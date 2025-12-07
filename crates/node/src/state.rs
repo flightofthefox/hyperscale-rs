@@ -465,8 +465,14 @@ impl StateMachine for NodeStateMachine {
                 return actions;
             }
 
-            // Other mempool events don't need special handling
-            Event::TransactionAccepted { .. } | Event::QueryTransactionStatus { .. } => {
+            // TransactionAccepted is informational - just log at debug level
+            Event::TransactionAccepted { tx_hash } => {
+                tracing::debug!(?tx_hash, "Transaction accepted into mempool");
+                return vec![];
+            }
+
+            // Query transaction status from mempool
+            Event::QueryTransactionStatus { .. } => {
                 if let Some(actions) = self.mempool.try_handle(&event) {
                     return actions;
                 }
