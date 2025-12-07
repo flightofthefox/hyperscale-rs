@@ -217,6 +217,26 @@ pub enum Event {
         valid: bool,
     },
 
+    /// View change vote signature verification completed.
+    ///
+    /// Callback from `Action::VerifyViewChangeVoteSignature`.
+    ViewChangeVoteSignatureVerified {
+        /// The view change vote that was verified.
+        vote: ViewChangeVote,
+        /// Whether the signature is valid.
+        valid: bool,
+    },
+
+    /// View change highest QC verification completed.
+    ///
+    /// Callback from `Action::VerifyViewChangeHighestQc`.
+    ViewChangeHighestQcVerified {
+        /// The view change vote whose highest_qc was verified.
+        vote: ViewChangeVote,
+        /// Whether the highest_qc's aggregated signature is valid.
+        valid: bool,
+    },
+
     /// Single-shard transaction execution completed.
     TransactionsExecuted {
         block_hash: Hash,
@@ -339,6 +359,8 @@ impl Event {
             | Event::StateVoteSignatureVerified { .. }
             | Event::StateCertificateSignatureVerified { .. }
             | Event::QcSignatureVerified { .. }
+            | Event::ViewChangeVoteSignatureVerified { .. }
+            | Event::ViewChangeHighestQcVerified { .. }
             | Event::TransactionsExecuted { .. }
             | Event::CrossShardTransactionExecuted { .. }
             | Event::MerkleRootComputed { .. }

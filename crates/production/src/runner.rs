@@ -595,6 +595,47 @@ impl ProductionRunner {
                 });
             }
 
+            Action::VerifyViewChangeVoteSignature {
+                vote,
+                public_key,
+                signing_message,
+            } => {
+                let event_tx = self.event_tx.clone();
+                self.thread_pools.spawn_crypto(move || {
+                    let valid = public_key.verify(&signing_message, &vote.signature);
+                    let _ = event_tx
+                        .blocking_send(Event::ViewChangeVoteSignatureVerified { vote, valid });
+                });
+            }
+
+            Action::VerifyViewChangeHighestQc { vote, public_keys } => {
+                let event_tx = self.event_tx.clone();
+                self.thread_pools.spawn_crypto(move || {
+                    // Get signer keys based on the highest_qc's signer bitfield
+                    let signer_keys: Vec<_> = public_keys
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| vote.highest_qc.signers.is_set(*i))
+                        .map(|(_, pk)| pk.clone())
+                        .collect();
+
+                    let valid = if signer_keys.is_empty() {
+                        false
+                    } else {
+                        match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
+                            Ok(aggregated_pk) => aggregated_pk.verify(
+                                vote.highest_qc.block_hash.as_bytes(),
+                                &vote.highest_qc.aggregated_signature,
+                            ),
+                            Err(_) => false,
+                        }
+                    };
+
+                    let _ =
+                        event_tx.blocking_send(Event::ViewChangeHighestQcVerified { vote, valid });
+                });
+            }
+
             // Transaction execution on dedicated execution thread pool
             Action::ExecuteTransactions {
                 block_hash,

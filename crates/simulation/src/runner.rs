@@ -682,6 +682,48 @@ impl SimulationRunner {
                 );
             }
 
+            Action::VerifyViewChangeVoteSignature {
+                vote,
+                public_key,
+                signing_message,
+            } => {
+                // In simulation, verify the signature instantly
+                let valid = public_key.verify(&signing_message, &vote.signature);
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::ViewChangeVoteSignatureVerified { vote, valid },
+                );
+            }
+
+            Action::VerifyViewChangeHighestQc { vote, public_keys } => {
+                // Verify aggregated BLS signature on the highest_qc
+                let signer_keys: Vec<_> = public_keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| vote.highest_qc.signers.is_set(*i))
+                    .map(|(_, pk)| pk.clone())
+                    .collect();
+
+                let valid = if signer_keys.is_empty() {
+                    false
+                } else {
+                    match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
+                        Ok(aggregated_pk) => aggregated_pk.verify(
+                            vote.highest_qc.block_hash.as_bytes(),
+                            &vote.highest_qc.aggregated_signature,
+                        ),
+                        Err(_) => false,
+                    }
+                };
+
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::ViewChangeHighestQcVerified { vote, valid },
+                );
+            }
+
             Action::ExecuteTransactions {
                 block_hash,
                 transactions,

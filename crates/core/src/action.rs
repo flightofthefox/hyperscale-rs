@@ -4,7 +4,7 @@ use crate::{message::OutboundMessage, Event, RequestId, TimerId};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Hash, NodeId, PublicKey, QuorumCertificate, RoutableTransaction,
     ShardGroupId, StateCertificate, StateProvision, StateVoteBlock, SubstateWrite,
-    TransactionCertificate, TransactionDecision,
+    TransactionCertificate, TransactionDecision, ViewChangeVote,
 };
 use std::time::Duration;
 
@@ -110,6 +110,37 @@ pub enum Action {
         /// The block hash this QC verification is associated with (for correlation).
         /// This is the hash of the block whose header contains this QC as parent_qc.
         block_hash: Hash,
+    },
+
+    /// Verify a view change vote's signature.
+    ///
+    /// View change votes must be verified before being counted toward quorum.
+    /// The signature is over (shard_group, height, new_round).
+    ///
+    /// Delegated to a thread pool in production, instant in simulation.
+    /// Returns `Event::ViewChangeVoteSignatureVerified` when complete.
+    VerifyViewChangeVoteSignature {
+        /// The view change vote to verify.
+        vote: ViewChangeVote,
+        /// Public key of the voter (pre-resolved by state machine).
+        public_key: PublicKey,
+        /// The signing message (shard_group || height || new_round).
+        /// Pre-computed by state machine since it has the shard_group context.
+        signing_message: Vec<u8>,
+    },
+
+    /// Verify the highest QC attached to a view change vote.
+    ///
+    /// View change votes include the voter's highest QC. This QC must be verified
+    /// before being used to determine the new proposer's starting point.
+    ///
+    /// Delegated to a thread pool in production, instant in simulation.
+    /// Returns `Event::ViewChangeHighestQcVerified` when complete.
+    VerifyViewChangeHighestQc {
+        /// The view change vote containing the highest_qc.
+        vote: ViewChangeVote,
+        /// Public keys of the QC signers (pre-resolved from highest_qc.signers bitfield).
+        public_keys: Vec<PublicKey>,
     },
 
     /// Execute a batch of single-shard transactions.
@@ -242,6 +273,8 @@ impl Action {
                 | Action::VerifyStateVoteSignature { .. }
                 | Action::VerifyStateCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
+                | Action::VerifyViewChangeVoteSignature { .. }
+                | Action::VerifyViewChangeHighestQc { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
                 | Action::ComputeMerkleRoot { .. }

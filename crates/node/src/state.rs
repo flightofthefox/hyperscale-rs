@@ -245,14 +245,50 @@ impl StateMachine for NodeStateMachine {
                     }
                 }
 
-                if let Some((height, new_round)) =
-                    self.view_change.add_view_change_vote(vote.clone())
-                {
-                    // Quorum reached - apply the view change and get actions
-                    tracing::info!(height, new_round, "View change quorum reached");
-                    return self.view_change.apply_view_change(height, new_round);
+                // Delegate verification to runner (async)
+                return self.view_change.on_view_change_vote(vote.clone());
+            }
+
+            // View change vote signature verification completed
+            Event::ViewChangeVoteSignatureVerified { vote, valid } => {
+                let mut actions = self
+                    .view_change
+                    .on_vote_signature_verified(vote.clone(), *valid);
+
+                // Check if quorum was reached (ViewChangeCompleted will be in actions)
+                for action in &actions {
+                    if let Action::EnqueueInternal {
+                        event: Event::ViewChangeCompleted { height, new_round },
+                    } = action
+                    {
+                        // Apply view change when quorum is reached
+                        tracing::info!(height, new_round, "View change quorum reached");
+                        actions.extend(self.view_change.apply_view_change(*height, *new_round));
+                        break;
+                    }
                 }
-                return vec![];
+                return actions;
+            }
+
+            // View change highest QC verification completed
+            Event::ViewChangeHighestQcVerified { vote, valid } => {
+                let mut actions = self
+                    .view_change
+                    .on_highest_qc_verified(vote.clone(), *valid);
+
+                // Check if quorum was reached (ViewChangeCompleted will be in actions)
+                for action in &actions {
+                    if let Action::EnqueueInternal {
+                        event: Event::ViewChangeCompleted { height, new_round },
+                    } = action
+                    {
+                        // Apply view change when quorum is reached
+                        tracing::info!(height, new_round, "View change quorum reached");
+                        actions.extend(self.view_change.apply_view_change(*height, *new_round));
+                        break;
+                    }
+                }
+                return actions;
             }
 
             Event::ViewChangeCertificateReceived { cert } => {

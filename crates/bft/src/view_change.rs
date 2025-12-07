@@ -21,6 +21,16 @@ use tracing::{debug, info, warn};
 use hyperscale_core::{Action, Event, OutboundMessage, TimerId};
 use hyperscale_messages::{ViewChangeVote, ViewChangeVoteGossip};
 
+/// Marker for view change vote pending signature verification.
+/// The vote itself is returned in the verification callback event.
+#[derive(Debug, Clone, Copy)]
+struct PendingVoteVerification;
+
+/// Marker for view change vote pending highest_qc verification.
+/// The vote itself is returned in the verification callback event.
+#[derive(Debug, Clone, Copy)]
+struct PendingHighestQcVerification;
+
 /// View change state for a deterministic BFT node.
 ///
 /// Unlike the async version that uses DashMap and AtomicU64, this version
@@ -59,6 +69,14 @@ pub struct ViewChangeState {
     /// Highest QC seen from view change votes: (height, new_round) -> highest QC.
     highest_qc_collector: HashMap<(u64, u64), QuorumCertificate>,
 
+    /// Votes pending vote signature verification.
+    /// Key: (height, new_round, voter)
+    pending_vote_verifications: HashMap<(u64, u64, ValidatorId), PendingVoteVerification>,
+
+    /// Votes pending highest_qc verification (vote signature already verified).
+    /// Key: (height, new_round, voter)
+    pending_qc_verifications: HashMap<(u64, u64, ValidatorId), PendingHighestQcVerification>,
+
     /// Current simulation time.
     now: Duration,
 }
@@ -83,6 +101,8 @@ impl ViewChangeState {
             vote_collector: HashMap::new(),
             highest_qc: QuorumCertificate::genesis(),
             highest_qc_collector: HashMap::new(),
+            pending_vote_verifications: HashMap::new(),
+            pending_qc_verifications: HashMap::new(),
             now: Duration::ZERO,
         }
     }
@@ -249,10 +269,9 @@ impl ViewChangeState {
                 message: OutboundMessage::ViewChangeVote(gossip),
             });
 
-            // Also process our own vote
-            if let Some(result) = self.add_view_change_vote(vote) {
-                actions.extend(self.apply_view_change(result.0, result.1));
-            }
+            // Process our own vote directly (no verification needed - we just created it)
+            // Skip the signature verification since we signed it ourselves
+            actions.extend(self.finalize_vote(vote));
         }
 
         actions
@@ -287,7 +306,7 @@ impl ViewChangeState {
     }
 
     /// Create the message bytes to sign for a view change vote.
-    fn view_change_message(shard_group: &Hash, height: BlockHeight, new_round: u64) -> Vec<u8> {
+    pub fn view_change_message(shard_group: &Hash, height: BlockHeight, new_round: u64) -> Vec<u8> {
         let mut message = Vec::with_capacity(60);
         message.extend_from_slice(b"view_change:");
         message.extend_from_slice(shard_group.as_bytes());
@@ -296,12 +315,18 @@ impl ViewChangeState {
         message
     }
 
-    /// Add a view change vote from another validator.
+    /// Get the shard group hash (needed for signing message construction).
+    pub fn shard_group(&self) -> &Hash {
+        &self.shard_group
+    }
+
+    /// Handle a view change vote from another validator.
     ///
-    /// Returns Some((height, new_round)) if quorum reached.
-    pub fn add_view_change_vote(&mut self, vote: ViewChangeVote) -> Option<(u64, u64)> {
+    /// Performs initial validation and delegates signature verification to the runner.
+    /// Returns actions to verify the vote signature.
+    pub fn on_view_change_vote(&mut self, vote: ViewChangeVote) -> Vec<Action> {
         let (height, new_round) = vote.vote_key();
-        let vote_key = (height.0, new_round);
+        let vote_key = (height.0, new_round, vote.voter);
 
         // Ignore votes for old heights
         if height.0 < self.current_height {
@@ -310,7 +335,7 @@ impl ViewChangeState {
                 current_height = self.current_height,
                 "Ignoring view change vote for old height"
             );
-            return None;
+            return vec![];
         }
 
         // Ignore votes for rounds we've already passed
@@ -320,43 +345,137 @@ impl ViewChangeState {
                 current_round = self.current_round,
                 "Ignoring view change vote for old/current round"
             );
-            return None;
+            return vec![];
+        }
+
+        // Check if already pending verification
+        if self.pending_vote_verifications.contains_key(&vote_key)
+            || self.pending_qc_verifications.contains_key(&vote_key)
+        {
+            debug!(voter = ?vote.voter, "Vote already pending verification");
+            return vec![];
+        }
+
+        // Check for duplicate (already accepted vote)
+        let voters = self.vote_collector.get(&(height.0, new_round));
+        if voters.is_some_and(|v| v.contains_key(&vote.voter)) {
+            debug!(voter = ?vote.voter, "Ignoring duplicate view change vote");
+            return vec![];
         }
 
         // Verify the voter is in the committee
-        let _voter_index = match self.committee_index(vote.voter) {
-            Some(idx) => idx,
-            None => {
-                warn!(voter = ?vote.voter, "View change vote from unknown validator");
-                return None;
-            }
-        };
+        if self.committee_index(vote.voter).is_none() {
+            warn!(voter = ?vote.voter, "View change vote from unknown validator");
+            return vec![];
+        }
 
         let public_key = match self.public_key(vote.voter) {
             Some(pk) => pk,
             None => {
                 warn!(voter = ?vote.voter, "No public key for voter");
-                return None;
+                return vec![];
             }
         };
 
-        // Verify the vote signature
-        let message = Self::view_change_message(&self.shard_group, height, new_round);
-        if !public_key.verify(&message, &vote.signature) {
-            warn!(
-                voter = ?vote.voter,
-                "View change vote has invalid signature"
-            );
-            return None;
+        // Store pending verification marker
+        self.pending_vote_verifications
+            .insert(vote_key, PendingVoteVerification);
+
+        // Delegate vote signature verification to runner
+        let signing_message = Self::view_change_message(&self.shard_group, height, new_round);
+        vec![Action::VerifyViewChangeVoteSignature {
+            vote,
+            public_key,
+            signing_message,
+        }]
+    }
+
+    /// Handle vote signature verification result.
+    ///
+    /// If valid, proceeds to verify the highest_qc (if non-genesis).
+    /// Returns actions to verify the QC signature, or finalizes the vote if genesis QC.
+    pub fn on_vote_signature_verified(&mut self, vote: ViewChangeVote, valid: bool) -> Vec<Action> {
+        let (height, new_round) = vote.vote_key();
+        let vote_key = (height.0, new_round, vote.voter);
+
+        // Remove from pending
+        if self.pending_vote_verifications.remove(&vote_key).is_none() {
+            warn!(voter = ?vote.voter, "Vote signature verified but not pending");
+            return vec![];
         }
 
-        // Verify the attached highest_qc
+        if !valid {
+            warn!(voter = ?vote.voter, "View change vote has invalid signature");
+            return vec![];
+        }
+
+        // Check the attached highest_qc has quorum (structural check)
         let total_power = self.total_voting_power();
         if !vote.highest_qc.is_genesis() && !vote.highest_qc.has_quorum(total_power) {
             warn!(voter = ?vote.voter, "View change vote contains QC without quorum");
-            return None;
+            return vec![];
         }
-        // Note: In production, we'd also verify the QC signature
+
+        // If highest_qc is genesis, skip QC verification and finalize directly
+        if vote.highest_qc.is_genesis() {
+            return self.finalize_vote(vote);
+        }
+
+        // Get public keys for QC signers
+        let signer_keys: Vec<PublicKey> = vote
+            .highest_qc
+            .signers
+            .set_indices()
+            .filter_map(|idx| {
+                self.topology
+                    .local_validator_at_index(idx)
+                    .and_then(|v| self.public_key(v))
+            })
+            .collect();
+
+        if signer_keys.is_empty() {
+            warn!(voter = ?vote.voter, "No valid signer keys for highest_qc");
+            return vec![];
+        }
+
+        // Store pending QC verification marker
+        self.pending_qc_verifications
+            .insert(vote_key, PendingHighestQcVerification);
+
+        // Delegate QC signature verification to runner
+        vec![Action::VerifyViewChangeHighestQc {
+            vote,
+            public_keys: signer_keys,
+        }]
+    }
+
+    /// Handle highest_qc signature verification result.
+    ///
+    /// If valid, finalizes the vote and checks for quorum.
+    pub fn on_highest_qc_verified(&mut self, vote: ViewChangeVote, valid: bool) -> Vec<Action> {
+        let (height, new_round) = vote.vote_key();
+        let vote_key = (height.0, new_round, vote.voter);
+
+        // Remove from pending
+        if self.pending_qc_verifications.remove(&vote_key).is_none() {
+            warn!(voter = ?vote.voter, "Highest QC verified but not pending");
+            return vec![];
+        }
+
+        if !valid {
+            warn!(voter = ?vote.voter, "View change vote has invalid highest_qc signature");
+            return vec![];
+        }
+
+        self.finalize_vote(vote)
+    }
+
+    /// Finalize a view change vote after all verifications pass.
+    ///
+    /// Adds the vote to the collector and checks for quorum.
+    fn finalize_vote(&mut self, vote: ViewChangeVote) -> Vec<Action> {
+        let (height, new_round) = vote.vote_key();
+        let vote_key = (height.0, new_round);
 
         // Track the highest QC seen for this (height, new_round)
         self.highest_qc_collector
@@ -371,23 +490,10 @@ impl ViewChangeState {
         // Add vote to collector
         let voters = self.vote_collector.entry(vote_key).or_default();
 
-        // Check for duplicate vote
+        // Double-check for duplicate (shouldn't happen, but be safe)
         if voters.contains_key(&vote.voter) {
-            debug!(
-                voter = ?vote.voter,
-                "Ignoring duplicate view change vote"
-            );
-            // Collect voter IDs first to avoid borrow issues
-            let voter_ids: Vec<ValidatorId> = voters.keys().copied().collect();
-            let _ = voters; // Release the borrow
-
-            // Calculate voting power
-            let vote_power = self.calculate_voting_power(&voter_ids);
-
-            if VotePower::has_quorum(vote_power, total_power) {
-                return Some(vote_key);
-            }
-            return None;
+            debug!(voter = ?vote.voter, "Ignoring duplicate view change vote in finalize");
+            return vec![];
         }
 
         // Add new vote
@@ -396,12 +502,10 @@ impl ViewChangeState {
             (vote.signature.clone(), vote.highest_qc.clone()),
         );
 
-        // Collect voter IDs first to avoid borrow issues
-        let voter_ids: Vec<ValidatorId> = voters.keys().copied().collect();
-        let _ = voters; // Release the borrow
-
         // Calculate voting power
+        let voter_ids: Vec<ValidatorId> = voters.keys().copied().collect();
         let vote_power = self.calculate_voting_power(&voter_ids);
+        let total_power = self.total_voting_power();
 
         debug!(
             height = height.0,
@@ -418,7 +522,58 @@ impl ViewChangeState {
                 new_round = new_round,
                 "View change quorum reached"
             );
-            return Some(vote_key);
+
+            // Emit internal event to trigger view change completion
+            return vec![Action::EnqueueInternal {
+                event: Event::ViewChangeCompleted {
+                    height: height.0,
+                    new_round,
+                },
+            }];
+        }
+
+        vec![]
+    }
+
+    /// Legacy method for backward compatibility with tests.
+    /// Performs synchronous verification (NOT for production use).
+    #[cfg(test)]
+    pub fn add_view_change_vote(&mut self, vote: ViewChangeVote) -> Option<(u64, u64)> {
+        let (height, new_round) = vote.vote_key();
+
+        // Perform all the checks that on_view_change_vote does
+        if height.0 < self.current_height {
+            return None;
+        }
+        if height.0 == self.current_height && new_round <= self.current_round {
+            return None;
+        }
+        self.committee_index(vote.voter)?;
+        let public_key = self.public_key(vote.voter)?;
+
+        // Synchronous signature verification (test only)
+        let message = Self::view_change_message(&self.shard_group, height, new_round);
+        if !public_key.verify(&message, &vote.signature) {
+            return None;
+        }
+
+        // Check QC quorum
+        let total_power = self.total_voting_power();
+        if !vote.highest_qc.is_genesis() && !vote.highest_qc.has_quorum(total_power) {
+            return None;
+        }
+
+        // Finalize vote and check for quorum
+        let actions = self.finalize_vote(vote);
+
+        // Check if quorum was reached (ViewChangeCompleted emitted)
+        for action in actions {
+            if let Action::EnqueueInternal {
+                event: Event::ViewChangeCompleted { height, new_round },
+            } = action
+            {
+                return Some((height, new_round));
+            }
         }
 
         None
