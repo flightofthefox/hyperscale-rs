@@ -1,0 +1,31 @@
+[package]
+name = "hyperscale-simulation"
+version.workspace = true
+edition.workspace = true
+description = "Simulation runner"
+
+[dependencies]
+hyperscale-core.workspace = true
+hyperscale-bft.workspace = true
+hyperscale-engine.workspace = true
+hyperscale-node.workspace = true
+hyperscale-types.workspace = true
+# Radix dependencies for real execution
+radix-common = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+
+# In-memory storage with O(1) snapshots
+im.workspace = true
+
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+
+[dev-dependencies]
+hyperscale-execution.workspace = true
+
+# Radix dependencies for e2e tests
+radix-common = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+radix-transactions = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+
+tracing-test = "0.2.5"

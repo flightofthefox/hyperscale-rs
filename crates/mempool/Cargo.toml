@@ -1,0 +1,16 @@
+[package]
+name = "hyperscale-mempool"
+version.workspace = true
+edition.workspace = true
+description = "Mempool state machine"
+
+[dependencies]
+hyperscale-core.workspace = true
+hyperscale-messages.workspace = true
+hyperscale-types.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+hyperscale-types = { workspace = true, features = ["test-utils"] }

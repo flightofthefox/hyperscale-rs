@@ -1,0 +1,41 @@
+# Rust
+/target/
+/deterministic/target/
+/deterministic/Cargo.lock
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+/target/
+/simulation-failures/
+/reference/
+
+# Benchmarks
+/target/criterion/
+profile.json.gz
+
+# Temporary files
+*.tmp
+*.temp
+
+# Logs
+*.log
+
+# RocksDB
+*.sst
+*.log
+MANIFEST-*
+CURRENT
+IDENTITY
+LOCK
+OPTIONS-*
+LOG*

@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/types",
+    "crates/core",
+    "crates/messages",
+    "crates/bft",
+    "crates/engine",
+    "crates/execution",
+    "crates/livelock",
+    "crates/mempool",
+    "crates/sync",
+    "crates/node",
+    "crates/simulation",
+    "crates/simulator",
+    "crates/production",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+# Internal crates
+hyperscale-types = { path = "crates/types" }
+hyperscale-core = { path = "crates/core" }
+hyperscale-messages = { path = "crates/messages" }
+hyperscale-bft = { path = "crates/bft" }
+hyperscale-execution = { path = "crates/execution" }
+hyperscale-livelock = { path = "crates/livelock" }
+hyperscale-mempool = { path = "crates/mempool" }
+hyperscale-node = { path = "crates/node" }
+hyperscale-simulation = { path = "crates/simulation" }
+hyperscale-production = { path = "crates/production" }
+hyperscale-engine = { path = "crates/engine" }
+hyperscale-sync = { path = "crates/sync" }
+hyperscale-simulator = { path = "crates/simulator" }
+
+# External dependencies
+thiserror = "2.0.17"
+tracing = "0.1.43"
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
+rayon = "1.10"
+rand = "0.8.5"
+rand_chacha = "0.3.1"
+sbor = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+indexmap = "2.12.1"
+im = "15.1"

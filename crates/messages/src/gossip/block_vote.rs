@@ -1,0 +1,75 @@
+//! BlockVote gossip message.
+
+use hyperscale_types::{BlockVote, NetworkMessage, ShardMessage};
+use sbor::prelude::BasicSbor;
+
+/// Vote on a block proposal. 2f+1 matching votes create a QuorumCertificate.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct BlockVoteGossip {
+    /// The block vote being gossiped
+    pub vote: BlockVote,
+}
+
+impl BlockVoteGossip {
+    /// Create a new block vote gossip message.
+    pub fn new(vote: BlockVote) -> Self {
+        Self { vote }
+    }
+
+    /// Get the inner block vote.
+    pub fn vote(&self) -> &BlockVote {
+        &self.vote
+    }
+
+    /// Consume and return the inner block vote.
+    pub fn into_vote(self) -> BlockVote {
+        self.vote
+    }
+}
+
+// Network message implementation
+impl NetworkMessage for BlockVoteGossip {
+    fn message_type_id() -> &'static str {
+        "block.vote"
+    }
+}
+
+impl ShardMessage for BlockVoteGossip {}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::{BlockHeight, Hash, Signature, ValidatorId};
+
+    use super::*;
+
+    #[test]
+    fn test_block_vote_gossip_creation() {
+        let vote = BlockVote {
+            block_hash: Hash::from_bytes(b"block_hash"),
+            height: BlockHeight(10),
+            round: 0,
+            voter: ValidatorId(2),
+            signature: Signature::zero(),
+            timestamp: 1000000000000,
+        };
+
+        let gossip = BlockVoteGossip::new(vote.clone());
+        assert_eq!(gossip.vote(), &vote);
+    }
+
+    #[test]
+    fn test_block_vote_gossip_into_vote() {
+        let vote = BlockVote {
+            block_hash: Hash::from_bytes(b"test"),
+            height: BlockHeight(5),
+            round: 0,
+            voter: ValidatorId(1),
+            signature: Signature::zero(),
+            timestamp: 1000000000000,
+        };
+
+        let gossip = BlockVoteGossip::new(vote.clone());
+        let extracted = gossip.into_vote();
+        assert_eq!(extracted, vote);
+    }
+}

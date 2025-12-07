@@ -1,0 +1,20 @@
+[package]
+name = "hyperscale-node"
+version.workspace = true
+edition.workspace = true
+description = "Combined node state machine"
+
+[dependencies]
+hyperscale-core.workspace = true
+hyperscale-bft.workspace = true
+hyperscale-execution.workspace = true
+hyperscale-livelock.workspace = true
+hyperscale-mempool.workspace = true
+hyperscale-messages.workspace = true
+hyperscale-sync.workspace = true
+hyperscale-types.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]

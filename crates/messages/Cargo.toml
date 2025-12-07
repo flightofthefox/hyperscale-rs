@@ -1,0 +1,13 @@
+[package]
+name = "hyperscale-messages"
+version.workspace = true
+edition.workspace = true
+description = "Network message types"
+
+[dependencies]
+hyperscale-types = { workspace = true, features = ["test-utils"] }
+
+# Serialization
+sbor.workspace = true
+
+[dev-dependencies]

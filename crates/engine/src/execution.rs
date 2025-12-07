@@ -1,0 +1,197 @@
+//! Execution context for cross-shard transactions.
+//!
+//! Provides an overlay that combines local storage with provisions from other shards.
+
+use crate::error::ExecutionError;
+use hyperscale_types::{
+    Hash, NodeId, PartitionNumber, StateEntry, StateProvision, SubstateWrite,
+};
+use radix_common::network::NetworkDefinition;
+use radix_common::prelude::DatabaseUpdate;
+use radix_engine::transaction::{
+    execute_transaction, ExecutionConfig, TransactionReceipt, TransactionResult,
+};
+use radix_engine::vm::DefaultVmModules;
+use radix_substate_store_impls::substate_database_overlay::SubstateDatabaseOverlay;
+use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
+use radix_substate_store_interface::interface::{
+    CommittableSubstateDatabase, CreateDatabaseUpdates, DatabaseUpdates, DbSortKey,
+    NodeDatabaseUpdates, PartitionDatabaseUpdates, SubstateDatabase,
+};
+use radix_transactions::model::UserTransaction;
+use radix_transactions::prelude::*;
+use radix_transactions::validation::TransactionValidator;
+
+/// Execution context that combines local storage with provisioned state.
+///
+/// Uses Radix's `SubstateDatabaseOverlay` to layer provisioned state on top
+/// of local storage, enabling cross-shard transaction execution.
+pub struct ProvisionedExecutionContext<'a, S: SubstateDatabase> {
+    base_store: &'a S,
+    provisions: DatabaseUpdates,
+    network: NetworkDefinition,
+}
+
+impl<'a, S: SubstateDatabase> ProvisionedExecutionContext<'a, S> {
+    /// Create a new execution context.
+    pub fn new(base_store: &'a S, network: NetworkDefinition) -> Self {
+        Self {
+            base_store,
+            provisions: DatabaseUpdates::default(),
+            network,
+        }
+    }
+
+    /// Add a state provision from another shard.
+    pub fn add_provision(&mut self, provision: &StateProvision) {
+        for entry in &provision.entries {
+            self.add_entry(entry);
+        }
+    }
+
+    /// Add a single state entry to the provisions.
+    pub fn add_entry(&mut self, entry: &StateEntry) {
+        let radix_node_id = radix_common::types::NodeId(entry.node_id.0);
+        let radix_partition = radix_common::types::PartitionNumber(entry.partition.0);
+
+        let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
+        let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
+        let db_sort_key = DbSortKey(entry.sort_key.clone());
+
+        // StateEntry value is Option<Vec<u8>>: None means delete, Some(v) means set
+        let update = match &entry.value {
+            None => DatabaseUpdate::Delete,
+            Some(v) if v.is_empty() => DatabaseUpdate::Delete,
+            Some(v) => DatabaseUpdate::Set(v.clone()),
+        };
+
+        let node_updates = self
+            .provisions
+            .node_updates
+            .entry(db_node_key)
+            .or_insert_with(|| NodeDatabaseUpdates {
+                partition_updates: indexmap::IndexMap::new(),
+            });
+
+        let partition_updates = node_updates
+            .partition_updates
+            .entry(db_partition_num)
+            .or_insert_with(|| PartitionDatabaseUpdates::Delta {
+                substate_updates: indexmap::IndexMap::new(),
+            });
+
+        if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
+            substate_updates.insert(db_sort_key, update);
+        }
+    }
+
+    /// Execute a transaction with the accumulated provisions.
+    pub fn execute(
+        &self,
+        executable: &ExecutableTransaction,
+    ) -> Result<TransactionReceipt, ExecutionError> {
+        let mut overlay = SubstateDatabaseOverlay::new_unmergeable(self.base_store);
+        overlay.commit(&self.provisions);
+
+        let vm_modules = DefaultVmModules::default();
+        let execution_config = ExecutionConfig::for_notarized_transaction(self.network.clone());
+
+        let receipt = execute_transaction(&overlay, &vm_modules, &execution_config, executable);
+
+        Ok(receipt)
+    }
+
+    /// Execute a `UserTransaction` (V1 or V2).
+    pub fn execute_user_transaction(
+        &self,
+        transaction: &UserTransaction,
+    ) -> Result<TransactionReceipt, ExecutionError> {
+        let validator = TransactionValidator::new_with_latest_config(&self.network);
+
+        let validated = transaction.prepare_and_validate(&validator).map_err(|e| {
+            ExecutionError::Preparation(format!("Transaction validation failed: {:?}", e))
+        })?;
+
+        let executable = validated.create_executable();
+        self.execute(&executable)
+    }
+}
+
+/// Extract state updates from a committed transaction receipt.
+pub fn extract_state_updates(receipt: &TransactionReceipt) -> Option<DatabaseUpdates> {
+    match &receipt.result {
+        TransactionResult::Commit(commit) => Some(commit.state_updates.create_database_updates()),
+        TransactionResult::Reject(_) | TransactionResult::Abort(_) => None,
+    }
+}
+
+/// Check if a transaction receipt represents a successful commit.
+pub fn is_commit_success(receipt: &TransactionReceipt) -> bool {
+    matches!(&receipt.result, TransactionResult::Commit(_))
+}
+
+/// Extract SubstateWrites from a receipt.
+pub fn extract_substate_writes(receipt: &TransactionReceipt) -> Vec<SubstateWrite> {
+    let Some(updates) = extract_state_updates(receipt) else {
+        return Vec::new();
+    };
+
+    let mut writes = Vec::new();
+
+    for (db_node_key, node_updates) in &updates.node_updates {
+        // Convert DbNodeKey back to NodeId (extract 30-byte suffix after 20-byte hash prefix)
+        let node_id = if db_node_key.len() >= 50 {
+            let mut id = [0u8; 30];
+            id.copy_from_slice(&db_node_key[20..50]);
+            NodeId(id)
+        } else {
+            continue;
+        };
+
+        for (partition_num, partition_updates) in &node_updates.partition_updates {
+            let partition = PartitionNumber(*partition_num);
+
+            if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
+                for (db_sort_key, update) in substate_updates {
+                    if let DatabaseUpdate::Set(value) = update {
+                        writes.push(SubstateWrite::new(
+                            node_id,
+                            partition,
+                            db_sort_key.0.clone(),
+                            value.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    writes
+}
+
+/// Compute merkle root from substate writes.
+///
+/// Uses a simple hash chain for now. A proper implementation would use
+/// a sparse Merkle tree.
+pub fn compute_merkle_root(writes: &[SubstateWrite]) -> Hash {
+    if writes.is_empty() {
+        return Hash::ZERO;
+    }
+
+    // Sort writes for determinism
+    let mut sorted: Vec<_> = writes.iter().collect();
+    sorted.sort_by(|a, b| {
+        (&a.node_id.0, a.partition.0, &a.sort_key).cmp(&(&b.node_id.0, b.partition.0, &b.sort_key))
+    });
+
+    // Hash chain
+    let mut data = Vec::new();
+    for write in sorted {
+        data.extend_from_slice(&write.node_id.0);
+        data.push(write.partition.0);
+        data.extend_from_slice(&write.sort_key);
+        data.extend_from_slice(&write.value);
+    }
+
+    Hash::from_bytes(&data)
+}

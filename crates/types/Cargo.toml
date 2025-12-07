@@ -1,0 +1,28 @@
+[package]
+name = "hyperscale-types"
+version.workspace = true
+edition.workspace = true
+description = "Core types for Hyperscale consensus"
+
+[dependencies]
+# Cryptographic primitives
+blake3 = "1.5"
+hex = "0.4"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+blst = "0.3"
+rand = "0.8"
+
+# Serialization
+sbor.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Radix transaction types
+radix-common = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+radix-transactions = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+
+[features]
+test-utils = []
+
+[dev-dependencies]

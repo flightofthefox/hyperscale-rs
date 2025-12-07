@@ -1,0 +1,17 @@
+[package]
+name = "hyperscale-execution"
+version.workspace = true
+edition.workspace = true
+description = "Execution state machine"
+
+[dependencies]
+hyperscale-core.workspace = true
+hyperscale-bft.workspace = true
+hyperscale-mempool.workspace = true
+hyperscale-messages.workspace = true
+hyperscale-types.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]

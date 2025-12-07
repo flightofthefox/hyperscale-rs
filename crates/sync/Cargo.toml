@@ -1,0 +1,15 @@
+[package]
+name = "hyperscale-sync"
+version = "0.1.0"
+edition = "2021"
+description = "Block synchronization state machine"
+
+[dependencies]
+hyperscale-core = { path = "../core" }
+hyperscale-types = { path = "../types" }
+hyperscale-messages = { path = "../messages" }
+
+tracing = "0.1"
+
+[dev-dependencies]
+tracing-test = "0.2"

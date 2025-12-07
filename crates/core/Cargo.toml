@@ -1,0 +1,13 @@
+[package]
+name = "hyperscale-core"
+version.workspace = true
+edition.workspace = true
+description = "Core types for Hyperscale consensus: Event, Action, and StateMachine trait"
+
+[dependencies]
+hyperscale-types.workspace = true
+hyperscale-messages.workspace = true
+
+thiserror.workspace = true
+
+[dev-dependencies]

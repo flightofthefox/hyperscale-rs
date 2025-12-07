@@ -1,0 +1,18 @@
+[package]
+name = "hyperscale-bft"
+version.workspace = true
+edition.workspace = true
+description = "BFT consensus state machine"
+
+[dependencies]
+hyperscale-core.workspace = true
+hyperscale-messages.workspace = true
+hyperscale-types.workspace = true
+
+indexmap.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tracing-test = "0.2"

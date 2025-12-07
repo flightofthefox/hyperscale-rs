@@ -1,0 +1,35 @@
+[package]
+name = "hyperscale-simulator"
+version.workspace = true
+edition.workspace = true
+description = "Long-running workload simulator"
+
+[dependencies]
+hyperscale-core.workspace = true
+hyperscale-mempool.workspace = true
+hyperscale-simulation.workspace = true
+hyperscale-types.workspace = true
+hyperscale-engine.workspace = true
+
+# Radix dependencies for transaction building
+radix-common = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+radix-transactions = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+
+# Metrics
+hdrhistogram = "7.5"
+
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[[bin]]
+name = "hyperscale-sim"
+path = "src/bin/main.rs"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing-test = "0.2.5"
