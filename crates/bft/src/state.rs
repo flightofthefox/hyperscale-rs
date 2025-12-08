@@ -1679,17 +1679,6 @@ impl BftState {
         ]
     }
 
-    /// Handle block committed event.
-    pub fn on_block_committed(
-        &mut self,
-        _block_hash: Hash,
-        _height: u64,
-        _block: &Block,
-    ) -> Vec<Action> {
-        // This event is mostly for other subsystems (mempool, execution) to react to
-        vec![]
-    }
-
     /// Handle a synced block that's ready to be applied.
     ///
     /// This is for blocks fetched via sync protocol, not blocks we participated
@@ -2110,11 +2099,7 @@ impl SubStateMachine for BftState {
             Event::BlockReadyToCommit { block_hash, qc } => {
                 Some(self.on_block_ready_to_commit(*block_hash, qc.clone()))
             }
-            Event::BlockCommitted {
-                block_hash,
-                height,
-                block,
-            } => Some(self.on_block_committed(*block_hash, *height, block)),
+            Event::BlockCommitted { .. } => Some(vec![]),
             Event::VoteSignatureVerified { vote, valid } => {
                 Some(self.on_vote_signature_verified(vote.clone(), *valid))
             }
