@@ -8,7 +8,7 @@ use crate::event_queue::EventKey;
 use crate::network::{NetworkConfig, SimulatedNetwork};
 use crate::storage::SimStorage;
 use crate::NodeIndex;
-use hyperscale_bft::BftConfig;
+use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_engine::RadixExecutor;
 use hyperscale_node::NodeStateMachine;
@@ -170,11 +170,13 @@ impl SimulationRunner {
                     shard_committees.clone(),
                 ));
 
+                // Fresh start - no recovered state
                 nodes.push(NodeStateMachine::new(
                     node_index as NodeIndex,
                     topology,
                     keys[node_index as usize].clone(),
                     BftConfig::default(),
+                    RecoveredState::default(),
                 ));
             }
         }
@@ -897,6 +899,23 @@ impl SimulationRunner {
                 // Store certificate in this node's storage
                 let storage = &mut self.node_storage[from as usize];
                 storage.put_certificate(certificate.transaction_hash, certificate);
+            }
+            Action::PersistOwnVote {
+                height,
+                round,
+                block_hash,
+            } => {
+                // **BFT Safety Critical**: Store our vote before broadcasting.
+                // This ensures we remember what we voted for after a restart.
+                let storage = &mut self.node_storage[from as usize];
+                storage.put_own_vote(height.0, round, block_hash);
+                trace!(
+                    node = from,
+                    height = height.0,
+                    round = round,
+                    block_hash = ?block_hash,
+                    "Persisted own vote"
+                );
             }
             Action::PersistSubstateWrites { .. } => {}
 

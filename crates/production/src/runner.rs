@@ -5,7 +5,7 @@ use crate::storage::RocksDbStorage;
 use crate::sync::{SyncConfig, SyncManager};
 use crate::thread_pools::ThreadPoolManager;
 use crate::timers::TimerManager;
-use hyperscale_bft::BftConfig;
+use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::TransactionStatus;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_types::BlockHeight;
@@ -169,7 +169,16 @@ impl ProductionRunner {
         let (event_tx, event_rx) = mpsc::channel(channel_capacity);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let local_shard = topology.local_shard();
-        let state = NodeStateMachine::new(node_index, topology.clone(), signing_key, bft_config);
+        // TODO: Load RecoveredState from storage for crash recovery.
+        // For now, start fresh (unsafe for production restarts).
+        let recovered = RecoveredState::default();
+        let state = NodeStateMachine::new(
+            node_index,
+            topology.clone(),
+            signing_key,
+            bft_config,
+            recovered,
+        );
         let timer_manager = TimerManager::new(event_tx.clone());
 
         Ok(Self {
@@ -217,7 +226,16 @@ impl ProductionRunner {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let validator_id = topology.local_validator_id();
         let local_shard = topology.local_shard();
-        let state = NodeStateMachine::new(node_index, topology.clone(), signing_key, bft_config);
+        // TODO: Load RecoveredState from storage for crash recovery.
+        // For now, start fresh (unsafe for production restarts).
+        let recovered = RecoveredState::default();
+        let state = NodeStateMachine::new(
+            node_index,
+            topology.clone(),
+            signing_key,
+            bft_config,
+            recovered,
+        );
         let timer_manager = TimerManager::new(event_tx.clone());
 
         // Create network adapter (returns both adapter and sync request receiver)
@@ -853,6 +871,17 @@ impl ProductionRunner {
 
             Action::PersistTransactionCertificate { certificate: _ } => {
                 // TODO: self.storage.persist_certificate(&certificate).await;
+            }
+
+            Action::PersistOwnVote {
+                height: _,
+                round: _,
+                block_hash: _,
+            } => {
+                // TODO: **BFT Safety Critical** - Implement vote persistence in RocksDbStorage.
+                // This MUST be persisted synchronously before the vote is broadcast.
+                // After crash/restart, votes must be loaded to prevent equivocation.
+                // self.storage.persist_own_vote(height, round, block_hash).await;
             }
 
             Action::PersistSubstateWrites {

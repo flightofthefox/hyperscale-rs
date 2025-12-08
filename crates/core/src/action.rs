@@ -219,6 +219,19 @@ pub enum Action {
         qc: QuorumCertificate,
     },
 
+    /// Persist our own vote before broadcasting it.
+    ///
+    /// **BFT Safety Critical**: This MUST be persisted before the vote is sent.
+    /// After a crash/restart, we must remember what we voted for to prevent
+    /// equivocation (voting for a different block at the same height).
+    ///
+    /// Key: (height, round) → block_hash
+    PersistOwnVote {
+        height: BlockHeight,
+        round: u64,
+        block_hash: Hash,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Storage: Execution
     // ═══════════════════════════════════════════════════════════════════════
@@ -268,6 +281,7 @@ impl Action {
             Action::BroadcastToShard { .. }
                 | Action::BroadcastGlobal { .. }
                 | Action::PersistBlock { .. }
+                | Action::PersistOwnVote { .. }
                 | Action::PersistTransactionCertificate { .. }
                 | Action::PersistSubstateWrites { .. }
         )
@@ -303,6 +317,7 @@ impl Action {
         matches!(
             self,
             Action::PersistBlock { .. }
+                | Action::PersistOwnVote { .. }
                 | Action::PersistTransactionCertificate { .. }
                 | Action::PersistSubstateWrites { .. }
         )

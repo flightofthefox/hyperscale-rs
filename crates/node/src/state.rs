@@ -1,6 +1,6 @@
 //! Node state machine.
 
-use hyperscale_bft::{BftConfig, BftState, ViewChangeState};
+use hyperscale_bft::{BftConfig, BftState, RecoveredState, ViewChangeState};
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, SubStateMachine};
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
@@ -66,11 +66,13 @@ impl NodeStateMachine {
     /// * `topology` - Network topology (single source of truth)
     /// * `signing_key` - Key for signing votes and proposals
     /// * `bft_config` - BFT configuration
+    /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     pub fn new(
         node_index: NodeIndex,
         topology: Arc<dyn Topology>,
         signing_key: KeyPair,
         bft_config: BftConfig,
+        recovered: RecoveredState,
     ) -> Self {
         // Create shard group hash for view change replay protection
         let shard_group_hash = Hash::from_bytes(&topology.local_shard().0.to_le_bytes());
@@ -88,6 +90,7 @@ impl NodeStateMachine {
                 signing_key.clone(),
                 topology.clone(),
                 bft_config.clone(),
+                recovered,
             ),
             view_change: ViewChangeState::new(
                 shard_group_hash,

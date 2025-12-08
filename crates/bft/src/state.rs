@@ -22,6 +22,26 @@ use crate::config::BftConfig;
 use crate::pending::PendingBlock;
 use crate::vote_set::VoteSet;
 
+/// State recovered from storage on startup.
+///
+/// Passed to `BftState::new()` to restore consensus state after a crash/restart.
+/// For a fresh start, use `RecoveredState::default()`.
+#[derive(Debug, Clone, Default)]
+pub struct RecoveredState {
+    /// Our own votes, indexed by height → (block_hash, round).
+    /// **BFT Safety Critical**: Prevents equivocation after restart.
+    pub voted_heights: HashMap<u64, (Hash, u64)>,
+
+    /// Last committed block height.
+    pub committed_height: u64,
+
+    /// Last committed block hash (None for fresh start).
+    pub committed_hash: Option<Hash>,
+
+    /// Latest QC (certifies the highest certified block).
+    pub latest_qc: Option<QuorumCertificate>,
+}
+
 /// Vote pending signature verification.
 #[derive(Debug, Clone)]
 struct PendingVoteVerification {
@@ -188,14 +208,23 @@ impl BftState {
     /// * `signing_key` - Key for signing votes and proposals
     /// * `topology` - Network topology (single source of truth)
     /// * `config` - BFT configuration
+    /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     pub fn new(
         node_index: NodeIndex,
         signing_key: KeyPair,
         topology: Arc<dyn Topology>,
         config: BftConfig,
+        recovered: RecoveredState,
     ) -> Self {
         // Create shard group hash for vote signature domain separation
         let shard_group = Hash::from_bytes(&topology.local_shard().0.to_le_bytes());
+
+        // Filter out votes for heights at or below committed height (stale votes from storage)
+        let voted_heights: HashMap<u64, (Hash, u64)> = recovered
+            .voted_heights
+            .into_iter()
+            .filter(|(height, _)| *height > recovered.committed_height)
+            .collect();
 
         Self {
             node_index,
@@ -203,13 +232,15 @@ impl BftState {
             shard_group,
             topology,
             view: 0,
-            committed_height: 0,
-            committed_hash: Hash::from_bytes(&[0u8; 32]),
-            latest_qc: None,
+            committed_height: recovered.committed_height,
+            committed_hash: recovered
+                .committed_hash
+                .unwrap_or(Hash::from_bytes(&[0u8; 32])),
+            latest_qc: recovered.latest_qc,
             genesis_block: None,
             pending_blocks: HashMap::new(),
             vote_sets: HashMap::new(),
-            voted_heights: HashMap::new(),
+            voted_heights,
             received_votes_by_height: HashMap::new(),
             certified_blocks: HashMap::new(),
             pending_vote_verifications: HashMap::new(),
@@ -364,6 +395,10 @@ impl BftState {
             self.committed_hash = h;
         }
         self.latest_qc = qc.clone();
+
+        // Clean up any votes for heights at or below the committed height.
+        // This handles the case where we loaded votes from storage that are now stale.
+        self.cleanup_old_state(height.0);
 
         info!(
             validator = ?self.validator_id(),
@@ -1173,10 +1208,21 @@ impl BftState {
         // Broadcast vote
         let gossip = hyperscale_messages::BlockVoteGossip { vote: vote.clone() };
 
-        let mut actions = vec![Action::BroadcastToShard {
-            shard: self.local_shard(),
-            message: OutboundMessage::BlockVote(gossip),
-        }];
+        // **BFT Safety Critical**: Persist the vote BEFORE broadcasting.
+        // If we crash after broadcasting but before persisting, we could vote
+        // for a different block at this height after restart (equivocation).
+        // The persist action should be handled synchronously by the runner.
+        let mut actions = vec![
+            Action::PersistOwnVote {
+                height: BlockHeight(height),
+                round,
+                block_hash,
+            },
+            Action::BroadcastToShard {
+                shard: self.local_shard(),
+                message: OutboundMessage::BlockVote(gossip),
+            },
+        ];
 
         // Also process our own vote locally
         actions.extend(self.on_block_vote_internal(vote));
@@ -2007,6 +2053,11 @@ impl BftState {
         self.committed_height
     }
 
+    /// Get the committed block hash.
+    pub fn committed_hash(&self) -> Hash {
+        self.committed_hash
+    }
+
     /// Get the latest QC.
     pub fn latest_qc(&self) -> Option<&QuorumCertificate> {
         self.latest_qc.as_ref()
@@ -2020,6 +2071,11 @@ impl BftState {
     /// Get the BFT configuration.
     pub fn config(&self) -> &BftConfig {
         &self.config
+    }
+
+    /// Get the voted heights map (for testing/debugging).
+    pub fn voted_heights(&self) -> &HashMap<u64, (Hash, u64)> {
+        &self.voted_heights
     }
 }
 
@@ -2105,7 +2161,13 @@ mod tests {
         // Create topology
         let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
 
-        BftState::new(0, keys[0].clone(), topology, BftConfig::default())
+        BftState::new(
+            0,
+            keys[0].clone(),
+            topology,
+            BftConfig::default(),
+            RecoveredState::default(),
+        )
     }
 
     #[test]
@@ -2255,7 +2317,13 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
         let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
-        let mut state = BftState::new(1, keys[1].clone(), topology, BftConfig::default());
+        let mut state = BftState::new(
+            1,
+            keys[1].clone(),
+            topology,
+            BftConfig::default(),
+            RecoveredState::default(),
+        );
 
         // Set time for timestamp validation
         state.set_time(Duration::from_secs(100));
@@ -2322,7 +2390,13 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
         let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
-        let mut state = BftState::new(1, keys[1].clone(), topology, BftConfig::default());
+        let mut state = BftState::new(
+            1,
+            keys[1].clone(),
+            topology,
+            BftConfig::default(),
+            RecoveredState::default(),
+        );
 
         state.set_time(Duration::from_secs(100));
 
@@ -2385,7 +2459,13 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
         let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
-        let mut state = BftState::new(1, keys[1].clone(), topology, BftConfig::default());
+        let mut state = BftState::new(
+            1,
+            keys[1].clone(),
+            topology,
+            BftConfig::default(),
+            RecoveredState::default(),
+        );
 
         state.set_time(Duration::from_secs(100));
 
@@ -2457,7 +2537,13 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
         let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
-        let mut state = BftState::new(1, keys[1].clone(), topology, BftConfig::default());
+        let mut state = BftState::new(
+            1,
+            keys[1].clone(),
+            topology,
+            BftConfig::default(),
+            RecoveredState::default(),
+        );
 
         state.set_time(Duration::from_secs(100));
 
@@ -2511,7 +2597,13 @@ mod tests {
 
         // Validator 1 - will be proposer at (height=1, round=0) since (1+0)%4 = 1
         let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
-        let mut state = BftState::new(1, keys[1].clone(), topology, BftConfig::default());
+        let mut state = BftState::new(
+            1,
+            keys[1].clone(),
+            topology,
+            BftConfig::default(),
+            RecoveredState::default(),
+        );
 
         state.set_time(Duration::from_secs(100));
 
@@ -2544,7 +2636,13 @@ mod tests {
 
         // Validator 0 - NOT the proposer at (height=1, round=0) since (1+0)%4 = 1
         let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
-        let mut state = BftState::new(0, keys[0].clone(), topology, BftConfig::default());
+        let mut state = BftState::new(
+            0,
+            keys[0].clone(),
+            topology,
+            BftConfig::default(),
+            RecoveredState::default(),
+        );
 
         state.set_time(Duration::from_secs(100));
 
@@ -2593,7 +2691,13 @@ mod tests {
 
         // Validator 2 will be proposer at (height=1, round=1) since (1+1)%4 = 2
         let topology = Arc::new(StaticTopology::new(ValidatorId(2), 1, validator_set));
-        let mut state = BftState::new(2, keys[2].clone(), topology, BftConfig::default());
+        let mut state = BftState::new(
+            2,
+            keys[2].clone(),
+            topology,
+            BftConfig::default(),
+            RecoveredState::default(),
+        );
 
         // Set current time way ahead
         state.set_time(Duration::from_secs(1000));
@@ -2860,7 +2964,13 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
         let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
-        let state = BftState::new(0, keys[0].clone(), topology, BftConfig::default());
+        let state = BftState::new(
+            0,
+            keys[0].clone(),
+            topology,
+            BftConfig::default(),
+            RecoveredState::default(),
+        );
         (state, keys)
     }
 

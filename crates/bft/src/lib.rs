@@ -23,6 +23,6 @@ mod vote_set;
 
 pub use config::BftConfig;
 pub use pending::PendingBlock;
-pub use state::BftState;
+pub use state::{BftState, RecoveredState};
 pub use view_change::ViewChangeState;
 pub use vote_set::VoteSet;

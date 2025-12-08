@@ -34,6 +34,7 @@ use std::sync::{Arc, RwLock};
 /// - Committed blocks indexed by height
 /// - Transaction certificates indexed by hash
 /// - Chain metadata (committed height)
+/// - Own votes (for BFT safety across restarts)
 pub struct SimStorage {
     /// Radix substate data.
     data: Arc<RwLock<OrdMap<Vec<u8>, Vec<u8>>>>,
@@ -51,6 +52,11 @@ pub struct SimStorage {
     /// Transaction certificates indexed by transaction hash.
     /// Used for cross-shard transaction finalization.
     certificates: HashMap<Hash, TransactionCertificate>,
+
+    /// Our own votes indexed by height.
+    /// **BFT Safety Critical**: Used to prevent equivocation after restart.
+    /// Key: height → (block_hash, round)
+    own_votes: HashMap<u64, (Hash, u64)>,
 }
 
 impl SimStorage {
@@ -61,6 +67,7 @@ impl SimStorage {
             blocks: BTreeMap::new(),
             committed_height: BlockHeight(0),
             certificates: HashMap::new(),
+            own_votes: HashMap::new(),
         }
     }
 
@@ -70,6 +77,7 @@ impl SimStorage {
         self.blocks.clear();
         self.committed_height = BlockHeight(0);
         self.certificates.clear();
+        self.own_votes.clear();
     }
 
     /// Get number of substate keys stored.
@@ -145,6 +153,41 @@ impl SimStorage {
     /// Get a transaction certificate by transaction hash.
     pub fn get_certificate(&self, hash: &Hash) -> Option<TransactionCertificate> {
         self.certificates.get(hash).cloned()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Own vote storage (BFT safety)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Store our own vote for a height.
+    ///
+    /// **BFT Safety Critical**: This must be called before broadcasting the vote.
+    /// If we crash and restart, we must remember what we voted for to prevent
+    /// voting for a different block at the same height (equivocation).
+    pub fn put_own_vote(&mut self, height: u64, round: u64, block_hash: Hash) {
+        self.own_votes.insert(height, (block_hash, round));
+    }
+
+    /// Get our own vote for a height (if any).
+    ///
+    /// Returns `Some((block_hash, round))` if we previously voted at this height.
+    pub fn get_own_vote(&self, height: u64) -> Option<(Hash, u64)> {
+        self.own_votes.get(&height).copied()
+    }
+
+    /// Get all our own votes (for recovery on startup).
+    ///
+    /// Returns a map of height → (block_hash, round).
+    pub fn get_all_own_votes(&self) -> &HashMap<u64, (Hash, u64)> {
+        &self.own_votes
+    }
+
+    /// Remove votes at or below a committed height (cleanup).
+    ///
+    /// Once a height is committed, we no longer need to track our vote for it.
+    pub fn prune_own_votes(&mut self, committed_height: u64) {
+        self.own_votes
+            .retain(|height, _| *height > committed_height);
     }
 }
 
