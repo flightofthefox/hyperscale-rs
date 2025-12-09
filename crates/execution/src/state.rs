@@ -342,8 +342,10 @@ impl ExecutionState {
             "Starting single-shard execution with voting"
         );
 
-        // Emit status change: Committed → Executing (single-shard skips provisioning)
-        actions.push(self.emit_status_change(tx_hash, TransactionStatus::Executing));
+        // Emit status change: Pending → Committed
+        actions.push(
+            self.emit_status_change(tx_hash, TransactionStatus::Committed(BlockHeight(_height))),
+        );
 
         // Step 1: Start tracking votes (same as cross-shard)
         let quorum = self.quorum_threshold();
@@ -437,8 +439,10 @@ impl ExecutionState {
             "Starting cross-shard execution"
         );
 
-        // Emit status change: Committed → Provisioning
-        actions.push(self.emit_status_change(tx_hash, TransactionStatus::Provisioning));
+        // Emit status change: Pending → Committed
+        actions.push(
+            self.emit_status_change(tx_hash, TransactionStatus::Committed(BlockHeight(height))),
+        );
 
         // Phase 1: Initiate provision broadcast (async - fetches state first)
         actions.extend(self.initiate_provision_broadcast(&tx, BlockHeight(height)));
@@ -778,9 +782,6 @@ impl ExecutionState {
             // Remove tracker
             self.provisioning_trackers.remove(&tx_hash);
 
-            // Emit status change: Provisioning → Provisioned
-            actions.push(self.emit_status_change(tx_hash, TransactionStatus::Provisioned));
-
             // Store completed provisions
             self.completed_provisions.insert(tx_hash, provisions);
 
@@ -813,17 +814,12 @@ impl ExecutionState {
             .remove(&tx_hash)
             .unwrap_or_default();
 
-        // Emit status change: Provisioned → Executing
-        let mut actions = vec![self.emit_status_change(tx_hash, TransactionStatus::Executing)];
-
         // Delegate execution to the runner
-        actions.push(Action::ExecuteCrossShardTransaction {
+        vec![Action::ExecuteCrossShardTransaction {
             tx_hash,
             transaction: tx,
             provisions,
-        });
-
-        actions
+        }]
     }
 
     /// Handle cross-shard transaction execution completion.
@@ -1015,9 +1011,6 @@ impl ExecutionState {
             // Extract data from tracker before releasing borrow
             let read_nodes = tracker.read_nodes().to_vec();
             let participating_shards = tracker.participating_shards().to_vec();
-
-            // Emit status change: Executing → Finalizing (collecting certificates from all shards)
-            actions.push(self.emit_status_change(tx_hash, TransactionStatus::Finalizing));
 
             // Create state certificate
             let certificate =

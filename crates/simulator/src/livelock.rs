@@ -433,6 +433,6 @@ mod tests {
             status_name(&TransactionStatus::Committed(BlockHeight(1))),
             "Committed"
         );
-        assert_eq!(status_name(&TransactionStatus::Unknown), "Unknown");
+        assert_eq!(status_name(&TransactionStatus::Completed), "Completed");
     }
 }

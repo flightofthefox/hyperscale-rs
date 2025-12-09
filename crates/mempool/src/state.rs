@@ -187,14 +187,12 @@ impl MempoolState {
         // Track current height for retry creation
         self.current_height = height;
 
-        // 1. Mark transactions as committed
-        for tx in &block.transactions {
-            if let Some(entry) = self.pool.get_mut(&tx.hash()) {
-                entry.status = TransactionStatus::Committed(height);
-            }
-        }
+        // Note: We do NOT update transaction status to Committed here.
+        // Status updates flow through TransactionStatusChanged events from the
+        // execution state machine, which ensures proper ordering when early
+        // votes/provisions are replayed.
 
-        // 2. Process deferrals - update status to Blocked
+        // 1. Process deferrals - update status to Blocked
         for deferral in &block.deferred {
             actions.extend(self.on_deferral_committed(deferral.tx_hash, &deferral.reason, height));
         }
@@ -404,7 +402,7 @@ impl MempoolState {
     /// Update transaction status to a new state.
     ///
     /// This is used by the execution state machine to update status during
-    /// the transaction lifecycle (Provisioning, Executing, etc.).
+    /// the transaction lifecycle (Committed, Finalized, etc.).
     pub fn update_status(&mut self, tx_hash: &Hash, new_status: TransactionStatus) {
         if let Some(entry) = self.pool.get_mut(tx_hash) {
             // Case 1: Idempotent update - already in the target state
@@ -640,10 +638,9 @@ impl MempoolState {
                 }
             }
 
-            // Also check other lock-holding states
-            // (Provisioning, Provisioned, Executing, Finalizing)
-            // These don't have committed_at embedded, so we'd need to track
-            // when they entered these states. For now, only handle Committed.
+            // Note: Finalized transactions also hold locks but don't have a
+            // committed height embedded. For simplicity, we only timeout from
+            // Committed state. Finalized→Completed should happen quickly anyway.
 
             // Check for too many retries
             if entry.tx.exceeds_max_retries(max_retries) {
@@ -762,6 +759,9 @@ mod tests {
         // Commit the transaction first (deferrals apply to committed TXs)
         let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![], vec![]);
         mempool.on_block_committed_full(&commit_block);
+
+        // Simulate the TransactionStatusChanged event from execution
+        mempool.update_status(&tx_hash, TransactionStatus::Committed(BlockHeight(1)));
 
         // Verify status is Committed
         assert!(matches!(
@@ -883,6 +883,9 @@ mod tests {
 
         let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
         mempool.on_block_committed_full(&commit_block);
+
+        // Simulate the TransactionStatusChanged event from execution
+        mempool.update_status(&tx_hash, TransactionStatus::Committed(BlockHeight(1)));
 
         // Check for timeouts - not enough blocks elapsed
         let aborts = mempool.get_timed_out_transactions(BlockHeight(20), 30, 3);

@@ -515,85 +515,51 @@ impl RetryDetails {
 ///
 /// Transactions progress through these states:
 ///
-/// **Single-Shard Flow**:
+/// **Normal Flow** (both single-shard and cross-shard):
 /// ```text
-/// Pending → Accepted → Committed → Executing → Finalized → Completed
-/// ```
-/// (Single-shard transactions skip Provisioning/Provisioned/Finalizing)
-///
-/// **Cross-Shard Flow**:
-/// ```text
-/// Pending → Accepted → Committed → Provisioning → Provisioned →
-/// Executing → Finalizing → Finalized → Completed
+/// Pending → Committed → Finalized → Completed
 /// ```
 ///
 /// **Cross-Shard with Conflict (Livelock Prevention)**:
 /// ```text
-/// Pending → Accepted → Committed → Provisioning → [conflict detected] → Blocked(by: winner)
-///                                                                              ↓
-///                                               [winner completes] → Retried(new_tx: retry_hash)
+/// Pending → Committed → [conflict detected] → Blocked(by: winner)
+///                                                      ↓
+///                       [winner completes] → Retried(new_tx: retry_hash)
 /// ```
 ///
 /// # State Descriptions
 ///
-/// - **Pending**: Transaction has been submitted but not yet included in a proposed block
-/// - **Accepted**: Transaction is in a proposed block (has block hash)
-/// - **Committed**: Block containing transaction has been committed
-/// - **Provisioning**: Cross-shard transaction is loading required state from all shards
-/// - **Provisioned**: Cross-shard transaction has received all required state inputs
-/// - **Executing**: Transaction is running execution phase
-/// - **Finalizing**: Collecting state certificates from all shards
+/// - **Pending**: Transaction has been submitted but not yet included in a committed block
+/// - **Committed**: Block containing transaction has been committed; execution is in progress
 /// - **Finalized**: TransactionCertificate created with Accept/Reject decision
 /// - **Completed**: Transaction fully processed, can be evicted from mempool
 /// - **Blocked**: Transaction was deferred due to cross-shard conflict, waiting for winner
 /// - **Retried**: Transaction was superseded by a retry transaction (terminal)
+///
+/// # Note on Intermediate States
+///
+/// The execution state machine internally tracks finer-grained progress (provisioning,
+/// executing, collecting votes/certificates), but the mempool only needs to know:
+/// - Is the transaction holding state locks? (Committed, Finalized)
+/// - Is it done? (Completed, Retried)
+/// - Is it blocked? (Blocked)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
 pub enum TransactionStatus {
-    /// Transaction not found.
-    Unknown,
-
     /// Transaction submitted, waiting to be included in a block.
     Pending,
 
-    /// Transaction included in a proposed block.
-    ///
-    /// The block may not be committed yet. Block hash identifies which block
-    /// contains this transaction.
-    Accepted(Hash),
-
     /// Block containing transaction has been committed.
     ///
-    /// For single-shard transactions, they proceed directly to Executing.
-    /// For cross-shard transactions, they proceed to Provisioning.
+    /// The transaction is now being executed. This state holds locks on all
+    /// declared nodes until execution completes (Finalized) or the transaction
+    /// is deferred (Blocked/Retried).
+    ///
+    /// For cross-shard transactions, this encompasses:
+    /// - State provisioning (collecting state from other shards)
+    /// - Execution (running the transaction logic)
+    /// - Vote collection (gathering 2f+1 votes for state certificate)
+    /// - Certificate collection (gathering certificates from all shards)
     Committed(BlockHeight),
-
-    /// Cross-shard transaction is loading state from participating shards.
-    ///
-    /// Each shard provisions its local state and broadcasts StateProvisions to
-    /// other participating shards. Waits for 2f+1 matching provisions per remote state.
-    Provisioning,
-
-    /// Cross-shard transaction has received all required state inputs.
-    ///
-    /// All state provisions have been collected and the transaction is ready for execution.
-    /// This state exists to clearly separate provisioning completion from execution start.
-    Provisioned,
-
-    /// Transaction is executing.
-    ///
-    /// For single-shard transactions: executing locally.
-    /// For cross-shard transactions: executing via 2PC where each participating shard:
-    /// 1. Executes the transaction locally
-    /// 2. Creates StateVoteBlock with execution result
-    /// 3. Collects 2f+1 votes → creates StateCertificate
-    Executing,
-
-    /// Collecting state certificates from all shards (cross-shard only).
-    ///
-    /// Execution has completed and StateCertificates are being collected from
-    /// all participating shards. Once all certificates are collected, the
-    /// TransactionCertificate will be created.
-    Finalizing,
 
     /// TransactionCertificate has been created with final decision.
     ///
@@ -601,6 +567,7 @@ pub enum TransactionStatus {
     /// TransactionCertificate with Accept or Reject decision.
     ///
     /// The transaction is waiting for the certificate to be included in a block.
+    /// Still holds state locks until Completed.
     Finalized(TransactionDecision),
 
     /// Transaction has been fully processed and can be evicted.
@@ -652,49 +619,30 @@ impl TransactionStatus {
 
     /// Check if this status means the transaction holds state locks.
     ///
-    /// State locks are acquired when a transaction is Accepted into a block and
+    /// State locks are acquired when a transaction is committed in a block and
     /// released when the TransactionCertificate is committed in a block (Completed),
     /// or when the transaction is deferred (Blocked/Retried).
     ///
-    /// This matches the reference implementation where locks are held until the
-    /// AtomCertificate is durably committed. The lock prevents conflicting
-    /// transactions from being selected for blocks while this transaction is:
-    /// - Waiting for its block to commit (Accepted)
-    /// - Being provisioned with cross-shard state (Provisioning/Provisioned)
-    /// - Executing (Executing)
-    /// - Collecting state certificates (Finalizing)
-    /// - Waiting for its certificate to be included in a block (Finalized)
+    /// The lock prevents conflicting transactions from being selected for blocks
+    /// while this transaction is being executed.
     ///
     /// The following statuses do NOT hold locks:
-    /// - Pending: not yet accepted into a block
-    /// - Unknown: transaction not found
+    /// - Pending: not yet committed into a block
     /// - Completed: certificate committed, transaction done
     /// - Blocked: deferred due to conflict, locks released
     /// - Retried: superseded by retry transaction, locks released
     pub fn holds_state_lock(&self) -> bool {
         matches!(
             self,
-            TransactionStatus::Accepted(_)
-                | TransactionStatus::Committed(_)
-                | TransactionStatus::Provisioning
-                | TransactionStatus::Provisioned
-                | TransactionStatus::Executing
-                | TransactionStatus::Finalizing
-                | TransactionStatus::Finalized(_)
+            TransactionStatus::Committed(_) | TransactionStatus::Finalized(_)
         )
     }
 
     /// Get a short name for this status (for logging/debugging).
     pub fn name(&self) -> &'static str {
         match self {
-            TransactionStatus::Unknown => "Unknown",
             TransactionStatus::Pending => "Pending",
-            TransactionStatus::Accepted(_) => "Accepted",
             TransactionStatus::Committed(_) => "Committed",
-            TransactionStatus::Provisioning => "Provisioning",
-            TransactionStatus::Provisioned => "Provisioned",
-            TransactionStatus::Executing => "Executing",
-            TransactionStatus::Finalizing => "Finalizing",
             TransactionStatus::Finalized(_) => "Finalized",
             TransactionStatus::Completed => "Completed",
             TransactionStatus::Blocked { .. } => "Blocked",
@@ -730,25 +678,13 @@ impl TransactionStatus {
 
     /// Check if this transaction is in a state where it can be deferred.
     ///
-    /// Transactions can be deferred if they are in a lock-holding state.
-    /// This includes all states from Committed through Finalizing.
+    /// Transactions can be deferred if they are in Committed state (executing).
     /// States that cannot be deferred:
-    /// - Pre-lock states: Unknown, Pending, Accepted (no locks held yet)
+    /// - Pre-lock states: Pending (no locks held yet)
     /// - Terminal states: Finalized, Completed (too late to defer)
     /// - Already deferred: Blocked, Retried (already handled)
     pub fn is_deferrable(&self) -> bool {
-        // Per livelock design Decision #31: Executing and Finalizing are also
-        // deferrable because they still hold locks. Only terminal states
-        // (Completed, Blocked, Retried) and pre-lock states (Unknown, Pending,
-        // Accepted) are not deferrable.
-        matches!(
-            self,
-            TransactionStatus::Committed(_)
-                | TransactionStatus::Provisioning
-                | TransactionStatus::Provisioned
-                | TransactionStatus::Executing
-                | TransactionStatus::Finalizing
-        )
+        matches!(self, TransactionStatus::Committed(_))
     }
 
     /// Returns a rough ordering value for the status in the normal lifecycle.
@@ -758,24 +694,17 @@ impl TransactionStatus {
     /// (e.g., Blocked/Retried can happen from multiple states), but it helps identify
     /// clearly stale updates.
     ///
-    /// Ordering: Unknown(0) < Pending(1) < Accepted(2) < Committed(3) < Provisioning(4)
-    ///           < Provisioned(5) < Executing(6) < Finalizing(7) < Finalized(8) < Completed(9)
+    /// Ordering: Pending(0) < Committed(1) < Finalized(2) < Completed(3)
     ///
-    /// Blocked and Retried are terminal side-branches and get high ordinals (10, 11).
+    /// Blocked and Retried are terminal side-branches and get high ordinals (4, 5).
     pub fn ordinal(&self) -> u8 {
         match self {
-            TransactionStatus::Unknown => 0,
-            TransactionStatus::Pending => 1,
-            TransactionStatus::Accepted(_) => 2,
-            TransactionStatus::Committed(_) => 3,
-            TransactionStatus::Provisioning => 4,
-            TransactionStatus::Provisioned => 5,
-            TransactionStatus::Executing => 6,
-            TransactionStatus::Finalizing => 7,
-            TransactionStatus::Finalized(_) => 8,
-            TransactionStatus::Completed => 9,
-            TransactionStatus::Blocked { .. } => 10,
-            TransactionStatus::Retried { .. } => 11,
+            TransactionStatus::Pending => 0,
+            TransactionStatus::Committed(_) => 1,
+            TransactionStatus::Finalized(_) => 2,
+            TransactionStatus::Completed => 3,
+            TransactionStatus::Blocked { .. } => 4,
+            TransactionStatus::Retried { .. } => 5,
         }
     }
 
@@ -784,26 +713,17 @@ impl TransactionStatus {
         use TransactionStatus::*;
 
         match (self, next) {
-            // Pending → Accepted
-            (Pending, Accepted(_)) => true,
+            // Pending → Committed
+            (Pending, Committed(_)) => true,
 
-            // Pending → Retried (if a retry arrived before original was accepted)
+            // Pending → Retried (if a retry arrived before original was committed)
             (Pending, Retried { .. }) => true,
 
             // Pending → Blocked (cross-shard livelock prevention)
             (Pending, Blocked { .. }) => true,
 
-            // Accepted → Committed
-            (Accepted(_), Committed(_)) => true,
-
-            // Accepted → Retried (superseded by retry from another shard)
-            (Accepted(_), Retried { .. }) => true,
-
-            // Committed → Provisioning (cross-shard transactions)
-            (Committed(_), Provisioning) => true,
-
-            // Committed → Executing (single-shard transactions can skip provisioning)
-            (Committed(_), Executing) => true,
+            // Committed → Finalized (execution complete, certificate created)
+            (Committed(_), Finalized(_)) => true,
 
             // Committed → Blocked (deferred due to conflict)
             (Committed(_), Blocked { .. }) => true,
@@ -811,46 +731,7 @@ impl TransactionStatus {
             // Committed → Retried (superseded by retry from another shard)
             (Committed(_), Retried { .. }) => true,
 
-            // Provisioning → Provisioned
-            (Provisioning, Provisioned) => true,
-
-            // Provisioning → Blocked (deferred due to conflict)
-            (Provisioning, Blocked { .. }) => true,
-
-            // Provisioning → Retried (superseded by retry from another shard)
-            (Provisioning, Retried { .. }) => true,
-
-            // Provisioned → Executing
-            (Provisioned, Executing) => true,
-
-            // Provisioned → Blocked (deferred due to conflict)
-            (Provisioned, Blocked { .. }) => true,
-
-            // Provisioned → Retried (superseded by retry from another shard)
-            (Provisioned, Retried { .. }) => true,
-
-            // Executing → Finalizing (cross-shard transactions)
-            (Executing, Finalizing) => true,
-
-            // Executing → Finalized (single-shard transactions can skip Finalizing)
-            (Executing, Finalized(_)) => true,
-
-            // Executing → Blocked (deferred due to late-detected conflict)
-            (Executing, Blocked { .. }) => true,
-
-            // Executing → Retried (superseded by retry from another shard)
-            (Executing, Retried { .. }) => true,
-
-            // Finalizing → Finalized
-            (Finalizing, Finalized(_)) => true,
-
-            // Finalizing → Blocked (deferred due to late-detected conflict)
-            (Finalizing, Blocked { .. }) => true,
-
-            // Finalizing → Retried (superseded by retry from another shard)
-            (Finalizing, Retried { .. }) => true,
-
-            // Finalized → Completed
+            // Finalized → Completed (certificate committed in block)
             (Finalized(_), Completed) => true,
 
             // Blocked → Retried (when winner completes, loser gets a retry)
@@ -865,14 +746,8 @@ impl TransactionStatus {
 impl std::fmt::Display for TransactionStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransactionStatus::Unknown => write!(f, "Unknown"),
             TransactionStatus::Pending => write!(f, "Pending"),
-            TransactionStatus::Accepted(block) => write!(f, "Accepted({})", block),
             TransactionStatus::Committed(height) => write!(f, "Committed({})", height.0),
-            TransactionStatus::Provisioning => write!(f, "Provisioning"),
-            TransactionStatus::Provisioned => write!(f, "Provisioned"),
-            TransactionStatus::Executing => write!(f, "Executing"),
-            TransactionStatus::Finalizing => write!(f, "Finalizing"),
             TransactionStatus::Finalized(TransactionDecision::Accept) => {
                 write!(f, "Finalized(Accept)")
             }
