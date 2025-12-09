@@ -263,6 +263,14 @@ impl PublicKey {
 
         Ok(PublicKey::Bls12381(agg.to_public_key().to_bytes().to_vec()))
     }
+
+    /// Get the raw bytes of this public key.
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            PublicKey::Ed25519(bytes) => bytes.as_slice(),
+            PublicKey::Bls12381(bytes) => bytes.as_slice(),
+        }
+    }
 }
 
 impl fmt::Debug for PublicKey {

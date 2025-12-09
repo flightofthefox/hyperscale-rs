@@ -47,7 +47,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use hyperscale_bft::BftConfig;
 use hyperscale_core::Event;
-use hyperscale_production::network::Libp2pConfig;
+use hyperscale_production::network::{derive_libp2p_keypair, Libp2pConfig};
 use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
 use hyperscale_production::{
     init_telemetry, ProductionRunner, RocksDbConfig, RocksDbStorage, TelemetryConfig,
@@ -57,7 +57,6 @@ use hyperscale_types::{
     KeyPair, KeyType, PublicKey, ShardGroupId, StaticTopology, ValidatorId, ValidatorInfo,
     ValidatorSet,
 };
-use libp2p::identity;
 use parking_lot::RwLock;
 use serde::Deserialize;
 use std::fs;
@@ -483,44 +482,6 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<KeyPair> {
     }
 }
 
-/// Load or generate a libp2p identity keypair.
-fn load_or_generate_libp2p_identity(data_dir: &PathBuf) -> Result<identity::Keypair> {
-    let identity_path = data_dir.join("p2p_identity.key");
-
-    if identity_path.exists() {
-        let key_bytes = fs::read(&identity_path)?;
-
-        // libp2p ed25519 keys are 64 bytes (secret + public)
-        let mut key_array = [0u8; 64];
-        if key_bytes.len() == 64 {
-            key_array.copy_from_slice(&key_bytes);
-        } else {
-            bail!(
-                "Invalid p2p identity key size: expected 64 bytes, got {}",
-                key_bytes.len()
-            );
-        }
-
-        identity::Keypair::ed25519_from_bytes(key_array)
-            .map_err(|e| anyhow::anyhow!("Failed to parse p2p identity: {}", e))
-    } else {
-        info!("Generating new p2p identity");
-        let keypair = identity::Keypair::generate_ed25519();
-
-        // Save the identity (64 bytes: secret key + public key)
-        fs::create_dir_all(data_dir)?;
-        let key_bytes = keypair
-            .clone()
-            .try_into_ed25519()
-            .map_err(|_| anyhow::anyhow!("Failed to get ed25519 keypair"))?
-            .to_bytes();
-        fs::write(&identity_path, key_bytes)?;
-        info!("Saved p2p identity to {}", identity_path.display());
-
-        Ok(keypair)
-    }
-}
-
 /// Build the topology from genesis configuration.
 fn build_topology(
     config: &ValidatorConfig,
@@ -717,10 +678,12 @@ async fn main() -> Result<()> {
         "Loaded signing keypair"
     );
 
-    let p2p_identity = load_or_generate_libp2p_identity(&config.node.data_dir)?;
+    // Derive libp2p identity deterministically from signing key
+    // This ensures PeerIds are predictable and can be computed from public keys
+    let p2p_identity = derive_libp2p_keypair(&signing_keypair.public_key());
     info!(
         peer_id = %p2p_identity.public().to_peer_id(),
-        "Loaded p2p identity"
+        "Derived p2p identity from signing key"
     );
 
     // Build topology

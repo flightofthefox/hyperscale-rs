@@ -1,6 +1,8 @@
 //! Production runner implementation.
 
-use crate::network::{InboundSyncRequest, Libp2pAdapter, Libp2pConfig, NetworkError};
+use crate::network::{
+    compute_peer_id_for_validator, InboundSyncRequest, Libp2pAdapter, Libp2pConfig, NetworkError,
+};
 use crate::rpc::NodeStatusState;
 use crate::storage::RocksDbStorage;
 use crate::sync::{SyncConfig, SyncManager};
@@ -292,6 +294,15 @@ impl ProductionRunnerBuilder {
 
         // Subscribe to local shard topics
         network.subscribe_shard(local_shard).await?;
+
+        // Register known validators for peer validation
+        // This allows us to validate that messages come from known validators
+        for validator_id in topology.local_committee() {
+            if let Some(public_key) = topology.public_key(*validator_id) {
+                let peer_id = compute_peer_id_for_validator(&public_key);
+                network.register_validator(*validator_id, peer_id).await;
+            }
+        }
 
         // Create sync manager
         let sync_manager =

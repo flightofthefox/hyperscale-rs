@@ -76,6 +76,10 @@ anyhow = "1.0"
 hex = "0.4"
 rand = "0.8"
 
+# Cryptographic primitives for deterministic PeerId derivation
+sha2 = "0.10"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+
 # Core pinning support (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
