@@ -26,6 +26,8 @@ BASE_PORT=9000          # libp2p port
 BASE_RPC_PORT=8080      # HTTP RPC port
 DATA_DIR="./cluster-data"
 CLEAN=false
+ACCOUNTS_PER_SHARD=100  # Spammer accounts per shard
+INITIAL_BALANCE=1000000 # Initial XRD balance per account
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -42,13 +44,23 @@ while [[ $# -gt 0 ]]; do
             CLEAN=true
             shift
             ;;
+        --accounts-per-shard)
+            ACCOUNTS_PER_SHARD="$2"
+            shift 2
+            ;;
+        --initial-balance)
+            INITIAL_BALANCE="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean]"
             echo ""
             echo "Options:"
-            echo "  --shards N              Number of shards (default: 2)"
-            echo "  --validators-per-shard M  Validators per shard (default: 3)"
-            echo "  --clean                 Remove existing data directories"
+            echo "  --shards N               Number of shards (default: 2)"
+            echo "  --validators-per-shard M Validators per shard (default: 3)"
+            echo "  --accounts-per-shard N   Spammer accounts per shard (default: 100)"
+            echo "  --initial-balance N      Initial XRD balance per account (default: 1000000)"
+            echo "  --clean                  Remove existing data directories"
             exit 0
             ;;
         *)
@@ -64,6 +76,8 @@ echo "=== Hyperscale Local Cluster ==="
 echo "Shards: $NUM_SHARDS"
 echo "Validators per shard: $VALIDATORS_PER_SHARD"
 echo "Total validators: $TOTAL_VALIDATORS"
+echo "Accounts per shard: $ACCOUNTS_PER_SHARD"
+echo "Initial balance: $INITIAL_BALANCE XRD"
 echo ""
 
 # Clean up if requested
@@ -75,15 +89,21 @@ fi
 # Create data directory
 mkdir -p "$DATA_DIR"
 
-# Build the validator and keygen binaries
+# Build the validator, keygen, and spammer binaries
 echo "Building binaries..."
-cargo build --release --bin hyperscale-validator --bin hyperscale-keygen 2>&1 | tail -3
+cargo build --release --bin hyperscale-validator --bin hyperscale-keygen --bin hyperscale-spammer 2>&1 | tail -3
 
 VALIDATOR_BIN="./target/release/hyperscale-validator"
 KEYGEN_BIN="./target/release/hyperscale-keygen"
+SPAMMER_BIN="./target/release/hyperscale-spammer"
 
 if [ ! -f "$VALIDATOR_BIN" ]; then
     echo "ERROR: Validator binary not found at $VALIDATOR_BIN"
+    exit 1
+fi
+
+if [ ! -f "$SPAMMER_BIN" ]; then
+    echo "ERROR: Spammer binary not found at $SPAMMER_BIN"
     exit 1
 fi
 
@@ -107,6 +127,14 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     PUBLIC_KEYS[$i]=$("$KEYGEN_BIN" "$SEED_HEX")
     echo "  Validator $i: public_key=${PUBLIC_KEYS[$i]:0:16}..."
 done
+
+# Generate genesis balances for spammer accounts
+echo "Generating genesis balances for spammer accounts..."
+GENESIS_BALANCES=$("$SPAMMER_BIN" genesis \
+    --num-shards "$NUM_SHARDS" \
+    --accounts-per-shard "$ACCOUNTS_PER_SHARD" \
+    --balance "$INITIAL_BALANCE")
+echo "  Generated balances for $((NUM_SHARDS * ACCOUNTS_PER_SHARD)) accounts"
 
 # Calculate bootstrap peer addresses
 # First validator of each shard will be bootstrap peers
@@ -192,6 +220,8 @@ listen_addr = "0.0.0.0:$rpc_port"
 enabled = false
 
 $GENESIS_VALIDATORS
+
+$GENESIS_BALANCES
 EOF
 
     echo "  Created config for validator $i (shard $shard, p2p port $p2p_port, rpc port $rpc_port)"
@@ -236,5 +266,24 @@ echo "  Get status:    curl http://localhost:$BASE_RPC_PORT/api/v1/status"
 echo "  View metrics:  curl http://localhost:$BASE_RPC_PORT/metrics"
 echo "  View logs:     tail -f $DATA_DIR/validator-0/output.log"
 echo "  Stop cluster:  ./scripts/stop-cluster.sh"
+echo ""
+
+# Build spammer endpoint list
+SPAMMER_ENDPOINTS=""
+for shard in $(seq 0 $((NUM_SHARDS - 1))); do
+    first_validator=$((shard * VALIDATORS_PER_SHARD))
+    rpc_port=$((BASE_RPC_PORT + first_validator))
+    if [ -n "$SPAMMER_ENDPOINTS" ]; then
+        SPAMMER_ENDPOINTS="$SPAMMER_ENDPOINTS,"
+    fi
+    SPAMMER_ENDPOINTS="${SPAMMER_ENDPOINTS}http://localhost:$rpc_port"
+done
+
+echo "Run spammer:"
+echo "  $SPAMMER_BIN run \\"
+echo "    --endpoints $SPAMMER_ENDPOINTS \\"
+echo "    --num-shards $NUM_SHARDS \\"
+echo "    --tps 100 \\"
+echo "    --duration 30s"
 echo ""
 echo "PIDs written to: $PID_FILE"

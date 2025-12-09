@@ -1,6 +1,7 @@
 //! Configuration types for the simulator.
 
 use hyperscale_simulation::NetworkConfig;
+use hyperscale_spammer::SelectionMode;
 use radix_common::math::Decimal;
 use std::time::Duration;
 
@@ -89,27 +90,6 @@ impl Default for SimulatorConfig {
     }
 }
 
-/// Account selection distribution mode.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AccountDistribution {
-    /// Pure random selection - can cause high contention.
-    #[default]
-    Random,
-
-    /// Round-robin selection - cycles through accounts to minimize contention.
-    RoundRobin,
-
-    /// Zipf distribution - realistic "popular accounts" pattern.
-    /// The exponent parameter controls skewness (higher = more skewed).
-    Zipf {
-        /// Zipf exponent (1 = mild skew, 2+ = heavy skew toward hotspots).
-        exponent: u32,
-    },
-
-    /// Partitioned - each batch uses disjoint account sets (zero contention).
-    NoContention,
-}
-
 /// Workload configuration.
 #[derive(Clone, Debug)]
 pub struct WorkloadConfig {
@@ -127,8 +107,8 @@ pub struct WorkloadConfig {
     /// Time between transaction batches (simulated time).
     pub batch_interval: Duration,
 
-    /// Account selection distribution mode.
-    pub account_distribution: AccountDistribution,
+    /// Account selection mode.
+    pub selection_mode: SelectionMode,
 }
 
 impl Default for WorkloadConfig {
@@ -138,7 +118,7 @@ impl Default for WorkloadConfig {
             cross_shard_ratio: 0.3,
             batch_size: 10,
             batch_interval: Duration::from_millis(500),
-            account_distribution: AccountDistribution::default(),
+            selection_mode: SelectionMode::default(),
         }
     }
 }
@@ -170,24 +150,24 @@ impl WorkloadConfig {
         self
     }
 
-    /// Set the account distribution mode.
-    pub fn with_account_distribution(mut self, distribution: AccountDistribution) -> Self {
-        self.account_distribution = distribution;
+    /// Set the account selection mode.
+    pub fn with_selection_mode(mut self, mode: SelectionMode) -> Self {
+        self.selection_mode = mode;
         self
     }
 
     /// Use round-robin account selection (minimal contention).
     pub fn with_round_robin(self) -> Self {
-        self.with_account_distribution(AccountDistribution::RoundRobin)
+        self.with_selection_mode(SelectionMode::RoundRobin)
     }
 
     /// Use Zipf distribution for realistic hotspot patterns.
-    pub fn with_zipf(self, exponent: u32) -> Self {
-        self.with_account_distribution(AccountDistribution::Zipf { exponent })
+    pub fn with_zipf(self, exponent: f64) -> Self {
+        self.with_selection_mode(SelectionMode::Zipf { exponent })
     }
 
     /// Use partitioned accounts for zero contention testing.
     pub fn with_no_contention(self) -> Self {
-        self.with_account_distribution(AccountDistribution::NoContention)
+        self.with_selection_mode(SelectionMode::NoContention)
     }
 }

@@ -3,17 +3,17 @@
 //! Orchestrates workload generation, transaction submission, and metrics collection
 //! using the deterministic simulation framework.
 
-use crate::accounts::AccountPool;
 use crate::config::SimulatorConfig;
 use crate::metrics::{MetricsCollector, SimulationReport};
-use crate::workload::{MixedWorkload, TransferWorkload, WorkloadGenerator};
 use hyperscale_core::{Event, RequestId};
 use hyperscale_mempool::LockContentionStats;
 use hyperscale_simulation::NodeIndex;
 use hyperscale_simulation::SimulationRunner;
+use hyperscale_spammer::{AccountPool, AccountPoolError, TransferWorkload, WorkloadGenerator};
 use hyperscale_types::{
     shard_for_node, Hash, ShardGroupId, TransactionDecision, TransactionStatus,
 };
+use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
@@ -29,7 +29,10 @@ pub struct Simulator {
     accounts: AccountPool,
 
     /// Workload generator.
-    workload: MixedWorkload,
+    workload: TransferWorkload,
+
+    /// Batch size for transaction generation.
+    batch_size: usize,
 
     /// Metrics collector.
     metrics: MetricsCollector,
@@ -56,10 +59,12 @@ impl Simulator {
         // Generate accounts
         let accounts = AccountPool::generate(config.num_shards as u64, config.accounts_per_shard)?;
 
-        // Create workload generator
-        let transfer = TransferWorkload::new(config.workload.cross_shard_ratio)
-            .with_distribution(config.workload.account_distribution);
-        let workload = MixedWorkload::new(transfer, config.workload.batch_size);
+        // Create workload generator using spammer's TransferWorkload
+        let workload = TransferWorkload::new(NetworkDefinition::simulator())
+            .with_cross_shard_ratio(config.workload.cross_shard_ratio)
+            .with_selection_mode(config.workload.selection_mode);
+
+        let batch_size = config.workload.batch_size;
 
         // RNG for workload (separate from simulation RNG for independence)
         let rng = ChaCha8Rng::seed_from_u64(config.seed.wrapping_add(1));
@@ -78,6 +83,7 @@ impl Simulator {
             runner,
             accounts,
             workload,
+            batch_size,
             metrics,
             config,
             rng,
@@ -159,9 +165,9 @@ impl Simulator {
         while self.runner.now() < submission_end_time {
             // Generate and submit a batch of transactions
             let current_time = self.runner.now();
-            let batch = self
-                .workload
-                .generate_batch(&mut self.accounts, &mut self.rng);
+            let batch =
+                self.workload
+                    .generate_batch(&self.accounts, self.batch_size, &mut self.rng);
 
             for tx in batch {
                 let hash = tx.hash();
@@ -360,7 +366,7 @@ impl Simulator {
     }
 
     /// Get account usage statistics.
-    pub fn account_usage_stats(&self) -> crate::accounts::AccountUsageStats {
+    pub fn account_usage_stats(&self) -> hyperscale_spammer::AccountUsageStats {
         self.accounts.usage_stats()
     }
 
@@ -382,7 +388,7 @@ impl Simulator {
 #[derive(Debug, thiserror::Error)]
 pub enum SimulatorError {
     #[error("Account pool error: {0}")]
-    AccountPool(#[from] crate::accounts::AccountPoolError),
+    AccountPool(#[from] AccountPoolError),
 }
 
 #[cfg(test)]

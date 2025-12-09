@@ -1,18 +1,19 @@
-//! Account management for simulations.
+//! Account management for transaction generation.
 //!
-//! Provides an `AccountPool` that manages funded accounts distributed across shards.
-//! Accounts are funded at genesis time for zero consensus overhead.
+//! Provides a `FundedAccount` type and `AccountPool` for managing accounts
+//! distributed across shards. Accounts are funded at genesis time.
 
-use crate::config::AccountDistribution;
 use hyperscale_types::{shard_for_node, KeyPair, KeyType, NodeId, ShardGroupId};
 use radix_common::crypto::Ed25519PublicKey;
 use radix_common::math::Decimal;
 use radix_common::types::ComponentAddress;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::info;
 
 /// A funded account that can sign transactions.
-#[derive(Clone)]
+///
+/// Uses atomic nonce for thread-safe concurrent transaction generation.
 pub struct FundedAccount {
     /// The keypair for signing transactions.
     pub keypair: KeyPair,
@@ -23,12 +24,26 @@ pub struct FundedAccount {
     /// The shard this account belongs to.
     pub shard: ShardGroupId,
 
-    /// Nonce counter for transaction signing.
-    nonce: u64,
+    /// Nonce counter for transaction signing (thread-safe).
+    nonce: AtomicU64,
+}
+
+impl Clone for FundedAccount {
+    fn clone(&self) -> Self {
+        Self {
+            keypair: self.keypair.clone(),
+            address: self.address,
+            shard: self.shard,
+            nonce: AtomicU64::new(self.nonce.load(Ordering::SeqCst)),
+        }
+    }
 }
 
 impl FundedAccount {
     /// Create a new funded account from a seed.
+    ///
+    /// The seed is deterministically expanded to create a keypair,
+    /// and the account's shard is determined by hashing the address.
     pub fn from_seed(seed: u64, num_shards: u64) -> Self {
         // Create varied seed bytes from the u64 seed
         let mut seed_bytes = [0u8; 32];
@@ -48,20 +63,25 @@ impl FundedAccount {
             keypair,
             address,
             shard,
-            nonce: 0,
+            nonce: AtomicU64::new(0),
         }
     }
 
-    /// Get the next nonce and increment.
-    pub fn next_nonce(&mut self) -> u64 {
-        let nonce = self.nonce;
-        self.nonce += 1;
-        nonce
+    /// Get the next nonce and increment atomically.
+    ///
+    /// Thread-safe for concurrent transaction generation.
+    pub fn next_nonce(&self) -> u64 {
+        self.nonce.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Get current nonce without incrementing.
     pub fn current_nonce(&self) -> u64 {
-        self.nonce
+        self.nonce.load(Ordering::SeqCst)
+    }
+
+    /// Set the nonce value (useful for restoring state).
+    pub fn set_nonce(&self, value: u64) {
+        self.nonce.store(value, Ordering::SeqCst);
     }
 
     /// Derive account address from keypair.
@@ -83,28 +103,50 @@ impl FundedAccount {
     }
 }
 
+/// Account selection mode for picking accounts from the pool.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum SelectionMode {
+    /// Pure random selection - can cause contention under high load.
+    #[default]
+    Random,
+
+    /// Round-robin selection - cycles through accounts sequentially.
+    RoundRobin,
+
+    /// Zipf distribution - realistic "popular accounts" pattern.
+    /// Higher exponent = more skewed toward lower indices (hotspots).
+    Zipf { exponent: f64 },
+
+    /// No contention - each call gets a disjoint pair of accounts.
+    /// Uses a global counter to ensure no conflicts between transactions.
+    /// With N accounts per shard, supports N/2 concurrent non-conflicting transactions.
+    NoContention,
+}
+
 /// Pool of funded accounts distributed across shards.
 pub struct AccountPool {
     /// Accounts grouped by shard.
-    by_shard: HashMap<ShardGroupId, Vec<FundedAccount>>,
+    pub(crate) by_shard: HashMap<ShardGroupId, Vec<FundedAccount>>,
 
     /// Number of shards.
     num_shards: u64,
 
-    /// Round-robin counters per shard (for RoundRobin mode).
-    round_robin_counters: HashMap<ShardGroupId, usize>,
+    /// Round-robin counters per shard.
+    round_robin_counters: HashMap<ShardGroupId, std::sync::atomic::AtomicUsize>,
 
     /// Global transaction counter for NoContention mode.
     /// Each transaction reserves 2 account slots to ensure zero conflicts.
-    no_contention_counter: usize,
+    no_contention_counter: std::sync::atomic::AtomicUsize,
 
     /// Usage tracking: total selections per account index per shard.
-    usage_counts: HashMap<ShardGroupId, Vec<u64>>,
+    usage_counts: HashMap<ShardGroupId, Vec<std::sync::atomic::AtomicU64>>,
 }
 
 impl AccountPool {
     /// Create an empty account pool.
     pub fn new(num_shards: u64) -> Self {
+        use std::sync::atomic::AtomicUsize;
+
         let mut by_shard = HashMap::new();
         let mut round_robin_counters = HashMap::new();
         let mut usage_counts = HashMap::new();
@@ -112,7 +154,7 @@ impl AccountPool {
         for shard in 0..num_shards {
             let shard_id = ShardGroupId(shard);
             by_shard.insert(shard_id, Vec::new());
-            round_robin_counters.insert(shard_id, 0);
+            round_robin_counters.insert(shard_id, AtomicUsize::new(0));
             usage_counts.insert(shard_id, Vec::new());
         }
 
@@ -120,7 +162,7 @@ impl AccountPool {
             by_shard,
             num_shards,
             round_robin_counters,
-            no_contention_counter: 0,
+            no_contention_counter: AtomicUsize::new(0),
             usage_counts,
         }
     }
@@ -128,15 +170,16 @@ impl AccountPool {
     /// Generate accounts targeting specific shards.
     ///
     /// This searches for keypair seeds whose derived accounts land on each shard.
-    /// The accounts are NOT funded yet - use `genesis_balances()` to get the
-    /// balances to pass to genesis configuration.
+    /// Seeds start at 100 (after reserved seeds) for compatibility with simulator.
     pub fn generate(num_shards: u64, accounts_per_shard: usize) -> Result<Self, AccountPoolError> {
+        use std::sync::atomic::AtomicU64;
+
         info!(num_shards, accounts_per_shard, "Generating account pool");
 
         let mut pool = Self::new(num_shards);
 
-        // Find accounts for each shard
-        let mut seed = 100u64; // Start after reserved seeds
+        // Find accounts for each shard - start at seed 100 for compatibility
+        let mut seed = 100u64;
         let mut found_per_shard = vec![0usize; num_shards as usize];
         let max_iterations = accounts_per_shard * num_shards as usize * 10;
         let mut iterations = 0;
@@ -167,7 +210,7 @@ impl AccountPool {
         for shard in 0..num_shards {
             let shard_id = ShardGroupId(shard);
             let count = pool.by_shard.get(&shard_id).map(|v| v.len()).unwrap_or(0);
-            let counters: Vec<u64> = vec![0; count];
+            let counters: Vec<AtomicU64> = (0..count).map(|_| AtomicU64::new(0)).collect();
             pool.usage_counts.insert(shard_id, counters);
         }
 
@@ -180,10 +223,6 @@ impl AccountPool {
     }
 
     /// Get the XRD balances for a specific shard to configure in genesis.
-    ///
-    /// Returns a list of (address, balance) pairs suitable for passing to
-    /// genesis configuration. Only includes accounts that belong to the
-    /// specified shard.
     pub fn genesis_balances_for_shard(
         &self,
         shard: ShardGroupId,
@@ -200,35 +239,20 @@ impl AccountPool {
             .unwrap_or_default()
     }
 
-    /// Get a mutable reference to a random account on a specific shard.
-    pub fn random_on_shard(
-        &mut self,
-        shard: ShardGroupId,
-        rng: &mut impl rand::Rng,
-    ) -> Option<&mut FundedAccount> {
-        let accounts = self.by_shard.get_mut(&shard)?;
-        if accounts.is_empty() {
-            return None;
-        }
-        let idx = rng.gen_range(0..accounts.len());
-        Some(&mut accounts[idx])
+    /// Get all genesis balances across all shards.
+    pub fn all_genesis_balances(&self, balance: Decimal) -> Vec<(ComponentAddress, Decimal)> {
+        self.by_shard
+            .values()
+            .flat_map(|accounts| accounts.iter().map(|a| (a.address, balance)))
+            .collect()
     }
 
     /// Get a pair of accounts on the same shard.
-    /// Uses pure random selection - can cause high contention.
     pub fn same_shard_pair(
-        &mut self,
+        &self,
         rng: &mut impl rand::Rng,
-    ) -> Option<(&mut FundedAccount, &mut FundedAccount)> {
-        self.same_shard_pair_with_distribution(rng, AccountDistribution::Random)
-    }
-
-    /// Get a pair of accounts on the same shard with specified distribution mode.
-    pub fn same_shard_pair_with_distribution(
-        &mut self,
-        rng: &mut impl rand::Rng,
-        distribution: AccountDistribution,
-    ) -> Option<(&mut FundedAccount, &mut FundedAccount)> {
+        mode: SelectionMode,
+    ) -> Option<(&FundedAccount, &FundedAccount)> {
         let shard = ShardGroupId(rng.gen_range(0..self.num_shards));
         let num_accounts = self.by_shard.get(&shard)?.len();
 
@@ -236,133 +260,18 @@ impl AccountPool {
             return None;
         }
 
-        let (idx1, idx2) = self.select_pair_indices(shard, num_accounts, rng, distribution);
+        let (idx1, idx2) = self.select_pair_indices(shard, num_accounts, rng, mode);
 
-        // Track usage
-        self.record_usage(shard, idx1);
-        self.record_usage(shard, idx2);
-
-        // Use split_at_mut to get two mutable references
-        let accounts = self.by_shard.get_mut(&shard)?;
-        let (min_idx, max_idx) = if idx1 < idx2 {
-            (idx1, idx2)
-        } else {
-            (idx2, idx1)
-        };
-        let (left, right) = accounts.split_at_mut(max_idx);
-        Some((&mut left[min_idx], &mut right[0]))
-    }
-
-    /// Select a pair of distinct account indices based on distribution mode.
-    fn select_pair_indices(
-        &mut self,
-        shard: ShardGroupId,
-        num_accounts: usize,
-        rng: &mut impl rand::Rng,
-        distribution: AccountDistribution,
-    ) -> (usize, usize) {
-        match distribution {
-            AccountDistribution::Random => {
-                let idx1 = rng.gen_range(0..num_accounts);
-                let mut idx2 = rng.gen_range(0..num_accounts);
-                while idx2 == idx1 {
-                    idx2 = rng.gen_range(0..num_accounts);
-                }
-                (idx1, idx2)
-            }
-            AccountDistribution::RoundRobin => {
-                // Cycles through accounts sequentially: (0,1), (2,3), (4,5)...
-                let counter = self.round_robin_counters.get_mut(&shard).unwrap();
-                let idx1 = (*counter * 2) % num_accounts;
-                let idx2 = (*counter * 2 + 1) % num_accounts;
-                *counter += 1;
-                (idx1, idx2)
-            }
-            AccountDistribution::Zipf { exponent } => {
-                // Zipf distribution: P(k) ~ 1/k^s where s is the exponent
-                // Higher exponent = more skewed toward lower indices (hotspots)
-                let idx1 = self.zipf_index(num_accounts, exponent, rng);
-                let mut idx2 = self.zipf_index(num_accounts, exponent, rng);
-                while idx2 == idx1 {
-                    idx2 = self.zipf_index(num_accounts, exponent, rng);
-                }
-                (idx1, idx2)
-            }
-            AccountDistribution::NoContention => {
-                // Each transaction gets a disjoint pair of accounts using a GLOBAL counter.
-                // This ensures no conflicts between same-shard and cross-shard transactions.
-                // With N accounts per shard, can support N/2 concurrent non-conflicting transactions.
-                let counter = self.no_contention_counter;
-                self.no_contention_counter += 1;
-                // Each counter value maps to a unique pair: (2*c, 2*c+1)
-                let pair_base = (counter * 2) % num_accounts;
-                let idx1 = pair_base;
-                let idx2 = (pair_base + 1) % num_accounts;
-                (idx1, idx2)
-            }
-        }
-    }
-
-    /// Select a single account index based on distribution mode.
-    /// Used for cross-shard transactions where we need one account per shard.
-    fn select_single_index(
-        &mut self,
-        shard: ShardGroupId,
-        num_accounts: usize,
-        rng: &mut impl rand::Rng,
-        distribution: AccountDistribution,
-    ) -> usize {
-        match distribution {
-            AccountDistribution::Random => rng.gen_range(0..num_accounts),
-            AccountDistribution::RoundRobin => {
-                let counter = self.round_robin_counters.get_mut(&shard).unwrap();
-                let idx = *counter % num_accounts;
-                *counter += 1;
-                idx
-            }
-            AccountDistribution::NoContention => {
-                // Use the global counter and reserve a full pair slot (2 indices).
-                let counter = self.no_contention_counter;
-                self.no_contention_counter += 1;
-                (counter * 2) % num_accounts
-            }
-            AccountDistribution::Zipf { exponent } => self.zipf_index(num_accounts, exponent, rng),
-        }
-    }
-
-    /// Generate a Zipf-distributed index.
-    fn zipf_index(&self, n: usize, exponent: u32, rng: &mut impl rand::Rng) -> usize {
-        // Simplified Zipf: use inverse transform sampling approximation
-        let exp = exponent.max(1) as f64;
-        let u: f64 = rng.gen();
-        // Inverse CDF approximation for Zipf
-        let idx = ((n as f64).powf(1.0 - u)).powf(1.0 / exp) as usize;
-        idx.min(n - 1)
-    }
-
-    /// Record that an account was selected.
-    fn record_usage(&mut self, shard: ShardGroupId, idx: usize) {
-        if let Some(counts) = self.usage_counts.get_mut(&shard) {
-            if let Some(counter) = counts.get_mut(idx) {
-                *counter += 1;
-            }
-        }
+        let accounts = self.by_shard.get(&shard)?;
+        Some((&accounts[idx1], &accounts[idx2]))
     }
 
     /// Get a pair of accounts on different shards (for cross-shard transactions).
     pub fn cross_shard_pair(
-        &mut self,
+        &self,
         rng: &mut impl rand::Rng,
-    ) -> Option<(FundedAccount, FundedAccount)> {
-        self.cross_shard_pair_with_distribution(rng, AccountDistribution::Random)
-    }
-
-    /// Get a pair of accounts on different shards with specified distribution mode.
-    pub fn cross_shard_pair_with_distribution(
-        &mut self,
-        rng: &mut impl rand::Rng,
-        distribution: AccountDistribution,
-    ) -> Option<(FundedAccount, FundedAccount)> {
+        mode: SelectionMode,
+    ) -> Option<(&FundedAccount, &FundedAccount)> {
         if self.num_shards < 2 {
             return None;
         }
@@ -376,31 +285,119 @@ impl AccountPool {
         let num_accounts1 = self.by_shard.get(&shard1)?.len();
         let num_accounts2 = self.by_shard.get(&shard2)?.len();
 
-        // Select single index per shard (not pairs)
-        let idx1 = self.select_single_index(shard1, num_accounts1, rng, distribution);
-        let idx2 = self.select_single_index(shard2, num_accounts2, rng, distribution);
+        if num_accounts1 == 0 || num_accounts2 == 0 {
+            return None;
+        }
 
-        // Track usage
-        self.record_usage(shard1, idx1);
-        self.record_usage(shard2, idx2);
+        let idx1 = self.select_single_index(shard1, num_accounts1, rng, mode);
+        let idx2 = self.select_single_index(shard2, num_accounts2, rng, mode);
 
-        // Clone accounts since they're on different shards
-        let account1 = self.by_shard.get_mut(&shard1)?[idx1].clone();
-        let account2 = self.by_shard.get(&shard2)?[idx2].clone();
+        // Get references from different shards
+        let accounts1 = self.by_shard.get(&shard1)?;
+        let accounts2 = self.by_shard.get(&shard2)?;
 
-        Some((account1, account2))
+        Some((&accounts1[idx1], &accounts2[idx2]))
     }
 
-    /// Update an account after mutation (for nonce tracking with cross-shard).
-    pub fn update_account(&mut self, account: FundedAccount) {
-        if let Some(accounts) = self.by_shard.get_mut(&account.shard) {
-            for a in accounts.iter_mut() {
-                if a.address == account.address {
-                    *a = account;
-                    return;
+    /// Select a pair of distinct account indices based on selection mode.
+    fn select_pair_indices(
+        &self,
+        shard: ShardGroupId,
+        num_accounts: usize,
+        rng: &mut impl rand::Rng,
+        mode: SelectionMode,
+    ) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+
+        let (idx1, idx2) = match mode {
+            SelectionMode::Random => {
+                let idx1 = rng.gen_range(0..num_accounts);
+                let mut idx2 = rng.gen_range(0..num_accounts);
+                while idx2 == idx1 {
+                    idx2 = rng.gen_range(0..num_accounts);
                 }
+                (idx1, idx2)
+            }
+            SelectionMode::RoundRobin => {
+                let counter = self.round_robin_counters.get(&shard).unwrap();
+                let c = counter.fetch_add(1, Ordering::SeqCst);
+                let idx1 = (c * 2) % num_accounts;
+                let idx2 = (c * 2 + 1) % num_accounts;
+                (idx1, idx2)
+            }
+            SelectionMode::Zipf { exponent } => {
+                let idx1 = self.zipf_index(num_accounts, exponent, rng);
+                let mut idx2 = self.zipf_index(num_accounts, exponent, rng);
+                while idx2 == idx1 {
+                    idx2 = self.zipf_index(num_accounts, exponent, rng);
+                }
+                (idx1, idx2)
+            }
+            SelectionMode::NoContention => {
+                // Each call gets a disjoint pair using a GLOBAL counter.
+                // This ensures no conflicts between same-shard and cross-shard transactions.
+                let counter = self.no_contention_counter.fetch_add(1, Ordering::SeqCst);
+                let pair_base = (counter * 2) % num_accounts;
+                let idx1 = pair_base;
+                let idx2 = (pair_base + 1) % num_accounts;
+                (idx1, idx2)
+            }
+        };
+
+        // Track usage
+        self.record_usage(shard, idx1);
+        self.record_usage(shard, idx2);
+
+        (idx1, idx2)
+    }
+
+    /// Select a single account index based on selection mode.
+    fn select_single_index(
+        &self,
+        shard: ShardGroupId,
+        num_accounts: usize,
+        rng: &mut impl rand::Rng,
+        mode: SelectionMode,
+    ) -> usize {
+        use std::sync::atomic::Ordering;
+
+        let idx = match mode {
+            SelectionMode::Random => rng.gen_range(0..num_accounts),
+            SelectionMode::RoundRobin => {
+                let counter = self.round_robin_counters.get(&shard).unwrap();
+                counter.fetch_add(1, Ordering::SeqCst) % num_accounts
+            }
+            SelectionMode::Zipf { exponent } => self.zipf_index(num_accounts, exponent, rng),
+            SelectionMode::NoContention => {
+                // Use the global counter and reserve a full pair slot (2 indices).
+                let counter = self.no_contention_counter.fetch_add(1, Ordering::SeqCst);
+                (counter * 2) % num_accounts
+            }
+        };
+
+        // Track usage
+        self.record_usage(shard, idx);
+
+        idx
+    }
+
+    /// Record that an account was selected.
+    fn record_usage(&self, shard: ShardGroupId, idx: usize) {
+        use std::sync::atomic::Ordering;
+
+        if let Some(counts) = self.usage_counts.get(&shard) {
+            if let Some(counter) = counts.get(idx) {
+                counter.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Generate a Zipf-distributed index.
+    fn zipf_index(&self, n: usize, exponent: f64, rng: &mut impl rand::Rng) -> usize {
+        let exp = exponent.max(1.0);
+        let u: f64 = rng.gen();
+        let idx = ((n as f64).powf(1.0 - u)).powf(1.0 / exp) as usize;
+        idx.min(n - 1)
     }
 
     /// Total number of accounts across all shards.
@@ -423,15 +420,23 @@ impl AccountPool {
         self.num_shards
     }
 
+    /// Get accounts for a specific shard.
+    pub fn accounts_for_shard(&self, shard: ShardGroupId) -> Option<&[FundedAccount]> {
+        self.by_shard.get(&shard).map(|v| v.as_slice())
+    }
+
     /// Get usage statistics for analysis.
     pub fn usage_stats(&self) -> AccountUsageStats {
+        use std::sync::atomic::Ordering;
+
         let mut total_selections = 0u64;
         let mut max_selections = 0u64;
         let mut min_selections = u64::MAX;
         let mut account_count = 0usize;
 
         for counts in self.usage_counts.values() {
-            for &count in counts {
+            for counter in counts {
+                let count = counter.load(Ordering::Relaxed);
                 total_selections += count;
                 max_selections = max_selections.max(count);
                 if count > 0 {
@@ -502,7 +507,6 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
-    use std::collections::HashSet;
 
     #[test]
     fn test_account_generation() {
@@ -513,15 +517,57 @@ mod tests {
     }
 
     #[test]
-    fn test_no_contention_same_shard_disjoint() {
-        let mut pool = AccountPool::generate(2, 20).unwrap();
+    fn test_account_deterministic() {
+        let acc1 = FundedAccount::from_seed(42, 2);
+        let acc2 = FundedAccount::from_seed(42, 2);
+        assert_eq!(acc1.address, acc2.address);
+    }
+
+    #[test]
+    fn test_atomic_nonce() {
+        let account = FundedAccount::from_seed(100, 2);
+        assert_eq!(account.next_nonce(), 0);
+        assert_eq!(account.next_nonce(), 1);
+        assert_eq!(account.next_nonce(), 2);
+        assert_eq!(account.current_nonce(), 3);
+    }
+
+    #[test]
+    fn test_same_shard_pair() {
+        let pool = AccountPool::generate(2, 10).unwrap();
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let mut used_indices: HashSet<(u64, usize)> = HashSet::new();
+
+        let pair = pool.same_shard_pair(&mut rng, SelectionMode::Random);
+        assert!(pair.is_some());
+
+        let (from, to) = pair.unwrap();
+        assert_eq!(from.shard, to.shard);
+        assert_ne!(from.address, to.address);
+    }
+
+    #[test]
+    fn test_cross_shard_pair() {
+        let pool = AccountPool::generate(2, 10).unwrap();
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let pair = pool.cross_shard_pair(&mut rng, SelectionMode::Random);
+        assert!(pair.is_some());
+
+        let (from, to) = pair.unwrap();
+        assert_ne!(from.shard, to.shard);
+    }
+
+    #[test]
+    fn test_no_contention_mode() {
+        let pool = AccountPool::generate(2, 20).unwrap();
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut used_indices: std::collections::HashSet<(u64, usize)> =
+            std::collections::HashSet::new();
 
         // Generate 10 same-shard pairs - should all be disjoint
         for _ in 0..10 {
             let (from, to) = pool
-                .same_shard_pair_with_distribution(&mut rng, AccountDistribution::NoContention)
+                .same_shard_pair(&mut rng, SelectionMode::NoContention)
                 .unwrap();
 
             let shard = from.shard;
@@ -549,6 +595,19 @@ mod tests {
                 shard.0,
                 to_idx
             );
+        }
+    }
+
+    #[test]
+    fn test_genesis_balances() {
+        let pool = AccountPool::generate(2, 5).unwrap();
+        let balance = Decimal::from(1000u32);
+
+        let all_balances = pool.all_genesis_balances(balance);
+        assert_eq!(all_balances.len(), 10);
+
+        for (_, bal) in &all_balances {
+            assert_eq!(*bal, balance);
         }
     }
 }
