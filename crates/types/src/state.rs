@@ -1,8 +1,8 @@
 //! State-related types for cross-shard execution.
 
 use crate::{
-    BlockHeight, Hash, NodeId, PartitionNumber, ShardGroupId, Signature, SignerBitfield,
-    ValidatorId,
+    exec_vote_message, state_provision_message, BlockHeight, Hash, NodeId, PartitionNumber,
+    ShardGroupId, Signature, SignerBitfield, ValidatorId,
 };
 use sbor::prelude::*;
 
@@ -119,19 +119,18 @@ pub struct StateProvision {
 
 impl StateProvision {
     /// Create the canonical message bytes for signing.
+    ///
+    /// Uses the centralized `state_provision_message` function with the
+    /// `DOMAIN_STATE_PROVISION` tag for domain separation.
     pub fn signing_message(&self) -> Vec<u8> {
-        let mut msg = Vec::new();
-        msg.extend_from_slice(b"STATE_PROVISION");
-        msg.extend_from_slice(self.transaction_hash.as_bytes());
-        msg.extend_from_slice(&self.target_shard.0.to_le_bytes());
-        msg.extend_from_slice(&self.source_shard.0.to_le_bytes());
-        msg.extend_from_slice(&self.block_height.0.to_le_bytes());
-
-        for entry in &self.entries {
-            msg.extend_from_slice(entry.hash().as_bytes());
-        }
-
-        msg
+        let entry_hashes: Vec<Hash> = self.entries.iter().map(|e| e.hash()).collect();
+        state_provision_message(
+            &self.transaction_hash,
+            self.target_shard,
+            self.source_shard,
+            self.block_height,
+            &entry_hashes,
+        )
     }
 
     /// Compute a hash of all entries for comparison purposes.
@@ -176,6 +175,22 @@ impl StateVoteBlock {
         data.push(if self.success { 1 } else { 0 });
 
         Hash::from_bytes(&data)
+    }
+
+    /// Create the canonical message bytes for signing.
+    ///
+    /// Uses the centralized `exec_vote_message` function with the
+    /// `DOMAIN_EXEC_VOTE` tag for domain separation.
+    ///
+    /// Note: StateCertificates aggregate signatures from StateVoteBlocks,
+    /// so StateCertificate::signing_message() returns the same format.
+    pub fn signing_message(&self) -> Vec<u8> {
+        exec_vote_message(
+            &self.transaction_hash,
+            &self.state_root,
+            self.shard_group_id,
+            self.success,
+        )
     }
 }
 
@@ -264,6 +279,23 @@ impl StateCertificate {
             signers: SignerBitfield::empty(),
             voting_power: 0,
         }
+    }
+
+    /// Create the canonical message bytes for signature verification.
+    ///
+    /// Uses the centralized `exec_vote_message` function with the
+    /// `DOMAIN_EXEC_VOTE` tag for domain separation.
+    ///
+    /// Note: This returns the same message format as StateVoteBlock::signing_message()
+    /// because StateCertificates aggregate signatures from StateVoteBlocks. The
+    /// aggregated signature is verified against this same message.
+    pub fn signing_message(&self) -> Vec<u8> {
+        exec_vote_message(
+            &self.transaction_hash,
+            &self.outputs_merkle_root,
+            self.shard_group_id,
+            self.success,
+        )
     }
 }
 

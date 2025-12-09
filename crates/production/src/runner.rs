@@ -683,16 +683,8 @@ impl ProductionRunner {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
-                    // Build signing message (must match ExecutionState::sign_provision)
-                    let mut msg = Vec::new();
-                    msg.extend_from_slice(b"STATE_PROVISION");
-                    msg.extend_from_slice(provision.transaction_hash.as_bytes());
-                    msg.extend_from_slice(&provision.target_shard.0.to_le_bytes());
-                    msg.extend_from_slice(&provision.source_shard.0.to_le_bytes());
-                    msg.extend_from_slice(&provision.block_height.0.to_le_bytes());
-                    for entry in &provision.entries {
-                        msg.extend_from_slice(entry.hash().as_bytes());
-                    }
+                    // Use centralized signing message (must match ExecutionState::sign_provision)
+                    let msg = provision.signing_message();
 
                     let valid = public_key.verify(&msg, &provision.signature);
                     crate::metrics::record_signature_verification_latency(
@@ -710,13 +702,8 @@ impl ProductionRunner {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
-                    // Build signing message (must match ExecutionState::create_vote)
-                    let mut msg = Vec::new();
-                    msg.extend_from_slice(b"EXEC_VOTE");
-                    msg.extend_from_slice(vote.transaction_hash.as_bytes());
-                    msg.extend_from_slice(vote.state_root.as_bytes());
-                    msg.extend_from_slice(&vote.shard_group_id.0.to_le_bytes());
-                    msg.push(if vote.success { 1 } else { 0 });
+                    // Use centralized signing message (must match ExecutionState::create_vote)
+                    let msg = vote.signing_message();
 
                     let valid = public_key.verify(&msg, &vote.signature);
                     crate::metrics::record_signature_verification_latency(
@@ -737,13 +724,9 @@ impl ProductionRunner {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
-                    // Build signing message
-                    let mut msg = Vec::new();
-                    msg.extend_from_slice(b"STATE_CERT");
-                    msg.extend_from_slice(certificate.transaction_hash.as_bytes());
-                    msg.extend_from_slice(certificate.outputs_merkle_root.as_bytes());
-                    msg.extend_from_slice(&certificate.shard_group_id.0.to_le_bytes());
-                    msg.push(if certificate.success { 1 } else { 0 });
+                    // Use centralized signing message - StateCertificates aggregate signatures
+                    // from StateVoteBlocks, so they use the same EXEC_VOTE domain tag.
+                    let msg = certificate.signing_message();
 
                     // Get signer keys based on bitfield
                     let signer_keys: Vec<_> = public_keys

@@ -10,8 +10,8 @@
 //! BLS signature aggregation.
 
 use hyperscale_types::{
-    BlockHeight, Hash, KeyPair, PublicKey, QuorumCertificate, ShardGroupId, Signature,
-    SignerBitfield, Topology, ValidatorId, ViewChangeCertificate, VotePower,
+    BlockHeight, KeyPair, PublicKey, QuorumCertificate, ShardGroupId, Signature, SignerBitfield,
+    Topology, ValidatorId, ViewChangeCertificate, VotePower,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -44,7 +44,7 @@ struct PendingCertificateVerification;
 /// uses plain HashMap and u64 since it's single-threaded.
 pub struct ViewChangeState {
     /// Shard group identifier for replay protection.
-    shard_group: Hash,
+    shard_group: ShardGroupId,
 
     /// Signing key for votes.
     signing_key: KeyPair,
@@ -95,7 +95,7 @@ pub struct ViewChangeState {
 impl ViewChangeState {
     /// Create a new view change state.
     pub fn new(
-        shard_group: Hash,
+        shard_group: ShardGroupId,
         signing_key: KeyPair,
         topology: Arc<dyn Topology>,
         timeout: Duration,
@@ -304,7 +304,7 @@ impl ViewChangeState {
         let new_round = current_round + 1;
 
         // Sign the vote: (shard_group, height, new_round)
-        let message = Self::view_change_message(&self.shard_group, height, new_round);
+        let message = Self::view_change_message(self.shard_group, height, new_round);
         let signature = self.signing_key.sign(&message);
 
         Some(ViewChangeVote::new(
@@ -318,18 +318,19 @@ impl ViewChangeState {
     }
 
     /// Create the message bytes to sign for a view change vote.
-    pub fn view_change_message(shard_group: &Hash, height: BlockHeight, new_round: u64) -> Vec<u8> {
-        let mut message = Vec::with_capacity(60);
-        message.extend_from_slice(b"view_change:");
-        message.extend_from_slice(shard_group.as_bytes());
-        message.extend_from_slice(&height.0.to_le_bytes());
-        message.extend_from_slice(&new_round.to_le_bytes());
-        message
+    ///
+    /// Uses the centralized `view_change_message` from `hyperscale_types::signing`.
+    pub fn view_change_message(
+        shard_group: ShardGroupId,
+        height: BlockHeight,
+        new_round: u64,
+    ) -> Vec<u8> {
+        hyperscale_types::view_change_message(shard_group, height, new_round)
     }
 
-    /// Get the shard group hash (needed for signing message construction).
-    pub fn shard_group(&self) -> &Hash {
-        &self.shard_group
+    /// Get the shard group ID (needed for signing message construction).
+    pub fn shard_group(&self) -> ShardGroupId {
+        self.shard_group
     }
 
     /// Handle a view change vote from another validator.
@@ -394,7 +395,7 @@ impl ViewChangeState {
             .insert(vote_key, PendingVoteVerification);
 
         // Delegate vote signature verification to runner
-        let signing_message = Self::view_change_message(&self.shard_group, height, new_round);
+        let signing_message = Self::view_change_message(self.shard_group, height, new_round);
         vec![Action::VerifyViewChangeVoteSignature {
             vote,
             public_key,
@@ -456,7 +457,7 @@ impl ViewChangeState {
 
         // Construct signing message for the highest_qc with domain separation
         let signing_message = BftState::block_vote_message(
-            &self.shard_group,
+            self.shard_group,
             vote.highest_qc.height.0,
             vote.highest_qc.round,
             &vote.highest_qc.block_hash,
@@ -573,7 +574,7 @@ impl ViewChangeState {
         let public_key = self.public_key(vote.voter)?;
 
         // Synchronous signature verification (test only)
-        let message = Self::view_change_message(&self.shard_group, height, new_round);
+        let message = Self::view_change_message(self.shard_group, height, new_round);
         if !public_key.verify(&message, &vote.signature) {
             return None;
         }
@@ -801,7 +802,7 @@ impl ViewChangeState {
 
         // Construct the message that was signed
         let signing_message =
-            Self::view_change_message(&self.shard_group, cert.height, cert.new_round());
+            Self::view_change_message(self.shard_group, cert.height, cert.new_round());
 
         // Delegate signature verification to runner
         vec![Action::VerifyViewChangeCertificateSignature {
@@ -904,7 +905,8 @@ mod tests {
         // Create topology
         let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
 
-        let shard_group = Hash::from_bytes(b"test_shard");
+        // Use the topology's shard group for consistency
+        let shard_group = topology.local_shard();
 
         let state = ViewChangeState::new(
             shard_group,
@@ -964,14 +966,15 @@ mod tests {
         let (mut state, keys) = make_test_state();
         state.current_height = 1;
 
-        let shard_group = Hash::from_bytes(b"test_shard");
+        // Use the state's shard_group for consistency
+        let shard_group = state.shard_group();
 
         // Create votes from validators 1, 2, 3
         // Note: Using range loop intentionally because i is used both for indexing keys
         // and for constructing ValidatorId (which must match the key index).
         #[allow(clippy::needless_range_loop)]
         for i in 1..=3 {
-            let message = ViewChangeState::view_change_message(&shard_group, BlockHeight(1), 1);
+            let message = hyperscale_types::view_change_message(shard_group, BlockHeight(1), 1);
             let signature = keys[i].sign(&message);
             let vote = ViewChangeVote::new(
                 BlockHeight(1),

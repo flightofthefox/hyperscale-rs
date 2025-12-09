@@ -6,7 +6,7 @@ use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::MempoolState;
 use hyperscale_sync::{SyncConfig, SyncState};
-use hyperscale_types::{Block, Hash, KeyPair, ShardGroupId, Topology};
+use hyperscale_types::{Block, KeyPair, ShardGroupId, Topology};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,9 +74,6 @@ impl NodeStateMachine {
         bft_config: BftConfig,
         recovered: RecoveredState,
     ) -> Self {
-        // Create shard group hash for view change replay protection
-        let shard_group_hash = Hash::from_bytes(&topology.local_shard().0.to_le_bytes());
-
         // Total validators for sync peer selection
         let total_validators = topology.local_committee().len() as u32;
 
@@ -93,7 +90,7 @@ impl NodeStateMachine {
                 recovered,
             ),
             view_change: ViewChangeState::new(
-                shard_group_hash,
+                local_shard,
                 signing_key.clone(),
                 topology.clone(),
                 bft_config.view_change_timeout,

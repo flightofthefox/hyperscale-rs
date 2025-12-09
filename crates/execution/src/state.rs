@@ -580,6 +580,8 @@ impl ExecutionState {
     }
 
     /// Sign a provision.
+    ///
+    /// Uses the centralized `state_provision_message` for domain-separated signing.
     fn sign_provision(
         &self,
         tx_hash: &Hash,
@@ -588,17 +590,14 @@ impl ExecutionState {
         block_height: BlockHeight,
         entries: &[StateEntry],
     ) -> Signature {
-        let mut msg = Vec::new();
-        msg.extend_from_slice(b"STATE_PROVISION");
-        msg.extend_from_slice(tx_hash.as_bytes());
-        msg.extend_from_slice(&target_shard.0.to_le_bytes());
-        msg.extend_from_slice(&source_shard.0.to_le_bytes());
-        msg.extend_from_slice(&block_height.0.to_le_bytes());
-
-        for entry in entries {
-            msg.extend_from_slice(entry.hash().as_bytes());
-        }
-
+        let entry_hashes: Vec<Hash> = entries.iter().map(|e| e.hash()).collect();
+        let msg = hyperscale_types::state_provision_message(
+            tx_hash,
+            target_shard,
+            source_shard,
+            block_height,
+            &entry_hashes,
+        );
         self.signing_key.sign(&msg)
     }
 
@@ -859,18 +858,15 @@ impl ExecutionState {
     }
 
     /// Create a state vote block.
+    ///
+    /// Uses the centralized `exec_vote_message` for domain-separated signing.
     fn create_vote(&self, tx_hash: Hash, state_root: Hash, success: bool) -> StateVoteBlock {
         let shard_group = self.local_shard();
         let validator_id = self.validator_id();
 
-        // Build signing message
-        let mut message = Vec::new();
-        message.extend_from_slice(b"EXEC_VOTE");
-        message.extend_from_slice(tx_hash.as_bytes());
-        message.extend_from_slice(state_root.as_bytes());
-        message.extend_from_slice(&shard_group.0.to_le_bytes());
-        message.push(if success { 1 } else { 0 });
-
+        // Build signing message using centralized domain-separated function
+        let message =
+            hyperscale_types::exec_vote_message(&tx_hash, &state_root, shard_group, success);
         let signature = self.signing_key.sign(&message);
 
         StateVoteBlock {

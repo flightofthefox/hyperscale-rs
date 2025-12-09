@@ -17,6 +17,7 @@ mod crypto;
 mod hash;
 mod identifiers;
 mod network;
+mod signing;
 
 // Consensus types
 mod block;
@@ -32,6 +33,10 @@ pub use crypto::{AggregateError, KeyPair, KeyType, PublicKey, Signature};
 pub use hash::{Hash, HexError};
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
 pub use network::{GlobalMessage, NetworkMessage, Request, ShardMessage};
+pub use signing::{
+    block_vote_message, exec_vote_message, state_provision_message, view_change_message,
+    DOMAIN_BLOCK_VOTE, DOMAIN_EXEC_VOTE, DOMAIN_STATE_PROVISION, DOMAIN_VIEW_CHANGE,
+};
 
 pub use block::{Block, BlockHeader};
 pub use quorum_certificate::QuorumCertificate;

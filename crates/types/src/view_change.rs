@@ -1,7 +1,8 @@
 //! View change types for liveness.
 
 use crate::{
-    BlockHeight, Hash, QuorumCertificate, Signature, SignerBitfield, ValidatorId, VotePower,
+    view_change_message, BlockHeight, Hash, QuorumCertificate, ShardGroupId, Signature,
+    SignerBitfield, ValidatorId, VotePower,
 };
 use sbor::prelude::*;
 
@@ -52,14 +53,16 @@ impl ViewChangeVote {
         (self.height, self.new_view)
     }
 
-    /// Get the message that was signed.
-    pub fn signing_message(&self) -> Vec<u8> {
-        let mut msg = Vec::new();
-        msg.extend_from_slice(b"VIEW_CHANGE");
-        msg.extend_from_slice(&self.new_view.to_le_bytes());
-        msg.extend_from_slice(&self.height.0.to_le_bytes());
-        msg.extend_from_slice(self.highest_qc.block_hash.as_bytes());
-        msg
+    /// Create the canonical message bytes for signing.
+    ///
+    /// Uses the centralized `view_change_message` function with the
+    /// `DOMAIN_VIEW_CHANGE` tag for domain separation.
+    ///
+    /// Note: View change votes require `shard_group` context which this type
+    /// doesn't contain. Use `hyperscale_types::view_change_message()` with
+    /// the shard_group from your BFT state.
+    pub fn signing_message(&self, shard_group: ShardGroupId) -> Vec<u8> {
+        view_change_message(shard_group, self.height, self.new_view)
     }
 }
 
@@ -122,9 +125,11 @@ impl ViewChangeCertificate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Hash, DOMAIN_VIEW_CHANGE};
 
     #[test]
     fn test_view_change_vote_signing_message() {
+        let shard_group = ShardGroupId(1);
         let vote = ViewChangeVote {
             new_view: 5,
             current_round: 4,
@@ -134,9 +139,23 @@ mod tests {
             signature: Signature::zero(),
         };
 
-        let msg = vote.signing_message();
-        assert!(msg.starts_with(b"VIEW_CHANGE"));
+        let msg = vote.signing_message(shard_group);
+        assert!(msg.starts_with(DOMAIN_VIEW_CHANGE));
         assert_eq!(vote.vote_key(), (BlockHeight(10), 5));
+    }
+
+    #[test]
+    fn test_view_change_certificate_has_hash() {
+        let vcc = ViewChangeCertificate {
+            new_view: 5,
+            height: BlockHeight(10),
+            highest_qc: QuorumCertificate::genesis(),
+            highest_qc_block_hash: Hash::ZERO,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(0),
+        };
+        assert_eq!(vcc.highest_qc_block_hash, Hash::ZERO);
     }
 
     #[test]
