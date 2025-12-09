@@ -407,7 +407,17 @@ impl MempoolState {
     /// the transaction lifecycle (Provisioning, Executing, etc.).
     pub fn update_status(&mut self, tx_hash: &Hash, new_status: TransactionStatus) {
         if let Some(entry) = self.pool.get_mut(tx_hash) {
-            // Validate transition
+            // Case 1: Idempotent update - already in the target state
+            if entry.status == new_status {
+                tracing::trace!(
+                    tx_hash = ?tx_hash,
+                    status = %entry.status,
+                    "Ignoring duplicate status update"
+                );
+                return;
+            }
+
+            // Case 2: Valid transition - apply it
             if entry.status.can_transition_to(&new_status) {
                 tracing::debug!(
                     tx_hash = ?tx_hash,
@@ -416,7 +426,21 @@ impl MempoolState {
                     "Transaction status transition"
                 );
                 entry.status = new_status;
+                return;
+            }
+
+            // Case 3: Invalid transition - determine if stale or truly invalid
+            if new_status.ordinal() < entry.status.ordinal() {
+                // Stale update: we've already progressed past this state.
+                // This can happen due to message reordering in distributed systems.
+                tracing::debug!(
+                    tx_hash = ?tx_hash,
+                    current = %entry.status,
+                    stale = %new_status,
+                    "Ignoring stale status update (already progressed past this state)"
+                );
             } else {
+                // Truly invalid transition - this indicates a bug in the state machine
                 tracing::warn!(
                     tx_hash = ?tx_hash,
                     from = %entry.status,

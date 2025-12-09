@@ -751,6 +751,34 @@ impl TransactionStatus {
         )
     }
 
+    /// Returns a rough ordering value for the status in the normal lifecycle.
+    ///
+    /// This is used to detect stale status updates (where we've already progressed
+    /// past the incoming status). Note that this doesn't capture all valid transitions
+    /// (e.g., Blocked/Retried can happen from multiple states), but it helps identify
+    /// clearly stale updates.
+    ///
+    /// Ordering: Unknown(0) < Pending(1) < Accepted(2) < Committed(3) < Provisioning(4)
+    ///           < Provisioned(5) < Executing(6) < Finalizing(7) < Finalized(8) < Completed(9)
+    ///
+    /// Blocked and Retried are terminal side-branches and get high ordinals (10, 11).
+    pub fn ordinal(&self) -> u8 {
+        match self {
+            TransactionStatus::Unknown => 0,
+            TransactionStatus::Pending => 1,
+            TransactionStatus::Accepted(_) => 2,
+            TransactionStatus::Committed(_) => 3,
+            TransactionStatus::Provisioning => 4,
+            TransactionStatus::Provisioned => 5,
+            TransactionStatus::Executing => 6,
+            TransactionStatus::Finalizing => 7,
+            TransactionStatus::Finalized(_) => 8,
+            TransactionStatus::Completed => 9,
+            TransactionStatus::Blocked { .. } => 10,
+            TransactionStatus::Retried { .. } => 11,
+        }
+    }
+
     /// Check if this transition is valid.
     pub fn can_transition_to(&self, next: &TransactionStatus) -> bool {
         use TransactionStatus::*;
