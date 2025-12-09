@@ -644,6 +644,14 @@ impl SimulationRunner {
                     }
                 };
 
+                if !valid {
+                    tracing::warn!(
+                        tx_hash = ?certificate.transaction_hash,
+                        shard = certificate.shard_group_id.0,
+                        "State certificate signature verification failed"
+                    );
+                }
+
                 self.schedule_event(
                     from,
                     self.now,

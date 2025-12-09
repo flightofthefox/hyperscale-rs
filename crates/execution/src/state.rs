@@ -1049,8 +1049,15 @@ impl ExecutionState {
     ) -> StateCertificate {
         let shard = self.local_shard();
 
-        // Aggregate BLS signatures
-        let bls_signatures: Vec<Signature> = votes
+        // Deduplicate votes by validator to avoid aggregating the same signature multiple times
+        let mut seen_validators = std::collections::HashSet::new();
+        let unique_votes: Vec<_> = votes
+            .iter()
+            .filter(|vote| seen_validators.insert(vote.validator))
+            .collect();
+
+        // Aggregate BLS signatures from unique votes only
+        let bls_signatures: Vec<Signature> = unique_votes
             .iter()
             .filter_map(|vote| match &vote.signature {
                 Signature::Bls12381(_) => Some(vote.signature.clone()),
@@ -1069,7 +1076,7 @@ impl ExecutionState {
         let mut signers = SignerBitfield::new(committee_size);
         let mut total_power = 0u64;
 
-        for vote in votes {
+        for vote in unique_votes {
             if let Some(index) = self.committee_index(vote.validator) {
                 signers.set(index);
                 total_power += self.voting_power(vote.validator);
