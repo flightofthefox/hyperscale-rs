@@ -155,6 +155,8 @@ pub struct ProductionRunnerBuilder {
     tx_status_cache: Option<Arc<TokioRwLock<TransactionStatusCache>>>,
     /// Optional mempool snapshot for RPC queries.
     mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
+    /// Optional genesis configuration for initial state.
+    genesis_config: Option<hyperscale_engine::GenesisConfig>,
 }
 
 impl Default for ProductionRunnerBuilder {
@@ -178,6 +180,7 @@ impl ProductionRunnerBuilder {
             rpc_status: None,
             tx_status_cache: None,
             mempool_snapshot: None,
+            genesis_config: None,
         }
     }
 
@@ -247,6 +250,15 @@ impl ProductionRunnerBuilder {
     /// When set, the runner will periodically update mempool statistics.
     pub fn mempool_snapshot(mut self, snapshot: Arc<TokioRwLock<MempoolSnapshot>>) -> Self {
         self.mempool_snapshot = Some(snapshot);
+        self
+    }
+
+    /// Set the genesis configuration for initial state.
+    ///
+    /// When set, the runner will use this configuration to bootstrap the Radix Engine
+    /// state with initial XRD balances and other genesis parameters.
+    pub fn genesis_config(mut self, config: hyperscale_engine::GenesisConfig) -> Self {
+        self.genesis_config = Some(config);
         self
     }
 
@@ -349,6 +361,7 @@ impl ProductionRunnerBuilder {
             rpc_status: self.rpc_status,
             tx_status_cache: self.tx_status_cache,
             mempool_snapshot: self.mempool_snapshot,
+            genesis_config: self.genesis_config,
             sync_request_rx,
             shutdown_rx,
             shutdown_tx: Some(shutdown_tx),
@@ -401,6 +414,8 @@ pub struct ProductionRunner {
     tx_status_cache: Option<Arc<TokioRwLock<TransactionStatusCache>>>,
     /// Optional mempool snapshot for RPC queries.
     mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
+    /// Optional genesis configuration for initial state.
+    genesis_config: Option<hyperscale_engine::GenesisConfig>,
     /// Inbound sync request channel (from network adapter).
     sync_request_rx: mpsc::Receiver<InboundSyncRequest>,
     /// Shutdown signal receiver.
@@ -482,7 +497,16 @@ impl ProductionRunner {
         // Run Radix Engine genesis to set up initial state
         {
             let mut storage = self.storage.write();
-            if let Err(e) = self.executor.run_genesis(&mut *storage) {
+            let result = if let Some(config) = self.genesis_config.take() {
+                tracing::info!(
+                    xrd_balances = config.xrd_balances.len(),
+                    "Running genesis with custom configuration"
+                );
+                self.executor.run_genesis_with_config(&mut *storage, config)
+            } else {
+                self.executor.run_genesis(&mut *storage)
+            };
+            if let Err(e) = result {
                 tracing::warn!(error = ?e, "Radix Engine genesis failed (may be OK for testing)");
             }
         }

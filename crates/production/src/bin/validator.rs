@@ -58,6 +58,8 @@ use hyperscale_types::{
     ValidatorSet,
 };
 use parking_lot::RwLock;
+use radix_common::network::NetworkDefinition;
+use radix_common::prelude::AddressBech32Decoder;
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
@@ -359,12 +361,26 @@ fn default_service_name() -> String {
     "hyperscale-validator".to_string()
 }
 
-/// Genesis configuration defining the validator set.
+/// Genesis configuration defining the validator set and initial balances.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct GenesisConfig {
     /// Validators in the network
     #[serde(default)]
     pub validators: Vec<ValidatorEntry>,
+
+    /// Initial XRD balances for accounts
+    #[serde(default)]
+    pub xrd_balances: Vec<XrdBalanceEntry>,
+}
+
+/// An XRD balance entry for genesis configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct XrdBalanceEntry {
+    /// Bech32-encoded account address (e.g., "account_sim1...")
+    pub address: String,
+
+    /// Balance as a string (parsed as Decimal)
+    pub balance: String,
 }
 
 /// A validator entry in genesis configuration.
@@ -552,6 +568,46 @@ fn build_topology(
         )
         .into_arc(),
     )
+}
+
+/// Build engine genesis configuration from TOML config.
+///
+/// Converts the TOML-friendly genesis config (with string addresses and balances)
+/// to the engine's GenesisConfig type.
+fn build_engine_genesis_config(config: &GenesisConfig) -> Result<hyperscale_engine::GenesisConfig> {
+    use radix_common::math::Decimal;
+    use radix_common::types::ComponentAddress;
+    use std::str::FromStr;
+
+    let network = NetworkDefinition::simulator();
+    let decoder = AddressBech32Decoder::new(&network);
+
+    let mut engine_config = hyperscale_engine::GenesisConfig::test_default();
+
+    // Convert XRD balances
+    for entry in &config.xrd_balances {
+        // Decode bech32 address
+        let (_, address_bytes) = decoder
+            .validate_and_decode(&entry.address)
+            .map_err(|e| anyhow::anyhow!("Invalid address '{}': {:?}", entry.address, e))?;
+
+        let address = ComponentAddress::try_from(address_bytes.as_slice()).map_err(|e| {
+            anyhow::anyhow!("Invalid component address '{}': {:?}", entry.address, e)
+        })?;
+
+        // Parse balance
+        let balance = Decimal::from_str(&entry.balance)
+            .map_err(|e| anyhow::anyhow!("Invalid balance '{}': {:?}", entry.balance, e))?;
+
+        engine_config.xrd_balances.push((address, balance));
+    }
+
+    info!(
+        xrd_balances = engine_config.xrd_balances.len(),
+        "Parsed genesis XRD balances"
+    );
+
+    Ok(engine_config)
 }
 
 /// Build thread pool configuration from TOML config.
@@ -761,6 +817,13 @@ async fn main() -> Result<()> {
             .rpc_status(handle.node_status().clone())
             .tx_status_cache(handle.tx_status_cache().clone())
             .mempool_snapshot(handle.mempool_snapshot().clone());
+    }
+
+    // Wire up genesis configuration if XRD balances are specified
+    if !config.genesis.xrd_balances.is_empty() {
+        let engine_genesis = build_engine_genesis_config(&config.genesis)
+            .context("Failed to parse genesis configuration")?;
+        runner_builder = runner_builder.genesis_config(engine_genesis);
     }
 
     let mut runner = runner_builder

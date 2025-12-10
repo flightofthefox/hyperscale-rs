@@ -76,6 +76,9 @@ anyhow = "1.0"
 hex = "0.4"
 rand = "0.8"
 
+# Radix types for genesis configuration parsing
+radix-common = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+
 # Cryptographic primitives for deterministic PeerId derivation
 sha2 = "0.10"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
