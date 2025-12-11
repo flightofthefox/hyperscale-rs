@@ -65,6 +65,10 @@ struct Args {
     #[arg(long)]
     analyze_livelocks: bool,
 
+    /// Enable network traffic analysis for bandwidth estimation
+    #[arg(long)]
+    network_analysis: bool,
+
     /// Use no-contention account distribution (disjoint pairs for zero conflicts)
     #[arg(long)]
     no_contention: bool,
@@ -147,9 +151,17 @@ fn run_parallel(args: &Args, cross_shard_ratio: f64) {
         .build()
         .expect("Failed to create tokio runtime");
 
-    let report = rt.block_on(async {
-        let orchestrator =
+    let enable_network_analysis = args.network_analysis;
+
+    let (report, traffic_report) = rt.block_on(async {
+        let mut orchestrator =
             ParallelOrchestrator::new(config).expect("Failed to create parallel orchestrator");
+
+        // Enable traffic analysis if requested
+        if enable_network_analysis {
+            orchestrator.enable_traffic_analysis();
+        }
+
         orchestrator
             .run()
             .await
@@ -158,6 +170,11 @@ fn run_parallel(args: &Args, cross_shard_ratio: f64) {
 
     // Print summary
     report.print_summary();
+
+    // Print network traffic analysis after main report
+    if let Some(traffic) = traffic_report {
+        traffic.print_summary();
+    }
 }
 
 fn run_deterministic(args: &Args, cross_shard_ratio: f64) {
@@ -205,10 +222,23 @@ fn run_deterministic(args: &Args, cross_shard_ratio: f64) {
 
     // Create and initialize simulator
     let mut simulator = Simulator::new(config).expect("Failed to create simulator");
+
+    // Enable traffic analysis if requested
+    if args.network_analysis {
+        simulator.enable_traffic_analysis();
+    }
+
     simulator.initialize();
 
     // Run simulation for the specified duration (hard stop, no ramp-down)
     let _report = simulator.run_for(Duration::from_secs(args.duration));
+
+    // Network traffic analysis
+    if args.network_analysis {
+        if let Some(traffic_report) = simulator.traffic_report() {
+            traffic_report.print_summary();
+        }
+    }
 
     // Livelock analysis
     if args.analyze_livelocks {

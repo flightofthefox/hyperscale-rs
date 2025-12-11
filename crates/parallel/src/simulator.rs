@@ -12,7 +12,7 @@ use crate::router::Destination;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_node::NodeStateMachine;
-use hyperscale_simulation::SimStorage;
+use hyperscale_simulation::{NetworkTrafficAnalyzer, SimStorage};
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, Hash, KeyPair, PartitionNumber, PublicKey, QuorumCertificate,
     RoutableTransaction, ShardGroupId, Signature, StaticTopology, Topology, TransactionDecision,
@@ -480,6 +480,8 @@ pub struct ParallelSimulator {
     latencies: Vec<u64>,
     /// Submission times for latency calculation (simulated time)
     submission_times: HashMap<Hash, Duration>,
+    /// Optional traffic analyzer for bandwidth estimation.
+    traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
 }
 
 impl ParallelSimulator {
@@ -496,7 +498,29 @@ impl ParallelSimulator {
             in_flight: HashSet::new(),
             latencies: Vec::new(),
             submission_times: HashMap::new(),
+            traffic_analyzer: None,
         }
+    }
+
+    /// Enable network traffic analysis for bandwidth estimation.
+    pub fn enable_traffic_analysis(&mut self) {
+        if self.traffic_analyzer.is_none() {
+            self.traffic_analyzer = Some(Arc::new(NetworkTrafficAnalyzer::new()));
+        }
+    }
+
+    /// Check if traffic analysis is enabled.
+    pub fn has_traffic_analysis(&self) -> bool {
+        self.traffic_analyzer.is_some()
+    }
+
+    /// Get a bandwidth report from the traffic analyzer.
+    ///
+    /// Returns `None` if traffic analysis is not enabled.
+    pub fn traffic_report(&self) -> Option<hyperscale_simulation::BandwidthReport> {
+        self.traffic_analyzer
+            .as_ref()
+            .map(|analyzer| analyzer.generate_report(self.simulated_time, self.nodes.len()))
     }
 
     /// Initialize the simulator (create nodes, run genesis).
@@ -649,10 +673,21 @@ impl ParallelSimulator {
             }
         }
 
-        // Step 3: Route messages to recipients
+        // Step 3: Route messages to recipients (and record traffic if enabled)
         for (from, dest, msg) in all_messages {
             let recipients = self.get_recipients(from, &dest);
             for recipient in recipients {
+                // Record traffic for bandwidth analysis (if enabled)
+                if let Some(ref analyzer) = self.traffic_analyzer {
+                    let (payload_size, wire_size) = msg.encoded_size();
+                    analyzer.record_message(
+                        msg.type_name(),
+                        payload_size,
+                        wire_size,
+                        from,
+                        recipient,
+                    );
+                }
                 self.nodes[recipient as usize].deliver_message(msg.clone());
             }
         }

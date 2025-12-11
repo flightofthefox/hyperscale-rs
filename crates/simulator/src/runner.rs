@@ -374,6 +374,27 @@ impl Simulator {
         );
         analyzer.analyze()
     }
+
+    /// Enable network traffic analysis for bandwidth estimation.
+    ///
+    /// Call this before `run_for()` to collect network traffic statistics.
+    /// After the simulation, call `traffic_report()` to get the bandwidth report.
+    pub fn enable_traffic_analysis(&mut self) {
+        self.runner.enable_traffic_analysis();
+    }
+
+    /// Check if traffic analysis is enabled.
+    pub fn has_traffic_analysis(&self) -> bool {
+        self.runner.has_traffic_analysis()
+    }
+
+    /// Get a network traffic bandwidth report.
+    ///
+    /// Returns `None` if traffic analysis is not enabled.
+    /// Call `enable_traffic_analysis()` before `run_for()` to collect data.
+    pub fn traffic_report(&self) -> Option<hyperscale_simulation::BandwidthReport> {
+        self.runner.traffic_report()
+    }
 }
 
 /// Errors that can occur during simulation.

@@ -6,6 +6,7 @@ use hyperscale_messages::{
     StateVoteBlockGossip, TraceContext, TransactionGossip, ViewChangeCertificateGossip,
     ViewChangeVoteGossip,
 };
+use sbor::prelude::*;
 
 /// Outbound network messages.
 ///
@@ -118,6 +119,47 @@ impl OutboundMessage {
             | OutboundMessage::ViewChangeCertificate(_)
             | OutboundMessage::StateVoteBlock(_) => {}
         }
+    }
+
+    /// Estimate the encoded size of this message in bytes.
+    ///
+    /// This uses SBOR encoding to get an accurate size estimate for bandwidth analysis.
+    /// Returns (payload_size, wire_size) where wire_size includes framing overhead.
+    pub fn encoded_size(&self) -> (usize, usize) {
+        let payload_size = match self {
+            OutboundMessage::BlockHeader(gossip) => {
+                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
+            }
+            OutboundMessage::BlockVote(gossip) => {
+                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
+            }
+            OutboundMessage::ViewChangeVote(gossip) => {
+                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
+            }
+            OutboundMessage::ViewChangeCertificate(gossip) => {
+                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
+            }
+            OutboundMessage::StateProvision(gossip) => {
+                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
+            }
+            OutboundMessage::StateVoteBlock(gossip) => {
+                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
+            }
+            OutboundMessage::StateCertificate(gossip) => {
+                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
+            }
+            OutboundMessage::TransactionGossip(gossip) => {
+                basic_encode(gossip.as_ref()).map(|v| v.len()).unwrap_or(0)
+            }
+        };
+
+        // Add framing overhead estimate:
+        // - 4 bytes length prefix
+        // - 1 byte message type tag
+        // - ~10 bytes protocol overhead
+        let wire_size = payload_size + 15;
+
+        (payload_size, wire_size)
     }
 
     /// Convert an outbound message to the corresponding inbound event.

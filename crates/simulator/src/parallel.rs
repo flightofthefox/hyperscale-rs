@@ -198,11 +198,19 @@ impl ParallelOrchestrator {
     /// 1. Initialize the simulator (creates all nodes, runs genesis)
     /// 2. Submit all transactions
     /// 3. Step the simulation until all transactions complete
-    /// 4. Return the final report
+    /// 4. Return the final report and optional traffic report
     ///
     /// Note: Uses target_tps and submission_duration to calculate total transactions.
     /// The simulation runs synchronously using rayon for parallelism.
-    pub async fn run(mut self) -> Result<SimulationReport, ParallelOrchestratorError> {
+    pub async fn run(
+        mut self,
+    ) -> Result<
+        (
+            SimulationReport,
+            Option<hyperscale_simulation::BandwidthReport>,
+        ),
+        ParallelOrchestratorError,
+    > {
         // Initialize the simulator
         self.simulator.initialize();
 
@@ -305,6 +313,10 @@ impl ParallelOrchestrator {
         }
 
         let wall_clock_duration = start_time.elapsed();
+
+        // Get traffic report before finalize() consumes the simulator
+        let traffic_report = self.simulator.traffic_report();
+
         let report = self.simulator.finalize(wall_clock_duration);
 
         info!(
@@ -316,7 +328,7 @@ impl ParallelOrchestrator {
             "Simulation complete"
         );
 
-        Ok(report)
+        Ok((report, traffic_report))
     }
 
     /// Get access to the underlying simulator (for advanced control).
@@ -327,6 +339,26 @@ impl ParallelOrchestrator {
     /// Get mutable access to the underlying simulator.
     pub fn simulator_mut(&mut self) -> &mut ParallelSimulator {
         &mut self.simulator
+    }
+
+    /// Enable network traffic analysis for bandwidth estimation.
+    ///
+    /// Call this before `run()` to collect network traffic statistics.
+    pub fn enable_traffic_analysis(&mut self) {
+        self.simulator.enable_traffic_analysis();
+    }
+
+    /// Check if traffic analysis is enabled.
+    pub fn has_traffic_analysis(&self) -> bool {
+        self.simulator.has_traffic_analysis()
+    }
+
+    /// Get a network traffic bandwidth report.
+    ///
+    /// Returns `None` if traffic analysis is not enabled.
+    /// Note: This should be called before `run()` consumes the orchestrator.
+    pub fn traffic_report(&self) -> Option<hyperscale_simulation::BandwidthReport> {
+        self.simulator.traffic_report()
     }
 
     /// Determine the target shard for a transaction based on its first declared write.

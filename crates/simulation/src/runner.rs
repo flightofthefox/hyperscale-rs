@@ -7,6 +7,7 @@
 use crate::event_queue::EventKey;
 use crate::network::{NetworkConfig, SimulatedNetwork};
 use crate::storage::SimStorage;
+use crate::traffic::NetworkTrafficAnalyzer;
 use crate::NodeIndex;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
@@ -69,6 +70,9 @@ pub struct SimulationRunner {
     /// Whether genesis has been executed on each node's storage.
     /// Index corresponds to node index.
     genesis_executed: Vec<bool>,
+
+    /// Optional traffic analyzer for bandwidth estimation.
+    traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
 }
 
 /// Statistics collected during simulation.
@@ -209,7 +213,40 @@ impl SimulationRunner {
             node_storage,
             node_executor,
             genesis_executed,
+            traffic_analyzer: None,
         }
+    }
+
+    /// Create a new simulation runner with traffic analysis enabled.
+    ///
+    /// This creates a runner that records all network messages for bandwidth
+    /// analysis. Use `traffic_report()` at the end of the simulation to get
+    /// detailed bandwidth statistics.
+    pub fn with_traffic_analysis(network_config: NetworkConfig, seed: u64) -> Self {
+        let mut runner = Self::new(network_config, seed);
+        runner.traffic_analyzer = Some(Arc::new(NetworkTrafficAnalyzer::new()));
+        runner
+    }
+
+    /// Enable traffic analysis on an existing runner.
+    pub fn enable_traffic_analysis(&mut self) {
+        if self.traffic_analyzer.is_none() {
+            self.traffic_analyzer = Some(Arc::new(NetworkTrafficAnalyzer::new()));
+        }
+    }
+
+    /// Check if traffic analysis is enabled.
+    pub fn has_traffic_analysis(&self) -> bool {
+        self.traffic_analyzer.is_some()
+    }
+
+    /// Get a bandwidth report from the traffic analyzer.
+    ///
+    /// Returns `None` if traffic analysis is not enabled.
+    pub fn traffic_report(&self) -> Option<crate::traffic::BandwidthReport> {
+        self.traffic_analyzer
+            .as_ref()
+            .map(|analyzer| analyzer.generate_report(self.now, self.network.total_nodes()))
     }
 
     /// Get a reference to a node's storage.
@@ -515,8 +552,7 @@ impl SimulationRunner {
                 let peers = self.network.peers_in_shard(shard);
                 for to in peers {
                     if to != from {
-                        let event = self.message_to_event(message.clone());
-                        self.try_deliver_message(from, to, event);
+                        self.try_deliver_message(from, to, &message);
                     }
                 }
             }
@@ -524,8 +560,7 @@ impl SimulationRunner {
             Action::BroadcastGlobal { message } => {
                 for to in self.network.all_nodes() {
                     if to != from {
-                        let event = self.message_to_event(message.clone());
-                        self.try_deliver_message(from, to, event);
+                        self.try_deliver_message(from, to, &message);
                     }
                 }
             }
@@ -1075,7 +1110,7 @@ impl SimulationRunner {
 
     /// Try to deliver a message, accounting for partitions and packet loss.
     /// Updates stats based on delivery outcome.
-    fn try_deliver_message(&mut self, from: NodeIndex, to: NodeIndex, event: Event) {
+    fn try_deliver_message(&mut self, from: NodeIndex, to: NodeIndex, message: &OutboundMessage) {
         // Check partition first (deterministic - doesn't consume RNG)
         if self.network.is_partitioned(from, to) {
             self.stats.messages_dropped_partition += 1;
@@ -1090,20 +1125,18 @@ impl SimulationRunner {
             return;
         }
 
+        // Record traffic for bandwidth analysis (if enabled)
+        if let Some(ref analyzer) = self.traffic_analyzer {
+            let (payload_size, wire_size) = message.encoded_size();
+            analyzer.record_message(message.type_name(), payload_size, wire_size, from, to);
+        }
+
         // Message will be delivered - sample latency and schedule
+        let event = message.to_received_event();
         let latency = self.network.sample_latency(from, to, &mut self.rng);
         let delivery_time = self.now + latency;
         self.schedule_event(to, delivery_time, event);
         self.stats.messages_sent += 1;
-    }
-
-    /// Convert an outbound message to an inbound event.
-    ///
-    /// Note: Sender identity is not included in Events anymore.
-    /// In production, sender identity comes from message signatures (ValidatorId).
-    /// In simulation, sender identity isn't needed for consensus correctness.
-    fn message_to_event(&self, message: OutboundMessage) -> Event {
-        message.to_received_event()
     }
 
     /// Convert a timer ID to an event.
