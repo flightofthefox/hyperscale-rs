@@ -4,7 +4,7 @@
 //! for multi-core performance testing.
 
 use crate::config::SimulatorConfig;
-use hyperscale_parallel::{ParallelConfig, ParallelError, ParallelSimulator, SimulationReport};
+use hyperscale_parallel::{ParallelConfig, ParallelSimulator, SimulationReport};
 use hyperscale_spammer::{
     AccountPool, AccountPoolError, SelectionMode, TransferWorkload, WorkloadGenerator,
 };
@@ -12,6 +12,7 @@ use hyperscale_types::{shard_for_node, RoutableTransaction, ShardGroupId};
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::info;
@@ -21,8 +22,6 @@ use tracing::info;
 pub enum ParallelOrchestratorError {
     #[error("Account pool error: {0}")]
     AccountPool(#[from] AccountPoolError),
-    #[error("Parallel simulator error: {0}")]
-    Parallel(#[from] ParallelError),
 }
 
 /// Configuration for parallel orchestrator.
@@ -140,7 +139,7 @@ impl From<&SimulatorConfig> for ParallelOrchestratorConfig {
 
 /// Orchestrates parallel simulation with workload generation.
 ///
-/// Uses `ParallelSimulator` under the hood for multi-core execution,
+/// Uses `ParallelSimulator` under the hood for multi-core execution via rayon,
 /// combined with `AccountPool` and `TransferWorkload` for transaction
 /// generation.
 pub struct ParallelOrchestrator {
@@ -193,67 +192,128 @@ impl ParallelOrchestrator {
         })
     }
 
-    /// Run the full parallel simulation.
+    /// Run the full parallel simulation with simulated time.
     ///
     /// This will:
-    /// 1. Start the simulator (spawns all node tasks)
-    /// 2. Generate and submit transactions at the target TPS rate
-    /// 3. Drain remaining in-flight transactions
-    /// 4. Shutdown and return the final report
+    /// 1. Initialize the simulator (creates all nodes, runs genesis)
+    /// 2. Submit all transactions
+    /// 3. Step the simulation until all transactions complete
+    /// 4. Return the final report
+    ///
+    /// Note: Uses target_tps and submission_duration to calculate total transactions.
+    /// The simulation runs synchronously using rayon for parallelism.
     pub async fn run(mut self) -> Result<SimulationReport, ParallelOrchestratorError> {
-        // Start the simulator
-        self.simulator.start().await?;
+        // Initialize the simulator
+        self.simulator.initialize();
+
+        // Calculate total transactions and submission rate
+        let total_transactions = (self.config.target_tps as f64
+            * self.config.submission_duration.as_secs_f64())
+            as usize;
+
+        // Calculate how many transactions to submit per millisecond of simulated time
+        let submission_duration_ms = self.config.submission_duration.as_millis() as usize;
+        let txs_per_ms = if submission_duration_ms > 0 {
+            (total_transactions as f64 / submission_duration_ms as f64).ceil() as usize
+        } else {
+            total_transactions
+        };
 
         info!(
             target_tps = self.config.target_tps,
-            submission_duration_secs = self.config.submission_duration.as_secs_f64(),
-            "Starting transaction submission"
+            submission_duration_ms,
+            total_transactions,
+            txs_per_ms,
+            "Starting simulation"
         );
 
-        // Calculate batch size and interval for target TPS
-        // Submit in small batches to spread load evenly
-        let batch_size = (self.config.target_tps / 10).max(1) as usize;
-        let batch_interval = Duration::from_millis(100); // 10 batches per second
+        let start_time = Instant::now();
 
-        let submission_end = Instant::now() + self.config.submission_duration;
-        let mut total_submitted = 0u64;
+        // Generate all transactions upfront
+        let mut transactions: VecDeque<_> = self
+            .workload
+            .generate_batch(&self.accounts, total_transactions, &mut self.rng)
+            .into();
 
-        while Instant::now() < submission_end {
-            // Generate a batch of transactions
-            let transactions =
-                self.workload
-                    .generate_batch(&self.accounts, batch_size, &mut self.rng);
+        // Run simulation: submit transactions over time while stepping
+        let max_steps = submission_duration_ms + 10_000; // submission + drain
+        let mut steps = 0;
+        let mut stall_count = 0;
+        let mut last_in_flight = 0;
+        let mut last_logged_completed = 0u64;
+        let progress_interval = (total_transactions / 10).max(100) as u64;
 
-            // Submit transactions to the appropriate shard
-            for tx in transactions {
-                let target_shard = self.get_target_shard(&tx);
-                // Submit to first validator in the target shard
-                let node_index =
-                    (target_shard.0 as usize * self.config.validators_per_shard) as u32;
-                if let Err(e) = self.simulator.submit_transaction(node_index, tx).await {
-                    tracing::warn!("Failed to submit transaction: {}", e);
+        while steps < max_steps {
+            // Submit transactions for this millisecond of simulated time
+            if !transactions.is_empty() {
+                let to_submit = txs_per_ms.min(transactions.len());
+                for _ in 0..to_submit {
+                    if let Some(tx) = transactions.pop_front() {
+                        self.simulator.submit_transaction(tx);
+                    }
                 }
-                total_submitted += 1;
             }
 
-            // Process any pending completions
-            self.simulator.process_metrics();
+            // Step the simulation
+            let events = self.simulator.step();
+            steps += 1;
 
-            // Wait before next batch
-            tokio::time::sleep(batch_interval).await;
+            let (submitted, completed, rejected, current_in_flight) = self.simulator.metrics();
+
+            // Check for completion (all submitted and none in flight)
+            if transactions.is_empty() && current_in_flight == 0 {
+                break;
+            }
+
+            // Check for stall (only after all transactions submitted)
+            if transactions.is_empty() {
+                if current_in_flight == last_in_flight && events == 0 {
+                    stall_count += 1;
+                    if stall_count >= 1000 {
+                        tracing::warn!(
+                            in_flight = current_in_flight,
+                            steps,
+                            "Simulation stalled - no progress"
+                        );
+                        break;
+                    }
+                } else {
+                    stall_count = 0;
+                }
+            }
+            last_in_flight = current_in_flight;
+
+            // Log progress when completions cross thresholds
+            if completed / progress_interval > last_logged_completed / progress_interval {
+                let elapsed = start_time.elapsed();
+                let current_tps = if elapsed.as_secs_f64() > 0.0 {
+                    completed as f64 / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
+                info!(
+                    submitted,
+                    completed,
+                    rejected,
+                    in_flight = current_in_flight,
+                    simulated_time_ms = self.simulator.simulated_time().as_millis(),
+                    tps = format!("{:.1}", current_tps),
+                    "Simulation progress"
+                );
+                last_logged_completed = completed;
+            }
         }
 
+        let wall_clock_duration = start_time.elapsed();
+        let report = self.simulator.finalize(wall_clock_duration);
+
         info!(
-            total_submitted,
-            in_flight = self.simulator.in_flight_count(),
-            "Submission complete, draining"
+            completed = report.completed,
+            rejected = report.rejected,
+            tps = format!("{:.2}", report.tps),
+            wall_clock_ms = wall_clock_duration.as_millis(),
+            "Simulation complete"
         );
-
-        // Drain in-flight transactions
-        self.simulator.drain().await;
-
-        // Shutdown and get report
-        let report = self.simulator.shutdown().await;
 
         Ok(report)
     }
@@ -269,7 +329,7 @@ impl ParallelOrchestrator {
     }
 
     /// Determine the target shard for a transaction based on its first declared write.
-    fn get_target_shard(&self, tx: &RoutableTransaction) -> ShardGroupId {
+    fn _get_target_shard(&self, tx: &RoutableTransaction) -> ShardGroupId {
         tx.declared_writes
             .first()
             .map(|node_id| shard_for_node(node_id, self.config.num_shards as u64))

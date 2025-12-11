@@ -1,123 +1,524 @@
-//! Parallel simulator orchestrator.
+//! Parallel simulator using rayon for CPU parallelism.
 //!
-//! Manages the lifecycle of a parallel simulation:
-//! 1. Creates nodes with storage and state machines
-//! 2. Initializes genesis on all nodes
-//! 3. Spawns router and node tasks
-//! 4. Provides interface for transaction submission
-//! 5. Coordinates shutdown and collects final metrics
+//! Processes nodes in a step-based loop, using rayon to parallelize
+//! event processing across CPU cores. This gives us:
+//! - Deterministic simulated time (we control when time advances)
+//! - CPU parallelism (rayon processes nodes on multiple cores)
+//! - No scheduling issues (no tokio task coordination needed)
 
 use crate::config::ParallelConfig;
-use crate::metrics::{MetricsCollector, SharedMetrics, SimulationReport};
-use crate::node_task::{NodeHandle, NodeTask, NodeTaskConfig};
-use crate::router::{MessageRouter, RoutedMessage, RouterStatsHandle};
+use crate::metrics::SimulationReport;
+use crate::router::Destination;
 use hyperscale_bft::{BftConfig, RecoveredState};
-use hyperscale_core::Event;
-use hyperscale_engine::{NetworkDefinition, RadixExecutor};
+use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_node::NodeStateMachine;
-use hyperscale_production::ThreadPoolManager;
 use hyperscale_simulation::SimStorage;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, Hash, KeyPair, KeyType, PublicKey, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, StaticTopology, Topology, ValidatorId, ValidatorInfo,
-    ValidatorSet,
+    Block, BlockHeader, BlockHeight, Hash, KeyPair, PartitionNumber, PublicKey, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, Signature, StaticTopology, Topology, TransactionDecision,
+    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
-use std::collections::HashMap;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use thiserror::Error;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{debug, info};
 
-/// Errors from parallel simulation.
-#[derive(Debug, Error)]
-pub enum ParallelError {
-    #[error("Simulation not started")]
-    NotStarted,
-    #[error("Simulation already started")]
-    AlreadyStarted,
-    #[error("Node {0} not found")]
-    NodeNotFound(u32),
-    #[error("Failed to submit transaction: {0}")]
-    SubmitFailed(String),
+/// A simulated node in the parallel simulator.
+pub struct SimNode {
+    index: u32,
+    state: NodeStateMachine,
+    storage: SimStorage,
+    /// Pending inbound messages from other nodes.
+    inbound_queue: VecDeque<Arc<OutboundMessage>>,
+    /// Pending internal events (timer fires, crypto results, etc.)
+    internal_queue: VecDeque<Event>,
+    /// Pending transaction submissions.
+    tx_queue: VecDeque<Event>,
+    /// Outbound messages to be routed after processing.
+    outbound_messages: Vec<(Destination, Arc<OutboundMessage>)>,
+    /// Transaction status updates to report.
+    status_updates: Vec<(Hash, TransactionStatus)>,
+    /// Pending timers: timer_id -> fire_time
+    pending_timers: HashMap<TimerId, Duration>,
+    /// Simulated time for this node.
+    simulated_time: Duration,
 }
 
-/// Parallel simulator orchestrator.
-///
-/// Manages all components of a parallel simulation and provides
-/// the interface for running simulations and collecting results.
-pub struct ParallelSimulator {
-    config: ParallelConfig,
-    /// Node handles for controlling each node.
-    node_handles: Vec<NodeHandle>,
-    /// Router statistics handle.
-    router_stats: Option<RouterStatsHandle>,
-    /// Metrics collector.
-    metrics: Option<MetricsCollector>,
-    /// Shared metrics for atomic counters.
-    shared_metrics: Arc<SharedMetrics>,
-    /// Router task handle.
-    router_handle: Option<JoinHandle<()>>,
-    /// Node task handles.
-    node_task_handles: Vec<JoinHandle<()>>,
-    /// Thread pool manager (shared across all nodes).
-    thread_pools: Arc<ThreadPoolManager>,
-    /// Sender for routing messages (cloned to each node, unbounded).
-    router_tx: Option<mpsc::UnboundedSender<RoutedMessage>>,
-    /// Whether simulation has been started.
-    started: bool,
-}
-
-impl ParallelSimulator {
-    /// Create a new parallel simulator with the given configuration.
-    pub fn new(config: ParallelConfig) -> Self {
-        let thread_pools = Arc::new(
-            ThreadPoolManager::new(config.thread_pools.clone())
-                .expect("Failed to create thread pools"),
-        );
-        let shared_metrics = SharedMetrics::new();
-
+impl SimNode {
+    /// Create a new simulated node.
+    pub fn new(index: u32, state: NodeStateMachine, storage: SimStorage) -> Self {
         Self {
-            config,
-            node_handles: Vec::new(),
-            router_stats: None,
-            metrics: None,
-            shared_metrics,
-            router_handle: None,
-            node_task_handles: Vec::new(),
-            thread_pools,
-            router_tx: None,
-            started: false,
+            index,
+            state,
+            storage,
+            inbound_queue: VecDeque::new(),
+            internal_queue: VecDeque::new(),
+            tx_queue: VecDeque::new(),
+            outbound_messages: Vec::new(),
+            status_updates: Vec::new(),
+            pending_timers: HashMap::new(),
+            simulated_time: Duration::ZERO,
         }
     }
 
-    /// Start the simulation.
-    ///
-    /// Creates all nodes, initializes genesis, and spawns tasks.
-    pub async fn start(&mut self) -> Result<(), ParallelError> {
-        if self.started {
-            return Err(ParallelError::AlreadyStarted);
+    /// Submit a transaction to this node.
+    pub fn submit_transaction(&mut self, event: Event) {
+        self.tx_queue.push_back(event);
+    }
+
+    /// Deliver an inbound message to this node.
+    pub fn deliver_message(&mut self, message: Arc<OutboundMessage>) {
+        self.inbound_queue.push_back(message);
+    }
+
+    /// Process all pending events until the queues are empty.
+    /// Returns the number of events processed.
+    pub fn drain_events(&mut self) -> usize {
+        let mut total_processed = 0;
+
+        loop {
+            let mut processed = 0;
+
+            // Process internal events first (highest priority)
+            while let Some(event) = self.internal_queue.pop_front() {
+                self.handle_event(event);
+                processed += 1;
+            }
+
+            // Process inbound messages
+            while let Some(msg) = self.inbound_queue.pop_front() {
+                let event = msg.to_received_event();
+                self.handle_event(event);
+                processed += 1;
+            }
+
+            // Process transaction submissions
+            while let Some(event) = self.tx_queue.pop_front() {
+                self.handle_event(event);
+                processed += 1;
+            }
+
+            total_processed += processed;
+
+            // If nothing was processed, we're done
+            if processed == 0 {
+                break;
+            }
         }
 
+        total_processed
+    }
+
+    /// Take outbound messages (clears the buffer).
+    pub fn take_outbound_messages(&mut self) -> Vec<(Destination, Arc<OutboundMessage>)> {
+        std::mem::take(&mut self.outbound_messages)
+    }
+
+    /// Take status updates (clears the buffer).
+    pub fn take_status_updates(&mut self) -> Vec<(Hash, TransactionStatus)> {
+        std::mem::take(&mut self.status_updates)
+    }
+
+    /// Advance simulated time and fire any due timers.
+    pub fn advance_time(&mut self, new_time: Duration) {
+        self.simulated_time = new_time;
+        self.state.set_time(new_time);
+
+        // Check for timers that should fire
+        let due_timers: Vec<TimerId> = self
+            .pending_timers
+            .iter()
+            .filter(|(_, fire_time)| **fire_time <= new_time)
+            .map(|(id, _)| *id)
+            .collect();
+
+        for timer_id in due_timers {
+            self.pending_timers.remove(&timer_id);
+            let event = match timer_id {
+                TimerId::Proposal => Event::ProposalTimer,
+                TimerId::ViewChange => Event::ViewChangeTimer,
+                TimerId::Cleanup => Event::CleanupTimer,
+            };
+            self.internal_queue.push_back(event);
+        }
+    }
+
+    /// Handle a single event.
+    fn handle_event(&mut self, event: Event) {
+        // Process through state machine (time is set by advance_time)
+        let actions = self.state.handle(event);
+
+        // Execute actions
+        for action in actions {
+            self.execute_action(action);
+        }
+    }
+
+    /// Execute an action from the state machine.
+    fn execute_action(&mut self, action: Action) {
+        match action {
+            Action::BroadcastToShard { shard, message } => {
+                self.outbound_messages
+                    .push((Destination::Shard(shard), Arc::new(message)));
+            }
+
+            Action::BroadcastGlobal { message } => {
+                self.outbound_messages
+                    .push((Destination::Global, Arc::new(message)));
+            }
+
+            Action::SetTimer { id, duration } => {
+                // Schedule timer to fire at current_time + duration
+                let fire_time = self.simulated_time + duration;
+                self.pending_timers.insert(id, fire_time);
+            }
+
+            Action::CancelTimer { id } => {
+                self.pending_timers.remove(&id);
+            }
+
+            Action::EnqueueInternal { event } => {
+                self.internal_queue.push_back(event);
+            }
+
+            Action::EmitTransactionStatus { tx_hash, status } => {
+                if status.is_final() {
+                    self.status_updates.push((tx_hash, status));
+                }
+            }
+
+            // Signature verification - synchronous
+            Action::VerifyVoteSignature {
+                vote,
+                public_key,
+                signing_message,
+            } => {
+                let valid = public_key.verify(&signing_message, &vote.signature);
+                self.internal_queue
+                    .push_back(Event::VoteSignatureVerified { vote, valid });
+            }
+
+            Action::VerifyProvisionSignature {
+                provision,
+                public_key,
+            } => {
+                let msg = provision.signing_message();
+                let valid = public_key.verify(&msg, &provision.signature);
+                self.internal_queue
+                    .push_back(Event::ProvisionSignatureVerified { provision, valid });
+            }
+
+            Action::VerifyStateVoteSignature { vote, public_key } => {
+                let msg = vote.signing_message();
+                let valid = public_key.verify(&msg, &vote.signature);
+                self.internal_queue
+                    .push_back(Event::StateVoteSignatureVerified { vote, valid });
+            }
+
+            Action::VerifyStateCertificateSignature {
+                certificate,
+                public_keys,
+            } => {
+                let msg = certificate.signing_message();
+                let signer_keys: Vec<_> = public_keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| certificate.signers.is_set(*i))
+                    .map(|(_, pk)| pk.clone())
+                    .collect();
+                let valid = Self::verify_aggregated_signature(
+                    &signer_keys,
+                    &msg,
+                    &certificate.aggregated_signature,
+                );
+                self.internal_queue
+                    .push_back(Event::StateCertificateSignatureVerified { certificate, valid });
+            }
+
+            Action::VerifyQcSignature {
+                qc,
+                public_keys,
+                block_hash,
+                signing_message,
+            } => {
+                let signer_keys: Vec<_> = public_keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| qc.signers.is_set(*i))
+                    .map(|(_, pk)| pk.clone())
+                    .collect();
+                let valid = if signer_keys.is_empty() {
+                    false
+                } else {
+                    Self::verify_aggregated_signature(
+                        &signer_keys,
+                        &signing_message,
+                        &qc.aggregated_signature,
+                    )
+                };
+                self.internal_queue
+                    .push_back(Event::QcSignatureVerified { block_hash, valid });
+            }
+
+            Action::VerifyViewChangeVoteSignature {
+                vote,
+                public_key,
+                signing_message,
+            } => {
+                let valid = public_key.verify(&signing_message, &vote.signature);
+                self.internal_queue
+                    .push_back(Event::ViewChangeVoteSignatureVerified { vote, valid });
+            }
+
+            Action::VerifyViewChangeHighestQc {
+                vote,
+                public_keys,
+                signing_message,
+            } => {
+                let signer_keys: Vec<_> = public_keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| vote.highest_qc.signers.is_set(*i))
+                    .map(|(_, pk)| pk.clone())
+                    .collect();
+                let valid = if signer_keys.is_empty() {
+                    vote.highest_qc.is_genesis()
+                } else {
+                    Self::verify_aggregated_signature(
+                        &signer_keys,
+                        &signing_message,
+                        &vote.highest_qc.aggregated_signature,
+                    )
+                };
+                self.internal_queue
+                    .push_back(Event::ViewChangeHighestQcVerified { vote, valid });
+            }
+
+            Action::VerifyViewChangeCertificateSignature {
+                certificate,
+                public_keys,
+                signing_message,
+            } => {
+                let signer_keys: Vec<_> = public_keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| certificate.signers.is_set(*i))
+                    .map(|(_, pk)| pk.clone())
+                    .collect();
+                let valid = Self::verify_aggregated_signature(
+                    &signer_keys,
+                    &signing_message,
+                    &certificate.aggregated_signature,
+                );
+                self.internal_queue
+                    .push_back(Event::ViewChangeCertificateSignatureVerified {
+                        certificate,
+                        valid,
+                    });
+            }
+
+            // Transaction execution - simplified
+            Action::ExecuteTransactions {
+                block_hash,
+                transactions,
+                ..
+            } => {
+                let results = transactions
+                    .iter()
+                    .map(|tx| hyperscale_types::ExecutionResult {
+                        transaction_hash: tx.hash(),
+                        success: true,
+                        state_root: Hash::ZERO,
+                        writes: vec![],
+                        error: None,
+                    })
+                    .collect();
+                self.internal_queue.push_back(Event::TransactionsExecuted {
+                    block_hash,
+                    results,
+                });
+            }
+
+            Action::ExecuteCrossShardTransaction { tx_hash, .. } => {
+                let result = hyperscale_types::ExecutionResult {
+                    transaction_hash: tx_hash,
+                    success: true,
+                    state_root: Hash::ZERO,
+                    writes: vec![],
+                    error: None,
+                };
+                self.internal_queue
+                    .push_back(Event::CrossShardTransactionExecuted { tx_hash, result });
+            }
+
+            Action::ComputeMerkleRoot { tx_hash, .. } => {
+                self.internal_queue.push_back(Event::MerkleRootComputed {
+                    tx_hash,
+                    root: Hash::ZERO,
+                });
+            }
+
+            // Storage actions
+            Action::PersistBlock { block, qc } => {
+                let height = block.header.height;
+                self.storage.put_block(height, block, qc);
+            }
+
+            Action::PersistTransactionCertificate { certificate } => {
+                let local_shard = self.state.shard();
+                if let Some((_, proof)) = certificate
+                    .shard_proofs
+                    .iter()
+                    .find(|(shard, _)| **shard == local_shard)
+                {
+                    self.storage
+                        .commit_certificate_with_writes(&certificate, &proof.state_writes);
+                } else {
+                    self.storage
+                        .put_certificate(certificate.transaction_hash, certificate);
+                }
+            }
+
+            Action::PersistOwnVote {
+                height,
+                round,
+                block_hash,
+            } => {
+                self.storage.put_own_vote(height.0, round, block_hash);
+            }
+
+            Action::FetchStateEntries { tx_hash, nodes } => {
+                use hyperscale_engine::SubstateStore;
+                let entries: Vec<_> = nodes
+                    .iter()
+                    .flat_map(|node_id| {
+                        self.storage
+                            .list_substates_for_node(node_id)
+                            .map(
+                                |(partition, sort_key, value)| hyperscale_types::StateEntry {
+                                    node_id: *node_id,
+                                    partition: PartitionNumber(partition),
+                                    sort_key: sort_key.0,
+                                    value: Some(value),
+                                },
+                            )
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                self.internal_queue
+                    .push_back(Event::StateEntriesFetched { tx_hash, entries });
+            }
+
+            Action::FetchBlock { height } => {
+                let block = self.storage.get_block(height).map(|(b, _)| b);
+                self.internal_queue
+                    .push_back(Event::BlockFetched { height, block });
+            }
+
+            Action::FetchChainMetadata => {
+                let height = self.storage.committed_height();
+                let (hash, qc) = self
+                    .storage
+                    .get_block(height)
+                    .map(|(b, q)| (Some(b.hash()), Some(q)))
+                    .unwrap_or((None, None));
+                self.internal_queue
+                    .push_back(Event::ChainMetadataFetched { height, hash, qc });
+            }
+
+            Action::EmitCommittedBlock { block } => {
+                debug!(
+                    node = self.index,
+                    height = block.header.height.0,
+                    "Block committed"
+                );
+            }
+        }
+    }
+
+    fn verify_aggregated_signature(
+        signer_keys: &[PublicKey],
+        message: &[u8],
+        signature: &Signature,
+    ) -> bool {
+        if signer_keys.is_empty() {
+            *signature == Signature::zero()
+        } else {
+            match PublicKey::aggregate_bls(signer_keys) {
+                Ok(aggregated_pk) => aggregated_pk.verify(message, signature),
+                Err(_) => false,
+            }
+        }
+    }
+}
+
+/// Parallel simulator using rayon for multi-core CPU parallelism.
+///
+/// Processes nodes synchronously in a step-based loop, using rayon to
+/// parallelize event processing across CPU cores. Each step:
+/// 1. Processes all pending events on all nodes (in parallel)
+/// 2. Collects outbound messages
+/// 3. Routes messages to recipients
+/// 4. Collects transaction status updates
+/// 5. Advances simulated time and fires due timers
+pub struct ParallelSimulator {
+    config: ParallelConfig,
+    nodes: Vec<SimNode>,
+    /// Shard membership: shard -> list of node indices
+    shard_members: HashMap<ShardGroupId, Vec<u32>>,
+    /// Simulated time
+    simulated_time: Duration,
+    /// Metrics
+    submitted: AtomicU64,
+    completed: AtomicU64,
+    rejected: AtomicU64,
+    /// In-flight transaction hashes
+    in_flight: HashSet<Hash>,
+    /// Latencies in microseconds
+    latencies: Vec<u64>,
+    /// Submission times for latency calculation (simulated time)
+    submission_times: HashMap<Hash, Duration>,
+}
+
+impl ParallelSimulator {
+    /// Create a new parallel simulator.
+    pub fn new(config: ParallelConfig) -> Self {
+        Self {
+            config,
+            nodes: Vec::new(),
+            shard_members: HashMap::new(),
+            simulated_time: Duration::ZERO,
+            submitted: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
+            in_flight: HashSet::new(),
+            latencies: Vec::new(),
+            submission_times: HashMap::new(),
+        }
+    }
+
+    /// Initialize the simulator (create nodes, run genesis).
+    pub fn initialize(&mut self) {
         let num_shards = self.config.num_shards;
-        let validators_per_shard = self.config.validators_per_shard;
-        let total_nodes = self.config.total_nodes();
-        let seed = self.config.seed;
+        let validators_per_shard = self.config.validators_per_shard as u32;
+        let total_nodes = num_shards * self.config.validators_per_shard;
 
         info!(
             num_shards,
-            validators_per_shard, total_nodes, seed, "Starting parallel simulation"
+            validators_per_shard, total_nodes, "Initializing parallel simulator"
         );
 
-        // Generate deterministic keys for all validators
+        // Generate keys deterministically
+        let seed = self.config.seed;
         let keys: Vec<KeyPair> = (0..total_nodes)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
                 let key_seed = seed.wrapping_add(i as u64).wrapping_mul(0x517cc1b727220a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
                 seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
-                KeyPair::from_seed(KeyType::Bls12381, &seed_bytes)
+                KeyPair::from_seed(hyperscale_types::KeyType::Bls12381, &seed_bytes)
             })
             .collect();
         let public_keys: Vec<PublicKey> = keys.iter().map(|k| k.public_key()).collect();
@@ -132,53 +533,29 @@ impl ParallelSimulator {
             .collect();
         let global_validator_set = ValidatorSet::new(global_validators);
 
-        // Build per-shard committee mappings
+        // Build shard committees
         let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
         for shard_id in 0..num_shards {
             let shard = ShardGroupId(shard_id as u64);
-            let shard_start = shard_id * validators_per_shard;
-            let committee: Vec<ValidatorId> = (0..validators_per_shard)
-                .map(|v| ValidatorId((shard_start + v) as u64))
+            let shard_start = shard_id * self.config.validators_per_shard;
+            let shard_end = shard_start + self.config.validators_per_shard;
+            let committee: Vec<ValidatorId> = (shard_start..shard_end)
+                .map(|i| ValidatorId(i as u64))
                 .collect();
             shard_committees.insert(shard, committee);
+            self.shard_members
+                .insert(shard, (shard_start..shard_end).map(|i| i as u32).collect());
         }
 
-        // Create router (unbounded channels for simulation)
-        let (router, node_receivers) = MessageRouter::new(
-            num_shards,
-            validators_per_shard,
-            self.config.network.clone(),
-            seed,
-        );
-        self.router_stats = Some(router.stats_handle());
-
-        // Create router channel (unbounded)
-        let (router_tx, router_rx) = mpsc::unbounded_channel();
-        self.router_tx = Some(router_tx.clone());
-
-        // Create metrics channel
-        let (metrics_tx, metrics_rx) = mpsc::channel(10_000);
-        self.metrics = Some(MetricsCollector::new(
-            Arc::clone(&self.shared_metrics),
-            metrics_rx,
-        ));
-
-        // Create executor for genesis
-        let executor = RadixExecutor::new(NetworkDefinition::simulator());
-
         // Create nodes
-        let mut nodes = Vec::with_capacity(total_nodes);
-        let mut storages = Vec::with_capacity(total_nodes);
-
         for shard_id in 0..num_shards {
             let shard = ShardGroupId(shard_id as u64);
-            let shard_start = shard_id * validators_per_shard;
+            let shard_start = shard_id * self.config.validators_per_shard;
 
-            for v in 0..validators_per_shard {
-                let node_index = (shard_start + v) as u32;
+            for v in 0..self.config.validators_per_shard {
+                let node_index = shard_start + v;
                 let validator_id = ValidatorId(node_index as u64);
 
-                // Create topology for this node
                 let topology: Arc<dyn Topology> = Arc::new(StaticTopology::with_shard_committees(
                     validator_id,
                     shard,
@@ -187,43 +564,31 @@ impl ParallelSimulator {
                     shard_committees.clone(),
                 ));
 
-                // Create state machine
-                let state_machine = NodeStateMachine::new(
-                    node_index,
+                let state = NodeStateMachine::new(
+                    node_index as u32,
                     topology,
-                    keys[node_index as usize].clone(),
+                    keys[node_index].clone(),
                     BftConfig::default(),
                     RecoveredState::default(),
                 );
 
-                // Create storage and run genesis
-                let mut storage = SimStorage::new();
-                if let Err(e) = executor.run_genesis(&mut storage) {
-                    tracing::warn!(node = node_index, "Genesis failed: {:?}", e);
-                }
-
-                nodes.push(state_machine);
-                storages.push(storage);
+                let storage = SimStorage::new();
+                let node = SimNode::new(node_index as u32, state, storage);
+                self.nodes.push(node);
             }
         }
 
-        info!(total_nodes, "Created nodes and ran genesis");
-
-        // Initialize genesis blocks on each shard and collect initial actions
-        let mut initial_actions: Vec<Vec<hyperscale_core::Action>> =
-            Vec::with_capacity(total_nodes);
-
+        // Initialize genesis for each shard
         for shard_id in 0..num_shards {
             let genesis_header = BlockHeader {
                 height: BlockHeight(0),
                 parent_hash: Hash::from_bytes(&[0u8; 32]),
                 parent_qc: QuorumCertificate::genesis(),
-                proposer: ValidatorId((shard_id * validators_per_shard) as u64),
+                proposer: ValidatorId((shard_id * self.config.validators_per_shard) as u64),
                 timestamp: 0,
                 round: 0,
                 is_fallback: false,
             };
-
             let genesis_block = Block {
                 header: genesis_header,
                 transactions: vec![],
@@ -232,234 +597,200 @@ impl ParallelSimulator {
                 aborted: vec![],
             };
 
-            let shard_start = shard_id * validators_per_shard;
-            let shard_end = shard_start + validators_per_shard;
+            let shard_start = shard_id * self.config.validators_per_shard;
+            let shard_end = shard_start + self.config.validators_per_shard;
 
-            for node in nodes[shard_start..shard_end].iter_mut() {
-                let actions = node.initialize_genesis(genesis_block.clone());
-                initial_actions.push(actions);
+            for node_index in shard_start..shard_end {
+                let node = &mut self.nodes[node_index];
+                let actions = node.state.initialize_genesis(genesis_block.clone());
+                for action in actions {
+                    node.execute_action(action);
+                }
             }
         }
 
-        info!(num_shards, "Initialized genesis blocks");
-
-        // Spawn router task
-        let router_handle = tokio::spawn(async move {
-            router.run(router_rx).await;
-        });
-        self.router_handle = Some(router_handle);
-
-        // Spawn node tasks
-        let mut node_handles = Vec::with_capacity(total_nodes);
-        let mut task_handles = Vec::with_capacity(total_nodes);
-
-        // Convert node_receivers HashMap to a more usable form
-        let mut receivers: Vec<_> = node_receivers.into_iter().collect();
-        receivers.sort_by_key(|(k, _)| *k);
-
-        for (node_index, (_, message_rx)) in receivers.into_iter().enumerate() {
-            let node = nodes.remove(0);
-            let storage = storages.remove(0);
-            let node_initial_actions = initial_actions.remove(0);
-
-            let config = NodeTaskConfig {
-                node_index: node_index as u32,
-                state_machine: node,
-                storage,
-                message_rx,
-                router_tx: router_tx.clone(),
-                thread_pools: Arc::clone(&self.thread_pools),
-                metrics_tx: metrics_tx.clone(),
-                initial_actions: node_initial_actions,
-            };
-
-            let (task, handle) = NodeTask::new(config);
-            node_handles.push(handle);
-
-            let task_handle = tokio::spawn(async move {
-                task.run().await;
-            });
-            task_handles.push(task_handle);
-        }
-
-        self.node_handles = node_handles;
-        self.node_task_handles = task_handles;
-        self.started = true;
-
-        info!(total_nodes, "All node tasks spawned");
-
-        Ok(())
+        info!("Genesis initialized for all shards");
     }
 
-    /// Submit a transaction to a specific node.
-    pub async fn submit_transaction(
-        &mut self,
-        node_index: u32,
-        tx: RoutableTransaction,
-    ) -> Result<(), ParallelError> {
-        if !self.started {
-            return Err(ParallelError::NotStarted);
-        }
+    /// Submit a transaction to the appropriate node.
+    pub fn submit_transaction(&mut self, tx: RoutableTransaction) {
+        let tx_hash = tx.hash();
+        let target_shard = tx
+            .declared_writes
+            .first()
+            .map(|w| hyperscale_types::shard_for_node(w, self.config.num_shards as u64))
+            .unwrap_or(ShardGroupId(0));
 
-        let handle = self
-            .node_handles
-            .get(node_index as usize)
-            .ok_or(ParallelError::NodeNotFound(node_index))?;
+        // Submit to first validator in target shard
+        let node_index = (target_shard.0 as usize * self.config.validators_per_shard) as u32;
+        let event = Event::SubmitTransaction { tx };
+        self.nodes[node_index as usize].submit_transaction(event);
 
-        // Record submission in metrics
-        if let Some(metrics) = &mut self.metrics {
-            metrics.record_submission(tx.hash());
-        }
-
-        // Submit to node
-        handle
-            .tx_submit
-            .send(Event::SubmitTransaction { tx })
-            .await
-            .map_err(|e| ParallelError::SubmitFailed(e.to_string()))?;
-
-        Ok(())
+        self.submitted.fetch_add(1, Ordering::Relaxed);
+        self.in_flight.insert(tx_hash);
+        self.submission_times.insert(tx_hash, self.simulated_time);
     }
 
-    /// Submit transactions to random nodes (round-robin by shard).
-    pub async fn submit_transactions(
-        &mut self,
-        transactions: Vec<RoutableTransaction>,
-    ) -> Result<(), ParallelError> {
-        let validators_per_shard = self.config.validators_per_shard;
+    /// Run one step of the simulation.
+    /// Returns the number of events processed across all nodes.
+    pub fn step(&mut self) -> usize {
+        // Step 1: Process all nodes in parallel
+        let events_processed: usize = self
+            .nodes
+            .par_iter_mut()
+            .map(|node| node.drain_events())
+            .sum();
 
-        for (i, tx) in transactions.into_iter().enumerate() {
-            // Route to first validator in each shard, round-robin
-            let shard = i % self.config.num_shards;
-            let node_index = (shard * validators_per_shard) as u32;
-            self.submit_transaction(node_index, tx).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Process pending metrics (call periodically during long simulations).
-    pub fn process_metrics(&mut self) {
-        if let Some(metrics) = &mut self.metrics {
-            metrics.process_completions();
-        }
-    }
-
-    /// Get current in-flight transaction count.
-    pub fn in_flight_count(&self) -> usize {
-        self.metrics
-            .as_ref()
-            .map(|m| m.in_flight_count())
-            .unwrap_or(0)
-    }
-
-    /// Wait for drain duration and process remaining completions.
-    pub async fn drain(&mut self) {
-        let drain_duration = self.config.drain_duration;
-        info!(
-            duration_secs = drain_duration.as_secs_f64(),
-            "Draining in-flight transactions"
-        );
-
-        // Process completions periodically during drain
-        let interval = Duration::from_millis(100);
-        let mut elapsed = Duration::ZERO;
-
-        while elapsed < drain_duration {
-            tokio::time::sleep(interval).await;
-            self.process_metrics();
-            elapsed += interval;
-
-            // Early exit if all transactions completed
-            if self.in_flight_count() == 0 {
-                break;
+        // Step 2: Collect outbound messages from all nodes
+        let mut all_messages: Vec<(u32, Destination, Arc<OutboundMessage>)> = Vec::new();
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            for (dest, msg) in node.take_outbound_messages() {
+                all_messages.push((i as u32, dest, msg));
             }
         }
 
-        // Final processing
-        self.process_metrics();
+        // Step 3: Route messages to recipients
+        for (from, dest, msg) in all_messages {
+            let recipients = self.get_recipients(from, &dest);
+            for recipient in recipients {
+                self.nodes[recipient as usize].deliver_message(msg.clone());
+            }
+        }
+
+        // Step 4: Collect status updates
+        for node in &mut self.nodes {
+            for (tx_hash, status) in node.take_status_updates() {
+                if self.in_flight.remove(&tx_hash) {
+                    // Calculate latency
+                    if let Some(submit_time) = self.submission_times.remove(&tx_hash) {
+                        let latency = self.simulated_time.saturating_sub(submit_time);
+                        self.latencies.push(latency.as_micros() as u64);
+                    }
+
+                    match status {
+                        TransactionStatus::Completed(TransactionDecision::Accept) => {
+                            self.completed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        TransactionStatus::Completed(TransactionDecision::Reject)
+                        | TransactionStatus::Aborted { .. } => {
+                            self.rejected.fetch_add(1, Ordering::Relaxed);
+                        }
+                        TransactionStatus::Retried { new_tx } => {
+                            // Track new hash
+                            self.in_flight.insert(new_tx);
+                            if let Some(submit_time) = self.submission_times.get(&tx_hash) {
+                                self.submission_times.insert(new_tx, *submit_time);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Step 5: Advance simulated time and fire due timers on all nodes
+        self.simulated_time += Duration::from_millis(1);
+        for node in &mut self.nodes {
+            node.advance_time(self.simulated_time);
+        }
+
+        events_processed
     }
 
-    /// Shutdown the simulation and collect final report.
-    pub async fn shutdown(mut self) -> SimulationReport {
-        info!("Shutting down parallel simulation");
-
-        // Signal all nodes to shutdown
-        for handle in self.node_handles.drain(..) {
-            let _ = handle.shutdown.send(());
+    /// Get recipient node indices for a destination.
+    fn get_recipients(&self, _from: u32, dest: &Destination) -> Vec<u32> {
+        match dest {
+            Destination::Shard(shard) => self.shard_members.get(shard).cloned().unwrap_or_default(),
+            Destination::Global => (0..self.nodes.len() as u32).collect(),
+            Destination::Validator(validator) => vec![validator.0 as u32],
         }
-
-        // Wait for node tasks to complete
-        for handle in self.node_task_handles.drain(..) {
-            let _ = handle.await;
-        }
-
-        // Drop router sender to trigger router shutdown
-        drop(self.router_tx.take());
-
-        // Wait for router to complete
-        if let Some(handle) = self.router_handle.take() {
-            let _ = handle.await;
-        }
-
-        // Collect final metrics
-        let router_stats = self
-            .router_stats
-            .take()
-            .map(|h| h.snapshot())
-            .unwrap_or_default();
-
-        let metrics = self
-            .metrics
-            .take()
-            .expect("Metrics should exist after start");
-
-        let report = metrics.finalize(router_stats);
-
-        info!(
-            completed = report.completed,
-            tps = format!("{:.2}", report.tps),
-            "Simulation complete"
-        );
-
-        report
     }
 
-    /// Run a complete simulation with the given transactions.
+    /// Get current metrics.
+    pub fn metrics(&self) -> (u64, u64, u64, usize) {
+        (
+            self.submitted.load(Ordering::Relaxed),
+            self.completed.load(Ordering::Relaxed),
+            self.rejected.load(Ordering::Relaxed),
+            self.in_flight.len(),
+        )
+    }
+
+    /// Get simulated time.
+    pub fn simulated_time(&self) -> Duration {
+        self.simulated_time
+    }
+
+    /// Finalize and produce report.
     ///
-    /// Starts the simulation, submits all transactions, drains, and shuts down.
-    pub async fn run(
-        mut self,
-        transactions: Vec<RoutableTransaction>,
-    ) -> Result<SimulationReport, ParallelError> {
-        self.start().await?;
-        self.submit_transactions(transactions).await?;
-        self.drain().await;
-        Ok(self.shutdown().await)
+    /// TPS is calculated from wall clock duration for meaningful performance metrics.
+    /// Latency is in simulated time (milliseconds converted to microseconds).
+    pub fn finalize(mut self, wall_clock_duration: Duration) -> SimulationReport {
+        let (submitted, completed, rejected, in_flight) = self.metrics();
+
+        // Compute latency percentiles (in simulated microseconds)
+        self.latencies.sort_unstable();
+        let p50 = percentile(&self.latencies, 0.50);
+        let p90 = percentile(&self.latencies, 0.90);
+        let p99 = percentile(&self.latencies, 0.99);
+        let max = self.latencies.last().copied().unwrap_or(0);
+        let avg = if self.latencies.is_empty() {
+            0
+        } else {
+            self.latencies.iter().sum::<u64>() / self.latencies.len() as u64
+        };
+
+        // TPS based on wall clock time (meaningful performance metric)
+        let tps = if wall_clock_duration.as_secs_f64() > 0.0 {
+            completed as f64 / wall_clock_duration.as_secs_f64()
+        } else {
+            0.0
+        };
+
+        SimulationReport {
+            duration: wall_clock_duration,
+            submitted,
+            completed,
+            rejected,
+            retries: 0,
+            in_flight: in_flight as u64,
+            messages_dropped_loss: 0,
+            messages_dropped_partition: 0,
+            tps,
+            latency_p50_us: p50,
+            latency_p90_us: p90,
+            latency_p99_us: p99,
+            latency_max_us: max,
+            latency_avg_us: avg,
+        }
     }
+}
+
+fn percentile(sorted: &[u64], p: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len() as f64 * p) as usize).min(sorted.len() - 1);
+    sorted[idx]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_simulator_creation() {
-        let config = ParallelConfig::new(1, 4);
-        let simulator = ParallelSimulator::new(config);
-        assert!(!simulator.started);
-    }
+    #[test]
+    fn test_parallel_simulator_basic() {
+        let config = ParallelConfig::new(2, 3);
+        let mut sim = ParallelSimulator::new(config);
+        sim.initialize();
 
-    #[tokio::test]
-    async fn test_simulator_start_shutdown() {
-        let config = ParallelConfig::new(1, 4).with_drain_duration(Duration::from_millis(100));
+        // Run a few steps
+        for _ in 0..10 {
+            sim.step();
+        }
 
-        let mut simulator = ParallelSimulator::new(config);
-        simulator.start().await.unwrap();
-        assert!(simulator.started);
-
-        let report = simulator.shutdown().await;
-        assert_eq!(report.submitted, 0);
-        assert_eq!(report.completed, 0);
+        let (submitted, _completed, _rejected, in_flight) = sim.metrics();
+        assert_eq!(submitted, 0);
+        assert_eq!(in_flight, 0);
     }
 }

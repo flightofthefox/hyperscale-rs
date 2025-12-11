@@ -1,33 +1,31 @@
 //! Parallel (non-deterministic) simulation for multi-core performance testing.
 //!
 //! Unlike the deterministic `hyperscale-simulation` crate which runs all nodes
-//! sequentially on a single thread, this crate runs each node as an independent
-//! tokio task, enabling multi-core utilization for performance testing.
+//! sequentially on a single thread, this crate runs nodes in parallel using
+//! rayon for multi-core CPU utilization.
 //!
 //! # Goals
 //!
-//! 1. **Multi-core Performance**: Utilize all available CPU cores
-//! 2. **Per-Node Parallelism**: Each node runs in its own tokio task
-//! 3. **Realistic Concurrency**: Better model real-world asynchronous behavior
-//! 4. **Reuse Production Infrastructure**: Leverage thread pools from production
-//! 5. **Feature Parity**: Support same network simulation features (latency, loss)
+//! 1. **Multi-core Performance**: Utilize all available CPU cores via rayon
+//! 2. **Simulated Time**: No wall-clock delays, timers fire instantly
+//! 3. **Synchronous Processing**: Step-based simulation with explicit control
+//! 4. **Feature Parity**: Support same network simulation features (latency, loss)
 //!
 //! # Non-Goals
 //!
-//! - **Determinism**: Results may vary between runs due to scheduling
+//! - **Determinism**: Results may vary between runs due to rayon scheduling
 //! - **Replacing Deterministic Simulation**: Use `hyperscale-simulation` for correctness testing
 //!
 //! # Architecture
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────────────────┐
-//! │                          ParallelSimulator                                  │
-//! │                     (orchestrator - main tokio task)                        │
+//! │                        ParallelSimulator                                    │
+//! │                      (step-based simulation loop)                           │
 //! ├─────────────────────────────────────────────────────────────────────────────┤
 //! │                                                                             │
 //! │   ┌───────────────┐  ┌───────────────┐  ┌───────────────┐                   │
-//! │   │   Node 0      │  │   Node 1      │  │   Node 2      │  ...              │
-//! │   │   (task)      │  │   (task)      │  │   (task)      │                   │
+//! │   │   SimNode 0   │  │   SimNode 1   │  │   SimNode 2   │  ...              │
 //! │   │               │  │               │  │               │                   │
 //! │   │  ┌─────────┐  │  │  ┌─────────┐  │  │  ┌─────────┐  │                   │
 //! │   │  │ State   │  │  │  │ State   │  │  │  │ State   │  │                   │
@@ -35,31 +33,23 @@
 //! │   │  └─────────┘  │  │  └─────────┘  │  │  └─────────┘  │                   │
 //! │   │  ┌─────────┐  │  │  ┌─────────┐  │  │  ┌─────────┐  │                   │
 //! │   │  │ Storage │  │  │  │ Storage │  │  │  │ Storage │  │                   │
-//! │   │  │+Executor│  │  │  │+Executor│  │  │  │+Executor│  │                   │
 //! │   │  └─────────┘  │  │  └─────────┘  │  │  └─────────┘  │                   │
-//! │   └───────┬───────┘  └───────┬───────┘  └───────┬───────┘                   │
-//! │           │                  │                  │                           │
-//! │           └──────────────────┼──────────────────┘                           │
-//! │                              │                                              │
-//! │                    ┌─────────▼─────────┐                                    │
-//! │                    │  MessageRouter    │                                    │
-//! │                    │  (DelayQueue +    │                                    │
-//! │                    │   NetworkConfig)  │                                    │
-//! │                    └───────────────────┘                                    │
+//! │   └───────────────┘  └───────────────┘  └───────────────┘                   │
 //! │                                                                             │
-//! ├─────────────────────────────────────────────────────────────────────────────┤
-//! │                    Shared Crypto Thread Pool (rayon)                        │
-//! │                    - BLS signature verification                             │
-//! │                    - Aggregated signature verification                      │
+//! │   Step 1: Process all nodes in parallel (rayon par_iter_mut)                │
+//! │   Step 2: Collect outbound messages                                         │
+//! │   Step 3: Route messages to recipients                                      │
+//! │   Step 4: Collect status updates                                            │
+//! │   Step 5: Advance simulated time                                            │
 //! └─────────────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! Transaction execution happens inline within each NodeTask (synchronous).
-//! The crypto thread pool is shared across all nodes for signature verification.
+//! Each step processes nodes in parallel using rayon, then synchronously
+//! routes messages between nodes. Crypto verification is done inline
+//! (synchronous) and timers fire instantly.
 
 mod config;
 mod metrics;
-mod node_task;
 mod router;
 mod simulator;
 
@@ -67,9 +57,8 @@ pub use config::ParallelConfig;
 pub use metrics::{
     MetricsCollector, MetricsEvent, MetricsRx, MetricsTx, SharedMetrics, SimulationReport,
 };
-pub use node_task::{NodeHandle, NodeTask, NodeTaskConfig};
 pub use router::{
     Destination, InboundMessage, MessageRouter, NodeRx, RoutedMessage, RouterStats,
     RouterStatsHandle, RouterTx,
 };
-pub use simulator::{ParallelError, ParallelSimulator};
+pub use simulator::{ParallelSimulator, SimNode};

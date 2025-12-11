@@ -8,6 +8,11 @@ use std::time::Duration;
 ///
 /// The parallel simulator runs each node as an independent tokio task,
 /// enabling multi-core utilization for performance testing.
+///
+/// Uses simulated time (not wall-clock time) so that:
+/// - Timers fire instantly (no real delays)
+/// - Crypto verification is done synchronously inline
+/// - Simulation runs as fast as the CPU can process
 #[derive(Debug, Clone)]
 pub struct ParallelConfig {
     /// Number of shards in the network.
