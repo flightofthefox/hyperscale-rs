@@ -55,7 +55,7 @@ impl Default for Libp2pConfig {
             listen_addresses: vec!["/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()],
             bootstrap_peers: vec![],
             request_timeout: Duration::from_secs(30),
-            max_message_size: 1024 * 1024, // 1MB
+            max_message_size: 1024 * 1024 * 10, // 10MB
             gossipsub_heartbeat: Duration::from_secs(1),
             idle_connection_timeout: Duration::from_secs(60),
         }
