@@ -133,23 +133,23 @@ impl SimulationCache {
     ) -> bool {
         let key = Self::sig_cache_key(message, signature, signer_keys);
 
-        // Fast path: check cache
+        // Fast path: check cache without taking entry lock
         if let Some(valid) = self.aggregated_sigs.get(&key) {
             return *valid;
         }
 
-        // Slow path: compute and cache
-        let valid = if signer_keys.is_empty() {
-            *signature == Signature::zero()
-        } else {
-            match PublicKey::aggregate_bls(signer_keys) {
-                Ok(aggregated_pk) => aggregated_pk.verify(message, signature),
-                Err(_) => false,
+        // Slow path: use entry API to ensure only one thread computes
+        // Note: or_insert_with holds write lock during computation, preventing TOCTOU races
+        *self.aggregated_sigs.entry(key).or_insert_with(|| {
+            if signer_keys.is_empty() {
+                *signature == Signature::zero()
+            } else {
+                match PublicKey::aggregate_bls(signer_keys) {
+                    Ok(aggregated_pk) => aggregated_pk.verify(message, signature),
+                    Err(_) => false,
+                }
             }
-        };
-
-        self.aggregated_sigs.insert(key, valid);
-        valid
+        })
     }
 
     /// Execute transactions for a block using the shared Radix executor.
@@ -164,15 +164,17 @@ impl SimulationCache {
     ) -> Vec<hyperscale_types::ExecutionResult> {
         let key = (shard_id, block_hash);
 
-        // Fast path: check cache
+        // Fast path: check cache without taking entry lock
         if let Some(results) = self.block_executions.get(&key) {
             return results.clone();
         }
 
-        // Slow path: execute using shard's executor and storage
-        let results = self.do_execute_block(shard_id, transactions);
-        self.block_executions.insert(key, results.clone());
-        results
+        // Slow path: use entry API to ensure only one thread executes
+        // Note: or_insert_with holds write lock during execution, preventing TOCTOU races
+        self.block_executions
+            .entry(key)
+            .or_insert_with(|| self.do_execute_block(shard_id, transactions))
+            .clone()
     }
 
     /// Internal: perform block execution using Radix engine.
@@ -258,15 +260,19 @@ impl SimulationCache {
     ) -> hyperscale_types::ExecutionResult {
         let key = (shard_id, tx_hash);
 
-        // Fast path: check cache
+        // Fast path: check cache without taking entry lock
         if let Some(result) = self.cross_shard_executions.get(&key) {
             return result.clone();
         }
 
-        // Slow path: execute using shard's executor and storage
-        let result = self.do_execute_cross_shard(shard_id, transaction, provisions, is_local_node);
-        self.cross_shard_executions.insert(key, result.clone());
-        result
+        // Slow path: use entry API to ensure only one thread executes
+        // Note: or_insert_with holds write lock during execution, preventing TOCTOU races
+        self.cross_shard_executions
+            .entry(key)
+            .or_insert_with(|| {
+                self.do_execute_cross_shard(shard_id, transaction, provisions, &is_local_node)
+            })
+            .clone()
     }
 
     /// Internal: perform cross-shard execution using Radix engine.
@@ -275,7 +281,7 @@ impl SimulationCache {
         shard_id: u64,
         transaction: &RoutableTransaction,
         provisions: &[hyperscale_types::StateProvision],
-        is_local_node: impl Fn(&NodeId) -> bool,
+        is_local_node: &impl Fn(&NodeId) -> bool,
     ) -> hyperscale_types::ExecutionResult {
         let executor_ref = match self.shard_executors.get(&shard_id) {
             Some(e) => e,
@@ -344,20 +350,5 @@ impl SimulationCache {
                 }
             }
         }
-    }
-
-    /// Get number of cached signature verifications.
-    pub fn sig_cache_len(&self) -> usize {
-        self.aggregated_sigs.len()
-    }
-
-    /// Get number of cached block executions.
-    pub fn block_cache_len(&self) -> usize {
-        self.block_executions.len()
-    }
-
-    /// Get number of cached cross-shard executions.
-    pub fn cross_shard_cache_len(&self) -> usize {
-        self.cross_shard_executions.len()
     }
 }
