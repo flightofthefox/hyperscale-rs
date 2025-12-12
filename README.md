@@ -8,6 +8,7 @@ Rust implementation of Hyperscale consensus protocol.
 - Pure consensus layer — no I/O, no locks, no async
 - Created with deterministic simulation testing in mind
 - Faster two-chain commit consensus based on HotStuff-2
+- Optimistic pipelining — proposers propose immediately after QC formation
 - Improved cross-shard livelock prevention
 - Real Radix Engine integration
 
