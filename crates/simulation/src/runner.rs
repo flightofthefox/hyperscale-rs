@@ -20,7 +20,8 @@ use hyperscale_types::{
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher}; // Used by compute_dedup_key
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
@@ -73,6 +74,10 @@ pub struct SimulationRunner {
 
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
+
+    /// Seen message cache for deduplication (matches libp2p gossipsub behavior).
+    /// Key is hash of (recipient, message_hash) to deduplicate per-node.
+    seen_messages: HashSet<u64>,
 }
 
 /// Statistics collected during simulation.
@@ -90,6 +95,8 @@ pub struct SimulationStats {
     pub messages_dropped_partition: u64,
     /// Messages dropped due to packet loss.
     pub messages_dropped_loss: u64,
+    /// Messages deduplicated (same message already received by node).
+    pub messages_deduplicated: u64,
     /// Timers set.
     pub timers_set: u64,
     /// Timers cancelled.
@@ -214,6 +221,7 @@ impl SimulationRunner {
             node_executor,
             genesis_executed,
             traffic_analyzer: None,
+            seen_messages: HashSet::new(),
         }
     }
 
@@ -1181,7 +1189,16 @@ impl SimulationRunner {
         key
     }
 
-    /// Try to deliver a message, accounting for partitions and packet loss.
+    /// Compute deduplication key for a (recipient, message) pair.
+    /// Each node maintains its own deduplication, so we include the recipient.
+    fn compute_dedup_key(to: NodeIndex, message_hash: u64) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        to.hash(&mut hasher);
+        message_hash.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Try to deliver a message, accounting for partitions, packet loss, and deduplication.
     /// Updates stats based on delivery outcome.
     fn try_deliver_message(&mut self, from: NodeIndex, to: NodeIndex, message: &OutboundMessage) {
         // Check partition first (deterministic - doesn't consume RNG)
@@ -1195,6 +1212,22 @@ impl SimulationRunner {
         if self.network.should_drop_packet(&mut self.rng) {
             self.stats.messages_dropped_loss += 1;
             trace!(from = from, to = to, "Message dropped due to packet loss");
+            return;
+        }
+
+        // Check deduplication (matches libp2p gossipsub behavior)
+        // Uses OutboundMessage::message_hash() which hashes encoded message data
+        let message_hash = message.message_hash();
+        let dedup_key = Self::compute_dedup_key(to, message_hash);
+        if !self.seen_messages.insert(dedup_key) {
+            // Message already seen by this recipient - deduplicate
+            self.stats.messages_deduplicated += 1;
+            trace!(
+                from = from,
+                to = to,
+                message_type = message.type_name(),
+                "Message deduplicated (already seen)"
+            );
             return;
         }
 

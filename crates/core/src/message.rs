@@ -7,6 +7,7 @@ use hyperscale_messages::{
     ViewChangeVoteGossip,
 };
 use sbor::prelude::*;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// Outbound network messages.
@@ -161,6 +162,58 @@ impl OutboundMessage {
         let wire_size = payload_size + 15;
 
         (payload_size, wire_size)
+    }
+
+    /// Compute a hash of the message content for deduplication.
+    ///
+    /// This matches the libp2p gossipsub `message_id_fn` approach: hash the
+    /// encoded message data using `DefaultHasher`. Two identical messages
+    /// will produce the same hash, allowing deduplication.
+    pub fn message_hash(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        match self {
+            OutboundMessage::BlockHeader(g) => {
+                if let Ok(encoded) = basic_encode(g) {
+                    encoded.hash(&mut hasher);
+                }
+            }
+            OutboundMessage::BlockVote(g) => {
+                if let Ok(encoded) = basic_encode(g) {
+                    encoded.hash(&mut hasher);
+                }
+            }
+            OutboundMessage::ViewChangeVote(g) => {
+                if let Ok(encoded) = basic_encode(g) {
+                    encoded.hash(&mut hasher);
+                }
+            }
+            OutboundMessage::ViewChangeCertificate(g) => {
+                if let Ok(encoded) = basic_encode(g) {
+                    encoded.hash(&mut hasher);
+                }
+            }
+            OutboundMessage::StateProvision(g) => {
+                if let Ok(encoded) = basic_encode(g) {
+                    encoded.hash(&mut hasher);
+                }
+            }
+            OutboundMessage::StateVoteBlock(g) => {
+                if let Ok(encoded) = basic_encode(g) {
+                    encoded.hash(&mut hasher);
+                }
+            }
+            OutboundMessage::StateCertificate(g) => {
+                if let Ok(encoded) = basic_encode(g) {
+                    encoded.hash(&mut hasher);
+                }
+            }
+            OutboundMessage::TransactionGossip(g) => {
+                if let Ok(encoded) = basic_encode(g.as_ref()) {
+                    encoded.hash(&mut hasher);
+                }
+            }
+        }
+        hasher.finish()
     }
 
     /// Convert an outbound message to the corresponding inbound event.
