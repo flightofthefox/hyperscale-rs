@@ -809,7 +809,7 @@ mod tests {
                 is_fallback: false,
             },
             transactions: transactions.into_iter().map(Arc::new).collect(),
-            committed_certificates: certificates,
+            committed_certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
         }

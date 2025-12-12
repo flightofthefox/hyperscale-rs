@@ -429,7 +429,7 @@ impl BftState {
         mempool: &[Arc<RoutableTransaction>],
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
-        certificates: Vec<TransactionCertificate>,
+        certificates: Vec<Arc<TransactionCertificate>>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This allows the chain to grow
@@ -607,7 +607,7 @@ impl BftState {
             pending.add_transaction_arc(Arc::clone(tx));
         }
         for cert in &committed_certificates {
-            pending.add_certificate(cert.clone());
+            pending.add_certificate(Arc::clone(cert));
         }
         if let Ok(constructed) = pending.construct_block() {
             self.pending_blocks.insert(block_hash, pending);
@@ -739,7 +739,7 @@ impl BftState {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         mempool: &HashMap<Hash, Arc<RoutableTransaction>>,
-        certificates: &HashMap<Hash, TransactionCertificate>,
+        certificates: &HashMap<Hash, Arc<TransactionCertificate>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height.0;
@@ -835,7 +835,7 @@ impl BftState {
         // Try to fill in certificates from local certificate store
         for cert_hash in &cert_hashes {
             if let Some(cert) = certificates.get(cert_hash) {
-                pending.add_certificate(cert.clone());
+                pending.add_certificate(Arc::clone(cert));
             }
         }
 
@@ -1597,7 +1597,7 @@ impl BftState {
         mempool: &[Arc<RoutableTransaction>],
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
-        certificates: Vec<TransactionCertificate>,
+        certificates: Vec<Arc<TransactionCertificate>>,
     ) -> Vec<Action> {
         let height = qc.height.0;
 
@@ -2105,7 +2105,7 @@ impl BftState {
     pub fn check_pending_blocks_for_certificate(
         &mut self,
         cert_hash: Hash,
-        certificates: &HashMap<Hash, TransactionCertificate>,
+        certificates: &HashMap<Hash, Arc<TransactionCertificate>>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -2121,7 +2121,7 @@ impl BftState {
             if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
                 // Try to add the certificate
                 if let Some(cert) = certificates.get(&cert_hash) {
-                    pending.add_certificate(cert.clone());
+                    pending.add_certificate(Arc::clone(cert));
                 }
 
                 // Check if block is now complete
@@ -2938,7 +2938,7 @@ mod tests {
         Block {
             header: make_header_at_height(height, 100_000),
             transactions: vec![],
-            committed_certificates: certificates,
+            committed_certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
         }

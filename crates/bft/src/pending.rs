@@ -32,9 +32,9 @@ pub struct PendingBlock {
     /// Set of transaction hashes we're still waiting for (HashSet for O(1) lookup).
     missing_transaction_hashes: HashSet<Hash>,
 
-    /// Map of transaction hash -> TransactionCertificate (for received certificates).
+    /// Map of transaction hash -> Arc<TransactionCertificate> (for received certificates).
     /// Uses IndexMap for deterministic iteration order (insertion order) when constructing blocks.
-    received_certificates: IndexMap<Hash, TransactionCertificate>,
+    received_certificates: IndexMap<Hash, Arc<TransactionCertificate>>,
 
     /// Set of certificate hashes we're still waiting for (HashSet for O(1) lookup).
     missing_certificate_hashes: HashSet<Hash>,
@@ -113,7 +113,7 @@ impl PendingBlock {
     /// Add a received certificate.
     ///
     /// Returns true if this certificate was needed, false if duplicate or not in this block.
-    pub fn add_certificate(&mut self, cert: TransactionCertificate) -> bool {
+    pub fn add_certificate(&mut self, cert: Arc<TransactionCertificate>) -> bool {
         let cert_hash = cert.transaction_hash;
         // O(1) lookup and removal with HashSet
         if self.missing_certificate_hashes.remove(&cert_hash) {
@@ -186,7 +186,7 @@ impl PendingBlock {
             .drain(..)
             .map(|(_, v)| v)
             .collect();
-        let certificates: Vec<TransactionCertificate> = self
+        let certificates: Vec<Arc<TransactionCertificate>> = self
             .received_certificates
             .drain(..)
             .map(|(_, v)| v)

@@ -825,7 +825,7 @@ mod tests {
                 is_fallback: false,
             },
             transactions: vec![],
-            committed_certificates: vec![cert],
+            committed_certificates: vec![std::sync::Arc::new(cert)],
             deferred: vec![],
             aborted: vec![],
         };

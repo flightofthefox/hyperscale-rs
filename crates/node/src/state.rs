@@ -339,15 +339,8 @@ impl StateMachine for NodeStateMachine {
                     30, // execution_timeout_blocks
                     3,  // max_retries
                 );
-                // Get finalized certificates from execution state (cloned, not taken).
-                // Certificates are removed when they're committed in a block via
-                // on_block_committed, not when proposed.
-                let certificates: Vec<_> = self
-                    .execution
-                    .get_finalized_certificates()
-                    .into_iter()
-                    .cloned()
-                    .collect();
+                // Get finalized certificates (removed when committed in a block)
+                let certificates = self.execution.get_finalized_certificates();
                 return self
                     .bft
                     .on_proposal_timer(&txs, deferred, aborted, certificates);
@@ -385,12 +378,7 @@ impl StateMachine for NodeStateMachine {
                     30, // execution_timeout_blocks
                     3,  // max_retries
                 );
-                let certificates: Vec<_> = self
-                    .execution
-                    .get_finalized_certificates()
-                    .into_iter()
-                    .cloned()
-                    .collect();
+                let certificates = self.execution.get_finalized_certificates();
                 return self.bft.on_qc_formed(
                     *block_hash,
                     qc.clone(),

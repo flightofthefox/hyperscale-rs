@@ -63,9 +63,9 @@ impl BlockHeader {
 /// 3. **deferred**: Transactions deferred due to cross-shard cycles (livelock prevention)
 /// 4. **aborted**: Transactions aborted due to timeout or rejection
 ///
-/// Transactions are stored as `Arc<RoutableTransaction>` for efficient cloning
+/// Transactions and certificates are stored as `Arc` for efficient cloning
 /// and sharing across the system. When serialized (for storage or network),
-/// the underlying transaction data is written directly.
+/// the underlying data is written directly.
 #[derive(Debug, Clone)]
 pub struct Block {
     /// Block header with consensus metadata.
@@ -75,7 +75,7 @@ pub struct Block {
     pub transactions: Vec<Arc<RoutableTransaction>>,
 
     /// Transaction certificates for finalized transactions.
-    pub committed_certificates: Vec<TransactionCertificate>,
+    pub committed_certificates: Vec<Arc<TransactionCertificate>>,
 
     /// Transactions deferred due to cross-shard livelock cycles.
     ///
@@ -92,7 +92,7 @@ pub struct Block {
     pub aborted: Vec<TransactionAbort>,
 }
 
-// Manual PartialEq - compare transaction content, not Arc pointers
+// Manual PartialEq - compare transaction/certificate content, not Arc pointers
 impl PartialEq for Block {
     fn eq(&self, other: &Self) -> bool {
         self.header == other.header
@@ -102,7 +102,12 @@ impl PartialEq for Block {
                 .iter()
                 .zip(other.transactions.iter())
                 .all(|(a, b)| a.hash() == b.hash())
-            && self.committed_certificates == other.committed_certificates
+            && self.committed_certificates.len() == other.committed_certificates.len()
+            && self
+                .committed_certificates
+                .iter()
+                .zip(other.committed_certificates.iter())
+                .all(|(a, b)| a.as_ref() == b.as_ref())
             && self.deferred == other.deferred
             && self.aborted == other.aborted
     }
@@ -121,16 +126,22 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(5)?; // 5 fields
+        encoder.write_size(5)?;
         encoder.encode(&self.header)?;
-        // Encode transactions as Vec<RoutableTransaction> (unwrap Arcs)
+        // Transactions (manual encoding to unwrap Arc)
         encoder.write_value_kind(sbor::ValueKind::Array)?;
-        encoder.write_value_kind(sbor::ValueKind::Tuple)?; // element type
+        encoder.write_value_kind(sbor::ValueKind::Tuple)?;
         encoder.write_size(self.transactions.len())?;
         for tx in &self.transactions {
             encoder.encode_deeper_body(tx.as_ref())?;
         }
-        encoder.encode(&self.committed_certificates)?;
+        // Certificates (manual encoding to unwrap Arc)
+        encoder.write_value_kind(sbor::ValueKind::Array)?;
+        encoder.write_value_kind(sbor::ValueKind::Tuple)?;
+        encoder.write_size(self.committed_certificates.len())?;
+        for cert in &self.committed_certificates {
+            encoder.encode_deeper_body(cert.as_ref())?;
+        }
         encoder.encode(&self.deferred)?;
         encoder.encode(&self.aborted)?;
         Ok(())
@@ -154,9 +165,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
 
         let header: BlockHeader = decoder.decode()?;
 
-        // Decode transactions as Vec<Arc<RoutableTransaction>>
+        // Transactions (manual decoding to wrap in Arc)
         decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
-        decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?; // element type
+        decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
         let tx_count = decoder.read_size()?;
         let mut transactions = Vec::with_capacity(tx_count);
         for _ in 0..tx_count {
@@ -165,7 +176,17 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             transactions.push(Arc::new(tx));
         }
 
-        let committed_certificates: Vec<TransactionCertificate> = decoder.decode()?;
+        // Certificates (manual decoding to wrap in Arc)
+        decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
+        decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
+        let cert_count = decoder.read_size()?;
+        let mut committed_certificates = Vec::with_capacity(cert_count);
+        for _ in 0..cert_count {
+            let cert: TransactionCertificate =
+                decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
+            committed_certificates.push(Arc::new(cert));
+        }
+
         let deferred: Vec<TransactionDefer> = decoder.decode()?;
         let aborted: Vec<TransactionAbort> = decoder.decode()?;
 

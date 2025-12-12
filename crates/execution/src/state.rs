@@ -71,7 +71,7 @@ pub struct ExecutionState {
 
     /// Finalized transaction certificates ready for block inclusion.
     /// Uses BTreeMap for deterministic iteration order.
-    finalized_certificates: BTreeMap<Hash, TransactionCertificate>,
+    finalized_certificates: BTreeMap<Hash, Arc<TransactionCertificate>>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Cross-shard state (Phase 1-2: Provisioning)
@@ -1241,8 +1241,8 @@ impl ExecutionState {
                     "TransactionCertificate created successfully"
                 );
 
-                // Store finalized certificate
-                self.finalized_certificates.insert(tx_hash, tx_cert);
+                self.finalized_certificates
+                    .insert(tx_hash, Arc::new(tx_cert));
 
                 // Notify mempool that transaction execution is complete
                 actions.push(Action::EnqueueInternal {
@@ -1268,17 +1268,17 @@ impl ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Get finalized certificates for block inclusion.
-    pub fn get_finalized_certificates(&self) -> Vec<&TransactionCertificate> {
-        self.finalized_certificates.values().collect()
+    pub fn get_finalized_certificates(&self) -> Vec<Arc<TransactionCertificate>> {
+        self.finalized_certificates.values().cloned().collect()
     }
 
     /// Get finalized certificates as a HashMap for block validation.
     pub fn finalized_certificates_by_hash(
         &self,
-    ) -> std::collections::HashMap<Hash, TransactionCertificate> {
+    ) -> std::collections::HashMap<Hash, Arc<TransactionCertificate>> {
         self.finalized_certificates
             .iter()
-            .map(|(h, c)| (*h, c.clone()))
+            .map(|(h, c)| (*h, Arc::clone(c)))
             .collect()
     }
 
@@ -1286,7 +1286,7 @@ impl ExecutionState {
     pub fn remove_finalized_certificate(
         &mut self,
         tx_hash: &Hash,
-    ) -> Option<TransactionCertificate> {
+    ) -> Option<Arc<TransactionCertificate>> {
         self.finalized_certificates.remove(tx_hash)
     }
 
