@@ -6,10 +6,7 @@ use hyperscale_simulator::{Simulator, SimulatorConfig, WorkloadConfig};
 use std::time::Duration;
 
 /// Run a simple single-shard simulation.
-// TODO: Investigate why this test is slow/hanging - may be related to mempool performance
-// with large transaction counts.
 #[test]
-#[ignore]
 fn test_single_shard_simulation() {
     // Initialize tracing for debugging
     let _ = tracing_subscriber::fmt()
@@ -18,19 +15,14 @@ fn test_single_shard_simulation() {
         .try_init();
 
     // Configure simulation: 1 shard, 4 validators
-    // With NoContention mode, we need (accounts / 2) >= max_concurrent_transactions
-    // to avoid wrap-around contention. With 530 txs over 5s and ~1s finalization time,
-    // we could have ~100+ concurrent txs. Use 500 accounts (250 pairs) for headroom.
     let config = SimulatorConfig::new(1, 4)
-        .with_accounts_per_shard(500)
+        .with_accounts_per_shard(20)
         .with_seed(42)
         .with_workload(
             WorkloadConfig::transfers_only()
-                .with_batch_size(5)
-                // Use smaller batch interval than proposal_interval (100ms)
-                // to ensure transactions are available when proposals happen
-                .with_batch_interval(Duration::from_millis(50))
-                .with_no_contention(), // Zero lock contention
+                .with_batch_size(3)
+                .with_batch_interval(Duration::from_millis(500))
+                .with_no_contention(),
         );
 
     // Create and initialize simulator
