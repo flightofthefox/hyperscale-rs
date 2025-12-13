@@ -232,45 +232,43 @@ impl Simulator {
     fn check_completions(&mut self) {
         let current_time = self.runner.now();
 
-        // We need to check the mempool status for each in-flight transaction
-        // This is a polling approach - in a more sophisticated version we'd use events
+        // We need to check the transaction status cache for each in-flight transaction
+        // Using tx_status() which captures all emitted statuses, even after eviction
         let hashes: Vec<Hash> = self.in_flight.keys().copied().collect();
 
         for hash in hashes {
             if let Some((submit_time, shard)) = self.in_flight.get(&hash).copied() {
-                // Check status from a node in the target shard
+                // Check status from the status cache (survives eviction from mempool)
                 let node_idx = self.get_node_for_shard(shard);
-                if let Some(node) = self.runner.node(node_idx) {
-                    if let Some(status) = node.mempool().status(&hash) {
-                        // Only remove from in_flight when reaching a terminal state
-                        if status.is_final() {
-                            self.in_flight.remove(&hash);
+                if let Some(status) = self.runner.tx_status(node_idx, &hash).cloned() {
+                    // Only remove from in_flight when reaching a terminal state
+                    if status.is_final() {
+                        self.in_flight.remove(&hash);
 
-                            match status {
-                                TransactionStatus::Completed(TransactionDecision::Accept) => {
-                                    // Transaction fully executed - record completion and latency
-                                    let latency = current_time.saturating_sub(submit_time);
-                                    self.metrics.record_completion(latency);
-                                    debug!(
-                                        ?hash,
-                                        latency_ms = latency.as_millis(),
-                                        "Transaction completed"
-                                    );
-                                }
-                                TransactionStatus::Completed(TransactionDecision::Reject)
-                                | TransactionStatus::Aborted { .. } => {
-                                    // Transaction was rejected or aborted
-                                    self.metrics.record_rejection();
-                                    debug!(?hash, %status, "Transaction rejected/aborted");
-                                }
-                                TransactionStatus::Retried { new_tx } => {
-                                    // Transaction was retried - track the new hash instead
-                                    self.in_flight.insert(new_tx, (submit_time, shard));
-                                    self.metrics.record_retry();
-                                    debug!(?hash, ?new_tx, "Transaction retried");
-                                }
-                                _ => unreachable!("Transaction status is not final: {:?}", status),
+                        match status {
+                            TransactionStatus::Completed(TransactionDecision::Accept) => {
+                                // Transaction fully executed - record completion and latency
+                                let latency = current_time.saturating_sub(submit_time);
+                                self.metrics.record_completion(latency);
+                                debug!(
+                                    ?hash,
+                                    latency_ms = latency.as_millis(),
+                                    "Transaction completed"
+                                );
                             }
+                            TransactionStatus::Completed(TransactionDecision::Reject)
+                            | TransactionStatus::Aborted { .. } => {
+                                // Transaction was rejected or aborted
+                                self.metrics.record_rejection();
+                                debug!(?hash, %status, "Transaction rejected/aborted");
+                            }
+                            TransactionStatus::Retried { new_tx } => {
+                                // Transaction was retried - track the new hash instead
+                                self.in_flight.insert(new_tx, (submit_time, shard));
+                                self.metrics.record_retry();
+                                debug!(?hash, ?new_tx, "Transaction retried");
+                            }
+                            _ => unreachable!("Transaction status is not final: {:?}", status),
                         }
                     }
                 }

@@ -237,17 +237,18 @@ impl MempoolState {
             ));
         }
 
-        // 4. Process aborts - mark as aborted with reason
+        // 4. Process aborts - mark as aborted with reason and evict
         for abort in &block.aborted {
-            if let Some(entry) = self.pool.get_mut(&abort.tx_hash) {
+            if self.pool.contains_key(&abort.tx_hash) {
                 let status = TransactionStatus::Aborted {
                     reason: abort.reason.clone(),
                 };
-                entry.status = status.clone();
                 actions.push(Action::EmitTransactionStatus {
                     tx_hash: abort.tx_hash,
                     status,
                 });
+                // Evict from pool - terminal state, no longer needed in state machine
+                self.pool.remove(&abort.tx_hash);
             }
         }
 
@@ -311,13 +312,14 @@ impl MempoolState {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        // Mark the certificate's TX as completed with the final decision
-        if let Some(entry) = self.pool.get_mut(&tx_hash) {
-            entry.status = TransactionStatus::Completed(decision);
+        // Mark the certificate's TX as completed with the final decision and evict
+        if self.pool.contains_key(&tx_hash) {
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Completed(decision),
             });
+            // Evict from pool - terminal state, no longer needed in state machine
+            self.pool.remove(&tx_hash);
         }
 
         // Check if any blocked TXs were waiting for this winner using reverse index (O(1) lookup)
@@ -343,16 +345,15 @@ impl MempoolState {
                 "Creating retry for deferred transaction"
             );
 
-            // Update original's status to Retried
-            if let Some(entry) = self.pool.get_mut(&loser_hash) {
-                entry.status = TransactionStatus::Retried { new_tx: retry_hash };
+            // Update original's status to Retried and evict
+            if self.pool.contains_key(&loser_hash) {
                 actions.push(Action::EmitTransactionStatus {
                     tx_hash: loser_hash,
                     status: TransactionStatus::Retried { new_tx: retry_hash },
                 });
+                // Evict from pool - terminal state, no longer needed in state machine
+                self.pool.remove(&loser_hash);
             }
-
-            // Note: loser_hash already removed from blocked_by above
 
             // Add retry to mempool if not already present (dedup by hash)
             if !self.pool.contains_key(&retry_hash) {
@@ -438,16 +439,15 @@ impl MempoolState {
                 "Creating retry for blocked transaction (winner finalized)"
             );
 
-            // Update original's status to Retried
-            if let Some(entry) = self.pool.get_mut(&loser_hash) {
-                entry.status = TransactionStatus::Retried { new_tx: retry_hash };
+            // Update original's status to Retried and evict
+            if self.pool.contains_key(&loser_hash) {
                 actions.push(Action::EmitTransactionStatus {
                     tx_hash: loser_hash,
                     status: TransactionStatus::Retried { new_tx: retry_hash },
                 });
+                // Evict from pool - terminal state, no longer needed in state machine
+                self.pool.remove(&loser_hash);
             }
-
-            // Note: loser_hash already removed from blocked_by above
 
             // Add retry to mempool if not already present (dedup by hash)
             if !self.pool.contains_key(&retry_hash) {
@@ -477,10 +477,11 @@ impl MempoolState {
 
     /// Mark a transaction as completed (certificate committed in block).
     ///
-    /// This is the terminal state - the transaction can be evicted from mempool.
+    /// This is a terminal state - the transaction is evicted from mempool.
     pub fn mark_completed(&mut self, tx_hash: &Hash, decision: TransactionDecision) -> Vec<Action> {
-        if let Some(entry) = self.pool.get_mut(tx_hash) {
-            entry.status = TransactionStatus::Completed(decision);
+        if self.pool.contains_key(tx_hash) {
+            // Evict from pool - terminal state, no longer needed in state machine
+            self.pool.remove(tx_hash);
             return vec![Action::EmitTransactionStatus {
                 tx_hash: *tx_hash,
                 status: TransactionStatus::Completed(decision),
@@ -946,29 +947,37 @@ mod tests {
         let cert_block = make_test_block(3, vec![], vec![], vec![winner_cert], vec![]);
         let actions = mempool.on_block_committed_full(&cert_block);
 
-        // Should have created a retry TX (gossip action)
+        // Should have emitted Retried status for loser
+        let retried_action = actions.iter().find(|a| {
+            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Retried { .. } } if *tx_hash == loser_hash)
+        });
         assert!(
-            !actions.is_empty(),
-            "Should have gossiped retry transaction"
+            retried_action.is_some(),
+            "Should have emitted Retried status for loser"
         );
 
-        // Loser should now be Retried
-        let loser_status = mempool.status(&loser_hash);
+        // Loser should be evicted from pool (terminal state)
         assert!(
-            matches!(loser_status, Some(TransactionStatus::Retried { .. })),
-            "Loser should be Retried, got {:?}",
-            loser_status
+            mempool.status(&loser_hash).is_none(),
+            "Loser should be evicted from pool after Retried"
         );
+
+        // Extract retry hash from the action
+        let retry_hash = match retried_action.unwrap() {
+            Action::EmitTransactionStatus {
+                status: TransactionStatus::Retried { new_tx },
+                ..
+            } => *new_tx,
+            _ => unreachable!(),
+        };
 
         // Retry should exist in pool as Pending
-        if let Some(TransactionStatus::Retried { new_tx }) = loser_status {
-            let retry_status = mempool.status(&new_tx);
-            assert!(
-                matches!(retry_status, Some(TransactionStatus::Pending)),
-                "Retry should be Pending, got {:?}",
-                retry_status
-            );
-        }
+        let retry_status = mempool.status(&retry_hash);
+        assert!(
+            matches!(retry_status, Some(TransactionStatus::Pending)),
+            "Retry should be Pending, got {:?}",
+            retry_status
+        );
 
         // blocked_by should be cleared
         assert!(!mempool.blocked_by.contains_key(&loser_hash));
@@ -1051,13 +1060,22 @@ mod tests {
             block_height: BlockHeight(35),
         };
         let abort_block = make_test_block(35, vec![], vec![], vec![], vec![abort]);
-        mempool.on_block_committed_full(&abort_block);
+        let actions = mempool.on_block_committed_full(&abort_block);
 
-        // Status should be Aborted (terminal)
-        assert!(matches!(
-            mempool.status(&tx_hash),
-            Some(TransactionStatus::Aborted { .. })
-        ));
+        // Should have emitted Aborted status
+        let aborted_action = actions.iter().find(|a| {
+            matches!(a, Action::EmitTransactionStatus { tx_hash: h, status: TransactionStatus::Aborted { .. } } if *h == tx_hash)
+        });
+        assert!(
+            aborted_action.is_some(),
+            "Should have emitted Aborted status"
+        );
+
+        // Transaction should be evicted from pool (terminal state)
+        assert!(
+            mempool.status(&tx_hash).is_none(),
+            "Transaction should be evicted from pool after Aborted"
+        );
     }
 
     #[test]

@@ -688,9 +688,9 @@ fn test_resolves_livelocks_in_under_x_seconds() {
         runner.run_until(runner.now() + Duration::from_millis(50));
         iteration += 1;
 
-        let node0 = runner.node(0).unwrap();
-        let status_a = node0.mempool().status(&hash_a);
-        let status_b = node0.mempool().status(&hash_b);
+        // Use the status cache for reliable status checks (survives eviction)
+        let status_a = runner.tx_status(0, &hash_a).cloned();
+        let status_b = runner.tx_status(0, &hash_b).cloned();
 
         // Log status changes for TX A
         if status_a != last_status_a {
@@ -731,7 +731,7 @@ fn test_resolves_livelocks_in_under_x_seconds() {
 
         // Check retry transaction status
         if let Some(rh) = retry_hash {
-            let retry_status = node0.mempool().status(&rh);
+            let retry_status = runner.tx_status(0, &rh).cloned();
             if retry_status != last_retry_status {
                 let elapsed = runner.now() - resolution_start;
                 println!(
@@ -757,11 +757,10 @@ fn test_resolves_livelocks_in_under_x_seconds() {
     // Calculate total resolution time
     let resolution_time = runner.now() - resolution_start;
 
-    // Get final statuses
-    let node0 = runner.node(0).unwrap();
-    let final_status_a = node0.mempool().status(&hash_a);
-    let final_status_b = node0.mempool().status(&hash_b);
-    let final_retry_status = retry_hash.and_then(|h| node0.mempool().status(&h));
+    // Get final statuses from cache (reliable even after eviction)
+    let final_status_a = runner.tx_status(0, &hash_a);
+    let final_status_b = runner.tx_status(0, &hash_b);
+    let final_retry_status = retry_hash.and_then(|h| runner.tx_status(0, &h));
 
     println!("\n=== Results ===");
     println!("Resolution time: {:?}", resolution_time);
@@ -827,6 +826,7 @@ fn test_resolves_livelocks_in_under_x_seconds() {
         MAX_WINNER_SECONDS
     );
 
+    // Retry transaction must complete for full livelock resolution
     assert!(
         retry_completed,
         "Retry transaction must complete. Final status: {:?}",
@@ -840,8 +840,8 @@ fn test_resolves_livelocks_in_under_x_seconds() {
         MAX_TOTAL_SECONDS
     );
 
-    // Calculate deferral overhead
-    let retry_time = retry_completion_time.unwrap();
+    // Calculate deferral overhead (if we tracked the retry)
+    let retry_time = retry_completion_time.unwrap_or(winner_time);
     let deferral_overhead = retry_time - winner_time;
 
     println!("\n✅ LIVELOCK RESOLUTION TEST PASSED!");

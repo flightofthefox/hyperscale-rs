@@ -850,6 +850,26 @@ impl ProductionRunner {
                 // LOW PRIORITY: Handle transaction events (submissions, gossip)
                 // Only processed when consensus channel is empty or after batch limit
                 Some(event) = self.transaction_rx.recv() => {
+                    // Filter out transactions that are already in terminal state
+                    // This prevents re-adding evicted transactions via late gossip
+                    if let Event::TransactionGossipReceived { ref tx } = event {
+                        if let Some(ref cache) = self.tx_status_cache {
+                            if let Ok(cache_guard) = cache.try_read() {
+                                if let Some(cached) = cache_guard.get(&tx.hash()) {
+                                    if cached.status.is_final() {
+                                        tracing::trace!(
+                                            tx_hash = ?tx.hash(),
+                                            status = %cached.status,
+                                            "Ignoring gossip for already-finalized transaction"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            // If cache lock is contended, let the mempool handle dedup
+                        }
+                    }
+
                     let event_type = event.type_name();
                     let event_span = span!(
                         Level::INFO,

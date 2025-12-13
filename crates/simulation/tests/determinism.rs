@@ -1237,9 +1237,9 @@ fn test_execution_flow() {
 
     let node0 = runner.node(0).expect("Node 0 should exist");
 
-    // Check transaction completed the full execution flow.
-    // Status should be Completed (certificate was committed in a block).
-    let status = node0.mempool().status(&tx_hash);
+    // Check transaction completed the full execution flow using the status cache.
+    // The cache captures all emitted statuses, even after eviction from mempool.
+    let status = runner.tx_status(0, &tx_hash);
     println!("  Committed height: {}", node0.bft().committed_height());
     println!("  Tx status: {:?}", status);
 
@@ -1253,6 +1253,12 @@ fn test_execution_flow() {
         ),
         "Transaction should be Completed (certificate committed), got {:?}",
         status
+    );
+
+    // Verify blocks were committed (transaction was processed)
+    assert!(
+        node0.bft().committed_height() > 0,
+        "Should have committed blocks"
     );
 }
 

@@ -178,7 +178,7 @@ fn test_e2e_single_shard_transaction() {
     );
 
     // Check mempool status on node 0
-    // Note: By this point (2s of consensus), the transaction may already be committed or completed!
+    // Note: By this point (2s of consensus), the transaction may already be completed and evicted!
     let node0 = runner.node(0).expect("Node 0 should exist");
     let initial_status = node0.mempool().status(&tx_hash);
     println!(
@@ -186,15 +186,31 @@ fn test_e2e_single_shard_transaction() {
         initial_status
     );
 
-    // Transaction should be in mempool (any state - Pending, Committed, or Completed)
-    assert!(
-        initial_status.is_some(),
-        "Transaction should be tracked in mempool"
-    );
+    // If status is None, the transaction completed and was evicted from mempool.
+    // This is the expected behavior for completed transactions.
+    // Check execution state to confirm it was processed.
+    if initial_status.is_none() {
+        // Transaction was evicted - check if it was executed
+        let is_executed = node0.execution().is_executed(&tx_hash);
+        if is_executed {
+            println!("✓ Transaction already completed and evicted after initial consensus!\n");
 
-    // If already completed, we can skip the polling loop.
-    // Completed status means the certificate was committed in a block,
-    // which is the terminal success state for the full execution flow.
+            // Print final state
+            let max_height: u64 = (0..4)
+                .map(|i| runner.node(i).unwrap().bft().committed_height())
+                .max()
+                .unwrap();
+
+            println!("\n✅ E2E Single-Shard Test PASSED!");
+            println!("   ✅ Genesis initialized");
+            println!("   ✅ Transaction committed and executed");
+            println!("   ✅ Max committed height: {}", max_height);
+            return;
+        }
+        // If not executed, it might just not have been processed yet - continue with polling
+    }
+
+    // If already completed (but not yet evicted due to timing), we can skip the polling loop.
     if matches!(initial_status, Some(TransactionStatus::Completed(_))) {
         println!("✓ Transaction already completed after initial consensus!\n");
 

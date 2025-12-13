@@ -14,8 +14,8 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_engine::RadixExecutor;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
-    Block, KeyPair, KeyType, PublicKey, QuorumCertificate, ShardGroupId, StaticTopology, Topology,
-    ValidatorId, ValidatorInfo, ValidatorSet,
+    Block, Hash as TxHash, KeyPair, KeyType, PublicKey, QuorumCertificate, ShardGroupId,
+    StaticTopology, Topology, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
@@ -82,6 +82,10 @@ pub struct SimulationRunner {
     /// Per-node sync targets. Maps node index to sync target height.
     /// Used by the runner to track sync progress (replaces SyncState tracking).
     sync_targets: HashMap<NodeIndex, u64>,
+
+    /// Per-node transaction status cache. Captures all emitted statuses.
+    /// Maps (node_index, tx_hash) -> status for querying final transaction states.
+    tx_status_cache: HashMap<(NodeIndex, TxHash), TransactionStatus>,
 }
 
 /// Statistics collected during simulation.
@@ -227,6 +231,7 @@ impl SimulationRunner {
             traffic_analyzer: None,
             seen_messages: HashSet::new(),
             sync_targets: HashMap::new(),
+            tx_status_cache: HashMap::new(),
         }
     }
 
@@ -265,6 +270,15 @@ impl SimulationRunner {
     /// Get a reference to a node's storage.
     pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage> {
         self.node_storage.get(node as usize)
+    }
+
+    /// Get the last emitted transaction status for a node.
+    ///
+    /// Unlike `node.mempool().status()`, this returns the last status that was
+    /// emitted via `EmitTransactionStatus` action, even if the transaction has
+    /// been evicted from the mempool (e.g., after reaching terminal state).
+    pub fn tx_status(&self, node: NodeIndex, tx_hash: &TxHash) -> Option<&TransactionStatus> {
+        self.tx_status_cache.get(&(node, *tx_hash))
     }
 
     /// Get simulation statistics.
@@ -911,6 +925,8 @@ impl SimulationRunner {
 
             Action::EmitTransactionStatus { tx_hash, status } => {
                 debug!(?tx_hash, ?status, "Transaction status");
+                // Cache the status for test queries
+                self.tx_status_cache.insert((from, tx_hash), status);
             }
 
             // Storage writes - store in SimStorage
