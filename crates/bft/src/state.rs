@@ -1858,16 +1858,24 @@ impl BftState {
             }
         }
 
-        // Immediately try to propose the next block.
+        // Immediately try to propose the next block if there's content to include.
         // This is how the QC propagates to other validators - the next block
         // header will include this QC as parent_qc.
         //
-        // We check if we're the proposer for the next height at the current round.
-        // If we are, we propose immediately rather than waiting for the next timer.
+        // We only propose immediately if there's actual content (transactions,
+        // deferrals, aborts, or certificates). Empty blocks provide no value and
+        // just waste resources on signature verification and storage. If there's
+        // nothing to include, the regular proposal timer will fire and propagate
+        // the QC then.
         let next_height = height + 1;
         let round = self.view;
 
-        if self.should_propose(next_height, round) {
+        let has_content = !mempool.is_empty()
+            || !deferred.is_empty()
+            || !aborted.is_empty()
+            || !certificates.is_empty();
+
+        if has_content && self.should_propose(next_height, round) {
             debug!(
                 validator = ?self.validator_id(),
                 next_height = next_height,
@@ -5038,6 +5046,109 @@ mod tests {
                 .received_votes_by_height
                 .contains_key(&(6, ValidatorId(0))),
             "Height 6 entries should remain"
+        );
+    }
+
+    #[test]
+    fn test_qc_formed_does_not_propose_empty_block() {
+        // When a QC forms and there's no content (empty mempool, no deferrals,
+        // no aborts, no certificates), we should NOT immediately propose.
+        // This avoids wasting resources on empty block pipelining.
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+
+        // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 100_000,
+        };
+
+        // Call on_qc_formed with empty content
+        let actions = state.on_qc_formed(
+            qc.block_hash,
+            qc,
+            &[],    // empty mempool
+            vec![], // no deferrals
+            vec![], // no aborts
+            vec![], // no certificates
+        );
+
+        // Should NOT contain a BlockHeader broadcast (no proposal)
+        let has_block_header = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+
+        assert!(
+            !has_block_header,
+            "Should not propose empty block immediately after QC formation"
+        );
+    }
+
+    #[test]
+    fn test_qc_formed_proposes_when_has_deferrals() {
+        // When a QC forms and there IS content (e.g., deferrals), we SHOULD
+        // immediately propose to pipeline block production.
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+
+        // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 100_000,
+        };
+
+        // Create a deferral to include
+        use hyperscale_types::{DeferReason, TransactionDefer};
+        let deferral = TransactionDefer {
+            tx_hash: Hash::from_bytes(b"deferred_tx"),
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: Hash::from_bytes(b"winner_tx"),
+            },
+            block_height: BlockHeight(0), // Will be filled in when included
+        };
+
+        // Call on_qc_formed with a deferral
+        let actions = state.on_qc_formed(
+            qc.block_hash,
+            qc,
+            &[],            // empty mempool
+            vec![deferral], // has a deferral
+            vec![],         // no aborts
+            vec![],         // no certificates
+        );
+
+        // Should contain a BlockHeader broadcast (proposal triggered)
+        let has_block_header = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+
+        assert!(
+            has_block_header,
+            "Should propose immediately after QC formation when has deferrals"
         );
     }
 }
