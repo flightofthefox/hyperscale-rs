@@ -1475,6 +1475,10 @@ impl ProductionRunner {
                     "Block committed"
                 );
 
+                // Update sync manager's committed height - critical for correct sync behavior
+                // Without this, the sync manager would always try to sync from height 0
+                self.sync_manager.set_committed_height(height);
+
                 // Update RPC status with new block height and view
                 if let Some(ref rpc_status) = self.rpc_status {
                     let rpc_status = rpc_status.clone();
