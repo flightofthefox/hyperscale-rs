@@ -25,12 +25,13 @@ pub struct RateLimitConfig {
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            // Validators can request up to 100 blocks/sec with burst of 50
-            validator_requests_per_sec: 100,
-            validator_burst: 50,
-            // Unknown peers limited to 5 blocks/sec with burst of 10
-            unknown_peer_requests_per_sec: 5,
-            unknown_peer_burst: 10,
+            // Validators can request up to 1000 blocks/sec with burst of 200
+            // High limits allow fast sync catch-up without being a bottleneck
+            validator_requests_per_sec: 1000,
+            validator_burst: 200,
+            // Unknown peers limited to 10 blocks/sec with burst of 20
+            unknown_peer_requests_per_sec: 10,
+            unknown_peer_burst: 20,
             // Clean up peer state after 5 minutes of inactivity
             peer_ttl: Duration::from_secs(300),
         }
