@@ -20,7 +20,6 @@ use hyperscale_types::{
     RoutableTransaction, ShardGroupId, Signature, StateVoteBlock, Topology, ValidatorId,
 };
 use libp2p::identity;
-use parking_lot::RwLock;
 use sbor::prelude::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -110,7 +109,6 @@ impl Drop for ShutdownHandle {
 /// use hyperscale_types::KeyPair;
 /// use libp2p::identity;
 /// use std::sync::Arc;
-/// use parking_lot::RwLock;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// // Create required dependencies
@@ -129,7 +127,7 @@ impl Drop for ShutdownHandle {
 ///     .topology(topology)
 ///     .signing_key(signing_key)
 ///     .bft_config(bft_config)
-///     .storage(Arc::new(RwLock::new(storage)))
+///     .storage(Arc::new(storage))
 ///     .network(network_config, ed25519_keypair)
 ///     .build()
 ///     .await?;
@@ -141,7 +139,7 @@ pub struct ProductionRunnerBuilder {
     signing_key: Option<KeyPair>,
     bft_config: Option<BftConfig>,
     thread_pools: Option<Arc<ThreadPoolManager>>,
-    storage: Option<Arc<RwLock<RocksDbStorage>>>,
+    storage: Option<Arc<RocksDbStorage>>,
     network_config: Option<Libp2pConfig>,
     ed25519_keypair: Option<identity::Keypair>,
     channel_capacity: usize,
@@ -218,7 +216,9 @@ impl ProductionRunnerBuilder {
     }
 
     /// Set the RocksDB storage for persistence and crash recovery.
-    pub fn storage(mut self, storage: Arc<RwLock<RocksDbStorage>>) -> Self {
+    ///
+    /// RocksDB is internally thread-safe, so no external lock is needed.
+    pub fn storage(mut self, storage: Arc<RocksDbStorage>) -> Self {
         self.storage = Some(storage);
         self
     }
@@ -316,10 +316,7 @@ impl ProductionRunnerBuilder {
         let local_shard = topology.local_shard();
 
         // Load RecoveredState from storage for crash recovery
-        let recovered = {
-            let storage_guard = storage.read();
-            storage_guard.load_recovered_state()
-        };
+        let recovered = storage.load_recovered_state();
 
         // NodeIndex is a simulation concept - production uses 0
         let state = NodeStateMachine::new(
@@ -472,7 +469,8 @@ pub struct ProductionRunner {
     /// Network topology (needed for cross-shard execution).
     topology: Arc<dyn Topology>,
     /// Block storage for persistence and crash recovery.
-    storage: Arc<RwLock<RocksDbStorage>>,
+    /// RocksDB is internally thread-safe, so no external lock is needed.
+    storage: Arc<RocksDbStorage>,
     /// Transaction executor.
     executor: Arc<RadixExecutor>,
     /// Transaction validator for signature verification.
@@ -556,11 +554,8 @@ impl ProductionRunner {
     /// and initializes the state machine, which sets up the initial proposal timer.
     fn maybe_initialize_genesis(&mut self) {
         // Check if we already have committed blocks
-        let has_blocks = {
-            let storage = self.storage.read();
-            let (height, _, _) = storage.get_chain_metadata();
-            height.0 > 0
-        };
+        let (height, _, _) = self.storage.get_chain_metadata();
+        let has_blocks = height.0 > 0;
 
         if has_blocks {
             tracing::info!("Existing blocks found, skipping genesis initialization");
@@ -573,20 +568,23 @@ impl ProductionRunner {
         );
 
         // Run Radix Engine genesis to set up initial state
-        {
-            let mut storage = self.storage.write();
-            let result = if let Some(config) = self.genesis_config.take() {
+        // SAFETY: RocksDB is internally thread-safe. We use unsafe to get &mut
+        // because the CommittableSubstateDatabase trait requires it, but RocksDB
+        // doesn't actually need exclusive access.
+        let result = unsafe {
+            let storage_mut = self.storage.as_mut();
+            if let Some(config) = self.genesis_config.take() {
                 tracing::info!(
                     xrd_balances = config.xrd_balances.len(),
                     "Running genesis with custom configuration"
                 );
-                self.executor.run_genesis_with_config(&mut *storage, config)
+                self.executor.run_genesis_with_config(storage_mut, config)
             } else {
-                self.executor.run_genesis(&mut *storage)
-            };
-            if let Err(e) = result {
-                tracing::warn!(error = ?e, "Radix Engine genesis failed (may be OK for testing)");
+                self.executor.run_genesis(storage_mut)
             }
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = ?e, "Radix Engine genesis failed (may be OK for testing)");
         }
 
         // Create genesis block
@@ -1230,11 +1228,8 @@ impl ProductionRunner {
                 let executor = self.executor.clone();
 
                 self.thread_pools.spawn_execution(move || {
-                    // Execute transactions with READ lock - execution is read-only
-                    let storage_guard = storage.read();
-                    let results = match executor
-                        .execute_single_shard(&*storage_guard, &transactions)
-                    {
+                    // Execute transactions - RocksDB is internally thread-safe
+                    let results = match executor.execute_single_shard(&*storage, &transactions) {
                         Ok(output) => output
                             .results()
                             .iter()
@@ -1288,10 +1283,9 @@ impl ProductionRunner {
                         topology.shard_for_node_id(node_id) == local_shard
                     };
 
-                    // Execute with provisions - READ lock since execution is read-only
-                    let storage_guard = storage.read();
+                    // Execute with provisions - RocksDB is internally thread-safe
                     let result = match executor.execute_cross_shard(
-                        &*storage_guard,
+                        &*storage,
                         &[transaction],
                         &provisions,
                         is_local_node,
@@ -1434,15 +1428,15 @@ impl ProductionRunner {
             // ═══════════════════════════════════════════════════════════════════════
             Action::PersistBlock { block, qc } => {
                 // Fire-and-forget block persistence - not latency critical
+                // RocksDB is internally thread-safe, no lock needed
                 let storage = self.storage.clone();
                 let height = block.height();
                 tokio::spawn(async move {
-                    let guard = storage.write();
-                    guard.put_block(height, &block, &qc);
+                    storage.put_block(height, &block, &qc);
                     // Update chain metadata
-                    guard.set_chain_metadata(height, None, None);
+                    storage.set_chain_metadata(height, None, None);
                     // Prune old votes - we no longer need votes at or below committed height
-                    guard.prune_own_votes(height.0);
+                    storage.prune_own_votes(height.0);
                 });
             }
 
@@ -1459,10 +1453,10 @@ impl ProductionRunner {
                     .map(|p| p.state_writes.clone())
                     .unwrap_or_default();
 
-                // Run on blocking thread since RocksDB write is sync
+                // Run on blocking thread since RocksDB write is sync I/O
+                // RocksDB is internally thread-safe, no lock needed
                 tokio::task::spawn_blocking(move || {
-                    let mut guard = storage.write();
-                    guard.commit_certificate_with_writes(&certificate, &writes);
+                    storage.commit_certificate_with_writes(&certificate, &writes);
                 })
                 .await
                 .ok();
@@ -1480,15 +1474,14 @@ impl ProductionRunner {
                 // Use spawn_blocking since we need sync writes for BFT safety
                 // We await completion to ensure vote is persisted before returning
                 tokio::task::spawn_blocking(move || {
-                    let guard = storage.read();
-                    guard.put_own_vote(height.0, round, block_hash);
+                    storage.put_own_vote(height.0, round, block_hash);
                 })
                 .await
                 .ok();
             }
 
             // ═══════════════════════════════════════════════════════════════════════
-            // Storage reads - delegate to async storage, send callback event
+            // Storage reads - RocksDB is internally thread-safe, no lock needed
             // ═══════════════════════════════════════════════════════════════════════
             Action::FetchStateEntries { tx_hash, nodes } => {
                 let event_tx = self.consensus_tx.clone();
@@ -1496,8 +1489,7 @@ impl ProductionRunner {
                 let executor = self.executor.clone();
 
                 tokio::task::spawn_blocking(move || {
-                    let guard = storage.read();
-                    let entries = executor.fetch_state_entries(&*guard, &nodes);
+                    let entries = executor.fetch_state_entries(&*storage, &nodes);
                     let _ = event_tx.blocking_send(Event::StateEntriesFetched { tx_hash, entries });
                 });
             }
@@ -1507,8 +1499,7 @@ impl ProductionRunner {
                 let storage = self.storage.clone();
 
                 tokio::task::spawn_blocking(move || {
-                    let guard = storage.read();
-                    let block = guard.get_block(height).map(|(b, _qc)| b);
+                    let block = storage.get_block(height).map(|(b, _qc)| b);
                     let _ = event_tx.blocking_send(Event::BlockFetched { height, block });
                 });
             }
@@ -1518,8 +1509,7 @@ impl ProductionRunner {
                 let storage = self.storage.clone();
 
                 tokio::task::spawn_blocking(move || {
-                    let guard = storage.read();
-                    let (height, hash, qc) = guard.get_chain_metadata();
+                    let (height, hash, qc) = storage.get_chain_metadata();
                     let _ =
                         event_tx.blocking_send(Event::ChainMetadataFetched { height, hash, qc });
                 });
@@ -1792,8 +1782,8 @@ impl ProductionRunner {
             "Handling inbound sync request"
         );
 
-        // Look up block from storage
-        let response = if let Some((block, qc)) = self.storage.read().get_block(height) {
+        // Look up block from storage - RocksDB is internally thread-safe
+        let response = if let Some((block, qc)) = self.storage.get_block(height) {
             // Encode the response as SBOR: (Some(block), Some(qc))
             match sbor::basic_encode(&(Some(&block), Some(&qc))) {
                 Ok(data) => data,

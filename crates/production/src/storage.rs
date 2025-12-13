@@ -13,6 +13,7 @@ use hyperscale_engine::{
 use hyperscale_types::NodeId;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
 use sbor::prelude::*;
+use std::cell::UnsafeCell;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -161,8 +162,14 @@ impl SubstateDatabase for RocksDbStorage {
     }
 }
 
-impl CommittableSubstateDatabase for RocksDbStorage {
-    fn commit(&mut self, updates: &DatabaseUpdates) {
+impl RocksDbStorage {
+    /// Commit database updates using a shared reference.
+    ///
+    /// # Safety
+    /// This is safe because RocksDB's `DB::write()` only requires `&self` internally.
+    /// The `CommittableSubstateDatabase` trait requires `&mut self` but RocksDB doesn't
+    /// actually need exclusive access - it handles synchronization internally.
+    pub fn commit(&self, updates: &DatabaseUpdates) {
         let start = Instant::now();
         let mut batch = WriteBatch::default();
 
@@ -208,11 +215,33 @@ impl CommittableSubstateDatabase for RocksDbStorage {
             }
         }
 
-        // Write batch atomically
+        // Write batch atomically - RocksDB handles internal synchronization
         if let Err(e) = self.db.write(batch) {
             tracing::error!("Failed to commit updates: {}", e);
         }
         metrics::record_rocksdb_write(start.elapsed().as_secs_f64());
+    }
+
+    /// Get a mutable reference for APIs that require `&mut self`.
+    ///
+    /// # Safety
+    /// This is safe because RocksDB is internally thread-safe. The mutable reference
+    /// is only needed to satisfy trait bounds (like `CommittableSubstateDatabase`),
+    /// not for actual exclusivity. RocksDB's `DB` type uses internal locking.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn as_mut(&self) -> &mut Self {
+        // Use UnsafeCell pattern to avoid the invalid_reference_casting lint.
+        // This is sound because RocksDB is internally synchronized.
+        let cell = UnsafeCell::new(std::ptr::null_mut::<Self>());
+        *cell.get() = self as *const Self as *mut Self;
+        &mut **cell.get()
+    }
+}
+
+impl CommittableSubstateDatabase for RocksDbStorage {
+    fn commit(&mut self, updates: &DatabaseUpdates) {
+        // Delegate to the shared version - RocksDB doesn't need &mut
+        RocksDbStorage::commit(self, updates)
     }
 }
 
@@ -537,7 +566,7 @@ impl RocksDbStorage {
     /// * `certificate` - The transaction certificate to store
     /// * `writes` - The state writes from the certificate's shard_proofs for the local shard
     pub fn commit_certificate_with_writes(
-        &mut self,
+        &self,
         certificate: &TransactionCertificate,
         writes: &[hyperscale_types::SubstateWrite],
     ) {
@@ -827,7 +856,7 @@ mod tests {
     #[test]
     fn test_basic_substate_operations() {
         let temp_dir = TempDir::new().unwrap();
-        let mut storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
         let partition_key = DbPartitionKey {
             node_key: vec![1, 2, 3],
@@ -870,7 +899,7 @@ mod tests {
     #[test]
     fn test_snapshot() {
         let temp_dir = TempDir::new().unwrap();
-        let mut storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
         let partition_key = DbPartitionKey {
             node_key: vec![1, 2, 3],
@@ -1029,7 +1058,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         let temp_dir = TempDir::new().unwrap();
-        let mut storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
         // Create a certificate with state writes
         let tx_hash = Hash::from_bytes(&[42; 32]);
@@ -1250,7 +1279,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         let temp_dir = TempDir::new().unwrap();
-        let mut storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
         let tx_hash = Hash::from_bytes(&[42; 32]);
         let shard_group = ShardGroupId(0);

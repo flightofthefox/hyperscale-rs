@@ -57,7 +57,6 @@ use hyperscale_types::{
     KeyPair, KeyType, PublicKey, ShardGroupId, StaticTopology, ValidatorId, ValidatorInfo,
     ValidatorSet,
 };
-use parking_lot::RwLock;
 use radix_common::network::NetworkDefinition;
 use radix_common::prelude::AddressBech32Decoder;
 use serde::Deserialize;
@@ -883,7 +882,7 @@ async fn main() -> Result<()> {
     let db_path = config.node.data_dir.join("db");
     let storage = RocksDbStorage::open_with_config(&db_path, rocksdb_config)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
-    let storage = Arc::new(RwLock::new(storage));
+    let storage = Arc::new(storage);
     info!("Storage opened at {}", db_path.display());
 
     // Create transaction submission channel for RPC server

@@ -16,7 +16,6 @@ use hyperscale_production::{ProductionRunner, RocksDbStorage};
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId,
 };
-use parking_lot::RwLock;
 use radix_common::network::NetworkDefinition;
 use serial_test::serial;
 use std::sync::Arc;
@@ -291,7 +290,7 @@ async fn test_production_runner_with_network() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_db");
     let storage = RocksDbStorage::open(&db_path).unwrap();
-    let storage = Arc::new(RwLock::new(storage));
+    let storage = Arc::new(storage);
 
     let ed25519_keypair = identity::Keypair::generate_ed25519();
     let network_config = Libp2pConfig {
@@ -357,7 +356,7 @@ async fn test_graceful_shutdown() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_db");
     let storage = RocksDbStorage::open(&db_path).unwrap();
-    let storage = Arc::new(RwLock::new(storage));
+    let storage = Arc::new(storage);
 
     let ed25519_keypair = identity::Keypair::generate_ed25519();
     let network_config = Libp2pConfig {
