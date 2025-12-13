@@ -868,28 +868,22 @@ impl BftState {
             "Received block header"
         );
 
-        // Check if this header reveals we're significantly behind and need to sync.
+        // Check if this header reveals we're missing blocks and need to sync.
         // The parent_qc certifies block at height N-1 for a block at height N.
         //
-        // IMPORTANT: We use committed_height (not latest_qc.height) to determine if
-        // we need to sync. The reason is that latest_qc can be updated from:
-        // 1. Block headers we receive but can't process (we update latest_qc below)
-        // 2. View change certificates/votes
-        // In both cases, we may have a high latest_qc without actually having the
-        // blocks, which would prevent sync from being triggered.
+        // We check if we actually have the parent block (at parent_height) in any state:
+        // - committed (already persisted)
+        // - pending_blocks (received via consensus, may be waiting for transactions)
+        // - certified_blocks (has QC, waiting for 2-chain commit)
+        // - pending_synced_block_verifications (received via sync, verifying QC)
         //
-        // Using committed_height ensures we trigger sync when the incoming block
-        // references parents we haven't actually committed.
-        //
-        // The two-chain commit rule means we may receive blocks 1-2 heights ahead
-        // of our committed_height, but anything beyond that requires sync.
+        // Only trigger sync if we're genuinely missing the block, not just because
+        // commits are lagging behind due to the pipelined 2-chain commit rule.
         if !header.parent_qc.is_genesis() {
             let parent_height = header.parent_qc.height.0;
-            // Trigger sync if the parent QC references a height beyond what we've committed + 2.
-            // The +2 accounts for:
-            // - Block at committed_height + 1 is pending (waiting for QC to commit committed_height)
-            // - Block at committed_height + 2 can be proposed once we have the QC
-            if parent_height > self.committed_height + 2 {
+
+            // Check if we have the parent block in any form
+            if !self.has_block_at_height(parent_height) {
                 let target_height = parent_height;
                 let target_hash = header.parent_qc.block_hash;
 
@@ -898,7 +892,7 @@ impl BftState {
                     committed_height = self.committed_height,
                     parent_height = parent_height,
                     target_height = target_height,
-                    "Detected we're significantly behind, triggering sync"
+                    "Missing parent block, triggering sync"
                 );
 
                 return vec![Action::EnqueueInternal {
@@ -2856,6 +2850,50 @@ impl BftState {
         &self.voted_heights
     }
 
+    /// Check if we have a block at the given height in any state.
+    ///
+    /// Returns true if we have the block in:
+    /// - `pending_blocks` (received header, may be waiting for transactions)
+    /// - `certified_blocks` (has QC, waiting for commit)
+    /// - `pending_synced_block_verifications` (received via sync, verifying QC)
+    ///
+    /// This is used to determine if we need to sync for a block.
+    fn has_block_at_height(&self, height: u64) -> bool {
+        // Already committed
+        if height <= self.committed_height {
+            return true;
+        }
+
+        // In pending blocks (received via consensus)
+        if self
+            .pending_blocks
+            .values()
+            .any(|pb| pb.header().height.0 == height)
+        {
+            return true;
+        }
+
+        // In certified blocks (has QC, waiting for commit)
+        if self
+            .certified_blocks
+            .values()
+            .any(|(block, _)| block.header.height.0 == height)
+        {
+            return true;
+        }
+
+        // In pending synced block verifications
+        if self
+            .pending_synced_block_verifications
+            .values()
+            .any(|p| p.block.header.height.0 == height)
+        {
+            return true;
+        }
+
+        false
+    }
+
     /// Check if this node will propose at the next height.
     ///
     /// Returns true if:
@@ -3133,6 +3171,7 @@ mod tests {
 
     #[test]
     fn test_qc_signature_verification_delegates_to_runner() {
+        use crate::pending::PendingBlock;
         use hyperscale_core::Action;
         use hyperscale_types::SignerBitfield;
 
@@ -3159,8 +3198,21 @@ mod tests {
         // Set time for timestamp validation
         state.set_time(Duration::from_secs(100));
 
-        // Create a block at height 2 with a non-genesis parent QC
+        // Create parent block at height 1 (needed to avoid sync trigger)
         let parent_hash = Hash::from_bytes(b"parent_block");
+        let parent_header = BlockHeader {
+            height: BlockHeight(1),
+            parent_hash: Hash::ZERO,
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(1),
+            timestamp: 99_000,
+            round: 0,
+            is_fallback: false,
+        };
+        let parent_pending = PendingBlock::new(parent_header, vec![], vec![]);
+        state.pending_blocks.insert(parent_hash, parent_pending);
+
+        // Create a block at height 2 with a non-genesis parent QC
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -3207,6 +3259,7 @@ mod tests {
 
     #[test]
     fn test_qc_signature_verified_success_triggers_vote() {
+        use crate::pending::PendingBlock;
         use hyperscale_core::Action;
         use hyperscale_types::SignerBitfield;
 
@@ -3232,8 +3285,21 @@ mod tests {
 
         state.set_time(Duration::from_secs(100));
 
-        // Create block header with non-genesis QC
+        // Create parent block at height 1 (needed to avoid sync trigger)
         let parent_hash = Hash::from_bytes(b"parent_block");
+        let parent_header = BlockHeader {
+            height: BlockHeight(1),
+            parent_hash: Hash::ZERO,
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(1),
+            timestamp: 99_000,
+            round: 0,
+            is_fallback: false,
+        };
+        let parent_pending = PendingBlock::new(parent_header, vec![], vec![]);
+        state.pending_blocks.insert(parent_hash, parent_pending);
+
+        // Create block header with non-genesis QC
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -3285,6 +3351,7 @@ mod tests {
 
     #[test]
     fn test_qc_signature_verified_failure_rejects_block() {
+        use crate::pending::PendingBlock;
         use hyperscale_types::SignerBitfield;
 
         let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
@@ -3309,8 +3376,21 @@ mod tests {
 
         state.set_time(Duration::from_secs(100));
 
-        // Create block header
+        // Create parent block at height 1 (needed to avoid sync trigger)
         let parent_hash = Hash::from_bytes(b"parent_block");
+        let parent_header = BlockHeader {
+            height: BlockHeight(1),
+            parent_hash: Hash::ZERO,
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(1),
+            timestamp: 99_000,
+            round: 0,
+            is_fallback: false,
+        };
+        let parent_pending = PendingBlock::new(parent_header, vec![], vec![]);
+        state.pending_blocks.insert(parent_hash, parent_pending);
+
+        // Create block header
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
