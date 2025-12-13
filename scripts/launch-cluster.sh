@@ -6,8 +6,8 @@
 #   ./scripts/launch-cluster.sh [--shards N] [--validators-per-shard M] [--clean]
 #
 # Examples:
-#   ./scripts/launch-cluster.sh                    # 2 shards, 3 validators each (default)
-#   ./scripts/launch-cluster.sh --shards 4         # 4 shards, 3 validators each
+#   ./scripts/launch-cluster.sh                    # 2 shards, 4 validators each (default)
+#   ./scripts/launch-cluster.sh --shards 4         # 4 shards, 4 validators each
 #   ./scripts/launch-cluster.sh --clean            # Clean data directories first
 #
 # This script:
@@ -21,7 +21,7 @@ set -e
 
 # Default configuration
 NUM_SHARDS=2
-VALIDATORS_PER_SHARD=3
+VALIDATORS_PER_SHARD=4  # Minimum 4 required for BFT (3 validators can't tolerate any delays)
 BASE_PORT=9000          # libp2p port
 BASE_RPC_PORT=8080      # HTTP RPC port
 DATA_DIR="./cluster-data"
@@ -57,7 +57,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --shards N               Number of shards (default: 2)"
-            echo "  --validators-per-shard M Validators per shard (default: 3)"
+            echo "  --validators-per-shard M Validators per shard (default: 4, minimum: 4)"
             echo "  --accounts-per-shard N   Spammer accounts per shard (default: 100)"
             echo "  --initial-balance N      Initial XRD balance per account (default: 1000000)"
             echo "  --clean                  Remove existing data directories"
@@ -71,6 +71,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 TOTAL_VALIDATORS=$((NUM_SHARDS * VALIDATORS_PER_SHARD))
+
+# Validate minimum validators per shard
+if [ "$VALIDATORS_PER_SHARD" -lt 4 ]; then
+    echo "ERROR: Minimum 4 validators per shard required for BFT consensus."
+    echo "       With 3 validators, timing delays can cause permanent stalls."
+    echo "       Use --validators-per-shard 4 or higher."
+    exit 1
+fi
 
 echo "=== Hyperscale Local Cluster ==="
 echo "Shards: $NUM_SHARDS"
