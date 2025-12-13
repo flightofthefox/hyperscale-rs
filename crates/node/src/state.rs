@@ -710,11 +710,11 @@ impl StateMachine for NodeStateMachine {
             // ═══════════════════════════════════════════════════════════════════════
             // Transaction Fetch Protocol
             // ═══════════════════════════════════════════════════════════════════════
-            Event::TransactionFetchTimer { block_hash } => {
+            Event::TransactionTimer { block_hash } => {
                 return self.bft.on_transaction_fetch_timer(*block_hash);
             }
 
-            Event::TransactionFetchNeeded {
+            Event::TransactionNeeded {
                 block_hash,
                 proposer,
                 missing_tx_hashes,
@@ -728,9 +728,9 @@ impl StateMachine for NodeStateMachine {
                     "Transaction fetch needed - runner should request from peer"
                 );
                 // Return the event as-is in an action for the runner to handle.
-                // The runner will make the network request and deliver TransactionFetchReceived.
+                // The runner will make the network request and deliver TransactionReceived.
                 return vec![Action::EnqueueInternal {
-                    event: Event::TransactionFetchNeeded {
+                    event: Event::TransactionNeeded {
                         block_hash: *block_hash,
                         proposer: *proposer,
                         missing_tx_hashes: missing_tx_hashes.clone(),
@@ -738,7 +738,7 @@ impl StateMachine for NodeStateMachine {
                 }];
             }
 
-            Event::TransactionFetchReceived {
+            Event::TransactionReceived {
                 block_hash,
                 transactions,
             } => {

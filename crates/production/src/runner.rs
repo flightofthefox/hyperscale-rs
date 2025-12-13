@@ -715,10 +715,10 @@ impl ProductionRunner {
                                 continue;
                             }
 
-                            // Check for TransactionFetchNeeded - handle specially
+                            // Check for TransactionNeeded - handle specially
                             // The runner handles this directly (network fetch), not the state machine.
                             // If we passed it to state.handle(), it would re-enqueue itself infinitely.
-                            if let Event::TransactionFetchNeeded {
+                            if let Event::TransactionNeeded {
                                 block_hash,
                                 proposer,
                                 missing_tx_hashes,
@@ -1903,10 +1903,10 @@ impl ProductionRunner {
         }
     }
 
-    /// Handle a TransactionFetchNeeded event - fetch missing transactions from the proposer.
+    /// Handle a TransactionNeeded event - fetch missing transactions from the proposer.
     ///
     /// Makes an outbound request to the proposer to get the missing transactions,
-    /// then delivers them to the state machine via TransactionFetchReceived.
+    /// then delivers them to the state machine via TransactionReceived.
     async fn handle_transaction_fetch_needed(
         &self,
         block_hash: Hash,
@@ -1951,13 +1951,13 @@ impl ProductionRunner {
 
                         if tx_count > 0 {
                             // Send to state machine
-                            let event = Event::TransactionFetchReceived {
+                            let event = Event::TransactionReceived {
                                 block_hash,
                                 transactions: response.into_transactions(),
                             };
 
                             if let Err(e) = self.consensus_tx.send(event).await {
-                                tracing::error!(error = ?e, "Failed to send TransactionFetchReceived event");
+                                tracing::error!(error = ?e, "Failed to send TransactionReceived event");
                             }
                         }
                     }

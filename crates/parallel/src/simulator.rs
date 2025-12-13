@@ -231,9 +231,7 @@ impl SimNode {
                 TimerId::ViewChange => Event::ViewChangeTimer,
                 TimerId::Cleanup => Event::CleanupTimer,
                 TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
-                TimerId::TransactionFetch { block_hash } => {
-                    Event::TransactionFetchTimer { block_hash }
-                }
+                TimerId::TransactionFetch { block_hash } => Event::TransactionTimer { block_hash },
             };
             self.internal_queue.push_back(event);
         }

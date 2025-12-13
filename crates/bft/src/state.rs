@@ -2269,7 +2269,7 @@ impl BftState {
 
     /// Handle transaction fetch timer expiry.
     ///
-    /// If the pending block is still incomplete, emit TransactionFetchNeeded
+    /// If the pending block is still incomplete, emit TransactionNeeded
     /// so the runner can request the missing transactions from a peer.
     pub fn on_transaction_fetch_timer(&mut self, block_hash: Hash) -> Vec<Action> {
         let Some(pending) = self.pending_blocks.get(&block_hash) else {
@@ -2299,7 +2299,7 @@ impl BftState {
         );
 
         vec![Action::EnqueueInternal {
-            event: Event::TransactionFetchNeeded {
+            event: Event::TransactionNeeded {
                 block_hash,
                 proposer,
                 missing_tx_hashes: missing,

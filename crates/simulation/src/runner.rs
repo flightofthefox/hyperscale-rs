@@ -598,8 +598,8 @@ impl SimulationRunner {
                     None
                 };
 
-                // TransactionFetchNeeded: the runner fetches transactions from peers
-                let tx_fetch_info = if let Event::TransactionFetchNeeded {
+                // TransactionNeeded: the runner fetches transactions from peers
+                let tx_fetch_info = if let Event::TransactionNeeded {
                     block_hash,
                     proposer,
                     missing_tx_hashes,
@@ -611,7 +611,7 @@ impl SimulationRunner {
                 };
 
                 // Schedule the event so the state machine knows about it
-                // (Skip TransactionFetchNeeded as we handle it directly)
+                // (Skip TransactionNeeded as we handle it directly)
                 if tx_fetch_info.is_none() {
                     self.schedule_event(from, self.now, event);
                 }
@@ -1263,7 +1263,7 @@ impl SimulationRunner {
         );
 
         // Deliver the transactions to the requesting node
-        let event = Event::TransactionFetchReceived {
+        let event = Event::TransactionReceived {
             block_hash,
             transactions: found_transactions,
         };
@@ -1341,7 +1341,7 @@ impl SimulationRunner {
             TimerId::ViewChange => Event::ViewChangeTimer,
             TimerId::Cleanup => Event::CleanupTimer,
             TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
-            TimerId::TransactionFetch { block_hash } => Event::TransactionFetchTimer { block_hash },
+            TimerId::TransactionFetch { block_hash } => Event::TransactionTimer { block_hash },
         }
     }
 
