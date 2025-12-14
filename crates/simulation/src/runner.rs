@@ -563,6 +563,14 @@ impl SimulationRunner {
             }
         }
 
+        // Always advance time to end_time, even if we ran out of events.
+        // This ensures callers can rely on runner.now() advancing to the requested time,
+        // preventing infinite loops in polling patterns like:
+        //   while runner.now() < deadline { runner.run_until(runner.now() + step); }
+        if self.now < end_time {
+            self.now = end_time;
+        }
+
         trace!(
             events_processed = self.stats.events_processed,
             actions_generated = self.stats.actions_generated,

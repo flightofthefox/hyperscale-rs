@@ -590,10 +590,9 @@ fn test_e2e_cross_shard_transaction() {
     println!("Cross-shard transaction: {:?}", tx_hash);
 
     // Submit cross-shard transaction
-    let submit_time = runner.now();
     runner.schedule_initial_event(
         0,
-        submit_time,
+        Duration::ZERO,
         Event::SubmitTransaction {
             tx: Arc::new(cross_shard_tx),
         },

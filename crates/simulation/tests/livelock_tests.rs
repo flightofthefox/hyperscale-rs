@@ -181,15 +181,14 @@ fn test_two_shard_cycle_detection() {
     };
 
     // Submit both transactions nearly simultaneously to create cycle potential
-    let submit_time = runner.now();
     runner.schedule_initial_event(
         0,
-        submit_time,
+        Duration::ZERO,
         Event::SubmitTransaction { tx: Arc::new(tx_a) },
     );
     runner.schedule_initial_event(
         3,
-        submit_time + Duration::from_millis(5),
+        Duration::from_millis(5),
         Event::SubmitTransaction { tx: Arc::new(tx_b) },
     );
 
@@ -364,10 +363,9 @@ fn test_retry_completion_after_winner() {
 
     println!("Cross-shard transaction: {:?}", tx_hash);
 
-    let submit_time = runner.now();
     runner.schedule_initial_event(
         0,
-        submit_time,
+        Duration::ZERO,
         Event::SubmitTransaction { tx: Arc::new(tx) },
     );
 
@@ -644,15 +642,14 @@ fn test_resolves_livelocks_in_under_x_seconds() {
     println!("  Expected winner (lower hash): {}\n", winner_label);
 
     // Submit both transactions simultaneously to maximize cycle potential
-    let submit_time = runner.now();
     runner.schedule_initial_event(
         0,
-        submit_time,
+        Duration::ZERO,
         Event::SubmitTransaction { tx: Arc::new(tx_a) },
     );
     runner.schedule_initial_event(
         3,
-        submit_time + Duration::from_millis(1), // Near-simultaneous
+        Duration::from_millis(1), // Near-simultaneous
         Event::SubmitTransaction { tx: Arc::new(tx_b) },
     );
 
@@ -907,10 +904,9 @@ fn test_timeout_abort_mechanism() {
 
     println!("Submitting cross-shard transaction: {:?}", tx_hash);
 
-    let submit_time = runner.now();
     runner.schedule_initial_event(
         0,
-        submit_time,
+        Duration::ZERO,
         Event::SubmitTransaction { tx: Arc::new(tx) },
     );
 

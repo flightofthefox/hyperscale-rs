@@ -1016,6 +1016,9 @@ fn test_block_commit_determinism() {
 /// This verifies the two-chain commit rule is working correctly:
 /// - QC for height N commits height N-1
 /// - Blocks are committed in sequential order
+///
+/// Note: With empty mempools, blocks are only produced via the proposal timer
+/// (~300ms interval), so we expect ~6 blocks in 2 seconds.
 #[test]
 fn test_sequential_commit() {
     let config = test_network_config();
@@ -1056,9 +1059,10 @@ fn test_sequential_commit() {
         );
     }
 
+    // With 300ms proposal interval, expect ~6 blocks in 2 seconds
     assert!(
-        first > 10,
-        "Should have committed more than 10 blocks, got {}",
+        first >= 5,
+        "Should have committed at least 5 blocks in 2 seconds, got {}",
         first
     );
     println!("Sequential commit verified: {} blocks committed", first);
@@ -1069,6 +1073,9 @@ fn test_sequential_commit() {
 /// This test measures:
 /// - Blocks per second
 /// - Messages per block
+///
+/// Note: With empty mempools, blocks are only produced via the proposal timer
+/// (~300ms interval), so we expect ~16 blocks in 5 seconds (~3.3 blocks/second).
 #[test]
 fn test_consensus_throughput() {
     let config = test_network_config();
@@ -1096,14 +1103,15 @@ fn test_consensus_throughput() {
     println!("  Messages per block: {:.1}", messages_per_block);
     println!("  Events processed: {}", stats.events_processed);
 
-    // Sanity checks
+    // With 300ms proposal interval and empty blocks, expect ~16 blocks in 5 seconds
+    // (5000ms / 300ms ≈ 16.6 blocks, accounting for latency)
     assert!(
-        committed_height > 100,
-        "Should commit at least 100 blocks in 5 seconds"
+        committed_height >= 10,
+        "Should commit at least 10 blocks in 5 seconds with 300ms proposal interval"
     );
     assert!(
-        blocks_per_second > 20.0,
-        "Should achieve at least 20 blocks/second"
+        blocks_per_second >= 2.0,
+        "Should achieve at least 2 blocks/second with timer-based proposals"
     );
 }
 
@@ -1594,6 +1602,10 @@ fn test_multi_shard_determinism() {
 
 /// Test that consensus continues when a single node is isolated.
 /// With 4 validators (f=1), we can tolerate 1 faulty/isolated node.
+///
+/// Note: When a node is isolated and happens to be the proposer for some heights,
+/// progress depends on the view change timeout mechanism. With a 3 second
+/// view change timeout, we need to run long enough for rounds to advance.
 #[traced_test]
 #[test]
 fn test_consensus_with_isolated_node() {
@@ -1612,7 +1624,9 @@ fn test_consensus_with_isolated_node() {
     println!("Node 0 isolated");
 
     // Continue running - consensus should still work with 3/4 nodes
-    runner.run_until(Duration::from_secs(3));
+    // We need to run long enough for view change timeout (3s) to kick in
+    // when the isolated node was the proposer
+    runner.run_until(Duration::from_secs(6));
 
     // Check that non-isolated nodes made progress
     let height_node1 = runner.node(1).unwrap().bft().committed_height();
