@@ -41,7 +41,7 @@ use hyperscale_types::{
 };
 use radix_common::network::NetworkDefinition;
 use radix_engine::transaction::{execute_transaction, ExecutionConfig, TransactionReceipt};
-use radix_engine::vm::VmModules;
+use radix_engine::vm::DefaultVmModules;
 use radix_transactions::validation::TransactionValidator;
 use std::sync::Arc;
 
@@ -73,14 +73,25 @@ use std::sync::Arc;
 /// - **Production**: Spawns executor methods on rayon thread pool (async callbacks)
 pub struct RadixExecutor {
     network: NetworkDefinition,
+    /// Cached VM modules to avoid recreating per transaction
+    vm_modules: DefaultVmModules,
+    /// Cached execution config
+    exec_config: ExecutionConfig,
 }
 
 impl RadixExecutor {
     /// Create a new executor for the given network.
     ///
     /// The executor does not own storage - storage is passed to each method.
+    /// VM modules and execution config are cached to avoid per-transaction overhead.
     pub fn new(network: NetworkDefinition) -> Self {
-        Self { network }
+        let vm_modules = DefaultVmModules::default();
+        let exec_config = ExecutionConfig::for_notarized_transaction(network.clone());
+        Self {
+            network,
+            vm_modules,
+            exec_config,
+        }
     }
 
     /// Run genesis bootstrapping on the given storage.
@@ -198,11 +209,13 @@ impl RadixExecutor {
             .map_err(|e| ExecutionError::Preparation(format!("Validation failed: {:?}", e)))?;
         let executable = validated.create_executable();
 
-        let vm_modules = VmModules::default();
-        let exec_config = ExecutionConfig::for_notarized_transaction(self.network.clone());
-
-        let receipt =
-            execute_transaction(snapshot.as_ref(), &vm_modules, &exec_config, &executable);
+        // Use cached vm_modules and exec_config
+        let receipt = execute_transaction(
+            snapshot.as_ref(),
+            &self.vm_modules,
+            &self.exec_config,
+            &executable,
+        );
 
         let result = self.receipt_to_result(tx.hash(), &receipt);
 
@@ -322,8 +335,7 @@ impl RadixExecutor {
 
 impl Clone for RadixExecutor {
     fn clone(&self) -> Self {
-        Self {
-            network: self.network.clone(),
-        }
+        // Create fresh cached instances for the clone
+        Self::new(self.network.clone())
     }
 }
