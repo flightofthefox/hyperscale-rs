@@ -184,6 +184,12 @@ pub struct BftState {
     /// This handles out-of-order commit events caused by parallel signature verification.
     pending_commits: std::collections::BTreeMap<u64, (Hash, QuorumCertificate)>,
 
+    /// Commits waiting for block data (transactions/certificates) to arrive.
+    /// Maps block_hash -> (height, QC).
+    /// When BlockReadyToCommit fires but the block isn't complete yet (still fetching
+    /// transactions), we buffer the commit here and retry when the data arrives.
+    pending_commits_awaiting_data: HashMap<Hash, (u64, QuorumCertificate)>,
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Configuration
     // ═══════════════════════════════════════════════════════════════════════════
@@ -259,6 +265,7 @@ impl BftState {
             pending_qc_verifications: HashMap::new(),
             pending_synced_block_verifications: HashMap::new(),
             pending_commits: std::collections::BTreeMap::new(),
+            pending_commits_awaiting_data: HashMap::new(),
             config,
             now: Duration::ZERO,
         }
@@ -1915,7 +1922,25 @@ impl BftState {
         };
 
         let Some(block) = block else {
-            warn!("Block {} not found for commit", block_hash);
+            // Block not yet constructed - check if it's pending (waiting for transactions/certificates)
+            if let Some(pending) = self.pending_blocks.get(&block_hash) {
+                let height = pending.header().height.0;
+                // Only buffer if not already committed
+                if height > self.committed_height {
+                    debug!(
+                        validator = ?self.validator_id(),
+                        block_hash = ?block_hash,
+                        height = height,
+                        missing_txs = pending.missing_transaction_count(),
+                        missing_certs = pending.missing_certificate_count(),
+                        "Block not yet complete, buffering commit until data arrives"
+                    );
+                    self.pending_commits_awaiting_data
+                        .insert(block_hash, (height, qc));
+                }
+            } else {
+                warn!("Block {} not found for commit", block_hash);
+            }
             return vec![];
         };
 
@@ -1946,6 +1971,25 @@ impl BftState {
 
         // Commit this block and any buffered subsequent blocks
         self.commit_block_and_buffered(block_hash, qc)
+    }
+
+    /// Check if a block that just became complete has a pending commit waiting for it.
+    ///
+    /// When `BlockReadyToCommit` fires but the block data (transactions/certificates) hasn't
+    /// arrived yet, we buffer the commit in `pending_commits_awaiting_data`. This method
+    /// checks that buffer and retries the commit now that the block is complete.
+    fn try_commit_pending_data(&mut self, block_hash: Hash) -> Vec<Action> {
+        if let Some((height, qc)) = self.pending_commits_awaiting_data.remove(&block_hash) {
+            info!(
+                validator = ?self.validator_id(),
+                block_hash = ?block_hash,
+                height = height,
+                "Retrying commit after block data arrived"
+            );
+            self.on_block_ready_to_commit(block_hash, qc)
+        } else {
+            vec![]
+        }
     }
 
     /// Commit a block and any buffered subsequent blocks that are now ready.
@@ -2576,7 +2620,12 @@ impl BftState {
         );
 
         // Trigger QC verification (for non-genesis) or vote directly (for genesis)
-        self.trigger_qc_verification_or_vote(block_hash)
+        let mut actions = self.trigger_qc_verification_or_vote(block_hash);
+
+        // Check if this block had a pending commit waiting for data
+        actions.extend(self.try_commit_pending_data(block_hash));
+
+        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2730,7 +2779,12 @@ impl BftState {
         );
 
         // Trigger QC verification (for non-genesis) or vote directly (for genesis)
-        self.trigger_qc_verification_or_vote(block_hash)
+        let mut actions = self.trigger_qc_verification_or_vote(block_hash);
+
+        // Check if this block had a pending commit waiting for data
+        actions.extend(self.try_commit_pending_data(block_hash));
+
+        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2785,6 +2839,9 @@ impl BftState {
                     // transactions arrive late. Previously this called try_vote_on_block directly,
                     // which skipped QC verification - a safety bug.
                     actions.extend(self.trigger_qc_verification_or_vote(block_hash));
+
+                    // Check if this block had a pending commit waiting for data
+                    actions.extend(self.try_commit_pending_data(block_hash));
                 }
             }
         }
@@ -2841,6 +2898,9 @@ impl BftState {
                     // certificates arrive late. Previously this called try_vote_on_block directly,
                     // which skipped QC verification - a safety bug.
                     actions.extend(self.trigger_qc_verification_or_vote(block_hash));
+
+                    // Check if this block had a pending commit waiting for data
+                    actions.extend(self.try_commit_pending_data(block_hash));
                 }
             }
         }
@@ -2902,6 +2962,10 @@ impl BftState {
         // Remove certified blocks at or below committed height
         self.certified_blocks
             .retain(|_, (block, _)| block.header.height.0 > committed_height);
+
+        // Remove pending commits awaiting data at or below committed height
+        self.pending_commits_awaiting_data
+            .retain(|_, (height, _)| *height > committed_height);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
