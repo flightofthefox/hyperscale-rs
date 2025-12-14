@@ -91,6 +91,12 @@ pub struct MempoolState {
     /// Maps: tx_hash -> block_height when tombstoned (for cleanup)
     tombstones: HashMap<Hash, BlockHeight>,
 
+    /// Cached set of locked nodes (incrementally maintained).
+    /// A node is locked if any transaction that declares it is in Committed or Executed status.
+    /// This avoids O(n) scan on every ready_transactions() call.
+    /// Note: Only one transaction can lock a node at a time (enforced by ready_transactions filtering).
+    locked_nodes_cache: HashSet<NodeId>,
+
     /// Current time.
     now: Duration,
 
@@ -112,6 +118,7 @@ impl MempoolState {
             pending_retries: HashMap::new(),
             completed_winners: HashMap::new(),
             tombstones: HashMap::new(),
+            locked_nodes_cache: HashSet::new(),
             now: Duration::ZERO,
             topology,
             current_height: BlockHeight(0),
@@ -217,6 +224,17 @@ impl MempoolState {
     /// - Aborted (explicitly aborted)
     /// - Retried (replaced by a new transaction)
     fn evict_terminal(&mut self, tx_hash: Hash) {
+        // Remove locked nodes if this transaction was holding locks
+        let tx_to_unlock = self.pool.get(&tx_hash).and_then(|entry| {
+            if entry.status.holds_state_lock() {
+                Some(Arc::clone(&entry.tx))
+            } else {
+                None
+            }
+        });
+        if let Some(tx) = tx_to_unlock {
+            self.remove_locked_nodes(&tx);
+        }
         self.pool.remove(&tx_hash);
         self.tombstones.insert(tx_hash, self.current_height);
     }
@@ -579,6 +597,19 @@ impl MempoolState {
     #[deprecated(note = "Use on_block_committed_full instead")]
     pub fn on_block_committed(&mut self, tx_hashes: &[Hash], height: BlockHeight) {
         for hash in tx_hashes {
+            // Check if we need to add locked nodes (clone tx first to avoid borrow issues)
+            let should_add_locks = self
+                .pool
+                .get(hash)
+                .is_some_and(|entry| !entry.status.holds_state_lock());
+            let tx_clone = self.pool.get(hash).map(|e| Arc::clone(&e.tx));
+
+            if should_add_locks {
+                if let Some(tx) = tx_clone {
+                    self.add_locked_nodes(&tx);
+                }
+            }
+
             if let Some(entry) = self.pool.get_mut(hash) {
                 entry.status = TransactionStatus::Committed(height);
             }
@@ -710,6 +741,22 @@ impl MempoolState {
                     to = %new_status,
                     "Transaction status transition"
                 );
+
+                // Update locked nodes cache based on status transition
+                let was_holding = entry.status.holds_state_lock();
+                let will_hold = new_status.holds_state_lock();
+                let tx = Arc::clone(&entry.tx);
+
+                if !was_holding && will_hold {
+                    // Acquiring lock
+                    self.add_locked_nodes(&tx);
+                } else if was_holding && !will_hold {
+                    // Releasing lock (shouldn't happen - locks held until terminal)
+                    self.remove_locked_nodes(&tx);
+                }
+
+                // Re-borrow entry after calling helper methods
+                let entry = self.pool.get_mut(tx_hash).unwrap();
                 entry.status = new_status.clone();
                 return vec![Action::EmitTransactionStatus {
                     tx_hash: *tx_hash,
@@ -740,21 +787,27 @@ impl MempoolState {
         vec![]
     }
 
-    /// Get all NodeIds that are currently locked by in-flight transactions.
-    ///
-    /// A node is locked if any transaction that declares it (read or write)
-    /// is in a lock-holding state (Committed or Executed).
-    fn locked_nodes(&self) -> HashSet<NodeId> {
-        self.pool
-            .values()
-            .filter(|e| e.status.holds_state_lock())
-            .flat_map(|e| e.tx.all_declared_nodes().cloned())
-            .collect()
+    /// Add a transaction's nodes to the locked set.
+    /// Called when a transaction transitions TO a lock-holding state (Committed/Executed).
+    fn add_locked_nodes(&mut self, tx: &RoutableTransaction) {
+        for node in tx.all_declared_nodes() {
+            self.locked_nodes_cache.insert(*node);
+        }
+    }
+
+    /// Remove a transaction's nodes from the locked set.
+    /// Called when a transaction transitions FROM a lock-holding state (evicted).
+    fn remove_locked_nodes(&mut self, tx: &RoutableTransaction) {
+        for node in tx.all_declared_nodes() {
+            self.locked_nodes_cache.remove(node);
+        }
     }
 
     /// Check if a transaction conflicts with any locked nodes.
-    fn conflicts_with_locked(&self, tx: &RoutableTransaction, locked: &HashSet<NodeId>) -> bool {
-        tx.all_declared_nodes().any(|node| locked.contains(node))
+    /// Uses the cached locked_nodes_cache for O(k) lookup where k = nodes in tx.
+    fn conflicts_with_locked(&self, tx: &RoutableTransaction) -> bool {
+        tx.all_declared_nodes()
+            .any(|node| self.locked_nodes_cache.contains(node))
     }
 
     /// Get transactions ready for inclusion in a block.
@@ -767,17 +820,13 @@ impl MempoolState {
     /// The hash-ordering ensures different shards are more likely to pick
     /// the same transactions, reducing cycle formation in cross-shard execution.
     pub fn ready_transactions(&self, max_count: usize) -> Vec<Arc<RoutableTransaction>> {
-        // Get all nodes currently locked by in-flight transactions
-        // TODO: Cache locked_nodes() to avoid O(n) scan on every call
-        let locked = self.locked_nodes();
-
-        // Collect pending transactions that don't conflict
-        // TODO: Use partial sort / bounded heap to avoid sorting all txs
+        // Collect pending transactions that don't conflict with locked nodes
+        // Uses cached locked_nodes_cache for O(1) lookup per node
         let mut ready: Vec<_> = self
             .pool
             .values()
             .filter(|e| e.status == TransactionStatus::Pending)
-            .filter(|e| !self.conflicts_with_locked(&e.tx, &locked))
+            .filter(|e| !self.conflicts_with_locked(&e.tx))
             .map(|e| Arc::clone(&e.tx))
             .collect();
 
@@ -799,8 +848,7 @@ impl MempoolState {
     /// - `committed_count`: Number of transactions in Committed status
     /// - `executed_count`: Number of transactions in Executed status
     pub fn lock_contention_stats(&self) -> LockContentionStats {
-        let locked = self.locked_nodes();
-        let locked_nodes = locked.len() as u64;
+        let locked_nodes = self.locked_nodes_cache.len() as u64;
         let blocked_count = self.blocked_by.len() as u64;
 
         // Single pass over pool to count transactions by status
@@ -809,7 +857,7 @@ impl MempoolState {
                 (0u64, 0u64, 0u64, 0u64),
                 |(pending, pending_blocked, committed, executed), e| match &e.status {
                     TransactionStatus::Pending => {
-                        let is_blocked = self.conflicts_with_locked(&e.tx, &locked);
+                        let is_blocked = self.conflicts_with_locked(&e.tx);
                         (
                             pending + 1,
                             pending_blocked + is_blocked as u64,
