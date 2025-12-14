@@ -886,7 +886,8 @@ async fn main() -> Result<()> {
     info!("Storage opened at {}", db_path.display());
 
     // Create transaction submission channel for RPC server
-    let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel(1000);
+    // Sized to match runner's channel_capacity (10,000) to avoid backpressure
+    let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel(10_000);
 
     // Create transaction validator for signature verification
     let tx_validator = Arc::new(hyperscale_engine::TransactionValidation::new(
