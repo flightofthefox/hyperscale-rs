@@ -2,9 +2,14 @@
 //!
 //! Provides infrastructure for measuring end-to-end transaction latency by
 //! tracking submitted transactions and polling for their completion status.
+//!
+//! When a transaction is retried (e.g., due to conflicts), this tracker follows
+//! the retry chain to the final transaction, measuring latency from the original
+//! submission time to the final completion.
 
 use crate::client::RpcClient;
 use hdrhistogram::Histogram;
+use hyperscale_types::TransactionStatus;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,6 +43,8 @@ pub struct LatencyStats {
     pub failed: u64,
     /// Number of transactions that timed out (still in-flight at end).
     pub timed_out: u64,
+    /// Number of retries followed (transactions that were retried).
+    pub retries: u64,
 }
 
 impl LatencyTracker {
@@ -85,8 +92,36 @@ impl LatencyTracker {
                     let client = &clients[client_idx % clients.len()];
 
                     match client.get_transaction_status(&tx_hash).await {
-                        Ok(status) => {
-                            if status.is_terminal() {
+                        Ok(status_response) => {
+                            // Try to convert to typed status for better handling
+                            let typed_status = status_response.to_status();
+
+                            // Check if this is a retry - follow the new transaction hash
+                            if let Some(TransactionStatus::Retried { new_tx }) = typed_status {
+                                // Remove old hash, add new hash with same submit time
+                                // This preserves the original submit time for accurate latency
+                                let new_hash = format!("{}", new_tx);
+                                {
+                                    let mut guard = in_flight.lock().await;
+                                    guard.remove(&tx_hash);
+                                    guard.insert(new_hash.clone(), (submit_time, client_idx));
+                                }
+
+                                // Count the retry
+                                {
+                                    let mut s = stats.lock().await;
+                                    s.retries += 1;
+                                }
+
+                                debug!(
+                                    old_hash = %tx_hash,
+                                    new_hash = %new_hash,
+                                    "Following retried transaction"
+                                );
+                                continue;
+                            }
+
+                            if status_response.is_terminal() {
                                 let latency = submit_time.elapsed();
                                 let latency_us = latency.as_micros() as u64;
 
@@ -102,7 +137,7 @@ impl LatencyTracker {
                                 // Update stats
                                 {
                                     let mut s = stats.lock().await;
-                                    if status.is_success() {
+                                    if status_response.is_success() {
                                         s.completed += 1;
                                     } else {
                                         s.failed += 1;
@@ -112,7 +147,7 @@ impl LatencyTracker {
                                 debug!(
                                     tx_hash = %tx_hash,
                                     latency_ms = latency.as_millis(),
-                                    status = %status.status,
+                                    status = %status_response.status,
                                     "Transaction completed"
                                 );
                             }
@@ -247,6 +282,11 @@ impl LatencyReport {
         self.stats.timed_out
     }
 
+    /// Number of retries followed.
+    pub fn retries(&self) -> u64 {
+        self.stats.retries
+    }
+
     /// Check if we have any latency measurements.
     pub fn has_measurements(&self) -> bool {
         !self.histogram.is_empty()
@@ -259,6 +299,7 @@ impl LatencyReport {
         println!("Completed: {}", self.stats.completed);
         println!("Failed:    {}", self.stats.failed);
         println!("Timed out: {}", self.stats.timed_out);
+        println!("Retries:   {}", self.stats.retries);
 
         if self.has_measurements() {
             println!();

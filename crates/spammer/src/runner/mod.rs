@@ -119,7 +119,7 @@ impl Spammer {
 
         // Calculate transactions per shard per batch (distribute equally)
         let num_shards = self.config.num_shards as usize;
-        let txs_per_shard = (self.config.batch_size + num_shards - 1) / num_shards;
+        let txs_per_shard = self.config.batch_size.div_ceil(num_shards);
 
         info!(
             target_tps = self.config.target_tps,

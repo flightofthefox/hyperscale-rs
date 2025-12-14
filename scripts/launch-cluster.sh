@@ -21,13 +21,13 @@ set -e
 
 # Default configuration
 NUM_SHARDS=2
-VALIDATORS_PER_SHARD=4  # Minimum 4 required for BFT (3 validators can't tolerate any delays)
-BASE_PORT=9000          # libp2p port
-BASE_RPC_PORT=8080      # HTTP RPC port
+VALIDATORS_PER_SHARD=4      # Minimum 4 required for BFT (3 validators can't tolerate any delays)
+BASE_PORT=9000              # libp2p port
+BASE_RPC_PORT=8080          # HTTP RPC port
 DATA_DIR="./cluster-data"
 CLEAN=false
-ACCOUNTS_PER_SHARD=100  # Spammer accounts per shard
-INITIAL_BALANCE=1000000 # Initial XRD balance per account
+ACCOUNTS_PER_SHARD=10000    # Spammer accounts per shard
+INITIAL_BALANCE=1000000     # Initial XRD balance per account
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -136,13 +136,20 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     echo "  Validator $i: public_key=${PUBLIC_KEYS[$i]:0:16}..."
 done
 
-# Generate genesis balances for spammer accounts
+# Generate genesis balances for spammer accounts (per-shard)
+# Each validator only needs balances for accounts on its shard to avoid
+# memory issues with large account counts.
 echo "Generating genesis balances for spammer accounts..."
-GENESIS_BALANCES=$("$SPAMMER_BIN" genesis \
-    --num-shards "$NUM_SHARDS" \
-    --accounts-per-shard "$ACCOUNTS_PER_SHARD" \
-    --balance "$INITIAL_BALANCE")
-echo "  Generated balances for $((NUM_SHARDS * ACCOUNTS_PER_SHARD)) accounts"
+declare -a SHARD_GENESIS_BALANCES
+for shard in $(seq 0 $((NUM_SHARDS - 1))); do
+    SHARD_GENESIS_BALANCES[$shard]=$("$SPAMMER_BIN" genesis \
+        --num-shards "$NUM_SHARDS" \
+        --accounts-per-shard "$ACCOUNTS_PER_SHARD" \
+        --balance "$INITIAL_BALANCE" \
+        --shard "$shard")
+    echo "  Shard $shard: $ACCOUNTS_PER_SHARD accounts"
+done
+echo "  Generated balances for $((NUM_SHARDS * ACCOUNTS_PER_SHARD)) accounts total"
 
 # Calculate bootstrap peer addresses
 # First validator of each shard will be bootstrap peers
@@ -231,7 +238,7 @@ enabled = false
 
 $GENESIS_VALIDATORS
 
-$GENESIS_BALANCES
+${SHARD_GENESIS_BALANCES[$shard]}
 EOF
 
     echo "  Created config for validator $i (shard $shard, p2p port $p2p_port, rpc port $rpc_port)"
@@ -307,6 +314,7 @@ sleep 3
 "$SPAMMER_BIN" smoke-test \
     --endpoints "$SPAMMER_ENDPOINTS" \
     --num-shards "$NUM_SHARDS" \
+    --validators-per-shard "$VALIDATORS_PER_SHARD" \
     --accounts-per-shard "$ACCOUNTS_PER_SHARD" \
     --wait-ready \
     --timeout 60s \

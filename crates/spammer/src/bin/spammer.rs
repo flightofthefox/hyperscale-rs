@@ -6,10 +6,9 @@ use clap::{Parser, Subcommand};
 use hyperscale_spammer::accounts::{AccountPool, SelectionMode};
 use hyperscale_spammer::client::RpcClient;
 use hyperscale_spammer::config::SpammerConfig;
-use hyperscale_spammer::genesis::generate_genesis_toml;
+use hyperscale_spammer::genesis::{generate_genesis_toml, generate_genesis_toml_for_shard};
 use hyperscale_spammer::runner::Spammer;
-use hyperscale_spammer::workloads::{TransferWorkload, WorkloadGenerator};
-use hyperscale_types::shard_for_node;
+use hyperscale_spammer::workloads::TransferWorkload;
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
@@ -28,6 +27,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Generate genesis configuration with funded accounts
+    ///
+    /// By default, generates balances for ALL accounts across all shards.
+    /// Use --shard to generate balances only for accounts on a specific shard,
+    /// which is required when running with large numbers of accounts per shard.
     Genesis {
         /// Number of shards
         #[arg(long, default_value = "2")]
@@ -40,6 +43,11 @@ enum Commands {
         /// Initial balance per account
         #[arg(long, default_value = "1000000")]
         balance: u64,
+
+        /// Generate balances only for accounts on this specific shard.
+        /// If not specified, generates balances for all accounts across all shards.
+        #[arg(long)]
+        shard: Option<u64>,
     },
 
     /// Run transaction spammer against network endpoints
@@ -128,6 +136,10 @@ enum Commands {
         #[arg(long, default_value = "2")]
         num_shards: u64,
 
+        /// Number of validators per shard (for load distribution)
+        #[arg(long, default_value = "1")]
+        validators_per_shard: usize,
+
         /// Accounts per shard (must match genesis configuration)
         #[arg(long, default_value = "100")]
         accounts_per_shard: usize,
@@ -171,10 +183,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             num_shards,
             accounts_per_shard,
             balance,
+            shard,
         } => {
             // Don't initialize tracing for genesis - output goes to stdout
-            let toml =
-                generate_genesis_toml(num_shards, accounts_per_shard, Decimal::from(balance))?;
+            let toml = if let Some(shard_id) = shard {
+                generate_genesis_toml_for_shard(
+                    num_shards,
+                    accounts_per_shard,
+                    Decimal::from(balance),
+                    shard_id,
+                )?
+            } else {
+                generate_genesis_toml(num_shards, accounts_per_shard, Decimal::from(balance))?
+            };
             print!("{}", toml);
         }
 
@@ -243,6 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::SmokeTest {
             endpoints,
             num_shards,
+            validators_per_shard,
             accounts_per_shard,
             timeout,
             poll_interval,
@@ -254,6 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("=== Smoke Test ===");
             println!("Endpoints: {:?}", endpoints);
             println!("Shards: {}", num_shards);
+            println!("Validators per shard: {}", validators_per_shard);
 
             // Create RPC clients
             let clients: Vec<RpcClient> = endpoints
@@ -301,7 +324,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("Warning: failed to load nonces: {}", e),
             }
 
-            // Create a simple same-shard transfer
+            // Create a simple same-shard transfer targeting shard 0
+            // Using a specific shard ensures we know exactly which validators to submit to
             let workload =
                 TransferWorkload::new(NetworkDefinition::simulator()).with_cross_shard_ratio(0.0); // Same-shard for simplicity
 
@@ -311,18 +335,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap()
                 .as_nanos() as u64;
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+            // Generate a transaction specifically for shard 0
+            let target_shard: usize = 0;
             let tx = workload
-                .generate_one(&accounts, &mut rng)
-                .expect("Failed to generate transaction");
+                .generate_for_shard(
+                    &accounts,
+                    hyperscale_types::ShardGroupId(target_shard as u64),
+                    &mut rng,
+                )
+                .expect("Failed to generate transaction for shard 0");
 
-            // Determine which shard to submit to
-            let target_shard = if let Some(first_write) = tx.declared_writes.first() {
-                shard_for_node(first_write, num_shards).0 as usize
-            } else {
-                0
-            };
-
-            let client_idx = target_shard % clients.len();
+            // Calculate client index: endpoints are organized as shard0_v0, shard0_v1, ..., shard1_v0, ...
+            // So for shard N, the validators are at indices [N*validators_per_shard .. (N+1)*validators_per_shard)
+            let base_idx = target_shard * validators_per_shard;
+            let client_idx = base_idx % clients.len();
             let client = &clients[client_idx];
 
             // Submit the transaction
