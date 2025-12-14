@@ -78,6 +78,13 @@ pub struct MempoolState {
     /// Maps: loser_tx_hash -> (winner_tx_hash, cert_height)
     pending_retries: HashMap<Hash, (Hash, BlockHeight)>,
 
+    /// Completed winners whose certificates have been committed.
+    /// Used to handle the race condition where a deferral arrives after
+    /// the winner has already completed. When a deferral references a
+    /// winner in this set, we immediately create the retry.
+    /// Maps: winner_tx_hash -> cert_height
+    completed_winners: HashMap<Hash, BlockHeight>,
+
     /// Current time.
     now: Duration,
 
@@ -97,6 +104,7 @@ impl MempoolState {
             blocked_losers_by_winner: HashMap::new(),
             pending_deferrals: HashMap::new(),
             pending_retries: HashMap::new(),
+            completed_winners: HashMap::new(),
             now: Duration::ZERO,
             topology,
             current_height: BlockHeight(0),
@@ -295,6 +303,37 @@ impl MempoolState {
     ) -> Vec<Action> {
         let DeferReason::LivelockCycle { winner_tx_hash } = reason;
 
+        // Check if the winner has already completed - if so, create retry immediately.
+        // This handles the race condition where the deferral arrives after the winner
+        // has already been executed and its certificate committed.
+        if let Some(&cert_height) = self.completed_winners.get(winner_tx_hash) {
+            if let Some(entry) = self.pool.get(&tx_hash) {
+                // Loser is in pool and winner already completed - create retry immediately
+                tracing::info!(
+                    tx_hash = %tx_hash,
+                    winner = %winner_tx_hash,
+                    "Deferral arrived after winner completed - creating retry immediately"
+                );
+                let loser_tx = Arc::clone(&entry.tx);
+                return self.create_retry_for_transaction(
+                    loser_tx,
+                    tx_hash,
+                    *winner_tx_hash,
+                    cert_height,
+                );
+            } else {
+                // Loser not in pool yet but winner already completed - store for later retry
+                tracing::debug!(
+                    tx_hash = %tx_hash,
+                    winner = %winner_tx_hash,
+                    "Deferral arrived after winner completed, loser not in pool - storing for later retry"
+                );
+                self.pending_retries
+                    .insert(tx_hash, (*winner_tx_hash, cert_height));
+                return vec![];
+            }
+        }
+
         // Get the transaction and update its status
         if let Some(entry) = self.pool.get_mut(&tx_hash) {
             // Update status to Blocked
@@ -369,6 +408,9 @@ impl MempoolState {
             // Evict from pool - terminal state, no longer needed in state machine
             self.pool.remove(&tx_hash);
         }
+
+        // Track this winner as completed so late-arriving deferrals can create retries immediately
+        self.completed_winners.insert(tx_hash, height);
 
         // Check if any blocked TXs were waiting for this winner using reverse index (O(1) lookup)
         let loser_hashes = self
