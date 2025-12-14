@@ -862,8 +862,8 @@ impl ProductionRunner {
                                 }
                             }
 
-                            // Try to collect more verifications from queued consensus events
-                            // This drains any immediately available events to maximize batch size
+                            // Try to collect more verifications from queued consensus events.
+                            // First drain any immediately available events.
                             while let Ok(more_event) = self.consensus_rx.try_recv() {
                                 // Update time for each event
                                 let now = self.start_time.elapsed();
@@ -883,6 +883,49 @@ impl ProductionRunner {
                                             if let Err(e) = self.process_action(other).await {
                                                 tracing::error!(error = ?e, "Error processing action");
                                             }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // If we have pending verifications, wait briefly for more to arrive.
+                            // This allows votes that arrive close together to be batched,
+                            // improving verification throughput (batch BLS verification is faster).
+                            // The 5ms delay is small relative to the ~300ms block interval.
+                            if !pending.is_empty() {
+                                let batch_deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+                                loop {
+                                    match tokio::time::timeout_at(batch_deadline, self.consensus_rx.recv()).await {
+                                        Ok(Some(more_event)) => {
+                                            // Update time for each event
+                                            let now = self.start_time.elapsed();
+                                            self.state.set_time(now);
+
+                                            let more_actions = self.state.handle(more_event);
+
+                                            for action in more_actions {
+                                                match action {
+                                                    Action::VerifyVoteSignature { vote, public_key, signing_message } => {
+                                                        pending.block_votes.push((vote, public_key, signing_message));
+                                                    }
+                                                    Action::VerifyStateVoteSignature { vote, public_key } => {
+                                                        pending.state_votes.push((vote, public_key));
+                                                    }
+                                                    other => {
+                                                        if let Err(e) = self.process_action(other).await {
+                                                            tracing::error!(error = ?e, "Error processing action");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ok(None) => {
+                                            // Channel closed
+                                            break;
+                                        }
+                                        Err(_) => {
+                                            // Timeout reached, proceed with current batch
+                                            break;
                                         }
                                     }
                                 }
