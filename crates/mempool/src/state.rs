@@ -85,6 +85,11 @@ pub struct MempoolState {
     /// Maps: winner_tx_hash -> cert_height
     completed_winners: HashMap<Hash, BlockHeight>,
 
+    /// Tombstones for transactions that have reached terminal states.
+    /// Prevents re-adding completed/aborted/retried transactions via gossip.
+    /// Maps: tx_hash -> block_height when tombstoned (for cleanup)
+    tombstones: HashMap<Hash, BlockHeight>,
+
     /// Current time.
     now: Duration,
 
@@ -105,6 +110,7 @@ impl MempoolState {
             pending_deferrals: HashMap::new(),
             pending_retries: HashMap::new(),
             completed_winners: HashMap::new(),
+            tombstones: HashMap::new(),
             now: Duration::ZERO,
             topology,
             current_height: BlockHeight(0),
@@ -122,6 +128,12 @@ impl MempoolState {
                 tx_hash: hash,
                 status: TransactionStatus::Pending, // Already exists
             }];
+        }
+
+        // Reject if tombstoned (already completed/aborted/retried)
+        if self.is_tombstoned(&hash) {
+            tracing::debug!(tx_hash = ?hash, "Rejecting tombstoned transaction submission");
+            return vec![];
         }
 
         self.pool.insert(
@@ -153,8 +165,8 @@ impl MempoolState {
     pub fn on_transaction_gossip_arc(&mut self, tx: Arc<RoutableTransaction>) -> Vec<Action> {
         let hash = tx.hash();
 
-        // Ignore if already have it
-        if self.pool.contains_key(&hash) {
+        // Ignore if already have it or if tombstoned (completed/aborted/retried)
+        if self.pool.contains_key(&hash) || self.is_tombstoned(&hash) {
             return vec![];
         }
 
@@ -194,6 +206,23 @@ impl MempoolState {
                 message: OutboundMessage::TransactionGossip(Box::new(gossip.clone())),
             })
             .collect()
+    }
+
+    /// Evict a transaction that has reached a terminal state.
+    ///
+    /// This removes the transaction from the pool and adds it to the tombstone set
+    /// to prevent it from being re-added via gossip. Terminal states include:
+    /// - Completed (certificate committed)
+    /// - Aborted (explicitly aborted)
+    /// - Retried (replaced by a new transaction)
+    fn evict_terminal(&mut self, tx_hash: Hash) {
+        self.pool.remove(&tx_hash);
+        self.tombstones.insert(tx_hash, self.current_height);
+    }
+
+    /// Check if a transaction hash is tombstoned (reached terminal state).
+    pub fn is_tombstoned(&self, tx_hash: &Hash) -> bool {
+        self.tombstones.contains_key(tx_hash)
     }
 
     /// Process a committed block - update statuses and trigger retries.
@@ -282,8 +311,8 @@ impl MempoolState {
                     tx_hash: abort.tx_hash,
                     status,
                 });
-                // Evict from pool - terminal state, no longer needed in state machine
-                self.pool.remove(&abort.tx_hash);
+                // Evict from pool and tombstone - terminal state
+                self.evict_terminal(abort.tx_hash);
             }
         }
 
@@ -405,8 +434,8 @@ impl MempoolState {
                 tx_hash,
                 status: TransactionStatus::Completed(decision),
             });
-            // Evict from pool - terminal state, no longer needed in state machine
-            self.pool.remove(&tx_hash);
+            // Evict from pool and tombstone - terminal state
+            self.evict_terminal(tx_hash);
         }
 
         // Track this winner as completed so late-arriving deferrals can create retries immediately
@@ -439,12 +468,12 @@ impl MempoolState {
                         tx_hash: loser_hash,
                         status: TransactionStatus::Retried { new_tx: retry_hash },
                     });
-                    // Evict from pool - terminal state, no longer needed in state machine
-                    self.pool.remove(&loser_hash);
+                    // Evict from pool and tombstone - terminal state
+                    self.evict_terminal(loser_hash);
                 }
 
                 // Add retry to mempool if not already present (dedup by hash)
-                if !self.pool.contains_key(&retry_hash) {
+                if !self.pool.contains_key(&retry_hash) && !self.is_tombstoned(&retry_hash) {
                     let retry_tx = Arc::new(retry_tx);
                     self.pool.insert(
                         retry_hash,
@@ -516,12 +545,12 @@ impl MempoolState {
                 tx_hash: loser_hash,
                 status: TransactionStatus::Retried { new_tx: retry_hash },
             });
-            // Evict from pool - terminal state, no longer needed in state machine
-            self.pool.remove(&loser_hash);
+            // Evict from pool and tombstone - terminal state
+            self.evict_terminal(loser_hash);
         }
 
         // Add retry to mempool if not already present (dedup by hash)
-        if !self.pool.contains_key(&retry_hash) {
+        if !self.pool.contains_key(&retry_hash) && !self.is_tombstoned(&retry_hash) {
             let retry_tx = Arc::new(retry_tx);
             self.pool.insert(
                 retry_hash,
@@ -609,12 +638,12 @@ impl MempoolState {
                     tx_hash: loser_hash,
                     status: TransactionStatus::Retried { new_tx: retry_hash },
                 });
-                // Evict from pool - terminal state, no longer needed in state machine
-                self.pool.remove(&loser_hash);
+                // Evict from pool and tombstone - terminal state
+                self.evict_terminal(loser_hash);
             }
 
             // Add retry to mempool if not already present (dedup by hash)
-            if !self.pool.contains_key(&retry_hash) {
+            if !self.pool.contains_key(&retry_hash) && !self.is_tombstoned(&retry_hash) {
                 let retry_tx = Arc::new(retry_tx);
                 self.pool.insert(
                     retry_hash,
@@ -644,8 +673,8 @@ impl MempoolState {
     /// This is a terminal state - the transaction is evicted from mempool.
     pub fn mark_completed(&mut self, tx_hash: &Hash, decision: TransactionDecision) -> Vec<Action> {
         if self.pool.contains_key(tx_hash) {
-            // Evict from pool - terminal state, no longer needed in state machine
-            self.pool.remove(tx_hash);
+            // Evict from pool and tombstone - terminal state
+            self.evict_terminal(*tx_hash);
             return vec![Action::EmitTransactionStatus {
                 tx_hash: *tx_hash,
                 status: TransactionStatus::Completed(decision),
@@ -930,6 +959,39 @@ impl MempoolState {
         }
 
         aborts
+    }
+
+    /// Clean up old tombstones and completed winners to prevent unbounded memory growth.
+    ///
+    /// Tombstones are kept for `retention_blocks` after creation to ensure gossip
+    /// propagation has completed. After that, they can be safely removed since any
+    /// late-arriving gossip for a very old transaction is likely stale anyway.
+    ///
+    /// # Parameters
+    /// - `current_height`: The current block height
+    /// - `retention_blocks`: Number of blocks to retain tombstones after creation
+    ///
+    /// # Returns
+    /// Number of tombstones cleaned up
+    pub fn cleanup_old_tombstones(
+        &mut self,
+        current_height: BlockHeight,
+        retention_blocks: u64,
+    ) -> usize {
+        let cutoff = current_height.0.saturating_sub(retention_blocks);
+        let before_count = self.tombstones.len();
+
+        self.tombstones.retain(|_, height| height.0 > cutoff);
+
+        // Also clean up completed_winners using the same retention policy
+        self.completed_winners.retain(|_, height| height.0 > cutoff);
+
+        before_count - self.tombstones.len()
+    }
+
+    /// Get the number of tombstones currently tracked.
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.len()
     }
 }
 
@@ -1516,5 +1578,242 @@ mod tests {
             mempool.status(&tx_a_hash).is_none(),
             "TX_A should be evicted after retry created"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Tombstone Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_completed_transaction_is_tombstoned() {
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+
+        // Submit and commit the transaction
+        mempool.on_submit_transaction(tx.clone());
+        let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
+        mempool.on_block_committed_full(&commit_block);
+
+        // Commit the certificate
+        let cert = make_test_certificate(tx_hash);
+        let cert_block = make_test_block(2, vec![], vec![], vec![cert], vec![]);
+        mempool.on_block_committed_full(&cert_block);
+
+        // Transaction should be tombstoned
+        assert!(mempool.is_tombstoned(&tx_hash));
+        assert!(mempool.status(&tx_hash).is_none());
+    }
+
+    #[test]
+    fn test_tombstoned_transaction_rejected_on_gossip() {
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+
+        // Submit and complete the transaction
+        mempool.on_submit_transaction(tx.clone());
+        let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![], vec![]);
+        mempool.on_block_committed_full(&commit_block);
+
+        let cert = make_test_certificate(tx_hash);
+        let cert_block = make_test_block(2, vec![], vec![], vec![cert], vec![]);
+        mempool.on_block_committed_full(&cert_block);
+
+        // Verify it's tombstoned
+        assert!(mempool.is_tombstoned(&tx_hash));
+
+        // Try to re-add via gossip - should be rejected
+        let actions = mempool.on_transaction_gossip(tx.clone());
+        assert!(actions.is_empty(), "Tombstoned tx should be rejected");
+
+        // Should still not be in pool
+        assert!(mempool.status(&tx_hash).is_none());
+    }
+
+    #[test]
+    fn test_tombstoned_transaction_rejected_on_submit() {
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+
+        // Submit and complete the transaction
+        mempool.on_submit_transaction(tx.clone());
+        let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![], vec![]);
+        mempool.on_block_committed_full(&commit_block);
+
+        let cert = make_test_certificate(tx_hash);
+        let cert_block = make_test_block(2, vec![], vec![], vec![cert], vec![]);
+        mempool.on_block_committed_full(&cert_block);
+
+        // Try to re-submit - should be rejected (no status emitted)
+        let actions = mempool.on_submit_transaction(tx.clone());
+        assert!(actions.is_empty(), "Tombstoned tx should be rejected");
+
+        // Should still not be in pool
+        assert!(mempool.status(&tx_hash).is_none());
+    }
+
+    #[test]
+    fn test_aborted_transaction_is_tombstoned() {
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+
+        // Submit and commit the transaction
+        mempool.on_submit_transaction(tx.clone());
+
+        // Abort the transaction
+        let abort = TransactionAbort {
+            tx_hash,
+            reason: AbortReason::ExecutionTimeout {
+                committed_at: BlockHeight(1),
+            },
+            block_height: BlockHeight(2),
+        };
+        let abort_block = make_test_block(2, vec![], vec![], vec![], vec![abort]);
+        mempool.on_block_committed_full(&abort_block);
+
+        // Transaction should be tombstoned
+        assert!(mempool.is_tombstoned(&tx_hash));
+
+        // Try to re-add via gossip - should be rejected
+        let actions = mempool.on_transaction_gossip(tx);
+        assert!(actions.is_empty(), "Aborted tx should be rejected");
+    }
+
+    #[test]
+    fn test_retried_transaction_is_tombstoned() {
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        let loser = test_transaction(1);
+        let loser_hash = loser.hash();
+        let winner = test_transaction(2);
+        let winner_hash = winner.hash();
+
+        // Submit both transactions
+        mempool.on_submit_transaction(loser.clone());
+        mempool.on_submit_transaction(winner.clone());
+
+        // Commit both
+        let commit_block = make_test_block(
+            1,
+            vec![loser.clone(), winner.clone()],
+            vec![],
+            vec![],
+            vec![],
+        );
+        mempool.on_block_committed_full(&commit_block);
+
+        // Defer the loser
+        let deferral = TransactionDefer {
+            tx_hash: loser_hash,
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: winner_hash,
+            },
+            block_height: BlockHeight(2),
+        };
+        let defer_block = make_test_block(2, vec![], vec![deferral], vec![], vec![]);
+        mempool.on_block_committed_full(&defer_block);
+
+        // Complete the winner - this creates a retry for the loser
+        let cert = make_test_certificate(winner_hash);
+        let cert_block = make_test_block(3, vec![], vec![], vec![cert], vec![]);
+        mempool.on_block_committed_full(&cert_block);
+
+        // Original loser should be tombstoned
+        assert!(mempool.is_tombstoned(&loser_hash));
+
+        // Try to re-add via gossip - should be rejected
+        let actions = mempool.on_transaction_gossip(loser);
+        assert!(actions.is_empty(), "Retried tx should be rejected");
+    }
+
+    #[test]
+    fn test_tombstone_cleanup() {
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        // Create and complete several transactions at different heights
+        for i in 1..=5 {
+            let tx = test_transaction(i);
+            let tx_hash = tx.hash();
+
+            mempool.on_submit_transaction(tx.clone());
+            let commit_block = make_test_block(i as u64, vec![tx], vec![], vec![], vec![]);
+            mempool.on_block_committed_full(&commit_block);
+
+            let cert = make_test_certificate(tx_hash);
+            let cert_block = make_test_block(i as u64 + 100, vec![], vec![], vec![cert], vec![]);
+            mempool.on_block_committed_full(&cert_block);
+        }
+
+        // Should have 5 tombstones
+        assert_eq!(mempool.tombstone_count(), 5);
+
+        // Cleanup with short retention - should remove some
+        let cleaned = mempool.cleanup_old_tombstones(BlockHeight(110), 5);
+        assert!(cleaned > 0, "Should have cleaned up some tombstones");
+
+        // Cleanup with long retention - should remove all remaining
+        let _cleaned = mempool.cleanup_old_tombstones(BlockHeight(200), 5);
+        assert_eq!(mempool.tombstone_count(), 0);
+    }
+
+    #[test]
+    fn test_tombstone_prevents_resurrection_during_sync() {
+        // Scenario: During sync, we receive blocks in rapid succession.
+        // A transaction completes in block N, but gossip from block N-1
+        // arrives afterwards trying to re-add it.
+
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+
+        // Commit the transaction
+        mempool.on_submit_transaction(tx.clone());
+        let commit_block = make_test_block(10, vec![tx.clone()], vec![], vec![], vec![]);
+        mempool.on_block_committed_full(&commit_block);
+
+        // Complete the transaction
+        let cert = make_test_certificate(tx_hash);
+        let cert_block = make_test_block(11, vec![], vec![], vec![cert], vec![]);
+        mempool.on_block_committed_full(&cert_block);
+
+        // Pool should be empty
+        assert_eq!(mempool.len(), 0);
+
+        // Simulate late-arriving gossip
+        let _actions = mempool.on_transaction_gossip(tx);
+
+        // Pool should still be empty - tombstone prevented resurrection
+        assert_eq!(mempool.len(), 0);
+        assert!(mempool.is_tombstoned(&tx_hash));
+    }
+
+    #[test]
+    fn test_mark_completed_creates_tombstone() {
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+
+        // Submit the transaction
+        mempool.on_submit_transaction(tx.clone());
+
+        // Mark as completed directly
+        mempool.mark_completed(&tx_hash, TransactionDecision::Accept);
+
+        // Should be tombstoned
+        assert!(mempool.is_tombstoned(&tx_hash));
+        assert!(mempool.status(&tx_hash).is_none());
+
+        // Should reject gossip
+        let actions = mempool.on_transaction_gossip(tx);
+        assert!(actions.is_empty());
     }
 }

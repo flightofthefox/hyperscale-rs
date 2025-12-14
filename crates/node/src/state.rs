@@ -5,7 +5,7 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, SubStateMach
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::MempoolState;
-use hyperscale_types::{Block, KeyPair, ShardGroupId, Topology};
+use hyperscale_types::{Block, BlockHeight, KeyPair, ShardGroupId, Topology};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -164,7 +164,13 @@ impl NodeStateMachine {
         // meaning the network has progressed but we're stuck.
         actions.extend(self.bft.check_sync_health());
 
-        // TODO: Clean up other stale state (mempool, execution, etc.)
+        // Clean up old tombstones in mempool to prevent unbounded memory growth.
+        // Retain tombstones for 1000 blocks (plenty of time for gossip propagation).
+        const TOMBSTONE_RETENTION_BLOCKS: u64 = 1000;
+        let current_height = BlockHeight(self.bft.committed_height());
+        self.mempool
+            .cleanup_old_tombstones(current_height, TOMBSTONE_RETENTION_BLOCKS);
+
         actions
     }
 
