@@ -1812,13 +1812,30 @@ impl ProductionRunner {
                     }
                 }
 
-                // Process BLS state votes individually
-                for (vote, pk, msg) in bls_votes {
-                    let valid = pk.verify(&msg, &vote.signature);
-                    if !valid {
-                        crate::metrics::record_signature_verification_failure();
+                // Process BLS state votes using batch verification
+                // This is faster than individual verification when batch size > 2
+                if !bls_votes.is_empty() {
+                    let messages: Vec<&[u8]> =
+                        bls_votes.iter().map(|(_, _, m)| m.as_slice()).collect();
+                    let signatures: Vec<Signature> = bls_votes
+                        .iter()
+                        .map(|(v, _, _)| v.signature.clone())
+                        .collect();
+                    let pubkeys: Vec<PublicKey> =
+                        bls_votes.iter().map(|(_, pk, _)| pk.clone()).collect();
+
+                    let results = PublicKey::batch_verify_bls_different_messages(
+                        &messages,
+                        &signatures,
+                        &pubkeys,
+                    );
+
+                    for ((vote, _, _), valid) in bls_votes.into_iter().zip(results) {
+                        if !valid {
+                            crate::metrics::record_signature_verification_failure();
+                        }
+                        let _ = event_tx.send(Event::StateVoteSignatureVerified { vote, valid });
                     }
-                    let _ = event_tx.send(Event::StateVoteSignatureVerified { vote, valid });
                 }
             }
 
