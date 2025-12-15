@@ -302,12 +302,28 @@ impl MempoolState {
             }
         }
 
-        // Note: We do NOT update transaction status to Committed here.
-        // Status updates flow through TransactionStatusChanged events from the
-        // execution state machine, which ensures proper ordering when early
-        // votes/provisions are replayed.
+        // 1. Update transaction status to Committed and add locks.
+        // This must happen synchronously to prevent the same transactions from being
+        // re-proposed before the status update is processed. The execution state machine
+        // also emits TransactionStatusChanged events, but those go through an async channel
+        // that may not be processed before the next proposal.
+        for tx in &block.transactions {
+            let hash = tx.hash();
+            if let Some(entry) = self.pool.get_mut(&hash) {
+                // Only update if still Pending (avoid overwriting later states during sync)
+                if matches!(entry.status, TransactionStatus::Pending) {
+                    entry.status = TransactionStatus::Committed(height);
+                    // Add locks for committed transactions
+                    self.add_locked_nodes(tx);
+                    actions.push(Action::EmitTransactionStatus {
+                        tx_hash: hash,
+                        status: TransactionStatus::Committed(height),
+                    });
+                }
+            }
+        }
 
-        // 1. Process deferrals - update status to Blocked
+        // 2. Process deferrals - update status to Blocked
         for deferral in &block.deferred {
             actions.extend(self.on_deferral_committed(deferral.tx_hash, &deferral.reason, height));
         }

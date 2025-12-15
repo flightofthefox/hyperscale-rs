@@ -34,8 +34,7 @@ use hyperscale_messages::{StateCertificateGossip, StateProvisionGossip, StateVot
 use hyperscale_types::{
     BlockHeight, ExecutionResult, Hash, KeyPair, NodeId, PublicKey, RoutableTransaction,
     ShardGroupId, Signature, SignerBitfield, StateCertificate, StateEntry, StateProvision,
-    StateVoteBlock, Topology, TransactionCertificate, TransactionDecision, TransactionStatus,
-    ValidatorId,
+    StateVoteBlock, Topology, TransactionCertificate, TransactionDecision, ValidatorId,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -256,17 +255,6 @@ impl ExecutionState {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Status Change Helpers
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Emit a status change event for the mempool.
-    fn emit_status_change(&self, tx_hash: Hash, status: TransactionStatus) -> Action {
-        Action::EnqueueInternal {
-            event: Event::TransactionStatusChanged { tx_hash, status },
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
     // Block Commit Handling
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -357,11 +345,6 @@ impl ExecutionState {
             "Starting single-shard execution with voting"
         );
 
-        // Emit status change: Pending → Committed
-        actions.push(
-            self.emit_status_change(tx_hash, TransactionStatus::Committed(BlockHeight(_height))),
-        );
-
         // Step 1: Start tracking votes (same as cross-shard)
         let quorum = self.quorum_threshold();
         let vote_tracker = VoteTracker::new(
@@ -429,11 +412,6 @@ impl ExecutionState {
             shard = local_shard.0,
             participating = ?participating_shards,
             "Starting cross-shard execution"
-        );
-
-        // Emit status change: Pending → Committed
-        actions.push(
-            self.emit_status_change(tx_hash, TransactionStatus::Committed(BlockHeight(height))),
         );
 
         // Phase 1: Initiate provision broadcast (async - fetches state first)
