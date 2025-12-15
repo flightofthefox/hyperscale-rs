@@ -81,12 +81,17 @@ pub mod sync_error;
 pub mod telemetry;
 mod thread_pools;
 mod timers;
+mod validation_batcher;
 
 pub use fetch::{FetchConfig, FetchKind, FetchManager, FetchStatus};
 pub use sync::{SyncConfig, SyncManager};
 pub use sync_error::SyncResponseError;
 pub use telemetry::{init_telemetry, TelemetryConfig, TelemetryError, TelemetryGuard};
 pub use timers::TimerManager;
+pub use validation_batcher::{
+    spawn_tx_validation_batcher, ValidationBatcherConfig, ValidationBatcherHandle,
+    ValidationBatcherStats,
+};
 
 pub use network::Libp2pConfig;
 pub use runner::{ProductionRunner, RunnerError, ShutdownHandle};

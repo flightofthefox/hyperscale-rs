@@ -37,6 +37,22 @@ fn test_thread_pools() -> Arc<ThreadPoolManager> {
     Arc::new(ThreadPoolManager::new(ThreadPoolConfig::minimal()).unwrap())
 }
 
+/// Create a test transaction validation handle.
+/// The output channel is returned so tests can receive validated transactions.
+fn test_tx_validation_handle() -> (
+    hyperscale_production::ValidationBatcherHandle,
+    mpsc::Receiver<hyperscale_core::Event>,
+) {
+    let (output_tx, output_rx) = mpsc::channel(1000);
+    let handle = hyperscale_production::spawn_tx_validation_batcher(
+        hyperscale_production::ValidationBatcherConfig::default(),
+        test_tx_validator(),
+        test_thread_pools(),
+        output_tx,
+    );
+    (handle, output_rx)
+}
+
 /// Test timeout values (from design spec).
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 #[allow(dead_code)]
@@ -126,7 +142,7 @@ async fn test_network_adapter_starts() {
     };
 
     let (consensus_tx, _consensus_rx) = mpsc::channel(100);
-    let (transaction_tx, _transaction_rx) = mpsc::channel(100);
+    let (tx_validation_handle, _tx_rx) = test_tx_validation_handle();
 
     let result = timeout(
         CONNECTION_TIMEOUT,
@@ -136,9 +152,7 @@ async fn test_network_adapter_starts() {
             validator_id,
             shard,
             consensus_tx,
-            transaction_tx,
-            test_tx_validator(),
-            test_thread_pools(),
+            tx_validation_handle,
         ),
     )
     .await;
@@ -173,17 +187,15 @@ async fn test_two_node_connection() {
         ..Default::default()
     };
     let (consensus_tx1, _consensus_rx1) = mpsc::channel(100);
-    let (transaction_tx1, _transaction_rx1) = mpsc::channel(100);
+    let (tx_validation_handle1, _tx_rx1) = test_tx_validation_handle();
 
-    let (adapter1, _sync_rx1, _tx_rx1, _cert_rx1) = Libp2pAdapter::new(
+    let (adapter1, _sync_rx1, _tx_req_rx1, _cert_rx1) = Libp2pAdapter::new(
         config1,
         keypair1,
         ValidatorId(0),
         ShardGroupId(0),
         consensus_tx1,
-        transaction_tx1,
-        test_tx_validator(),
-        test_thread_pools(),
+        tx_validation_handle1,
     )
     .await
     .unwrap();
@@ -203,17 +215,15 @@ async fn test_two_node_connection() {
         ..Default::default()
     };
     let (consensus_tx2, _consensus_rx2) = mpsc::channel(100);
-    let (transaction_tx2, _transaction_rx2) = mpsc::channel(100);
+    let (tx_validation_handle2, _tx_rx2) = test_tx_validation_handle();
 
-    let (adapter2, _sync_rx2, _tx_rx2, _cert_rx2) = Libp2pAdapter::new(
+    let (adapter2, _sync_rx2, _tx_req_rx2, _cert_rx2) = Libp2pAdapter::new(
         config2,
         keypair2,
         ValidatorId(1),
         ShardGroupId(0),
         consensus_tx2,
-        transaction_tx2,
-        test_tx_validator(),
-        test_thread_pools(),
+        tx_validation_handle2,
     )
     .await
     .unwrap();
@@ -261,17 +271,15 @@ async fn test_topic_subscription() {
         ..Default::default()
     };
     let (consensus_tx, _consensus_rx) = mpsc::channel(100);
-    let (transaction_tx, _transaction_rx) = mpsc::channel(100);
+    let (tx_validation_handle, _tx_rx) = test_tx_validation_handle();
 
-    let (adapter, _sync_rx, _tx_rx, _cert_rx) = Libp2pAdapter::new(
+    let (adapter, _sync_rx, _tx_req_rx, _cert_rx) = Libp2pAdapter::new(
         config,
         keypair,
         ValidatorId(0),
         ShardGroupId(0),
         consensus_tx,
-        transaction_tx,
-        test_tx_validator(),
-        test_thread_pools(),
+        tx_validation_handle,
     )
     .await
     .unwrap();

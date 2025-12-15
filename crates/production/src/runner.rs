@@ -345,18 +345,25 @@ impl ProductionRunnerBuilder {
             network_definition.clone(),
         ));
 
-        // Create network adapter with transaction validation
-        // Pass both channels - consensus for BFT messages, transaction for mempool
-        // Thread pools enable non-blocking transaction validation on the crypto pool
+        // Create the shared transaction validation batcher
+        // This is used by both network gossip and RPC submissions for:
+        // 1. Deduplication - skip already-seen transactions
+        // 2. Batching - collect transactions over time window for parallel validation
+        let tx_validation_handle = crate::validation_batcher::spawn_tx_validation_batcher(
+            crate::validation_batcher::ValidationBatcherConfig::default(),
+            tx_validator.clone(),
+            thread_pools.clone(),
+            transaction_tx.clone(),
+        );
+
+        // Create network adapter with shared transaction validation batcher
         let (network, sync_request_rx, tx_request_rx, cert_request_rx) = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
             validator_id,
             local_shard,
             consensus_tx.clone(),
-            transaction_tx.clone(),
-            tx_validator.clone(),
-            thread_pools.clone(),
+            tx_validation_handle.clone(),
         )
         .await?;
 

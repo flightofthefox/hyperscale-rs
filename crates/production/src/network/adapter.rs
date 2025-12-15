@@ -11,10 +11,9 @@ use super::config::Libp2pConfig;
 use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
 use super::topic::Topic;
 use crate::metrics;
-use crate::thread_pools::ThreadPoolManager;
+use crate::validation_batcher::ValidationBatcherHandle;
 use futures::StreamExt;
 use hyperscale_core::{Event, OutboundMessage};
-use hyperscale_engine::TransactionValidation;
 use hyperscale_types::{PublicKey, ShardGroupId, ValidatorId};
 use libp2p::{
     gossipsub, identity, kad,
@@ -318,10 +317,6 @@ pub struct Libp2pAdapter {
     #[allow(dead_code)]
     consensus_tx: mpsc::Sender<Event>,
 
-    /// Transaction event channel for low-priority mempool messages (sent to runner).
-    #[allow(dead_code)]
-    transaction_tx: mpsc::Sender<Event>,
-
     /// Known validators (ValidatorId -> PeerId).
     /// Built from Topology at startup.
     validator_peers: Arc<RwLock<HashMap<ValidatorId, Libp2pPeerId>>>,
@@ -362,8 +357,7 @@ impl Libp2pAdapter {
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
     /// * `consensus_tx` - Channel for high-priority consensus events (BFT messages)
-    /// * `transaction_tx` - Channel for low-priority transaction events (mempool)
-    /// * `tx_validator` - Transaction validator for signature verification
+    /// * `tx_validation_handle` - Handle for submitting transactions to the shared batcher
     ///
     /// # Returns
     ///
@@ -378,9 +372,7 @@ impl Libp2pAdapter {
         validator_id: ValidatorId,
         shard: ShardGroupId,
         consensus_tx: mpsc::Sender<Event>,
-        transaction_tx: mpsc::Sender<Event>,
-        tx_validator: Arc<TransactionValidation>,
-        thread_pools: Arc<ThreadPoolManager>,
+        tx_validation_handle: ValidationBatcherHandle,
     ) -> Result<
         (
             Arc<Self>,
@@ -485,7 +477,6 @@ impl Libp2pAdapter {
             local_shard: shard,
             command_tx,
             consensus_tx: consensus_tx.clone(),
-            transaction_tx: transaction_tx.clone(),
             validator_peers: validator_peers.clone(),
             peer_validators: peer_validators.clone(),
             request_timeout: config.request_timeout,
@@ -503,17 +494,15 @@ impl Libp2pAdapter {
             swarm,
             command_rx,
             consensus_tx,
-            transaction_tx,
             peer_validators,
             shutdown_rx,
             sync_request_tx,
             tx_request_tx,
             cert_request_tx,
             rate_limit_config,
-            tx_validator,
             cached_peer_count,
             shard,
-            thread_pools,
+            tx_validation_handle,
         ));
 
         Ok((adapter, sync_request_rx, tx_request_rx, cert_request_rx))
@@ -800,17 +789,15 @@ impl Libp2pAdapter {
         mut swarm: Swarm<Behaviour>,
         mut command_rx: mpsc::UnboundedReceiver<SwarmCommand>,
         consensus_tx: mpsc::Sender<Event>,
-        transaction_tx: mpsc::Sender<Event>,
         peer_validators: Arc<RwLock<HashMap<Libp2pPeerId, ValidatorId>>>,
         mut shutdown_rx: mpsc::Receiver<()>,
         sync_request_tx: mpsc::Sender<InboundSyncRequest>,
         tx_request_tx: mpsc::Sender<InboundTransactionRequest>,
         cert_request_tx: mpsc::Sender<InboundCertificateRequest>,
         rate_limit_config: RateLimitConfig,
-        tx_validator: Arc<TransactionValidation>,
         cached_peer_count: Arc<AtomicUsize>,
         local_shard: ShardGroupId,
-        thread_pools: Arc<ThreadPoolManager>,
+        tx_validation_handle: ValidationBatcherHandle,
     ) {
         // Track pending sync requests (outbound)
         let mut pending_requests: HashMap<
@@ -901,7 +888,6 @@ impl Libp2pAdapter {
                     Self::handle_swarm_event(
                         event,
                         &consensus_tx,
-                        &transaction_tx,
                         &peer_validators,
                         &mut pending_requests,
                         &mut pending_response_channels,
@@ -910,9 +896,8 @@ impl Libp2pAdapter {
                         &tx_request_tx,
                         &cert_request_tx,
                         &mut rate_limiter,
-                        &tx_validator,
                         local_shard,
-                        &thread_pools,
+                        &tx_validation_handle,
                     ).await;
 
                     // Update cached peer count after connection changes
@@ -1076,7 +1061,6 @@ impl Libp2pAdapter {
     async fn handle_swarm_event(
         event: SwarmEvent<BehaviourEvent>,
         consensus_tx: &mpsc::Sender<Event>,
-        transaction_tx: &mpsc::Sender<Event>,
         peer_validators: &Arc<RwLock<HashMap<Libp2pPeerId, ValidatorId>>>,
         pending_requests: &mut HashMap<
             request_response::OutboundRequestId,
@@ -1088,9 +1072,8 @@ impl Libp2pAdapter {
         tx_request_tx: &mpsc::Sender<InboundTransactionRequest>,
         cert_request_tx: &mpsc::Sender<InboundCertificateRequest>,
         rate_limiter: &mut SyncRateLimiter,
-        tx_validator: &Arc<TransactionValidation>,
         local_shard: ShardGroupId,
-        thread_pools: &ThreadPoolManager,
+        tx_validation_handle: &ValidationBatcherHandle,
     ) {
         match event {
             // Handle gossipsub messages
@@ -1161,35 +1144,21 @@ impl Libp2pAdapter {
                         metrics::record_network_message_received();
 
                         // Route based on event type:
-                        // - Transactions: dispatch to crypto pool for async validation
+                        // - Transactions: submit to batched validator (dedup + batch validation)
                         // - Consensus messages: send directly to high-priority channel
                         match decoded.event {
                             Event::TransactionGossipReceived { tx } => {
-                                // Fire-and-forget: dispatch validation to crypto pool
-                                // This prevents blocking the network loop on signature verification
-                                let validator = tx_validator.clone();
-                                let tx_channel = transaction_tx.clone();
-                                let peer = propagation_source;
-                                thread_pools.spawn_crypto(move || {
-                                    match validator.validate_transaction(&tx) {
-                                        Ok(()) => {
-                                            // Validation passed - send to transaction channel
-                                            let _ = tx_channel.blocking_send(
-                                                Event::TransactionGossipReceived { tx },
-                                            );
-                                        }
-                                        Err(e) => {
-                                            // Validation failed - drop the transaction
-                                            debug!(
-                                                tx_hash = %hex::encode(tx.hash().as_bytes()),
-                                                peer = %peer,
-                                                error = %e,
-                                                "Dropping gossiped transaction with invalid signature"
-                                            );
-                                            metrics::record_invalid_message();
-                                        }
-                                    }
-                                });
+                                // Submit to batched validator for dedup and parallel validation
+                                // The batcher handles:
+                                // 1. Deduplication via seen-cache (skips already-seen txs)
+                                // 2. Batching over time window for better throughput
+                                // 3. Parallel validation via rayon on crypto thread pool
+                                if !tx_validation_handle.submit(tx) {
+                                    trace!(
+                                        peer = %propagation_source,
+                                        "Transaction deduplicated or batcher closed"
+                                    );
+                                }
                             }
                             event => {
                                 // Consensus messages go directly to high-priority channel
