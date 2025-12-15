@@ -26,7 +26,7 @@ BASE_PORT=9000              # libp2p port
 BASE_RPC_PORT=8080          # HTTP RPC port
 DATA_DIR="./cluster-data"
 CLEAN=false
-ACCOUNTS_PER_SHARD=10000    # Spammer accounts per shard
+ACCOUNTS_PER_SHARD=16000    # Spammer accounts per shard
 INITIAL_BALANCE=1000000     # Initial XRD balance per account
 MONITORING=false            # Start Prometheus + Grafana monitoring stack
 
