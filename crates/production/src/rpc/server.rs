@@ -103,22 +103,19 @@ impl RpcServer {
     /// # Arguments
     ///
     /// * `config` - Server configuration
-    /// * `tx_sender` - Channel to send submitted transactions to the node
-    /// * `tx_validator` - Transaction validator for signature verification
+    /// * `tx_submission_tx` - Channel to submit transactions to the runner for validation and gossip
     pub fn new(
         config: RpcServerConfig,
-        tx_sender: mpsc::Sender<RoutableTransaction>,
-        tx_validator: Arc<hyperscale_engine::TransactionValidation>,
+        tx_submission_tx: mpsc::UnboundedSender<Arc<RoutableTransaction>>,
     ) -> Self {
         let state = RpcState {
             ready: Arc::new(AtomicBool::new(false)),
             sync_status: Arc::new(RwLock::new(SyncStatus::default())),
             node_status: Arc::new(RwLock::new(NodeStatusState::default())),
-            tx_sender,
+            tx_submission_tx,
             start_time: Instant::now(),
             tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
-            tx_validator,
         };
 
         Self { config, state }
@@ -133,20 +130,18 @@ impl RpcServer {
         ready: Arc<AtomicBool>,
         sync_status: Arc<RwLock<SyncStatus>>,
         node_status: Arc<RwLock<NodeStatusState>>,
-        tx_sender: mpsc::Sender<RoutableTransaction>,
+        tx_submission_tx: mpsc::UnboundedSender<Arc<RoutableTransaction>>,
         tx_status_cache: Arc<RwLock<TransactionStatusCache>>,
         mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
-        tx_validator: Arc<hyperscale_engine::TransactionValidation>,
     ) -> Self {
         let state = RpcState {
             ready,
             sync_status,
             node_status,
-            tx_sender,
+            tx_submission_tx,
             start_time: Instant::now(),
             tx_status_cache,
             mempool_snapshot,
-            tx_validator,
         };
 
         Self { config, state }
@@ -193,8 +188,6 @@ impl RpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_engine::TransactionValidation;
-    use radix_common::network::NetworkDefinition;
 
     #[test]
     fn test_default_config() {
@@ -205,10 +198,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_creation() {
-        let (tx, _rx) = mpsc::channel(100);
         let config = RpcServerConfig::default();
-        let tx_validator = Arc::new(TransactionValidation::new(NetworkDefinition::simulator()));
-        let server = RpcServer::new(config, tx, tx_validator);
+        let (tx_submission_tx, _rx) = mpsc::unbounded_channel();
+        let server = RpcServer::new(config, tx_submission_tx);
 
         // Server should be created successfully
         assert!(!server.state.ready.load(Ordering::SeqCst));

@@ -46,7 +46,6 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use hyperscale_bft::BftConfig;
-use hyperscale_core::Event;
 use hyperscale_production::network::{derive_libp2p_keypair, Libp2pConfig};
 use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
 use hyperscale_production::{
@@ -885,62 +884,36 @@ async fn main() -> Result<()> {
     let storage = Arc::new(storage);
     info!("Storage opened at {}", db_path.display());
 
-    // Create transaction submission channel for RPC server
-    // Sized to match runner's channel_capacity (10,000) to avoid backpressure
-    let (tx_sender, mut tx_receiver) = tokio::sync::mpsc::channel(10_000);
+    // Create shared RPC state objects that will be used by both runner and RPC server.
+    // These are created first so they can be wired into both components.
+    use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::RwLock;
 
-    // Create transaction validator for signature verification
-    let tx_validator = Arc::new(hyperscale_engine::TransactionValidation::new(
-        NetworkDefinition::simulator(),
-    ));
+    let rpc_ready = Arc::new(AtomicBool::new(false));
+    let rpc_sync_status = Arc::new(RwLock::new(hyperscale_production::SyncStatus::default()));
+    let rpc_node_status = Arc::new(RwLock::new(NodeStatusState {
+        validator_id: config.node.validator_id,
+        shard: config.node.shard,
+        num_shards: config.node.num_shards,
+        ..Default::default()
+    }));
+    let rpc_tx_status_cache = Arc::new(RwLock::new(TransactionStatusCache::new()));
+    let rpc_mempool_snapshot = Arc::new(RwLock::new(MempoolSnapshot::default()));
 
-    // Start RPC server
-    let rpc_handle = if config.metrics.enabled {
-        let rpc_config = RpcServerConfig {
-            listen_addr: config.metrics.listen_addr.parse().with_context(|| {
-                format!(
-                    "Invalid metrics listen address: {}",
-                    config.metrics.listen_addr
-                )
-            })?,
-            metrics_enabled: true,
-        };
-
-        let rpc_server = RpcServer::new(rpc_config, tx_sender, tx_validator.clone());
-        let handle = rpc_server
-            .start()
-            .await
-            .context("Failed to start RPC server")?;
-
-        // Update node status with initial values
-        {
-            let mut status = handle.node_status().write().await;
-            status.validator_id = config.node.validator_id;
-            status.shard = config.node.shard;
-            status.num_shards = config.node.num_shards;
-        }
-
-        Some(handle)
-    } else {
-        None
-    };
-
-    // Create production runner
+    // Create production runner first (before RPC server)
+    // This is necessary because the runner creates the shared ValidationBatcherHandle
+    // that we need to pass to the RPC server for async transaction validation.
     let mut runner_builder = ProductionRunner::builder()
         .topology(topology)
         .signing_key(signing_keypair)
         .bft_config(bft_config)
         .thread_pools(thread_pools)
         .storage(storage)
-        .network(network_config, p2p_identity);
-
-    // Wire up RPC status updates if RPC server is enabled
-    if let Some(ref handle) = rpc_handle {
-        runner_builder = runner_builder
-            .rpc_status(handle.node_status().clone())
-            .tx_status_cache(handle.tx_status_cache().clone())
-            .mempool_snapshot(handle.mempool_snapshot().clone());
-    }
+        .network(network_config, p2p_identity)
+        .rpc_status(rpc_node_status.clone())
+        .tx_status_cache(rpc_tx_status_cache.clone())
+        .mempool_snapshot(rpc_mempool_snapshot.clone());
 
     // Wire up genesis configuration if XRD balances are specified
     if !config.genesis.xrd_balances.is_empty() {
@@ -954,29 +927,47 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to create production runner")?;
 
-    // Get transaction sender for transaction injection
-    // Use transaction_sender() rather than event_sender() so that transactions
-    // are gossiped to relevant shards before being dispatched to the state machine.
-    let transaction_sender = runner.transaction_sender();
+    // Get the transaction submission sender from the runner
+    // RPC-submitted transactions go through this channel to:
+    // 1. Gossip to all relevant shards (RPC submissions need gossip)
+    // 2. Validate via the shared batcher
+    // 3. Dispatch to mempool
+    let tx_submission_sender = runner.tx_submission_sender();
+
+    // Start RPC server with the transaction submission channel and state
+    let rpc_handle = if config.metrics.enabled {
+        let rpc_config = RpcServerConfig {
+            listen_addr: config.metrics.listen_addr.parse().with_context(|| {
+                format!(
+                    "Invalid metrics listen address: {}",
+                    config.metrics.listen_addr
+                )
+            })?,
+            metrics_enabled: true,
+        };
+
+        // Use with_state to pass all shared state objects
+        let rpc_server = RpcServer::with_state(
+            rpc_config,
+            rpc_ready.clone(),
+            rpc_sync_status,
+            rpc_node_status.clone(),
+            tx_submission_sender,
+            rpc_tx_status_cache,
+            rpc_mempool_snapshot,
+        );
+        let handle = rpc_server
+            .start()
+            .await
+            .context("Failed to start RPC server")?;
+
+        Some(handle)
+    } else {
+        None
+    };
 
     // Get shutdown handle
     let shutdown_handle = runner.shutdown_handle();
-
-    // Spawn transaction forwarder (RPC -> event loop)
-    tokio::spawn(async move {
-        while let Some(tx) = tx_receiver.recv().await {
-            // Submit transaction via the transaction channel (emits status updates)
-            // The runner will gossip to relevant shards before dispatching to state machine
-            if let Err(e) = transaction_sender
-                .send(Event::SubmitTransaction {
-                    tx: std::sync::Arc::new(tx),
-                })
-                .await
-            {
-                warn!("Failed to forward RPC transaction: {}", e);
-            }
-        }
-    });
 
     // Spawn shutdown signal handler
     tokio::spawn(async move {

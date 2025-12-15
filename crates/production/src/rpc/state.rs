@@ -2,7 +2,6 @@
 
 use crate::sync::SyncStatus;
 use hyperscale_core::TransactionStatus;
-use hyperscale_engine::TransactionValidation;
 use hyperscale_types::{Hash, RoutableTransaction};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -19,16 +18,22 @@ pub struct RpcState {
     pub sync_status: Arc<RwLock<SyncStatus>>,
     /// Node status provider.
     pub node_status: Arc<RwLock<NodeStatusState>>,
-    /// Channel to submit transactions to the node.
-    pub tx_sender: mpsc::Sender<RoutableTransaction>,
+    /// Channel to submit transactions to the runner.
+    ///
+    /// RPC-submitted transactions go through this channel to the runner, which:
+    /// 1. Validates the transaction (via the batcher)
+    /// 2. Gossips to all relevant shards (RPC transactions need gossiping)
+    /// 3. Dispatches to the mempool
+    ///
+    /// This is different from gossip-received transactions which skip the gossip
+    /// step since they've already been gossiped by the sender.
+    pub tx_submission_tx: mpsc::UnboundedSender<Arc<RoutableTransaction>>,
     /// Server start time for uptime calculation.
     pub start_time: Instant,
     /// Transaction status cache for querying transaction state.
     pub tx_status_cache: Arc<RwLock<TransactionStatusCache>>,
     /// Mempool snapshot for querying mempool stats.
     pub mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
-    /// Transaction validator for signature verification before mempool.
-    pub tx_validator: Arc<TransactionValidation>,
 }
 
 /// Cached transaction status entry.

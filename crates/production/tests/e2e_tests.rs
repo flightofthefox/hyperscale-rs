@@ -41,9 +41,9 @@ fn test_thread_pools() -> Arc<ThreadPoolManager> {
 /// The output channel is returned so tests can receive validated transactions.
 fn test_tx_validation_handle() -> (
     hyperscale_production::ValidationBatcherHandle,
-    mpsc::Receiver<hyperscale_core::Event>,
+    mpsc::UnboundedReceiver<hyperscale_core::Event>,
 ) {
-    let (output_tx, output_rx) = mpsc::channel(1000);
+    let (output_tx, output_rx) = mpsc::unbounded_channel();
     let handle = hyperscale_production::spawn_tx_validation_batcher(
         hyperscale_production::ValidationBatcherConfig::default(),
         test_tx_validator(),

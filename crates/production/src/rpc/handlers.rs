@@ -12,7 +12,7 @@ use hyperscale_core::TransactionStatus;
 use hyperscale_types::{Hash, RoutableTransaction, TransactionDecision};
 use prometheus::{Encoder, TextEncoder};
 use std::sync::atomic::Ordering;
-use tokio::sync::mpsc;
+use std::sync::Arc;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Health & Readiness Handlers
@@ -123,13 +123,19 @@ pub async fn sync_handler(State(state): State<RpcState>) -> impl IntoResponse {
 
 /// Handler for `POST /api/v1/transactions` - submit transaction.
 ///
-/// Performs signature validation before accepting the transaction into the
-/// mempool. Invalid transactions are rejected with a 400 Bad Request response.
+/// Performs quick structural validation (hex decode, SBOR decode) and submits
+/// to the runner for validation and gossip.
+///
+/// Returns 202 Accepted immediately with transaction hash. Clients should poll
+/// `GET /api/v1/transactions/{hash}` to check the result.
+///
+/// This matches Ethereum behavior where `eth_sendRawTransaction` returns the
+/// transaction hash immediately, and invalid transactions simply never get mined.
 pub async fn submit_transaction_handler(
     State(state): State<RpcState>,
     Json(request): Json<SubmitTransactionRequest>,
 ) -> impl IntoResponse {
-    // Decode hex
+    // Decode hex - structural validation, return error immediately
     let tx_bytes = match hex::decode(&request.transaction_hex) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -144,7 +150,7 @@ pub async fn submit_transaction_handler(
         }
     };
 
-    // Decode SBOR
+    // Decode SBOR - structural validation, return error immediately
     let transaction: RoutableTransaction = match sbor::prelude::basic_decode(&tx_bytes) {
         Ok(tx) => tx,
         Err(e) => {
@@ -160,80 +166,34 @@ pub async fn submit_transaction_handler(
     };
 
     let hash = hex::encode(transaction.hash().as_bytes());
+    let tx_arc = Arc::new(transaction);
 
-    // Validate transaction signatures before accepting into mempool
-    {
-        let validator = state.tx_validator.clone();
-        let tx_for_validation = transaction.clone();
-
-        // Run validation on blocking thread pool to avoid blocking async runtime
-        // Signature verification is CPU-intensive
-        let validation_result =
-            tokio::task::spawn_blocking(move || validator.validate_transaction(&tx_for_validation))
-                .await;
-
-        match validation_result {
-            Ok(Ok(())) => {
-                // Validation passed, continue to send
-            }
-            Ok(Err(e)) => {
-                // Validation failed - reject transaction
-                tracing::debug!(
-                    tx_hash = %hash,
-                    error = %e,
-                    "Transaction validation failed"
-                );
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(SubmitTransactionResponse {
-                        accepted: false,
-                        hash,
-                        error: Some(format!("Transaction validation failed: {}", e)),
-                    }),
-                );
-            }
-            Err(e) => {
-                // spawn_blocking task panicked - shouldn't happen
-                tracing::error!(error = ?e, "Validation task panicked");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(SubmitTransactionResponse {
-                        accepted: false,
-                        hash,
-                        error: Some("Internal validation error".to_string()),
-                    }),
-                );
-            }
-        }
-    }
-
-    // Send to node
-    match state.tx_sender.try_send(transaction) {
-        Ok(()) => (
-            StatusCode::ACCEPTED,
-            Json(SubmitTransactionResponse {
-                accepted: true,
-                hash,
-                error: None,
-            }),
-        ),
-        Err(mpsc::error::TrySendError::Full(_)) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(SubmitTransactionResponse {
-                accepted: false,
-                hash,
-                error: Some("Transaction queue full, try again later".to_string()),
-            }),
-        ),
-        Err(mpsc::error::TrySendError::Closed(_)) => (
+    // Submit to runner via channel
+    // The runner will:
+    // 1. Gossip to all relevant shards (RPC submissions need gossip)
+    // 2. Submit to batcher for validation
+    // 3. Dispatch to mempool after validation
+    if state.tx_submission_tx.send(tx_arc).is_err() {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(SubmitTransactionResponse {
                 accepted: false,
                 hash,
                 error: Some("Node is shutting down".to_string()),
             }),
-        ),
+        );
     }
+
+    // Return immediately - validation and gossip happen async
+    // Client should poll GET /api/v1/transactions/{hash} to check result
+    (
+        StatusCode::ACCEPTED,
+        Json(SubmitTransactionResponse {
+            accepted: true,
+            hash,
+            error: None,
+        }),
+    )
 }
 
 /// Handler for `GET /api/v1/transactions/:hash` - get transaction status.
@@ -382,26 +342,23 @@ mod tests {
     use crate::rpc::state::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
     use crate::sync::SyncStatus;
     use axum::{body::Body, http::Request, Router};
-    use hyperscale_engine::TransactionValidation;
     use hyperscale_types::{BlockHeight, TransactionDecision};
-    use radix_common::network::NetworkDefinition;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Instant;
-    use tokio::sync::RwLock;
+    use tokio::sync::{mpsc, RwLock};
     use tower::ServiceExt;
 
     fn create_test_state() -> RpcState {
-        let (tx_sender, _rx) = tokio::sync::mpsc::channel(100);
+        let (tx_submission_tx, _rx) = mpsc::unbounded_channel();
         RpcState {
             ready: Arc::new(AtomicBool::new(false)),
             sync_status: Arc::new(RwLock::new(SyncStatus::default())),
             node_status: Arc::new(RwLock::new(NodeStatusState::default())),
-            tx_sender,
+            tx_submission_tx,
             start_time: Instant::now(),
             tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
-            tx_validator: Arc::new(TransactionValidation::new(NetworkDefinition::simulator())),
         }
     }
 

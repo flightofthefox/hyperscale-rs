@@ -38,8 +38,6 @@ mod tests {
     use super::*;
     use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
     use axum::{body::Body, http::Request};
-    use hyperscale_engine::TransactionValidation;
-    use radix_common::network::NetworkDefinition;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Instant;
@@ -47,7 +45,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn create_test_state() -> RpcState {
-        let (tx_sender, _rx) = mpsc::channel(100);
+        let (tx_submission_tx, _rx) = mpsc::unbounded_channel();
         RpcState {
             ready: Arc::new(AtomicBool::new(true)),
             sync_status: Arc::new(RwLock::new(crate::sync::SyncStatus::default())),
@@ -59,11 +57,10 @@ mod tests {
                 view: 100,
                 connected_peers: 5,
             })),
-            tx_sender,
+            tx_submission_tx,
             start_time: Instant::now(),
             tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
-            tx_validator: Arc::new(TransactionValidation::new(NetworkDefinition::simulator())),
         }
     }
 

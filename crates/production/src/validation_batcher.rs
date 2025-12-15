@@ -187,7 +187,7 @@ pub struct ValidationBatcher {
     config: ValidationBatcherConfig,
     validator: Arc<TransactionValidation>,
     thread_pools: Arc<ThreadPoolManager>,
-    output_tx: mpsc::Sender<Event>,
+    output_tx: mpsc::UnboundedSender<Event>,
     stats: Arc<ValidationBatcherStats>,
 }
 
@@ -280,7 +280,7 @@ impl ValidationBatcher {
                 match result {
                     Ok(()) => {
                         stats.valid.fetch_add(1, Ordering::Relaxed);
-                        let _ = output_tx.blocking_send(Event::TransactionGossipReceived { tx });
+                        let _ = output_tx.send(Event::TransactionGossipReceived { tx });
                     }
                     Err(e) => {
                         stats.invalid.fetch_add(1, Ordering::Relaxed);
@@ -304,7 +304,7 @@ pub fn spawn_tx_validation_batcher(
     config: ValidationBatcherConfig,
     validator: Arc<TransactionValidation>,
     thread_pools: Arc<ThreadPoolManager>,
-    output_tx: mpsc::Sender<Event>,
+    output_tx: mpsc::UnboundedSender<Event>,
 ) -> ValidationBatcherHandle {
     let stats = Arc::new(ValidationBatcherStats::default());
     let seen_cache = Arc::new(RwLock::new(SeenCache::new(config.seen_cache_capacity)));

@@ -310,13 +310,17 @@ impl ProductionRunnerBuilder {
         //   These are results of in-flight work and must be processed immediately to
         //   unblock consensus progress (e.g., vote signature verified -> can count vote)
         // - consensus_tx/rx: High priority BFT events (votes, proposals, QCs)
-        // - transaction_tx/rx: Transaction ingestion (gossip, submissions)
+        // - validated_tx_tx/rx: Validated transactions from batcher (unbounded - don't block crypto pool)
+        //   Gossip-received transactions flow through here after validation
+        // - rpc_tx_tx/rx: RPC-submitted transactions (unbounded - don't block RPC handlers)
+        //   These need gossip before validation, unlike gossip-received transactions
         // - status_tx/rx: Transaction status updates (non-consensus-critical)
         // This prevents transaction floods from starving consensus events
         let (timer_tx, timer_rx) = mpsc::channel(16); // Small channel, just for timers
         let (callback_tx, callback_rx) = mpsc::unbounded_channel(); // Unbounded - thread pools must never block
         let (consensus_tx, consensus_rx) = mpsc::channel(self.channel_capacity);
-        let (transaction_tx, transaction_rx) = mpsc::channel(self.channel_capacity);
+        let (validated_tx_tx, validated_tx_rx) = mpsc::unbounded_channel(); // Unbounded - batcher must never block
+        let (rpc_tx_tx, rpc_tx_rx) = mpsc::unbounded_channel(); // Unbounded - RPC must never block
         let (status_tx, status_rx) = mpsc::channel(self.channel_capacity);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let validator_id = topology.local_validator_id();
@@ -349,11 +353,12 @@ impl ProductionRunnerBuilder {
         // This is used by both network gossip and RPC submissions for:
         // 1. Deduplication - skip already-seen transactions
         // 2. Batching - collect transactions over time window for parallel validation
+        // Output goes to validated_tx_tx (unbounded) to avoid blocking crypto pool threads
         let tx_validation_handle = crate::validation_batcher::spawn_tx_validation_batcher(
             crate::validation_batcher::ValidationBatcherConfig::default(),
             tx_validator.clone(),
             thread_pools.clone(),
-            transaction_tx.clone(),
+            validated_tx_tx,
         );
 
         // Create network adapter with shared transaction validation batcher
@@ -418,8 +423,9 @@ impl ProductionRunnerBuilder {
             callback_tx,
             consensus_rx,
             consensus_tx,
-            transaction_rx,
-            transaction_tx,
+            validated_tx_rx,
+            rpc_tx_rx,
+            rpc_tx_tx,
             status_rx,
             status_tx,
             state,
@@ -434,6 +440,7 @@ impl ProductionRunnerBuilder {
             storage,
             executor,
             tx_validator,
+            tx_validation_handle,
             rpc_status: self.rpc_status,
             tx_status_cache: self.tx_status_cache,
             mempool_snapshot: self.mempool_snapshot,
@@ -476,10 +483,14 @@ pub struct ProductionRunner {
     consensus_rx: mpsc::Receiver<Event>,
     /// Clone this to send consensus events from network.
     consensus_tx: mpsc::Sender<Event>,
-    /// Receives low-priority transaction events (submissions, gossip).
-    transaction_rx: mpsc::Receiver<Event>,
-    /// Clone this to send transaction events (used by submit_transaction).
-    transaction_tx: mpsc::Sender<Event>,
+    /// Receives validated transactions from the batcher (unbounded to avoid blocking crypto pool).
+    /// Gossip-received transactions flow through here after validation.
+    validated_tx_rx: mpsc::UnboundedReceiver<Event>,
+    /// Receives RPC-submitted transactions (unbounded to avoid blocking RPC handlers).
+    /// These need to be gossiped before validation, unlike gossip-received transactions.
+    rpc_tx_rx: mpsc::UnboundedReceiver<Arc<RoutableTransaction>>,
+    /// Sender for RPC transaction submissions - exposed via tx_submission_sender().
+    rpc_tx_tx: mpsc::UnboundedSender<Arc<RoutableTransaction>>,
     /// Receives background status events (TransactionStatusChanged, TransactionExecuted).
     /// These are non-consensus-critical and processed opportunistically.
     status_rx: mpsc::Receiver<Event>,
@@ -510,6 +521,9 @@ pub struct ProductionRunner {
     executor: Arc<RadixExecutor>,
     /// Transaction validator for signature verification.
     tx_validator: Arc<hyperscale_engine::TransactionValidation>,
+    /// Handle for the shared transaction validation batcher.
+    /// Used by both network gossip and RPC for dedup + batched validation.
+    tx_validation_handle: crate::validation_batcher::ValidationBatcherHandle,
     /// Optional RPC status state to update on block commits.
     rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
     /// Optional transaction status cache for RPC queries.
@@ -561,18 +575,31 @@ impl ProductionRunner {
         self.consensus_tx.clone()
     }
 
-    /// Get a sender for submitting transactions.
-    ///
-    /// This is the appropriate channel for `SubmitTransaction` events.
-    /// Transactions sent via this channel will be gossiped to relevant shards
-    /// before being dispatched to the state machine.
-    pub fn transaction_sender(&self) -> mpsc::Sender<Event> {
-        self.transaction_tx.clone()
-    }
-
     /// Get the transaction validator for signature verification.
     pub fn tx_validator(&self) -> Arc<hyperscale_engine::TransactionValidation> {
         self.tx_validator.clone()
+    }
+
+    /// Get a sender for RPC transaction submissions.
+    ///
+    /// Transactions submitted through this channel will be:
+    /// 1. Gossiped to all relevant shards (RPC submissions need gossip)
+    /// 2. Validated via the shared batcher
+    /// 3. Dispatched to the mempool
+    ///
+    /// This is the correct path for RPC-submitted transactions.
+    /// Network gossip uses the validation batcher directly (no gossip needed).
+    pub fn tx_submission_sender(&self) -> mpsc::UnboundedSender<Arc<RoutableTransaction>> {
+        self.rpc_tx_tx.clone()
+    }
+
+    /// Get the transaction validation batcher handle.
+    ///
+    /// This handle is used by network gossip for dedup + batched validation.
+    /// RPC submissions should use `tx_submission_sender()` instead, which
+    /// handles gossip before validation.
+    pub fn tx_validation_handle(&self) -> crate::validation_batcher::ValidationBatcherHandle {
+        self.tx_validation_handle.clone()
     }
 
     /// Take the shutdown handle.
@@ -947,10 +974,11 @@ impl ProductionRunner {
                     }
                 }
 
-                // Handle transaction events (submissions, gossip)
-                Some(event) = self.transaction_rx.recv() => {
+                // Handle validated transactions from batcher (unbounded channel)
+                // These are transactions that passed crypto validation in the batcher.
+                // Process before direct submissions since they've already been validated.
+                Some(event) = self.validated_tx_rx.recv() => {
                     // Filter out transactions that are already in terminal state
-                    // This prevents re-adding evicted transactions via late gossip
                     if let Event::TransactionGossipReceived { ref tx } = event {
                         if let Some(ref cache) = self.tx_status_cache {
                             if let Ok(cache_guard) = cache.try_read() {
@@ -959,64 +987,71 @@ impl ProductionRunner {
                                         tracing::trace!(
                                             tx_hash = ?tx.hash(),
                                             status = %cached.status,
-                                            "Ignoring gossip for already-finalized transaction"
+                                            "Ignoring validated tx for already-finalized transaction"
                                         );
                                         continue;
                                     }
                                 }
-                            }
-                            // If cache lock is contended, let the mempool handle dedup
-                        }
-                    }
-
-                    // For SubmitTransaction events, gossip to all relevant shards first.
-                    // This moves gossip responsibility from the state machine to the runner,
-                    // avoiding unnecessary state machine thrashing for broadcast actions.
-                    if let Event::SubmitTransaction { ref tx } = event {
-                        let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(tx));
-                        for shard in self.topology.all_shards_for_transaction(tx) {
-                            let mut message = OutboundMessage::TransactionGossip(Box::new(gossip.clone()));
-                            message.inject_trace_context();
-                            if let Err(e) = self.network.broadcast_shard(shard, &message).await {
-                                tracing::warn!(
-                                    ?shard,
-                                    error = ?e,
-                                    "Failed to gossip transaction to shard"
-                                );
                             }
                         }
                     }
 
                     let event_type = event.type_name();
                     let event_span = span!(
-                        Level::INFO,
-                        "handle_event",
+                        Level::DEBUG,
+                        "handle_validated_tx",
                         event.type = %event_type,
                         node = self.state.node_index(),
                         shard = ?self.state.shard(),
-                        otel.kind = "INTERNAL",
                     );
                     let _event_guard = event_span.enter();
 
-                    // Update time
                     let now = self.start_time.elapsed();
                     self.state.set_time(now);
 
-                    // Process transaction event
                     let actions = self.state.handle(event);
-
-                    if !actions.is_empty() {
-                        tracing::info!(
-                            event_type = %event_type,
-                            num_actions = actions.len(),
-                            "Event produced actions"
-                        );
-                    }
 
                     for action in actions {
                         if let Err(e) = self.process_action(action).await {
-                            tracing::error!(error = ?e, "Error processing action");
+                            tracing::error!(error = ?e, "Error processing validated tx action");
                         }
+                    }
+                }
+
+                // Handle RPC-submitted transactions
+                // These need to be gossiped to all relevant shards BEFORE validation,
+                // unlike gossip-received transactions which are already gossiped.
+                Some(tx) = self.rpc_tx_rx.recv() => {
+                    let tx_span = span!(
+                        Level::DEBUG,
+                        "handle_rpc_tx",
+                        tx_hash = ?tx.hash(),
+                        node = self.state.node_index(),
+                        shard = ?self.state.shard(),
+                    );
+                    let _tx_guard = tx_span.enter();
+
+                    // Step 1: Gossip to all relevant shards FIRST
+                    // This ensures other validators see the transaction even if we fail later
+                    let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(&tx));
+                    for shard in self.topology.all_shards_for_transaction(&tx) {
+                        let mut message = OutboundMessage::TransactionGossip(Box::new(gossip.clone()));
+                        message.inject_trace_context();
+                        if let Err(e) = self.network.broadcast_shard(shard, &message).await {
+                            tracing::warn!(
+                                ?shard,
+                                tx_hash = ?tx.hash(),
+                                error = ?e,
+                                "Failed to gossip RPC transaction to shard"
+                            );
+                        }
+                    }
+
+                    // Step 2: Submit to batcher for validation
+                    // After validation, it will come back through validated_tx_rx
+                    // and get dispatched to the state machine
+                    if !self.tx_validation_handle.submit(tx) {
+                        tracing::debug!("RPC transaction deduplicated or batcher closed");
                     }
                 }
 
@@ -1938,16 +1973,29 @@ impl ProductionRunner {
 
     /// Submit a transaction.
     ///
-    /// The transaction status can be queried via the RPC status cache.
-    /// Transactions are sent to the low-priority transaction channel to avoid
-    /// starving consensus events during high transaction load.
+    /// The transaction is gossiped to all relevant shards and then submitted
+    /// to the validation batcher for crypto verification. The transaction status
+    /// can be queried via the RPC status cache.
     pub async fn submit_transaction(&mut self, tx: RoutableTransaction) -> Result<(), RunnerError> {
-        self.transaction_tx
-            .send(Event::SubmitTransaction {
-                tx: std::sync::Arc::new(tx),
-            })
-            .await
-            .map_err(|e| RunnerError::SendError(e.to_string()))
+        let tx = std::sync::Arc::new(tx);
+
+        // Gossip to all relevant shards first
+        let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(&tx));
+        for shard in self.topology.all_shards_for_transaction(&tx) {
+            let mut message = OutboundMessage::TransactionGossip(Box::new(gossip.clone()));
+            message.inject_trace_context();
+            if let Err(e) = self.network.broadcast_shard(shard, &message).await {
+                tracing::warn!(
+                    ?shard,
+                    error = ?e,
+                    "Failed to gossip transaction to shard"
+                );
+            }
+        }
+
+        // Submit to batcher for validation
+        self.tx_validation_handle.submit(tx);
+        Ok(())
     }
 
     /// Handle an inbound sync request from a peer.
