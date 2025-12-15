@@ -124,8 +124,8 @@ impl ThreadPoolConfig {
             // Minimum viable: 1 each
             (1, 1, 1)
         } else {
-            let crypto = (remaining * 25 / 100).max(1);
-            let execution = (remaining * 50 / 100).max(1);
+            let crypto = (remaining * 50 / 100).max(1);
+            let execution = (remaining * 25 / 100).max(1);
             let io = remaining
                 .saturating_sub(crypto)
                 .saturating_sub(execution)
