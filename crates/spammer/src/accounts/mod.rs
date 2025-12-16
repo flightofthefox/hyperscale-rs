@@ -349,7 +349,8 @@ impl AccountPool {
             }
             SelectionMode::RoundRobin => {
                 let counter = self.round_robin_counters.get(&shard).unwrap();
-                let c = counter.fetch_add(1, Ordering::SeqCst);
+                // Relaxed ordering is sufficient - we just need unique values, not ordering guarantees
+                let c = counter.fetch_add(1, Ordering::Relaxed);
                 let idx1 = (c * 2) % num_accounts;
                 let idx2 = (c * 2 + 1) % num_accounts;
                 (idx1, idx2)
@@ -366,8 +367,9 @@ impl AccountPool {
                 // Use per-shard counter to ensure each shard cycles through its own
                 // accounts independently. This provides even distribution across shards
                 // while still avoiding contention within each shard.
+                // Relaxed ordering is sufficient - we just need unique values, not ordering guarantees
                 let counter = self.round_robin_counters.get(&shard).unwrap();
-                let c = counter.fetch_add(1, Ordering::SeqCst);
+                let c = counter.fetch_add(1, Ordering::Relaxed);
                 let pair_base = (c * 2) % num_accounts;
                 let idx1 = pair_base;
                 let idx2 = (pair_base + 1) % num_accounts;
@@ -396,13 +398,13 @@ impl AccountPool {
             SelectionMode::Random => rng.gen_range(0..num_accounts),
             SelectionMode::RoundRobin => {
                 let counter = self.round_robin_counters.get(&shard).unwrap();
-                counter.fetch_add(1, Ordering::SeqCst) % num_accounts
+                counter.fetch_add(1, Ordering::Relaxed) % num_accounts
             }
             SelectionMode::Zipf { exponent } => self.zipf_index(num_accounts, exponent, rng),
             SelectionMode::NoContention => {
                 // Use per-shard counter for even distribution within each shard.
                 let counter = self.round_robin_counters.get(&shard).unwrap();
-                counter.fetch_add(1, Ordering::SeqCst) % num_accounts
+                counter.fetch_add(1, Ordering::Relaxed) % num_accounts
             }
         };
 

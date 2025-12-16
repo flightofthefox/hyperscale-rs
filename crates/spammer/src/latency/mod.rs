@@ -8,22 +8,29 @@
 //! submission time to the final completion.
 
 use crate::client::RpcClient;
+use dashmap::DashMap;
 use hdrhistogram::Histogram;
 use hyperscale_types::TransactionStatus;
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
 use tracing::debug;
 
 /// Tracks in-flight transactions and measures their latency.
+///
+/// Uses lock-free data structures to minimize contention:
+/// - DashMap for in-flight transaction tracking (sharded concurrent map)
+/// - Atomics for stats counters
+/// - parking_lot::Mutex for histogram (only acquired when recording, not reading)
 pub struct LatencyTracker {
     /// In-flight transactions: tx_hash -> (submit_time, client_index)
-    in_flight: Arc<Mutex<HashMap<String, (Instant, usize)>>>,
+    /// Uses DashMap for lock-free concurrent access from multiple threads.
+    in_flight: Arc<DashMap<String, (Instant, usize)>>,
     /// Latency histogram (microseconds).
-    histogram: Arc<Mutex<Histogram<u64>>>,
-    /// Completion counts.
-    stats: Arc<Mutex<LatencyStats>>,
+    /// Uses parking_lot::Mutex which is faster than tokio::sync::Mutex for short critical sections.
+    histogram: Arc<parking_lot::Mutex<Histogram<u64>>>,
+    /// Completion counts - using atomics for lock-free updates.
+    stats: Arc<LatencyStats>,
     /// Poll interval for checking transaction status.
     poll_interval: Duration,
     /// RPC clients for polling.
@@ -33,17 +40,41 @@ pub struct LatencyTracker {
 }
 
 /// Statistics collected during latency tracking.
+/// Uses atomics for lock-free concurrent updates.
 #[derive(Default)]
 pub struct LatencyStats {
     /// Number of transactions tracked.
-    pub tracked: u64,
+    pub tracked: AtomicU64,
     /// Number of transactions completed successfully.
-    pub completed: u64,
+    pub completed: AtomicU64,
     /// Number of transactions that failed/aborted.
-    pub failed: u64,
+    pub failed: AtomicU64,
     /// Number of transactions that timed out (still in-flight at end).
-    pub timed_out: u64,
+    pub timed_out: AtomicU64,
     /// Number of retries followed (transactions that were retried).
+    pub retries: AtomicU64,
+}
+
+impl LatencyStats {
+    /// Get a snapshot of the current stats.
+    fn snapshot(&self) -> LatencyStatsSnapshot {
+        LatencyStatsSnapshot {
+            tracked: self.tracked.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            timed_out: self.timed_out.load(Ordering::Relaxed),
+            retries: self.retries.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A point-in-time snapshot of latency stats.
+#[derive(Default)]
+pub struct LatencyStatsSnapshot {
+    pub tracked: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub timed_out: u64,
     pub retries: u64,
 }
 
@@ -51,11 +82,11 @@ impl LatencyTracker {
     /// Create a new latency tracker.
     pub fn new(clients: Vec<RpcClient>, poll_interval: Duration) -> Self {
         Self {
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
-            histogram: Arc::new(Mutex::new(
+            in_flight: Arc::new(DashMap::new()),
+            histogram: Arc::new(parking_lot::Mutex::new(
                 Histogram::new(3).expect("histogram creation should succeed"),
             )),
-            stats: Arc::new(Mutex::new(LatencyStats::default())),
+            stats: Arc::new(LatencyStats::default()),
             poll_interval,
             clients,
             poll_handle: None,
@@ -74,20 +105,20 @@ impl LatencyTracker {
             loop {
                 tokio::time::sleep(poll_interval).await;
 
-                // Get all in-flight transactions
-                let to_check: Vec<(String, Instant, usize)> = {
-                    let guard = in_flight.lock().await;
-                    guard
-                        .iter()
-                        .map(|(hash, (time, idx))| (hash.clone(), *time, *idx))
-                        .collect()
-                };
+                // Collect keys to check - this is a quick read that doesn't block writers
+                let to_check: Vec<(String, Instant, usize)> = in_flight
+                    .iter()
+                    .map(|entry| {
+                        let (hash, (time, idx)) = entry.pair();
+                        (hash.clone(), *time, *idx)
+                    })
+                    .collect();
 
                 if to_check.is_empty() {
                     continue;
                 }
 
-                // Check each transaction
+                // Check each transaction - no locks held during RPC calls
                 for (tx_hash, submit_time, client_idx) in to_check {
                     let client = &clients[client_idx % clients.len()];
 
@@ -98,20 +129,16 @@ impl LatencyTracker {
 
                             // Check if this is a retry - follow the new transaction hash
                             if let Some(TransactionStatus::Retried { new_tx }) = typed_status {
-                                // Remove old hash, add new hash with same submit time
+                                // Atomically update: remove old hash, add new hash with same submit time
                                 // This preserves the original submit time for accurate latency
                                 let new_hash = format!("{}", new_tx);
-                                {
-                                    let mut guard = in_flight.lock().await;
-                                    guard.remove(&tx_hash);
-                                    guard.insert(new_hash.clone(), (submit_time, client_idx));
-                                }
 
-                                // Count the retry
-                                {
-                                    let mut s = stats.lock().await;
-                                    s.retries += 1;
-                                }
+                                // Remove old and insert new - DashMap operations are lock-free
+                                in_flight.remove(&tx_hash);
+                                in_flight.insert(new_hash.clone(), (submit_time, client_idx));
+
+                                // Atomic increment - no lock needed
+                                stats.retries.fetch_add(1, Ordering::Relaxed);
 
                                 debug!(
                                     old_hash = %tx_hash,
@@ -125,23 +152,20 @@ impl LatencyTracker {
                                 let latency = submit_time.elapsed();
                                 let latency_us = latency.as_micros() as u64;
 
-                                // Remove from in-flight
-                                in_flight.lock().await.remove(&tx_hash);
+                                // Remove from in-flight - lock-free
+                                in_flight.remove(&tx_hash);
 
-                                // Record latency
+                                // Record latency - short critical section with parking_lot mutex
                                 {
-                                    let mut hist = histogram.lock().await;
+                                    let mut hist = histogram.lock();
                                     let _ = hist.record(latency_us);
                                 }
 
-                                // Update stats
-                                {
-                                    let mut s = stats.lock().await;
-                                    if status_response.is_success() {
-                                        s.completed += 1;
-                                    } else {
-                                        s.failed += 1;
-                                    }
+                                // Update stats - atomic, no lock
+                                if status_response.is_success() {
+                                    stats.completed.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    stats.failed.fetch_add(1, Ordering::Relaxed);
                                 }
 
                                 debug!(
@@ -172,13 +196,14 @@ impl LatencyTracker {
     }
 
     /// Track a submitted transaction for latency measurement.
-    pub async fn track(&self, tx_hash: String, client_idx: usize) {
-        let mut guard = self.in_flight.lock().await;
-        guard.insert(tx_hash, (Instant::now(), client_idx));
-        drop(guard);
-
-        let mut s = self.stats.lock().await;
-        s.tracked += 1;
+    ///
+    /// This is now lock-free and can be called from the hot path with minimal overhead.
+    #[inline]
+    pub fn track(&self, tx_hash: String, client_idx: usize) {
+        // DashMap insert is lock-free (uses fine-grained sharding)
+        self.in_flight.insert(tx_hash, (Instant::now(), client_idx));
+        // Atomic increment - no lock
+        self.stats.tracked.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Finalize tracking and generate a report.
@@ -191,20 +216,16 @@ impl LatencyTracker {
         // Stop the polling task
         self.stop_polling();
 
-        // Mark remaining in-flight as timed out
-        let timed_out = {
-            let guard = self.in_flight.lock().await;
-            guard.len() as u64
-        };
+        // Count remaining in-flight as timed out
+        let timed_out = self.in_flight.len() as u64;
+        self.stats.timed_out.store(timed_out, Ordering::Relaxed);
 
-        let stats = {
-            let mut s = self.stats.lock().await;
-            s.timed_out = timed_out;
-            std::mem::take(&mut *s)
-        };
+        // Take snapshot of stats
+        let stats = self.stats.snapshot();
 
+        // Clone the histogram
         let histogram = {
-            let guard = self.histogram.lock().await;
+            let guard = self.histogram.lock();
             guard.clone()
         };
 
@@ -212,8 +233,9 @@ impl LatencyTracker {
     }
 
     /// Get current in-flight count.
-    pub async fn in_flight_count(&self) -> usize {
-        self.in_flight.lock().await.len()
+    #[inline]
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
     }
 }
 
@@ -227,8 +249,8 @@ impl Clone for RpcClient {
 pub struct LatencyReport {
     /// Latency histogram (values in microseconds).
     histogram: Histogram<u64>,
-    /// Statistics.
-    stats: LatencyStats,
+    /// Statistics snapshot.
+    stats: LatencyStatsSnapshot,
 }
 
 impl LatencyReport {

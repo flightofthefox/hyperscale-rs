@@ -44,6 +44,8 @@ tracing-subscriber = "0.3"
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 hdrhistogram = "7"
+dashmap = "6"
+parking_lot = "0.12"
 
 [dev-dependencies]
 tokio-test = "0.4"

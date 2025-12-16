@@ -157,7 +157,7 @@ impl Spammer {
 
             // Print progress periodically
             if last_progress.elapsed() >= self.config.progress_interval {
-                self.print_progress(start.elapsed()).await;
+                self.print_progress(start.elapsed());
                 last_progress = Instant::now();
             }
 
@@ -166,7 +166,7 @@ impl Spammer {
         }
 
         // Print final progress
-        self.print_progress(start.elapsed()).await;
+        self.print_progress(start.elapsed());
 
         // Save nonces for next run
         match self.accounts.save_nonces_default() {
@@ -229,9 +229,10 @@ impl Spammer {
                     self.stats.accepted.fetch_add(1, Ordering::SeqCst);
 
                     // Track for latency measurement if sampled
+                    // Note: track() is now lock-free (uses DashMap + atomics)
                     if should_track {
                         if let Some(ref tracker) = self.latency_tracker {
-                            tracker.track(result.hash, client_idx).await;
+                            tracker.track(result.hash, client_idx);
                         }
                     }
                 } else {
@@ -249,16 +250,16 @@ impl Spammer {
     }
 
     /// Print progress statistics.
-    async fn print_progress(&self, elapsed: Duration) {
+    fn print_progress(&self, elapsed: Duration) {
         let submitted = self.stats.submitted.load(Ordering::SeqCst);
         let accepted = self.stats.accepted.load(Ordering::SeqCst);
         let rejected = self.stats.rejected.load(Ordering::SeqCst);
         let errors = self.stats.errors.load(Ordering::SeqCst);
         let tps = self.stats.tps();
 
-        // Get in-flight count for latency tracking
+        // Get in-flight count for latency tracking (lock-free)
         let in_flight_info = if let Some(ref tracker) = self.latency_tracker {
-            let count = tracker.in_flight_count().await;
+            let count = tracker.in_flight_count();
             format!(" | tracking: {}", count)
         } else {
             String::new()
