@@ -411,7 +411,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Average view changes across all validators in the last 5 minutes",
+      "description": "Average view changes per minute across all validators",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -446,11 +446,11 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "avg(hyperscale_view_changes)",
+          "expr": "avg(rate(hyperscale_view_changes[1m])) * 60",
           "refId": "A"
         }
       ],
-      "title": "Avg View Changes",
+      "title": "View Changes/min",
       "type": "stat"
     },
     {
