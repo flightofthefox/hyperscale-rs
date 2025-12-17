@@ -8,6 +8,7 @@ use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_transactions::builder::ManifestBuilder;
 use rand::{Rng, RngCore};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::warn;
 
 /// Generates XRD transfer transactions.
@@ -23,6 +24,11 @@ pub struct TransferWorkload {
 
     /// Network definition for transaction signing.
     network: NetworkDefinition,
+
+    /// Round-robin counter for shard selection in NoContention mode.
+    /// Ensures even distribution across shards to prevent one shard's
+    /// account counter from advancing faster than others.
+    shard_counter: AtomicU64,
 }
 
 impl TransferWorkload {
@@ -33,6 +39,7 @@ impl TransferWorkload {
             selection_mode: SelectionMode::default(),
             amount: Decimal::from(100u32),
             network,
+            shard_counter: AtomicU64::new(0),
         }
     }
 
@@ -60,7 +67,16 @@ impl TransferWorkload {
         accounts: &AccountPool,
         rng: &mut R,
     ) -> Option<RoutableTransaction> {
-        let shard = ShardGroupId(rng.gen_range(0..accounts.num_shards()));
+        // For NoContention mode, use round-robin shard selection to ensure even
+        // distribution. Random selection can cause one shard's account counter
+        // to advance much faster than others, leading to account reuse before
+        // transactions complete.
+        let shard = if self.selection_mode == SelectionMode::NoContention {
+            let counter = self.shard_counter.fetch_add(1, Ordering::Relaxed);
+            ShardGroupId(counter % accounts.num_shards())
+        } else {
+            ShardGroupId(rng.gen_range(0..accounts.num_shards()))
+        };
         let (from, to) = accounts.pair_for_shard(shard, rng, self.selection_mode)?;
         self.build_transfer(from, to)
     }
