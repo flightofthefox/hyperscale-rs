@@ -1255,7 +1255,11 @@ impl ProductionRunner {
                     if !valid {
                         crate::metrics::record_signature_verification_failure();
                     }
-                    let _ = event_tx.send(Event::VoteSignatureVerified { vote, valid });
+                    event_tx
+                        .send(Event::VoteSignatureVerified { vote, valid })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
                 });
             }
 
@@ -1276,7 +1280,11 @@ impl ProductionRunner {
                     if !valid {
                         crate::metrics::record_signature_verification_failure();
                     }
-                    let _ = event_tx.send(Event::ProvisionSignatureVerified { provision, valid });
+                    event_tx
+                        .send(Event::ProvisionSignatureVerified { provision, valid })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
                 });
             }
 
@@ -1294,7 +1302,11 @@ impl ProductionRunner {
                     if !valid {
                         crate::metrics::record_signature_verification_failure();
                     }
-                    let _ = event_tx.send(Event::StateVoteSignatureVerified { vote, valid });
+                    event_tx
+                        .send(Event::StateVoteSignatureVerified { vote, valid })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
                 });
             }
 
@@ -1377,7 +1389,11 @@ impl ProductionRunner {
                     if !valid {
                         crate::metrics::record_signature_verification_failure();
                     }
-                    let _ = event_tx.send(Event::QcSignatureVerified { block_hash, valid });
+                    event_tx
+                        .send(Event::QcSignatureVerified { block_hash, valid })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
                 });
             }
 
@@ -1424,10 +1440,14 @@ impl ProductionRunner {
                         }
                     };
 
-                    let _ = event_tx.send(Event::TransactionsExecuted {
-                        block_hash,
-                        results,
-                    });
+                    event_tx
+                        .send(Event::TransactionsExecuted {
+                            block_hash,
+                            results,
+                        })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
                 });
             }
 
@@ -1489,7 +1509,11 @@ impl ProductionRunner {
                         }
                     };
 
-                    let _ = event_tx.send(Event::CrossShardTransactionExecuted { tx_hash, result });
+                    event_tx
+                        .send(Event::CrossShardTransactionExecuted { tx_hash, result })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
                 });
             }
 
@@ -1516,7 +1540,11 @@ impl ProductionRunner {
                         }
                         hyperscale_types::Hash::from_bytes(&data)
                     };
-                    let _ = event_tx.send(Event::MerkleRootComputed { tx_hash, root });
+                    event_tx
+                        .send(Event::MerkleRootComputed { tx_hash, root })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
                 });
             }
 
@@ -1675,7 +1703,11 @@ impl ProductionRunner {
 
                 tokio::task::spawn_blocking(move || {
                     let entries = executor.fetch_state_entries(&*storage, &nodes);
-                    let _ = event_tx.send(Event::StateEntriesFetched { tx_hash, entries });
+                    event_tx
+                        .send(Event::StateEntriesFetched { tx_hash, entries })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
                 });
             }
 
@@ -1685,7 +1717,9 @@ impl ProductionRunner {
 
                 tokio::task::spawn_blocking(move || {
                     let block = storage.get_block(height).map(|(b, _qc)| b);
-                    let _ = event_tx.send(Event::BlockFetched { height, block });
+                    event_tx.send(Event::BlockFetched { height, block }).expect(
+                        "callback channel closed - Loss of this event would cause a deadlock",
+                    );
                 });
             }
 
@@ -1695,7 +1729,11 @@ impl ProductionRunner {
 
                 tokio::task::spawn_blocking(move || {
                     let (height, hash, qc) = storage.get_chain_metadata();
-                    let _ = event_tx.send(Event::ChainMetadataFetched { height, hash, qc });
+                    event_tx
+                        .send(Event::ChainMetadataFetched { height, hash, qc })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
                 });
             }
 
@@ -1856,8 +1894,9 @@ impl ProductionRunner {
 
                     if batch_valid {
                         for (vote, _, _) in ed25519_votes {
-                            let _ =
-                                event_tx.send(Event::VoteSignatureVerified { vote, valid: true });
+                            event_tx
+                                .send(Event::VoteSignatureVerified { vote, valid: true })
+                                .expect("callback channel closed - Loss of this event would cause a deadlock");
                         }
                     } else {
                         // Fallback to individual verification to find which ones failed
@@ -1866,7 +1905,9 @@ impl ProductionRunner {
                             if !valid {
                                 crate::metrics::record_signature_verification_failure();
                             }
-                            let _ = event_tx.send(Event::VoteSignatureVerified { vote, valid });
+                            event_tx
+                                .send(Event::VoteSignatureVerified { vote, valid })
+                                .expect("callback channel closed - Loss of this event would cause a deadlock");
                         }
                     }
                 }
@@ -1877,7 +1918,9 @@ impl ProductionRunner {
                     if !valid {
                         crate::metrics::record_signature_verification_failure();
                     }
-                    let _ = event_tx.send(Event::VoteSignatureVerified { vote, valid });
+                    event_tx
+                        .send(Event::VoteSignatureVerified { vote, valid })
+                        .expect("callback channel closed - Loss of this event would cause a deadlock");
                 }
             }
 
@@ -1926,8 +1969,9 @@ impl ProductionRunner {
 
                     if batch_valid {
                         for (vote, _, _) in ed25519_votes {
-                            let _ = event_tx
-                                .send(Event::StateVoteSignatureVerified { vote, valid: true });
+                            event_tx
+                                .send(Event::StateVoteSignatureVerified { vote, valid: true })
+                                .expect("callback channel closed - Loss of this event would cause a deadlock");
                         }
                     } else {
                         for (vote, pk, msg) in ed25519_votes {
@@ -1935,8 +1979,9 @@ impl ProductionRunner {
                             if !valid {
                                 crate::metrics::record_signature_verification_failure();
                             }
-                            let _ =
-                                event_tx.send(Event::StateVoteSignatureVerified { vote, valid });
+                            event_tx
+                                .send(Event::StateVoteSignatureVerified { vote, valid })
+                                .expect("callback channel closed - Loss of this event would cause a deadlock");
                         }
                     }
                 }
@@ -1963,7 +2008,9 @@ impl ProductionRunner {
                         if !valid {
                             crate::metrics::record_signature_verification_failure();
                         }
-                        let _ = event_tx.send(Event::StateVoteSignatureVerified { vote, valid });
+                        event_tx
+                            .send(Event::StateVoteSignatureVerified { vote, valid })
+                            .expect("callback channel closed - Loss of this event would cause a deadlock");
                     }
                 }
             }
