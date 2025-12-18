@@ -840,7 +840,6 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         .with_gossipsub_heartbeat(Duration::from_millis(config.gossipsub_heartbeat_ms)))
 }
 
-
 /// Build RocksDB configuration from TOML config.
 fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
     RocksDbConfig {

@@ -47,6 +47,11 @@ use crate::pending::{
 };
 use crate::trackers::{CertificateTracker, ProvisioningTracker, VoteTracker};
 
+/// Number of blocks to retain committed certificates for peer fetch requests.
+/// This allows slow validators to catch up and fetch certificates from peers
+/// even after the proposer has committed the block.
+const CERTIFICATE_RETENTION_BLOCKS: u64 = 100;
+
 /// Key type for the pending verifications reverse index.
 /// Identifies which type of verification and the secondary key (validator or shard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,6 +104,15 @@ pub struct ExecutionState {
     /// Finalized transaction certificates ready for block inclusion.
     /// Uses BTreeMap for deterministic iteration order.
     finalized_certificates: BTreeMap<Hash, Arc<TransactionCertificate>>,
+
+    /// Recently committed certificates kept for peer fetch requests.
+    /// Maps tx_hash -> (certificate, commit_height).
+    /// Certificates are moved here when committed to a block, then pruned
+    /// after CERTIFICATE_RETENTION_BLOCKS to allow slow peers to fetch them.
+    recently_committed_certificates: HashMap<Hash, (Arc<TransactionCertificate>, u64)>,
+
+    /// Current committed height for pruning recently_committed_certificates.
+    committed_height: u64,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Cross-shard state (Phase 1-2: Provisioning)
@@ -279,6 +293,8 @@ impl ExecutionState {
             executed_txs: HashSet::new(),
             pending_single_shard_executions: HashMap::new(),
             finalized_certificates: BTreeMap::new(),
+            recently_committed_certificates: HashMap::new(),
+            committed_height: 0,
             provisioning_trackers: HashMap::new(),
             completed_provisions: HashMap::new(),
             pending_provisioning: HashMap::new(),
@@ -1691,18 +1707,29 @@ impl ExecutionState {
     }
 
     /// Get a single finalized certificate by transaction hash.
+    ///
+    /// Checks both the pending finalized certificates (not yet committed) and
+    /// the recently committed certificates cache (for peer fetch requests).
     pub fn get_finalized_certificate(&self, tx_hash: &Hash) -> Option<Arc<TransactionCertificate>> {
-        self.finalized_certificates.get(tx_hash).cloned()
+        // First check pending finalized certificates
+        if let Some(cert) = self.finalized_certificates.get(tx_hash) {
+            return Some(cert.clone());
+        }
+        // Fall back to recently committed certificates cache
+        self.recently_committed_certificates
+            .get(tx_hash)
+            .map(|(cert, _)| cert.clone())
     }
 
     /// Remove a finalized certificate (after it's been included in a block).
     ///
+    /// Moves the certificate to the recently_committed_certificates cache
+    /// so that slow peers can still fetch it. The cache is pruned after
+    /// CERTIFICATE_RETENTION_BLOCKS.
+    ///
     /// Also cleans up the verified state vote cache for this transaction
     /// since we no longer need to track verification state after finalization.
-    pub fn remove_finalized_certificate(
-        &mut self,
-        tx_hash: &Hash,
-    ) -> Option<Arc<TransactionCertificate>> {
+    pub fn remove_finalized_certificate(&mut self, tx_hash: &Hash, commit_height: u64) {
         // Clean up verified vote cache using reverse index for O(k) instead of O(n)
         if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
             for vid in validators {
@@ -1710,7 +1737,26 @@ impl ExecutionState {
             }
         }
 
-        self.finalized_certificates.remove(tx_hash)
+        // Move certificate to recently_committed cache instead of discarding
+        if let Some(cert) = self.finalized_certificates.remove(tx_hash) {
+            self.recently_committed_certificates
+                .insert(*tx_hash, (cert, commit_height));
+        }
+
+        // Update committed height and prune old entries
+        if commit_height > self.committed_height {
+            self.committed_height = commit_height;
+            self.prune_recently_committed_certificates();
+        }
+    }
+
+    /// Prune recently committed certificates older than CERTIFICATE_RETENTION_BLOCKS.
+    fn prune_recently_committed_certificates(&mut self) {
+        let cutoff = self
+            .committed_height
+            .saturating_sub(CERTIFICATE_RETENTION_BLOCKS);
+        self.recently_committed_certificates
+            .retain(|_, (_, height)| *height > cutoff);
     }
 
     /// Check if a transaction has been executed.
