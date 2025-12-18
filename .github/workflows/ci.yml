@@ -2,10 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [ "main", "gh-actions" ]
+    branches: [ "main" ]
     tags: [ "v*" ]
   pull_request:
-    branches: [ "main", "gh-actions" ]
+    branches: [ "main" ]
 
 env:
   REGISTRY: ghcr.io
@@ -21,6 +21,19 @@ jobs:
       - uses: swatinem/rust-cache@v2
       - name: Cargo Check
         run: cargo check
+
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      - name: Cargo Test
+        run: cargo test
+      - name: Cargo Clippy
+        run: cargo clippy -- -D warnings
 
   image:
     name: Build Docker Image

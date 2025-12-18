@@ -80,6 +80,7 @@ The `launch-docker-compose.sh` script launches a full cluster inside Docker cont
 
 **Options:**
 - `--build <true|false>`: Whether to build the docker image (default: true). Set to false to use existing image for much faster startup.
+- `--use-ghcr-image`: Use the latest pre-built image from GHCR instead of building locally.
 - `--shards <N>`: Number of shards (default: 1)
 - `--validators-per-shard <M>`: Validators per shard (default: 8)
 
