@@ -496,13 +496,14 @@ mod tests {
     }
 
     fn make_provision(tx_hash: Hash, source_shard: ShardGroupId) -> StateProvision {
+        use std::sync::Arc;
         // Create a provision with no entries (no node overlap possible)
         StateProvision {
             transaction_hash: tx_hash,
             target_shard: ShardGroupId(0),
             source_shard,
             block_height: BlockHeight(1),
-            entries: vec![],
+            entries: Arc::new(vec![]),
             validator_id: ValidatorId(0),
             signature: Signature::zero(),
         }
@@ -514,8 +515,9 @@ mod tests {
         node_ids: Vec<NodeId>,
     ) -> StateProvision {
         use hyperscale_types::{PartitionNumber, StateEntry};
+        use std::sync::Arc;
         // Create a provision with specific nodes
-        let entries = node_ids
+        let entries: Vec<_> = node_ids
             .into_iter()
             .map(|node_id| StateEntry::new(node_id, PartitionNumber(0), vec![], None))
             .collect();
@@ -524,7 +526,7 @@ mod tests {
             target_shard: ShardGroupId(0),
             source_shard,
             block_height: BlockHeight(1),
-            entries,
+            entries: Arc::new(entries),
             validator_id: ValidatorId(0),
             signature: Signature::zero(),
         }

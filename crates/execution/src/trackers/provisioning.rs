@@ -129,6 +129,7 @@ impl ProvisioningTracker {
 mod tests {
     use super::*;
     use hyperscale_types::{BlockHeight, Signature, ValidatorId};
+    use std::sync::Arc;
 
     #[test]
     fn test_provisioning_tracker_basic() {
@@ -152,7 +153,7 @@ mod tests {
             target_shard: ShardGroupId(2),
             source_shard: shard0,
             block_height: BlockHeight(1),
-            entries: vec![],
+            entries: Arc::new(vec![]),
             validator_id: ValidatorId(0),
             signature: Signature::zero(),
         };
@@ -167,7 +168,7 @@ mod tests {
             target_shard: ShardGroupId(2),
             source_shard: shard1,
             block_height: BlockHeight(1),
-            entries: vec![],
+            entries: Arc::new(vec![]),
             validator_id: ValidatorId(1),
             signature: Signature::zero(),
         };
@@ -194,7 +195,7 @@ mod tests {
             target_shard: ShardGroupId(2),
             source_shard: ShardGroupId(99), // Unknown
             block_height: BlockHeight(1),
-            entries: vec![],
+            entries: Arc::new(vec![]),
             validator_id: ValidatorId(0),
             signature: Signature::zero(),
         };

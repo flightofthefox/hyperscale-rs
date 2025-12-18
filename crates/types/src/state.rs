@@ -5,6 +5,7 @@ use crate::{
     ShardGroupId, Signature, SignerBitfield, ValidatorId,
 };
 use sbor::prelude::*;
+use std::sync::Arc;
 
 /// A state entry (key-value pair from the state tree).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
@@ -93,7 +94,11 @@ impl SubstateWrite {
 }
 
 /// State provision from a source shard to a target shard.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+///
+/// The `entries` field uses `Arc<Vec<StateEntry>>` for efficient sharing when
+/// broadcasting the same provision data to multiple target shards (avoiding
+/// expensive clones of potentially large state entry vectors).
+#[derive(Debug, Clone)]
 pub struct StateProvision {
     /// Hash of the transaction this provision is for.
     pub transaction_hash: Hash,
@@ -108,13 +113,107 @@ pub struct StateProvision {
     pub block_height: BlockHeight,
 
     /// The state entries being provided.
-    pub entries: Vec<StateEntry>,
+    /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
+    pub entries: Arc<Vec<StateEntry>>,
 
     /// Validator ID in source shard who created this provision.
     pub validator_id: ValidatorId,
 
     /// Signature from the source shard validator.
     pub signature: Signature,
+}
+
+// Manual PartialEq (compare Arc contents, not pointer identity)
+impl PartialEq for StateProvision {
+    fn eq(&self, other: &Self) -> bool {
+        self.transaction_hash == other.transaction_hash
+            && self.target_shard == other.target_shard
+            && self.source_shard == other.source_shard
+            && self.block_height == other.block_height
+            && *self.entries == *other.entries
+            && self.validator_id == other.validator_id
+            && self.signature == other.signature
+    }
+}
+
+impl Eq for StateProvision {}
+
+// ============================================================================
+// Manual SBOR implementation (since Arc doesn't derive BasicSbor)
+// We serialize/deserialize the inner Vec<StateEntry> directly.
+// ============================================================================
+
+impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
+    for StateProvision
+{
+    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_value_kind(sbor::ValueKind::Tuple)
+    }
+
+    fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_size(7)?;
+        encoder.encode(&self.transaction_hash)?;
+        encoder.encode(&self.target_shard)?;
+        encoder.encode(&self.source_shard)?;
+        encoder.encode(&self.block_height)?;
+        // Entries: encode the inner Vec directly (unwrap Arc)
+        encoder.encode(self.entries.as_ref())?;
+        encoder.encode(&self.validator_id)?;
+        encoder.encode(&self.signature)?;
+        Ok(())
+    }
+}
+
+impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
+    for StateProvision
+{
+    fn decode_body_with_value_kind(
+        decoder: &mut D,
+        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
+    ) -> Result<Self, sbor::DecodeError> {
+        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
+        let length = decoder.read_size()?;
+
+        if length != 7 {
+            return Err(sbor::DecodeError::UnexpectedSize {
+                expected: 7,
+                actual: length,
+            });
+        }
+
+        let transaction_hash: Hash = decoder.decode()?;
+        let target_shard: ShardGroupId = decoder.decode()?;
+        let source_shard: ShardGroupId = decoder.decode()?;
+        let block_height: BlockHeight = decoder.decode()?;
+        // Entries: decode Vec and wrap in Arc
+        let entries: Vec<StateEntry> = decoder.decode()?;
+        let validator_id: ValidatorId = decoder.decode()?;
+        let signature: Signature = decoder.decode()?;
+
+        Ok(Self {
+            transaction_hash,
+            target_shard,
+            source_shard,
+            block_height,
+            entries: Arc::new(entries),
+            validator_id,
+            signature,
+        })
+    }
+}
+
+impl sbor::Categorize<sbor::NoCustomValueKind> for StateProvision {
+    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
+        sbor::ValueKind::Tuple
+    }
+}
+
+impl sbor::Describe<sbor::NoCustomTypeKind> for StateProvision {
+    const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("StateProvision", &[], &[]);
+
+    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
+        sbor::TypeData::unnamed(sbor::TypeKind::Any)
+    }
 }
 
 impl StateProvision {
@@ -136,7 +235,7 @@ impl StateProvision {
     /// Compute a hash of all entries for comparison purposes.
     pub fn entries_hash(&self) -> Hash {
         let mut hasher = blake3::Hasher::new();
-        for entry in &self.entries {
+        for entry in self.entries.iter() {
             hasher.update(entry.hash().as_bytes());
         }
         Hash::from_bytes(hasher.finalize().as_bytes())

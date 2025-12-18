@@ -42,7 +42,7 @@ impl<'a, S: SubstateDatabase> ProvisionedExecutionContext<'a, S> {
 
     /// Add a state provision from another shard.
     pub fn add_provision(&mut self, provision: &StateProvision) {
-        for entry in &provision.entries {
+        for entry in provision.entries.iter() {
             self.add_entry(entry);
         }
     }

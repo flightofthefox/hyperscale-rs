@@ -162,6 +162,7 @@ mod tests {
     use hyperscale_types::{
         BlockHeight, Hash, ShardGroupId, Signature, SignerBitfield, ValidatorId,
     };
+    use std::sync::Arc;
 
     #[test]
     fn test_state_provision_gossip() {
@@ -170,7 +171,7 @@ mod tests {
             target_shard: ShardGroupId(1),
             source_shard: ShardGroupId(0),
             block_height: BlockHeight(10),
-            entries: vec![],
+            entries: Arc::new(vec![]),
             validator_id: ValidatorId(0),
             signature: Signature::zero(),
         };
@@ -243,7 +244,7 @@ mod tests {
             target_shard: ShardGroupId(1),
             source_shard: ShardGroupId(0),
             block_height: BlockHeight(10),
-            entries: vec![],
+            entries: Arc::new(vec![]),
             validator_id: ValidatorId(0),
             signature: Signature::zero(),
         };

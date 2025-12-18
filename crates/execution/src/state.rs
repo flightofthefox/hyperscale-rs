@@ -1898,6 +1898,10 @@ impl ExecutionState {
         let mut actions = Vec::new();
         let local_shard = self.local_shard();
 
+        // Wrap entries in Arc once for efficient sharing across multiple target shards.
+        // This avoids cloning the potentially large Vec<StateEntry> for each broadcast.
+        let entries = Arc::new(entries);
+
         // Create and broadcast provisions to each target shard
         for target_shard in pending.target_shards {
             let provision = StateProvision {
@@ -1905,7 +1909,7 @@ impl ExecutionState {
                 target_shard,
                 source_shard: local_shard,
                 block_height: pending.block_height,
-                entries: entries.clone(),
+                entries: Arc::clone(&entries),
                 validator_id: self.validator_id(),
                 signature: self.sign_provision(
                     &tx_hash,
