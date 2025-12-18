@@ -16,6 +16,11 @@ use tracing::instrument;
 /// keeping the pool small enough for efficient state lock checking.
 pub const DEFAULT_RPC_MEMPOOL_LIMIT: usize = 4096 * 4; // 16,384 transactions
 
+/// Number of blocks to retain evicted transactions for peer fetch requests.
+/// This allows slow validators to catch up and fetch transactions from peers
+/// even after the transaction has been evicted from the active pool.
+const TRANSACTION_RETENTION_BLOCKS: u64 = 100;
+
 /// Mempool configuration.
 #[derive(Debug, Clone)]
 pub struct MempoolConfig {
@@ -143,6 +148,12 @@ pub struct MempoolState {
     /// Maps: tx_hash -> block_height when tombstoned (for cleanup)
     tombstones: HashMap<Hash, BlockHeight>,
 
+    /// Recently evicted transactions kept for peer fetch requests.
+    /// Maps tx_hash -> (transaction, eviction_height).
+    /// Transactions are moved here when evicted, then pruned after
+    /// TRANSACTION_RETENTION_BLOCKS to allow slow peers to fetch them.
+    recently_evicted: HashMap<Hash, (Arc<RoutableTransaction>, BlockHeight)>,
+
     /// Cached set of locked nodes (incrementally maintained).
     /// A node is locked if any transaction that declares it is in Committed or Executed status.
     /// This avoids O(n) scan on every ready_transactions() call.
@@ -178,6 +189,7 @@ impl MempoolState {
             pending_retries: HashMap::new(),
             completed_winners: HashMap::new(),
             tombstones: HashMap::new(),
+            recently_evicted: HashMap::new(),
             locked_nodes_cache: HashSet::new(),
             now: Duration::ZERO,
             topology,
@@ -287,8 +299,12 @@ impl MempoolState {
 
     /// Evict a transaction that has reached a terminal state.
     ///
-    /// This removes the transaction from the pool and adds it to the tombstone set
-    /// to prevent it from being re-added via gossip. Terminal states include:
+    /// This removes the transaction from the pool and moves it to the
+    /// recently_evicted cache so slow peers can still fetch it. The cache
+    /// is pruned after TRANSACTION_RETENTION_BLOCKS.
+    ///
+    /// Also adds the transaction to the tombstone set to prevent it from
+    /// being re-added via gossip. Terminal states include:
     /// - Completed (certificate committed)
     /// - Aborted (explicitly aborted)
     /// - Retried (replaced by a new transaction)
@@ -304,13 +320,28 @@ impl MempoolState {
         if let Some(tx) = tx_to_unlock {
             self.remove_locked_nodes(&tx);
         }
-        self.pool.remove(&tx_hash);
+
+        // Move transaction to recently_evicted cache instead of discarding
+        if let Some(entry) = self.pool.remove(&tx_hash) {
+            self.recently_evicted
+                .insert(tx_hash, (entry.tx, self.current_height));
+        }
         self.tombstones.insert(tx_hash, self.current_height);
     }
 
     /// Check if a transaction hash is tombstoned (reached terminal state).
     pub fn is_tombstoned(&self, tx_hash: &Hash) -> bool {
         self.tombstones.contains_key(tx_hash)
+    }
+
+    /// Prune recently evicted transactions older than TRANSACTION_RETENTION_BLOCKS.
+    fn prune_recently_evicted(&mut self) {
+        let cutoff = self
+            .current_height
+            .0
+            .saturating_sub(TRANSACTION_RETENTION_BLOCKS);
+        self.recently_evicted
+            .retain(|_, (_, height)| height.0 > cutoff);
     }
 
     /// Process a committed block - update statuses and trigger retries.
@@ -330,6 +361,9 @@ impl MempoolState {
 
         // Track current height for retry creation
         self.current_height = height;
+
+        // Prune old entries from recently_evicted cache
+        self.prune_recently_evicted();
 
         // Ensure all committed transactions are in the mempool.
         // This handles the case where we fetched transactions to vote on a block
@@ -1025,8 +1059,18 @@ impl MempoolState {
     }
 
     /// Get a transaction Arc by hash.
+    ///
+    /// Checks both the active pool and the recently_evicted cache
+    /// (for peer fetch requests of transactions that have completed).
     pub fn get_transaction(&self, hash: &Hash) -> Option<Arc<RoutableTransaction>> {
-        self.pool.get(hash).map(|e| Arc::clone(&e.tx))
+        // First check active pool
+        if let Some(entry) = self.pool.get(hash) {
+            return Some(Arc::clone(&entry.tx));
+        }
+        // Fall back to recently evicted cache
+        self.recently_evicted
+            .get(hash)
+            .map(|(tx, _)| Arc::clone(tx))
     }
 
     /// Get transaction status.
