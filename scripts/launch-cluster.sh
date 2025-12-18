@@ -392,41 +392,44 @@ if [ "$MONITORING" = true ]; then
     done
 
     cat > "$MONITORING_DIR/prometheus.yml" << EOF
-# Prometheus configuration for Hyperscale local cluster
-# $NUM_SHARDS shards x $VALIDATORS_PER_SHARD validators = $TOTAL_VALIDATORS total
-#
-# Shard assignment (auto-generated):
-$(for shard in $(seq 0 $((NUM_SHARDS - 1))); do
-    first_port=$((BASE_RPC_PORT + shard * VALIDATORS_PER_SHARD))
-    last_port=$((first_port + VALIDATORS_PER_SHARD - 1))
-    echo "#   - Shard $shard: ports $first_port-$last_port"
-done)
+    # Prometheus configuration for Hyperscale local cluster
+    # $NUM_SHARDS shards x $VALIDATORS_PER_SHARD validators = $TOTAL_VALIDATORS total
+    #
+    # Shard assignment (auto-generated):
+    $(for shard in $(seq 0 $((NUM_SHARDS - 1))); do
+        first_port=$((BASE_RPC_PORT + shard * VALIDATORS_PER_SHARD))
+        last_port=$((first_port + VALIDATORS_PER_SHARD - 1))
+        echo "#   - Shard $shard: ports $first_port-$last_port"
+    done)
+    
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 5s
+    
+    scrape_configs:
+      - job_name: 'hyperscale'
+        static_configs:$PROM_STATIC_CONFIGS
+        metrics_path: '/metrics'
+        scrape_timeout: 5s
+    EOF
 
-global:
-  scrape_interval: 5s
-  evaluation_interval: 5s
-
-scrape_configs:
-  - job_name: 'hyperscale'
-    static_configs:$PROM_STATIC_CONFIGS
-    metrics_path: '/metrics'
-    scrape_timeout: 5s
-EOF
-
+    
+    DC=$(command -v docker-compose >/dev/null 2>&1 && echo "docker-compose" || echo "docker compose")
+    
     # Check if Docker is available
     if ! command -v docker &> /dev/null; then
         echo "WARNING: Docker not found. Cannot start monitoring stack."
-        echo "Install Docker and run manually: cd $MONITORING_DIR && docker-compose up -d"
+        echo "Install Docker and run manually: cd $MONITORING_DIR && $DC up -d"
     else
         # Start the monitoring stack
         echo "Starting Prometheus and Grafana..."
-        (cd "$MONITORING_DIR" && docker-compose up -d 2>&1) | tail -5
+        (cd "$MONITORING_DIR" && $DC up -d 2>&1) | tail -5
 
         echo ""
         echo "Monitoring URLs:"
         echo "  Prometheus: http://localhost:9090"
         echo "  Grafana:    http://localhost:3000/d/hyperscale-cluster/hyperscale-cluster"
         echo ""
-        echo "Stop monitoring: cd $MONITORING_DIR && docker-compose down"
+        echo "Stop monitoring: cd $MONITORING_DIR && $DC down"
     fi
 fi
