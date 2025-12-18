@@ -102,7 +102,28 @@ impl VoteTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{Signature, ValidatorId};
+    use hyperscale_types::{build_merkle_tree_with_proofs, vote_leaf_hash, Signature, ValidatorId};
+
+    fn test_vote(tx_hash: Hash, state_root: Hash, validator: ValidatorId) -> StateVoteBlock {
+        let shard_group_id = ShardGroupId(0);
+        let success = true;
+
+        // Build merkle tree with single leaf
+        let leaf_hash = vote_leaf_hash(&tx_hash, &state_root, shard_group_id.0, success);
+        let (merkle_root, proofs) = build_merkle_tree_with_proofs(&[leaf_hash]);
+
+        StateVoteBlock {
+            transaction_hash: tx_hash,
+            shard_group_id,
+            state_root,
+            success,
+            validator,
+            signature: Signature::zero(),
+            vote_merkle_root: merkle_root,
+            vote_merkle_proof: proofs.into_iter().next().unwrap(),
+            batch_block_height: None,
+        }
+    }
 
     #[test]
     fn test_vote_tracker_quorum() {
@@ -116,14 +137,7 @@ mod tests {
             3, // quorum = 3
         );
 
-        let vote = StateVoteBlock {
-            transaction_hash: tx_hash,
-            shard_group_id: ShardGroupId(0),
-            state_root: merkle_root,
-            success: true,
-            validator: ValidatorId(0),
-            signature: Signature::zero(),
-        };
+        let vote = test_vote(tx_hash, merkle_root, ValidatorId(0));
 
         // Not quorum yet
         tracker.add_vote(vote.clone(), 1);
@@ -151,23 +165,8 @@ mod tests {
 
         let mut tracker = VoteTracker::new(tx_hash, vec![ShardGroupId(0)], vec![], 3);
 
-        let vote_a = StateVoteBlock {
-            transaction_hash: tx_hash,
-            shard_group_id: ShardGroupId(0),
-            state_root: root_a,
-            success: true,
-            validator: ValidatorId(0),
-            signature: Signature::zero(),
-        };
-
-        let vote_b = StateVoteBlock {
-            transaction_hash: tx_hash,
-            shard_group_id: ShardGroupId(0),
-            state_root: root_b,
-            success: true,
-            validator: ValidatorId(1),
-            signature: Signature::zero(),
-        };
+        let vote_a = test_vote(tx_hash, root_a, ValidatorId(0));
+        let vote_b = test_vote(tx_hash, root_b, ValidatorId(1));
 
         // Split votes - no quorum
         tracker.add_vote(vote_a.clone(), 1);

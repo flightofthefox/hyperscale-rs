@@ -182,16 +182,67 @@ mod tests {
         assert_eq!(extracted, provision);
     }
 
-    #[test]
-    fn test_state_vote_block_gossip() {
-        let vote = StateVoteBlock {
-            transaction_hash: Hash::from_bytes(b"tx"),
-            shard_group_id: ShardGroupId(0),
-            state_root: Hash::from_bytes(b"root"),
-            success: true,
+    fn test_vote() -> StateVoteBlock {
+        use hyperscale_types::{build_merkle_tree_with_proofs, vote_leaf_hash};
+
+        let tx_hash = Hash::from_bytes(b"tx");
+        let state_root = Hash::from_bytes(b"root");
+        let shard_group_id = ShardGroupId(0);
+        let success = true;
+
+        // Build merkle tree with single leaf
+        let leaf_hash = vote_leaf_hash(&tx_hash, &state_root, shard_group_id.0, success);
+        let (merkle_root, proofs) = build_merkle_tree_with_proofs(&[leaf_hash]);
+
+        StateVoteBlock {
+            transaction_hash: tx_hash,
+            shard_group_id,
+            state_root,
+            success,
             validator: ValidatorId(0),
             signature: Signature::zero(),
-        };
+            vote_merkle_root: merkle_root,
+            vote_merkle_proof: proofs.into_iter().next().unwrap(),
+            batch_block_height: None,
+        }
+    }
+
+    fn test_certificate() -> StateCertificate {
+        use hyperscale_types::{build_merkle_tree_with_proofs, vote_leaf_hash};
+
+        let tx_hash = Hash::from_bytes(b"tx");
+        let outputs_merkle_root = Hash::from_bytes(b"root");
+        let shard_group_id = ShardGroupId(0);
+        let success = true;
+
+        // Build merkle tree with single leaf
+        let leaf_hash = vote_leaf_hash(&tx_hash, &outputs_merkle_root, shard_group_id.0, success);
+        let (merkle_root, proofs) = build_merkle_tree_with_proofs(&[leaf_hash]);
+
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+
+        StateCertificate {
+            transaction_hash: tx_hash,
+            shard_group_id,
+            read_nodes: vec![],
+            state_writes: vec![],
+            outputs_merkle_root,
+            success,
+            aggregated_signature: Signature::zero(),
+            signers,
+            voting_power: 3,
+            vote_merkle_root: merkle_root,
+            vote_merkle_proof: proofs.into_iter().next().unwrap(),
+            batch_block_height: None,
+        }
+    }
+
+    #[test]
+    fn test_state_vote_block_gossip() {
+        let vote = test_vote();
 
         let msg = StateVoteBlockGossip::new(vote.clone());
         assert_eq!(msg.vote(), &vote);
@@ -202,22 +253,7 @@ mod tests {
 
     #[test]
     fn test_state_certificate_gossip() {
-        let mut signers = SignerBitfield::new(4);
-        signers.set(0);
-        signers.set(1);
-        signers.set(2);
-
-        let cert = StateCertificate {
-            transaction_hash: Hash::from_bytes(b"tx"),
-            shard_group_id: ShardGroupId(0),
-            read_nodes: vec![],
-            state_writes: vec![],
-            outputs_merkle_root: Hash::from_bytes(b"root"),
-            success: true,
-            aggregated_signature: Signature::zero(),
-            signers,
-            voting_power: 3,
-        };
+        let cert = test_certificate();
 
         let msg = StateCertificateGossip::new(cert.clone());
         assert_eq!(msg.certificate(), &cert);
@@ -260,22 +296,7 @@ mod tests {
 
     #[test]
     fn test_state_certificate_trace_context() {
-        let mut signers = SignerBitfield::new(4);
-        signers.set(0);
-        signers.set(1);
-        signers.set(2);
-
-        let cert = StateCertificate {
-            transaction_hash: Hash::from_bytes(b"tx"),
-            shard_group_id: ShardGroupId(0),
-            read_nodes: vec![],
-            state_writes: vec![],
-            outputs_merkle_root: Hash::from_bytes(b"root"),
-            success: true,
-            aggregated_signature: Signature::zero(),
-            signers,
-            voting_power: 3,
-        };
+        let cert = test_certificate();
 
         // new() should have empty trace context
         let msg = StateCertificateGossip::new(cert.clone());

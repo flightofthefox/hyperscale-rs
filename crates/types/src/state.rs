@@ -1,8 +1,8 @@
 //! State-related types for cross-shard execution.
 
 use crate::{
-    exec_vote_message, state_provision_message, BlockHeight, Hash, NodeId, PartitionNumber,
-    ShardGroupId, Signature, SignerBitfield, ValidatorId,
+    batched_vote_message, state_provision_message, vote_leaf_hash, BlockHeight, Hash, MerkleProof,
+    NodeId, PartitionNumber, ShardGroupId, Signature, SignerBitfield, ValidatorId,
 };
 use sbor::prelude::*;
 
@@ -144,6 +144,10 @@ impl StateProvision {
 }
 
 /// Vote on execution state from a validator.
+///
+/// Uses Merkle-batched signing: multiple votes are batched into a Merkle tree,
+/// and the validator signs the root once. Each vote carries a Merkle proof for
+/// inclusion verification. This reduces BLS signatures from O(n) to O(1) per block.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct StateVoteBlock {
     /// Hash of the transaction.
@@ -162,7 +166,27 @@ pub struct StateVoteBlock {
     pub validator: ValidatorId,
 
     /// Signature from the voting validator.
+    ///
+    /// Signs `batched_vote_message(shard, height, vote_merkle_root)`.
+    /// All votes in the same batch share this signature.
     pub signature: Signature,
+
+    /// Merkle root of all votes in this batch.
+    ///
+    /// All votes from this validator in the same batch share this root.
+    /// The signature covers this root.
+    pub vote_merkle_root: Hash,
+
+    /// Merkle proof that this vote is included in `vote_merkle_root`.
+    ///
+    /// Verification: compute leaf hash from vote data, verify inclusion in merkle root.
+    pub vote_merkle_proof: MerkleProof,
+
+    /// Block height for the batch (used in signing message).
+    ///
+    /// For block-level batches: the block height being executed.
+    /// For latent/cross-shard batches: None (encoded as 0 in signing message).
+    pub batch_block_height: Option<u64>,
 }
 
 impl StateVoteBlock {
@@ -179,22 +203,41 @@ impl StateVoteBlock {
 
     /// Create the canonical message bytes for signing.
     ///
-    /// Uses the centralized `exec_vote_message` function with the
-    /// `DOMAIN_EXEC_VOTE` tag for domain separation.
-    ///
-    /// Note: StateCertificates aggregate signatures from StateVoteBlocks,
-    /// so StateCertificate::signing_message() returns the same format.
+    /// Uses `batched_vote_message` with the `DOMAIN_BATCH_STATE_VOTE` tag.
+    /// The signature covers the merkle root of all votes in the batch.
     pub fn signing_message(&self) -> Vec<u8> {
-        exec_vote_message(
+        batched_vote_message(
+            self.shard_group_id,
+            self.batch_block_height,
+            &self.vote_merkle_root,
+        )
+    }
+
+    /// Compute the leaf hash for this vote (used in merkle tree).
+    ///
+    /// This is the hash that gets included in the merkle tree when batching.
+    pub fn leaf_hash(&self) -> Hash {
+        vote_leaf_hash(
             &self.transaction_hash,
             &self.state_root,
-            self.shard_group_id,
+            self.shard_group_id.0,
             self.success,
         )
+    }
+
+    /// Verify the merkle proof for this vote.
+    ///
+    /// Returns true if the merkle proof verifies against the merkle root.
+    pub fn verify_merkle_proof(&self) -> bool {
+        let leaf = self.leaf_hash();
+        self.vote_merkle_proof.verify(&leaf, &self.vote_merkle_root)
     }
 }
 
 /// Certificate proving a shard agreed on execution state.
+///
+/// The certificate aggregates BLS signatures from multiple validators who voted
+/// on the same execution result. The aggregated signature covers the `vote_merkle_root`.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct StateCertificate {
     /// Hash of the transaction.
@@ -215,7 +258,9 @@ pub struct StateCertificate {
     /// Whether execution succeeded.
     pub success: bool,
 
-    /// Aggregated signature.
+    /// Aggregated signature from all voting validators.
+    ///
+    /// Covers `vote_merkle_root` via `batched_vote_message()`.
     pub aggregated_signature: Signature,
 
     /// Which validators signed.
@@ -223,6 +268,20 @@ pub struct StateCertificate {
 
     /// Total voting power of all signers.
     pub voting_power: u64,
+
+    /// Merkle root of all votes in the batch that formed this certificate.
+    ///
+    /// The `aggregated_signature` verifies against this root
+    /// via `batched_vote_message(shard, block_height, vote_merkle_root)`.
+    pub vote_merkle_root: Hash,
+
+    /// Merkle proof that this transaction's vote is included in `vote_merkle_root`.
+    ///
+    /// Allows individual verification of this transaction's inclusion in the batch.
+    pub vote_merkle_proof: MerkleProof,
+
+    /// Block height used in the batched vote signing message.
+    pub batch_block_height: Option<u64>,
 }
 
 impl StateCertificate {
@@ -261,41 +320,29 @@ impl StateCertificate {
         !self.state_writes.is_empty()
     }
 
-    /// Create a certificate for a single-shard transaction.
-    pub fn single_shard(
-        transaction_hash: Hash,
-        outputs_merkle_root: Hash,
-        shard_group_id: ShardGroupId,
-        success: bool,
-    ) -> Self {
-        Self {
-            transaction_hash,
-            shard_group_id,
-            read_nodes: vec![],
-            state_writes: vec![],
-            outputs_merkle_root,
-            success,
-            aggregated_signature: Signature::zero(),
-            signers: SignerBitfield::empty(),
-            voting_power: 0,
-        }
-    }
-
     /// Create the canonical message bytes for signature verification.
     ///
-    /// Uses the centralized `exec_vote_message` function with the
-    /// `DOMAIN_EXEC_VOTE` tag for domain separation.
-    ///
-    /// Note: This returns the same message format as StateVoteBlock::signing_message()
-    /// because StateCertificates aggregate signatures from StateVoteBlocks. The
-    /// aggregated signature is verified against this same message.
+    /// Uses `batched_vote_message` with the `DOMAIN_BATCH_STATE_VOTE` tag.
+    /// The signature covers the vote merkle root.
     pub fn signing_message(&self) -> Vec<u8> {
-        exec_vote_message(
+        batched_vote_message(
+            self.shard_group_id,
+            self.batch_block_height,
+            &self.vote_merkle_root,
+        )
+    }
+
+    /// Verify the merkle proof for this certificate.
+    ///
+    /// Returns true if the merkle proof verifies this transaction's vote is in the batch.
+    pub fn verify_merkle_proof(&self) -> bool {
+        let leaf = crate::vote_leaf_hash(
             &self.transaction_hash,
             &self.outputs_merkle_root,
-            self.shard_group_id,
+            self.shard_group_id.0,
             self.success,
-        )
+        );
+        self.vote_merkle_proof.verify(&leaf, &self.vote_merkle_root)
     }
 }
 
@@ -334,18 +381,5 @@ mod tests {
         let hash1 = entry.hash();
         let hash2 = entry.hash();
         assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_single_shard_certificate() {
-        let cert = StateCertificate::single_shard(
-            Hash::from_bytes(b"tx"),
-            Hash::from_bytes(b"root"),
-            ShardGroupId(0),
-            true,
-        );
-
-        assert!(cert.success);
-        assert!(cert.signers.is_empty());
     }
 }

@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, instrument};
 
+use crate::batcher::{PendingVote, VoteBatcher};
 use crate::pending::{
     PendingCertificateVerification, PendingFetchedCertificateVerification,
     PendingProvisionBroadcast, PendingProvisionVerification, PendingStateVoteVerification,
@@ -81,9 +82,9 @@ pub struct ExecutionState {
     executed_txs: HashSet<Hash>,
 
     /// Pending single-shard executions waiting for callback.
-    /// Maps block_hash -> list of single-shard transactions in that block.
+    /// Maps block_hash -> (block_height, list of single-shard transactions in that block).
     /// After execution completes, we create votes instead of direct certificates.
-    pending_single_shard_executions: HashMap<Hash, Vec<Arc<RoutableTransaction>>>,
+    pending_single_shard_executions: HashMap<Hash, (u64, Vec<Arc<RoutableTransaction>>)>,
 
     /// Finalized transaction certificates ready for block inclusion.
     /// Uses BTreeMap for deterministic iteration order.
@@ -118,6 +119,10 @@ pub struct ExecutionState {
     /// State certificates from vote aggregation (local shard's certificate).
     /// Maps tx_hash -> StateCertificate
     state_certificates: HashMap<Hash, StateCertificate>,
+
+    /// Vote batcher for efficient merkle-batched signing.
+    /// Batches votes per-block for single-shard transactions and per-timer for cross-shard.
+    vote_batcher: VoteBatcher,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Cross-shard state (Phase 5: Finalization)
@@ -163,6 +168,17 @@ pub struct ExecutionState {
     /// we can skip re-verification and proceed directly to vote aggregation.
     /// The height is stored to enable cleanup of old entries after finalization.
     verified_state_votes: HashMap<(Hash, ValidatorId), u64>,
+
+    /// Cache of verified Merkle roots for batched votes.
+    /// Maps (validator_id, merkle_root) -> ().
+    /// When we verify a batched vote's signature, we cache the result so subsequent
+    /// votes from the same batch can skip BLS verification and only verify the Merkle proof.
+    ///
+    /// Note: Unlike `verified_state_votes`, this cache is keyed by merkle root, not tx_hash.
+    /// One merkle root covers an entire batch of transactions. The cache is bounded by
+    /// (num_validators * num_blocks) rather than (num_validators * num_transactions).
+    /// Cleanup happens in `on_finalized()` when blocks are finalized.
+    verified_merkle_roots: HashMap<(ValidatorId, Hash), ()>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Speculative Execution State
@@ -252,6 +268,10 @@ impl ExecutionState {
         speculative_max_txs: usize,
         view_change_cooldown_rounds: u64,
     ) -> Self {
+        let local_shard = topology.local_shard();
+        let validator_id = topology.local_validator_id();
+        let vote_batcher = VoteBatcher::new(signing_key.clone(), local_shard, validator_id);
+
         Self {
             topology,
             signing_key,
@@ -265,6 +285,7 @@ impl ExecutionState {
             pending_provision_fetches: HashMap::new(),
             vote_trackers: HashMap::new(),
             state_certificates: HashMap::new(),
+            vote_batcher,
             certificate_trackers: HashMap::new(),
             early_provisions: HashMap::new(),
             early_votes: HashMap::new(),
@@ -274,6 +295,7 @@ impl ExecutionState {
             pending_cert_verifications: HashMap::new(),
             pending_fetched_cert_verifications: HashMap::new(),
             verified_state_votes: HashMap::new(),
+            verified_merkle_roots: HashMap::new(),
             speculative_results: HashMap::new(),
             speculative_in_flight_txs: HashSet::new(),
             speculative_reads_index: HashMap::new(),
@@ -508,7 +530,7 @@ impl ExecutionState {
     fn start_single_shard_execution(
         &mut self,
         tx: Arc<RoutableTransaction>,
-        _height: u64,
+        height: u64,
         block_hash: Hash,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -564,7 +586,8 @@ impl ExecutionState {
         // ExecuteTransactions is emitted by on_block_committed after all txs are collected
         self.pending_single_shard_executions
             .entry(block_hash)
-            .or_default()
+            .or_insert_with(|| (height, Vec::new()))
+            .1
             .push(tx);
 
         actions
@@ -748,6 +771,9 @@ impl ExecutionState {
     }
 
     /// Handle execution completion callback for single-shard transactions.
+    ///
+    /// Uses batched voting: all votes from this block are signed with a single BLS signature
+    /// over a Merkle root, reducing signing overhead from O(n) to O(1).
     #[instrument(skip(self, results), fields(
         block_hash = ?block_hash,
         result_count = results.len()
@@ -759,8 +785,10 @@ impl ExecutionState {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        // Get the transactions we were executing
-        let Some(transactions) = self.pending_single_shard_executions.remove(&block_hash) else {
+        // Get the transactions we were executing along with block height
+        let Some((block_height, transactions)) =
+            self.pending_single_shard_executions.remove(&block_hash)
+        else {
             tracing::warn!(?block_hash, "Execution complete for unknown block");
             return actions;
         };
@@ -769,7 +797,8 @@ impl ExecutionState {
         let results_map: HashMap<Hash, &ExecutionResult> =
             results.iter().map(|r| (r.transaction_hash, r)).collect();
 
-        for tx in transactions {
+        // Add all votes to the batcher
+        for tx in &transactions {
             let tx_hash = tx.hash();
 
             // Get execution result
@@ -777,24 +806,53 @@ impl ExecutionState {
             let success = result.is_none_or(|r| r.success);
             let state_root = result.map(|r| r.state_root).unwrap_or(Hash::ZERO);
 
-            let exec_result = ExecutionResult {
-                transaction_hash: tx_hash,
+            tracing::debug!(
+                tx_hash = ?tx_hash,
                 success,
-                state_root,
-                writes: result.map(|r| r.writes.clone()).unwrap_or_default(),
-                error: result.and_then(|r| r.error.clone()),
-            };
+                state_root = ?state_root,
+                "Adding vote to batch"
+            );
 
-            actions.extend(self.on_single_tx_execution_complete(block_hash, exec_result));
+            // Add to batcher instead of creating individual vote
+            self.vote_batcher.add_block_vote(
+                block_height,
+                PendingVote {
+                    tx_hash,
+                    state_root,
+                    success,
+                },
+            );
+        }
+
+        // Flush the batch to get all votes with shared signature
+        let votes = self.vote_batcher.flush_block();
+        let local_shard = self.local_shard();
+
+        tracing::debug!(
+            block_height = block_height,
+            vote_count = votes.len(),
+            "Flushed batched votes"
+        );
+
+        // Broadcast and handle all votes
+        for vote in votes {
+            let gossip = StateVoteBlockGossip { vote: vote.clone() };
+            actions.push(Action::BroadcastToShard {
+                message: OutboundMessage::StateVoteBlock(gossip),
+                shard: local_shard,
+            });
+
+            // Handle our own vote (ensures we count without relying on network loopback)
+            actions.extend(self.handle_vote_internal(vote));
         }
 
         actions
     }
 
-    /// Handle execution completion for a single transaction.
+    /// Handle execution completion for a single transaction (speculative hits).
     ///
-    /// Creates and broadcasts a vote for the transaction.
-    /// Used by both normal execution and speculative execution paths.
+    /// For speculative hits, we create an individual vote since the execution
+    /// completed outside of the normal block execution flow.
     fn on_single_tx_execution_complete(
         &mut self,
         _block_hash: Hash,
@@ -811,11 +869,12 @@ impl ExecutionState {
             tx_hash = ?tx_hash,
             success,
             state_root = ?state_root,
-            "Single-shard execution complete, creating vote"
+            "Speculative execution complete, creating individual vote"
         );
 
-        // Create signed vote (same as cross-shard voting)
-        let vote = self.create_vote(tx_hash, state_root, success);
+        // For speculative hits, create individual vote (batch of 1)
+        // These arrive outside normal block execution flow
+        let vote = self.create_vote(tx_hash, state_root, success, None);
 
         // Broadcast vote within shard
         let gossip = StateVoteBlockGossip { vote: vote.clone() };
@@ -827,7 +886,7 @@ impl ExecutionState {
         tracing::debug!(
             tx_hash = ?tx_hash,
             shard = local_shard.0,
-            "Broadcasted single-shard vote"
+            "Broadcasted speculative vote"
         );
 
         // Handle our own vote (ensures we count without relying on network loopback)
@@ -996,6 +1055,9 @@ impl ExecutionState {
     ///
     /// Called when the runner completes `Action::ExecuteCrossShardTransaction`.
     /// Creates and broadcasts a vote based on the execution result.
+    ///
+    /// Cross-shard votes are batched using a latent batcher with time/size thresholds.
+    /// This amortizes signature cost across multiple async cross-shard completions.
     #[instrument(skip(self, result), fields(
         tx_hash = ?result.transaction_hash,
         success = result.success
@@ -1009,35 +1071,59 @@ impl ExecutionState {
             tx_hash = ?tx_hash,
             success = result.success,
             state_root = ?result.state_root,
-            "Cross-shard execution complete, creating vote"
+            "Cross-shard execution complete, adding to latent batch"
         );
 
-        // Create vote from execution result
-        let vote = self.create_vote(tx_hash, result.state_root, result.success);
+        // Add to latent batcher - may trigger flush if threshold reached
+        let votes = self.vote_batcher.add_latent_vote(
+            PendingVote {
+                tx_hash,
+                state_root: result.state_root,
+                success: result.success,
+            },
+            self.now,
+        );
 
-        // Broadcast vote to local shard
-        let gossip = StateVoteBlockGossip { vote: vote.clone() };
-        actions.push(Action::BroadcastToShard {
-            message: OutboundMessage::StateVoteBlock(gossip),
-            shard: local_shard,
-        });
+        // If batcher flushed, broadcast and handle votes
+        for vote in votes {
+            let gossip = StateVoteBlockGossip { vote: vote.clone() };
+            actions.push(Action::BroadcastToShard {
+                message: OutboundMessage::StateVoteBlock(gossip),
+                shard: local_shard,
+            });
 
-        // Handle our own vote
-        actions.extend(self.handle_vote_internal(vote));
+            // Handle our own vote
+            actions.extend(self.handle_vote_internal(vote));
+        }
 
         actions
     }
 
-    /// Create a state vote block.
+    /// Create a state vote block for a single transaction.
     ///
-    /// Uses the centralized `exec_vote_message` for domain-separated signing.
-    fn create_vote(&self, tx_hash: Hash, state_root: Hash, success: bool) -> StateVoteBlock {
+    /// Uses merkle-batched signing with a batch size of 1. For bulk batching
+    /// of multiple votes, use VoteBatcher instead.
+    fn create_vote(
+        &self,
+        tx_hash: Hash,
+        state_root: Hash,
+        success: bool,
+        block_height: Option<u64>,
+    ) -> StateVoteBlock {
         let shard_group = self.local_shard();
         let validator_id = self.validator_id();
 
-        // Build signing message using centralized domain-separated function
+        // Compute leaf hash for merkle tree
+        let leaf_hash =
+            hyperscale_types::vote_leaf_hash(&tx_hash, &state_root, shard_group.0, success);
+
+        // Build merkle tree with single leaf (root = leaf, empty proof)
+        let (merkle_root, proofs) = hyperscale_types::build_merkle_tree_with_proofs(&[leaf_hash]);
+        let proof = proofs.into_iter().next().unwrap();
+
+        // Sign the merkle root
         let message =
-            hyperscale_types::exec_vote_message(&tx_hash, &state_root, shard_group, success);
+            hyperscale_types::batched_vote_message(shard_group, block_height, &merkle_root);
         let signature = self.signing_key.sign(&message);
 
         StateVoteBlock {
@@ -1047,6 +1133,9 @@ impl ExecutionState {
             success,
             validator: validator_id,
             signature,
+            vote_merkle_root: merkle_root,
+            vote_merkle_proof: proof,
+            batch_block_height: block_height,
         }
     }
 
@@ -1106,6 +1195,33 @@ impl ExecutionState {
                 "State vote already verified, skipping re-verification"
             );
             return self.handle_vote_internal(vote);
+        }
+
+        // Check if we've already verified this validator's merkle root.
+        // If so, we only need to verify the merkle proof (O(log n) hashes) instead of
+        // the BLS signature (expensive crypto). This is the key optimization for batched votes.
+        if self
+            .verified_merkle_roots
+            .contains_key(&(validator_id, vote.vote_merkle_root))
+        {
+            // Merkle root already verified for this validator - just check the proof
+            if vote.verify_merkle_proof() {
+                tracing::trace!(
+                    tx_hash = ?tx_hash,
+                    validator = validator_id.0,
+                    "Batched vote verified via cached merkle root"
+                );
+                // Cache this specific vote as verified too
+                self.verified_state_votes.insert((tx_hash, validator_id), 0);
+                return self.handle_vote_internal(vote);
+            } else {
+                tracing::warn!(
+                    tx_hash = ?tx_hash,
+                    validator = validator_id.0,
+                    "Batched vote merkle proof verification failed"
+                );
+                return vec![];
+            }
         }
 
         // Check if already pending verification (duplicate vote in parallel execution)
@@ -1180,10 +1296,17 @@ impl ExecutionState {
         // (e.g., during gossiping or retries). We use 0 as a placeholder height
         // since cleanup is done by tx_hash in cleanup_transaction().
         self.verified_state_votes.insert((tx_hash, validator_id), 0);
+
+        // Cache the verified merkle root so subsequent votes from the same batch
+        // can skip BLS verification entirely and just verify the merkle proof
+        // (much cheaper - O(log n) hashes vs BLS verify).
+        self.verified_merkle_roots
+            .insert((validator_id, pending.vote.vote_merkle_root), ());
         tracing::trace!(
             tx_hash = ?tx_hash,
             validator = validator_id.0,
-            "Cached verified state vote"
+            merkle_root = ?pending.vote.vote_merkle_root,
+            "Cached verified merkle root for batched votes"
         );
 
         // Process with cached voting power
@@ -1255,6 +1378,9 @@ impl ExecutionState {
     }
 
     /// Create a state certificate from votes.
+    ///
+    /// All votes use merkle batching - they share the same `vote_merkle_root` and signature.
+    /// The certificate stores this merkle root and aggregates signatures.
     fn create_state_certificate(
         &self,
         tx_hash: Hash,
@@ -1291,7 +1417,7 @@ impl ExecutionState {
         let mut signers = SignerBitfield::new(committee_size);
         let mut total_power = 0u64;
 
-        for vote in unique_votes {
+        for vote in &unique_votes {
             if let Some(index) = self.committee_index(vote.validator) {
                 signers.set(index);
                 total_power += self.voting_power(vote.validator);
@@ -1299,6 +1425,16 @@ impl ExecutionState {
         }
 
         let success = votes.first().map(|v| v.success).unwrap_or(false);
+
+        // Get merkle batching info from the first vote (all votes share the same root)
+        let first_vote = unique_votes.first().expect("votes should not be empty");
+
+        // Find the merkle proof for this specific transaction
+        let proof = votes
+            .iter()
+            .find(|v| v.transaction_hash == tx_hash)
+            .map(|v| v.vote_merkle_proof.clone())
+            .expect("tx_hash must match one of the votes");
 
         StateCertificate {
             transaction_hash: tx_hash,
@@ -1310,6 +1446,9 @@ impl ExecutionState {
             aggregated_signature,
             signers,
             voting_power: total_power,
+            vote_merkle_root: first_vote.vote_merkle_root,
+            vote_merkle_proof: proof,
+            batch_block_height: first_vote.batch_block_height,
         }
     }
 
@@ -1642,6 +1781,24 @@ impl ExecutionState {
     ) -> Option<Arc<TransactionCertificate>> {
         // Clean up verified vote cache for this transaction
         self.verified_state_votes.retain(|(h, _), _| h != tx_hash);
+
+        // Periodically clean merkle root cache to prevent unbounded growth.
+        // The cache is keyed by (validator, merkle_root), bounded by O(blocks * validators).
+        // We cap at 10000 entries to handle long-running nodes.
+        const MAX_MERKLE_ROOT_CACHE: usize = 10000;
+        if self.verified_merkle_roots.len() > MAX_MERKLE_ROOT_CACHE {
+            // Clear half the cache (simple LRU-like behavior without tracking access times)
+            let to_remove = self.verified_merkle_roots.len() / 2;
+            let keys_to_remove: Vec<_> = self
+                .verified_merkle_roots
+                .keys()
+                .take(to_remove)
+                .cloned()
+                .collect();
+            for key in keys_to_remove {
+                self.verified_merkle_roots.remove(&key);
+            }
+        }
 
         self.finalized_certificates.remove(tx_hash)
     }
@@ -2153,6 +2310,42 @@ impl ExecutionState {
     /// Check if speculative execution is in flight for a transaction.
     pub fn is_speculative_in_flight_for_tx(&self, tx_hash: &Hash) -> bool {
         self.speculative_in_flight_txs.contains(tx_hash)
+    }
+
+    /// Flush any pending latent votes that have exceeded their time threshold.
+    ///
+    /// Called periodically (e.g., on timer tick) to ensure cross-shard votes
+    /// are broadcast even when the threshold count isn't reached.
+    pub fn flush_pending_latent_votes(&mut self) -> Vec<Action> {
+        if !self.vote_batcher.should_flush_latent(self.now) {
+            return vec![];
+        }
+
+        let votes = self.vote_batcher.flush_latent(self.now);
+        if votes.is_empty() {
+            return vec![];
+        }
+
+        let local_shard = self.local_shard();
+        let mut actions = Vec::new();
+
+        tracing::debug!(
+            vote_count = votes.len(),
+            "Flushing pending latent votes on timer"
+        );
+
+        for vote in votes {
+            let gossip = StateVoteBlockGossip { vote: vote.clone() };
+            actions.push(Action::BroadcastToShard {
+                message: OutboundMessage::StateVoteBlock(gossip),
+                shard: local_shard,
+            });
+
+            // Handle our own vote
+            actions.extend(self.handle_vote_internal(vote));
+        }
+
+        actions
     }
 
     /// Cleanup stale speculative results that have exceeded the max age.

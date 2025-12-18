@@ -16,6 +16,7 @@
 mod crypto;
 mod hash;
 mod identifiers;
+mod merkle;
 mod network;
 mod signing;
 
@@ -36,10 +37,11 @@ pub use epoch::{
 };
 pub use hash::{Hash, HexError};
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
+pub use merkle::{build_merkle_tree_with_proofs, vote_leaf_hash, MerkleProof};
 pub use network::{GlobalMessage, NetworkMessage, Request, ShardMessage};
 pub use signing::{
-    block_vote_message, exec_vote_message, state_provision_message, DOMAIN_BLOCK_VOTE,
-    DOMAIN_EXEC_VOTE, DOMAIN_STATE_PROVISION,
+    batched_vote_message, block_vote_message, state_provision_message, DOMAIN_BATCH_STATE_VOTE,
+    DOMAIN_BLOCK_VOTE, DOMAIN_STATE_PROVISION,
 };
 
 pub use block::{Block, BlockHeader};

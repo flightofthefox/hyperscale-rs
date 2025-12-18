@@ -164,19 +164,30 @@ impl CertificateTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{Signature, SignerBitfield};
+    use hyperscale_types::{
+        build_merkle_tree_with_proofs, vote_leaf_hash, Signature, SignerBitfield,
+    };
 
     fn make_certificate(tx_hash: Hash, shard: ShardGroupId, merkle_root: Hash) -> StateCertificate {
+        let success = true;
+
+        // Build merkle tree with single leaf
+        let leaf_hash = vote_leaf_hash(&tx_hash, &merkle_root, shard.0, success);
+        let (vote_merkle_root, proofs) = build_merkle_tree_with_proofs(&[leaf_hash]);
+
         StateCertificate {
             transaction_hash: tx_hash,
             shard_group_id: shard,
             read_nodes: vec![],
             state_writes: vec![],
             outputs_merkle_root: merkle_root,
-            success: true,
+            success,
             aggregated_signature: Signature::zero(),
             signers: SignerBitfield::new(4),
             voting_power: 3,
+            vote_merkle_root,
+            vote_merkle_proof: proofs.into_iter().next().unwrap(),
+            batch_block_height: None,
         }
     }
 
