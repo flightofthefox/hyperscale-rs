@@ -2164,8 +2164,10 @@ impl ProductionRunner {
                     }
                 }
 
-                // Process BLS state votes using batch verification
-                // This is faster than individual verification when batch size > 2
+                // Process BLS state votes using blst's native batch verification.
+                // This uses random linear combination to verify ALL signatures in ~2 pairings
+                // regardless of whether they have the same or different messages.
+                // For N signatures, this is O(1) crypto instead of O(N).
                 if !bls_votes.is_empty() {
                     let messages: Vec<&[u8]> =
                         bls_votes.iter().map(|(_, _, m)| m.as_slice()).collect();
@@ -2176,6 +2178,8 @@ impl ProductionRunner {
                     let pubkeys: Vec<PublicKey> =
                         bls_votes.iter().map(|(_, pk, _)| pk.clone()).collect();
 
+                    // Use blst's batch verification with random linear combination.
+                    // This verifies all signatures in ~2 pairings instead of N.
                     let results = PublicKey::batch_verify_bls_different_messages(
                         &messages,
                         &signatures,

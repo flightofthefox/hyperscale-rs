@@ -157,6 +157,13 @@ pub struct ExecutionState {
     /// Maps tx_hash -> PendingFetchedCertificateVerification
     pending_fetched_cert_verifications: HashMap<Hash, PendingFetchedCertificateVerification>,
 
+    /// Cache of already-verified state vote signatures.
+    /// Maps (tx_hash, validator_id) -> height when verified.
+    /// When we see the same vote again (e.g., during gossiping or retries),
+    /// we can skip re-verification and proceed directly to vote aggregation.
+    /// The height is stored to enable cleanup of old entries after finalization.
+    verified_state_votes: HashMap<(Hash, ValidatorId), u64>,
+
     // ═══════════════════════════════════════════════════════════════════════
     // Speculative Execution State
     // ═══════════════════════════════════════════════════════════════════════
@@ -266,6 +273,7 @@ impl ExecutionState {
             pending_vote_verifications: HashMap::new(),
             pending_cert_verifications: HashMap::new(),
             pending_fetched_cert_verifications: HashMap::new(),
+            verified_state_votes: HashMap::new(),
             speculative_results: HashMap::new(),
             speculative_in_flight_txs: HashSet::new(),
             speculative_reads_index: HashMap::new(),
@@ -1085,6 +1093,21 @@ impl ExecutionState {
             return self.handle_vote_internal(vote);
         }
 
+        // Check if we've already verified this exact vote (by tx_hash + validator).
+        // This happens when votes are gossiped multiple times or during retries.
+        // Avoids redundant crypto work.
+        if self
+            .verified_state_votes
+            .contains_key(&(tx_hash, validator_id))
+        {
+            tracing::trace!(
+                tx_hash = ?tx_hash,
+                validator = validator_id.0,
+                "State vote already verified, skipping re-verification"
+            );
+            return self.handle_vote_internal(vote);
+        }
+
         // Check if already pending verification (duplicate vote in parallel execution)
         if self
             .pending_vote_verifications
@@ -1152,6 +1175,16 @@ impl ExecutionState {
             );
             return vec![];
         }
+
+        // Cache the verified vote so we don't re-verify it if we see it again
+        // (e.g., during gossiping or retries). We use 0 as a placeholder height
+        // since cleanup is done by tx_hash in cleanup_transaction().
+        self.verified_state_votes.insert((tx_hash, validator_id), 0);
+        tracing::trace!(
+            tx_hash = ?tx_hash,
+            validator = validator_id.0,
+            "Cached verified state vote"
+        );
 
         // Process with cached voting power
         self.handle_vote_internal_with_power(pending.vote, pending.voting_power)
@@ -1600,10 +1633,16 @@ impl ExecutionState {
     }
 
     /// Remove a finalized certificate (after it's been included in a block).
+    ///
+    /// Also cleans up the verified state vote cache for this transaction
+    /// since we no longer need to track verification state after finalization.
     pub fn remove_finalized_certificate(
         &mut self,
         tx_hash: &Hash,
     ) -> Option<Arc<TransactionCertificate>> {
+        // Clean up verified vote cache for this transaction
+        self.verified_state_votes.retain(|(h, _), _| h != tx_hash);
+
         self.finalized_certificates.remove(tx_hash)
     }
 
@@ -1708,6 +1747,9 @@ impl ExecutionState {
             .retain(|(h, _), _| h != tx_hash);
         self.pending_cert_verifications
             .retain(|(h, _), _| h != tx_hash);
+
+        // Verified vote cache cleanup
+        self.verified_state_votes.retain(|(h, _), _| h != tx_hash);
 
         tracing::debug!(
             tx_hash = %tx_hash,

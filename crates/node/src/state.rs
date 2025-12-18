@@ -87,6 +87,7 @@ impl NodeStateMachine {
     }
 
     /// Create a new node state machine with custom speculative execution config.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_speculative_config(
         node_index: NodeIndex,
         topology: Arc<dyn Topology>,

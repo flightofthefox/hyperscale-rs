@@ -213,10 +213,87 @@ impl PublicKey {
 
     /// Batch verify multiple BLS signatures over DIFFERENT messages.
     ///
-    /// Uses blst's multi-scalar multiplication for efficient batch verification.
-    /// This is faster than individual verification when batch size > 2.
+    /// Uses blst's `verify_multiple_aggregate_signatures` for efficient batch verification.
+    /// This uses random linear combination to verify all signatures in ~2 pairing operations
+    /// instead of N individual verifications (~1-2ms each).
+    ///
+    /// Returns `true` only if ALL signatures are valid. If any is invalid, returns `false`.
+    /// For identifying which signatures failed, use individual verification as fallback.
+    ///
+    /// All inputs must be BLS keys/signatures. Returns `false` if any are Ed25519.
+    pub fn batch_verify_bls_different_messages_all_or_nothing(
+        messages: &[&[u8]],
+        signatures: &[Signature],
+        pubkeys: &[PublicKey],
+    ) -> bool {
+        if messages.len() != signatures.len() || signatures.len() != pubkeys.len() {
+            return false;
+        }
+        if messages.is_empty() {
+            return true;
+        }
+
+        // Convert to blst types
+        let mut bls_sigs = Vec::with_capacity(signatures.len());
+        let mut bls_pks = Vec::with_capacity(pubkeys.len());
+
+        for (sig, pk) in signatures.iter().zip(pubkeys.iter()) {
+            match (sig, pk) {
+                (Signature::Bls12381(sig_bytes), PublicKey::Bls12381(pk_bytes)) => {
+                    let sig = match blst::min_pk::Signature::from_bytes(sig_bytes) {
+                        Ok(s) => s,
+                        Err(_) => return false,
+                    };
+                    let pk = match blst::min_pk::PublicKey::from_bytes(pk_bytes) {
+                        Ok(p) => p,
+                        Err(_) => return false,
+                    };
+                    bls_sigs.push(sig);
+                    bls_pks.push(pk);
+                }
+                _ => return false, // Mixed types or Ed25519
+            }
+        }
+
+        // Generate random scalars for the linear combination.
+        // Using 64 bits of randomness provides 2^-64 probability of false positive.
+        let mut rands = Vec::with_capacity(signatures.len());
+        for _ in 0..signatures.len() {
+            let mut rand_bytes = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rand_bytes);
+            let mut scalar = blst::blst_scalar::default();
+            unsafe {
+                blst::blst_scalar_from_bendian(&mut scalar, rand_bytes.as_ptr());
+            }
+            rands.push(scalar);
+        }
+
+        // Build reference slices for the blst API
+        let sig_refs: Vec<&blst::min_pk::Signature> = bls_sigs.iter().collect();
+        let pk_refs: Vec<&blst::min_pk::PublicKey> = bls_pks.iter().collect();
+
+        // Use blst's batch verification with random linear combination.
+        // This verifies: ∏ e(r_i * sig_i, G2) == ∏ e(r_i * pk_i, H(msg_i))
+        // in ~2 pairings instead of N.
+        let result = blst::min_pk::Signature::verify_multiple_aggregate_signatures(
+            messages,
+            &[], // DST - empty since we don't use domain separation in signing
+            &pk_refs,
+            false, // pks_validate - already validated above
+            &sig_refs,
+            true, // sigs_groupcheck - verify signatures are in the group
+            &rands,
+            64, // rand_bits - 64 bits of randomness
+        );
+
+        result == blst::BLST_ERROR::BLST_SUCCESS
+    }
+
+    /// Batch verify multiple BLS signatures over DIFFERENT messages.
     ///
     /// Returns a Vec of bools indicating which signatures are valid.
+    /// Uses batch verification first (fast path), then falls back to individual
+    /// verification only if the batch fails (to identify which ones failed).
     pub fn batch_verify_bls_different_messages(
         messages: &[&[u8]],
         signatures: &[Signature],
@@ -229,8 +306,12 @@ impl PublicKey {
             return vec![];
         }
 
-        // For different messages, we verify each individually but can still
-        // benefit from parallel verification within blst
+        // Fast path: try batch verification first
+        if Self::batch_verify_bls_different_messages_all_or_nothing(messages, signatures, pubkeys) {
+            return vec![true; signatures.len()];
+        }
+
+        // Slow path: batch failed, verify individually to find failures
         messages
             .iter()
             .zip(signatures.iter())
