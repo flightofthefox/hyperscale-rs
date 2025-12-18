@@ -616,6 +616,37 @@ impl SimulationRunner {
                 }
             }
 
+            // Domain-specific execution broadcasts (no batching in simulation)
+            Action::BroadcastStateVote { shard, vote } => {
+                let event = Event::StateVoteReceived { vote };
+                let peers = self.network.peers_in_shard(shard);
+                for to in peers {
+                    if to != from {
+                        self.try_deliver_event(from, to, event.clone());
+                    }
+                }
+            }
+
+            Action::BroadcastStateCertificate { shard, certificate } => {
+                let event = Event::StateCertificateReceived { cert: certificate };
+                let peers = self.network.peers_in_shard(shard);
+                for to in peers {
+                    if to != from {
+                        self.try_deliver_event(from, to, event.clone());
+                    }
+                }
+            }
+
+            Action::BroadcastStateProvision { shard, provision } => {
+                let event = Event::StateProvisionReceived { provision };
+                let peers = self.network.peers_in_shard(shard);
+                for to in peers {
+                    if to != from {
+                        self.try_deliver_event(from, to, event.clone());
+                    }
+                }
+            }
+
             Action::SetTimer { id, duration } => {
                 let fire_time = self.now + duration;
                 let event = self.timer_to_event(id.clone());
@@ -1469,7 +1500,37 @@ impl SimulationRunner {
         }
 
         // Message will be delivered - sample latency and schedule
-        let event = message.to_received_event();
+        // Batched messages expand to multiple events
+        let events = message.to_received_events();
+        let latency = self.network.sample_latency(from, to, &mut self.rng);
+        let delivery_time = self.now + latency;
+        for event in events {
+            self.schedule_event(to, delivery_time, event);
+        }
+        self.stats.messages_sent += 1;
+    }
+
+    /// Try to deliver an event directly, accounting for partitions and packet loss.
+    /// Used for domain-specific actions that don't go through OutboundMessage.
+    fn try_deliver_event(&mut self, from: NodeIndex, to: NodeIndex, event: Event) {
+        // Check partition first (deterministic - doesn't consume RNG)
+        if self.network.is_partitioned(from, to) {
+            self.stats.messages_dropped_partition += 1;
+            trace!(from = from, to = to, "Event dropped due to partition");
+            return;
+        }
+
+        // Check packet loss (probabilistic but deterministic with seeded RNG)
+        if self.network.should_drop_packet(&mut self.rng) {
+            self.stats.messages_dropped_loss += 1;
+            trace!(from = from, to = to, "Event dropped due to packet loss");
+            return;
+        }
+
+        // Note: No deduplication for domain-specific events - they are unique per transaction
+        // The state machine already handles duplicate detection via tracker sets
+
+        // Schedule delivery with network latency
         let latency = self.network.sample_latency(from, to, &mut self.rng);
         let delivery_time = self.now + latency;
         self.schedule_event(to, delivery_time, event);

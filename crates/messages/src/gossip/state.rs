@@ -1,4 +1,7 @@
 //! State-related gossip messages for cross-shard transactions.
+//!
+//! All state messages use batching to reduce network overhead.
+//! The runner accumulates individual items and flushes them periodically.
 
 use crate::trace_context::TraceContext;
 use hyperscale_types::{
@@ -6,155 +9,189 @@ use hyperscale_types::{
 };
 use sbor::prelude::BasicSbor;
 
-/// Broadcasts state from owning shard to executing shard for cross-shard transactions.
+/// Batched state provisions for cross-shard transactions.
+///
+/// Broadcasts state from owning shard to executing shard.
 /// Target shard waits for 2f+1 matching provisions before marking as "provisioned".
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct StateProvisionGossip {
-    /// The state provision being broadcast
-    pub provision: StateProvision,
+pub struct StateProvisionBatch {
+    /// The state provisions being broadcast
+    pub provisions: Vec<StateProvision>,
     /// Trace context for distributed tracing (empty when feature disabled).
     pub trace_context: TraceContext,
 }
 
-impl StateProvisionGossip {
-    /// Create a new state provision gossip message.
-    ///
-    /// Does not capture trace context. Use `with_trace_context()` to include
-    /// distributed tracing information.
-    pub fn new(provision: StateProvision) -> Self {
+impl StateProvisionBatch {
+    /// Create a new state provision batch.
+    pub fn new(provisions: Vec<StateProvision>) -> Self {
         Self {
-            provision,
+            provisions,
             trace_context: TraceContext::default(),
         }
     }
 
-    /// Create a new state provision gossip message with trace context from current span.
-    ///
-    /// When `trace-propagation` feature is enabled, captures the current OpenTelemetry
-    /// span context for distributed tracing across nodes.
-    pub fn with_trace_context(provision: StateProvision) -> Self {
+    /// Create a batch from a single provision.
+    pub fn single(provision: StateProvision) -> Self {
+        Self::new(vec![provision])
+    }
+
+    /// Create a new state provision batch with trace context from current span.
+    pub fn with_trace_context(provisions: Vec<StateProvision>) -> Self {
         Self {
-            provision,
+            provisions,
             trace_context: TraceContext::from_current(),
         }
     }
 
-    /// Get the inner state provision.
-    pub fn provision(&self) -> &StateProvision {
-        &self.provision
+    /// Get the provisions.
+    pub fn provisions(&self) -> &[StateProvision] {
+        &self.provisions
     }
 
-    /// Consume and return the inner state provision.
-    pub fn into_provision(self) -> StateProvision {
-        self.provision
+    /// Consume and return the provisions.
+    pub fn into_provisions(self) -> Vec<StateProvision> {
+        self.provisions
     }
 
     /// Get the trace context.
     pub fn trace_context(&self) -> &TraceContext {
         &self.trace_context
     }
-}
 
-// Network message implementation
-impl NetworkMessage for StateProvisionGossip {
-    fn message_type_id() -> &'static str {
-        "state.provision"
+    /// Check if the batch is empty.
+    pub fn is_empty(&self) -> bool {
+        self.provisions.is_empty()
+    }
+
+    /// Get the number of provisions in the batch.
+    pub fn len(&self) -> usize {
+        self.provisions.len()
     }
 }
 
-impl ShardMessage for StateProvisionGossip {}
+impl NetworkMessage for StateProvisionBatch {
+    fn message_type_id() -> &'static str {
+        "state.provision.batch"
+    }
+}
 
-/// Vote on transaction execution results within a shard (local shard only, not cross-shard).
+impl ShardMessage for StateProvisionBatch {}
+
+/// Batched votes on transaction execution results within a shard.
+///
 /// 2f+1 matching votes create a StateCertificate with aggregated BLS signature.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct StateVoteBlockGossip {
-    /// The state vote being gossiped
-    pub vote: StateVoteBlock,
+pub struct StateVoteBatch {
+    /// The state votes being gossiped
+    pub votes: Vec<StateVoteBlock>,
 }
 
-impl StateVoteBlockGossip {
-    /// Create a new state vote block gossip message.
-    pub fn new(vote: StateVoteBlock) -> Self {
-        Self { vote }
+impl StateVoteBatch {
+    /// Create a new state vote batch.
+    pub fn new(votes: Vec<StateVoteBlock>) -> Self {
+        Self { votes }
     }
 
-    /// Get the inner state vote.
-    pub fn vote(&self) -> &StateVoteBlock {
-        &self.vote
+    /// Create a batch from a single vote.
+    pub fn single(vote: StateVoteBlock) -> Self {
+        Self::new(vec![vote])
     }
 
-    /// Consume and return the inner state vote.
-    pub fn into_vote(self) -> StateVoteBlock {
-        self.vote
+    /// Get the votes.
+    pub fn votes(&self) -> &[StateVoteBlock] {
+        &self.votes
+    }
+
+    /// Consume and return the votes.
+    pub fn into_votes(self) -> Vec<StateVoteBlock> {
+        self.votes
+    }
+
+    /// Check if the batch is empty.
+    pub fn is_empty(&self) -> bool {
+        self.votes.is_empty()
+    }
+
+    /// Get the number of votes in the batch.
+    pub fn len(&self) -> usize {
+        self.votes.len()
     }
 }
 
-// Network message implementation
-impl NetworkMessage for StateVoteBlockGossip {
+impl NetworkMessage for StateVoteBatch {
     fn message_type_id() -> &'static str {
-        "state.vote"
+        "state.vote.batch"
     }
 }
 
-impl ShardMessage for StateVoteBlockGossip {}
+impl ShardMessage for StateVoteBatch {}
 
-/// Proves a shard executed a transaction (2f+1 quorum). Broadcast to all participating shards.
+/// Batched certificates proving execution quorum.
+///
 /// Contains full state data. Once all shards' certificates collected, transaction is finalized.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct StateCertificateGossip {
-    /// The state certificate being gossiped
-    pub certificate: StateCertificate,
+pub struct StateCertificateBatch {
+    /// The state certificates being gossiped
+    pub certificates: Vec<StateCertificate>,
     /// Trace context for distributed tracing (empty when feature disabled).
     pub trace_context: TraceContext,
 }
 
-impl StateCertificateGossip {
-    /// Create a new state certificate gossip message.
-    ///
-    /// Does not capture trace context. Use `with_trace_context()` to include
-    /// distributed tracing information.
-    pub fn new(certificate: StateCertificate) -> Self {
+impl StateCertificateBatch {
+    /// Create a new state certificate batch.
+    pub fn new(certificates: Vec<StateCertificate>) -> Self {
         Self {
-            certificate,
+            certificates,
             trace_context: TraceContext::default(),
         }
     }
 
-    /// Create a new state certificate gossip message with trace context from current span.
-    ///
-    /// When `trace-propagation` feature is enabled, captures the current OpenTelemetry
-    /// span context for distributed tracing across nodes.
-    pub fn with_trace_context(certificate: StateCertificate) -> Self {
+    /// Create a batch from a single certificate.
+    pub fn single(certificate: StateCertificate) -> Self {
+        Self::new(vec![certificate])
+    }
+
+    /// Create a new state certificate batch with trace context from current span.
+    pub fn with_trace_context(certificates: Vec<StateCertificate>) -> Self {
         Self {
-            certificate,
+            certificates,
             trace_context: TraceContext::from_current(),
         }
     }
 
-    /// Get the inner state certificate.
-    pub fn certificate(&self) -> &StateCertificate {
-        &self.certificate
+    /// Get the certificates.
+    pub fn certificates(&self) -> &[StateCertificate] {
+        &self.certificates
     }
 
-    /// Consume and return the inner state certificate.
-    pub fn into_certificate(self) -> StateCertificate {
-        self.certificate
+    /// Consume and return the certificates.
+    pub fn into_certificates(self) -> Vec<StateCertificate> {
+        self.certificates
     }
 
     /// Get the trace context.
     pub fn trace_context(&self) -> &TraceContext {
         &self.trace_context
     }
-}
 
-// Network message implementation
-impl NetworkMessage for StateCertificateGossip {
-    fn message_type_id() -> &'static str {
-        "state.certificate"
+    /// Check if the batch is empty.
+    pub fn is_empty(&self) -> bool {
+        self.certificates.is_empty()
+    }
+
+    /// Get the number of certificates in the batch.
+    pub fn len(&self) -> usize {
+        self.certificates.len()
     }
 }
 
-impl ShardMessage for StateCertificateGossip {}
+impl NetworkMessage for StateCertificateBatch {
+    fn message_type_id() -> &'static str {
+        "state.certificate.batch"
+    }
+}
+
+impl ShardMessage for StateCertificateBatch {}
 
 #[cfg(test)]
 mod tests {
@@ -165,7 +202,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_state_provision_gossip() {
+    fn test_state_provision_batch() {
         let provision = StateProvision {
             transaction_hash: Hash::from_bytes(b"tx"),
             target_shard: ShardGroupId(1),
@@ -176,15 +213,18 @@ mod tests {
             signature: Signature::zero(),
         };
 
-        let msg = StateProvisionGossip::new(provision.clone());
-        assert_eq!(msg.provision(), &provision);
+        let batch = StateProvisionBatch::single(provision.clone());
+        assert_eq!(batch.len(), 1);
+        assert!(!batch.is_empty());
+        assert_eq!(batch.provisions()[0], provision);
 
-        let extracted = msg.into_provision();
-        assert_eq!(extracted, provision);
+        let extracted = batch.into_provisions();
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0], provision);
     }
 
     #[test]
-    fn test_state_vote_block_gossip() {
+    fn test_state_vote_batch() {
         let vote = StateVoteBlock {
             transaction_hash: Hash::from_bytes(b"tx"),
             shard_group_id: ShardGroupId(0),
@@ -194,15 +234,18 @@ mod tests {
             signature: Signature::zero(),
         };
 
-        let msg = StateVoteBlockGossip::new(vote.clone());
-        assert_eq!(msg.vote(), &vote);
+        let batch = StateVoteBatch::single(vote.clone());
+        assert_eq!(batch.len(), 1);
+        assert!(!batch.is_empty());
+        assert_eq!(batch.votes()[0], vote);
 
-        let extracted = msg.into_vote();
-        assert_eq!(extracted, vote);
+        let extracted = batch.into_votes();
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0], vote);
     }
 
     #[test]
-    fn test_state_certificate_gossip() {
+    fn test_state_certificate_batch() {
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -220,21 +263,42 @@ mod tests {
             voting_power: 3,
         };
 
-        let msg = StateCertificateGossip::new(cert.clone());
-        assert_eq!(msg.certificate(), &cert);
+        let batch = StateCertificateBatch::single(cert.clone());
+        assert_eq!(batch.len(), 1);
+        assert!(!batch.is_empty());
+        assert_eq!(batch.certificates()[0], cert);
 
-        let extracted = msg.into_certificate();
-        assert_eq!(extracted, cert);
+        let extracted = batch.into_certificates();
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0], cert);
     }
 
     #[test]
     fn test_message_type_ids() {
-        assert_eq!(StateProvisionGossip::message_type_id(), "state.provision");
-        assert_eq!(StateVoteBlockGossip::message_type_id(), "state.vote");
         assert_eq!(
-            StateCertificateGossip::message_type_id(),
-            "state.certificate"
+            StateProvisionBatch::message_type_id(),
+            "state.provision.batch"
         );
+        assert_eq!(StateVoteBatch::message_type_id(), "state.vote.batch");
+        assert_eq!(
+            StateCertificateBatch::message_type_id(),
+            "state.certificate.batch"
+        );
+    }
+
+    #[test]
+    fn test_empty_batches() {
+        let provisions: StateProvisionBatch = StateProvisionBatch::new(vec![]);
+        assert!(provisions.is_empty());
+        assert_eq!(provisions.len(), 0);
+
+        let votes = StateVoteBatch::new(vec![]);
+        assert!(votes.is_empty());
+        assert_eq!(votes.len(), 0);
+
+        let certs = StateCertificateBatch::new(vec![]);
+        assert!(certs.is_empty());
+        assert_eq!(certs.len(), 0);
     }
 
     #[test]
@@ -250,13 +314,12 @@ mod tests {
         };
 
         // new() should have empty trace context
-        let msg = StateProvisionGossip::new(provision.clone());
-        assert!(!msg.trace_context().has_trace());
+        let batch = StateProvisionBatch::single(provision.clone());
+        assert!(!batch.trace_context().has_trace());
 
         // with_trace_context() without active span should also be empty
-        let msg_with_ctx = StateProvisionGossip::with_trace_context(provision);
-        // When no span is active, trace context will be empty
-        assert!(!msg_with_ctx.trace_context().has_trace() || TraceContext::is_enabled());
+        let batch_with_ctx = StateProvisionBatch::with_trace_context(vec![provision]);
+        assert!(!batch_with_ctx.trace_context().has_trace() || TraceContext::is_enabled());
     }
 
     #[test]
@@ -279,11 +342,11 @@ mod tests {
         };
 
         // new() should have empty trace context
-        let msg = StateCertificateGossip::new(cert.clone());
-        assert!(!msg.trace_context().has_trace());
+        let batch = StateCertificateBatch::single(cert.clone());
+        assert!(!batch.trace_context().has_trace());
 
         // with_trace_context() without active span should also be empty
-        let msg_with_ctx = StateCertificateGossip::with_trace_context(cert);
-        assert!(!msg_with_ctx.trace_context().has_trace() || TraceContext::is_enabled());
+        let batch_with_ctx = StateCertificateBatch::with_trace_context(vec![cert]);
+        assert!(!batch_with_ctx.trace_context().has_trace() || TraceContext::is_enabled());
     }
 }

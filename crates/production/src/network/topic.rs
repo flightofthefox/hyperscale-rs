@@ -213,19 +213,19 @@ impl Topic {
         Self::shard("transaction.gossip", shard)
     }
 
-    /// Topic for state provision gossip.
-    pub fn state_provision(shard: ShardGroupId) -> Self {
-        Self::shard("state.provision", shard)
+    /// Topic for state provision batch gossip.
+    pub fn state_provision_batch(shard: ShardGroupId) -> Self {
+        Self::shard("state.provision.batch", shard)
     }
 
-    /// Topic for state vote gossip.
-    pub fn state_vote(shard: ShardGroupId) -> Self {
-        Self::shard("state.vote", shard)
+    /// Topic for state vote batch gossip.
+    pub fn state_vote_batch(shard: ShardGroupId) -> Self {
+        Self::shard("state.vote.batch", shard)
     }
 
-    /// Topic for state certificate gossip.
-    pub fn state_certificate(shard: ShardGroupId) -> Self {
-        Self::shard("state.certificate", shard)
+    /// Topic for state certificate batch gossip.
+    pub fn state_certificate_batch(shard: ShardGroupId) -> Self {
+        Self::shard("state.certificate.batch", shard)
     }
 }
 

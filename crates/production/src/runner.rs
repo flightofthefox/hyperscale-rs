@@ -1467,6 +1467,32 @@ impl ProductionRunner {
                 tracing::debug!(msg_type = message.type_name(), "Broadcast globally");
             }
 
+            // Domain-specific execution broadcasts
+            // These use batch wire format but currently send single items.
+            // TODO: Accumulate and flush periodically for batching optimization.
+            Action::BroadcastStateVote { shard, vote } => {
+                let batch = hyperscale_messages::StateVoteBatch::single(vote);
+                let message = OutboundMessage::StateVoteBatch(batch);
+                self.network.broadcast_shard(shard, &message).await?;
+                tracing::debug!(?shard, "Broadcast state vote");
+            }
+
+            Action::BroadcastStateCertificate { shard, certificate } => {
+                let mut batch = hyperscale_messages::StateCertificateBatch::single(certificate);
+                batch.trace_context = hyperscale_messages::TraceContext::from_current();
+                let message = OutboundMessage::StateCertificateBatch(batch);
+                self.network.broadcast_shard(shard, &message).await?;
+                tracing::debug!(?shard, "Broadcast state certificate");
+            }
+
+            Action::BroadcastStateProvision { shard, provision } => {
+                let mut batch = hyperscale_messages::StateProvisionBatch::single(provision);
+                batch.trace_context = hyperscale_messages::TraceContext::from_current();
+                let message = OutboundMessage::StateProvisionBatch(batch);
+                self.network.broadcast_shard(shard, &message).await?;
+                tracing::debug!(?shard, "Broadcast state provision");
+            }
+
             // Timers via timer manager
             Action::SetTimer { id, duration } => {
                 self.timer_manager.set_timer(id, duration);

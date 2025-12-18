@@ -284,11 +284,12 @@ impl SimNode {
             }
         }
 
-        // Process inbound messages
+        // Process inbound messages (batched messages expand to multiple events)
         for _ in 0..inbound_count {
             if let Some(msg) = self.inbound_queue.pop_front() {
-                let event = msg.to_received_event();
-                self.handle_event(event, cache);
+                for event in msg.to_received_events() {
+                    self.handle_event(event, cache);
+                }
                 processed += 1;
             }
         }
@@ -379,6 +380,28 @@ impl SimNode {
             Action::BroadcastGlobal { message } => {
                 self.outbound_messages
                     .push((Destination::Global, Arc::new(message)));
+            }
+
+            // Domain-specific execution broadcasts - convert to batch OutboundMessage
+            Action::BroadcastStateVote { shard, vote } => {
+                let batch = hyperscale_messages::StateVoteBatch::single(vote);
+                let message = OutboundMessage::StateVoteBatch(batch);
+                self.outbound_messages
+                    .push((Destination::Shard(shard), Arc::new(message)));
+            }
+
+            Action::BroadcastStateCertificate { shard, certificate } => {
+                let batch = hyperscale_messages::StateCertificateBatch::single(certificate);
+                let message = OutboundMessage::StateCertificateBatch(batch);
+                self.outbound_messages
+                    .push((Destination::Shard(shard), Arc::new(message)));
+            }
+
+            Action::BroadcastStateProvision { shard, provision } => {
+                let batch = hyperscale_messages::StateProvisionBatch::single(provision);
+                let message = OutboundMessage::StateProvisionBatch(batch);
+                self.outbound_messages
+                    .push((Destination::Shard(shard), Arc::new(message)));
             }
 
             Action::SetTimer { id, duration } => {

@@ -563,9 +563,9 @@ impl Libp2pAdapter {
             Topic::block_vote(shard),
             // Note: view_change topics removed - using HotStuff-2 implicit rounds
             Topic::transaction_gossip(shard),
-            Topic::state_provision(shard),
-            Topic::state_vote(shard),
-            Topic::state_certificate(shard),
+            Topic::state_provision_batch(shard),
+            Topic::state_vote_batch(shard),
+            Topic::state_certificate_batch(shard),
         ];
 
         for topic in &topics {
@@ -1174,41 +1174,44 @@ impl Libp2pAdapter {
                         // Route based on event type:
                         // - Transactions: submit to batched validator (dedup + batch validation)
                         // - Consensus messages: send directly to high-priority channel
-                        match decoded.event {
-                            Event::TransactionGossipReceived { tx } => {
-                                // Submit to batched validator for dedup and parallel validation
-                                // The batcher handles:
-                                // 1. Deduplication via seen-cache (skips already-seen txs)
-                                // 2. Batching over time window for better throughput
-                                // 3. Parallel validation via rayon on crypto thread pool
-                                if !tx_validation_handle.submit(tx) {
-                                    trace!(
-                                        peer = %propagation_source,
-                                        "Transaction deduplicated or batcher closed"
-                                    );
-                                }
-                            }
-                            event => {
-                                // Consensus messages go directly to high-priority channel
-                                // Extract trace context for distributed tracing (when feature enabled)
-                                let send_future = async {
-                                    if consensus_tx.send(event).await.is_err() {
-                                        warn!("Consensus channel closed");
-                                    }
-                                };
-                                #[cfg(feature = "trace-propagation")]
-                                let send_future = {
-                                    let span = tracing::trace_span!("cross_shard_message");
-                                    if let Some(ref trace_ctx) = decoded.trace_context {
-                                        let _ = span.set_parent(trace_ctx.extract());
-                                        tracing::trace!(
-                                            "Extracted trace context from cross-shard message"
+                        // Batched messages produce multiple events
+                        for event in decoded.events {
+                            match event {
+                                Event::TransactionGossipReceived { tx } => {
+                                    // Submit to batched validator for dedup and parallel validation
+                                    // The batcher handles:
+                                    // 1. Deduplication via seen-cache (skips already-seen txs)
+                                    // 2. Batching over time window for better throughput
+                                    // 3. Parallel validation via rayon on crypto thread pool
+                                    if !tx_validation_handle.submit(tx) {
+                                        trace!(
+                                            peer = %propagation_source,
+                                            "Transaction deduplicated or batcher closed"
                                         );
                                     }
-                                    send_future.instrument(span)
-                                };
+                                }
+                                event => {
+                                    // Consensus messages go directly to high-priority channel
+                                    // Extract trace context for distributed tracing (when feature enabled)
+                                    let send_future = async {
+                                        if consensus_tx.send(event).await.is_err() {
+                                            warn!("Consensus channel closed");
+                                        }
+                                    };
+                                    #[cfg(feature = "trace-propagation")]
+                                    let send_future = {
+                                        let span = tracing::trace_span!("cross_shard_message");
+                                        if let Some(ref trace_ctx) = decoded.trace_context {
+                                            let _ = span.set_parent(trace_ctx.extract());
+                                            tracing::trace!(
+                                                "Extracted trace context from cross-shard message"
+                                            );
+                                        }
+                                        send_future.instrument(span)
+                                    };
 
-                                send_future.await;
+                                    send_future.await;
+                                }
                             }
                         }
                     }

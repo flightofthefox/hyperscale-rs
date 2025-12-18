@@ -29,8 +29,7 @@
 //! Validators collect StateCertificates from all participating shards. When all
 //! certificates are received, an TransactionCertificate is created.
 
-use hyperscale_core::{Action, Event, OutboundMessage, SubStateMachine};
-use hyperscale_messages::{StateCertificateGossip, StateProvisionGossip, StateVoteBlockGossip};
+use hyperscale_core::{Action, Event, SubStateMachine};
 use hyperscale_types::{
     BlockHeight, ExecutionResult, Hash, KeyPair, NodeId, PublicKey, RoutableTransaction,
     ShardGroupId, Signature, SignerBitfield, StateCertificate, StateEntry, StateProvision,
@@ -840,11 +839,10 @@ impl ExecutionState {
         // Create signed vote (same as cross-shard voting)
         let vote = self.create_vote(tx_hash, state_root, success);
 
-        // Broadcast vote within shard
-        let gossip = StateVoteBlockGossip { vote: vote.clone() };
-        actions.push(Action::BroadcastToShard {
-            message: OutboundMessage::StateVoteBlock(gossip),
+        // Broadcast vote within shard (runner handles batching)
+        actions.push(Action::BroadcastStateVote {
             shard: local_shard,
+            vote: vote.clone(),
         });
 
         tracing::debug!(
@@ -1047,11 +1045,10 @@ impl ExecutionState {
         // Create vote from execution result
         let vote = self.create_vote(tx_hash, result.state_root, result.success);
 
-        // Broadcast vote to local shard
-        let gossip = StateVoteBlockGossip { vote: vote.clone() };
-        actions.push(Action::BroadcastToShard {
-            message: OutboundMessage::StateVoteBlock(gossip),
+        // Broadcast vote to local shard (runner handles batching)
+        actions.push(Action::BroadcastStateVote {
             shard: local_shard,
+            vote: vote.clone(),
         });
 
         // Handle our own vote
@@ -1295,14 +1292,11 @@ impl ExecutionState {
             // Store certificate
             self.state_certificates.insert(tx_hash, certificate.clone());
 
-            // Broadcast certificate to all participating shards
-            // Use Arc to avoid cloning the gossip message for each shard
-            let gossip = Arc::new(StateCertificateGossip::new(certificate.clone()));
-
+            // Broadcast certificate to all participating shards (runner handles batching)
             for target_shard in participating_shards {
-                actions.push(Action::BroadcastToShard {
-                    message: OutboundMessage::StateCertificate(Arc::clone(&gossip)),
+                actions.push(Action::BroadcastStateCertificate {
                     shard: target_shard,
+                    certificate: certificate.clone(),
                 });
             }
 
@@ -1938,10 +1932,9 @@ impl ExecutionState {
                 ),
             };
 
-            let gossip = StateProvisionGossip::new(provision);
-            actions.push(Action::BroadcastToShard {
-                message: OutboundMessage::StateProvision(gossip),
+            actions.push(Action::BroadcastStateProvision {
                 shard: target_shard,
+                provision,
             });
 
             tracing::debug!(
@@ -2472,10 +2465,10 @@ mod tests {
 
         // Should broadcast vote within shard + handle own vote
         assert!(!actions.is_empty());
-        // Should have broadcast action
+        // Should have broadcast state vote action
         assert!(actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastToShard { .. })));
+            .any(|a| matches!(a, Action::BroadcastStateVote { .. })));
 
         // With 4 validators and quorum threshold (2*4+1)/3 = 3,
         // single validator vote won't reach quorum yet
@@ -2555,10 +2548,10 @@ mod tests {
             .iter()
             .any(|a| matches!(a, Action::ExecuteTransactions { .. })));
 
-        // Should have broadcast vote (from speculative hit processing)
+        // Should have broadcast state vote (from speculative hit processing)
         assert!(actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastToShard { .. })));
+            .any(|a| matches!(a, Action::BroadcastStateVote { .. })));
     }
 
     #[test]
@@ -2607,10 +2600,10 @@ mod tests {
         let complete_actions = state.on_speculative_execution_complete(block_hash, spec_results);
 
         // Should process the result immediately (late hit)
-        // Should emit broadcast vote action
+        // Should emit broadcast state vote action
         assert!(complete_actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastToShard { .. })));
+            .any(|a| matches!(a, Action::BroadcastStateVote { .. })));
 
         // Should no longer be awaiting
         assert!(!state.committed_awaiting_speculation.contains_key(&tx_hash));

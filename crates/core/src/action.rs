@@ -28,12 +28,15 @@ pub struct CrossShardExecutionRequest {
 #[derive(Debug, Clone)]
 pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
-    // Network
+    // Network: Generic (for BFT consensus and mempool)
     // ═══════════════════════════════════════════════════════════════════════
     /// Broadcast a message to all nodes in a shard.
     ///
     /// Production uses gossipsub with topic-based routing.
     /// Simulation routes to all nodes in the shard.
+    ///
+    /// Used for BFT consensus messages (BlockHeader, BlockVote) and mempool
+    /// (TransactionGossip). Execution messages use domain-specific actions below.
     BroadcastToShard {
         shard: ShardGroupId,
         message: OutboundMessage,
@@ -41,6 +44,36 @@ pub enum Action {
 
     /// Broadcast a message to all nodes in the network.
     BroadcastGlobal { message: OutboundMessage },
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Network: Execution Layer (domain-specific, batchable by runner)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Broadcast a state vote to the local shard.
+    ///
+    /// The runner may batch multiple votes into a single network message
+    /// for efficiency. State machines emit individual votes.
+    BroadcastStateVote {
+        shard: ShardGroupId,
+        vote: StateVoteBlock,
+    },
+
+    /// Broadcast a state certificate to participating shards.
+    ///
+    /// The runner may batch multiple certificates into a single network message
+    /// for efficiency. State machines emit individual certificates.
+    BroadcastStateCertificate {
+        shard: ShardGroupId,
+        certificate: StateCertificate,
+    },
+
+    /// Broadcast a state provision to a target shard.
+    ///
+    /// The runner may batch multiple provisions into a single network message
+    /// for efficiency. State machines emit individual provisions.
+    BroadcastStateProvision {
+        shard: ShardGroupId,
+        provision: StateProvision,
+    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Timers
@@ -437,6 +470,9 @@ impl Action {
             self,
             Action::BroadcastToShard { .. }
                 | Action::BroadcastGlobal { .. }
+                | Action::BroadcastStateVote { .. }
+                | Action::BroadcastStateCertificate { .. }
+                | Action::BroadcastStateProvision { .. }
                 | Action::PersistBlock { .. }
                 | Action::PersistOwnVote { .. }
                 | Action::PersistTransactionCertificate { .. }
@@ -490,9 +526,14 @@ impl Action {
     /// Get the action type name for telemetry.
     pub fn type_name(&self) -> &'static str {
         match self {
-            // Network
+            // Network - Generic
             Action::BroadcastToShard { .. } => "BroadcastToShard",
             Action::BroadcastGlobal { .. } => "BroadcastGlobal",
+
+            // Network - Execution Layer (batchable)
+            Action::BroadcastStateVote { .. } => "BroadcastStateVote",
+            Action::BroadcastStateCertificate { .. } => "BroadcastStateCertificate",
+            Action::BroadcastStateProvision { .. } => "BroadcastStateProvision",
 
             // Timers
             Action::SetTimer { .. } => "SetTimer",

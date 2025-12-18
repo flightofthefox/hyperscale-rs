@@ -2,8 +2,8 @@
 
 use crate::Event;
 use hyperscale_messages::{
-    BlockHeaderGossip, BlockVoteGossip, StateCertificateGossip, StateProvisionGossip,
-    StateVoteBlockGossip, TraceContext, TransactionGossip,
+    BlockHeaderGossip, BlockVoteGossip, StateCertificateBatch, StateProvisionBatch, StateVoteBatch,
+    TraceContext, TransactionGossip,
 };
 use sbor::prelude::*;
 use std::hash::{Hash, Hasher};
@@ -13,6 +13,10 @@ use std::sync::Arc;
 ///
 /// These are the messages that a node can send to other nodes.
 /// The runner handles the actual network I/O.
+///
+/// State messages (provisions, votes, certificates) use batching to reduce
+/// network overhead. The runner accumulates individual items and flushes
+/// them periodically.
 #[derive(Debug, Clone)]
 pub enum OutboundMessage {
     // ═══════════════════════════════════════════════════════════════════════
@@ -25,17 +29,16 @@ pub enum OutboundMessage {
     BlockVote(BlockVoteGossip),
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Execution Messages
+    // Execution Messages (Batched)
     // ═══════════════════════════════════════════════════════════════════════
-    /// State provision for cross-shard execution.
-    StateProvision(StateProvisionGossip),
+    /// Batched state provisions for cross-shard execution.
+    StateProvisionBatch(StateProvisionBatch),
 
-    /// Vote on execution result.
-    StateVoteBlock(StateVoteBlockGossip),
+    /// Batched votes on execution results.
+    StateVoteBatch(StateVoteBatch),
 
-    /// Certificate proving execution quorum.
-    /// Wrapped in Arc for efficient cloning when broadcasting to multiple shards.
-    StateCertificate(Arc<StateCertificateGossip>),
+    /// Batched certificates proving execution quorum.
+    StateCertificateBatch(StateCertificateBatch),
 
     // ═══════════════════════════════════════════════════════════════════════
     // Mempool Messages
@@ -50,9 +53,9 @@ impl OutboundMessage {
         match self {
             OutboundMessage::BlockHeader(_) => "BlockHeader",
             OutboundMessage::BlockVote(_) => "BlockVote",
-            OutboundMessage::StateProvision(_) => "StateProvision",
-            OutboundMessage::StateVoteBlock(_) => "StateVoteBlock",
-            OutboundMessage::StateCertificate(_) => "StateCertificate",
+            OutboundMessage::StateProvisionBatch(_) => "StateProvisionBatch",
+            OutboundMessage::StateVoteBatch(_) => "StateVoteBatch",
+            OutboundMessage::StateCertificateBatch(_) => "StateCertificateBatch",
             OutboundMessage::TransactionGossip(_) => "TransactionGossip",
         }
     }
@@ -69,9 +72,9 @@ impl OutboundMessage {
     pub fn is_execution(&self) -> bool {
         matches!(
             self,
-            OutboundMessage::StateProvision(_)
-                | OutboundMessage::StateVoteBlock(_)
-                | OutboundMessage::StateCertificate(_)
+            OutboundMessage::StateProvisionBatch(_)
+                | OutboundMessage::StateVoteBatch(_)
+                | OutboundMessage::StateCertificateBatch(_)
         )
     }
 
@@ -83,8 +86,8 @@ impl OutboundMessage {
     /// Inject trace context into cross-shard messages for distributed tracing.
     ///
     /// Only affects messages that carry trace context:
-    /// - `StateProvision` (cross-shard state)
-    /// - `StateCertificate` (cross-shard 2PC completion)
+    /// - `StateProvisionBatch` (cross-shard state)
+    /// - `StateCertificateBatch` (cross-shard 2PC completion)
     /// - `TransactionGossip` (transaction propagation)
     ///
     /// Other message types (BFT consensus, state votes) are unaffected.
@@ -94,12 +97,11 @@ impl OutboundMessage {
     pub fn inject_trace_context(&mut self) {
         let ctx = TraceContext::from_current();
         match self {
-            OutboundMessage::StateProvision(gossip) => {
-                gossip.trace_context = ctx;
+            OutboundMessage::StateProvisionBatch(batch) => {
+                batch.trace_context = ctx;
             }
-            OutboundMessage::StateCertificate(gossip) => {
-                // Use Arc::make_mut for copy-on-write: only clones if Arc is shared
-                Arc::make_mut(gossip).trace_context = ctx;
+            OutboundMessage::StateCertificateBatch(batch) => {
+                batch.trace_context = ctx;
             }
             OutboundMessage::TransactionGossip(gossip) => {
                 gossip.trace_context = ctx;
@@ -107,7 +109,7 @@ impl OutboundMessage {
             // BFT consensus and state vote messages don't carry trace context
             OutboundMessage::BlockHeader(_)
             | OutboundMessage::BlockVote(_)
-            | OutboundMessage::StateVoteBlock(_) => {}
+            | OutboundMessage::StateVoteBatch(_) => {}
         }
     }
 
@@ -123,14 +125,14 @@ impl OutboundMessage {
             OutboundMessage::BlockVote(gossip) => {
                 basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
             }
-            OutboundMessage::StateProvision(gossip) => {
-                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
+            OutboundMessage::StateProvisionBatch(batch) => {
+                basic_encode(batch).map(|v| v.len()).unwrap_or(0)
             }
-            OutboundMessage::StateVoteBlock(gossip) => {
-                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
+            OutboundMessage::StateVoteBatch(batch) => {
+                basic_encode(batch).map(|v| v.len()).unwrap_or(0)
             }
-            OutboundMessage::StateCertificate(gossip) => {
-                basic_encode(gossip.as_ref()).map(|v| v.len()).unwrap_or(0)
+            OutboundMessage::StateCertificateBatch(batch) => {
+                basic_encode(batch).map(|v| v.len()).unwrap_or(0)
             }
             OutboundMessage::TransactionGossip(gossip) => {
                 basic_encode(gossip.as_ref()).map(|v| v.len()).unwrap_or(0)
@@ -164,18 +166,18 @@ impl OutboundMessage {
                     encoded.hash(&mut hasher);
                 }
             }
-            OutboundMessage::StateProvision(g) => {
-                if let Ok(encoded) = basic_encode(g) {
+            OutboundMessage::StateProvisionBatch(batch) => {
+                if let Ok(encoded) = basic_encode(batch) {
                     encoded.hash(&mut hasher);
                 }
             }
-            OutboundMessage::StateVoteBlock(g) => {
-                if let Ok(encoded) = basic_encode(g) {
+            OutboundMessage::StateVoteBatch(batch) => {
+                if let Ok(encoded) = basic_encode(batch) {
                     encoded.hash(&mut hasher);
                 }
             }
-            OutboundMessage::StateCertificate(g) => {
-                if let Ok(encoded) = basic_encode(g.as_ref()) {
+            OutboundMessage::StateCertificateBatch(batch) => {
+                if let Ok(encoded) = basic_encode(batch) {
                     encoded.hash(&mut hasher);
                 }
             }
@@ -188,34 +190,44 @@ impl OutboundMessage {
         hasher.finish()
     }
 
-    /// Convert an outbound message to the corresponding inbound event.
+    /// Convert an outbound message to the corresponding inbound events.
     ///
     /// This is used by both the deterministic and parallel simulators
     /// to handle received messages uniformly.
-    pub fn to_received_event(&self) -> Event {
+    ///
+    /// Returns a Vec because batched messages expand to multiple events.
+    pub fn to_received_events(&self) -> Vec<Event> {
         match self {
-            OutboundMessage::BlockHeader(gossip) => Event::BlockHeaderReceived {
+            OutboundMessage::BlockHeader(gossip) => vec![Event::BlockHeaderReceived {
                 header: gossip.header.clone(),
                 tx_hashes: gossip.transaction_hashes.clone(),
                 cert_hashes: gossip.certificate_hashes.clone(),
                 deferred: gossip.deferred.clone(),
                 aborted: gossip.aborted.clone(),
-            },
-            OutboundMessage::BlockVote(gossip) => Event::BlockVoteReceived {
+            }],
+            OutboundMessage::BlockVote(gossip) => vec![Event::BlockVoteReceived {
                 vote: gossip.vote.clone(),
-            },
-            OutboundMessage::StateProvision(gossip) => Event::StateProvisionReceived {
-                provision: gossip.provision.clone(),
-            },
-            OutboundMessage::StateVoteBlock(gossip) => Event::StateVoteReceived {
-                vote: gossip.vote.clone(),
-            },
-            OutboundMessage::StateCertificate(gossip) => Event::StateCertificateReceived {
-                cert: gossip.certificate.clone(),
-            },
-            OutboundMessage::TransactionGossip(gossip) => Event::TransactionGossipReceived {
+            }],
+            OutboundMessage::StateProvisionBatch(batch) => batch
+                .provisions
+                .iter()
+                .map(|provision| Event::StateProvisionReceived {
+                    provision: provision.clone(),
+                })
+                .collect(),
+            OutboundMessage::StateVoteBatch(batch) => batch
+                .votes
+                .iter()
+                .map(|vote| Event::StateVoteReceived { vote: vote.clone() })
+                .collect(),
+            OutboundMessage::StateCertificateBatch(batch) => batch
+                .certificates
+                .iter()
+                .map(|cert| Event::StateCertificateReceived { cert: cert.clone() })
+                .collect(),
+            OutboundMessage::TransactionGossip(gossip) => vec![Event::TransactionGossipReceived {
                 tx: Arc::clone(&gossip.transaction),
-            },
+            }],
         }
     }
 }

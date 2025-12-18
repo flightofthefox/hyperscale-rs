@@ -16,8 +16,8 @@
 
 use hyperscale_core::{Event, OutboundMessage};
 use hyperscale_messages::gossip::{
-    BlockHeaderGossip, BlockVoteGossip, StateCertificateGossip, StateProvisionGossip,
-    StateVoteBlockGossip, TransactionGossip,
+    BlockHeaderGossip, BlockVoteGossip, StateCertificateBatch, StateProvisionBatch, StateVoteBatch,
+    TransactionGossip,
 };
 use hyperscale_messages::TraceContext;
 use hyperscale_types::ShardGroupId;
@@ -55,12 +55,15 @@ pub fn encode_message(message: &OutboundMessage) -> Result<Vec<u8>, CodecError> 
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
             OutboundMessage::BlockVote(gossip) => sbor::basic_encode(gossip)
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
-            OutboundMessage::StateProvision(gossip) => sbor::basic_encode(gossip)
-                .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
-            OutboundMessage::StateVoteBlock(gossip) => sbor::basic_encode(gossip)
-                .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
-            OutboundMessage::StateCertificate(gossip) => sbor::basic_encode(gossip.as_ref())
-                .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
+            OutboundMessage::StateProvisionBatch(batch) => {
+                sbor::basic_encode(batch).map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?
+            }
+            OutboundMessage::StateVoteBatch(batch) => {
+                sbor::basic_encode(batch).map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?
+            }
+            OutboundMessage::StateCertificateBatch(batch) => {
+                sbor::basic_encode(batch).map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?
+            }
             OutboundMessage::TransactionGossip(gossip) => sbor::basic_encode(gossip.as_ref())
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
         };
@@ -74,10 +77,10 @@ pub fn encode_message(message: &OutboundMessage) -> Result<Vec<u8>, CodecError> 
 
 /// Result of decoding a message, including optional trace context.
 pub struct DecodedMessage {
-    /// The decoded event.
-    pub event: Event,
+    /// The decoded events (batched messages produce multiple events).
+    pub events: Vec<Event>,
     /// Trace context from the message, if present.
-    /// Only cross-shard messages (StateProvision, StateCertificate, TransactionGossip)
+    /// Only cross-shard messages (StateProvisionBatch, StateCertificateBatch, TransactionGossip)
     /// carry trace context.
     ///
     /// Only read when `trace-propagation` feature is enabled.
@@ -88,7 +91,7 @@ pub struct DecodedMessage {
 /// Decode a message from wire format based on topic.
 ///
 /// The topic determines the message type (topic-based dispatch).
-/// Returns the decoded event along with any trace context for distributed tracing.
+/// Returns the decoded events along with any trace context for distributed tracing.
 pub fn decode_message(topic: &str, data: &[u8]) -> Result<DecodedMessage, CodecError> {
     if data.is_empty() {
         return Err(CodecError::MessageTooShort);
@@ -114,13 +117,13 @@ pub fn decode_message(topic: &str, data: &[u8]) -> Result<DecodedMessage, CodecE
             let gossip: BlockHeaderGossip = sbor::basic_decode(payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
             Ok(DecodedMessage {
-                event: Event::BlockHeaderReceived {
+                events: vec![Event::BlockHeaderReceived {
                     header: gossip.header,
                     tx_hashes: gossip.transaction_hashes,
                     cert_hashes: gossip.certificate_hashes,
                     deferred: gossip.deferred,
                     aborted: gossip.aborted,
-                },
+                }],
                 trace_context: None,
             })
         }
@@ -128,47 +131,56 @@ pub fn decode_message(topic: &str, data: &[u8]) -> Result<DecodedMessage, CodecE
             let gossip: BlockVoteGossip = sbor::basic_decode(payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
             Ok(DecodedMessage {
-                event: Event::BlockVoteReceived { vote: gossip.vote },
+                events: vec![Event::BlockVoteReceived { vote: gossip.vote }],
                 trace_context: None,
             })
         }
-        // Note: view_change.vote and view_change.certificate topics removed
-        // Using HotStuff-2 implicit rounds instead
-        "state.provision" => {
-            let gossip: StateProvisionGossip = sbor::basic_decode(payload)
+        "state.provision.batch" => {
+            let batch: StateProvisionBatch = sbor::basic_decode(payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
-            let trace_ctx = if gossip.trace_context.has_trace() {
-                Some(gossip.trace_context)
+            let trace_ctx = if batch.trace_context.has_trace() {
+                Some(batch.trace_context.clone())
             } else {
                 None
             };
+            let events = batch
+                .into_provisions()
+                .into_iter()
+                .map(|provision| Event::StateProvisionReceived { provision })
+                .collect();
             Ok(DecodedMessage {
-                event: Event::StateProvisionReceived {
-                    provision: gossip.provision,
-                },
+                events,
                 trace_context: trace_ctx,
             })
         }
-        "state.vote" => {
-            let gossip: StateVoteBlockGossip = sbor::basic_decode(payload)
+        "state.vote.batch" => {
+            let batch: StateVoteBatch = sbor::basic_decode(payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
+            let events = batch
+                .into_votes()
+                .into_iter()
+                .map(|vote| Event::StateVoteReceived { vote })
+                .collect();
             Ok(DecodedMessage {
-                event: Event::StateVoteReceived { vote: gossip.vote },
+                events,
                 trace_context: None,
             })
         }
-        "state.certificate" => {
-            let gossip: StateCertificateGossip = sbor::basic_decode(payload)
+        "state.certificate.batch" => {
+            let batch: StateCertificateBatch = sbor::basic_decode(payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
-            let trace_ctx = if gossip.trace_context.has_trace() {
-                Some(gossip.trace_context)
+            let trace_ctx = if batch.trace_context.has_trace() {
+                Some(batch.trace_context.clone())
             } else {
                 None
             };
+            let events = batch
+                .into_certificates()
+                .into_iter()
+                .map(|cert| Event::StateCertificateReceived { cert })
+                .collect();
             Ok(DecodedMessage {
-                event: Event::StateCertificateReceived {
-                    cert: gossip.certificate,
-                },
+                events,
                 trace_context: trace_ctx,
             })
         }
@@ -181,9 +193,9 @@ pub fn decode_message(topic: &str, data: &[u8]) -> Result<DecodedMessage, CodecE
                 None
             };
             Ok(DecodedMessage {
-                event: Event::TransactionGossipReceived {
+                events: vec![Event::TransactionGossipReceived {
                     tx: gossip.transaction,
-                },
+                }],
                 trace_context: trace_ctx,
             })
         }
@@ -198,9 +210,9 @@ pub fn topic_for_message(message: &OutboundMessage, shard: ShardGroupId) -> crat
     match message {
         OutboundMessage::BlockHeader(_) => Topic::block_header(shard),
         OutboundMessage::BlockVote(_) => Topic::block_vote(shard),
-        OutboundMessage::StateProvision(_) => Topic::state_provision(shard),
-        OutboundMessage::StateVoteBlock(_) => Topic::state_vote(shard),
-        OutboundMessage::StateCertificate(_) => Topic::state_certificate(shard),
+        OutboundMessage::StateProvisionBatch(_) => Topic::state_provision_batch(shard),
+        OutboundMessage::StateVoteBatch(_) => Topic::state_vote_batch(shard),
+        OutboundMessage::StateCertificateBatch(_) => Topic::state_certificate_batch(shard),
         OutboundMessage::TransactionGossip(_) => Topic::transaction_gossip(shard),
     }
 }
@@ -246,8 +258,9 @@ mod tests {
 
         // Block headers don't carry trace context
         assert!(decoded.trace_context.is_none());
+        assert_eq!(decoded.events.len(), 1);
 
-        match decoded.event {
+        match &decoded.events[0] {
             Event::BlockHeaderReceived {
                 header: decoded_header,
                 ..
@@ -278,8 +291,9 @@ mod tests {
 
         // Block votes don't carry trace context
         assert!(decoded.trace_context.is_none());
+        assert_eq!(decoded.events.len(), 1);
 
-        match decoded.event {
+        match &decoded.events[0] {
             Event::BlockVoteReceived { vote: decoded_vote } => {
                 assert_eq!(decoded_vote.block_hash, vote.block_hash);
                 assert_eq!(decoded_vote.voter, vote.voter);
