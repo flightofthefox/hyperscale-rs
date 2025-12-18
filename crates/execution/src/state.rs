@@ -1233,11 +1233,12 @@ impl ExecutionState {
             self.state_certificates.insert(tx_hash, certificate.clone());
 
             // Broadcast certificate to all participating shards
-            let gossip = StateCertificateGossip::new(certificate.clone());
+            // Use Arc to avoid cloning the gossip message for each shard
+            let gossip = Arc::new(StateCertificateGossip::new(certificate.clone()));
 
             for target_shard in participating_shards {
                 actions.push(Action::BroadcastToShard {
-                    message: OutboundMessage::StateCertificate(gossip.clone()),
+                    message: OutboundMessage::StateCertificate(Arc::clone(&gossip)),
                     shard: target_shard,
                 });
             }

@@ -59,7 +59,7 @@ pub fn encode_message(message: &OutboundMessage) -> Result<Vec<u8>, CodecError> 
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
             OutboundMessage::StateVoteBlock(gossip) => sbor::basic_encode(gossip)
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
-            OutboundMessage::StateCertificate(gossip) => sbor::basic_encode(gossip)
+            OutboundMessage::StateCertificate(gossip) => sbor::basic_encode(gossip.as_ref())
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
             OutboundMessage::TransactionGossip(gossip) => sbor::basic_encode(gossip.as_ref())
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,

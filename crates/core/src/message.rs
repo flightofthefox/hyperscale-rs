@@ -34,7 +34,8 @@ pub enum OutboundMessage {
     StateVoteBlock(StateVoteBlockGossip),
 
     /// Certificate proving execution quorum.
-    StateCertificate(StateCertificateGossip),
+    /// Wrapped in Arc for efficient cloning when broadcasting to multiple shards.
+    StateCertificate(Arc<StateCertificateGossip>),
 
     // ═══════════════════════════════════════════════════════════════════════
     // Mempool Messages
@@ -97,7 +98,8 @@ impl OutboundMessage {
                 gossip.trace_context = ctx;
             }
             OutboundMessage::StateCertificate(gossip) => {
-                gossip.trace_context = ctx;
+                // Use Arc::make_mut for copy-on-write: only clones if Arc is shared
+                Arc::make_mut(gossip).trace_context = ctx;
             }
             OutboundMessage::TransactionGossip(gossip) => {
                 gossip.trace_context = ctx;
@@ -128,7 +130,7 @@ impl OutboundMessage {
                 basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
             }
             OutboundMessage::StateCertificate(gossip) => {
-                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
+                basic_encode(gossip.as_ref()).map(|v| v.len()).unwrap_or(0)
             }
             OutboundMessage::TransactionGossip(gossip) => {
                 basic_encode(gossip.as_ref()).map(|v| v.len()).unwrap_or(0)
@@ -173,7 +175,7 @@ impl OutboundMessage {
                 }
             }
             OutboundMessage::StateCertificate(g) => {
-                if let Ok(encoded) = basic_encode(g) {
+                if let Ok(encoded) = basic_encode(g.as_ref()) {
                     encoded.hash(&mut hasher);
                 }
             }
