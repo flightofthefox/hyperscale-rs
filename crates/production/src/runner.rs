@@ -1392,7 +1392,8 @@ impl ProductionRunner {
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
                     // Use centralized signing message - StateCertificates aggregate signatures
-                    // from StateVoteBlocks, so they use the same EXEC_VOTE domain tag.
+                    // from StateVoteBlocks. For batched certificates, this uses BATCH_STATE_VOTE
+                    // domain tag over the vote_merkle_root. For legacy certificates, uses EXEC_VOTE.
                     let msg = certificate.signing_message();
 
                     // Get signer keys based on bitfield
@@ -2107,17 +2108,15 @@ impl ProductionRunner {
             if !pending.state_votes.is_empty() {
                 let start = std::time::Instant::now();
 
-                // Build signing messages for state votes (must match ExecutionState::create_vote)
+                // Build signing messages for state votes.
+                // For batched votes: signature covers the vote_merkle_root
+                // For legacy votes: signature covers individual vote data
+                // StateVoteBlock::signing_message() handles both cases.
                 let votes_with_msgs: Vec<(StateVoteBlock, PublicKey, Vec<u8>)> = pending
                     .state_votes
                     .into_iter()
                     .map(|(vote, pk)| {
-                        let mut msg = Vec::with_capacity(9 + 32 + 32 + 8 + 1); // Pre-allocate exact size
-                        msg.extend_from_slice(b"EXEC_VOTE");
-                        msg.extend_from_slice(vote.transaction_hash.as_bytes());
-                        msg.extend_from_slice(vote.state_root.as_bytes());
-                        msg.extend_from_slice(&vote.shard_group_id.0.to_le_bytes());
-                        msg.push(if vote.success { 1 } else { 0 });
+                        let msg = vote.signing_message();
                         (vote, pk, msg)
                     })
                     .collect();

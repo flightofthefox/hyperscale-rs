@@ -1052,8 +1052,9 @@ mod tests {
     #[test]
     fn test_atomic_certificate_persistence() {
         use hyperscale_types::{
-            NodeId, PartitionNumber, ShardExecutionProof, ShardGroupId, Signature,
-            StateCertificate, SubstateWrite, TransactionCertificate, TransactionDecision,
+            build_merkle_tree_with_proofs, vote_leaf_hash, NodeId, PartitionNumber,
+            ShardExecutionProof, ShardGroupId, Signature, StateCertificate, SubstateWrite,
+            TransactionCertificate, TransactionDecision,
         };
         use std::collections::BTreeMap;
 
@@ -1070,16 +1071,26 @@ mod tests {
             value: vec![99, 88, 77],
         }];
 
+        let outputs_merkle_root = Hash::from_bytes(&[0; 32]);
+        let success = true;
+
+        // Build merkle tree with single leaf
+        let leaf_hash = vote_leaf_hash(&tx_hash, &outputs_merkle_root, shard_group.0, success);
+        let (vote_merkle_root, proofs) = build_merkle_tree_with_proofs(&[leaf_hash]);
+
         let state_cert = StateCertificate {
             transaction_hash: tx_hash,
             shard_group_id: shard_group,
             read_nodes: vec![],
             state_writes: writes.clone(),
-            outputs_merkle_root: Hash::from_bytes(&[0; 32]),
-            success: true,
+            outputs_merkle_root,
+            success,
             aggregated_signature: Signature::zero(),
             signers: hyperscale_types::SignerBitfield::new(4),
             voting_power: 0,
+            vote_merkle_root,
+            vote_merkle_proof: proofs.into_iter().next().unwrap(),
+            batch_block_height: None,
         };
 
         let shard_proof = ShardExecutionProof {
@@ -1273,8 +1284,9 @@ mod tests {
     #[test]
     fn test_certificate_idempotency() {
         use hyperscale_types::{
-            NodeId, PartitionNumber, ShardExecutionProof, ShardGroupId, Signature,
-            StateCertificate, SubstateWrite, TransactionCertificate, TransactionDecision,
+            build_merkle_tree_with_proofs, vote_leaf_hash, NodeId, PartitionNumber,
+            ShardExecutionProof, ShardGroupId, Signature, StateCertificate, SubstateWrite,
+            TransactionCertificate, TransactionDecision,
         };
         use std::collections::BTreeMap;
 
@@ -1290,16 +1302,26 @@ mod tests {
             value: vec![99, 88, 77],
         }];
 
+        let outputs_merkle_root = Hash::from_bytes(&[0; 32]);
+        let success = true;
+
+        // Build merkle tree with single leaf
+        let leaf_hash = vote_leaf_hash(&tx_hash, &outputs_merkle_root, shard_group.0, success);
+        let (vote_merkle_root, proofs) = build_merkle_tree_with_proofs(&[leaf_hash]);
+
         let state_cert = StateCertificate {
             transaction_hash: tx_hash,
             shard_group_id: shard_group,
             read_nodes: vec![],
             state_writes: writes.clone(),
-            outputs_merkle_root: Hash::from_bytes(&[0; 32]),
-            success: true,
+            outputs_merkle_root,
+            success,
             aggregated_signature: Signature::zero(),
             signers: hyperscale_types::SignerBitfield::new(4),
             voting_power: 0,
+            vote_merkle_root,
+            vote_merkle_proof: proofs.into_iter().next().unwrap(),
+            batch_block_height: None,
         };
 
         let shard_proof = ShardExecutionProof {
