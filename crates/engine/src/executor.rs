@@ -43,7 +43,20 @@ use radix_common::network::NetworkDefinition;
 use radix_engine::transaction::{execute_transaction, ExecutionConfig, TransactionReceipt};
 use radix_engine::vm::DefaultVmModules;
 use radix_transactions::validation::TransactionValidator;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Shared executor caches to avoid rebuilding on clone.
+///
+/// These are wrapped in Arc so that cloning the executor is cheap.
+struct ExecutorCaches {
+    /// Cached VM modules to avoid recreating per transaction
+    vm_modules: DefaultVmModules,
+    /// Cached execution config
+    exec_config: ExecutionConfig,
+    /// Cached transaction validator to avoid recreating per transaction
+    validator: TransactionValidator,
+}
 
 /// Synchronous Radix Engine executor for deterministic simulation.
 ///
@@ -71,14 +84,15 @@ use std::sync::Arc;
 ///
 /// - **Simulation**: Calls executor methods inline (synchronous, deterministic)
 /// - **Production**: Spawns executor methods on rayon thread pool (async callbacks)
+///
+/// # Cloning
+///
+/// Cloning the executor is cheap - it only increments reference counts for
+/// the shared caches (VM modules, execution config, validator).
 pub struct RadixExecutor {
     network: NetworkDefinition,
-    /// Cached VM modules to avoid recreating per transaction
-    vm_modules: DefaultVmModules,
-    /// Cached execution config
-    exec_config: ExecutionConfig,
-    /// Cached transaction validator to avoid recreating per transaction
-    validator: TransactionValidator,
+    /// Shared caches wrapped in Arc for cheap cloning
+    caches: Arc<ExecutorCaches>,
 }
 
 impl RadixExecutor {
@@ -92,9 +106,11 @@ impl RadixExecutor {
         let validator = TransactionValidator::new_with_latest_config(&network);
         Self {
             network,
-            vm_modules,
-            exec_config,
-            validator,
+            caches: Arc::new(ExecutorCaches {
+                vm_modules,
+                exec_config,
+                validator,
+            }),
         }
     }
 
@@ -159,25 +175,43 @@ impl RadixExecutor {
         provisions: &[StateProvision],
         _is_local_node: impl Fn(&NodeId) -> bool,
     ) -> Result<ExecutionOutput, ExecutionError> {
+        // Pre-index provisions by transaction hash for O(1) lookup per transaction
+        // instead of O(N*M) where N=transactions, M=provisions
+        let mut provisions_by_tx: HashMap<Hash, Vec<&StateProvision>> =
+            HashMap::with_capacity(transactions.len());
+        for provision in provisions {
+            provisions_by_tx
+                .entry(provision.transaction_hash)
+                .or_default()
+                .push(provision);
+        }
+
         let mut results = Vec::with_capacity(transactions.len());
 
         // Take a snapshot for isolated execution
         let snapshot = storage.snapshot();
 
         for tx in transactions {
-            // Create execution context with provisions
-            let mut context =
-                ProvisionedExecutionContext::new(snapshot.as_ref(), self.network.clone());
-            for provision in provisions {
-                // Only add provisions relevant to this transaction
-                if provision.transaction_hash == tx.hash() {
+            // Create execution context with provisions (passing network by reference)
+            let mut context = ProvisionedExecutionContext::new(snapshot.as_ref(), &self.network);
+
+            // O(1) lookup instead of O(M) scan per transaction
+            if let Some(tx_provisions) = provisions_by_tx.get(&tx.hash()) {
+                for provision in tx_provisions {
                     context.add_provision(provision);
                 }
             }
 
-            // Execute
-            let user_tx = tx.transaction();
-            let receipt = context.execute_user_transaction(user_tx)?;
+            // Execute using cached VM modules and config
+            let validated = tx
+                .get_or_validate(&self.caches.validator)
+                .ok_or_else(|| ExecutionError::Preparation("Validation failed".to_string()))?;
+            let executable = validated.clone().create_executable();
+            let receipt = context.execute_with_cache(
+                &executable,
+                &self.caches.vm_modules,
+                &self.caches.exec_config,
+            )?;
             // Use cross-shard result which filters writes to declared_writes
             // so all shards compute the same merkle root
             let result =
@@ -207,15 +241,15 @@ impl RadixExecutor {
         // Get or create validated transaction (cached on RoutableTransaction)
         // This avoids re-validating signatures if already validated at RPC submission
         let validated = tx
-            .get_or_validate(&self.validator)
+            .get_or_validate(&self.caches.validator)
             .ok_or_else(|| ExecutionError::Preparation("Validation failed".to_string()))?;
         let executable = validated.clone().create_executable();
 
         // Use cached vm_modules and exec_config
         let receipt = execute_transaction(
             snapshot.as_ref(),
-            &self.vm_modules,
-            &self.exec_config,
+            &self.caches.vm_modules,
+            &self.caches.exec_config,
             &executable,
         );
 
@@ -337,7 +371,10 @@ impl RadixExecutor {
 
 impl Clone for RadixExecutor {
     fn clone(&self) -> Self {
-        // Create fresh cached instances for the clone
-        Self::new(self.network.clone())
+        // Cheap clone: just increment Arc reference counts for shared caches
+        Self {
+            network: self.network.clone(),
+            caches: Arc::clone(&self.caches),
+        }
     }
 }

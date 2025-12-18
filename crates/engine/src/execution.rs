@@ -27,12 +27,12 @@ use radix_transactions::validation::TransactionValidator;
 pub struct ProvisionedExecutionContext<'a, S: SubstateDatabase> {
     base_store: &'a S,
     provisions: DatabaseUpdates,
-    network: NetworkDefinition,
+    network: &'a NetworkDefinition,
 }
 
 impl<'a, S: SubstateDatabase> ProvisionedExecutionContext<'a, S> {
     /// Create a new execution context.
-    pub fn new(base_store: &'a S, network: NetworkDefinition) -> Self {
+    pub fn new(base_store: &'a S, network: &'a NetworkDefinition) -> Self {
         Self {
             base_store,
             provisions: DatabaseUpdates::default(),
@@ -42,8 +42,73 @@ impl<'a, S: SubstateDatabase> ProvisionedExecutionContext<'a, S> {
 
     /// Add a state provision from another shard.
     pub fn add_provision(&mut self, provision: &StateProvision) {
+        // Fast path: if no entries, nothing to do
+        if provision.entries.is_empty() {
+            return;
+        }
+
+        // Batch insert all entries, reusing node key lookups when consecutive
+        // entries belong to the same node (common case for provisions)
+        let mut last_node_key: Option<Vec<u8>> = None;
+
         for entry in provision.entries.iter() {
-            self.add_entry(entry);
+            let radix_node_id = radix_common::types::NodeId(entry.node_id.0);
+            let radix_partition = radix_common::types::PartitionNumber(entry.partition.0);
+
+            let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
+            let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
+            let db_sort_key = DbSortKey(entry.sort_key.clone());
+
+            let update = match &entry.value {
+                None => DatabaseUpdate::Delete,
+                Some(v) if v.is_empty() => DatabaseUpdate::Delete,
+                Some(v) => DatabaseUpdate::Set(v.clone()),
+            };
+
+            // Check if we can reuse the cached node key (avoids recomputing hash)
+            let node_changed = last_node_key.as_ref() != Some(&db_node_key);
+            if node_changed {
+                // Need to look up or create node updates
+                let node_updates = self
+                    .provisions
+                    .node_updates
+                    .entry(db_node_key.clone())
+                    .or_insert_with(|| NodeDatabaseUpdates {
+                        partition_updates: indexmap::IndexMap::new(),
+                    });
+
+                // Get partition updates for this node
+                let partition_updates = node_updates
+                    .partition_updates
+                    .entry(db_partition_num)
+                    .or_insert_with(|| PartitionDatabaseUpdates::Delta {
+                        substate_updates: indexmap::IndexMap::new(),
+                    });
+
+                if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
+                    substate_updates.insert(db_sort_key, update);
+                }
+
+                last_node_key = Some(db_node_key);
+            } else {
+                // Same node - use get_mut to avoid recreating node key
+                let node_updates = self
+                    .provisions
+                    .node_updates
+                    .get_mut(&db_node_key)
+                    .expect("node should exist");
+
+                let partition_updates = node_updates
+                    .partition_updates
+                    .entry(db_partition_num)
+                    .or_insert_with(|| PartitionDatabaseUpdates::Delta {
+                        substate_updates: indexmap::IndexMap::new(),
+                    });
+
+                if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
+                    substate_updates.insert(db_sort_key, update);
+                }
+            }
         }
     }
 
@@ -99,12 +164,27 @@ impl<'a, S: SubstateDatabase> ProvisionedExecutionContext<'a, S> {
         Ok(receipt)
     }
 
+    /// Execute a transaction with cached VM modules and config (more efficient).
+    pub fn execute_with_cache(
+        &self,
+        executable: &ExecutableTransaction,
+        vm_modules: &DefaultVmModules,
+        exec_config: &ExecutionConfig,
+    ) -> Result<TransactionReceipt, ExecutionError> {
+        let mut overlay = SubstateDatabaseOverlay::new_unmergeable(self.base_store);
+        overlay.commit(&self.provisions);
+
+        let receipt = execute_transaction(&overlay, vm_modules, exec_config, executable);
+
+        Ok(receipt)
+    }
+
     /// Execute a `UserTransaction` (V1 or V2).
     pub fn execute_user_transaction(
         &self,
         transaction: &UserTransaction,
     ) -> Result<TransactionReceipt, ExecutionError> {
-        let validator = TransactionValidator::new_with_latest_config(&self.network);
+        let validator = TransactionValidator::new_with_latest_config(self.network);
 
         let validated = transaction.prepare_and_validate(&validator).map_err(|e| {
             ExecutionError::Preparation(format!("Transaction validation failed: {:?}", e))

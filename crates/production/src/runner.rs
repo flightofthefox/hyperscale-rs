@@ -2427,7 +2427,7 @@ impl ProductionRunner {
 
                             match executor.execute_cross_shard(
                                 &*storage,
-                                &[req.transaction.clone()],
+                                std::slice::from_ref(&req.transaction),
                                 &req.provisions,
                                 is_local_node,
                             ) {
