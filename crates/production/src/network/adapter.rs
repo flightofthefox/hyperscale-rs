@@ -455,7 +455,7 @@ impl Libp2pAdapter {
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
-                libp2p::tcp::Config::default(),
+                libp2p::tcp::Config::default().nodelay(true), // Disable Nagle's algorithm for lower latency
                 libp2p::noise::Config::new,
                 || {
                     let mut config = libp2p::yamux::Config::default();
