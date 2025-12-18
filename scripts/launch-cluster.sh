@@ -419,6 +419,21 @@ cleanup() {
             fi
         done < "$PID_FILE"
     fi
+
+    # Stop monitoring stack if it was started
+    if [ "$MONITORING" = true ]; then
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        MONITORING_DIR="$SCRIPT_DIR/monitoring"
+
+        if command -v docker &> /dev/null; then
+            if docker ps --format '{{.Names}}' | grep -q "hyperscale-prometheus\|hyperscale-grafana"; then
+                echo ""
+                echo "Stopping monitoring stack and removing volumes..."
+                (cd "$MONITORING_DIR" && docker-compose down -v 2>&1) | tail -2
+                echo "Monitoring stopped."
+            fi
+        fi
+    fi
     exit 0
 }
 
