@@ -142,11 +142,14 @@ impl Default for SyncConfig {
             initial_timeout: Duration::from_secs(5),
             max_timeout: Duration::from_secs(30),
             max_retries_per_peer: 3,
-            peer_cooldown: Duration::from_secs(60),
+            // Short cooldown to allow quick recovery from transient failures.
+            // The desperation mode will reset cooldowns if we fall too far behind.
+            peer_cooldown: Duration::from_secs(5),
             base_ban_duration: Duration::from_secs(600), // 10 minutes
             max_ban_duration: Duration::from_secs(86400), // 24 hours
-            // If 10+ blocks behind and all peers in cooldown, enter desperation mode
-            desperation_threshold_blocks: 10,
+            // If 3+ blocks behind and all peers in cooldown, enter desperation mode.
+            // Low threshold ensures we don't get stuck due to transient network issues.
+            desperation_threshold_blocks: 3,
         }
     }
 }

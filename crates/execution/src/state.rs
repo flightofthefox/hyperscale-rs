@@ -2206,6 +2206,32 @@ impl ExecutionState {
         self.speculative_invalidated_count = 0;
         metrics
     }
+
+    /// Get the number of cross-shard transactions currently in flight.
+    ///
+    /// Counts unique transaction hashes across all cross-shard tracking phases:
+    /// - Provisioning phase (waiting for state provisions from other shards)
+    /// - Vote aggregation phase (waiting for vote quorum)
+    /// - Certificate collection phase (waiting for certificates from all shards)
+    pub fn cross_shard_pending_count(&self) -> usize {
+        // Use a HashSet to count unique transactions since a tx might be in multiple phases
+        let mut pending_txs = HashSet::new();
+
+        // Phase 1-2: Provisioning
+        pending_txs.extend(self.provisioning_trackers.keys());
+
+        // Phase 3-4: Vote aggregation (only count if not single-shard, i.e. has provisioning)
+        // Actually, vote_trackers contains both single-shard and cross-shard, but we only
+        // want cross-shard. Cross-shard txs will have certificate_trackers with multiple shards.
+        // For simplicity, count certificate_trackers with > 1 shard.
+        for (tx_hash, tracker) in &self.certificate_trackers {
+            if tracker.expected_count() > 1 {
+                pending_txs.insert(*tx_hash);
+            }
+        }
+
+        pending_txs.len()
+    }
 }
 
 impl std::fmt::Debug for ExecutionState {

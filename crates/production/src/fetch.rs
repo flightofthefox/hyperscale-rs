@@ -84,7 +84,10 @@ impl Default for FetchConfig {
             initial_timeout: Duration::from_millis(500),
             max_timeout: Duration::from_secs(5),
             max_retries: 3,
-            peer_cooldown: Duration::from_secs(10),
+            // Short cooldown allows quick recovery from transient failures.
+            // Failed peers can be retried quickly while still avoiding
+            // hammering a truly unavailable peer.
+            peer_cooldown: Duration::from_secs(3),
             stale_fetch_timeout: Duration::from_secs(30),
             max_hashes_per_request: 100,
             // Fetch from 2 peers in parallel by default to reduce latency
@@ -726,18 +729,22 @@ impl FetchManager {
                 FetchKind::Transaction => {
                     self.tx_fetches.remove(&block_hash);
                     // Notify BFT that transaction fetch permanently failed
-                    // so it can remove the pending block and allow sync
+                    // so it can remove the pending block and allow sync.
+                    // CRITICAL: Must use .send().await to ensure delivery - dropping
+                    // this event would leave the block stuck forever.
                     let event = Event::TransactionFetchFailed { block_hash };
-                    if let Err(e) = self.event_tx.try_send(event) {
+                    if let Err(e) = self.event_tx.send(event).await {
                         warn!(?block_hash, error = ?e, "Failed to send TransactionFetchFailed event");
                     }
                 }
                 FetchKind::Certificate => {
                     self.cert_fetches.remove(&block_hash);
                     // Notify BFT that certificate fetch permanently failed
-                    // so it can remove the pending block and allow sync
+                    // so it can remove the pending block and allow sync.
+                    // CRITICAL: Must use .send().await to ensure delivery - dropping
+                    // this event would leave the block stuck forever.
                     let event = Event::CertificateFetchFailed { block_hash };
-                    if let Err(e) = self.event_tx.try_send(event) {
+                    if let Err(e) = self.event_tx.send(event).await {
                         warn!(?block_hash, error = ?e, "Failed to send CertificateFetchFailed event");
                     }
                 }

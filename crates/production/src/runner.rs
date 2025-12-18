@@ -929,6 +929,9 @@ impl ProductionRunner {
                         // Update Prometheus metrics
                         crate::metrics::set_mempool_size(total);
                         crate::metrics::set_lock_contention_from_stats(&stats);
+                        crate::metrics::set_cross_shard_pending(
+                            self.state.execution().cross_shard_pending_count(),
+                        );
 
                         if let Ok(mut snap) = snapshot.try_write() {
                             snap.pending_count = stats.pending_count as usize;
