@@ -800,20 +800,26 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
     // Handle QUIC listener
     if let Some(ref range_str) = config.quic_port_range {
         let range = parse_port_range(range_str).context("Failed to parse QUIC port range")?;
-        
+
         // For range-based binding, we default to 0.0.0.0 for now.
         // In the future we could try to extract the IP from listen_addr if user wants specific binding.
         let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
-        let port = find_available_udp_port(range.clone(), ip)
-            .with_context(|| format!("Failed to find available UDP/QUIC port in range {:?}", range))?;
+        let port = find_available_udp_port(range.clone(), ip).with_context(|| {
+            format!(
+                "Failed to find available UDP/QUIC port in range {:?}",
+                range
+            )
+        })?;
 
         let quic_addr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", port)
             .parse::<libp2p::Multiaddr>()
             .context("Failed to construct QUIC multiaddr")?;
-            
-        info!("Listening on QUIC address: {} (selected from range)", quic_addr);
+
+        info!(
+            "Listening on QUIC address: {} (selected from range)",
+            quic_addr
+        );
         listen_addresses.push(quic_addr);
-        
     } else {
         // Fall back to exact listen_addr
         listen_addresses.push(listen_addr.clone());
@@ -825,7 +831,7 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
     if let Some(ref range_str) = config.tcp_fallback_port_range {
         // Explicit TCP range configured
         let range = parse_port_range(range_str).context("Failed to parse TCP port range")?;
-        
+
         // Extract IP from main listen address
         // Note: we assume the TCP fallback should listen on the same IP interface as the main address
         let ip_filter = match listen_addr.iter().next() {
@@ -839,14 +845,16 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
 
         let port = find_available_tcp_port(range.clone(), ip_filter)
             .with_context(|| format!("Failed to find available TCP port in range {:?}", range))?;
-            
+
         let tcp_addr = format!("/ip4/{}/tcp/{}", ip_filter, port)
             .parse::<libp2p::Multiaddr>()
             .context("Failed to construct TCP multiaddr")?;
-            
-        info!("Enabled TCP fallback listener on {} (legacy match)", tcp_addr);
+
+        info!(
+            "Enabled TCP fallback listener on {} (legacy match)",
+            tcp_addr
+        );
         listen_addresses.push(tcp_addr);
-        
     } else if config.listen_addr.contains("/udp/") && config.listen_addr.contains("/quic-v1") {
         // Legacy fallback: try to use same port as QUIC if possible
         let tcp_addr_str = config
@@ -900,26 +908,41 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         .with_gossipsub_heartbeat(Duration::from_millis(config.gossipsub_heartbeat_ms)))
 }
 
-
 /// Parse a port range string (e.g., "9000-9100").
 fn parse_port_range(range: &str) -> Result<std::ops::RangeInclusive<u16>> {
     let parts: Vec<&str> = range.split('-').collect();
     if parts.len() != 2 {
-        bail!("Invalid port range format. Expected 'start-end', got '{}'", range);
+        bail!(
+            "Invalid port range format. Expected 'start-end', got '{}'",
+            range
+        );
     }
 
-    let start = parts[0].trim().parse::<u16>().with_context(|| "Invalid start port")?;
-    let end = parts[1].trim().parse::<u16>().with_context(|| "Invalid end port")?;
+    let start = parts[0]
+        .trim()
+        .parse::<u16>()
+        .with_context(|| "Invalid start port")?;
+    let end = parts[1]
+        .trim()
+        .parse::<u16>()
+        .with_context(|| "Invalid end port")?;
 
     if start > end {
-        bail!("Invalid port range: start port {} is greater than end port {}", start, end);
+        bail!(
+            "Invalid port range: start port {} is greater than end port {}",
+            start,
+            end
+        );
     }
 
     Ok(start..=end)
 }
 
 /// Find a free UDP port in the given range.
-fn find_available_udp_port(range: std::ops::RangeInclusive<u16>, ip: std::net::IpAddr) -> Result<u16> {
+fn find_available_udp_port(
+    range: std::ops::RangeInclusive<u16>,
+    ip: std::net::IpAddr,
+) -> Result<u16> {
     for port in range {
         let addr = std::net::SocketAddr::new(ip, port);
         if std::net::UdpSocket::bind(addr).is_ok() {
@@ -930,7 +953,10 @@ fn find_available_udp_port(range: std::ops::RangeInclusive<u16>, ip: std::net::I
 }
 
 /// Find a free TCP port in the given range.
-fn find_available_tcp_port(range: std::ops::RangeInclusive<u16>, ip: std::net::IpAddr) -> Result<u16> {
+fn find_available_tcp_port(
+    range: std::ops::RangeInclusive<u16>,
+    ip: std::net::IpAddr,
+) -> Result<u16> {
     for port in range {
         let addr = std::net::SocketAddr::new(ip, port);
         if std::net::TcpListener::bind(addr).is_ok() {
@@ -964,11 +990,11 @@ mod tests {
         // This test is best effort since we can't guarantee port availability on CI
         let range = 30000..=31000;
         let ip = "127.0.0.1".parse().unwrap();
-        
+
         if let Ok(port) = find_available_udp_port(range.clone(), ip) {
             assert!(port >= 30000 && port <= 31000);
         }
-        
+
         if let Ok(port) = find_available_tcp_port(range, ip) {
             assert!(port >= 30000 && port <= 31000);
         }

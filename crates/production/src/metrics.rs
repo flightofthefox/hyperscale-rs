@@ -44,6 +44,10 @@ pub struct Metrics {
     pub speculative_execution_invalidated: Counter,
 
     // === Thread Pools ===
+    /// Queue depth of the consensus crypto pool (block votes, QC verification).
+    /// This pool is liveness-critical and should remain near zero under load.
+    pub consensus_crypto_pool_queue_depth: Gauge,
+    /// Queue depth of the general crypto pool (provisions, state votes, tx validation).
     pub crypto_pool_queue_depth: Gauge,
     pub execution_pool_queue_depth: Gauge,
 
@@ -235,9 +239,15 @@ impl Metrics {
             .unwrap(),
 
             // Thread Pools
+            consensus_crypto_pool_queue_depth: register_gauge!(
+                "hyperscale_consensus_crypto_pool_queue_depth",
+                "Number of pending tasks in consensus crypto pool (block votes, QC verification)"
+            )
+            .unwrap(),
+
             crypto_pool_queue_depth: register_gauge!(
                 "hyperscale_crypto_pool_queue_depth",
-                "Number of pending tasks in crypto verification pool"
+                "Number of pending tasks in general crypto pool (provisions, state votes)"
             )
             .unwrap(),
 
@@ -533,8 +543,10 @@ pub fn set_cross_shard_pending(count: usize) {
 }
 
 /// Update thread pool queue depths.
-pub fn set_pool_queue_depths(crypto: usize, execution: usize) {
+pub fn set_pool_queue_depths(consensus_crypto: usize, crypto: usize, execution: usize) {
     let m = metrics();
+    m.consensus_crypto_pool_queue_depth
+        .set(consensus_crypto as f64);
     m.crypto_pool_queue_depth.set(crypto as f64);
     m.execution_pool_queue_depth.set(execution as f64);
 }

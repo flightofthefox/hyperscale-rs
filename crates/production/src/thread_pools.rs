@@ -52,8 +52,14 @@ pub enum ThreadPoolError {
 /// and allocate them using recommended ratios.
 #[derive(Debug, Clone)]
 pub struct ThreadPoolConfig {
-    /// Number of threads for crypto operations (signature verification).
-    /// These are CPU-bound and benefit from dedicated cores.
+    /// Number of threads for consensus-critical crypto operations (block votes, QC verification).
+    /// This is a dedicated high-priority pool that is never blocked by execution-layer
+    /// crypto work (provisions, state votes). Keeping this pool responsive is critical
+    /// for consensus liveness - block vote verification delays cause view changes.
+    pub consensus_crypto_threads: usize,
+
+    /// Number of threads for general crypto operations (provisions, state votes, tx validation).
+    /// These are CPU-bound but not consensus-critical. They can queue without affecting liveness.
     pub crypto_threads: usize,
 
     /// Number of threads for transaction execution.
@@ -99,9 +105,10 @@ impl ThreadPoolConfig {
     ///
     /// Uses the following allocation ratios:
     /// - State Machine: 1 core (always)
-    /// - Execution: 50% of remaining cores (min 1)
-    /// - Crypto: 25% of remaining cores (min 1)
-    /// - I/O: 25% of remaining cores (min 1)
+    /// - Consensus Crypto: 2 threads (dedicated for block votes/QC - liveness critical)
+    /// - Execution: 40% of remaining cores (min 1)
+    /// - General Crypto: 30% of remaining cores (min 1)
+    /// - I/O: 30% of remaining cores (min 1)
     ///
     /// On systems with fewer than 4 cores, all pools get 1 thread each.
     pub fn auto() -> Self {
@@ -117,23 +124,30 @@ impl ThreadPoolConfig {
     /// Useful for testing or when you want to limit resource usage.
     pub fn for_core_count(total_cores: usize) -> Self {
         // Reserve 1 core for state machine
-        let remaining = total_cores.saturating_sub(1).max(3);
+        let remaining = total_cores.saturating_sub(1).max(4);
 
-        // Allocation ratios: execution 50%, crypto 25%, I/O 25%
-        let (crypto, execution, io) = if remaining <= 3 {
-            // Minimum viable: 1 each
-            (1, 1, 1)
+        // Allocation: consensus_crypto gets dedicated threads, rest split among others
+        // Consensus crypto is critical for liveness - even under heavy load, block votes
+        // must be verified quickly to form QCs within the view_change_timeout (3s default)
+        let (consensus_crypto, crypto, execution, io) = if remaining <= 4 {
+            // Minimum viable: 1 each, consensus_crypto always gets at least 1
+            (1, 1, 1, 1)
         } else {
-            let execution = (remaining * 50 / 100).max(1);
-            let crypto = (remaining * 25 / 100).max(1);
-            let io = remaining
+            // Consensus crypto: fixed 2 threads (enough for ~1000 votes/sec)
+            let consensus_crypto = 2;
+            let after_consensus = remaining.saturating_sub(consensus_crypto);
+            // Remaining split: execution 40%, crypto 30%, I/O 30%
+            let execution = (after_consensus * 40 / 100).max(1);
+            let crypto = (after_consensus * 30 / 100).max(1);
+            let io = after_consensus
                 .saturating_sub(crypto)
                 .saturating_sub(execution)
                 .max(1);
-            (crypto, execution, io)
+            (consensus_crypto, crypto, execution, io)
         };
 
         Self {
+            consensus_crypto_threads: consensus_crypto,
             crypto_threads: crypto,
             execution_threads: execution,
             io_threads: io,
@@ -155,6 +169,7 @@ impl ThreadPoolConfig {
     /// Create a minimal configuration for testing (1 thread per pool).
     pub fn minimal() -> Self {
         Self {
+            consensus_crypto_threads: 1,
             crypto_threads: 1,
             execution_threads: 1,
             io_threads: 1,
@@ -170,11 +185,19 @@ impl ThreadPoolConfig {
 
     /// Total number of threads that will be spawned (excluding state machine).
     pub fn total_threads(&self) -> usize {
-        self.crypto_threads + self.execution_threads + self.io_threads
+        self.consensus_crypto_threads
+            + self.crypto_threads
+            + self.execution_threads
+            + self.io_threads
     }
 
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), ThreadPoolError> {
+        if self.consensus_crypto_threads == 0 {
+            return Err(ThreadPoolError::InvalidConfig(
+                "consensus_crypto_threads must be at least 1".to_string(),
+            ));
+        }
         if self.crypto_threads == 0 {
             return Err(ThreadPoolError::InvalidConfig(
                 "crypto_threads must be at least 1".to_string(),
@@ -197,7 +220,11 @@ impl ThreadPoolConfig {
                 .map(NonZeroUsize::get)
                 .unwrap_or(4);
 
-            let total_needed = 1 + self.crypto_threads + self.execution_threads + self.io_threads;
+            let total_needed = 1
+                + self.consensus_crypto_threads
+                + self.crypto_threads
+                + self.execution_threads
+                + self.io_threads;
             if total_needed > available {
                 return Err(ThreadPoolError::InvalidConfig(format!(
                     "Configuration requires {} cores but only {} are available",
@@ -224,7 +251,14 @@ impl ThreadPoolConfigBuilder {
         }
     }
 
-    /// Set the number of crypto verification threads.
+    /// Set the number of consensus crypto threads (block votes, QC verification).
+    /// These are liveness-critical and should not be set too low.
+    pub fn consensus_crypto_threads(mut self, count: usize) -> Self {
+        self.config.consensus_crypto_threads = count;
+        self
+    }
+
+    /// Set the number of general crypto verification threads (provisions, state votes).
     pub fn crypto_threads(mut self, count: usize) -> Self {
         self.config.crypto_threads = count;
         self
@@ -309,20 +343,32 @@ impl Default for ThreadPoolConfigBuilder {
 /// Manages thread pools for production deployment.
 ///
 /// Creates and owns:
-/// - A rayon thread pool for crypto operations
-/// - A rayon thread pool for execution operations
+/// - A rayon thread pool for consensus-critical crypto (block votes, QC verification)
+/// - A rayon thread pool for general crypto operations (provisions, state votes, tx validation)
+/// - A rayon thread pool for execution operations (Radix Engine)
 /// - Configuration for tokio runtime (actual runtime created by caller)
+///
+/// The separation of consensus crypto from general crypto is critical for liveness:
+/// under high load, provision and state vote verification can queue up, but block vote
+/// verification must remain responsive to form QCs within the view_change_timeout.
 pub struct ThreadPoolManager {
     /// Configuration used to create the pools.
     config: ThreadPoolConfig,
 
-    /// Rayon pool for crypto operations (signature verification).
+    /// Rayon pool for consensus-critical crypto (block votes, QC verification).
+    /// This pool is kept small and dedicated to ensure liveness under load.
+    consensus_crypto_pool: rayon::ThreadPool,
+
+    /// Rayon pool for general crypto operations (provisions, state votes, tx validation).
     crypto_pool: rayon::ThreadPool,
 
     /// Rayon pool for execution operations (Radix Engine).
     execution_pool: rayon::ThreadPool,
 
-    /// Queue depth tracking for crypto pool (for metrics).
+    /// Queue depth tracking for consensus crypto pool (for metrics).
+    consensus_crypto_pending: Arc<AtomicUsize>,
+
+    /// Queue depth tracking for general crypto pool (for metrics).
     crypto_pending: Arc<AtomicUsize>,
 
     /// Queue depth tracking for execution pool (for metrics).
@@ -334,10 +380,12 @@ impl ThreadPoolManager {
     pub fn new(config: ThreadPoolConfig) -> Result<Self, ThreadPoolError> {
         config.validate()?;
 
+        let consensus_crypto_pool = Self::build_consensus_crypto_pool(&config)?;
         let crypto_pool = Self::build_crypto_pool(&config)?;
         let execution_pool = Self::build_execution_pool(&config)?;
 
         tracing::info!(
+            consensus_crypto_threads = config.consensus_crypto_threads,
             crypto_threads = config.crypto_threads,
             execution_threads = config.execution_threads,
             io_threads = config.io_threads,
@@ -347,8 +395,10 @@ impl ThreadPoolManager {
 
         Ok(Self {
             config,
+            consensus_crypto_pool,
             crypto_pool,
             execution_pool,
+            consensus_crypto_pending: Arc::new(AtomicUsize::new(0)),
             crypto_pending: Arc::new(AtomicUsize::new(0)),
             execution_pending: Arc::new(AtomicUsize::new(0)),
         })
@@ -359,6 +409,25 @@ impl ThreadPoolManager {
         Self::new(ThreadPoolConfig::auto())
     }
 
+    /// Build the consensus-critical crypto pool (block votes, QC verification).
+    /// This pool is kept separate from general crypto to ensure liveness under load.
+    fn build_consensus_crypto_pool(
+        config: &ThreadPoolConfig,
+    ) -> Result<rayon::ThreadPool, ThreadPoolError> {
+        let builder = rayon::ThreadPoolBuilder::new()
+            .num_threads(config.consensus_crypto_threads)
+            .stack_size(config.crypto_stack_size)
+            .thread_name(|i| format!("consensus-crypto-{}", i));
+
+        // Note: We don't pin consensus crypto threads by default - they should be
+        // available to run on any core for best responsiveness under load.
+
+        builder
+            .build()
+            .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
+    }
+
+    /// Build the general crypto pool (provisions, state votes, tx validation).
     fn build_crypto_pool(config: &ThreadPoolConfig) -> Result<rayon::ThreadPool, ThreadPoolError> {
         let mut builder = rayon::ThreadPoolBuilder::new()
             .num_threads(config.crypto_threads)
@@ -367,7 +436,9 @@ impl ThreadPoolManager {
 
         // Core pinning for crypto threads
         if config.pin_cores {
-            let start_core = config.crypto_core_start.unwrap_or(1); // Default: after state machine
+            let start_core = config
+                .crypto_core_start
+                .unwrap_or(1 + config.consensus_crypto_threads); // Default: after consensus crypto
             builder = builder.start_handler(move |i| {
                 let core_id = start_core + i;
                 if let Err(e) = pin_thread_to_core(core_id) {
@@ -395,7 +466,7 @@ impl ThreadPoolManager {
         if config.pin_cores {
             let start_core = config
                 .execution_core_start
-                .unwrap_or(1 + config.crypto_threads); // Default: after crypto pool
+                .unwrap_or(1 + config.consensus_crypto_threads + config.crypto_threads); // Default: after both crypto pools
             builder = builder.start_handler(move |i| {
                 let core_id = start_core + i;
                 if let Err(e) = pin_thread_to_core(core_id) {
@@ -411,7 +482,12 @@ impl ThreadPoolManager {
             .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
     }
 
-    /// Get a reference to the crypto thread pool.
+    /// Get a reference to the consensus crypto thread pool.
+    pub fn consensus_crypto_pool(&self) -> &rayon::ThreadPool {
+        &self.consensus_crypto_pool
+    }
+
+    /// Get a reference to the general crypto thread pool.
     pub fn crypto_pool(&self) -> &rayon::ThreadPool {
         &self.crypto_pool
     }
@@ -454,7 +530,30 @@ impl ThreadPoolManager {
             .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
     }
 
-    /// Spawn a crypto verification task on the crypto pool.
+    /// Spawn a consensus-critical crypto task on the dedicated consensus crypto pool.
+    ///
+    /// Use this for block vote and QC signature verification - these are liveness-critical
+    /// and must not be blocked by general crypto work (provisions, state votes).
+    ///
+    /// Returns immediately; the task runs asynchronously.
+    /// Queue depth is tracked for metrics.
+    pub fn spawn_consensus_crypto<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.consensus_crypto_pending
+            .fetch_add(1, Ordering::Relaxed);
+        let pending = self.consensus_crypto_pending.clone();
+        self.consensus_crypto_pool.spawn(move || {
+            f();
+            pending.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+
+    /// Spawn a general crypto verification task on the crypto pool.
+    ///
+    /// Use this for provisions, state votes, and transaction validation - these are
+    /// not consensus-critical and can queue without affecting liveness.
     ///
     /// Returns immediately; the task runs asynchronously.
     /// Queue depth is tracked for metrics.
@@ -486,7 +585,12 @@ impl ThreadPoolManager {
         });
     }
 
-    /// Get current crypto pool queue depth (for metrics).
+    /// Get current consensus crypto pool queue depth (for metrics).
+    pub fn consensus_crypto_queue_depth(&self) -> usize {
+        self.consensus_crypto_pending.load(Ordering::Relaxed)
+    }
+
+    /// Get current general crypto pool queue depth (for metrics).
     pub fn crypto_queue_depth(&self) -> usize {
         self.crypto_pending.load(Ordering::Relaxed)
     }
@@ -565,6 +669,7 @@ mod tests {
     #[test]
     fn test_auto_config() {
         let config = ThreadPoolConfig::auto();
+        assert!(config.consensus_crypto_threads >= 1);
         assert!(config.crypto_threads >= 1);
         assert!(config.execution_threads >= 1);
         assert!(config.io_threads >= 1);
@@ -573,28 +678,34 @@ mod tests {
 
     #[test]
     fn test_for_core_count() {
-        // 4 cores: 1 state + 1 crypto + 1 exec + 1 io
+        // 4 cores: 1 state + 1 consensus_crypto + 1 crypto + 1 exec + 1 io (minimum viable)
         let config = ThreadPoolConfig::for_core_count(4);
+        assert_eq!(config.consensus_crypto_threads, 1);
         assert_eq!(config.crypto_threads, 1);
         assert_eq!(config.execution_threads, 1);
         assert_eq!(config.io_threads, 1);
 
-        // 8 cores: 1 state + ~1 crypto + ~3 exec + ~3 io
+        // 8 cores: 1 state + 2 consensus_crypto + rest split
         let config = ThreadPoolConfig::for_core_count(8);
+        assert!(config.consensus_crypto_threads >= 1);
         assert!(config.crypto_threads >= 1);
-        assert!(config.execution_threads >= 3);
+        assert!(config.execution_threads >= 1);
         assert!(config.io_threads >= 1);
 
-        // 16 cores: more balanced
+        // 16 cores: more balanced with dedicated consensus crypto
+        // 15 remaining after state machine, 13 after consensus crypto (2)
+        // execution 40% = 5, crypto 30% = 3, io = 5
         let config = ThreadPoolConfig::for_core_count(16);
+        assert_eq!(config.consensus_crypto_threads, 2); // Fixed 2 threads for consensus crypto
         assert!(config.crypto_threads >= 3);
-        assert!(config.execution_threads >= 7);
+        assert!(config.execution_threads >= 4);
         assert!(config.io_threads >= 2);
     }
 
     #[test]
     fn test_minimal_config() {
         let config = ThreadPoolConfig::minimal();
+        assert_eq!(config.consensus_crypto_threads, 1);
         assert_eq!(config.crypto_threads, 1);
         assert_eq!(config.execution_threads, 1);
         assert_eq!(config.io_threads, 1);
@@ -651,6 +762,7 @@ mod tests {
         let config = ThreadPoolConfig::minimal();
         let manager = ThreadPoolManager::new(config).unwrap();
 
+        assert_eq!(manager.config().consensus_crypto_threads, 1);
         assert_eq!(manager.config().crypto_threads, 1);
         assert_eq!(manager.config().execution_threads, 1);
         assert_eq!(manager.io_threads(), 1);
@@ -663,10 +775,17 @@ mod tests {
         let config = ThreadPoolConfig::minimal();
         let manager = ThreadPoolManager::new(config).unwrap();
 
+        let consensus_crypto_counter = Arc::new(AtomicUsize::new(0));
         let crypto_counter = Arc::new(AtomicUsize::new(0));
         let exec_counter = Arc::new(AtomicUsize::new(0));
 
-        // Spawn on crypto pool
+        // Spawn on consensus crypto pool
+        let counter = consensus_crypto_counter.clone();
+        manager.spawn_consensus_crypto(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Spawn on general crypto pool
         let counter = crypto_counter.clone();
         manager.spawn_crypto(move || {
             counter.fetch_add(1, Ordering::SeqCst);
@@ -681,6 +800,7 @@ mod tests {
         // Wait for tasks to complete
         std::thread::sleep(std::time::Duration::from_millis(100));
 
+        assert_eq!(consensus_crypto_counter.load(Ordering::SeqCst), 1);
         assert_eq!(crypto_counter.load(Ordering::SeqCst), 1);
         assert_eq!(exec_counter.load(Ordering::SeqCst), 1);
     }
@@ -688,11 +808,12 @@ mod tests {
     #[test]
     fn test_total_threads() {
         let config = ThreadPoolConfig::builder()
+            .consensus_crypto_threads(2)
             .crypto_threads(4)
             .execution_threads(6)
             .io_threads(2)
             .build_unchecked();
 
-        assert_eq!(config.total_threads(), 12);
+        assert_eq!(config.total_threads(), 14); // 2 + 4 + 6 + 2
     }
 }

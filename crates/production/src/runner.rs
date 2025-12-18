@@ -897,6 +897,7 @@ impl ProductionRunner {
                 _ = metrics_tick.tick() => {
                     // Update thread pool queue depths (non-blocking)
                     crate::metrics::set_pool_queue_depths(
+                        self.thread_pools.consensus_crypto_queue_depth(),
                         self.thread_pools.crypto_queue_depth(),
                         self.thread_pools.execution_queue_depth(),
                     );
@@ -1587,14 +1588,15 @@ impl ProductionRunner {
                 self.timer_manager.cancel_timer(id);
             }
 
-            // Crypto verification on dedicated crypto thread pool
+            // Block vote verification on CONSENSUS crypto pool (liveness-critical)
             Action::VerifyVoteSignature {
                 vote,
                 public_key,
                 signing_message,
             } => {
                 let event_tx = self.callback_tx.clone();
-                self.thread_pools.spawn_crypto(move || {
+                // Block votes are liveness-critical - use dedicated consensus crypto pool
+                self.thread_pools.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
                     // Verify vote signature against domain-separated message
                     let valid = public_key.verify(&signing_message, &vote.signature);
@@ -1713,7 +1715,8 @@ impl ProductionRunner {
                 signing_message,
             } => {
                 let event_tx = self.callback_tx.clone();
-                self.thread_pools.spawn_crypto(move || {
+                // QC verification is LIVENESS-CRITICAL - use consensus crypto pool
+                self.thread_pools.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
                     // Get signer keys based on QC's signer bitfield
                     let signer_keys: Vec<_> = public_keys
@@ -2235,7 +2238,11 @@ impl ProductionRunner {
         Ok(())
     }
 
-    /// Dispatch block vote verifications to the crypto thread pool.
+    /// Dispatch block vote verifications to the CONSENSUS crypto thread pool.
+    ///
+    /// Block votes are LIVENESS-CRITICAL and use the dedicated consensus crypto pool
+    /// to ensure they are never blocked by general crypto work (provisions, state votes).
+    /// This is essential for forming QCs within the view_change_timeout (default 3s).
     ///
     /// Block votes use a short batching window (5ms) since they are latency-sensitive
     /// for consensus progress.
@@ -2250,7 +2257,8 @@ impl ProductionRunner {
         let event_tx = self.callback_tx.clone();
         let batch_size = pending.len();
 
-        self.thread_pools.spawn_crypto(move || {
+        // Use dedicated consensus crypto pool - never blocked by provisions/state votes
+        self.thread_pools.spawn_consensus_crypto(move || {
             let start = std::time::Instant::now();
 
             // Separate by key type for appropriate batch verification

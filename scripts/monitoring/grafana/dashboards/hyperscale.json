@@ -1653,8 +1653,14 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "avg(hyperscale_consensus_crypto_pool_queue_depth)",
+          "legendFormat": "Consensus Crypto Pool (avg/validator)",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "expr": "avg(hyperscale_crypto_pool_queue_depth)",
-          "legendFormat": "Crypto Pool (avg/validator)",
+          "legendFormat": "General Crypto Pool (avg/validator)",
           "refId": "A"
         },
         {
