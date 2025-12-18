@@ -144,7 +144,7 @@ impl StateProvision {
 }
 
 /// Vote on execution state from a validator.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
 pub struct StateVoteBlock {
     /// Hash of the transaction.
     pub transaction_hash: Hash,

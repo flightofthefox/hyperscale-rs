@@ -381,7 +381,7 @@ impl fmt::Debug for PublicKey {
 }
 
 /// A cryptographic signature.
-#[derive(Clone, PartialEq, Eq, BasicSbor)]
+#[derive(Clone, PartialEq, Eq, Hash, BasicSbor)]
 pub enum Signature {
     /// ED25519 signature (64 bytes).
     Ed25519(Vec<u8>),

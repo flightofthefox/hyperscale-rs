@@ -133,7 +133,8 @@ pub struct ExecutionState {
     early_provisions: HashMap<Hash, Vec<StateProvision>>,
 
     /// Votes that arrived before tracking started.
-    early_votes: HashMap<Hash, Vec<StateVoteBlock>>,
+    /// Uses HashSet for O(1) deduplication instead of O(n) Vec::contains.
+    early_votes: HashMap<Hash, HashSet<StateVoteBlock>>,
 
     /// Certificates that arrived before tracking started.
     early_certificates: HashMap<Hash, Vec<StateCertificate>>,
@@ -1075,11 +1076,8 @@ impl ExecutionState {
             if self.state_certificates.contains_key(&tx_hash) {
                 return vec![];
             }
-            // Buffer for later (deduplicate to avoid double-verification in parallel execution)
-            let buffer = self.early_votes.entry(tx_hash).or_default();
-            if !buffer.contains(&vote) {
-                buffer.push(vote);
-            }
+            // Buffer for later (HashSet provides O(1) deduplication)
+            self.early_votes.entry(tx_hash).or_default().insert(vote);
             return vec![];
         }
 
