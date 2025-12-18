@@ -222,12 +222,13 @@ echo "  Generated balances for $((NUM_SHARDS * ACCOUNTS_PER_SHARD)) accounts tot
 BOOTSTRAP_PEERS=""
 for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     first_validator=$((shard * VALIDATORS_PER_SHARD))
-    port=$((BASE_PORT + first_validator))
+    quic_port=$((BASE_PORT + first_validator))
+    tcp_port=$((TCP_BASE_PORT + first_validator))
     if [ -n "$BOOTSTRAP_PEERS" ]; then
         BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS,"
     fi
     # We'll use localhost multiaddr format
-    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/127.0.0.1/udp/$port/quic-v1\",\"/ip4/127.0.0.1/tcp/$port\""
+    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/127.0.0.1/udp/$quic_port/quic-v1\",\"/ip4/127.0.0.1/tcp/$tcp_port\""
 done
 
 # Generate TOML configs for each validator
@@ -260,6 +261,10 @@ public_key = \"${PUBLIC_KEYS[$j]}\"
 voting_power = 1"
     done
 
+    # Calculate per-validator ports to avoid race conditions during startup
+    validator_quic_port=$((BASE_PORT + i))
+    validator_tcp_port=$((TCP_BASE_PORT + i))
+
     cat > "$CONFIG_FILE" << EOF
 # Hyperscale Validator Configuration
 # Auto-generated for local cluster testing
@@ -272,11 +277,9 @@ key_path = "$KEY_FILE"
 data_dir = "$NODE_DATA_DIR"
 
 [network]
-# Use configured port ranges for firewall friendliness
-quic_port_range = "$QUIC_PORT_RANGE"
-tcp_fallback_port_range = "$TCP_PORT_RANGE"
-# listen_addr is ignored when ranges are present, but be safe and keep a valid default
-listen_addr = "/ip4/0.0.0.0/udp/0/quic-v1"
+# Use specific ports per validator to avoid race conditions during parallel startup
+listen_addr = "/ip4/0.0.0.0/udp/$validator_quic_port/quic-v1"
+tcp_fallback_port = $validator_tcp_port
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 request_timeout_ms = 500
 max_message_size = 10485760
