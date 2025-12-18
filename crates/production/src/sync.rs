@@ -139,8 +139,8 @@ impl Default for SyncConfig {
             // With 3 peers (4-validator shard minus self) at 2 requests each,
             // we could do 6 concurrent, but we allow more headroom for larger shards.
             max_concurrent_fetches: 16,
-            initial_timeout: Duration::from_secs(5),
-            max_timeout: Duration::from_secs(30),
+            initial_timeout: Duration::from_millis(500),
+            max_timeout: Duration::from_secs(5),
             max_retries_per_peer: 3,
             // Short cooldown to allow quick recovery from transient failures.
             // The desperation mode will reset cooldowns if we fall too far behind.
@@ -1295,7 +1295,7 @@ mod tests {
     fn test_sync_config_defaults() {
         let config = SyncConfig::default();
         assert_eq!(config.max_concurrent_fetches, 16);
-        assert_eq!(config.initial_timeout, Duration::from_secs(5));
+        assert_eq!(config.initial_timeout, Duration::from_millis(500));
         assert_eq!(config.max_retries_per_peer, 3);
     }
 
