@@ -178,6 +178,12 @@ pub struct ExecutionState {
     /// Used to retrieve declared_reads when speculative execution completes.
     pending_speculative_executions: HashMap<Hash, Vec<Arc<RoutableTransaction>>>,
 
+    /// Transactions that committed while speculation was in-flight.
+    /// When speculation completes, these are processed via on_execution_complete
+    /// instead of being cached. Maps tx_hash -> (block_hash, transaction).
+    /// This avoids double-execution when commit beats speculation.
+    committed_awaiting_speculation: HashMap<Hash, (Hash, Arc<RoutableTransaction>)>,
+
     // ═══════════════════════════════════════════════════════════════════════
     // Speculative Execution Config
     // ═══════════════════════════════════════════════════════════════════════
@@ -199,7 +205,12 @@ pub struct ExecutionState {
     /// Count of speculative executions started since last metrics read.
     speculative_started_count: u64,
     /// Count of speculative cache hits since last metrics read.
+    /// Includes both early hits (speculation completed before commit) and
+    /// late hits (commit arrived before speculation, but waited for it).
     speculative_cache_hit_count: u64,
+    /// Count of "late hits" - speculation completed after commit but we waited.
+    /// This is a subset of cache_hit_count, tracking the dedup optimization.
+    speculative_late_hit_count: u64,
     /// Count of speculative cache misses since last metrics read.
     speculative_cache_miss_count: u64,
     /// Count of speculative results invalidated since last metrics read.
@@ -259,11 +270,13 @@ impl ExecutionState {
             speculative_in_flight_txs: HashSet::new(),
             speculative_reads_index: HashMap::new(),
             pending_speculative_executions: HashMap::new(),
+            committed_awaiting_speculation: HashMap::new(),
             speculative_max_txs,
             view_change_cooldown_rounds,
             last_view_change_height: 0,
             speculative_started_count: 0,
             speculative_cache_hit_count: 0,
+            speculative_late_hit_count: 0,
             speculative_cache_miss_count: 0,
             speculative_invalidated_count: 0,
         }
@@ -402,24 +415,28 @@ impl ExecutionState {
         // Check for cached speculative results to avoid re-execution
         let mut txs_needing_execution = Vec::new();
         let mut speculative_hits = Vec::new();
+        let mut awaiting_speculation = Vec::new();
 
         for tx in single_shard {
             let tx_hash = tx.hash();
 
-            // Remove from in-flight tracking if it was being speculatively executed
-            self.speculative_in_flight_txs.remove(&tx_hash);
-
             if let Some(result) = self.take_speculative_result(&tx_hash) {
-                // Use cached speculative result - no re-execution needed
+                // Speculation completed - use cached result
+                self.speculative_in_flight_txs.remove(&tx_hash);
                 tracing::info!(
                     tx_hash = ?tx_hash,
                     "SPECULATIVE HIT: Using cached speculative result"
                 );
                 speculative_hits.push((tx, result));
+            } else if self.speculative_in_flight_txs.contains(&tx_hash) {
+                // Speculation still in-flight - wait for it instead of double-executing
+                tracing::info!(
+                    tx_hash = ?tx_hash,
+                    "SPECULATIVE WAIT: Commit arrived before speculation complete, waiting"
+                );
+                awaiting_speculation.push(tx);
             } else {
-                // No cached result - need to execute
-                // (If speculation is still in-flight, it will complete but results won't be used.
-                // This is simpler and more correct than trying to wait for in-flight speculation.)
+                // No speculation at all - execute normally
                 tracing::info!(
                     tx_hash = ?tx_hash,
                     speculative_results_count = self.speculative_results.len(),
@@ -436,6 +453,17 @@ impl ExecutionState {
             actions.extend(self.start_single_shard_execution(tx.clone(), height, block_hash));
             // Directly process the execution result
             actions.extend(self.on_single_tx_execution_complete(block_hash, result));
+        }
+
+        // Track transactions waiting for in-flight speculation to complete.
+        // When SpeculativeExecutionComplete arrives, these will be processed.
+        for tx in awaiting_speculation {
+            let tx_hash = tx.hash();
+            // Start execution tracking (vote trackers, etc.) but don't emit ExecuteTransactions
+            actions.extend(self.start_single_shard_execution(tx.clone(), height, block_hash));
+            // Track that this committed tx is waiting for speculation
+            self.committed_awaiting_speculation
+                .insert(tx_hash, (block_hash, tx));
         }
 
         // Start execution tracking for transactions that need execution
@@ -1891,8 +1919,8 @@ impl ExecutionState {
     /// Handle speculative execution completion callback.
     ///
     /// Caches the results for use when the block commits. If the block has already
-    /// committed before speculation finished, the results are simply discarded
-    /// (the commit path will have executed normally).
+    /// committed and is waiting for this speculation, the result is processed
+    /// immediately via the normal execution path.
     pub fn on_speculative_execution_complete(
         &mut self,
         block_hash: Hash,
@@ -1904,6 +1932,8 @@ impl ExecutionState {
             "SPECULATIVE COMPLETE: Received speculative execution results"
         );
 
+        let mut actions = Vec::new();
+
         // Get the transactions we were executing to retrieve their declared_reads
         let transactions = self
             .pending_speculative_executions
@@ -1914,12 +1944,28 @@ impl ExecutionState {
         let tx_map: HashMap<Hash, &Arc<RoutableTransaction>> =
             transactions.iter().map(|tx| (tx.hash(), tx)).collect();
 
-        // Cache results for later use (if tx hasn't already been committed)
+        // Process results - either use immediately if committed, or cache for later
         for (tx_hash, result) in results {
             // Remove from in-flight tracking
             self.speculative_in_flight_txs.remove(&tx_hash);
 
-            // Skip if already executed (block committed before speculation finished)
+            // Check if this tx already committed and is waiting for speculation
+            if let Some((committed_block_hash, _tx)) =
+                self.committed_awaiting_speculation.remove(&tx_hash)
+            {
+                // Block already committed - use result immediately
+                tracing::info!(
+                    tx_hash = ?tx_hash,
+                    committed_block_hash = ?committed_block_hash,
+                    "SPECULATIVE LATE HIT: Using speculative result for already-committed tx"
+                );
+                self.record_speculative_late_hit();
+                // Process through the normal execution completion path
+                actions.extend(self.on_single_tx_execution_complete(committed_block_hash, result));
+                continue;
+            }
+
+            // Skip if already executed through some other path
             if self.executed_txs.contains(&tx_hash) {
                 tracing::debug!(
                     tx_hash = ?tx_hash,
@@ -1942,7 +1988,7 @@ impl ExecutionState {
                     .insert(tx_hash);
             }
 
-            // Cache the result
+            // Cache the result for later use when block commits
             self.speculative_results.insert(
                 tx_hash,
                 SpeculativeResult {
@@ -1959,8 +2005,7 @@ impl ExecutionState {
             );
         }
 
-        // No actions needed - results are cached for later use
-        vec![]
+        actions
     }
 
     /// Invalidate speculative results that conflict with a committed certificate.
@@ -2051,6 +2096,13 @@ impl ExecutionState {
         self.speculative_cache_miss_count += 1;
     }
 
+    /// Record a late hit (speculation completed after commit but we waited for it).
+    /// This counts as both a hit and a late hit.
+    fn record_speculative_late_hit(&mut self) {
+        self.speculative_cache_hit_count += 1;
+        self.speculative_late_hit_count += 1;
+    }
+
     /// Check if a speculative result exists for a transaction.
     pub fn has_speculative_result(&self, tx_hash: &Hash) -> bool {
         self.speculative_results.contains_key(tx_hash)
@@ -2095,16 +2147,19 @@ impl ExecutionState {
 
     /// Get and reset speculative execution metrics.
     ///
-    /// Returns (started, cache_hits, cache_misses, invalidated) and resets counters to 0.
-    pub fn take_speculative_metrics(&mut self) -> (u64, u64, u64, u64) {
+    /// Returns (started, cache_hits, late_hits, cache_misses, invalidated) and resets counters to 0.
+    /// Note: late_hits is a subset of cache_hits (both are incremented for late hits).
+    pub fn take_speculative_metrics(&mut self) -> (u64, u64, u64, u64, u64) {
         let metrics = (
             self.speculative_started_count,
             self.speculative_cache_hit_count,
+            self.speculative_late_hit_count,
             self.speculative_cache_miss_count,
             self.speculative_invalidated_count,
         );
         self.speculative_started_count = 0;
         self.speculative_cache_hit_count = 0;
+        self.speculative_late_hit_count = 0;
         self.speculative_cache_miss_count = 0;
         self.speculative_invalidated_count = 0;
         metrics
@@ -2289,4 +2344,131 @@ mod tests {
     // - trackers/provisioning.rs
     // - trackers/vote.rs
     // - trackers/certificate.rs
+
+    #[test]
+    fn test_speculative_hit_before_commit() {
+        // Scenario: Speculation completes BEFORE block commits (normal HIT)
+        let mut state = make_test_state();
+
+        let tx = Arc::new(test_transaction(1));
+        let tx_hash = tx.hash();
+        let block_hash = Hash::from_bytes(b"block1");
+
+        // Use height past view change cooldown (default cooldown is 3 rounds)
+        let height = 10;
+
+        // Trigger speculative execution
+        let actions = state.trigger_speculative_execution(block_hash, height, vec![tx.clone()]);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::SpeculativeExecute { .. })));
+        assert!(state.speculative_in_flight_txs.contains(&tx_hash));
+
+        // Speculation completes
+        let spec_results = vec![(
+            tx_hash,
+            ExecutionResult {
+                transaction_hash: tx_hash,
+                success: true,
+                state_root: Hash::ZERO,
+                writes: vec![],
+                error: None,
+            },
+        )];
+        let _ = state.on_speculative_execution_complete(block_hash, spec_results);
+
+        // Result should be cached
+        assert!(state.has_speculative_result(&tx_hash));
+        assert!(!state.speculative_in_flight_txs.contains(&tx_hash));
+
+        // Now block commits - should use cached result (HIT)
+        let actions = state.on_block_committed(block_hash, height, vec![tx]);
+
+        // Should NOT emit ExecuteTransactions (speculation was used)
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::ExecuteTransactions { .. })));
+
+        // Should have broadcast vote (from speculative hit processing)
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::BroadcastToShard { .. })));
+    }
+
+    #[test]
+    fn test_speculative_late_hit_commit_before_complete() {
+        // Scenario: Block commits BEFORE speculation completes (LATE HIT)
+        let mut state = make_test_state();
+
+        let tx = Arc::new(test_transaction(1));
+        let tx_hash = tx.hash();
+        let block_hash = Hash::from_bytes(b"block1");
+
+        // Use height past view change cooldown (default cooldown is 3 rounds)
+        let height = 10;
+
+        // Trigger speculative execution
+        let actions = state.trigger_speculative_execution(block_hash, height, vec![tx.clone()]);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::SpeculativeExecute { .. })));
+        assert!(state.speculative_in_flight_txs.contains(&tx_hash));
+
+        // Block commits BEFORE speculation completes
+        let commit_actions = state.on_block_committed(block_hash, height, vec![tx]);
+
+        // Should NOT emit ExecuteTransactions (waiting for speculation)
+        assert!(!commit_actions
+            .iter()
+            .any(|a| matches!(a, Action::ExecuteTransactions { .. })));
+
+        // Should be tracked as awaiting speculation
+        assert!(state.committed_awaiting_speculation.contains_key(&tx_hash));
+        // Still in-flight
+        assert!(state.speculative_in_flight_txs.contains(&tx_hash));
+
+        // Now speculation completes
+        let spec_results = vec![(
+            tx_hash,
+            ExecutionResult {
+                transaction_hash: tx_hash,
+                success: true,
+                state_root: Hash::ZERO,
+                writes: vec![],
+                error: None,
+            },
+        )];
+        let complete_actions = state.on_speculative_execution_complete(block_hash, spec_results);
+
+        // Should process the result immediately (late hit)
+        // Should emit broadcast vote action
+        assert!(complete_actions
+            .iter()
+            .any(|a| matches!(a, Action::BroadcastToShard { .. })));
+
+        // Should no longer be awaiting
+        assert!(!state.committed_awaiting_speculation.contains_key(&tx_hash));
+        assert!(!state.speculative_in_flight_txs.contains(&tx_hash));
+    }
+
+    #[test]
+    fn test_speculative_miss_no_speculation() {
+        // Scenario: No speculation was triggered (MISS - normal execution)
+        let mut state = make_test_state();
+
+        let tx = Arc::new(test_transaction(1));
+        let tx_hash = tx.hash();
+        let block_hash = Hash::from_bytes(b"block1");
+
+        // Block commits without any speculation
+        let actions = state.on_block_committed(block_hash, 1, vec![tx]);
+
+        // Should emit ExecuteTransactions (no speculation to use)
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::ExecuteTransactions { .. })));
+
+        // Should not be awaiting speculation
+        assert!(!state.committed_awaiting_speculation.contains_key(&tx_hash));
+    }
 }

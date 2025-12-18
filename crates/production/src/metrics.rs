@@ -39,6 +39,7 @@ pub struct Metrics {
     // === Speculative Execution ===
     pub speculative_execution_started: Counter,
     pub speculative_execution_cache_hit: Counter,
+    pub speculative_execution_late_hit: Counter,
     pub speculative_execution_cache_miss: Counter,
     pub speculative_execution_invalidated: Counter,
 
@@ -211,6 +212,12 @@ impl Metrics {
             speculative_execution_cache_hit: register_counter!(
                 "hyperscale_speculative_execution_cache_hit_total",
                 "Speculative execution results used on block commit"
+            )
+            .unwrap(),
+
+            speculative_execution_late_hit: register_counter!(
+                "hyperscale_speculative_execution_late_hit_total",
+                "Speculative results used after commit (dedup optimization)"
             )
             .unwrap(),
 
@@ -768,6 +775,12 @@ pub fn record_speculative_execution_started(count: u64) {
 /// Record speculative execution cache hit.
 pub fn record_speculative_execution_cache_hit() {
     metrics().speculative_execution_cache_hit.inc();
+}
+
+/// Record speculative execution late hit (commit before speculation complete).
+/// These are also counted as cache hits - this metric tracks the dedup optimization.
+pub fn record_speculative_execution_late_hit() {
+    metrics().speculative_execution_late_hit.inc();
 }
 
 /// Record speculative execution cache miss.

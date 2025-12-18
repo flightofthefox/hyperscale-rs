@@ -1877,6 +1877,12 @@
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(hyperscale_speculative_execution_late_hit_total[1m]))",
+          "legendFormat": "Late Hit (dedup)",
+          "refId": "E"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "expr": "sum(rate(hyperscale_speculative_execution_cache_miss_total[1m]))",
           "legendFormat": "Cache Miss",
           "refId": "C"

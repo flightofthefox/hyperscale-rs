@@ -872,13 +872,16 @@ impl ProductionRunner {
                     crate::metrics::set_bft_stats(&bft_stats);
 
                     // Update speculative execution metrics
-                    let (started, hits, misses, invalidated) =
+                    let (started, hits, late_hits, misses, invalidated) =
                         self.state.execution_mut().take_speculative_metrics();
                     if started > 0 {
                         crate::metrics::record_speculative_execution_started(started);
                     }
                     for _ in 0..hits {
                         crate::metrics::record_speculative_execution_cache_hit();
+                    }
+                    for _ in 0..late_hits {
+                        crate::metrics::record_speculative_execution_late_hit();
                     }
                     for _ in 0..misses {
                         crate::metrics::record_speculative_execution_cache_miss();
