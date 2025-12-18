@@ -1011,31 +1011,10 @@ impl ProductionRunner {
                     // Process timer event
                     let actions = self.dispatch_event(event).await;
 
-                    // Collect cross-shard executions for immediate batch dispatch
-                    let mut cross_shard_batch = Vec::new();
-
                     for action in actions {
-                        match action {
-                            Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
-                                cross_shard_batch.push(
-                                    hyperscale_core::CrossShardExecutionRequest {
-                                        tx_hash,
-                                        transaction,
-                                        provisions,
-                                    }
-                                );
-                            }
-                            other => {
-                                if let Err(e) = self.process_action(other).await {
-                                    tracing::error!(error = ?e, "Error processing action from timer");
-                                }
-                            }
+                        if let Err(e) = self.process_action(action).await {
+                            tracing::error!(error = ?e, "Error processing action from timer");
                         }
-                    }
-
-                    // Dispatch immediately
-                    if !cross_shard_batch.is_empty() {
-                        self.dispatch_cross_shard_executions(cross_shard_batch);
                     }
                 }
 
@@ -1061,33 +1040,10 @@ impl ProductionRunner {
                     // Dispatch event through unified handler
                     let actions = self.dispatch_event(event).await;
 
-                    // Collect cross-shard executions for immediate batch dispatch
-                    let mut cross_shard_batch = Vec::new();
-
                     for action in actions {
-                        match action {
-                            Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
-                                // Collect for immediate batch execution (don't defer to select branch)
-                                cross_shard_batch.push(
-                                    hyperscale_core::CrossShardExecutionRequest {
-                                        tx_hash,
-                                        transaction,
-                                        provisions,
-                                    }
-                                );
-                            }
-                            other => {
-                                if let Err(e) = self.process_action(other).await {
-                                    tracing::error!(error = ?e, "Error processing action from callback");
-                                }
-                            }
+                        if let Err(e) = self.process_action(action).await {
+                            tracing::error!(error = ?e, "Error processing action from callback");
                         }
-                    }
-
-                    // Dispatch cross-shard executions immediately - don't rely on deadline select branch
-                    // which may not fire when event loop is busy processing callbacks
-                    if !cross_shard_batch.is_empty() {
-                        self.dispatch_cross_shard_executions(cross_shard_batch);
                     }
                 }
 
@@ -1374,31 +1330,10 @@ impl ProductionRunner {
 
                     let actions = self.state.handle(event);
 
-                    // Collect cross-shard executions for immediate batch dispatch
-                    let mut cross_shard_batch = Vec::new();
-
                     for action in actions {
-                        match action {
-                            Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
-                                cross_shard_batch.push(
-                                    hyperscale_core::CrossShardExecutionRequest {
-                                        tx_hash,
-                                        transaction,
-                                        provisions,
-                                    }
-                                );
-                            }
-                            other => {
-                                if let Err(e) = self.process_action(other).await {
-                                    tracing::error!(error = ?e, "Error processing validated tx action");
-                                }
-                            }
+                        if let Err(e) = self.process_action(action).await {
+                            tracing::error!(error = ?e, "Error processing validated tx action");
                         }
-                    }
-
-                    // Dispatch immediately
-                    if !cross_shard_batch.is_empty() {
-                        self.dispatch_cross_shard_executions(cross_shard_batch);
                     }
                 }
 
@@ -1514,31 +1449,10 @@ impl ProductionRunner {
                     // Process status event (updates mempool state)
                     let actions = self.state.handle(event);
 
-                    // Collect cross-shard executions for immediate batch dispatch
-                    let mut cross_shard_batch = Vec::new();
-
                     for action in actions {
-                        match action {
-                            Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
-                                cross_shard_batch.push(
-                                    hyperscale_core::CrossShardExecutionRequest {
-                                        tx_hash,
-                                        transaction,
-                                        provisions,
-                                    }
-                                );
-                            }
-                            other => {
-                                if let Err(e) = self.process_action(other).await {
-                                    tracing::error!(error = ?e, "Error processing status action");
-                                }
-                            }
+                        if let Err(e) = self.process_action(action).await {
+                            tracing::error!(error = ?e, "Error processing status action");
                         }
-                    }
-
-                    // Dispatch immediately
-                    if !cross_shard_batch.is_empty() {
-                        self.dispatch_cross_shard_executions(cross_shard_batch);
                     }
                 }
             }
