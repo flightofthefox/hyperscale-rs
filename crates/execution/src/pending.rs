@@ -3,10 +3,13 @@
 //! These structs track in-flight signature verifications that have been
 //! delegated to the runner. When verification completes, the runner sends
 //! an event back and we look up the pending state to continue processing.
+//!
+//! Note: Provision signature verification is now handled by ProvisionCoordinator
+//! in the `hyperscale-provisions` crate.
 
 use hyperscale_types::{
-    BlockHeight, Hash, NodeId, RoutableTransaction, ShardGroupId, StateCertificate, StateProvision,
-    StateVoteBlock, TransactionCertificate,
+    BlockHeight, Hash, NodeId, RoutableTransaction, ShardGroupId, StateCertificate, StateVoteBlock,
+    TransactionCertificate,
 };
 use std::collections::HashSet;
 
@@ -25,17 +28,6 @@ pub struct PendingProvisionBroadcast {
     pub target_shards: Vec<ShardGroupId>,
     /// Nodes we own that need to be provisioned.
     pub owned_nodes: Vec<NodeId>,
-}
-
-/// Tracks a pending provision signature verification.
-///
-/// When we receive a provision from another shard, we delegate signature
-/// verification to the runner before processing.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct PendingProvisionVerification {
-    /// The provision awaiting verification.
-    pub provision: StateProvision,
 }
 
 /// Tracks a pending state vote signature verification.

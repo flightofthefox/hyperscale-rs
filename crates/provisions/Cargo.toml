@@ -1,0 +1,13 @@
+[package]
+name = "hyperscale-provisions"
+version.workspace = true
+edition.workspace = true
+description = "Centralized provision coordination for cross-shard transactions"
+
+[dependencies]
+hyperscale-core.workspace = true
+hyperscale-types.workspace = true
+
+tracing.workspace = true
+
+[dev-dependencies]

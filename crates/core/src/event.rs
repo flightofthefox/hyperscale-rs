@@ -233,6 +233,71 @@ pub enum Event {
     MerkleRootComputed { tx_hash: Hash, root: Hash },
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Provision Coordinator Events (priority: Internal)
+    // Events emitted by ProvisionCoordinator for cross-shard coordination
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Quorum of provisions reached for a source shard.
+    ///
+    /// Emitted by ProvisionCoordinator when enough verified provisions have been
+    /// collected from a source shard. This is the ONLY trigger for cycle detection
+    /// in livelock (Byzantine-safe because only verified provisions count).
+    ///
+    /// Note: This is emitted per-shard as quorum is reached, not once for all shards.
+    /// Livelock uses this for cycle detection; execution waits for all required shards.
+    ProvisionQuorumReached {
+        /// The transaction these provisions are for.
+        tx_hash: Hash,
+        /// The source shard that reached quorum.
+        source_shard: ShardGroupId,
+        /// The provisions that formed the quorum (verified signatures).
+        provisions: Vec<StateProvision>,
+    },
+
+    /// All required shards have reached provision quorum - ready for execution.
+    ///
+    /// Emitted by ProvisionCoordinator when ALL required source shards have reached
+    /// quorum. This triggers cross-shard execution in ExecutionState.
+    ProvisioningComplete {
+        /// The transaction that is now ready for cross-shard execution.
+        tx_hash: Hash,
+        /// One provision per required shard (majority-selected from quorum).
+        provisions: Vec<StateProvision>,
+    },
+
+    /// Cross-shard transaction registered for provision tracking.
+    ///
+    /// Emitted by ExecutionState when a cross-shard transaction is committed.
+    /// ProvisionCoordinator uses this to start tracking provisions for the transaction.
+    CrossShardTxRegistered {
+        /// The transaction hash.
+        tx_hash: Hash,
+        /// Shards we need provisions from.
+        required_shards: std::collections::BTreeSet<ShardGroupId>,
+        /// Quorum threshold per shard.
+        quorum_thresholds: std::collections::HashMap<ShardGroupId, usize>,
+        /// Block height when committed.
+        committed_height: BlockHeight,
+    },
+
+    /// Cross-shard transaction completed successfully.
+    ///
+    /// Emitted when a cross-shard transaction's certificate is committed.
+    /// ProvisionCoordinator uses this to clean up tracking state.
+    CrossShardTxCompleted {
+        /// The transaction hash.
+        tx_hash: Hash,
+    },
+
+    /// Cross-shard transaction aborted.
+    ///
+    /// Emitted when a cross-shard transaction is aborted (timeout or failure).
+    /// ProvisionCoordinator uses this to clean up tracking state.
+    CrossShardTxAborted {
+        /// The transaction hash.
+        tx_hash: Hash,
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Storage Callbacks (priority: Internal)
     // Results from storage read operations
     // ═══════════════════════════════════════════════════════════════════════
@@ -517,6 +582,11 @@ impl Event {
             | Event::SpeculativeExecutionComplete { .. }
             | Event::CrossShardTransactionsExecuted { .. }
             | Event::MerkleRootComputed { .. }
+            | Event::ProvisionQuorumReached { .. }
+            | Event::ProvisioningComplete { .. }
+            | Event::CrossShardTxRegistered { .. }
+            | Event::CrossShardTxCompleted { .. }
+            | Event::CrossShardTxAborted { .. }
             | Event::StateEntriesFetched { .. }
             | Event::BlockFetched { .. }
             | Event::ChainMetadataFetched { .. } => EventPriority::Internal,
@@ -622,6 +692,13 @@ impl Event {
             Event::SpeculativeExecutionComplete { .. } => "SpeculativeExecutionComplete",
             Event::CrossShardTransactionsExecuted { .. } => "CrossShardTransactionsExecuted",
             Event::MerkleRootComputed { .. } => "MerkleRootComputed",
+
+            // Provision Coordinator Events
+            Event::ProvisionQuorumReached { .. } => "ProvisionQuorumReached",
+            Event::ProvisioningComplete { .. } => "ProvisioningComplete",
+            Event::CrossShardTxRegistered { .. } => "CrossShardTxRegistered",
+            Event::CrossShardTxCompleted { .. } => "CrossShardTxCompleted",
+            Event::CrossShardTxAborted { .. } => "CrossShardTxAborted",
 
             // Storage Callbacks
             Event::StateEntriesFetched { .. } => "StateEntriesFetched",

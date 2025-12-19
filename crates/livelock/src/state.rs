@@ -168,43 +168,51 @@ impl LivelockState {
         }
     }
 
-    /// Called when we receive a provision from another shard.
+    /// Called when a quorum of verified provisions is reached for a source shard.
     ///
-    /// Performs cycle detection and queues a deferral if a bidirectional
-    /// cycle is detected. Only triggers if there's actual state-level conflict.
+    /// This is the ONLY entry point for cycle detection in the new architecture.
+    /// This method only processes provisions that
+    /// have been signature-verified and have reached quorum threshold. This prevents
+    /// Byzantine validators from triggering false deferrals with forged provisions.
     ///
-    /// Returns empty vec - no actions emitted. Just updates internal state.
-    pub fn on_provision_received(&mut self, provision: &StateProvision) {
-        let remote_tx_hash = provision.transaction_hash;
-        let source_shard = provision.source_shard;
-
+    /// # Arguments
+    /// * `remote_tx_hash` - The remote transaction's hash
+    /// * `source_shard` - The shard that reached quorum
+    /// * `provisions` - The verified provisions that formed the quorum
+    pub fn on_provision_quorum_reached(
+        &mut self,
+        remote_tx_hash: Hash,
+        source_shard: ShardGroupId,
+        provisions: &[StateProvision],
+    ) {
         trace!(
             remote_tx = %remote_tx_hash,
             source_shard = source_shard.0,
-            "Processing provision for cycle detection"
+            provision_count = provisions.len(),
+            "Processing verified quorum for cycle detection"
         );
 
         // Check tombstone - discard late provisions for deferred TXs
         if self.deferred_tombstones.contains_key(&remote_tx_hash) {
             trace!(
                 remote_tx = %remote_tx_hash,
-                "Discarding provision - TX has tombstone (was deferred)"
+                "Discarding quorum - TX has tombstone (was deferred)"
             );
             return;
         }
 
         // Check if we've already processed this (tx, shard) for cycle detection
-        // Only perform cycle detection once per (tx, shard) pair
         if !self.provision_tracker.add(remote_tx_hash, source_shard) {
-            // Already seen this provision, skip cycle detection
             return;
         }
 
-        // Extract the nodes that the remote TX is providing (these are the nodes it writes/reads)
-        let remote_tx_nodes: HashSet<NodeId> =
-            provision.entries.iter().map(|e| e.node_id).collect();
+        // Collect all nodes from the quorum provisions
+        let remote_tx_nodes: HashSet<NodeId> = provisions
+            .iter()
+            .flat_map(|p| p.entries.iter().map(|e| e.node_id))
+            .collect();
 
-        // Cycle detection: Check if any of our local TXs have overlapping state with the remote TX
+        // Check for cycle with our local committed TXs
         self.check_for_cycle(remote_tx_hash, source_shard, &remote_tx_nodes);
     }
 
@@ -442,8 +450,15 @@ pub struct LivelockStats {
 impl SubStateMachine for LivelockState {
     fn try_handle(&mut self, event: &Event) -> Option<Vec<Action>> {
         match event {
-            Event::StateProvisionReceived { provision, .. } => {
-                self.on_provision_received(provision);
+            // ProvisionQuorumReached is the ONLY entry point for cycle detection.
+            // This ensures Byzantine safety - only verified, quorum-reaching provisions
+            // can trigger deferrals.
+            Event::ProvisionQuorumReached {
+                tx_hash,
+                source_shard,
+                provisions,
+            } => {
+                self.on_provision_quorum_reached(*tx_hash, *source_shard, provisions);
                 Some(vec![])
             }
             Event::BlockCommitted { block, .. } => {
@@ -575,11 +590,11 @@ mod tests {
         );
         state.committed_tracker.add(local_tx, needs);
 
-        // Receive provision from shard 1 for remote_tx with the SAME conflicting node
+        // Receive quorum of provisions from shard 1 for remote_tx with the SAME conflicting node
         // This simulates shard 1 having committed a TX that also uses the conflicting node
         let provision =
             make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
-        state.on_provision_received(&provision);
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &[provision]);
 
         // Should have queued a deferral (local_tx loses to remote_tx)
         let deferrals = state.get_pending_deferrals();
@@ -611,10 +626,10 @@ mod tests {
         );
         state.committed_tracker.add(local_tx, needs);
 
-        // Receive provision from shard 1 for remote_tx with overlapping node
+        // Receive quorum of provisions from shard 1 for remote_tx with overlapping node
         let provision =
             make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
-        state.on_provision_received(&provision);
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &[provision]);
 
         // Should NOT have queued a deferral (we win, remote should defer)
         assert!(state.get_pending_deferrals().is_empty());
@@ -640,9 +655,9 @@ mod tests {
         );
         state.committed_tracker.add(local_tx, needs);
 
-        // Receive provision from shard 1 for remote_tx with DIFFERENT node
+        // Receive quorum of provisions from shard 1 for remote_tx with DIFFERENT node
         let provision = make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![remote_node]);
-        state.on_provision_received(&provision);
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &[provision]);
 
         // Should NOT have queued a deferral - no node overlap means no real conflict
         assert!(state.get_pending_deferrals().is_empty());
@@ -660,9 +675,9 @@ mod tests {
             .deferred_tombstones
             .insert(tx, Duration::from_secs(100));
 
-        // Receive provision for the deferred TX
+        // Receive quorum of provisions for the deferred TX
         let provision = make_provision(tx, ShardGroupId(1));
-        state.on_provision_received(&provision);
+        state.on_provision_quorum_reached(tx, ShardGroupId(1), &[provision]);
 
         // Should not have added to provision tracker (tombstone filtered)
         assert!(!state.provision_tracker.has_provision(tx, ShardGroupId(1)));
@@ -711,15 +726,19 @@ mod tests {
         );
         state.committed_tracker.add(local_tx, needs);
 
-        // Receive provision - should queue deferral
+        // Receive quorum of provisions - should queue deferral
         let provision =
             make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
-        state.on_provision_received(&provision);
+        state.on_provision_quorum_reached(
+            remote_tx,
+            ShardGroupId(1),
+            std::slice::from_ref(&provision),
+        );
 
         assert_eq!(state.get_pending_deferrals().len(), 1);
 
-        // Receive same provision again - should NOT queue duplicate deferral
-        state.on_provision_received(&provision);
+        // Receive same quorum again - should NOT queue duplicate deferral
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &[provision]);
 
         assert_eq!(
             state.get_pending_deferrals().len(),
@@ -727,10 +746,10 @@ mod tests {
             "Should not queue duplicate deferral"
         );
 
-        // Receive provision from different shard for same cycle - still no duplicate
+        // Receive quorum from different shard for same cycle - still no duplicate
         let provision2 =
             make_provision_with_nodes(remote_tx, ShardGroupId(2), vec![conflicting_node]);
-        state.on_provision_received(&provision2);
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(2), &[provision2]);
 
         assert_eq!(
             state.get_pending_deferrals().len(),
@@ -858,11 +877,11 @@ mod tests {
             make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node1])]);
         state.committed_tracker.add(local_tx, needs);
 
-        // Receive provision from shard 2 (not shard 1) for remote_tx
+        // Receive quorum from shard 2 (not shard 1) for remote_tx
         // This means remote_tx needs our state, but we don't need shard 2's state
         // so there's no cycle with our local_tx
         let provision = make_provision_with_nodes(remote_tx, ShardGroupId(2), vec![node2]);
-        state.on_provision_received(&provision);
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(2), &[provision]);
 
         // Should NOT queue a deferral - no cycle exists
         // Our local_tx needs shard 1, provision is from shard 2

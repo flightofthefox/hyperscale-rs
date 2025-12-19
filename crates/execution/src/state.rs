@@ -43,9 +43,9 @@ use tracing::{debug, instrument};
 
 use crate::pending::{
     PendingCertificateVerification, PendingFetchedCertificateVerification,
-    PendingProvisionBroadcast, PendingProvisionVerification, PendingStateVoteVerification,
+    PendingProvisionBroadcast, PendingStateVoteVerification,
 };
-use crate::trackers::{CertificateTracker, ProvisioningTracker, VoteTracker};
+use crate::trackers::{CertificateTracker, VoteTracker};
 
 /// Number of blocks to retain committed certificates for peer fetch requests.
 /// This allows slow validators to catch up and fetch certificates from peers
@@ -54,10 +54,9 @@ const CERTIFICATE_RETENTION_BLOCKS: u64 = 100;
 
 /// Key type for the pending verifications reverse index.
 /// Identifies which type of verification and the secondary key (validator or shard).
+/// Note: Provision verification is handled by ProvisionCoordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PendingVerificationKey {
-    /// Pending provision verification for a validator.
-    Provision(ValidatorId),
     /// Pending vote verification for a validator.
     Vote(ValidatorId),
     /// Pending certificate verification for a shard.
@@ -117,16 +116,9 @@ pub struct ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════
     // Cross-shard state (Phase 1-2: Provisioning)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Provisioning trackers for cross-shard transactions.
-    /// Maps tx_hash -> ProvisioningTracker
-    provisioning_trackers: HashMap<Hash, ProvisioningTracker>,
-
-    /// Completed provisions ready for execution.
-    /// Maps tx_hash -> provisions from all source shards
-    completed_provisions: HashMap<Hash, Vec<StateProvision>>,
-
     /// Transactions waiting for provisioning to complete before execution.
     /// Maps tx_hash -> (transaction, block_height)
+    /// Note: Provision tracking is handled by ProvisionCoordinator.
     pending_provisioning: HashMap<Hash, (Arc<RoutableTransaction>, u64)>,
 
     /// Pending provision broadcasts waiting for state fetch.
@@ -154,8 +146,10 @@ pub struct ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════
     // Early arrivals (before tracking starts)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Provisions that arrived before the block was committed.
-    early_provisions: HashMap<Hash, Vec<StateProvision>>,
+    /// ProvisioningComplete events that arrived before the block was committed.
+    /// This can happen when provisions reach quorum before we've seen the block.
+    /// Maps tx_hash -> provisions
+    early_provisioning_complete: HashMap<Hash, Vec<StateProvision>>,
 
     /// Votes that arrived before tracking started.
     /// Uses HashSet for O(1) deduplication instead of O(n) Vec::contains.
@@ -167,9 +161,7 @@ pub struct ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════
     // Pending signature verifications
     // ═══════════════════════════════════════════════════════════════════════
-    /// Provisions awaiting signature verification.
-    /// Maps (tx_hash, validator_id) -> PendingProvisionVerification
-    pending_provision_verifications: HashMap<(Hash, ValidatorId), PendingProvisionVerification>,
+    /// Note: Provision signature verification is handled by ProvisionCoordinator.
 
     /// State votes awaiting signature verification.
     /// Maps (tx_hash, validator_id) -> PendingStateVoteVerification
@@ -295,17 +287,14 @@ impl ExecutionState {
             finalized_certificates: BTreeMap::new(),
             recently_committed_certificates: HashMap::new(),
             committed_height: 0,
-            provisioning_trackers: HashMap::new(),
-            completed_provisions: HashMap::new(),
             pending_provisioning: HashMap::new(),
             pending_provision_fetches: HashMap::new(),
             vote_trackers: HashMap::new(),
             state_certificates: HashMap::new(),
             certificate_trackers: HashMap::new(),
-            early_provisions: HashMap::new(),
+            early_provisioning_complete: HashMap::new(),
             early_votes: HashMap::new(),
             early_certificates: HashMap::new(),
-            pending_provision_verifications: HashMap::new(),
             pending_vote_verifications: HashMap::new(),
             pending_cert_verifications: HashMap::new(),
             pending_fetched_cert_verifications: HashMap::new(),
@@ -650,12 +639,30 @@ impl ExecutionState {
                 .map(|&shard| (shard, self.provisioning_quorum_for_shard(shard)))
                 .collect();
 
-            let tracker = ProvisioningTracker::new(tx_hash, remote_shards, quorum_thresholds);
-            self.provisioning_trackers.insert(tx_hash, tracker);
+            // Emit registration event for ProvisionCoordinator
+            // The coordinator will handle provision tracking centrally
+            actions.push(Action::EnqueueInternal {
+                event: Event::CrossShardTxRegistered {
+                    tx_hash,
+                    required_shards: remote_shards,
+                    quorum_thresholds,
+                    committed_height: BlockHeight(height),
+                },
+            });
 
-            // Store transaction for later execution
+            // Store transaction for later execution (will execute when ProvisioningComplete arrives)
             self.pending_provisioning
                 .insert(tx_hash, (tx.clone(), height));
+
+            // Check if ProvisioningComplete arrived before the block committed
+            if let Some(provisions) = self.early_provisioning_complete.remove(&tx_hash) {
+                tracing::debug!(
+                    tx_hash = ?tx_hash,
+                    count = provisions.len(),
+                    "Replaying early ProvisioningComplete"
+                );
+                actions.extend(self.on_provisioning_complete(tx_hash, provisions));
+            }
         }
 
         // Phase 3-4: Start tracking votes
@@ -671,14 +678,6 @@ impl ExecutionState {
         // Phase 5: Start tracking certificates for finalization
         let cert_tracker = CertificateTracker::new(tx_hash, participating_shards.clone());
         self.certificate_trackers.insert(tx_hash, cert_tracker);
-
-        // Replay any early provisions
-        if let Some(early) = self.early_provisions.remove(&tx_hash) {
-            tracing::debug!(tx_hash = ?tx_hash, count = early.len(), "Replaying early provisions");
-            for provision in early {
-                actions.extend(self.handle_provision_internal(provision));
-            }
-        }
 
         // Replay any early votes
         if let Some(early) = self.early_votes.remove(&tx_hash) {
@@ -874,161 +873,43 @@ impl ExecutionState {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Phase 2: Provisioning Reception
+    // Phase 2: Provisioning Complete
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle state provision received (cross-shard Phase 2).
+    /// Handle provisioning complete (all source shards have reached quorum).
     ///
-    /// Delegates signature verification to the runner before processing.
-    /// Handle a state provision received from another validator.
+    /// Called when ProvisionCoordinator emits `ProvisioningComplete`, meaning
+    /// all required source shards have provided a quorum of verified provisions.
+    /// This triggers cross-shard execution.
     ///
-    /// Sender identity comes from provision.validator_id.
-    #[instrument(skip(self, provision), fields(
-        tx_hash = ?provision.transaction_hash,
-        source_shard = provision.source_shard.0,
-        validator = ?provision.validator_id
-    ))]
-    pub fn on_provision(&mut self, provision: StateProvision) -> Vec<Action> {
-        let tx_hash = provision.transaction_hash;
-        let validator_id = provision.validator_id;
+    /// If the block hasn't been committed yet (i.e., tx not in pending_provisioning),
+    /// we buffer the provisions and replay when the block commits.
+    #[instrument(skip(self, provisions), fields(tx_hash = ?tx_hash))]
+    pub fn on_provisioning_complete(
+        &mut self,
+        tx_hash: Hash,
+        provisions: Vec<StateProvision>,
+    ) -> Vec<Action> {
+        let local_shard = self.local_shard();
 
-        // Check if we're tracking this transaction
-        if !self.provisioning_trackers.contains_key(&tx_hash) {
-            // Check if already completed
-            if self.completed_provisions.contains_key(&tx_hash) {
-                return vec![];
-            }
-            // Buffer for later
-            self.early_provisions
-                .entry(tx_hash)
-                .or_default()
-                .push(provision);
-            return vec![];
-        }
-
-        // Get public key for signature verification
-        let Some(public_key) = self.public_key(validator_id) else {
-            tracing::warn!(
+        // Get the transaction waiting for provisions
+        let Some((tx, _height)) = self.pending_provisioning.remove(&tx_hash) else {
+            // Block hasn't committed yet - buffer for later
+            tracing::debug!(
                 tx_hash = ?tx_hash,
-                validator = validator_id.0,
-                "Unknown validator for provision"
+                shard = local_shard.0,
+                "Provisioning complete before block committed, buffering"
             );
+            self.early_provisioning_complete.insert(tx_hash, provisions);
             return vec![];
         };
 
-        // Track pending verification
-        self.pending_provision_verifications.insert(
-            (tx_hash, validator_id),
-            PendingProvisionVerification {
-                provision: provision.clone(),
-            },
+        tracing::debug!(
+            tx_hash = ?tx_hash,
+            shard = local_shard.0,
+            provision_count = provisions.len(),
+            "Provisioning complete, executing cross-shard transaction"
         );
-        // Update reverse index for O(k) cleanup
-        self.pending_verifications_by_tx
-            .entry(tx_hash)
-            .or_default()
-            .insert(PendingVerificationKey::Provision(validator_id));
-
-        // Delegate signature verification to runner
-        vec![Action::VerifyProvisionSignature {
-            provision,
-            public_key,
-        }]
-    }
-
-    /// Handle provision signature verification result.
-    #[instrument(skip(self, provision), fields(
-        tx_hash = ?provision.transaction_hash,
-        validator = ?provision.validator_id,
-        valid = valid
-    ))]
-    pub fn on_provision_verified(&mut self, provision: StateProvision, valid: bool) -> Vec<Action> {
-        let tx_hash = provision.transaction_hash;
-        let validator_id = provision.validator_id;
-
-        // Remove from pending and reverse index
-        self.pending_provision_verifications
-            .remove(&(tx_hash, validator_id));
-        if let Some(keys) = self.pending_verifications_by_tx.get_mut(&tx_hash) {
-            keys.remove(&PendingVerificationKey::Provision(validator_id));
-        }
-
-        if !valid {
-            tracing::warn!(
-                tx_hash = ?tx_hash,
-                validator = validator_id.0,
-                "Invalid provision signature"
-            );
-            return vec![];
-        }
-
-        self.handle_provision_internal(provision)
-    }
-
-    /// Internal provision handling (assumes tracking is active).
-    fn handle_provision_internal(&mut self, provision: StateProvision) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let tx_hash = provision.transaction_hash;
-        let local_shard = self.local_shard();
-
-        // Validate target shard
-        if provision.target_shard != local_shard {
-            tracing::warn!(
-                tx_hash = ?tx_hash,
-                target = provision.target_shard.0,
-                expected = local_shard.0,
-                "Provision for wrong shard"
-            );
-            return actions;
-        }
-
-        let Some(tracker) = self.provisioning_trackers.get_mut(&tx_hash) else {
-            return actions;
-        };
-
-        let complete = tracker.add_provision(provision);
-
-        if complete {
-            tracing::debug!(tx_hash = ?tx_hash, shard = local_shard.0, "Provisioning complete");
-
-            // Get provisioned state before releasing borrow
-            let provisions = tracker.get_provisioned_state().unwrap_or_default();
-
-            // Remove tracker
-            self.provisioning_trackers.remove(&tx_hash);
-
-            // Store completed provisions
-            self.completed_provisions.insert(tx_hash, provisions);
-
-            // Execute with provisions
-            if let Some((tx, _height)) = self.pending_provisioning.remove(&tx_hash) {
-                actions.extend(self.execute_with_provisions(tx));
-            }
-        }
-
-        actions
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Phase 3: Cross-Shard Execution
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Execute a cross-shard transaction with provisioned state (Phase 3).
-    ///
-    /// Emits `Action::ExecuteCrossShardTransaction` to delegate execution to the runner.
-    /// The runner accumulates these actions and executes them in parallel batches.
-    /// When execution completes, `on_cross_shard_execution_complete` handles the result.
-    fn execute_with_provisions(&mut self, tx: Arc<RoutableTransaction>) -> Vec<Action> {
-        let tx_hash = tx.hash();
-        let local_shard = self.local_shard();
-
-        tracing::debug!(tx_hash = ?tx_hash, shard = local_shard.0, "Executing with provisions");
-
-        // Get the provisions we collected
-        let provisions = self
-            .completed_provisions
-            .remove(&tx_hash)
-            .unwrap_or_default();
 
         // Delegate execution to the runner (which batches for parallel execution)
         vec![Action::ExecuteCrossShardTransaction {
@@ -1037,6 +918,10 @@ impl ExecutionState {
             provisions,
         }]
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Phase 3: Cross-Shard Execution
+    // ═══════════════════════════════════════════════════════════════════════════
 
     /// Handle cross-shard transaction execution completion.
     ///
@@ -1769,14 +1654,11 @@ impl ExecutionState {
         self.finalized_certificates.contains_key(tx_hash)
     }
 
-    /// Check if provisioning is complete for a transaction.
-    pub fn is_provisioned(&self, tx_hash: &Hash) -> bool {
-        self.completed_provisions.contains_key(tx_hash)
-    }
-
-    /// Check if we're tracking provisioning for a transaction.
-    pub fn is_tracking_provisioning(&self, tx_hash: &Hash) -> bool {
-        self.provisioning_trackers.contains_key(tx_hash)
+    /// Check if we're waiting for provisioning to complete for a transaction.
+    ///
+    /// Note: Actual provision tracking is handled by ProvisionCoordinator.
+    pub fn is_awaiting_provisioning(&self, tx_hash: &Hash) -> bool {
+        self.pending_provisioning.contains_key(tx_hash)
     }
 
     /// Check if we're tracking votes for a transaction.
@@ -1836,10 +1718,9 @@ impl ExecutionState {
         self.executed_txs.remove(tx_hash);
 
         // Phase 1-2: Provisioning cleanup
-        self.provisioning_trackers.remove(tx_hash);
+        // Note: Provision tracking is handled by ProvisionCoordinator
         self.pending_provisioning.remove(tx_hash);
         self.pending_provision_fetches.remove(tx_hash);
-        self.completed_provisions.remove(tx_hash);
 
         // Phase 3-4: Vote cleanup
         self.vote_trackers.remove(tx_hash);
@@ -1849,18 +1730,15 @@ impl ExecutionState {
         self.certificate_trackers.remove(tx_hash);
 
         // Early arrivals cleanup
-        self.early_provisions.remove(tx_hash);
+        self.early_provisioning_complete.remove(tx_hash);
         self.early_votes.remove(tx_hash);
         self.early_certificates.remove(tx_hash);
 
         // Pending verifications cleanup using reverse index for O(k) instead of O(n)
+        // Note: Provision signature verification is handled by ProvisionCoordinator
         if let Some(keys) = self.pending_verifications_by_tx.remove(tx_hash) {
             for key in keys {
                 match key {
-                    PendingVerificationKey::Provision(vid) => {
-                        self.pending_provision_verifications
-                            .remove(&(*tx_hash, vid));
-                    }
                     PendingVerificationKey::Vote(vid) => {
                         self.pending_vote_verifications.remove(&(*tx_hash, vid));
                     }
@@ -2350,17 +2228,18 @@ impl ExecutionState {
     /// - Provisioning phase (waiting for state provisions from other shards)
     /// - Vote aggregation phase (waiting for vote quorum)
     /// - Certificate collection phase (waiting for certificates from all shards)
+    ///
+    /// Note: Actual provision tracking is handled by ProvisionCoordinator.
+    /// This counts transactions in pending_provisioning and certificate_trackers.
     pub fn cross_shard_pending_count(&self) -> usize {
         // Use a HashSet to count unique transactions since a tx might be in multiple phases
         let mut pending_txs = HashSet::new();
 
-        // Phase 1-2: Provisioning
-        pending_txs.extend(self.provisioning_trackers.keys());
+        // Phase 1-2: Waiting for provisioning (tracked by ProvisionCoordinator)
+        pending_txs.extend(self.pending_provisioning.keys());
 
-        // Phase 3-4: Vote aggregation (only count if not single-shard, i.e. has provisioning)
-        // Actually, vote_trackers contains both single-shard and cross-shard, but we only
-        // want cross-shard. Cross-shard txs will have certificate_trackers with multiple shards.
-        // For simplicity, count certificate_trackers with > 1 shard.
+        // Phase 3-5: Vote aggregation and certificate collection
+        // Cross-shard txs will have certificate_trackers with multiple shards.
         for (tx_hash, tracker) in &self.certificate_trackers {
             if tracker.expected_count() > 1 {
                 pending_txs.insert(*tx_hash);
@@ -2382,7 +2261,7 @@ impl std::fmt::Debug for ExecutionState {
                 &self.pending_single_shard_executions.len(),
             )
             .field("finalized_certificates", &self.finalized_certificates.len())
-            .field("provisioning_trackers", &self.provisioning_trackers.len())
+            .field("pending_provisioning", &self.pending_provisioning.len())
             .field("vote_trackers", &self.vote_trackers.len())
             .field("certificate_trackers", &self.certificate_trackers.len())
             .finish()
@@ -2407,18 +2286,16 @@ impl SubStateMachine for ExecutionState {
             Event::CrossShardTransactionsExecuted { results } => {
                 Some(self.on_cross_shard_executions_complete(results.clone()))
             }
-            Event::StateProvisionReceived { provision } => {
-                Some(self.on_provision(provision.clone()))
-            }
+            Event::ProvisioningComplete {
+                tx_hash,
+                provisions,
+            } => Some(self.on_provisioning_complete(*tx_hash, provisions.clone())),
             Event::StateVoteReceived { vote } => Some(self.on_vote(vote.clone())),
             Event::StateCertificateReceived { cert } => Some(self.on_certificate(cert.clone())),
             Event::StateEntriesFetched { tx_hash, entries } => {
                 Some(self.on_state_entries_fetched(*tx_hash, entries.clone()))
             }
             // Signature verification callbacks
-            Event::ProvisionSignatureVerified { provision, valid } => {
-                Some(self.on_provision_verified(provision.clone(), *valid))
-            }
             Event::StateVoteSignatureVerified { vote, valid } => {
                 Some(self.on_state_vote_verified(vote.clone(), *valid))
             }

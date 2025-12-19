@@ -9,6 +9,7 @@ members = [
     "crates/execution",
     "crates/livelock",
     "crates/mempool",
+    "crates/provisions",
     "crates/node",
     "crates/simulation",
     "crates/simulator",
@@ -30,6 +31,7 @@ hyperscale-bft = { path = "crates/bft" }
 hyperscale-execution = { path = "crates/execution" }
 hyperscale-livelock = { path = "crates/livelock" }
 hyperscale-mempool = { path = "crates/mempool" }
+hyperscale-provisions = { path = "crates/provisions" }
 hyperscale-node = { path = "crates/node" }
 hyperscale-simulation = { path = "crates/simulation" }
 hyperscale-production = { path = "crates/production" }

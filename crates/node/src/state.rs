@@ -5,6 +5,7 @@ use hyperscale_core::{Action, Event, StateMachine, SubStateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
+use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_types::{Block, BlockHeight, KeyPair, ShardGroupId, Topology};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +16,7 @@ pub type NodeIndex = u32;
 
 /// Combined node state machine.
 ///
-/// Composes BFT, execution, mempool, and livelock into a single state machine.
+/// Composes BFT, execution, mempool, provisions, and livelock into a single state machine.
 /// View changes are handled implicitly via local round advancement in BftState (HotStuff-2 style).
 ///
 /// Note: Sync is handled entirely by the runner (production: SyncManager, simulation: runner logic).
@@ -35,6 +36,9 @@ pub struct NodeStateMachine {
 
     /// Mempool state.
     mempool: MempoolState,
+
+    /// Provision coordination for cross-shard transactions.
+    provisions: ProvisionCoordinator,
 
     /// Livelock prevention state (cycle detection for cross-shard TXs).
     livelock: LivelockState,
@@ -117,6 +121,7 @@ impl NodeStateMachine {
                 view_change_cooldown_rounds,
             ),
             mempool: MempoolState::with_config(topology.clone(), mempool_config),
+            provisions: ProvisionCoordinator::new(local_shard, topology.clone()),
             livelock: LivelockState::new(local_shard, topology),
             now: Duration::ZERO,
             last_qc_time: Duration::ZERO,
@@ -166,6 +171,11 @@ impl NodeStateMachine {
     /// Get a reference to the livelock state.
     pub fn livelock(&self) -> &LivelockState {
         &self.livelock
+    }
+
+    /// Get a reference to the provision coordinator.
+    pub fn provisions(&self) -> &ProvisionCoordinator {
+        &self.provisions
     }
 
     /// Initialize the node with a genesis block.
@@ -406,11 +416,26 @@ impl StateMachine for NodeStateMachine {
                 }
 
                 // Pass transactions directly from block to execution (no need for mempool lookup)
+                // NOTE: execution.on_block_committed emits CrossShardTxRegistered events, which
+                // will be processed by the coordinator via EnqueueInternal actions.
                 let exec_actions = self.execution.on_block_committed(
                     *block_hash,
                     *height,
                     block.transactions.clone(),
                 );
+
+                // Process CrossShardTxRegistered events immediately so coordinator has
+                // registrations before any subsequent provisions arrive.
+                // This ensures ProvisionQuorumReached can be emitted for livelock.
+                for action in &exec_actions {
+                    if let Action::EnqueueInternal { event: reg_event } = action {
+                        if let Event::CrossShardTxRegistered { .. } = reg_event {
+                            if let Some(reg_actions) = self.provisions.try_handle(reg_event) {
+                                actions.extend(reg_actions);
+                            }
+                        }
+                    }
+                }
                 actions.extend(exec_actions);
 
                 // Also let mempool handle it (marks transactions as committed, processes deferrals/aborts)
@@ -418,15 +443,75 @@ impl StateMachine for NodeStateMachine {
                     actions.extend(mempool_actions);
                 }
 
+                // Let provisions coordinator handle cleanup (certificates, aborts, deferrals)
+                if let Some(provision_actions) = self.provisions.try_handle(&event) {
+                    actions.extend(provision_actions);
+                }
+
                 return actions;
             }
 
-            // StateProvisionReceived: route to livelock for cycle detection, then execution
-            Event::StateProvisionReceived { provision } => {
-                // First: cycle detection in livelock (may queue a deferral)
-                self.livelock.on_provision_received(provision);
+            // ═══════════════════════════════════════════════════════════════════════
+            // Provision Events (Byzantine-safe)
+            //
+            // Provisions are routed ONLY to ProvisionCoordinator, which:
+            // 1. Verifies signatures
+            // 2. Tracks quorum per source shard
+            // 3. Emits ProvisionQuorumReached when a shard reaches quorum
+            // 4. Emits ProvisioningComplete when ALL required shards reach quorum
+            //
+            // ExecutionState listens to ProvisioningComplete to trigger execution.
+            // LivelockState listens to ProvisionQuorumReached for cycle detection.
+            // ═══════════════════════════════════════════════════════════════════════
+            Event::StateProvisionReceived { .. } => {
+                // Route ONLY to provision coordinator
+                if let Some(actions) = self.provisions.try_handle(&event) {
+                    return actions;
+                }
+            }
 
-                // Then: pass to execution for quorum tracking
+            Event::ProvisionSignatureVerified { .. } => {
+                // Route ONLY to provision coordinator
+                if let Some(actions) = self.provisions.try_handle(&event) {
+                    return actions;
+                }
+            }
+
+            // CrossShardTxRegistered: route to coordinator for tracking
+            Event::CrossShardTxRegistered { .. } => {
+                if let Some(actions) = self.provisions.try_handle(&event) {
+                    return actions;
+                }
+            }
+
+            // CrossShardTxCompleted/Aborted: route to coordinator for cleanup
+            Event::CrossShardTxCompleted { .. } | Event::CrossShardTxAborted { .. } => {
+                if let Some(actions) = self.provisions.try_handle(&event) {
+                    return actions;
+                }
+            }
+
+            // ProvisionQuorumReached: Byzantine-safe cycle detection (per-shard)
+            //
+            // This is the ONLY entry point for livelock cycle detection.
+            // Only verified provisions that have reached quorum trigger this event.
+            // This prevents Byzantine validators from triggering false deferrals
+            // by sending forged provisions.
+            Event::ProvisionQuorumReached {
+                tx_hash,
+                source_shard,
+                provisions,
+            } => {
+                // Cycle detection in livelock (may queue a deferral)
+                self.livelock
+                    .on_provision_quorum_reached(*tx_hash, *source_shard, provisions);
+
+                // No actions needed - execution waits for ProvisioningComplete
+                return vec![];
+            }
+
+            // ProvisioningComplete: All shards have quorum, trigger execution
+            Event::ProvisioningComplete { .. } => {
                 if let Some(actions) = self.execution.try_handle(&event) {
                     return actions;
                 }
@@ -438,7 +523,6 @@ impl StateMachine for NodeStateMachine {
             | Event::StateVoteReceived { .. }
             | Event::StateCertificateReceived { .. }
             | Event::MerkleRootComputed { .. }
-            | Event::ProvisionSignatureVerified { .. }
             | Event::StateVoteSignatureVerified { .. }
             | Event::StateCertificateSignatureVerified { .. }
             | Event::SpeculativeExecutionComplete { .. } => {
@@ -738,6 +822,7 @@ impl StateMachine for NodeStateMachine {
         self.bft.set_time(now);
         self.execution.set_time(now);
         self.mempool.set_time(now);
+        self.provisions.set_time(now);
         self.livelock.set_time(now);
     }
 
