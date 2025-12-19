@@ -8,6 +8,7 @@ BASE_P2P_PORT=9000
 BASE_RPC_PORT=18080
 CLEAN=true
 BUILD=true
+USE_GHCR=false
 ACCOUNTS_PER_SHARD=16000
 INITIAL_BALANCE=1000000
 LOG_LEVEL="info"
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
         --validators-per-shard) VALIDATORS_PER_SHARD="$2"; shift 2 ;;
         --clean) CLEAN=true; shift ;;
         --build) BUILD="$2"; shift 2 ;;
+        --use-ghcr-image) USE_GHCR=true; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -44,6 +46,13 @@ if [ "$CLEAN" = true ]; then
     rm -rf "$DATA_DIR"
 fi
 mkdir -p "$DATA_DIR"
+
+if [ "$USE_GHCR" = true ]; then
+    IMAGE_NAME="ghcr.io/flightofthefox/hyperscale-rs:latest"
+    BUILD=false
+    echo "Using GHCR image: $IMAGE_NAME"
+    docker pull "$IMAGE_NAME"
+fi
 
 if [ "$BUILD" = true ]; then
     cd "$ROOT_DIR" && docker build -t "$IMAGE_NAME" .
