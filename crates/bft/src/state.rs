@@ -1393,15 +1393,27 @@ impl BftState {
             }
         }
 
-        // Validate deferrals and aborts in the block before voting
+        // Validate block contents before voting
         if let Some(pending) = self.pending_blocks.get(&block_hash) {
             if let Some(block) = pending.block() {
+                // Validate deferrals and aborts
                 if let Err(e) = self.validate_deferrals_and_aborts(&block) {
                     warn!(
                         validator = ?self.validator_id(),
                         block_hash = ?block_hash,
                         error = %e,
                         "Block has invalid deferrals/aborts - not voting"
+                    );
+                    return vec![];
+                }
+
+                // Validate transaction ordering
+                if let Err(e) = self.validate_transaction_ordering(&block) {
+                    warn!(
+                        validator = ?self.validator_id(),
+                        block_hash = ?block_hash,
+                        error = %e,
+                        "Block has invalid transaction ordering - not voting"
                     );
                     return vec![];
                 }
@@ -1502,6 +1514,84 @@ impl BftState {
                     // No structural validation needed - execution rejection reasons are
                     // determined by the executor
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate transaction ordering in a proposed block.
+    ///
+    /// # Ordering Rules
+    ///
+    /// Transactions must be ordered as follows:
+    /// 1. **Priority group first**: Cross-shard TXs with CommitmentProof (in hash order)
+    /// 2. **Others second**: All other TXs (in hash order)
+    ///
+    /// Within each group, transactions must be sorted by hash (ascending).
+    /// This deterministic ordering:
+    /// - Reduces cross-shard conflicts (all shards pick same TXs)
+    /// - Prioritizes TXs that other shards are waiting on
+    /// - Is verifiable by all validators without local state
+    fn validate_transaction_ordering(&self, block: &Block) -> Result<(), String> {
+        let txs = &block.transactions;
+
+        if txs.is_empty() {
+            return Ok(());
+        }
+
+        // Split into priority (with proof) and others (without proof)
+        let mut with_proof: Vec<Hash> = Vec::new();
+        let mut without_proof: Vec<Hash> = Vec::new();
+
+        for tx in txs.iter() {
+            if tx.has_commitment_proof() {
+                with_proof.push(tx.hash());
+            } else {
+                without_proof.push(tx.hash());
+            }
+        }
+
+        // Verify priority group is sorted by hash
+        for window in with_proof.windows(2) {
+            if window[0] >= window[1] {
+                return Err(format!(
+                    "Priority transactions not in hash order: {} should be < {}",
+                    window[0], window[1]
+                ));
+            }
+        }
+
+        // Verify others group is sorted by hash
+        for window in without_proof.windows(2) {
+            if window[0] >= window[1] {
+                return Err(format!(
+                    "Non-priority transactions not in hash order: {} should be < {}",
+                    window[0], window[1]
+                ));
+            }
+        }
+
+        // Verify priority group comes before others group
+        // (all TXs with proof must have lower index than all TXs without proof)
+        if !with_proof.is_empty() && !without_proof.is_empty() {
+            // Find the last TX with proof and first TX without proof
+            let mut last_proof_idx = 0;
+            let mut first_no_proof_idx = txs.len();
+
+            for (i, tx) in txs.iter().enumerate() {
+                if tx.has_commitment_proof() {
+                    last_proof_idx = i;
+                } else if first_no_proof_idx == txs.len() {
+                    first_no_proof_idx = i;
+                }
+            }
+
+            if last_proof_idx > first_no_proof_idx {
+                return Err(format!(
+                    "Priority transactions must come before non-priority: found proof TX at index {} after non-proof TX at index {}",
+                    last_proof_idx, first_no_proof_idx
+                ));
             }
         }
 
@@ -4543,6 +4633,7 @@ mod tests {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
+            proof: None, // Proof validation tested separately
         };
         let block = make_test_block(5, vec![valid_deferral], vec![], vec![]);
         assert!(state.validate_deferrals_and_aborts(&block).is_ok());
@@ -4554,6 +4645,7 @@ mod tests {
                 winner_tx_hash: loser_hash,
             },
             block_height: BlockHeight(5),
+            proof: None, // Proof validation tested separately
         };
         let block = make_test_block(5, vec![invalid_deferral], vec![], vec![]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -4585,6 +4677,7 @@ mod tests {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
+            proof: None, // Proof validation tested separately
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![winner_cert]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -4616,6 +4709,7 @@ mod tests {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
+            proof: None, // Proof validation tested separately
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![loser_cert]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -6203,6 +6297,7 @@ mod tests {
                 winner_tx_hash: Hash::from_bytes(b"winner_tx"),
             },
             block_height: BlockHeight(0), // Will be filled in when included
+            proof: None,                  // Proof validation tested separately
         };
 
         // Call on_qc_formed with a deferral
@@ -6354,5 +6449,173 @@ mod tests {
             has_broadcast,
             "Should proceed directly to voting when QC already verified"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Transaction Ordering Validation Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    fn make_test_block_with_transactions(
+        height: u64,
+        transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
+    ) -> Block {
+        Block {
+            header: make_header_at_height(height, 100_000),
+            transactions,
+            committed_certificates: vec![],
+            deferred: vec![],
+            aborted: vec![],
+        }
+    }
+
+    fn make_test_tx(seed: u8, with_proof: bool) -> Arc<hyperscale_types::RoutableTransaction> {
+        use hyperscale_types::{test_utils, CommitmentProof, PartitionNumber, ShardGroupId};
+
+        let mut tx = test_utils::test_transaction(seed);
+
+        if with_proof {
+            let node = test_utils::test_node(seed);
+            let proof = CommitmentProof::new(
+                tx.hash(),
+                ShardGroupId(1),
+                SignerBitfield::new(4),
+                Signature::zero(),
+                BlockHeight(1),
+                vec![hyperscale_types::StateEntry::new(
+                    node,
+                    PartitionNumber(0),
+                    vec![],
+                    None,
+                )],
+            );
+            tx.set_commitment_proof(proof);
+        }
+
+        Arc::new(tx)
+    }
+
+    /// Sort transactions by hash for test setup
+    fn sort_txs_by_hash(txs: &mut [Arc<hyperscale_types::RoutableTransaction>]) {
+        txs.sort_by_key(|tx| tx.hash());
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_empty_block() {
+        let state = make_test_state();
+        let block = make_test_block_with_transactions(5, vec![]);
+        assert!(state.validate_transaction_ordering(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_single_tx() {
+        let state = make_test_state();
+        let tx = make_test_tx(1, false);
+        let block = make_test_block_with_transactions(5, vec![tx]);
+        assert!(state.validate_transaction_ordering(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_valid_no_proofs() {
+        let state = make_test_state();
+
+        // Create TXs and sort by hash
+        let mut txs = vec![
+            make_test_tx(10, false),
+            make_test_tx(20, false),
+            make_test_tx(30, false),
+        ];
+        sort_txs_by_hash(&mut txs);
+
+        let block = make_test_block_with_transactions(5, txs);
+        assert!(state.validate_transaction_ordering(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_invalid_no_proofs() {
+        let state = make_test_state();
+
+        // Create TXs, sort, then reverse (invalid order)
+        let mut txs = vec![
+            make_test_tx(10, false),
+            make_test_tx(20, false),
+            make_test_tx(30, false),
+        ];
+        sort_txs_by_hash(&mut txs);
+        txs.reverse();
+
+        let block = make_test_block_with_transactions(5, txs);
+        let result = state.validate_transaction_ordering(&block);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not in hash order"));
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_valid_with_proofs_first() {
+        let state = make_test_state();
+
+        // Create priority TXs (with proofs) and sort
+        let mut proof_txs = vec![make_test_tx(10, true), make_test_tx(20, true)];
+        sort_txs_by_hash(&mut proof_txs);
+
+        // Create non-priority TXs and sort
+        let mut no_proof_txs = vec![make_test_tx(30, false), make_test_tx(40, false)];
+        sort_txs_by_hash(&mut no_proof_txs);
+
+        // Combine: priority first, then non-priority
+        let mut txs = proof_txs;
+        txs.extend(no_proof_txs);
+
+        let block = make_test_block_with_transactions(5, txs);
+        assert!(state.validate_transaction_ordering(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_invalid_proof_group_unsorted() {
+        let state = make_test_state();
+
+        // Create priority TXs, sort, then reverse (invalid order)
+        let mut txs = vec![make_test_tx(10, true), make_test_tx(20, true)];
+        sort_txs_by_hash(&mut txs);
+        txs.reverse();
+
+        let block = make_test_block_with_transactions(5, txs);
+        let result = state.validate_transaction_ordering(&block);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Priority transactions not in hash order"));
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_invalid_non_priority_before_priority() {
+        let state = make_test_state();
+
+        // Non-priority TX comes before priority TX - invalid
+        let no_proof_tx = make_test_tx(10, false);
+        let proof_tx = make_test_tx(20, true);
+
+        // Put non-priority first (invalid)
+        let block = make_test_block_with_transactions(5, vec![no_proof_tx, proof_tx]);
+        let result = state.validate_transaction_ordering(&block);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Priority transactions must come before non-priority"));
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_all_have_proofs() {
+        let state = make_test_state();
+
+        // All TXs have proofs - valid as long as sorted
+        let mut txs = vec![
+            make_test_tx(10, true),
+            make_test_tx(20, true),
+            make_test_tx(30, true),
+        ];
+        sort_txs_by_hash(&mut txs);
+
+        let block = make_test_block_with_transactions(5, txs);
+        assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 }

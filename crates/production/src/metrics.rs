@@ -26,8 +26,14 @@ pub struct Metrics {
     pub transactions_finalized: HistogramVec,
     pub mempool_size: Gauge,
 
-    // === Cross-shard ===
+    // === Cross-shard & Backpressure ===
     pub cross_shard_pending: Gauge,
+    /// Number of cross-shard TXs tracked by provision coordinator (for backpressure).
+    pub provisions_registered: Gauge,
+    /// Whether backpressure limit is currently active (0 or 1).
+    pub backpressure_active: Gauge,
+    /// Number of TXs with commitment proofs attached in last proposal.
+    pub txs_with_commitment_proof: Gauge,
 
     // === Infrastructure ===
     pub network_messages_sent: Counter,
@@ -165,10 +171,25 @@ impl Metrics {
             )
             .unwrap(),
 
-            // Cross-shard
+            // Cross-shard & Backpressure
             cross_shard_pending: register_gauge!(
                 "hyperscale_cross_shard_pending",
                 "Number of cross-shard transactions in flight"
+            )
+            .unwrap(),
+            provisions_registered: register_gauge!(
+                "hyperscale_provisions_registered",
+                "Number of cross-shard TXs registered in provision coordinator"
+            )
+            .unwrap(),
+            backpressure_active: register_gauge!(
+                "hyperscale_backpressure_active",
+                "Whether backpressure limit is currently active (1) or not (0)"
+            )
+            .unwrap(),
+            txs_with_commitment_proof: register_gauge!(
+                "hyperscale_txs_with_commitment_proof",
+                "Number of TXs with commitment proofs in last proposal"
             )
             .unwrap(),
 
@@ -540,6 +561,23 @@ pub fn set_mempool_size(size: usize) {
 /// Update cross-shard pending count.
 pub fn set_cross_shard_pending(count: usize) {
     metrics().cross_shard_pending.set(count as f64);
+}
+
+/// Update provision coordinator metrics for backpressure monitoring.
+pub fn set_provisions_registered(count: usize) {
+    metrics().provisions_registered.set(count as f64);
+}
+
+/// Update backpressure active status.
+pub fn set_backpressure_active(active: bool) {
+    metrics()
+        .backpressure_active
+        .set(if active { 1.0 } else { 0.0 });
+}
+
+/// Update count of TXs with commitment proofs.
+pub fn set_txs_with_commitment_proof(count: usize) {
+    metrics().txs_with_commitment_proof.set(count as f64);
 }
 
 /// Update thread pool queue depths.
