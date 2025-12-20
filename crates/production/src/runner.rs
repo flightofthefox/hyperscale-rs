@@ -1509,8 +1509,11 @@ impl ProductionRunner {
                 provision,
                 public_key,
             } => {
+                // Use throttled spawn for provisions - this applies backpressure
+                // when the crypto pool is busy, slowing the rate we accept new
+                // provisions rather than rejecting them outright.
                 let event_tx = self.callback_tx.clone();
-                self.thread_pools.spawn_crypto(move || {
+                self.thread_pools.spawn_crypto_throttled(move || {
                     let start = std::time::Instant::now();
                     // Use centralized signing message (must match ExecutionState::sign_provision)
                     let msg = provision.signing_message();
