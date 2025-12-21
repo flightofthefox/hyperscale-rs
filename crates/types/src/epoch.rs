@@ -43,9 +43,10 @@ impl fmt::Display for EpochId {
 pub const DEFAULT_EPOCH_LENGTH: u64 = 14400;
 
 /// Validator lifecycle states for shuffling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor, Default)]
 pub enum ValidatorShardState {
     /// Actively participating in consensus for this shard.
+    #[default]
     Active,
 
     /// Syncing to this shard, will become Active next epoch.
@@ -59,11 +60,7 @@ pub enum ValidatorShardState {
     Leaving,
 }
 
-impl Default for ValidatorShardState {
-    fn default() -> Self {
-        Self::Active
-    }
-}
+
 
 impl fmt::Display for ValidatorShardState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
