@@ -1012,32 +1012,29 @@ impl ProductionRunner {
                 // These must be processed quickly to unblock OTHER validators' consensus.
                 // A peer waiting for our certificates/transactions can't vote until we respond.
                 // These are O(1) hashmap lookups - very fast, won't block the loop.
+                //
+                // IMPORTANT: We drain ALL pending requests in one iteration to minimize
+                // response latency. Under load, requests can queue up while the loop
+                // processes other events. Draining ensures we respond to all waiting
+                // peers before moving on, preventing timeout-induced view changes.
                 Some(request) = self.cert_request_rx.recv() => {
-                    let cert_span = span!(
-                        Level::DEBUG,
-                        "handle_cert_request",
-                        peer = %request.peer,
-                        block_hash = ?request.block_hash,
-                        cert_count = request.cert_hashes.len(),
-                        channel_id = request.channel_id,
-                    );
-                    let _cert_guard = cert_span.enter();
-
+                    // Handle the first request
                     self.handle_inbound_certificate_request(request);
+
+                    // Drain any additional pending requests
+                    while let Ok(request) = self.cert_request_rx.try_recv() {
+                        self.handle_inbound_certificate_request(request);
+                    }
                 }
 
                 Some(request) = self.tx_request_rx.recv() => {
-                    let tx_span = span!(
-                        Level::DEBUG,
-                        "handle_tx_request",
-                        peer = %request.peer,
-                        block_hash = ?request.block_hash,
-                        tx_count = request.tx_hashes.len(),
-                        channel_id = request.channel_id,
-                    );
-                    let _tx_guard = tx_span.enter();
-
+                    // Handle the first request
                     self.handle_inbound_transaction_request(request);
+
+                    // Drain any additional pending requests
+                    while let Ok(request) = self.tx_request_rx.try_recv() {
+                        self.handle_inbound_transaction_request(request);
+                    }
                 }
 
                 // HIGH PRIORITY: Callback events (crypto/execution results)
