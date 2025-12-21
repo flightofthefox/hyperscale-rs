@@ -467,10 +467,20 @@ impl Libp2pAdapter {
                         config
                     },
                 )
-                .map_err(|e| NetworkError::NetworkError(e.to_string()))?
+                .map_err(|e| {
+                    NetworkError::NetworkError(format!(
+                        "Failed to configure TCP transport: {:?}",
+                        e
+                    ))
+                })?
                 .with_quic()
                 .with_behaviour(|_| behaviour)
-                .map_err(|e| NetworkError::NetworkError(e.to_string()))?
+                .map_err(|e| {
+                    NetworkError::NetworkError(format!(
+                        "Failed to configure swarm behaviour: {:?}",
+                        e
+                    ))
+                })?
                 .with_swarm_config(|c| {
                     c.with_idle_connection_timeout(config.idle_connection_timeout)
                         .with_max_negotiating_inbound_streams(100)
@@ -482,7 +492,12 @@ impl Libp2pAdapter {
                 .with_tokio()
                 .with_quic()
                 .with_behaviour(|_| behaviour)
-                .map_err(|e| NetworkError::NetworkError(e.to_string()))?
+                .map_err(|e| {
+                    NetworkError::NetworkError(format!(
+                        "Failed to configure swarm behaviour: {:?}",
+                        e
+                    ))
+                })?
                 .with_swarm_config(|c| {
                     c.with_idle_connection_timeout(config.idle_connection_timeout)
                         .with_max_negotiating_inbound_streams(100)
@@ -492,9 +507,12 @@ impl Libp2pAdapter {
 
         // Listen on configured addresses (QUIC)
         for addr in &config.listen_addresses {
-            swarm
-                .listen_on(addr.clone())
-                .map_err(|e| NetworkError::NetworkError(e.to_string()))?;
+            swarm.listen_on(addr.clone()).map_err(|e| {
+                NetworkError::NetworkError(format!(
+                    "Failed to bind QUIC transport on {}: {:?}",
+                    addr, e
+                ))
+            })?;
             info!("Listening on: {}", addr);
         }
 
@@ -506,9 +524,12 @@ impl Libp2pAdapter {
                     .map_err(|e| {
                         NetworkError::NetworkError(format!("Invalid TCP address: {}", e))
                     })?;
-                swarm
-                    .listen_on(tcp_addr.clone())
-                    .map_err(|e| NetworkError::NetworkError(e.to_string()))?;
+                swarm.listen_on(tcp_addr.clone()).map_err(|e| {
+                    NetworkError::NetworkError(format!(
+                        "Failed to bind TCP transport on {}: {:?}",
+                        tcp_addr, e
+                    ))
+                })?;
                 info!("Listening on TCP fallback: {}", tcp_addr);
             }
         }

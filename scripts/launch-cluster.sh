@@ -333,6 +333,7 @@ echo ""
 echo "Launching validators..."
 PID_FILE="$DATA_DIR/pids.txt"
 > "$PID_FILE"
+declare -a VALIDATOR_PIDS
 
 for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     shard=$((i / VALIDATORS_PER_SHARD))
@@ -346,12 +347,38 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     # libp2p_gossipsub=error to suppress "duplicate message" warnings which are normal in gossip
     RUST_LOG="warn,hyperscale=$LOG_LEVEL,hyperscale_production=$LOG_LEVEL,libp2p_gossipsub=error" "$VALIDATOR_BIN" --config "$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
     PID=$!
+    VALIDATOR_PIDS[$i]=$PID
     echo "$PID" >> "$PID_FILE"
     echo "    PID: $PID, logs: $LOG_FILE"
 
     # Small delay to stagger startup
     sleep 0.2
 done
+
+# Wait a moment for validators to either start or fail
+sleep 1
+
+# Check if any validators died during startup
+FAILED=false
+for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
+    PID=${VALIDATOR_PIDS[$i]}
+    if ! kill -0 "$PID" 2>/dev/null; then
+        echo ""
+        echo "ERROR: Validator $i (PID $PID) failed to start!"
+        echo "Log output:"
+        cat "$DATA_DIR/validator-$i/output.log"
+        echo ""
+        FAILED=true
+    fi
+done
+
+if [ "$FAILED" = true ]; then
+    echo "One or more validators failed to start. Stopping cluster..."
+    for pid in "${VALIDATOR_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    exit 1
+fi
 
 echo ""
 echo "=== Cluster Started ==="
