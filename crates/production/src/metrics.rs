@@ -26,9 +26,10 @@ pub struct Metrics {
     pub transactions_finalized: HistogramVec,
     pub mempool_size: Gauge,
 
-    // === Cross-shard & Backpressure ===
-    pub cross_shard_pending: Gauge,
-    /// Number of cross-shard TXs tracked by provision coordinator (for backpressure).
+    // === Backpressure ===
+    /// Number of transactions currently holding state locks (Committed or Executed status).
+    pub in_flight: Gauge,
+    /// Deprecated: alias for in_flight. Use in_flight instead.
     pub provisions_registered: Gauge,
     /// Whether backpressure limit is currently active (0 or 1).
     pub backpressure_active: Gauge,
@@ -171,15 +172,15 @@ impl Metrics {
             )
             .unwrap(),
 
-            // Cross-shard & Backpressure
-            cross_shard_pending: register_gauge!(
-                "hyperscale_cross_shard_pending",
-                "Number of cross-shard transactions in flight"
+            // Backpressure
+            in_flight: register_gauge!(
+                "hyperscale_in_flight",
+                "Number of transactions holding state locks (Committed or Executed)"
             )
             .unwrap(),
             provisions_registered: register_gauge!(
                 "hyperscale_provisions_registered",
-                "Number of cross-shard TXs registered in provision coordinator"
+                "Deprecated: same as in_flight"
             )
             .unwrap(),
             backpressure_active: register_gauge!(
@@ -558,13 +559,10 @@ pub fn set_mempool_size(size: usize) {
     metrics().mempool_size.set(size as f64);
 }
 
-/// Update cross-shard pending count.
-pub fn set_cross_shard_pending(count: usize) {
-    metrics().cross_shard_pending.set(count as f64);
-}
-
-/// Update provision coordinator metrics for backpressure monitoring.
-pub fn set_provisions_registered(count: usize) {
+/// Update in-flight transaction count (transactions holding state locks).
+pub fn set_in_flight(count: usize) {
+    metrics().in_flight.set(count as f64);
+    // Also update deprecated metric for backwards compatibility
     metrics().provisions_registered.set(count as f64);
 }
 

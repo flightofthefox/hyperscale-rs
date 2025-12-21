@@ -490,7 +490,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "avg(avg by (shard) (hyperscale_cross_shard_pending))",
+          "expr": "avg(avg by (shard) (hyperscale_in_flight))",
           "refId": "A"
         }
       ],
@@ -1631,8 +1631,8 @@
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "max by (shard) (hyperscale_cross_shard_pending)",
-          "legendFormat": "Shard {{shard}} Pending",
+          "expr": "max by (shard) (hyperscale_in_flight)",
+          "legendFormat": "Shard {{shard}} In-Flight",
           "refId": "B"
         },
         {
@@ -1691,8 +1691,8 @@
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "avg by (shard) (hyperscale_cross_shard_pending)",
-          "legendFormat": "Shard {{shard}} Pending",
+          "expr": "avg by (shard) (hyperscale_in_flight)",
+          "legendFormat": "Shard {{shard}} In-Flight",
           "refId": "B"
         }
       ],

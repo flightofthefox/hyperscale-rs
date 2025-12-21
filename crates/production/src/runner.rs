@@ -964,8 +964,7 @@ impl ProductionRunner {
 
                         // Backpressure metrics - use mempool's view of in-flight TXs
                         let in_flight = mempool.in_flight();
-                        crate::metrics::set_cross_shard_pending(in_flight);
-                        crate::metrics::set_provisions_registered(in_flight);
+                        crate::metrics::set_in_flight(in_flight);
                         crate::metrics::set_backpressure_active(mempool.at_in_flight_limit());
 
                         if let Ok(mut snap) = snapshot.try_write() {
