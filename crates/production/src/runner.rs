@@ -1194,45 +1194,71 @@ impl ProductionRunner {
                             // improving verification throughput (batch BLS verification is faster).
                             // The 5ms delay is small relative to the ~300ms block interval.
                             // Note: State votes use a separate 20ms window handled by a dedicated select branch.
+                            //
+                            // IMPORTANT: We must also handle fetch requests during this window!
+                            // Other validators may be waiting for our certificates/transactions.
+                            // Blocking fetch responses for 5ms would cause cascading timeouts.
                             if !pending_block_votes.is_empty() {
                                 let batch_deadline = tokio::time::Instant::now() + Duration::from_millis(5);
                                 loop {
-                                    match tokio::time::timeout_at(batch_deadline, self.consensus_rx.recv()).await {
-                                        Ok(Some(more_event)) => {
-                                            // Update time for each event
-                                            let now = self.start_time.elapsed();
-                                            self.state.set_time(now);
+                                    tokio::select! {
+                                        biased;
 
-                                            let more_actions = self.state.handle(more_event);
+                                        // Handle fetch requests with priority during batching
+                                        Some(request) = self.cert_request_rx.recv() => {
+                                            self.handle_inbound_certificate_request(request);
+                                            while let Ok(request) = self.cert_request_rx.try_recv() {
+                                                self.handle_inbound_certificate_request(request);
+                                            }
+                                        }
 
-                                            for action in more_actions {
-                                                match action {
-                                                    Action::VerifyVoteSignature { vote, public_key, signing_message } => {
-                                                        pending_block_votes.votes.push((vote, public_key, signing_message));
-                                                    }
-                                                    Action::VerifyStateVoteSignature { vote, public_key } => {
-                                                        if self.pending_state_votes.is_empty() {
-                                                            self.state_vote_deadline = Some(
-                                                                tokio::time::Instant::now() + Duration::from_millis(20)
-                                                            );
-                                                        }
-                                                        self.pending_state_votes.votes.push((vote, public_key));
-                                                    }
-                                                    other => {
-                                                        if let Err(e) = self.process_action(other).await {
-                                                            tracing::error!(error = ?e, "Error processing action");
+                                        Some(request) = self.tx_request_rx.recv() => {
+                                            self.handle_inbound_transaction_request(request);
+                                            while let Ok(request) = self.tx_request_rx.try_recv() {
+                                                self.handle_inbound_transaction_request(request);
+                                            }
+                                        }
+
+                                        // Also collect more votes for batching
+                                        result = tokio::time::timeout_at(batch_deadline, self.consensus_rx.recv()) => {
+                                            match result {
+                                                Ok(Some(more_event)) => {
+                                                    // Update time for each event
+                                                    let now = self.start_time.elapsed();
+                                                    self.state.set_time(now);
+
+                                                    let more_actions = self.state.handle(more_event);
+
+                                                    for action in more_actions {
+                                                        match action {
+                                                            Action::VerifyVoteSignature { vote, public_key, signing_message } => {
+                                                                pending_block_votes.votes.push((vote, public_key, signing_message));
+                                                            }
+                                                            Action::VerifyStateVoteSignature { vote, public_key } => {
+                                                                if self.pending_state_votes.is_empty() {
+                                                                    self.state_vote_deadline = Some(
+                                                                        tokio::time::Instant::now() + Duration::from_millis(20)
+                                                                    );
+                                                                }
+                                                                self.pending_state_votes.votes.push((vote, public_key));
+                                                            }
+                                                            other => {
+                                                                if let Err(e) = self.process_action(other).await {
+                                                                    tracing::error!(error = ?e, "Error processing action");
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
+                                                Ok(None) => {
+                                                    // Channel closed
+                                                    break;
+                                                }
+                                                Err(_) => {
+                                                    // Timeout reached, proceed with current batch
+                                                    break;
+                                                }
                                             }
-                                        }
-                                        Ok(None) => {
-                                            // Channel closed
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            // Timeout reached, proceed with current batch
-                                            break;
                                         }
                                     }
                                 }
@@ -1375,17 +1401,15 @@ impl ProductionRunner {
                 }
 
                 // Handle inbound sync requests from peers
+                // Drain all pending requests to minimize response latency.
                 Some(request) = self.sync_request_rx.recv() => {
-                    let sync_span = span!(
-                        Level::DEBUG,
-                        "handle_sync_request",
-                        peer = %request.peer,
-                        height = request.height,
-                        channel_id = request.channel_id,
-                    );
-                    let _sync_guard = sync_span.enter();
-
+                    // Handle the first request
                     self.handle_inbound_sync_request(request);
+
+                    // Drain any additional pending requests
+                    while let Ok(request) = self.sync_request_rx.try_recv() {
+                        self.handle_inbound_sync_request(request);
+                    }
                 }
 
                 // Periodic sync and fetch manager tick
