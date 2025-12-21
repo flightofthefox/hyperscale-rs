@@ -205,7 +205,8 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     echo "$SEED_HEX" | xxd -r -p > "$KEY_FILE"
 
     # Derive the actual public key from the seed using our keygen tool
-    PUBLIC_KEYS[$i]=$("$KEYGEN_BIN" "$SEED_HEX")
+    # keygen outputs "public_key_hex peer_id" - we only need the public key
+    PUBLIC_KEYS[$i]=$("$KEYGEN_BIN" "$SEED_HEX" | awk '{print $1}')
     echo "  Validator $i: public_key=${PUBLIC_KEYS[$i]:0:16}..."
 done
 
@@ -490,16 +491,9 @@ if [ "$MONITORING" = true ]; then
           shard: '$shard'"
     done
 
-    cat > "$MONITORING_DIR/prometheus.yml" << 'EOF'
+    cat > "$MONITORING_DIR/prometheus.yml" << EOF
 # Prometheus configuration for Hyperscale local cluster
 # $NUM_SHARDS shards x $VALIDATORS_PER_SHARD validators = $TOTAL_VALIDATORS total
-#
-# Shard assignment (auto-generated):
-$(for shard in $(seq 0 $((NUM_SHARDS - 1))); do
-    first_port=$((BASE_RPC_PORT + shard * VALIDATORS_PER_SHARD))
-    last_port=$((first_port + VALIDATORS_PER_SHARD - 1))
-    echo "#   - Shard $shard: ports $first_port-$last_port"
-done)
 
 global:
   scrape_interval: 5s
