@@ -195,39 +195,56 @@ jobs:
           PR_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
           PR_ADDITIONS: ${{ github.event.pull_request.additions }}
           PR_DELETIONS: ${{ github.event.pull_request.deletions }}
-          # On pull_request events, head_commit is null. These will be empty strings. 
-          # The script logic below handles this separation correctly.
           COMMIT_MSG: ${{ github.event.head_commit.message }}
           COMMIT_AUTHOR: ${{ github.event.head_commit.author.name }}
           COMMIT_URL: ${{ github.event.head_commit.url }}
           COMMIT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
-          # Using toJson to safely handle JSON arrays, will be "null" string on PRs
+          # Using toJson for arrays is correct
           COMMIT_ADDED: ${{ toJson(github.event.head_commit.added) }}
           COMMIT_REMOVED: ${{ toJson(github.event.head_commit.removed) }}
           COMMIT_MODIFIED: ${{ toJson(github.event.head_commit.modified) }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
+          escape_html() {
+            local s="$1"
+            # escape HTML characters for Telegram
+            s="${s//&/&amp;}"
+            s="${s//</&lt;}"
+            s="${s//>/&gt;}"
+            s="${s//\"/&quot;}"
+            echo "$s"
+          }
+
           get_gh_name() {
             local login="$1"
-            # Silence errors, fallback to login
+            # silence errors, fallback to login
             gh api "users/$login" --jq '.name // .login' 2>/dev/null || echo "$login"
           }
+
+          # sanitize inputs that might contain special chars
+          SAFE_PR_TITLE=$(escape_html "$PR_TITLE")
+          SAFE_COMMIT_MSG=$(escape_html "$COMMIT_MSG")
+          SAFE_COMMIT_AUTHOR=$(escape_html "$COMMIT_AUTHOR")
 
           if [ "$EVENT_NAME" == "pull_request" ]; then
             if [ "$EVENT_ACTION" == "closed" ] && [ "$PR_MERGED" == "true" ]; then
               FRIENDLY_NAME=$(get_gh_name "$PR_MERGER_LOGIN")
-              TEXT="🚀 <b>PR Merged:</b> $PR_TITLE"
+              SAFE_FRIENDLY_NAME=$(escape_html "$FRIENDLY_NAME")
+              
+              TEXT="🚀 <b>PR Merged:</b> $SAFE_PR_TITLE"
               TEXT+=$'\n'
-              TEXT+=$'\n'"<b>By:</b> $FRIENDLY_NAME"
+              TEXT+=$'\n'"<b>By:</b> $SAFE_FRIENDLY_NAME"
               TEXT+=$'\n'"<b>Date:</b> $PR_MERGED_AT"
               TEXT+=$'\n'"<b>Diff:</b> $PR_CHANGED_FILES file(s) (+$PR_ADDITIONS -$PR_DELETIONS)"
               TEXT+=$'\n'
               TEXT+=$'\n'"<a href=\"$PR_URL\">View on GitHub</a>"
             else
               FRIENDLY_NAME=$(get_gh_name "$PR_USER_LOGIN")
-              TEXT="🔨 <b>New PR:</b> $PR_TITLE"
+              SAFE_FRIENDLY_NAME=$(escape_html "$FRIENDLY_NAME")
+
+              TEXT="🔨 <b>New PR:</b> $SAFE_PR_TITLE"
               TEXT+=$'\n'
-              TEXT+=$'\n'"<b>Author:</b> $FRIENDLY_NAME"
+              TEXT+=$'\n'"<b>Author:</b> $SAFE_FRIENDLY_NAME"
               TEXT+=$'\n'"<b>Date:</b> $PR_CREATED_AT"
               TEXT+=$'\n'"<b>Diff:</b> $PR_CHANGED_FILES file(s) (+$PR_ADDITIONS -$PR_DELETIONS)"
               TEXT+=$'\n'
@@ -235,27 +252,33 @@ jobs:
             fi
           else
             # Push event
-            
-            # skip standard merge commits
             if [[ "$COMMIT_MSG" == "Merge pull request"* ]] || [[ "$COMMIT_MSG" == "Merge branch"* ]]; then
-              echo "Merge commit detected, skipping notification to avoid duplicate PR merged msg."
+              echo "Merge commit detected, skipping."
               exit 0
             fi
             
-            # only runs if COMMIT_ADDED is valid JSON
-            ADDED_LEN=$(echo "$COMMIT_ADDED" | jq 'length' 2>/dev/null || echo 0)
-            REMOVED_LEN=$(echo "$COMMIT_REMOVED" | jq 'length' 2>/dev/null || echo 0)
-            MODIFIED_LEN=$(echo "$COMMIT_MODIFIED" | jq 'length' 2>/dev/null || echo 0)
-            TOTAL_CHANGED=$((ADDED_LEN + REMOVED_LEN + MODIFIED_LEN))
+            # fetch detailed stats and file count for the commit
+            STATS_JSON=$(gh api "repos/${{ github.repository }}/commits/$COMMIT_SHA" \
+              --jq '{files: (.files | length), additions: .stats.additions, deletions: .stats.deletions}' \
+              2>/dev/null || echo "")
             
-            # fetch detailed stats
-            COMMIT_STATS=$(gh api "repos/${{ github.repository }}/commits/$COMMIT_SHA" --jq '.stats' 2>/dev/null || echo '{"additions":0,"deletions":0}')
-            COMMIT_ADDITIONS=$(echo "$COMMIT_STATS" | jq '.additions')
-            COMMIT_DELETIONS=$(echo "$COMMIT_STATS" | jq '.deletions')
+            if [ -n "$STATS_JSON" ]; then
+              TOTAL_CHANGED=$(echo "$STATS_JSON" | jq '.files')
+              COMMIT_ADDITIONS=$(echo "$STATS_JSON" | jq '.additions')
+              COMMIT_DELETIONS=$(echo "$STATS_JSON" | jq '.deletions')
+            else
+              # fallback to payload data if API fails
+              ADDED_LEN=$(echo "$COMMIT_ADDED" | jq 'length' 2>/dev/null || echo 0)
+              REMOVED_LEN=$(echo "$COMMIT_REMOVED" | jq 'length' 2>/dev/null || echo 0)
+              MODIFIED_LEN=$(echo "$COMMIT_MODIFIED" | jq 'length' 2>/dev/null || echo 0)
+              TOTAL_CHANGED=$((ADDED_LEN + REMOVED_LEN + MODIFIED_LEN))
+              COMMIT_ADDITIONS="?"
+              COMMIT_DELETIONS="?"
+            fi
 
-            TEXT="✨ <b>New Commit:</b> $COMMIT_MSG"
+            TEXT="✨ <b>New Commit:</b> $SAFE_COMMIT_MSG"
             TEXT+=$'\n'
-            TEXT+=$'\n'"<b>Author:</b> $COMMIT_AUTHOR"
+            TEXT+=$'\n'"<b>Author:</b> $SAFE_COMMIT_AUTHOR"
             TEXT+=$'\n'"<b>Date:</b> $COMMIT_TIMESTAMP"
             TEXT+=$'\n'"<b>Diff:</b> $TOTAL_CHANGED file(s) (+$COMMIT_ADDITIONS -$COMMIT_DELETIONS)"
             TEXT+=$'\n'
