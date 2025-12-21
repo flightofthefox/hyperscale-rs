@@ -12,6 +12,10 @@ USE_GHCR=false
 ACCOUNTS_PER_SHARD=16000
 INITIAL_BALANCE=1000000
 LOG_LEVEL="info"
+MEMORY_LIMIT=""
+CPU_LIMIT=""
+LATENCY=0
+LATENCY_NODES=1
 
 # Subnet for the cluster
 SUBNET="172.99.0.0/16"
@@ -32,6 +36,10 @@ while [[ $# -gt 0 ]]; do
         --clean) CLEAN=true; shift ;;
         --build) BUILD="$2"; shift 2 ;;
         --use-ghcr-image) USE_GHCR=true; shift ;;
+        --memory) MEMORY_LIMIT="$2"; shift 2 ;;
+        --cpus) CPU_LIMIT="$2"; shift 2 ;;
+        --latency) LATENCY="$2"; shift 2 ;;
+        --latency-nodes) LATENCY_NODES="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -128,6 +136,30 @@ $GENESIS_VALIDATORS
 $SHARD_BALANCES
 EOF
 
+    # Prepare optional configuration
+    RESOURCE_OPTS=""
+    if [ -n "$MEMORY_LIMIT" ] || [ -n "$CPU_LIMIT" ]; then
+        RESOURCE_OPTS="    deploy:
+      resources:
+        limits:"
+        if [ -n "$MEMORY_LIMIT" ]; then RESOURCE_OPTS="$RESOURCE_OPTS
+          memory: $MEMORY_LIMIT"; fi
+        if [ -n "$CPU_LIMIT" ]; then RESOURCE_OPTS="$RESOURCE_OPTS
+          cpus: '$CPU_LIMIT'"; fi
+    fi
+
+    CAP_OPTS=""
+    USER_OPTS=""
+    if [ "$LATENCY" -gt 0 ] && [ "$i" -lt "$LATENCY_NODES" ]; then
+        CAP_OPTS="    cap_add:
+      - NET_ADMIN"
+        USER_OPTS="    user: root"
+        ENTRY_OPTS="    entrypoint: [\"/bin/bash\", \"-c\", \"tc qdisc add dev eth0 root netem delay ${LATENCY}ms && exec runuser -u hyperscalers -- /usr/local/bin/hyperscale-validator --config /home/hyperscalers/config.toml\"]"
+    else
+        ENTRY_OPTS="    entrypoint: [\"/usr/local/bin/hyperscale-validator\"]
+    command: [\"--config\", \"/home/hyperscalers/config.toml\"]"
+    fi
+
     cat >> "$COMPOSE_FILE" <<EOF
   validator-$i:
     image: $IMAGE_NAME
@@ -142,8 +174,10 @@ EOF
       - "$((BASE_P2P_PORT + i)):9000"
     volumes:
       - $NODE_DIR:/home/hyperscalers
-    entrypoint: ["/usr/local/bin/hyperscale-validator"]
-    command: ["--config", "/home/hyperscalers/config.toml"]
+$RESOURCE_OPTS
+$CAP_OPTS
+$USER_OPTS
+$ENTRY_OPTS
     environment:
       - RUST_LOG=warn,hyperscale=$LOG_LEVEL,libp2p_gossipsub=error
     healthcheck:
@@ -242,6 +276,14 @@ if $SPAM_BIN smoke-test \
     echo "------------------------------------------------------------------"
     echo "Success! Cluster is reaching consensus and producing blocks."
     echo "Grafana: http://localhost:3000"
+    echo ""
+    echo "To run the spammer manually:"
+    echo "./target/release/hyperscale-spammer run \\"
+    echo "    --endpoints \"$ENDPOINTS\" \\"
+    echo "    --num-shards \"$NUM_SHARDS\" \\"
+    echo "    --validators-per-shard \"$VALIDATORS_PER_SHARD\" \\"
+    echo "    --tps 150 \\"
+    echo "    --duration 60s --cross-shard-ratio 0 --measure-latency"
     echo "------------------------------------------------------------------"
 else
     echo "------------------------------------------------------------------"
