@@ -54,6 +54,11 @@ pub struct NodeStateMachine {
     /// Prevents a Byzantine leader from spamming headers to delay view changes.
     /// We only reset once per (height, round) from the leader.
     last_header_reset: Option<(u64, u64)>,
+
+    /// Whether we are currently syncing (catching up to the network).
+    /// View changes are suppressed while syncing since we're intentionally behind.
+    /// Set to true on SyncBlockReadyToApply, set to false on SyncComplete.
+    syncing: bool,
 }
 
 impl std::fmt::Debug for NodeStateMachine {
@@ -132,6 +137,7 @@ impl NodeStateMachine {
             now: Duration::ZERO,
             last_leader_activity: Duration::ZERO,
             last_header_reset: None,
+            syncing: false,
         }
     }
 
@@ -257,6 +263,11 @@ impl NodeStateMachine {
     /// Note: Header receipt only resets once per (height, round) to prevent
     /// a Byzantine leader from spamming headers to delay view changes.
     fn should_advance_round(&self) -> bool {
+        // Never trigger view changes while syncing - we're intentionally behind
+        // and catching up. This follows Tendermint/HotStuff best practices.
+        if self.syncing {
+            return false;
+        }
         let timeout = self.bft.config().view_change_timeout;
         self.now.saturating_sub(self.last_leader_activity) >= timeout
     }
@@ -706,12 +717,16 @@ impl StateMachine for NodeStateMachine {
             }
 
             Event::SyncBlockReadyToApply { block, qc } => {
+                // Mark that we're syncing - suppresses view changes during catch-up
+                self.syncing = true;
                 // Apply the synced block to BFT state
                 return self.bft.on_synced_block_ready(block.clone(), qc.clone());
             }
 
             Event::SyncComplete { height } => {
                 tracing::info!(height, "Sync complete, resuming normal consensus");
+                // Mark sync as complete - re-enables view changes
+                self.syncing = false;
                 // Reset round timeout since we've caught up
                 self.last_leader_activity = self.now;
             }
