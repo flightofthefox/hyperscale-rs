@@ -45,6 +45,9 @@ data/
 keys/
 cluster-data/
 .hyperscale-nonces.json
+bootstrap-data/
+distributed-cluster-data/
+docker-cluster-data/
 
 # Modelling
 tla/

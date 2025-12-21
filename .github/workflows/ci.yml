@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "**" ]
     tags: [ "v*" ]
   pull_request:
+    types: [opened, synchronize, reopened, closed]
     branches: [ "main" ]
 
 env:
@@ -25,7 +26,10 @@ jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: >
+      github.event_name == 'pull_request' || 
+      startsWith(github.ref, 'refs/tags/') || 
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -38,12 +42,11 @@ jobs:
   build:
     name: Build Docker Image
     runs-on: ubuntu-latest
-    needs: check
-    if: github.event_name != 'pull_request'
+    needs: test
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: read
       packages: write
-      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -54,11 +57,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3.5.0
-        with:
-          cosign-release: 'v2.2.4'
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3.0.0
@@ -107,11 +105,11 @@ jobs:
   merge:
     runs-on: ubuntu-latest
     needs: build
-    if: github.event_name != 'pull_request'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: read
       packages: write
-      id-token: write
+      id-token: write # required for cosign
     steps:
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.5.0
@@ -154,11 +152,9 @@ jobs:
       - name: Inspect image
         id: inspect
         run: |
-          # Parse the first tag from the newline-separated list
           FIRST_TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -n 1)
           docker buildx imagetools inspect ${FIRST_TAG}
-          # Capture the digest
-          DIGEST=$(docker buildx imagetools inspect ${FIRST_TAG} --format '{{.Manifest.Digest}}')
+          DIGEST=$(docker buildx imagetools inspect ${FIRST_TAG} | grep "^Digest:" | awk '{print $2}')
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
 
       - name: Sign the published Docker image
@@ -174,13 +170,130 @@ jobs:
 
   notify:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # permission for gh api
+    permissions:
+      contents: read 
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && (github.event.action == 'opened' || (github.event.action == 'closed' && github.event.pull_request.merged == true)))
     steps:
       - name: Send message to Telegram
         continue-on-error: true
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_USER_LOGIN: ${{ github.event.pull_request.user.login }}
+          PR_MERGER_LOGIN: ${{ github.event.pull_request.merged_by.login }}
+          PR_CREATED_AT: ${{ github.event.pull_request.created_at }}
+          PR_MERGED_AT: ${{ github.event.pull_request.merged_at }}
+          PR_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+          PR_ADDITIONS: ${{ github.event.pull_request.additions }}
+          PR_DELETIONS: ${{ github.event.pull_request.deletions }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          COMMIT_AUTHOR: ${{ github.event.head_commit.author.name }}
+          COMMIT_URL: ${{ github.event.head_commit.url }}
+          COMMIT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
+          # Using toJson for arrays is correct
+          COMMIT_ADDED: ${{ toJson(github.event.head_commit.added) }}
+          COMMIT_REMOVED: ${{ toJson(github.event.head_commit.removed) }}
+          COMMIT_MODIFIED: ${{ toJson(github.event.head_commit.modified) }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          MESSAGE="New commit from ${{ github.event.head_commit.author.name }}: ${{ github.event.head_commit.message }}"
-          curl -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" -d "chat_id=$CHANNEL_ID&text=$MESSAGE"
+          escape_html() {
+            local s="$1"
+            # escape HTML characters for Telegram
+            s="${s//&/&amp;}"
+            s="${s//</&lt;}"
+            s="${s//>/&gt;}"
+            s="${s//\"/&quot;}"
+            echo "$s"
+          }
+
+          get_gh_name() {
+            local login="$1"
+            # silence errors, fallback to login
+            gh api "users/$login" --jq '.name // .login' 2>/dev/null || echo "$login"
+          }
+
+          # sanitize inputs that might contain special chars
+          SAFE_PR_TITLE=$(escape_html "$PR_TITLE")
+          SAFE_COMMIT_MSG=$(escape_html "$COMMIT_MSG")
+          SAFE_COMMIT_AUTHOR=$(escape_html "$COMMIT_AUTHOR")
+
+          if [ "$EVENT_NAME" == "pull_request" ]; then
+            if [ "$EVENT_ACTION" == "closed" ] && [ "$PR_MERGED" == "true" ]; then
+              FRIENDLY_NAME=$(get_gh_name "$PR_MERGER_LOGIN")
+              SAFE_FRIENDLY_NAME=$(escape_html "$FRIENDLY_NAME")
+              
+              TEXT="🚀 <b>PR Merged:</b> $SAFE_PR_TITLE"
+              TEXT+=$'\n'
+              TEXT+=$'\n'"<b>By:</b> $SAFE_FRIENDLY_NAME"
+              TEXT+=$'\n'"<b>Date:</b> $PR_MERGED_AT"
+              TEXT+=$'\n'"<b>Diff:</b> $PR_CHANGED_FILES file(s) (+$PR_ADDITIONS -$PR_DELETIONS)"
+              TEXT+=$'\n'
+              TEXT+=$'\n'"<a href=\"$PR_URL\">View on GitHub</a>"
+            else
+              FRIENDLY_NAME=$(get_gh_name "$PR_USER_LOGIN")
+              SAFE_FRIENDLY_NAME=$(escape_html "$FRIENDLY_NAME")
+
+              TEXT="🔨 <b>New PR:</b> $SAFE_PR_TITLE"
+              TEXT+=$'\n'
+              TEXT+=$'\n'"<b>Author:</b> $SAFE_FRIENDLY_NAME"
+              TEXT+=$'\n'"<b>Date:</b> $PR_CREATED_AT"
+              TEXT+=$'\n'"<b>Diff:</b> $PR_CHANGED_FILES file(s) (+$PR_ADDITIONS -$PR_DELETIONS)"
+              TEXT+=$'\n'
+              TEXT+=$'\n'"<a href=\"$PR_URL\">View on GitHub</a>"
+            fi
+          else
+            # Push event
+
+            # commenting this out for now, otherwise PRs from forks get no notifications
+            
+            # if [[ "$COMMIT_MSG" == "Merge pull request"* ]] || [[ "$COMMIT_MSG" == "Merge branch"* ]]; then
+            #   echo "Merge commit detected, skipping."
+            #   exit 0
+            # fi
+            
+            # fetch detailed stats and file count for the commit
+            STATS_JSON=$(gh api "repos/${{ github.repository }}/commits/$COMMIT_SHA" \
+              --jq '{files: (.files | length), additions: .stats.additions, deletions: .stats.deletions}' \
+              2>/dev/null || echo "")
+            
+            if [ -n "$STATS_JSON" ]; then
+              TOTAL_CHANGED=$(echo "$STATS_JSON" | jq '.files')
+              COMMIT_ADDITIONS=$(echo "$STATS_JSON" | jq '.additions')
+              COMMIT_DELETIONS=$(echo "$STATS_JSON" | jq '.deletions')
+            else
+              # fallback to payload data if API fails
+              ADDED_LEN=$(echo "$COMMIT_ADDED" | jq 'length' 2>/dev/null || echo 0)
+              REMOVED_LEN=$(echo "$COMMIT_REMOVED" | jq 'length' 2>/dev/null || echo 0)
+              MODIFIED_LEN=$(echo "$COMMIT_MODIFIED" | jq 'length' 2>/dev/null || echo 0)
+              TOTAL_CHANGED=$((ADDED_LEN + REMOVED_LEN + MODIFIED_LEN))
+              COMMIT_ADDITIONS="?"
+              COMMIT_DELETIONS="?"
+            fi
+
+            TEXT="✨ <b>New Commit:</b> $SAFE_COMMIT_MSG"
+            TEXT+=$'\n'
+            TEXT+=$'\n'"<b>Author:</b> $SAFE_COMMIT_AUTHOR"
+            TEXT+=$'\n'"<b>Date:</b> $COMMIT_TIMESTAMP"
+            TEXT+=$'\n'"<b>Diff:</b> $TOTAL_CHANGED file(s) (+$COMMIT_ADDITIONS -$COMMIT_DELETIONS)"
+            TEXT+=$'\n'
+            TEXT+=$'\n'"<a href=\"$COMMIT_URL\">View on GitHub</a>"
+          fi
+
+          # safely create the payload for TG
+          jq -n \
+            --arg chat_id "$CHANNEL_ID" \
+            --arg text "$TEXT" \
+            '{"chat_id": $chat_id, "text": $text, "parse_mode": "HTML", "disable_web_page_preview": true}' > payload.json
+          
+          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
+            -H 'Content-Type: application/json' \
+            -d @payload.json

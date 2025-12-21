@@ -12,6 +12,10 @@ USE_GHCR=false
 ACCOUNTS_PER_SHARD=16000
 INITIAL_BALANCE=1000000
 LOG_LEVEL="info"
+MEMORY_LIMIT=""
+CPU_LIMIT=""
+LATENCY=0
+LATENCY_NODES=1
 
 # Subnet for the cluster
 SUBNET="172.99.0.0/16"
@@ -32,6 +36,31 @@ while [[ $# -gt 0 ]]; do
         --clean) CLEAN=true; shift ;;
         --build) BUILD="$2"; shift 2 ;;
         --use-ghcr-image) USE_GHCR=true; shift ;;
+        --memory) MEMORY_LIMIT="$2"; shift 2 ;;
+        --cpus) CPU_LIMIT="$2"; shift 2 ;;
+        --latency) LATENCY="$2"; shift 2 ;;
+        --latency) LATENCY="$2"; shift 2 ;;
+        --latency-nodes) LATENCY_NODES="$2"; shift 2 ;;
+        --help|-h)
+            echo "Usage: $0 [options]"
+            echo ""
+            echo "Options:"
+            echo "  --shards N               Number of shards (default: 1)"
+            echo "  --validators-per-shard M Validators per shard (default: 8)"
+            echo "  --accounts-per-shard N   Spammer accounts per shard (default: 16000)"
+            echo "  --initial-balance N      Initial XRD balance per account (default: 1000000)"
+            echo "  --clean                  Remove existing data directories"
+            echo "  --build true|false       Build docker image (default: true)"
+            echo "  --use-ghcr-image         Use pre-built image from GHCR"
+            echo ""
+            echo "Resource Limits & Network Simulation:"
+            echo "  --memory LIMIT           Memory limit per validator (e.g. 512m, 1g)"
+            echo "  --cpus LIMIT             CPU limit per validator (e.g. 0.5, 1.0)"
+            echo "  --latency MS             Artificial network latency in ms (e.g. 100)"
+            echo "  --latency-nodes N        Number of nodes to apply latency to, starting from 0 (default: 1)"
+            echo ""
+            exit 0
+            ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -116,6 +145,7 @@ data_dir = "/home/hyperscalers/data"
 [network]
 listen_addr = "/ip4/0.0.0.0/udp/9000/quic-v1"
 external_addr = "/ip4/$IP/udp/9000/quic-v1"
+upnp_enabled = false
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 tcp_fallback_port_range = "9000-9000"
 [consensus]
@@ -127,6 +157,30 @@ listen_addr = "0.0.0.0:8080"
 $GENESIS_VALIDATORS
 $SHARD_BALANCES
 EOF
+
+    # Prepare optional configuration
+    RESOURCE_OPTS=""
+    if [ -n "$MEMORY_LIMIT" ] || [ -n "$CPU_LIMIT" ]; then
+        RESOURCE_OPTS="    deploy:
+      resources:
+        limits:"
+        if [ -n "$MEMORY_LIMIT" ]; then RESOURCE_OPTS="$RESOURCE_OPTS
+          memory: $MEMORY_LIMIT"; fi
+        if [ -n "$CPU_LIMIT" ]; then RESOURCE_OPTS="$RESOURCE_OPTS
+          cpus: '$CPU_LIMIT'"; fi
+    fi
+
+    CAP_OPTS=""
+    USER_OPTS=""
+    if [ "$LATENCY" -gt 0 ] && [ "$i" -lt "$LATENCY_NODES" ]; then
+        CAP_OPTS="    cap_add:
+      - NET_ADMIN"
+        USER_OPTS="    user: root"
+        ENTRY_OPTS="    entrypoint: [\"/bin/bash\", \"-c\", \"tc qdisc add dev eth0 root netem delay ${LATENCY}ms && exec runuser -u hyperscalers -- /usr/local/bin/hyperscale-validator --config /home/hyperscalers/config.toml\"]"
+    else
+        ENTRY_OPTS="    entrypoint: [\"/usr/local/bin/hyperscale-validator\"]
+    command: [\"--config\", \"/home/hyperscalers/config.toml\"]"
+    fi
 
     cat >> "$COMPOSE_FILE" <<EOF
   validator-$i:
@@ -142,8 +196,10 @@ EOF
       - "$((BASE_P2P_PORT + i)):9000"
     volumes:
       - $NODE_DIR:/home/hyperscalers
-    entrypoint: ["/usr/local/bin/hyperscale-validator"]
-    command: ["--config", "/home/hyperscalers/config.toml"]
+$RESOURCE_OPTS
+$CAP_OPTS
+$USER_OPTS
+$ENTRY_OPTS
     environment:
       - RUST_LOG=warn,hyperscale=$LOG_LEVEL,libp2p_gossipsub=error
     healthcheck:
@@ -242,6 +298,14 @@ if $SPAM_BIN smoke-test \
     echo "------------------------------------------------------------------"
     echo "Success! Cluster is reaching consensus and producing blocks."
     echo "Grafana: http://localhost:3000"
+    echo ""
+    echo "To run the spammer manually:"
+    echo "./target/release/hyperscale-spammer run \\"
+    echo "    --endpoints \"$ENDPOINTS\" \\"
+    echo "    --num-shards \"$NUM_SHARDS\" \\"
+    echo "    --validators-per-shard \"$VALIDATORS_PER_SHARD\" \\"
+    echo "    --tps 150 \\"
+    echo "    --duration 60s --cross-shard-ratio 0 --measure-latency"
     echo "------------------------------------------------------------------"
 else
     echo "------------------------------------------------------------------"
