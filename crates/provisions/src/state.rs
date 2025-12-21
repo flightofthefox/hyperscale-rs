@@ -488,12 +488,13 @@ impl ProvisionCoordinator {
     pub fn build_commitment_proof(&self, tx_hash: &Hash) -> Option<CommitmentProof> {
         let by_shard = self.verified_provisions.get(tx_hash)?;
 
-        // Get the first shard that has provisions
-        let (source_shard, provisions) = by_shard.iter().next()?;
-
-        if provisions.is_empty() {
-            return None;
-        }
+        // Find a shard that has non-empty provisions.
+        // We can't just use .next() because HashMap iteration order is arbitrary,
+        // and some shards may have empty provision vectors. This must be consistent
+        // with has_any_verified_provisions() which checks if ANY shard has provisions.
+        let (source_shard, provisions) = by_shard
+            .iter()
+            .find(|(_, provisions)| !provisions.is_empty())?;
 
         // Get block height and entries from the first provision
         // All provisions for the same (tx, shard) should have same entries
