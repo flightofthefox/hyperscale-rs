@@ -39,7 +39,28 @@ while [[ $# -gt 0 ]]; do
         --memory) MEMORY_LIMIT="$2"; shift 2 ;;
         --cpus) CPU_LIMIT="$2"; shift 2 ;;
         --latency) LATENCY="$2"; shift 2 ;;
+        --latency) LATENCY="$2"; shift 2 ;;
         --latency-nodes) LATENCY_NODES="$2"; shift 2 ;;
+        --help|-h)
+            echo "Usage: $0 [options]"
+            echo ""
+            echo "Options:"
+            echo "  --shards N               Number of shards (default: 1)"
+            echo "  --validators-per-shard M Validators per shard (default: 8)"
+            echo "  --accounts-per-shard N   Spammer accounts per shard (default: 16000)"
+            echo "  --initial-balance N      Initial XRD balance per account (default: 1000000)"
+            echo "  --clean                  Remove existing data directories"
+            echo "  --build true|false       Build docker image (default: true)"
+            echo "  --use-ghcr-image         Use pre-built image from GHCR"
+            echo ""
+            echo "Resource Limits & Network Simulation:"
+            echo "  --memory LIMIT           Memory limit per validator (e.g. 512m, 1g)"
+            echo "  --cpus LIMIT             CPU limit per validator (e.g. 0.5, 1.0)"
+            echo "  --latency MS             Artificial network latency in ms (e.g. 100)"
+            echo "  --latency-nodes N        Number of nodes to apply latency to, starting from 0 (default: 1)"
+            echo ""
+            exit 0
+            ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done

@@ -83,6 +83,18 @@ The `launch-docker-compose.sh` script launches a full cluster inside Docker cont
 - `--use-ghcr-image`: Use the latest pre-built image from GHCR instead of building locally.
 - `--shards <N>`: Number of shards (default: 1)
 - `--validators-per-shard <M>`: Validators per shard (default: 8)
+- `--memory <limit>`: Memory limit per validator (e.g. `1g`, `512m`)
+- `--cpus <limit>`: CPU limit per validator (e.g. `0.5`)
+- `--latency <ms>`: Artificial network latency per validator
+- `--latency-nodes <N>`: Number of nodes to apply latency to (default: 1)
+
+### Stopping the Cluster
+
+To stop the Docker cluster and remove volumes:
+
+```bash
+./scripts/stop-docker-compose.sh
+```
 
 ### Running Load Tests (Spammer)
 
