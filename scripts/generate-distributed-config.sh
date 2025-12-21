@@ -3,27 +3,32 @@
 # Generate configuration for a distributed hyperscale cluster.
 #
 # Usage:
-#   ./scripts/generate-distributed-config.sh --nodes "IP1,IP2,IP3..." [--out-dir DIR]
+#   ./scripts/generate-distributed-config.sh --hosts "IP1,IP2..." [--nodes-per-host N] [--out-dir DIR]
 #
 # Examples:
-#   ./scripts/generate-distributed-config.sh --nodes "192.168.1.10,192.168.1.11"
+#   ./scripts/generate-distributed-config.sh --hosts "192.168.1.10,192.168.1.11" --nodes-per-host 2
 #
 
 set -e
 
 # Default configuration
-NODES=""
+HOSTS=""
 OUT_DIR="./distributed-cluster-data"
 BASE_PORT=9000
 TCP_BASE_PORT=30500
 RPC_BASE_PORT=8080
 NUM_SHARDS=1 # Simplification for now: 1 shard for N nodes
 CLEAN=false
+NODES_PER_HOST=1
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --nodes)
-            NODES="$2"
+        --hosts)
+            HOSTS="$2"
+            shift 2
+            ;;
+        --nodes) # Deprecated alias for back-compat or user muscle memory, mapping to HOSTS
+            HOSTS="$2"
             shift 2
             ;;
         --out-dir)
@@ -34,8 +39,16 @@ while [[ $# -gt 0 ]]; do
             CLEAN=true
             shift
             ;;
+        --nodes-per-host)
+            NODES_PER_HOST="$2"
+            shift 2
+            ;;
+        --validators-per-node) # Deprecated alias
+            NODES_PER_HOST="$2"
+            shift 2
+            ;;
         --help|-h)
-            echo "Usage: $0 --nodes \"IP1,IP2...\" [--out-dir DIR] [--clean]"
+            echo "Usage: $0 --hosts \"IP1,IP2...\" [--nodes-per-host N] [--out-dir DIR] [--clean]"
             exit 0
             ;;
         *)
@@ -45,18 +58,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ -z "$NODES" ]; then
-    echo "ERROR: --nodes argument is required (comma-separated IPs)"
+if [ -z "$HOSTS" ]; then
+    echo "ERROR: --hosts argument is required (comma-separated IPs)"
     exit 1
 fi
 
-# Split nodes into array
-IFS=',' read -r -a NODE_IPS <<< "$NODES"
-TOTAL_VALIDATORS=${#NODE_IPS[@]}
+# Split hosts into array
+IFS=',' read -r -a HOST_IPS <<< "$HOSTS"
+NUM_HOSTS=${#HOST_IPS[@]}
+TOTAL_NODES=$((NUM_HOSTS * NODES_PER_HOST))
 
 echo "=== Generating Distributed Cluster Config ==="
-echo "Nodes: ${NODE_IPS[*]}"
-echo "Total Validators: $TOTAL_VALIDATORS"
+echo "Hosts: ${HOST_IPS[*]}"
+echo "Nodes per Host: $NODES_PER_HOST"
+echo "Total Nodes (Validators): $TOTAL_NODES"
 echo "Output Directory: $OUT_DIR"
 echo "Clean: $CLEAN"
 echo ""
@@ -81,27 +96,47 @@ mkdir -p "$OUT_DIR"
 echo "Generating keys..."
 declare -a PUBLIC_KEYS
 declare -a PEER_IDS
-declare -a KEY_FILES
 
-for i in "${!NODE_IPS[@]}"; do
-    NODE_DIR="$OUT_DIR/node-$i"
-    mkdir -p "$NODE_DIR"
-    KEY_FILE="$NODE_DIR/signing.key"
+# Flattened list of nodes for easier iterating later
+# Structure: NODE_HOST_IPS[id] = IP, NODE_P2P_PORTS[id] = BASE_PORT + offset
+declare -a NODE_HOST_IPS
+declare -a NODE_P2P_PORTS
+
+for i in "${!HOST_IPS[@]}"; do
+    IP="${HOST_IPS[$i]}"
+    HOST_DIR="$OUT_DIR/host-$i"
+    mkdir -p "$HOST_DIR"
     
-    # Deterministic seed for reproducibility
-    SEED_HEX=$(printf '%064x' $((99999 + i)))
-    echo "$SEED_HEX" | xxd -r -p > "$KEY_FILE"
-    
-    # Keygen now outputs: PUBKEY_HEX PEER_ID
-    OUTPUT=$("$KEYGEN_BIN" "$SEED_HEX")
-    PUBLIC_KEYS[$i]=$(echo "$OUTPUT" | cut -d' ' -f1)
-    PEER_IDS[$i]=$(echo "$OUTPUT" | cut -d' ' -f2)
-    
-    echo "  Node $i (${NODE_IPS[$i]}): ${PUBLIC_KEYS[$i]:0:16}... PeerID: ${PEER_IDS[$i]}"
+    for v in $(seq 0 $((NODES_PER_HOST - 1))); do
+        # Global node ID
+        NODE_ID=$((i * NODES_PER_HOST + v))
+        NODE_DIR="$HOST_DIR/node-$v"
+        mkdir -p "$NODE_DIR"
+        
+        KEY_FILE="$NODE_DIR/signing.key"
+        
+        # Deterministic seed for reproducibility (99999 + NODE_ID)
+        SEED_HEX=$(printf '%064x' $((99999 + NODE_ID)))
+        echo "$SEED_HEX" | xxd -r -p > "$KEY_FILE"
+        
+        # Keygen outputs: PUBKEY_HEX PEER_ID
+        OUTPUT=$("$KEYGEN_BIN" "$SEED_HEX")
+        PUBKEY=$(echo "$OUTPUT" | cut -d' ' -f1)
+        PEER_ID=$(echo "$OUTPUT" | cut -d' ' -f2)
+        
+        PUBLIC_KEYS[$NODE_ID]=$PUBKEY
+        PEER_IDS[$NODE_ID]=$PEER_ID
+        
+        NODE_HOST_IPS[$NODE_ID]=$IP
+        
+        # Calculate ports: offset by local index
+        NODE_P2P_PORTS[$NODE_ID]=$((BASE_PORT + v))
+        
+        echo "  Host $i ($IP) Node $v (Global ID $NODE_ID): ${PUBKEY:0:16}... PeerID: $PEER_ID"
+    done
 done
 
 # 2. Build Genesis Balances for Spammer (using spammer tool)
-# In distributed setup with 1 shard, we generate for shard 0.
 ACCOUNTS_PER_SHARD=16000
 INITIAL_BALANCE=1000000
 
@@ -118,60 +153,71 @@ done
 
 # 3. Build Genesis Validator Set
 GENESIS_VALIDATORS=""
-for i in "${!NODE_IPS[@]}"; do
+for id in $(seq 0 $((TOTAL_NODES - 1))); do
     if [ -n "$GENESIS_VALIDATORS" ]; then
         GENESIS_VALIDATORS="$GENESIS_VALIDATORS
 "
     fi
     GENESIS_VALIDATORS="$GENESIS_VALIDATORS[[genesis.validators]]
-id = $i
+id = $id
 shard = 0
-public_key = \"${PUBLIC_KEYS[$i]}\"
+public_key = \"${PUBLIC_KEYS[$id]}\"
 voting_power = 1"
 done
 
-# 4. Build Bootstrap Peer List (All nodes point to all other nodes ideally, or at least Node 0)
-# Here we add ALL nodes as bootstrap peers for robustness, using their public IPs.
+# 4. Build Bootstrap Peer List
 BOOTSTRAP_PEERS=""
-for i in "${!NODE_IPS[@]}"; do
-    IP="${NODE_IPS[$i]}"
-    PID="${PEER_IDS[$i]}"
-    # Each node listens on BASE_PORT (QUIC) and TCP_BASE_PORT (TCP)
-    # Since these are distinct machines, they can all use the same port numbers locally!
-    # But for the bootstrap list, we use their PUBLIC IPs.
+for id in $(seq 0 $((TOTAL_NODES - 1))); do
+    IP="${NODE_HOST_IPS[$id]}"
+    PID="${PEER_IDS[$id]}"
+    PORT="${NODE_P2P_PORTS[$id]}"
+    
     if [ -n "$BOOTSTRAP_PEERS" ]; then BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS,"; fi
     
-    # IMPORTANT: Include Peer ID in the multiaddr to ensure connectivity
-    # QUIC-only bootstrap peers as requested
-    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/$IP/udp/$BASE_PORT/quic-v1/p2p/$PID\""
+    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/$IP/udp/$PORT/quic-v1/p2p/$PID\""
 done
 
 # 5. Generate Config Files
 echo "Generating config files..."
-for i in "${!NODE_IPS[@]}"; do
-    NODE_DIR="$OUT_DIR/node-$i"
-    CONFIG_FILE="$NODE_DIR/config.toml"
-    IP="${NODE_IPS[$i]}"
+# Generate Prometheus targets string
+PROM_TARGETS=""
+
+for i in "${!HOST_IPS[@]}"; do
+    IP="${HOST_IPS[$i]}"
+    HOST_DIR="$OUT_DIR/host-$i"
     
-    # We use standard ports for the local bind since each is on a dedicated machine/VM
-    
-    cat > "$CONFIG_FILE" << EOF
+    for v in $(seq 0 $((NODES_PER_HOST - 1))); do
+        NODE_ID=$((i * NODES_PER_HOST + v))
+        NODE_DIR="$HOST_DIR/node-$v"
+        CONFIG_FILE="$NODE_DIR/config.toml"
+        
+        P2P_PORT=$((BASE_PORT + v))
+        TCP_PORT=$((TCP_BASE_PORT + v))
+        RPC_PORT=$((RPC_BASE_PORT + v))
+        
+        # Add to prometheus targets
+        if [ -n "$PROM_TARGETS" ]; then PROM_TARGETS="$PROM_TARGETS, "; fi
+        PROM_TARGETS="$PROM_TARGETS'$IP:$RPC_PORT'"
+        
+        cat > "$CONFIG_FILE" << EOF
 # Distributed Node Configuration
-# Node ID: $i
+# Host ID: $i
+# Local Node Index: $v
+# Global Validator (Node) ID: $NODE_ID
 # Public IP: $IP
 
 [node]
-validator_id = $i
+validator_id = $NODE_ID
 shard = 0
 num_shards = 1
-key_path = "./distributed-cluster-data/node-$i/signing.key"
-data_dir = "./distributed-cluster-data/node-$i/data"
+key_path = "./distributed-cluster-data/host-$i/node-$v/signing.key"
+data_dir = "./distributed-cluster-data/host-$i/node-$v/data"
 
 [network]
 # bind to all interfaces
-listen_addr = "/ip4/0.0.0.0/udp/$BASE_PORT/quic-v1"
+listen_addr = "/ip4/0.0.0.0/udp/$P2P_PORT/quic-v1"
 tcp_fallback_enabled = false
-tcp_fallback_port = $TCP_BASE_PORT
+tcp_fallback_port = $TCP_PORT
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 upnp_enabled = false
 request_timeout_ms = 500
@@ -184,7 +230,7 @@ view_change_timeout_ms = 3000
 
 [metrics]
 enabled = true
-listen_addr = "0.0.0.0:$RPC_BASE_PORT"
+listen_addr = "0.0.0.0:$RPC_PORT"
 
 [telemetry]
 enabled = false
@@ -193,22 +239,13 @@ $GENESIS_VALIDATORS
 
 ${SHARD_GENESIS_BALANCES[0]}
 EOF
-    echo "  Generated config for Node $i"
+        echo "  Generated config for Host $i ($IP) Node $v (Port $RPC_PORT)"
+    done
 done
 
-# 5. Generate Prometheus Configuration
+# 6. Generate Prometheus Configuration
 PROMETHEUS_CONFIG="$OUT_DIR/prometheus.yml"
 echo "Generating monitoring config at $PROMETHEUS_CONFIG..."
-
-# Build targets list
-PROM_TARGETS=""
-for i in "${!NODE_IPS[@]}"; do
-    IP="${NODE_IPS[$i]}"
-    if [ -n "$PROM_TARGETS" ]; then
-        PROM_TARGETS="$PROM_TARGETS, "
-    fi
-    PROM_TARGETS="$PROM_TARGETS'$IP:8080'"
-done
 
 cat > "$PROMETHEUS_CONFIG" << EOF
 global:
@@ -224,14 +261,20 @@ scrape_configs:
           cluster: 'distributed'
           shard: '0'
 EOF
+
 echo "=== Generation Complete ==="
 echo "Artifacts are in '$OUT_DIR'."
 echo ""
 echo "Deployment Instructions:"
-for i in "${!NODE_IPS[@]}"; do
-    IP="${NODE_IPS[$i]}"
-    echo "  Machine $IP:"
-    echo "    1. Copy '$OUT_DIR/node-$i' to the machine."
-    echo "    2. Copy 'target/release/hyperscale-validator' to the machine."
-    echo "    3. Run: ./hyperscale-validator --config node-$i/config.toml"
+for i in "${!HOST_IPS[@]}"; do
+    IP="${HOST_IPS[$i]}"
+    echo "  Host $IP (ID $i):"
+    echo "    1. Copy config dir:"
+    echo "       scp -r $OUT_DIR/host-$i $IP:~/git/hyperscale-rs/distributed-cluster-data/"
+    echo "    2. Copy binary:"
+    echo "       scp target/release/hyperscale-validator $IP:~/git/hyperscale-rs/"
+    echo "    3. Run nodes:"
+    for v in $(seq 0 $((NODES_PER_HOST - 1))); do
+        echo "       ./hyperscale-validator --config distributed-cluster-data/host-$i/node-$v/config.toml &"
+    done
 done
