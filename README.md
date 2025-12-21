@@ -31,6 +31,59 @@ Rust implementation of Hyperscale consensus protocol.
 | `hyperscale-production` | Production runner: libp2p networking, RocksDB storage, thread pools |
 | `hyperscale-spammer` | Transaction spammer CLI and library for load testing |
 
+## Prerequisites
+
+### 1. Install Rust
+Install Rust using [rustup](https://rustup.rs/):
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+### 2. Install Build Dependencies
+
+You will need `clang`, `lld`, `protobuf`, and `openssl`.
+
+#### macOS
+```bash
+brew install llvm protobuf openssl pkg-config
+```
+
+#### Linux (Ubuntu/Debian)
+```bash
+sudo apt-get update && sudo apt-get install -y \
+    clang \
+    lld \
+    pkg-config \
+    protobuf-compiler \
+    git \
+    build-essential \
+    libssl-dev \
+    libc6-dev
+```
+
+#### Windows
+1.  Install [Rust](https://rustup.rs/).
+2.  Install [LLVM](https://releases.llvm.org/download.html).
+3.  Install [Protoc](https://github.com/protocolbuffers/protobuf/releases).
+4.  Ensure `clang` and `protoc` are in your `PATH`.
+
+### 3. Install Docker (Optional)
+
+Required only if you plan to run the `launch-docker-compose.sh` script or use the provided `Dockerfile`.
+
+#### macOS & Windows
+Recommended: [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [Rancher Desktop](https://rancherdesktop.io/).
+
+#### Linux
+Install the Docker Engine and Docker Compose plugin:
+[Install on Ubuntu](https://docs.docker.com/engine/install/ubuntu/) | [Install on Debian](https://docs.docker.com/engine/install/debian/) | [Install on Fedora](https://docs.docker.com/engine/install/fedora/)
+
+Ensure your user is in the `docker` group to run commands without `sudo`:
+```bash
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
 ## Building
 
 ```bash
