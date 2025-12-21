@@ -952,6 +952,24 @@ impl BftState {
         if !header.parent_qc.is_genesis() {
             let parent_height = header.parent_qc.height.0;
 
+            // IMPORTANT: Update latest_qc from the header BEFORE checking if we need sync.
+            // This ensures that even when we return early for sync, our latest_qc reflects
+            // the highest QC we've seen from the network. Without this, a validator that
+            // falls behind would have a stale latest_qc and sync to outdated targets.
+            let should_update_qc = self
+                .latest_qc
+                .as_ref()
+                .is_none_or(|existing| header.parent_qc.height.0 > existing.height.0);
+            if should_update_qc {
+                debug!(
+                    validator = ?self.validator_id(),
+                    qc_height = header.parent_qc.height.0,
+                    "Updated latest_qc from received block header (before sync check)"
+                );
+                self.latest_qc = Some(header.parent_qc.clone());
+                self.maybe_unlock_for_qc(&header.parent_qc);
+            }
+
             // Check if we have the parent block in any form
             if !self.has_block_at_height(parent_height) {
                 let target_height = parent_height;
@@ -1015,27 +1033,6 @@ impl BftState {
         // Store pending block with creation timestamp for stale detection
         self.pending_blocks.insert(block_hash, pending);
         self.pending_block_created_at.insert(block_hash, self.now);
-
-        // Update our latest_qc from the received header's parent_qc
-        // This is how QCs propagate through the network - via block proposals
-        if !header.parent_qc.is_genesis() {
-            let should_update = self
-                .latest_qc
-                .as_ref()
-                .is_none_or(|existing| header.parent_qc.height.0 > existing.height.0);
-            if should_update {
-                debug!(
-                    validator = ?self.validator_id(),
-                    qc_height = header.parent_qc.height.0,
-                    "Updated latest_qc from received block header"
-                );
-                self.latest_qc = Some(header.parent_qc.clone());
-
-                // HotStuff-2 unlock: when we see a higher QC, we can safely unlock
-                // our vote locks at or below that QC's height
-                self.maybe_unlock_for_qc(&header.parent_qc);
-            }
-        }
 
         // Check if we have buffered votes for this block that can now form a QC
         // (Votes may arrive before the header due to network timing)
