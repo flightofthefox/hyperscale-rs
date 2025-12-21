@@ -904,8 +904,16 @@ impl Libp2pAdapter {
                 }
 
                 // Handle commands from adapter methods
+                // Drain all pending commands to ensure responses are sent promptly.
+                // Response commands (SendCertificateResponse, etc.) are time-critical
+                // as they unblock other validators waiting for data.
                 Some(cmd) = command_rx.recv() => {
                     Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_response_channels).await;
+
+                    // Drain any additional pending commands
+                    while let Ok(cmd) = command_rx.try_recv() {
+                        Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_response_channels).await;
+                    }
                 }
 
                 // Handle swarm events
