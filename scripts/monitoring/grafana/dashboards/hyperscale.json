@@ -494,7 +494,7 @@
           "refId": "A"
         }
       ],
-      "title": "Cross-Shard In-Flight (avg)",
+      "title": "Execution In-Flight (avg)",
       "type": "stat"
     },
     {
