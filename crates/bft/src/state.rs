@@ -3335,37 +3335,25 @@ impl BftState {
             }
         }
 
-        // No QC for this block - safe to give up and let sync handle it
-        if let Some(pending) = self.pending_blocks.remove(&block_hash) {
+        // No QC for this block yet - don't remove it, just stop actively fetching.
+        // The block might still complete via:
+        // 1. StateCertificate gossip → local TransactionCertificate creation
+        // 2. Later fetches triggered by cleanup timer
+        // 3. Certificates arriving from other sources
+        //
+        // The stale_pending_block_timeout will clean up truly dead blocks later.
+        if let Some(pending) = self.pending_blocks.get(&block_hash) {
             let height = pending.header().height.0;
-            warn!(
+            debug!(
                 validator = ?self.validator_id(),
                 block_hash = ?block_hash,
                 height = height,
                 missing_txs = pending.missing_transaction_count(),
                 missing_certs = pending.missing_certificate_count(),
-                "Removing pending block due to permanent fetch failure"
-            );
-            self.pending_block_created_at.remove(&block_hash);
-        }
-
-        // Also clean up any buffered commit that was waiting for this block's data.
-        // Without this, the entry would stay in pending_commits_awaiting_data forever
-        // since the block will never complete.
-        if self
-            .pending_commits_awaiting_data
-            .remove(&block_hash)
-            .is_some()
-        {
-            debug!(
-                validator = ?self.validator_id(),
-                block_hash = ?block_hash,
-                "Removed buffered commit awaiting data for failed fetch"
+                "Fetch failed but keeping pending block - may complete via gossip/local creation"
             );
         }
 
-        // Sync will be triggered by check_sync_health() when it detects we can't
-        // make progress (next block to commit is missing or incomplete)
         vec![]
     }
 
