@@ -519,8 +519,8 @@ impl FetchManager {
         // Process any completed fetch results
         self.process_results().await;
 
-        // Clean up stale fetches
-        self.cleanup_stale();
+        // Clean up stale fetches (and notify BFT of failures)
+        self.cleanup_stale().await;
 
         // Process pending queue - spawn new fetches
         self.process_pending_queue().await;
@@ -1184,24 +1184,61 @@ impl FetchManager {
     }
 
     /// Clean up stale fetches (that have been pending too long).
-    fn cleanup_stale(&mut self) {
+    ///
+    /// Sends failure events to BFT for any stale fetches so blocks don't get
+    /// stuck in pending state indefinitely.
+    async fn cleanup_stale(&mut self) {
         let stale_timeout = self.config.stale_fetch_timeout;
 
-        self.tx_fetches.retain(|hash, state| {
-            let stale = state.is_stale(stale_timeout);
-            if stale {
-                warn!(?hash, "Cleaning up stale transaction fetch");
-            }
-            !stale
-        });
+        // Collect stale transaction fetches
+        let stale_tx_hashes: Vec<Hash> = self
+            .tx_fetches
+            .iter()
+            .filter(|(_, state)| state.is_stale(stale_timeout))
+            .map(|(hash, _)| *hash)
+            .collect();
 
-        self.cert_fetches.retain(|hash, state| {
-            let stale = state.is_stale(stale_timeout);
-            if stale {
-                warn!(?hash, "Cleaning up stale certificate fetch");
+        // Remove and notify for each stale transaction fetch
+        for hash in stale_tx_hashes {
+            if let Some(state) = self.tx_fetches.remove(&hash) {
+                warn!(
+                    ?hash,
+                    missing = state.missing_hashes.len(),
+                    age_secs = state.created.elapsed().as_secs(),
+                    "Cleaning up stale transaction fetch - notifying BFT"
+                );
+                // Notify BFT so it can handle the failure (e.g., remove pending block)
+                let event = Event::TransactionFetchFailed { block_hash: hash };
+                if let Err(e) = self.event_tx.send(event).await {
+                    warn!(?hash, error = ?e, "Failed to send TransactionFetchFailed for stale fetch");
+                }
             }
-            !stale
-        });
+        }
+
+        // Collect stale certificate fetches
+        let stale_cert_hashes: Vec<Hash> = self
+            .cert_fetches
+            .iter()
+            .filter(|(_, state)| state.is_stale(stale_timeout))
+            .map(|(hash, _)| *hash)
+            .collect();
+
+        // Remove and notify for each stale certificate fetch
+        for hash in stale_cert_hashes {
+            if let Some(state) = self.cert_fetches.remove(&hash) {
+                warn!(
+                    ?hash,
+                    missing = state.missing_hashes.len(),
+                    age_secs = state.created.elapsed().as_secs(),
+                    "Cleaning up stale certificate fetch - notifying BFT"
+                );
+                // Notify BFT so it can handle the failure
+                let event = Event::CertificateFetchFailed { block_hash: hash };
+                if let Err(e) = self.event_tx.send(event).await {
+                    warn!(?hash, error = ?e, "Failed to send CertificateFetchFailed for stale fetch");
+                }
+            }
+        }
     }
 }
 
