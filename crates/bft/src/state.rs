@@ -6895,8 +6895,10 @@ mod tests {
         let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
 
         // Create config with smaller limit
-        let mut config = BftConfig::default();
-        config.pipeline_backpressure_limit = 5;
+        let config = BftConfig {
+            pipeline_backpressure_limit: 5,
+            ..BftConfig::default()
+        };
 
         let mut state = BftState::new(
             0,
