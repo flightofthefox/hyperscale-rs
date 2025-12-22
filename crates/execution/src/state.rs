@@ -458,21 +458,21 @@ impl ExecutionState {
             if let Some(result) = self.take_speculative_result(&tx_hash) {
                 // Speculation completed - use cached result
                 self.speculative_in_flight_txs.remove(&tx_hash);
-                tracing::info!(
+                tracing::debug!(
                     tx_hash = ?tx_hash,
                     "SPECULATIVE HIT: Using cached speculative result"
                 );
                 speculative_hits.push((tx, result));
             } else if self.speculative_in_flight_txs.contains(&tx_hash) {
                 // Speculation still in-flight - wait for it instead of double-executing
-                tracing::info!(
+                tracing::debug!(
                     tx_hash = ?tx_hash,
                     "SPECULATIVE WAIT: Commit arrived before speculation complete, waiting"
                 );
                 awaiting_speculation.push(tx);
             } else {
                 // No speculation at all - execute normally
-                tracing::info!(
+                tracing::debug!(
                     tx_hash = ?tx_hash,
                     speculative_results_count = self.speculative_results.len(),
                     in_flight_txs = self.speculative_in_flight_txs.len(),
@@ -2019,7 +2019,7 @@ impl ExecutionState {
                 self.committed_awaiting_speculation.remove(&tx_hash)
             {
                 // Block already committed - use result immediately
-                tracing::info!(
+                tracing::debug!(
                     tx_hash = ?tx_hash,
                     committed_block_hash = ?committed_block_hash,
                     "SPECULATIVE LATE HIT: Using speculative result for already-committed tx"
