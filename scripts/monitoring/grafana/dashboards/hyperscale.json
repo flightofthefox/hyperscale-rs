@@ -230,7 +230,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m]))) + (sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m]))) or vector(0)) / 2",
+          "expr": "sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m])) + (sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m])) or vector(0))",
           "refId": "A"
         }
       ],
@@ -757,20 +757,20 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m])))",
+          "expr": "sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m]))",
           "legendFormat": "Single-shard",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "(sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m]))) or vector(0)) / 2",
-          "legendFormat": "Cross-shard (unique)",
+          "expr": "(sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m])) or vector(0))",
+          "legendFormat": "Cross-shard",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m]))) + (sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m]))) or vector(0)) / 2",
-          "legendFormat": "Total (unique)",
+          "expr": "sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m])) + (sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m])) or vector(0))",
+          "legendFormat": "Total",
           "refId": "C"
         }
       ],
