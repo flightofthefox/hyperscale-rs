@@ -563,7 +563,9 @@ impl ExecutionState {
         let cert_tracker = CertificateTracker::new(tx_hash, participating_shards);
         self.certificate_trackers.insert(tx_hash, cert_tracker);
 
-        // Step 3: Replay any early votes that arrived before tracking started
+        // Step 3: Replay any early votes that arrived before tracking started.
+        // IMPORTANT: We must go through on_vote() to ensure proper signature verification.
+        // Early votes were buffered without verification, so they need to be verified now.
         if let Some(early) = self.early_votes.remove(&tx_hash) {
             tracing::debug!(
                 tx_hash = ?tx_hash,
@@ -571,11 +573,14 @@ impl ExecutionState {
                 "Replaying early votes for single-shard tx"
             );
             for vote in early {
-                actions.extend(self.handle_vote_internal(vote));
+                // Use on_vote() to ensure signature verification happens
+                actions.extend(self.on_vote(vote));
             }
         }
 
-        // Step 4: Replay any early certificates (shouldn't happen often for single-shard)
+        // Step 4: Replay any early certificates (shouldn't happen often for single-shard).
+        // IMPORTANT: We must go through on_certificate() to ensure proper signature verification.
+        // Early certificates were buffered without verification, so they need to be verified now.
         if let Some(early) = self.early_certificates.remove(&tx_hash) {
             tracing::debug!(
                 tx_hash = ?tx_hash,
@@ -583,7 +588,8 @@ impl ExecutionState {
                 "Replaying early certificates for single-shard tx"
             );
             for cert in early {
-                actions.extend(self.handle_certificate_internal(cert));
+                // Use on_certificate() to ensure signature verification happens
+                actions.extend(self.on_certificate(cert));
             }
         }
 
@@ -679,19 +685,25 @@ impl ExecutionState {
         let cert_tracker = CertificateTracker::new(tx_hash, participating_shards.clone());
         self.certificate_trackers.insert(tx_hash, cert_tracker);
 
-        // Replay any early votes
+        // Replay any early votes.
+        // IMPORTANT: We must go through on_vote() to ensure proper signature verification.
+        // Early votes were buffered without verification, so they need to be verified now.
         if let Some(early) = self.early_votes.remove(&tx_hash) {
             tracing::debug!(tx_hash = ?tx_hash, count = early.len(), "Replaying early votes");
             for vote in early {
-                actions.extend(self.handle_vote_internal(vote));
+                // Use on_vote() to ensure signature verification happens
+                actions.extend(self.on_vote(vote));
             }
         }
 
-        // Replay any early certificates
+        // Replay any early certificates.
+        // IMPORTANT: We must go through on_certificate() to ensure proper signature verification.
+        // Early certificates were buffered without verification, so they need to be verified now.
         if let Some(early) = self.early_certificates.remove(&tx_hash) {
             tracing::debug!(tx_hash = ?tx_hash, count = early.len(), "Replaying early certificates");
             for cert in early {
-                actions.extend(self.handle_certificate_internal(cert));
+                // Use on_certificate() to ensure signature verification happens
+                actions.extend(self.on_certificate(cert));
             }
         }
 
