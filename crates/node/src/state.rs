@@ -211,6 +211,11 @@ impl NodeStateMachine {
         // Clean up expired tombstones in livelock state
         self.livelock.cleanup();
 
+        // Check pending blocks that need fetch requests.
+        // We delay fetching to give gossip and local certificate creation
+        // time to fill in missing data first.
+        actions.extend(self.bft.check_pending_block_fetches());
+
         // Clean up stale incomplete pending blocks in BFT state.
         // This prevents nodes from getting stuck when transaction/certificate
         // fetches fail permanently (e.g., proposer offline).

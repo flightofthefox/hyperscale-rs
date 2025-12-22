@@ -1118,42 +1118,24 @@ impl BftState {
             return actions;
         }
 
-        // Block not complete yet - request missing data immediately
-        // The runner handles retries; BFT just requests what it needs
+        // Block not complete yet - don't fetch immediately!
+        // Wait for the configured timeout to give gossip/local creation a chance.
+        // The cleanup timer calls check_pending_block_fetches() periodically to
+        // emit fetch requests for blocks that have been waiting long enough.
+        //
+        // This reduces unnecessary network traffic:
+        // - Transactions often arrive via gossip before we need to fetch
+        // - Certificates can be created locally from state certificates
         if let Some(pending) = self.pending_blocks.get(&block_hash) {
-            let proposer = pending.header().proposer;
-
-            // Request missing transactions
-            let missing_txs = pending.missing_transactions();
-            if !missing_txs.is_empty() {
-                debug!(
-                    validator = ?self.validator_id(),
-                    block_hash = ?block_hash,
-                    missing_tx_count = missing_txs.len(),
-                    "Requesting missing transactions for incomplete block"
-                );
-                actions.push(Action::FetchTransactions {
-                    block_hash,
-                    proposer,
-                    tx_hashes: missing_txs,
-                });
-            }
-
-            // Request missing certificates
-            let missing_certs = pending.missing_certificates();
-            if !missing_certs.is_empty() {
-                debug!(
-                    validator = ?self.validator_id(),
-                    block_hash = ?block_hash,
-                    missing_cert_count = missing_certs.len(),
-                    "Requesting missing certificates for incomplete block"
-                );
-                actions.push(Action::FetchCertificates {
-                    block_hash,
-                    proposer,
-                    cert_hashes: missing_certs,
-                });
-            }
+            debug!(
+                validator = ?self.validator_id(),
+                block_hash = ?block_hash,
+                missing_txs = pending.missing_transaction_count(),
+                missing_certs = pending.missing_certificate_count(),
+                tx_timeout_ms = self.config.transaction_fetch_timeout.as_millis(),
+                cert_timeout_ms = self.config.certificate_fetch_timeout.as_millis(),
+                "Block incomplete, will fetch after timeout if still missing"
+            );
         }
 
         actions
@@ -3631,6 +3613,74 @@ impl BftState {
         // where multiple proposals at the same height share the same parent_qc.
         self.verified_qcs
             .retain(|_, height| *height > committed_height.saturating_sub(2));
+    }
+
+    /// Check pending blocks and emit fetch requests for those that have been
+    /// waiting longer than the configured timeout.
+    ///
+    /// This is called periodically by the cleanup timer. Instead of fetching
+    /// immediately when a block header arrives, we give gossip and local
+    /// certificate creation time to fill in the missing data first.
+    ///
+    /// - `transaction_fetch_timeout`: How long to wait before fetching missing txs
+    /// - `certificate_fetch_timeout`: How long to wait before fetching missing certs
+    pub fn check_pending_block_fetches(&self) -> Vec<Action> {
+        let now = self.now;
+        let tx_timeout = self.config.transaction_fetch_timeout;
+        let cert_timeout = self.config.certificate_fetch_timeout;
+        let mut actions = Vec::new();
+
+        for (block_hash, pending) in &self.pending_blocks {
+            // Skip complete blocks
+            if pending.is_complete() {
+                continue;
+            }
+
+            let Some(&created_at) = self.pending_block_created_at.get(block_hash) else {
+                continue;
+            };
+
+            let age = now.saturating_sub(created_at);
+            let proposer = pending.header().proposer;
+
+            // Check if we should fetch missing transactions
+            let missing_txs = pending.missing_transactions();
+            if !missing_txs.is_empty() && age >= tx_timeout {
+                debug!(
+                    validator = ?self.validator_id(),
+                    block_hash = ?block_hash,
+                    missing_tx_count = missing_txs.len(),
+                    age_ms = age.as_millis(),
+                    timeout_ms = tx_timeout.as_millis(),
+                    "Fetch timeout reached, requesting missing transactions"
+                );
+                actions.push(Action::FetchTransactions {
+                    block_hash: *block_hash,
+                    proposer,
+                    tx_hashes: missing_txs,
+                });
+            }
+
+            // Check if we should fetch missing certificates
+            let missing_certs = pending.missing_certificates();
+            if !missing_certs.is_empty() && age >= cert_timeout {
+                debug!(
+                    validator = ?self.validator_id(),
+                    block_hash = ?block_hash,
+                    missing_cert_count = missing_certs.len(),
+                    age_ms = age.as_millis(),
+                    timeout_ms = cert_timeout.as_millis(),
+                    "Fetch timeout reached, requesting missing certificates"
+                );
+                actions.push(Action::FetchCertificates {
+                    block_hash: *block_hash,
+                    proposer,
+                    cert_hashes: missing_certs,
+                });
+            }
+        }
+
+        actions
     }
 
     /// Clean up stale incomplete pending blocks.
