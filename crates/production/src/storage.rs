@@ -375,6 +375,20 @@ use hyperscale_types::{
     TransactionCertificate,
 };
 
+/// Result of attempting to fetch a block for sync.
+///
+/// When serving sync requests, we prefer to return complete blocks. However,
+/// if transactions or certificates are missing (e.g., due to incomplete
+/// persistence or pruning), we fall back to returning just the metadata.
+/// The receiver can then use the fetch protocol to retrieve the missing data.
+#[derive(Debug, Clone)]
+pub enum SyncBlockData {
+    /// Full block with all transactions and certificates.
+    Complete(Block, QuorumCertificate),
+    /// Only metadata available - transactions/certificates must be fetched separately.
+    MetadataOnly(BlockMetadata),
+}
+
 impl RocksDbStorage {
     /// Store a committed block with its quorum certificate.
     ///
@@ -682,6 +696,103 @@ impl RocksDbStorage {
         metrics::record_storage_operation("get_block_denormalized", elapsed);
 
         Some((block, metadata.qc))
+    }
+
+    /// Get block metadata only (without fetching transactions/certificates).
+    ///
+    /// This is much faster than `get_block_denormalized` because it only
+    /// reads the block metadata from storage, not the full transaction and
+    /// certificate data.
+    ///
+    /// Used for partial sync responses when the full block cannot be
+    /// reconstructed (e.g., missing transactions or certificates).
+    pub fn get_block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
+        let start = Instant::now();
+
+        let blocks_cf = self.db.cf_handle("blocks")?;
+        let key = height.0.to_be_bytes();
+
+        let metadata: BlockMetadata = self
+            .db
+            .get_cf(blocks_cf, key)
+            .ok()
+            .flatten()
+            .and_then(|v| sbor::basic_decode(&v).ok())?;
+
+        let elapsed = start.elapsed().as_secs_f64();
+        metrics::record_rocksdb_read(elapsed);
+        metrics::record_storage_operation("get_block_metadata", elapsed);
+
+        Some(metadata)
+    }
+
+    /// Try to get a full block, falling back to metadata-only if data is missing.
+    ///
+    /// Returns:
+    /// - `Some(SyncBlockData::Complete(block, qc))` if full block available
+    /// - `Some(SyncBlockData::MetadataOnly(metadata))` if metadata exists but txs/certs missing
+    /// - `None` if no block metadata exists at this height
+    pub fn get_block_for_sync(&self, height: BlockHeight) -> Option<SyncBlockData> {
+        let start = Instant::now();
+
+        // 1. Get block metadata
+        let blocks_cf = self.db.cf_handle("blocks")?;
+        let key = height.0.to_be_bytes();
+
+        let metadata: BlockMetadata = self
+            .db
+            .get_cf(blocks_cf, key)
+            .ok()
+            .flatten()
+            .and_then(|v| sbor::basic_decode(&v).ok())?;
+
+        // 2. Try to batch-fetch transactions (preserving order)
+        let transactions = self.get_transactions_batch_ordered(&metadata.tx_hashes);
+
+        // Check if all transactions are present
+        if transactions.len() != metadata.tx_hashes.len() {
+            tracing::debug!(
+                height = height.0,
+                expected = metadata.tx_hashes.len(),
+                found = transactions.len(),
+                "Block has missing transactions - returning metadata only"
+            );
+            let elapsed = start.elapsed().as_secs_f64();
+            metrics::record_storage_operation("get_block_for_sync_metadata_only", elapsed);
+            return Some(SyncBlockData::MetadataOnly(metadata));
+        }
+
+        // 3. Try to batch-fetch certificates (preserving order)
+        let certificates = self.get_certificates_batch_ordered(&metadata.cert_hashes);
+
+        // Check if all certificates are present
+        if certificates.len() != metadata.cert_hashes.len() {
+            tracing::debug!(
+                height = height.0,
+                expected = metadata.cert_hashes.len(),
+                found = certificates.len(),
+                "Block has missing certificates - returning metadata only"
+            );
+            let elapsed = start.elapsed().as_secs_f64();
+            metrics::record_storage_operation("get_block_for_sync_metadata_only", elapsed);
+            return Some(SyncBlockData::MetadataOnly(metadata));
+        }
+
+        // 4. Full block available - reconstruct it
+        let block = Block {
+            header: metadata.header,
+            transactions,
+            committed_certificates: certificates,
+            deferred: metadata.deferred,
+            aborted: metadata.aborted,
+            commitment_proofs: metadata.commitment_proofs,
+        };
+
+        let elapsed = start.elapsed().as_secs_f64();
+        metrics::record_rocksdb_read(elapsed);
+        metrics::record_storage_operation("get_block_for_sync_complete", elapsed);
+
+        Some(SyncBlockData::Complete(block, metadata.qc))
     }
 
     /// Get multiple transactions by hash, preserving order.

@@ -12,9 +12,10 @@
 
 use crate::metrics;
 use crate::network::{compute_peer_id_for_validator, Libp2pAdapter};
+use crate::storage::RocksDbStorage;
 use crate::sync_error::SyncResponseError;
 use hyperscale_core::Event;
-use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, Topology};
+use hyperscale_types::{Block, BlockHeight, BlockMetadata, Hash, QuorumCertificate, Topology};
 use libp2p::PeerId;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -196,6 +197,21 @@ struct PendingFetch {
     tried_peers: HashSet<PeerId>,
 }
 
+/// A pending sync backfill - block where we have metadata but are fetching txs/certs.
+#[derive(Debug)]
+struct PendingBackfill {
+    /// Block metadata (header + tx/cert hashes + QC).
+    metadata: BlockMetadata,
+    /// When backfill started.
+    started: Instant,
+    /// Transaction hashes we've received.
+    received_txs: HashSet<Hash>,
+    /// Certificate hashes we've received.
+    received_certs: HashSet<Hash>,
+    /// Whether we've triggered fetch requests.
+    fetch_triggered: bool,
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Validation Functions
 // ═══════════════════════════════════════════════════════════════════════════
@@ -253,6 +269,7 @@ pub fn validate_sync_response(
 /// 2. Fetching blocks from peers using request-response protocol (concurrently)
 /// 3. Validating and ordering received blocks
 /// 4. Delivering verified blocks directly to BFT for commitment
+/// 5. Handling metadata-only responses by triggering backfill fetches
 ///
 /// This is a complete sync solution - no separate SyncState SubStateMachine needed.
 pub struct SyncManager {
@@ -260,6 +277,8 @@ pub struct SyncManager {
     config: SyncConfig,
     /// Network adapter for sending requests.
     network: Arc<Libp2pAdapter>,
+    /// Storage for reconstructing blocks from metadata.
+    storage: Arc<RocksDbStorage>,
     /// Event sender for delivering fetched blocks.
     event_tx: mpsc::Sender<Event>,
     /// Network topology - source of truth for committee membership.
@@ -283,6 +302,9 @@ pub struct SyncManager {
     fetch_result_rx: mpsc::Receiver<SyncFetchResult>,
     /// Sender for spawned fetch tasks to report results.
     fetch_result_tx: mpsc::Sender<SyncFetchResult>,
+    /// Pending backfills - blocks where we have metadata but are fetching txs/certs.
+    /// Maps height -> pending backfill state.
+    pending_backfills: HashMap<u64, PendingBackfill>,
 }
 
 impl SyncManager {
@@ -294,6 +316,7 @@ impl SyncManager {
     pub fn new(
         config: SyncConfig,
         network: Arc<Libp2pAdapter>,
+        storage: Arc<RocksDbStorage>,
         event_tx: mpsc::Sender<Event>,
         topology: Arc<dyn Topology>,
     ) -> Self {
@@ -304,6 +327,7 @@ impl SyncManager {
         Self {
             config,
             network,
+            storage,
             event_tx,
             topology,
             sync_target: None,
@@ -314,6 +338,7 @@ impl SyncManager {
             committed_height: 0,
             fetch_result_rx,
             fetch_result_tx,
+            pending_backfills: HashMap::new(),
         }
     }
 
@@ -1032,17 +1057,27 @@ impl SyncManager {
 
     /// Handle a block response from a peer.
     ///
-    /// Decodes the response, validates the block and QC, and either:
-    /// - Calls `on_block_received` for valid blocks
-    /// - Calls `on_sync_response_error` for invalid/empty responses
+    /// Response format: `(Option<Block>, Option<QC>, Option<BlockMetadata>)`
+    /// - `(Some(block), Some(qc), _)` = complete block with all data
+    /// - `(None, None, Some(metadata))` = metadata only (txs/certs must be fetched)
+    /// - `(None, None, None)` = block not found at this height
+    ///
+    /// For complete blocks: validates and delivers to state machine.
+    /// For metadata-only: starts backfill to fetch missing txs/certs.
+    /// For empty/invalid: calls `on_sync_response_error` for retry.
     async fn handle_block_response(&mut self, height: u64, peer: PeerId, response_bytes: Vec<u8>) {
-        // Decode the response: (Option<Block>, Option<QC>)
-        let decoded: Result<(Option<Block>, Option<QuorumCertificate>), _> =
-            sbor::basic_decode(&response_bytes);
+        let decoded: Result<
+            (
+                Option<Block>,
+                Option<QuorumCertificate>,
+                Option<BlockMetadata>,
+            ),
+            _,
+        > = sbor::basic_decode(&response_bytes);
 
         match decoded {
-            Ok((Some(block), Some(qc))) => {
-                // Validate block and QC
+            Ok((Some(block), Some(qc), _)) => {
+                // Complete block - validate and deliver
                 match validate_sync_response(height, &block, &qc) {
                     Ok(()) => {
                         // Block and QC are valid - deliver to state machine
@@ -1054,13 +1089,39 @@ impl SyncManager {
                     }
                 }
             }
-            Ok((None, _)) | Ok((_, None)) => {
-                // Peer doesn't have this block (empty response)
+            Ok((None, None, Some(metadata))) => {
+                // Metadata-only response - peer has block structure but missing txs/certs
+                // Start a backfill to fetch the missing data
+                info!(
+                    height,
+                    tx_count = metadata.tx_hashes.len(),
+                    cert_count = metadata.cert_hashes.len(),
+                    ?peer,
+                    "Received metadata-only sync response, starting backfill"
+                );
+
+                // Update peer reputation - this counts as success for the height
+                // (peer is not faulty, just missing data)
+                if let Some(rep) = self.peer_reputations.get_mut(&peer) {
+                    rep.in_flight = rep.in_flight.saturating_sub(1);
+                    rep.successes += 1;
+                    rep.last_success = Some(Instant::now());
+                }
+
+                // Remove from pending fetches - we got a valid response
+                self.pending_fetches.remove(&height);
+
+                // Start backfill for this block
+                self.start_backfill(height, metadata);
+
+                metrics::record_sync_metadata_only();
+            }
+            Ok((None, None, None)) | Ok((None, _, _)) | Ok((_, None, _)) => {
+                // Empty response - peer doesn't have this block
                 let error = SyncResponseError::EmptyResponse { height };
                 self.on_sync_response_error(peer, height, error);
             }
             Err(e) => {
-                // Decode error - treat as network error (non-malicious)
                 warn!(height, ?peer, error = ?e, "Failed to decode sync response");
                 let error = SyncResponseError::NetworkError {
                     reason: format!("decode error: {e:?}"),
@@ -1068,6 +1129,256 @@ impl SyncManager {
                 self.on_sync_response_error(peer, height, error);
             }
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Backfill Methods
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Start a backfill for a block where we have metadata but missing txs/certs.
+    ///
+    /// This stores the metadata and will trigger fetches. The FetchManager
+    /// (via runner) will notify us when data arrives via `on_backfill_data_received`.
+    fn start_backfill(&mut self, height: u64, metadata: BlockMetadata) {
+        // Check if already pending
+        if self.pending_backfills.contains_key(&height) {
+            debug!(height, "Backfill already pending for height");
+            return;
+        }
+
+        // Check if already committed
+        if height <= self.committed_height {
+            debug!(height, "Not starting backfill - already committed");
+            return;
+        }
+
+        info!(
+            height,
+            tx_count = metadata.tx_hashes.len(),
+            cert_count = metadata.cert_hashes.len(),
+            "Starting sync backfill"
+        );
+
+        // Store pending backfill
+        self.pending_backfills.insert(
+            height,
+            PendingBackfill {
+                metadata,
+                started: Instant::now(),
+                received_txs: HashSet::new(),
+                received_certs: HashSet::new(),
+                fetch_triggered: false,
+            },
+        );
+
+        // Try to complete immediately (in case data is already in storage)
+        // This also triggers fetches if needed
+        self.try_complete_backfill(height);
+    }
+
+    /// Notify that transactions have been received (from FetchManager).
+    ///
+    /// Called by the runner when TransactionReceived events arrive.
+    /// Checks all pending backfills to see if any can now be completed.
+    pub fn on_transactions_received(&mut self, block_hash: Hash, tx_hashes: &[Hash]) {
+        // Find the backfill by block hash
+        let height = self
+            .pending_backfills
+            .iter()
+            .find(|(_, b)| b.metadata.header.hash() == block_hash)
+            .map(|(&h, _)| h);
+
+        if let Some(height) = height {
+            if let Some(backfill) = self.pending_backfills.get_mut(&height) {
+                for hash in tx_hashes {
+                    backfill.received_txs.insert(*hash);
+                }
+                debug!(
+                    height,
+                    received = backfill.received_txs.len(),
+                    needed = backfill.metadata.tx_hashes.len(),
+                    "Backfill received transactions"
+                );
+            }
+            self.try_complete_backfill(height);
+        }
+    }
+
+    /// Notify that certificates have been received (from FetchManager).
+    ///
+    /// Called by the runner when CertificateReceived events arrive.
+    /// Checks all pending backfills to see if any can now be completed.
+    pub fn on_certificates_received(&mut self, block_hash: Hash, cert_hashes: &[Hash]) {
+        // Find the backfill by block hash
+        let height = self
+            .pending_backfills
+            .iter()
+            .find(|(_, b)| b.metadata.header.hash() == block_hash)
+            .map(|(&h, _)| h);
+
+        if let Some(height) = height {
+            if let Some(backfill) = self.pending_backfills.get_mut(&height) {
+                for hash in cert_hashes {
+                    backfill.received_certs.insert(*hash);
+                }
+                debug!(
+                    height,
+                    received = backfill.received_certs.len(),
+                    needed = backfill.metadata.cert_hashes.len(),
+                    "Backfill received certificates"
+                );
+            }
+            self.try_complete_backfill(height);
+        }
+    }
+
+    /// Try to complete a backfill by reconstructing the block from storage.
+    ///
+    /// If all required data is available, reconstructs the block and delivers
+    /// it to BFT via SyncBlockReadyToApply event.
+    fn try_complete_backfill(&mut self, height: u64) {
+        if !self.pending_backfills.contains_key(&height) {
+            return;
+        }
+
+        // Try to reconstruct from storage
+        // The FetchManager persists txs/certs eagerly, so they should be in storage
+        let block_height = BlockHeight(height);
+
+        // First check if we can get the full block from storage now
+        if let Some((block, qc)) = self.storage.get_block_denormalized(block_height) {
+            // Success! Block is complete in storage
+            info!(
+                height,
+                txs = block.transactions.len(),
+                certs = block.committed_certificates.len(),
+                "Backfill complete - block reconstructed from storage"
+            );
+
+            // Remove from pending
+            self.pending_backfills.remove(&height);
+
+            // Deliver to BFT
+            let event = Event::SyncBlockReadyToApply { block, qc };
+            let event_tx = self.event_tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = event_tx.send(event).await {
+                    warn!(height, error = ?e, "Failed to deliver backfilled block to BFT");
+                }
+            });
+
+            return;
+        }
+
+        // Block not yet complete - mark as needing fetch
+        // The runner will call get_pending_backfill_fetches() and trigger FetchManager
+        let backfill = self.pending_backfills.get_mut(&height).unwrap();
+
+        if !backfill.fetch_triggered {
+            backfill.fetch_triggered = true;
+
+            // Check which transactions are missing from storage
+            let missing_txs: Vec<Hash> = backfill
+                .metadata
+                .tx_hashes
+                .iter()
+                .filter(|h| self.storage.get_transaction(h).is_none())
+                .cloned()
+                .collect();
+
+            // Check which certificates are missing from storage
+            let missing_certs: Vec<Hash> = backfill
+                .metadata
+                .cert_hashes
+                .iter()
+                .filter(|h| self.storage.get_certificate(h).is_none())
+                .cloned()
+                .collect();
+
+            if !missing_txs.is_empty() || !missing_certs.is_empty() {
+                info!(
+                    height,
+                    missing_txs = missing_txs.len(),
+                    missing_certs = missing_certs.len(),
+                    "Backfill needs fetch for missing data"
+                );
+            } else {
+                // All data should be in storage but get_block_denormalized failed
+                // This shouldn't happen - log a warning
+                warn!(
+                    height,
+                    "Backfill has all data in storage but block reconstruction failed"
+                );
+            }
+        }
+    }
+
+    /// Get pending backfill fetch requests.
+    ///
+    /// Returns a list of (block_hash, proposer, missing_tx_hashes, missing_cert_hashes)
+    /// for backfills that need data fetched. The runner should pass these to FetchManager.
+    pub fn get_pending_backfill_fetches(
+        &self,
+    ) -> Vec<(Hash, hyperscale_types::ValidatorId, Vec<Hash>, Vec<Hash>)> {
+        self.pending_backfills
+            .values()
+            .filter(|b| b.fetch_triggered)
+            .map(|b| {
+                let block_hash = b.metadata.header.hash();
+                let proposer = b.metadata.header.proposer;
+
+                // Check which transactions are missing from storage
+                let missing_txs: Vec<Hash> = b
+                    .metadata
+                    .tx_hashes
+                    .iter()
+                    .filter(|h| self.storage.get_transaction(h).is_none())
+                    .cloned()
+                    .collect();
+
+                // Check which certificates are missing from storage
+                let missing_certs: Vec<Hash> = b
+                    .metadata
+                    .cert_hashes
+                    .iter()
+                    .filter(|h| self.storage.get_certificate(h).is_none())
+                    .cloned()
+                    .collect();
+
+                (block_hash, proposer, missing_txs, missing_certs)
+            })
+            .filter(|(_, _, txs, certs)| !txs.is_empty() || !certs.is_empty())
+            .collect()
+    }
+
+    /// Tick backfills - check for completions and timeouts.
+    ///
+    /// Called periodically by the runner to check if any backfills can be completed
+    /// now that more data may have arrived in storage.
+    pub fn tick_backfills(&mut self) {
+        // Get heights to check (avoid borrowing issues)
+        let heights: Vec<u64> = self.pending_backfills.keys().cloned().collect();
+
+        for height in heights {
+            self.try_complete_backfill(height);
+        }
+
+        // Clean up old backfills that have timed out (5 minutes)
+        let timeout = Duration::from_secs(300);
+        let now = Instant::now();
+        self.pending_backfills.retain(|height, backfill| {
+            if now.duration_since(backfill.started) > timeout {
+                warn!(height, "Backfill timed out after 5 minutes");
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Get the number of pending backfills.
+    pub fn pending_backfill_count(&self) -> usize {
+        self.pending_backfills.len()
     }
 }
 

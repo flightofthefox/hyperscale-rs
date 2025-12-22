@@ -776,6 +776,15 @@ pub fn record_sync_peer_banned() {
     metrics().sync_peers_banned.inc();
 }
 
+/// Record a metadata-only sync response (triggers backfill).
+pub fn record_sync_metadata_only() {
+    // Use the existing sync_response_errors counter with a distinct label
+    metrics()
+        .sync_response_errors
+        .with_label_values(&["metadata_only"])
+        .inc();
+}
+
 /// Record a livelock cycle detection event.
 pub fn record_livelock_cycle_detected() {
     metrics().livelock_cycles_detected.inc();

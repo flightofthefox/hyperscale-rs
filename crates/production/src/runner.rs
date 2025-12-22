@@ -21,9 +21,9 @@ use hyperscale_types::BlockHeight;
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
-    Block, BlockHeader, BlockVote, CommitmentProof, Hash, KeyPair, PublicKey, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, Signature, SignerBitfield, StateVoteBlock, Topology,
-    ValidatorId,
+    Block, BlockHeader, BlockMetadata, BlockVote, CommitmentProof, Hash, KeyPair, PublicKey,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
+    StateVoteBlock, Topology, ValidatorId,
 };
 use libp2p::identity;
 use sbor::prelude::*;
@@ -469,6 +469,7 @@ impl ProductionRunnerBuilder {
         let sync_manager = SyncManager::new(
             SyncConfig::default(),
             network.clone(),
+            storage.clone(),
             consensus_tx.clone(),
             topology.clone(),
         );
@@ -1435,6 +1436,21 @@ impl ProductionRunner {
                     // Tick both managers to process pending fetches
                     self.sync_manager.tick().await;
                     self.fetch_manager.tick().await;
+
+                    // Process sync backfills - trigger fetches for missing data
+                    self.sync_manager.tick_backfills();
+                    for (block_hash, proposer, missing_txs, missing_certs) in
+                        self.sync_manager.get_pending_backfill_fetches()
+                    {
+                        if !missing_txs.is_empty() {
+                            self.fetch_manager
+                                .request_transactions(block_hash, proposer, missing_txs);
+                        }
+                        if !missing_certs.is_empty() {
+                            self.fetch_manager
+                                .request_certificates(block_hash, proposer, missing_certs);
+                        }
+                    }
                 }
 
                 // Transaction status updates (non-consensus-critical)
@@ -2668,7 +2684,14 @@ impl ProductionRunner {
     ///
     /// Looks up the requested block from denormalized storage (reconstructing from
     /// block metadata + transactions + certificates) and sends the response.
+    ///
+    /// Response format: `(Option<Block>, Option<QC>, Option<BlockMetadata>)`
+    /// - `(Some(block), Some(qc), None)` = complete block with all data
+    /// - `(None, None, Some(metadata))` = metadata only (txs/certs must be fetched)
+    /// - `(None, None, None)` = block not found at this height
     fn handle_inbound_sync_request(&self, request: InboundSyncRequest) {
+        use crate::storage::SyncBlockData;
+
         let height = BlockHeight(request.height);
         let channel_id = request.channel_id;
 
@@ -2679,21 +2702,58 @@ impl ProductionRunner {
             "Handling inbound sync request"
         );
 
-        // Look up block from denormalized storage - reconstructs from 3 CFs
-        let response = if let Some((block, qc)) = self.storage.get_block_denormalized(height) {
-            // Encode the response as SBOR: (Some(block), Some(qc))
-            match sbor::basic_encode(&(Some(&block), Some(&qc))) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::warn!(height = request.height, error = ?e, "Failed to encode block response");
-                    // Send empty response on encoding failure
-                    sbor::basic_encode(&(None::<()>, None::<()>)).unwrap_or_default()
+        // Look up block from storage - returns Complete, MetadataOnly, or None
+        let response = match self.storage.get_block_for_sync(height) {
+            Some(SyncBlockData::Complete(block, qc)) => {
+                // Full block available - encode as (Some(block), Some(qc), None)
+                match sbor::basic_encode(&(Some(&block), Some(&qc), None::<BlockMetadata>)) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::warn!(height = request.height, error = ?e, "Failed to encode block response");
+                        sbor::basic_encode(&(
+                            None::<Block>,
+                            None::<QuorumCertificate>,
+                            None::<BlockMetadata>,
+                        ))
+                        .unwrap_or_default()
+                    }
                 }
             }
-        } else {
-            tracing::trace!(height = request.height, "Block not found for sync request");
-            // Send "not found" response
-            sbor::basic_encode(&(None::<()>, None::<()>)).unwrap_or_default()
+            Some(SyncBlockData::MetadataOnly(metadata)) => {
+                // Metadata only - encode as (None, None, Some(metadata))
+                tracing::debug!(
+                    height = request.height,
+                    tx_count = metadata.tx_hashes.len(),
+                    cert_count = metadata.cert_hashes.len(),
+                    "Returning metadata-only sync response"
+                );
+                match sbor::basic_encode(&(
+                    None::<Block>,
+                    None::<QuorumCertificate>,
+                    Some(&metadata),
+                )) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::warn!(height = request.height, error = ?e, "Failed to encode metadata response");
+                        sbor::basic_encode(&(
+                            None::<Block>,
+                            None::<QuorumCertificate>,
+                            None::<BlockMetadata>,
+                        ))
+                        .unwrap_or_default()
+                    }
+                }
+            }
+            None => {
+                tracing::trace!(height = request.height, "Block not found for sync request");
+                // Not found - encode as (None, None, None)
+                sbor::basic_encode(&(
+                    None::<Block>,
+                    None::<QuorumCertificate>,
+                    None::<BlockMetadata>,
+                ))
+                .unwrap_or_default()
+            }
         };
 
         // Send response via network adapter
