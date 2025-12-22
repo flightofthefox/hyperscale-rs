@@ -477,6 +477,7 @@ impl ProductionRunnerBuilder {
         let mut fetch_manager = crate::fetch::FetchManager::new(
             crate::fetch::FetchConfig::default(),
             network.clone(),
+            storage.clone(),
             consensus_tx.clone(),
         );
 

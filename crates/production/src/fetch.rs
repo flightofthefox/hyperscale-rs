@@ -24,6 +24,7 @@
 
 use crate::metrics;
 use crate::network::Libp2pAdapter;
+use crate::storage::RocksDbStorage;
 use hyperscale_core::Event;
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
 use hyperscale_types::{Hash, RoutableTransaction, TransactionCertificate, ValidatorId};
@@ -323,6 +324,10 @@ pub struct FetchManager {
     config: FetchConfig,
     /// Network adapter for sending requests.
     network: Arc<Libp2pAdapter>,
+    /// Storage for persisting fetched data.
+    /// Fetched transactions and certificates are eagerly persisted to ensure
+    /// they're available for sync requests from peers.
+    storage: Arc<RocksDbStorage>,
     /// Event sender for delivering fetched data.
     event_tx: mpsc::Sender<Event>,
     /// Pending transaction fetches by block hash.
@@ -350,6 +355,7 @@ impl FetchManager {
     pub fn new(
         config: FetchConfig,
         network: Arc<Libp2pAdapter>,
+        storage: Arc<RocksDbStorage>,
         event_tx: mpsc::Sender<Event>,
     ) -> Self {
         // Channel for fetch results - buffer size matches max concurrent
@@ -358,6 +364,7 @@ impl FetchManager {
         Self {
             config,
             network,
+            storage,
             event_tx,
             tx_fetches: HashMap::new(),
             cert_fetches: HashMap::new(),
@@ -602,6 +609,25 @@ impl FetchManager {
 
         metrics::record_fetch_items_received(FetchKind::Transaction, received_count);
 
+        // Eagerly persist fetched transactions to storage.
+        // This ensures they're available for sync requests from peers, preventing
+        // the scenario where all validators have data in memory but can't serve
+        // sync requests because storage is empty.
+        //
+        // Note: We persist before BFT validation. This is safe because:
+        // 1. Transactions are stored by hash (content-addressable)
+        // 2. Blocks reference specific hashes - invalid data won't be used
+        // 3. Worst case is wasted disk space from Byzantine peers
+        if !transactions.is_empty() {
+            let storage = self.storage.clone();
+            let txs_to_persist = transactions.clone();
+            tokio::spawn(async move {
+                for tx in &txs_to_persist {
+                    storage.put_transaction(tx);
+                }
+            });
+        }
+
         // Deliver to BFT
         if !transactions.is_empty() {
             let event = Event::TransactionReceived {
@@ -680,6 +706,25 @@ impl FetchManager {
         );
 
         metrics::record_fetch_items_received(FetchKind::Certificate, received_count);
+
+        // Eagerly persist fetched certificates to storage.
+        // This ensures they're available for sync requests from peers, preventing
+        // the scenario where all validators have data in memory but can't serve
+        // sync requests because storage is empty.
+        //
+        // Note: We persist before BFT signature verification. This is safe because:
+        // 1. Certificates are stored by transaction hash (content-addressable)
+        // 2. Blocks reference specific hashes - invalid data won't be used
+        // 3. Worst case is wasted disk space from Byzantine peers
+        if !certificates.is_empty() {
+            let storage = self.storage.clone();
+            let certs_to_persist = certificates.clone();
+            tokio::spawn(async move {
+                for cert in &certs_to_persist {
+                    storage.put_certificate(&cert.transaction_hash, cert);
+                }
+            });
+        }
 
         // Deliver to BFT
         if !certificates.is_empty() {
