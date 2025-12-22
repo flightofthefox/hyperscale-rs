@@ -178,20 +178,16 @@ fn test_provision_coordinator_tracking() {
     // Run to allow processing
     runner.run_until(Duration::from_secs(3));
 
-    // Check backpressure state - now driven by mempool
+    // Check backpressure state - driven by mempool
     let node = runner.node(0).unwrap();
     let mempool = node.mempool();
 
     let in_flight = mempool.in_flight();
     let at_limit = mempool.at_in_flight_limit();
 
-    // Also check provision coordinator for comparison
-    let provisions = node.provisions();
-    let coordinator_count = provisions.cross_shard_pending_count();
-
     println!(
-        "After submission: mempool_in_flight={}, coordinator_count={}, at_limit={}",
-        in_flight, coordinator_count, at_limit
+        "After submission: mempool_in_flight={}, at_limit={}",
+        in_flight, at_limit
     );
 
     // We shouldn't be at limit with small number of TXs

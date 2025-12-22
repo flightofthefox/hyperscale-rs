@@ -4,7 +4,6 @@
 //! cross-shard provisions, manages signature verification, and emits quorum
 //! events for downstream consumers.
 
-use crate::ProvisionConfig;
 use hyperscale_core::{Action, Event, SubStateMachine};
 use hyperscale_types::{
     BlockHeight, CommitmentProof, Hash, NodeId, ShardGroupId, Signature, SignerBitfield,
@@ -40,8 +39,11 @@ pub struct TxRegistration {
 /// - Receive provisions from network
 /// - Manage signature verification lifecycle
 /// - Track quorum per (tx, shard)
-/// - Enforce backpressure limits
 /// - Notify consumers when provisions are verified/quorum reached
+///
+/// Note: Backpressure is handled by the mempool module, not here.
+/// This module provides `has_any_verified_provisions()` which mempool
+/// uses to decide whether to bypass soft limits for cross-shard TXs.
 pub struct ProvisionCoordinator {
     // ═══════════════════════════════════════════════════════════════════
     // Configuration
@@ -51,9 +53,6 @@ pub struct ProvisionCoordinator {
 
     /// Network topology for validator lookups.
     topology: Arc<dyn Topology>,
-
-    /// Backpressure configuration.
-    config: ProvisionConfig,
 
     // ═══════════════════════════════════════════════════════════════════
     // Transaction Registration
@@ -116,19 +115,9 @@ impl std::fmt::Debug for ProvisionCoordinator {
 impl ProvisionCoordinator {
     /// Create a new ProvisionCoordinator.
     pub fn new(local_shard: ShardGroupId, topology: Arc<dyn Topology>) -> Self {
-        Self::with_config(local_shard, topology, ProvisionConfig::default())
-    }
-
-    /// Create a new ProvisionCoordinator with custom configuration.
-    pub fn with_config(
-        local_shard: ShardGroupId,
-        topology: Arc<dyn Topology>,
-        config: ProvisionConfig,
-    ) -> Self {
         Self {
             local_shard,
             topology,
-            config,
             registered_txs: HashMap::new(),
             pending_verifications: HashMap::new(),
             verified_provisions: HashMap::new(),
@@ -449,19 +438,6 @@ impl ProvisionCoordinator {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    /// Get current count of cross-shard transactions in flight.
-    ///
-    /// Used by backpressure to decide whether to accept new cross-shard txs.
-    pub fn cross_shard_pending_count(&self) -> usize {
-        self.registered_txs.len()
-    }
-
-    /// Check if we're at the backpressure limit.
-    pub fn at_backpressure_limit(&self) -> bool {
-        self.config.backpressure_enabled
-            && self.cross_shard_pending_count() >= self.config.max_cross_shard_pending
     }
 
     /// Check if a transaction is registered.
@@ -1112,23 +1088,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_shard_pending_count() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
-
-        assert_eq!(coordinator.cross_shard_pending_count(), 0);
-
-        let tx1 = Hash::from_bytes(b"tx1");
-        let tx2 = Hash::from_bytes(b"tx2");
-
-        coordinator.on_tx_registered(tx1, make_registration(vec![ShardGroupId(1)], 1));
-        assert_eq!(coordinator.cross_shard_pending_count(), 1);
-
-        coordinator.on_tx_registered(tx2, make_registration(vec![ShardGroupId(1)], 1));
-        assert_eq!(coordinator.cross_shard_pending_count(), 2);
-    }
-
-    #[test]
     fn test_build_commitment_proof_returns_none_without_provisions() {
         let topology = make_test_topology(ShardGroupId(0));
         let coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
@@ -1236,48 +1195,5 @@ mod tests {
         coordinator.on_tx_aborted(&tx_hash);
 
         assert!(!coordinator.is_registered(&tx_hash));
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Backpressure Tests
-    // ═══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_at_backpressure_limit() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let config = ProvisionConfig::with_max_pending(2);
-        let mut coordinator = ProvisionCoordinator::with_config(ShardGroupId(0), topology, config);
-
-        assert!(!coordinator.at_backpressure_limit());
-
-        // Add transactions up to limit
-        coordinator.on_tx_registered(
-            Hash::from_bytes(b"tx1"),
-            make_registration(vec![ShardGroupId(1)], 1),
-        );
-        coordinator.on_tx_registered(
-            Hash::from_bytes(b"tx2"),
-            make_registration(vec![ShardGroupId(1)], 1),
-        );
-
-        assert!(coordinator.at_backpressure_limit());
-    }
-
-    #[test]
-    fn test_backpressure_disabled() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let config = ProvisionConfig::disabled();
-        let mut coordinator = ProvisionCoordinator::with_config(ShardGroupId(0), topology, config);
-
-        // Add many transactions
-        for i in 0..100 {
-            coordinator.on_tx_registered(
-                Hash::from_bytes(format!("tx{}", i).as_bytes()),
-                make_registration(vec![ShardGroupId(1)], 1),
-            );
-        }
-
-        // Should never be at limit when disabled
-        assert!(!coordinator.at_backpressure_limit());
     }
 }

@@ -1,7 +1,7 @@
 //! Centralized provision coordination for cross-shard transactions.
 //!
 //! This crate provides the `ProvisionCoordinator`, which centralizes all provision
-//! tracking, verification, and backpressure logic for cross-shard transactions.
+//! tracking and verification for cross-shard transactions.
 //!
 //! # Problem
 //!
@@ -13,12 +13,6 @@
 //! 2. **Fragmented provision state**: Provisions were tracked in multiple places
 //!    (ExecutionState, LivelockState) with different views (verified vs unverified).
 //!
-//! 3. **Missing backpressure**: No limit on cross-shard transactions in flight could
-//!    overwhelm the system.
-//!
-//! 4. **Complex cross-module queries**: Backpressure required provision info spanning
-//!    multiple modules.
-//!
 //! # Solution
 //!
 //! The `ProvisionCoordinator` provides:
@@ -26,7 +20,10 @@
 //! - **Single source of truth**: All provision lifecycle management in one place
 //! - **Quorum-based triggers**: Events emitted only after verified quorum is reached
 //! - **Byzantine safety**: Only verified provisions affect state machine decisions
-//! - **Backpressure support**: Query methods for mempool to enforce limits
+//!
+//! Note: Backpressure is handled by the mempool module, which tracks in-flight
+//! transactions and enforces limits. The provisions module provides query methods
+//! (like `has_any_verified_provisions`) that mempool uses for its decisions.
 //!
 //! # Architecture
 //!
@@ -61,11 +58,8 @@
 //! # Components
 //!
 //! - [`ProvisionCoordinator`] - Main sub-state machine
-//! - [`ProvisionConfig`] - Configuration for backpressure limits
 //! - [`TxRegistration`] - Registration info for cross-shard transactions
 
-mod config;
 mod state;
 
-pub use config::ProvisionConfig;
 pub use state::{ProvisionCoordinator, TxRegistration};
