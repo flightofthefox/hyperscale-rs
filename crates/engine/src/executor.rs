@@ -31,7 +31,8 @@
 
 use crate::error::ExecutionError;
 use crate::execution::{
-    compute_merkle_root, extract_substate_writes, is_commit_success, ProvisionedExecutionContext,
+    compute_merkle_root, extract_substate_writes, is_commit_success, PreparedProvisions,
+    ProvisionedExecutionContext,
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
@@ -192,15 +193,22 @@ impl RadixExecutor {
         let snapshot = storage.snapshot();
 
         for tx in transactions {
-            // Create execution context with provisions (passing network by reference)
-            let mut context = ProvisionedExecutionContext::new(snapshot.as_ref(), &self.network);
+            // Get provisions for this transaction
+            let tx_provisions = provisions_by_tx.get(&tx.hash());
 
-            // O(1) lookup instead of O(M) scan per transaction
-            if let Some(tx_provisions) = provisions_by_tx.get(&tx.hash()) {
-                for provision in tx_provisions {
-                    context.add_provision(provision);
-                }
-            }
+            // Pre-process provisions into DatabaseUpdates (computes DB keys once)
+            let prepared = if let Some(provs) = tx_provisions {
+                PreparedProvisions::from_provisions(provs)
+            } else {
+                PreparedProvisions::default()
+            };
+
+            // Create execution context with pre-computed provisions
+            let context = ProvisionedExecutionContext::with_prepared_provisions(
+                snapshot.as_ref(),
+                &self.network,
+                prepared,
+            );
 
             // Execute using cached VM modules and config
             let validated = tx

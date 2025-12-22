@@ -20,6 +20,104 @@ use radix_transactions::model::UserTransaction;
 use radix_transactions::prelude::*;
 use radix_transactions::validation::TransactionValidator;
 
+/// Pre-processed provisions ready for fast execution.
+///
+/// Converts StateProvisions into DatabaseUpdates once, avoiding repeated
+/// SpreadPrefixKeyMapper computations during execution.
+#[derive(Default)]
+pub struct PreparedProvisions {
+    updates: DatabaseUpdates,
+}
+
+impl PreparedProvisions {
+    /// Create prepared provisions from raw StateProvisions.
+    ///
+    /// This pre-computes all DB keys (SpreadPrefixKeyMapper hashes) once,
+    /// so they don't need to be recomputed for each transaction execution.
+    pub fn from_provisions(provisions: &[&StateProvision]) -> Self {
+        let mut updates = DatabaseUpdates::default();
+
+        for provision in provisions {
+            if provision.entries.is_empty() {
+                continue;
+            }
+
+            // Track last node key to avoid redundant HashMap lookups for consecutive
+            // entries from the same node (common case)
+            let mut last_node_key: Option<Vec<u8>> = None;
+
+            for entry in provision.entries.iter() {
+                let radix_node_id = radix_common::types::NodeId(entry.node_id.0);
+                let radix_partition = radix_common::types::PartitionNumber(entry.partition.0);
+
+                let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
+                let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
+                let db_sort_key = DbSortKey(entry.sort_key.clone());
+
+                let update = match &entry.value {
+                    None => DatabaseUpdate::Delete,
+                    Some(v) if v.is_empty() => DatabaseUpdate::Delete,
+                    Some(v) => DatabaseUpdate::Set(v.clone()),
+                };
+
+                // Check if we can reuse cached node reference
+                let node_changed = last_node_key.as_ref() != Some(&db_node_key);
+
+                if node_changed {
+                    // Different node - lookup/create in HashMap
+                    let node_updates = updates
+                        .node_updates
+                        .entry(db_node_key.clone())
+                        .or_insert_with(|| NodeDatabaseUpdates {
+                            partition_updates: indexmap::IndexMap::new(),
+                        });
+
+                    let partition_updates = node_updates
+                        .partition_updates
+                        .entry(db_partition_num)
+                        .or_insert_with(|| PartitionDatabaseUpdates::Delta {
+                            substate_updates: indexmap::IndexMap::new(),
+                        });
+
+                    if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates
+                    {
+                        substate_updates.insert(db_sort_key, update);
+                    }
+
+                    last_node_key = Some(db_node_key);
+                    // Can't cache mutable reference across loop iterations safely,
+                    // but the HashMap lookup is still avoided for consecutive same-node entries
+                } else if let Some(ref db_key) = last_node_key {
+                    // Same node - use get_mut
+                    let node_updates = updates
+                        .node_updates
+                        .get_mut(db_key)
+                        .expect("node should exist");
+
+                    let partition_updates = node_updates
+                        .partition_updates
+                        .entry(db_partition_num)
+                        .or_insert_with(|| PartitionDatabaseUpdates::Delta {
+                            substate_updates: indexmap::IndexMap::new(),
+                        });
+
+                    if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates
+                    {
+                        substate_updates.insert(db_sort_key, update);
+                    }
+                }
+            }
+        }
+
+        Self { updates }
+    }
+
+    /// Check if there are any provisions.
+    pub fn is_empty(&self) -> bool {
+        self.updates.node_updates.is_empty()
+    }
+}
+
 /// Execution context that combines local storage with provisioned state.
 ///
 /// Uses Radix's `SubstateDatabaseOverlay` to layer provisioned state on top
@@ -36,6 +134,22 @@ impl<'a, S: SubstateDatabase> ProvisionedExecutionContext<'a, S> {
         Self {
             base_store,
             provisions: DatabaseUpdates::default(),
+            network,
+        }
+    }
+
+    /// Create a new execution context with pre-processed provisions.
+    ///
+    /// This is more efficient than calling `add_provision` repeatedly because
+    /// the DB key computations have already been done in `PreparedProvisions`.
+    pub fn with_prepared_provisions(
+        base_store: &'a S,
+        network: &'a NetworkDefinition,
+        prepared: PreparedProvisions,
+    ) -> Self {
+        Self {
+            base_store,
+            provisions: prepared.updates,
             network,
         }
     }
