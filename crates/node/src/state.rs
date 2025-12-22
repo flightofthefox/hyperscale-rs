@@ -404,6 +404,57 @@ impl StateMachine for NodeStateMachine {
                     self.last_header_reset = Some(header_key);
                 }
 
+                // Validate in-flight limits to prevent malicious/buggy proposers from
+                // overwhelming the system. The rules mirror ready_transactions():
+                //
+                // 1. Transactions WITH commitment proofs can exceed soft limit (up to hard limit)
+                //    - These are cross-shard TXs committed on other shards waiting on us
+                // 2. Transactions WITHOUT proofs must respect soft limit
+                // 3. Nothing can exceed hard limit
+                //
+                // In-flight count is deterministic across all honest validators because:
+                // - A TX becomes in-flight when committed in a block (same blocks everywhere)
+                // - A TX stops being in-flight when its certificate is committed (same blocks)
+                let current_in_flight = self.mempool.in_flight();
+                let config = self.mempool.config();
+                let soft_limit = config.max_in_flight;
+                let hard_limit = config.max_in_flight_hard_limit;
+
+                // Count transactions with and without commitment proofs
+                let with_proofs = tx_hashes
+                    .iter()
+                    .filter(|h| commitment_proofs.contains_key(h))
+                    .count();
+                let without_proofs = tx_hashes.len() - with_proofs;
+
+                // Hard limit check: total transactions (with or without proofs)
+                if current_in_flight + tx_hashes.len() > hard_limit {
+                    tracing::warn!(
+                        current_in_flight = current_in_flight,
+                        proposed_tx_count = tx_hashes.len(),
+                        hard_limit = hard_limit,
+                        block_hash = ?header.hash(),
+                        height = header.height.0,
+                        "Rejecting block that would exceed in-flight hard limit"
+                    );
+                    return vec![];
+                }
+
+                // Soft limit check: transactions without proofs
+                // If we're at/above soft limit, only transactions with proofs should be included
+                if current_in_flight >= soft_limit && without_proofs > 0 {
+                    tracing::warn!(
+                        current_in_flight = current_in_flight,
+                        soft_limit = soft_limit,
+                        txs_without_proofs = without_proofs,
+                        txs_with_proofs = with_proofs,
+                        block_hash = ?header.hash(),
+                        height = header.height.0,
+                        "Rejecting block with non-priority transactions while at soft limit"
+                    );
+                    return vec![];
+                }
+
                 let mempool_txs = self.mempool.transactions_by_hash();
                 let local_certs = self.execution.finalized_certificates_by_hash();
 
@@ -439,8 +490,18 @@ impl StateMachine for NodeStateMachine {
                 // Reset timeout - QC formed means progress
                 self.last_leader_activity = self.now;
 
+                // Count transactions in the block that will be committed by this QC.
+                // This is critical for respecting in-flight limits: the BlockCommitted
+                // event won't be processed until after we select transactions, so we
+                // need to preemptively count those transactions as "about to be in-flight".
+                let pending_commit_count = self.bft.pending_commit_tx_count(qc);
+
                 let max_txs = self.bft.config().max_transactions_per_block;
-                let txs = self.mempool.ready_transactions(max_txs, &self.provisions);
+                let txs = self.mempool.ready_transactions_with_pending_commits(
+                    max_txs,
+                    &self.provisions,
+                    pending_commit_count,
+                );
                 let commitment_proofs = self.build_commitment_proofs(&txs);
                 let deferred = self.livelock.get_pending_deferrals();
                 let current_height = hyperscale_types::BlockHeight(self.bft.committed_height() + 1);

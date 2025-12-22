@@ -999,8 +999,28 @@ impl MempoolState {
         max_count: usize,
         provisions: &ProvisionCoordinator,
     ) -> Vec<Arc<RoutableTransaction>> {
-        let at_soft_limit = self.at_in_flight_limit();
-        let at_hard_limit = self.at_in_flight_hard_limit();
+        self.ready_transactions_with_pending_commits(max_count, provisions, 0)
+    }
+
+    /// Get ready transactions, accounting for pending commits.
+    ///
+    /// Similar to `ready_transactions`, but adds `pending_commit_count` to the in-flight
+    /// count when checking limits. This prevents the race condition where transactions
+    /// are selected BEFORE a block commit is processed, causing the in-flight limit
+    /// to be bypassed.
+    ///
+    /// The `pending_commit_count` should be the number of transactions in blocks that
+    /// are about to be committed but haven't been processed yet (e.g., from a QC that
+    /// just formed but whose BlockCommitted event hasn't been dispatched).
+    pub fn ready_transactions_with_pending_commits(
+        &self,
+        max_count: usize,
+        provisions: &ProvisionCoordinator,
+        pending_commit_count: usize,
+    ) -> Vec<Arc<RoutableTransaction>> {
+        let effective_in_flight = self.in_flight() + pending_commit_count;
+        let at_soft_limit = effective_in_flight >= self.config.max_in_flight;
+        let at_hard_limit = effective_in_flight >= self.config.max_in_flight_hard_limit;
 
         // At hard limit: no TXs at all
         if at_hard_limit {
@@ -1116,6 +1136,11 @@ impl MempoolState {
     /// with provisions. This prevents unbounded growth and controls system pressure.
     pub fn at_in_flight_hard_limit(&self) -> bool {
         self.in_flight() >= self.config.max_in_flight_hard_limit
+    }
+
+    /// Get the mempool configuration.
+    pub fn config(&self) -> &MempoolConfig {
+        &self.config
     }
 
     /// Check if we have a transaction.

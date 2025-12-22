@@ -2026,6 +2026,42 @@ impl BftState {
     // QC and Commit Logic
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// Count transactions in the block that would be committed by a QC.
+    ///
+    /// This is used by the mempool to account for "about to be committed" transactions
+    /// when calculating in-flight limits. When a QC forms, the 2-chain commit rule
+    /// may commit a parent block, but that commit event won't be processed until after
+    /// transaction selection. This method allows the caller to preemptively count those
+    /// transactions.
+    ///
+    /// Returns 0 if the QC won't trigger a commit or the block data isn't available.
+    pub fn pending_commit_tx_count(&self, qc: &QuorumCertificate) -> usize {
+        if !qc.has_committable_block() {
+            return 0;
+        }
+
+        let Some(committable_hash) = qc.committable_hash() else {
+            return 0;
+        };
+        let Some(committable_height) = qc.committable_height() else {
+            return 0;
+        };
+
+        // Only count if we haven't already committed this height
+        if committable_height.0 <= self.committed_height {
+            return 0;
+        }
+
+        // Look up the block to count transactions
+        if let Some(pending) = self.pending_blocks.get(&committable_hash) {
+            pending.block().map(|b| b.transactions.len()).unwrap_or(0)
+        } else if let Some((block, _)) = self.certified_blocks.get(&committable_hash) {
+            block.transactions.len()
+        } else {
+            0
+        }
+    }
+
     /// Handle QC formation.
     ///
     /// When a QC forms, we:
