@@ -1677,6 +1677,7 @@ impl ProductionRunner {
                 committee_size,
             } => {
                 let event_tx = self.callback_tx.clone();
+                let topology = self.topology.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
 
@@ -1706,12 +1707,13 @@ impl ProductionRunner {
                     };
 
                     // Create signer bitfield
+                    // Use topology to get correct committee index for the shard.
+                    // Validator IDs are global but committee indices are per-shard.
                     let mut signers = SignerBitfield::new(committee_size);
 
                     for vote in &unique_votes {
-                        // Use validator ID as index (assumes validators are numbered 0..N)
-                        let idx = vote.validator.0 as usize;
-                        if idx < committee_size {
+                        if let Some(idx) = topology.committee_index_for_shard(shard, vote.validator)
+                        {
                             signers.set(idx);
                         }
                     }
