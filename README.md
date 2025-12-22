@@ -178,3 +178,22 @@ Example command (adjust ports as needed):
   --tps 100 \
   --duration 30s
 ```
+
+
+## Troubleshooting
+
+### Windows: "Path too long" Error
+
+If you encounter "path too long" errors during `cargo build` on Windows (often due to deep dependency trees), you need to enable Long Paths in Windows.
+
+1.  Open **PowerShell** as Administrator.
+2.  Run the following command to enable long paths in the registry:
+    ```powershell
+    New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+    ```
+3.  Restart your computer (or sign out and back in).
+4.  Run this git command to ensure git uses long paths:
+    ```bash
+    git config --system core.longpaths true
+    ```
+
