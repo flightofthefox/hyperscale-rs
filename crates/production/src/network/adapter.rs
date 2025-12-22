@@ -342,12 +342,14 @@ pub struct Libp2pAdapter {
     sync_request_tx: mpsc::Sender<InboundSyncRequest>,
 
     /// Channel for inbound transaction fetch requests (sent to runner for processing).
+    /// Unbounded to avoid blocking the network event loop.
     #[allow(dead_code)]
-    tx_request_tx: mpsc::Sender<InboundTransactionRequest>,
+    tx_request_tx: mpsc::UnboundedSender<InboundTransactionRequest>,
 
     /// Channel for inbound certificate fetch requests (sent to runner for processing).
+    /// Unbounded to avoid blocking the network event loop.
     #[allow(dead_code)]
-    cert_request_tx: mpsc::Sender<InboundCertificateRequest>,
+    cert_request_tx: mpsc::UnboundedSender<InboundCertificateRequest>,
 
     /// Cached connected peer count (updated by background task).
     /// This avoids blocking the consensus loop to query peer count.
@@ -384,8 +386,8 @@ impl Libp2pAdapter {
         (
             Arc<Self>,
             mpsc::Receiver<InboundSyncRequest>,
-            mpsc::Receiver<InboundTransactionRequest>,
-            mpsc::Receiver<InboundCertificateRequest>,
+            mpsc::UnboundedReceiver<InboundTransactionRequest>,
+            mpsc::UnboundedReceiver<InboundCertificateRequest>,
         ),
         NetworkError,
     > {
@@ -577,8 +579,8 @@ impl Libp2pAdapter {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (sync_request_tx, sync_request_rx) = mpsc::channel(1000); // Buffer for inbound sync requests
-        let (tx_request_tx, tx_request_rx) = mpsc::channel(5000); // Buffer for inbound transaction requests (high under load)
-        let (cert_request_tx, cert_request_rx) = mpsc::channel(5000); // Buffer for inbound certificate requests (high under load)
+        let (tx_request_tx, tx_request_rx) = mpsc::unbounded_channel(); // Unbounded to avoid blocking network event loop
+        let (cert_request_tx, cert_request_rx) = mpsc::unbounded_channel(); // Unbounded to avoid blocking network event loop
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
         let adapter = Arc::new(Self {
@@ -902,8 +904,8 @@ impl Libp2pAdapter {
         peer_validators: Arc<RwLock<HashMap<Libp2pPeerId, ValidatorId>>>,
         mut shutdown_rx: mpsc::Receiver<()>,
         sync_request_tx: mpsc::Sender<InboundSyncRequest>,
-        tx_request_tx: mpsc::Sender<InboundTransactionRequest>,
-        cert_request_tx: mpsc::Sender<InboundCertificateRequest>,
+        tx_request_tx: mpsc::UnboundedSender<InboundTransactionRequest>,
+        cert_request_tx: mpsc::UnboundedSender<InboundCertificateRequest>,
         rate_limit_config: RateLimitConfig,
         cached_peer_count: Arc<AtomicUsize>,
         local_shard: ShardGroupId,
@@ -1187,8 +1189,8 @@ impl Libp2pAdapter {
         pending_response_channels: &mut HashMap<u64, ResponseChannel<Vec<u8>>>,
         next_channel_id: &mut u64,
         sync_request_tx: &mpsc::Sender<InboundSyncRequest>,
-        tx_request_tx: &mpsc::Sender<InboundTransactionRequest>,
-        cert_request_tx: &mpsc::Sender<InboundCertificateRequest>,
+        tx_request_tx: &mpsc::UnboundedSender<InboundTransactionRequest>,
+        cert_request_tx: &mpsc::UnboundedSender<InboundCertificateRequest>,
         rate_limiter: &mut SyncRateLimiter,
         local_shard: ShardGroupId,
         tx_validation_handle: &ValidationBatcherHandle,
@@ -1460,10 +1462,10 @@ impl Libp2pAdapter {
                                     channel_id,
                                 };
 
-                                if tx_request_tx.send(inbound_request).await.is_err() {
+                                if tx_request_tx.send(inbound_request).is_err() {
                                     warn!(
                                         channel_id,
-                                        "Failed to send transaction request to runner (channel full or closed)"
+                                        "Failed to send transaction request to fetch handler (channel closed)"
                                     );
                                     pending_response_channels.remove(&channel_id);
                                 }
@@ -1496,10 +1498,10 @@ impl Libp2pAdapter {
                                     channel_id,
                                 };
 
-                                if cert_request_tx.send(inbound_request).await.is_err() {
+                                if cert_request_tx.send(inbound_request).is_err() {
                                     warn!(
                                         channel_id,
-                                        "Failed to send certificate request to runner (channel full or closed)"
+                                        "Failed to send certificate request to fetch handler (channel closed)"
                                     );
                                     pending_response_channels.remove(&channel_id);
                                 }
