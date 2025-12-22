@@ -2026,40 +2026,54 @@ impl BftState {
     // QC and Commit Logic
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Count transactions in the block that would be committed by a QC.
+    /// Count transactions and certificates in the block that would be committed by a QC.
     ///
     /// This is used by the mempool to account for "about to be committed" transactions
     /// when calculating in-flight limits. When a QC forms, the 2-chain commit rule
     /// may commit a parent block, but that commit event won't be processed until after
-    /// transaction selection. This method allows the caller to preemptively count those
-    /// transactions.
+    /// transaction selection. This method allows the caller to preemptively count:
+    /// - Transactions that will INCREASE in-flight (new commits)
+    /// - Certificates that will DECREASE in-flight (completed transactions)
     ///
-    /// Returns 0 if the QC won't trigger a commit or the block data isn't available.
-    pub fn pending_commit_tx_count(&self, qc: &QuorumCertificate) -> usize {
+    /// Returns (tx_count, cert_count). Both are 0 if the QC won't trigger a commit
+    /// or the block data isn't available.
+    pub fn pending_commit_counts(&self, qc: &QuorumCertificate) -> (usize, usize) {
         if !qc.has_committable_block() {
-            return 0;
+            return (0, 0);
         }
 
         let Some(committable_hash) = qc.committable_hash() else {
-            return 0;
+            return (0, 0);
         };
         let Some(committable_height) = qc.committable_height() else {
-            return 0;
+            return (0, 0);
         };
 
         // Only count if we haven't already committed this height
         if committable_height.0 <= self.committed_height {
-            return 0;
+            return (0, 0);
         }
 
-        // Look up the block to count transactions
+        // Look up the block to count transactions and certificates
         if let Some(pending) = self.pending_blocks.get(&committable_hash) {
-            pending.block().map(|b| b.transactions.len()).unwrap_or(0)
+            if let Some(block) = pending.block() {
+                (block.transactions.len(), block.committed_certificates.len())
+            } else {
+                (0, 0)
+            }
         } else if let Some((block, _)) = self.certified_blocks.get(&committable_hash) {
-            block.transactions.len()
+            (block.transactions.len(), block.committed_certificates.len())
         } else {
-            0
+            (0, 0)
         }
+    }
+
+    /// Count transactions in the block that would be committed by a QC.
+    ///
+    /// Convenience method - returns only the transaction count.
+    /// Use `pending_commit_counts` if you also need certificate count.
+    pub fn pending_commit_tx_count(&self, qc: &QuorumCertificate) -> usize {
+        self.pending_commit_counts(qc).0
     }
 
     /// Handle QC formation.

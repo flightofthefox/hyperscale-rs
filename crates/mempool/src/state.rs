@@ -999,26 +999,32 @@ impl MempoolState {
         max_count: usize,
         provisions: &ProvisionCoordinator,
     ) -> Vec<Arc<RoutableTransaction>> {
-        self.ready_transactions_with_pending_commits(max_count, provisions, 0)
+        self.ready_transactions_with_pending_commits(max_count, provisions, 0, 0)
     }
 
-    /// Get ready transactions, accounting for pending commits.
+    /// Get ready transactions, accounting for pending commits and completions.
     ///
-    /// Similar to `ready_transactions`, but adds `pending_commit_count` to the in-flight
-    /// count when checking limits. This prevents the race condition where transactions
-    /// are selected BEFORE a block commit is processed, causing the in-flight limit
-    /// to be bypassed.
+    /// Similar to `ready_transactions`, but adjusts the in-flight count for pending
+    /// block commits. This prevents the race condition where transactions are selected
+    /// BEFORE a block commit is processed, causing the in-flight limit to be bypassed.
     ///
-    /// The `pending_commit_count` should be the number of transactions in blocks that
-    /// are about to be committed but haven't been processed yet (e.g., from a QC that
-    /// just formed but whose BlockCommitted event hasn't been dispatched).
+    /// Parameters:
+    /// - `pending_commit_tx_count`: Transactions about to be committed (INCREASES in-flight)
+    /// - `pending_commit_cert_count`: Certificates about to be committed (DECREASES in-flight)
+    ///
+    /// The effective in-flight is: current + pending_txs - pending_certs
     pub fn ready_transactions_with_pending_commits(
         &self,
         max_count: usize,
         provisions: &ProvisionCoordinator,
-        pending_commit_count: usize,
+        pending_commit_tx_count: usize,
+        pending_commit_cert_count: usize,
     ) -> Vec<Arc<RoutableTransaction>> {
-        let effective_in_flight = self.in_flight() + pending_commit_count;
+        // Certificates reduce in-flight (transactions complete), txs increase it
+        let effective_in_flight = self
+            .in_flight()
+            .saturating_add(pending_commit_tx_count)
+            .saturating_sub(pending_commit_cert_count);
         let at_soft_limit = effective_in_flight >= self.config.max_in_flight;
         let at_hard_limit = effective_in_flight >= self.config.max_in_flight_hard_limit;
 

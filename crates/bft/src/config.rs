@@ -55,7 +55,7 @@ impl Default for BftConfig {
         Self {
             proposal_interval: Duration::from_millis(300),
             view_change_timeout: Duration::from_secs(3),
-            max_transactions_per_block: 4096,
+            max_transactions_per_block: 1024,
             max_certificates_per_block: 4096,
             max_timestamp_delay_ms: 30_000,
             max_timestamp_rush_ms: 2_000,

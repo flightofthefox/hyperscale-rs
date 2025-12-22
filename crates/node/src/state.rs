@@ -415,7 +415,13 @@ impl StateMachine for NodeStateMachine {
                 // In-flight count is deterministic across all honest validators because:
                 // - A TX becomes in-flight when committed in a block (same blocks everywhere)
                 // - A TX stops being in-flight when its certificate is committed (same blocks)
+                //
+                // The block being validated also contains certificates that REDUCE in-flight,
+                // so we account for those as well.
                 let current_in_flight = self.mempool.in_flight();
+                let certs_in_block = cert_hashes.len();
+                let effective_in_flight = current_in_flight.saturating_sub(certs_in_block);
+
                 let config = self.mempool.config();
                 let soft_limit = config.max_in_flight;
                 let hard_limit = config.max_in_flight_hard_limit;
@@ -427,10 +433,12 @@ impl StateMachine for NodeStateMachine {
                     .count();
                 let without_proofs = tx_hashes.len() - with_proofs;
 
-                // Hard limit check: total transactions (with or without proofs)
-                if current_in_flight + tx_hashes.len() > hard_limit {
+                // Hard limit check: effective_in_flight + new txs
+                if effective_in_flight + tx_hashes.len() > hard_limit {
                     tracing::warn!(
                         current_in_flight = current_in_flight,
+                        certs_in_block = certs_in_block,
+                        effective_in_flight = effective_in_flight,
                         proposed_tx_count = tx_hashes.len(),
                         hard_limit = hard_limit,
                         block_hash = ?header.hash(),
@@ -442,9 +450,10 @@ impl StateMachine for NodeStateMachine {
 
                 // Soft limit check: transactions without proofs
                 // If we're at/above soft limit, only transactions with proofs should be included
-                if current_in_flight >= soft_limit && without_proofs > 0 {
+                if effective_in_flight >= soft_limit && without_proofs > 0 {
                     tracing::warn!(
                         current_in_flight = current_in_flight,
+                        effective_in_flight = effective_in_flight,
                         soft_limit = soft_limit,
                         txs_without_proofs = without_proofs,
                         txs_with_proofs = with_proofs,
@@ -490,17 +499,20 @@ impl StateMachine for NodeStateMachine {
                 // Reset timeout - QC formed means progress
                 self.last_leader_activity = self.now;
 
-                // Count transactions in the block that will be committed by this QC.
+                // Count transactions and certificates in the block that will be committed.
                 // This is critical for respecting in-flight limits: the BlockCommitted
                 // event won't be processed until after we select transactions, so we
-                // need to preemptively count those transactions as "about to be in-flight".
-                let pending_commit_count = self.bft.pending_commit_tx_count(qc);
+                // need to preemptively account for:
+                // - Transactions that will INCREASE in-flight (new commits)
+                // - Certificates that will DECREASE in-flight (completed transactions)
+                let (pending_tx_count, pending_cert_count) = self.bft.pending_commit_counts(qc);
 
                 let max_txs = self.bft.config().max_transactions_per_block;
                 let txs = self.mempool.ready_transactions_with_pending_commits(
                     max_txs,
                     &self.provisions,
-                    pending_commit_count,
+                    pending_tx_count,
+                    pending_cert_count,
                 );
                 let commitment_proofs = self.build_commitment_proofs(&txs);
                 let deferred = self.livelock.get_pending_deferrals();
