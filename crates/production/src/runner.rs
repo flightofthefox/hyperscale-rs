@@ -1,8 +1,7 @@
 //! Production runner implementation.
 
 use crate::action_dispatcher::{
-    spawn_action_dispatcher, ActionDispatcherConfig, ActionDispatcherContext,
-    ActionDispatcherHandle, DispatchableAction,
+    spawn_action_dispatcher, ActionDispatcherContext, ActionDispatcherHandle, DispatchableAction,
 };
 use crate::fetch_handler::{spawn_fetch_handler, FetchHandlerConfig, FetchHandlerHandle};
 use crate::network::{
@@ -519,13 +518,10 @@ impl ProductionRunnerBuilder {
 
         // Spawn action dispatcher task for fire-and-forget network I/O.
         // Network broadcasts are moved off the event loop to prevent blocking.
-        let action_dispatcher = spawn_action_dispatcher(
-            ActionDispatcherConfig::default(),
-            ActionDispatcherContext {
-                network: network.clone(),
-                message_batcher: message_batcher.clone(),
-            },
-        );
+        let action_dispatcher = spawn_action_dispatcher(ActionDispatcherContext {
+            network: network.clone(),
+            message_batcher: message_batcher.clone(),
+        });
         let dispatch_tx = action_dispatcher.tx.clone();
 
         Ok(ProductionRunner {
@@ -683,7 +679,8 @@ pub struct ProductionRunner {
     fetch_handler: FetchHandlerHandle,
     /// Sender for dispatching fire-and-forget actions to the action dispatcher task.
     /// Network broadcasts, timer management, and non-critical writes go through this.
-    dispatch_tx: mpsc::Sender<DispatchableAction>,
+    /// Unbounded to prevent dropping critical consensus messages under load.
+    dispatch_tx: mpsc::UnboundedSender<DispatchableAction>,
     /// Handle for the dedicated action dispatcher task.
     #[allow(dead_code)]
     action_dispatcher: ActionDispatcherHandle,
@@ -1494,39 +1491,20 @@ impl ProductionRunner {
                 // Inject trace context for cross-shard messages (no-op if feature disabled)
                 message.inject_trace_context();
 
-                // Dispatch to action dispatcher - non-blocking
-                if let Err(e) = self
+                // Dispatch to action dispatcher (unbounded channel - never blocks or drops)
+                let _ = self
                     .dispatch_tx
-                    .try_send(DispatchableAction::BroadcastToShard { shard, message })
-                {
-                    // Channel full or closed - fall back to direct send (blocking)
-                    tracing::warn!(
-                        "Action dispatch channel full, falling back to blocking broadcast"
-                    );
-                    if let DispatchableAction::BroadcastToShard { shard, message } = e.into_inner()
-                    {
-                        self.network.broadcast_shard(shard, &message).await?;
-                    }
-                }
+                    .send(DispatchableAction::BroadcastToShard { shard, message });
             }
 
             Action::BroadcastGlobal { mut message } => {
                 // Inject trace context for cross-shard messages (no-op if feature disabled)
                 message.inject_trace_context();
 
-                // Dispatch to action dispatcher - non-blocking
-                if let Err(e) = self
+                // Dispatch to action dispatcher (unbounded channel - never blocks or drops)
+                let _ = self
                     .dispatch_tx
-                    .try_send(DispatchableAction::BroadcastGlobal { message })
-                {
-                    // Channel full or closed - fall back to direct send (blocking)
-                    tracing::warn!(
-                        "Action dispatch channel full, falling back to blocking broadcast"
-                    );
-                    if let DispatchableAction::BroadcastGlobal { message } = e.into_inner() {
-                        self.network.broadcast_global(&message).await?;
-                    }
-                }
+                    .send(DispatchableAction::BroadcastGlobal { message });
             }
 
             // Domain-specific execution broadcasts - dispatch to action dispatcher
@@ -1534,19 +1512,19 @@ impl ProductionRunner {
             Action::BroadcastStateVote { shard, vote } => {
                 let _ = self
                     .dispatch_tx
-                    .try_send(DispatchableAction::QueueStateVote { shard, vote });
+                    .send(DispatchableAction::QueueStateVote { shard, vote });
             }
 
             Action::BroadcastStateCertificate { shard, certificate } => {
                 let _ = self
                     .dispatch_tx
-                    .try_send(DispatchableAction::QueueStateCertificate { shard, certificate });
+                    .send(DispatchableAction::QueueStateCertificate { shard, certificate });
             }
 
             Action::BroadcastStateProvision { shard, provision } => {
                 let _ = self
                     .dispatch_tx
-                    .try_send(DispatchableAction::QueueStateProvision { shard, provision });
+                    .send(DispatchableAction::QueueStateProvision { shard, provision });
             }
 
             // Timers via timer manager
@@ -2213,8 +2191,8 @@ impl ProductionRunner {
 
                     // After persist completes, send broadcast to action dispatcher
                     // This ensures persist-before-broadcast ordering without blocking the event loop
-                    let _ = dispatch_tx
-                        .try_send(DispatchableAction::BroadcastToShard { shard, message });
+                    let _ =
+                        dispatch_tx.send(DispatchableAction::BroadcastToShard { shard, message });
                 });
                 // Note: No .await - we don't block the event loop
             }
