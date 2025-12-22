@@ -520,10 +520,11 @@ impl SimNode {
                 };
 
                 // Create signer bitfield
+                // Use topology to get correct committee index for the shard.
+                let topology = self.state.topology();
                 let mut signers = SignerBitfield::new(committee_size);
                 for vote in &unique_votes {
-                    let idx = vote.validator.0 as usize;
-                    if idx < committee_size {
+                    if let Some(idx) = topology.committee_index_for_shard(shard, vote.validator) {
                         signers.set(idx);
                     }
                 }

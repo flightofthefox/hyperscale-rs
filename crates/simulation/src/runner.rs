@@ -799,9 +799,15 @@ impl SimulationRunner {
                 };
 
                 // Create signer bitfield
+                // Compute committee index from validator ID and shard.
+                // In simulation, validator IDs are sequential across shards:
+                // Shard 0: validators 0, 1, 2; Shard 1: validators 3, 4, 5, etc.
+                // Committee index = validator_id - (shard * validators_per_shard)
+                let validators_per_shard = self.network.config().validators_per_shard as u64;
+                let shard_base = shard.0 * validators_per_shard;
                 let mut signers = SignerBitfield::new(committee_size);
                 for vote in &unique_votes {
-                    let idx = vote.validator.0 as usize;
+                    let idx = (vote.validator.0 - shard_base) as usize;
                     if idx < committee_size {
                         signers.set(idx);
                     }
