@@ -1021,6 +1021,39 @@ impl StateMachine for NodeStateMachine {
             Event::CertificateFetchFailed { block_hash } => {
                 return self.bft.on_fetch_failed(*block_hash);
             }
+
+            // TransactionCertificateReceived is handled directly by the production runner
+            // (verified and persisted to storage without going through the state machine).
+            // In simulation, we handle it in the simulator's runner, not here.
+            Event::TransactionCertificateReceived { .. } => {
+                // No action needed - runner handles verification and persistence
+                return vec![];
+            }
+
+            // GossipedCertificateVerified - a gossiped certificate has been verified and persisted.
+            // Cancel local certificate building and add to finalized certificates.
+            Event::GossipedCertificateVerified { certificate } => {
+                let tx_hash = certificate.transaction_hash;
+
+                // Cancel any ongoing local certificate building
+                self.execution.cancel_certificate_building(&tx_hash);
+
+                // Add to finalized certificates if not already present
+                self.execution.add_verified_certificate(certificate.clone());
+
+                // Notify mempool that transaction is finalized
+                return vec![Action::EnqueueInternal {
+                    event: Event::TransactionExecuted {
+                        tx_hash,
+                        accepted: certificate.is_accepted(),
+                    },
+                }];
+            }
+
+            // GossipedCertificateSignatureVerified is handled by the runner, not here
+            Event::GossipedCertificateSignatureVerified { .. } => {
+                return vec![];
+            }
         }
 
         // Event not handled by any sub-machine

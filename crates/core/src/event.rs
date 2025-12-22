@@ -88,6 +88,13 @@ pub enum Event {
     /// Received a state certificate for cross-shard execution.
     StateCertificateReceived { cert: StateCertificate },
 
+    /// Received a finalized transaction certificate via gossip.
+    ///
+    /// This is gossiped to same-shard peers so they can persist the certificate
+    /// before the proposer includes it in a block. This ensures the certificate
+    /// is available for fetch requests when other validators receive the block header.
+    TransactionCertificateReceived { certificate: TransactionCertificate },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Network Messages - Mempool (priority: Network)
     // ═══════════════════════════════════════════════════════════════════════
@@ -589,6 +596,33 @@ pub enum Event {
         /// Hash of the block whose certificates failed to fetch.
         block_hash: Hash,
     },
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Gossiped Certificate Verification (priority: Internal)
+    // Runner verifies gossiped TransactionCertificates before persisting.
+    // ═══════════════════════════════════════════════════════════════════════
+    /// A shard's signature in a gossiped certificate has been verified (priority: Internal).
+    ///
+    /// Internal callback from the crypto pool. When all shards are verified,
+    /// runner emits GossipedCertificateVerified.
+    GossipedCertificateSignatureVerified {
+        /// Transaction hash identifying the certificate.
+        tx_hash: Hash,
+        /// Shard whose StateCertificate was verified.
+        shard: ShardGroupId,
+        /// Whether the aggregated signature is valid.
+        valid: bool,
+    },
+
+    /// A gossiped TransactionCertificate has been fully verified (priority: Internal).
+    ///
+    /// Emitted by the runner after verifying all embedded StateCertificate
+    /// signatures. The certificate has been persisted to storage; state machine
+    /// should cancel local certificate building and add to finalized certificates.
+    GossipedCertificateVerified {
+        /// The verified certificate.
+        certificate: TransactionCertificate,
+    },
 }
 
 impl Event {
@@ -671,6 +705,13 @@ impl Event {
 
             // BLS aggregation callbacks
             Event::StateCertificateAggregated { .. } => EventPriority::Internal,
+
+            // Transaction certificate gossip
+            Event::TransactionCertificateReceived { .. } => EventPriority::Network,
+
+            // Gossiped certificate verification callbacks
+            Event::GossipedCertificateSignatureVerified { .. } => EventPriority::Internal,
+            Event::GossipedCertificateVerified { .. } => EventPriority::Internal,
         }
     }
 
@@ -704,6 +745,7 @@ impl Event {
             Event::StateProvisionReceived { .. } => "StateProvisionReceived",
             Event::StateVoteReceived { .. } => "StateVoteReceived",
             Event::StateCertificateReceived { .. } => "StateCertificateReceived",
+            Event::TransactionCertificateReceived { .. } => "TransactionCertificateReceived",
 
             // Network - Mempool
             Event::TransactionGossipReceived { .. } => "TransactionGossipReceived",
@@ -774,6 +816,12 @@ impl Event {
 
             // BLS aggregation callbacks
             Event::StateCertificateAggregated { .. } => "StateCertificateAggregated",
+
+            // Gossiped certificate verification
+            Event::GossipedCertificateSignatureVerified { .. } => {
+                "GossipedCertificateSignatureVerified"
+            }
+            Event::GossipedCertificateVerified { .. } => "GossipedCertificateVerified",
         }
     }
 }

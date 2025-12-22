@@ -22,7 +22,7 @@ use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     Block, BlockHeader, BlockMetadata, BlockVote, CommitmentProof, Hash, KeyPair, PublicKey,
     QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
-    StateVoteBlock, Topology, ValidatorId,
+    StateVoteBlock, Topology, TransactionCertificate, ValidatorId,
 };
 use libp2p::identity;
 use sbor::prelude::*;
@@ -108,6 +108,20 @@ impl PendingCrossShardExecutions {
     fn take(&mut self) -> Vec<hyperscale_core::CrossShardExecutionRequest> {
         std::mem::take(&mut self.requests)
     }
+}
+
+/// Pending verification of a gossiped TransactionCertificate.
+///
+/// When we receive a TransactionCertificate via gossip, we verify each embedded
+/// StateCertificate's BLS signature before persisting. This tracks the verification
+/// progress for a single certificate.
+struct PendingGossipCertVerification {
+    /// The certificate being verified.
+    certificate: TransactionCertificate,
+    /// Shards still awaiting verification callback.
+    pending_shards: std::collections::HashSet<ShardGroupId>,
+    /// Whether any verification has failed.
+    failed: bool,
 }
 
 /// Handle for shutting down a running ProductionRunner.
@@ -567,6 +581,7 @@ impl ProductionRunnerBuilder {
             dispatch_tx,
             action_dispatcher,
             rpc_submitted_txs: std::collections::HashSet::new(),
+            pending_gossip_cert_verifications: std::collections::HashMap::new(),
         })
     }
 }
@@ -689,6 +704,11 @@ pub struct ProductionRunner {
     /// Used to track which transactions should contribute to latency metrics.
     /// Transactions are added when received via RPC, removed when finalized.
     rpc_submitted_txs: std::collections::HashSet<hyperscale_types::Hash>,
+    /// Pending verifications for gossiped TransactionCertificates.
+    /// Maps tx_hash -> verification state. When all shards verified, certificate is
+    /// persisted and GossipedCertificateVerified event sent to state machine.
+    pending_gossip_cert_verifications:
+        std::collections::HashMap<Hash, PendingGossipCertVerification>,
 }
 
 impl ProductionRunner {
@@ -1140,6 +1160,126 @@ impl ProductionRunner {
                             // Update time
                             let now = self.wall_clock_time();
                             self.state.set_time(now);
+
+                            // Handle TransactionCertificateReceived - verify before persisting.
+                            // This is a certificate gossiped from another validator. We verify all
+                            // embedded StateCertificate BLS signatures before persisting to prevent
+                            // malicious peers from filling our storage with invalid certificates.
+                            if let Event::TransactionCertificateReceived { certificate } = &event {
+                                let tx_hash = certificate.transaction_hash;
+
+                                // Skip if already verified or in storage
+                                if self.pending_gossip_cert_verifications.contains_key(&tx_hash) {
+                                    continue;
+                                }
+                                if self.storage.get_certificate(&tx_hash).is_some() {
+                                    continue;
+                                }
+
+                                // Collect shards that need verification
+                                let pending_shards: std::collections::HashSet<ShardGroupId> =
+                                    certificate.shard_proofs.keys().copied().collect();
+
+                                if pending_shards.is_empty() {
+                                    // Empty certificate (no shard proofs) - persist directly
+                                    // This shouldn't happen in practice but handle it gracefully
+                                    self.persist_and_notify_gossiped_certificate(certificate.clone());
+                                    continue;
+                                }
+
+                                // Track pending verification
+                                self.pending_gossip_cert_verifications.insert(
+                                    tx_hash,
+                                    PendingGossipCertVerification {
+                                        certificate: certificate.clone(),
+                                        pending_shards: pending_shards.clone(),
+                                        failed: false,
+                                    },
+                                );
+
+                                // Spawn verification for each StateCertificate on crypto pool
+                                for (shard_id, state_cert) in &certificate.shard_proofs {
+                                    let committee = self.topology.committee_for_shard(*shard_id);
+                                    let public_keys: Vec<PublicKey> = committee
+                                        .iter()
+                                        .filter_map(|&vid| self.topology.public_key(vid))
+                                        .collect();
+
+                                    if public_keys.len() != committee.len() {
+                                        tracing::warn!(
+                                            tx_hash = ?tx_hash,
+                                            shard = shard_id.0,
+                                            "Could not resolve all public keys for gossiped certificate"
+                                        );
+                                        // Mark as failed
+                                        if let Some(pending) =
+                                            self.pending_gossip_cert_verifications.get_mut(&tx_hash)
+                                        {
+                                            pending.failed = true;
+                                            pending.pending_shards.remove(shard_id);
+                                        }
+                                        continue;
+                                    }
+
+                                    let cert = state_cert.clone();
+                                    let shard = *shard_id;
+                                    let callback_tx = self.callback_tx.clone();
+
+                                    self.thread_pools.spawn_crypto(move || {
+                                        let valid =
+                                            verify_state_certificate_signature(&cert, &public_keys);
+                                        let _ = callback_tx.send(
+                                            Event::GossipedCertificateSignatureVerified {
+                                                tx_hash,
+                                                shard,
+                                                valid,
+                                            },
+                                        );
+                                    });
+                                }
+
+                                // Don't dispatch to state machine yet - wait for verification
+                                continue;
+                            }
+
+                            // Handle GossipedCertificateSignatureVerified callbacks
+                            if let Event::GossipedCertificateSignatureVerified {
+                                tx_hash,
+                                shard,
+                                valid,
+                            } = &event
+                            {
+                                if let Some(pending) =
+                                    self.pending_gossip_cert_verifications.get_mut(tx_hash)
+                                {
+                                    if !valid {
+                                        pending.failed = true;
+                                        tracing::warn!(
+                                            tx_hash = ?tx_hash,
+                                            shard = shard.0,
+                                            "Gossiped certificate signature verification failed"
+                                        );
+                                    }
+                                    pending.pending_shards.remove(shard);
+
+                                    // Check if all shards verified
+                                    if pending.pending_shards.is_empty() {
+                                        let pending = self
+                                            .pending_gossip_cert_verifications
+                                            .remove(tx_hash)
+                                            .unwrap();
+
+                                        if !pending.failed {
+                                            // All verified - persist and notify state machine
+                                            self.persist_and_notify_gossiped_certificate(
+                                                pending.certificate,
+                                            );
+                                        }
+                                        // If failed, just drop - don't persist invalid certificate
+                                    }
+                                }
+                                continue;
+                            }
 
                             // Process event synchronously (fast)
                             // Note: Runner I/O requests (StartSync, FetchTransactions, FetchCertificates)
@@ -2183,11 +2323,21 @@ impl ProductionRunner {
 
                 // Run on blocking thread since RocksDB write is sync I/O
                 // RocksDB is internally thread-safe, no lock needed
+                let cert_for_persist = certificate.clone();
                 tokio::task::spawn_blocking(move || {
-                    storage.commit_certificate_with_writes(&certificate, &writes);
+                    storage.commit_certificate_with_writes(&cert_for_persist, &writes);
                 })
                 .await
                 .ok();
+
+                // After persisting, gossip certificate to same-shard peers.
+                // This ensures other validators have the certificate before the proposer
+                // includes it in a block, avoiding fetch delays that can cause backpressure.
+                let gossip = hyperscale_messages::TransactionCertificateGossip::new(certificate);
+                let _ = self.dispatch_tx.send(DispatchableAction::BroadcastToShard {
+                    shard: local_shard,
+                    message: OutboundMessage::TransactionCertificateGossip(gossip),
+                });
             }
 
             Action::PersistAndBroadcastVote {
@@ -2734,6 +2884,34 @@ impl ProductionRunner {
         });
     }
 
+    /// Persist a verified gossiped certificate and notify the state machine.
+    ///
+    /// Called after all StateCertificate signatures in a gossiped TransactionCertificate
+    /// have been verified. Persists to storage and sends GossipedCertificateVerified
+    /// to the state machine to cancel local certificate building.
+    fn persist_and_notify_gossiped_certificate(&self, certificate: TransactionCertificate) {
+        let storage = self.storage.clone();
+        let local_shard = self.local_shard;
+        let callback_tx = self.callback_tx.clone();
+
+        // Extract writes for local shard
+        let writes: Vec<_> = certificate
+            .shard_proofs
+            .get(&local_shard)
+            .map(|c| c.state_writes.clone())
+            .unwrap_or_default();
+
+        let cert_for_persist = certificate.clone();
+
+        // Fire-and-forget persist (don't block event loop)
+        tokio::task::spawn_blocking(move || {
+            storage.commit_certificate_with_writes(&cert_for_persist, &writes);
+        });
+
+        // Notify state machine to cancel local building and add to finalized
+        let _ = callback_tx.send(Event::GossipedCertificateVerified { certificate });
+    }
+
     /// Submit a transaction.
     ///
     /// The transaction is gossiped to all relevant shards and then submitted
@@ -2859,5 +3037,36 @@ impl ProductionRunner {
     /// state machine and handled in process_action().
     async fn dispatch_event(&mut self, event: Event) -> Vec<Action> {
         self.state.handle(event)
+    }
+}
+
+/// Verify a StateCertificate's aggregated BLS signature.
+///
+/// This is the same verification logic used for fetched certificates and gossiped
+/// certificates. Checks that the aggregated signature from the signers bitfield
+/// matches the signing message.
+fn verify_state_certificate_signature(
+    certificate: &hyperscale_types::StateCertificate,
+    public_keys: &[PublicKey],
+) -> bool {
+    let msg = certificate.signing_message();
+
+    // Get signer keys based on bitfield
+    let signer_keys: Vec<_> = public_keys
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| certificate.signers.is_set(*i))
+        .map(|(_, pk)| pk.clone())
+        .collect();
+
+    if signer_keys.is_empty() {
+        // No signers - valid only if zero signature (single-validator or genesis case)
+        certificate.aggregated_signature == Signature::zero()
+    } else {
+        // Verify aggregated BLS signature
+        match PublicKey::aggregate_bls(&signer_keys) {
+            Ok(aggregated_pk) => aggregated_pk.verify(&msg, &certificate.aggregated_signature),
+            Err(_) => false,
+        }
     }
 }

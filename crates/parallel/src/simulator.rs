@@ -361,6 +361,38 @@ impl SimNode {
             }
         }
 
+        // Handle TransactionCertificateReceived directly in runner (like production).
+        // Verify and persist before notifying state machine.
+        if let Event::TransactionCertificateReceived { ref certificate } = event {
+            let tx_hash = certificate.transaction_hash;
+
+            // Skip if already in storage
+            if self.storage.get_certificate(&tx_hash).is_some() {
+                return;
+            }
+
+            // In parallel simulation, we trust certificates (skip BLS verification for speed).
+            // Production verifies signatures before persisting.
+            let local_shard = self.state.shard();
+            let writes: Vec<_> = certificate
+                .shard_proofs
+                .get(&local_shard)
+                .map(|c| c.state_writes.clone())
+                .unwrap_or_default();
+
+            self.storage
+                .commit_certificate_with_writes(certificate, &writes);
+
+            // Notify state machine to cancel local building and add to finalized
+            let actions = self.state.handle(Event::GossipedCertificateVerified {
+                certificate: certificate.clone(),
+            });
+            for action in actions {
+                self.execute_action(action, cache);
+            }
+            return;
+        }
+
         // Process through state machine (time is set by advance_time)
         let actions = self.state.handle(event);
 
@@ -688,8 +720,17 @@ impl SimNode {
                     cache.commit_writes(local_shard.0, &cert.state_writes);
                 } else {
                     self.storage
-                        .put_certificate(certificate.transaction_hash, certificate);
+                        .put_certificate(certificate.transaction_hash, certificate.clone());
                 }
+
+                // After persisting, gossip certificate to same-shard peers.
+                // This ensures other validators have the certificate before the proposer
+                // includes it in a block, avoiding fetch delays.
+                let gossip =
+                    hyperscale_messages::TransactionCertificateGossip::new(certificate.clone());
+                let message = OutboundMessage::TransactionCertificateGossip(gossip);
+                self.outbound_messages
+                    .push((Destination::Shard(local_shard), Arc::new(message)));
             }
 
             Action::PersistAndBroadcastVote {

@@ -559,6 +559,41 @@ impl SimulationRunner {
                 }
             }
 
+            // Handle TransactionCertificateReceived directly in runner (like production).
+            // Verify signatures synchronously (no async in simulation) and persist.
+            if let Event::TransactionCertificateReceived { ref certificate } = event {
+                let storage = &mut self.node_storage[node_index as usize];
+                let tx_hash = certificate.transaction_hash;
+
+                // Skip if already in storage
+                if storage.get_certificate(&tx_hash).is_some() {
+                    continue;
+                }
+
+                // In simulation, we trust certificates (skip BLS verification for speed).
+                // Production verifies signatures before persisting.
+                // For full fidelity, we could add verification here but it would slow tests.
+                let local_shard = self.nodes[node_index as usize].shard();
+                let writes: Vec<_> = certificate
+                    .shard_proofs
+                    .get(&local_shard)
+                    .map(|c| c.state_writes.clone())
+                    .unwrap_or_default();
+
+                storage.commit_certificate_with_writes(certificate, &writes);
+
+                // Notify state machine to cancel local building and add to finalized
+                let node = &mut self.nodes[node_index as usize];
+                let actions = node.handle(Event::GossipedCertificateVerified {
+                    certificate: certificate.clone(),
+                });
+                for action in actions {
+                    self.process_action(node_index, action);
+                }
+
+                continue;
+            }
+
             // Update node's time and process event
             let node = &mut self.nodes[node_index as usize];
             node.set_time(self.now);
@@ -1205,6 +1240,19 @@ impl SimulationRunner {
 
                 // Commit certificate + writes atomically (mirrors production behavior)
                 storage.commit_certificate_with_writes(&certificate, writes);
+
+                // After persisting, gossip certificate to same-shard peers.
+                // This ensures other validators have the certificate before the proposer
+                // includes it in a block, avoiding fetch delays.
+                let gossip =
+                    hyperscale_messages::TransactionCertificateGossip::new(certificate.clone());
+                let message = OutboundMessage::TransactionCertificateGossip(gossip);
+                let peers = self.network.peers_in_shard(local_shard);
+                for to in peers {
+                    if to != from {
+                        self.try_deliver_message(from, to, &message);
+                    }
+                }
             }
             Action::PersistAndBroadcastVote {
                 height,

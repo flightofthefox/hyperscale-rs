@@ -8,7 +8,7 @@ pub mod trace_context;
 // Re-export commonly used types
 pub use gossip::{
     BlockHeaderGossip, BlockVoteGossip, StateCertificateBatch, StateProvisionBatch, StateVoteBatch,
-    TransactionGossip,
+    TransactionCertificateGossip, TransactionGossip,
 };
 pub use request::{GetBlockRequest, SyncCompleteAnnouncement};
 pub use response::GetBlockResponse;

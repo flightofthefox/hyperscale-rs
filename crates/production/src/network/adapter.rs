@@ -647,6 +647,7 @@ impl Libp2pAdapter {
             Topic::block_vote(shard),
             // Note: view_change topics removed - using HotStuff-2 implicit rounds
             Topic::transaction_gossip(shard),
+            Topic::transaction_certificate(shard),
             Topic::state_provision_batch(shard),
             Topic::state_vote_batch(shard),
             Topic::state_certificate_batch(shard),

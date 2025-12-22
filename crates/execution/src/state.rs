@@ -1774,47 +1774,101 @@ impl ExecutionState {
 
     /// Cancel local certificate building for a transaction.
     ///
-    /// Called when we receive a fetched certificate from another node instead of
-    /// building our own. This cleans up the certificate tracking state to avoid
-    /// wasting resources on a certificate we no longer need to build.
+    /// Called when we receive a verified certificate from another node (via fetch or gossip)
+    /// instead of building our own. This cleans up all local certificate building state:
+    /// certificate tracking, vote aggregation, our own StateCertificate, and pending verifications.
     ///
-    /// Note: This does NOT clean up provisioning or vote tracking - those may still
-    /// be needed for other purposes (e.g., responding to peers who need our votes).
-    /// It only cancels the certificate aggregation.
+    /// Note: This keeps `executed_txs` for deduplication.
     pub fn cancel_certificate_building(&mut self, tx_hash: &Hash) {
         let had_tracker = self.certificate_trackers.remove(tx_hash).is_some();
         let had_early = self.early_certificates.remove(tx_hash).is_some();
 
+        // Clean up vote aggregation - we don't need to build our own StateCertificate
+        let had_vote_tracker = self.vote_trackers.remove(tx_hash).is_some();
+        let had_aggregation = self.pending_cert_aggregations.remove(tx_hash).is_some();
+        self.early_votes.remove(tx_hash);
+
+        // Clean up our local StateCertificate - peers can't request it, and the
+        // external certificate we received contains all the StateCertificates we need
+        self.state_certificates.remove(tx_hash);
+
         // Clean up pending fetched certificate verifications for this tx
         self.pending_fetched_cert_verifications.remove(tx_hash);
 
-        // Clean up pending cert verifications using reverse index
-        let mut removed_count = 0;
+        // Clean up pending verifications using reverse index
+        let mut removed_cert_count = 0;
+        let mut removed_vote_count = 0;
         if let Some(keys) = self.pending_verifications_by_tx.get_mut(tx_hash) {
-            // Only remove Certificate keys, keep Provision and Vote keys
-            let cert_keys: Vec<_> = keys
-                .iter()
-                .filter_map(|k| match k {
-                    PendingVerificationKey::Certificate(shard) => Some(*shard),
-                    _ => None,
-                })
-                .collect();
-            for shard in cert_keys {
-                self.pending_cert_verifications.remove(&(*tx_hash, shard));
-                keys.remove(&PendingVerificationKey::Certificate(shard));
-                removed_count += 1;
+            // Remove both Certificate and Vote verification keys - we don't need either
+            let keys_to_remove: Vec<_> = keys.iter().cloned().collect();
+            for key in keys_to_remove {
+                match key {
+                    PendingVerificationKey::Certificate(shard) => {
+                        self.pending_cert_verifications.remove(&(*tx_hash, shard));
+                        keys.remove(&key);
+                        removed_cert_count += 1;
+                    }
+                    PendingVerificationKey::Vote(vid) => {
+                        self.pending_vote_verifications.remove(&(*tx_hash, vid));
+                        keys.remove(&key);
+                        removed_vote_count += 1;
+                    }
+                }
             }
         }
 
-        if had_tracker || had_early || removed_count > 0 {
+        // Clean up verified votes cache
+        if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
+            for vid in validators {
+                self.verified_state_votes.remove(&(*tx_hash, vid));
+            }
+        }
+
+        if had_tracker
+            || had_early
+            || had_vote_tracker
+            || had_aggregation
+            || removed_cert_count > 0
+            || removed_vote_count > 0
+        {
             tracing::debug!(
                 tx_hash = %tx_hash,
-                had_tracker = had_tracker,
-                had_early = had_early,
-                removed_verifications = removed_count,
-                "Cancelled local certificate building - using fetched certificate"
+                had_cert_tracker = had_tracker,
+                had_vote_tracker = had_vote_tracker,
+                had_aggregation = had_aggregation,
+                removed_cert_verifications = removed_cert_count,
+                removed_vote_verifications = removed_vote_count,
+                "Cancelled local certificate building - using external certificate"
             );
         }
+    }
+
+    /// Add a verified certificate received from gossip or fetch.
+    ///
+    /// Called after a TransactionCertificate from another validator has been verified.
+    /// This adds it to finalized_certificates so it's available for block inclusion,
+    /// without going through the normal vote aggregation and certificate tracking flow.
+    pub fn add_verified_certificate(&mut self, certificate: TransactionCertificate) {
+        let tx_hash = certificate.transaction_hash;
+
+        // Check if already finalized
+        if self.finalized_certificates.contains_key(&tx_hash) {
+            tracing::debug!(
+                tx_hash = ?tx_hash,
+                "Certificate already finalized, skipping add"
+            );
+            return;
+        }
+
+        tracing::debug!(
+            tx_hash = ?tx_hash,
+            decision = ?certificate.decision,
+            shards = certificate.shard_proofs.len(),
+            "Adding verified certificate from gossip"
+        );
+
+        self.finalized_certificates
+            .insert(tx_hash, Arc::new(certificate));
     }
 
     /// Handle state entries fetched from storage.
