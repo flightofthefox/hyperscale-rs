@@ -55,7 +55,7 @@ dashmap = "5.5"
 # OpenTelemetry for distributed tracing
 opentelemetry = "0.31.0"
 opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic", "reqwest-rustls"] }
 opentelemetry-semantic-conventions = "0.31.0"
 
 # Tracing integration (version matched to opentelemetry 0.31.0)
