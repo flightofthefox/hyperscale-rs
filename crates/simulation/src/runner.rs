@@ -15,8 +15,8 @@ use hyperscale_engine::RadixExecutor;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     Block, CommitmentProof, Hash as TxHash, KeyPair, KeyType, PublicKey, QuorumCertificate,
-    ShardGroupId, Signature, SignerBitfield, StateCertificate, StaticTopology, Topology,
-    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
+    ShardGroupId, Signature, SignerBitfield, StateCertificate, StateVoteBlock, StaticTopology,
+    Topology, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
@@ -68,6 +68,10 @@ pub struct SimulationRunner {
     /// Per-node executor. Each node has its own executor instance.
     /// Index corresponds to node index.
     node_executor: Vec<RadixExecutor>,
+
+    /// Per-node signing keys. Each node has its own key for signing votes.
+    /// Index corresponds to node index.
+    node_keys: Vec<KeyPair>,
 
     /// Whether genesis has been executed on each node's storage.
     /// Index corresponds to node index.
@@ -228,6 +232,7 @@ impl SimulationRunner {
             stats: SimulationStats::default(),
             node_storage,
             node_executor,
+            node_keys: keys,
             genesis_executed,
             traffic_analyzer: None,
             seen_messages: HashSet::new(),
@@ -1063,7 +1068,7 @@ impl SimulationRunner {
 
             // Note: View change verification actions removed - using HotStuff-2 implicit rounds
             Action::ExecuteTransactions {
-                block_hash,
+                block_hash: _,
                 transactions,
                 ..
             } => {
@@ -1073,45 +1078,75 @@ impl SimulationRunner {
                 // NOTE: Execution is READ-ONLY. State writes are collected in the results
                 // and committed later when TransactionCertificate is included in a block
                 // (via PersistTransactionCertificate handler).
+                //
+                // After execution, sign votes and send StateVoteReceived directly
+                // (matches production runner pattern).
                 let storage = &self.node_storage[from as usize];
                 let executor = &self.node_executor[from as usize];
+                let signing_key = self.node_keys[from as usize].clone();
+                let local_shard = self.nodes[from as usize].shard();
+                let validator_id = self.nodes[from as usize].topology().local_validator_id();
 
-                let results = match executor.execute_single_shard(storage, &transactions) {
-                    Ok(output) => output
-                        .results()
-                        .iter()
-                        .map(|r| hyperscale_types::ExecutionResult {
-                            transaction_hash: r.tx_hash,
-                            success: r.success,
-                            state_root: r.outputs_merkle_root,
-                            writes: r.state_writes.clone(),
-                            error: r.error.clone(),
-                        })
-                        .collect(),
-                    Err(e) => {
-                        // Execution failed - mark all transactions as failed
-                        warn!(node = from, ?block_hash, error = %e, "Transaction execution failed");
-                        transactions
+                let results: Vec<hyperscale_types::ExecutionResult> =
+                    match executor.execute_single_shard(storage, &transactions) {
+                        Ok(output) => output
+                            .results()
                             .iter()
-                            .map(|tx| hyperscale_types::ExecutionResult {
-                                transaction_hash: tx.hash(),
-                                success: false,
-                                state_root: hyperscale_types::Hash::ZERO,
-                                writes: vec![],
-                                error: Some(format!("{}", e)),
+                            .map(|r| hyperscale_types::ExecutionResult {
+                                transaction_hash: r.tx_hash,
+                                success: r.success,
+                                state_root: r.outputs_merkle_root,
+                                writes: r.state_writes.clone(),
+                                error: r.error.clone(),
                             })
-                            .collect()
-                    }
-                };
+                            .collect(),
+                        Err(e) => {
+                            // Execution failed - mark all transactions as failed
+                            warn!(node = from, error = %e, "Transaction execution failed");
+                            transactions
+                                .iter()
+                                .map(|tx| hyperscale_types::ExecutionResult {
+                                    transaction_hash: tx.hash(),
+                                    success: false,
+                                    state_root: hyperscale_types::Hash::ZERO,
+                                    writes: vec![],
+                                    error: Some(format!("{}", e)),
+                                })
+                                .collect()
+                        }
+                    };
 
-                self.schedule_event(
-                    from,
-                    self.now,
-                    Event::TransactionsExecuted {
-                        block_hash,
-                        results,
-                    },
-                );
+                // Sign votes and send StateVoteReceived for each result
+                for result in results {
+                    let message = hyperscale_types::exec_vote_message(
+                        &result.transaction_hash,
+                        &result.state_root,
+                        local_shard,
+                        result.success,
+                    );
+                    let signature = signing_key.sign(&message);
+
+                    let vote = StateVoteBlock {
+                        transaction_hash: result.transaction_hash,
+                        shard_group_id: local_shard,
+                        state_root: result.state_root,
+                        success: result.success,
+                        validator: validator_id,
+                        signature,
+                    };
+
+                    // Broadcast to shard peers
+                    let broadcast_event = Event::StateVoteReceived { vote: vote.clone() };
+                    let peers = self.network.peers_in_shard(local_shard);
+                    for to in peers {
+                        if to != from {
+                            self.try_deliver_event(from, to, broadcast_event.clone());
+                        }
+                    }
+
+                    // Send to state machine for local handling (skips verification for own votes)
+                    self.schedule_event(from, self.now, Event::StateVoteReceived { vote });
+                }
             }
 
             Action::SpeculativeExecute {
@@ -1184,13 +1219,15 @@ impl SimulationRunner {
                 // and committed later when TransactionCertificate is included in a block
                 // (via PersistTransactionCertificate handler).
                 //
-                // In simulation, we execute immediately and return as a batch of 1.
-                // Production runner batches multiple actions for parallel execution.
+                // After execution, sign vote and send StateVoteReceived directly
+                // (matches production runner pattern).
                 let storage = &self.node_storage[from as usize];
                 let executor = &self.node_executor[from as usize];
+                let signing_key = self.node_keys[from as usize].clone();
+                let local_shard = self.nodes[from as usize].shard();
+                let validator_id = self.nodes[from as usize].topology().local_validator_id();
 
                 // Determine which nodes are local to this shard
-                let local_shard = self.nodes[from as usize].shard();
                 let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
                     self.nodes[from as usize]
                         .topology()
@@ -1235,14 +1272,74 @@ impl SimulationRunner {
                     }
                 };
 
-                // Return as batch event (production runner batches multiple actions)
-                self.schedule_event(
-                    from,
-                    self.now,
-                    Event::CrossShardTransactionsExecuted {
-                        results: vec![result],
-                    },
+                // Sign vote and send StateVoteReceived
+                let message = hyperscale_types::exec_vote_message(
+                    &result.transaction_hash,
+                    &result.state_root,
+                    local_shard,
+                    result.success,
                 );
+                let signature = signing_key.sign(&message);
+
+                let vote = StateVoteBlock {
+                    transaction_hash: result.transaction_hash,
+                    shard_group_id: local_shard,
+                    state_root: result.state_root,
+                    success: result.success,
+                    validator: validator_id,
+                    signature,
+                };
+
+                // Broadcast to shard peers
+                let broadcast_event = Event::StateVoteReceived { vote: vote.clone() };
+                let peers = self.network.peers_in_shard(local_shard);
+                for to in peers {
+                    if to != from {
+                        self.try_deliver_event(from, to, broadcast_event.clone());
+                    }
+                }
+
+                // Send to state machine for local handling (skips verification for own votes)
+                self.schedule_event(from, self.now, Event::StateVoteReceived { vote });
+            }
+
+            // Sign already-executed results (e.g., speculative execution cache hits).
+            // Signs votes and sends StateVoteReceived for local handling.
+            Action::SignExecutionResults { results } => {
+                let signing_key = self.node_keys[from as usize].clone();
+                let local_shard = self.nodes[from as usize].shard();
+                let validator_id = self.nodes[from as usize].topology().local_validator_id();
+
+                for result in results {
+                    let message = hyperscale_types::exec_vote_message(
+                        &result.transaction_hash,
+                        &result.state_root,
+                        local_shard,
+                        result.success,
+                    );
+                    let signature = signing_key.sign(&message);
+
+                    let vote = StateVoteBlock {
+                        transaction_hash: result.transaction_hash,
+                        shard_group_id: local_shard,
+                        state_root: result.state_root,
+                        success: result.success,
+                        validator: validator_id,
+                        signature,
+                    };
+
+                    // Broadcast to shard peers
+                    let broadcast_event = Event::StateVoteReceived { vote: vote.clone() };
+                    let peers = self.network.peers_in_shard(local_shard);
+                    for to in peers {
+                        if to != from {
+                            self.try_deliver_event(from, to, broadcast_event.clone());
+                        }
+                    }
+
+                    // Send to state machine for local handling
+                    self.schedule_event(from, self.now, Event::StateVoteReceived { vote });
+                }
             }
 
             Action::ComputeMerkleRoot { tx_hash, writes } => {

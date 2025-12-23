@@ -6,6 +6,17 @@ use hyperscale_types::{
 };
 use tracing::instrument;
 
+/// Data needed to build a QC asynchronously.
+type QcBuildData = (
+    BlockHeight,
+    u64,
+    Hash,
+    Vec<(usize, BlockVote)>,
+    SignerBitfield,
+    u64,
+    u128,
+);
+
 /// Votes for a specific block.
 #[derive(Debug, Clone)]
 pub struct VoteSet {
@@ -169,17 +180,7 @@ impl VoteSet {
     /// - No votes collected
     /// - QC already built or being built
     /// - Missing height or parent_block_hash
-    pub fn prepare_qc_build(
-        &mut self,
-    ) -> Option<(
-        BlockHeight,
-        u64,
-        Hash,
-        Vec<(usize, BlockVote)>,
-        SignerBitfield,
-        u64,
-        u128,
-    )> {
+    pub fn prepare_qc_build(&mut self) -> Option<QcBuildData> {
         if self.votes.is_empty() || self.qc_built {
             return None;
         }

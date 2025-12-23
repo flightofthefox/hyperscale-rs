@@ -26,8 +26,8 @@ use hyperscale_simulation::{NetworkTrafficAnalyzer, SimStorage, SimulatedNetwork
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, CommitmentProof, ExecutionResult, Hash, KeyPair, NodeId,
     PublicKey, QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
-    StateCertificate, StaticTopology, Topology, TransactionDecision, TransactionStatus,
-    ValidatorId, ValidatorInfo, ValidatorSet,
+    StateCertificate, StateVoteBlock, StaticTopology, Topology, TransactionDecision,
+    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -216,6 +216,8 @@ pub struct SimNode {
     index: u32,
     state: NodeStateMachine,
     storage: SimStorage,
+    /// Signing key for state vote signing (cloned from state machine).
+    signing_key: KeyPair,
     /// Pending inbound messages from other nodes.
     inbound_queue: VecDeque<Arc<OutboundMessage>>,
     /// Pending internal events (timer fires, crypto results, etc.)
@@ -232,15 +234,23 @@ pub struct SimNode {
     pending_timers: HashMap<TimerId, Duration>,
     /// Simulated time for this node.
     simulated_time: Duration,
+    /// Outbound events that need to be broadcast to shard peers.
+    outbound_events: Vec<(ShardGroupId, Event)>,
 }
 
 impl SimNode {
     /// Create a new simulated node.
-    pub fn new(index: u32, state: NodeStateMachine, storage: SimStorage) -> Self {
+    pub fn new(
+        index: u32,
+        state: NodeStateMachine,
+        storage: SimStorage,
+        signing_key: KeyPair,
+    ) -> Self {
         Self {
             index,
             state,
             storage,
+            signing_key,
             inbound_queue: VecDeque::new(),
             internal_queue: VecDeque::new(),
             tx_queue: VecDeque::new(),
@@ -249,6 +259,7 @@ impl SimNode {
             status_updates: Vec::new(),
             pending_timers: HashMap::new(),
             simulated_time: Duration::ZERO,
+            outbound_events: Vec::new(),
         }
     }
 
@@ -725,17 +736,44 @@ impl SimNode {
 
             // Transaction execution - cached per shard using real Radix engine.
             // All validators in a shard execute the same block, so results are cached.
+            // After execution, sign votes and send StateVoteReceived (matches production runner).
             Action::ExecuteTransactions {
                 block_hash,
                 transactions,
                 ..
             } => {
                 let shard_id = self.state.shard().0;
+                let local_shard = self.state.shard();
+                let validator_id = self.state.topology().local_validator_id();
                 let results = cache.execute_block(shard_id, block_hash, &transactions);
-                self.internal_queue.push_back(Event::TransactionsExecuted {
-                    block_hash,
-                    results,
-                });
+
+                // Sign votes and send StateVoteReceived for each result
+                for result in results {
+                    let message = hyperscale_types::exec_vote_message(
+                        &result.transaction_hash,
+                        &result.state_root,
+                        local_shard,
+                        result.success,
+                    );
+                    let signature = self.signing_key.sign(&message);
+
+                    let vote = StateVoteBlock {
+                        transaction_hash: result.transaction_hash,
+                        shard_group_id: local_shard,
+                        state_root: result.state_root,
+                        success: result.success,
+                        validator: validator_id,
+                        signature,
+                    };
+
+                    // Broadcast to shard peers
+                    self.outbound_events
+                        .push((local_shard, Event::StateVoteReceived { vote: vote.clone() }));
+
+                    // Handle locally
+                    self.internal_queue
+                        .push_back(Event::StateVoteReceived { vote });
+                }
             }
 
             // Speculative execution - same as ExecuteTransactions but returns different event
@@ -762,10 +800,11 @@ impl SimNode {
                 transaction,
                 provisions,
             } => {
-                // Execute single cross-shard transaction, return as batch of 1
-                // (production runner batches multiple actions for parallel execution)
+                // Execute single cross-shard transaction, sign vote and send StateVoteReceived
+                // (matches production runner pattern)
                 let shard_id = self.state.shard().0;
                 let local_shard = self.state.shard();
+                let validator_id = self.state.topology().local_validator_id();
                 let topology = self.state.topology();
                 let is_local_node = |node_id: &NodeId| -> bool {
                     topology.shard_for_node_id(node_id) == local_shard
@@ -777,10 +816,65 @@ impl SimNode {
                     &provisions,
                     is_local_node,
                 );
+
+                // Sign vote and send StateVoteReceived
+                let message = hyperscale_types::exec_vote_message(
+                    &result.transaction_hash,
+                    &result.state_root,
+                    local_shard,
+                    result.success,
+                );
+                let signature = self.signing_key.sign(&message);
+
+                let vote = StateVoteBlock {
+                    transaction_hash: result.transaction_hash,
+                    shard_group_id: local_shard,
+                    state_root: result.state_root,
+                    success: result.success,
+                    validator: validator_id,
+                    signature,
+                };
+
+                // Broadcast to shard peers
+                self.outbound_events
+                    .push((local_shard, Event::StateVoteReceived { vote: vote.clone() }));
+
+                // Handle locally
                 self.internal_queue
-                    .push_back(Event::CrossShardTransactionsExecuted {
-                        results: vec![result],
-                    });
+                    .push_back(Event::StateVoteReceived { vote });
+            }
+
+            // Sign execution results (for speculative cache hits) - sign and broadcast votes
+            Action::SignExecutionResults { results } => {
+                let local_shard = self.state.shard();
+                let validator_id = self.state.topology().local_validator_id();
+
+                for result in results {
+                    let message = hyperscale_types::exec_vote_message(
+                        &result.transaction_hash,
+                        &result.state_root,
+                        local_shard,
+                        result.success,
+                    );
+                    let signature = self.signing_key.sign(&message);
+
+                    let vote = StateVoteBlock {
+                        transaction_hash: result.transaction_hash,
+                        shard_group_id: local_shard,
+                        state_root: result.state_root,
+                        success: result.success,
+                        validator: validator_id,
+                        signature,
+                    };
+
+                    // Broadcast to shard peers
+                    self.outbound_events
+                        .push((local_shard, Event::StateVoteReceived { vote: vote.clone() }));
+
+                    // Handle locally
+                    self.internal_queue
+                        .push_back(Event::StateVoteReceived { vote });
+                }
             }
 
             Action::ComputeMerkleRoot { tx_hash, .. } => {
@@ -1073,16 +1167,17 @@ impl ParallelSimulator {
                     shard_committees.clone(),
                 ));
 
+                let signing_key = keys[node_index].clone();
                 let state = NodeStateMachine::new(
                     node_index as u32,
                     topology,
-                    keys[node_index].clone(),
+                    signing_key.clone(),
                     BftConfig::default(),
                     RecoveredState::default(),
                 );
 
                 let storage = SimStorage::new();
-                let node = SimNode::new(node_index as u32, state, storage);
+                let node = SimNode::new(node_index as u32, state, storage, signing_key);
                 self.nodes.push(node);
             }
         }
@@ -1211,16 +1306,17 @@ impl ParallelSimulator {
                     shard_committees.clone(),
                 ));
 
+                let signing_key = keys[node_index].clone();
                 let state = NodeStateMachine::new(
                     node_index as u32,
                     topology,
-                    keys[node_index].clone(),
+                    signing_key.clone(),
                     BftConfig::default(),
                     RecoveredState::default(),
                 );
 
                 let storage = SimStorage::new();
-                let node = SimNode::new(node_index as u32, state, storage);
+                let node = SimNode::new(node_index as u32, state, storage, signing_key);
                 self.nodes.push(node);
             }
         }

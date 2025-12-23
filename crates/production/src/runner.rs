@@ -467,6 +467,9 @@ impl ProductionRunnerBuilder {
         // Load RecoveredState from storage for crash recovery
         let recovered = storage.load_recovered_state();
 
+        // Clone signing key for runner's state vote signing (state machine also needs it)
+        let runner_signing_key = signing_key.clone();
+
         // NodeIndex is a simulation concept - production uses 0
         let state = NodeStateMachine::with_speculative_config(
             0, // node_index not meaningful in production
@@ -631,6 +634,7 @@ impl ProductionRunnerBuilder {
             cross_shard_execution_deadline: None,
             pending_state_certs: PendingStateCerts::default(),
             state_cert_deadline: None,
+            signing_key: runner_signing_key,
             message_batcher,
             fetch_handler,
             dispatch_tx,
@@ -744,6 +748,8 @@ pub struct ProductionRunner {
     pending_state_certs: PendingStateCerts,
     /// Deadline for flushing pending state certificates. None if none pending.
     state_cert_deadline: Option<tokio::time::Instant>,
+    /// Signing key for state vote signing (cloned from state machine).
+    signing_key: KeyPair,
     /// Message batcher for execution layer messages (votes, certificates, provisions).
     /// Accumulates items and flushes periodically to reduce network overhead.
     /// Note: Now primarily used by action dispatcher, kept here for direct access if needed.
@@ -1154,7 +1160,7 @@ impl ProductionRunner {
                     // Dispatch event through unified handler (span created by state.handle())
                     let actions = self.dispatch_event(event).await;
 
-                    // Process actions, accumulating cross-shard executions for batching
+                    // Process actions, accumulating cross-shard executions and vote signings for batching
                     for action in actions {
                         match action {
                             Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
@@ -2210,15 +2216,21 @@ impl ProductionRunner {
             // Transaction execution on dedicated execution thread pool
             // NOTE: Execution is READ-ONLY. State writes are collected in the results
             // and committed later when TransactionCertificate is included in a block.
+            // After execution, signs votes and broadcasts + sends to state machine directly,
+            // avoiding a round-trip through the state machine for signing.
             Action::ExecuteTransactions {
-                block_hash,
+                block_hash: _,
                 transactions,
                 state_root: _,
             } => {
                 let event_tx = self.callback_tx.clone();
+                let dispatch_tx = self.dispatch_tx.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
                 let thread_pools = self.thread_pools.clone();
+                let signing_key = self.signing_key.clone();
+                let local_shard = self.local_shard;
+                let validator_id = self.topology.local_validator_id();
 
                 self.thread_pools.spawn_execution(move || {
                     let start = std::time::Instant::now();
@@ -2267,14 +2279,41 @@ impl ProductionRunner {
                         });
                     crate::metrics::record_execution_latency(start.elapsed().as_secs_f64());
 
-                    event_tx
-                        .send(Event::TransactionsExecuted {
-                            block_hash,
-                            results,
-                        })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
+                    // Sign votes for each execution result. The runner handles:
+                    // 1. Signing (done here)
+                    // 2. Broadcasting (via dispatch_tx)
+                    // 3. Local handling (via StateVoteReceived to state machine)
+                    for result in results {
+                        let message = hyperscale_types::exec_vote_message(
+                            &result.transaction_hash,
+                            &result.state_root,
+                            local_shard,
+                            result.success,
                         );
+                        let signature = signing_key.sign(&message);
+
+                        let vote = StateVoteBlock {
+                            transaction_hash: result.transaction_hash,
+                            shard_group_id: local_shard,
+                            state_root: result.state_root,
+                            success: result.success,
+                            validator: validator_id,
+                            signature,
+                        };
+
+                        // Broadcast to shard peers via message batcher
+                        let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
+                            shard: local_shard,
+                            vote: vote.clone(),
+                        });
+
+                        // Send to state machine for local handling (skips verification for own votes)
+                        event_tx
+                            .send(Event::StateVoteReceived { vote })
+                            .expect(
+                                "callback channel closed - Loss of this event would cause a deadlock",
+                            );
+                    }
                 });
             }
 
@@ -2361,6 +2400,48 @@ impl ProductionRunner {
                 // This should never be reached - the action is intercepted in the event loop
                 // and accumulated for batch execution.
                 tracing::error!("ExecuteCrossShardTransaction reached process_action - should be handled by event loop batching");
+            }
+
+            // Sign already-executed results (e.g., speculative execution cache hits).
+            // Signs votes and broadcasts + sends StateVoteReceived for local handling.
+            Action::SignExecutionResults { results } => {
+                let event_tx = self.callback_tx.clone();
+                let dispatch_tx = self.dispatch_tx.clone();
+                let signing_key = self.signing_key.clone();
+                let local_shard = self.local_shard;
+                let validator_id = self.topology.local_validator_id();
+
+                self.thread_pools.spawn_execution(move || {
+                    for result in results {
+                        let message = hyperscale_types::exec_vote_message(
+                            &result.transaction_hash,
+                            &result.state_root,
+                            local_shard,
+                            result.success,
+                        );
+                        let signature = signing_key.sign(&message);
+
+                        let vote = StateVoteBlock {
+                            transaction_hash: result.transaction_hash,
+                            shard_group_id: local_shard,
+                            state_root: result.state_root,
+                            success: result.success,
+                            validator: validator_id,
+                            signature,
+                        };
+
+                        // Broadcast to shard peers via message batcher
+                        let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
+                            shard: local_shard,
+                            vote: vote.clone(),
+                        });
+
+                        // Send to state machine for local handling
+                        event_tx
+                            .send(Event::StateVoteReceived { vote })
+                            .expect("callback channel closed");
+                    }
+                });
             }
 
             // Merkle computation on execution pool (can be parallelized internally)
@@ -3153,7 +3234,8 @@ impl ProductionRunner {
     ///
     /// Executes all transactions in parallel using rayon's par_iter for maximum throughput.
     /// Each transaction is executed with its provisioned state from other shards.
-    /// Results are sent back as a single batch event.
+    /// After execution, signs votes and broadcasts + sends to state machine directly,
+    /// avoiding a round-trip through the state machine for signing.
     fn dispatch_cross_shard_executions(
         &self,
         requests: Vec<hyperscale_core::CrossShardExecutionRequest>,
@@ -3163,12 +3245,15 @@ impl ProductionRunner {
         }
 
         let event_tx = self.callback_tx.clone();
+        let dispatch_tx = self.dispatch_tx.clone();
         let storage = self.storage.clone();
         let executor = self.executor.clone();
         let topology = self.topology.clone();
         let local_shard = self.local_shard;
         let thread_pools = self.thread_pools.clone();
         let batch_size = requests.len();
+        let signing_key = self.signing_key.clone();
+        let validator_id = topology.local_validator_id();
 
         self.thread_pools.spawn_execution(move || {
             let start = std::time::Instant::now();
@@ -3237,9 +3322,39 @@ impl ProductionRunner {
                 );
             }
 
-            event_tx
-                .send(Event::CrossShardTransactionsExecuted { results })
-                .expect("callback channel closed - Loss of this event would cause a deadlock");
+            // Sign votes for each execution result. The runner handles:
+            // 1. Signing (done here)
+            // 2. Broadcasting (via dispatch_tx)
+            // 3. Local handling (via StateVoteReceived to state machine)
+            for result in results {
+                let message = hyperscale_types::exec_vote_message(
+                    &result.transaction_hash,
+                    &result.state_root,
+                    local_shard,
+                    result.success,
+                );
+                let signature = signing_key.sign(&message);
+
+                let vote = StateVoteBlock {
+                    transaction_hash: result.transaction_hash,
+                    shard_group_id: local_shard,
+                    state_root: result.state_root,
+                    success: result.success,
+                    validator: validator_id,
+                    signature,
+                };
+
+                // Broadcast to shard peers via message batcher
+                let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
+                    shard: local_shard,
+                    vote: vote.clone(),
+                });
+
+                // Send to state machine for local handling (skips verification for own votes)
+                event_tx
+                    .send(Event::StateVoteReceived { vote })
+                    .expect("callback channel closed - Loss of this event would cause a deadlock");
+            }
         });
     }
 
