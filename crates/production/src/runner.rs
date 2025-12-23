@@ -728,7 +728,7 @@ pub struct ProductionRunner {
     /// Optional genesis configuration for initial state.
     genesis_config: Option<hyperscale_engine::GenesisConfig>,
     /// Inbound sync request channel (from network adapter).
-    sync_request_rx: mpsc::Receiver<InboundSyncRequest>,
+    sync_request_rx: mpsc::UnboundedReceiver<InboundSyncRequest>,
     /// Shutdown signal receiver.
     shutdown_rx: oneshot::Receiver<()>,
     /// Shutdown handle sender (stored to return to caller).

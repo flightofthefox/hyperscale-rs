@@ -339,8 +339,9 @@ pub struct Libp2pAdapter {
     shutdown_tx: Option<mpsc::Sender<()>>,
 
     /// Channel for inbound sync requests (sent to runner for processing).
+    /// Unbounded to avoid blocking the network event loop.
     #[allow(dead_code)]
-    sync_request_tx: mpsc::Sender<InboundSyncRequest>,
+    sync_request_tx: mpsc::UnboundedSender<InboundSyncRequest>,
 
     /// Channel for inbound transaction fetch requests (sent to runner for processing).
     /// Unbounded to avoid blocking the network event loop.
@@ -386,7 +387,7 @@ impl Libp2pAdapter {
     ) -> Result<
         (
             Arc<Self>,
-            mpsc::Receiver<InboundSyncRequest>,
+            mpsc::UnboundedReceiver<InboundSyncRequest>,
             mpsc::UnboundedReceiver<InboundTransactionRequest>,
             mpsc::UnboundedReceiver<InboundCertificateRequest>,
         ),
@@ -579,7 +580,7 @@ impl Libp2pAdapter {
         let peer_validators = Arc::new(DashMap::new());
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (sync_request_tx, sync_request_rx) = mpsc::channel(1000); // Buffer for inbound sync requests
+        let (sync_request_tx, sync_request_rx) = mpsc::unbounded_channel(); // Unbounded to avoid blocking network event loop
         let (tx_request_tx, tx_request_rx) = mpsc::unbounded_channel(); // Unbounded to avoid blocking network event loop
         let (cert_request_tx, cert_request_rx) = mpsc::unbounded_channel(); // Unbounded to avoid blocking network event loop
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
@@ -900,7 +901,7 @@ impl Libp2pAdapter {
         consensus_tx: mpsc::Sender<Event>,
         peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         mut shutdown_rx: mpsc::Receiver<()>,
-        sync_request_tx: mpsc::Sender<InboundSyncRequest>,
+        sync_request_tx: mpsc::UnboundedSender<InboundSyncRequest>,
         tx_request_tx: mpsc::UnboundedSender<InboundTransactionRequest>,
         cert_request_tx: mpsc::UnboundedSender<InboundCertificateRequest>,
         rate_limit_config: RateLimitConfig,
@@ -1204,7 +1205,7 @@ impl Libp2pAdapter {
         >,
         pending_response_channels: &mut HashMap<u64, ResponseChannel<Vec<u8>>>,
         next_channel_id: &mut u64,
-        sync_request_tx: &mpsc::Sender<InboundSyncRequest>,
+        sync_request_tx: &mpsc::UnboundedSender<InboundSyncRequest>,
         tx_request_tx: &mpsc::UnboundedSender<InboundTransactionRequest>,
         cert_request_tx: &mpsc::UnboundedSender<InboundCertificateRequest>,
         rate_limiter: &mut SyncRateLimiter,
@@ -1427,10 +1428,10 @@ impl Libp2pAdapter {
                         channel_id,
                     };
 
-                    if sync_request_tx.send(sync_request).await.is_err() {
+                    if sync_request_tx.send(sync_request).is_err() {
                         warn!(
                             height,
-                            "Failed to send sync request to runner (channel full or closed)"
+                            "Failed to send sync request to runner (channel closed)"
                         );
                         // Remove the channel since we can't process this request
                         pending_response_channels.remove(&channel_id);
