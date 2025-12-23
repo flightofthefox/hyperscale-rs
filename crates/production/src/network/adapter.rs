@@ -12,6 +12,7 @@ use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
 use super::topic::Topic;
 use crate::metrics;
 use crate::validation_batcher::ValidationBatcherHandle;
+use dashmap::DashMap;
 use futures::future::Either;
 use futures::StreamExt;
 use hyperscale_core::{Event, OutboundMessage};
@@ -29,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 #[cfg(feature = "trace-propagation")]
 use tracing::Instrument;
 use tracing::{debug, info, trace, warn};
@@ -326,10 +327,10 @@ pub struct Libp2pAdapter {
 
     /// Known validators (ValidatorId -> PeerId).
     /// Built from Topology at startup.
-    validator_peers: Arc<RwLock<HashMap<ValidatorId, Libp2pPeerId>>>,
+    validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
 
     /// Reverse mapping (PeerId -> ValidatorId) for inbound message validation.
-    peer_validators: Arc<RwLock<HashMap<Libp2pPeerId, ValidatorId>>>,
+    peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
 
     /// Request timeout.
     request_timeout: Duration,
@@ -574,8 +575,8 @@ impl Libp2pAdapter {
             info!("Dialing bootstrap peer: {}", addr);
         }
 
-        let validator_peers = Arc::new(RwLock::new(HashMap::new()));
-        let peer_validators = Arc::new(RwLock::new(HashMap::new()));
+        let validator_peers = Arc::new(DashMap::new());
+        let peer_validators = Arc::new(DashMap::new());
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (sync_request_tx, sync_request_rx) = mpsc::channel(1000); // Buffer for inbound sync requests
@@ -624,12 +625,8 @@ impl Libp2pAdapter {
     ///
     /// Called during initialization to build the validator allowlist.
     pub async fn register_validator(&self, validator_id: ValidatorId, peer_id: Libp2pPeerId) {
-        let mut vp = self.validator_peers.write().await;
-        vp.insert(validator_id, peer_id);
-        drop(vp);
-
-        let mut pv = self.peer_validators.write().await;
-        pv.insert(peer_id, validator_id);
+        self.validator_peers.insert(validator_id, peer_id);
+        self.peer_validators.insert(peer_id, validator_id);
 
         debug!(
             validator_id = validator_id.0,
@@ -787,9 +784,8 @@ impl Libp2pAdapter {
     }
 
     /// Get the peer ID for a validator (if known).
-    pub async fn peer_for_validator(&self, validator_id: ValidatorId) -> Option<Libp2pPeerId> {
-        let vp = self.validator_peers.read().await;
-        vp.get(&validator_id).cloned()
+    pub fn peer_for_validator(&self, validator_id: ValidatorId) -> Option<Libp2pPeerId> {
+        self.validator_peers.get(&validator_id).map(|r| *r)
     }
 
     /// Send a block response for an inbound sync request.
@@ -902,7 +898,7 @@ impl Libp2pAdapter {
         mut swarm: Swarm<Behaviour>,
         mut command_rx: mpsc::UnboundedReceiver<SwarmCommand>,
         consensus_tx: mpsc::Sender<Event>,
-        peer_validators: Arc<RwLock<HashMap<Libp2pPeerId, ValidatorId>>>,
+        peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         mut shutdown_rx: mpsc::Receiver<()>,
         sync_request_tx: mpsc::Sender<InboundSyncRequest>,
         tx_request_tx: mpsc::UnboundedSender<InboundTransactionRequest>,
@@ -1201,7 +1197,7 @@ impl Libp2pAdapter {
     async fn handle_swarm_event(
         event: SwarmEvent<BehaviourEvent>,
         consensus_tx: &mpsc::Sender<Event>,
-        peer_validators: &Arc<RwLock<HashMap<Libp2pPeerId, ValidatorId>>>,
+        peer_validators: &Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         pending_requests: &mut HashMap<
             request_response::OutboundRequestId,
             tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
@@ -1232,8 +1228,7 @@ impl Libp2pAdapter {
                 // This is defense-in-depth - messages are also verified by signature.
                 // The peer_validators map is populated at startup using
                 // compute_peer_id_for_validator() for all validators in the local committee.
-                let peer_map = peer_validators.read().await;
-                if !peer_map.contains_key(&propagation_source) {
+                if !peer_validators.contains_key(&propagation_source) {
                     debug!(
                         peer = %propagation_source,
                         topic = %topic,
@@ -1242,7 +1237,6 @@ impl Libp2pAdapter {
                     metrics::record_invalid_message();
                     return;
                 }
-                drop(peer_map);
 
                 // Defense-in-depth: Validate that shard-local messages come from the correct shard.
                 // Gossipsub should only deliver messages for subscribed topics, but we
@@ -1392,9 +1386,7 @@ impl Libp2pAdapter {
                 },
             )) => {
                 // Check if sender is a known validator
-                let peer_map = peer_validators.read().await;
-                let is_validator = peer_map.contains_key(&peer);
-                drop(peer_map);
+                let is_validator = peer_validators.contains_key(&peer);
 
                 // Apply rate limiting
                 if !rate_limiter.check_request(&peer, is_validator) {
