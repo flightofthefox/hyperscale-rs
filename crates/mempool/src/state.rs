@@ -530,11 +530,18 @@ impl MempoolState {
                     "Transaction deferred due to livelock cycle"
                 );
                 let cross_shard = entry.cross_shard;
+                let was_holding_lock = entry.status.holds_state_lock();
+                let tx = Arc::clone(&entry.tx);
                 entry.status = new_status.clone();
 
+                // Release locks if the transaction was holding them.
+                // Blocked transactions don't hold locks (they've been deferred).
+                if was_holding_lock {
+                    self.remove_locked_nodes(&tx);
+                }
+
                 // Track for retry when winner completes
-                self.blocked_by
-                    .insert(tx_hash, (Arc::clone(&entry.tx), *winner_tx_hash));
+                self.blocked_by.insert(tx_hash, (tx, *winner_tx_hash));
 
                 // Maintain reverse index for O(1) lookup
                 self.blocked_losers_by_winner
@@ -542,6 +549,8 @@ impl MempoolState {
                     .or_default()
                     .push(tx_hash);
 
+                // Re-borrow entry after calling helper methods
+                let entry = self.pool.get(&tx_hash).unwrap();
                 return vec![Action::EmitTransactionStatus {
                     tx_hash,
                     status: new_status,

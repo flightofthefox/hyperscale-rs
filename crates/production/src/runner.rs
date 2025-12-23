@@ -2402,6 +2402,16 @@ impl ProductionRunner {
                 // so we pass 0.0 for latency. The block height gauge is still useful.
                 crate::metrics::record_block_committed(height, 0.0);
 
+                // Record livelock metrics for deferrals in this block.
+                for _deferral in &block.deferred {
+                    crate::metrics::record_livelock_deferral();
+                    crate::metrics::record_livelock_cycle_detected();
+                }
+
+                // Update deferred transaction count gauge.
+                let livelock_stats = self.state.livelock().stats();
+                crate::metrics::set_livelock_deferred_count(livelock_stats.pending_deferrals);
+
                 // Update sync manager's committed height - critical for correct sync behavior.
                 // If sync completes, notify the state machine so it can resume view changes.
                 if let Some(sync_height) = self.sync_manager.set_committed_height(height) {
