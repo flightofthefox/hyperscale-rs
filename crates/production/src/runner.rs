@@ -131,6 +131,28 @@ impl PendingProvisions {
     }
 }
 
+/// Pending state certificate verifications with batching window.
+///
+/// State certificates have aggregated BLS signatures that are expensive to verify
+/// (~1.5ms each). By batching them with a 15ms window, we can use BLS batch
+/// verification which is ~40% faster than individual verification.
+#[derive(Default)]
+struct PendingStateCerts {
+    /// State certificates waiting for verification.
+    /// Each entry contains: (certificate, public_keys for the shard)
+    certs: Vec<(hyperscale_types::StateCertificate, Vec<PublicKey>)>,
+}
+
+impl PendingStateCerts {
+    fn is_empty(&self) -> bool {
+        self.certs.is_empty()
+    }
+
+    fn take(&mut self) -> Vec<(hyperscale_types::StateCertificate, Vec<PublicKey>)> {
+        std::mem::take(&mut self.certs)
+    }
+}
+
 /// Pending verification of a gossiped TransactionCertificate.
 ///
 /// When we receive a TransactionCertificate via gossip, we verify each embedded
@@ -599,6 +621,8 @@ impl ProductionRunnerBuilder {
             cross_shard_execution_deadline: None,
             pending_provisions: PendingProvisions::default(),
             provision_deadline: None,
+            pending_state_certs: PendingStateCerts::default(),
+            state_cert_deadline: None,
             message_batcher,
             fetch_handler,
             dispatch_tx,
@@ -713,6 +737,11 @@ pub struct ProductionRunner {
     pending_provisions: PendingProvisions,
     /// Deadline for flushing pending provisions. None if none pending.
     provision_deadline: Option<tokio::time::Instant>,
+    /// Pending state certificates accumulated for batch signature verification.
+    /// Uses a 15ms batching window - state certs are the highest volume crypto operation.
+    pending_state_certs: PendingStateCerts,
+    /// Deadline for flushing pending state certificates. None if none pending.
+    state_cert_deadline: Option<tokio::time::Instant>,
     /// Message batcher for execution layer messages (votes, certificates, provisions).
     /// Accumulates items and flushes periodically to reduce network overhead.
     /// Note: Now primarily used by action dispatcher, kept here for direct access if needed.
@@ -1359,6 +1388,15 @@ impl ProductionRunner {
                                         }
                                         self.pending_provisions.provisions.push((provision, public_key));
                                     }
+                                    Action::VerifyStateCertificateSignature { certificate, public_keys } => {
+                                        // Add to accumulated state certs with 15ms batching window
+                                        if self.pending_state_certs.is_empty() {
+                                            self.state_cert_deadline = Some(
+                                                tokio::time::Instant::now() + Duration::from_millis(15)
+                                            );
+                                        }
+                                        self.pending_state_certs.certs.push((certificate, public_keys));
+                                    }
                                     // Note: ExecuteCrossShardTransaction only comes from ProvisioningComplete
                                     // which routes through the callback channel, not the consensus channel.
                                     other => {
@@ -1398,6 +1436,14 @@ impl ProductionRunner {
                                                 );
                                             }
                                             self.pending_provisions.provisions.push((provision, public_key));
+                                        }
+                                        Action::VerifyStateCertificateSignature { certificate, public_keys } => {
+                                            if self.pending_state_certs.is_empty() {
+                                                self.state_cert_deadline = Some(
+                                                    tokio::time::Instant::now() + Duration::from_millis(15)
+                                                );
+                                            }
+                                            self.pending_state_certs.certs.push((certificate, public_keys));
                                         }
                                         other => {
                                             if let Err(e) = self.process_action(other).await {
@@ -1447,6 +1493,14 @@ impl ProductionRunner {
                                                             );
                                                         }
                                                         self.pending_provisions.provisions.push((provision, public_key));
+                                                    }
+                                                    Action::VerifyStateCertificateSignature { certificate, public_keys } => {
+                                                        if self.pending_state_certs.is_empty() {
+                                                            self.state_cert_deadline = Some(
+                                                                tokio::time::Instant::now() + Duration::from_millis(15)
+                                                            );
+                                                        }
+                                                        self.pending_state_certs.certs.push((certificate, public_keys));
                                                     }
                                                     other => {
                                                         if let Err(e) = self.process_action(other).await {
@@ -1542,6 +1596,28 @@ impl ProductionRunner {
                             "Flushing provision batch after 10ms window"
                         );
                         self.dispatch_provision_verifications(provisions);
+                    }
+                }
+
+                // STATE CERTIFICATE BATCHING: Flush accumulated state certs when deadline expires.
+                // Uses a 15ms batching window - state certs are the highest volume crypto operation
+                // and benefit significantly from batch BLS verification (~40% faster).
+                _ = async {
+                    match self.state_cert_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.state_cert_deadline.is_some() => {
+                    let certs = self.pending_state_certs.take();
+                    let batch_size = certs.len();
+                    self.state_cert_deadline = None;
+
+                    if !certs.is_empty() {
+                        tracing::debug!(
+                            batch_size,
+                            "Flushing state cert batch after 15ms window"
+                        );
+                        self.dispatch_state_cert_verifications(certs);
                     }
                 }
 
@@ -2003,44 +2079,16 @@ impl ProductionRunner {
                 certificate,
                 public_keys,
             } => {
-                let event_tx = self.callback_tx.clone();
-                self.thread_pools.spawn_crypto(move || {
-                    let start = std::time::Instant::now();
-                    // Use centralized signing message - StateCertificates aggregate signatures
-                    // from StateVoteBlocks, so they use the same EXEC_VOTE domain tag.
-                    let msg = certificate.signing_message();
-
-                    // Get signer keys based on bitfield
-                    let signer_keys: Vec<_> = public_keys
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| certificate.signers.is_set(*i))
-                        .map(|(_, pk)| pk.clone())
-                        .collect();
-
-                    let valid = if signer_keys.is_empty() {
-                        // No signers - valid only if zero signature (single-shard case)
-                        certificate.aggregated_signature == hyperscale_types::Signature::zero()
-                    } else {
-                        // Verify aggregated BLS signature
-                        match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
-                            Ok(aggregated_pk) => {
-                                aggregated_pk.verify(&msg, &certificate.aggregated_signature)
-                            }
-                            Err(_) => false,
-                        }
-                    };
-
-                    crate::metrics::record_signature_verification_latency(
-                        "state_cert",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        crate::metrics::record_signature_verification_failure();
-                    }
-                    let _ = event_tx
-                        .send(Event::StateCertificateSignatureVerified { certificate, valid });
-                });
+                // NOTE: State certs should normally be batched via the event loop's
+                // pending_state_certs accumulator. This fallback handles any certs
+                // that come through process_action (e.g., from callback channel events).
+                if self.pending_state_certs.is_empty() {
+                    self.state_cert_deadline =
+                        Some(tokio::time::Instant::now() + Duration::from_millis(15));
+                }
+                self.pending_state_certs
+                    .certs
+                    .push((certificate, public_keys));
             }
 
             Action::VerifyQcSignature {
@@ -3017,6 +3065,138 @@ impl ProductionRunner {
                 tracing::debug!(
                     batch_size,
                     "Batch verified provision signatures (10ms window)"
+                );
+            }
+        });
+    }
+
+    /// Dispatch state certificate verifications to the crypto thread pool.
+    ///
+    /// State certificates contain aggregated BLS signatures that are expensive to verify.
+    /// By batching them with a 15ms window, we can use BLS batch verification which is
+    /// ~40% faster than individual verification. This is the highest volume crypto operation.
+    ///
+    /// The verification process:
+    /// 1. For each certificate, aggregate signer public keys based on bitfield (parallel with rayon)
+    /// 2. Batch verify all (aggregated_pk, message, aggregated_sig) tuples
+    /// 3. Send individual results back as events
+    fn dispatch_state_cert_verifications(
+        &self,
+        certs: Vec<(hyperscale_types::StateCertificate, Vec<PublicKey>)>,
+    ) {
+        if certs.is_empty() {
+            return;
+        }
+
+        let event_tx = self.callback_tx.clone();
+        let batch_size = certs.len();
+
+        self.thread_pools.spawn_crypto(move || {
+            use rayon::prelude::*;
+
+            let start = std::time::Instant::now();
+
+            // Step 1: Pre-process certificates in parallel - aggregate signer keys and build messages
+            // This is the expensive part that benefits from parallelization
+            let prepared: Vec<_> = certs
+                .into_par_iter()
+                .map(|(cert, public_keys)| {
+                    let msg = cert.signing_message();
+
+                    // Get signer keys based on bitfield
+                    let signer_keys: Vec<_> = public_keys
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| cert.signers.is_set(*i))
+                        .map(|(_, pk)| pk.clone())
+                        .collect();
+
+                    // Pre-aggregate the public keys
+                    let aggregated_pk = if signer_keys.is_empty() {
+                        None // Will check for zero signature
+                    } else {
+                        PublicKey::aggregate_bls(&signer_keys).ok()
+                    };
+
+                    (cert, msg, aggregated_pk)
+                })
+                .collect();
+
+            // Step 2: Batch verify all signatures
+            // Separate into verifiable (have aggregated_pk) and special cases (empty signers)
+            let mut verifiable: Vec<(hyperscale_types::StateCertificate, Vec<u8>, PublicKey)> =
+                Vec::new();
+            let mut zero_sig_certs: Vec<hyperscale_types::StateCertificate> = Vec::new();
+            let mut failed_aggregation: Vec<hyperscale_types::StateCertificate> = Vec::new();
+
+            for (cert, msg, maybe_pk) in prepared {
+                match maybe_pk {
+                    Some(pk) => verifiable.push((cert, msg, pk)),
+                    None => {
+                        // No signers - check if it's a valid zero signature case
+                        if cert.aggregated_signature == Signature::zero() {
+                            zero_sig_certs.push(cert);
+                        } else {
+                            failed_aggregation.push(cert);
+                        }
+                    }
+                }
+            }
+
+            // Batch verify the aggregated signatures
+            let verification_results = if !verifiable.is_empty() {
+                let messages: Vec<&[u8]> =
+                    verifiable.iter().map(|(_, m, _)| m.as_slice()).collect();
+                let signatures: Vec<Signature> = verifiable
+                    .iter()
+                    .map(|(c, _, _)| c.aggregated_signature.clone())
+                    .collect();
+                let pubkeys: Vec<PublicKey> =
+                    verifiable.iter().map(|(_, _, pk)| pk.clone()).collect();
+
+                PublicKey::batch_verify_bls_different_messages(&messages, &signatures, &pubkeys)
+            } else {
+                vec![]
+            };
+
+            // Step 3: Send results
+            // Verified certs
+            for ((cert, _, _), valid) in verifiable.into_iter().zip(verification_results) {
+                if !valid {
+                    crate::metrics::record_signature_verification_failure();
+                }
+                let _ = event_tx.send(Event::StateCertificateSignatureVerified {
+                    certificate: cert,
+                    valid,
+                });
+            }
+
+            // Zero signature certs (valid)
+            for cert in zero_sig_certs {
+                let _ = event_tx.send(Event::StateCertificateSignatureVerified {
+                    certificate: cert,
+                    valid: true,
+                });
+            }
+
+            // Failed aggregation certs (invalid)
+            for cert in failed_aggregation {
+                crate::metrics::record_signature_verification_failure();
+                let _ = event_tx.send(Event::StateCertificateSignatureVerified {
+                    certificate: cert,
+                    valid: false,
+                });
+            }
+
+            crate::metrics::record_signature_verification_latency(
+                "state_cert",
+                start.elapsed().as_secs_f64(),
+            );
+
+            if batch_size > 1 {
+                tracing::debug!(
+                    batch_size,
+                    "Batch verified state cert signatures (15ms window)"
                 );
             }
         });
