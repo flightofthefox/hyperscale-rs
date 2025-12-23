@@ -110,35 +110,27 @@ pub enum Action {
         signing_message: Vec<u8>,
     },
 
-    /// Verify a state provision's signature (cross-shard Phase 2).
+    /// Batch verify and aggregate provisions (cross-shard Phase 2).
+    ///
+    /// Verifies all provision signatures and aggregates valid ones into a CommitmentProof.
+    /// This combines verification and aggregation into a single operation, avoiding
+    /// wasted work on provisions that might never reach quorum.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::ProvisionSignatureVerified` when complete.
-    VerifyProvisionSignature {
-        /// The provision to verify.
-        provision: StateProvision,
-        /// Public key of the sending validator (pre-resolved by state machine).
-        public_key: PublicKey,
-    },
-
-    /// Aggregate provisions into a CommitmentProof (cross-shard quorum reached).
-    ///
-    /// Performs BLS signature aggregation which is compute-intensive.
-    /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::CommitmentProofAggregated` when complete.
-    AggregateCommitmentProof {
+    /// Returns `Event::ProvisionsVerifiedAndAggregated` when complete.
+    VerifyAndAggregateProvisions {
         /// Transaction hash for correlation.
         tx_hash: Hash,
-        /// Source shard that reached quorum.
+        /// Source shard the provisions are from.
         source_shard: ShardGroupId,
         /// Block height when provisions were created.
         block_height: BlockHeight,
-        /// State entries (deduplicated from provisions).
+        /// State entries (from first provision - all should match).
         entries: Vec<StateEntry>,
-        /// Signatures to aggregate (one per provision).
-        signatures: Vec<Signature>,
-        /// Validator indices in committee (for SignerBitfield).
-        signer_indices: Vec<usize>,
+        /// Provisions to verify and aggregate.
+        provisions: Vec<StateProvision>,
+        /// Public keys for each provision (same order as provisions).
+        public_keys: Vec<PublicKey>,
         /// Committee size (for SignerBitfield capacity).
         committee_size: usize,
     },
@@ -534,8 +526,7 @@ impl Action {
         matches!(
             self,
             Action::VerifyVoteSignature { .. }
-                | Action::VerifyProvisionSignature { .. }
-                | Action::AggregateCommitmentProof { .. }
+                | Action::VerifyAndAggregateProvisions { .. }
                 | Action::AggregateStateCertificate { .. }
                 | Action::VerifyStateVoteSignature { .. }
                 | Action::VerifyStateCertificateSignature { .. }
@@ -596,8 +587,7 @@ impl Action {
 
             // Delegated Work - Crypto Verification
             Action::VerifyVoteSignature { .. } => "VerifyVoteSignature",
-            Action::VerifyProvisionSignature { .. } => "VerifyProvisionSignature",
-            Action::AggregateCommitmentProof { .. } => "AggregateCommitmentProof",
+            Action::VerifyAndAggregateProvisions { .. } => "VerifyAndAggregateProvisions",
             Action::AggregateStateCertificate { .. } => "AggregateStateCertificate",
             Action::VerifyStateVoteSignature { .. } => "VerifyStateVoteSignature",
             Action::VerifyStateCertificateSignature { .. } => "VerifyStateCertificateSignature",

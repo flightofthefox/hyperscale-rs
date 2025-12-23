@@ -665,16 +665,9 @@ impl StateMachine for NodeStateMachine {
                 }
             }
 
-            Event::ProvisionSignatureVerified { .. } => {
-                // Route ONLY to provision coordinator
-                if let Some(actions) = self.provisions.try_handle(&event) {
-                    return actions;
-                }
-            }
-
-            // CommitmentProofAggregated: callback from signature aggregation
-            Event::CommitmentProofAggregated { .. } => {
-                // Route to provision coordinator to emit ProvisionQuorumReached
+            // ProvisionsVerifiedAndAggregated: callback from batch verification + aggregation
+            Event::ProvisionsVerifiedAndAggregated { .. } => {
+                // Route to provision coordinator to handle verified provisions and quorum
                 if let Some(actions) = self.provisions.try_handle(&event) {
                     return actions;
                 }

@@ -470,52 +470,99 @@ impl SimNode {
                     .push_back(Event::VoteSignatureVerified { vote, valid });
             }
 
-            Action::VerifyProvisionSignature {
-                provision,
-                public_key,
-            } => {
-                let msg = provision.signing_message();
-                let valid = public_key.verify(&msg, &provision.signature);
-                self.internal_queue
-                    .push_back(Event::ProvisionSignatureVerified { provision, valid });
-            }
-
-            Action::AggregateCommitmentProof {
+            Action::VerifyAndAggregateProvisions {
                 tx_hash,
                 source_shard,
                 block_height,
                 entries,
-                signatures,
-                signer_indices,
+                provisions,
+                public_keys,
                 committee_size,
             } => {
-                // Build signer bitfield
-                let mut signers = SignerBitfield::new(committee_size);
-                for idx in &signer_indices {
-                    signers.set(*idx);
-                }
+                // All provisions for the same (tx, source_shard) sign the SAME message.
+                // Happy path: aggregate verification with single pairing check.
+                let signatures: Vec<Signature> =
+                    provisions.iter().map(|p| p.signature.clone()).collect();
+                let message = provisions
+                    .first()
+                    .map(|p| p.signing_message())
+                    .unwrap_or_default();
 
-                // Aggregate BLS signatures
-                let aggregated_signature = if signatures.is_empty() {
-                    Signature::zero()
-                } else {
-                    Signature::aggregate_bls(&signatures).unwrap_or_else(|_| Signature::zero())
-                };
+                let topology = self.state.topology();
+                let all_valid =
+                    PublicKey::batch_verify_bls_same_message(&message, &signatures, &public_keys);
 
-                // Build the commitment proof
-                let commitment_proof = CommitmentProof::new(
-                    tx_hash,
-                    source_shard,
-                    signers,
-                    aggregated_signature,
-                    block_height,
-                    entries,
-                );
+                let (verified_provisions, commitment_proof) = if all_valid {
+                    // Fast path: all valid
+                    let mut signers = SignerBitfield::new(committee_size);
+                    for provision in &provisions {
+                        if let Some(idx) =
+                            topology.committee_index_for_shard(source_shard, provision.validator_id)
+                        {
+                            signers.set(idx);
+                        }
+                    }
 
-                self.internal_queue
-                    .push_back(Event::CommitmentProofAggregated {
+                    let aggregated_signature =
+                        Signature::aggregate_bls(&signatures).unwrap_or_else(|_| Signature::zero());
+
+                    let proof = CommitmentProof::new(
                         tx_hash,
                         source_shard,
+                        signers,
+                        aggregated_signature,
+                        block_height,
+                        entries,
+                    );
+
+                    (provisions, Some(proof))
+                } else {
+                    // Slow path: find valid signatures individually
+                    let mut verified = Vec::new();
+                    let mut valid_sigs = Vec::new();
+                    let mut signer_indices = Vec::new();
+
+                    for (provision, pk) in provisions.iter().zip(public_keys.iter()) {
+                        if pk.verify(&message, &provision.signature) {
+                            verified.push(provision.clone());
+                            valid_sigs.push(provision.signature.clone());
+                            if let Some(idx) = topology
+                                .committee_index_for_shard(source_shard, provision.validator_id)
+                            {
+                                signer_indices.push(idx);
+                            }
+                        }
+                    }
+
+                    let proof = if !valid_sigs.is_empty() {
+                        let mut signers = SignerBitfield::new(committee_size);
+                        for idx in &signer_indices {
+                            signers.set(*idx);
+                        }
+
+                        let aggregated_signature = Signature::aggregate_bls(&valid_sigs)
+                            .unwrap_or_else(|_| Signature::zero());
+
+                        Some(CommitmentProof::new(
+                            tx_hash,
+                            source_shard,
+                            signers,
+                            aggregated_signature,
+                            block_height,
+                            entries,
+                        ))
+                    } else {
+                        None
+                    };
+
+                    (verified, proof)
+                };
+
+                self.internal_queue
+                    .push_back(Event::ProvisionsVerifiedAndAggregated {
+                        tx_hash,
+                        source_shard,
+                        verified_provisions,
                         commitment_proof,
                     });
             }

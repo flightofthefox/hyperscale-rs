@@ -174,27 +174,21 @@ pub enum Event {
         valid: bool,
     },
 
-    /// State provision signature verification completed.
+    /// Batch provision verification and aggregation completed.
     ///
-    /// Callback from `Action::VerifyProvisionSignature`.
-    ProvisionSignatureVerified {
-        /// The provision that was verified.
-        provision: StateProvision,
-        /// Whether the signature is valid.
-        valid: bool,
-    },
-
-    /// Commitment proof aggregation completed.
-    ///
-    /// Callback from `Action::AggregateCommitmentProof`.
-    /// Contains the aggregated BLS signature proving quorum commitment.
-    CommitmentProofAggregated {
+    /// Callback from `Action::VerifyAndAggregateProvisions`.
+    /// Contains only the provisions that passed signature verification,
+    /// plus the aggregated commitment proof (if we have enough valid signatures).
+    ProvisionsVerifiedAndAggregated {
         /// Transaction hash for correlation.
         tx_hash: Hash,
-        /// Source shard that reached quorum.
+        /// Source shard the provisions are from.
         source_shard: ShardGroupId,
-        /// The aggregated commitment proof.
-        commitment_proof: CommitmentProof,
+        /// Provisions that passed signature verification (may be fewer than input).
+        verified_provisions: Vec<StateProvision>,
+        /// Aggregated commitment proof from valid signatures, if quorum reached.
+        /// None if no valid signatures or aggregation failed.
+        commitment_proof: Option<CommitmentProof>,
     },
 
     /// State certificate aggregation completed.
@@ -639,8 +633,7 @@ impl Event {
             | Event::TransactionExecuted { .. }
             | Event::TransactionStatusChanged { .. }
             | Event::VoteSignatureVerified { .. }
-            | Event::ProvisionSignatureVerified { .. }
-            | Event::CommitmentProofAggregated { .. }
+            | Event::ProvisionsVerifiedAndAggregated { .. }
             | Event::StateVoteSignatureVerified { .. }
             | Event::StateCertificateSignatureVerified { .. }
             | Event::QcSignatureVerified { .. }
@@ -759,8 +752,7 @@ impl Event {
 
             // Async Callbacks - Crypto Verification
             Event::VoteSignatureVerified { .. } => "VoteSignatureVerified",
-            Event::ProvisionSignatureVerified { .. } => "ProvisionSignatureVerified",
-            Event::CommitmentProofAggregated { .. } => "CommitmentProofAggregated",
+            Event::ProvisionsVerifiedAndAggregated { .. } => "ProvisionsVerifiedAndAggregated",
             Event::StateVoteSignatureVerified { .. } => "StateVoteSignatureVerified",
             Event::StateCertificateSignatureVerified { .. } => "StateCertificateSignatureVerified",
             Event::QcSignatureVerified { .. } => "QcSignatureVerified",
