@@ -1735,22 +1735,59 @@ impl ProductionRunner {
 
             // Domain-specific execution broadcasts - dispatch to action dispatcher
             // The batcher accumulates items and flushes periodically to reduce network overhead.
+            // These are critical cross-shard messages - log errors if dispatch fails.
             Action::BroadcastStateVote { shard, vote } => {
-                let _ = self
+                if self
                     .dispatch_tx
-                    .send(DispatchableAction::QueueStateVote { shard, vote });
+                    .send(DispatchableAction::QueueStateVote {
+                        shard,
+                        vote: vote.clone(),
+                    })
+                    .is_err()
+                {
+                    tracing::error!(
+                        shard = shard.0,
+                        tx_hash = ?vote.transaction_hash,
+                        "CRITICAL: Failed to dispatch state vote - dispatcher channel closed"
+                    );
+                    crate::metrics::increment_dispatch_failures("state_vote");
+                }
             }
 
             Action::BroadcastStateCertificate { shard, certificate } => {
-                let _ = self
+                if self
                     .dispatch_tx
-                    .send(DispatchableAction::QueueStateCertificate { shard, certificate });
+                    .send(DispatchableAction::QueueStateCertificate {
+                        shard,
+                        certificate: certificate.clone(),
+                    })
+                    .is_err()
+                {
+                    tracing::error!(
+                        shard = shard.0,
+                        tx_hash = ?certificate.transaction_hash,
+                        "CRITICAL: Failed to dispatch state certificate - dispatcher channel closed"
+                    );
+                    crate::metrics::increment_dispatch_failures("state_certificate");
+                }
             }
 
             Action::BroadcastStateProvision { shard, provision } => {
-                let _ = self
+                if self
                     .dispatch_tx
-                    .send(DispatchableAction::QueueStateProvision { shard, provision });
+                    .send(DispatchableAction::QueueStateProvision {
+                        shard,
+                        provision: provision.clone(),
+                    })
+                    .is_err()
+                {
+                    tracing::error!(
+                        shard = shard.0,
+                        tx_hash = ?provision.transaction_hash,
+                        "CRITICAL: Failed to dispatch state provision - dispatcher channel closed"
+                    );
+                    crate::metrics::increment_dispatch_failures("state_provision");
+                }
             }
 
             // Timers via timer manager

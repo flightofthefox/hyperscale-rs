@@ -130,6 +130,22 @@ pub struct Metrics {
     pub signature_verification_failures: Counter,
     pub invalid_messages_received: Counter,
     pub transactions_rejected: CounterVec,
+
+    // === Cross-Shard Message Delivery ===
+    /// Failures to dispatch cross-shard messages (channel closed).
+    pub dispatch_failures: CounterVec,
+    /// Cross-shard message batches that failed initial broadcast (queued for retry).
+    pub broadcast_failures: Counter,
+    /// Cross-shard message batches successfully delivered after retry.
+    pub broadcast_retry_successes: Counter,
+    /// Cross-shard message batches dropped after max retries.
+    pub broadcast_messages_dropped: Counter,
+    /// Current size of the broadcast retry queue.
+    pub broadcast_retry_queue_size: Gauge,
+    /// Gossipsub publish failures by topic.
+    pub gossipsub_publish_failures: CounterVec,
+    /// Early arrival buffer evictions.
+    pub early_arrival_evictions: Counter,
 }
 
 impl Metrics {
@@ -563,6 +579,51 @@ impl Metrics {
                 "hyperscale_transactions_rejected_total",
                 "Total transactions rejected",
                 &["reason"]
+            )
+            .unwrap(),
+
+            // Cross-Shard Message Delivery
+            dispatch_failures: register_counter_vec!(
+                "hyperscale_dispatch_failures_total",
+                "Failures to dispatch cross-shard messages (channel closed)",
+                &["message_type"]
+            )
+            .unwrap(),
+
+            broadcast_failures: register_counter!(
+                "hyperscale_broadcast_failures_total",
+                "Cross-shard message batches that failed initial broadcast"
+            )
+            .unwrap(),
+
+            broadcast_retry_successes: register_counter!(
+                "hyperscale_broadcast_retry_successes_total",
+                "Cross-shard message batches successfully delivered after retry"
+            )
+            .unwrap(),
+
+            broadcast_messages_dropped: register_counter!(
+                "hyperscale_broadcast_messages_dropped_total",
+                "Cross-shard message batches dropped after max retries (CRITICAL)"
+            )
+            .unwrap(),
+
+            broadcast_retry_queue_size: register_gauge!(
+                "hyperscale_broadcast_retry_queue_size",
+                "Current size of the broadcast retry queue"
+            )
+            .unwrap(),
+
+            gossipsub_publish_failures: register_counter_vec!(
+                "hyperscale_gossipsub_publish_failures_total",
+                "Gossipsub publish failures by topic type",
+                &["topic_type"]
+            )
+            .unwrap(),
+
+            early_arrival_evictions: register_counter!(
+                "hyperscale_early_arrival_evictions_total",
+                "Early arrival buffer entries evicted due to size limit"
             )
             .unwrap(),
         }
@@ -1000,4 +1061,53 @@ pub fn record_fetch_response_sent(kind: &str, count: usize) {
         .fetch_items_sent
         .with_label_values(&[kind])
         .inc_by(count as f64);
+}
+
+// === Cross-Shard Message Delivery Metrics ===
+
+/// Increment dispatch failure counter for cross-shard messages.
+///
+/// Called when the action dispatcher channel is closed (critical failure).
+pub fn increment_dispatch_failures(message_type: &str) {
+    metrics()
+        .dispatch_failures
+        .with_label_values(&[message_type])
+        .inc();
+}
+
+/// Record a broadcast failure (queued for retry).
+pub fn record_broadcast_failure() {
+    metrics().broadcast_failures.inc();
+}
+
+/// Record a successful retry of a broadcast.
+pub fn record_broadcast_retry_success() {
+    metrics().broadcast_retry_successes.inc();
+}
+
+/// Record a message batch dropped after max retries.
+pub fn record_broadcast_message_dropped() {
+    metrics().broadcast_messages_dropped.inc();
+}
+
+/// Update the current retry queue size.
+pub fn set_broadcast_retry_queue_size(size: usize) {
+    metrics().broadcast_retry_queue_size.set(size as f64);
+}
+
+/// Record a gossipsub publish failure.
+///
+/// Extracts the topic type from the full topic string for better grouping.
+pub fn record_gossipsub_publish_failure(topic: &str) {
+    // Extract topic type from full topic string (e.g., "/hyperscale/shard/0/votes" -> "votes")
+    let topic_type = topic.rsplit('/').next().unwrap_or("unknown");
+    metrics()
+        .gossipsub_publish_failures
+        .with_label_values(&[topic_type])
+        .inc();
+}
+
+/// Record an early arrival buffer eviction.
+pub fn record_early_arrival_eviction() {
+    metrics().early_arrival_evictions.inc();
 }

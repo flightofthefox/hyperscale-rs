@@ -1051,12 +1051,31 @@ impl Libp2pAdapter {
                 }
             }
             SwarmCommand::Broadcast { topic, data } => {
-                let topic = gossipsub::IdentTopic::new(topic.clone());
+                let topic_ident = gossipsub::IdentTopic::new(topic.clone());
+                let data_len = data.len();
 
-                if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
-                    debug!("Failed to publish message to topic {}: {:?}", topic, e);
+                if let Err(e) = swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(topic_ident.clone(), data)
+                {
+                    // Duplicate errors are expected - multiple validators create the same
+                    // certificate and try to gossip it. Gossipsub correctly deduplicates.
+                    if matches!(e, gossipsub::PublishError::Duplicate) {
+                        trace!(topic = %topic, "Gossipsub duplicate (expected, already delivered)");
+                    } else {
+                        // Other errors are significant - messages may be lost
+                        warn!(
+                            topic = %topic,
+                            data_len,
+                            error = ?e,
+                            peers = swarm.connected_peers().count(),
+                            "Failed to publish message to gossipsub topic - message may be lost"
+                        );
+                        crate::metrics::record_gossipsub_publish_failure(&topic);
+                    }
                 } else {
-                    trace!("Published message to topic: {}", topic);
+                    trace!(topic = %topic, data_len, "Published message to gossipsub topic");
                 }
             }
             SwarmCommand::Dial { address } => {
