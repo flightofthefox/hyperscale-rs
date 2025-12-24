@@ -36,7 +36,7 @@ LOG_LEVEL="info"                                # Default log level (trace, debu
 SMOKE_TEST_TIMEOUT="${SMOKE_TEST_TIMEOUT:-60s}" # Smoke test timeout
 SKIP_BUILD="${SKIP_BUILD:-false}"               # Skip building binaries
 NODE_HOSTNAME="${NODE_HOSTNAME:-localhost}"     # Hostname for spammer endpoints
-TCP_FALLBACK_ENABLED="${TCP_FALLBACK_ENABLED:-false}" # Enable TCP fallback transport (default: true)
+TCP_FALLBACK_ENABLED="${TCP_FALLBACK_ENABLED:-false}" # Enable TCP fallback transport (default: false)
 
 # Define explicit port ranges for Docker and firewall whitelisting
 # let's give a range of 500 ports which should be ok for local testing
@@ -90,12 +90,12 @@ while [[ $# -gt 0 ]]; do
             MONITORING=true
             shift
             ;;
-        --tracing)
-            TRACING=true
+        --tcp-fallback)
+            TCP_FALLBACK_ENABLED="true"
             shift
             ;;
-        --no-tcp-fallback)
-            TCP_FALLBACK_ENABLED="false"
+        --tracing)
+            TRACING=true
             shift
             ;;
         --help|-h)
@@ -114,7 +114,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --log-level LEVEL        Log level: trace, debug, info, warn, error (default: info)"
             echo "  --skip-build             Skip building binaries (default: false)"
             echo "  --start-monitoring       Start Prometheus + Grafana monitoring stack (default: false)"
-            echo "  --no-tcp-fallback        Disable TCP fallback transport (QUIC only)"
+            echo "  --tcp-fallback           Enable TCP fallback transport (QUIC only)"
             echo ""
             echo "Environment Variables:"
             echo "  VALIDATOR_BIN            Path to validator binary (default: ./target/release/hyperscale-validator)"
