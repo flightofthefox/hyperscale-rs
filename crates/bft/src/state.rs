@@ -388,7 +388,7 @@ impl BftState {
     /// Create the message bytes to sign for a block vote.
     ///
     /// Includes domain separation to prevent cross-shard replay attacks:
-    /// - Domain tag ("block_vote:")
+    /// - Domain tag ("BLOCK_VOTE")
     /// - Shard group identifier
     /// - Block height
     /// - Round number

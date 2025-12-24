@@ -10,7 +10,7 @@
 //!
 //! | Tag | Purpose |
 //! |-----|---------|
-//! | `block_vote:` | BFT block votes |
+//! | `BLOCK_VOTE` | BFT block votes |
 //! | `STATE_PROVISION` | Cross-shard state provisions |
 //! | `EXEC_VOTE` | Execution state votes |
 //!
@@ -24,8 +24,8 @@ use crate::{BlockHeight, Hash, ShardGroupId};
 
 /// Domain tag for BFT block votes.
 ///
-/// Format: `block_vote:` || shard_group_id || height || round || block_hash
-pub const DOMAIN_BLOCK_VOTE: &[u8] = b"block_vote:";
+/// Format: `BLOCK_VOTE` || shard_group_id || height || round || block_hash
+pub const DOMAIN_BLOCK_VOTE: &[u8] = b"BLOCK_VOTE";
 
 /// Domain tag for cross-shard state provisions.
 ///
