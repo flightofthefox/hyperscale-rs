@@ -20,6 +20,9 @@ RPC_BASE_PORT=8080
 NUM_SHARDS=1 # Simplification for now: 1 shard for N nodes
 CLEAN=false
 NODES_PER_HOST=1
+CRYPTO_THREADS=2
+EXECUTION_THREADS=4
+IO_THREADS=2
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -51,8 +54,21 @@ while [[ $# -gt 0 ]]; do
             NUM_SHARDS="$2"
             shift 2
             ;;
+        --crypto-threads)
+            CRYPTO_THREADS="$2"
+            shift 2
+            ;;
+        --execution-threads)
+            EXECUTION_THREADS="$2"
+            shift 2
+            ;;
+        --io-threads)
+            IO_THREADS="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 --hosts \"IP1,IP2...\" [--nodes-per-host N] [--shards N] [--out-dir DIR] [--clean]"
+            echo "       [--crypto-threads N] [--execution-threads N] [--io-threads N]"
             exit 0
             ;;
         *)
@@ -256,6 +272,12 @@ view_change_timeout_ms = 3000
 max_transactions_per_block = 1024
 max_certificates_per_block = 4096
 rpc_mempool_limit = 16384
+
+[threads]
+crypto_threads = $CRYPTO_THREADS
+execution_threads = $EXECUTION_THREADS
+io_threads = $IO_THREADS
+pin_cores = false
 
 [metrics]
 enabled = true
