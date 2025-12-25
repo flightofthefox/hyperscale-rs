@@ -64,6 +64,16 @@ pub struct Libp2pConfig {
     ///
     /// Default: Strict
     pub version_interop_mode: VersionInteroperabilityMode,
+
+    /// Maximum number of direct validator connections.
+    ///
+    /// Default: 50
+    pub direct_connection_limit: usize,
+
+    /// Timeout for direct validator connection attempts.
+    ///
+    /// Default: 10 seconds
+    pub direct_connection_timeout: Duration,
 }
 
 /// Mode for version interoperability checks.
@@ -128,6 +138,8 @@ impl Default for Libp2pConfig {
             tcp_fallback_enabled: true,
             tcp_fallback_port: None,
             version_interop_mode: VersionInteroperabilityMode::Relaxed,
+            direct_connection_limit: 50,
+            direct_connection_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -190,12 +202,26 @@ impl Libp2pConfig {
             tcp_fallback_enabled: true,
             tcp_fallback_port: None,
             version_interop_mode: VersionInteroperabilityMode::Relaxed,
+            direct_connection_limit: 50,
+            direct_connection_timeout: Duration::from_secs(5),
         }
     }
 
     /// Set the version interoperability mode.
     pub fn with_version_interop_mode(mut self, mode: VersionInteroperabilityMode) -> Self {
         self.version_interop_mode = mode;
+        self
+    }
+
+    /// Set the direct connection limit.
+    pub fn with_direct_connection_limit(mut self, limit: usize) -> Self {
+        self.direct_connection_limit = limit;
+        self
+    }
+
+    /// Set the direct connection timeout.
+    pub fn with_direct_connection_timeout(mut self, timeout: Duration) -> Self {
+        self.direct_connection_timeout = timeout;
         self
     }
 }

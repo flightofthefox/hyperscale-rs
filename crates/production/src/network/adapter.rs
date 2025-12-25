@@ -8,6 +8,7 @@
 
 use super::codec::{decode_message, encode_message, CodecError};
 use super::config::Libp2pConfig;
+use super::direct::DirectValidatorNetwork;
 use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
 use super::topic::Topic;
 use crate::metrics;
@@ -127,7 +128,8 @@ pub struct InboundCertificateRequest {
 }
 
 /// Commands sent to the swarm task.
-enum SwarmCommand {
+#[derive(Debug)]
+pub enum SwarmCommand {
     /// Subscribe to a gossipsub topic.
     Subscribe { topic: String },
 
@@ -178,6 +180,9 @@ enum SwarmCommand {
 
     /// Send a response to a certificate request (by channel ID).
     SendCertificateResponse { channel_id: u64, response: Vec<u8> },
+
+    /// Send a direct message to a peer (unicast).
+    SendDirectMessage { peer: Libp2pPeerId, data: Vec<u8> },
 }
 
 /// A pending response channel with its creation time for timeout cleanup.
@@ -389,6 +394,9 @@ pub struct Libp2pAdapter {
     /// Cached connected peer count (updated by background task).
     /// This avoids blocking the consensus loop to query peer count.
     cached_peer_count: Arc<AtomicUsize>,
+
+    /// Direct validator network for high-performance consensus messaging.
+    direct_network: Arc<DirectValidatorNetwork>,
 }
 
 impl Libp2pAdapter {
@@ -645,6 +653,13 @@ impl Libp2pAdapter {
         let (cert_request_tx, cert_request_rx) = mpsc::unbounded_channel();
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
+        let direct_network = Arc::new(DirectValidatorNetwork::new(
+            validator_id,
+            command_tx.clone(),
+            validator_peers.clone(),
+            config.clone(),
+        ));
+
         let adapter = Arc::new(Self {
             local_peer_id,
             local_validator_id: validator_id,
@@ -659,6 +674,7 @@ impl Libp2pAdapter {
             tx_request_tx: tx_request_tx.clone(),
             cert_request_tx: cert_request_tx.clone(),
             cached_peer_count: cached_peer_count.clone(),
+            direct_network: direct_network.clone(),
         });
 
         // Spawn event loop (takes ownership of swarm)
@@ -729,6 +745,11 @@ impl Libp2pAdapter {
         );
     }
 
+    /// Update the committee for a shard (delegates to direct network).
+    pub fn update_committee(&self, shard: ShardGroupId, validators: Vec<ValidatorId>) {
+        self.direct_network.update_committee(shard, validators);
+    }
+
     /// Subscribe to all message types for a shard.
     ///
     /// Called once at startup to subscribe to the local shard's topics.
@@ -763,6 +784,35 @@ impl Libp2pAdapter {
         shard: ShardGroupId,
         message: &OutboundMessage,
     ) -> Result<(), NetworkError> {
+        // Direct broadcast for critical consensus messages (BlockHeader, BlockVote)
+        if message.type_name().contains("Block") {
+            // Check if we have the committee info for this shard
+            if let Some(committee) = self.direct_network.get_committee(shard) {
+                // Try direct broadcast
+                match self
+                    .direct_network
+                    .broadcast_to_shard(shard, message, &committee)
+                {
+                    Ok(_) => {
+                        // Successfully queued direct messages.
+                        // We can return early, OR we can also gossip as a backup (redundancy).
+                        // For now, let's return early to test the "bypass" goal.
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        // Log error and fall back to gossip
+                        warn!(shard = shard.0, error = ?e, "Direct broadcast failed, falling back to gossip");
+                    }
+                }
+            } else {
+                // No committee info, fallback to gossip (and maybe log a debug warning)
+                debug!(
+                    shard = shard.0,
+                    "No committee info for direct broadcast, using gossip"
+                );
+            }
+        }
+
         let topic = super::codec::topic_for_message(message, shard);
         let data = encode_message(message)?;
         let data_len = data.len();
@@ -1462,6 +1512,16 @@ impl Libp2pAdapter {
                 } else {
                     warn!(channel_id, "Unknown channel ID for certificate response");
                 }
+            }
+            SwarmCommand::SendDirectMessage { peer, data } => {
+                // Send as a request, ignoring the response (fire and forget).
+                // We reuse the existing request-response protocol but just don't track the request.
+                // This is a simplification; ideally we'd use a separate protocol or streams.
+                let _req_id = swarm
+                    .behaviour_mut()
+                    .request_response
+                    .send_request(&peer, data);
+                // We don't insert into pending_requests because we don't expect/wait for a response.
             }
         }
     }
