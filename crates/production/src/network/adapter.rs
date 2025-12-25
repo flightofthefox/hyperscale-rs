@@ -1311,7 +1311,7 @@ impl Libp2pAdapter {
                         }
                     }
 
-                    Self::handle_swarm_event(
+                    let action = Self::handle_swarm_event(
                         event,
                         &consensus_tx,
                         &peer_validators,
@@ -1325,6 +1325,20 @@ impl Libp2pAdapter {
                         local_shard,
                         &tx_validation_handle,
                     ).await;
+
+                    // Execute any action returned by the event handler
+                    match action {
+                        SwarmAction::SendResponse { channel, data } => {
+                            if let Err(e) = swarm
+                                .behaviour_mut()
+                                .request_response
+                                .send_response(channel, data)
+                            {
+                                warn!("Failed to send direct response: {:?}", e);
+                            }
+                        }
+                        SwarmAction::None => {}
+                    }
 
                     // Update cached peer count after connection changes
                     if is_connection_event {
@@ -1525,7 +1539,19 @@ impl Libp2pAdapter {
             }
         }
     }
+}
 
+/// Internal action to take after handling a swarm event
+/// Internal action to take after handling a swarm event
+enum SwarmAction {
+    None,
+    SendResponse {
+        channel: request_response::ResponseChannel<Vec<u8>>,
+        data: Vec<u8>,
+    },
+}
+
+impl Libp2pAdapter {
     /// Handle a single swarm event.
     #[allow(clippy::too_many_arguments)]
     async fn handle_swarm_event(
@@ -1541,7 +1567,7 @@ impl Libp2pAdapter {
         rate_limiter: &mut SyncRateLimiter,
         local_shard: ShardGroupId,
         tx_validation_handle: &ValidationBatcherHandle,
-    ) {
+    ) -> SwarmAction {
         match event {
             // Handle gossipsub messages
             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -1561,7 +1587,7 @@ impl Libp2pAdapter {
                             "Received message with invalid topic format"
                         );
                         metrics::record_invalid_message();
-                        return;
+                        return SwarmAction::None;
                     }
                 };
 
@@ -1581,7 +1607,7 @@ impl Libp2pAdapter {
                         "Ignoring message from unknown peer (not in validator set)"
                     );
                     metrics::record_invalid_message();
-                    return;
+                    return SwarmAction::None;
                 }
                 //
                 // Cross-shard messages (allowed from any shard):
@@ -1604,7 +1630,7 @@ impl Libp2pAdapter {
                                 "Dropping shard-local message from wrong shard (cross-shard contamination attempt)"
                             );
                             metrics::record_invalid_message();
-                            return;
+                            return SwarmAction::None;
                         }
                     }
                 }
@@ -1657,6 +1683,7 @@ impl Libp2pAdapter {
                                 }
                             }
                         }
+                        SwarmAction::None
                     }
                     Err(e) => {
                         warn!(
@@ -1666,6 +1693,7 @@ impl Libp2pAdapter {
                             "Failed to decode message"
                         );
                         metrics::record_invalid_message();
+                        SwarmAction::None
                     }
                 }
             }
@@ -1676,6 +1704,7 @@ impl Libp2pAdapter {
                 topic,
             })) => {
                 debug!("Peer {:?} subscribed to topic: {}", peer_id, topic);
+                SwarmAction::None
             }
 
             // Handle request-response messages
@@ -1694,6 +1723,7 @@ impl Libp2pAdapter {
                 if let Some(pending) = pending_requests.remove(&request_id) {
                     let _ = pending.response_tx.send(Ok(response));
                 }
+                SwarmAction::None
             }
 
             // Handle request failures
@@ -1711,6 +1741,7 @@ impl Libp2pAdapter {
                             error
                         ))));
                 }
+                SwarmAction::None
             }
 
             // Handle inbound requests (sync blocks or transaction fetch)
@@ -1737,7 +1768,7 @@ impl Libp2pAdapter {
                     metrics::record_request_rate_limited(is_validator);
                     // Drop the request by not processing it
                     // The channel will be dropped, which signals failure to the requester
-                    return;
+                    return SwarmAction::None;
                 }
 
                 // Determine request type:
@@ -1781,6 +1812,7 @@ impl Libp2pAdapter {
                         // Remove the channel since we can't process this request
                         pending_response_channels.remove(&channel_id);
                     }
+                    SwarmAction::None
                 } else if let Ok(decoded) = super::codec::decode_direct_message(&request) {
                     // Direct consensus message (Block/Vote)
                     // We cannot send a response here because we don't have access to the swarm behavior.
@@ -1798,6 +1830,10 @@ impl Libp2pAdapter {
                         if consensus_tx.send(event).await.is_err() {
                             warn!("Consensus channel closed during direct message dispatch");
                         }
+                    }
+                    SwarmAction::SendResponse {
+                        channel,
+                        data: vec![],
                     }
                 } else if request.len() > 8 {
                     // Decode as transaction or certificate fetch request based on fetch_type tag.
@@ -1901,8 +1937,10 @@ impl Libp2pAdapter {
                             warn!(peer = %peer, len = request.len(), ?fetch_type, "Unknown fetch request type");
                         }
                     }
+                    SwarmAction::None
                 } else {
                     warn!(peer = %peer, len = request.len(), "Invalid request (too short)");
+                    SwarmAction::None
                 }
             }
 
@@ -1919,6 +1957,7 @@ impl Libp2pAdapter {
                     protocols = ?info.protocols,
                     "Identified peer"
                 );
+                SwarmAction::None
             }
 
             // Connection events
@@ -1938,6 +1977,7 @@ impl Libp2pAdapter {
                 // Note: num_established is connections to this peer, not total peers
                 // We would need swarm.connected_peers().count() for total, but we don't have access here
                 // The metrics tick in runner.rs can poll connected_peers() periodically instead
+                SwarmAction::None
             }
 
             SwarmEvent::ConnectionClosed {
@@ -1952,14 +1992,17 @@ impl Libp2pAdapter {
                     remaining_connections = num_established,
                     "Connection closed"
                 );
+                SwarmAction::None
             }
 
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("Listening on new address: {}", address);
+                SwarmAction::None
             }
 
             _ => {
                 // Ignore other events
+                SwarmAction::None
             }
         }
     }
