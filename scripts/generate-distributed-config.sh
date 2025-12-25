@@ -246,11 +246,14 @@ bootstrap_peers = [$BOOTSTRAP_PEERS]
 upnp_enabled = false
 request_timeout_ms = 30000
 max_message_size = 10485760
-gossipsub_heartbeat_ms = 1000
+gossipsub_heartbeat_ms = 100
 
 [consensus]
 proposal_interval_ms = 300
 view_change_timeout_ms = 3000
+max_transactions_per_block = 1024
+max_certificates_per_block = 4096
+rpc_mempool_limit = 16384
 
 [metrics]
 enabled = true
