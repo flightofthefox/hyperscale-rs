@@ -2670,7 +2670,7 @@ impl ProductionRunner {
                 // enables storage-backed fetch requests.
                 let storage = self.storage.clone();
                 let height = block.height();
-                tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || {
                     storage.put_block_denormalized(&block, &qc);
                     // Update chain metadata
                     storage.set_chain_metadata(height, None, None);

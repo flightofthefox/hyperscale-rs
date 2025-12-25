@@ -1057,6 +1057,12 @@ impl Libp2pAdapter {
         let mut pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest> =
             HashMap::new();
 
+        // Track pending direct messages (outbound) for debugging delivery
+        let mut pending_direct_messages: HashMap<
+            request_response::OutboundRequestId,
+            std::time::Instant,
+        > = HashMap::new();
+
         // Track pending response channels (inbound) - keyed by channel_id
         // Uses PendingResponseChannel to track creation time for timeout cleanup
         let mut pending_response_channels: HashMap<u64, PendingResponseChannel> = HashMap::new();
@@ -1140,6 +1146,18 @@ impl Libp2pAdapter {
                         );
                     }
 
+                    // 3. Clean up timed-out direct messages
+                    let expired_direct: Vec<_> = pending_direct_messages
+                        .iter()
+                        .filter(|(_, &created_at)| now.duration_since(created_at) > PENDING_REQUEST_TIMEOUT)
+                        .map(|(id, _)| *id)
+                        .collect();
+
+                    for req_id in &expired_direct {
+                         warn!(?req_id, "Timed out waiting for direct message acknowledgement");
+                         pending_direct_messages.remove(req_id);
+                    }
+
                     // 3. Record metrics for pending response channels
                     metrics::record_pending_response_channels(pending_response_channels.len());
 
@@ -1207,11 +1225,11 @@ impl Libp2pAdapter {
                 // Response commands (SendCertificateResponse, etc.) are time-critical
                 // as they unblock other validators waiting for data.
                 Some(cmd) = command_rx.recv() => {
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_response_channels).await;
+                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages, &mut pending_response_channels).await;
 
                     // Drain any additional pending commands
                     while let Ok(cmd) = command_rx.try_recv() {
-                        Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_response_channels).await;
+                        Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages, &mut pending_response_channels).await;
                     }
                 }
 
@@ -1316,6 +1334,7 @@ impl Libp2pAdapter {
                         &consensus_tx,
                         &peer_validators,
                         &mut pending_requests,
+                        &mut pending_direct_messages,
                         &mut pending_response_channels,
                         &mut next_channel_id,
                         &sync_request_tx,
@@ -1355,6 +1374,10 @@ impl Libp2pAdapter {
         swarm: &mut Swarm<Behaviour>,
         cmd: SwarmCommand,
         pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
+        pending_direct_messages: &mut HashMap<
+            request_response::OutboundRequestId,
+            std::time::Instant,
+        >,
         pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
     ) {
         match cmd {
@@ -1528,14 +1551,13 @@ impl Libp2pAdapter {
                 }
             }
             SwarmCommand::SendDirectMessage { peer, data } => {
-                // Send as a request, ignoring the response (fire and forget).
-                // We reuse the existing request-response protocol but just don't track the request.
-                // This is a simplification; ideally we'd use a separate protocol or streams.
-                let _req_id = swarm
+                // Send as a request, reusing the existing request-response protocol.
+                let req_id = swarm
                     .behaviour_mut()
                     .request_response
                     .send_request(&peer, data);
-                // We don't insert into pending_requests because we don't expect/wait for a response.
+
+                pending_direct_messages.insert(req_id, std::time::Instant::now());
             }
         }
     }
@@ -1559,6 +1581,10 @@ impl Libp2pAdapter {
         consensus_tx: &mpsc::Sender<Event>,
         peer_validators: &Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
+        pending_direct_messages: &mut HashMap<
+            request_response::OutboundRequestId,
+            std::time::Instant,
+        >,
         pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
         next_channel_id: &mut u64,
         sync_request_tx: &mpsc::UnboundedSender<InboundSyncRequest>,
@@ -1722,6 +1748,9 @@ impl Libp2pAdapter {
                 // Route response to waiting requester
                 if let Some(pending) = pending_requests.remove(&request_id) {
                     let _ = pending.response_tx.send(Ok(response));
+                } else if pending_direct_messages.remove(&request_id).is_some() {
+                    // Direct message acknowledged (empty response received)
+                    trace!("Direct message acknowledged {:?}", request_id);
                 }
                 SwarmAction::None
             }
@@ -1740,6 +1769,11 @@ impl Libp2pAdapter {
                             "Request failed: {:?}",
                             error
                         ))));
+                } else if pending_direct_messages.remove(&request_id).is_some() {
+                    warn!(
+                        "Direct message request {:?} failed: {:?}",
+                        request_id, error
+                    );
                 }
                 SwarmAction::None
             }
@@ -1818,14 +1852,41 @@ impl Libp2pAdapter {
                     // We cannot send a response here because we don't have access to the swarm behavior.
                     // Instead, we drop the channel which will close the stream (implicit done).
 
-                    info!(
-                        peer = %peer,
-                        is_validator = is_validator,
-                        "Received direct consensus message"
-                    );
-
                     // Process events
                     for event in decoded.events {
+                        match &event {
+                            Event::BlockHeaderReceived { header, .. } => {
+                                info!(
+                                    peer = %peer,
+                                    is_validator = is_validator,
+                                    msg_type = "BlockHeader",
+                                    round = header.round,
+                                    height = header.height.0,
+                                    hash = %header.hash(),
+                                    "Received direct consensus message"
+                                );
+                            }
+                            Event::BlockVoteReceived { vote } => {
+                                info!(
+                                    peer = %peer,
+                                    is_validator = is_validator,
+                                    msg_type = "BlockVote",
+                                    round = vote.round,
+                                    height = vote.height.0,
+                                    block_hash = %vote.block_hash,
+                                    "Received direct consensus message"
+                                );
+                            }
+                            _ => {
+                                info!(
+                                    peer = %peer,
+                                    is_validator = is_validator,
+                                    msg_type = "Other",
+                                    "Received direct consensus message"
+                                );
+                            }
+                        }
+
                         // Direct messages are critical, send to consensus immediately
                         if consensus_tx.send(event).await.is_err() {
                             warn!("Consensus channel closed during direct message dispatch");
