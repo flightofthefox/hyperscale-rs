@@ -546,6 +546,13 @@ impl ProductionRunnerBuilder {
                 .await;
         }
 
+        // Initialize shard committees in DirectValidatorNetwork to enable direct messaging
+        for shard_idx in 0..topology.num_shards() {
+            let shard_id = hyperscale_types::ShardGroupId(shard_idx);
+            let committee = topology.committee_for_shard(shard_id).into_owned();
+            network.update_committee(shard_id, committee);
+        }
+
         // Create sync manager (uses consensus channel for sync events)
         // The topology is passed directly - SyncManager queries it for committee members
         let sync_manager = SyncManager::new(
