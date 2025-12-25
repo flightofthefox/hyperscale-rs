@@ -447,7 +447,8 @@ impl Libp2pAdapter {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 msg.data.hash(&mut hasher);
                 msg.topic.hash(&mut hasher);
-                gossipsub::MessageId::from(hasher.finish().to_string())
+                // more efficient than previous .to_string()
+                gossipsub::MessageId::from(hasher.finish().to_le_bytes().to_vec())
             })
             .max_transmit_size(config.max_message_size)
             .build()
@@ -1302,7 +1303,7 @@ impl Libp2pAdapter {
                 }
             }
             SwarmCommand::Broadcast { topic, data } => {
-                let topic_ident = gossipsub::IdentTopic::new(topic.clone());
+                let topic_ident = gossipsub::IdentTopic::new(topic);
                 let data_len = data.len();
 
                 if let Err(e) = swarm
@@ -1313,20 +1314,20 @@ impl Libp2pAdapter {
                     // Duplicate errors are expected - multiple validators create the same
                     // certificate and try to gossip it. Gossipsub correctly deduplicates.
                     if matches!(e, gossipsub::PublishError::Duplicate) {
-                        trace!(topic = %topic, "Gossipsub duplicate (expected, already delivered)");
+                        trace!(topic = %topic_ident, "Gossipsub duplicate (expected, already delivered)");
                     } else {
                         // Other errors are significant - messages may be lost
                         warn!(
-                            topic = %topic,
+                            topic = %topic_ident,
                             data_len,
                             error = ?e,
                             peers = swarm.connected_peers().count(),
                             "Failed to publish message to gossipsub topic - message may be lost"
                         );
-                        crate::metrics::record_gossipsub_publish_failure(&topic);
+                        crate::metrics::record_gossipsub_publish_failure(&topic_ident.to_string());
                     }
                 } else {
-                    trace!(topic = %topic, data_len, "Published message to gossipsub topic");
+                    trace!(topic = %topic_ident, data_len, "Published message to gossipsub topic");
                 }
             }
             SwarmCommand::Dial { address } => {
@@ -1488,7 +1489,22 @@ impl Libp2pAdapter {
                 message,
                 ..
             })) => {
-                let topic = message.topic.to_string();
+                // Parse topic immediately to determine message type and shard
+                // Using .as_str() avoids allocation
+                let topic_str = message.topic.as_str();
+                let parsed_topic = match crate::network::Topic::parse(topic_str) {
+                    Some(t) => t,
+                    None => {
+                        warn!(
+                            topic = %topic_str,
+                            peer = %propagation_source,
+                            "Received message with invalid topic format"
+                        );
+                        metrics::record_invalid_message();
+                        return;
+                    }
+                };
+
                 let data_len = message.data.len();
 
                 // Record inbound bandwidth
@@ -1501,49 +1517,40 @@ impl Libp2pAdapter {
                 if !peer_validators.contains_key(&propagation_source) {
                     debug!(
                         peer = %propagation_source,
-                        topic = %topic,
+                        topic = %topic_str,
                         "Ignoring message from unknown peer (not in validator set)"
                     );
                     metrics::record_invalid_message();
                     return;
                 }
-
-                // Defense-in-depth: Validate that shard-local messages come from the correct shard.
-                // Gossipsub should only deliver messages for subscribed topics, but we
-                // verify anyway to prevent cross-shard contamination.
-                //
-                // Shard-local messages (must match local_shard):
-                // - block.header, block.vote: BFT consensus messages
-                // - state.vote: Execution layer voting (votes are shard-local)
                 //
                 // Cross-shard messages (allowed from any shard):
                 // - state.provision: Sent cross-shard to request state for transactions
                 // - state.certificate: Needed for cross-shard transaction execution
                 // - transaction.gossip: Can be routed to appropriate shard
-                if let Some(parsed_topic) = crate::network::Topic::parse(&topic) {
-                    let msg_type = parsed_topic.message_type();
-                    let is_shard_local_message =
-                        matches!(msg_type, "block.header" | "block.vote" | "state.vote");
 
-                    if is_shard_local_message {
-                        if let Some(topic_shard) = parsed_topic.shard_id() {
-                            if topic_shard != local_shard {
-                                warn!(
-                                    topic = %topic,
-                                    topic_shard = topic_shard.0,
-                                    local_shard = local_shard.0,
-                                    msg_type = msg_type,
-                                    "Dropping shard-local message from wrong shard (cross-shard contamination attempt)"
-                                );
-                                metrics::record_invalid_message();
-                                return;
-                            }
+                let msg_type = parsed_topic.message_type();
+                let is_shard_local_message =
+                    matches!(msg_type, "block.header" | "block.vote" | "state.vote");
+
+                if is_shard_local_message {
+                    if let Some(topic_shard) = parsed_topic.shard_id() {
+                        if topic_shard != local_shard {
+                            warn!(
+                                topic = %topic_str,
+                                topic_shard = topic_shard.0,
+                                local_shard = local_shard.0,
+                                msg_type = msg_type,
+                                "Dropping shard-local message from wrong shard (cross-shard contamination attempt)"
+                            );
+                            metrics::record_invalid_message();
+                            return;
                         }
                     }
                 }
 
                 // Decode message based on topic
-                match decode_message(&topic, &message.data) {
+                match decode_message(&parsed_topic, &message.data) {
                     Ok(decoded) => {
                         metrics::record_network_message_received();
 
@@ -1594,7 +1601,7 @@ impl Libp2pAdapter {
                     Err(e) => {
                         warn!(
                             error = %e,
-                            topic = %topic,
+                            topic = %topic_str,
                             peer = %propagation_source,
                             "Failed to decode message"
                         );

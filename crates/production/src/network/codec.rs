@@ -94,7 +94,10 @@ pub struct DecodedMessage {
 ///
 /// The topic determines the message type (topic-based dispatch).
 /// Returns the decoded events along with any trace context for distributed tracing.
-pub fn decode_message(topic: &str, data: &[u8]) -> Result<DecodedMessage, CodecError> {
+pub fn decode_message(
+    parsed_topic: &crate::network::Topic,
+    data: &[u8],
+) -> Result<DecodedMessage, CodecError> {
     if data.is_empty() {
         return Err(CodecError::MessageTooShort);
     }
@@ -106,10 +109,6 @@ pub fn decode_message(topic: &str, data: &[u8]) -> Result<DecodedMessage, CodecE
     }
 
     let payload = &data[1..];
-
-    // Parse topic to determine message type
-    let parsed_topic = crate::network::Topic::parse(topic)
-        .ok_or_else(|| CodecError::UnknownTopic(topic.to_string()))?;
 
     let msg_type = parsed_topic.message_type();
 
@@ -214,7 +213,7 @@ pub fn decode_message(topic: &str, data: &[u8]) -> Result<DecodedMessage, CodecE
                 trace_context: None,
             })
         }
-        _ => Err(CodecError::UnknownTopic(topic.to_string())),
+        _ => Err(CodecError::UnknownTopic(parsed_topic.to_string())),
     }
 }
 
@@ -273,8 +272,9 @@ mod tests {
         assert_eq!(bytes[0], WIRE_VERSION);
 
         // Decode with topic
-        let topic = "hyperscale/block.header/shard-0/1.0.0";
-        let decoded = decode_message(topic, &bytes).unwrap();
+        let topic_str = "hyperscale/block.header/shard-0/1.0.0";
+        let topic = crate::network::Topic::parse(topic_str).unwrap();
+        let decoded = decode_message(&topic, &bytes).unwrap();
 
         // Block headers don't carry trace context
         assert!(decoded.trace_context.is_none());
@@ -306,8 +306,9 @@ mod tests {
         let message = OutboundMessage::BlockVote(gossip);
 
         let bytes = encode_message(&message).unwrap();
-        let topic = "hyperscale/block.vote/shard-0/1.0.0";
-        let decoded = decode_message(topic, &bytes).unwrap();
+        let topic_str = "hyperscale/block.vote/shard-0/1.0.0";
+        let topic = crate::network::Topic::parse(topic_str).unwrap();
+        let decoded = decode_message(&topic, &bytes).unwrap();
 
         // Block votes don't carry trace context
         assert!(decoded.trace_context.is_none());
@@ -325,14 +326,17 @@ mod tests {
     #[test]
     fn test_unknown_version() {
         let bytes = vec![99, 1, 2, 3]; // version 99 doesn't exist
-        let result = decode_message("hyperscale/block.header/shard-0/1.0.0", &bytes);
+        let topic = crate::network::Topic::parse("hyperscale/block.header/shard-0/1.0.0").unwrap();
+        let result = decode_message(&topic, &bytes);
         assert!(matches!(result, Err(CodecError::UnknownVersion(99))));
     }
 
     #[test]
     fn test_unknown_topic() {
         let bytes = vec![WIRE_VERSION, 1, 2, 3];
-        let result = decode_message("hyperscale/unknown.type/shard-0/1.0.0", &bytes);
+        // Topic with unknown message type
+        let topic = crate::network::Topic::parse("hyperscale/unknown.type/shard-0/1.0.0").unwrap();
+        let result = decode_message(&topic, &bytes);
         assert!(matches!(result, Err(CodecError::UnknownTopic(_))));
     }
 
