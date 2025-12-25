@@ -88,7 +88,7 @@ impl DirectValidatorNetwork {
         // But `SwarmCommand::DirectSend` (which we need to add) would take bytes.
 
         // Optimization: Encode message once here
-        let data = super::codec::encode_message(message)?;
+        let data = super::codec::encode_direct_message(message)?;
         let topic = super::codec::topic_for_message(message, shard);
 
         if committee.is_empty() {

@@ -1833,8 +1833,28 @@ impl Libp2pAdapter {
                                     );
                                     pending_response_channels.remove(&channel_id);
                                 }
+                            } else if let Ok(decoded) =
+                                super::codec::decode_direct_message(&request)
+                            {
+                                // Direct consensus message (Block/Vote)
+                                // We cannot send a response here because we don't have access to the swarm behavior.
+                                // Instead, we drop the channel which will close the stream (implicit done).
+
+                                info!(
+                                    peer = %peer,
+                                    is_validator = is_validator,
+                                    "Received direct consensus message"
+                                );
+
+                                // Process events
+                                for event in decoded.events {
+                                    // Direct messages are critical, send to consensus immediately
+                                    if consensus_tx.send(event).await.is_err() {
+                                        warn!("Consensus channel closed during direct message dispatch");
+                                    }
+                                }
                             } else {
-                                warn!(peer = %peer, "Failed to decode transaction fetch request");
+                                warn!(peer = %peer, "Failed to decode transaction fetch request or direct message");
                             }
                         }
                         Some(FETCH_TYPE_CERTIFICATE) => {
