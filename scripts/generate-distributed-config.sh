@@ -247,6 +247,8 @@ upnp_enabled = false
 request_timeout_ms = 30000
 max_message_size = 10485760
 gossipsub_heartbeat_ms = 100
+direct_connection_limit = 50
+direct_connection_timeout_ms = 10000
 
 [consensus]
 proposal_interval_ms = 300
