@@ -7181,4 +7181,200 @@ mod tests {
             "last_proposal_time should be updated to current time"
         );
     }
+
+    // ========================================================================
+    // Crypto Verification Tests - Using real BLS signatures
+    // ========================================================================
+
+    #[test]
+    fn test_qc_with_real_bls_signatures() {
+        use hyperscale_test_helpers::{fixtures, TestCommittee};
+
+        let committee = TestCommittee::new(4, 42);
+        let parent_hash = Hash::from_bytes(b"parent_block");
+
+        // Create a QC with REAL aggregated BLS signatures
+        let qc = fixtures::make_signed_qc(
+            &committee,
+            &[0, 1, 2], // 3 voters for quorum
+            parent_hash,
+            BlockHeight(1),
+            0,
+            Hash::ZERO,
+            ShardGroupId(0),
+        );
+
+        // Build the signing message as the runner would
+        let signing_message = hyperscale_types::block_vote_message(
+            ShardGroupId(0),
+            qc.height.0,
+            qc.round,
+            &qc.block_hash,
+        );
+
+        // Get signer public keys based on bitfield
+        let signer_keys: Vec<_> = qc
+            .signers
+            .set_indices()
+            .map(|idx| committee.public_key(idx).clone())
+            .collect();
+
+        // Aggregate public keys (what the runner does)
+        let aggregated_pk = hyperscale_types::PublicKey::aggregate_bls(&signer_keys)
+            .expect("Aggregation should succeed");
+
+        // Verify the QC signature - THIS IS THE CRITICAL TEST
+        let valid = aggregated_pk.verify(&signing_message, &qc.aggregated_signature);
+        assert!(
+            valid,
+            "QC signature should verify successfully with real BLS signatures"
+        );
+
+        // Also verify that batch verification works
+        let signatures: Vec<_> = (0..3)
+            .map(|i| committee.keypair(i).sign(&signing_message))
+            .collect();
+        let pubkeys: Vec<_> = (0..3).map(|i| committee.public_key(i).clone()).collect();
+
+        let batch_valid = hyperscale_types::PublicKey::batch_verify_bls_same_message(
+            &signing_message,
+            &signatures,
+            &pubkeys,
+        );
+        assert!(batch_valid, "Batch verification should also succeed");
+    }
+
+    #[test]
+    fn test_block_vote_with_real_bls_signature() {
+        use hyperscale_test_helpers::{fixtures, TestCommittee};
+
+        let committee = TestCommittee::new(4, 42);
+        let block_hash = Hash::from_bytes(b"test_block");
+        let shard = ShardGroupId(0);
+
+        // Create a properly signed block vote
+        let vote = fixtures::make_signed_block_vote(
+            &committee,
+            0, // voter index
+            block_hash,
+            BlockHeight(1),
+            0,
+            shard,
+        );
+
+        // Verify the signature manually
+        let message = hyperscale_types::block_vote_message(shard, 1, 0, &block_hash);
+        let valid = committee.public_key(0).verify(&message, &vote.signature);
+        assert!(valid, "Block vote signature should verify");
+
+        // Verify with wrong key fails
+        let invalid = committee.public_key(1).verify(&message, &vote.signature);
+        assert!(!invalid, "Block vote should NOT verify with wrong key");
+    }
+
+    #[test]
+    fn test_batch_verify_block_votes_same_message() {
+        use hyperscale_test_helpers::TestCommittee;
+
+        let committee = TestCommittee::new(4, 42);
+        let block_hash = Hash::from_bytes(b"test_block");
+        let shard = ShardGroupId(0);
+        let height = 1u64;
+        let round = 0u64;
+
+        // All validators sign the same message
+        let message = hyperscale_types::block_vote_message(shard, height, round, &block_hash);
+
+        let signatures: Vec<Signature> = (0..3)
+            .map(|i| committee.keypair(i).sign(&message))
+            .collect();
+
+        let pubkeys: Vec<hyperscale_types::PublicKey> =
+            (0..3).map(|i| committee.public_key(i).clone()).collect();
+
+        // Batch verify all signatures at once (same message optimization)
+        let valid = hyperscale_types::PublicKey::batch_verify_bls_same_message(
+            &message,
+            &signatures,
+            &pubkeys,
+        );
+        assert!(
+            valid,
+            "Batch verification should succeed for valid signatures"
+        );
+    }
+
+    #[test]
+    fn test_batch_verify_rejects_one_bad_signature() {
+        use hyperscale_test_helpers::TestCommittee;
+
+        let committee = TestCommittee::new(4, 42);
+        let block_hash = Hash::from_bytes(b"test_block");
+        let shard = ShardGroupId(0);
+        let height = 1u64;
+        let round = 0u64;
+
+        let message = hyperscale_types::block_vote_message(shard, height, round, &block_hash);
+
+        // First two are valid, third is signed with wrong key
+        let signatures: Vec<Signature> = vec![
+            committee.keypair(0).sign(&message),
+            committee.keypair(1).sign(&message),
+            committee.keypair(3).sign(&message), // Wrong key! (claims to be validator 2)
+        ];
+
+        let pubkeys: Vec<hyperscale_types::PublicKey> = vec![
+            committee.public_key(0).clone(),
+            committee.public_key(1).clone(),
+            committee.public_key(2).clone(), // But we're verifying with key 2
+        ];
+
+        // Batch verification should fail
+        let valid = hyperscale_types::PublicKey::batch_verify_bls_same_message(
+            &message,
+            &signatures,
+            &pubkeys,
+        );
+        assert!(
+            !valid,
+            "Batch verification should fail when one signature is invalid"
+        );
+    }
+
+    #[test]
+    fn test_qc_aggregation_and_verification() {
+        use hyperscale_test_helpers::TestCommittee;
+
+        let committee = TestCommittee::new(4, 42);
+        let block_hash = Hash::from_bytes(b"test_block");
+        let shard = ShardGroupId(0);
+        let height = 1u64;
+        let round = 0u64;
+
+        let message = hyperscale_types::block_vote_message(shard, height, round, &block_hash);
+
+        // Simulate vote collection and aggregation (what vote_set.rs does)
+        let voter_indices = [0, 1, 2];
+
+        let signatures: Vec<Signature> = voter_indices
+            .iter()
+            .map(|&i| committee.keypair(i).sign(&message))
+            .collect();
+
+        // Aggregate signatures (what happens when building QC)
+        let aggregated_sig =
+            Signature::aggregate_bls(&signatures).expect("Aggregation should succeed");
+
+        // Aggregate public keys of signers
+        let signer_pks: Vec<hyperscale_types::PublicKey> = voter_indices
+            .iter()
+            .map(|&i| committee.public_key(i).clone())
+            .collect();
+        let aggregated_pk = hyperscale_types::PublicKey::aggregate_bls(&signer_pks)
+            .expect("PK aggregation should succeed");
+
+        // Verify aggregated signature against aggregated public key
+        let valid = aggregated_pk.verify(&message, &aggregated_sig);
+        assert!(valid, "Aggregated QC signature should verify");
+    }
 }

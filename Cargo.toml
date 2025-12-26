@@ -16,6 +16,7 @@ members = [
     "crates/production",
     "crates/spammer",
     "crates/parallel",
+    "crates/test-helpers",
 ]
 
 [workspace.package]
@@ -39,6 +40,7 @@ hyperscale-engine = { path = "crates/engine" }
 hyperscale-simulator = { path = "crates/simulator" }
 hyperscale-spammer = { path = "crates/spammer" }
 hyperscale-parallel = { path = "crates/parallel" }
+hyperscale-test-helpers = { path = "crates/test-helpers" }
 
 # External dependencies
 thiserror = "2.0.17"

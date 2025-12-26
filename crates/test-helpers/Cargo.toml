@@ -1,0 +1,8 @@
+[package]
+name = "hyperscale-test-helpers"
+version.workspace = true
+edition.workspace = true
+description = "Test helpers for Hyperscale - provides properly-signed fixtures for crypto testing"
+
+[dependencies]
+hyperscale-types = { path = "../types", features = ["test-utils"] }

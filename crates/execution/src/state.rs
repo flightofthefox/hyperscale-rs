@@ -2644,4 +2644,148 @@ mod tests {
         // Should not be awaiting speculation
         assert!(!state.committed_awaiting_speculation.contains_key(&tx_hash));
     }
+
+    // ========================================================================
+    // Crypto Verification Tests - Using real BLS signatures
+    // ========================================================================
+
+    #[test]
+    fn test_state_vote_with_real_bls_signature() {
+        use hyperscale_test_helpers::{fixtures, TestCommittee};
+
+        let committee = TestCommittee::new(4, 42);
+        let tx_hash = Hash::from_bytes(b"test_tx");
+        let state_root = Hash::from_bytes(b"state_root");
+        let shard = ShardGroupId(0);
+
+        // Create a properly signed state vote
+        let vote = fixtures::make_signed_state_vote(
+            &committee, 0, // voter index
+            tx_hash, state_root, shard, true,
+        );
+
+        // Verify the signature using the signing_message method
+        let message = vote.signing_message();
+        let valid = committee.public_key(0).verify(&message, &vote.signature);
+        assert!(valid, "State vote signature should verify");
+
+        // Verify with wrong key fails
+        let invalid = committee.public_key(1).verify(&message, &vote.signature);
+        assert!(!invalid, "State vote should NOT verify with wrong key");
+    }
+
+    #[test]
+    fn test_state_certificate_with_real_bls_signatures() {
+        use hyperscale_test_helpers::{fixtures, TestCommittee};
+
+        let committee = TestCommittee::new(4, 42);
+        let tx_hash = Hash::from_bytes(b"test_tx");
+        let merkle_root = Hash::from_bytes(b"merkle_root");
+        let shard = ShardGroupId(0);
+
+        // Create a state certificate with real aggregated signatures
+        let cert = fixtures::make_signed_state_certificate(
+            &committee,
+            &[0, 1, 2], // 3 voters
+            tx_hash,
+            merkle_root,
+            shard,
+            true,
+        );
+
+        // Verify using the certificate's signing_message
+        let message = cert.signing_message();
+
+        // Get signer public keys based on bitfield
+        let signer_keys: Vec<_> = cert
+            .signers
+            .set_indices()
+            .map(|idx| committee.public_key(idx).clone())
+            .collect();
+
+        // Aggregate public keys (what the runner does)
+        let aggregated_pk = hyperscale_types::PublicKey::aggregate_bls(&signer_keys)
+            .expect("Aggregation should succeed");
+
+        // Verify the aggregated signature
+        let valid = aggregated_pk.verify(&message, &cert.aggregated_signature);
+        assert!(valid, "State certificate signature should verify");
+    }
+
+    #[test]
+    fn test_batch_verify_state_votes_different_messages() {
+        use hyperscale_test_helpers::TestCommittee;
+
+        let committee = TestCommittee::new(4, 42);
+        let shard = ShardGroupId(0);
+
+        // Different transactions = different messages
+        let tx1 = Hash::from_bytes(b"tx1");
+        let tx2 = Hash::from_bytes(b"tx2");
+        let tx3 = Hash::from_bytes(b"tx3");
+        let root = Hash::from_bytes(b"root");
+
+        let msg1 = hyperscale_types::exec_vote_message(&tx1, &root, shard, true);
+        let msg2 = hyperscale_types::exec_vote_message(&tx2, &root, shard, true);
+        let msg3 = hyperscale_types::exec_vote_message(&tx3, &root, shard, true);
+
+        let sig1 = committee.keypair(0).sign(&msg1);
+        let sig2 = committee.keypair(1).sign(&msg2);
+        let sig3 = committee.keypair(2).sign(&msg3);
+
+        let messages: Vec<&[u8]> = vec![&msg1, &msg2, &msg3];
+        let signatures = vec![sig1, sig2, sig3];
+        let pubkeys: Vec<_> = (0..3).map(|i| committee.public_key(i).clone()).collect();
+
+        // Batch verify with different messages (what dispatch_state_vote_verifications does)
+        let results = hyperscale_types::PublicKey::batch_verify_bls_different_messages(
+            &messages,
+            &signatures,
+            &pubkeys,
+        );
+
+        assert_eq!(
+            results,
+            vec![true, true, true],
+            "All signatures should verify"
+        );
+    }
+
+    #[test]
+    fn test_batch_verify_state_votes_partial_failure() {
+        use hyperscale_test_helpers::TestCommittee;
+
+        let committee = TestCommittee::new(4, 42);
+        let shard = ShardGroupId(0);
+
+        let tx1 = Hash::from_bytes(b"tx1");
+        let tx2 = Hash::from_bytes(b"tx2");
+        let root = Hash::from_bytes(b"root");
+
+        let msg1 = hyperscale_types::exec_vote_message(&tx1, &root, shard, true);
+        let msg2 = hyperscale_types::exec_vote_message(&tx2, &root, shard, true);
+
+        // First is valid, second is signed with wrong key
+        let sig1 = committee.keypair(0).sign(&msg1);
+        let sig2 = committee.keypair(3).sign(&msg2); // Wrong key! Should be keypair 1
+
+        let messages: Vec<&[u8]> = vec![&msg1, &msg2];
+        let signatures = vec![sig1, sig2];
+        let pubkeys = vec![
+            committee.public_key(0).clone(),
+            committee.public_key(1).clone(), // Verifying with key 1
+        ];
+
+        let results = hyperscale_types::PublicKey::batch_verify_bls_different_messages(
+            &messages,
+            &signatures,
+            &pubkeys,
+        );
+
+        assert_eq!(
+            results,
+            vec![true, false],
+            "Second signature should fail verification"
+        );
+    }
 }

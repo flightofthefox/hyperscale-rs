@@ -165,6 +165,108 @@ mod tests {
     }
 
     #[test]
+    fn test_vote_power_quorum_boundary_conditions() {
+        // BFT safety requires STRICTLY GREATER than 2/3
+        // Formula: voted * 3 > total * 2
+
+        // Exact 2/3 should NOT be quorum (need > 2/3)
+        // 6/9 = 2/3 exactly: 6*3 = 18, 9*2 = 18, 18 > 18 is false
+        assert!(
+            !VotePower::has_quorum(6, 9),
+            "Exactly 2/3 should not be quorum"
+        );
+
+        // Just over 2/3 should be quorum
+        // 7/10 = 70%: 7*3 = 21, 10*2 = 20, 21 > 20 is true
+        assert!(
+            VotePower::has_quorum(7, 10),
+            "Just over 2/3 should be quorum"
+        );
+
+        // Just under 2/3 should NOT be quorum
+        // 6/10 = 60%: 6*3 = 18, 10*2 = 20, 18 > 20 is false
+        assert!(!VotePower::has_quorum(6, 10), "60% should not be quorum");
+
+        // Edge case: total of 3 (smallest BFT)
+        // Need > 2/3, so need > 2 votes = 3 votes
+        assert!(!VotePower::has_quorum(2, 3), "2/3 should not be quorum");
+        assert!(VotePower::has_quorum(3, 3), "3/3 should be quorum");
+
+        // Edge case: total of 1
+        assert!(VotePower::has_quorum(1, 1), "1/1 should be quorum");
+        assert!(!VotePower::has_quorum(0, 1), "0/1 should not be quorum");
+
+        // Edge case: zero total (degenerate)
+        assert!(!VotePower::has_quorum(0, 0), "0/0 should not be quorum");
+
+        // Common committee sizes
+        // n=4: need > 8/3 = 2.67, so need 3
+        assert!(!VotePower::has_quorum(2, 4));
+        assert!(VotePower::has_quorum(3, 4));
+
+        // n=7: need > 14/3 = 4.67, so need 5
+        assert!(!VotePower::has_quorum(4, 7));
+        assert!(VotePower::has_quorum(5, 7));
+
+        // n=10: need > 20/3 = 6.67, so need 7
+        assert!(!VotePower::has_quorum(6, 10));
+        assert!(VotePower::has_quorum(7, 10));
+
+        // n=100: need > 200/3 = 66.67, so need 67
+        assert!(!VotePower::has_quorum(66, 100));
+        assert!(VotePower::has_quorum(67, 100));
+    }
+
+    #[test]
+    fn test_vote_power_quorum_large_values() {
+        // Test with large values to ensure no overflow issues
+        // The formula is: voted * 3 > total * 2
+        // Maximum safe values before overflow: u64::MAX / 3 for voted
+
+        let max_safe_voted = u64::MAX / 3;
+
+        // With max safe values, quorum should still work correctly
+        // voted = max/3, total = max/3 + 1
+        // voted * 3 = max (approximately)
+        // total * 2 = (max/3 + 1) * 2 = 2*max/3 + 2
+        // max > 2*max/3 + 2 is true
+        assert!(
+            VotePower::has_quorum(max_safe_voted, max_safe_voted + 1),
+            "Large values near u64::MAX/3 should work"
+        );
+
+        // SAFETY NOTE: The current implementation will panic on overflow
+        // for values where voted > u64::MAX / 3 or total > u64::MAX / 2.
+        // In practice, total voting power should never approach these limits
+        // since typical voting power is in the range of 1-1000 per validator.
+        // A 10,000 validator network with max power 1000 each = 10M total,
+        // which is far below the overflow threshold of ~6 quintillion.
+    }
+
+    #[test]
+    fn test_vote_power_quorum_unequal_distribution() {
+        // Test quorum with realistic unequal voting power distributions
+        // In practice, validators may have different stakes
+
+        // Scenario: 4 validators with powers [3, 2, 2, 1] = 8 total
+        // Need > 16/3 = 5.33, so need 6 power for quorum
+        let total = 8;
+        assert!(!VotePower::has_quorum(5, total), "5/8 should not be quorum");
+        assert!(VotePower::has_quorum(6, total), "6/8 should be quorum");
+
+        // Byzantine scenario: One validator has 40% power
+        // 4 validators: [4, 2, 2, 2] = 10 total
+        // Need > 20/3 = 6.67, so need 7 power
+        // If Byzantine (power 4) colludes with one honest (power 2), they have 6 (not enough)
+        let total = 10;
+        assert!(
+            !VotePower::has_quorum(6, total),
+            "Byzantine + 1 honest (6/10) should not be quorum"
+        );
+        assert!(VotePower::has_quorum(7, total), "7/10 should be quorum");
+    }
+
+    #[test]
     fn test_node_id() {
         let bytes = [42u8; 30];
         let node_id = NodeId(bytes);

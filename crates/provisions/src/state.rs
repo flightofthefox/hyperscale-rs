@@ -1363,4 +1363,148 @@ mod tests {
 
         assert!(!coordinator.is_registered(&tx_hash));
     }
+
+    // ========================================================================
+    // Crypto Verification Tests - Using real BLS signatures
+    // ========================================================================
+
+    #[test]
+    fn test_provision_with_real_bls_signature() {
+        use hyperscale_test_helpers::{fixtures, TestCommittee};
+        use hyperscale_types::NodeId;
+
+        let committee = TestCommittee::new(4, 42);
+        let tx_hash = Hash::from_bytes(b"test_tx");
+        let entries = vec![StateEntry::test_entry(
+            NodeId([1u8; 30]),
+            1,
+            vec![1, 2, 3],
+            Some(vec![4, 5, 6]),
+        )];
+
+        // Create a properly signed provision
+        let provision = fixtures::make_signed_provision(
+            &committee,
+            0, // validator index
+            tx_hash,
+            ShardGroupId(1), // target
+            ShardGroupId(0), // source
+            BlockHeight(10),
+            entries,
+        );
+
+        // Verify the signature using the signing_message method
+        let message = provision.signing_message();
+        let valid = committee
+            .public_key(0)
+            .verify(&message, &provision.signature);
+        assert!(valid, "Provision signature should verify");
+
+        // Verify with wrong key fails
+        let invalid = committee
+            .public_key(1)
+            .verify(&message, &provision.signature);
+        assert!(!invalid, "Provision should NOT verify with wrong key");
+    }
+
+    #[test]
+    fn test_batch_verify_provisions_same_message() {
+        use hyperscale_test_helpers::TestCommittee;
+        use hyperscale_types::NodeId;
+
+        let committee = TestCommittee::new(4, 42);
+        let tx_hash = Hash::from_bytes(b"test_tx");
+        let entries = [StateEntry::test_entry(
+            NodeId([1u8; 30]),
+            1,
+            vec![1, 2, 3],
+            Some(vec![4, 5, 6]),
+        )];
+        let entry_hashes: Vec<_> = entries.iter().map(|e| e.hash()).collect();
+
+        // All validators sign the same provision message
+        let message = hyperscale_types::state_provision_message(
+            &tx_hash,
+            ShardGroupId(1),
+            ShardGroupId(0),
+            BlockHeight(10),
+            &entry_hashes,
+        );
+
+        let signatures: Vec<hyperscale_types::Signature> = (0..3)
+            .map(|i| committee.keypair(i).sign(&message))
+            .collect();
+
+        let pubkeys: Vec<hyperscale_types::PublicKey> =
+            (0..3).map(|i| committee.public_key(i).clone()).collect();
+
+        // Batch verify (what VerifyAndAggregateProvisions does)
+        let valid = hyperscale_types::PublicKey::batch_verify_bls_same_message(
+            &message,
+            &signatures,
+            &pubkeys,
+        );
+        assert!(
+            valid,
+            "Batch verification should succeed for valid signatures"
+        );
+
+        // Aggregate signatures to create CommitmentProof
+        let aggregated = hyperscale_types::Signature::aggregate_bls(&signatures)
+            .expect("Aggregation should succeed");
+
+        // Verify aggregated signature
+        let agg_pk = hyperscale_types::PublicKey::aggregate_bls(&pubkeys)
+            .expect("PK aggregation should succeed");
+        let agg_valid = agg_pk.verify(&message, &aggregated);
+        assert!(agg_valid, "Aggregated provision signature should verify");
+    }
+
+    #[test]
+    fn test_provision_batch_verify_rejects_bad_signature() {
+        use hyperscale_test_helpers::TestCommittee;
+        use hyperscale_types::NodeId;
+
+        let committee = TestCommittee::new(4, 42);
+        let tx_hash = Hash::from_bytes(b"test_tx");
+        let entries = [StateEntry::test_entry(
+            NodeId([1u8; 30]),
+            1,
+            vec![1, 2, 3],
+            Some(vec![4, 5, 6]),
+        )];
+        let entry_hashes: Vec<_> = entries.iter().map(|e| e.hash()).collect();
+
+        let message = hyperscale_types::state_provision_message(
+            &tx_hash,
+            ShardGroupId(1),
+            ShardGroupId(0),
+            BlockHeight(10),
+            &entry_hashes,
+        );
+
+        // Two valid signatures, one bad (signed with wrong key)
+        let signatures: Vec<hyperscale_types::Signature> = vec![
+            committee.keypair(0).sign(&message),
+            committee.keypair(1).sign(&message),
+            committee.keypair(3).sign(&message), // Wrong! Should be keypair 2
+        ];
+
+        let pubkeys: Vec<hyperscale_types::PublicKey> = vec![
+            committee.public_key(0).clone(),
+            committee.public_key(1).clone(),
+            committee.public_key(2).clone(), // Verifying with key 2
+        ];
+
+        // Batch verification should fail
+        let valid = hyperscale_types::PublicKey::batch_verify_bls_same_message(
+            &message,
+            &signatures,
+            &pubkeys,
+        );
+        assert!(
+            !valid,
+            "Batch verification should fail with one bad signature"
+        );
+    }
 }
