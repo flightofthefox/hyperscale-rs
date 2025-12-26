@@ -129,7 +129,24 @@ pub struct InboundCertificateRequest {
     pub channel_id: u64,
 }
 
-/// Commands sent to the swarm task.
+/// High-priority response commands sent to the swarm task.
+///
+/// These commands are processed before normal commands because they unblock
+/// other validators waiting for data. Using a separate channel ensures
+/// response commands don't get queued behind broadcasts/requests.
+#[derive(Debug)]
+pub enum ResponseCommand {
+    /// Send a response to a block request (by channel ID).
+    SendBlockResponse { channel_id: u64, response: Vec<u8> },
+
+    /// Send a response to a transaction request (by channel ID).
+    SendTransactionResponse { channel_id: u64, response: Vec<u8> },
+
+    /// Send a response to a certificate request (by channel ID).
+    SendCertificateResponse { channel_id: u64, response: Vec<u8> },
+}
+
+/// Commands sent to the swarm task (normal priority).
 #[derive(Debug)]
 pub enum SwarmCommand {
     /// Subscribe to a gossipsub topic.
@@ -158,9 +175,6 @@ pub enum SwarmCommand {
         response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
     },
 
-    /// Send a response to a block request (by channel ID).
-    SendBlockResponse { channel_id: u64, response: Vec<u8> },
-
     /// Request transactions from a peer (for pending block completion).
     RequestTransactions {
         peer: Libp2pPeerId,
@@ -169,9 +183,6 @@ pub enum SwarmCommand {
         response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
     },
 
-    /// Send a response to a transaction request (by channel ID).
-    SendTransactionResponse { channel_id: u64, response: Vec<u8> },
-
     /// Request certificates from a peer (for pending block completion).
     RequestCertificates {
         peer: Libp2pPeerId,
@@ -179,9 +190,6 @@ pub enum SwarmCommand {
         cert_hashes: Vec<hyperscale_types::Hash>,
         response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
     },
-
-    /// Send a response to a certificate request (by channel ID).
-    SendCertificateResponse { channel_id: u64, response: Vec<u8> },
 
     /// Send a direct message to a peer (unicast).
     SendDirectMessage { peer: Libp2pPeerId, data: Vec<u8> },
@@ -365,8 +373,12 @@ pub struct Libp2pAdapter {
     #[allow(dead_code)]
     local_shard: ShardGroupId,
 
-    /// Command channel to swarm task.
+    /// Command channel to swarm task (normal priority).
     command_tx: mpsc::UnboundedSender<SwarmCommand>,
+
+    /// High-priority response command channel.
+    /// Responses are processed first to unblock waiting validators.
+    response_tx: mpsc::UnboundedSender<ResponseCommand>,
 
     /// Consensus event channel for high-priority BFT messages (sent to runner).
     #[allow(dead_code)]
@@ -661,6 +673,9 @@ impl Libp2pAdapter {
         let peer_validators = Arc::new(DashMap::new());
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
+        // High-priority channel for response commands - processed before normal commands
+        // to minimize latency for validators waiting for sync data.
+        let (response_tx, response_rx) = mpsc::unbounded_channel();
         // Inbound request channels are unbounded to avoid blocking the network event loop.
         // Protection against unbounded growth:
         // 1. Rate limiter limits requests per peer (validators get higher limit)
@@ -684,6 +699,7 @@ impl Libp2pAdapter {
             local_validator_id: validator_id,
             local_shard: shard,
             command_tx,
+            response_tx,
             consensus_tx: consensus_tx.clone(),
             validator_peers: validator_peers.clone(),
             peer_validators: peer_validators.clone(),
@@ -707,6 +723,7 @@ impl Libp2pAdapter {
             let result = std::panic::AssertUnwindSafe(Self::event_loop(
                 swarm,
                 command_rx,
+                response_rx,
                 consensus_tx,
                 peer_validators,
                 shutdown_rx,
@@ -934,13 +951,14 @@ impl Libp2pAdapter {
     /// Send a block response for an inbound sync request.
     ///
     /// The `channel_id` comes from the `InboundSyncRequest` received via the sync request channel.
+    /// Uses the high-priority response channel to minimize latency.
     pub fn send_block_response(
         &self,
         channel_id: u64,
         response: Vec<u8>,
     ) -> Result<(), NetworkError> {
-        self.command_tx
-            .send(SwarmCommand::SendBlockResponse {
+        self.response_tx
+            .send(ResponseCommand::SendBlockResponse {
                 channel_id,
                 response,
             })
@@ -978,13 +996,14 @@ impl Libp2pAdapter {
     /// Send a transaction response for an inbound request.
     ///
     /// The `channel_id` comes from the inbound request.
+    /// Uses the high-priority response channel to minimize latency.
     pub fn send_transaction_response(
         &self,
         channel_id: u64,
         response: Vec<u8>,
     ) -> Result<(), NetworkError> {
-        self.command_tx
-            .send(SwarmCommand::SendTransactionResponse {
+        self.response_tx
+            .send(ResponseCommand::SendTransactionResponse {
                 channel_id,
                 response,
             })
@@ -1022,13 +1041,14 @@ impl Libp2pAdapter {
     /// Send a certificate response for an inbound request.
     ///
     /// The `channel_id` comes from the inbound request.
+    /// Uses the high-priority response channel to minimize latency.
     pub fn send_certificate_response(
         &self,
         channel_id: u64,
         response: Vec<u8>,
     ) -> Result<(), NetworkError> {
-        self.command_tx
-            .send(SwarmCommand::SendCertificateResponse {
+        self.response_tx
+            .send(ResponseCommand::SendCertificateResponse {
                 channel_id,
                 response,
             })
@@ -1040,6 +1060,7 @@ impl Libp2pAdapter {
     async fn event_loop(
         mut swarm: Swarm<Behaviour>,
         mut command_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+        mut response_rx: mpsc::UnboundedReceiver<ResponseCommand>,
         consensus_tx: mpsc::Sender<Event>,
         peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         mut shutdown_rx: mpsc::Receiver<()>,
@@ -1220,16 +1241,29 @@ impl Libp2pAdapter {
                     }
                 }
 
-                // Handle commands from adapter methods
-                // Drain all pending commands to ensure responses are sent promptly.
-                // Response commands (SendCertificateResponse, etc.) are time-critical
-                // as they unblock other validators waiting for data.
+                // Handle high-priority response commands first.
+                // These unblock other validators waiting for sync data.
+                Some(cmd) = response_rx.recv() => {
+                    Self::handle_response_command(&mut swarm, cmd, &mut pending_response_channels);
+
+                    // Drain all pending response commands
+                    while let Ok(cmd) = response_rx.try_recv() {
+                        Self::handle_response_command(&mut swarm, cmd, &mut pending_response_channels);
+                    }
+                }
+
+                // Handle normal-priority commands from adapter methods.
                 Some(cmd) = command_rx.recv() => {
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages, &mut pending_response_channels).await;
+                    // First, drain any pending response commands (priority)
+                    while let Ok(resp_cmd) = response_rx.try_recv() {
+                        Self::handle_response_command(&mut swarm, resp_cmd, &mut pending_response_channels);
+                    }
+
+                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
 
                     // Drain any additional pending commands
                     while let Ok(cmd) = command_rx.try_recv() {
-                        Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages, &mut pending_response_channels).await;
+                        Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
                     }
                 }
 
@@ -1370,7 +1404,7 @@ impl Libp2pAdapter {
         }
     }
 
-    /// Handle a command from the adapter.
+    /// Handle a normal-priority command from the adapter.
     async fn handle_command(
         swarm: &mut Swarm<Behaviour>,
         cmd: SwarmCommand,
@@ -1379,7 +1413,6 @@ impl Libp2pAdapter {
             request_response::OutboundRequestId,
             std::time::Instant,
         >,
-        pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
     ) {
         match cmd {
             SwarmCommand::Subscribe { topic } => {
@@ -1451,22 +1484,6 @@ impl Libp2pAdapter {
                 );
                 debug!("Sent block request to {:?} for height {}", peer, height);
             }
-            SwarmCommand::SendBlockResponse {
-                channel_id,
-                response,
-            } => {
-                if let Some(pending) = pending_response_channels.remove(&channel_id) {
-                    if let Err(e) = swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_response(pending.channel, response)
-                    {
-                        warn!("Failed to send block response: {:?}", e);
-                    }
-                } else {
-                    warn!(channel_id, "Unknown channel ID for block response");
-                }
-            }
             SwarmCommand::RequestTransactions {
                 peer,
                 block_hash,
@@ -1492,22 +1509,6 @@ impl Libp2pAdapter {
                     "Sent transaction request to {:?} for block {:?}",
                     peer, block_hash
                 );
-            }
-            SwarmCommand::SendTransactionResponse {
-                channel_id,
-                response,
-            } => {
-                if let Some(pending) = pending_response_channels.remove(&channel_id) {
-                    if let Err(e) = swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_response(pending.channel, response)
-                    {
-                        warn!("Failed to send transaction response: {:?}", e);
-                    }
-                } else {
-                    warn!(channel_id, "Unknown channel ID for transaction response");
-                }
             }
             SwarmCommand::RequestCertificates {
                 peer,
@@ -1535,22 +1536,6 @@ impl Libp2pAdapter {
                     peer, block_hash
                 );
             }
-            SwarmCommand::SendCertificateResponse {
-                channel_id,
-                response,
-            } => {
-                if let Some(pending) = pending_response_channels.remove(&channel_id) {
-                    if let Err(e) = swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_response(pending.channel, response)
-                    {
-                        warn!("Failed to send certificate response: {:?}", e);
-                    }
-                } else {
-                    warn!(channel_id, "Unknown channel ID for certificate response");
-                }
-            }
             SwarmCommand::SendDirectMessage { peer, data } => {
                 // Send as a request, reusing the existing request-response protocol.
                 let req_id = swarm
@@ -1563,6 +1548,7 @@ impl Libp2pAdapter {
             SwarmCommand::DirectBroadcast { peers, data } => {
                 // Send to all peers in a single event loop iteration (fire-and-forget).
                 // No ACK tracking - consensus messages don't need delivery confirmation.
+                // Bytes::clone() is O(1) - just increments a refcount, no data copy.
                 let peer_count = peers.len();
                 for peer in peers {
                     // send_request returns immediately, queuing the message internally
@@ -1577,6 +1563,65 @@ impl Libp2pAdapter {
                     total = peer_count,
                     "Direct broadcast sent to all peers"
                 );
+            }
+        }
+    }
+
+    /// Handle a high-priority response command.
+    /// These are processed before normal commands to minimize latency for waiting validators.
+    fn handle_response_command(
+        swarm: &mut Swarm<Behaviour>,
+        cmd: ResponseCommand,
+        pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
+    ) {
+        match cmd {
+            ResponseCommand::SendBlockResponse {
+                channel_id,
+                response,
+            } => {
+                if let Some(pending) = pending_response_channels.remove(&channel_id) {
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(pending.channel, response)
+                    {
+                        warn!("Failed to send block response: {:?}", e);
+                    }
+                } else {
+                    warn!(channel_id, "Unknown channel ID for block response");
+                }
+            }
+            ResponseCommand::SendTransactionResponse {
+                channel_id,
+                response,
+            } => {
+                if let Some(pending) = pending_response_channels.remove(&channel_id) {
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(pending.channel, response)
+                    {
+                        warn!("Failed to send transaction response: {:?}", e);
+                    }
+                } else {
+                    warn!(channel_id, "Unknown channel ID for transaction response");
+                }
+            }
+            ResponseCommand::SendCertificateResponse {
+                channel_id,
+                response,
+            } => {
+                if let Some(pending) = pending_response_channels.remove(&channel_id) {
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(pending.channel, response)
+                    {
+                        warn!("Failed to send certificate response: {:?}", e);
+                    }
+                } else {
+                    warn!(channel_id, "Unknown channel ID for certificate response");
+                }
             }
         }
     }
