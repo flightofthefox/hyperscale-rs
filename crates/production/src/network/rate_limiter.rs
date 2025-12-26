@@ -2,9 +2,12 @@
 //!
 //! Uses a token bucket algorithm to limit the rate of requests per peer.
 //! Known validators (in topology) get higher limits than unknown peers.
+//!
+//! Uses a min-heap to track non-validator peers by last request time for O(log n)
+//! eviction instead of O(n) scan when capacity is reached.
 
 use libp2p::PeerId;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::time::{Duration, Instant};
 
 /// Configuration for rate limiting.
@@ -101,11 +104,34 @@ impl TokenBucket {
     }
 }
 
+/// Entry in the non-validator eviction heap.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct EvictionHeapEntry {
+    last_request: Instant,
+    peer: PeerId,
+}
+
+impl Ord for EvictionHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse ordering so oldest entries (smallest last_request) are at the top
+        other.last_request.cmp(&self.last_request)
+    }
+}
+
+impl PartialOrd for EvictionHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Per-peer rate limiter using token buckets.
 pub struct SyncRateLimiter {
     config: RateLimitConfig,
     /// Token buckets per peer.
     buckets: HashMap<PeerId, TokenBucket>,
+    /// Min-heap of non-validator peers ordered by last_request (oldest first).
+    /// Enables O(log n) eviction of oldest non-validator peer.
+    non_validator_heap: BinaryHeap<EvictionHeapEntry>,
     /// Last cleanup time.
     last_cleanup: Instant,
 }
@@ -116,6 +142,7 @@ impl SyncRateLimiter {
         Self {
             config,
             buckets: HashMap::new(),
+            non_validator_heap: BinaryHeap::new(),
             last_cleanup: Instant::now(),
         }
     }
@@ -136,12 +163,20 @@ impl SyncRateLimiter {
 
         // Check if peer already exists
         if let Some(bucket) = self.buckets.get_mut(peer) {
-            return bucket.try_consume();
+            let allowed = bucket.try_consume();
+            // Update heap entry for non-validators (lazy update - old entries become stale)
+            if allowed && !bucket.is_validator {
+                self.non_validator_heap.push(EvictionHeapEntry {
+                    last_request: bucket.last_request,
+                    peer: *peer,
+                });
+            }
+            return allowed;
         }
 
         // New peer - check capacity before inserting
         if self.buckets.len() >= self.config.max_tracked_peers {
-            // Evict oldest non-validator entry
+            // Evict oldest non-validator entry using heap (O(log n))
             self.evict_oldest_non_validator();
 
             // If still at capacity (all validators), reject unknown peers
@@ -166,27 +201,46 @@ impl SyncRateLimiter {
         };
 
         self.buckets.insert(*peer, bucket);
-        self.buckets.get_mut(peer).unwrap().try_consume()
+
+        // try_consume updates last_request, so we must call it first
+        let allowed = self.buckets.get_mut(peer).unwrap().try_consume();
+
+        // Add non-validators to the eviction heap AFTER try_consume updates last_request
+        if !is_validator {
+            let last_request = self.buckets.get(peer).unwrap().last_request;
+            self.non_validator_heap.push(EvictionHeapEntry {
+                last_request,
+                peer: *peer,
+            });
+        }
+
+        allowed
     }
 
     /// Evict the oldest non-validator entry to make room for new peers.
+    /// Uses a min-heap for O(log n) eviction instead of O(n) scan.
     fn evict_oldest_non_validator(&mut self) {
-        let oldest = self
-            .buckets
-            .iter()
-            .filter(|(_, bucket)| !bucket.is_validator)
-            .min_by_key(|(_, bucket)| bucket.last_request)
-            .map(|(peer, _)| *peer);
-
-        if let Some(peer_to_evict) = oldest {
-            self.buckets.remove(&peer_to_evict);
+        // Pop entries from heap until we find one that's still valid
+        while let Some(heap_entry) = self.non_validator_heap.pop() {
+            if let Some(bucket) = self.buckets.get(&heap_entry.peer) {
+                // Check if this heap entry is current (not stale)
+                if !bucket.is_validator && bucket.last_request == heap_entry.last_request {
+                    self.buckets.remove(&heap_entry.peer);
+                    return;
+                }
+                // Entry is stale (peer was updated since), continue to next
+            }
+            // Entry doesn't exist anymore, continue to next
         }
+        // No non-validator entries found to evict
     }
 
     /// Remove stale peer entries to prevent unbounded memory growth.
     fn cleanup(&mut self) {
         let ttl = self.config.peer_ttl;
         self.buckets.retain(|_, bucket| !bucket.is_stale(ttl));
+        // Note: We don't clean up the heap here - stale entries are handled lazily
+        // during eviction. This keeps cleanup O(n) on buckets only.
         self.last_cleanup = Instant::now();
     }
 
