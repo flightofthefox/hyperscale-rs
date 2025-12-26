@@ -179,6 +179,14 @@ pub struct MempoolState {
     /// Note: Only one transaction can lock a node at a time (enforced by ready_transactions filtering).
     locked_nodes_cache: HashSet<NodeId>,
 
+    /// Cached count of committed transactions (incrementally maintained).
+    /// This avoids O(n) scan on every lock_contention_stats() call.
+    committed_count: usize,
+
+    /// Cached count of executed transactions (incrementally maintained).
+    /// This avoids O(n) scan on every lock_contention_stats() call.
+    executed_count: usize,
+
     // ========== Incremental Ready Sets ==========
     //
     // These sets are maintained incrementally to provide O(1) ready_transactions().
@@ -243,6 +251,8 @@ impl MempoolState {
             tombstones: HashMap::new(),
             recently_evicted: HashMap::new(),
             locked_nodes_cache: HashSet::new(),
+            committed_count: 0,
+            executed_count: 0,
             ready_retries: BTreeMap::new(),
             ready_priority: BTreeMap::new(),
             ready_others: BTreeMap::new(),
@@ -379,16 +389,25 @@ impl MempoolState {
     /// - Aborted (explicitly aborted)
     /// - Retried (replaced by a new transaction)
     fn evict_terminal(&mut self, tx_hash: Hash) {
-        // Remove locked nodes if this transaction was holding locks
-        let tx_to_unlock = self.pool.get(&tx_hash).and_then(|entry| {
+        // Remove locked nodes and update counters if this transaction was holding locks
+        let info_to_unlock = self.pool.get(&tx_hash).and_then(|entry| {
             if entry.status.holds_state_lock() {
-                Some(Arc::clone(&entry.tx))
+                Some((Arc::clone(&entry.tx), entry.status.clone()))
             } else {
                 None
             }
         });
-        if let Some(tx) = tx_to_unlock {
+        if let Some((tx, status)) = info_to_unlock {
             self.remove_locked_nodes(&tx);
+            match status {
+                TransactionStatus::Committed(_) => {
+                    self.committed_count = self.committed_count.saturating_sub(1);
+                }
+                TransactionStatus::Executed(_) => {
+                    self.executed_count = self.executed_count.saturating_sub(1);
+                }
+                _ => {}
+            }
         }
 
         // Remove from ready tracking
@@ -496,8 +515,9 @@ impl MempoolState {
                     entry.status = TransactionStatus::Committed(height);
                     // Remove from ready tracking (no longer Pending)
                     self.remove_from_ready_tracking(&hash);
-                    // Add locks for committed transactions
+                    // Add locks for committed transactions and update counter
                     self.add_locked_nodes(tx);
+                    self.committed_count += 1;
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: hash,
                         status: TransactionStatus::Committed(height),
@@ -611,7 +631,7 @@ impl MempoolState {
                     "Transaction deferred due to livelock cycle"
                 );
                 let cross_shard = entry.cross_shard;
-                let was_holding_lock = entry.status.holds_state_lock();
+                let old_status = entry.status.clone();
                 let tx = Arc::clone(&entry.tx);
                 entry.status = new_status.clone();
 
@@ -620,8 +640,17 @@ impl MempoolState {
 
                 // Release locks if the transaction was holding them.
                 // Blocked transactions don't hold locks (they've been deferred).
-                if was_holding_lock {
+                if old_status.holds_state_lock() {
                     self.remove_locked_nodes(&tx);
+                    match old_status {
+                        TransactionStatus::Committed(_) => {
+                            self.committed_count = self.committed_count.saturating_sub(1);
+                        }
+                        TransactionStatus::Executed(_) => {
+                            self.executed_count = self.executed_count.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
                 }
 
                 // Track for retry when winner completes, with height for cleanup
@@ -957,6 +986,7 @@ impl MempoolState {
             if should_add_locks {
                 if let Some(tx) = tx_clone {
                     self.add_locked_nodes(&tx);
+                    self.committed_count += 1;
                 }
             }
 
@@ -983,6 +1013,13 @@ impl MempoolState {
             let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
             let submitted_locally = entry.submitted_locally;
+
+            // Update counters for Committed → Executed transition
+            if matches!(entry.status, TransactionStatus::Committed(_)) {
+                self.committed_count = self.committed_count.saturating_sub(1);
+                self.executed_count += 1;
+            }
+
             entry.status = TransactionStatus::Executed(decision);
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
@@ -1120,18 +1157,52 @@ impl MempoolState {
                     "Transaction status transition"
                 );
 
-                // Update locked nodes cache based on status transition
-                let was_holding = entry.status.holds_state_lock();
+                // Update locked nodes cache and counters based on status transition
+                let old_status = entry.status.clone();
+                let was_holding = old_status.holds_state_lock();
                 let will_hold = new_status.holds_state_lock();
                 let tx = Arc::clone(&entry.tx);
                 let cross_shard = entry.cross_shard;
 
                 if !was_holding && will_hold {
-                    // Acquiring lock
+                    // Acquiring lock - transaction becomes in-flight
                     self.add_locked_nodes(&tx);
-                } else if was_holding && !will_hold {
+                }
+                if was_holding && !will_hold {
                     // Releasing lock (shouldn't happen - locks held until terminal)
                     self.remove_locked_nodes(&tx);
+                }
+
+                // Update status counters
+                match (&old_status, &new_status) {
+                    // Entering Committed
+                    (_, TransactionStatus::Committed(_))
+                        if !matches!(old_status, TransactionStatus::Committed(_)) =>
+                    {
+                        self.committed_count += 1;
+                    }
+                    // Leaving Committed
+                    (TransactionStatus::Committed(_), _)
+                        if !matches!(new_status, TransactionStatus::Committed(_)) =>
+                    {
+                        self.committed_count = self.committed_count.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+                match (&old_status, &new_status) {
+                    // Entering Executed
+                    (_, TransactionStatus::Executed(_))
+                        if !matches!(old_status, TransactionStatus::Executed(_)) =>
+                    {
+                        self.executed_count += 1;
+                    }
+                    // Leaving Executed
+                    (TransactionStatus::Executed(_), _)
+                        if !matches!(new_status, TransactionStatus::Executed(_)) =>
+                    {
+                        self.executed_count = self.executed_count.saturating_sub(1);
+                    }
+                    _ => {}
                 }
 
                 // Re-borrow entry after calling helper methods
@@ -1502,7 +1573,7 @@ impl MempoolState {
     /// - `committed_count`: Number of transactions in Committed status
     /// - `executed_count`: Number of transactions in Executed status
     ///
-    /// Pending stats are O(1) via ready sets. Committed/Executed still require O(n) scan.
+    /// All stats are O(1) via cached counters and ready sets.
     pub fn lock_contention_stats(&self) -> LockContentionStats {
         let locked_nodes = self.locked_nodes_cache.len() as u64;
         let blocked_count = self.blocked_by.len() as u64;
@@ -1513,23 +1584,13 @@ impl MempoolState {
         let pending_blocked = self.blocked_by_nodes.len() as u64;
         let pending_count = (ready_count + self.blocked_by_nodes.len()) as u64;
 
-        // Committed/Executed still require pool scan (could add counters if needed)
-        let (committed_count, executed_count) =
-            self.pool
-                .values()
-                .fold((0u64, 0u64), |(committed, executed), e| match &e.status {
-                    TransactionStatus::Committed(_) => (committed + 1, executed),
-                    TransactionStatus::Executed(_) => (committed, executed + 1),
-                    _ => (committed, executed),
-                });
-
         LockContentionStats {
             locked_nodes,
             blocked_count,
             pending_count,
             pending_blocked,
-            committed_count,
-            executed_count,
+            committed_count: self.committed_count as u64,
+            executed_count: self.executed_count as u64,
         }
     }
 
@@ -1539,11 +1600,11 @@ impl MempoolState {
     /// which are actively holding state locks and consuming execution/crypto resources.
     ///
     /// Used for backpressure to control overall system load.
+    ///
+    /// This is O(1) as it returns a cached count maintained incrementally
+    /// when transaction status changes or transactions are evicted.
     pub fn in_flight(&self) -> usize {
-        self.pool
-            .values()
-            .filter(|e| e.status.holds_state_lock())
-            .count()
+        self.committed_count + self.executed_count
     }
 
     /// Check if we're at the backpressure soft limit.
