@@ -1154,17 +1154,17 @@ impl ProductionRunner {
                     if started > 0 {
                         crate::metrics::record_speculative_execution_started(started);
                     }
-                    for _ in 0..hits {
-                        crate::metrics::record_speculative_execution_cache_hit();
+                    if hits > 0 {
+                        crate::metrics::record_speculative_execution_cache_hit(hits);
                     }
-                    for _ in 0..late_hits {
-                        crate::metrics::record_speculative_execution_late_hit();
+                    if late_hits > 0 {
+                        crate::metrics::record_speculative_execution_late_hit(late_hits);
                     }
-                    for _ in 0..misses {
-                        crate::metrics::record_speculative_execution_cache_miss();
+                    if misses > 0 {
+                        crate::metrics::record_speculative_execution_cache_miss(misses);
                     }
-                    for _ in 0..invalidated {
-                        crate::metrics::record_speculative_execution_invalidated();
+                    if invalidated > 0 {
+                        crate::metrics::record_speculative_execution_invalidated(invalidated);
                     }
 
                     // Update mempool snapshot for RPC queries (non-blocking: skip if contended)

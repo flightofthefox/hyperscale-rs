@@ -1079,25 +1079,33 @@ pub fn record_speculative_execution_started(count: u64) {
     metrics().speculative_execution_started.inc_by(count as f64);
 }
 
-/// Record speculative execution cache hit.
-pub fn record_speculative_execution_cache_hit() {
-    metrics().speculative_execution_cache_hit.inc();
+/// Record speculative execution cache hits.
+pub fn record_speculative_execution_cache_hit(count: u64) {
+    metrics()
+        .speculative_execution_cache_hit
+        .inc_by(count as f64);
 }
 
-/// Record speculative execution late hit (commit before speculation complete).
+/// Record speculative execution late hits (commit before speculation complete).
 /// These are also counted as cache hits - this metric tracks the dedup optimization.
-pub fn record_speculative_execution_late_hit() {
-    metrics().speculative_execution_late_hit.inc();
+pub fn record_speculative_execution_late_hit(count: u64) {
+    metrics()
+        .speculative_execution_late_hit
+        .inc_by(count as f64);
 }
 
-/// Record speculative execution cache miss.
-pub fn record_speculative_execution_cache_miss() {
-    metrics().speculative_execution_cache_miss.inc();
+/// Record speculative execution cache misses.
+pub fn record_speculative_execution_cache_miss(count: u64) {
+    metrics()
+        .speculative_execution_cache_miss
+        .inc_by(count as f64);
 }
 
-/// Record speculative execution invalidated.
-pub fn record_speculative_execution_invalidated() {
-    metrics().speculative_execution_invalidated.inc();
+/// Record speculative executions invalidated.
+pub fn record_speculative_execution_invalidated(count: u64) {
+    metrics()
+        .speculative_execution_invalidated
+        .inc_by(count as f64);
 }
 
 /// Update lock contention metrics.
