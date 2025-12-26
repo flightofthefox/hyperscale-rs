@@ -1786,10 +1786,19 @@ impl Libp2pAdapter {
             // Handle request failures
             SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(
                 request_response::Event::OutboundFailure {
-                    request_id, error, ..
+                    request_id,
+                    error,
+                    peer,
+                    ..
                 },
             )) => {
-                warn!("Request {:?} failed: {:?}", request_id, error);
+                // Log detailed failure info to understand connection timeouts
+                warn!(
+                    peer = %peer,
+                    request_id = ?request_id,
+                    error = ?error,
+                    "Request-response outbound failure"
+                );
                 if let Some(pending) = pending_requests.remove(&request_id) {
                     let _ = pending
                         .response_tx
@@ -1799,8 +1808,10 @@ impl Libp2pAdapter {
                         ))));
                 } else if pending_direct_messages.remove(&request_id).is_some() {
                     warn!(
-                        "Direct message request {:?} failed: {:?}",
-                        request_id, error
+                        peer = %peer,
+                        request_id = ?request_id,
+                        error = ?error,
+                        "Direct message failed (fire-and-forget, no ACK expected)"
                     );
                 }
                 SwarmAction::None
@@ -2078,13 +2089,20 @@ impl Libp2pAdapter {
                 peer_id,
                 cause,
                 num_established,
+                connection_id,
                 ..
             } => {
-                info!(
+                // Detailed logging to debug connection timeouts
+                let cause_str = match &cause {
+                    Some(e) => format!("{:?}", e),
+                    None => "None (graceful)".to_string(),
+                };
+                warn!(
                     peer = %peer_id,
-                    cause = ?cause,
+                    connection_id = ?connection_id,
+                    cause = %cause_str,
                     remaining_connections = num_established,
-                    "Connection closed"
+                    "Connection closed - investigating timeout cause"
                 );
                 SwarmAction::None
             }
