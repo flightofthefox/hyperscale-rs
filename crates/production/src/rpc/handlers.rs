@@ -134,11 +134,33 @@ pub async fn sync_handler(State(state): State<RpcState>) -> impl IntoResponse {
 /// This matches Ethereum behavior where `eth_sendRawTransaction` returns the
 /// transaction hash immediately, and invalid transactions simply never get mined.
 ///
-/// Returns 503 Service Unavailable if the mempool is full (backpressure).
+/// Returns 503 Service Unavailable if the mempool is full (backpressure) or
+/// if the node is syncing and too far behind.
 pub async fn submit_transaction_handler(
     State(state): State<RpcState>,
     Json(request): Json<SubmitTransactionRequest>,
 ) -> impl IntoResponse {
+    // Check if node is syncing and too far behind to accept transactions.
+    // This prevents a syncing node from falling further behind by processing
+    // new transactions instead of catching up.
+    if let Some(threshold) = state.sync_backpressure_threshold {
+        let sync_status = state.sync_status.load();
+        if sync_status.blocks_behind > threshold {
+            crate::metrics::record_tx_ingress_rejected_syncing();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(SubmitTransactionResponse {
+                    accepted: false,
+                    hash: String::new(),
+                    error: Some(format!(
+                        "Node is syncing ({} blocks behind). Try again later.",
+                        sync_status.blocks_behind
+                    )),
+                }),
+            );
+        }
+    }
+
     // Check backpressure using semaphore (lock-free) if available,
     // otherwise fall back to mempool snapshot (requires lock)
     if let Some(ref ingress) = state.tx_ingress {
@@ -424,6 +446,7 @@ mod tests {
             tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
             tx_ingress: None, // Tests use legacy path
+            sync_backpressure_threshold: Some(10),
         }
     }
 
@@ -733,5 +756,129 @@ mod tests {
         assert_eq!(resp.executed_count, 2);
         assert_eq!(resp.blocked_count, 2);
         assert_eq!(resp.total_count, 17);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Sync Backpressure Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_submit_rejected_when_syncing() {
+        let (tx_submission_tx, _rx) = mpsc::unbounded_channel();
+
+        // Create state with node that is 20 blocks behind (threshold is 10)
+        let sync_status = crate::sync::SyncStatus {
+            state: crate::sync::SyncStateKind::Syncing,
+            current_height: 80,
+            target_height: Some(100),
+            blocks_behind: 20,
+            sync_peers: 3,
+            pending_fetches: 2,
+            queued_heights: 5,
+        };
+
+        let state = RpcState {
+            ready: Arc::new(AtomicBool::new(true)),
+            sync_status: Arc::new(ArcSwap::new(Arc::new(sync_status))),
+            node_status: Arc::new(RwLock::new(NodeStatusState::default())),
+            tx_submission_tx,
+            start_time: Instant::now(),
+            tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
+            mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
+            tx_ingress: None,
+            sync_backpressure_threshold: Some(10),
+        };
+
+        let app = Router::new()
+            .route("/tx", axum::routing::post(submit_transaction_handler))
+            .with_state(state);
+
+        // Submit a valid transaction (we expect it to be rejected due to sync)
+        let tx = hyperscale_types::test_utils::test_transaction(1);
+        let tx_hex = hex::encode(sbor::prelude::basic_encode(&tx).unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&SubmitTransactionRequest {
+                            transaction_hex: tx_hex,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should get 503 Service Unavailable
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Parse response and check error message
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let resp: SubmitTransactionResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!resp.accepted);
+        assert!(resp.error.unwrap().contains("syncing"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_accepted_when_caught_up() {
+        let (tx_submission_tx, _rx) = mpsc::unbounded_channel();
+
+        // Create state with node that is only 5 blocks behind (under threshold of 10)
+        let sync_status = crate::sync::SyncStatus {
+            state: crate::sync::SyncStateKind::Syncing,
+            current_height: 95,
+            target_height: Some(100),
+            blocks_behind: 5,
+            sync_peers: 3,
+            pending_fetches: 1,
+            queued_heights: 2,
+        };
+
+        let state = RpcState {
+            ready: Arc::new(AtomicBool::new(true)),
+            sync_status: Arc::new(ArcSwap::new(Arc::new(sync_status))),
+            node_status: Arc::new(RwLock::new(NodeStatusState::default())),
+            tx_submission_tx,
+            start_time: Instant::now(),
+            tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
+            mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
+            tx_ingress: None,
+            sync_backpressure_threshold: Some(10),
+        };
+
+        let app = Router::new()
+            .route("/tx", axum::routing::post(submit_transaction_handler))
+            .with_state(state);
+
+        // Submit a valid transaction
+        let tx = hyperscale_types::test_utils::test_transaction(1);
+        let tx_hex = hex::encode(sbor::prelude::basic_encode(&tx).unwrap());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tx")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&SubmitTransactionRequest {
+                            transaction_hex: tx_hex,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should be accepted (202)
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 }

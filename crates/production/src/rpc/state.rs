@@ -41,6 +41,11 @@ pub struct RpcState {
     /// When set, provides lock-free backpressure for transaction submission.
     /// Falls back to mempool_snapshot check if not set.
     pub tx_ingress: Option<TxIngressHandle>,
+    /// Number of blocks behind before rejecting transaction submissions.
+    ///
+    /// When set and the node is this many blocks behind, new transaction
+    /// submissions are rejected to allow the node to catch up.
+    pub sync_backpressure_threshold: Option<u64>,
 }
 
 /// Cached transaction status entry.

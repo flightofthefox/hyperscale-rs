@@ -91,6 +91,8 @@ pub struct Metrics {
     pub tx_ingress_submitted: Counter,
     /// Total transactions rejected due to backpressure.
     pub tx_ingress_rejected: Counter,
+    /// Total transactions rejected because node is syncing.
+    pub tx_ingress_rejected_syncing: Counter,
 
     // === Storage ===
     pub rocksdb_read_latency: Histogram,
@@ -405,6 +407,12 @@ impl Metrics {
             tx_ingress_rejected: register_counter!(
                 "hyperscale_tx_ingress_rejected_total",
                 "Total transactions rejected due to backpressure"
+            )
+            .unwrap(),
+
+            tx_ingress_rejected_syncing: register_counter!(
+                "hyperscale_tx_ingress_rejected_syncing_total",
+                "Total transactions rejected because node is syncing"
             )
             .unwrap(),
 
@@ -830,6 +838,11 @@ pub fn record_tx_ingress_submitted() {
 /// Record a rejected transaction due to backpressure.
 pub fn record_tx_ingress_rejected() {
     metrics().tx_ingress_rejected.inc();
+}
+
+/// Record a rejected transaction because the node is syncing.
+pub fn record_tx_ingress_rejected_syncing() {
+    metrics().tx_ingress_rejected_syncing.inc();
 }
 
 /// Record RocksDB read latency.

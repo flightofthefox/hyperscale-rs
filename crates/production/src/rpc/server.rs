@@ -28,6 +28,15 @@ pub struct RpcServerConfig {
     pub listen_addr: SocketAddr,
     /// Enable metrics endpoint.
     pub metrics_enabled: bool,
+    /// Number of blocks behind before rejecting transaction submissions.
+    ///
+    /// When the node is syncing and falls this many blocks behind, new transaction
+    /// submissions are rejected with 503. This prevents a syncing node from getting
+    /// further behind by processing new transactions instead of catching up.
+    ///
+    /// Set to `None` to disable sync-based backpressure.
+    /// Default: 10 blocks
+    pub sync_backpressure_threshold: Option<u64>,
 }
 
 impl Default for RpcServerConfig {
@@ -35,6 +44,7 @@ impl Default for RpcServerConfig {
         Self {
             listen_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             metrics_enabled: true,
+            sync_backpressure_threshold: Some(10),
         }
     }
 }
@@ -109,6 +119,7 @@ impl RpcServer {
         config: RpcServerConfig,
         tx_submission_tx: mpsc::UnboundedSender<Arc<RoutableTransaction>>,
     ) -> Self {
+        let sync_backpressure_threshold = config.sync_backpressure_threshold;
         let state = RpcState {
             ready: Arc::new(AtomicBool::new(false)),
             sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
@@ -118,6 +129,7 @@ impl RpcServer {
             tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
             tx_ingress: None,
+            sync_backpressure_threshold,
         };
 
         Self { config, state }
@@ -136,6 +148,7 @@ impl RpcServer {
         tx_status_cache: Arc<RwLock<TransactionStatusCache>>,
         mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
     ) -> Self {
+        let sync_backpressure_threshold = config.sync_backpressure_threshold;
         let state = RpcState {
             ready,
             sync_status,
@@ -145,6 +158,7 @@ impl RpcServer {
             tx_status_cache,
             mempool_snapshot,
             tx_ingress: None,
+            sync_backpressure_threshold,
         };
 
         Self { config, state }

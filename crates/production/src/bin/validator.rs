@@ -1213,6 +1213,7 @@ async fn main() -> Result<()> {
                 )
             })?,
             metrics_enabled: true,
+            sync_backpressure_threshold: Some(10),
         };
 
         // Use with_state to pass all shared state objects
