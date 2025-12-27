@@ -2574,10 +2574,14 @@ impl ProductionRunner {
                     "Block committed"
                 );
 
-                // Record block committed metric.
-                // For now, we don't have the proposal timestamp available here,
-                // so we pass 0.0 for latency. The block height gauge is still useful.
-                crate::metrics::record_block_committed(height, 0.0);
+                // Record block committed metric with latency from proposal to commit.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let commit_latency_secs =
+                    (now_ms.saturating_sub(block.header.timestamp)) as f64 / 1000.0;
+                crate::metrics::record_block_committed(height, commit_latency_secs);
 
                 // Record livelock metrics for deferrals in this block.
                 for _deferral in &block.deferred {
