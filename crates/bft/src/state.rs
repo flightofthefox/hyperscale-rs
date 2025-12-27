@@ -219,6 +219,23 @@ pub struct BftState {
     /// Used for rate limiting block production via min_block_interval.
     last_proposal_time: Duration,
 
+    /// Time of last leader activity (for round timeout detection).
+    /// Reset when we see leader activity (proposal, header receipt, QC, commit).
+    last_leader_activity: Duration,
+
+    /// Last (height, round) for which we reset the leader activity timer on header receipt.
+    /// Prevents a Byzantine leader from spamming headers to delay view changes.
+    /// We only reset once per (height, round) from the leader.
+    last_header_reset: Option<(u64, u64)>,
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Sync State
+    // ═══════════════════════════════════════════════════════════════════════════
+    /// Whether we are currently syncing (catching up to the network).
+    /// When syncing, we propose empty blocks instead of skipping our turn,
+    /// and view changes are suppressed since we're intentionally behind.
+    syncing: bool,
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Statistics
     // ═══════════════════════════════════════════════════════════════════════════
@@ -295,6 +312,9 @@ impl BftState {
             config,
             now: Duration::ZERO,
             last_proposal_time: Duration::ZERO,
+            last_leader_activity: Duration::ZERO,
+            last_header_reset: None,
+            syncing: false,
             view_changes: 0,
         }
     }
@@ -362,6 +382,129 @@ impl BftState {
     /// Get committee index for a validator.
     fn committee_index(&self, validator_id: ValidatorId) -> Option<usize> {
         self.topology.local_committee_index(validator_id)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Sync State Management
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Set whether this validator is currently syncing.
+    ///
+    /// When syncing:
+    /// - Proposer will create empty "sync blocks" instead of skipping their turn
+    /// - View changes are suppressed (we're intentionally behind)
+    fn set_syncing(&mut self, syncing: bool) {
+        if syncing && !self.syncing {
+            info!(
+                validator = ?self.validator_id(),
+                "Entering sync mode - will propose empty blocks if selected"
+            );
+        } else if !syncing && self.syncing {
+            info!(
+                validator = ?self.validator_id(),
+                "Exiting sync mode - resuming normal block production"
+            );
+            // Reset leader activity timeout since we've caught up
+            self.last_leader_activity = self.now;
+        }
+        self.syncing = syncing;
+    }
+
+    /// Check if this validator is currently syncing.
+    pub fn is_syncing(&self) -> bool {
+        self.syncing
+    }
+
+    /// Handle a synced block ready to apply (from runner via Event::SyncBlockReadyToApply).
+    ///
+    /// This sets the syncing flag and delegates to the actual sync block handler.
+    pub fn on_sync_block_ready_to_apply(
+        &mut self,
+        block: Block,
+        qc: QuorumCertificate,
+    ) -> Vec<Action> {
+        // Mark that we're syncing - this enables sync block proposals
+        // and suppresses view changes during catch-up
+        self.set_syncing(true);
+        self.on_synced_block_ready(block, qc)
+    }
+
+    /// Handle sync complete (from runner via Event::SyncComplete).
+    ///
+    /// Re-enables normal block proposals and view changes.
+    pub fn on_sync_complete(&mut self) -> Vec<Action> {
+        info!(
+            validator = ?self.validator_id(),
+            "Sync complete, resuming normal consensus"
+        );
+        self.set_syncing(false);
+        vec![]
+    }
+
+    /// Record leader activity (resets the view change timeout).
+    ///
+    /// Called when we observe leader activity:
+    /// - We propose a block
+    /// - A QC forms
+    /// - A block commits
+    /// - We receive a valid header (rate-limited per height/round)
+    fn record_leader_activity(&mut self) {
+        self.last_leader_activity = self.now;
+    }
+
+    /// Record leader activity from receiving a block header.
+    ///
+    /// Rate-limited to once per (height, round) to prevent a Byzantine leader
+    /// from spamming headers with different hashes to delay view changes.
+    fn record_header_activity(&mut self, height: u64, round: u64) {
+        let header_key = (height, round);
+        if self.last_header_reset != Some(header_key) {
+            self.last_leader_activity = self.now;
+            self.last_header_reset = Some(header_key);
+        }
+    }
+
+    /// Check if we should advance the round due to timeout.
+    ///
+    /// Returns true if the leader has been inactive for longer than
+    /// `view_change_timeout` and we're not currently syncing.
+    ///
+    /// View changes should only happen when the leader fails to propose,
+    /// not just because vote aggregation is slow.
+    fn should_advance_round(&self) -> bool {
+        // Never trigger view changes while syncing - we're intentionally behind
+        // and catching up. This follows Tendermint/HotStuff best practices.
+        if self.syncing {
+            return false;
+        }
+        let timeout = self.config.view_change_timeout;
+        self.now.saturating_sub(self.last_leader_activity) >= timeout
+    }
+
+    /// Check for round timeout and advance if needed.
+    ///
+    /// This should be called before processing the proposal timer.
+    /// Returns actions for view change if timeout triggered, or empty vec if not.
+    ///
+    /// If a view change occurs, the caller should NOT proceed to call
+    /// `on_proposal_timer` in the same event handling cycle.
+    pub fn check_round_timeout(&mut self) -> Option<Vec<Action>> {
+        if !self.should_advance_round() {
+            return None;
+        }
+
+        // Reset the timeout so we don't immediately trigger another view change.
+        self.last_leader_activity = self.now;
+        // Clear the header reset tracker since we're changing rounds
+        self.last_header_reset = None;
+
+        info!(
+            validator = ?self.validator_id(),
+            view = self.view,
+            "Round timeout - advancing round (implicit view change)"
+        );
+
+        Some(self.advance_round())
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -567,6 +710,12 @@ impl BftState {
             return actions;
         }
 
+        // If we're syncing, propose an empty sync block instead of a full block.
+        // This keeps the chain advancing while we catch up on execution state.
+        if self.syncing {
+            return self.build_and_broadcast_sync_block(next_height, round);
+        }
+
         // Build and broadcast block - parent is the latest certified block
         let (parent_hash, parent_qc) = if let Some(qc) = &self.latest_qc {
             (qc.block_hash, qc.clone())
@@ -735,6 +884,9 @@ impl BftState {
         // Track proposal time for rate limiting
         self.last_proposal_time = self.now;
 
+        // Record leader activity - we are producing blocks
+        self.record_leader_activity();
+
         actions.push(Action::BroadcastToShard {
             shard: self.local_shard(),
             message: OutboundMessage::BlockHeader(Box::new(gossip)),
@@ -831,6 +983,104 @@ impl BftState {
 
         // Set proposal timer in case this fallback block doesn't get quorum.
         // Without this timer, consensus could stall if the block doesn't reach quorum.
+        actions.push(Action::SetTimer {
+            id: TimerId::Proposal,
+            duration: self.config.proposal_interval,
+        });
+
+        actions
+    }
+
+    /// Build and broadcast an empty block while syncing.
+    ///
+    /// Sync blocks allow the chain to keep advancing even when the proposer
+    /// can't execute transactions (because they're catching up). Other validators
+    /// will include transactions when it's their turn to propose.
+    ///
+    /// # Key Differences from Fallback Blocks
+    ///
+    /// | Aspect | Sync Block | Fallback Block |
+    /// |--------|------------|----------------|
+    /// | Trigger | Proposer is syncing | Leader timeout |
+    /// | Timestamp | Normal (`self.now`) | Inherited from parent |
+    /// | `is_fallback` | `false` | `true` |
+    /// | Cadence | Normal proposal interval | After 3s timeout |
+    ///
+    /// Sync blocks use normal timestamps because the proposer is online with
+    /// an accurate clock - they just can't execute transactions.
+    fn build_and_broadcast_sync_block(&mut self, height: u64, round: u64) -> Vec<Action> {
+        let mut actions = vec![];
+
+        // Get parent info from latest QC
+        let (parent_hash, parent_qc) = if let Some(qc) = &self.latest_qc {
+            (qc.block_hash, qc.clone())
+        } else {
+            (self.committed_hash, QuorumCertificate::genesis())
+        };
+
+        // Sync blocks use normal timestamps - the proposer is online with a good clock,
+        // they just can't execute transactions. This differs from fallback blocks which
+        // inherit the parent timestamp (proposed after timeout, clock may have drifted).
+        let timestamp = self.now.as_millis() as u64;
+
+        let header = BlockHeader {
+            height: BlockHeight(height),
+            parent_hash,
+            parent_qc: parent_qc.clone(),
+            proposer: self.validator_id(),
+            timestamp,
+            round,
+            is_fallback: false, // Not a fallback - just empty due to sync
+        };
+
+        let block = Block {
+            header: header.clone(),
+            retry_transactions: vec![],
+            priority_transactions: vec![],
+            transactions: vec![],
+            committed_certificates: vec![],
+            deferred: vec![],
+            aborted: vec![],
+            commitment_proofs: HashMap::new(),
+        };
+
+        let block_hash = block.hash();
+
+        info!(
+            validator = ?self.validator_id(),
+            height = height,
+            round = round,
+            block_hash = ?block_hash,
+            "Building sync block (syncing, empty payload)"
+        );
+
+        // Store our own block as pending (already complete since it's empty)
+        let mut pending = PendingBlock::new(header.clone(), vec![], vec![], vec![], vec![]);
+        if let Ok(constructed) = pending.construct_block() {
+            self.pending_blocks.insert(block_hash, pending);
+            self.pending_block_created_at.insert(block_hash, self.now);
+            self.certified_blocks
+                .insert(block_hash, ((*constructed).clone(), parent_qc));
+        }
+
+        // Create gossip message (sync blocks have no transactions, deferrals, or aborts)
+        let gossip = hyperscale_messages::BlockHeaderGossip::new(header, vec![], vec![], vec![]);
+
+        // Track proposal time for rate limiting
+        self.last_proposal_time = self.now;
+
+        // Record leader activity - we are producing blocks
+        self.record_leader_activity();
+
+        actions.push(Action::BroadcastToShard {
+            shard: self.local_shard(),
+            message: OutboundMessage::BlockHeader(Box::new(gossip)),
+        });
+
+        // Vote for our own sync block
+        actions.extend(self.create_vote(block_hash, height, round));
+
+        // Set proposal timer for next round
         actions.push(Action::SetTimer {
             id: TimerId::Proposal,
             duration: self.config.proposal_interval,
@@ -1059,6 +1309,11 @@ impl BftState {
             );
             return vec![];
         }
+
+        // Record leader activity for receiving a valid header.
+        // Rate-limited to once per (height, round) to prevent Byzantine leaders
+        // from spamming different headers to delay view changes.
+        self.record_header_activity(height, round);
 
         // Check if we already have this block
         if self.pending_blocks.contains_key(&block_hash) {
@@ -2112,14 +2367,6 @@ impl BftState {
         }
     }
 
-    /// Count transactions in the block that would be committed by a QC.
-    ///
-    /// Convenience method - returns only the transaction count.
-    /// Use `pending_commit_counts` if you also need certificate count.
-    pub fn pending_commit_tx_count(&self, qc: &QuorumCertificate) -> usize {
-        self.pending_commit_counts(qc).0
-    }
-
     /// Count transactions and certificates in ALL pending blocks above committed height.
     ///
     /// This accounts for pipelining in chained BFT: multiple blocks can be proposed
@@ -2176,6 +2423,9 @@ impl BftState {
             height = height,
             "QC formed"
         );
+
+        // Record leader activity - QC forming indicates progress
+        self.record_leader_activity();
 
         // Update latest QC if this is newer
         let should_update = self
@@ -2459,6 +2709,9 @@ impl BftState {
             self.committed_height = height;
             self.committed_hash = current_hash;
 
+            // Record leader activity - block committing indicates progress
+            self.record_leader_activity();
+
             // Clean up old state
             self.cleanup_old_state(height);
 
@@ -2531,7 +2784,7 @@ impl BftState {
         height = block.header.height.0,
         block_hash = ?block.hash()
     ))]
-    pub fn on_synced_block_ready(&mut self, block: Block, qc: QuorumCertificate) -> Vec<Action> {
+    fn on_synced_block_ready(&mut self, block: Block, qc: QuorumCertificate) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header.height.0;
 
@@ -2894,7 +3147,7 @@ impl BftState {
     ///
     /// Returns actions to propose if we're the new proposer.
     #[instrument(skip(self), fields(new_round = self.view + 1))]
-    pub fn advance_round(&mut self) -> Vec<Action> {
+    fn advance_round(&mut self) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This matches on_proposal_timer behavior.
         let height = self
@@ -3001,7 +3254,7 @@ impl BftState {
     /// This is the key mechanism that prevents view divergence: nodes that fall behind
     /// (e.g., due to network partitions or slow clocks) will catch up when they see
     /// QCs from the rest of the network.
-    pub fn maybe_unlock_for_qc(&mut self, qc: &QuorumCertificate) {
+    fn maybe_unlock_for_qc(&mut self, qc: &QuorumCertificate) {
         if qc.is_genesis() {
             return;
         }
@@ -3051,45 +3304,6 @@ impl BftState {
     // ═══════════════════════════════════════════════════════════════════════════
     // Transaction Fetch Protocol
     // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Handle transaction fetch timer expiry.
-    ///
-    /// If the pending block is still incomplete, emit TransactionNeeded
-    /// so the runner can request the missing transactions from a peer.
-    #[instrument(skip(self), fields(block_hash = ?block_hash))]
-    pub fn on_transaction_fetch_timer(&mut self, block_hash: Hash) -> Vec<Action> {
-        let Some(pending) = self.pending_blocks.get(&block_hash) else {
-            // Block no longer pending (completed or removed)
-            return vec![];
-        };
-
-        if pending.is_complete() {
-            // Block is now complete, no fetch needed
-            return vec![];
-        }
-
-        let missing = pending.missing_transactions();
-        if missing.is_empty() {
-            // Only missing certificates, not transactions
-            return vec![];
-        }
-
-        let proposer = pending.header().proposer;
-
-        info!(
-            validator = ?self.validator_id(),
-            block_hash = ?block_hash,
-            proposer = ?proposer,
-            missing_count = missing.len(),
-            "Transaction fetch timer fired - requesting missing transactions"
-        );
-
-        vec![Action::FetchTransactions {
-            block_hash,
-            proposer,
-            tx_hashes: missing,
-        }]
-    }
 
     /// Handle transactions received from a fetch request.
     ///
@@ -3209,45 +3423,6 @@ impl BftState {
     // ═══════════════════════════════════════════════════════════════════════════
     // Certificate Fetch Protocol
     // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Handle certificate fetch timer expiry.
-    ///
-    /// If the pending block is still missing certificates, emit CertificateNeeded
-    /// so the runner can request them from a peer.
-    #[instrument(skip(self), fields(block_hash = ?block_hash))]
-    pub fn on_certificate_fetch_timer(&mut self, block_hash: Hash) -> Vec<Action> {
-        let Some(pending) = self.pending_blocks.get(&block_hash) else {
-            // Block no longer pending (completed or removed)
-            return vec![];
-        };
-
-        if pending.is_complete() {
-            // Block is now complete, no fetch needed
-            return vec![];
-        }
-
-        let missing = pending.missing_certificates();
-        if missing.is_empty() {
-            // Only missing transactions, not certificates
-            return vec![];
-        }
-
-        let proposer = pending.header().proposer;
-
-        info!(
-            validator = ?self.validator_id(),
-            block_hash = ?block_hash,
-            proposer = ?proposer,
-            missing_count = missing.len(),
-            "Certificate fetch timer fired - requesting missing certificates"
-        );
-
-        vec![Action::FetchCertificates {
-            block_hash,
-            proposer,
-            cert_hashes: missing,
-        }]
-    }
 
     /// Handle certificates received from a fetch request.
     ///
@@ -4085,56 +4260,15 @@ impl BftState {
 
 impl SubStateMachine for BftState {
     fn try_handle(&mut self, event: &Event) -> Option<Vec<Action>> {
+        // Only handle events that BFT can process independently.
+        // Events requiring external data (mempool, execution, etc.) must be
+        // handled by NodeStateMachine which has access to all subsystems.
         match event {
-            Event::ProposalTimer => {
-                // Note: In real usage, mempool, deferrals, certificates, and proofs would be passed in
-                Some(self.on_proposal_timer(
-                    &ReadyTransactions::default(),
-                    vec![],
-                    vec![],
-                    vec![],
-                    HashMap::new(),
-                ))
-            }
-            Event::BlockHeaderReceived {
-                header,
-                retry_hashes,
-                priority_hashes,
-                tx_hashes,
-                cert_hashes,
-                deferred,
-                aborted,
-                commitment_proofs,
-            } => Some(self.on_block_header(
-                header.clone(),
-                retry_hashes.clone(),
-                priority_hashes.clone(),
-                tx_hashes.clone(),
-                cert_hashes.clone(),
-                deferred.clone(),
-                aborted.clone(),
-                commitment_proofs.clone(),
-                &HashMap::new(), // In real usage, mempool would be passed
-                &HashMap::new(), // In real usage, certificates would be passed
-            )),
+            // Self-contained BFT events
             Event::BlockVoteReceived { vote } => Some(self.on_block_vote(vote.clone())),
-            Event::QuorumCertificateFormed { block_hash, qc } => {
-                // Note: In SubStateMachine context, we pass empty mempool, deferrals, aborts, certs, and proofs.
-                // The NodeStateMachine should handle this event directly with actual data.
-                Some(self.on_qc_formed(
-                    *block_hash,
-                    qc.clone(),
-                    &ReadyTransactions::default(),
-                    vec![],
-                    vec![],
-                    vec![],
-                    HashMap::new(),
-                ))
-            }
             Event::BlockReadyToCommit { block_hash, qc } => {
                 Some(self.on_block_ready_to_commit(*block_hash, qc.clone()))
             }
-            Event::BlockCommitted { .. } => Some(vec![]),
             Event::QuorumCertificateResult {
                 block_hash,
                 qc,
@@ -4146,6 +4280,16 @@ impl SubStateMachine for BftState {
             Event::ChainMetadataFetched { height, hash, qc } => {
                 Some(self.on_chain_metadata_fetched(*height, *hash, qc.clone()))
             }
+            Event::SyncBlockReadyToApply { block, qc } => {
+                Some(self.on_sync_block_ready_to_apply(block.clone(), qc.clone()))
+            }
+            Event::SyncComplete { .. } => Some(self.on_sync_complete()),
+
+            // Events requiring external data - must be handled by NodeStateMachine:
+            // - ProposalTimer: needs mempool transactions, deferrals, certificates
+            // - BlockHeaderReceived: needs mempool for tx lookup, cert store for certs
+            // - QuorumCertificateFormed: needs mempool for immediate proposal
+            // - BlockCommitted: needs to notify execution, mempool, livelock, etc.
             _ => None,
         }
     }
