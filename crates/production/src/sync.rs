@@ -18,7 +18,8 @@ use hyperscale_core::Event;
 use hyperscale_types::{Block, BlockHeight, BlockMetadata, Hash, QuorumCertificate, Topology};
 use libp2p::PeerId;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -301,8 +302,11 @@ pub struct SyncManager {
     topology: Arc<dyn Topology>,
     /// Current sync target (if syncing).
     sync_target: Option<(u64, Hash)>,
-    /// Heights we need to fetch.
-    heights_to_fetch: VecDeque<u64>,
+    /// Heights we need to fetch (min-heap ensures lowest height is fetched first).
+    /// Using Reverse<u64> makes BinaryHeap a min-heap instead of max-heap.
+    heights_to_fetch: BinaryHeap<Reverse<u64>>,
+    /// Set of heights currently in the queue (for O(1) duplicate checking).
+    heights_queued: HashSet<u64>,
     /// Currently pending fetch requests.
     pending_fetches: HashMap<u64, PendingFetch>,
     /// Peers that have been tried for each height (for retry rotation).
@@ -346,7 +350,8 @@ impl SyncManager {
             event_tx,
             topology,
             sync_target: None,
-            heights_to_fetch: VecDeque::new(),
+            heights_to_fetch: BinaryHeap::new(),
+            heights_queued: HashSet::new(),
             pending_fetches: HashMap::new(),
             tried_peers_for_height: HashMap::new(),
             peer_reputations: HashMap::new(),
@@ -355,6 +360,40 @@ impl SyncManager {
             fetch_result_tx,
             pending_backfills: HashMap::new(),
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Height Queue Helpers (maintain heap + set consistency)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Queue a height for fetching (no-op if already queued).
+    fn queue_height(&mut self, height: u64) {
+        if self.heights_queued.insert(height) {
+            self.heights_to_fetch.push(Reverse(height));
+        }
+    }
+
+    /// Pop the next height to fetch (lowest height first).
+    fn pop_next_height(&mut self) -> Option<u64> {
+        while let Some(Reverse(height)) = self.heights_to_fetch.pop() {
+            // Only return if still in the queued set (handles stale entries)
+            if self.heights_queued.remove(&height) {
+                return Some(height);
+            }
+        }
+        None
+    }
+
+    /// Clear all queued heights.
+    fn clear_height_queue(&mut self) {
+        self.heights_to_fetch.clear();
+        self.heights_queued.clear();
+    }
+
+    /// Remove heights at or below a threshold.
+    fn remove_heights_at_or_below(&mut self, threshold: u64) {
+        self.heights_queued.retain(|&h| h > threshold);
+        // Heap will be lazily cleaned when popping via pop_next_height
     }
 
     /// Get the count of same-shard peers available for sync (excluding self).
@@ -418,7 +457,7 @@ impl SyncManager {
         self.committed_height = height;
 
         // Remove heights at or below committed from pending lists
-        self.heights_to_fetch.retain(|h| *h > height);
+        self.remove_heights_at_or_below(height);
 
         // When removing pending fetches, decrement in_flight for the associated peers
         // to prevent the counter from getting stuck
@@ -443,7 +482,7 @@ impl SyncManager {
                     target, "Sync complete - returning to normal consensus"
                 );
                 self.sync_target = None;
-                self.heights_to_fetch.clear();
+                self.clear_height_queue();
                 return Some(target);
             }
         }
@@ -479,10 +518,8 @@ impl SyncManager {
         // QC verification failure clearing pending_synced_block_verifications).
         let first_height = self.committed_height + 1;
         for height in first_height..=target_height {
-            if !self.pending_fetches.contains_key(&height)
-                && !self.heights_to_fetch.contains(&height)
-            {
-                self.heights_to_fetch.push_back(height);
+            if !self.pending_fetches.contains_key(&height) {
+                self.queue_height(height);
             }
         }
 
@@ -494,7 +531,7 @@ impl SyncManager {
     pub fn cancel_sync(&mut self) {
         debug!("Cancelling sync");
         self.sync_target = None;
-        self.heights_to_fetch.clear();
+        self.clear_height_queue();
         self.pending_fetches.clear();
         self.tried_peers_for_height.clear();
     }
@@ -567,10 +604,8 @@ impl SyncManager {
                 self.tried_peers_for_height.insert(height, tried);
             }
 
-            // Re-queue the height for retry
-            if !self.heights_to_fetch.contains(&height) {
-                self.heights_to_fetch.push_back(height);
-            }
+            // Re-queue the height for retry (will be prioritized by min-heap)
+            self.queue_height(height);
         }
     }
 
@@ -580,7 +615,7 @@ impl SyncManager {
     /// for ongoing progress after retries or when slots free up.
     fn spawn_pending_fetches(&mut self) {
         while self.pending_fetches.len() < self.config.max_concurrent_fetches {
-            if let Some(height) = self.heights_to_fetch.pop_front() {
+            if let Some(height) = self.pop_next_height() {
                 // Get peers already tried for this height (if any)
                 // Clone to avoid borrow conflict with select_peer_for_height
                 let tried_peers = self.tried_peers_for_height.get(&height).cloned();
@@ -588,7 +623,7 @@ impl SyncManager {
                     self.spawn_fetch(height, peer);
                 } else {
                     // No available peers, put height back and stop
-                    self.heights_to_fetch.push_front(height);
+                    self.queue_height(height);
                     break;
                 }
             } else {
@@ -708,9 +743,7 @@ impl SyncManager {
             if !self.validate_block(&block, &qc) {
                 warn!(height, ?from_peer, "Invalid block received during sync");
                 // Re-queue for retry from another peer
-                if !self.heights_to_fetch.contains(&height) {
-                    self.heights_to_fetch.push_back(height);
-                }
+                self.queue_height(height);
                 return;
             }
 
@@ -784,7 +817,7 @@ impl SyncManager {
             rep.last_failure = Some(Instant::now());
 
             // Re-queue the height for retry (with a different peer if possible)
-            self.heights_to_fetch.push_back(height);
+            self.queue_height(height);
         } else {
             // Request was already handled (likely by timeout) - just log it
             trace!(
@@ -1120,7 +1153,7 @@ impl SyncManager {
         // Store tried peers for this height so spawn_fetch can use them
         // We use a simple approach: store in a separate map
         self.tried_peers_for_height.insert(height, tried_peers);
-        self.heights_to_fetch.push_back(height);
+        self.queue_height(height);
     }
 
     /// Handle a block response from a peer.
@@ -1469,7 +1502,8 @@ mod tests {
         TestSyncManager {
             config: SyncConfig::default(),
             sync_target: None,
-            heights_to_fetch: VecDeque::new(),
+            heights_to_fetch: BinaryHeap::new(),
+            heights_queued: HashSet::new(),
             pending_fetches: HashMap::new(),
             peer_reputations: HashMap::new(),
             peer_shards: HashMap::new(),
@@ -1484,7 +1518,8 @@ mod tests {
     struct TestSyncManager {
         config: SyncConfig,
         sync_target: Option<(u64, Hash)>,
-        heights_to_fetch: VecDeque<u64>,
+        heights_to_fetch: BinaryHeap<Reverse<u64>>,
+        heights_queued: HashSet<u64>,
         pending_fetches: HashMap<u64, PendingFetch>,
         peer_reputations: HashMap<PeerId, PeerReputation>,
         peer_shards: HashMap<PeerId, ShardGroupId>,
@@ -1493,6 +1528,16 @@ mod tests {
     }
 
     impl TestSyncManager {
+        fn queue_height(&mut self, height: u64) {
+            if self.heights_queued.insert(height) {
+                self.heights_to_fetch.push(Reverse(height));
+            }
+        }
+
+        fn is_height_queued(&self, height: u64) -> bool {
+            self.heights_queued.contains(&height)
+        }
+
         fn register_peer(&mut self, peer_id: PeerId) {
             self.peer_shards.insert(peer_id, self.local_shard);
             self.peer_reputations.entry(peer_id).or_default();
@@ -1540,7 +1585,7 @@ mod tests {
                 rep.last_failure = Some(Instant::now());
             }
 
-            self.heights_to_fetch.push_back(height);
+            self.queue_height(height);
         }
 
         fn blocks_behind(&self) -> u64 {
@@ -1689,7 +1734,7 @@ mod tests {
         fn start_sync(&mut self, target_height: u64, target_hash: Hash) {
             self.sync_target = Some((target_height, target_hash));
             for h in (self.committed_height + 1)..=target_height {
-                self.heights_to_fetch.push_back(h);
+                self.queue_height(h);
             }
         }
 
@@ -1717,9 +1762,7 @@ mod tests {
                     }
                 }
 
-                if !self.heights_to_fetch.contains(&height) {
-                    self.heights_to_fetch.push_back(height);
-                }
+                self.queue_height(height);
             }
 
             timed_out_heights
@@ -2323,7 +2366,7 @@ mod tests {
         assert!(mgr.is_peer_banned(&peer));
 
         // Height should be re-queued
-        assert!(mgr.heights_to_fetch.contains(&100));
+        assert!(mgr.is_height_queued(100));
 
         // Pending fetch should be removed
         assert!(!mgr.pending_fetches.contains_key(&100));
@@ -2348,7 +2391,7 @@ mod tests {
         assert!(rep.last_failure.is_some());
 
         // Height should be re-queued
-        assert!(mgr.heights_to_fetch.contains(&100));
+        assert!(mgr.is_height_queued(100));
     }
 
     #[test]
@@ -2626,7 +2669,7 @@ mod tests {
         assert!(manager.pending_fetches.is_empty());
 
         // Height should be re-queued
-        assert!(manager.heights_to_fetch.contains(&100));
+        assert!(manager.is_height_queued(100));
     }
 
     #[test]
