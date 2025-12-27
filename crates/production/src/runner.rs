@@ -16,6 +16,7 @@ use hyperscale_bft::BftConfig;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_types::BlockHeight;
+use quick_cache::sync::Cache as QuickCache;
 
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine};
 use hyperscale_node::NodeStateMachine;
@@ -704,6 +705,7 @@ impl ProductionRunnerBuilder {
             action_dispatcher,
             rpc_submitted_txs: std::collections::HashMap::new(),
             pending_gossip_cert_verifications: std::collections::HashMap::new(),
+            recently_built_certs: QuickCache::new(10_000),
             pending_gossiped_cert_batch: PendingGossipedCertBatch::default(),
             gossiped_cert_batch_deadline: None,
         })
@@ -842,6 +844,11 @@ pub struct ProductionRunner {
     /// persisted and GossipedCertificateVerified event sent to state machine.
     pending_gossip_cert_verifications:
         std::collections::HashMap<Hash, PendingGossipCertVerification>,
+    /// LRU cache of recently locally-built certificate hashes.
+    /// Used to skip verification of gossiped certificates we already built ourselves.
+    /// Capacity of 10,000 is sufficient - certificates older than this will have
+    /// long since been included in blocks.
+    recently_built_certs: QuickCache<Hash, ()>,
     /// Pending gossiped certificates accumulated for batch signature verification.
     /// Uses a 15ms batching window with backpressure to prevent crypto pool saturation.
     pending_gossiped_cert_batch: PendingGossipedCertBatch,
@@ -1323,7 +1330,13 @@ impl ProductionRunner {
                             if let Event::TransactionCertificateReceived { certificate } = &event {
                                 let tx_hash = certificate.transaction_hash;
 
-                                // Skip if already verified or in storage
+                                // Skip if we built this certificate locally (O(1) memory check).
+                                // This is the fast path - avoids storage I/O and verification work.
+                                if self.recently_built_certs.get(&tx_hash).is_some() {
+                                    continue;
+                                }
+
+                                // Skip if already in verification pipeline or storage
                                 if self.pending_gossip_cert_verifications.contains_key(&tx_hash) {
                                     continue;
                                 }
@@ -2661,14 +2674,24 @@ impl ProductionRunner {
                     storage.commit_certificate_with_writes(&cert_for_persist, &writes);
                 });
 
-                // After persisting, gossip certificate to same-shard peers.
-                // This ensures other validators have the certificate before the proposer
-                // includes it in a block, avoiding fetch delays that can cause backpressure.
-                let gossip = hyperscale_messages::TransactionCertificateGossip::new(certificate);
-                let _ = self.dispatch_tx.send(DispatchableAction::BroadcastToShard {
-                    shard: local_shard,
-                    message: OutboundMessage::TransactionCertificateGossip(gossip),
-                });
+                // Track locally-built certificates to skip redundant gossip verification.
+                // This prevents wasted work when we receive a gossiped copy of a cert
+                // we already built ourselves.
+                self.recently_built_certs
+                    .insert(certificate.transaction_hash, ());
+
+                // Only gossip cross-shard certificates where it provides more value.
+                // Single-shard: all validators start at same time, gossip is mostly redundant.
+                // Cross-shard: validators receive provisions at different times, gossip helps
+                // slower validators skip redundant certificate building.
+                if certificate.shard_proofs.len() > 1 {
+                    let gossip =
+                        hyperscale_messages::TransactionCertificateGossip::new(certificate);
+                    let _ = self.dispatch_tx.send(DispatchableAction::BroadcastToShard {
+                        shard: local_shard,
+                        message: OutboundMessage::TransactionCertificateGossip(gossip),
+                    });
+                }
             }
 
             Action::PersistAndBroadcastVote {
