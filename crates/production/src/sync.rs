@@ -39,6 +39,9 @@ pub enum SyncFetchResult {
         height: u64,
         peer: PeerId,
         error: String,
+        /// True if the failure was due to network backpressure.
+        /// When true, the manager should apply a global cooldown before retrying ANY peer.
+        is_backpressure: bool,
     },
 }
 
@@ -324,6 +327,9 @@ pub struct SyncManager {
     /// Pending backfills - blocks where we have metadata but are fetching txs/certs.
     /// Maps height -> pending backfill state.
     pending_backfills: HashMap<u64, PendingBackfill>,
+    /// Global backpressure cooldown - don't spawn any fetches until this time.
+    /// Set when we receive a Backpressure error from the network adapter.
+    backpressure_until: Option<Instant>,
 }
 
 impl SyncManager {
@@ -359,6 +365,7 @@ impl SyncManager {
             fetch_result_rx,
             fetch_result_tx,
             pending_backfills: HashMap::new(),
+            backpressure_until: None,
         }
     }
 
@@ -614,6 +621,16 @@ impl SyncManager {
     /// Called both from start_sync() for immediate spawning and from tick()
     /// for ongoing progress after retries or when slots free up.
     fn spawn_pending_fetches(&mut self) {
+        // Check global backpressure cooldown
+        if let Some(until) = self.backpressure_until {
+            if Instant::now() < until {
+                trace!("Sync fetch paused due to backpressure cooldown");
+                return;
+            }
+            // Cooldown expired, clear it
+            self.backpressure_until = None;
+        }
+
         while self.pending_fetches.len() < self.config.max_concurrent_fetches {
             if let Some(height) = self.pop_next_height() {
                 // Get peers already tried for this height (if any)
@@ -652,7 +669,11 @@ impl SyncManager {
                     height,
                     peer,
                     error,
+                    is_backpressure,
                 } => {
+                    if is_backpressure {
+                        self.on_backpressure();
+                    }
                     self.on_fetch_failed(height, peer, &error);
                 }
             }
@@ -694,11 +715,15 @@ impl SyncManager {
                     peer,
                     response_bytes,
                 },
-                Err(e) => SyncFetchResult::Failed {
-                    height,
-                    peer,
-                    error: format!("network error: {e}"),
-                },
+                Err(ref e) => {
+                    let is_backpressure = matches!(e, crate::network::NetworkError::Backpressure);
+                    SyncFetchResult::Failed {
+                        height,
+                        peer,
+                        error: format!("network error: {e}"),
+                        is_backpressure,
+                    }
+                }
             };
 
             // Send result back - ignore error if receiver dropped
@@ -789,6 +814,22 @@ impl SyncManager {
         // Note: QC signature verification is done by BftState when processing
         // SyncBlockReadyToApply. We just validate basic properties here.
         true
+    }
+
+    /// Handle network backpressure by applying a global cooldown.
+    ///
+    /// When the network adapter reports backpressure (too many pending requests),
+    /// we pause ALL fetch activity for a short period to let the network drain.
+    /// This prevents a tight retry loop that would just generate more backpressure.
+    fn on_backpressure(&mut self) {
+        const BACKPRESSURE_COOLDOWN: Duration = Duration::from_millis(500);
+
+        let until = Instant::now() + BACKPRESSURE_COOLDOWN;
+        info!(
+            cooldown_ms = BACKPRESSURE_COOLDOWN.as_millis(),
+            "Network backpressure detected, pausing sync fetches"
+        );
+        self.backpressure_until = Some(until);
     }
 
     /// Handle a failed fetch (timeout or error).

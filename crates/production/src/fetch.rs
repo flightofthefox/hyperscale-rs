@@ -177,6 +177,8 @@ pub enum FetchResult {
         kind: FetchKind,
         peer: PeerId,
         error: String,
+        /// True if the failure was due to network backpressure.
+        is_backpressure: bool,
     },
 }
 
@@ -350,6 +352,9 @@ pub struct FetchManager {
     result_tx: mpsc::Sender<FetchResult>,
     /// Total in-flight requests (for limiting).
     total_in_flight: usize,
+    /// Global backpressure cooldown - don't spawn any fetches until this time.
+    /// Set when we receive a Backpressure error from the network adapter.
+    backpressure_until: Option<Instant>,
 }
 
 impl FetchManager {
@@ -376,6 +381,7 @@ impl FetchManager {
             result_rx,
             result_tx,
             total_in_flight: 0,
+            backpressure_until: None,
         }
     }
 
@@ -564,7 +570,11 @@ impl FetchManager {
                     kind,
                     peer,
                     error,
+                    is_backpressure,
                 } => {
+                    if is_backpressure {
+                        self.on_backpressure();
+                    }
                     self.handle_fetch_failed(block_hash, kind, peer, &error)
                         .await;
                 }
@@ -767,6 +777,21 @@ impl FetchManager {
         }
     }
 
+    /// Handle network backpressure by applying a global cooldown.
+    ///
+    /// When the network adapter reports backpressure (too many pending requests),
+    /// we pause ALL fetch activity for a short period to let the network drain.
+    fn on_backpressure(&mut self) {
+        const BACKPRESSURE_COOLDOWN: Duration = Duration::from_millis(500);
+
+        let until = Instant::now() + BACKPRESSURE_COOLDOWN;
+        info!(
+            cooldown_ms = BACKPRESSURE_COOLDOWN.as_millis(),
+            "Network backpressure detected, pausing fetches"
+        );
+        self.backpressure_until = Some(until);
+    }
+
     /// Handle a failed fetch request.
     async fn handle_fetch_failed(
         &mut self,
@@ -864,6 +889,16 @@ impl FetchManager {
 
     /// Process the pending queue and spawn new fetch tasks.
     async fn process_pending_queue(&mut self) {
+        // Check global backpressure cooldown
+        if let Some(until) = self.backpressure_until {
+            if Instant::now() < until {
+                trace!("Fetch processing paused due to backpressure cooldown");
+                return;
+            }
+            // Cooldown expired, clear it
+            self.backpressure_until = None;
+        }
+
         // Collect fetch tasks to spawn (to avoid borrow issues)
         let mut to_spawn: Vec<(Hash, FetchKind, PeerId, Vec<Hash>)> = Vec::new();
         let max_hashes = self.config.max_hashes_per_request;
@@ -1132,20 +1167,26 @@ impl FetchManager {
                         kind: FetchKind::Transaction,
                         peer,
                         error: format!("decode error: {:?}", e),
+                        is_backpressure: false,
                     },
                 }
             }
-            Ok(Err(e)) => FetchResult::Failed {
-                block_hash,
-                kind: FetchKind::Transaction,
-                peer,
-                error: format!("network error: {}", e),
-            },
+            Ok(Err(ref e)) => {
+                let is_backpressure = matches!(e, crate::network::NetworkError::Backpressure);
+                FetchResult::Failed {
+                    block_hash,
+                    kind: FetchKind::Transaction,
+                    peer,
+                    error: format!("network error: {}", e),
+                    is_backpressure,
+                }
+            }
             Err(_) => FetchResult::Failed {
                 block_hash,
                 kind: FetchKind::Transaction,
                 peer,
                 error: "timeout".to_string(),
+                is_backpressure: false,
             },
         }
     }
@@ -1182,20 +1223,26 @@ impl FetchManager {
                         kind: FetchKind::Certificate,
                         peer,
                         error: format!("decode error: {:?}", e),
+                        is_backpressure: false,
                     },
                 }
             }
-            Ok(Err(e)) => FetchResult::Failed {
-                block_hash,
-                kind: FetchKind::Certificate,
-                peer,
-                error: format!("network error: {}", e),
-            },
+            Ok(Err(ref e)) => {
+                let is_backpressure = matches!(e, crate::network::NetworkError::Backpressure);
+                FetchResult::Failed {
+                    block_hash,
+                    kind: FetchKind::Certificate,
+                    peer,
+                    error: format!("network error: {}", e),
+                    is_backpressure,
+                }
+            }
             Err(_) => FetchResult::Failed {
                 block_hash,
                 kind: FetchKind::Certificate,
                 peer,
                 error: "timeout".to_string(),
+                is_backpressure: false,
             },
         }
     }

@@ -32,6 +32,7 @@ use std::fmt;
 /// - [`Timeout`](Self::Timeout) - Request timed out
 /// - [`NetworkError`](Self::NetworkError) - Network-level failure
 /// - [`EmptyResponse`](Self::EmptyResponse) - Peer doesn't have the requested block
+/// - [`Backpressure`](Self::Backpressure) - Network adapter is overloaded
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncResponseError {
     // === Non-malicious errors (don't ban, just retry with different peer) ===
@@ -79,6 +80,11 @@ pub enum SyncResponseError {
         /// Height that was requested.
         height: u64,
     },
+
+    /// Network adapter backpressure - too many pending requests.
+    /// This indicates the local network layer is overloaded and callers
+    /// should apply a global cooldown before retrying ANY peer.
+    Backpressure,
 
     // === Malicious errors (ban the peer) ===
     /// QC doesn't match the block it claims to certify.
@@ -162,6 +168,15 @@ impl SyncResponseError {
         matches!(self, Self::EmptyResponse { .. })
     }
 
+    /// Returns true if this is a backpressure error.
+    ///
+    /// Backpressure indicates the local network adapter is overloaded.
+    /// Callers should apply a global cooldown before retrying ANY peer,
+    /// not just the peer that returned this error.
+    pub fn is_backpressure(&self) -> bool {
+        matches!(self, Self::Backpressure)
+    }
+
     /// Returns the metric label for this error type.
     ///
     /// Labels are designed to be low-cardinality for Prometheus metrics.
@@ -174,6 +189,7 @@ impl SyncResponseError {
             Self::Timeout { .. } => "timeout",
             Self::NetworkError { .. } => "network_error",
             Self::EmptyResponse { .. } => "empty_response",
+            Self::Backpressure => "backpressure",
             Self::QcBlockHashMismatch { .. } => "qc_hash_mismatch",
             Self::QcHeightMismatch { .. } => "qc_height_mismatch",
             Self::QcSignatureInvalid { .. } => "qc_sig_invalid",
@@ -211,6 +227,9 @@ impl fmt::Display for SyncResponseError {
             }
             Self::EmptyResponse { height } => {
                 write!(f, "empty sync response for height {}", height)
+            }
+            Self::Backpressure => {
+                write!(f, "network backpressure - too many pending requests")
             }
             Self::QcBlockHashMismatch { height } => {
                 write!(f, "QC block hash mismatch at height {}", height)
@@ -300,11 +319,23 @@ mod tests {
             // EmptyResponse is non-malicious - peer may have pruned the block
             // or be behind in sync themselves
             SyncResponseError::EmptyResponse { height: 1 },
+            // Backpressure is non-malicious - local network overload
+            SyncResponseError::Backpressure,
         ];
 
         for err in non_malicious {
             assert!(!err.is_malicious(), "{} should not be malicious", err);
         }
+    }
+
+    #[test]
+    fn test_backpressure_detection() {
+        assert!(SyncResponseError::Backpressure.is_backpressure());
+        assert!(!SyncResponseError::Timeout { height: 1 }.is_backpressure());
+        assert!(!SyncResponseError::NetworkError {
+            reason: "test".to_string()
+        }
+        .is_backpressure());
     }
 
     #[test]
@@ -325,6 +356,7 @@ mod tests {
                 reason: "test".to_string(),
             },
             SyncResponseError::EmptyResponse { height: 1 },
+            SyncResponseError::Backpressure,
             SyncResponseError::QcBlockHashMismatch { height: 1 },
             SyncResponseError::QcHeightMismatch {
                 block_height: 1,

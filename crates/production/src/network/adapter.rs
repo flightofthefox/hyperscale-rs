@@ -237,6 +237,15 @@ const RESPONSE_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
 /// If a peer doesn't respond within this time, the request is considered failed.
 const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum number of pending outbound requests before applying backpressure.
+/// When exceeded, new requests are rejected with `NetworkError::Backpressure`.
+/// This prevents runaway request accumulation when the network is saturated
+/// (e.g., when libp2p hits max sub-streams and requests fail fast, triggering
+/// rapid retries that accumulate in pending_requests).
+/// Set to ~1000 to allow healthy concurrency while preventing pathological cases
+/// where 5000+ requests accumulate.
+const MAX_PENDING_REQUESTS: usize = 1000;
+
 /// Delay before attempting to reconnect to a disconnected validator.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
@@ -363,6 +372,9 @@ pub enum NetworkError {
 
     #[error("Invalid peer ID")]
     InvalidPeerId,
+
+    #[error("Network backpressure - too many pending requests")]
+    Backpressure,
 }
 
 /// Codec for request-response protocol with length-prefixed messages.
@@ -1742,20 +1754,29 @@ impl Libp2pAdapter {
                 height,
                 response_tx,
             } => {
-                // Encode block request as simple height bytes
-                let data = Bytes::copy_from_slice(&height.to_le_bytes());
-                let req_id = swarm
-                    .behaviour_mut()
-                    .request_response
-                    .send_request(&peer, data);
-                pending_requests.insert(
-                    req_id,
-                    PendingRequest {
-                        response_tx,
-                        created_at: std::time::Instant::now(),
-                    },
-                );
-                debug!("Sent block request to {:?} for height {}", peer, height);
+                // Apply backpressure if too many pending requests
+                if pending_requests.len() >= MAX_PENDING_REQUESTS {
+                    debug!(
+                        pending = pending_requests.len(),
+                        "Backpressure: rejecting block request"
+                    );
+                    let _ = response_tx.send(Err(NetworkError::Backpressure));
+                } else {
+                    // Encode block request as simple height bytes
+                    let data = Bytes::copy_from_slice(&height.to_le_bytes());
+                    let req_id = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_request(&peer, data);
+                    pending_requests.insert(
+                        req_id,
+                        PendingRequest {
+                            response_tx,
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
+                    debug!("Sent block request to {:?} for height {}", peer, height);
+                }
             }
             SwarmCommand::RequestTransactions {
                 peer,
@@ -1763,25 +1784,34 @@ impl Libp2pAdapter {
                 tx_hashes,
                 response_tx,
             } => {
-                // Encode transaction request using SBOR
-                use hyperscale_messages::request::GetTransactionsRequest;
-                let request = GetTransactionsRequest::new(block_hash, tx_hashes);
-                let data = Bytes::from(sbor::basic_encode(&request).unwrap_or_default());
-                let req_id = swarm
-                    .behaviour_mut()
-                    .request_response
-                    .send_request(&peer, data);
-                pending_requests.insert(
-                    req_id,
-                    PendingRequest {
-                        response_tx,
-                        created_at: std::time::Instant::now(),
-                    },
-                );
-                debug!(
-                    "Sent transaction request to {:?} for block {:?}",
-                    peer, block_hash
-                );
+                // Apply backpressure if too many pending requests
+                if pending_requests.len() >= MAX_PENDING_REQUESTS {
+                    debug!(
+                        pending = pending_requests.len(),
+                        "Backpressure: rejecting transaction request"
+                    );
+                    let _ = response_tx.send(Err(NetworkError::Backpressure));
+                } else {
+                    // Encode transaction request using SBOR
+                    use hyperscale_messages::request::GetTransactionsRequest;
+                    let request = GetTransactionsRequest::new(block_hash, tx_hashes);
+                    let data = Bytes::from(sbor::basic_encode(&request).unwrap_or_default());
+                    let req_id = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_request(&peer, data);
+                    pending_requests.insert(
+                        req_id,
+                        PendingRequest {
+                            response_tx,
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
+                    debug!(
+                        "Sent transaction request to {:?} for block {:?}",
+                        peer, block_hash
+                    );
+                }
             }
             SwarmCommand::RequestCertificates {
                 peer,
@@ -1789,25 +1819,34 @@ impl Libp2pAdapter {
                 cert_hashes,
                 response_tx,
             } => {
-                // Encode certificate request using SBOR
-                use hyperscale_messages::request::GetCertificatesRequest;
-                let request = GetCertificatesRequest::new(block_hash, cert_hashes);
-                let data = Bytes::from(sbor::basic_encode(&request).unwrap_or_default());
-                let req_id = swarm
-                    .behaviour_mut()
-                    .request_response
-                    .send_request(&peer, data);
-                pending_requests.insert(
-                    req_id,
-                    PendingRequest {
-                        response_tx,
-                        created_at: std::time::Instant::now(),
-                    },
-                );
-                debug!(
-                    "Sent certificate request to {:?} for block {:?}",
-                    peer, block_hash
-                );
+                // Apply backpressure if too many pending requests
+                if pending_requests.len() >= MAX_PENDING_REQUESTS {
+                    debug!(
+                        pending = pending_requests.len(),
+                        "Backpressure: rejecting certificate request"
+                    );
+                    let _ = response_tx.send(Err(NetworkError::Backpressure));
+                } else {
+                    // Encode certificate request using SBOR
+                    use hyperscale_messages::request::GetCertificatesRequest;
+                    let request = GetCertificatesRequest::new(block_hash, cert_hashes);
+                    let data = Bytes::from(sbor::basic_encode(&request).unwrap_or_default());
+                    let req_id = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_request(&peer, data);
+                    pending_requests.insert(
+                        req_id,
+                        PendingRequest {
+                            response_tx,
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
+                    debug!(
+                        "Sent certificate request to {:?} for block {:?}",
+                        peer, block_hash
+                    );
+                }
             }
             SwarmCommand::SendDirectMessage { peer, data } => {
                 // Send as a request, reusing the existing request-response protocol.
