@@ -638,16 +638,27 @@ impl ProductionRunnerBuilder {
             network.clone(),
         );
 
+        // Create shared certificate cache for fetch handler.
+        // This cache serves two purposes:
+        // 1. Skip verification of gossiped certificates we already built ourselves
+        // 2. Serve fetch requests before async storage write completes (race fix)
+        // The race can occur when: proposer builds cert -> includes in block -> broadcasts
+        // but async storage write hasn't completed when peers try to fetch the cert.
+        let recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>> =
+            Arc::new(QuickCache::new(10_000));
+
         // Spawn dedicated fetch handler task.
         // This handles all inbound fetch requests (transactions/certificates) by
         // reading directly from RocksDB storage. Hot data is served from RocksDB's
-        // block cache for performance.
+        // block cache for performance. Also checks recently_built_certs cache first
+        // to handle the race between cert creation and storage write completion.
         let fetch_handler = spawn_fetch_handler(
             FetchHandlerConfig::default(),
             storage.clone(),
             network.clone(),
             tx_request_rx,
             cert_request_rx,
+            recently_built_certs.clone(),
         );
 
         // Spawn action dispatcher task for fire-and-forget network I/O.
@@ -705,7 +716,7 @@ impl ProductionRunnerBuilder {
             action_dispatcher,
             rpc_submitted_txs: std::collections::HashMap::new(),
             pending_gossip_cert_verifications: std::collections::HashMap::new(),
-            recently_built_certs: QuickCache::new(10_000),
+            recently_built_certs,
             pending_gossiped_cert_batch: PendingGossipedCertBatch::default(),
             gossiped_cert_batch_deadline: None,
         })
@@ -844,11 +855,14 @@ pub struct ProductionRunner {
     /// persisted and GossipedCertificateVerified event sent to state machine.
     pending_gossip_cert_verifications:
         std::collections::HashMap<Hash, PendingGossipCertVerification>,
-    /// LRU cache of recently locally-built certificate hashes.
-    /// Used to skip verification of gossiped certificates we already built ourselves.
+    /// LRU cache of recently locally-built certificates.
+    /// Serves two purposes:
+    /// 1. Skip verification of gossiped certificates we already built ourselves
+    /// 2. Serve fetch requests before async storage write completes (race fix)
+    /// Shared with fetch handler via Arc for serving sync requests.
     /// Capacity of 10,000 is sufficient - certificates older than this will have
     /// long since been included in blocks.
-    recently_built_certs: QuickCache<Hash, ()>,
+    recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
     /// Pending gossiped certificates accumulated for batch signature verification.
     /// Uses a 15ms batching window with backpressure to prevent crypto pool saturation.
     pending_gossiped_cert_batch: PendingGossipedCertBatch,
@@ -2667,18 +2681,23 @@ impl ProductionRunner {
                     .map(|cert| cert.state_writes.clone())
                     .unwrap_or_default();
 
+                // Cache the certificate BEFORE spawning the storage write.
+                // This fixes a race condition where:
+                // 1. We build a cert and include it in a block proposal
+                // 2. Peer receives the block and tries to fetch the cert from us
+                // 3. But our async storage write hasn't completed yet
+                // The fetch handler checks this cache first, so we can serve the cert
+                // even before storage write completes.
+                let tx_hash = certificate.transaction_hash;
+                let cert_arc = Arc::new(certificate.clone());
+                self.recently_built_certs.insert(tx_hash, cert_arc);
+
                 // Run on blocking thread since RocksDB write is sync I/O
                 // RocksDB is internally thread-safe, no lock needed
                 let cert_for_persist = certificate.clone();
                 tokio::task::spawn_blocking(move || {
                     storage.commit_certificate_with_writes(&cert_for_persist, &writes);
                 });
-
-                // Track locally-built certificates to skip redundant gossip verification.
-                // This prevents wasted work when we receive a gossiped copy of a cert
-                // we already built ourselves.
-                self.recently_built_certs
-                    .insert(certificate.transaction_hash, ());
 
                 // Only gossip cross-shard certificates where it provides more value.
                 // Single-shard: all validators start at same time, gossip is mostly redundant.

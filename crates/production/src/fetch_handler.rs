@@ -31,6 +31,8 @@
 use crate::network::{InboundCertificateRequest, InboundTransactionRequest, Libp2pAdapter};
 use crate::storage::RocksDbStorage;
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
+use hyperscale_types::{Hash, TransactionCertificate};
+use quick_cache::sync::Cache as QuickCache;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
@@ -96,9 +98,18 @@ pub fn spawn_fetch_handler(
     network: Arc<Libp2pAdapter>,
     tx_request_rx: mpsc::UnboundedReceiver<InboundTransactionRequest>,
     cert_request_rx: mpsc::UnboundedReceiver<InboundCertificateRequest>,
+    recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
 ) -> FetchHandlerHandle {
     let join_handle = tokio::spawn(async move {
-        run_fetch_handler(config, storage, network, tx_request_rx, cert_request_rx).await;
+        run_fetch_handler(
+            config,
+            storage,
+            network,
+            tx_request_rx,
+            cert_request_rx,
+            recently_built_certs,
+        )
+        .await;
     });
 
     FetchHandlerHandle { join_handle }
@@ -113,8 +124,9 @@ async fn run_fetch_handler(
     network: Arc<Libp2pAdapter>,
     mut tx_request_rx: mpsc::UnboundedReceiver<InboundTransactionRequest>,
     mut cert_request_rx: mpsc::UnboundedReceiver<InboundCertificateRequest>,
+    recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
 ) {
-    tracing::info!("Fetch handler task started (storage-backed)");
+    tracing::info!("Fetch handler task started (storage-backed with cert cache)");
 
     loop {
         tokio::select! {
@@ -122,11 +134,11 @@ async fn run_fetch_handler(
 
             // Handle certificate fetch requests (usually more latency-sensitive)
             Some(request) = cert_request_rx.recv() => {
-                handle_certificate_request(&config, &storage, &network, request);
+                handle_certificate_request(&config, &storage, &network, &recently_built_certs, request);
 
                 // Drain any additional pending requests
                 while let Ok(request) = cert_request_rx.try_recv() {
-                    handle_certificate_request(&config, &storage, &network, request);
+                    handle_certificate_request(&config, &storage, &network, &recently_built_certs, request);
                 }
             }
 
@@ -218,12 +230,14 @@ fn handle_transaction_request(
 
 /// Handle an inbound certificate fetch request.
 ///
-/// Reads requested certificates directly from RocksDB storage.
-/// Hot data is served from RocksDB's block cache for performance.
+/// First checks the recently_built_certs cache (for certs we built but haven't
+/// persisted yet), then falls back to RocksDB storage. This fixes a race condition
+/// where a proposer includes a cert in a block before its async storage write completes.
 fn handle_certificate_request(
     config: &FetchHandlerConfig,
     storage: &RocksDbStorage,
     network: &Arc<Libp2pAdapter>,
+    recently_built_certs: &QuickCache<Hash, Arc<TransactionCertificate>>,
     request: InboundCertificateRequest,
 ) {
     let channel_id = request.channel_id;
@@ -244,14 +258,34 @@ fn handle_certificate_request(
         &request.cert_hashes
     };
 
-    // Read directly from RocksDB storage (block cache handles hot data)
-    let found_certificates = storage.get_certificates_batch(hashes_to_fetch);
+    // First check the in-memory cache for recently built certificates.
+    // This handles the race where we built a cert and included it in a block,
+    // but the async storage write hasn't completed yet.
+    let mut found_certificates = Vec::with_capacity(hashes_to_fetch.len());
+    let mut missing_hashes = Vec::new();
+
+    for hash in hashes_to_fetch {
+        if let Some(cert) = recently_built_certs.get(hash) {
+            found_certificates.push((*cert).clone());
+        } else {
+            missing_hashes.push(*hash);
+        }
+    }
+
+    // Fall back to RocksDB for any not found in cache
+    if !missing_hashes.is_empty() {
+        let from_storage = storage.get_certificates_batch(&missing_hashes);
+        found_certificates.extend(from_storage);
+    }
+
     let found_count = found_certificates.len();
+    let from_cache = hashes_to_fetch.len() - missing_hashes.len();
 
     debug!(
         block_hash = ?request.block_hash,
         requested = requested_count,
         found = found_count,
+        from_cache = from_cache,
         "Responding to certificate fetch request (fetch handler)"
     );
 
