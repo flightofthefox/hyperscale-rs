@@ -14,6 +14,7 @@ use tracing::info;
 /// A funded account that can sign transactions.
 ///
 /// Uses atomic nonce for thread-safe concurrent transaction generation.
+/// The nonce is wrapped in Arc so it can be shared across partitions.
 pub struct FundedAccount {
     /// The keypair for signing transactions.
     pub keypair: KeyPair,
@@ -24,8 +25,8 @@ pub struct FundedAccount {
     /// The shard this account belongs to.
     pub shard: ShardGroupId,
 
-    /// Nonce counter for transaction signing (thread-safe).
-    nonce: AtomicU64,
+    /// Nonce counter for transaction signing (thread-safe, shared across partitions).
+    nonce: std::sync::Arc<AtomicU64>,
 }
 
 impl Clone for FundedAccount {
@@ -34,7 +35,8 @@ impl Clone for FundedAccount {
             keypair: self.keypair.clone(),
             address: self.address,
             shard: self.shard,
-            nonce: AtomicU64::new(self.nonce.load(Ordering::SeqCst)),
+            // Share the same nonce across clones (important for partitioning)
+            nonce: std::sync::Arc::clone(&self.nonce),
         }
     }
 }
@@ -63,7 +65,7 @@ impl FundedAccount {
             keypair,
             address,
             shard,
-            nonce: AtomicU64::new(0),
+            nonce: std::sync::Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -141,6 +143,25 @@ pub struct AccountPool {
 
     /// Usage tracking: total selections per account index per shard.
     usage_counts: HashMap<ShardGroupId, Vec<std::sync::atomic::AtomicU64>>,
+}
+
+/// A partition of accounts for a single worker thread.
+///
+/// Each partition contains a disjoint subset of accounts from the main pool.
+/// This allows lock-free access during spamming since each worker exclusively
+/// owns its accounts.
+pub struct AccountPartition {
+    /// Accounts grouped by shard (owned, not shared).
+    by_shard: HashMap<ShardGroupId, Vec<FundedAccount>>,
+
+    /// Number of shards.
+    num_shards: u64,
+
+    /// Round-robin counter for same-shard pair selection.
+    round_robin_counter: usize,
+
+    /// Round-robin counter for cross-shard selection.
+    cross_shard_counter: usize,
 }
 
 impl AccountPool {
@@ -493,6 +514,41 @@ impl AccountPool {
         self.by_shard.get(&shard).map(|v| v.as_slice())
     }
 
+    /// Partition the account pool into multiple disjoint partitions.
+    ///
+    /// Each partition gets an exclusive subset of accounts, enabling lock-free
+    /// parallel spamming. Accounts are distributed round-robin across partitions
+    /// to ensure even distribution.
+    ///
+    /// # Arguments
+    /// * `num_partitions` - Number of partitions to create (typically = num workers)
+    ///
+    /// # Returns
+    /// A vector of `AccountPartition`, each containing a disjoint subset of accounts.
+    /// If there are fewer accounts than partitions, some partitions may be empty.
+    pub fn partition(&self, num_partitions: usize) -> Vec<AccountPartition> {
+        let num_partitions = num_partitions.max(1);
+
+        // Initialize empty partitions
+        let mut partitions: Vec<AccountPartition> = (0..num_partitions)
+            .map(|_| AccountPartition::new(self.num_shards))
+            .collect();
+
+        // Distribute accounts round-robin across partitions
+        for (&shard, accounts) in &self.by_shard {
+            for (i, account) in accounts.iter().enumerate() {
+                let partition_idx = i % num_partitions;
+                partitions[partition_idx]
+                    .by_shard
+                    .entry(shard)
+                    .or_default()
+                    .push(account.clone());
+            }
+        }
+
+        partitions
+    }
+
     /// Get usage statistics for analysis.
     pub fn usage_stats(&self) -> AccountUsageStats {
         use std::sync::atomic::Ordering;
@@ -643,6 +699,161 @@ impl AccountPool {
     /// Save nonces to the default file path.
     pub fn save_nonces_default(&self) -> Result<usize, AccountPoolError> {
         self.save_nonces(std::path::Path::new(DEFAULT_NONCE_FILE))
+    }
+}
+
+impl AccountPartition {
+    /// Create an empty partition.
+    fn new(num_shards: u64) -> Self {
+        Self {
+            by_shard: HashMap::new(),
+            num_shards,
+            round_robin_counter: 0,
+            cross_shard_counter: 0,
+        }
+    }
+
+    /// Get the number of shards.
+    pub fn num_shards(&self) -> u64 {
+        self.num_shards
+    }
+
+    /// Get total number of accounts in this partition.
+    pub fn total_accounts(&self) -> usize {
+        self.by_shard.values().map(|v| v.len()).sum()
+    }
+
+    /// Get number of accounts on a specific shard.
+    pub fn accounts_on_shard(&self, shard: ShardGroupId) -> usize {
+        self.by_shard.get(&shard).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Get accounts for a specific shard.
+    pub fn accounts_for_shard(&self, shard: ShardGroupId) -> Option<&[FundedAccount]> {
+        self.by_shard.get(&shard).map(|v| v.as_slice())
+    }
+
+    /// Get a pair of accounts on the same shard (mutable for counter updates).
+    ///
+    /// Uses round-robin selection for NoContention mode to ensure no account reuse.
+    pub fn pair_for_shard(
+        &mut self,
+        shard: ShardGroupId,
+        rng: &mut impl rand::Rng,
+        mode: SelectionMode,
+    ) -> Option<(&FundedAccount, &FundedAccount)> {
+        let accounts = self.by_shard.get(&shard)?;
+        let num_accounts = accounts.len();
+
+        if num_accounts < 2 {
+            return None;
+        }
+
+        let (idx1, idx2) = match mode {
+            SelectionMode::NoContention | SelectionMode::RoundRobin => {
+                // Use local counter - no atomics needed since we own this partition
+                let c = self.round_robin_counter;
+                self.round_robin_counter = c.wrapping_add(1);
+                let pair_base = (c * 2) % num_accounts;
+                (pair_base, (pair_base + 1) % num_accounts)
+            }
+            SelectionMode::Random => {
+                let idx1 = rng.gen_range(0..num_accounts);
+                let mut idx2 = rng.gen_range(0..num_accounts);
+                while idx2 == idx1 {
+                    idx2 = rng.gen_range(0..num_accounts);
+                }
+                (idx1, idx2)
+            }
+            SelectionMode::Zipf { exponent } => {
+                let idx1 = Self::zipf_index(num_accounts, exponent, rng);
+                let mut idx2 = Self::zipf_index(num_accounts, exponent, rng);
+                while idx2 == idx1 {
+                    idx2 = Self::zipf_index(num_accounts, exponent, rng);
+                }
+                (idx1, idx2)
+            }
+        };
+
+        Some((&accounts[idx1], &accounts[idx2]))
+    }
+
+    /// Get a cross-shard pair of accounts.
+    pub fn cross_shard_pair(
+        &mut self,
+        rng: &mut impl rand::Rng,
+        mode: SelectionMode,
+    ) -> Option<(&FundedAccount, &FundedAccount)> {
+        if self.num_shards < 2 {
+            return None;
+        }
+
+        let shard1 = ShardGroupId(rng.gen_range(0..self.num_shards));
+        let mut shard2 = ShardGroupId(rng.gen_range(0..self.num_shards));
+        while shard2 == shard1 {
+            shard2 = ShardGroupId(rng.gen_range(0..self.num_shards));
+        }
+
+        self.cross_shard_pair_for(shard1, shard2, rng, mode)
+    }
+
+    /// Get a cross-shard pair for specific shards.
+    pub fn cross_shard_pair_for(
+        &mut self,
+        from_shard: ShardGroupId,
+        to_shard: ShardGroupId,
+        rng: &mut impl rand::Rng,
+        mode: SelectionMode,
+    ) -> Option<(&FundedAccount, &FundedAccount)> {
+        let accounts1 = self.by_shard.get(&from_shard)?;
+        let accounts2 = self.by_shard.get(&to_shard)?;
+
+        let num_accounts1 = accounts1.len();
+        let num_accounts2 = accounts2.len();
+
+        if num_accounts1 == 0 || num_accounts2 == 0 {
+            return None;
+        }
+
+        let (idx1, idx2) = match mode {
+            SelectionMode::NoContention => {
+                let c = self.cross_shard_counter;
+                self.cross_shard_counter = c.wrapping_add(1);
+                (c % num_accounts1, c % num_accounts2)
+            }
+            SelectionMode::RoundRobin => {
+                let c = self.cross_shard_counter;
+                self.cross_shard_counter = c.wrapping_add(1);
+                (c % num_accounts1, c % num_accounts2)
+            }
+            SelectionMode::Random => (
+                rng.gen_range(0..num_accounts1),
+                rng.gen_range(0..num_accounts2),
+            ),
+            SelectionMode::Zipf { exponent } => (
+                Self::zipf_index(num_accounts1, exponent, rng),
+                Self::zipf_index(num_accounts2, exponent, rng),
+            ),
+        };
+
+        // Need to re-borrow because we need both slices
+        let accounts1 = self.by_shard.get(&from_shard)?;
+        let accounts2 = self.by_shard.get(&to_shard)?;
+
+        Some((&accounts1[idx1], &accounts2[idx2]))
+    }
+
+    /// Generate a Zipf-distributed index.
+    fn zipf_index(n: usize, exponent: f64, rng: &mut impl rand::Rng) -> usize {
+        let exp = exponent.max(1.0);
+        let u: f64 = rng.gen();
+        let idx = ((n as f64).powf(1.0 - u)).powf(1.0 / exp) as usize;
+        idx.min(n - 1)
+    }
+
+    /// Get all shards that have accounts in this partition.
+    pub fn shards(&self) -> impl Iterator<Item = ShardGroupId> + '_ {
+        self.by_shard.keys().copied()
     }
 }
 
@@ -833,5 +1044,114 @@ mod tests {
                 to_idx
             );
         }
+    }
+
+    #[test]
+    fn test_partition_distribution() {
+        // Test that partitioning distributes accounts evenly
+        let pool = AccountPool::generate(2, 100).unwrap();
+        let partitions = pool.partition(4);
+
+        assert_eq!(partitions.len(), 4);
+
+        // Each partition should have ~25 accounts per shard (100/4)
+        for partition in &partitions {
+            // Should have both shards
+            assert!(partition.accounts_on_shard(ShardGroupId(0)) > 0);
+            assert!(partition.accounts_on_shard(ShardGroupId(1)) > 0);
+
+            // Should have roughly equal distribution (within 1 due to rounding)
+            let shard0_count = partition.accounts_on_shard(ShardGroupId(0));
+            let shard1_count = partition.accounts_on_shard(ShardGroupId(1));
+            assert!(
+                (24..=26).contains(&shard0_count),
+                "Expected ~25 accounts, got {} for shard 0",
+                shard0_count
+            );
+            assert!(
+                (24..=26).contains(&shard1_count),
+                "Expected ~25 accounts, got {} for shard 1",
+                shard1_count
+            );
+        }
+
+        // Total accounts across all partitions should equal original
+        let total: usize = partitions.iter().map(|p| p.total_accounts()).sum();
+        assert_eq!(total, pool.total_accounts());
+    }
+
+    #[test]
+    fn test_partition_disjoint() {
+        // Test that partitions have disjoint account sets
+        let pool = AccountPool::generate(2, 20).unwrap();
+        let partitions = pool.partition(4);
+
+        let mut all_addresses: std::collections::HashSet<_> = std::collections::HashSet::new();
+
+        for partition in &partitions {
+            for shard_id in 0..2 {
+                if let Some(accounts) = partition.accounts_for_shard(ShardGroupId(shard_id)) {
+                    for account in accounts {
+                        assert!(
+                            all_addresses.insert(account.address),
+                            "Account {:?} appears in multiple partitions!",
+                            account.address
+                        );
+                    }
+                }
+            }
+        }
+
+        assert_eq!(all_addresses.len(), pool.total_accounts());
+    }
+
+    #[test]
+    fn test_partition_pair_selection() {
+        // Test that partition pair selection works correctly
+        let pool = AccountPool::generate(2, 20).unwrap();
+        let mut partitions = pool.partition(2);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Each partition should be able to generate pairs
+        for partition in &mut partitions {
+            let pair =
+                partition.pair_for_shard(ShardGroupId(0), &mut rng, SelectionMode::NoContention);
+            assert!(
+                pair.is_some(),
+                "Should be able to get a pair from partition"
+            );
+
+            let (from, to) = pair.unwrap();
+            assert_eq!(from.shard, to.shard);
+            assert_ne!(from.address, to.address);
+        }
+    }
+
+    #[test]
+    fn test_partition_shares_nonces() {
+        // Test that partitions share nonces with the original pool
+        // This is critical for saving nonces after multi-threaded spamming
+        let pool = AccountPool::generate(1, 10).unwrap();
+        let partitions = pool.partition(2);
+
+        // Get an account from partition 0 and increment its nonce
+        let partition0_accounts = partitions[0].accounts_for_shard(ShardGroupId(0)).unwrap();
+        let account_in_partition = &partition0_accounts[0];
+        let address = account_in_partition.address;
+
+        // Increment nonce via the partition's account
+        let nonce1 = account_in_partition.next_nonce();
+        assert_eq!(nonce1, 0);
+        let nonce2 = account_in_partition.next_nonce();
+        assert_eq!(nonce2, 1);
+
+        // The original pool should see the updated nonce
+        let pool_accounts = pool.accounts_for_shard(ShardGroupId(0)).unwrap();
+        let original_account = pool_accounts.iter().find(|a| a.address == address).unwrap();
+        assert_eq!(
+            original_account.current_nonce(),
+            2,
+            "Original pool should see nonce updates from partition"
+        );
     }
 }

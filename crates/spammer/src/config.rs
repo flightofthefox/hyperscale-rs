@@ -54,6 +54,10 @@ pub struct SpammerConfig {
 
     /// Timeout for waiting for in-flight transactions to complete after spammer stops.
     pub latency_finalization_timeout: Duration,
+
+    /// Number of worker threads for parallel submission.
+    /// Each worker gets its own partition of accounts.
+    pub num_workers: usize,
 }
 
 impl Default for SpammerConfig {
@@ -77,6 +81,7 @@ impl Default for SpammerConfig {
             latency_sample_rate: 0.01,
             latency_poll_interval: Duration::from_millis(100),
             latency_finalization_timeout: Duration::from_secs(30),
+            num_workers: 1,
         }
     }
 }
@@ -165,6 +170,12 @@ impl SpammerConfig {
     /// Set the finalization timeout for latency tracking.
     pub fn with_latency_finalization_timeout(mut self, timeout: Duration) -> Self {
         self.latency_finalization_timeout = timeout;
+        self
+    }
+
+    /// Set the number of worker threads for parallel submission.
+    pub fn with_num_workers(mut self, num_workers: usize) -> Self {
+        self.num_workers = num_workers.max(1);
         self
     }
 

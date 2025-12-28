@@ -20,7 +20,8 @@ pub mod runner;
 pub mod workloads;
 
 pub use accounts::{
-    AccountPool, AccountPoolError, AccountUsageStats, FundedAccount, SelectionMode,
+    AccountPartition, AccountPool, AccountPoolError, AccountUsageStats, FundedAccount,
+    SelectionMode,
 };
 pub use client::RpcClient;
 pub use config::SpammerConfig;

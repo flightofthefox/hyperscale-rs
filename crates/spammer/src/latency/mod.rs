@@ -237,6 +237,22 @@ impl LatencyTracker {
     pub fn in_flight_count(&self) -> usize {
         self.in_flight.len()
     }
+
+    /// Create a lightweight clone that shares the same backing data structures.
+    ///
+    /// This is useful for multi-threaded spamming where each worker needs to
+    /// track latency but all data should be aggregated in one place.
+    /// The clone does NOT own the polling task or clients - only the main tracker does.
+    pub fn clone_tracker(&self) -> Self {
+        Self {
+            in_flight: Arc::clone(&self.in_flight),
+            histogram: Arc::clone(&self.histogram),
+            stats: Arc::clone(&self.stats),
+            poll_interval: self.poll_interval,
+            clients: Vec::new(), // Workers don't need clients - they just track
+            poll_handle: None,   // Workers don't own the polling task
+        }
+    }
 }
 
 impl Clone for RpcClient {

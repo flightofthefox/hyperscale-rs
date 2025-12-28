@@ -120,6 +120,13 @@ enum Commands {
         /// Only used if --measure-latency is set.
         #[arg(long, default_value = "30s")]
         latency_timeout: humantime::Duration,
+
+        /// Number of worker threads for parallel transaction submission.
+        ///
+        /// Each worker gets an exclusive partition of accounts (no locks needed).
+        /// Use more workers to achieve higher TPS. Default is number of CPU cores.
+        #[arg(long, short = 'w')]
+        workers: Option<usize>,
     },
 
     /// Submit a single transaction and wait for it to complete (smoke test)
@@ -214,6 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             latency_sample_rate,
             latency_poll_interval,
             latency_timeout,
+            workers,
         } => {
             // Initialize tracing for the run command
             tracing_subscriber::fmt::init();
@@ -223,6 +231,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Clamp batch size to target TPS to avoid sending more txns than intended
             let effective_batch_size = batch_size.min(tps as usize).max(1);
 
+            // Default to 1 worker if not specified (use --workers to enable multi-threading)
+            let num_workers = workers.unwrap_or(1);
+
             let mut config = SpammerConfig::new(endpoints)
                 .with_num_shards(num_shards)
                 .with_validators_per_shard(validators_per_shard)
@@ -231,7 +242,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_accounts_per_shard(accounts_per_shard)
                 .with_selection_mode(selection_mode)
                 .with_batch_size(effective_batch_size)
-                .with_network(NetworkDefinition::simulator());
+                .with_network(NetworkDefinition::simulator())
+                .with_num_workers(num_workers);
 
             if measure_latency {
                 config = config
