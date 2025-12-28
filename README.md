@@ -23,13 +23,15 @@ Rust implementation of Hyperscale consensus protocol.
 | `hyperscale-execution` | Transaction execution with cross-shard 2PC coordination |
 | `hyperscale-mempool` | Transaction pool management |
 | `hyperscale-livelock` | Cross-shard deadlock detection and prevention |
-| `hyperscale-sync` | Block synchronization for nodes catching up |
 | `hyperscale-node` | Composes all sub-state machines into the main `NodeStateMachine` |
+| `hyperscale-provisions` | Centralized provision coordination for cross-shard transactions |
 | `hyperscale-engine` | Radix Engine integration for smart contract execution |
 | `hyperscale-simulation` | Deterministic simulator with configurable network conditions |
 | `hyperscale-simulator` | CLI tool for running simulations with metrics |
 | `hyperscale-production` | Production runner: libp2p networking, RocksDB storage, thread pools |
 | `hyperscale-spammer` | Transaction spammer CLI and library for load testing |
+| `hyperscale-parallel` | Parallel (non-deterministic) simulation for multi-core performance testing |
+| `hyperscale-test-helpers` | Test helpers providing properly-signed fixtures for crypto testing |
 
 ## Installation
 
