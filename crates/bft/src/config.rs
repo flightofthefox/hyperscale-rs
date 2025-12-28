@@ -49,13 +49,6 @@ pub struct BftConfig {
     /// - Checks sync health and triggers catch-up sync if needed
     pub cleanup_interval: Duration,
 
-    /// Maximum gap between QC height and committed height before applying back pressure.
-    ///
-    /// When the pipeline gets too deep (QC height far ahead of committed height),
-    /// we skip proposals to let commits catch up. This prevents runaway pipelining
-    /// that can cause slower validators to fall behind and eventually lose quorum.
-    pub pipeline_backpressure_limit: u64,
-
     /// Minimum time between block proposals (rate limiting).
     ///
     /// Even when a QC forms immediately, we wait at least this long since the last
@@ -82,7 +75,6 @@ impl Default for BftConfig {
             certificate_fetch_timeout: Duration::from_millis(500),
             stale_pending_block_timeout: Duration::from_secs(30),
             cleanup_interval: Duration::from_secs(1),
-            pipeline_backpressure_limit: 12,
             min_block_interval: Duration::from_millis(150),
         }
     }
