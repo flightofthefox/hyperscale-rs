@@ -4,7 +4,6 @@
 //! prevents bidirectional livelock in cross-shard transactions.
 
 use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker, RemoteStateNeeds};
-use hyperscale_core::{Action, Event, SubStateMachine};
 use hyperscale_types::{
     BlockHeight, CommitmentProof, CycleProof, DeferReason, Hash, NodeId, RoutableTransaction,
     ShardGroupId, Topology, TransactionDefer,
@@ -116,6 +115,11 @@ impl LivelockState {
             now: Duration::ZERO,
             config,
         }
+    }
+
+    /// Set the current time.
+    pub fn set_time(&mut self, now: Duration) {
+        self.now = now;
     }
 
     /// Called when a cross-shard transaction is committed.
@@ -469,37 +473,6 @@ pub struct LivelockStats {
     pub active_tombstones: usize,
     /// Number of transactions being tracked for cycle detection.
     pub tracked_transactions: usize,
-}
-
-impl SubStateMachine for LivelockState {
-    fn try_handle(&mut self, event: &Event) -> Option<Vec<Action>> {
-        match event {
-            // ProvisionQuorumReached is the ONLY entry point for cycle detection.
-            // This ensures Byzantine safety - only verified, quorum-reaching provisions
-            // can trigger deferrals.
-            Event::ProvisionQuorumReached {
-                tx_hash,
-                source_shard,
-                commitment_proof,
-            } => {
-                self.on_provision_quorum_reached(*tx_hash, *source_shard, commitment_proof);
-                Some(vec![])
-            }
-            Event::BlockCommitted { block, .. } => {
-                self.on_block_committed(block);
-                Some(vec![])
-            }
-            Event::CleanupTimer => {
-                self.cleanup();
-                Some(vec![])
-            }
-            _ => None,
-        }
-    }
-
-    fn set_time(&mut self, now: Duration) {
-        self.now = now;
-    }
 }
 
 #[cfg(test)]

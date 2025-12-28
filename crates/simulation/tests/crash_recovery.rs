@@ -11,7 +11,6 @@ use std::collections::HashMap;
 #[test]
 fn test_recovered_votes_prevent_equivocation() {
     use hyperscale_bft::{BftConfig, BftState};
-    use hyperscale_core::SubStateMachine;
     use hyperscale_types::{
         BlockHeader, BlockHeight, KeyPair, QuorumCertificate, Signature, SignerBitfield,
         StaticTopology, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,

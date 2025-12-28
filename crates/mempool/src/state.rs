@@ -1,6 +1,6 @@
 //! Mempool state.
 
-use hyperscale_core::{Action, Event, OutboundMessage, SubStateMachine, TransactionStatus};
+use hyperscale_core::{Action, OutboundMessage, TransactionStatus};
 use hyperscale_types::{
     AbortReason, Block, BlockHeight, DeferReason, Hash, NodeId, ReadyTransactions,
     RoutableTransaction, Topology, TransactionAbort, TransactionDecision,
@@ -280,6 +280,11 @@ impl MempoolState {
             current_height: BlockHeight(0),
             config,
         }
+    }
+
+    /// Set the current time.
+    pub fn set_time(&mut self, now: Duration) {
+        self.now = now;
     }
 
     /// Handle transaction submission from client.
@@ -1888,33 +1893,6 @@ impl MempoolState {
     /// Get the number of tombstones currently tracked.
     pub fn tombstone_count(&self) -> usize {
         self.tombstones.len()
-    }
-}
-
-impl SubStateMachine for MempoolState {
-    fn try_handle(&mut self, event: &Event) -> Option<Vec<Action>> {
-        match event {
-            Event::SubmitTransaction { tx } => Some(self.on_submit_transaction_arc(Arc::clone(tx))),
-            Event::TransactionGossipReceived { tx } => {
-                Some(self.on_transaction_gossip_arc(Arc::clone(tx)))
-            }
-            Event::BlockCommitted { block, .. } => {
-                // Process block fully including deferrals, certificates, and aborts
-                Some(self.on_block_committed_full(block))
-            }
-            Event::TransactionExecuted { tx_hash, accepted } => {
-                Some(self.on_transaction_executed(*tx_hash, *accepted))
-            }
-            // Handle status update events from execution
-            Event::TransactionStatusChanged { tx_hash, status } => {
-                Some(self.update_status(tx_hash, status.clone()))
-            }
-            _ => None,
-        }
-    }
-
-    fn set_time(&mut self, now: Duration) {
-        self.now = now;
     }
 }
 

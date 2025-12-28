@@ -16,7 +16,7 @@
 //! This avoids wasting CPU on provisions we'll never use (e.g., if we only
 //! receive 2 of 3 needed provisions, we don't verify any).
 
-use hyperscale_core::{Action, Event, SubStateMachine};
+use hyperscale_core::{Action, Event};
 use hyperscale_types::{
     BlockHeight, CommitmentProof, Hash, NodeId, PublicKey, ShardGroupId, Signature, SignerBitfield,
     StateEntry, StateProvision, Topology, ValidatorId,
@@ -151,6 +151,11 @@ impl ProvisionCoordinator {
             txs_by_source_shard: HashMap::new(),
             now: Duration::ZERO,
         }
+    }
+
+    /// Set the current time.
+    pub fn set_time(&mut self, now: Duration) {
+        self.now = now;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -757,68 +762,6 @@ impl ProvisionCoordinator {
         // Remove quorum tracking
         self.shards_with_quorum.remove(tx_hash);
         self.quorum_reached.remove(tx_hash);
-    }
-}
-
-impl SubStateMachine for ProvisionCoordinator {
-    fn try_handle(&mut self, event: &Event) -> Option<Vec<Action>> {
-        match event {
-            // ═══════════════════════════════════════════════════════════
-            // Provision Lifecycle
-            // ═══════════════════════════════════════════════════════════
-            Event::StateProvisionReceived { provision } => {
-                Some(self.on_provision_received(provision.clone()))
-            }
-
-            // Callback from batch verification + aggregation
-            Event::ProvisionsVerifiedAndAggregated {
-                tx_hash,
-                source_shard,
-                verified_provisions,
-                commitment_proof,
-            } => Some(self.on_provisions_verified_and_aggregated(
-                *tx_hash,
-                *source_shard,
-                verified_provisions.clone(),
-                commitment_proof.clone(),
-            )),
-
-            // ═══════════════════════════════════════════════════════════
-            // Transaction Registration (from ExecutionState)
-            // ═══════════════════════════════════════════════════════════
-            Event::CrossShardTxRegistered {
-                tx_hash,
-                required_shards,
-                quorum_thresholds,
-                committed_height,
-            } => {
-                let registration = TxRegistration {
-                    required_shards: required_shards.clone(),
-                    quorum_thresholds: quorum_thresholds.clone(),
-                    registered_at: *committed_height,
-                    nodes_by_shard: HashMap::new(), // Populated later if needed
-                };
-                Some(self.on_tx_registered(*tx_hash, registration))
-            }
-
-            // ═══════════════════════════════════════════════════════════
-            // Transaction Completion/Abort (cleanup)
-            // ═══════════════════════════════════════════════════════════
-            Event::CrossShardTxCompleted { tx_hash } => Some(self.on_tx_completed(tx_hash)),
-
-            Event::CrossShardTxAborted { tx_hash } => Some(self.on_tx_aborted(tx_hash)),
-
-            // ═══════════════════════════════════════════════════════════
-            // Block Lifecycle (cleanup)
-            // ═══════════════════════════════════════════════════════════
-            Event::BlockCommitted { block, .. } => Some(self.on_block_committed(block)),
-
-            _ => None,
-        }
-    }
-
-    fn set_time(&mut self, now: Duration) {
-        self.now = now;
     }
 }
 

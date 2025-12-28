@@ -29,7 +29,7 @@
 //! Validators collect StateCertificates from all participating shards. When all
 //! certificates are received, an TransactionCertificate is created.
 
-use hyperscale_core::{Action, Event, SubStateMachine};
+use hyperscale_core::{Action, Event};
 use hyperscale_types::{
     BlockHeight, Hash, KeyPair, NodeId, PublicKey, RoutableTransaction, ShardGroupId, Signature,
     StateCertificate, StateEntry, StateProvision, StateVoteBlock, Topology, TransactionCertificate,
@@ -320,6 +320,15 @@ impl ExecutionState {
             speculative_cache_miss_count: 0,
             speculative_invalidated_count: 0,
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Time Management
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Set the current time.
+    pub fn set_time(&mut self, now: Duration) {
+        self.now = now;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1107,7 +1116,7 @@ impl ExecutionState {
         shard = certificate.shard_group_id.0,
         success = certificate.success
     ))]
-    fn on_state_certificate_aggregated(
+    pub fn on_state_certificate_aggregated(
         &mut self,
         tx_hash: Hash,
         certificate: StateCertificate,
@@ -2298,59 +2307,6 @@ impl std::fmt::Debug for ExecutionState {
             .field("vote_trackers", &self.vote_trackers.len())
             .field("certificate_trackers", &self.certificate_trackers.len())
             .finish()
-    }
-}
-
-impl SubStateMachine for ExecutionState {
-    fn try_handle(&mut self, event: &Event) -> Option<Vec<Action>> {
-        match event {
-            Event::BlockCommitted {
-                block_hash,
-                height,
-                block,
-            } => {
-                // Now we have the full block with transactions from all sections
-                let all_txs: Vec<_> = block.all_transactions().cloned().collect();
-                Some(self.on_block_committed(*block_hash, *height, all_txs))
-            }
-            // TransactionsExecuted and CrossShardTransactionsExecuted are no longer used.
-            // Runners now sign votes directly and send StateVoteReceived events.
-            Event::TransactionsExecuted { .. } | Event::CrossShardTransactionsExecuted { .. } => {
-                Some(vec![])
-            }
-            Event::ProvisioningComplete {
-                tx_hash,
-                provisions,
-            } => Some(self.on_provisioning_complete(*tx_hash, provisions.clone())),
-            Event::StateVoteReceived { vote } => Some(self.on_vote(vote.clone())),
-            Event::StateCertificateReceived { cert } => Some(self.on_certificate(cert.clone())),
-            Event::StateEntriesFetched { tx_hash, entries } => {
-                Some(self.on_state_entries_fetched(*tx_hash, entries.clone()))
-            }
-            // Signature verification callbacks
-            Event::StateVotesVerifiedAndAggregated {
-                tx_hash,
-                verified_votes,
-            } => Some(self.on_state_votes_verified(*tx_hash, verified_votes.clone())),
-            Event::StateCertificateSignatureVerified { certificate, valid } => {
-                Some(self.on_certificate_verified(certificate.clone(), *valid))
-            }
-            // Speculative execution callback
-            Event::SpeculativeExecutionComplete {
-                block_hash,
-                tx_hashes,
-            } => Some(self.on_speculative_execution_complete(*block_hash, tx_hashes.clone())),
-            // BLS aggregation callback
-            Event::StateCertificateAggregated {
-                tx_hash,
-                certificate,
-            } => Some(self.on_state_certificate_aggregated(*tx_hash, certificate.clone())),
-            _ => None,
-        }
-    }
-
-    fn set_time(&mut self, now: Duration) {
-        self.now = now;
     }
 }
 

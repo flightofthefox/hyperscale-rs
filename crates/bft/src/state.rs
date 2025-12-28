@@ -3,7 +3,7 @@
 //! This module implements the BFT consensus state machine
 //! as a synchronous, event-driven model.
 
-use hyperscale_core::{Action, Event, OutboundMessage, SubStateMachine, TimerId};
+use hyperscale_core::{Action, Event, OutboundMessage, TimerId};
 
 /// BFT statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
@@ -382,6 +382,15 @@ impl BftState {
     /// Get committee index for a validator.
     fn committee_index(&self, validator_id: ValidatorId) -> Option<usize> {
         self.topology.local_committee_index(validator_id)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Time Management
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Set the current time.
+    pub fn set_time(&mut self, now: Duration) {
+        self.now = now;
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -4255,47 +4264,6 @@ impl BftState {
         let round = self.view;
 
         self.should_propose(next_height, round) && !self.voted_heights.contains_key(&next_height)
-    }
-}
-
-impl SubStateMachine for BftState {
-    fn try_handle(&mut self, event: &Event) -> Option<Vec<Action>> {
-        // Only handle events that BFT can process independently.
-        // Events requiring external data (mempool, execution, etc.) must be
-        // handled by NodeStateMachine which has access to all subsystems.
-        match event {
-            // Self-contained BFT events
-            Event::BlockVoteReceived { vote } => Some(self.on_block_vote(vote.clone())),
-            Event::BlockReadyToCommit { block_hash, qc } => {
-                Some(self.on_block_ready_to_commit(*block_hash, qc.clone()))
-            }
-            Event::QuorumCertificateResult {
-                block_hash,
-                qc,
-                verified_votes,
-            } => Some(self.on_qc_result(*block_hash, qc.clone(), verified_votes.clone())),
-            Event::QcSignatureVerified { block_hash, valid } => {
-                Some(self.on_qc_signature_verified(*block_hash, *valid))
-            }
-            Event::ChainMetadataFetched { height, hash, qc } => {
-                Some(self.on_chain_metadata_fetched(*height, *hash, qc.clone()))
-            }
-            Event::SyncBlockReadyToApply { block, qc } => {
-                Some(self.on_sync_block_ready_to_apply(block.clone(), qc.clone()))
-            }
-            Event::SyncComplete { .. } => Some(self.on_sync_complete()),
-
-            // Events requiring external data - must be handled by NodeStateMachine:
-            // - ProposalTimer: needs mempool transactions, deferrals, certificates
-            // - BlockHeaderReceived: needs mempool for tx lookup, cert store for certs
-            // - QuorumCertificateFormed: needs mempool for immediate proposal
-            // - BlockCommitted: needs to notify execution, mempool, livelock, etc.
-            _ => None,
-        }
-    }
-
-    fn set_time(&mut self, now: Duration) {
-        self.now = now;
     }
 }
 

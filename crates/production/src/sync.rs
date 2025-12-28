@@ -7,8 +7,6 @@
 //! - Timeout handling
 //! - Block validation and ordering
 //! - Delivery to BFT via SyncBlockReadyToApply events
-//!
-//! This is a complete sync solution - no separate SyncState SubStateMachine needed.
 
 use crate::metrics;
 use crate::network::{compute_peer_id_for_validator, Libp2pAdapter};
@@ -289,8 +287,6 @@ pub fn validate_sync_response(
 /// 3. Validating and ordering received blocks
 /// 4. Delivering verified blocks directly to BFT for commitment
 /// 5. Handling metadata-only responses by triggering backfill fetches
-///
-/// This is a complete sync solution - no separate SyncState SubStateMachine needed.
 pub struct SyncManager {
     /// Configuration.
     config: SyncConfig,

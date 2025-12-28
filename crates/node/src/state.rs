@@ -1,7 +1,7 @@
 //! Node state machine.
 
 use hyperscale_bft::{BftConfig, BftState, RecoveredState};
-use hyperscale_core::{Action, Event, StateMachine, SubStateMachine, TimerId};
+use hyperscale_core::{Action, Event, StateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
@@ -455,14 +455,24 @@ impl StateMachine for NodeStateMachine {
                 );
             }
 
-            // Other BFT events don't need mempool context
-            Event::BlockVoteReceived { .. }
-            | Event::BlockReadyToCommit { .. }
-            | Event::QuorumCertificateResult { .. }
-            | Event::QcSignatureVerified { .. } => {
-                if let Some(actions) = self.bft.try_handle(&event) {
-                    return actions;
-                }
+            // Self-contained BFT events - direct delegation
+            Event::BlockVoteReceived { vote } => {
+                return self.bft.on_block_vote(vote.clone());
+            }
+            Event::BlockReadyToCommit { block_hash, qc } => {
+                return self.bft.on_block_ready_to_commit(*block_hash, qc.clone());
+            }
+            Event::QuorumCertificateResult {
+                block_hash,
+                qc,
+                verified_votes,
+            } => {
+                return self
+                    .bft
+                    .on_qc_result(*block_hash, qc.clone(), verified_votes.clone());
+            }
+            Event::QcSignatureVerified { block_hash, valid } => {
+                return self.bft.on_qc_signature_verified(*block_hash, *valid);
             }
 
             // Block committed needs special handling - notify multiple subsystems
@@ -519,25 +529,32 @@ impl StateMachine for NodeStateMachine {
                 // registrations before any subsequent provisions arrive.
                 // This ensures ProvisionQuorumReached can be emitted for livelock.
                 for action in &exec_actions {
-                    if let Action::EnqueueInternal { event: reg_event } = action {
-                        if let Event::CrossShardTxRegistered { .. } = reg_event {
-                            if let Some(reg_actions) = self.provisions.try_handle(reg_event) {
-                                actions.extend(reg_actions);
-                            }
-                        }
+                    if let Action::EnqueueInternal {
+                        event:
+                            Event::CrossShardTxRegistered {
+                                tx_hash,
+                                required_shards,
+                                quorum_thresholds,
+                                committed_height,
+                            },
+                    } = action
+                    {
+                        let registration = hyperscale_provisions::TxRegistration {
+                            required_shards: required_shards.clone(),
+                            quorum_thresholds: quorum_thresholds.clone(),
+                            registered_at: *committed_height,
+                            nodes_by_shard: std::collections::HashMap::new(),
+                        };
+                        actions.extend(self.provisions.on_tx_registered(*tx_hash, registration));
                     }
                 }
                 actions.extend(exec_actions);
 
                 // Also let mempool handle it (marks transactions as committed, processes deferrals/aborts)
-                if let Some(mempool_actions) = self.mempool.try_handle(&event) {
-                    actions.extend(mempool_actions);
-                }
+                actions.extend(self.mempool.on_block_committed_full(block));
 
                 // Let provisions coordinator handle cleanup (certificates, aborts, deferrals)
-                if let Some(provision_actions) = self.provisions.try_handle(&event) {
-                    actions.extend(provision_actions);
-                }
+                actions.extend(self.provisions.on_block_committed(block));
 
                 return actions;
             }
@@ -554,38 +571,55 @@ impl StateMachine for NodeStateMachine {
             // ExecutionState listens to ProvisioningComplete to trigger execution.
             // LivelockState listens to ProvisionQuorumReached for cycle detection.
             // ═══════════════════════════════════════════════════════════════════════
-            Event::StateProvisionReceived { .. } => {
-                // Route ONLY to provision coordinator
-                if let Some(actions) = self.provisions.try_handle(&event) {
-                    return actions;
-                }
+            Event::StateProvisionReceived { provision } => {
+                return self.provisions.on_provision_received(provision.clone());
             }
 
             // ProvisionsVerifiedAndAggregated: callback from batch verification + aggregation
-            Event::ProvisionsVerifiedAndAggregated { tx_hash, .. } => {
+            Event::ProvisionsVerifiedAndAggregated {
+                tx_hash,
+                source_shard,
+                verified_provisions,
+                commitment_proof,
+            } => {
                 // Notify mempool to promote this transaction to priority tier.
                 // This enables cross-shard transactions with verified provisions
                 // to bypass the soft backpressure limit.
                 self.mempool.on_provision_verified(*tx_hash);
 
                 // Route to provision coordinator to handle verified provisions and quorum
-                if let Some(actions) = self.provisions.try_handle(&event) {
-                    return actions;
-                }
+                return self.provisions.on_provisions_verified_and_aggregated(
+                    *tx_hash,
+                    *source_shard,
+                    verified_provisions.clone(),
+                    commitment_proof.clone(),
+                );
             }
 
             // CrossShardTxRegistered: route to coordinator for tracking
-            Event::CrossShardTxRegistered { .. } => {
-                if let Some(actions) = self.provisions.try_handle(&event) {
-                    return actions;
-                }
+            Event::CrossShardTxRegistered {
+                tx_hash,
+                required_shards,
+                quorum_thresholds,
+                committed_height,
+            } => {
+                let registration = hyperscale_provisions::TxRegistration {
+                    required_shards: required_shards.clone(),
+                    quorum_thresholds: quorum_thresholds.clone(),
+                    registered_at: *committed_height,
+                    nodes_by_shard: std::collections::HashMap::new(),
+                };
+                return self.provisions.on_tx_registered(*tx_hash, registration);
             }
 
-            // CrossShardTxCompleted/Aborted: route to coordinator for cleanup
-            Event::CrossShardTxCompleted { .. } | Event::CrossShardTxAborted { .. } => {
-                if let Some(actions) = self.provisions.try_handle(&event) {
-                    return actions;
-                }
+            // CrossShardTxCompleted: route to coordinator for cleanup
+            Event::CrossShardTxCompleted { tx_hash } => {
+                return self.provisions.on_tx_completed(tx_hash);
+            }
+
+            // CrossShardTxAborted: route to coordinator for cleanup
+            Event::CrossShardTxAborted { tx_hash } => {
+                return self.provisions.on_tx_aborted(tx_hash);
             }
 
             // ProvisionQuorumReached: Byzantine-safe cycle detection (per-shard)
@@ -611,25 +645,58 @@ impl StateMachine for NodeStateMachine {
             }
 
             // ProvisioningComplete: All shards have quorum, trigger execution
-            Event::ProvisioningComplete { .. } => {
-                if let Some(actions) = self.execution.try_handle(&event) {
-                    return actions;
-                }
+            Event::ProvisioningComplete {
+                tx_hash,
+                provisions,
+            } => {
+                return self
+                    .execution
+                    .on_provisioning_complete(*tx_hash, provisions.clone());
             }
 
-            // Other execution events
-            Event::TransactionsExecuted { .. }
-            | Event::CrossShardTransactionsExecuted { .. }
-            | Event::StateVoteReceived { .. }
-            | Event::StateCertificateReceived { .. }
-            | Event::MerkleRootComputed { .. }
-            | Event::StateVotesVerifiedAndAggregated { .. }
-            | Event::StateCertificateSignatureVerified { .. }
-            | Event::StateCertificateAggregated { .. }
-            | Event::SpeculativeExecutionComplete { .. } => {
-                if let Some(actions) = self.execution.try_handle(&event) {
-                    return actions;
-                }
+            // Execution events - direct delegation
+            Event::TransactionsExecuted { .. } | Event::CrossShardTransactionsExecuted { .. } => {
+                // These are deprecated - runners now sign votes directly
+                return vec![];
+            }
+            Event::StateVoteReceived { vote } => {
+                return self.execution.on_vote(vote.clone());
+            }
+            Event::StateCertificateReceived { cert } => {
+                return self.execution.on_certificate(cert.clone());
+            }
+            Event::MerkleRootComputed { .. } => {
+                // Not yet implemented
+                return vec![];
+            }
+            Event::StateVotesVerifiedAndAggregated {
+                tx_hash,
+                verified_votes,
+            } => {
+                return self
+                    .execution
+                    .on_state_votes_verified(*tx_hash, verified_votes.clone());
+            }
+            Event::StateCertificateSignatureVerified { certificate, valid } => {
+                return self
+                    .execution
+                    .on_certificate_verified(certificate.clone(), *valid);
+            }
+            Event::StateCertificateAggregated {
+                tx_hash,
+                certificate,
+            } => {
+                return self
+                    .execution
+                    .on_state_certificate_aggregated(*tx_hash, certificate.clone());
+            }
+            Event::SpeculativeExecutionComplete {
+                block_hash,
+                tx_hashes,
+            } => {
+                return self
+                    .execution
+                    .on_speculative_execution_complete(*block_hash, tx_hashes.clone());
             }
 
             // SubmitTransaction: add to local mempool only.
@@ -646,13 +713,9 @@ impl StateMachine for NodeStateMachine {
 
             // TransactionExecuted is emitted by execution, handled by mempool AND BFT
             // BFT might have pending blocks waiting for this certificate
-            Event::TransactionExecuted { tx_hash, .. } => {
-                let mut actions = vec![];
-
+            Event::TransactionExecuted { tx_hash, accepted } => {
                 // Notify mempool
-                if let Some(mempool_actions) = self.mempool.try_handle(&event) {
-                    actions.extend(mempool_actions);
-                }
+                let mut actions = self.mempool.on_transaction_executed(*tx_hash, *accepted);
 
                 // Check if any pending blocks are now complete with this certificate
                 let local_certs = self.execution.finalized_certificates_by_hash();
@@ -687,11 +750,10 @@ impl StateMachine for NodeStateMachine {
             }
 
             // Storage callback events - route to appropriate handler
-            Event::StateEntriesFetched { .. } => {
-                // TODO: Route to execution for provisioning completion
-                if let Some(actions) = self.execution.try_handle(&event) {
-                    return actions;
-                }
+            Event::StateEntriesFetched { tx_hash, entries } => {
+                return self
+                    .execution
+                    .on_state_entries_fetched(*tx_hash, entries.clone());
             }
 
             Event::BlockFetched { .. } => {
@@ -708,21 +770,23 @@ impl StateMachine for NodeStateMachine {
                 tracing::warn!("SyncBlockReceived event reached NodeStateMachine - should be handled by runner");
             }
 
-            Event::SyncBlockReadyToApply { .. }
-            | Event::SyncComplete { .. }
-            | Event::ChainMetadataFetched { .. } => {
-                // Route to BFT - it manages sync state internally
-                if let Some(actions) = self.bft.try_handle(&event) {
-                    return actions;
-                }
+            Event::SyncBlockReadyToApply { block, qc } => {
+                return self
+                    .bft
+                    .on_sync_block_ready_to_apply(block.clone(), qc.clone());
+            }
+            Event::SyncComplete { .. } => {
+                return self.bft.on_sync_complete();
+            }
+            Event::ChainMetadataFetched { height, hash, qc } => {
+                return self
+                    .bft
+                    .on_chain_metadata_fetched(*height, *hash, qc.clone());
             }
 
             // Transaction status changes from execution state machine
-            Event::TransactionStatusChanged { .. } => {
-                // Route to mempool to update status
-                if let Some(actions) = self.mempool.try_handle(&event) {
-                    return actions;
-                }
+            Event::TransactionStatusChanged { tx_hash, status } => {
+                return self.mempool.update_status(tx_hash, status.clone());
             }
 
             // ═══════════════════════════════════════════════════════════════════════

@@ -33,7 +33,7 @@ mod traits;
 pub use action::{Action, CrossShardExecutionRequest, TransactionStatus};
 pub use event::{Event, EventPriority};
 pub use message::OutboundMessage;
-pub use traits::{StateMachine, SubStateMachine};
+pub use traits::StateMachine;
 
 /// Type alias for timer identification.
 ///
