@@ -339,7 +339,7 @@ pub enum TransactionDecision {
 /// Reason a transaction was deferred during cross-shard execution.
 ///
 /// Used in `TransactionDefer` to explain why a transaction was temporarily
-/// blocked and will be retried later.
+/// deferred and will be retried later.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
 pub enum DeferReason {
     /// Transaction was part of a bidirectional cross-shard cycle.
@@ -729,7 +729,7 @@ impl RetryDetails {
 ///
 /// **Cross-Shard with Conflict (Livelock Prevention)**:
 /// ```text
-/// Pending → Committed → [conflict detected] → Blocked(by: winner)
+/// Pending → Committed → [conflict detected] → Deferred(by: winner)
 ///                                                      ↓
 ///                       [winner completes] → Retried(new_tx: retry_hash)
 /// ```
@@ -740,7 +740,7 @@ impl RetryDetails {
 /// - **Committed**: Block containing transaction has been committed; execution is in progress
 /// - **Executed**: Execution complete, certificate created (state NOT yet updated - waiting for block)
 /// - **Completed**: Certificate committed in block, state updated, transaction done
-/// - **Blocked**: Transaction was deferred due to cross-shard conflict, waiting for winner
+/// - **Deferred**: Transaction was deferred due to cross-shard conflict, waiting for winner
 /// - **Retried**: Transaction was superseded by a retry transaction (terminal)
 ///
 /// # Note on Intermediate States
@@ -749,7 +749,7 @@ impl RetryDetails {
 /// executing, collecting votes/certificates), but the mempool only needs to know:
 /// - Is the transaction holding state locks? (Committed, Executed)
 /// - Is it done? (Completed, Retried)
-/// - Is it blocked? (Blocked)
+/// - Is it deferred? (Deferred)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
 pub enum TransactionStatus {
     /// Transaction submitted, waiting to be included in a block.
@@ -759,7 +759,7 @@ pub enum TransactionStatus {
     ///
     /// The transaction is now being executed. This state holds locks on all
     /// declared nodes until execution completes (Executed) or the transaction
-    /// is deferred (Blocked/Retried).
+    /// is deferred (Deferred/Retried).
     ///
     /// For cross-shard transactions, this encompasses:
     /// - State provisioning (collecting state from other shards)
@@ -794,7 +794,7 @@ pub enum TransactionStatus {
     /// The transaction had a lower-hash transaction conflict with it across shards.
     /// It is waiting for the winning transaction to complete before being retried.
     /// This status does NOT hold state locks - locks are released when entering this state.
-    Blocked {
+    Deferred {
         /// Hash of the winning transaction we're waiting for.
         by: Hash,
     },
@@ -846,7 +846,7 @@ impl TransactionStatus {
     ///
     /// State locks are acquired when a transaction is committed in a block and
     /// released when the TransactionCertificate is committed in a block (Completed),
-    /// or when the transaction is deferred (Blocked/Retried).
+    /// or when the transaction is deferred (Deferred/Retried).
     ///
     /// The lock prevents conflicting transactions from being selected for blocks
     /// while this transaction is being executed.
@@ -854,7 +854,7 @@ impl TransactionStatus {
     /// The following statuses do NOT hold locks:
     /// - Pending: not yet committed into a block
     /// - Completed: certificate committed, transaction done
-    /// - Blocked: deferred due to conflict, locks released
+    /// - Deferred: deferred due to conflict, locks released
     /// - Retried: superseded by retry transaction, locks released
     /// - Aborted: transaction aborted, locks released
     pub fn holds_state_lock(&self) -> bool {
@@ -864,15 +864,15 @@ impl TransactionStatus {
         )
     }
 
-    /// Check if this transaction is blocked waiting for another transaction.
-    pub fn is_blocked(&self) -> bool {
-        matches!(self, TransactionStatus::Blocked { .. })
+    /// Check if this transaction is deferred waiting for another transaction.
+    pub fn is_deferred(&self) -> bool {
+        matches!(self, TransactionStatus::Deferred { .. })
     }
 
-    /// Get the hash of the blocking transaction if this transaction is blocked.
-    pub fn blocked_by(&self) -> Option<&Hash> {
+    /// Get the hash of the blocking transaction if this transaction is deferred.
+    pub fn deferred_by(&self) -> Option<&Hash> {
         match self {
-            TransactionStatus::Blocked { by } => Some(by),
+            TransactionStatus::Deferred { by } => Some(by),
             _ => None,
         }
     }
@@ -896,7 +896,7 @@ impl TransactionStatus {
     /// States that cannot be deferred:
     /// - Pre-lock states: Pending (no locks held yet)
     /// - Terminal states: Executed, Completed (too late to defer)
-    /// - Already deferred: Blocked, Retried (already handled)
+    /// - Already deferred: Deferred, Retried (already handled)
     pub fn is_deferrable(&self) -> bool {
         matches!(self, TransactionStatus::Committed(_))
     }
@@ -905,19 +905,19 @@ impl TransactionStatus {
     ///
     /// This is used to detect stale status updates (where we've already progressed
     /// past the incoming status). Note that this doesn't capture all valid transitions
-    /// (e.g., Blocked/Retried can happen from multiple states), but it helps identify
+    /// (e.g., Deferred/Retried can happen from multiple states), but it helps identify
     /// clearly stale updates.
     ///
     /// Ordering: Pending(0) < Committed(1) < Executed(2) < Completed(3)
     ///
-    /// Blocked, Retried, and Aborted are terminal side-branches and get high ordinals (4, 5, 6).
+    /// Deferred, Retried, and Aborted are terminal side-branches and get high ordinals (4, 5, 6).
     pub fn ordinal(&self) -> u8 {
         match self {
             TransactionStatus::Pending => 0,
             TransactionStatus::Committed(_) => 1,
             TransactionStatus::Executed(_) => 2,
             TransactionStatus::Completed(_) => 3,
-            TransactionStatus::Blocked { .. } => 4,
+            TransactionStatus::Deferred { .. } => 4,
             TransactionStatus::Retried { .. } => 5,
             TransactionStatus::Aborted { .. } => 6,
         }
@@ -934,14 +934,14 @@ impl TransactionStatus {
             // Pending → Retried (if a retry arrived before original was committed)
             (Pending, Retried { .. }) => true,
 
-            // Pending → Blocked (cross-shard livelock prevention)
-            (Pending, Blocked { .. }) => true,
+            // Pending → Deferred (cross-shard livelock prevention)
+            (Pending, Deferred { .. }) => true,
 
             // Committed → Executed (execution complete, certificate created)
             (Committed(_), Executed(_)) => true,
 
-            // Committed → Blocked (deferred due to conflict)
-            (Committed(_), Blocked { .. }) => true,
+            // Committed → Deferred (deferred due to conflict)
+            (Committed(_), Deferred { .. }) => true,
 
             // Committed → Retried (superseded by retry from another shard)
             (Committed(_), Retried { .. }) => true,
@@ -955,11 +955,11 @@ impl TransactionStatus {
             // Executed → Aborted (execution rejected or timeout)
             (Executed(_), Aborted { .. }) => true,
 
-            // Blocked → Retried (when winner completes, loser gets a retry)
-            (Blocked { .. }, Retried { .. }) => true,
+            // Deferred → Retried (when winner completes, loser gets a retry)
+            (Deferred { .. }, Retried { .. }) => true,
 
-            // Blocked → Aborted (too many retries)
-            (Blocked { .. }, Aborted { .. }) => true,
+            // Deferred → Aborted (too many retries)
+            (Deferred { .. }, Aborted { .. }) => true,
 
             // No other transitions are valid
             _ => false,
@@ -984,7 +984,7 @@ impl std::fmt::Display for TransactionStatus {
             TransactionStatus::Completed(TransactionDecision::Reject) => {
                 write!(f, "completed(reject)")
             }
-            TransactionStatus::Blocked { by } => write!(f, "blocked({})", by),
+            TransactionStatus::Deferred { by } => write!(f, "deferred({})", by),
             TransactionStatus::Retried { new_tx } => write!(f, "retried({})", new_tx),
             TransactionStatus::Aborted { reason } => write!(f, "aborted({})", reason),
         }
@@ -1033,12 +1033,12 @@ impl std::str::FromStr for TransactionStatus {
                 })?)?;
                 Ok(TransactionStatus::Completed(decision))
             }
-            "blocked" => {
+            "deferred" => {
                 let hash_str = inner
-                    .ok_or_else(|| TransactionStatusParseError::MissingValue("blocked".into()))?;
+                    .ok_or_else(|| TransactionStatusParseError::MissingValue("deferred".into()))?;
                 let hash = Hash::from_hex(hash_str)
                     .map_err(|_| TransactionStatusParseError::InvalidValue("hash".into()))?;
-                Ok(TransactionStatus::Blocked { by: hash })
+                Ok(TransactionStatus::Deferred { by: hash })
             }
             "retried" => {
                 let hash_str = inner

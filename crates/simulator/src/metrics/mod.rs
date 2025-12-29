@@ -45,8 +45,8 @@ pub struct MetricsCollector {
     /// Peak locked nodes observed.
     peak_locked_nodes: u64,
 
-    /// Peak blocked transactions observed.
-    peak_blocked: u64,
+    /// Peak deferred transactions observed.
+    peak_deferred: u64,
 
     /// Peak contention ratio observed.
     peak_contention_ratio: f64,
@@ -71,7 +71,7 @@ impl MetricsCollector {
             last_sample_time: start_time,
             last_sample_completions: 0,
             peak_locked_nodes: 0,
-            peak_blocked: 0,
+            peak_deferred: 0,
             peak_contention_ratio: 0.0,
             in_flight_at_end: 0,
         }
@@ -146,8 +146,8 @@ impl MetricsCollector {
         if lock_stats.locked_nodes > self.peak_locked_nodes {
             self.peak_locked_nodes = lock_stats.locked_nodes;
         }
-        if lock_stats.blocked_count > self.peak_blocked {
-            self.peak_blocked = lock_stats.blocked_count;
+        if lock_stats.deferred_count > self.peak_deferred {
+            self.peak_deferred = lock_stats.deferred_count;
         }
         let contention_ratio = lock_stats.contention_ratio();
         if contention_ratio > self.peak_contention_ratio {
@@ -162,7 +162,7 @@ impl MetricsCollector {
             in_flight,
             instant_tps,
             locked_nodes: lock_stats.locked_nodes,
-            blocked_count: lock_stats.blocked_count,
+            deferred_count: lock_stats.deferred_count,
             contention_ratio,
         });
 
@@ -203,7 +203,7 @@ impl MetricsCollector {
             submission_duration,
             samples: self.samples,
             peak_locked_nodes: self.peak_locked_nodes,
-            peak_blocked: self.peak_blocked,
+            peak_deferred: self.peak_deferred,
             peak_contention_ratio: self.peak_contention_ratio,
         }
     }
@@ -226,9 +226,9 @@ pub struct MetricsSample {
     pub instant_tps: f64,
     /// Number of locked nodes at this point.
     pub locked_nodes: u64,
-    /// Number of blocked transactions at this point.
-    pub blocked_count: u64,
-    /// Contention ratio at this point (pending_blocked / pending_count).
+    /// Number of deferred transactions at this point.
+    pub deferred_count: u64,
+    /// Contention ratio at this point (pending_deferred / pending_count).
     pub contention_ratio: f64,
 }
 
@@ -258,8 +258,8 @@ pub struct SimulationReport {
     pub samples: Vec<MetricsSample>,
     /// Peak number of locked nodes observed.
     pub peak_locked_nodes: u64,
-    /// Peak number of blocked transactions observed.
-    pub peak_blocked: u64,
+    /// Peak number of deferred transactions observed.
+    pub peak_deferred: u64,
     /// Peak contention ratio observed.
     pub peak_contention_ratio: f64,
 }
@@ -332,7 +332,7 @@ impl SimulationReport {
         println!();
         println!("Lock Contention (peak):");
         println!("  Locked nodes:     {}", self.peak_locked_nodes);
-        println!("  Blocked txs:      {}", self.peak_blocked);
+        println!("  Deferred txs:      {}", self.peak_deferred);
         println!(
             "  Contention ratio: {:.2}%",
             self.peak_contention_ratio * 100.0

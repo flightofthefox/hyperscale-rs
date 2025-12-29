@@ -77,9 +77,9 @@ pub struct LivelockReport {
     pub cross_shard_stuck: Vec<StuckTransaction>,
     /// Address contention map: address -> list of transactions holding/waiting
     pub address_contention: HashMap<NodeId, Vec<Hash>>,
-    /// Analysis of blocked transactions: what status is each winner in?
-    /// Maps winner_status -> count of blocked transactions waiting for winners in that status
-    pub blocked_winner_analysis: HashMap<String, usize>,
+    /// Analysis of deferred transactions: what status is each winner in?
+    /// Maps winner_status -> count of deferred transactions waiting for winners in that status
+    pub deferred_winner_analysis: HashMap<String, usize>,
 }
 
 impl LivelockReport {
@@ -111,7 +111,7 @@ impl LivelockReport {
 
         // Status breakdown
         println!("📈 By Status:");
-        let status_order = ["Pending", "Committed", "Blocked", "Retried"];
+        let status_order = ["Pending", "Committed", "Deferred", "Retried"];
         for status in &status_order {
             if let Some(txs) = self.by_status.get(*status) {
                 if !txs.is_empty() {
@@ -146,14 +146,14 @@ impl LivelockReport {
         }
         println!();
 
-        // Blocked winner analysis
-        if !self.blocked_winner_analysis.is_empty() {
-            println!("🔒 Blocked Transactions - Winner Status Analysis:");
-            println!("  (Why are blocked transactions not getting retried?)");
-            let mut sorted: Vec<_> = self.blocked_winner_analysis.iter().collect();
+        // Deferred winner analysis
+        if !self.deferred_winner_analysis.is_empty() {
+            println!("🔒 Deferred Transactions - Winner Status Analysis:");
+            println!("  (Why are deferred transactions not getting retried?)");
+            let mut sorted: Vec<_> = self.deferred_winner_analysis.iter().collect();
             sorted.sort_by(|a, b| b.1.cmp(a.1)); // Sort by count descending
             for (status, count) in sorted {
-                println!("  Winner in {}: {} blocked txs waiting", status, count);
+                println!("  Winner in {}: {} deferred txs waiting", status, count);
             }
             println!();
         }
@@ -293,17 +293,17 @@ impl LivelockAnalyzer {
         // Detect potential cycles
         let potential_cycles = self.detect_cycles(&address_contention);
 
-        // Analyze blocked transactions - what status is each winner in?
-        let mut blocked_winner_analysis: HashMap<String, usize> = HashMap::new();
+        // Analyze deferred transactions - what status is each winner in?
+        let mut deferred_winner_analysis: HashMap<String, usize> = HashMap::new();
         for tx in &self.stuck_transactions {
-            if let TransactionStatus::Blocked { by: winner_hash } = &tx.status {
+            if let TransactionStatus::Deferred { by: winner_hash } = &tx.status {
                 let winner_status_name =
                     if let Some(winner_status) = self.all_statuses.get(winner_hash) {
                         status_name(winner_status)
                     } else {
                         "Unknown/NotInPool".to_string()
                     };
-                *blocked_winner_analysis
+                *deferred_winner_analysis
                     .entry(winner_status_name)
                     .or_insert(0) += 1;
             }
@@ -316,7 +316,7 @@ impl LivelockAnalyzer {
             potential_cycles,
             cross_shard_stuck,
             address_contention,
-            blocked_winner_analysis,
+            deferred_winner_analysis,
         }
     }
 

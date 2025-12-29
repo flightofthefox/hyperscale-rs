@@ -228,8 +228,8 @@ pub struct MempoolSnapshot {
     pub executed_count: usize,
     /// Total number of transactions in the mempool.
     pub total_count: usize,
-    /// Number of transactions blocked waiting for a winner.
-    pub blocked_count: usize,
+    /// Number of transactions deferred waiting for a winner.
+    pub deferred_count: usize,
     /// When this snapshot was taken.
     pub updated_at: Option<Instant>,
     /// Whether the mempool is accepting new RPC transactions.
@@ -257,7 +257,7 @@ impl Default for MempoolSnapshot {
             committed_count: 0,
             executed_count: 0,
             total_count: 0,
-            blocked_count: 0,
+            deferred_count: 0,
             updated_at: None,
             accepting_rpc_transactions: true, // Default to accepting until we know otherwise
             at_pending_limit: false,          // Default to not at limit until we know otherwise
@@ -341,13 +341,13 @@ mod tests {
         let tx_hash = Hash::from_bytes(&[3u8; 32]);
         let blocker_hash = Hash::from_bytes(&[4u8; 32]);
 
-        cache.update(tx_hash, TransactionStatus::Blocked { by: blocker_hash });
+        cache.update(tx_hash, TransactionStatus::Deferred { by: blocker_hash });
 
         let cached = cache.get(&tx_hash).unwrap();
-        if let TransactionStatus::Blocked { by } = &cached.status {
+        if let TransactionStatus::Deferred { by } = &cached.status {
             assert_eq!(*by, blocker_hash);
         } else {
-            panic!("Expected Blocked status");
+            panic!("Expected Deferred status");
         }
     }
 

@@ -71,7 +71,7 @@ pub struct TransactionStatusResponse {
     /// Transaction hash (hex-encoded).
     pub hash: String,
     /// Current status of the transaction.
-    /// Possible values: "pending", "committed", "executed", "completed", "blocked", "retried", "unknown", "error"
+    /// Possible values: "pending", "committed", "executed", "completed", "deferred", "retried", "unknown", "error"
     pub status: String,
     /// Block height where committed (if committed).
     #[serde(default)]
@@ -79,9 +79,9 @@ pub struct TransactionStatusResponse {
     /// Final decision (if executed): "accept" or "reject".
     #[serde(default)]
     pub decision: Option<String>,
-    /// Hash of the transaction blocking this one (if blocked).
+    /// Hash of the transaction blocking this one (if deferred).
     #[serde(default)]
-    pub blocked_by: Option<String>,
+    pub deferred_by: Option<String>,
     /// Hash of the retry transaction (if retried).
     #[serde(default)]
     pub retry_tx: Option<String>,
@@ -110,9 +110,9 @@ impl TransactionStatusResponse {
             ))),
             "executed" => Some(TransactionStatus::Executed(decision()?)),
             "completed" => Some(TransactionStatus::Completed(decision()?)),
-            "blocked" => {
-                let hash = Hash::from_hex(self.blocked_by.as_deref()?).ok()?;
-                Some(TransactionStatus::Blocked { by: hash })
+            "deferred" => {
+                let hash = Hash::from_hex(self.deferred_by.as_deref()?).ok()?;
+                Some(TransactionStatus::Deferred { by: hash })
             }
             "retried" => {
                 let hash = Hash::from_hex(self.retry_tx.as_deref()?).ok()?;

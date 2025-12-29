@@ -129,7 +129,7 @@ fn test_single_shard_unaffected_by_backpressure() {
                     | Some(TransactionStatus::Executed { .. })
                     | Some(TransactionStatus::Completed(_))
             ),
-        "Single-shard TX should not be blocked by backpressure: {:?}",
+        "Single-shard TX should not be deferred by backpressure: {:?}",
         status
     );
 }

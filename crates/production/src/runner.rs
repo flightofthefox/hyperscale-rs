@@ -1215,7 +1215,7 @@ impl ProductionRunner {
                             snap.pending_count = stats.pending_count as usize;
                             snap.committed_count = stats.committed_count as usize;
                             snap.executed_count = stats.executed_count as usize;
-                            snap.blocked_count = stats.blocked_count as usize;
+                            snap.deferred_count = stats.deferred_count as usize;
                             snap.total_count = total;
                             snap.updated_at = Some(std::time::Instant::now());
                             snap.accepting_rpc_transactions = accepting;

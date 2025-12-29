@@ -234,7 +234,7 @@ fn test_two_shard_cycle_detection() {
             }
         }
 
-        // Check for blocked/retried status (indicates cycle detection working)
+        // Check for deferred/retried status (indicates cycle detection working)
         if iteration == 50 && (!a_completed || !b_completed) {
             let status_a = runner.node(0).unwrap().mempool().status(&hash_a);
             let status_b = runner.node(0).unwrap().mempool().status(&hash_b);
@@ -320,7 +320,7 @@ fn test_two_shard_cycle_detection() {
 ///
 /// This verifies the complete retry flow:
 /// 1. Loser transaction is deferred due to cycle
-/// 2. Loser transitions to Blocked status
+/// 2. Loser transitions to Deferred status
 /// 3. Winner completes and gets certificate
 /// 4. Loser is retried (new TX with different hash)
 /// 5. Retry completes successfully

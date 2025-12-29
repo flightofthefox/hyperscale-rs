@@ -133,7 +133,7 @@ pub struct Metrics {
     pub livelock_deferred_transactions: Gauge,
 
     // === Lock Contention ===
-    pub lock_contention_blocked: Gauge,
+    pub lock_contention_deferred: Gauge,
     pub lock_contention_ratio: Gauge,
 
     // === Errors ===
@@ -616,15 +616,15 @@ impl Metrics {
             .unwrap(),
 
             // Lock Contention
-            lock_contention_blocked: register_gauge!(
-                "hyperscale_lock_contention_blocked",
-                "Number of transactions currently blocked by lock contention"
+            lock_contention_deferred: register_gauge!(
+                "hyperscale_lock_contention_deferred",
+                "Number of transactions currently deferred by lock contention"
             )
             .unwrap(),
 
             lock_contention_ratio: register_gauge!(
                 "hyperscale_lock_contention_ratio",
-                "Ratio of blocked transactions to total (0.0 to 1.0)"
+                "Ratio of deferred transactions to total (0.0 to 1.0)"
             )
             .unwrap(),
 
@@ -1101,9 +1101,9 @@ pub fn record_speculative_execution_invalidated(count: u64) {
 }
 
 /// Update lock contention metrics.
-pub fn set_lock_contention(blocked: u64, ratio: f64) {
+pub fn set_lock_contention(deferred: u64, ratio: f64) {
     let m = metrics();
-    m.lock_contention_blocked.set(blocked as f64);
+    m.lock_contention_deferred.set(deferred as f64);
     m.lock_contention_ratio.set(ratio);
 }
 
@@ -1112,7 +1112,7 @@ pub fn set_lock_contention(blocked: u64, ratio: f64) {
 /// This is a convenience wrapper that extracts the relevant fields
 /// from the mempool's LockContentionStats struct.
 pub fn set_lock_contention_from_stats(stats: &hyperscale_mempool::LockContentionStats) {
-    set_lock_contention(stats.blocked_count, stats.contention_ratio());
+    set_lock_contention(stats.deferred_count, stats.contention_ratio());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

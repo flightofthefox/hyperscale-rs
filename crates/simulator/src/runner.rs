@@ -339,9 +339,9 @@ impl Simulator {
             if let Some(node) = self.runner.node(node_idx) {
                 let stats = node.mempool().lock_contention_stats();
                 total.locked_nodes += stats.locked_nodes;
-                total.blocked_count += stats.blocked_count;
+                total.deferred_count += stats.deferred_count;
                 total.pending_count += stats.pending_count;
-                total.pending_blocked += stats.pending_blocked;
+                total.pending_deferred += stats.pending_deferred;
             }
         }
 

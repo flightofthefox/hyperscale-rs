@@ -293,7 +293,7 @@ pub enum Action {
     /// - Committed: Transaction included in a committed block
     /// - Executed: Transaction execution complete (accept/reject decision made)
     /// - Completed: Transaction certificate committed, can be evicted
-    /// - Blocked: Transaction deferred due to cross-shard livelock
+    /// - Deferred: Transaction deferred due to cross-shard livelock
     /// - Retried: Transaction superseded by retry transaction
     ///
     /// The production runner updates the RPC status cache when processing

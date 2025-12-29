@@ -78,12 +78,12 @@ impl Default for MempoolConfig {
 pub struct LockContentionStats {
     /// Number of nodes currently locked by in-flight transactions.
     pub locked_nodes: u64,
-    /// Number of transactions blocked waiting for a winner to complete.
-    pub blocked_count: u64,
+    /// Number of transactions deferred waiting for a winner to complete.
+    pub deferred_count: u64,
     /// Number of transactions in Pending status.
     pub pending_count: u64,
     /// Number of pending transactions that conflict with locked nodes.
-    pub pending_blocked: u64,
+    pub pending_deferred: u64,
     /// Number of transactions in Committed status (block committed, being executed).
     pub committed_count: u64,
     /// Number of transactions in Executed status (execution done, awaiting certificate).
@@ -91,10 +91,10 @@ pub struct LockContentionStats {
 }
 
 impl LockContentionStats {
-    /// Contention ratio: what fraction of pending transactions are blocked.
+    /// Contention ratio: what fraction of pending transactions are deferred.
     pub fn contention_ratio(&self) -> f64 {
         if self.pending_count > 0 {
-            self.pending_blocked as f64 / self.pending_count as f64
+            self.pending_deferred as f64 / self.pending_count as f64
         } else {
             0.0
         }
@@ -146,17 +146,17 @@ pub struct MempoolState {
     /// Transaction pool sorted by hash (BTreeMap for ordered iteration).
     pool: BTreeMap<Hash, PoolEntry>,
 
-    /// Blocked transactions waiting for their winner to complete.
-    /// Maps: loser_tx_hash -> (loser_tx, winner_tx_hash, blocked_at_height)
+    /// Deferred transactions waiting for their winner to complete.
+    /// Maps: loser_tx_hash -> (loser_tx, winner_tx_hash, deferred_at_height)
     ///
-    /// When a deferral commits, the loser is added here with status Blocked.
+    /// When a deferral commits, the loser is added here with status Deferred.
     /// When the winner's certificate commits, we create a retry.
-    /// The blocked_at_height enables cleanup of stale entries.
-    blocked_by: HashMap<Hash, (Arc<RoutableTransaction>, Hash, BlockHeight)>,
+    /// The deferred_at_height enables cleanup of stale entries.
+    deferred_by: HashMap<Hash, (Arc<RoutableTransaction>, Hash, BlockHeight)>,
 
     /// Reverse index: winner_tx_hash -> Vec<loser_tx_hash>
-    /// Allows O(1) lookup of all losers blocked by a winner.
-    blocked_losers_by_winner: HashMap<Hash, Vec<Hash>>,
+    /// Allows O(1) lookup of all losers deferred by a winner.
+    deferred_losers_by_winner: HashMap<Hash, Vec<Hash>>,
 
     /// Pending deferrals for transactions not yet in the pool.
     /// This handles sync scenarios where a deferral references a transaction
@@ -208,9 +208,9 @@ pub struct MempoolState {
     // These sets are maintained incrementally to provide O(1) ready_transactions().
     // Invariants:
     // 1. A transaction is in exactly one of: ready_retries, ready_priority, ready_others,
-    //    blocked_by_nodes, or none (if not Pending or not in pool).
+    //    deferred_by_nodes, or none (if not Pending or not in pool).
     // 2. ready_* sets contain only Pending transactions with no locked node conflicts.
-    // 3. blocked_by_nodes contains Pending transactions blocked by locked nodes.
+    // 3. deferred_by_nodes contains Pending transactions deferred by locked nodes.
     /// Ready retry transactions (highest priority, bypass soft limit).
     /// BTreeMap maintains hash order for deterministic iteration.
     ready_retries: BTreeMap<Hash, ReadyEntry>,
@@ -223,14 +223,14 @@ pub struct MempoolState {
     /// BTreeMap maintains hash order for deterministic iteration.
     ready_others: BTreeMap<Hash, ReadyEntry>,
 
-    /// Pending transactions blocked by locked nodes.
+    /// Pending transactions deferred by locked nodes.
     /// Maps tx_hash -> set of blocking node IDs.
     /// When all blocking nodes are released, tx is promoted to a ready set.
-    blocked_by_nodes: HashMap<Hash, HashSet<NodeId>>,
+    deferred_by_nodes: HashMap<Hash, HashSet<NodeId>>,
 
-    /// Reverse index: node_id -> set of tx_hashes blocked by that node.
+    /// Reverse index: node_id -> set of tx_hashes deferred by that node.
     /// Enables efficient promotion when a node is unlocked.
-    txs_blocked_by_node: HashMap<NodeId, HashSet<Hash>>,
+    txs_deferred_by_node: HashMap<NodeId, HashSet<Hash>>,
 
     /// Reverse index: node_id -> set of tx_hashes in ready sets that declare that node.
     /// Enables O(1) blocking when a node becomes locked.
@@ -259,8 +259,8 @@ impl MempoolState {
     pub fn with_config(topology: Arc<dyn Topology>, config: MempoolConfig) -> Self {
         Self {
             pool: BTreeMap::new(),
-            blocked_by: HashMap::new(),
-            blocked_losers_by_winner: HashMap::new(),
+            deferred_by: HashMap::new(),
+            deferred_losers_by_winner: HashMap::new(),
             pending_deferrals: HashMap::new(),
             pending_retries: HashMap::new(),
             completed_winners: HashMap::new(),
@@ -272,8 +272,8 @@ impl MempoolState {
             ready_retries: BTreeMap::new(),
             ready_priority: BTreeMap::new(),
             ready_others: BTreeMap::new(),
-            blocked_by_nodes: HashMap::new(),
-            txs_blocked_by_node: HashMap::new(),
+            deferred_by_nodes: HashMap::new(),
+            txs_deferred_by_node: HashMap::new(),
             ready_txs_by_node: HashMap::new(),
             now: Duration::ZERO,
             topology,
@@ -461,8 +461,8 @@ impl MempoolState {
     ///
     /// This handles:
     /// 1. Mark committed transactions
-    /// 2. Process deferrals → update status to Blocked
-    /// 3. Process certificates → mark completed, trigger retries for blocked TXs
+    /// 2. Process deferrals → update status to Deferred
+    /// 3. Process certificates → mark completed, trigger retries for deferred TXs
     /// 4. Process aborts → update status to terminal
     #[instrument(skip(self, block), fields(
         height = block.header.height.0,
@@ -550,7 +550,7 @@ impl MempoolState {
             }
         }
 
-        // 2. Process deferrals - update status to Blocked
+        // 2. Process deferrals - update status to Deferred
         for deferral in &block.deferred {
             actions.extend(self.on_deferral_committed(deferral.tx_hash, &deferral.reason, height));
         }
@@ -565,7 +565,7 @@ impl MempoolState {
         }
 
         // 4. Process aborts - mark as aborted with reason and evict
-        //    Also abort any transactions that were blocked by the aborted winner.
+        //    Also abort any transactions that were deferred by the aborted winner.
         for abort in &block.aborted {
             if let Some(entry) = self.pool.get(&abort.tx_hash) {
                 let added_at = entry.added_at;
@@ -585,7 +585,7 @@ impl MempoolState {
                 self.evict_terminal(abort.tx_hash);
             }
 
-            // Also abort any losers that were blocked by this winner.
+            // Also abort any losers that were deferred by this winner.
             // If the winner was aborted (e.g., timeout), the losers can never complete
             // because they were waiting for the winner to finish.
             actions.extend(self.on_winner_aborted(abort.tx_hash, height));
@@ -596,7 +596,7 @@ impl MempoolState {
 
     /// Handle a deferral committed in a block.
     ///
-    /// Updates the deferred TX's status to Blocked and tracks it for retry.
+    /// Updates the deferred TX's status to Deferred and tracks it for retry.
     /// If the transaction is not yet in the pool (sync scenario), stores the
     /// deferral for processing when the transaction arrives.
     fn on_deferral_committed(
@@ -640,8 +640,8 @@ impl MempoolState {
 
         // Get the transaction and update its status
         if let Some(entry) = self.pool.get_mut(&tx_hash) {
-            // Update status to Blocked
-            let new_status = TransactionStatus::Blocked {
+            // Update status to Deferred
+            let new_status = TransactionStatus::Deferred {
                 by: *winner_tx_hash,
             };
             if entry.status.can_transition_to(&new_status) {
@@ -660,7 +660,7 @@ impl MempoolState {
                 self.remove_from_ready_tracking(&tx_hash);
 
                 // Release locks if the transaction was holding them.
-                // Blocked transactions don't hold locks (they've been deferred).
+                // Deferred transactions don't hold locks (they've been deferred).
                 if old_status.holds_state_lock() {
                     self.remove_locked_nodes(&tx);
                     match old_status {
@@ -675,11 +675,11 @@ impl MempoolState {
                 }
 
                 // Track for retry when winner completes, with height for cleanup
-                self.blocked_by
+                self.deferred_by
                     .insert(tx_hash, (tx, *winner_tx_hash, height));
 
                 // Maintain reverse index for O(1) lookup
-                self.blocked_losers_by_winner
+                self.deferred_losers_by_winner
                     .entry(*winner_tx_hash)
                     .or_default()
                     .push(tx_hash);
@@ -709,7 +709,7 @@ impl MempoolState {
 
             // Also set up the reverse index now, so that if the winner's certificate
             // arrives before the deferred transaction, we know there's a pending loser
-            self.blocked_losers_by_winner
+            self.deferred_losers_by_winner
                 .entry(*winner_tx_hash)
                 .or_default()
                 .push(tx_hash);
@@ -720,7 +720,7 @@ impl MempoolState {
 
     /// Handle a certificate committed in a block.
     ///
-    /// Marks the transaction as completed and triggers retries for any TXs blocked by it.
+    /// Marks the transaction as completed and triggers retries for any TXs deferred by it.
     fn on_certificate_committed(
         &mut self,
         tx_hash: Hash,
@@ -748,15 +748,16 @@ impl MempoolState {
         // Track this winner as completed so late-arriving deferrals can create retries immediately
         self.completed_winners.insert(tx_hash, height);
 
-        // Check if any blocked TXs were waiting for this winner using reverse index (O(1) lookup)
+        // Check if any deferred TXs were waiting for this winner using reverse index (O(1) lookup)
         let loser_hashes = self
-            .blocked_losers_by_winner
+            .deferred_losers_by_winner
             .remove(&tx_hash)
             .unwrap_or_default();
 
         for loser_hash in loser_hashes {
-            // First check if the loser is in blocked_by (normal case - tx was in pool when deferred)
-            if let Some((loser_tx, winner_hash, _blocked_at)) = self.blocked_by.remove(&loser_hash)
+            // First check if the loser is in deferred_by (normal case - tx was in pool when deferred)
+            if let Some((loser_tx, winner_hash, _deferred_at)) =
+                self.deferred_by.remove(&loser_hash)
             {
                 // Create retry transaction
                 let retry_tx = loser_tx.create_retry(winner_hash, height);
@@ -839,22 +840,22 @@ impl MempoolState {
     /// Handle winner transaction abort.
     ///
     /// When a winner transaction is aborted (e.g., due to timeout), any loser
-    /// transactions that were blocked by it should also be aborted. The losers
+    /// transactions that were deferred by it should also be aborted. The losers
     /// cannot complete without their winner completing first, so they must be
     /// retried from scratch.
     fn on_winner_aborted(&mut self, winner_hash: Hash, height: BlockHeight) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        // Get all losers blocked by this winner using reverse index
+        // Get all losers deferred by this winner using reverse index
         let loser_hashes = self
-            .blocked_losers_by_winner
+            .deferred_losers_by_winner
             .remove(&winner_hash)
             .unwrap_or_default();
 
         for loser_hash in loser_hashes {
-            // Get the loser from blocked_by and create a retry
-            if let Some((loser_tx, _winner, _blocked_at)) = self.blocked_by.remove(&loser_hash) {
-                // Create retry transaction for the blocked loser
+            // Get the loser from deferred_by and create a retry
+            if let Some((loser_tx, _winner, _deferred_at)) = self.deferred_by.remove(&loser_hash) {
+                // Create retry transaction for the deferred loser
                 let retry_tx = loser_tx.create_retry(winner_hash, height);
                 let retry_hash = retry_tx.hash();
 
@@ -862,7 +863,7 @@ impl MempoolState {
                     loser = %loser_hash,
                     winner = %winner_hash,
                     retry = %retry_hash,
-                    "Winner aborted - creating retry for blocked loser"
+                    "Winner aborted - creating retry for deferred loser"
                 );
 
                 // Emit status update for loser -> Retried
@@ -1020,7 +1021,7 @@ impl MempoolState {
     /// Mark a transaction as executed (execution complete, certificate created).
     ///
     /// Called when ExecutionState creates a TransactionCertificate.
-    /// Also triggers retries for any transactions blocked by this winner.
+    /// Also triggers retries for any transactions deferred by this winner.
     #[instrument(skip(self), fields(tx_hash = ?tx_hash, accepted = accepted))]
     pub fn on_transaction_executed(&mut self, tx_hash: Hash, accepted: bool) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -1051,19 +1052,19 @@ impl MempoolState {
             });
         }
 
-        // Check if any blocked transactions were waiting for this winner to complete.
+        // Check if any deferred transactions were waiting for this winner to complete.
         // This triggers retries immediately when the winner executes, rather than
         // waiting for the certificate to be committed in a block.
         // Using reverse index for O(1) lookup
         let loser_hashes = self
-            .blocked_losers_by_winner
+            .deferred_losers_by_winner
             .remove(&tx_hash)
             .unwrap_or_default();
 
         let height = self.current_height;
         for loser_hash in loser_hashes {
-            // Get the loser transaction from blocked_by
-            let Some((loser_tx, winner_hash, _blocked_at)) = self.blocked_by.remove(&loser_hash)
+            // Get the loser transaction from deferred_by
+            let Some((loser_tx, winner_hash, _deferred_at)) = self.deferred_by.remove(&loser_hash)
             else {
                 continue;
             };
@@ -1076,7 +1077,7 @@ impl MempoolState {
                 retry = %retry_hash,
                 winner = %winner_hash,
                 retry_count = retry_tx.retry_count(),
-                "Creating retry for blocked transaction (winner finalized)"
+                "Creating retry for deferred transaction (winner finalized)"
             );
 
             // Update original's status to Retried and evict
@@ -1280,11 +1281,11 @@ impl MempoolState {
     /// Remove a transaction's nodes from the locked set.
     /// Called when a transaction transitions FROM a lock-holding state (evicted).
     ///
-    /// Also promotes any blocked transactions that were waiting on these nodes.
+    /// Also promotes any deferred transactions that were waiting on these nodes.
     fn remove_locked_nodes(&mut self, tx: &RoutableTransaction) {
         for node in tx.all_declared_nodes() {
             if self.locked_nodes_cache.remove(node) {
-                // Promote any blocked transactions that were waiting on this node
+                // Promote any deferred transactions that were waiting on this node
                 self.promote_transactions_for_node(*node);
             }
         }
@@ -1294,8 +1295,8 @@ impl MempoolState {
 
     /// Add a transaction to ready tracking when it becomes Pending.
     ///
-    /// Determines if the transaction is blocked by locked nodes. If blocked,
-    /// adds to blocked_by_nodes. If ready, adds to the appropriate ready set.
+    /// Determines if the transaction is deferred by locked nodes. If deferred,
+    /// adds to deferred_by_nodes. If ready, adds to the appropriate ready set.
     fn add_to_ready_tracking(
         &mut self,
         hash: Hash,
@@ -1310,24 +1311,24 @@ impl MempoolState {
             .collect();
 
         if !blocking_nodes.is_empty() {
-            // Transaction is blocked by one or more locked nodes
+            // Transaction is deferred by one or more locked nodes
             for node in &blocking_nodes {
-                self.txs_blocked_by_node
+                self.txs_deferred_by_node
                     .entry(*node)
                     .or_default()
                     .insert(hash);
             }
-            self.blocked_by_nodes.insert(hash, blocking_nodes);
+            self.deferred_by_nodes.insert(hash, blocking_nodes);
             return;
         }
 
-        // Transaction is not blocked - add to appropriate ready set
+        // Transaction is not deferred - add to appropriate ready set
         self.add_to_ready_set(hash, tx, cross_shard);
     }
 
     /// Add a transaction to the appropriate ready set based on its properties.
     ///
-    /// Precondition: transaction must not be blocked by any locked nodes.
+    /// Precondition: transaction must not be deferred by any locked nodes.
     fn add_to_ready_set(&mut self, hash: Hash, tx: &Arc<RoutableTransaction>, cross_shard: bool) {
         let ready_entry = ReadyEntry {
             tx: Arc::clone(tx),
@@ -1365,13 +1366,13 @@ impl MempoolState {
             self.remove_from_ready_txs_by_node(hash, &entry.tx);
         }
 
-        // Remove from blocked tracking
-        if let Some(blocking_nodes) = self.blocked_by_nodes.remove(hash) {
+        // Remove from deferred tracking
+        if let Some(blocking_nodes) = self.deferred_by_nodes.remove(hash) {
             for node in blocking_nodes {
-                if let Some(blocked_txs) = self.txs_blocked_by_node.get_mut(&node) {
-                    blocked_txs.remove(hash);
-                    if blocked_txs.is_empty() {
-                        self.txs_blocked_by_node.remove(&node);
+                if let Some(deferred_txs) = self.txs_deferred_by_node.get_mut(&node) {
+                    deferred_txs.remove(hash);
+                    if deferred_txs.is_empty() {
+                        self.txs_deferred_by_node.remove(&node);
                     }
                 }
             }
@@ -1392,7 +1393,7 @@ impl MempoolState {
 
     /// Block ready transactions when a node becomes locked.
     ///
-    /// Moves transactions from ready sets to blocked_by_nodes if they conflict
+    /// Moves transactions from ready sets to deferred_by_nodes if they conflict
     /// with the newly locked node.
     ///
     /// Uses the ready_txs_by_node reverse index for O(transactions_touching_node)
@@ -1403,7 +1404,7 @@ impl MempoolState {
             return; // No ready transactions touch this node
         };
 
-        // Move each transaction from its ready set to blocked
+        // Move each transaction from its ready set to deferred
         for hash in tx_hashes {
             // Try to remove from each ready set (transaction is in exactly one)
             let removed_entry = self
@@ -1425,9 +1426,9 @@ impl MempoolState {
                     }
                 }
 
-                // Add to blocked tracking
-                self.blocked_by_nodes.entry(hash).or_default().insert(node);
-                self.txs_blocked_by_node
+                // Add to deferred tracking
+                self.deferred_by_nodes.entry(hash).or_default().insert(node);
+                self.txs_deferred_by_node
                     .entry(node)
                     .or_default()
                     .insert(hash);
@@ -1435,27 +1436,27 @@ impl MempoolState {
         }
     }
 
-    /// Promote blocked transactions when a node becomes unlocked.
+    /// Promote deferred transactions when a node becomes unlocked.
     ///
-    /// Checks all transactions blocked by this node. If they are no longer
-    /// blocked by any locked nodes, promotes them to the appropriate ready set.
+    /// Checks all transactions deferred by this node. If they are no longer
+    /// deferred by any locked nodes, promotes them to the appropriate ready set.
     fn promote_transactions_for_node(&mut self, node: NodeId) {
-        // Get transactions blocked by this node
-        let Some(blocked_txs) = self.txs_blocked_by_node.remove(&node) else {
+        // Get transactions deferred by this node
+        let Some(deferred_txs) = self.txs_deferred_by_node.remove(&node) else {
             return;
         };
 
         // Collect transactions to promote (to avoid borrow checker issues)
         let mut to_promote: Vec<(Hash, Arc<RoutableTransaction>, bool)> = Vec::new();
 
-        for tx_hash in blocked_txs {
-            if let Some(blocking_nodes) = self.blocked_by_nodes.get_mut(&tx_hash) {
+        for tx_hash in deferred_txs {
+            if let Some(blocking_nodes) = self.deferred_by_nodes.get_mut(&tx_hash) {
                 // Remove this node from the blocking set
                 blocking_nodes.remove(&node);
 
                 // If no more blockers, collect for promotion
                 if blocking_nodes.is_empty() {
-                    self.blocked_by_nodes.remove(&tx_hash);
+                    self.deferred_by_nodes.remove(&tx_hash);
 
                     // Get transaction info from pool
                     if let Some(entry) = self.pool.get(&tx_hash) {
@@ -1588,28 +1589,28 @@ impl MempoolState {
     ///
     /// Returns counts of:
     /// - `locked_nodes`: Number of nodes currently locked by in-flight transactions
-    /// - `blocked_count`: Number of transactions blocked waiting for a winner
+    /// - `deferred_count`: Number of transactions deferred waiting for a winner
     /// - `pending_count`: Number of transactions in Pending status
-    /// - `pending_blocked`: Number of pending transactions that conflict with locked nodes
+    /// - `pending_deferred`: Number of pending transactions that conflict with locked nodes
     /// - `committed_count`: Number of transactions in Committed status
     /// - `executed_count`: Number of transactions in Executed status
     ///
     /// All stats are O(1) via cached counters and ready sets.
     pub fn lock_contention_stats(&self) -> LockContentionStats {
         let locked_nodes = self.locked_nodes_cache.len() as u64;
-        let blocked_count = self.blocked_by.len() as u64;
+        let deferred_count = self.deferred_by.len() as u64;
 
         // Pending counts are O(1) from ready sets
         let ready_count =
             self.ready_retries.len() + self.ready_priority.len() + self.ready_others.len();
-        let pending_blocked = self.blocked_by_nodes.len() as u64;
-        let pending_count = (ready_count + self.blocked_by_nodes.len()) as u64;
+        let pending_deferred = self.deferred_by_nodes.len() as u64;
+        let pending_count = (ready_count + self.deferred_by_nodes.len()) as u64;
 
         LockContentionStats {
             locked_nodes,
-            blocked_count,
+            deferred_count,
             pending_count,
-            pending_blocked,
+            pending_deferred,
             committed_count: self.committed_count as u64,
             executed_count: self.executed_count as u64,
         }
@@ -1854,36 +1855,36 @@ impl MempoolState {
             .retain(|_, (_, height)| height.0 > cutoff);
         let cleaned_retries = before_retries - self.pending_retries.len();
 
-        // Clean up blocked_by - these are transactions waiting for their winner to
+        // Clean up deferred_by - these are transactions waiting for their winner to
         // complete. If it's been too long, the winner is likely never completing.
-        let before_blocked = self.blocked_by.len();
-        let stale_blocked: Vec<Hash> = self
-            .blocked_by
+        let before_deferred = self.deferred_by.len();
+        let stale_deferred: Vec<Hash> = self
+            .deferred_by
             .iter()
-            .filter(|(_, (_, _, blocked_at))| blocked_at.0 <= cutoff)
+            .filter(|(_, (_, _, deferred_at))| deferred_at.0 <= cutoff)
             .map(|(hash, _)| *hash)
             .collect();
 
-        for loser_hash in &stale_blocked {
-            if let Some((_, winner_hash, _)) = self.blocked_by.remove(loser_hash) {
+        for loser_hash in &stale_deferred {
+            if let Some((_, winner_hash, _)) = self.deferred_by.remove(loser_hash) {
                 // Also clean up the reverse index
-                if let Some(losers) = self.blocked_losers_by_winner.get_mut(&winner_hash) {
+                if let Some(losers) = self.deferred_losers_by_winner.get_mut(&winner_hash) {
                     losers.retain(|h| h != loser_hash);
                     if losers.is_empty() {
-                        self.blocked_losers_by_winner.remove(&winner_hash);
+                        self.deferred_losers_by_winner.remove(&winner_hash);
                     }
                 }
             }
         }
-        let cleaned_blocked = before_blocked - self.blocked_by.len();
+        let cleaned_deferred = before_deferred - self.deferred_by.len();
 
-        if cleaned_deferrals > 0 || cleaned_retries > 0 || cleaned_blocked > 0 {
+        if cleaned_deferrals > 0 || cleaned_retries > 0 || cleaned_deferred > 0 {
             tracing::debug!(
                 cleaned_deferrals,
                 cleaned_retries,
-                cleaned_blocked,
+                cleaned_deferred,
                 cutoff_height = cutoff,
-                "Cleaned up stale pending deferrals/retries/blocked"
+                "Cleaned up stale pending deferrals/retries/deferred"
             );
         }
 
@@ -1954,7 +1955,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deferral_updates_status_to_blocked() {
+    fn test_deferral_updates_status_to_deferred() {
         let mut mempool = MempoolState::new(make_test_topology());
 
         // Create and add a transaction
@@ -1994,15 +1995,15 @@ mod tests {
         let defer_block = make_test_block(2, vec![], vec![deferral], vec![], vec![]);
         mempool.on_block_committed_full(&defer_block);
 
-        // Verify status is now Blocked
+        // Verify status is now Deferred
         let status = mempool.status(&tx_hash);
         assert!(matches!(
             status,
-            Some(TransactionStatus::Blocked { by }) if by == winner_hash
+            Some(TransactionStatus::Deferred { by }) if by == winner_hash
         ));
 
-        // Verify it's tracked in blocked_by
-        assert!(mempool.blocked_by.contains_key(&tx_hash));
+        // Verify it's tracked in deferred_by
+        assert!(mempool.deferred_by.contains_key(&tx_hash));
     }
 
     #[test]
@@ -2041,10 +2042,10 @@ mod tests {
         let defer_block = make_test_block(2, vec![], vec![deferral], vec![], vec![]);
         mempool.on_block_committed_full(&defer_block);
 
-        // Verify loser is blocked
+        // Verify loser is deferred
         assert!(matches!(
             mempool.status(&loser_hash),
-            Some(TransactionStatus::Blocked { .. })
+            Some(TransactionStatus::Deferred { .. })
         ));
 
         // Winner's certificate commits
@@ -2084,8 +2085,8 @@ mod tests {
             retry_status
         );
 
-        // blocked_by should be cleared
-        assert!(!mempool.blocked_by.contains_key(&loser_hash));
+        // deferred_by should be cleared
+        assert!(!mempool.deferred_by.contains_key(&loser_hash));
     }
 
     #[test]
@@ -2309,7 +2310,7 @@ mod tests {
         // Reverse index should be set up
         assert!(
             mempool
-                .blocked_losers_by_winner
+                .deferred_losers_by_winner
                 .get(&winner_hash)
                 .is_some_and(|losers| losers.contains(&loser_hash)),
             "Reverse index should contain loser"
@@ -2378,21 +2379,21 @@ mod tests {
         );
         let actions = mempool.on_block_committed_full(&block);
 
-        // Transaction should be in pool and blocked
+        // Transaction should be in pool and deferred
         let status = mempool.status(&loser_hash);
         assert!(
-            matches!(status, Some(TransactionStatus::Blocked { by }) if by == winner_hash),
-            "Loser should be Blocked, got {:?}",
+            matches!(status, Some(TransactionStatus::Deferred { by }) if by == winner_hash),
+            "Loser should be Deferred, got {:?}",
             status
         );
 
-        // Should have emitted Blocked status
-        let blocked_action = actions.iter().find(|a| {
-            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Blocked { .. }, .. } if *tx_hash == loser_hash)
+        // Should have emitted Deferred status
+        let deferred_action = actions.iter().find(|a| {
+            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Deferred { .. }, .. } if *tx_hash == loser_hash)
         });
         assert!(
-            blocked_action.is_some(),
-            "Should have emitted Blocked status"
+            deferred_action.is_some(),
+            "Should have emitted Deferred status"
         );
 
         // Should NOT have pending deferral (it was processed immediately)
@@ -2406,7 +2407,7 @@ mod tests {
     fn test_sync_multiple_blocks_with_dependencies() {
         // Scenario: Multi-block sync where:
         // - Block N: TX_A committed
-        // - Block N+1: TX_A deferred (blocked by TX_B)
+        // - Block N+1: TX_A deferred (deferred by TX_B)
         // - Block N+2: TX_B's certificate commits, retry created for TX_A
 
         let mut mempool = MempoolState::new(make_test_topology());
@@ -2436,10 +2437,10 @@ mod tests {
         let block_n1 = make_test_block(6, vec![], vec![deferral], vec![], vec![]);
         mempool.on_block_committed_full(&block_n1);
 
-        // TX_A should be Blocked
+        // TX_A should be Deferred
         assert!(matches!(
             mempool.status(&tx_a_hash),
-            Some(TransactionStatus::Blocked { by }) if by == tx_b_hash
+            Some(TransactionStatus::Deferred { by }) if by == tx_b_hash
         ));
 
         // Block N+2: TX_B's certificate commits
@@ -2971,7 +2972,7 @@ mod tests {
         // At soft limit: normal TXs should be rejected, but retries should be allowed
         let ready = mempool.ready_transactions(10, 0, 0);
 
-        // Should contain ONLY the retry (normal TX blocked by backpressure)
+        // Should contain ONLY the retry (normal TX deferred by backpressure)
         assert_eq!(
             ready.len(),
             1,
