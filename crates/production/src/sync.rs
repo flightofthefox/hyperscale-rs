@@ -134,6 +134,11 @@ pub struct SyncConfig {
     pub fetch_timeout: Duration,
     /// Timeout for backfill operations (fetching missing txs/certs after metadata-only response).
     pub backfill_timeout: Duration,
+    /// Maximum number of heights to queue ahead of committed height.
+    /// This creates a sliding window that limits memory usage in BFT's buffered_synced_blocks.
+    /// When a block commits, we extend the window to queue more heights.
+    /// Set to 0 to disable windowing (queue all heights upfront - not recommended).
+    pub sync_window_size: u64,
 }
 
 impl Default for SyncConfig {
@@ -162,6 +167,11 @@ impl Default for SyncConfig {
             // metadata-only response). Aligned with BFT's stale_pending_block_timeout
             // so backfill gives up around the same time BFT would remove the block anyway.
             backfill_timeout: Duration::from_secs(30),
+            // Sync window limits how far ahead we queue fetches beyond committed height.
+            // This bounds memory usage in BFT's buffered_synced_blocks to ~64 blocks.
+            // With ~1MB per block, this caps buffer at ~64MB instead of unbounded growth.
+            // The window slides forward as blocks commit, maintaining fetch parallelism.
+            sync_window_size: 64,
         }
     }
 }
@@ -488,6 +498,10 @@ impl SyncManager {
                 self.clear_height_queue();
                 return Some(target);
             }
+
+            // Sync still in progress - extend the sliding window.
+            // As blocks commit, we queue more heights to maintain fetch parallelism.
+            self.queue_heights_in_window();
         }
 
         None
@@ -515,19 +529,42 @@ impl SyncManager {
 
         self.sync_target = Some((target_height, target_hash));
 
-        // Queue heights to fetch. We don't track "already fetched" heights because
-        // BFT is the source of truth - it will ignore duplicates. This avoids bugs
-        // where SyncManager thinks a block was fetched but BFT lost it (e.g., due to
-        // QC verification failure clearing pending_synced_block_verifications).
+        // Queue heights within the sync window. We use a sliding window to limit
+        // memory usage in BFT's buffered_synced_blocks - only queue heights that
+        // are within sync_window_size of committed_height. As blocks commit, we
+        // extend the window in set_committed_height().
+        self.queue_heights_in_window();
+
+        // Spawn initial batch of fetches immediately (don't wait for tick)
+        self.spawn_pending_fetches();
+    }
+
+    /// Queue heights within the sync window for fetching.
+    ///
+    /// Only queues heights from committed_height + 1 up to committed_height + sync_window_size,
+    /// capped at the sync target. This creates a sliding window that limits memory usage
+    /// in BFT's buffered_synced_blocks while maintaining fetch parallelism.
+    fn queue_heights_in_window(&mut self) {
+        let Some((target_height, _)) = self.sync_target else {
+            return;
+        };
+
         let first_height = self.committed_height + 1;
-        for height in first_height..=target_height {
+
+        // Calculate window end: either sync_window_size ahead or target, whichever is lower
+        let window_end = if self.config.sync_window_size == 0 {
+            // Window size 0 means no limit (legacy behavior)
+            target_height
+        } else {
+            (self.committed_height + self.config.sync_window_size).min(target_height)
+        };
+
+        // Queue heights in the window that aren't already pending
+        for height in first_height..=window_end {
             if !self.pending_fetches.contains_key(&height) {
                 self.queue_height(height);
             }
         }
-
-        // Spawn initial batch of fetches immediately (don't wait for tick)
-        self.spawn_pending_fetches();
     }
 
     /// Cancel the current sync operation.
@@ -1770,8 +1807,38 @@ mod tests {
 
         fn start_sync(&mut self, target_height: u64, target_hash: Hash) {
             self.sync_target = Some((target_height, target_hash));
-            for h in (self.committed_height + 1)..=target_height {
-                self.queue_height(h);
+            self.queue_heights_in_window();
+        }
+
+        fn queue_heights_in_window(&mut self) {
+            let Some((target_height, _)) = self.sync_target else {
+                return;
+            };
+
+            let first_height = self.committed_height + 1;
+            let window_end = if self.config.sync_window_size == 0 {
+                target_height
+            } else {
+                (self.committed_height + self.config.sync_window_size).min(target_height)
+            };
+
+            for height in first_height..=window_end {
+                if !self.pending_fetches.contains_key(&height) {
+                    self.queue_height(height);
+                }
+            }
+        }
+
+        fn set_committed_height(&mut self, height: u64) {
+            self.committed_height = height;
+
+            // Remove heights at or below committed
+            self.heights_queued.retain(|&h| h > height);
+            self.pending_fetches.retain(|h, _| *h > height);
+
+            // Extend window if still syncing
+            if self.sync_target.is_some() {
+                self.queue_heights_in_window();
             }
         }
 
@@ -2766,5 +2833,119 @@ mod tests {
         let config = SyncConfig::default();
         assert_eq!(config.fetch_timeout, Duration::from_secs(5));
         assert_eq!(config.backfill_timeout, Duration::from_secs(30));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Sync Window Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_sync_config_has_sync_window() {
+        let config = SyncConfig::default();
+        assert_eq!(config.sync_window_size, 64);
+    }
+
+    #[test]
+    fn test_sync_window_limits_queued_heights() {
+        let mut manager = create_test_sync_manager();
+        manager.config.sync_window_size = 10; // Small window for testing
+        manager.committed_height = 0;
+
+        let peer = PeerId::random();
+        manager.register_peer(peer);
+
+        // Start sync to height 100 (far beyond window)
+        manager.start_sync(100, Hash::from_bytes(&[1u8; 32]));
+
+        // Should only queue heights 1-10 (window size), not all 100
+        assert!(manager.heights_queued.len() <= 10);
+        assert!(manager.is_height_queued(1));
+        assert!(manager.is_height_queued(10));
+        assert!(!manager.is_height_queued(11)); // Beyond window
+        assert!(!manager.is_height_queued(100)); // Far beyond window
+    }
+
+    #[test]
+    fn test_sync_window_extends_on_commit() {
+        let mut manager = create_test_sync_manager();
+        manager.config.sync_window_size = 10;
+        manager.committed_height = 0;
+
+        let peer = PeerId::random();
+        manager.register_peer(peer);
+
+        // Start sync to height 100
+        manager.start_sync(100, Hash::from_bytes(&[1u8; 32]));
+
+        // Initially only heights 1-10 should be queued
+        assert!(manager.is_height_queued(1));
+        assert!(!manager.is_height_queued(11));
+
+        // Simulate committing height 5 - window should extend
+        manager.set_committed_height(5);
+
+        // Now heights 6-15 should be in scope (5 + 10 = 15)
+        // Height 11 should now be queued since it's within the new window
+        assert!(manager.is_height_queued(11));
+        assert!(manager.is_height_queued(15));
+        assert!(!manager.is_height_queued(16)); // Still beyond window
+    }
+
+    #[test]
+    fn test_sync_window_zero_disables_windowing() {
+        let mut manager = create_test_sync_manager();
+        manager.config.sync_window_size = 0; // Disable windowing
+        manager.committed_height = 0;
+
+        let peer = PeerId::random();
+        manager.register_peer(peer);
+
+        // Start sync to height 100
+        manager.start_sync(100, Hash::from_bytes(&[1u8; 32]));
+
+        // With window disabled, all heights should be queued
+        assert!(manager.is_height_queued(1));
+        assert!(manager.is_height_queued(50));
+        assert!(manager.is_height_queued(100));
+    }
+
+    #[test]
+    fn test_sync_window_respects_target() {
+        let mut manager = create_test_sync_manager();
+        manager.config.sync_window_size = 100; // Large window
+        manager.committed_height = 0;
+
+        let peer = PeerId::random();
+        manager.register_peer(peer);
+
+        // Start sync to height 20 (less than window size)
+        manager.start_sync(20, Hash::from_bytes(&[1u8; 32]));
+
+        // Should queue heights 1-20, not beyond target
+        assert!(manager.is_height_queued(1));
+        assert!(manager.is_height_queued(20));
+        assert!(!manager.is_height_queued(21)); // Beyond target
+    }
+
+    #[test]
+    fn test_sync_window_skips_pending_fetches() {
+        let mut manager = create_test_sync_manager();
+        manager.config.sync_window_size = 10;
+        manager.committed_height = 0;
+
+        let peer = PeerId::random();
+        manager.register_peer(peer);
+
+        // Add a pending fetch for height 5
+        manager.add_pending_fetch(5, peer, Instant::now());
+
+        // Start sync to height 100
+        manager.start_sync(100, Hash::from_bytes(&[1u8; 32]));
+
+        // Height 5 should not be in the queue (it's pending)
+        assert!(!manager.is_height_queued(5));
+        // But other heights should be
+        assert!(manager.is_height_queued(1));
+        assert!(manager.is_height_queued(10));
     }
 }
