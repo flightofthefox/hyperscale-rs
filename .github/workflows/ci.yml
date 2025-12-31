@@ -59,7 +59,7 @@ jobs:
           RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C debuginfo=0"
         run: cargo test
       - name: Cargo Clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --no-deps -- -D warnings
 
   build:
     name: Build Docker Image
