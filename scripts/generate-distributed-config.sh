@@ -276,27 +276,37 @@ tcp_fallback_port = $TCP_PORT
 version_interop_mode = "relaxed"
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 upnp_enabled = false
-request_timeout_ms = 30000
-max_message_size = 10485760
+request_timeout_ms = 5000
+max_message_size = 16_777_216
 gossipsub_heartbeat_ms = 100
-direct_connection_limit = 50
-direct_connection_timeout_ms = 10000
-# Aggressive keep-alive for distributed deployments (WAN tolerant)
-idle_connection_timeout_ms = 120000
-keep_alive_interval_ms = 10000
+direct_connection_limit = 200
+direct_connection_timeout_ms = 2000
+idle_connection_timeout_ms = 30000
+keep_alive_interval_ms = 5000
 
 [consensus]
 proposal_interval_ms = 300
 view_change_timeout_ms = 3000
-max_transactions_per_block = 1024
-max_certificates_per_block = 4096
-rpc_mempool_limit = 16384
+max_transactions_per_block = 4096
+max_certificates_per_block = 8192
+rpc_mempool_limit = 32768
+speculative_max_txs = 1000
 
 [threads]
 crypto_threads = $CRYPTO_THREADS
 execution_threads = $EXECUTION_THREADS
 io_threads = $IO_THREADS
 pin_cores = false
+
+[storage]
+# Optimized for high-throughput (more memory, faster writes)
+max_background_jobs = 8
+write_buffer_mb = 256
+max_write_buffer_number = 4
+block_cache_mb = 1024
+compression = "zstd"
+bloom_filter_bits = 10.0
+bytes_per_sync_mb = 4
 
 [metrics]
 enabled = true
