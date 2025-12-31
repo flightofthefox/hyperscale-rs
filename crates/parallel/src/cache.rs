@@ -219,7 +219,8 @@ impl SimulationCache {
             if signer_keys.is_empty() {
                 *signature == zero_bls_signature()
             } else {
-                match Bls12381G1PublicKey::aggregate(signer_keys, true) {
+                // Skip PK validation - keys come from trusted topology
+                match Bls12381G1PublicKey::aggregate(signer_keys, false) {
                     Ok(aggregated_pk) => verify_bls12381_v1(message, &aggregated_pk, signature),
                     Err(_) => false,
                 }

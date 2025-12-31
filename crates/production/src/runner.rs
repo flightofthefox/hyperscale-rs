@@ -2272,7 +2272,8 @@ impl ProductionRunner {
                         false
                     } else {
                         // Verify aggregated BLS signature against domain-separated message
-                        match Bls12381G1PublicKey::aggregate(&signer_keys, true) {
+                        // Skip PK validation - keys come from trusted topology
+                        match Bls12381G1PublicKey::aggregate(&signer_keys, false) {
                             Ok(aggregated_pk) => verify_bls12381_v1(
                                 &signing_message,
                                 &aggregated_pk,
@@ -2946,11 +2947,11 @@ impl ProductionRunner {
                             .map(|(_, pk)| *pk)
                             .collect();
 
-                        // Pre-aggregate the public keys
+                        // Pre-aggregate the public keys (skip validation - keys from trusted topology)
                         let aggregated_pk = if signer_keys.is_empty() {
                             None // Will check for zero signature
                         } else {
-                            Bls12381G1PublicKey::aggregate(&signer_keys, true).ok()
+                            Bls12381G1PublicKey::aggregate(&signer_keys, false).ok()
                         };
 
                         (cert, msg, aggregated_pk)
@@ -3173,11 +3174,11 @@ impl ProductionRunner {
                             .map(|(_, pk)| *pk)
                             .collect();
 
-                        // Pre-aggregate the public keys
+                        // Pre-aggregate the public keys (skip validation - keys from trusted topology)
                         let aggregated_pk = if signer_keys.is_empty() {
                             None // Will check for zero signature
                         } else {
-                            Bls12381G1PublicKey::aggregate(&signer_keys, true).ok()
+                            Bls12381G1PublicKey::aggregate(&signer_keys, false).ok()
                         };
 
                         (tx_hash, shard, cert, msg, aggregated_pk)

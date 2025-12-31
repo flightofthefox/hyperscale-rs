@@ -125,14 +125,14 @@ pub fn batch_verify_bls_same_message(
         return true;
     }
 
-    // Aggregate signatures
+    // Aggregate signatures (validate to catch malformed sigs)
     let agg_sig = match Bls12381G2Signature::aggregate(signatures, true) {
         Ok(s) => s,
         Err(_) => return false,
     };
 
-    // Aggregate public keys
-    let agg_pk = match Bls12381G1PublicKey::aggregate(pubkeys, true) {
+    // Aggregate public keys (skip validation - keys come from trusted topology)
+    let agg_pk = match Bls12381G1PublicKey::aggregate(pubkeys, false) {
         Ok(pk) => pk,
         Err(_) => return false,
     };

@@ -1117,8 +1117,8 @@ impl SimulationRunner {
                     // No signers - valid only if it's a zero signature (single-shard case)
                     certificate.aggregated_signature == zero_bls_signature()
                 } else {
-                    // Aggregate the public keys and verify
-                    match Bls12381G1PublicKey::aggregate(&signer_keys, true) {
+                    // Aggregate the public keys and verify (skip PK validation - trusted topology)
+                    match Bls12381G1PublicKey::aggregate(&signer_keys, false) {
                         Ok(aggregated_pk) => verify_bls12381_v1(
                             &msg,
                             &aggregated_pk,
@@ -1165,8 +1165,8 @@ impl SimulationRunner {
                     // No signers - invalid QC (genesis QC is handled before action is emitted)
                     false
                 } else {
-                    // Aggregate the public keys and verify
-                    match Bls12381G1PublicKey::aggregate(&signer_keys, true) {
+                    // Aggregate the public keys and verify (skip PK validation - trusted topology)
+                    match Bls12381G1PublicKey::aggregate(&signer_keys, false) {
                         Ok(aggregated_pk) => verify_bls12381_v1(
                             &signing_message,
                             &aggregated_pk,
