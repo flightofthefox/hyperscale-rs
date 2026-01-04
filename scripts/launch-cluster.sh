@@ -37,6 +37,8 @@ SMOKE_TEST_TIMEOUT="${SMOKE_TEST_TIMEOUT:-60s}" # Smoke test timeout
 SKIP_BUILD="${SKIP_BUILD:-false}"               # Skip building binaries
 NODE_HOSTNAME="${NODE_HOSTNAME:-localhost}"     # Hostname for spammer endpoints
 TCP_FALLBACK_ENABLED="${TCP_FALLBACK_ENABLED:-false}" # Enable TCP fallback transport (default: false)
+NETWORK_LATENCY_MS=""                           # Network latency in milliseconds (empty = disabled)
+PACKET_LOSS_PERCENT=""                          # Packet loss percentage (empty = disabled)
 
 # Define explicit port ranges for Docker and firewall whitelisting
 # let's give a range of 500 ports which should be ok for local testing
@@ -98,6 +100,14 @@ while [[ $# -gt 0 ]]; do
             TRACING=true
             shift
             ;;
+        --latency)
+            NETWORK_LATENCY_MS="$2"
+            shift 2
+            ;;
+        --packet-loss)
+            PACKET_LOSS_PERCENT="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean] [--monitoring] [--log-level LEVEL] [--smoke-timeout DURATION] [--node-hostname HOST] [--no-tcp-fallback]"
             echo ""
@@ -115,6 +125,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --skip-build             Skip building binaries (default: false)"
             echo "  --start-monitoring       Start Prometheus + Grafana monitoring stack (default: false)"
             echo "  --tcp-fallback           Enable TCP fallback transport (QUIC only)"
+            echo "  --latency MS             Add network latency between validators (requires sudo)"
+            echo "  --packet-loss PERCENT    Add packet loss between validators (requires sudo)"
             echo ""
             echo "Environment Variables:"
             echo "  VALIDATOR_BIN            Path to validator binary (default: ./target/release/hyperscale-validator)"
@@ -139,6 +151,92 @@ done
 
 TOTAL_VALIDATORS=$((NUM_SHARDS * VALIDATORS_PER_SHARD))
 
+# Network simulation functions (cross-platform: Linux tc, macOS dnctl/pfctl)
+apply_network_conditions() {
+    if [ -z "$NETWORK_LATENCY_MS" ] && [ -z "$PACKET_LOSS_PERCENT" ]; then
+        return 0
+    fi
+
+    local latency="${NETWORK_LATENCY_MS:-0}"
+    local loss="${PACKET_LOSS_PERCENT:-0}"
+
+    # Calculate port ranges for validators (P2P only, not RPC)
+    local quic_port_start=$BASE_PORT
+    local quic_port_end=$((BASE_PORT + TOTAL_VALIDATORS - 1))
+    local tcp_port_start=$TCP_BASE_PORT
+    local tcp_port_end=$((TCP_BASE_PORT + TOTAL_VALIDATORS - 1))
+
+    echo "Applying network conditions (latency: ${latency}ms, packet loss: ${loss}%)..."
+    echo "  Affecting P2P ports: QUIC ${quic_port_start}-${quic_port_end}, TCP ${tcp_port_start}-${tcp_port_end}"
+
+    case "$(uname -s)" in
+        Linux)
+            # Use tc with iptables marking for port-based filtering
+            # First, clean up any existing rules
+            sudo tc qdisc del dev lo root 2>/dev/null || true
+            sudo iptables -t mangle -F OUTPUT 2>/dev/null || true
+
+            # Mark packets for validator P2P ports (not RPC)
+            sudo iptables -t mangle -A OUTPUT -p udp --dport ${quic_port_start}:${quic_port_end} -j MARK --set-mark 1
+            sudo iptables -t mangle -A OUTPUT -p tcp --dport ${tcp_port_start}:${tcp_port_end} -j MARK --set-mark 1
+
+            # Create prio qdisc with netem for marked packets
+            sudo tc qdisc add dev lo root handle 1: prio
+            sudo tc qdisc add dev lo parent 1:3 handle 30: netem delay ${latency}ms loss ${loss}%
+            sudo tc filter add dev lo parent 1:0 protocol ip prio 3 handle 1 fw flowid 1:3
+
+            echo "  Applied via tc/iptables on Linux"
+            ;;
+        Darwin)
+            # Use dnctl + pfctl for macOS
+            # Clean up first
+            sudo pfctl -d 2>/dev/null || true
+            sudo dnctl -q flush 2>/dev/null || true
+
+            # Convert loss percentage to probability (0.0 to 1.0)
+            local plr=$(echo "scale=4; ${loss}/100" | bc)
+
+            # Create dummynet pipe with delay and packet loss
+            sudo dnctl pipe 1 config delay ${latency}ms plr ${plr}
+
+            # Create pf rules for validator P2P ports only (not RPC)
+            cat <<EOF | sudo pfctl -f -
+# Hyperscale network simulation rules (P2P only)
+dummynet in proto udp from any to any port ${quic_port_start}:${quic_port_end} pipe 1
+dummynet out proto udp from any port ${quic_port_start}:${quic_port_end} to any pipe 1
+dummynet in proto tcp from any to any port ${tcp_port_start}:${tcp_port_end} pipe 1
+dummynet out proto tcp from any port ${tcp_port_start}:${tcp_port_end} to any pipe 1
+EOF
+            sudo pfctl -e 2>/dev/null || true
+
+            echo "  Applied via dnctl/pfctl on macOS"
+            ;;
+        *)
+            echo "WARNING: Network simulation not supported on $(uname -s)"
+            return 1
+            ;;
+    esac
+}
+
+remove_network_conditions() {
+    if [ -z "$NETWORK_LATENCY_MS" ] && [ -z "$PACKET_LOSS_PERCENT" ]; then
+        return 0
+    fi
+
+    echo "Removing network conditions..."
+
+    case "$(uname -s)" in
+        Linux)
+            sudo tc qdisc del dev lo root 2>/dev/null || true
+            sudo iptables -t mangle -F OUTPUT 2>/dev/null || true
+            ;;
+        Darwin)
+            sudo pfctl -d 2>/dev/null || true
+            sudo dnctl -q flush 2>/dev/null || true
+            ;;
+    esac
+}
+
 # Validate minimum validators per shard
 if [ "$VALIDATORS_PER_SHARD" -lt 4 ]; then
     echo "ERROR: Minimum 4 validators per shard required for BFT consensus."
@@ -159,6 +257,9 @@ echo "Skip build: $SKIP_BUILD"
 echo "Clean data dir: $CLEAN"
 echo "TCP fallback: $TCP_FALLBACK_ENABLED"
 echo "Tracing: $TRACING"
+if [ -n "$NETWORK_LATENCY_MS" ] || [ -n "$PACKET_LOSS_PERCENT" ]; then
+    echo "Network simulation: latency=${NETWORK_LATENCY_MS:-0}ms, loss=${PACKET_LOSS_PERCENT:-0}%"
+fi
 echo "Network Ports:"
 echo "  QUIC Range: $QUIC_PORT_RANGE"
 echo "  TCP Range:  $TCP_PORT_RANGE"
@@ -390,6 +491,9 @@ if [ "$FAILED" = true ]; then
     exit 1
 fi
 
+# Apply network conditions after validators are running
+apply_network_conditions
+
 echo ""
 echo "=== Cluster Started ==="
 echo ""
@@ -462,6 +566,10 @@ fi
 cleanup() {
     echo ""
     echo "Stopping cluster..."
+
+    # Remove network conditions first
+    remove_network_conditions
+
     # Read PIDs from file if available, otherwise kill by pattern might be too aggressive
     if [ -f "$PID_FILE" ]; then
         while read -r pid; do
