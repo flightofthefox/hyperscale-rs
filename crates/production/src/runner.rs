@@ -613,10 +613,10 @@ impl ProductionRunnerBuilder {
         // Create sync manager (uses consensus channel for sync events)
         // The topology is passed directly - SyncManager queries it for committee members
         // SyncManager delegates retry logic to RequestManager.
+        // Sync only accepts complete blocks - no backfill mechanism needed.
         let sync_manager = SyncManager::new(
             SyncConfig::default(),
             request_manager.clone(),
-            storage.clone(),
             consensus_tx.clone(),
             topology.clone(),
         );
@@ -1712,21 +1712,6 @@ impl ProductionRunner {
                     // Tick both managers to process pending fetches
                     self.sync_manager.tick().await;
                     self.fetch_manager.tick().await;
-
-                    // Process sync backfills - trigger fetches for missing data
-                    self.sync_manager.tick_backfills();
-                    for (block_hash, proposer, missing_txs, missing_certs) in
-                        self.sync_manager.get_pending_backfill_fetches()
-                    {
-                        if !missing_txs.is_empty() {
-                            self.fetch_manager
-                                .request_transactions(block_hash, proposer, missing_txs);
-                        }
-                        if !missing_certs.is_empty() {
-                            self.fetch_manager
-                                .request_certificates(block_hash, proposer, missing_certs);
-                        }
-                    }
                 }
 
                 // Transaction status updates (non-consensus-critical)

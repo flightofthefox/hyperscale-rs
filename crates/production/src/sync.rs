@@ -3,9 +3,20 @@
 //! The sync manager handles block synchronization by delegating request retry
 //! and peer selection to the `RequestManager`. This module focuses on:
 //! - Tracking what heights need to be fetched
-//! - Ordering and delivering blocks to BFT
-//! - Handling metadata-only responses via backfill
+//! - Ordering and delivering complete blocks to BFT
 //! - Malicious peer banning (distinct from transient failures)
+//!
+//! # Design: Complete Blocks Only
+//!
+//! Sync only accepts **complete blocks** with all transactions, certificates,
+//! and a QC. If a peer can't provide a complete block (e.g., returns metadata
+//! only or an empty response), we treat it as "peer doesn't have the block"
+//! and retry with another peer.
+//!
+//! This simplifies the sync protocol significantly:
+//! - No need to track partial state or "backfill" missing data
+//! - No coordination with FetchManager during sync
+//! - Clear success/failure semantics
 //!
 //! # Architecture
 //!
@@ -14,12 +25,12 @@
 //! │  SyncNeeded     │────▶│  SyncManager     │────▶│ RequestManager  │
 //! │  (from BFT)     │     │ (orchestration)  │     │ (retry/peers)   │
 //! └─────────────────┘     └──────────────────┘     └─────────────────┘
-//!                                │                         │
-//!                                ▼                         ▼
-//!                         ┌──────────────┐          ┌─────────────┐
-//!                         │   Storage    │          │  Network    │
-//!                         │  (backfill)  │          │  Adapter    │
-//!                         └──────────────┘          └─────────────┘
+//!                                                          │
+//!                                                          ▼
+//!                                                   ┌─────────────┐
+//!                                                   │  Network    │
+//!                                                   │  Adapter    │
+//!                                                   └─────────────┘
 //! ```
 //!
 //! The `RequestManager` handles:
@@ -32,14 +43,12 @@
 //! - What heights need syncing
 //! - Block validation and ordering
 //! - Malicious peer banning
-//! - Backfill for metadata-only responses
 
 use crate::metrics;
 use crate::network::{compute_peer_id_for_validator, RequestManager, RequestPriority};
-use crate::storage::RocksDbStorage;
 use crate::sync_error::SyncResponseError;
 use hyperscale_core::Event;
-use hyperscale_types::{Block, BlockHeight, BlockMetadata, Hash, QuorumCertificate, Topology};
+use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, Topology};
 use libp2p::PeerId;
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -138,9 +147,6 @@ pub struct SyncConfig {
     /// Maximum ban duration (caps the exponential backoff).
     pub max_ban_duration: Duration,
 
-    /// Timeout for backfill operations (fetching missing txs/certs after metadata-only response).
-    pub backfill_timeout: Duration,
-
     /// Maximum number of heights to queue ahead of committed height.
     /// This creates a sliding window that limits memory usage in BFT's buffered_synced_blocks.
     pub sync_window_size: u64,
@@ -154,7 +160,6 @@ impl Default for SyncConfig {
             max_spawned_fetches: 32,
             base_ban_duration: Duration::from_secs(600), // 10 minutes
             max_ban_duration: Duration::from_secs(86400), // 24 hours
-            backfill_timeout: Duration::from_secs(30),
             sync_window_size: 64,
         }
     }
@@ -174,21 +179,6 @@ struct PeerBanState {
     banned_until: Option<Instant>,
     /// Number of times this peer has been banned (for exponential backoff).
     ban_count: u32,
-}
-
-/// A pending sync backfill - block where we have metadata but are fetching txs/certs.
-#[derive(Debug)]
-struct PendingBackfill {
-    /// Block metadata (header + tx/cert hashes + QC).
-    metadata: BlockMetadata,
-    /// When backfill started.
-    started: Instant,
-    /// Transaction hashes we've received.
-    received_txs: HashSet<Hash>,
-    /// Certificate hashes we've received.
-    received_certs: HashSet<Hash>,
-    /// Whether we've triggered fetch requests.
-    fetch_triggered: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -232,14 +222,12 @@ pub fn validate_sync_response(
 /// Manages sync block fetching for the production runner.
 ///
 /// Delegates retry logic and peer selection to `RequestManager`.
-/// Focuses on height tracking, block validation, and backfill.
+/// Focuses on height tracking and block validation.
 pub struct SyncManager {
     /// Configuration.
     config: SyncConfig,
     /// Request manager for network requests with retry.
     request_manager: Arc<RequestManager>,
-    /// Storage for reconstructing blocks from metadata.
-    storage: Arc<RocksDbStorage>,
     /// Event sender for delivering fetched blocks.
     event_tx: mpsc::Sender<Event>,
     /// Network topology - source of truth for committee membership.
@@ -258,10 +246,6 @@ pub struct SyncManager {
     fetch_result_rx: mpsc::Receiver<SyncFetchResult>,
     /// Sender for spawned fetch tasks to report results.
     fetch_result_tx: mpsc::Sender<SyncFetchResult>,
-    /// Pending backfills - blocks where we have metadata but are fetching txs/certs.
-    pending_backfills: HashMap<u64, PendingBackfill>,
-    /// Reverse lookup: block hash -> height for O(1) backfill lookup.
-    backfill_hash_to_height: HashMap<Hash, u64>,
     /// Peer ban states for malicious behavior.
     peer_bans: HashMap<PeerId, PeerBanState>,
 }
@@ -271,7 +255,6 @@ impl SyncManager {
     pub fn new(
         config: SyncConfig,
         request_manager: Arc<RequestManager>,
-        storage: Arc<RocksDbStorage>,
         event_tx: mpsc::Sender<Event>,
         topology: Arc<dyn Topology>,
     ) -> Self {
@@ -282,7 +265,6 @@ impl SyncManager {
         Self {
             config,
             request_manager,
-            storage,
             event_tx,
             topology,
             sync_target: None,
@@ -292,8 +274,6 @@ impl SyncManager {
             committed_height: 0,
             fetch_result_rx,
             fetch_result_tx,
-            pending_backfills: HashMap::new(),
-            backfill_hash_to_height: HashMap::new(),
             peer_bans: HashMap::new(),
         }
     }
@@ -578,42 +558,32 @@ impl SyncManager {
     }
 
     /// Handle a block response.
+    ///
+    /// We only accept complete blocks (block + QC). Empty responses or decode
+    /// errors are treated as "peer doesn't have the block" and we re-queue
+    /// the height for retry with another peer.
     async fn handle_block_response(&mut self, height: u64, response_bytes: Vec<u8>) {
-        let decoded: Result<
-            (
-                Option<Block>,
-                Option<QuorumCertificate>,
-                Option<BlockMetadata>,
-            ),
-            _,
-        > = sbor::basic_decode(&response_bytes);
+        // Wire format: Option<(Block, QuorumCertificate)>
+        // Some = complete block, None = not available
+        let decoded: Result<Option<(Block, QuorumCertificate)>, _> =
+            sbor::basic_decode(&response_bytes);
 
         match decoded {
-            Ok((Some(block), Some(qc), _)) => {
+            Ok(Some((block, qc))) => {
+                // Complete block received - validate and deliver
                 match validate_sync_response(height, &block, &qc) {
                     Ok(()) => {
                         self.on_block_received(height, block, qc).await;
                     }
                     Err(error) => {
-                        // Note: We can't ban here since RequestManager handles peer selection
-                        // In a full implementation, we'd want to communicate malicious responses back
                         warn!(height, ?error, "Invalid sync response");
                         metrics::record_sync_response_error(error.metric_label());
                         self.queue_height(height);
                     }
                 }
             }
-            Ok((None, None, Some(metadata))) => {
-                info!(
-                    height,
-                    tx_count = metadata.tx_hashes.len(),
-                    cert_count = metadata.cert_hashes.len(),
-                    "Received metadata-only sync response, starting backfill"
-                );
-                self.start_backfill(height, metadata);
-                metrics::record_sync_metadata_only();
-            }
-            Ok((None, None, None)) | Ok((None, _, _)) | Ok((_, None, _)) => {
+            Ok(None) => {
+                // Peer doesn't have the block - try another peer
                 debug!(height, "Empty sync response - re-queuing");
                 metrics::record_sync_response_error("empty");
                 self.queue_height(height);
@@ -696,229 +666,6 @@ impl SyncManager {
     /// Check if a peer is currently banned (public API).
     pub fn is_peer_banned_public(&self, peer: &PeerId) -> bool {
         self.is_peer_banned(peer, Instant::now())
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Backfill Methods
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Start a backfill for a block where we have metadata but missing txs/certs.
-    fn start_backfill(&mut self, height: u64, metadata: BlockMetadata) {
-        if self.pending_backfills.contains_key(&height) {
-            debug!(height, "Backfill already pending for height");
-            return;
-        }
-
-        if height <= self.committed_height {
-            debug!(height, "Not starting backfill - already committed");
-            return;
-        }
-
-        info!(
-            height,
-            tx_count = metadata.tx_hashes.len(),
-            cert_count = metadata.cert_hashes.len(),
-            "Starting sync backfill"
-        );
-
-        // Add reverse lookup for O(1) block hash -> height mapping
-        let block_hash = metadata.header.hash();
-        self.backfill_hash_to_height.insert(block_hash, height);
-
-        self.pending_backfills.insert(
-            height,
-            PendingBackfill {
-                metadata,
-                started: Instant::now(),
-                received_txs: HashSet::new(),
-                received_certs: HashSet::new(),
-                fetch_triggered: false,
-            },
-        );
-
-        self.try_complete_backfill(height);
-    }
-
-    /// Notify that transactions have been received (from FetchManager).
-    pub fn on_transactions_received(&mut self, block_hash: Hash, tx_hashes: &[Hash]) {
-        // O(1) lookup using reverse map instead of O(n) scan
-        let Some(&height) = self.backfill_hash_to_height.get(&block_hash) else {
-            return;
-        };
-
-        if let Some(backfill) = self.pending_backfills.get_mut(&height) {
-            for hash in tx_hashes {
-                backfill.received_txs.insert(*hash);
-            }
-            debug!(
-                height,
-                received = backfill.received_txs.len(),
-                needed = backfill.metadata.tx_hashes.len(),
-                "Backfill received transactions"
-            );
-        }
-        self.try_complete_backfill(height);
-    }
-
-    /// Notify that certificates have been received (from FetchManager).
-    pub fn on_certificates_received(&mut self, block_hash: Hash, cert_hashes: &[Hash]) {
-        // O(1) lookup using reverse map instead of O(n) scan
-        let Some(&height) = self.backfill_hash_to_height.get(&block_hash) else {
-            return;
-        };
-
-        if let Some(backfill) = self.pending_backfills.get_mut(&height) {
-            for hash in cert_hashes {
-                backfill.received_certs.insert(*hash);
-            }
-            debug!(
-                height,
-                received = backfill.received_certs.len(),
-                needed = backfill.metadata.cert_hashes.len(),
-                "Backfill received certificates"
-            );
-        }
-        self.try_complete_backfill(height);
-    }
-
-    /// Try to complete a backfill by reconstructing the block from storage.
-    fn try_complete_backfill(&mut self, height: u64) {
-        if !self.pending_backfills.contains_key(&height) {
-            return;
-        }
-
-        let block_height = BlockHeight(height);
-
-        if let Some((block, qc)) = self.storage.get_block_denormalized(block_height) {
-            info!(
-                height,
-                txs = block.transactions.len(),
-                certs = block.committed_certificates.len(),
-                "Backfill complete - block reconstructed from storage"
-            );
-
-            // Remove from both maps
-            if let Some(backfill) = self.pending_backfills.remove(&height) {
-                let block_hash = backfill.metadata.header.hash();
-                self.backfill_hash_to_height.remove(&block_hash);
-            }
-
-            let event = Event::SyncBlockReadyToApply { block, qc };
-            let event_tx = self.event_tx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = event_tx.send(event).await {
-                    warn!(height, error = ?e, "Failed to deliver backfilled block to BFT");
-                }
-            });
-
-            return;
-        }
-
-        let backfill = self.pending_backfills.get_mut(&height).unwrap();
-
-        if !backfill.fetch_triggered {
-            backfill.fetch_triggered = true;
-
-            let missing_txs: Vec<Hash> = backfill
-                .metadata
-                .tx_hashes
-                .iter()
-                .filter(|h| self.storage.get_transaction(h).is_none())
-                .cloned()
-                .collect();
-
-            let missing_certs: Vec<Hash> = backfill
-                .metadata
-                .cert_hashes
-                .iter()
-                .filter(|h| self.storage.get_certificate(h).is_none())
-                .cloned()
-                .collect();
-
-            if !missing_txs.is_empty() || !missing_certs.is_empty() {
-                info!(
-                    height,
-                    missing_txs = missing_txs.len(),
-                    missing_certs = missing_certs.len(),
-                    "Backfill needs fetch for missing data"
-                );
-            }
-        }
-    }
-
-    /// Get pending backfill fetch requests.
-    pub fn get_pending_backfill_fetches(
-        &self,
-    ) -> Vec<(Hash, hyperscale_types::ValidatorId, Vec<Hash>, Vec<Hash>)> {
-        let mut result = Vec::new();
-
-        for backfill in self.pending_backfills.values() {
-            if !backfill.fetch_triggered {
-                continue;
-            }
-
-            let block_hash = backfill.metadata.header.hash();
-            let proposer = backfill.metadata.header.proposer;
-
-            // Collect missing txs and certs in a single pass
-            let mut missing_txs = Vec::new();
-            let mut missing_certs = Vec::new();
-
-            for h in &backfill.metadata.tx_hashes {
-                if self.storage.get_transaction(h).is_none() {
-                    missing_txs.push(*h);
-                }
-            }
-
-            for h in &backfill.metadata.cert_hashes {
-                if self.storage.get_certificate(h).is_none() {
-                    missing_certs.push(*h);
-                }
-            }
-
-            if !missing_txs.is_empty() || !missing_certs.is_empty() {
-                result.push((block_hash, proposer, missing_txs, missing_certs));
-            }
-        }
-
-        result
-    }
-
-    /// Tick backfills - check for completions and timeouts.
-    pub fn tick_backfills(&mut self) {
-        let timeout = self.config.backfill_timeout;
-        let now = Instant::now();
-
-        // First, remove timed-out backfills and collect heights that need completion check
-        let mut heights_to_check = Vec::new();
-        let mut hashes_to_remove = Vec::new();
-
-        self.pending_backfills.retain(|&height, backfill| {
-            if now.duration_since(backfill.started) > timeout {
-                warn!(
-                    height,
-                    timeout_secs = timeout.as_secs(),
-                    "Backfill timed out"
-                );
-                metrics::record_sync_response_error("backfill_timeout");
-                // Track hash for reverse lookup cleanup
-                hashes_to_remove.push(backfill.metadata.header.hash());
-                false
-            } else {
-                heights_to_check.push(height);
-                true
-            }
-        });
-
-        // Clean up reverse lookup for timed-out backfills
-        for hash in hashes_to_remove {
-            self.backfill_hash_to_height.remove(&hash);
-        }
-
-        // Then try to complete remaining backfills
-        for height in heights_to_check {
-            self.try_complete_backfill(height);
-        }
     }
 }
 

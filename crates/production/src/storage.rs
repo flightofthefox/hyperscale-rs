@@ -413,20 +413,6 @@ use hyperscale_types::{
     TransactionCertificate,
 };
 
-/// Result of attempting to fetch a block for sync.
-///
-/// When serving sync requests, we prefer to return complete blocks. However,
-/// if transactions or certificates are missing (e.g., due to incomplete
-/// persistence or pruning), we fall back to returning just the metadata.
-/// The receiver can then use the fetch protocol to retrieve the missing data.
-#[derive(Debug, Clone)]
-pub enum SyncBlockData {
-    /// Full block with all transactions and certificates.
-    Complete(Block, QuorumCertificate),
-    /// Only metadata available - transactions/certificates must be fetched separately.
-    MetadataOnly(BlockMetadata),
-}
-
 impl RocksDbStorage {
     /// Store a committed block with its quorum certificate.
     ///
@@ -774,13 +760,17 @@ impl RocksDbStorage {
         Some(metadata)
     }
 
-    /// Try to get a full block, falling back to metadata-only if data is missing.
+    /// Get a complete block for serving sync requests.
     ///
-    /// Returns:
-    /// - `Some(SyncBlockData::Complete(block, qc))` if full block available
-    /// - `Some(SyncBlockData::MetadataOnly(metadata))` if metadata exists but txs/certs missing
-    /// - `None` if no block metadata exists at this height
-    pub fn get_block_for_sync(&self, height: BlockHeight) -> Option<SyncBlockData> {
+    /// Returns `Some((block, qc))` only if the full block is available with all
+    /// transactions and certificates. Returns `None` if:
+    /// - Block metadata doesn't exist at this height
+    /// - Any transactions are missing
+    /// - Any certificates are missing
+    ///
+    /// This ensures sync responses always contain complete, self-contained blocks.
+    /// If a peer can't provide a complete block, the requester should try another peer.
+    pub fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
         let start = Instant::now();
 
         // 1. Get block metadata
@@ -799,7 +789,7 @@ impl RocksDbStorage {
         let priority_transactions = self.get_transactions_batch_ordered(&metadata.priority_hashes);
         let transactions = self.get_transactions_batch_ordered(&metadata.tx_hashes);
 
-        // Check if all transactions are present
+        // Check if all transactions are present - if not, return None
         let total_expected =
             metadata.retry_hashes.len() + metadata.priority_hashes.len() + metadata.tx_hashes.len();
         let total_found =
@@ -809,27 +799,27 @@ impl RocksDbStorage {
                 height = height.0,
                 expected = total_expected,
                 found = total_found,
-                "Block has missing transactions - returning metadata only"
+                "Block has missing transactions - cannot serve sync request"
             );
             let elapsed = start.elapsed().as_secs_f64();
-            metrics::record_storage_operation("get_block_for_sync_metadata_only", elapsed);
-            return Some(SyncBlockData::MetadataOnly(metadata));
+            metrics::record_storage_operation("get_block_for_sync_incomplete", elapsed);
+            return None;
         }
 
         // 3. Try to batch-fetch certificates (preserving order)
         let certificates = self.get_certificates_batch_ordered(&metadata.cert_hashes);
 
-        // Check if all certificates are present
+        // Check if all certificates are present - if not, return None
         if certificates.len() != metadata.cert_hashes.len() {
             tracing::debug!(
                 height = height.0,
                 expected = metadata.cert_hashes.len(),
                 found = certificates.len(),
-                "Block has missing certificates - returning metadata only"
+                "Block has missing certificates - cannot serve sync request"
             );
             let elapsed = start.elapsed().as_secs_f64();
-            metrics::record_storage_operation("get_block_for_sync_metadata_only", elapsed);
-            return Some(SyncBlockData::MetadataOnly(metadata));
+            metrics::record_storage_operation("get_block_for_sync_incomplete", elapsed);
+            return None;
         }
 
         // 4. Full block available - reconstruct it
@@ -848,7 +838,7 @@ impl RocksDbStorage {
         metrics::record_rocksdb_read(elapsed);
         metrics::record_storage_operation("get_block_for_sync_complete", elapsed);
 
-        Some(SyncBlockData::Complete(block, metadata.qc))
+        Some((block, metadata.qc))
     }
 
     /// Get multiple transactions by hash, preserving order.
