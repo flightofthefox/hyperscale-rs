@@ -4,7 +4,6 @@
 
 mod block;
 mod certificate;
-mod sync;
 mod transaction;
 
 pub use block::GetBlockResponse;

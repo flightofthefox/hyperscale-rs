@@ -772,7 +772,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = RequestManagerConfig::default();
-        assert_eq!(config.max_concurrent, 32);
+        assert_eq!(config.max_concurrent, 64);
         assert_eq!(config.retries_before_rotation, 3); // Good for packet loss
         assert_eq!(config.max_total_attempts, 15); // More attempts for lossy networks
         assert_eq!(config.initial_backoff, Duration::from_millis(150));

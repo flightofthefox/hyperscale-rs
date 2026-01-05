@@ -52,9 +52,7 @@ use hyperscale_messages::request::{
     GetCertificatesRequest, GetTransactionsRequest, FETCH_TYPE_CERTIFICATE, FETCH_TYPE_TRANSACTION,
 };
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
-use hyperscale_types::{
-    Block, BlockHeight, BlockMetadata, Hash, QuorumCertificate, TransactionCertificate,
-};
+use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, TransactionCertificate};
 use libp2p::PeerId;
 use quick_cache::sync::Cache as QuickCache;
 use std::sync::Arc;
@@ -215,8 +213,6 @@ impl InboundRouter {
 
     /// Handle a block sync request.
     fn handle_block_request(&self, request: InboundRequest) {
-        use crate::storage::SyncBlockData;
-
         // Decode height from 8 bytes (little-endian u64)
         let height_bytes: [u8; 8] = match request.payload.as_ref().try_into() {
             Ok(bytes) => bytes,
@@ -243,40 +239,17 @@ impl InboundRouter {
         // Spawn on blocking thread pool to avoid blocking the router.
         // RocksDB reads are synchronous I/O that can take ms for large blocks.
         tokio::task::spawn_blocking(move || {
-            let response = match storage.get_block_for_sync(block_height) {
-                Some(SyncBlockData::Complete(block, qc)) => {
-                    // Full block available - encode as (Some(block), Some(qc), None)
-                    match sbor::basic_encode(&(Some(&block), Some(&qc), None::<BlockMetadata>)) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            warn!(height, error = ?e, "Failed to encode block response");
-                            Self::encode_empty_block_response()
-                        }
-                    }
-                }
-                Some(SyncBlockData::MetadataOnly(metadata)) => {
-                    // Metadata only - encode as (None, None, Some(metadata))
-                    debug!(
-                        height,
-                        tx_count = metadata.tx_hashes.len(),
-                        cert_count = metadata.cert_hashes.len(),
-                        "Returning metadata-only sync response"
-                    );
-                    match sbor::basic_encode(&(
-                        None::<Block>,
-                        None::<QuorumCertificate>,
-                        Some(&metadata),
-                    )) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            warn!(height, error = ?e, "Failed to encode metadata response");
-                            Self::encode_empty_block_response()
-                        }
-                    }
-                }
-                None => {
-                    trace!(height, "Block not found for sync request");
-                    Self::encode_empty_block_response()
+            // Wire format: Option<(Block, QuorumCertificate)>
+            // Some = complete block available, None = not available
+            let sync_response: Option<(Block, QuorumCertificate)> =
+                storage.get_block_for_sync(block_height);
+
+            let response = match sbor::basic_encode(&sync_response) {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(height, error = ?e, "Failed to encode block response");
+                    // Encode None as fallback
+                    sbor::basic_encode(&None::<(Block, QuorumCertificate)>).unwrap_or_default()
                 }
             };
 
@@ -428,16 +401,6 @@ impl InboundRouter {
 
         // Update metrics
         crate::metrics::record_fetch_response_sent("certificate", found_count);
-    }
-
-    /// Encode an empty block response.
-    fn encode_empty_block_response() -> Vec<u8> {
-        sbor::basic_encode(&(
-            None::<Block>,
-            None::<QuorumCertificate>,
-            None::<BlockMetadata>,
-        ))
-        .unwrap_or_default()
     }
 }
 

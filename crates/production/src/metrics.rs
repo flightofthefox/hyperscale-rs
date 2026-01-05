@@ -945,9 +945,9 @@ pub fn record_sync_block_downloaded() {
 /// - `"request_id_mismatch"` - wrong request ID
 /// - `"state_mismatch"` - block doesn't extend current state
 /// - `"timeout"` - sync fetch request timed out
-/// - `"backfill_timeout"` - backfill request timed out (transactions/certs for metadata-only block)
 /// - `"network_error"` - network-level failure
-/// - `"empty_response"` - peer doesn't have the block (may have pruned it)
+/// - `"empty"` - peer doesn't have the block (may have pruned it or has incomplete data)
+/// - `"decode_error"` - failed to decode response
 ///
 /// Malicious (results in peer ban):
 /// - `"qc_hash_mismatch"` - QC doesn't match block
@@ -966,15 +966,6 @@ pub fn record_sync_response_error(error_type: &str) {
 /// Record a peer banned for malicious sync behavior.
 pub fn record_sync_peer_banned() {
     metrics().sync_peers_banned.inc();
-}
-
-/// Record a metadata-only sync response (triggers backfill).
-pub fn record_sync_metadata_only() {
-    // Use the existing sync_response_errors counter with a distinct label
-    metrics()
-        .sync_response_errors
-        .with_label_values(&["metadata_only"])
-        .inc();
 }
 
 /// Record a livelock cycle detection event.
