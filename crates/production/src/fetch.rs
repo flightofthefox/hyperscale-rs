@@ -50,10 +50,8 @@ pub struct FetchConfig {
     /// Prevents overwhelming the network during many pending blocks.
     pub max_total_concurrent: usize,
 
-    /// Initial timeout for fetch requests.
-    pub initial_timeout: Duration,
-
-    /// Maximum timeout for fetch requests (after exponential backoff).
+    /// Maximum timeout for fetch requests.
+    /// Used as a cap on adaptive RTT-based timeouts and for stale request detection.
     pub max_timeout: Duration,
 
     /// Initial backoff delay after a failed retry round.
@@ -88,7 +86,7 @@ impl Default for FetchConfig {
             // Increased to allow parallel chunked fetching across more peers
             max_concurrent_per_block: 8,
             max_total_concurrent: 32,
-            initial_timeout: Duration::from_millis(500),
+            // Max timeout caps adaptive RTT-based timeouts
             max_timeout: Duration::from_secs(5),
             // Exponential backoff: 500ms -> 1s -> 2s -> 4s -> 5s (capped)
             initial_retry_backoff: Duration::from_millis(500),
@@ -112,7 +110,6 @@ impl FetchConfig {
     #[cfg(test)]
     pub fn for_local() -> Self {
         Self {
-            initial_timeout: Duration::from_millis(100),
             max_timeout: Duration::from_secs(1),
             peer_cooldown: Duration::from_secs(2),
             ..Default::default()
@@ -123,7 +120,6 @@ impl FetchConfig {
     #[cfg(test)]
     pub fn for_wan() -> Self {
         Self {
-            initial_timeout: Duration::from_secs(2),
             max_timeout: Duration::from_secs(15),
             peer_cooldown: Duration::from_secs(30),
             ..Default::default()
@@ -1147,15 +1143,14 @@ impl FetchManager {
 
         let network = self.network.clone();
         let result_tx = self.result_tx.clone();
-        let timeout = self.config.initial_timeout;
 
         tokio::spawn(async move {
             let result = match kind {
                 FetchKind::Transaction => {
-                    Self::fetch_transactions(network, peer, block_hash, hashes, timeout).await
+                    Self::fetch_transactions(network, peer, block_hash, hashes).await
                 }
                 FetchKind::Certificate => {
-                    Self::fetch_certificates(network, peer, block_hash, hashes, timeout).await
+                    Self::fetch_certificates(network, peer, block_hash, hashes).await
                 }
             };
 
@@ -1165,26 +1160,26 @@ impl FetchManager {
     }
 
     /// Fetch transactions from a peer.
+    ///
+    /// Uses adaptive per-peer timeout from the network adapter's RTT tracker.
     async fn fetch_transactions(
         network: Arc<Libp2pAdapter>,
         peer: PeerId,
         block_hash: Hash,
         tx_hashes: Vec<Hash>,
-        timeout: Duration,
     ) -> FetchResult {
         let start = Instant::now();
 
-        let result = tokio::time::timeout(
-            timeout,
-            network.request_transactions(peer, block_hash, tx_hashes),
-        )
-        .await;
+        // Network adapter uses adaptive RTT-based timeout internally
+        let result = network
+            .request_transactions(peer, block_hash, tx_hashes)
+            .await;
 
         let elapsed = start.elapsed();
         metrics::record_fetch_latency(FetchKind::Transaction, elapsed);
 
         match result {
-            Ok(Ok(response_bytes)) => {
+            Ok(response_bytes) => {
                 match sbor::basic_decode::<GetTransactionsResponse>(&response_bytes) {
                     Ok(response) => FetchResult::TransactionsReceived {
                         block_hash,
@@ -1200,47 +1195,45 @@ impl FetchManager {
                     },
                 }
             }
-            Ok(Err(ref e)) => {
+            Err(ref e) => {
                 let is_backpressure = matches!(e, crate::network::NetworkError::Backpressure);
+                let is_timeout = matches!(e, crate::network::NetworkError::Timeout);
                 FetchResult::Failed {
                     block_hash,
                     kind: FetchKind::Transaction,
                     peer,
-                    error: format!("network error: {}", e),
+                    error: if is_timeout {
+                        "timeout".to_string()
+                    } else {
+                        format!("network error: {}", e)
+                    },
                     is_backpressure,
                 }
             }
-            Err(_) => FetchResult::Failed {
-                block_hash,
-                kind: FetchKind::Transaction,
-                peer,
-                error: "timeout".to_string(),
-                is_backpressure: false,
-            },
         }
     }
 
     /// Fetch certificates from a peer.
+    ///
+    /// Uses adaptive per-peer timeout from the network adapter's RTT tracker.
     async fn fetch_certificates(
         network: Arc<Libp2pAdapter>,
         peer: PeerId,
         block_hash: Hash,
         cert_hashes: Vec<Hash>,
-        timeout: Duration,
     ) -> FetchResult {
         let start = Instant::now();
 
-        let result = tokio::time::timeout(
-            timeout,
-            network.request_certificates(peer, block_hash, cert_hashes),
-        )
-        .await;
+        // Network adapter uses adaptive RTT-based timeout internally
+        let result = network
+            .request_certificates(peer, block_hash, cert_hashes)
+            .await;
 
         let elapsed = start.elapsed();
         metrics::record_fetch_latency(FetchKind::Certificate, elapsed);
 
         match result {
-            Ok(Ok(response_bytes)) => {
+            Ok(response_bytes) => {
                 match sbor::basic_decode::<GetCertificatesResponse>(&response_bytes) {
                     Ok(response) => FetchResult::CertificatesReceived {
                         block_hash,
@@ -1256,35 +1249,37 @@ impl FetchManager {
                     },
                 }
             }
-            Ok(Err(ref e)) => {
+            Err(ref e) => {
                 let is_backpressure = matches!(e, crate::network::NetworkError::Backpressure);
+                let is_timeout = matches!(e, crate::network::NetworkError::Timeout);
                 FetchResult::Failed {
                     block_hash,
                     kind: FetchKind::Certificate,
                     peer,
-                    error: format!("network error: {}", e),
+                    error: if is_timeout {
+                        "timeout".to_string()
+                    } else {
+                        format!("network error: {}", e)
+                    },
                     is_backpressure,
                 }
             }
-            Err(_) => FetchResult::Failed {
-                block_hash,
-                kind: FetchKind::Certificate,
-                peer,
-                error: "timeout".to_string(),
-                is_backpressure: false,
-            },
         }
     }
 
     /// Check for timed out requests and retry them.
+    ///
+    /// Uses adaptive per-peer timeouts based on RTT, capped at max_timeout.
     async fn check_timeouts(&mut self) {
-        let timeout = self.config.max_timeout;
+        let max_timeout = self.config.max_timeout;
+        let rtt_tracker = self.network.rtt_tracker().clone();
 
         // Check transaction fetches
         let mut timed_out: Vec<(Hash, PeerId)> = Vec::new();
         for (block_hash, state) in &self.tx_fetches {
             for (peer, req) in &state.in_flight {
-                if req.started.elapsed() > timeout {
+                let adaptive_timeout = rtt_tracker.get_timeout(peer).min(max_timeout);
+                if req.started.elapsed() > adaptive_timeout {
                     timed_out.push((*block_hash, *peer));
                 }
             }
@@ -1300,7 +1295,8 @@ impl FetchManager {
         let mut timed_out: Vec<(Hash, PeerId)> = Vec::new();
         for (block_hash, state) in &self.cert_fetches {
             for (peer, req) in &state.in_flight {
-                if req.started.elapsed() > timeout {
+                let adaptive_timeout = rtt_tracker.get_timeout(peer).min(max_timeout);
+                if req.started.elapsed() > adaptive_timeout {
                     timed_out.push((*block_hash, *peer));
                 }
             }

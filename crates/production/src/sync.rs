@@ -606,24 +606,35 @@ impl SyncManager {
     /// This prevents stuck requests from blocking sync progress indefinitely.
     /// Timed-out requests are treated as failures and the height is re-queued
     /// for retry with a different peer.
+    ///
+    /// Uses adaptive per-peer timeouts based on observed RTT when available,
+    /// falling back to the configured fetch_timeout as a maximum.
     fn check_fetch_timeouts(&mut self) {
         let now = Instant::now();
-        let timeout = self.config.fetch_timeout;
+        let max_timeout = self.config.fetch_timeout;
+        let rtt_tracker = self.network.rtt_tracker();
 
-        // Find all timed-out requests
+        // Find all timed-out requests (using per-peer adaptive timeout)
         let timed_out: Vec<_> = self
             .pending_fetches
             .iter()
-            .filter(|(_, fetch)| now.duration_since(fetch.started) > timeout)
-            .map(|(&height, fetch)| (height, fetch.peer))
+            .filter(|(_, fetch)| {
+                // Get adaptive timeout for this peer, capped at max_timeout
+                let adaptive_timeout = rtt_tracker.get_timeout(&fetch.peer).min(max_timeout);
+                now.duration_since(fetch.started) > adaptive_timeout
+            })
+            .map(|(&height, fetch)| {
+                let adaptive_timeout = rtt_tracker.get_timeout(&fetch.peer).min(max_timeout);
+                (height, fetch.peer, adaptive_timeout)
+            })
             .collect();
 
         // Process each timed-out request
-        for (height, peer) in timed_out {
+        for (height, peer, timeout) in timed_out {
             warn!(
                 height,
                 ?peer,
-                timeout_secs = timeout.as_secs(),
+                timeout_ms = timeout.as_millis(),
                 "Sync fetch timed out"
             );
 

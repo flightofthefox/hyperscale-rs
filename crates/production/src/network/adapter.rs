@@ -522,9 +522,6 @@ pub struct Libp2pAdapter {
     /// Reverse mapping (PeerId -> ValidatorId) for inbound message validation.
     peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
 
-    /// Maximum number of retries on timeout.
-    max_request_retries: u32,
-
     /// Shutdown signal sender.
     shutdown_tx: Option<mpsc::Sender<()>>,
 
@@ -848,7 +845,6 @@ impl Libp2pAdapter {
             consensus_tx: consensus_tx.clone(),
             validator_peers: validator_peers.clone(),
             peer_validators: peer_validators.clone(),
-            max_request_retries: config.max_request_retries,
             shutdown_tx: Some(shutdown_tx),
             sync_request_tx: sync_request_tx.clone(),
             tx_request_tx: tx_request_tx.clone(),
@@ -1078,8 +1074,8 @@ impl Libp2pAdapter {
     /// Request a block from a peer for sync.
     ///
     /// Returns the raw response bytes. The caller is responsible for decoding.
-    /// Automatically retries on timeout (likely packet loss) up to `max_request_retries` times.
     /// Uses adaptive per-peer timeouts based on observed RTT.
+    /// Retries are handled by higher layers (sync/fetch managers) to avoid orphaned requests.
     pub async fn request_block(
         &self,
         peer: Libp2pPeerId,
@@ -1087,47 +1083,45 @@ impl Libp2pAdapter {
     ) -> Result<Vec<u8>, NetworkError> {
         // Use adaptive timeout based on observed RTT for this peer
         let adaptive_timeout = self.rtt_tracker.get_timeout(&peer);
-        let mut last_error = NetworkError::Timeout;
 
-        for attempt in 0..=self.max_request_retries {
-            let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
 
-            self.priority_channels
-                .send(SwarmCommand::RequestBlock {
-                    peer,
-                    height: height.0,
-                    response_tx: tx,
-                })
-                .map_err(|_| NetworkError::NetworkShutdown)?;
+        self.priority_channels
+            .send(SwarmCommand::RequestBlock {
+                peer,
+                height: height.0,
+                response_tx: tx,
+            })
+            .map_err(|_| NetworkError::NetworkShutdown)?;
 
-            // Wait for response with adaptive timeout
-            match tokio::time::timeout(adaptive_timeout, rx).await {
-                Ok(Ok(result)) => return result,
-                Ok(Err(_)) => return Err(NetworkError::NetworkShutdown),
-                Err(_) => {
-                    // Timeout - likely packet loss, retry
-                    last_error = NetworkError::Timeout;
-                    if attempt < self.max_request_retries {
-                        trace!(
-                            ?peer,
-                            height = height.0,
-                            attempt = attempt + 1,
-                            max_retries = self.max_request_retries,
-                            timeout_ms = adaptive_timeout.as_millis(),
-                            "Block request timeout, retrying"
-                        );
-                        metrics::record_request_retry("block");
-                    }
-                }
+        // Wait for response with adaptive timeout
+        match tokio::time::timeout(adaptive_timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
+            Err(_) => {
+                trace!(
+                    ?peer,
+                    height = height.0,
+                    timeout_ms = adaptive_timeout.as_millis(),
+                    "Block request timeout"
+                );
+                Err(NetworkError::Timeout)
             }
         }
-
-        Err(last_error)
     }
 
     /// Get the peer ID for a validator (if known).
     pub fn peer_for_validator(&self, validator_id: ValidatorId) -> Option<Libp2pPeerId> {
         self.validator_peers.get(&validator_id).map(|r| *r)
+    }
+
+    /// Get the shared RTT tracker for adaptive timeout calculations.
+    ///
+    /// This allows higher-level components (sync/fetch managers) to query
+    /// per-peer RTT data for their retry decisions. The tracker is updated
+    /// by the network event loop when responses arrive.
+    pub fn rtt_tracker(&self) -> &SharedRttTracker {
+        &self.rtt_tracker
     }
 
     /// Send a block response for an inbound sync request.
@@ -1151,8 +1145,8 @@ impl Libp2pAdapter {
     ///
     /// Returns the raw response bytes. The caller is responsible for decoding.
     /// Uses Critical priority since pending block completion is liveness-critical.
-    /// Automatically retries on timeout (likely packet loss) up to `max_request_retries` times.
     /// Uses adaptive per-peer timeouts based on observed RTT.
+    /// Retries are handled by higher layers (fetch manager) to avoid orphaned requests.
     pub async fn request_transactions(
         &self,
         peer: Libp2pPeerId,
@@ -1161,44 +1155,32 @@ impl Libp2pAdapter {
     ) -> Result<Vec<u8>, NetworkError> {
         // Use adaptive timeout based on observed RTT for this peer
         let adaptive_timeout = self.rtt_tracker.get_timeout(&peer);
-        let mut last_error = NetworkError::Timeout;
 
-        for attempt in 0..=self.max_request_retries {
-            let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
 
-            self.priority_channels
-                .send(SwarmCommand::RequestTransactions {
-                    peer,
-                    block_hash,
-                    tx_hashes: tx_hashes.clone(),
-                    response_tx: tx,
-                })
-                .map_err(|_| NetworkError::NetworkShutdown)?;
+        self.priority_channels
+            .send(SwarmCommand::RequestTransactions {
+                peer,
+                block_hash,
+                tx_hashes,
+                response_tx: tx,
+            })
+            .map_err(|_| NetworkError::NetworkShutdown)?;
 
-            // Wait for response with adaptive timeout
-            match tokio::time::timeout(adaptive_timeout, rx).await {
-                Ok(Ok(result)) => return result,
-                Ok(Err(_)) => return Err(NetworkError::NetworkShutdown),
-                Err(_) => {
-                    // Timeout - likely packet loss, retry
-                    last_error = NetworkError::Timeout;
-                    if attempt < self.max_request_retries {
-                        trace!(
-                            ?peer,
-                            ?block_hash,
-                            tx_count = tx_hashes.len(),
-                            attempt = attempt + 1,
-                            max_retries = self.max_request_retries,
-                            timeout_ms = adaptive_timeout.as_millis(),
-                            "Transaction request timeout, retrying"
-                        );
-                        metrics::record_request_retry("transaction");
-                    }
-                }
+        // Wait for response with adaptive timeout
+        match tokio::time::timeout(adaptive_timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
+            Err(_) => {
+                trace!(
+                    ?peer,
+                    ?block_hash,
+                    timeout_ms = adaptive_timeout.as_millis(),
+                    "Transaction request timeout"
+                );
+                Err(NetworkError::Timeout)
             }
         }
-
-        Err(last_error)
     }
 
     /// Send a transaction response for an inbound request.
@@ -1222,8 +1204,8 @@ impl Libp2pAdapter {
     ///
     /// Returns the raw response bytes. The caller is responsible for decoding.
     /// Uses Critical priority since pending block completion is liveness-critical.
-    /// Automatically retries on timeout (likely packet loss) up to `max_request_retries` times.
     /// Uses adaptive per-peer timeouts based on observed RTT.
+    /// Retries are handled by higher layers (fetch manager) to avoid orphaned requests.
     pub async fn request_certificates(
         &self,
         peer: Libp2pPeerId,
@@ -1232,44 +1214,32 @@ impl Libp2pAdapter {
     ) -> Result<Vec<u8>, NetworkError> {
         // Use adaptive timeout based on observed RTT for this peer
         let adaptive_timeout = self.rtt_tracker.get_timeout(&peer);
-        let mut last_error = NetworkError::Timeout;
 
-        for attempt in 0..=self.max_request_retries {
-            let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
 
-            self.priority_channels
-                .send(SwarmCommand::RequestCertificates {
-                    peer,
-                    block_hash,
-                    cert_hashes: cert_hashes.clone(),
-                    response_tx: tx,
-                })
-                .map_err(|_| NetworkError::NetworkShutdown)?;
+        self.priority_channels
+            .send(SwarmCommand::RequestCertificates {
+                peer,
+                block_hash,
+                cert_hashes,
+                response_tx: tx,
+            })
+            .map_err(|_| NetworkError::NetworkShutdown)?;
 
-            // Wait for response with adaptive timeout
-            match tokio::time::timeout(adaptive_timeout, rx).await {
-                Ok(Ok(result)) => return result,
-                Ok(Err(_)) => return Err(NetworkError::NetworkShutdown),
-                Err(_) => {
-                    // Timeout - likely packet loss, retry
-                    last_error = NetworkError::Timeout;
-                    if attempt < self.max_request_retries {
-                        trace!(
-                            ?peer,
-                            ?block_hash,
-                            cert_count = cert_hashes.len(),
-                            attempt = attempt + 1,
-                            max_retries = self.max_request_retries,
-                            timeout_ms = adaptive_timeout.as_millis(),
-                            "Certificate request timeout, retrying"
-                        );
-                        metrics::record_request_retry("certificate");
-                    }
-                }
+        // Wait for response with adaptive timeout
+        match tokio::time::timeout(adaptive_timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
+            Err(_) => {
+                trace!(
+                    ?peer,
+                    ?block_hash,
+                    timeout_ms = adaptive_timeout.as_millis(),
+                    "Certificate request timeout"
+                );
+                Err(NetworkError::Timeout)
             }
         }
-
-        Err(last_error)
     }
 
     /// Send a certificate response for an inbound request.
