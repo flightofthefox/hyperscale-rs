@@ -209,7 +209,8 @@ impl NodeStateMachine {
         // Clean up stale incomplete pending blocks in BFT state.
         // This prevents nodes from getting stuck when transaction/certificate
         // fetches fail permanently (e.g., proposer offline).
-        self.bft.cleanup_stale_pending_blocks();
+        // Returns CancelFetch actions for removed blocks.
+        actions.extend(self.bft.cleanup_stale_pending_blocks());
 
         // Check if we're behind and need to catch up via sync.
         // This handles the case where we have a higher latest_qc than committed_height,

@@ -43,7 +43,7 @@ use hyperscale_types::{Hash, RoutableTransaction, TransactionCertificate, Valida
 use libp2p::PeerId;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
@@ -59,9 +59,6 @@ pub struct FetchConfig {
     /// This provides fairness across blocks, not global limiting.
     pub max_concurrent_per_block: usize,
 
-    /// How long to wait before considering a fetch stale (for cleanup).
-    pub stale_fetch_timeout: Duration,
-
     /// Maximum number of hashes to request in a single fetch.
     /// Larger batches are chunked into multiple requests.
     pub max_hashes_per_request: usize,
@@ -75,29 +72,8 @@ impl Default for FetchConfig {
     fn default() -> Self {
         Self {
             max_concurrent_per_block: 8,
-            stale_fetch_timeout: Duration::from_secs(30),
             max_hashes_per_request: 50,
             parallel_fetches: 4,
-        }
-    }
-}
-
-impl FetchConfig {
-    /// Create config optimized for low-latency local networks.
-    #[cfg(test)]
-    pub fn for_local() -> Self {
-        Self {
-            stale_fetch_timeout: Duration::from_secs(10),
-            ..Default::default()
-        }
-    }
-
-    /// Create config for high-latency WANs.
-    #[cfg(test)]
-    pub fn for_wan() -> Self {
-        Self {
-            stale_fetch_timeout: Duration::from_secs(60),
-            ..Default::default()
         }
     }
 }
@@ -160,8 +136,6 @@ struct BlockFetchState {
     missing_hashes: HashSet<Hash>,
     /// Hashes currently being fetched (in-flight).
     in_flight_hashes: HashSet<Hash>,
-    /// When this fetch was started.
-    created: Instant,
     /// Number of in-flight fetch operations for this block.
     in_flight_count: usize,
 }
@@ -173,7 +147,6 @@ impl BlockFetchState {
             kind,
             missing_hashes: hashes.into_iter().collect(),
             in_flight_hashes: HashSet::new(),
-            created: Instant::now(),
             in_flight_count: 0,
         }
     }
@@ -181,18 +154,6 @@ impl BlockFetchState {
     /// Check if this fetch is complete (all hashes received).
     fn is_complete(&self) -> bool {
         self.missing_hashes.is_empty() && self.in_flight_hashes.is_empty()
-    }
-
-    /// Check if this fetch is stale (too old and no active operations).
-    ///
-    /// A fetch is only considered stale if:
-    /// 1. It's older than the timeout, AND
-    /// 2. There are no in-flight operations (nothing actively being fetched)
-    ///
-    /// This prevents cleaning up fetches that are still making progress through
-    /// RequestManager's retry logic under packet loss conditions.
-    fn is_stale(&self, timeout: Duration) -> bool {
-        self.created.elapsed() > timeout && self.in_flight_count == 0
     }
 
     /// Get hashes that need fetching (not in-flight).
@@ -454,9 +415,6 @@ impl FetchManager {
 
         // Spawn new fetch operations for pending blocks
         self.spawn_pending_fetches().await;
-
-        // Clean up stale fetches
-        self.cleanup_stale().await;
     }
 
     /// Process completed fetch results.
@@ -834,57 +792,6 @@ impl FetchManager {
                 hashes: cert_hashes,
                 error: format!("decode error: {:?}", e),
             },
-        }
-    }
-
-    /// Clean up stale fetches.
-    async fn cleanup_stale(&mut self) {
-        let stale_timeout = self.config.stale_fetch_timeout;
-
-        // Collect stale transaction fetches
-        let stale_tx: Vec<Hash> = self
-            .tx_fetches
-            .iter()
-            .filter(|(_, s)| s.is_stale(stale_timeout))
-            .map(|(h, _)| *h)
-            .collect();
-
-        for hash in stale_tx {
-            if let Some(state) = self.tx_fetches.remove(&hash) {
-                warn!(
-                    ?hash,
-                    missing = state.missing_hashes.len(),
-                    in_flight = state.in_flight_count,
-                    age_secs = state.created.elapsed().as_secs(),
-                    "Cleaning up stale transaction fetch"
-                );
-                metrics::record_fetch_stale_cleanup(FetchKind::Transaction);
-                let event = Event::TransactionFetchFailed { block_hash: hash };
-                let _ = self.event_tx.send(event).await;
-            }
-        }
-
-        // Collect stale certificate fetches
-        let stale_cert: Vec<Hash> = self
-            .cert_fetches
-            .iter()
-            .filter(|(_, s)| s.is_stale(stale_timeout))
-            .map(|(h, _)| *h)
-            .collect();
-
-        for hash in stale_cert {
-            if let Some(state) = self.cert_fetches.remove(&hash) {
-                warn!(
-                    ?hash,
-                    missing = state.missing_hashes.len(),
-                    in_flight = state.in_flight_count,
-                    age_secs = state.created.elapsed().as_secs(),
-                    "Cleaning up stale certificate fetch"
-                );
-                metrics::record_fetch_stale_cleanup(FetchKind::Certificate);
-                let event = Event::CertificateFetchFailed { block_hash: hash };
-                let _ = self.event_tx.send(event).await;
-            }
         }
     }
 }

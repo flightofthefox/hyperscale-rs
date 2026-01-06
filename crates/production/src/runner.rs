@@ -2877,6 +2877,16 @@ impl ProductionRunner {
                 self.fetch_manager
                     .request_certificates(block_hash, proposer, cert_hashes);
             }
+
+            Action::CancelFetch { block_hash } => {
+                // Cancel any pending fetch operations for this block.
+                // This is called when the block is committed, removed as stale,
+                // or superseded by sync.
+                self.fetch_manager
+                    .cancel_fetch(block_hash, crate::fetch::FetchKind::Transaction);
+                self.fetch_manager
+                    .cancel_fetch(block_hash, crate::fetch::FetchKind::Certificate);
+            }
         }
 
         Ok(())
