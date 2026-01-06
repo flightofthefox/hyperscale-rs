@@ -609,7 +609,7 @@ impl BftState {
 
         // Clean up any votes for heights at or below the committed height.
         // This handles the case where we loaded votes from storage that are now stale.
-        self.cleanup_old_state(height.0);
+        let removed_blocks = self.cleanup_old_state(height.0);
 
         info!(
             validator = ?self.validator_id(),
@@ -620,7 +620,7 @@ impl BftState {
         );
 
         // Set timers to resume consensus and background tasks
-        vec![
+        let mut actions = vec![
             Action::SetTimer {
                 id: TimerId::Proposal,
                 duration: self.config.proposal_interval,
@@ -629,7 +629,14 @@ impl BftState {
                 id: TimerId::Cleanup,
                 duration: self.config.cleanup_interval,
             },
-        ]
+        ];
+
+        // Cancel any pending fetches for removed blocks
+        for block_hash in removed_blocks {
+            actions.push(Action::CancelFetch { block_hash });
+        }
+
+        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2760,7 +2767,12 @@ impl BftState {
             self.record_leader_activity();
 
             // Clean up old state
-            self.cleanup_old_state(height);
+            let removed_blocks = self.cleanup_old_state(height);
+
+            // Cancel any pending fetches for removed blocks
+            for block_hash in removed_blocks {
+                actions.push(Action::CancelFetch { block_hash });
+            }
 
             // For sync protocol: we need to store the QC that certifies THIS block.
             //
@@ -3065,7 +3077,7 @@ impl BftState {
         }
 
         // Clean up old state
-        self.cleanup_old_state(height);
+        let removed_blocks = self.cleanup_old_state(height);
 
         // Emit actions for the synced block
         let mut actions = vec![
@@ -3084,6 +3096,11 @@ impl BftState {
                 },
             },
         ];
+
+        // Cancel any pending fetches for removed blocks
+        for block_hash in removed_blocks {
+            actions.push(Action::CancelFetch { block_hash });
+        }
 
         // After syncing a block, check if we have buffered commits for subsequent heights
         // that can now be processed. This handles the case where:
@@ -3857,7 +3874,18 @@ impl BftState {
     }
 
     /// Clean up old state after commit.
-    fn cleanup_old_state(&mut self, committed_height: u64) {
+    ///
+    /// Returns the hashes of pending blocks that were removed, so callers can
+    /// emit `CancelFetch` actions to clean up any in-flight fetch operations.
+    fn cleanup_old_state(&mut self, committed_height: u64) -> Vec<Hash> {
+        // Collect hashes of pending blocks that will be removed
+        let removed_hashes: Vec<Hash> = self
+            .pending_blocks
+            .iter()
+            .filter(|(_, pending)| pending.header().height.0 <= committed_height)
+            .map(|(hash, _)| *hash)
+            .collect();
+
         // Remove pending blocks at or below committed height
         self.pending_blocks
             .retain(|_, pending| pending.header().height.0 > committed_height);
@@ -3902,6 +3930,8 @@ impl BftState {
         // where multiple proposals at the same height share the same parent_qc.
         self.verified_qcs
             .retain(|_, height| *height > committed_height.saturating_sub(2));
+
+        removed_hashes
     }
 
     /// Check pending blocks and emit fetch requests for those that have been
@@ -3989,11 +4019,12 @@ impl BftState {
     /// fetches fail permanently. By removing stale incomplete blocks, we allow
     /// sync to be triggered when a later block header arrives.
     ///
-    /// Returns the number of blocks removed.
-    pub fn cleanup_stale_pending_blocks(&mut self) -> usize {
+    /// Returns `CancelFetch` actions for removed blocks so the runner can clean
+    /// up any in-flight fetch operations.
+    pub fn cleanup_stale_pending_blocks(&mut self) -> Vec<Action> {
         let timeout = self.config.stale_pending_block_timeout;
         let now = self.now;
-        let mut removed = 0;
+        let mut actions = Vec::new();
 
         // Collect hashes of stale incomplete blocks
         let stale_hashes: Vec<Hash> = self
@@ -4033,11 +4064,12 @@ impl BftState {
                 // Without this, the entry would stay in pending_commits_awaiting_data forever.
                 self.pending_commits_awaiting_data.remove(&hash);
 
-                removed += 1;
+                // Emit CancelFetch to clean up any in-flight fetch operations
+                actions.push(Action::CancelFetch { block_hash: hash });
             }
         }
 
-        removed
+        actions
     }
 
     /// Check if we're behind and need to catch up via sync.

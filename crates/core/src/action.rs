@@ -532,6 +532,16 @@ pub enum Action {
         /// Hashes of the missing certificates (transaction hashes).
         cert_hashes: Vec<Hash>,
     },
+
+    /// Cancel any pending fetch operations for a block.
+    ///
+    /// Emitted when a pending block is removed from BFT state (committed, stale,
+    /// or superseded by sync). The runner should cancel any in-flight fetch
+    /// operations for this block to free up resources.
+    CancelFetch {
+        /// Hash of the block whose fetches should be cancelled.
+        block_hash: Hash,
+    },
 }
 
 impl Action {
@@ -660,6 +670,7 @@ impl Action {
             Action::StartSync { .. } => "StartSync",
             Action::FetchTransactions { .. } => "FetchTransactions",
             Action::FetchCertificates { .. } => "FetchCertificates",
+            Action::CancelFetch { .. } => "CancelFetch",
         }
     }
 }

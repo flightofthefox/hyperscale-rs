@@ -1713,6 +1713,11 @@ impl SimulationRunner {
             Action::FetchEpochConfig { epoch } => {
                 tracing::debug!(?epoch, "FetchEpochConfig - not yet implemented");
             }
+            Action::CancelFetch { block_hash } => {
+                // In simulation, fetches are synchronous so there's nothing to cancel.
+                // This action is only relevant for production where fetches are async.
+                tracing::trace!(?block_hash, "CancelFetch - no-op in simulation");
+            }
         }
     }
 

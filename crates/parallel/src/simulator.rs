@@ -1075,6 +1075,11 @@ impl SimNode {
                     cert_hashes,
                 });
             }
+
+            Action::CancelFetch { .. } => {
+                // In parallel simulator, fetches are handled synchronously in process_fetch_requests,
+                // so there's nothing to cancel. This action is only relevant for production.
+            }
         }
     }
 }
