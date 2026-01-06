@@ -423,17 +423,71 @@ impl BftState {
         self.syncing
     }
 
-    /// Handle a synced block ready to apply (from runner via Event::SyncBlockReadyToApply).
+    /// Start syncing to catch up to the network.
     ///
-    /// This sets the syncing flag and delegates to the actual sync block handler.
+    /// This is the single entry point for initiating sync. It:
+    /// 1. Sets the syncing flag immediately (enables sync block proposals, suppresses fetches)
+    /// 2. Returns the StartSync action for the runner to begin fetching blocks
+    ///
+    /// Setting the syncing flag immediately (rather than waiting for the first synced block)
+    /// ensures that:
+    /// - `check_pending_block_fetches()` stops emitting fetch requests that would compete with sync
+    /// - Proposers create empty sync blocks instead of full blocks
+    /// - The state machine accurately reflects that we're waiting for sync data
+    ///
+    /// The syncing flag will be cleared when `Event::SyncComplete` arrives.
+    fn start_sync(&mut self, target_height: u64, target_hash: Hash) -> Vec<Action> {
+        // Don't restart sync if we're already syncing
+        // The runner's SyncManager handles target updates internally
+        if self.syncing {
+            debug!(
+                validator = ?self.validator_id(),
+                target_height,
+                "Already syncing, skipping duplicate start_sync"
+            );
+            return vec![];
+        }
+
+        info!(
+            validator = ?self.validator_id(),
+            target_height,
+            target_hash = ?target_hash,
+            committed_height = self.committed_height,
+            "Starting sync - setting syncing flag and requesting blocks"
+        );
+
+        // Set syncing flag immediately - this:
+        // - Enables sync block proposals if we're the proposer
+        // - Suppresses fetch requests (check_pending_block_fetches returns empty)
+        // - Signals to other code that we're catching up
+        self.set_syncing(true);
+
+        vec![Action::StartSync {
+            target_height,
+            target_hash,
+        }]
+    }
+
+    /// Handle a synced block ready to apply (from runner via Event::SyncBlockReadyToApply).
     pub fn on_sync_block_ready_to_apply(
         &mut self,
         block: Block,
         qc: QuorumCertificate,
     ) -> Vec<Action> {
-        // Mark that we're syncing - this enables sync block proposals
-        // and suppresses view changes during catch-up
-        self.set_syncing(true);
+        let block_height = block.header.height.0;
+
+        // Ignore stale blocks that have already been committed.
+        // Late-arriving sync blocks can arrive after sync completes.
+        if block_height <= self.committed_height {
+            debug!(
+                validator = ?self.validator_id(),
+                block_height,
+                committed_height = self.committed_height,
+                "Ignoring stale synced block - already committed"
+            );
+            return vec![];
+        }
+
         self.on_synced_block_ready(block, qc)
     }
 
@@ -1249,7 +1303,7 @@ impl BftState {
         );
 
         // Track whether we need to sync (will be added to actions at the end)
-        let mut sync_action = None;
+        let mut sync_actions = Vec::new();
 
         // Check if this header reveals we're missing blocks and need to sync.
         // The parent_qc certifies block at height N-1 for a block at height N.
@@ -1297,10 +1351,8 @@ impl BftState {
 
                 // Queue sync action but DON'T return - continue processing the header.
                 // This allows us to build QCs and propose sync blocks while syncing.
-                sync_action = Some(Action::StartSync {
-                    target_height,
-                    target_hash,
-                });
+                // start_sync sets the syncing flag immediately and returns StartSync action.
+                sync_actions = self.start_sync(target_height, target_hash);
             }
         }
 
@@ -1388,10 +1440,8 @@ impl BftState {
         // Check if we should trigger verification now that we have the header
         let mut actions = self.maybe_trigger_vote_verification(block_hash);
 
-        // Always include sync action if we need to sync
-        if let Some(sync) = sync_action.take() {
-            actions.push(sync);
-        }
+        // Always include sync actions if we need to sync
+        actions.extend(sync_actions);
 
         // If vote verification was triggered, return those actions.
         // But don't return early just for sync - we still want to vote on the block.
@@ -4018,16 +4068,26 @@ impl BftState {
             return vec![];
         }
 
+        // If we're already syncing, don't trigger another sync
+        if self.syncing {
+            return vec![];
+        }
+
         // Check if we can make progress from our current position.
         // The critical check is whether we have a COMPLETE block at the next height
         // we need to commit. Having blocks at higher heights doesn't help if we're
         // stuck on an earlier incomplete block.
         let next_needed_height = self.committed_height + 1;
 
+        // Check if we have the block data AND the commit authority for the next height.
+        // Having block data alone is NOT enough - we also need a pending commit
+        // (which comes from a QC that references this block as its parent).
+        let has_next_block = self.has_complete_block_at_height(next_needed_height);
+        let has_pending_commit = self.pending_commits.contains_key(&next_needed_height);
+
         // Log sync health status when behind
         let gap = qc_height.saturating_sub(self.committed_height);
         if gap > 5 {
-            let has_next = self.has_complete_block_at_height(next_needed_height);
             let pending_commit_count = self.pending_commits.len();
             let pending_data_count = self.pending_commits_awaiting_data.len();
             debug!(
@@ -4036,7 +4096,8 @@ impl BftState {
                 next_needed_height = next_needed_height,
                 qc_height = qc_height,
                 gap = gap,
-                has_next_complete = has_next,
+                has_next_complete = has_next_block,
+                has_pending_commit = has_pending_commit,
                 pending_commits = pending_commit_count,
                 pending_commits_awaiting_data = pending_data_count,
                 certified_blocks = self.certified_blocks.len(),
@@ -4045,27 +4106,46 @@ impl BftState {
             );
         }
 
-        if self.has_complete_block_at_height(next_needed_height) {
-            // We have the next block ready - commits should proceed normally
-            // But if we're significantly behind, something is wrong with the commit flow.
-            // This can happen after sync when the node's view of the chain diverges from
-            // what it was voting on - the blocks in certified_blocks may have different
-            // hashes than what the QCs reference.
-            if gap > 10 {
+        if has_next_block {
+            if has_pending_commit {
+                // We have block data AND commit authority - should proceed normally.
+                // But if we're significantly behind, something is wrong with the commit flow.
+                // This can happen after sync when the node's view of the chain diverges from
+                // what it was voting on - the blocks in certified_blocks may have different
+                // hashes than what the QCs reference.
+                if gap > 10 {
+                    warn!(
+                        validator = ?self.validator_id(),
+                        committed_height = self.committed_height,
+                        next_needed_height = next_needed_height,
+                        qc_height = qc_height,
+                        gap = gap,
+                        "Have complete block and pending commit but significantly behind - triggering sync to recover"
+                    );
+                    return self.start_sync(qc_height, qc_hash);
+                }
+                return vec![];
+            }
+
+            // We have block data but NO pending commit.
+            // This is normal during the window between block completion and QC formation.
+            // However, if the gap is significant (> 3), it suggests the QC that would
+            // trigger the commit was lost due to packet loss.
+            //
+            // The QC for block N+1 triggers commit of block N, so if we never formed/received
+            // QC N+1, we have no way to commit block N. Trigger sync to recover.
+            if gap > 3 {
                 warn!(
                     validator = ?self.validator_id(),
                     committed_height = self.committed_height,
                     next_needed_height = next_needed_height,
                     qc_height = qc_height,
                     gap = gap,
-                    "Have complete block at next height but significantly behind - triggering sync to recover"
+                    "Have complete block but no pending commit (missing QC) - triggering sync to recover"
                 );
-                // Force sync to get the correct blocks from the canonical chain
-                return vec![Action::StartSync {
-                    target_height: qc_height,
-                    target_hash: qc_hash,
-                }];
+                return self.start_sync(qc_height, qc_hash);
             }
+            // Gap is small, give normal consensus time to catch up
             return vec![];
         }
 
@@ -4080,10 +4160,7 @@ impl BftState {
             "Sync health check: can't make progress, triggering catch-up sync"
         );
 
-        vec![Action::StartSync {
-            target_height: qc_height,
-            target_hash: qc_hash,
-        }]
+        self.start_sync(qc_height, qc_hash)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -7895,13 +7972,48 @@ mod tests {
     }
 
     #[test]
-    fn test_on_sync_block_ready_to_apply_enters_sync_mode() {
+    fn test_start_sync_sets_syncing_flag() {
         let mut state = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         assert!(!state.is_syncing(), "Should not be syncing initially");
 
-        // Create a synced block
+        // Call start_sync (private, so we simulate what check_sync_health does)
+        // Set up latest_qc so check_sync_health has a target
+        state.latest_qc = Some(QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_5"),
+            height: BlockHeight(5),
+            parent_block_hash: Hash::from_bytes(b"block_4"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: zero_bls_signature(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 1000,
+        });
+
+        // check_sync_health should trigger sync since we're behind (committed=0, qc=5)
+        // and gap > 3 without a pending commit
+        let actions = state.check_sync_health();
+
+        assert!(
+            state.is_syncing(),
+            "Should be in sync mode after check_sync_health triggers start_sync"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::StartSync { .. })),
+            "Should emit StartSync action"
+        );
+    }
+
+    #[test]
+    fn test_stale_sync_block_ignored() {
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+        state.committed_height = 10; // Already committed past height 1
+
+        // Create a stale synced block at height 1
         let block = Block {
             header: BlockHeader {
                 height: BlockHeight(1),
@@ -7932,12 +8044,14 @@ mod tests {
             weighted_timestamp_ms: 1000,
         };
 
-        // Call on_sync_block_ready_to_apply
-        let _actions = state.on_sync_block_ready_to_apply(block, qc);
+        // Should return empty actions since block is stale
+        let actions = state.on_sync_block_ready_to_apply(block, qc);
+        assert!(actions.is_empty(), "Stale sync block should be ignored");
 
+        // Should NOT have set syncing flag
         assert!(
-            state.is_syncing(),
-            "Should be in sync mode after on_sync_block_ready_to_apply"
+            !state.is_syncing(),
+            "Should not enter sync mode for stale block"
         );
     }
 
