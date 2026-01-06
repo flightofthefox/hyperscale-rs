@@ -226,6 +226,9 @@ impl RequestManager {
     ///
     /// # Arguments
     /// * `peers` - Candidate peers to try (caller provides based on topology)
+    /// * `preferred_peer` - Optional hint for which peer to try first. This peer
+    ///   is likely to have the data (e.g., the block proposer for fetch requests).
+    ///   If `None`, uses health-weighted random selection.
     /// * `request` - The request to send
     /// * `priority` - Request priority (affects timeout and retry behavior)
     ///
@@ -234,6 +237,7 @@ impl RequestManager {
     pub async fn request(
         &self,
         peers: &[PeerId],
+        preferred_peer: Option<PeerId>,
         request: Request,
         priority: RequestPriority,
     ) -> Result<(PeerId, Bytes), RequestError> {
@@ -244,7 +248,9 @@ impl RequestManager {
         // Wait for concurrency slot
         self.acquire_slot().await?;
 
-        let result = self.request_inner(peers, request, priority).await;
+        let result = self
+            .request_inner(peers, preferred_peer, request, priority)
+            .await;
 
         // Release concurrency slot
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -259,20 +265,25 @@ impl RequestManager {
         height: BlockHeight,
         priority: RequestPriority,
     ) -> Result<(PeerId, Bytes), RequestError> {
-        self.request(peers, Request::Block { height }, priority)
+        self.request(peers, None, Request::Block { height }, priority)
             .await
     }
 
     /// Convenience method for transaction requests.
+    ///
+    /// # Arguments
+    /// * `preferred_peer` - Optional peer to try first (typically the block proposer).
     pub async fn request_transactions(
         &self,
         peers: &[PeerId],
+        preferred_peer: Option<PeerId>,
         block_hash: Hash,
         tx_hashes: Vec<Hash>,
         priority: RequestPriority,
     ) -> Result<(PeerId, Bytes), RequestError> {
         self.request(
             peers,
+            preferred_peer,
             Request::Transactions {
                 block_hash,
                 tx_hashes,
@@ -283,15 +294,20 @@ impl RequestManager {
     }
 
     /// Convenience method for certificate requests.
+    ///
+    /// # Arguments
+    /// * `preferred_peer` - Optional peer to try first (typically the block proposer).
     pub async fn request_certificates(
         &self,
         peers: &[PeerId],
+        preferred_peer: Option<PeerId>,
         block_hash: Hash,
         cert_hashes: Vec<Hash>,
         priority: RequestPriority,
     ) -> Result<(PeerId, Bytes), RequestError> {
         self.request(
             peers,
+            preferred_peer,
             Request::Certificates {
                 block_hash,
                 cert_hashes,
@@ -304,6 +320,7 @@ impl RequestManager {
     async fn request_inner(
         &self,
         peers: &[PeerId],
+        preferred_peer: Option<PeerId>,
         request: Request,
         priority: RequestPriority,
     ) -> Result<(PeerId, Bytes), RequestError> {
@@ -311,11 +328,16 @@ impl RequestManager {
         let mut current_peer_attempts: u32 = 0;
         let request_desc = request.description();
 
-        // Select initial peer
-        let mut current_peer = self
-            .health
-            .select_peer(peers)
-            .ok_or(RequestError::NoPeers)?;
+        // Select initial peer.
+        // Use the preferred peer if provided and it's in our peer list,
+        // otherwise fall back to health-weighted random selection.
+        let mut current_peer = match preferred_peer {
+            Some(peer) if peers.contains(&peer) => peer,
+            _ => self
+                .health
+                .select_peer(peers)
+                .ok_or(RequestError::NoPeers)?,
+        };
 
         // Compute initial backoff based on peer RTT (if known) and priority
         let mut backoff = self.compute_initial_backoff(&current_peer, priority);
