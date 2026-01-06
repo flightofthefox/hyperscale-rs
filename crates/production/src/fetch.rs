@@ -132,6 +132,8 @@ struct BlockFetchState {
     /// The type of fetch (for debugging).
     #[allow(dead_code)]
     kind: FetchKind,
+    /// The proposer of the block (preferred fetch target).
+    proposer: ValidatorId,
     /// Hashes we still need to fetch.
     missing_hashes: HashSet<Hash>,
     /// Hashes currently being fetched (in-flight).
@@ -144,10 +146,11 @@ struct BlockFetchState {
 }
 
 impl BlockFetchState {
-    fn new(block_hash: Hash, kind: FetchKind, hashes: Vec<Hash>) -> Self {
+    fn new(block_hash: Hash, kind: FetchKind, proposer: ValidatorId, hashes: Vec<Hash>) -> Self {
         Self {
             block_hash,
             kind,
+            proposer,
             missing_hashes: hashes.into_iter().collect(),
             in_flight_hashes: HashSet::new(),
             received_hashes: HashSet::new(),
@@ -310,7 +313,7 @@ impl FetchManager {
     pub fn request_transactions(
         &mut self,
         block_hash: Hash,
-        _proposer: ValidatorId,
+        proposer: ValidatorId,
         tx_hashes: Vec<Hash>,
     ) {
         if tx_hashes.is_empty() {
@@ -339,10 +342,11 @@ impl FetchManager {
         info!(
             ?block_hash,
             count = tx_hashes.len(),
+            proposer = proposer.0,
             "Starting transaction fetch"
         );
 
-        let state = BlockFetchState::new(block_hash, FetchKind::Transaction, tx_hashes);
+        let state = BlockFetchState::new(block_hash, FetchKind::Transaction, proposer, tx_hashes);
         self.tx_fetches.insert(block_hash, state);
         metrics::record_fetch_started(FetchKind::Transaction);
     }
@@ -351,7 +355,7 @@ impl FetchManager {
     pub fn request_certificates(
         &mut self,
         block_hash: Hash,
-        _proposer: ValidatorId,
+        proposer: ValidatorId,
         cert_hashes: Vec<Hash>,
     ) {
         if cert_hashes.is_empty() {
@@ -380,10 +384,11 @@ impl FetchManager {
         info!(
             ?block_hash,
             count = cert_hashes.len(),
+            proposer = proposer.0,
             "Starting certificate fetch"
         );
 
-        let state = BlockFetchState::new(block_hash, FetchKind::Certificate, cert_hashes);
+        let state = BlockFetchState::new(block_hash, FetchKind::Certificate, proposer, cert_hashes);
         self.cert_fetches.insert(block_hash, state);
         metrics::record_fetch_started(FetchKind::Certificate);
     }
@@ -618,8 +623,8 @@ impl FetchManager {
             return;
         }
 
-        // Collect fetches to spawn (block_hash, kind, hashes)
-        let mut to_spawn: Vec<(Hash, FetchKind, Vec<Hash>)> = Vec::new();
+        // Collect fetches to spawn (block_hash, kind, hashes, proposer)
+        let mut to_spawn: Vec<(Hash, FetchKind, Vec<Hash>, ValidatorId)> = Vec::new();
 
         // Check transaction fetches
         for (block_hash, state) in &mut self.tx_fetches {
@@ -642,7 +647,12 @@ impl FetchManager {
             {
                 let chunk_vec = chunk.to_vec();
                 state.mark_in_flight(&chunk_vec);
-                to_spawn.push((*block_hash, FetchKind::Transaction, chunk_vec));
+                to_spawn.push((
+                    *block_hash,
+                    FetchKind::Transaction,
+                    chunk_vec,
+                    state.proposer,
+                ));
             }
         }
 
@@ -667,24 +677,45 @@ impl FetchManager {
             {
                 let chunk_vec = chunk.to_vec();
                 state.mark_in_flight(&chunk_vec);
-                to_spawn.push((*block_hash, FetchKind::Certificate, chunk_vec));
+                to_spawn.push((
+                    *block_hash,
+                    FetchKind::Certificate,
+                    chunk_vec,
+                    state.proposer,
+                ));
             }
         }
 
         // Spawn the fetch tasks
-        for (block_hash, kind, hashes) in to_spawn {
-            self.spawn_fetch(block_hash, kind, hashes, peers.clone());
+        for (block_hash, kind, hashes, proposer) in to_spawn {
+            self.spawn_fetch(block_hash, kind, hashes, proposer, peers.clone());
         }
     }
 
     /// Spawn a single fetch operation.
+    ///
+    /// The proposer is used to prioritize fetching from the block's proposer,
+    /// who is guaranteed to have all transactions and certificates for their block.
     fn spawn_fetch(
         &self,
         block_hash: Hash,
         kind: FetchKind,
         hashes: Vec<Hash>,
+        proposer: ValidatorId,
         peers: Vec<PeerId>,
     ) {
+        // Look up the proposer's PeerId to pass as preferred peer.
+        // The proposer is guaranteed to have the data we need.
+        let preferred_peer = self.committee_peers.get(&proposer).copied();
+        if preferred_peer.is_some() {
+            trace!(
+                ?block_hash,
+                ?kind,
+                proposer = proposer.0,
+                "Will prioritize proposer peer for fetch"
+            );
+        }
+
         trace!(
             ?block_hash,
             ?kind,
@@ -698,10 +729,24 @@ impl FetchManager {
         tokio::spawn(async move {
             let fetch_result = match kind {
                 FetchKind::Transaction => {
-                    Self::fetch_transactions(request_manager, &peers, block_hash, hashes).await
+                    Self::fetch_transactions(
+                        request_manager,
+                        &peers,
+                        preferred_peer,
+                        block_hash,
+                        hashes,
+                    )
+                    .await
                 }
                 FetchKind::Certificate => {
-                    Self::fetch_certificates(request_manager, &peers, block_hash, hashes).await
+                    Self::fetch_certificates(
+                        request_manager,
+                        &peers,
+                        preferred_peer,
+                        block_hash,
+                        hashes,
+                    )
+                    .await
                 }
             };
 
@@ -713,6 +758,7 @@ impl FetchManager {
     async fn fetch_transactions(
         request_manager: Arc<RequestManager>,
         peers: &[PeerId],
+        preferred_peer: Option<PeerId>,
         block_hash: Hash,
         tx_hashes: Vec<Hash>,
     ) -> FetchResult {
@@ -722,6 +768,7 @@ impl FetchManager {
         let response = request_manager
             .request_transactions(
                 peers,
+                preferred_peer,
                 block_hash,
                 tx_hashes.clone(),
                 RequestPriority::Critical,
@@ -762,6 +809,7 @@ impl FetchManager {
     async fn fetch_certificates(
         request_manager: Arc<RequestManager>,
         peers: &[PeerId],
+        preferred_peer: Option<PeerId>,
         block_hash: Hash,
         cert_hashes: Vec<Hash>,
     ) -> FetchResult {
@@ -771,6 +819,7 @@ impl FetchManager {
         let response = request_manager
             .request_certificates(
                 peers,
+                preferred_peer,
                 block_hash,
                 cert_hashes.clone(),
                 RequestPriority::Critical,
@@ -823,13 +872,15 @@ mod tests {
     #[test]
     fn test_block_fetch_state() {
         let block_hash = Hash::from_bytes(b"test_block");
+        let proposer = ValidatorId(1);
         let hashes = vec![
             Hash::from_bytes(b"tx1_hash_data_here"),
             Hash::from_bytes(b"tx2_hash_data_here"),
             Hash::from_bytes(b"tx3_hash_data_here"),
         ];
 
-        let mut state = BlockFetchState::new(block_hash, FetchKind::Transaction, hashes.clone());
+        let mut state =
+            BlockFetchState::new(block_hash, FetchKind::Transaction, proposer, hashes.clone());
 
         assert!(!state.is_complete());
         assert_eq!(state.hashes_to_fetch().len(), 3);
@@ -859,12 +910,14 @@ mod tests {
     #[test]
     fn test_received_hashes_prevents_readd() {
         let block_hash = Hash::from_bytes(b"test_block");
+        let proposer = ValidatorId(1);
         let hashes = vec![
             Hash::from_bytes(b"tx1_hash_data_here"),
             Hash::from_bytes(b"tx2_hash_data_here"),
         ];
 
-        let mut state = BlockFetchState::new(block_hash, FetchKind::Transaction, hashes.clone());
+        let mut state =
+            BlockFetchState::new(block_hash, FetchKind::Transaction, proposer, hashes.clone());
 
         // Receive first hash
         state.mark_received(vec![hashes[0]]);
