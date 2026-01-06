@@ -648,31 +648,71 @@ impl RequestManager {
             Err(_) => return Err(NetworkError::Timeout),
         }
 
-        // Read length-prefixed response with timeout
-        let read_result = tokio::time::timeout(timeout, async {
-            let mut len_bytes = [0u8; 4];
-            stream.read_exact(&mut len_bytes).await?;
-            let response_len = u32::from_be_bytes(len_bytes) as usize;
-
-            // Sanity check response size (max 10MB)
-            if response_len > 10 * 1024 * 1024 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "response too large",
-                ));
-            }
-
-            let mut response = vec![0u8; response_len];
-            stream.read_exact(&mut response).await?;
-            Ok::<Vec<u8>, std::io::Error>(response)
-        })
-        .await;
-
-        match read_result {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(e)) => Err(NetworkError::StreamIo(format!("read failed: {}", e))),
-            Err(_) => Err(NetworkError::Timeout),
+        // Read response length with timeout
+        let mut len_bytes = [0u8; 4];
+        match tokio::time::timeout(timeout, stream.read_exact(&mut len_bytes)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(NetworkError::StreamIo(format!("read length failed: {}", e))),
+            Err(_) => return Err(NetworkError::Timeout),
         }
+
+        let response_len = u32::from_be_bytes(len_bytes) as usize;
+
+        // Sanity check response size (max 10MB)
+        if response_len > 10 * 1024 * 1024 {
+            return Err(NetworkError::StreamIo("response too large".to_string()));
+        }
+
+        // Read response body in chunks with activity-based timeout extension.
+        // This is critical for large responses under packet loss: QUIC will retransmit
+        // dropped packets, but we need to give it time. As long as we're receiving data,
+        // we keep extending the deadline.
+        let mut response = Vec::with_capacity(response_len);
+        let mut buf = [0u8; 65536]; // 64KB chunks
+
+        while response.len() < response_len {
+            let remaining = response_len - response.len();
+            let to_read = remaining.min(buf.len());
+
+            // Each chunk gets a fresh timeout - activity resets the clock
+            let chunk_result =
+                tokio::time::timeout(timeout, stream.read(&mut buf[..to_read])).await;
+
+            match chunk_result {
+                Ok(Ok(0)) => {
+                    // EOF before expected length
+                    return Err(NetworkError::StreamIo(format!(
+                        "unexpected EOF: got {} of {} bytes",
+                        response.len(),
+                        response_len
+                    )));
+                }
+                Ok(Ok(n)) => {
+                    response.extend_from_slice(&buf[..n]);
+                    // Timeout resets implicitly by looping - next read gets fresh timeout
+                    trace!(
+                        bytes_received = response.len(),
+                        bytes_total = response_len,
+                        chunk_size = n,
+                        "Received chunk, timeout extended"
+                    );
+                }
+                Ok(Err(e)) => {
+                    return Err(NetworkError::StreamIo(format!(
+                        "read failed at {} of {} bytes: {}",
+                        response.len(),
+                        response_len,
+                        e
+                    )));
+                }
+                Err(_) => {
+                    // Timeout with no activity
+                    return Err(NetworkError::Timeout);
+                }
+            }
+        }
+
+        Ok(response)
     }
 
     /// Compute the speculative retry timeout based on peer's RTT history.
