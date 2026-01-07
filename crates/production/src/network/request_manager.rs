@@ -32,6 +32,7 @@
 
 use super::adapter::{Libp2pAdapter, NetworkError};
 use super::peer_health::{PeerHealthConfig, PeerHealthTracker};
+use super::wire;
 use bytes::Bytes;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use hyperscale_types::{BlockHeight, Hash};
@@ -614,9 +615,10 @@ impl RequestManager {
     ///
     /// Uses raw streams with length-prefixed framing:
     /// 1. Open stream to peer
-    /// 2. Write [4-byte big-endian length][request data]
-    /// 3. Read [4-byte big-endian length][response data]
-    /// 4. Close stream
+    /// 2. Write [4-byte big-endian length][compressed request data]
+    /// 3. Read [4-byte big-endian length][compressed response data]
+    /// 4. Decompress response
+    /// 5. Close stream
     ///
     /// All I/O operations are wrapped with the provided timeout (RTT-based).
     async fn send_request_static(
@@ -627,8 +629,8 @@ impl RequestManager {
     ) -> Result<Vec<u8>, NetworkError> {
         use hyperscale_messages::request::{GetCertificatesRequest, GetTransactionsRequest};
 
-        // Encode request data
-        let data: Vec<u8> = match request {
+        // Encode request data (SBOR)
+        let sbor_data: Vec<u8> = match request {
             Request::Block { height } => height.0.to_le_bytes().to_vec(),
             Request::Transactions {
                 block_hash,
@@ -646,13 +648,16 @@ impl RequestManager {
             }
         };
 
+        // Compress request
+        let data = wire::compress(&sbor_data);
+
         // Open stream with timeout
         let mut stream = tokio::time::timeout(timeout, adapter.open_stream(*peer))
             .await
             .map_err(|_| NetworkError::Timeout)?
             .map_err(|e| NetworkError::StreamOpenFailed(format!("{:?}", e)))?;
 
-        // Write length-prefixed request with timeout
+        // Write length-prefixed compressed request with timeout
         let len = data.len() as u32;
         let write_result = tokio::time::timeout(timeout, async {
             stream.write_all(&len.to_be_bytes()).await?;
@@ -680,20 +685,20 @@ impl RequestManager {
 
         let response_len = u32::from_be_bytes(len_bytes) as usize;
 
-        // Sanity check response size (max 10MB)
+        // Sanity check compressed response size (max 10MB)
         if response_len > 10 * 1024 * 1024 {
             return Err(NetworkError::StreamIo("response too large".to_string()));
         }
 
-        // Read response body in chunks with activity-based timeout extension.
+        // Read compressed response body in chunks with activity-based timeout extension.
         // This is critical for large responses under packet loss: QUIC will retransmit
         // dropped packets, but we need to give it time. As long as we're receiving data,
         // we keep extending the deadline.
-        let mut response = Vec::with_capacity(response_len);
+        let mut compressed_response = Vec::with_capacity(response_len);
         let mut buf = [0u8; 65536]; // 64KB chunks
 
-        while response.len() < response_len {
-            let remaining = response_len - response.len();
+        while compressed_response.len() < response_len {
+            let remaining = response_len - compressed_response.len();
             let to_read = remaining.min(buf.len());
 
             // Each chunk gets a fresh timeout - activity resets the clock
@@ -705,15 +710,15 @@ impl RequestManager {
                     // EOF before expected length
                     return Err(NetworkError::StreamIo(format!(
                         "unexpected EOF: got {} of {} bytes",
-                        response.len(),
+                        compressed_response.len(),
                         response_len
                     )));
                 }
                 Ok(Ok(n)) => {
-                    response.extend_from_slice(&buf[..n]);
+                    compressed_response.extend_from_slice(&buf[..n]);
                     // Timeout resets implicitly by looping - next read gets fresh timeout
                     trace!(
-                        bytes_received = response.len(),
+                        bytes_received = compressed_response.len(),
                         bytes_total = response_len,
                         chunk_size = n,
                         "Received chunk, timeout extended"
@@ -722,7 +727,7 @@ impl RequestManager {
                 Ok(Err(e)) => {
                     return Err(NetworkError::StreamIo(format!(
                         "read failed at {} of {} bytes: {}",
-                        response.len(),
+                        compressed_response.len(),
                         response_len,
                         e
                     )));
@@ -734,7 +739,9 @@ impl RequestManager {
             }
         }
 
-        Ok(response)
+        // Decompress response
+        wire::decompress(&compressed_response)
+            .map_err(|e| NetworkError::StreamIo(format!("decompression failed: {}", e)))
     }
 
     /// Compute the speculative retry timeout based on peer's RTT history.

@@ -40,12 +40,14 @@
 //!
 //! # Wire Format
 //!
+//! All messages are SBOR-encoded then LZ4-compressed:
+//!
 //! ```text
-//! [version: u8][payload: SBOR-encoded message]
+//! [LZ4 compressed SBOR payload]
 //! ```
 //!
-//! - Version is currently `1`
-//! - Payload is the gossip struct (e.g., `BlockHeaderGossip`) encoded with SBOR
+//! LZ4 compression reduces bandwidth by 2-3x for typical messages and improves
+//! reliability under packet loss (fewer QUIC packets = fewer retransmissions).
 
 mod adapter;
 mod codec;
@@ -55,6 +57,7 @@ mod inbound_router;
 mod peer_health;
 mod request_manager;
 mod topic;
+mod wire;
 
 pub use adapter::{
     compute_peer_id_for_validator, derive_libp2p_keypair, Libp2pAdapter, NetworkError,

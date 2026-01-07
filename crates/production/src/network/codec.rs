@@ -2,18 +2,18 @@
 //!
 //! # Wire Format
 //!
-//! ```text
-//! [version: u8][payload: SBOR-encoded message]
-//! ```
+//! All gossip messages are SBOR-encoded then LZ4-compressed:
 //!
-//! - Version is currently `1`
-//! - Payload is SBOR-encoded gossip struct (e.g., `BlockHeaderGossip`)
+//! ```text
+//! [LZ4 compressed SBOR payload]
+//! ```
 //!
 //! # Topic-Based Type Dispatch
 //!
 //! Message type is determined by the gossipsub topic, not by a field in the
 //! message. This simplifies the wire format and allows efficient routing.
 
+use super::wire;
 use hyperscale_core::{Event, OutboundMessage};
 use hyperscale_messages::gossip::{
     BlockHeaderGossip, BlockVoteGossip, StateCertificateBatch, StateProvisionBatch, StateVoteBatch,
@@ -23,15 +23,9 @@ use hyperscale_messages::TraceContext;
 use hyperscale_types::ShardGroupId;
 use thiserror::Error;
 
-/// Current wire format version.
-pub const WIRE_VERSION: u8 = 1;
-
 /// Errors that can occur during message encoding/decoding.
 #[derive(Debug, Error)]
 pub enum CodecError {
-    #[error("Unknown wire version: {0}")]
-    UnknownVersion(u8),
-
     #[error("Message too short")]
     MessageTooShort,
 
@@ -41,15 +35,18 @@ pub enum CodecError {
     #[error("SBOR encode error: {0}")]
     SborEncode(String),
 
+    #[error("Decompression error: {0}")]
+    Decompress(String),
+
     #[error("Unknown topic: {0}")]
     UnknownTopic(String),
 }
 
 /// Encode an outbound message to wire format.
 ///
-/// Returns the bytes to publish to gossipsub.
+/// SBOR-encodes the message then LZ4-compresses it.
 pub fn encode_message(message: &OutboundMessage) -> Result<Vec<u8>, CodecError> {
-    let payload =
+    let sbor_bytes =
         match message {
             OutboundMessage::BlockHeader(gossip) => sbor::basic_encode(gossip)
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
@@ -70,11 +67,7 @@ pub fn encode_message(message: &OutboundMessage) -> Result<Vec<u8>, CodecError> 
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
         };
 
-    // Prepend version byte
-    let mut bytes = Vec::with_capacity(1 + payload.len());
-    bytes.push(WIRE_VERSION);
-    bytes.extend(payload);
-    Ok(bytes)
+    Ok(wire::compress(&sbor_bytes))
 }
 
 /// Result of decoding a message, including optional trace context.
@@ -92,6 +85,7 @@ pub struct DecodedMessage {
 
 /// Decode a message from wire format based on topic.
 ///
+/// LZ4-decompresses then SBOR-decodes the message.
 /// The topic determines the message type (topic-based dispatch).
 /// Returns the decoded events along with any trace context for distributed tracing.
 pub fn decode_message(
@@ -102,20 +96,15 @@ pub fn decode_message(
         return Err(CodecError::MessageTooShort);
     }
 
-    // Check version
-    let version = data[0];
-    if version != WIRE_VERSION {
-        return Err(CodecError::UnknownVersion(version));
-    }
-
-    let payload = &data[1..];
+    // Decompress
+    let payload = wire::decompress(data).map_err(|e| CodecError::Decompress(e.to_string()))?;
 
     let msg_type = parsed_topic.message_type();
 
     // Dispatch based on message type from topic
     match msg_type {
         "block.header" => {
-            let gossip: BlockHeaderGossip = sbor::basic_decode(payload)
+            let gossip: BlockHeaderGossip = sbor::basic_decode(&payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
             Ok(DecodedMessage {
                 events: vec![Event::BlockHeaderReceived {
@@ -132,7 +121,7 @@ pub fn decode_message(
             })
         }
         "block.vote" => {
-            let gossip: BlockVoteGossip = sbor::basic_decode(payload)
+            let gossip: BlockVoteGossip = sbor::basic_decode(&payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
             Ok(DecodedMessage {
                 events: vec![Event::BlockVoteReceived { vote: gossip.vote }],
@@ -140,7 +129,7 @@ pub fn decode_message(
             })
         }
         "state.provision.batch" => {
-            let batch: StateProvisionBatch = sbor::basic_decode(payload)
+            let batch: StateProvisionBatch = sbor::basic_decode(&payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
             let trace_ctx = if batch.trace_context.has_trace() {
                 Some(batch.trace_context.clone())
@@ -158,7 +147,7 @@ pub fn decode_message(
             })
         }
         "state.vote.batch" => {
-            let batch: StateVoteBatch = sbor::basic_decode(payload)
+            let batch: StateVoteBatch = sbor::basic_decode(&payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
             let events = batch
                 .into_votes()
@@ -171,7 +160,7 @@ pub fn decode_message(
             })
         }
         "state.certificate.batch" => {
-            let batch: StateCertificateBatch = sbor::basic_decode(payload)
+            let batch: StateCertificateBatch = sbor::basic_decode(&payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
             let trace_ctx = if batch.trace_context.has_trace() {
                 Some(batch.trace_context.clone())
@@ -189,7 +178,7 @@ pub fn decode_message(
             })
         }
         "transaction.gossip" => {
-            let gossip: TransactionGossip = sbor::basic_decode(payload)
+            let gossip: TransactionGossip = sbor::basic_decode(&payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
             let trace_ctx = if gossip.trace_context.has_trace() {
                 Some(gossip.trace_context)
@@ -204,7 +193,7 @@ pub fn decode_message(
             })
         }
         "transaction.certificate" => {
-            let gossip: TransactionCertificateGossip = sbor::basic_decode(payload)
+            let gossip: TransactionCertificateGossip = sbor::basic_decode(&payload)
                 .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
             Ok(DecodedMessage {
                 events: vec![Event::TransactionCertificateReceived {
@@ -267,9 +256,9 @@ mod tests {
         };
         let message = OutboundMessage::BlockHeader(Box::new(gossip));
 
-        // Encode
+        // Encode (now returns compressed data)
         let bytes = encode_message(&message).unwrap();
-        assert_eq!(bytes[0], WIRE_VERSION);
+        assert!(!bytes.is_empty());
 
         // Decode with topic
         let topic_str = "hyperscale/block.header/shard-0/1.0.0";
@@ -324,16 +313,18 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_version() {
-        let bytes = vec![99, 1, 2, 3]; // version 99 doesn't exist
+    fn test_invalid_compressed_data() {
+        let bytes = vec![99, 1, 2, 3]; // invalid LZ4 data
         let topic = crate::network::Topic::parse("hyperscale/block.header/shard-0/1.0.0").unwrap();
         let result = decode_message(&topic, &bytes);
-        assert!(matches!(result, Err(CodecError::UnknownVersion(99))));
+        assert!(matches!(result, Err(CodecError::Decompress(_))));
     }
 
     #[test]
     fn test_unknown_topic() {
-        let bytes = vec![WIRE_VERSION, 1, 2, 3];
+        // Create valid compressed data for testing unknown topic
+        let sbor_bytes = sbor::basic_encode(&()).unwrap();
+        let bytes = wire::compress(&sbor_bytes);
         // Topic with unknown message type
         let topic = crate::network::Topic::parse("hyperscale/unknown.type/shard-0/1.0.0").unwrap();
         let result = decode_message(&topic, &bytes);

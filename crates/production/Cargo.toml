@@ -44,6 +44,9 @@ igd-next = { version = "0.14.3", features = ["aio_tokio"] }
 # Serialization
 sbor.workspace = true
 
+# Network compression (pure Rust, no C dependencies)
+lz4_flex = "0.12.0"
+
 # Async runtime
 thiserror.workspace = true
 tracing.workspace = true

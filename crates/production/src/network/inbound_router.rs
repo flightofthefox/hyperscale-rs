@@ -37,6 +37,7 @@
 //! 3. **Request Type Discrimination**: Determines type from payload structure
 
 use super::adapter::{Libp2pAdapter, STREAM_PROTOCOL};
+use super::wire;
 use crate::storage::RocksDbStorage;
 use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use hyperscale_messages::request::{
@@ -163,8 +164,8 @@ impl InboundRouter {
 
     /// Handle a single incoming stream.
     async fn handle_stream(&self, peer: PeerId, mut stream: Stream) -> Result<(), StreamError> {
-        // Read length-prefixed request with timeout
-        let request_data = tokio::time::timeout(STREAM_IO_TIMEOUT, async {
+        // Read length-prefixed compressed request with timeout
+        let compressed_request = tokio::time::timeout(STREAM_IO_TIMEOUT, async {
             let mut len_bytes = [0u8; 4];
             stream.read_exact(&mut len_bytes).await?;
             let len = u32::from_be_bytes(len_bytes) as usize;
@@ -184,10 +185,21 @@ impl InboundRouter {
         .map_err(|_| StreamError::Timeout)?
         .map_err(StreamError::Io)?;
 
-        // Process the request and get response
-        let response_data = self.process_request(peer, &request_data);
+        // Decompress request
+        let request_data = wire::decompress(&compressed_request).map_err(|e| {
+            StreamError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("decompression failed: {}", e),
+            ))
+        })?;
 
-        // Write length-prefixed response with timeout
+        // Process the request and get response (returns SBOR-encoded bytes)
+        let response_sbor = self.process_request(peer, &request_data);
+
+        // Compress response
+        let response_data = wire::compress(&response_sbor);
+
+        // Write length-prefixed compressed response with timeout
         tokio::time::timeout(STREAM_IO_TIMEOUT, async {
             let len = response_data.len() as u32;
             stream.write_all(&len.to_be_bytes()).await?;

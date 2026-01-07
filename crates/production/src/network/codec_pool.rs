@@ -164,6 +164,5 @@ mod tests {
 
         let encoded = handle.encode_sync(&message).unwrap();
         assert!(!encoded.is_empty());
-        assert_eq!(encoded[0], 1); // WIRE_VERSION
     }
 }
