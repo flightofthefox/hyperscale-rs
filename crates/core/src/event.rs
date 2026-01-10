@@ -254,6 +254,18 @@ pub enum Event {
         valid: bool,
     },
 
+    /// CycleProof signature verification completed.
+    ///
+    /// Callback from `Action::VerifyCycleProof`.
+    CycleProofVerified {
+        /// Block hash containing this deferral.
+        block_hash: Hash,
+        /// Index of deferral in block's deferred list.
+        deferral_index: usize,
+        /// Whether signature is valid AND meets quorum.
+        valid: bool,
+    },
+
     /// Single-shard transaction execution completed.
     TransactionsExecuted {
         block_hash: Hash,
@@ -643,6 +655,7 @@ impl Event {
             | Event::StateVotesVerifiedAndAggregated { .. }
             | Event::StateCertificateSignatureVerified { .. }
             | Event::QcSignatureVerified { .. }
+            | Event::CycleProofVerified { .. }
             | Event::TransactionsExecuted { .. }
             | Event::SpeculativeExecutionComplete { .. }
             | Event::CrossShardTransactionsExecuted { .. }
@@ -758,6 +771,7 @@ impl Event {
             Event::StateVotesVerifiedAndAggregated { .. } => "StateVotesVerifiedAndAggregated",
             Event::StateCertificateSignatureVerified { .. } => "StateCertificateSignatureVerified",
             Event::QcSignatureVerified { .. } => "QcSignatureVerified",
+            Event::CycleProofVerified { .. } => "CycleProofVerified",
 
             // Async Callbacks - Execution
             Event::TransactionsExecuted { .. } => "TransactionsExecuted",

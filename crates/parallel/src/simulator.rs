@@ -798,6 +798,32 @@ impl SimNode {
                     .push_back(Event::QcSignatureVerified { block_hash, valid });
             }
 
+            Action::VerifyCycleProof {
+                block_hash,
+                deferral_index,
+                cycle_proof,
+                public_keys,
+                signing_message,
+                quorum_threshold,
+            } => {
+                let valid = if public_keys.is_empty() {
+                    false
+                } else {
+                    let sig_valid = cache.verify_aggregated(
+                        &public_keys,
+                        &signing_message,
+                        &cycle_proof.winner_commitment.aggregated_signature,
+                    );
+                    sig_valid
+                        && cycle_proof.winner_commitment.signer_count() as u64 >= quorum_threshold
+                };
+                self.internal_queue.push_back(Event::CycleProofVerified {
+                    block_hash,
+                    deferral_index,
+                    valid,
+                });
+            }
+
             // Note: BuildQuorumCertificate replaced by VerifyAndBuildQuorumCertificate above
 
             // Note: View change verification actions removed - using HotStuff-2 implicit rounds

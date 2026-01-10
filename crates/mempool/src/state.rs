@@ -1954,6 +1954,31 @@ mod tests {
         }
     }
 
+    fn make_test_deferral(loser_tx: Hash, winner_tx: Hash, height: u64) -> TransactionDefer {
+        use hyperscale_types::{
+            Bls12381G2Signature, CommitmentProof, CycleProof, ShardGroupId, SignerBitfield,
+        };
+
+        let commitment_proof = CommitmentProof {
+            tx_hash: winner_tx,
+            source_shard: ShardGroupId(1),
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Bls12381G2Signature([0u8; 96]),
+            block_height: BlockHeight(1),
+            entries: std::sync::Arc::new(vec![]),
+        };
+        let proof = CycleProof::new(winner_tx, commitment_proof);
+
+        TransactionDefer {
+            tx_hash: loser_tx,
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: winner_tx,
+            },
+            block_height: BlockHeight(height),
+            proof,
+        }
+    }
+
     #[test]
     fn test_deferral_updates_status_to_deferred() {
         let mut mempool = MempoolState::new(make_test_topology());
@@ -1982,14 +2007,7 @@ mod tests {
         mempool.on_submit_transaction(winner_tx.clone());
 
         // Create a deferral for our TX
-        let deferral = TransactionDefer {
-            tx_hash,
-            reason: DeferReason::LivelockCycle {
-                winner_tx_hash: winner_hash,
-            },
-            block_height: BlockHeight(2),
-            proof: None,
-        };
+        let deferral = make_test_deferral(tx_hash, winner_hash, 2);
 
         // Process block with deferral
         let defer_block = make_test_block(2, vec![], vec![deferral], vec![], vec![]);
@@ -2031,14 +2049,7 @@ mod tests {
         mempool.on_block_committed_full(&commit_block);
 
         // Defer the loser
-        let deferral = TransactionDefer {
-            tx_hash: loser_hash,
-            reason: DeferReason::LivelockCycle {
-                winner_tx_hash: winner_hash,
-            },
-            block_height: BlockHeight(2),
-            proof: None,
-        };
+        let deferral = make_test_deferral(loser_hash, winner_hash, 2);
         let defer_block = make_test_block(2, vec![], vec![deferral], vec![], vec![]);
         mempool.on_block_committed_full(&defer_block);
 
@@ -2227,14 +2238,7 @@ mod tests {
 
         // Process a synced block that contains ONLY the deferral and certificate
         // (simulating: loser_tx was in an earlier block we don't have yet)
-        let deferral = TransactionDefer {
-            tx_hash: loser_hash,
-            reason: DeferReason::LivelockCycle {
-                winner_tx_hash: winner_hash,
-            },
-            block_height: BlockHeight(5),
-            proof: None,
-        };
+        let deferral = make_test_deferral(loser_hash, winner_hash, 5);
         let winner_cert = make_test_certificate(winner_hash);
 
         // Process block with deferral and certificate, but WITHOUT the loser transaction
@@ -2291,14 +2295,7 @@ mod tests {
         let winner_hash = winner_tx.hash();
 
         // Block N: Deferral without loser tx in pool
-        let deferral = TransactionDefer {
-            tx_hash: loser_hash,
-            reason: DeferReason::LivelockCycle {
-                winner_tx_hash: winner_hash,
-            },
-            block_height: BlockHeight(5),
-            proof: None,
-        };
+        let deferral = make_test_deferral(loser_hash, winner_hash, 5);
         let block_n = make_test_block(5, vec![], vec![deferral], vec![], vec![]);
         mempool.on_block_committed_full(&block_n);
 
@@ -2362,14 +2359,7 @@ mod tests {
         let winner_hash = winner_tx.hash();
 
         // Block with both loser tx and deferral
-        let deferral = TransactionDefer {
-            tx_hash: loser_hash,
-            reason: DeferReason::LivelockCycle {
-                winner_tx_hash: winner_hash,
-            },
-            block_height: BlockHeight(5),
-            proof: None,
-        };
+        let deferral = make_test_deferral(loser_hash, winner_hash, 5);
         let block = make_test_block(
             5,
             vec![loser_tx.clone(), winner_tx],
@@ -2426,14 +2416,7 @@ mod tests {
         assert!(mempool.pool.contains_key(&tx_b_hash));
 
         // Block N+1: TX_A deferred
-        let deferral = TransactionDefer {
-            tx_hash: tx_a_hash,
-            reason: DeferReason::LivelockCycle {
-                winner_tx_hash: tx_b_hash,
-            },
-            block_height: BlockHeight(6),
-            proof: None,
-        };
+        let deferral = make_test_deferral(tx_a_hash, tx_b_hash, 6);
         let block_n1 = make_test_block(6, vec![], vec![deferral], vec![], vec![]);
         mempool.on_block_committed_full(&block_n1);
 
@@ -2594,14 +2577,7 @@ mod tests {
         mempool.on_block_committed_full(&commit_block);
 
         // Defer the loser
-        let deferral = TransactionDefer {
-            tx_hash: loser_hash,
-            reason: DeferReason::LivelockCycle {
-                winner_tx_hash: winner_hash,
-            },
-            block_height: BlockHeight(2),
-            proof: None,
-        };
+        let deferral = make_test_deferral(loser_hash, winner_hash, 2);
         let defer_block = make_test_block(2, vec![], vec![deferral], vec![], vec![]);
         mempool.on_block_committed_full(&defer_block);
 

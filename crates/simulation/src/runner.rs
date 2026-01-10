@@ -1183,6 +1183,47 @@ impl SimulationRunner {
                 );
             }
 
+            Action::VerifyCycleProof {
+                block_hash,
+                deferral_index,
+                cycle_proof,
+                public_keys,
+                signing_message,
+                quorum_threshold,
+            } => {
+                // Verify aggregated BLS signature on CycleProof's CommitmentProof
+                // Same logic as production - full cryptographic verification for correctness
+
+                let valid = if public_keys.is_empty() {
+                    // No signers - invalid proof
+                    false
+                } else {
+                    // Verify aggregated signature against the commitment proof message
+                    let sig_valid = match Bls12381G1PublicKey::aggregate(&public_keys, false) {
+                        Ok(aggregated_pk) => verify_bls12381_v1(
+                            &signing_message,
+                            &aggregated_pk,
+                            &cycle_proof.winner_commitment.aggregated_signature,
+                        ),
+                        Err(_) => false,
+                    };
+
+                    // Also verify quorum threshold
+                    sig_valid
+                        && cycle_proof.winner_commitment.signer_count() as u64 >= quorum_threshold
+                };
+
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::CycleProofVerified {
+                        block_hash,
+                        deferral_index,
+                        valid,
+                    },
+                );
+            }
+
             // Note: BuildQuorumCertificate has been replaced by VerifyAndBuildQuorumCertificate
             // which combines vote verification and QC building into a single operation.
 

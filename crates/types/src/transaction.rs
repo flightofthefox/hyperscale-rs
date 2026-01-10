@@ -384,7 +384,8 @@ pub struct TransactionDefer {
     ///
     /// Required for block validation. Validators verify this proof to ensure
     /// the deferral is justified without needing to have seen the same provisions.
-    pub proof: Option<CycleProof>,
+    /// BFT rejects blocks containing deferrals without valid proofs.
+    pub proof: CycleProof,
 }
 
 // ============================================================================
@@ -428,7 +429,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let tx_hash: Hash = decoder.decode()?;
         let reason: DeferReason = decoder.decode()?;
         let block_height: BlockHeight = decoder.decode()?;
-        let proof: Option<CycleProof> = decoder.decode()?;
+        let proof: CycleProof = decoder.decode()?;
 
         Ok(Self {
             tx_hash,
@@ -455,21 +456,8 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for TransactionDefer {
 }
 
 impl TransactionDefer {
-    /// Create a new transaction deferral for a livelock cycle without proof.
-    ///
-    /// The proof should be attached later using `with_proof()` before including
-    /// in a block.
-    pub fn livelock_cycle(tx_hash: Hash, winner_tx_hash: Hash, block_height: BlockHeight) -> Self {
-        Self {
-            tx_hash,
-            reason: DeferReason::LivelockCycle { winner_tx_hash },
-            block_height,
-            proof: None,
-        }
-    }
-
-    /// Create a new transaction deferral for a livelock cycle with proof.
-    pub fn livelock_cycle_with_proof(
+    /// Create a new transaction deferral for a livelock cycle.
+    pub fn new(
         tx_hash: Hash,
         winner_tx_hash: Hash,
         block_height: BlockHeight,
@@ -479,31 +467,20 @@ impl TransactionDefer {
             tx_hash,
             reason: DeferReason::LivelockCycle { winner_tx_hash },
             block_height,
-            proof: Some(proof),
+            proof,
         }
     }
 
-    /// Get the winner transaction hash if this was a livelock cycle deferral.
-    pub fn winner_hash(&self) -> Option<&Hash> {
+    /// Get the winner transaction hash.
+    pub fn winner_hash(&self) -> &Hash {
         match &self.reason {
-            DeferReason::LivelockCycle { winner_tx_hash } => Some(winner_tx_hash),
+            DeferReason::LivelockCycle { winner_tx_hash } => winner_tx_hash,
         }
     }
 
-    /// Check if this deferral has a proof attached.
-    pub fn has_proof(&self) -> bool {
-        self.proof.is_some()
-    }
-
-    /// Get the cycle proof if present.
-    pub fn cycle_proof(&self) -> Option<&CycleProof> {
-        self.proof.as_ref()
-    }
-
-    /// Create a copy of this deferral with a proof attached.
-    pub fn with_proof(mut self, proof: CycleProof) -> Self {
-        self.proof = Some(proof);
-        self
+    /// Get the cycle proof.
+    pub fn cycle_proof(&self) -> &CycleProof {
+        &self.proof
     }
 }
 

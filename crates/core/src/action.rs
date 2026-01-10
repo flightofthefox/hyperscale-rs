@@ -2,10 +2,10 @@
 
 use crate::{message::OutboundMessage, Event, TimerId};
 use hyperscale_types::{
-    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, EpochConfig, EpochId,
-    Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield,
-    StateCertificate, StateEntry, StateProvision, StateVoteBlock, TransactionCertificate,
-    ValidatorId, VotePower,
+    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CycleProof,
+    EpochConfig, EpochId, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    SignerBitfield, StateCertificate, StateEntry, StateProvision, StateVoteBlock,
+    TransactionCertificate, ValidatorId, VotePower,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -228,6 +228,30 @@ pub enum Action {
         /// The signing message (domain_tag || shard_group || height || round || qc.block_hash).
         /// Pre-computed by state machine since it has the shard_group context.
         signing_message: Vec<u8>,
+    },
+
+    /// Verify a CycleProof's aggregated BLS signature.
+    ///
+    /// This is CRITICAL for BFT safety: we must verify that the CycleProof's embedded
+    /// CommitmentProof has a valid aggregated signature from the claimed signers on the
+    /// source shard. Without this check, a Byzantine proposer could include deferrals
+    /// with forged CycleProofs, causing honest validators to incorrectly defer transactions.
+    ///
+    /// Delegated to a thread pool in production, instant in simulation.
+    /// Returns `Event::CycleProofVerified` when complete.
+    VerifyCycleProof {
+        /// Block hash containing this deferral (for correlation).
+        block_hash: Hash,
+        /// Index of deferral in block's deferred list.
+        deferral_index: usize,
+        /// The CycleProof to verify.
+        cycle_proof: CycleProof,
+        /// Public keys of signers (resolved from SignerBitfield).
+        public_keys: Vec<Bls12381G1PublicKey>,
+        /// Signing message for verification.
+        signing_message: Vec<u8>,
+        /// Quorum threshold for source shard.
+        quorum_threshold: u64,
     },
 
     /// Execute a batch of single-shard transactions.
@@ -570,6 +594,7 @@ impl Action {
                 | Action::VerifyAndAggregateStateVotes { .. }
                 | Action::VerifyStateCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
+                | Action::VerifyCycleProof { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
@@ -631,6 +656,7 @@ impl Action {
             Action::VerifyAndAggregateStateVotes { .. } => "VerifyAndAggregateStateVotes",
             Action::VerifyStateCertificateSignature { .. } => "VerifyStateCertificateSignature",
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
+            Action::VerifyCycleProof { .. } => "VerifyCycleProof",
 
             // Delegated Work - Execution
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",

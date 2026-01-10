@@ -11,7 +11,7 @@ use hyperscale_types::{
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 /// Configuration for livelock prevention.
 #[derive(Debug, Clone)]
@@ -316,6 +316,9 @@ impl LivelockState {
     }
 
     /// Queue a deferral for inclusion in the next block.
+    ///
+    /// The deferral will only be queued if we have a valid CycleProof for the winner.
+    /// This is required for BFT safety - blocks with proof-less deferrals are rejected.
     fn queue_deferral(&mut self, loser_tx: Hash, winner_tx: Hash) {
         // Check if already queued
         if self.pending_deferrals.iter().any(|d| d.tx_hash == loser_tx) {
@@ -323,11 +326,21 @@ impl LivelockState {
             return;
         }
 
-        // Build CycleProof from the stored commitment proof for the winner
-        let proof = self
-            .commitment_proofs
-            .get(&winner_tx)
-            .map(|commitment| CycleProof::new(winner_tx, commitment.clone()));
+        // Build CycleProof from the stored commitment proof for the winner.
+        // The proof MUST be present - BFT validation rejects deferrals without proofs.
+        let Some(commitment) = self.commitment_proofs.get(&winner_tx) else {
+            // This shouldn't happen in normal operation since we store the commitment
+            // proof before calling check_for_cycle. But if it does, we can't create
+            // a valid deferral, so we must skip it.
+            warn!(
+                loser_tx = %loser_tx,
+                winner_tx = %winner_tx,
+                "Cannot queue deferral - no commitment proof for winner (BFT requires proof)"
+            );
+            return;
+        };
+
+        let proof = CycleProof::new(winner_tx, commitment.clone());
 
         let deferral = TransactionDefer {
             tx_hash: loser_tx,
@@ -341,7 +354,6 @@ impl LivelockState {
         debug!(
             loser_tx = %loser_tx,
             winner_tx = %winner_tx,
-            has_proof = deferral.has_proof(),
             "Queuing deferral with cycle proof"
         );
 
@@ -562,6 +574,23 @@ mod tests {
         Hash::from_hash_bytes(&bytes)
     }
 
+    // Helper to create a minimal CycleProof for testing
+    fn make_test_cycle_proof(winner_tx_hash: Hash) -> CycleProof {
+        use hyperscale_types::{
+            Bls12381G2Signature, CommitmentProof, ShardGroupId, SignerBitfield,
+        };
+
+        let commitment_proof = CommitmentProof {
+            tx_hash: winner_tx_hash,
+            source_shard: ShardGroupId(1),
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Bls12381G2Signature([0u8; 96]),
+            block_height: BlockHeight(1),
+            entries: std::sync::Arc::new(vec![]),
+        };
+        CycleProof::new(winner_tx_hash, commitment_proof)
+    }
+
     #[test]
     fn test_cycle_detection_basic() {
         let topology = make_test_topology(ShardGroupId(0));
@@ -763,13 +792,14 @@ mod tests {
         assert!(state.committed_tracker.contains(&tx));
 
         // Simulate deferral being committed in a block
+        let winner = hash_with_prefix(0x00);
         let deferral = TransactionDefer {
             tx_hash: tx,
             reason: DeferReason::LivelockCycle {
-                winner_tx_hash: hash_with_prefix(0x00),
+                winner_tx_hash: winner,
             },
             block_height: BlockHeight(5),
-            proof: None,
+            proof: make_test_cycle_proof(winner),
         };
 
         let block = hyperscale_types::Block {

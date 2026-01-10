@@ -2281,6 +2281,59 @@ impl ProductionRunner {
                 });
             }
 
+            Action::VerifyCycleProof {
+                block_hash,
+                deferral_index,
+                cycle_proof,
+                public_keys,
+                signing_message,
+                quorum_threshold,
+            } => {
+                let event_tx = self.callback_tx.clone();
+                // CycleProof verification is LIVENESS-CRITICAL - use consensus crypto pool
+                self.thread_pools.spawn_consensus_crypto(move || {
+                    let start = std::time::Instant::now();
+
+                    let valid = if public_keys.is_empty() {
+                        // No signers - invalid proof
+                        false
+                    } else {
+                        // Verify aggregated BLS signature
+                        // Skip PK validation - keys come from trusted topology
+                        let sig_valid = match Bls12381G1PublicKey::aggregate(&public_keys, false) {
+                            Ok(aggregated_pk) => verify_bls12381_v1(
+                                &signing_message,
+                                &aggregated_pk,
+                                &cycle_proof.winner_commitment.aggregated_signature,
+                            ),
+                            Err(_) => false,
+                        };
+
+                        // Also verify quorum threshold
+                        sig_valid
+                            && cycle_proof.winner_commitment.signer_count() as u64
+                                >= quorum_threshold
+                    };
+
+                    crate::metrics::record_signature_verification_latency(
+                        "cycle_proof",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
+                    event_tx
+                        .send(Event::CycleProofVerified {
+                            block_hash,
+                            deferral_index,
+                            valid,
+                        })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
+                });
+            }
+
             // Transaction execution on dedicated execution thread pool
             // NOTE: Execution is READ-ONLY. State writes are collected in the results
             // and committed later when TransactionCertificate is included in a block.

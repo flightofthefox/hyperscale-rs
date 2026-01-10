@@ -480,6 +480,15 @@ impl StateMachine for NodeStateMachine {
             Event::QcSignatureVerified { block_hash, valid } => {
                 return self.bft.on_qc_signature_verified(*block_hash, *valid);
             }
+            Event::CycleProofVerified {
+                block_hash,
+                deferral_index,
+                valid,
+            } => {
+                return self
+                    .bft
+                    .on_cycle_proof_verified(*block_hash, *deferral_index, *valid);
+            }
 
             // Block committed needs special handling - notify multiple subsystems
             Event::BlockCommitted {
