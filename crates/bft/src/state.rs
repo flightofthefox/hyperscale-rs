@@ -168,7 +168,8 @@ pub struct BftState {
     pending_blocks: HashMap<Hash, PendingBlock>,
 
     /// Tracks when each pending block was created (hash -> creation time).
-    /// Used to detect stale pending blocks that should be removed to allow sync.
+    /// Used for fetch timeout tracking - we delay fetching missing data to allow
+    /// gossip and local certificate creation time to fill in missing data first.
     pending_block_created_at: HashMap<Hash, Duration>,
 
     /// Vote sets for blocks (hash -> vote set).
@@ -1427,8 +1428,11 @@ impl BftState {
                 self.maybe_unlock_for_qc(&header.parent_qc);
             }
 
-            // Check if we have the parent block in any form
-            if !self.has_block_at_height(parent_height) {
+            // Check if we have a COMPLETE parent block. If the parent is incomplete
+            // (missing transactions/certificates), we need to sync to get the full data.
+            // This is more aggressive than checking has_block_at_height() which would
+            // return true for incomplete pending blocks.
+            if !self.has_complete_block_at_height(parent_height) {
                 let target_height = parent_height;
                 let target_hash = header.parent_qc.block_hash;
 
@@ -4274,69 +4278,6 @@ impl BftState {
         actions
     }
 
-    /// Clean up stale incomplete pending blocks.
-    ///
-    /// Removes pending blocks that:
-    /// 1. Are incomplete (still waiting for transactions/certificates)
-    /// 2. Have been pending longer than `stale_pending_block_timeout`
-    ///
-    /// This prevents a node from getting stuck when transaction/certificate
-    /// fetches fail permanently. By removing stale incomplete blocks, we allow
-    /// sync to be triggered when a later block header arrives.
-    ///
-    /// Returns `CancelFetch` actions for removed blocks so the runner can clean
-    /// up any in-flight fetch operations.
-    pub fn cleanup_stale_pending_blocks(&mut self) -> Vec<Action> {
-        let timeout = self.config.stale_pending_block_timeout;
-        let now = self.now;
-        let mut actions = Vec::new();
-
-        // Collect hashes of stale incomplete blocks
-        let stale_hashes: Vec<Hash> = self
-            .pending_blocks
-            .iter()
-            .filter(|(hash, pending)| {
-                // Only remove incomplete blocks
-                if pending.is_complete() {
-                    return false;
-                }
-                // Check if it's been pending too long
-                if let Some(&created_at) = self.pending_block_created_at.get(*hash) {
-                    now.saturating_sub(created_at) >= timeout
-                } else {
-                    // No creation time tracked - shouldn't happen, but remove anyway
-                    true
-                }
-            })
-            .map(|(hash, _)| *hash)
-            .collect();
-
-        // Remove stale blocks and their associated buffered commits
-        for hash in stale_hashes {
-            if let Some(pending) = self.pending_blocks.remove(&hash) {
-                let height = pending.header().height.0;
-                warn!(
-                    validator = ?self.validator_id(),
-                    block_hash = ?hash,
-                    height = height,
-                    missing_txs = pending.missing_transaction_count(),
-                    missing_certs = pending.missing_certificate_count(),
-                    "Removing stale incomplete pending block to allow sync"
-                );
-                self.pending_block_created_at.remove(&hash);
-
-                // Also clean up any buffered commit that was waiting for this block's data.
-                // Without this, the entry would stay in pending_commits_awaiting_data forever.
-                self.pending_commits_awaiting_data.remove(&hash);
-
-                // Emit CancelFetch to clean up any in-flight fetch operations
-                actions.push(Action::CancelFetch { block_hash: hash });
-            }
-        }
-
-        actions
-    }
-
     /// Check if we're behind and need to catch up via sync.
     ///
     /// This is called periodically by the cleanup timer to detect when:
@@ -4509,64 +4450,9 @@ impl BftState {
         &self.voted_heights
     }
 
-    /// Check if we have a block at the given height in any state.
-    ///
-    /// Returns true if we have the block in:
-    /// - `pending_blocks` (received header, may be waiting for transactions)
-    /// - `certified_blocks` (has QC, waiting for commit)
-    /// - `pending_synced_block_verifications` (received via sync, verifying QC)
-    /// - `buffered_synced_blocks` (received via sync, waiting for earlier blocks)
-    ///
-    /// This is used to determine if we need to sync for a block.
-    ///
-    /// Note: We include ALL pending_blocks (even incomplete ones) because:
-    /// 1. Incomplete blocks will eventually be cleaned up by `cleanup_stale_pending_blocks()`
-    /// 2. The cleanup timer runs every second, so stale blocks won't prevent sync for long
-    /// 3. Being too aggressive about triggering sync causes performance issues
-    fn has_block_at_height(&self, height: u64) -> bool {
-        // Already committed
-        if height <= self.committed_height {
-            return true;
-        }
-
-        // In pending blocks (received via consensus)
-        if self
-            .pending_blocks
-            .values()
-            .any(|pb| pb.header().height.0 == height)
-        {
-            return true;
-        }
-
-        // In certified blocks (has QC, waiting for commit)
-        if self
-            .certified_blocks
-            .values()
-            .any(|(block, _)| block.header.height.0 == height)
-        {
-            return true;
-        }
-
-        // In pending synced block verifications
-        if self
-            .pending_synced_block_verifications
-            .values()
-            .any(|p| p.block.header.height.0 == height)
-        {
-            return true;
-        }
-
-        // In buffered synced blocks (waiting for earlier blocks)
-        if self.buffered_synced_blocks.contains_key(&height) {
-            return true;
-        }
-
-        false
-    }
-
     /// Check if we have a COMPLETE block at the given height that can be committed.
     ///
-    /// Unlike `has_block_at_height`, this only returns true if the block is fully
+    /// This only returns true if the block is fully
     /// constructed and ready for commit. Incomplete pending blocks (waiting for
     /// transactions/certificates) return false.
     ///
