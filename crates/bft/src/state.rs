@@ -1982,6 +1982,7 @@ impl BftState {
                     self.shard_group, // target_shard = our local shard (we received these provisions)
                     source_shard,     // source_shard = where the provisions came from
                     proof.winner_commitment.block_height,
+                    proof.winner_commitment.block_timestamp,
                     &entry_hashes,
                 );
                 let quorum_threshold = self.topology.quorum_threshold_for_shard(source_shard);
@@ -5270,6 +5271,7 @@ mod tests {
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             block_height: BlockHeight(1),
+            block_timestamp: 1000,
             entries: Arc::new(vec![]),
         };
         CycleProof::new(winner_tx_hash, commitment_proof)
@@ -7116,6 +7118,7 @@ mod tests {
                 SignerBitfield::new(4),
                 zero_bls_signature(),
                 BlockHeight(1),
+                1000, // block_timestamp
                 vec![StateEntry::test_entry(node, 0, vec![], None)],
             ))
         } else {

@@ -1981,6 +1981,7 @@ mod tests {
             signers: SignerBitfield::empty(),
             aggregated_signature: Bls12381G2Signature([0u8; 96]),
             block_height: BlockHeight(1),
+            block_timestamp: 1000,
             entries: std::sync::Arc::new(vec![]),
         };
         let proof = CycleProof::new(winner_tx, commitment_proof);

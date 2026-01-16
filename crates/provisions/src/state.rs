@@ -336,11 +336,12 @@ impl ProvisionCoordinator {
             .collect();
         let public_keys: Vec<_> = provisions_with_keys.iter().map(|(_, pk)| *pk).collect();
 
-        // Get block height and entries from first provision (all should match)
+        // Get block height, timestamp, and entries from first provision (all should match)
         let block_height = provisions
             .first()
             .map(|p| p.block_height)
             .unwrap_or(BlockHeight(0));
+        let block_timestamp = provisions.first().map(|p| p.block_timestamp).unwrap_or(0);
         let entries: Vec<StateEntry> = provisions
             .first()
             .map(|p| p.entries.as_ref().clone())
@@ -358,6 +359,7 @@ impl ProvisionCoordinator {
             tx_hash,
             source_shard,
             block_height,
+            block_timestamp,
             entries,
             provisions,
             public_keys,
@@ -622,10 +624,11 @@ impl ProvisionCoordinator {
             .iter()
             .find(|(_, provisions)| !provisions.is_empty())?;
 
-        // Get block height and entries from the first provision
+        // Get block height, timestamp, and entries from the first provision
         // All provisions for the same (tx, shard) should have same entries
         let first_provision = &provisions[0];
         let block_height = first_provision.block_height;
+        let block_timestamp = first_provision.block_timestamp;
         let entries = Arc::clone(&first_provision.entries);
 
         // Build signer bitfield from validator IDs
@@ -651,6 +654,7 @@ impl ProvisionCoordinator {
             signers,
             aggregated_signature,
             block_height,
+            block_timestamp,
             (*entries).clone(),
         ))
     }
@@ -813,12 +817,14 @@ mod tests {
 
         let target_shard = ShardGroupId(0);
         let block_height = BlockHeight(1);
+        let block_timestamp = 1000u64;
         let entry_hashes: Vec<Hash> = vec![];
         let message = state_provision_message(
             &tx_hash,
             target_shard,
             source_shard,
             block_height,
+            block_timestamp,
             &entry_hashes,
         );
         let signature = keypair.sign_v1(&message);
@@ -828,6 +834,7 @@ mod tests {
             target_shard,
             source_shard,
             block_height,
+            block_timestamp,
             entries: Arc::new(vec![]),
             validator_id,
             signature,
@@ -853,12 +860,14 @@ mod tests {
 
         let target_shard = ShardGroupId(0);
         let block_height = BlockHeight(1);
+        let block_timestamp = 1000u64;
         let entry_hashes: Vec<Hash> = entries.iter().map(|e| e.hash()).collect();
         let message = state_provision_message(
             &tx_hash,
             target_shard,
             source_shard,
             block_height,
+            block_timestamp,
             &entry_hashes,
         );
         let signature = keypair.sign_v1(&message);
@@ -868,6 +877,7 @@ mod tests {
             target_shard,
             source_shard,
             block_height,
+            block_timestamp,
             entries: Arc::new(entries),
             validator_id,
             signature,
@@ -1095,6 +1105,7 @@ mod tests {
             SignerBitfield::new(4),
             zero_bls_signature(),
             BlockHeight(1),
+            1000, // block_timestamp
             vec![],
         );
         coordinator.on_provisions_verified_and_aggregated(
@@ -1128,6 +1139,7 @@ mod tests {
             SignerBitfield::new(4),
             zero_bls_signature(),
             BlockHeight(1),
+            1000, // block_timestamp
             vec![],
         );
         coordinator.on_provisions_verified_and_aggregated(
@@ -1382,6 +1394,7 @@ mod tests {
             ShardGroupId(1), // target
             ShardGroupId(0), // source
             BlockHeight(10),
+            1000, // block_timestamp
             entries,
         );
 
@@ -1424,6 +1437,7 @@ mod tests {
             ShardGroupId(1),
             ShardGroupId(0),
             BlockHeight(10),
+            1000,
             &entry_hashes,
         );
 
@@ -1473,6 +1487,7 @@ mod tests {
             ShardGroupId(1),
             ShardGroupId(0),
             BlockHeight(10),
+            1000,
             &entry_hashes,
         );
 

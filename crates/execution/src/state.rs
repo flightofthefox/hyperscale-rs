@@ -425,6 +425,7 @@ impl ExecutionState {
         &mut self,
         block_hash: Hash,
         height: u64,
+        block_timestamp: u64,
         transactions: Vec<Arc<RoutableTransaction>>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -525,7 +526,7 @@ impl ExecutionState {
 
         // Handle cross-shard transactions (2PC)
         for tx in cross_shard {
-            actions.extend(self.start_cross_shard_execution(tx, height));
+            actions.extend(self.start_cross_shard_execution(tx, height, block_timestamp));
         }
 
         actions
@@ -604,6 +605,7 @@ impl ExecutionState {
         &mut self,
         tx: Arc<RoutableTransaction>,
         height: u64,
+        block_timestamp: u64,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = tx.hash();
@@ -620,7 +622,11 @@ impl ExecutionState {
         );
 
         // Phase 1: Initiate provision broadcast (async - fetches state first)
-        actions.extend(self.initiate_provision_broadcast(&tx, BlockHeight(height)));
+        actions.extend(self.initiate_provision_broadcast(
+            &tx,
+            BlockHeight(height),
+            block_timestamp,
+        ));
 
         // Phase 2: Start tracking provisioning
         // Find remote shards we need provisions from
@@ -717,6 +723,7 @@ impl ExecutionState {
         &mut self,
         tx: &RoutableTransaction,
         block_height: BlockHeight,
+        block_timestamp: u64,
     ) -> Vec<Action> {
         let local_shard = self.local_shard();
         let tx_hash = tx.hash();
@@ -759,6 +766,7 @@ impl ExecutionState {
             tx_hash,
             PendingProvisionBroadcast {
                 block_height,
+                block_timestamp,
                 target_shards,
             },
         );
@@ -779,6 +787,7 @@ impl ExecutionState {
         target_shard: ShardGroupId,
         source_shard: ShardGroupId,
         block_height: BlockHeight,
+        block_timestamp: u64,
         entries: &[StateEntry],
     ) -> Bls12381G2Signature {
         let entry_hashes: Vec<Hash> = entries.iter().map(|e| e.hash()).collect();
@@ -787,6 +796,7 @@ impl ExecutionState {
             target_shard,
             source_shard,
             block_height,
+            block_timestamp,
             &entry_hashes,
         );
         self.signing_key.sign_v1(&msg)
@@ -1900,6 +1910,7 @@ impl ExecutionState {
                 target_shard,
                 local_shard,
                 pending.block_height,
+                pending.block_timestamp,
                 &entries,
             );
             total_sign_us += sign_start.elapsed().as_micros() as u64;
@@ -1909,6 +1920,7 @@ impl ExecutionState {
                 target_shard,
                 source_shard: local_shard,
                 block_height: pending.block_height,
+                block_timestamp: pending.block_timestamp,
                 entries: Arc::clone(&entries),
                 validator_id: self.validator_id(),
                 signature,
@@ -2357,7 +2369,7 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block1");
 
         // Block committed with transaction
-        let actions = state.on_block_committed(block_hash, 1, vec![Arc::new(tx.clone())]);
+        let actions = state.on_block_committed(block_hash, 1, 1000, vec![Arc::new(tx.clone())]);
 
         // Should request execution (single-shard path) - now also sets up vote tracking
         assert!(!actions.is_empty());
@@ -2415,12 +2427,12 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block1");
 
         // First commit - should produce status change + execute transaction actions
-        let actions1 = state.on_block_committed(block_hash, 1, vec![Arc::new(tx.clone())]);
+        let actions1 = state.on_block_committed(block_hash, 1, 1000, vec![Arc::new(tx.clone())]);
         assert!(!actions1.is_empty()); // Status change + execute
 
         // Second commit of same transaction
         let block_hash2 = Hash::from_bytes(b"block2");
-        let actions2 = state.on_block_committed(block_hash2, 2, vec![Arc::new(tx)]);
+        let actions2 = state.on_block_committed(block_hash2, 2, 2000, vec![Arc::new(tx)]);
 
         // Should be empty (deduplicated)
         assert!(actions2.is_empty());
@@ -2460,7 +2472,7 @@ mod tests {
         assert!(!state.speculative_in_flight_txs.contains(&tx_hash));
 
         // Now block commits - should skip execution (votes already sent)
-        let actions = state.on_block_committed(block_hash, height, vec![tx]);
+        let actions = state.on_block_committed(block_hash, height, 10000, vec![tx]);
 
         // Should NOT emit ExecuteTransactions (speculation was used, votes already sent)
         assert!(!actions
@@ -2491,7 +2503,7 @@ mod tests {
         assert!(state.speculative_in_flight_txs.contains(&tx_hash));
 
         // Block commits WHILE speculation is in-flight
-        let commit_actions = state.on_block_committed(block_hash, height, vec![tx]);
+        let commit_actions = state.on_block_committed(block_hash, height, 10000, vec![tx]);
 
         // Should NOT emit ExecuteTransactions (votes will arrive from speculation)
         assert!(!commit_actions
@@ -2519,7 +2531,7 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block1");
 
         // Block commits without any speculation
-        let actions = state.on_block_committed(block_hash, 1, vec![tx]);
+        let actions = state.on_block_committed(block_hash, 1, 1000, vec![tx]);
 
         // Should emit ExecuteTransactions (no speculation to use)
         assert!(actions

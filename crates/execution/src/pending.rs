@@ -18,6 +18,8 @@ use std::collections::HashSet;
 pub struct PendingProvisionBroadcast {
     /// Block height when the transaction was committed.
     pub block_height: BlockHeight,
+    /// Unix timestamp (milliseconds) of the block that triggered this provision.
+    pub block_timestamp: u64,
     /// Target shards to broadcast to.
     pub target_shards: Vec<ShardGroupId>,
 }

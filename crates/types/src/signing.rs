@@ -29,7 +29,7 @@ pub const DOMAIN_BLOCK_VOTE: &[u8] = b"BLOCK_VOTE";
 
 /// Domain tag for cross-shard state provisions.
 ///
-/// Format: `STATE_PROVISION` || tx_hash || target_shard || source_shard || height || entries_hash
+/// Format: `STATE_PROVISION` || tx_hash || target_shard || source_shard || height || timestamp || entries_hash
 pub const DOMAIN_STATE_PROVISION: &[u8] = b"STATE_PROVISION";
 
 /// Domain tag for execution state votes.
@@ -69,6 +69,7 @@ pub fn state_provision_message(
     target_shard: ShardGroupId,
     source_shard: ShardGroupId,
     block_height: BlockHeight,
+    block_timestamp: u64,
     entries_hashes: &[Hash],
 ) -> Vec<u8> {
     let mut msg = Vec::new();
@@ -77,6 +78,7 @@ pub fn state_provision_message(
     msg.extend_from_slice(&target_shard.0.to_le_bytes());
     msg.extend_from_slice(&source_shard.0.to_le_bytes());
     msg.extend_from_slice(&block_height.0.to_le_bytes());
+    msg.extend_from_slice(&block_timestamp.to_le_bytes());
 
     for hash in entries_hashes {
         msg.extend_from_slice(hash.as_bytes());
@@ -147,6 +149,7 @@ mod tests {
             ShardGroupId(1),
             ShardGroupId(0),
             BlockHeight(10),
+            1234567890,
             &[entry1, entry2],
         );
         let msg2 = state_provision_message(
@@ -154,6 +157,7 @@ mod tests {
             ShardGroupId(1),
             ShardGroupId(0),
             BlockHeight(10),
+            1234567890,
             &[entry1, entry2],
         );
 

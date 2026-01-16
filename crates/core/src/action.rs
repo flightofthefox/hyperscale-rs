@@ -146,6 +146,8 @@ pub enum Action {
         source_shard: ShardGroupId,
         /// Block height when provisions were created.
         block_height: BlockHeight,
+        /// Unix timestamp (milliseconds) of the block that triggered the provisions.
+        block_timestamp: u64,
         /// State entries (from first provision - all should match).
         entries: Vec<StateEntry>,
         /// Provisions to verify and aggregate.

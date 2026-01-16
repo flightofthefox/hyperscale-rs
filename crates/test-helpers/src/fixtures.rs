@@ -206,6 +206,7 @@ pub fn make_signed_state_certificate(
 /// Create a properly-signed state provision.
 ///
 /// The provision is signed with the keypair at `validator_idx` in the committee.
+#[allow(clippy::too_many_arguments)]
 pub fn make_signed_provision(
     committee: &TestCommittee,
     validator_idx: usize,
@@ -213,6 +214,7 @@ pub fn make_signed_provision(
     target_shard: ShardGroupId,
     source_shard: ShardGroupId,
     block_height: BlockHeight,
+    block_timestamp: u64,
     entries: Vec<StateEntry>,
 ) -> StateProvision {
     // Compute entry hashes for signing
@@ -223,6 +225,7 @@ pub fn make_signed_provision(
         target_shard,
         source_shard,
         block_height,
+        block_timestamp,
         &entry_hashes,
     );
     let signature = committee.keypair(validator_idx).sign_v1(&message);
@@ -232,6 +235,7 @@ pub fn make_signed_provision(
         target_shard,
         source_shard,
         block_height,
+        block_timestamp,
         entries: Arc::new(entries),
         validator_id: committee.validator_id(validator_idx),
         signature,
@@ -404,6 +408,7 @@ mod tests {
             ShardGroupId(1),
             ShardGroupId(0),
             BlockHeight(10),
+            1000, // block_timestamp
             entries,
         );
 

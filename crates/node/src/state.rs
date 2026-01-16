@@ -530,9 +530,12 @@ impl StateMachine for NodeStateMachine {
                 // NOTE: execution.on_block_committed emits CrossShardTxRegistered events, which
                 // will be processed by the coordinator via EnqueueInternal actions.
                 let all_txs: Vec<_> = block.all_transactions().cloned().collect();
-                let exec_actions = self
-                    .execution
-                    .on_block_committed(*block_hash, *height, all_txs);
+                let exec_actions = self.execution.on_block_committed(
+                    *block_hash,
+                    *height,
+                    block.header.timestamp,
+                    all_txs,
+                );
 
                 // Process CrossShardTxRegistered events immediately so coordinator has
                 // registrations before any subsequent provisions arrive.

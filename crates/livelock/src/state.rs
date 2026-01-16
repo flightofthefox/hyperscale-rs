@@ -535,6 +535,7 @@ mod tests {
             SignerBitfield::new(3),
             zero_bls_signature(),
             BlockHeight(1),
+            1000, // block_timestamp
             vec![],
         )
     }
@@ -555,6 +556,7 @@ mod tests {
             SignerBitfield::new(3),
             zero_bls_signature(),
             BlockHeight(1),
+            1000, // block_timestamp
             entries,
         )
     }
@@ -593,6 +595,7 @@ mod tests {
             signers: SignerBitfield::empty(),
             aggregated_signature: Bls12381G2Signature([0u8; 96]),
             block_height: BlockHeight(1),
+            block_timestamp: 1000,
             entries: std::sync::Arc::new(vec![]),
         };
         CycleProof::new(winner_tx_hash, commitment_proof)

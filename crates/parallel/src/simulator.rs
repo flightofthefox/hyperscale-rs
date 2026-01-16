@@ -584,6 +584,7 @@ impl SimNode {
                 tx_hash,
                 source_shard,
                 block_height,
+                block_timestamp,
                 entries,
                 provisions,
                 public_keys,
@@ -621,6 +622,7 @@ impl SimNode {
                         signers,
                         aggregated_signature,
                         block_height,
+                        block_timestamp,
                         entries,
                     );
 
@@ -659,6 +661,7 @@ impl SimNode {
                             signers,
                             aggregated_signature,
                             block_height,
+                            block_timestamp,
                             entries,
                         ))
                     } else {

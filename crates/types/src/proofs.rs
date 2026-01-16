@@ -58,6 +58,9 @@ pub struct CommitmentProof {
     /// Block height at which the tx was committed on the source shard.
     pub block_height: BlockHeight,
 
+    /// Unix timestamp (milliseconds) of the block that triggered the provisions.
+    pub block_timestamp: u64,
+
     /// The state entries with pre-computed storage keys.
     /// Needed for cycle detection (node overlap checking via StateEntry::node_id()).
     /// Wrapped in Arc for efficient sharing.
@@ -72,6 +75,7 @@ impl PartialEq for CommitmentProof {
             && self.signers == other.signers
             && self.aggregated_signature == other.aggregated_signature
             && self.block_height == other.block_height
+            && self.block_timestamp == other.block_timestamp
             && *self.entries == *other.entries
     }
 }
@@ -90,12 +94,13 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(6)?;
+        encoder.write_size(7)?;
         encoder.encode(&self.tx_hash)?;
         encoder.encode(&self.source_shard)?;
         encoder.encode(&self.signers)?;
         encoder.encode(&self.aggregated_signature)?;
         encoder.encode(&self.block_height)?;
+        encoder.encode(&self.block_timestamp)?;
         // Entries: encode the inner Vec directly (unwrap Arc)
         encoder.encode(self.entries.as_ref())?;
         Ok(())
@@ -112,9 +117,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 6 {
+        if length != 7 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 6,
+                expected: 7,
                 actual: length,
             });
         }
@@ -124,6 +129,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let signers: SignerBitfield = decoder.decode()?;
         let aggregated_signature: Bls12381G2Signature = decoder.decode()?;
         let block_height: BlockHeight = decoder.decode()?;
+        let block_timestamp: u64 = decoder.decode()?;
         // Entries: decode Vec and wrap in Arc
         let entries: Vec<StateEntry> = decoder.decode()?;
 
@@ -133,6 +139,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             signers,
             aggregated_signature,
             block_height,
+            block_timestamp,
             entries: Arc::new(entries),
         })
     }
@@ -161,6 +168,7 @@ impl CommitmentProof {
         signers: SignerBitfield,
         aggregated_signature: Bls12381G2Signature,
         block_height: BlockHeight,
+        block_timestamp: u64,
         entries: Vec<StateEntry>,
     ) -> Self {
         Self {
@@ -169,6 +177,7 @@ impl CommitmentProof {
             signers,
             aggregated_signature,
             block_height,
+            block_timestamp,
             entries: Arc::new(entries),
         }
     }
@@ -372,6 +381,7 @@ mod tests {
             SignerBitfield::new(10),
             zero_bls_signature(),
             BlockHeight(100),
+            1000, // block_timestamp
             entries,
         );
 
@@ -391,6 +401,7 @@ mod tests {
             SignerBitfield::new(10),
             zero_bls_signature(),
             BlockHeight(100),
+            1000, // block_timestamp
             entries,
         );
 
@@ -409,6 +420,7 @@ mod tests {
             SignerBitfield::new(5),
             zero_bls_signature(),
             BlockHeight(50),
+            1000, // block_timestamp
             entries,
         );
 
@@ -430,6 +442,7 @@ mod tests {
             SignerBitfield::new(10),
             zero_bls_signature(),
             BlockHeight(100),
+            1000, // block_timestamp
             entries,
         );
 
@@ -450,6 +463,7 @@ mod tests {
             SignerBitfield::new(5),
             zero_bls_signature(),
             BlockHeight(100),
+            1000, // block_timestamp
             entries,
         );
 
@@ -477,6 +491,7 @@ mod tests {
             signers,
             zero_bls_signature(),
             BlockHeight(1),
+            1000, // block_timestamp
             vec![],
         );
 
@@ -493,6 +508,7 @@ mod tests {
             SignerBitfield::new(10),
             zero_bls_signature(),
             BlockHeight(1),
+            1000, // block_timestamp
             entries,
         );
 

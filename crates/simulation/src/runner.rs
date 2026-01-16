@@ -870,6 +870,7 @@ impl SimulationRunner {
                 tx_hash,
                 source_shard,
                 block_height,
+                block_timestamp,
                 entries,
                 provisions,
                 public_keys,
@@ -907,6 +908,7 @@ impl SimulationRunner {
                         signers,
                         aggregated_signature,
                         block_height,
+                        block_timestamp,
                         entries,
                     );
 
@@ -945,6 +947,7 @@ impl SimulationRunner {
                             signers,
                             aggregated_signature,
                             block_height,
+                            block_timestamp,
                             entries,
                         ))
                     } else {
