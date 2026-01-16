@@ -16,19 +16,35 @@
 //!
 //! Rather than having our own `Storage` trait that we adapt to Radix's `SubstateDatabase`,
 //! runner storage types implement `SubstateDatabase` + `CommittableSubstateDatabase` directly,
-//! plus our `SubstateStore` extension trait for snapshots and node listing.
+//! plus our `SubstateStore` extension trait for snapshots, node listing, and JMT state roots.
+//!
+//! # Jellyfish Merkle Tree (JMT)
+//!
+//! All `SubstateStore` implementations use JMT internally to maintain a cryptographic
+//! commitment to the entire state. This provides:
+//! - `state_version()` - Monotonically increasing version number
+//! - `state_root_hash()` - Merkle root of all substates at current version
+//!
+//! The JMT state root is useful for state sync, light client proofs, and verifying
+//! state consistency across validators. Note this is distinct from the per-transaction
+//! `compute_writes_commitment()` used in transaction certificates.
 
 use hyperscale_types::NodeId;
+use radix_common::crypto::Hash;
 use radix_substate_store_interface::interface::{
     CommittableSubstateDatabase, DbSortKey, SubstateDatabase,
 };
 
-/// Extension trait for substate storage that adds snapshot and node listing capabilities.
+/// Extension trait for substate storage with snapshots, node listing, and JMT state roots.
 ///
 /// This trait extends Radix's `SubstateDatabase` with additional methods needed
-/// for deterministic simulation:
+/// for deterministic simulation and state commitment:
 /// - `snapshot()` - Create isolated views for parallel execution
 /// - `list_substates_for_node()` - Enumerate substates for cross-shard provisioning
+/// - `state_version()` / `state_root_hash()` - JMT state commitment
+///
+/// All implementations use Jellyfish Merkle Tree (JMT) internally to maintain
+/// cryptographic state roots. This is handled automatically on each `commit()`.
 ///
 /// Runner storage types (`SimStorage`, `RocksDbStorage`) implement this trait
 /// along with `SubstateDatabase` and `CommittableSubstateDatabase`.
@@ -57,6 +73,21 @@ pub trait SubstateStore: SubstateDatabase + CommittableSubstateDatabase + Send +
         &self,
         node_id: &NodeId,
     ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_>;
+
+    /// Current state version.
+    ///
+    /// This is a monotonically increasing counter that increments on each `commit()`.
+    /// Version 0 means no commits have occurred (empty/genesis state).
+    fn state_version(&self) -> u64;
+
+    /// Current JMT state root hash.
+    ///
+    /// Returns the Merkle root of all substates at the current version.
+    /// This hash cryptographically commits to the entire state and can be used
+    /// for state sync, light client proofs, and cross-validator consistency checks.
+    ///
+    /// Returns a zero hash if no commits have occurred.
+    fn state_root_hash(&self) -> Hash;
 }
 
 /// Prefix for all Radix Engine data in storage.

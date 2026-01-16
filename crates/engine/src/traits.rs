@@ -69,8 +69,10 @@ pub trait ExecutionBackend: Clone + Send + Sync + 'static {
     /// Returns `StateEntry` with pre-computed storage keys for efficient cross-shard execution.
     fn fetch_state_entries(&self, nodes: &[NodeId]) -> Vec<StateEntry>;
 
-    /// Compute merkle root from state writes.
+    /// Compute writes commitment from state writes.
     ///
-    /// Computes a commitment to state modifications for the voting protocol.
-    fn compute_merkle_root(&self, writes: &[(NodeId, Vec<u8>)]) -> Hash;
+    /// Computes a deterministic hash of state modifications for the voting protocol.
+    /// This is used for transaction certificates - validators vote on this hash
+    /// to agree on execution results.
+    fn compute_writes_commitment(&self, writes: &[(NodeId, Vec<u8>)]) -> Hash;
 }

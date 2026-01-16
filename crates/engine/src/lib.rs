@@ -61,9 +61,16 @@ pub use storage::{keys, SubstateStore, RADIX_PREFIX};
 pub use validation::TransactionValidation;
 
 // Re-export commonly needed Radix types for storage implementations
+pub use radix_common::crypto::Hash as StateRootHash;
 pub use radix_common::network::NetworkDefinition;
 pub use radix_common::prelude::{DatabaseUpdate, DbSubstateValue};
 pub use radix_substate_store_interface::interface::{
     CommittableSubstateDatabase, DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates,
     PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase,
+};
+
+// Re-export JMT types for storage implementations
+pub use radix_substate_store_impls::state_tree::put_at_next_version;
+pub use radix_substate_store_impls::state_tree::tree_store::{
+    TypedInMemoryTreeStore, Version as StateVersion,
 };

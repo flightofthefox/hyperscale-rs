@@ -5,17 +5,24 @@
 //! Uses `im::OrdMap` for O(1) structural-sharing clones, enabling efficient
 //! snapshots without copying the entire dataset. This is critical for parallel
 //! transaction execution where each transaction needs an isolated view.
+//!
+//! # JMT Integration
+//!
+//! Uses `TypedInMemoryTreeStore` for Jellyfish Merkle Tree tracking, providing
+//! `state_version()` and `state_root_hash()` for state commitment. This ensures
+//! simulation has identical JMT behavior to production.
 
 use hyperscale_engine::{
-    keys, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase, SubstateStore,
+    keys, put_at_next_version, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates,
+    DbPartitionKey, DbSortKey, DbSubstateValue, PartitionDatabaseUpdates, PartitionEntry,
+    StateRootHash, SubstateDatabase, SubstateStore, TypedInMemoryTreeStore,
 };
 use hyperscale_types::{
     Block, BlockHeight, Hash, NodeId, QuorumCertificate, TransactionCertificate,
 };
 use im::OrdMap;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// In-memory storage for simulation and testing.
 ///
@@ -28,7 +35,15 @@ use std::sync::{Arc, RwLock};
 /// and snapshots are cheap regardless of data size.
 ///
 /// Implements Radix's `SubstateDatabase` and `CommittableSubstateDatabase` directly,
-/// plus our `SubstateStore` extension for snapshots and node listing.
+/// plus our `SubstateStore` extension for snapshots, node listing, and JMT state roots.
+///
+/// # JMT State Tracking
+///
+/// Uses `TypedInMemoryTreeStore` to maintain a Jellyfish Merkle Tree alongside
+/// the substate data. On each `commit()`, the JMT is updated and a new state
+/// root hash is computed. This provides:
+/// - `state_version()` - Monotonically increasing version number
+/// - `state_root_hash()` - Cryptographic commitment to entire state
 ///
 /// Also stores consensus metadata:
 /// - Committed blocks indexed by height
@@ -38,6 +53,19 @@ use std::sync::{Arc, RwLock};
 pub struct SimStorage {
     /// Radix substate data.
     data: Arc<RwLock<OrdMap<Vec<u8>, Vec<u8>>>>,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // JMT state tracking
+    // ═══════════════════════════════════════════════════════════════════════
+    /// JMT tree store for merkle root computation.
+    /// Uses Mutex because TypedInMemoryTreeStore uses RefCell internally (not Sync).
+    tree_store: Mutex<TypedInMemoryTreeStore>,
+
+    /// Current state version (increments on each commit).
+    current_version: Mutex<u64>,
+
+    /// Current JMT state root hash.
+    current_root_hash: Mutex<StateRootHash>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Consensus storage
@@ -64,6 +92,9 @@ impl SimStorage {
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(OrdMap::new())),
+            tree_store: Mutex::new(TypedInMemoryTreeStore::new().with_pruning_enabled()),
+            current_version: Mutex::new(0),
+            current_root_hash: Mutex::new(StateRootHash([0u8; 32])),
             blocks: BTreeMap::new(),
             committed_height: BlockHeight(0),
             certificates: HashMap::new(),
@@ -74,6 +105,9 @@ impl SimStorage {
     /// Clear all data (useful for testing).
     pub fn clear(&mut self) {
         self.data.write().unwrap().clear();
+        *self.tree_store.lock().unwrap() = TypedInMemoryTreeStore::new().with_pruning_enabled();
+        *self.current_version.lock().unwrap() = 0;
+        *self.current_root_hash.lock().unwrap() = StateRootHash([0u8; 32]);
         self.blocks.clear();
         self.committed_height = BlockHeight(0);
         self.certificates.clear();
@@ -267,57 +301,69 @@ impl SubstateDatabase for SimStorage {
 
 impl CommittableSubstateDatabase for SimStorage {
     fn commit(&mut self, updates: &DatabaseUpdates) {
-        let mut data = self.data.write().unwrap();
+        // 1. Update substate data
+        {
+            let mut data = self.data.write().unwrap();
 
-        for (node_key, node_updates) in &updates.node_updates {
-            for (partition_num, partition_updates) in &node_updates.partition_updates {
-                let partition_key = DbPartitionKey {
-                    node_key: node_key.clone(),
-                    partition_num: *partition_num,
-                };
+            for (node_key, node_updates) in &updates.node_updates {
+                for (partition_num, partition_updates) in &node_updates.partition_updates {
+                    let partition_key = DbPartitionKey {
+                        node_key: node_key.clone(),
+                        partition_num: *partition_num,
+                    };
 
-                match partition_updates {
-                    PartitionDatabaseUpdates::Delta { substate_updates } => {
-                        for (sort_key, update) in substate_updates {
-                            let key = keys::to_storage_key(&partition_key, sort_key);
-                            match update {
-                                DatabaseUpdate::Set(value) => {
-                                    data.insert(key, value.clone());
-                                }
-                                DatabaseUpdate::Delete => {
-                                    data.remove(&key);
+                    match partition_updates {
+                        PartitionDatabaseUpdates::Delta { substate_updates } => {
+                            for (sort_key, update) in substate_updates {
+                                let key = keys::to_storage_key(&partition_key, sort_key);
+                                match update {
+                                    DatabaseUpdate::Set(value) => {
+                                        data.insert(key, value.clone());
+                                    }
+                                    DatabaseUpdate::Delete => {
+                                        data.remove(&key);
+                                    }
                                 }
                             }
                         }
-                    }
-                    PartitionDatabaseUpdates::Reset {
-                        new_substate_values,
-                    } => {
-                        // Delete all existing in partition
-                        let prefix = keys::partition_prefix(&partition_key);
-                        let end = keys::next_prefix(&prefix);
+                        PartitionDatabaseUpdates::Reset {
+                            new_substate_values,
+                        } => {
+                            // Delete all existing in partition
+                            let prefix = keys::partition_prefix(&partition_key);
+                            let end = keys::next_prefix(&prefix);
 
-                        let existing_keys: Vec<Vec<u8>> = data
-                            .iter()
-                            .filter(|(k, _)| {
-                                k.as_slice() >= prefix.as_slice() && k.as_slice() < end.as_slice()
-                            })
-                            .map(|(k, _)| k.clone())
-                            .collect();
+                            let existing_keys: Vec<Vec<u8>> = data
+                                .iter()
+                                .filter(|(k, _)| {
+                                    k.as_slice() >= prefix.as_slice()
+                                        && k.as_slice() < end.as_slice()
+                                })
+                                .map(|(k, _)| k.clone())
+                                .collect();
 
-                        for key in existing_keys {
-                            data.remove(&key);
-                        }
+                            for key in existing_keys {
+                                data.remove(&key);
+                            }
 
-                        // Insert new values
-                        for (sort_key, value) in new_substate_values {
-                            let key = keys::to_storage_key(&partition_key, sort_key);
-                            data.insert(key, value.clone());
+                            // Insert new values
+                            for (sort_key, value) in new_substate_values {
+                                let key = keys::to_storage_key(&partition_key, sort_key);
+                                data.insert(key, value.clone());
+                            }
                         }
                     }
                 }
             }
         }
+
+        // 2. Update JMT and compute new root hash
+        let version = *self.current_version.lock().unwrap();
+        let parent_version = if version == 0 { None } else { Some(version) };
+        let new_root =
+            put_at_next_version(&*self.tree_store.lock().unwrap(), parent_version, updates);
+        *self.current_version.lock().unwrap() = version + 1;
+        *self.current_root_hash.lock().unwrap() = new_root;
     }
 }
 
@@ -349,6 +395,14 @@ impl SubstateStore for SimStorage {
                 None
             }
         }))
+    }
+
+    fn state_version(&self) -> u64 {
+        *self.current_version.lock().unwrap()
+    }
+
+    fn state_root_hash(&self) -> StateRootHash {
+        *self.current_root_hash.lock().unwrap()
     }
 }
 

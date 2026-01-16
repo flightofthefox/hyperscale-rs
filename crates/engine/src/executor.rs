@@ -31,7 +31,7 @@
 
 use crate::error::ExecutionError;
 use crate::execution::{
-    compute_merkle_root, extract_substate_writes, is_commit_success, ProvisionedSnapshot,
+    compute_writes_commitment, extract_substate_writes, is_commit_success, ProvisionedSnapshot,
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
@@ -276,8 +276,8 @@ impl RadixExecutor {
 
         if success {
             let state_writes = extract_substate_writes(receipt);
-            let merkle_root = compute_merkle_root(&state_writes);
-            SingleTxResult::success(tx_hash, merkle_root, state_writes)
+            let writes_commitment = compute_writes_commitment(&state_writes);
+            SingleTxResult::success(tx_hash, writes_commitment, state_writes)
         } else {
             let error = format!("{:?}", receipt.result);
             SingleTxResult::failure(tx_hash, error)
@@ -315,8 +315,8 @@ impl RadixExecutor {
                 .filter(|w| declared_set.contains(&w.node_id))
                 .cloned()
                 .collect();
-            let merkle_root = compute_merkle_root(&filtered_writes);
-            SingleTxResult::success(tx_hash, merkle_root, filtered_writes)
+            let writes_commitment = compute_writes_commitment(&filtered_writes);
+            SingleTxResult::success(tx_hash, writes_commitment, filtered_writes)
         } else {
             let error = format!("{:?}", receipt.result);
             SingleTxResult::failure(tx_hash, error)
@@ -371,8 +371,11 @@ impl RadixExecutor {
         entries
     }
 
-    /// Compute merkle root from state writes.
-    pub fn compute_merkle_root_simple(&self, writes: &[(NodeId, Vec<u8>)]) -> Hash {
+    /// Compute writes commitment from state writes.
+    ///
+    /// This is a simplified version that uses default partition/sort key.
+    /// Used for testing.
+    pub fn compute_writes_commitment_simple(&self, writes: &[(NodeId, Vec<u8>)]) -> Hash {
         // Convert to SubstateWrite format
         let substate_writes: Vec<_> = writes
             .iter()
@@ -386,7 +389,7 @@ impl RadixExecutor {
             })
             .collect();
 
-        compute_merkle_root(&substate_writes)
+        compute_writes_commitment(&substate_writes)
     }
 
     /// Get reference to the network definition.

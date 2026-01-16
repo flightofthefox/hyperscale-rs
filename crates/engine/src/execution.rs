@@ -119,11 +119,17 @@ pub fn substate_writes_to_database_updates(writes: &[SubstateWrite]) -> Database
     updates
 }
 
-/// Compute merkle root from substate writes.
+/// Compute a deterministic commitment hash for a set of substate writes.
 ///
-/// Uses a simple hash chain for now. A proper implementation would use
-/// a sparse Merkle tree.
-pub fn compute_merkle_root(writes: &[SubstateWrite]) -> Hash {
+/// This is used for transaction certificates - validators vote on this hash
+/// to agree on execution results before the writes are applied to storage.
+///
+/// Note: This is distinct from `storage.state_root_hash()` which is the JMT
+/// root of the entire state tree. This function only hashes the writes from
+/// a single transaction for voting purposes.
+///
+/// Uses a simple hash chain over sorted writes for determinism.
+pub fn compute_writes_commitment(writes: &[SubstateWrite]) -> Hash {
     if writes.is_empty() {
         return Hash::ZERO;
     }

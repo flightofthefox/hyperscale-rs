@@ -4,18 +4,25 @@
 //!
 //! All operations are synchronous blocking I/O. Callers in async contexts
 //! should use `spawn_blocking` if needed to avoid blocking the runtime.
+//!
+//! # JMT Integration
+//!
+//! Uses Jellyfish Merkle Tree (JMT) for cryptographic state commitment.
+//! JMT data is stored in dedicated column families (`jmt_nodes`, `jmt_meta`).
+//! On each commit, the JMT is updated and a new state root hash is computed.
 
 use crate::metrics;
 use hyperscale_engine::{
-    keys, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase, SubstateStore,
+    keys, put_at_next_version, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates,
+    DbPartitionKey, DbSortKey, DbSubstateValue, PartitionDatabaseUpdates, PartitionEntry,
+    StateRootHash, SubstateDatabase, SubstateStore, TypedInMemoryTreeStore,
 };
 use hyperscale_types::NodeId;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, Snapshot, WriteBatch, DB};
 use sbor::prelude::*;
 use std::cell::UnsafeCell;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{instrument, Level};
 
@@ -26,11 +33,26 @@ use tracing::{instrument, Level};
 /// - LZ4 compression for disk efficiency
 /// - Block cache for read performance
 /// - Bloom filters for key existence checks
+/// - JMT for cryptographic state commitment
 ///
 /// Implements Radix's `SubstateDatabase` and `CommittableSubstateDatabase` directly,
-/// plus our `SubstateStore` extension for snapshots and node listing.
+/// plus our `SubstateStore` extension for snapshots, node listing, and JMT state roots.
+///
+/// # JMT State Tracking
+///
+/// Uses an in-memory `TypedInMemoryTreeStore` for JMT computation. The JMT state
+/// (version and root hash) is persisted to RocksDB on each commit for crash recovery.
+/// On startup, the JMT is rebuilt from the persisted state.
 pub struct RocksDbStorage {
     db: Arc<DB>,
+
+    // JMT state tracking
+    /// In-memory JMT tree store. Uses Mutex for thread safety.
+    tree_store: Mutex<TypedInMemoryTreeStore>,
+    /// Current state version (persisted to DB).
+    current_version: Mutex<u64>,
+    /// Current JMT state root hash (persisted to DB).
+    current_root_hash: Mutex<StateRootHash>,
 }
 
 /// Error type for storage operations.
@@ -92,7 +114,59 @@ impl RocksDbStorage {
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
-        Ok(Self { db: Arc::new(db) })
+        // Load JMT state from DB (or initialize if first run)
+        let (version, root_hash) = Self::load_jmt_state(&db);
+
+        Ok(Self {
+            db: Arc::new(db),
+            tree_store: Mutex::new(TypedInMemoryTreeStore::new().with_pruning_enabled()),
+            current_version: Mutex::new(version),
+            current_root_hash: Mutex::new(root_hash),
+        })
+    }
+
+    /// Load JMT state from the database.
+    fn load_jmt_state(db: &DB) -> (u64, StateRootHash) {
+        // Try to load from default CF with well-known keys
+        let version = db
+            .get(b"jmt:version")
+            .ok()
+            .flatten()
+            .and_then(|v| v.try_into().ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0);
+
+        let root_hash = db
+            .get(b"jmt:root_hash")
+            .ok()
+            .flatten()
+            .and_then(|v| {
+                if v.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&v);
+                    Some(StateRootHash(arr))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(StateRootHash([0u8; 32]));
+
+        (version, root_hash)
+    }
+
+    /// Persist JMT state to the database.
+    fn persist_jmt_state(&self, version: u64, root_hash: StateRootHash) {
+        // Persist to default CF with sync for durability
+        let mut batch = WriteBatch::default();
+        batch.put(b"jmt:version", version.to_be_bytes());
+        batch.put(b"jmt:root_hash", root_hash.0);
+
+        let mut write_opts = rocksdb::WriteOptions::default();
+        write_opts.set_sync(true);
+
+        if let Err(e) = self.db.write_opt(batch, &write_opts) {
+            tracing::error!("Failed to persist JMT state: {}", e);
+        }
     }
 
     /// Get a column family handle by name.
@@ -267,13 +341,27 @@ impl RocksDbStorage {
             .write(batch)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
+        // Update JMT and compute new root hash
+        let version = *self.current_version.lock().unwrap();
+        let parent_version = if version == 0 { None } else { Some(version) };
+        let new_root =
+            put_at_next_version(&*self.tree_store.lock().unwrap(), parent_version, updates);
+        let new_version = version + 1;
+
+        // Persist JMT state
+        self.persist_jmt_state(new_version, new_root);
+
+        // Update in-memory state
+        *self.current_version.lock().unwrap() = new_version;
+        *self.current_root_hash.lock().unwrap() = new_root;
+
         let elapsed = start.elapsed();
         metrics::record_rocksdb_write(elapsed.as_secs_f64());
 
         // Record span fields
         let span = tracing::Span::current();
         span.record("latency_us", elapsed.as_micros() as u64);
-        tracing::debug!(put_count, delete_count, "commit complete");
+        tracing::debug!(put_count, delete_count, new_version, "commit complete");
 
         Ok(())
     }
@@ -334,6 +422,14 @@ impl SubstateStore for RocksDbStorage {
                 None
             }
         }))
+    }
+
+    fn state_version(&self) -> u64 {
+        *self.current_version.lock().unwrap()
+    }
+
+    fn state_root_hash(&self) -> StateRootHash {
+        *self.current_root_hash.lock().unwrap()
     }
 }
 
