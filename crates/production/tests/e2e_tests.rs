@@ -90,6 +90,8 @@ async fn test_storage_operations() {
         timestamp: 1000,
         round: 1,
         is_fallback: false,
+        state_root: Hash::ZERO,
+        state_version: 0,
     };
 
     let block = Block {

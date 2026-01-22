@@ -14,15 +14,119 @@
 
 use hyperscale_engine::{
     keys, put_at_next_version, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates,
-    DbPartitionKey, DbSortKey, DbSubstateValue, PartitionDatabaseUpdates, PartitionEntry,
-    StateRootHash, SubstateDatabase, SubstateStore, TypedInMemoryTreeStore,
+    DbPartitionKey, DbSortKey, DbSubstateValue, OverlayTreeStore, PartitionDatabaseUpdates,
+    PartitionEntry, StateRootHash, SubstateDatabase, SubstateStore, TypedInMemoryTreeStore,
 };
 use hyperscale_types::{
-    Block, BlockHeight, Hash, NodeId, QuorumCertificate, TransactionCertificate,
+    Block, BlockHeight, Hash, NodeId, QuorumCertificate, SubstateWrite, TransactionCertificate,
 };
 use im::OrdMap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
+
+/// Shared JMT state for safe access via Arc.
+pub(crate) struct SharedJmtState {
+    tree_store: Mutex<TypedInMemoryTreeStore>,
+    current_version: Mutex<u64>,
+    current_root_hash: Mutex<StateRootHash>,
+}
+
+impl SharedJmtState {
+    fn new() -> Self {
+        Self {
+            tree_store: Mutex::new(TypedInMemoryTreeStore::new().with_pruning_enabled()),
+            current_version: Mutex::new(0),
+            current_root_hash: Mutex::new(StateRootHash([0u8; 32])),
+        }
+    }
+
+    fn state_version(&self) -> u64 {
+        *self.current_version.lock().unwrap()
+    }
+
+    fn state_root_hash(&self) -> StateRootHash {
+        *self.current_root_hash.lock().unwrap()
+    }
+
+    /// Get the current JMT root as a Hash.
+    pub(crate) fn current_jmt_root(&self) -> Hash {
+        let root = *self.current_root_hash.lock().unwrap();
+        Hash::from_bytes(&root.0)
+    }
+
+    /// Compute speculative state root from a specific base root.
+    ///
+    /// This verifies the JMT root matches expected_base_root before computing.
+    /// Used for state root verification to ensure proposer and verifier compute
+    /// from the same base state.
+    fn compute_speculative_root_from_base(
+        &self,
+        expected_base_root: Hash,
+        writes_per_cert: &[Vec<SubstateWrite>],
+    ) -> Hash {
+        let current_root = *self.current_root_hash.lock().unwrap();
+        let current_root_hash = Hash::from_bytes(&current_root.0);
+
+        if writes_per_cert.is_empty() {
+            return current_root_hash;
+        }
+
+        // Verify the JMT root matches expected base root
+        if current_root_hash != expected_base_root {
+            tracing::warn!(
+                ?current_root_hash,
+                ?expected_base_root,
+                "JMT root mismatch - verification will likely fail"
+            );
+        }
+
+        let tree_store = self.tree_store.lock().unwrap();
+        let overlay = OverlayTreeStore::new(&tree_store);
+
+        let mut current_version = *self.current_version.lock().unwrap();
+        let mut result_root = current_root;
+
+        // Apply each certificate's writes at a separate version
+        for cert_writes in writes_per_cert {
+            if cert_writes.is_empty() {
+                current_version += 1;
+                continue;
+            }
+
+            let updates = hyperscale_engine::substate_writes_to_database_updates(cert_writes);
+            let parent_version = if current_version == 0 {
+                None
+            } else {
+                Some(current_version)
+            };
+
+            result_root = put_at_next_version(&overlay, parent_version, &updates);
+            current_version += 1;
+        }
+
+        Hash::from_bytes(&result_root.0)
+    }
+
+    fn commit(&self, updates: &DatabaseUpdates) {
+        if updates.node_updates.is_empty() {
+            return;
+        }
+
+        let tree_store = self.tree_store.lock().unwrap();
+        let mut current_version = self.current_version.lock().unwrap();
+        let mut current_root_hash = self.current_root_hash.lock().unwrap();
+
+        let parent_version = if *current_version == 0 {
+            None
+        } else {
+            Some(*current_version)
+        };
+
+        let new_root = put_at_next_version(&*tree_store, parent_version, updates);
+        *current_version += 1;
+        *current_root_hash = new_root;
+    }
+}
 
 /// In-memory storage for simulation and testing.
 ///
@@ -55,17 +159,11 @@ pub struct SimStorage {
     data: Arc<RwLock<OrdMap<Vec<u8>, Vec<u8>>>>,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // JMT state tracking
+    // JMT state tracking (shared via Arc for safe StateRootComputer access)
     // ═══════════════════════════════════════════════════════════════════════
-    /// JMT tree store for merkle root computation.
-    /// Uses Mutex because TypedInMemoryTreeStore uses RefCell internally (not Sync).
-    tree_store: Mutex<TypedInMemoryTreeStore>,
-
-    /// Current state version (increments on each commit).
-    current_version: Mutex<u64>,
-
-    /// Current JMT state root hash.
-    current_root_hash: Mutex<StateRootHash>,
+    /// Shared JMT state that can be accessed via Arc from StateRootComputer.
+    /// This allows safe, lock-free sharing without raw pointers.
+    jmt: Arc<SharedJmtState>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Consensus storage
@@ -92,9 +190,7 @@ impl SimStorage {
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(OrdMap::new())),
-            tree_store: Mutex::new(TypedInMemoryTreeStore::new().with_pruning_enabled()),
-            current_version: Mutex::new(0),
-            current_root_hash: Mutex::new(StateRootHash([0u8; 32])),
+            jmt: Arc::new(SharedJmtState::new()),
             blocks: BTreeMap::new(),
             committed_height: BlockHeight(0),
             certificates: HashMap::new(),
@@ -102,12 +198,16 @@ impl SimStorage {
         }
     }
 
+    /// Get the current JMT root hash.
+    pub fn current_jmt_root(&self) -> Hash {
+        self.jmt.current_jmt_root()
+    }
+
     /// Clear all data (useful for testing).
     pub fn clear(&mut self) {
         self.data.write().unwrap().clear();
-        *self.tree_store.lock().unwrap() = TypedInMemoryTreeStore::new().with_pruning_enabled();
-        *self.current_version.lock().unwrap() = 0;
-        *self.current_root_hash.lock().unwrap() = StateRootHash([0u8; 32]);
+        // Replace the shared JMT state with a fresh one
+        self.jmt = Arc::new(SharedJmtState::new());
         self.blocks.clear();
         self.committed_height = BlockHeight(0);
         self.certificates.clear();
@@ -206,11 +306,19 @@ impl SimStorage {
         certificate: &TransactionCertificate,
         writes: &[hyperscale_types::SubstateWrite],
     ) {
-        // 1. Commit state writes
+        // 1. Commit state writes (updates JMT)
         let updates = hyperscale_engine::substate_writes_to_database_updates(writes);
         self.commit(&updates);
 
         // 2. Store certificate
+        self.certificates
+            .insert(certificate.transaction_hash, certificate.clone());
+    }
+
+    /// Store a certificate without committing state writes.
+    ///
+    /// Used for gossiped certificates. State writes are applied later during block commit.
+    pub fn store_certificate(&mut self, certificate: &TransactionCertificate) {
         self.certificates
             .insert(certificate.transaction_hash, certificate.clone());
     }
@@ -357,13 +465,8 @@ impl CommittableSubstateDatabase for SimStorage {
             }
         }
 
-        // 2. Update JMT and compute new root hash
-        let version = *self.current_version.lock().unwrap();
-        let parent_version = if version == 0 { None } else { Some(version) };
-        let new_root =
-            put_at_next_version(&*self.tree_store.lock().unwrap(), parent_version, updates);
-        *self.current_version.lock().unwrap() = version + 1;
-        *self.current_root_hash.lock().unwrap() = new_root;
+        // 2. Update JMT and compute new root hash (via shared state)
+        self.jmt.commit(updates);
     }
 }
 
@@ -398,11 +501,26 @@ impl SubstateStore for SimStorage {
     }
 
     fn state_version(&self) -> u64 {
-        *self.current_version.lock().unwrap()
+        self.jmt.state_version()
     }
 
     fn state_root_hash(&self) -> StateRootHash {
-        *self.current_root_hash.lock().unwrap()
+        self.jmt.state_root_hash()
+    }
+}
+
+impl SimStorage {
+    /// Compute speculative state root from a specific base root.
+    ///
+    /// Used for state root verification to ensure proposer and verifier compute
+    /// from the same base state.
+    pub fn compute_speculative_root_from_base(
+        &self,
+        expected_base_root: Hash,
+        writes_per_cert: &[Vec<SubstateWrite>],
+    ) -> Hash {
+        self.jmt
+            .compute_speculative_root_from_base(expected_base_root, writes_per_cert)
     }
 }
 

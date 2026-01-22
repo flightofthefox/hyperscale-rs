@@ -32,6 +32,19 @@ pub enum EventPriority {
     Client = 3,
 }
 
+/// Result of state root computation for a proposal.
+#[derive(Debug, Clone)]
+pub enum StateRootComputeResult {
+    /// JMT was ready (or became ready), here's the computed root.
+    Success {
+        /// The computed state root after applying certificate writes.
+        state_root: Hash,
+    },
+    /// JMT didn't catch up to parent state within the timeout.
+    /// Proposer should build block without certificates.
+    Timeout,
+}
+
 /// All possible events a node can receive.
 ///
 /// Events are **passive data** - they describe something that happened.
@@ -264,6 +277,57 @@ pub enum Event {
         deferral_index: usize,
         /// Whether signature is valid AND meets quorum.
         valid: bool,
+    },
+
+    /// State root verification completed.
+    ///
+    /// Callback from `Action::VerifyStateRoot`. Reports whether the block's
+    /// claimed state_root matches the computed JMT root after applying all
+    /// committed_certificates.
+    ///
+    /// If valid=false, the validator MUST NOT vote for this block - the proposer
+    /// included an incorrect state root.
+    StateRootVerified {
+        /// Block hash this verification was for.
+        block_hash: Hash,
+        /// Whether the state root matches.
+        /// true = proposer's state_root is correct, safe to vote
+        /// false = proposer's state_root is WRONG, reject block
+        valid: bool,
+    },
+
+    /// State root computation completed for a proposal.
+    ///
+    /// Callback from `Action::ComputeStateRoot`. Used by proposers to get the
+    /// state root before broadcasting a block with certificates.
+    ///
+    /// The runner waits for the JMT to reach the parent state, then computes
+    /// the new root. If the JMT doesn't catch up in time, returns `Timeout`.
+    StateRootComputed {
+        /// Height of the proposal this computation was for.
+        height: u64,
+        /// Round of the proposal this computation was for.
+        round: u64,
+        /// The computation result.
+        result: StateRootComputeResult,
+    },
+
+    /// JMT state commit completed for a block's certificates.
+    ///
+    /// Sent by the runner after the async `spawn_blocking` JMT commit finishes.
+    /// NodeStateMachine tracks the last committed state to ensure proposals
+    /// and verifications use up-to-date JMT state.
+    ///
+    /// This prevents race conditions where speculative root computation reads
+    /// stale JMT state because async commits haven't finished yet.
+    StateCommitComplete {
+        /// Height of the block whose certificates were committed.
+        height: u64,
+        /// The JMT version after applying all certificates.
+        /// This is the version number to use as base for speculative computation.
+        state_version: u64,
+        /// The resulting JMT state root after applying all certificates.
+        state_root: Hash,
     },
 
     /// Single-shard transaction execution completed.
@@ -656,6 +720,8 @@ impl Event {
             | Event::StateCertificateSignatureVerified { .. }
             | Event::QcSignatureVerified { .. }
             | Event::CycleProofVerified { .. }
+            | Event::StateRootVerified { .. }
+            | Event::StateRootComputed { .. }
             | Event::TransactionsExecuted { .. }
             | Event::SpeculativeExecutionComplete { .. }
             | Event::CrossShardTransactionsExecuted { .. }
@@ -720,6 +786,9 @@ impl Event {
             // Gossiped certificate verification callbacks
             Event::GossipedCertificateSignatureVerified { .. } => EventPriority::Internal,
             Event::GossipedCertificateVerified { .. } => EventPriority::Internal,
+
+            // JMT state commit callback
+            Event::StateCommitComplete { .. } => EventPriority::Internal,
         }
     }
 
@@ -772,6 +841,8 @@ impl Event {
             Event::StateCertificateSignatureVerified { .. } => "StateCertificateSignatureVerified",
             Event::QcSignatureVerified { .. } => "QcSignatureVerified",
             Event::CycleProofVerified { .. } => "CycleProofVerified",
+            Event::StateRootVerified { .. } => "StateRootVerified",
+            Event::StateRootComputed { .. } => "StateRootComputed",
 
             // Async Callbacks - Execution
             Event::TransactionsExecuted { .. } => "TransactionsExecuted",
@@ -826,6 +897,9 @@ impl Event {
                 "GossipedCertificateSignatureVerified"
             }
             Event::GossipedCertificateVerified { .. } => "GossipedCertificateVerified",
+
+            // JMT state commit callback
+            Event::StateCommitComplete { .. } => "StateCommitComplete",
         }
     }
 }
