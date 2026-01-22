@@ -6,7 +6,7 @@ use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
 use hyperscale_provisions::ProvisionCoordinator;
-use hyperscale_types::{Block, BlockHeight, Bls12381G1PrivateKey, ShardGroupId, Topology};
+use hyperscale_types::{Block, BlockHeight, Bls12381G1PrivateKey, Hash, ShardGroupId, Topology};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
@@ -43,6 +43,16 @@ pub struct NodeStateMachine {
 
     /// Livelock prevention state (cycle detection for cross-shard TXs).
     livelock: LivelockState,
+
+    /// Last committed JMT state (height, version, root).
+    ///
+    /// Updated when `StateCommitComplete` is received from the runner.
+    /// Used by BftState (via StateCommitComplete) to track when JMT is ready
+    /// for state root verification.
+    ///
+    /// The version corresponds to the JMT version after applying all
+    /// certificates in the block at the given height.
+    last_committed_state: (u64, u64, Hash), // (height, version, root)
 
     /// Current time.
     now: Duration,
@@ -107,6 +117,11 @@ impl NodeStateMachine {
         let bft_signing_key =
             Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
+        // Initialize last_committed_state from recovered JMT state.
+        // This ensures we use actual persisted state, not genesis defaults.
+        let (jmt_version, jmt_root) = recovered.jmt_state.unwrap_or((0, Hash::ZERO));
+        let initial_height = recovered.committed_height;
+
         Self {
             node_index,
             topology: topology.clone(),
@@ -126,6 +141,8 @@ impl NodeStateMachine {
             mempool: MempoolState::with_config(topology.clone(), mempool_config),
             provisions: ProvisionCoordinator::new(local_shard, topology.clone()),
             livelock: LivelockState::new(local_shard, topology),
+            // Use recovered JMT state - critical for correct state root computation
+            last_committed_state: (initial_height, jmt_version, jmt_root),
             now: Duration::ZERO,
         }
     }
@@ -307,6 +324,7 @@ impl StateMachine for NodeStateMachine {
                     3,  // max_retries
                 );
 
+                // BftState handles state_root computation internally after filtering certificates
                 return self.bft.on_proposal_timer(
                     &ready_txs,
                     deferred,
@@ -444,6 +462,8 @@ impl StateMachine for NodeStateMachine {
                     3,  // max_retries
                 );
                 let certificates = self.execution.get_finalized_certificates();
+
+                // BftState handles state_root computation internally after filtering certificates
                 return self.bft.on_qc_formed(
                     *block_hash,
                     qc.clone(),
@@ -482,6 +502,54 @@ impl StateMachine for NodeStateMachine {
                 return self
                     .bft
                     .on_cycle_proof_verified(*block_hash, *deferral_index, *valid);
+            }
+            Event::StateRootVerified { block_hash, valid } => {
+                return self.bft.on_state_root_verified(*block_hash, *valid);
+            }
+
+            Event::StateRootComputed {
+                height,
+                round,
+                result,
+            } => {
+                return self
+                    .bft
+                    .on_state_root_computed(*height, *round, result.clone());
+            }
+
+            // JMT state commit completed - update tracked state and notify BFT
+            Event::StateCommitComplete {
+                height,
+                state_version,
+                state_root,
+            } => {
+                let (prev_height, prev_version, _) = self.last_committed_state;
+
+                // Update if this is a newer height OR if it's genesis bootstrap (height=0
+                // with a higher version than we started with). The genesis case handles
+                // when Radix Engine bootstrap populates the JMT at height 0 after state
+                // machine initialization.
+                let is_newer_height = *height > prev_height;
+                let is_genesis_bootstrap = *height == 0 && *state_version > prev_version;
+
+                if is_newer_height || is_genesis_bootstrap {
+                    self.last_committed_state = (*height, *state_version, *state_root);
+
+                    tracing::debug!(
+                        height = *height,
+                        state_version = *state_version,
+                        state_root = ?state_root,
+                        is_genesis_bootstrap,
+                        "JMT state commit complete"
+                    );
+                }
+
+                // Notify BFT so it can update its committed state tracking.
+                // BFT uses this as the source of truth for state_version in block headers,
+                // preventing speculative version propagation that causes deadlocks.
+                return self
+                    .bft
+                    .on_state_commit_complete(*state_version, *state_root);
             }
 
             // Block committed needs special handling - notify multiple subsystems

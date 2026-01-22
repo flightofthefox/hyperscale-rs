@@ -44,6 +44,7 @@ fn test_recovered_votes_prevent_equivocation() {
         committed_height: 3, // Committed up to height 3
         committed_hash: Some(Hash::from_bytes(b"committed_at_3_aaaaaaaaaaaa")),
         latest_qc: None,
+        jmt_state: None, // Fresh start for simulation test
     };
 
     let mut state = BftState::new(
@@ -88,6 +89,8 @@ fn test_recovered_votes_prevent_equivocation() {
         timestamp: 100000,
         round: 0,
         is_fallback: false,
+        state_root: Hash::ZERO,
+        state_version: 0,
     };
 
     // Compute block hash before moving header
@@ -189,6 +192,7 @@ fn test_stale_votes_pruned_on_recovery() {
         committed_height: 4, // Committed up to height 4
         committed_hash: Some(Hash::from_bytes(b"committed_at_4_aaaaaaaaaaaa")),
         latest_qc: None,
+        jmt_state: None, // Fresh start for simulation test
     };
 
     let state = BftState::new(
@@ -277,6 +281,7 @@ fn test_chain_metadata_recovery() {
         committed_height: 10,
         committed_hash: Some(committed_hash),
         latest_qc: Some(latest_qc.clone()),
+        jmt_state: None, // Fresh start for simulation test
     };
 
     let state = BftState::new(

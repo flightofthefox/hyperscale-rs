@@ -12,7 +12,7 @@
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
 //! the complete block data, making it recoverable from any honest validator in that set.
 
-use hyperscale_core::{Action, Event, OutboundMessage, TimerId};
+use hyperscale_core::{Action, Event, OutboundMessage, StateRootComputeResult, TimerId};
 
 /// BFT statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
@@ -35,7 +35,7 @@ use hyperscale_types::{
     TransactionDefer, ValidatorId, VotePower,
 };
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, instrument, trace, warn};
@@ -62,6 +62,15 @@ pub struct RecoveredState {
 
     /// Latest QC (certifies the highest certified block).
     pub latest_qc: Option<QuorumCertificate>,
+
+    /// Last committed JMT state (version, root_hash).
+    ///
+    /// This is the actual JMT state from storage at startup. Used to ensure
+    /// block headers derive state_version from actual committed state, not
+    /// from the hardcoded genesis (0, Hash::ZERO).
+    ///
+    /// If not provided (None), defaults to (0, Hash::ZERO) for fresh start.
+    pub jmt_state: Option<(u64, Hash)>,
 }
 
 /// Block header pending QC signature verification.
@@ -102,6 +111,56 @@ struct PendingCycleProofVerifications {
     verified: usize,
     /// Whether all verified proofs are valid so far.
     all_valid: bool,
+}
+
+/// Pending state root verification waiting for JMT to be ready.
+///
+/// When a block arrives but its parent block's state hasn't been committed to
+/// the JMT yet, we queue the verification here. Once StateCommitComplete arrives
+/// with a root matching required_root, we can proceed with verification.
+#[derive(Debug, Clone)]
+struct PendingStateRootVerification {
+    /// The state root of the parent block. Verification waits until local JMT
+    /// reaches this root, ensuring proposer and verifier compute from same base.
+    required_root: Hash,
+    /// State writes grouped by certificate (for incremental JMT application).
+    writes_per_cert: Vec<Vec<hyperscale_types::SubstateWrite>>,
+    /// The state root claimed by the proposer (to verify against).
+    expected_root: Hash,
+}
+
+/// Pending proposal waiting for state root computation.
+///
+/// When proposing a block with certificates, we need to wait for the JMT to
+/// reach the parent's state before we can compute the new state root. This
+/// struct stores all the context needed to finish building the block once
+/// the state root is computed.
+#[derive(Debug, Clone)]
+struct PendingProposal {
+    /// Block height being proposed.
+    height: BlockHeight,
+    /// Round being proposed.
+    round: u64,
+    /// Parent block hash.
+    parent_hash: Hash,
+    /// Parent QC (included in block header).
+    parent_qc: QuorumCertificate,
+    /// Block timestamp.
+    timestamp: u64,
+    /// Transactions to include (all three sections).
+    retry_transactions: Vec<Arc<RoutableTransaction>>,
+    priority_transactions: Vec<Arc<RoutableTransaction>>,
+    transactions: Vec<Arc<RoutableTransaction>>,
+    /// Committed certificates to include.
+    committed_certificates: Vec<Arc<TransactionCertificate>>,
+    /// Commitment proofs for cross-shard transactions.
+    commitment_proofs: HashMap<Hash, CommitmentProof>,
+    /// Deferred transactions.
+    deferred: Vec<TransactionDefer>,
+    /// Aborted transactions.
+    aborted: Vec<TransactionAbort>,
+    /// Parent's state version (for computing new state_version).
+    parent_state_version: u64,
 }
 
 /// BFT consensus state machine.
@@ -218,6 +277,64 @@ pub struct BftState {
     /// BLS signature before voting. This tracks the verification progress.
     pending_cycle_proof_verifications: HashMap<Hash, PendingCycleProofVerifications>,
 
+    /// Blocks where state root verification is currently in-flight (being computed).
+    /// When verification completes, the block hash is moved to verified_state_roots
+    /// (if valid) or the block is rejected (if invalid).
+    state_root_verifications_in_flight: HashSet<Hash>,
+
+    /// Blocks waiting for JMT to reach the required version before verification can start.
+    /// When a block arrives but the JMT hasn't committed the parent block's state yet,
+    /// we queue it here. When StateCommitComplete arrives, we check if any queued
+    /// verifications can now proceed.
+    pending_state_root_verifications: HashMap<Hash, PendingStateRootVerification>,
+
+    /// Last committed JMT state (version, root).
+    ///
+    /// Updated when StateCommitComplete is received. This represents the actual
+    /// local JMT state after async certificate commits.
+    ///
+    /// Used for: Determining when state root verification can proceed (verifier
+    /// needs JMT at the required version to compute the root).
+    ///
+    /// NOT used for: Determining state_version in block headers (use
+    /// `last_chain_committed_state_version` instead).
+    ///
+    /// - `version`: JMT version after the last committed block's certificates
+    /// - `root`: JMT root hash after the last committed block's certificates
+    last_committed_jmt_state: (u64, Hash),
+
+    /// State version from the most recently COMMITTED block's header.
+    ///
+    /// Updated SYNCHRONOUSLY when blocks commit (in commit_block_and_buffered).
+    /// This tracks the state_version from the COMMITTED chain, which is what
+    /// verifiers can actually reach via JMT commits.
+    ///
+    /// CRITICAL: This must be used as the base for proposals, NOT the parent
+    /// block's state_version from the QC chain. The QC chain can grow speculatively
+    /// (blocks get certified but not committed during view changes), causing
+    /// state_version to increment without JMT advancing. Using committed state
+    /// ensures verifiers can always reach the required_base_version.
+    ///
+    /// Example of the bug this prevents:
+    /// - Block A (height 10) commits with 5 certs, state_version = 9
+    /// - Block B (height 11) gets QC with 40 certs, state_version = 49, but view changes
+    /// - Block C (height 12) extends B's QC with 10 certs, state_version = 59
+    /// - Verifier needs JMT at 49 to verify C, but JMT is at 9 (only A committed)
+    /// - DEADLOCK!
+    ///
+    /// Fix: Use committed state_version (9) as base, not parent's speculative version.
+    last_chain_committed_state_version: u64,
+
+    /// Cache of successfully verified state roots.
+    /// When state root verification completes successfully, the block hash is added here
+    /// so we don't re-verify when try_vote_on_block is called again.
+    verified_state_roots: HashSet<Hash>,
+
+    /// Cache of successfully verified CycleProofs.
+    /// When all CycleProof verifications complete successfully, the block hash is added here
+    /// so we don't re-verify when try_vote_on_block is called again.
+    verified_cycle_proofs: HashSet<Hash>,
+
     /// Cache of already-verified QC signatures.
     /// Maps QC's block_hash (the block the QC certifies) -> height.
     /// When we see the same QC in multiple block headers (e.g., during view changes
@@ -245,6 +362,16 @@ pub struct BftState {
     /// When BlockReadyToCommit fires but the block isn't complete yet (still fetching
     /// transactions), we buffer the commit here and retry when the data arrives.
     pending_commits_awaiting_data: HashMap<Hash, (u64, QuorumCertificate)>,
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Pending Proposal
+    // ═══════════════════════════════════════════════════════════════════════════
+    /// Pending proposal waiting for state root computation.
+    ///
+    /// When proposing a block with certificates, we emit `Action::ComputeStateRoot`
+    /// and store the proposal context here. Once `Event::StateRootComputed` arrives,
+    /// we can finish building and broadcast the block.
+    pending_proposal: Option<PendingProposal>,
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Configuration
@@ -349,10 +476,19 @@ impl BftState {
             pending_qc_verifications: HashMap::new(),
             pending_synced_block_verifications: HashMap::new(),
             pending_cycle_proof_verifications: HashMap::new(),
+            state_root_verifications_in_flight: HashSet::new(),
+            pending_state_root_verifications: HashMap::new(),
+            last_committed_jmt_state: recovered.jmt_state.unwrap_or((0, Hash::ZERO)),
+            // Chain-committed state starts at the JMT state (they're in sync at startup)
+            // This will be updated when blocks commit via 2-chain rule.
+            last_chain_committed_state_version: recovered.jmt_state.map(|(v, _)| v).unwrap_or(0),
+            verified_state_roots: HashSet::new(),
+            verified_cycle_proofs: HashSet::new(),
             verified_qcs: HashMap::new(),
             buffered_synced_blocks: std::collections::BTreeMap::new(),
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
+            pending_proposal: None,
             config,
             now: Duration::ZERO,
             last_proposal_time: Duration::ZERO,
@@ -416,6 +552,60 @@ impl BftState {
     /// Get committee index for a validator.
     fn committee_index(&self, validator_id: ValidatorId) -> Option<usize> {
         self.topology.local_committee_index(validator_id)
+    }
+
+    /// Get the chain-committed state version.
+    ///
+    /// This returns the state_version from the most recently COMMITTED block.
+    /// Updated synchronously when blocks commit (in commit_block_and_buffered).
+    ///
+    /// CRITICAL: This must be used as the base for proposals with certificates.
+    /// Using the parent block's state_version from the QC chain would cause
+    /// deadlocks because the QC chain can grow speculatively during view changes
+    /// while JMT only advances when blocks actually commit.
+    ///
+    /// NodeStateMachine must use this same value when computing state_root.
+    pub fn get_chain_committed_state_version(&self) -> u64 {
+        self.last_chain_committed_state_version
+    }
+
+    /// Get the local JMT state (version, root).
+    ///
+    /// This returns the actual JMT state from local async certificate commits.
+    /// Different validators may have different values due to commit timing.
+    ///
+    /// Used by:
+    /// - Verifiers to check if JMT is ready for state root verification
+    /// - Fallback/sync blocks to get current root when no certs
+    fn get_local_jmt_state(&self) -> (u64, Hash) {
+        self.last_committed_jmt_state
+    }
+
+    /// Get a block by its hash.
+    ///
+    /// Looks up the block in certified_blocks, pending_blocks, or genesis.
+    /// Used to walk the QC chain when computing state_version for proposals.
+    fn get_block_by_hash(&self, block_hash: Hash) -> Option<Block> {
+        // Check certified_blocks (stores Block directly)
+        if let Some((block, _)) = self.certified_blocks.get(&block_hash) {
+            return Some(block.clone());
+        }
+
+        // Check pending_blocks (stores Arc<Block>)
+        if let Some(pending) = self.pending_blocks.get(&block_hash) {
+            if let Some(block) = pending.block() {
+                return Some((*block).clone());
+            }
+        }
+
+        // Check genesis (stores Block directly)
+        if let Some(genesis) = &self.genesis_block {
+            if genesis.hash() == block_hash {
+                return Some(genesis.clone());
+            }
+        }
+
+        None
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -679,12 +869,20 @@ impl BftState {
     /// Initialize with genesis block (for fresh start).
     pub fn initialize_genesis(&mut self, genesis: Block) -> Vec<Action> {
         let hash = genesis.hash();
+
+        // CRITICAL: Set chain-committed state version from genesis block header.
+        // The genesis block's state_version reflects the JMT state after genesis bootstrap
+        // (e.g., Radix Engine initialization). Without this, proposers would compute
+        // state_version starting from 0, while the JMT is actually at a higher version.
+        self.last_chain_committed_state_version = genesis.header.state_version;
+
         self.genesis_block = Some(genesis.clone());
         self.committed_hash = hash;
 
         info!(
             validator = ?self.validator_id(),
             genesis_hash = ?hash,
+            genesis_state_version = self.last_chain_committed_state_version,
             "Initialized genesis block"
         );
 
@@ -901,6 +1099,134 @@ impl BftState {
             })
             .collect();
 
+        // Walk the QC chain to find certificates already in pending blocks.
+        // We exclude these from our proposal to avoid duplicates.
+        let mut qc_chain_cert_hashes: std::collections::HashSet<Hash> =
+            std::collections::HashSet::new();
+
+        let mut current_hash = parent_hash;
+        while let Some(block) = self.get_block_by_hash(current_hash) {
+            let block_height = block.header.height.0;
+
+            // Stop when we reach or go below committed height
+            if block_height <= self.committed_height {
+                break;
+            }
+
+            // Collect certificate hashes from this block
+            for cert in &block.committed_certificates {
+                qc_chain_cert_hashes.insert(cert.transaction_hash);
+            }
+
+            // Move to parent
+            current_hash = block.header.parent_hash;
+        }
+
+        // Include certificates (limit by config), excluding those already in QC chain blocks
+        let committed_certificates: Vec<_> = certificates
+            .into_iter()
+            .filter(|c| !qc_chain_cert_hashes.contains(&c.transaction_hash))
+            .take(self.config.max_certificates_per_block)
+            .collect();
+
+        // Get parent's state from its block header.
+        // This is the base state that verifiers will use.
+        let (parent_state_root, parent_state_version) = self
+            .get_block_by_hash(parent_hash)
+            .map(|b| (b.header.state_root, b.header.state_version))
+            .unwrap_or((Hash::ZERO, 0)); // Genesis parent has zero state
+
+        // Check if we have certificates to include
+        if !committed_certificates.is_empty() {
+            // We have certificates - need to compute state root.
+            // Check if our JMT is at the parent's state.
+            let (_, jmt_root) = self.get_local_jmt_state();
+
+            if jmt_root == parent_state_root {
+                // JMT is ready - emit ComputeStateRoot action and wait for callback.
+                // Store all the proposal context so we can finish when the callback arrives.
+                let local_shard = self.local_shard();
+                let writes_per_cert: Vec<Vec<_>> = committed_certificates
+                    .iter()
+                    .map(|cert| {
+                        cert.shard_proofs
+                            .get(&local_shard)
+                            .map(|proof| proof.state_writes.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+
+                // Build set of certificate hashes for stale deferral filtering
+                let cert_hash_set: std::collections::HashSet<Hash> = committed_certificates
+                    .iter()
+                    .map(|c| c.transaction_hash)
+                    .collect();
+
+                // Filter out stale deferrals
+                let deferred_filtered: Vec<TransactionDefer> = deferred_with_height
+                    .into_iter()
+                    .filter(|d| {
+                        let hyperscale_types::DeferReason::LivelockCycle { winner_tx_hash } =
+                            &d.reason;
+                        !cert_hash_set.contains(winner_tx_hash)
+                            && !cert_hash_set.contains(&d.tx_hash)
+                    })
+                    .collect();
+
+                self.pending_proposal = Some(PendingProposal {
+                    height: block_height,
+                    round,
+                    parent_hash,
+                    parent_qc: parent_qc.clone(),
+                    timestamp,
+                    retry_transactions,
+                    priority_transactions,
+                    transactions: other_transactions,
+                    committed_certificates,
+                    commitment_proofs,
+                    deferred: deferred_filtered,
+                    aborted: aborted_with_height,
+                    parent_state_version,
+                });
+
+                info!(
+                    validator = ?self.validator_id(),
+                    height = next_height,
+                    round = round,
+                    certificates = self.pending_proposal.as_ref().unwrap().committed_certificates.len(),
+                    "JMT ready, requesting state root computation for proposal"
+                );
+
+                return vec![Action::ComputeStateRoot {
+                    height: next_height,
+                    round,
+                    parent_state_root,
+                    writes_per_cert,
+                    timeout: self.config.state_root_compute_timeout,
+                }];
+            } else {
+                // JMT not ready - propose without certificates.
+                // Certificates stay in the pool for next proposal.
+                info!(
+                    validator = ?self.validator_id(),
+                    height = next_height,
+                    round = round,
+                    jmt_root = ?jmt_root,
+                    parent_state_root = ?parent_state_root,
+                    pending_certs = committed_certificates.len(),
+                    "JMT not caught up to parent state, proposing without certificates"
+                );
+                // Fall through to build block without certificates
+            }
+        }
+
+        // No certificates (or JMT not ready) - build block immediately.
+        // State inherits from parent. Certificates are empty for this block.
+        let final_state_root = parent_state_root;
+        let final_state_version = parent_state_version;
+        let committed_certificates: Vec<Arc<TransactionCertificate>> = vec![];
+        let commitment_proofs: HashMap<Hash, CommitmentProof> = HashMap::new();
+
         let header = BlockHeader {
             height: block_height,
             parent_hash,
@@ -909,54 +1235,11 @@ impl BftState {
             timestamp,
             round,
             is_fallback: false,
+            state_root: final_state_root,
+            state_version: final_state_version,
         };
 
-        // Collect certificate hashes from pending blocks that will commit before our new block.
-        // These blocks are at heights between committed_height+1 and next_height-1.
-        // When they commit, their certificates will be removed from local storage,
-        // so other validators won't be able to validate our block if it includes them.
-        let pending_commit_cert_hashes: std::collections::HashSet<Hash> = self
-            .pending_blocks
-            .values()
-            .filter(|pending| {
-                let h = pending.header().height.0;
-                h > self.committed_height && h < next_height
-            })
-            .filter_map(|pending| pending.block())
-            .flat_map(|block| {
-                block
-                    .committed_certificates
-                    .iter()
-                    .map(|c| c.transaction_hash)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        // Include certificates (limit by config), excluding those already in pending-commit blocks
-        let committed_certificates: Vec<_> = certificates
-            .into_iter()
-            .filter(|c| !pending_commit_cert_hashes.contains(&c.transaction_hash))
-            .take(self.config.max_certificates_per_block)
-            .collect();
-
-        // Build set of certificate hashes being committed in this block
-        let cert_hash_set: std::collections::HashSet<Hash> = committed_certificates
-            .iter()
-            .map(|c| c.transaction_hash)
-            .collect();
-
-        // Filter out stale deferrals - those whose winner OR loser is being committed in this block.
-        // A deferral is "stale" if either:
-        // 1. The winner TX already has a certificate - cycle resolved, deferral not needed
-        // 2. The deferred TX (loser) already has a certificate - loser completed before defer
-        let deferred_with_height: Vec<TransactionDefer> = deferred_with_height
-            .into_iter()
-            .filter(|d| {
-                let hyperscale_types::DeferReason::LivelockCycle { winner_tx_hash } = &d.reason;
-                !cert_hash_set.contains(winner_tx_hash) && !cert_hash_set.contains(&d.tx_hash)
-            })
-            .collect();
-
+        // No certificates in this block, so no stale deferral filtering needed
         let block = Block {
             header: header.clone(),
             retry_transactions: retry_transactions.clone(),
@@ -1079,6 +1362,24 @@ impl BftState {
         // during view changes where a Byzantine proposer might try to advance consensus time
         let timestamp = parent_qc.weighted_timestamp_ms;
 
+        // Fallback blocks have no committed_certificates, so state doesn't change.
+        //
+        // CRITICAL: We MUST use get_chain_committed_state_version(), NOT the parent
+        // block's state_version. The parent might be from the speculative QC chain
+        // (certified but not committed), with an inflated state_version.
+        //
+        // Example of the bug this fixes:
+        // - Block A commits with state_version = 5
+        // - Block B gets QC with 40 certs, state_version = 45, but doesn't commit (view change)
+        // - Fallback C extends B: if we inherit parent's 45, we get state_version = 45
+        // - When C commits, last_chain_committed_state_version = 45 (WRONG!)
+        // - JMT is still at 5, but future proposals use base 45 → DEADLOCK
+        //
+        // Fix: Always use committed state version. Since fallback blocks have no certs,
+        // they don't change state, so state_version = committed_state_version is correct.
+        let state_version = self.get_chain_committed_state_version();
+        let (_, state_root) = self.get_local_jmt_state();
+
         let header = BlockHeader {
             height: BlockHeight(height),
             parent_hash,
@@ -1087,6 +1388,8 @@ impl BftState {
             timestamp,
             round,
             is_fallback: true,
+            state_root,
+            state_version,
         };
 
         let block = Block {
@@ -1178,6 +1481,18 @@ impl BftState {
         // inherit the parent timestamp (proposed after timeout, clock may have drifted).
         let timestamp = self.now.as_millis() as u64;
 
+        // Sync blocks have no committed_certificates, so state doesn't change.
+        //
+        // CRITICAL: We MUST use get_chain_committed_state_version(), NOT the parent
+        // block's state_version. The parent might be from the speculative QC chain
+        // (certified but not committed), with an inflated state_version.
+        //
+        // This is the same fix as for fallback blocks - see comment there for details.
+        // Since sync blocks have no certs, they don't change state, so
+        // state_version = committed_state_version is correct.
+        let state_version = self.get_chain_committed_state_version();
+        let (_, state_root) = self.get_local_jmt_state();
+
         let header = BlockHeader {
             height: BlockHeight(height),
             parent_hash,
@@ -1186,6 +1501,8 @@ impl BftState {
             timestamp,
             round,
             is_fallback: false, // Not a fallback - just empty due to sync
+            state_root,
+            state_version,
         };
 
         let block = Block {
@@ -1889,6 +2206,11 @@ impl BftState {
                 if self.block_needs_cycle_proof_verification(&block) {
                     return self.initiate_cycle_proof_verification(block_hash, &block);
                 }
+
+                // Verify state root before voting if block has committed certificates.
+                if self.block_needs_state_root_verification(&block) {
+                    return self.initiate_state_root_verification(block_hash, &block);
+                }
             }
         }
 
@@ -1901,8 +2223,19 @@ impl BftState {
     /// Returns true if the block has any deferrals with CycleProofs that haven't
     /// been verified yet.
     fn block_needs_cycle_proof_verification(&self, block: &Block) -> bool {
-        // If already pending verification, don't re-initiate
+        // Check if block has any deferrals that need verification
+        if block.deferred.is_empty() {
+            return false;
+        }
+
         let block_hash = block.hash();
+
+        // If already verified, don't re-verify
+        if self.verified_cycle_proofs.contains(&block_hash) {
+            return false;
+        }
+
+        // If verification is pending, don't re-initiate
         if self
             .pending_cycle_proof_verifications
             .contains_key(&block_hash)
@@ -1910,8 +2243,7 @@ impl BftState {
             return false;
         }
 
-        // Check if block has any deferrals that need verification
-        !block.deferred.is_empty()
+        true
     }
 
     /// Initiate async CycleProof verification for a block's deferrals.
@@ -2015,6 +2347,129 @@ impl BftState {
                     .and_then(|vid| self.topology.public_key(*vid))
             })
             .collect()
+    }
+
+    /// Check if a block needs state root verification before voting.
+    ///
+    /// Returns true if the block has committed_certificates (which change state)
+    /// and we haven't already verified or initiated verification.
+    fn block_needs_state_root_verification(&self, block: &Block) -> bool {
+        // If no certificates, state doesn't change - nothing to verify
+        if block.committed_certificates.is_empty() {
+            return false;
+        }
+
+        let block_hash = block.hash();
+
+        // If already verified, don't re-verify
+        if self.verified_state_roots.contains(&block_hash) {
+            return false;
+        }
+
+        // If verification is in-flight, don't re-initiate
+        if self
+            .state_root_verifications_in_flight
+            .contains(&block_hash)
+        {
+            return false;
+        }
+
+        // If queued waiting for JMT, don't re-queue
+        if self
+            .pending_state_root_verifications
+            .contains_key(&block_hash)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    /// Initiate state root verification for a block.
+    ///
+    /// Collects state writes from the block's committed_certificates for our local shard.
+    /// Uses the block header's state_version to derive the required base version, then
+    /// either verifies immediately (if JMT is ready) or queues for later.
+    ///
+    /// The verification computes: base_jmt_state + block.certificate_writes and compares
+    /// against block.header.state_root.
+    ///
+    /// The base version is derived from the block header, NOT our local committed state:
+    /// base_version = header.state_version - len(certificates)
+    ///
+    /// This ensures deterministic verification across validators, since all validators
+    /// see the same block header.
+    ///
+    /// If our JMT hasn't reached base_version yet, we queue the verification until
+    /// `StateCommitComplete` brings us there.
+    fn initiate_state_root_verification(&mut self, block_hash: Hash, block: &Block) -> Vec<Action> {
+        // Get the parent block's state_root. This is the base state that the proposer
+        // used when computing the new state_root. We must verify from the same base.
+        let parent_state_root = self
+            .get_block_by_hash(block.header.parent_hash)
+            .map(|parent| parent.header.state_root)
+            .unwrap_or(Hash::ZERO); // Genesis parent has zero root
+
+        // Collect state writes from committed certificates for our local shard only.
+        // Each certificate's writes are kept separate so they can be applied
+        // incrementally (one JMT version per cert) to match commit-time behavior.
+        let local_shard = self.local_shard();
+        let writes_per_cert: Vec<Vec<_>> = block
+            .committed_certificates
+            .iter()
+            .map(|cert| {
+                cert.shard_proofs
+                    .get(&local_shard)
+                    .map(|proof| proof.state_writes.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        // Check if our local JMT root matches the parent's state_root.
+        // This ensures we're computing from the same base state as the proposer.
+        let (_, current_root) = self.get_local_jmt_state();
+
+        if current_root == parent_state_root {
+            // JMT is ready - verify immediately
+            debug!(
+                block_hash = ?block_hash,
+                certificate_count = block.committed_certificates.len(),
+                expected_root = ?block.header.state_root,
+                parent_state_root = ?parent_state_root,
+                current_jmt_root = ?current_root,
+                "JMT ready - initiating state root verification"
+            );
+
+            self.state_root_verifications_in_flight.insert(block_hash);
+
+            vec![Action::VerifyStateRoot {
+                block_hash,
+                parent_state_root,
+                writes_per_cert,
+                expected_root: block.header.state_root,
+            }]
+        } else {
+            // JMT not ready - queue for later
+            debug!(
+                block_hash = ?block_hash,
+                certificate_count = block.committed_certificates.len(),
+                expected_root = ?block.header.state_root,
+                parent_state_root = ?parent_state_root,
+                current_jmt_root = ?current_root,
+                "JMT not ready - queueing state root verification"
+            );
+
+            self.pending_state_root_verifications.insert(
+                block_hash,
+                PendingStateRootVerification {
+                    required_root: parent_state_root,
+                    writes_per_cert,
+                    expected_root: block.header.state_root,
+                },
+            );
+
+            vec![] // No action yet - will be triggered by StateCommitComplete
+        }
     }
 
     /// Validate deferrals and aborts in a proposed block (structural validation).
@@ -2733,9 +3188,12 @@ impl BftState {
             return vec![];
         }
 
+        // Mark as verified so we don't re-verify when try_vote_on_block is called
+        self.verified_cycle_proofs.insert(block_hash);
+
         debug!(
             block_hash = ?block_hash,
-            "All CycleProofs verified successfully, proceeding to vote"
+            "All CycleProofs verified successfully"
         );
 
         // Get block info for voting
@@ -2750,8 +3208,440 @@ impl BftState {
         let height = pending_block.header().height.0;
         let round = pending_block.header().round;
 
-        // All CycleProofs verified - proceed to vote
-        self.create_vote(block_hash, height, round)
+        // CycleProofs verified - continue voting flow which may need state root verification
+        self.try_vote_on_block(block_hash, height, round)
+    }
+
+    /// Handle state root verification result.
+    ///
+    /// Called when the runner completes `Action::VerifyStateRoot`. If the state root
+    /// is invalid, the block is rejected (proposer included incorrect state commitment).
+    /// If valid, proceeds to vote for the block.
+    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
+    pub fn on_state_root_verified(&mut self, block_hash: Hash, valid: bool) -> Vec<Action> {
+        // Remove from in-flight regardless of outcome
+        self.state_root_verifications_in_flight.remove(&block_hash);
+
+        if !valid {
+            warn!(
+                block_hash = ?block_hash,
+                "State root verification FAILED - proposer included incorrect state_root!"
+            );
+            // Remove the pending block since the proposer lied about state
+            self.pending_blocks.remove(&block_hash);
+            return vec![];
+        }
+
+        // Mark as verified so we don't re-verify when try_vote_on_block is called
+        self.verified_state_roots.insert(block_hash);
+
+        debug!(
+            block_hash = ?block_hash,
+            "State root verified successfully"
+        );
+
+        // Get block info for voting
+        let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
+            warn!(
+                block_hash = ?block_hash,
+                "State root verification complete but pending block not found"
+            );
+            return vec![];
+        };
+
+        let height = pending_block.header().height.0;
+        let round = pending_block.header().round;
+
+        // State root verified - continue voting flow (all verifications should be done now)
+        self.try_vote_on_block(block_hash, height, round)
+    }
+
+    /// Handle state root computation result for a proposal.
+    ///
+    /// Called when the runner completes `Action::ComputeStateRoot`. If computation
+    /// succeeded, we can now build and broadcast the block with certificates.
+    /// If it timed out, we build a block without certificates.
+    #[instrument(skip(self, result), fields(height = height, round = round))]
+    pub fn on_state_root_computed(
+        &mut self,
+        height: u64,
+        round: u64,
+        result: StateRootComputeResult,
+    ) -> Vec<Action> {
+        // Take the pending proposal - if it doesn't match (height, round), something is wrong
+        let Some(pending) = self.pending_proposal.take() else {
+            warn!(
+                height = height,
+                round = round,
+                "StateRootComputed received but no pending proposal"
+            );
+            return vec![];
+        };
+
+        if pending.height.0 != height || pending.round != round {
+            warn!(
+                expected_height = pending.height.0,
+                expected_round = pending.round,
+                received_height = height,
+                received_round = round,
+                "StateRootComputed mismatch - discarding stale result"
+            );
+            // Put back the pending proposal if it's different (shouldn't happen)
+            self.pending_proposal = Some(pending);
+            return vec![];
+        }
+
+        match result {
+            StateRootComputeResult::Success { state_root } => {
+                // Computation succeeded - build and broadcast block with certificates
+                let state_version =
+                    pending.parent_state_version + pending.committed_certificates.len() as u64;
+
+                info!(
+                    validator = ?self.validator_id(),
+                    height = height,
+                    round = round,
+                    certificates = pending.committed_certificates.len(),
+                    state_root = ?state_root,
+                    state_version = state_version,
+                    "State root computed, building block with certificates"
+                );
+
+                self.build_and_broadcast_proposal(pending, state_root, state_version)
+            }
+            StateRootComputeResult::Timeout => {
+                // Timed out - build block without certificates
+                warn!(
+                    validator = ?self.validator_id(),
+                    height = height,
+                    round = round,
+                    pending_certs = pending.committed_certificates.len(),
+                    "State root computation timed out, building block without certificates"
+                );
+
+                // Build empty block (inherits parent state)
+                self.build_and_broadcast_empty_proposal(pending)
+            }
+        }
+    }
+
+    /// Build and broadcast a proposal with the computed state root.
+    fn build_and_broadcast_proposal(
+        &mut self,
+        pending: PendingProposal,
+        state_root: Hash,
+        state_version: u64,
+    ) -> Vec<Action> {
+        let header = BlockHeader {
+            height: pending.height,
+            parent_hash: pending.parent_hash,
+            parent_qc: pending.parent_qc.clone(),
+            proposer: self.validator_id(),
+            timestamp: pending.timestamp,
+            round: pending.round,
+            is_fallback: false,
+            state_root,
+            state_version,
+        };
+
+        let block = Block {
+            header: header.clone(),
+            retry_transactions: pending.retry_transactions.clone(),
+            priority_transactions: pending.priority_transactions.clone(),
+            transactions: pending.transactions.clone(),
+            committed_certificates: pending.committed_certificates.clone(),
+            deferred: pending.deferred.clone(),
+            aborted: pending.aborted.clone(),
+            commitment_proofs: pending.commitment_proofs.clone(),
+        };
+
+        let block_hash = block.hash();
+
+        let retry_hashes: Vec<Hash> = pending
+            .retry_transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect();
+        let priority_hashes: Vec<Hash> = pending
+            .priority_transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect();
+        let tx_hashes: Vec<Hash> = pending.transactions.iter().map(|tx| tx.hash()).collect();
+        let cert_hashes: Vec<Hash> = pending
+            .committed_certificates
+            .iter()
+            .map(|c| c.transaction_hash)
+            .collect();
+
+        let total_tx_count = retry_hashes.len() + priority_hashes.len() + tx_hashes.len();
+        info!(
+            validator = ?self.validator_id(),
+            height = pending.height.0,
+            round = pending.round,
+            block_hash = ?block_hash,
+            transactions = total_tx_count,
+            certificates = cert_hashes.len(),
+            "Proposing block with certificates"
+        );
+
+        // Store our own block as pending (already complete)
+        let mut pending_block = PendingBlock::with_proofs(
+            header.clone(),
+            retry_hashes.clone(),
+            priority_hashes.clone(),
+            tx_hashes.clone(),
+            cert_hashes.clone(),
+            pending.deferred.clone(),
+            pending.aborted.clone(),
+            pending.commitment_proofs.clone(),
+        );
+
+        for tx in &pending.retry_transactions {
+            pending_block.add_transaction_arc(Arc::clone(tx));
+        }
+        for tx in &pending.priority_transactions {
+            pending_block.add_transaction_arc(Arc::clone(tx));
+        }
+        for tx in &pending.transactions {
+            pending_block.add_transaction_arc(Arc::clone(tx));
+        }
+        for cert in &pending.committed_certificates {
+            pending_block.add_certificate(Arc::clone(cert));
+        }
+
+        if let Err(e) = pending_block.construct_block() {
+            warn!("Failed to construct own proposal block: {}", e);
+            return vec![];
+        }
+
+        self.pending_blocks.insert(block_hash, pending_block);
+        self.pending_block_created_at.insert(block_hash, self.now);
+        self.last_proposal_time = self.now;
+        self.record_leader_activity();
+
+        // Build gossip message with complete block data
+        let gossip = hyperscale_messages::BlockHeaderGossip {
+            header,
+            retry_hashes,
+            priority_hashes,
+            transaction_hashes: tx_hashes,
+            certificate_hashes: cert_hashes,
+            deferred: pending.deferred.clone(),
+            aborted: pending.aborted.clone(),
+            commitment_proofs: pending.commitment_proofs.clone(),
+        };
+
+        let mut actions = vec![Action::BroadcastToShard {
+            shard: self.local_shard(),
+            message: OutboundMessage::BlockHeader(Box::new(gossip)),
+        }];
+
+        // Vote for our own block
+        actions.extend(self.create_vote(block_hash, pending.height.0, pending.round));
+
+        actions
+    }
+
+    /// Build and broadcast a proposal without certificates (timeout or JMT not ready).
+    fn build_and_broadcast_empty_proposal(&mut self, pending: PendingProposal) -> Vec<Action> {
+        // Inherit parent's state since no certificates
+        let state_root = self
+            .get_block_by_hash(pending.parent_hash)
+            .map(|b| b.header.state_root)
+            .unwrap_or(Hash::ZERO);
+        let state_version = pending.parent_state_version;
+
+        let header = BlockHeader {
+            height: pending.height,
+            parent_hash: pending.parent_hash,
+            parent_qc: pending.parent_qc.clone(),
+            proposer: self.validator_id(),
+            timestamp: pending.timestamp,
+            round: pending.round,
+            is_fallback: false,
+            state_root,
+            state_version,
+        };
+
+        // No certificates, empty commitment proofs
+        let committed_certificates: Vec<Arc<TransactionCertificate>> = vec![];
+        let commitment_proofs: HashMap<Hash, CommitmentProof> = HashMap::new();
+
+        let block = Block {
+            header: header.clone(),
+            retry_transactions: pending.retry_transactions.clone(),
+            priority_transactions: pending.priority_transactions.clone(),
+            transactions: pending.transactions.clone(),
+            committed_certificates: committed_certificates.clone(),
+            deferred: pending.deferred.clone(),
+            aborted: pending.aborted.clone(),
+            commitment_proofs: commitment_proofs.clone(),
+        };
+
+        let block_hash = block.hash();
+
+        let retry_hashes: Vec<Hash> = pending
+            .retry_transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect();
+        let priority_hashes: Vec<Hash> = pending
+            .priority_transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect();
+        let tx_hashes: Vec<Hash> = pending.transactions.iter().map(|tx| tx.hash()).collect();
+        let cert_hashes: Vec<Hash> = vec![];
+
+        let total_tx_count = retry_hashes.len() + priority_hashes.len() + tx_hashes.len();
+        info!(
+            validator = ?self.validator_id(),
+            height = pending.height.0,
+            round = pending.round,
+            block_hash = ?block_hash,
+            transactions = total_tx_count,
+            "Proposing block without certificates (timeout)"
+        );
+
+        // Store our own block as pending (already complete)
+        let mut pending_block = PendingBlock::with_proofs(
+            header.clone(),
+            retry_hashes.clone(),
+            priority_hashes.clone(),
+            tx_hashes.clone(),
+            cert_hashes.clone(),
+            pending.deferred.clone(),
+            pending.aborted.clone(),
+            commitment_proofs.clone(),
+        );
+
+        for tx in &pending.retry_transactions {
+            pending_block.add_transaction_arc(Arc::clone(tx));
+        }
+        for tx in &pending.priority_transactions {
+            pending_block.add_transaction_arc(Arc::clone(tx));
+        }
+        for tx in &pending.transactions {
+            pending_block.add_transaction_arc(Arc::clone(tx));
+        }
+
+        if let Err(e) = pending_block.construct_block() {
+            warn!("Failed to construct own proposal block: {}", e);
+            return vec![];
+        }
+
+        self.pending_blocks.insert(block_hash, pending_block);
+        self.pending_block_created_at.insert(block_hash, self.now);
+        self.last_proposal_time = self.now;
+        self.record_leader_activity();
+
+        // Build gossip message
+        let gossip = hyperscale_messages::BlockHeaderGossip {
+            header,
+            retry_hashes,
+            priority_hashes,
+            transaction_hashes: tx_hashes,
+            certificate_hashes: cert_hashes,
+            deferred: pending.deferred,
+            aborted: pending.aborted,
+            commitment_proofs,
+        };
+
+        let mut actions = vec![Action::BroadcastToShard {
+            shard: self.local_shard(),
+            message: OutboundMessage::BlockHeader(Box::new(gossip)),
+        }];
+
+        // Vote for our own block
+        actions.extend(self.create_vote(block_hash, pending.height.0, pending.round));
+
+        actions
+    }
+
+    /// Handle JMT state commit completion.
+    ///
+    /// Called when the runner has finished committing a block's state to the JMT.
+    /// This updates our tracked local JMT state (last_committed_jmt_state) and
+    /// checks if any pending state root verifications can now proceed.
+    ///
+    /// NOTE: This does NOT update last_chain_committed_state_version. That field
+    /// is updated synchronously when blocks commit (in commit_block_and_buffered)
+    /// to ensure all validators use the same base version for proposals. The JMT
+    /// state tracked here may lag behind the chain-committed version due to async
+    /// commit timing, which is fine - verifications are queued until JMT catches up.
+    ///
+    /// # Arguments
+    /// * `state_version` - The JMT version after the commit
+    /// * `state_root` - The JMT root hash after the commit
+    ///
+    /// # Returns
+    /// Actions to verify any state roots that were waiting for this commit.
+    #[instrument(skip(self), fields(validator = ?self.validator_id()))]
+    pub fn on_state_commit_complete(
+        &mut self,
+        state_version: u64,
+        state_root: Hash,
+    ) -> Vec<Action> {
+        let (current_version, _) = self.last_committed_jmt_state;
+
+        // Only advance version forward (avoid out-of-order updates)
+        if state_version <= current_version {
+            return vec![];
+        }
+
+        debug!(
+            old_version = current_version,
+            new_version = state_version,
+            new_root = ?state_root,
+            pending_verifications = self.pending_state_root_verifications.len(),
+            "JMT state commit complete, checking for unblocked verifications"
+        );
+
+        self.last_committed_jmt_state = (state_version, state_root);
+
+        // NOTE: We do NOT update last_chain_committed_state_version here.
+        // That field is updated synchronously in commit_block_and_buffered() when
+        // blocks commit. It tracks the CHAIN's committed state (from block headers),
+        // not the JMT's async commit state.
+        //
+        // This function only updates last_committed_jmt_state, which is used to
+        // check if JMT has caught up enough for verification to proceed.
+
+        // Find all pending verifications where the JMT now has the required base root.
+        // We compare roots, not versions, because that's what guarantees both proposer
+        // and verifier compute from the same base state.
+        let unblocked: Vec<Hash> = self
+            .pending_state_root_verifications
+            .iter()
+            .filter(|(_, pv)| pv.required_root == state_root)
+            .map(|(hash, _)| *hash)
+            .collect();
+
+        if unblocked.is_empty() {
+            return vec![];
+        }
+
+        debug!(
+            unblocked_count = unblocked.len(),
+            "Unblocking pending state root verifications"
+        );
+
+        // Move unblocked verifications from pending to in-flight and emit actions
+        let mut actions = Vec::new();
+        for block_hash in unblocked {
+            if let Some(pv) = self.pending_state_root_verifications.remove(&block_hash) {
+                self.state_root_verifications_in_flight.insert(block_hash);
+                actions.push(Action::VerifyStateRoot {
+                    block_hash,
+                    parent_state_root: pv.required_root,
+                    writes_per_cert: pv.writes_per_cert,
+                    expected_root: pv.expected_root,
+                });
+            }
+        }
+
+        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2833,6 +3723,13 @@ impl BftState {
     /// Step 3 is critical for chain progress: without it, the chain would stall
     /// waiting for the next proposal timer, but the designated proposer for the
     /// next height might not know about this QC yet.
+    ///
+    /// # State Root Parameter
+    ///
+    /// `state_root` is the computed JMT root after applying writes from the certificates.
+    /// If certificates is empty, this is ignored and parent state is inherited.
+    /// `state_version` is derived from chain history (parent.state_version + certificates.len())
+    /// to avoid race conditions with async JMT commits.
     #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, commitment_proofs), fields(
         height = qc.height.0,
         block_hash = ?block_hash
@@ -2962,6 +3859,9 @@ impl BftState {
 
         if should_try_proposal && !rate_limited {
             // on_proposal_timer will check if we're the proposer, backpressure, etc.
+            // State root is computed by NodeStateMachine and passed in.
+            // If certificates is empty, on_proposal_timer will inherit parent state.
+            // State version is derived from chain history inside on_proposal_timer.
             actions.extend(self.on_proposal_timer(
                 ready_txs,
                 deferred,
@@ -3130,6 +4030,17 @@ impl BftState {
             // Update committed state
             self.committed_height = height;
             self.committed_hash = current_hash;
+
+            // Update chain-committed state version from the committed block's header.
+            //
+            // CRITICAL: This must be updated SYNCHRONOUSLY when a block commits.
+            // This value is used as the base for proposals, ensuring verifiers can
+            // always reach the required_base_version (because it's based on actually
+            // committed blocks, not speculative QC chain).
+            //
+            // The StateCommitComplete event still updates last_committed_jmt_state
+            // separately, which is used to check if JMT has caught up for verification.
+            self.last_chain_committed_state_version = block.header.state_version;
 
             // Reset backoff tracking - new height means fresh round counting
             self.view_at_height_start = self.view;
@@ -3398,6 +4309,10 @@ impl BftState {
         // Update committed state
         self.committed_height = height;
         self.committed_hash = block_hash;
+
+        // Update chain-committed state version from the synced block's header.
+        // (Same reasoning as in commit_block_and_buffered)
+        self.last_chain_committed_state_version = block.header.state_version;
 
         // Reset backoff tracking - new height means fresh round counting
         self.view_at_height_start = self.view;
@@ -4195,6 +5110,26 @@ impl BftState {
         self.pending_qc_verifications
             .retain(|hash, _| self.pending_blocks.contains_key(hash));
 
+        // Remove pending CycleProof verifications for blocks no longer in pending_blocks.
+        self.pending_cycle_proof_verifications
+            .retain(|hash, _| self.pending_blocks.contains_key(hash));
+
+        // Remove verified CycleProofs for blocks no longer in pending_blocks.
+        self.verified_cycle_proofs
+            .retain(|hash| self.pending_blocks.contains_key(hash));
+
+        // Remove pending state root verifications for blocks no longer in pending_blocks.
+        self.pending_state_root_verifications
+            .retain(|hash, _| self.pending_blocks.contains_key(hash));
+
+        // Remove in-flight state root verifications for blocks no longer in pending_blocks.
+        self.state_root_verifications_in_flight
+            .retain(|hash| self.pending_blocks.contains_key(hash));
+
+        // Remove verified state roots for blocks no longer in pending_blocks.
+        self.verified_state_roots
+            .retain(|hash| self.pending_blocks.contains_key(hash));
+
         // Remove verified QC cache entries for heights at or below committed height.
         // We keep entries slightly above committed_height in case of view changes
         // where multiple proposals at the same height share the same parent_qc.
@@ -4599,6 +5534,8 @@ mod tests {
             timestamp,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         }
     }
 
@@ -4616,6 +5553,8 @@ mod tests {
             timestamp: 0, // Genesis timestamp is 0
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
 
         // Should pass - genesis blocks skip timestamp validation
@@ -4707,6 +5646,8 @@ mod tests {
             timestamp: 50_000, // 50 seconds - would fail normal validation (now=100s, max_delay=30s)
             round: 5,          // High round indicates view changes occurred
             is_fallback: true,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
 
         // Should pass - fallback blocks skip timestamp validation
@@ -4724,6 +5665,8 @@ mod tests {
             timestamp: 50_000,
             round: 5,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         assert!(
             state.validate_timestamp(&normal_header).is_err(),
@@ -4796,6 +5739,8 @@ mod tests {
             timestamp: 100_000,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
 
         // Process the block header
@@ -4879,6 +5824,8 @@ mod tests {
             timestamp: 100_000,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
 
         let block_hash = header.hash();
@@ -4966,6 +5913,8 @@ mod tests {
             timestamp: 100_000,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
 
         let block_hash = header.hash();
@@ -5041,6 +5990,8 @@ mod tests {
             timestamp: 100_000,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
 
         // Process header
@@ -5569,6 +6520,8 @@ mod tests {
             timestamp: 100_000,
             round: round_0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         let block_a_hash = block_a.hash();
 
@@ -5580,6 +6533,8 @@ mod tests {
             timestamp: 100_001, // Different timestamp = different hash
             round: round_1,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         let block_b_hash = block_b.hash();
 
@@ -5620,6 +6575,8 @@ mod tests {
             timestamp: 100_000,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         let block_hash = block.hash();
 
@@ -5654,6 +6611,8 @@ mod tests {
                 timestamp: 100_000,
                 round: 0,
                 is_fallback: false,
+                state_root: Hash::ZERO,
+                state_version: 0,
             };
             state.try_vote_on_block(block.hash(), height, 0);
         }
@@ -5940,6 +6899,8 @@ mod tests {
             timestamp: 100_000,
             round: original_round,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         let original_block_hash = original_header.hash();
 
@@ -6029,6 +6990,8 @@ mod tests {
             timestamp: (state.now.as_millis() as u64), // Current time for timestamp validation
             round: original_round,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
 
         // Even though the receiving validator might be at view=31,
@@ -6060,6 +7023,8 @@ mod tests {
             timestamp: (state.now.as_millis() as u64),
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
 
         let result = state.validate_header(&header);
@@ -6392,6 +7357,8 @@ mod tests {
             timestamp: 100_000,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         let original_block_hash = original_header.hash();
 
@@ -6661,6 +7628,8 @@ mod tests {
             timestamp: 100_000,
             round: 1,
             is_fallback: true,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         let block_hash_r1 = header_round1.hash();
 
@@ -6672,6 +7641,8 @@ mod tests {
             timestamp: 100_001,
             round: 2,
             is_fallback: true,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         let block_hash_r2 = header_round2.hash();
 
@@ -6683,6 +7654,8 @@ mod tests {
             timestamp: 100_002,
             round: 3,
             is_fallback: true,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         let block_hash_r3 = header_round3.hash();
 
@@ -6695,6 +7668,8 @@ mod tests {
             timestamp: 100_003,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         let block_hash_h6 = header_height6.hash();
 
@@ -6968,6 +7943,8 @@ mod tests {
             timestamp: 100_000,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
 
         // Process first block header
@@ -7003,6 +7980,8 @@ mod tests {
             timestamp: 100_001,
             round: 1,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
 
         // Process second block header
@@ -8243,6 +9222,8 @@ mod tests {
                 timestamp: 1000,
                 round: 0,
                 is_fallback: false,
+                state_root: Hash::ZERO,
+                state_version: 0,
             },
             retry_transactions: vec![],
             priority_transactions: vec![],

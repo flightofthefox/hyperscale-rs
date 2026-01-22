@@ -12,6 +12,8 @@ use crate::NodeIndex;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_engine::RadixExecutor;
+use hyperscale_execution::{DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
+use hyperscale_mempool::MempoolConfig;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     batch_verify_bls_same_message, bls_keypair_from_seed, verify_bls12381_v1, zero_bls_signature,
@@ -177,6 +179,14 @@ impl SimulationRunner {
             shard_committees.insert(shard, committee);
         }
 
+        // Create per-node storage
+        let num_nodes = total_validators as usize;
+        let node_storage: Vec<SimStorage> = (0..num_nodes).map(|_| SimStorage::new()).collect();
+        let node_executor: Vec<RadixExecutor> = (0..num_nodes)
+            .map(|_| RadixExecutor::new(NetworkDefinition::simulator()))
+            .collect();
+        let genesis_executed = vec![false; num_nodes];
+
         // Create nodes with StaticTopology
         let mut nodes = Vec::new();
         for shard_id in 0..network_config.num_shards {
@@ -201,23 +211,18 @@ impl SimulationRunner {
                 let key_bytes = keys[node_index as usize].to_bytes();
                 let signing_key =
                     Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
-                nodes.push(NodeStateMachine::new(
+                nodes.push(NodeStateMachine::with_speculative_config(
                     node_index as NodeIndex,
                     topology,
                     signing_key,
                     BftConfig::default(),
                     RecoveredState::default(),
+                    DEFAULT_SPECULATIVE_MAX_TXS,
+                    DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
+                    MempoolConfig::default(),
                 ));
             }
         }
-
-        // Create per-node storage and executor
-        let num_nodes = nodes.len();
-        let node_storage: Vec<SimStorage> = (0..num_nodes).map(|_| SimStorage::new()).collect();
-        let node_executor: Vec<RadixExecutor> = (0..num_nodes)
-            .map(|_| RadixExecutor::new(NetworkDefinition::simulator()))
-            .collect();
-        let genesis_executed = vec![false; num_nodes];
 
         info!(
             num_nodes = nodes.len(),
@@ -369,6 +374,7 @@ impl SimulationRunner {
     ///
     /// After initialization, proposal timers are scheduled for all nodes.
     pub fn initialize_genesis(&mut self) {
+        use hyperscale_engine::SubstateStore;
         use hyperscale_types::{Block, BlockHeader, BlockHeight, Hash, QuorumCertificate};
 
         // Run Radix Engine genesis on each node's storage
@@ -393,7 +399,22 @@ impl SimulationRunner {
         let validators_per_shard = self.network.config().validators_per_shard;
 
         for shard_id in 0..num_shards {
-            // Create genesis block for this shard
+            // Get the JMT state AFTER genesis bootstrap from the first node in this shard.
+            // All nodes in the shard should have identical JMT state after genesis.
+            // This is critical - genesis block header must reflect the actual JMT state.
+            let shard_start = shard_id * validators_per_shard;
+            let first_node_storage = &self.node_storage[shard_start as usize];
+            let genesis_jmt_version = first_node_storage.state_version();
+            let genesis_jmt_root = Hash::from_bytes(&first_node_storage.state_root_hash().0);
+
+            info!(
+                shard = shard_id,
+                genesis_jmt_version,
+                genesis_jmt_root = ?genesis_jmt_root,
+                "JMT state after genesis bootstrap"
+            );
+
+            // Create genesis block for this shard using actual JMT state
             let genesis_header = BlockHeader {
                 height: BlockHeight(0),
                 parent_hash: Hash::from_bytes(&[0u8; 32]),
@@ -402,6 +423,8 @@ impl SimulationRunner {
                 timestamp: 0,
                 round: 0,
                 is_fallback: false,
+                state_root: genesis_jmt_root,
+                state_version: genesis_jmt_version,
             };
 
             let genesis_block = Block {
@@ -416,7 +439,6 @@ impl SimulationRunner {
             };
 
             // Initialize all validators in this shard
-            let shard_start = shard_id * validators_per_shard;
             let shard_end = shard_start + validators_per_shard;
 
             for node_index in shard_start..shard_end {
@@ -427,6 +449,17 @@ impl SimulationRunner {
                 for action in actions {
                     self.process_action(node_index, action);
                 }
+
+                // CRITICAL: Send StateCommitComplete to sync state machine with actual JMT state.
+                // The state machine was initialized with zero/default state, but genesis bootstrap
+                // has populated the JMT. We need to sync so future blocks compute state_root
+                // from the correct base.
+                let genesis_commit_event = Event::StateCommitComplete {
+                    height: 0,
+                    state_version: genesis_jmt_version,
+                    state_root: genesis_jmt_root,
+                };
+                self.schedule_event(node_index, self.now, genesis_commit_event);
             }
 
             info!(
@@ -449,7 +482,7 @@ impl SimulationRunner {
             radix_common::math::Decimal,
         )>,
     ) {
-        use hyperscale_engine::GenesisConfig;
+        use hyperscale_engine::{GenesisConfig, SubstateStore};
         use hyperscale_types::{Block, BlockHeader, BlockHeight, Hash, QuorumCertificate};
 
         // Run Radix Engine genesis on each node's storage with balances
@@ -481,7 +514,22 @@ impl SimulationRunner {
         let validators_per_shard = self.network.config().validators_per_shard;
 
         for shard_id in 0..num_shards {
-            // Create genesis block for this shard
+            // Get the JMT state AFTER genesis bootstrap from the first node in this shard.
+            // All nodes in the shard should have identical JMT state after genesis.
+            // This is critical - genesis block header must reflect the actual JMT state.
+            let shard_start = shard_id * validators_per_shard;
+            let first_node_storage = &self.node_storage[shard_start as usize];
+            let genesis_jmt_version = first_node_storage.state_version();
+            let genesis_jmt_root = Hash::from_bytes(&first_node_storage.state_root_hash().0);
+
+            info!(
+                shard = shard_id,
+                genesis_jmt_version,
+                genesis_jmt_root = ?genesis_jmt_root,
+                "JMT state after genesis bootstrap"
+            );
+
+            // Create genesis block for this shard using actual JMT state
             let genesis_header = BlockHeader {
                 height: BlockHeight(0),
                 parent_hash: Hash::from_bytes(&[0u8; 32]),
@@ -490,6 +538,8 @@ impl SimulationRunner {
                 timestamp: 0,
                 round: 0,
                 is_fallback: false,
+                state_root: genesis_jmt_root,
+                state_version: genesis_jmt_version,
             };
 
             let genesis_block = Block {
@@ -504,7 +554,6 @@ impl SimulationRunner {
             };
 
             // Initialize all validators in this shard
-            let shard_start = shard_id * validators_per_shard;
             let shard_end = shard_start + validators_per_shard;
 
             for node_index in shard_start..shard_end {
@@ -515,6 +564,17 @@ impl SimulationRunner {
                 for action in actions {
                     self.process_action(node_index, action);
                 }
+
+                // CRITICAL: Send StateCommitComplete to sync state machine with actual JMT state.
+                // The state machine was initialized with zero/default state, but genesis bootstrap
+                // has populated the JMT. We need to sync so future blocks compute state_root
+                // from the correct base.
+                let genesis_commit_event = Event::StateCommitComplete {
+                    height: 0,
+                    state_version: genesis_jmt_version,
+                    state_root: genesis_jmt_root,
+                };
+                self.schedule_event(node_index, self.now, genesis_commit_event);
             }
 
             info!(
@@ -588,14 +648,12 @@ impl SimulationRunner {
                 // In simulation, we trust certificates (skip BLS verification for speed).
                 // Production verifies signatures before persisting.
                 // For full fidelity, we could add verification here but it would slow tests.
-                let local_shard = self.nodes[node_index as usize].shard();
-                let writes: Vec<_> = certificate
-                    .shard_proofs
-                    .get(&local_shard)
-                    .map(|c| c.state_writes.clone())
-                    .unwrap_or_default();
 
-                storage.commit_certificate_with_writes(certificate, &writes);
+                // Store certificate WITHOUT committing state writes.
+                // State writes are only applied when the certificate is included in a
+                // committed block (via Action::PersistTransactionCertificate).
+                // This matches production behavior and keeps JMT state consistent.
+                storage.store_certificate(certificate);
 
                 // Notify state machine to cancel local building and add to finalized
                 let node = &mut self.nodes[node_index as usize];
@@ -1227,6 +1285,82 @@ impl SimulationRunner {
                 );
             }
 
+            Action::VerifyStateRoot {
+                block_hash,
+                parent_state_root,
+                writes_per_cert,
+                expected_root,
+            } => {
+                // Compute speculative state root using overlay pattern.
+                // Each certificate's writes are applied at a separate JMT version.
+                // Use parent_state_root as base to match proposer's computation.
+                let storage = &self.node_storage[from as usize];
+                let computed_root =
+                    storage.compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
+
+                let valid = computed_root == expected_root;
+
+                if !valid {
+                    tracing::warn!(
+                        node = from,
+                        ?block_hash,
+                        ?computed_root,
+                        ?expected_root,
+                        ?parent_state_root,
+                        "State root verification failed"
+                    );
+                }
+
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::StateRootVerified { block_hash, valid },
+                );
+            }
+
+            Action::ComputeStateRoot {
+                height,
+                round,
+                parent_state_root,
+                writes_per_cert,
+                timeout: _, // Timeout ignored in simulation - everything is synchronous
+            } => {
+                // In simulation, JMT commits are synchronous so we can compute immediately.
+                // Check if JMT is at the expected parent state.
+                let storage = &self.node_storage[from as usize];
+                let current_root = storage.current_jmt_root();
+
+                let result = if current_root == parent_state_root {
+                    // JMT is ready - compute speculative root
+                    let state_root = storage
+                        .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
+                    hyperscale_core::StateRootComputeResult::Success { state_root }
+                } else {
+                    // In simulation, if JMT isn't at the right state, it means we're ahead
+                    // of the commit sequence. This shouldn't happen often in well-behaved
+                    // simulation, but we handle it by returning timeout.
+                    tracing::warn!(
+                        node = from,
+                        height = height,
+                        round = round,
+                        ?current_root,
+                        ?parent_state_root,
+                        "JMT not at expected parent state in simulation - returning timeout"
+                    );
+                    hyperscale_core::StateRootComputeResult::Timeout
+                };
+
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::StateRootComputed {
+                        height,
+                        round,
+                        result,
+                    },
+                );
+            }
+
             // Note: BuildQuorumCertificate has been replaced by VerifyAndBuildQuorumCertificate
             // which combines vote verification and QC building into a single operation.
 
@@ -1548,6 +1682,36 @@ impl SimulationRunner {
             // Notifications - these would go to external observers
             Action::EmitCommittedBlock { block } => {
                 debug!(block_hash = ?block.hash(), "Block committed");
+
+                // Commit state writes for all certificates in this block.
+                // This matches production behavior where state is committed in EmitCommittedBlock.
+                let storage = &mut self.node_storage[from as usize];
+                let local_shard = self.nodes[from as usize].shard();
+
+                for cert in &block.committed_certificates {
+                    if let Some(shard_proof) = cert.shard_proofs.get(&local_shard) {
+                        let writes = &shard_proof.state_writes;
+                        if !writes.is_empty() {
+                            storage.commit_certificate_with_writes(cert, writes);
+                        }
+                    }
+                }
+
+                // Send StateCommitComplete so state machine knows JMT is up to date.
+                // In simulation this is synchronous, but we still need the event for tracking.
+                use hyperscale_engine::SubstateStore;
+                let state_version = storage.state_version();
+                let state_root_hash = storage.state_root_hash();
+                let state_root = hyperscale_types::Hash::from_bytes(&state_root_hash.0);
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::StateCommitComplete {
+                        height: block.header.height.0,
+                        state_version,
+                        state_root,
+                    },
+                );
             }
 
             Action::EmitTransactionStatus {

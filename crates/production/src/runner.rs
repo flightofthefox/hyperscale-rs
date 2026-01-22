@@ -1030,6 +1030,19 @@ impl ProductionRunner {
             tracing::warn!(error = ?e, "Radix Engine genesis failed (may be OK for testing)");
         }
 
+        // Get the JMT state AFTER genesis bootstrap.
+        // This is critical - genesis may have populated the JMT with initial state,
+        // and the genesis block header must reflect this actual state.
+        use hyperscale_engine::SubstateStore;
+        let genesis_jmt_version = self.storage.state_version();
+        let genesis_jmt_root = Hash::from_bytes(&self.storage.state_root_hash().0);
+
+        tracing::info!(
+            genesis_jmt_version,
+            genesis_jmt_root = ?genesis_jmt_root,
+            "JMT state after genesis bootstrap"
+        );
+
         // Create genesis block
         // The first validator in the committee is the proposer for genesis
         let first_validator = self
@@ -1039,6 +1052,8 @@ impl ProductionRunner {
             .copied()
             .unwrap_or(ValidatorId(0));
 
+        // Genesis block uses the actual JMT state from bootstrap, not zeros.
+        // This ensures all validators agree on the starting state.
         let genesis_header = BlockHeader {
             height: BlockHeight(0),
             parent_hash: Hash::from_bytes(&[0u8; 32]),
@@ -1047,6 +1062,8 @@ impl ProductionRunner {
             timestamp: 0,
             round: 0,
             is_fallback: false,
+            state_root: genesis_jmt_root,
+            state_version: genesis_jmt_version,
         };
 
         let genesis_block = Block {
@@ -1074,6 +1091,27 @@ impl ProductionRunner {
 
         // Process the actions (should be SetTimer for proposal)
         for action in actions {
+            self.process_action_sync(action);
+        }
+
+        // CRITICAL: Update state machine with the genesis JMT state.
+        // The state machine was created BEFORE genesis bootstrap ran, so it has
+        // stale/zero state. We need to sync it with the actual JMT state from
+        // genesis so future blocks compute state_root from the correct base.
+        let genesis_commit_actions = self.state.handle(Event::StateCommitComplete {
+            height: 0,
+            state_version: genesis_jmt_version,
+            state_root: genesis_jmt_root,
+        });
+
+        tracing::info!(
+            genesis_jmt_version,
+            genesis_jmt_root = ?genesis_jmt_root,
+            actions = genesis_commit_actions.len(),
+            "Updated state machine with genesis JMT state"
+        );
+
+        for action in genesis_commit_actions {
             self.process_action_sync(action);
         }
     }
@@ -2354,6 +2392,160 @@ impl ProductionRunner {
                 });
             }
 
+            Action::VerifyStateRoot {
+                block_hash,
+                parent_state_root,
+                writes_per_cert,
+                expected_root,
+            } => {
+                let event_tx = self.callback_tx.clone();
+                let storage = self.storage.clone();
+
+                // State root verification can be expensive for large blocks.
+                // Use consensus crypto pool since this is on the critical voting path.
+                self.thread_pools.spawn_consensus_crypto(move || {
+                    let start = std::time::Instant::now();
+
+                    // Compute what the root would be after applying writes incrementally.
+                    // Each certificate's writes are applied at a separate JMT version.
+                    // We verify from parent_state_root to ensure proposer and verifier
+                    // compute from the same base state.
+                    let computed_root = storage
+                        .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
+
+                    let valid = computed_root == expected_root;
+
+                    let elapsed = start.elapsed().as_secs_f64();
+                    if !valid {
+                        tracing::warn!(
+                            block_hash = ?block_hash,
+                            expected_root = ?expected_root,
+                            computed_root = ?computed_root,
+                            parent_state_root = ?parent_state_root,
+                            elapsed_ms = elapsed * 1000.0,
+                            "State root verification FAILED"
+                        );
+                    } else {
+                        tracing::debug!(
+                            block_hash = ?block_hash,
+                            elapsed_ms = elapsed * 1000.0,
+                            "State root verified"
+                        );
+                    }
+
+                    event_tx
+                        .send(Event::StateRootVerified { block_hash, valid })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
+                });
+            }
+
+            Action::ComputeStateRoot {
+                height,
+                round,
+                parent_state_root,
+                writes_per_cert,
+                timeout,
+            } => {
+                let event_tx = self.callback_tx.clone();
+                let storage = self.storage.clone();
+
+                // State root computation for proposals. Need to wait for JMT to catch up
+                // to parent_state_root before computing. Uses condvar for efficient waiting.
+                self.thread_pools.spawn_consensus_crypto(move || {
+                    use hyperscale_core::StateRootComputeResult;
+
+                    let start = std::time::Instant::now();
+
+                    // Wait for JMT to reach parent_state_root using condvar
+                    loop {
+                        let current_root = storage.current_jmt_root();
+
+                        if current_root == parent_state_root {
+                            // JMT is ready - compute the speculative root
+                            let state_root = storage.compute_speculative_root_from_base(
+                                parent_state_root,
+                                &writes_per_cert,
+                            );
+
+                            let elapsed = start.elapsed().as_secs_f64();
+                            tracing::debug!(
+                                height = height,
+                                round = round,
+                                state_root = ?state_root,
+                                elapsed_ms = elapsed * 1000.0,
+                                "State root computed for proposal"
+                            );
+
+                            event_tx
+                                .send(Event::StateRootComputed {
+                                    height,
+                                    round,
+                                    result: StateRootComputeResult::Success { state_root },
+                                })
+                                .expect("callback channel closed");
+                            return;
+                        }
+
+                        // Calculate remaining timeout
+                        let elapsed = start.elapsed();
+                        if elapsed >= timeout {
+                            tracing::warn!(
+                                height = height,
+                                round = round,
+                                current_root = ?current_root,
+                                parent_state_root = ?parent_state_root,
+                                elapsed_ms = elapsed.as_secs_f64() * 1000.0,
+                                "State root computation timed out - JMT not caught up"
+                            );
+
+                            event_tx
+                                .send(Event::StateRootComputed {
+                                    height,
+                                    round,
+                                    result: StateRootComputeResult::Timeout,
+                                })
+                                .expect("callback channel closed");
+                            return;
+                        }
+
+                        // Wait for JMT state to change with remaining timeout
+                        let remaining = timeout - elapsed;
+                        let (_, timed_out) = storage.wait_for_jmt_change(remaining);
+
+                        if timed_out {
+                            // Final check after timeout
+                            let current_root = storage.current_jmt_root();
+                            if current_root == parent_state_root {
+                                // Race: JMT caught up just as we timed out
+                                continue;
+                            }
+
+                            let elapsed = start.elapsed().as_secs_f64();
+                            tracing::warn!(
+                                height = height,
+                                round = round,
+                                current_root = ?current_root,
+                                parent_state_root = ?parent_state_root,
+                                elapsed_ms = elapsed * 1000.0,
+                                "State root computation timed out - JMT not caught up"
+                            );
+
+                            event_tx
+                                .send(Event::StateRootComputed {
+                                    height,
+                                    round,
+                                    result: StateRootComputeResult::Timeout,
+                                })
+                                .expect("callback channel closed");
+                            return;
+                        }
+                        // JMT changed - loop back to check if it's the root we need
+                    }
+                });
+            }
+
             // Transaction execution on dedicated execution thread pool
             // NOTE: Execution is READ-ONLY. State writes are collected in the results
             // and committed later when TransactionCertificate is included in a block.
@@ -2718,59 +2910,75 @@ impl ProductionRunner {
                 //
                 // EmitCommittedBlock is emitted when a block commits (not when certified),
                 // so this is the correct place for state application.
+                //
+                // After commit completes, we send StateCommitComplete so the state machine
+                // knows it's safe to compute speculative roots for the next proposal.
                 if !block.committed_certificates.is_empty() {
                     let storage = self.storage.clone();
                     let local_shard = self.local_shard;
                     let rpc_status = self.rpc_status.clone();
                     let block_for_commit = block.clone();
                     let block_height = height;
+                    let callback_tx = self.callback_tx.clone();
 
                     tokio::task::spawn_blocking(move || {
                         let mut applied_count = 0u32;
                         let mut empty_count = 0u32;
-                        let mut no_shard_count = 0u32;
                         for cert in &block_for_commit.committed_certificates {
-                            // Check if local shard exists in the cert
-                            if let Some(shard_proof) = cert.shard_proofs.get(&local_shard) {
-                                let writes = &shard_proof.state_writes;
-                                if !writes.is_empty() {
-                                    storage.commit_certificate_with_writes(cert, writes);
-                                    applied_count += 1;
-                                } else {
-                                    empty_count += 1;
-                                }
+                            // Always commit every certificate to advance JMT version.
+                            // This ensures JMT version matches certificates.len() used in state_version.
+                            // Get writes for local shard, or empty vec if no writes for this shard.
+                            let writes = cert
+                                .shard_proofs
+                                .get(&local_shard)
+                                .map(|proof| proof.state_writes.as_slice())
+                                .unwrap_or(&[]);
+
+                            storage.commit_certificate_with_writes(cert, writes);
+                            if writes.is_empty() {
+                                empty_count += 1;
                             } else {
-                                // Log what shards ARE in the cert
-                                let cert_shards: Vec<_> = cert.shard_proofs.keys().collect();
-                                tracing::debug!(
-                                    tx_hash = %cert.transaction_hash,
-                                    ?cert_shards,
-                                    local_shard = local_shard.0,
-                                    "Certificate missing local shard"
-                                );
-                                no_shard_count += 1;
+                                applied_count += 1;
                             }
                         }
+
+                        // Get the resulting state root after all commits
+                        use hyperscale_engine::SubstateStore;
+                        let state_root_hash = storage.state_root_hash();
+                        let state_version = storage.state_version();
+
                         tracing::info!(
                             block_height,
                             total_certs = block_for_commit.committed_certificates.len(),
                             applied_count,
                             empty_count,
-                            no_shard_count,
                             local_shard = local_shard.0,
                             "Applied certificate state writes"
                         );
 
                         // Update RPC status with new JMT state version and root hash
                         if let Some(rpc_status) = rpc_status {
-                            use hyperscale_engine::SubstateStore;
-                            let state_version = storage.state_version();
-                            let state_root_hash = hex::encode(storage.state_root_hash().0);
+                            let state_root_hex = hex::encode(state_root_hash.0);
                             tokio::spawn(async move {
                                 let mut status = rpc_status.write().await;
                                 status.state_version = state_version;
-                                status.state_root_hash = state_root_hash;
+                                status.state_root_hash = state_root_hex;
                             });
+                        }
+
+                        // Notify state machine that JMT commit is complete.
+                        // This allows safe computation of speculative roots for next proposal.
+                        let state_root = hyperscale_types::Hash::from_bytes(&state_root_hash.0);
+                        if let Err(e) = callback_tx.send(Event::StateCommitComplete {
+                            height: block_height,
+                            state_version,
+                            state_root,
+                        }) {
+                            tracing::error!(
+                                block_height,
+                                error = ?e,
+                                "Failed to send StateCommitComplete event"
+                            );
                         }
                     });
                 }

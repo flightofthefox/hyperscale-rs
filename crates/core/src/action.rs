@@ -4,7 +4,7 @@ use crate::{message::OutboundMessage, Event, TimerId};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CycleProof,
     EpochConfig, EpochId, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    SignerBitfield, StateCertificate, StateEntry, StateProvision, StateVoteBlock,
+    SignerBitfield, StateCertificate, StateEntry, StateProvision, StateVoteBlock, SubstateWrite,
     TransactionCertificate, ValidatorId, VotePower,
 };
 use std::sync::Arc;
@@ -254,6 +254,59 @@ pub enum Action {
         signing_message: Vec<u8>,
         /// Quorum threshold for source shard.
         quorum_threshold: u64,
+    },
+
+    /// Verify a block's state root against the JMT.
+    ///
+    /// Computes the speculative state root from committed_certificates and compares
+    /// against the block header's claimed state_root. Returns `Event::StateRootVerified`.
+    ///
+    /// Each inner Vec represents one certificate's writes. They must be applied
+    /// incrementally (one JMT version per certificate) to match commit-time behavior.
+    ///
+    /// The verification flow:
+    /// 1. Runner checks if local JMT root matches `parent_state_root`
+    /// 2. If match, applies `writes_per_cert` to compute new root
+    /// 3. Compares computed root against `expected_root`
+    ///
+    /// This ensures proposer and verifier compute from the same base state.
+    VerifyStateRoot {
+        block_hash: Hash,
+        /// The state root of the parent block. Verifier must wait for local JMT
+        /// to reach this root before computing. This ensures all validators
+        /// compute from the same base state regardless of commit timing.
+        parent_state_root: Hash,
+        /// State writes grouped by certificate. Each certificate's writes are applied
+        /// at a separate JMT version.
+        writes_per_cert: Vec<Vec<SubstateWrite>>,
+        /// The expected state root after applying all certificate writes.
+        expected_root: Hash,
+    },
+
+    /// Compute state root for a block proposal.
+    ///
+    /// Used by proposers to compute the state_root before broadcasting a block.
+    /// The runner waits for the JMT to reach `parent_state_root`, then computes
+    /// the new root after applying certificate writes.
+    ///
+    /// Returns `Event::StateRootComputed` with either the computed root or a
+    /// timeout if the JMT doesn't catch up within the specified duration.
+    ///
+    /// This ensures proposals only include certificates when the JMT is ready,
+    /// guaranteeing proposer and verifier compute from the same base state.
+    ComputeStateRoot {
+        /// Height of the block being proposed (for correlation).
+        height: u64,
+        /// Round of the block being proposed (for correlation).
+        round: u64,
+        /// The state root of the parent block. Runner waits for local JMT
+        /// to reach this root before computing.
+        parent_state_root: Hash,
+        /// State writes grouped by certificate. Each certificate's writes are
+        /// applied at a separate JMT version.
+        writes_per_cert: Vec<Vec<SubstateWrite>>,
+        /// Maximum time to wait for JMT to catch up before returning timeout.
+        timeout: Duration,
     },
 
     /// Execute a batch of single-shard transactions.
@@ -597,6 +650,8 @@ impl Action {
                 | Action::VerifyStateCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
                 | Action::VerifyCycleProof { .. }
+                | Action::VerifyStateRoot { .. }
+                | Action::ComputeStateRoot { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
@@ -659,6 +714,8 @@ impl Action {
             Action::VerifyStateCertificateSignature { .. } => "VerifyStateCertificateSignature",
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
             Action::VerifyCycleProof { .. } => "VerifyCycleProof",
+            Action::VerifyStateRoot { .. } => "VerifyStateRoot",
+            Action::ComputeStateRoot { .. } => "ComputeStateRoot",
 
             // Delegated Work - Execution
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",

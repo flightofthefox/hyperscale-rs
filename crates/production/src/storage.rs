@@ -14,8 +14,8 @@
 use crate::metrics;
 use hyperscale_engine::{
     keys, put_at_next_version, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates,
-    DbPartitionKey, DbSortKey, DbSubstateValue, PartitionDatabaseUpdates, PartitionEntry,
-    StateRootHash, SubstateDatabase, SubstateStore, TypedInMemoryTreeStore,
+    DbPartitionKey, DbSortKey, DbSubstateValue, OverlayTreeStore, PartitionDatabaseUpdates,
+    PartitionEntry, StateRootHash, SubstateDatabase, SubstateStore, TypedInMemoryTreeStore,
 };
 use hyperscale_types::NodeId;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, Snapshot, WriteBatch, DB};
@@ -25,6 +25,20 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{instrument, Level};
+
+/// Size of the speculative state root cache.
+///
+/// This cache avoids redundant JMT computation when the same block is verified
+/// multiple times (e.g., proposer computes root, then validator verifies).
+///
+/// The cache only needs to hold entries for:
+/// - The current round's proposed block
+/// - A few competing blocks during view changes
+/// - Recently committed blocks (brief window)
+///
+/// 32 entries is generous for typical operation. The cache uses LRU eviction,
+/// so older entries are automatically evicted under pressure.
+const SPECULATIVE_CACHE_SIZE: usize = 32;
 
 /// JMT state bundled together for atomic updates.
 ///
@@ -64,6 +78,18 @@ pub struct RocksDbStorage {
     /// This prevents race conditions where concurrent `commit_certificate_with_writes`
     /// calls could read stale versions and attempt to update from pruned parent nodes.
     jmt: Mutex<JmtState>,
+
+    /// Condition variable for waiting on JMT state changes.
+    ///
+    /// Used by proposers waiting for JMT to catch up to parent state before
+    /// computing state roots. Notified whenever JMT state is committed.
+    jmt_changed: std::sync::Condvar,
+
+    /// Cache of speculative root computations, keyed by block hash.
+    /// Avoids recomputing JMT roots when the same block is verified multiple times.
+    /// Uses quick_cache for O(1) concurrent LRU eviction.
+    speculative_cache:
+        quick_cache::sync::Cache<hyperscale_types::Hash, (hyperscale_types::Hash, u64)>,
 }
 
 /// Error type for storage operations.
@@ -135,6 +161,8 @@ impl RocksDbStorage {
                 current_version: version,
                 current_root_hash: root_hash,
             }),
+            jmt_changed: std::sync::Condvar::new(),
+            speculative_cache: quick_cache::sync::Cache::new(SPECULATIVE_CACHE_SIZE),
         })
     }
 
@@ -375,6 +403,9 @@ impl RocksDbStorage {
         // Persist JMT state (outside lock - RocksDB is thread-safe)
         self.persist_jmt_state(new_version, new_root);
 
+        // Notify any waiters that JMT state has changed
+        self.jmt_changed.notify_all();
+
         let elapsed = start.elapsed();
         metrics::record_rocksdb_write(elapsed.as_secs_f64());
 
@@ -450,6 +481,99 @@ impl SubstateStore for RocksDbStorage {
 
     fn state_root_hash(&self) -> StateRootHash {
         self.jmt.lock().unwrap().current_root_hash
+    }
+}
+
+impl RocksDbStorage {
+    /// Get the current JMT root hash.
+    pub fn current_jmt_root(&self) -> hyperscale_types::Hash {
+        let jmt = self.jmt.lock().unwrap();
+        hyperscale_types::Hash::from_bytes(&jmt.current_root_hash.0)
+    }
+
+    /// Wait for the JMT state to change, with a timeout.
+    ///
+    /// Returns the new JMT root after waking, or the current root if timed out.
+    /// Also returns whether the wait timed out.
+    pub fn wait_for_jmt_change(
+        &self,
+        timeout: std::time::Duration,
+    ) -> (hyperscale_types::Hash, bool) {
+        let jmt = self.jmt.lock().unwrap();
+        let result = self.jmt_changed.wait_timeout(jmt, timeout).unwrap();
+        let timed_out = result.1.timed_out();
+        let root = hyperscale_types::Hash::from_bytes(&result.0.current_root_hash.0);
+        (root, timed_out)
+    }
+
+    /// Compute speculative state root after applying writes from multiple certificates.
+    ///
+    /// Compute speculative state root from a specific base root.
+    ///
+    /// This is used for state root verification. The caller specifies the expected
+    /// base root (parent block's state_root), and we verify the JMT matches before
+    /// computing the new root after applying certificate writes.
+    ///
+    /// This ensures proposer and verifier compute from the same base state,
+    /// regardless of async commit timing differences.
+    ///
+    /// # Arguments
+    /// * `expected_base_root` - The state root we expect the JMT to have. If the
+    ///   JMT's current root doesn't match, verification will likely fail.
+    /// * `writes_per_cert` - State writes grouped by certificate.
+    ///
+    /// # Returns
+    /// The state root after applying all certificate writes.
+    pub fn compute_speculative_root_from_base(
+        &self,
+        expected_base_root: hyperscale_types::Hash,
+        writes_per_cert: &[Vec<hyperscale_types::SubstateWrite>],
+    ) -> hyperscale_types::Hash {
+        let jmt = self.jmt.lock().unwrap();
+
+        let current_root = hyperscale_types::Hash::from_bytes(&jmt.current_root_hash.0);
+
+        // If no certificates with writes, return current root.
+        if writes_per_cert.is_empty() {
+            return current_root;
+        }
+
+        // Verify the JMT root matches the expected base root.
+        // This is the key guarantee: both proposer and verifier must compute from
+        // the same base state for verification to succeed.
+        if current_root != expected_base_root {
+            tracing::warn!(
+                current_root = ?current_root,
+                expected_base_root = ?expected_base_root,
+                "JMT root mismatch - verification will likely fail"
+            );
+            // Continue anyway - the computed root won't match and verification will fail
+        }
+
+        // Apply each certificate's writes at a separate version using the overlay.
+        let overlay = OverlayTreeStore::new(&jmt.tree_store);
+
+        let mut current_version = jmt.current_version;
+        let mut root = jmt.current_root_hash;
+
+        for cert_writes in writes_per_cert {
+            if cert_writes.is_empty() {
+                current_version += 1;
+                continue;
+            }
+
+            let updates = hyperscale_engine::substate_writes_to_database_updates(cert_writes);
+            let parent_version = if current_version == 0 {
+                None
+            } else {
+                Some(current_version)
+            };
+
+            root = put_at_next_version(&overlay, parent_version, &updates);
+            current_version += 1;
+        }
+
+        hyperscale_types::Hash::from_bytes(&root.0)
     }
 }
 
@@ -1288,6 +1412,12 @@ impl RocksDbStorage {
         // 5. Persist JMT state (outside lock - RocksDB is thread-safe)
         self.persist_jmt_state(new_version, new_root);
 
+        // 6. Notify any waiters that JMT state has changed
+        self.jmt_changed.notify_all();
+
+        // 7. Invalidate speculative cache (stale after JMT update).
+        self.speculative_cache.clear();
+
         tracing::debug!(
             tx_hash = %certificate.transaction_hash,
             write_count = writes.len(),
@@ -1434,6 +1564,18 @@ impl RocksDbStorage {
         let (committed_height, committed_hash, latest_qc) = self.get_chain_metadata();
         let voted_heights = self.get_all_own_votes();
 
+        // Get current JMT state from storage - critical for correct state root computation.
+        // Without this, the state machine would start with (0, Hash::ZERO) which causes
+        // state root verification failures if the JMT has already advanced.
+        //
+        // Note: We always include JMT state, even at version 0, because genesis bootstrap
+        // populates the JMT with initial Radix state at version 0 but with a non-zero root.
+        // The version 0 case is handled correctly by the state machine.
+        use hyperscale_engine::SubstateStore;
+        let jmt_version = self.state_version();
+        let jmt_root = hyperscale_types::Hash::from_bytes(&self.state_root_hash().0);
+        let jmt_state = Some((jmt_version, jmt_root));
+
         let elapsed = start.elapsed().as_secs_f64();
         metrics::record_storage_operation("load_recovered_state", elapsed);
 
@@ -1442,6 +1584,8 @@ impl RocksDbStorage {
             has_committed_hash = committed_hash.is_some(),
             has_latest_qc = latest_qc.is_some(),
             vote_count = voted_heights.len(),
+            jmt_version,
+            jmt_root = ?jmt_root,
             load_time_ms = elapsed * 1000.0,
             "Loaded recovered state from storage"
         );
@@ -1451,6 +1595,7 @@ impl RocksDbStorage {
             committed_height: committed_height.0,
             committed_hash,
             latest_qc,
+            jmt_state,
         }
     }
 }
@@ -1825,6 +1970,8 @@ mod tests {
                 timestamp: 12345,
                 round: 0,
                 is_fallback: false,
+                state_root: Hash::ZERO,
+                state_version: 0,
             },
             retry_transactions: vec![],
             priority_transactions: vec![],
@@ -1879,6 +2026,8 @@ mod tests {
                     timestamp: h * 1000,
                     round: 0,
                     is_fallback: false,
+                    state_root: Hash::ZERO,
+                    state_version: 0,
                 },
                 retry_transactions: vec![],
                 priority_transactions: vec![],

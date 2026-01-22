@@ -827,6 +827,52 @@ impl SimNode {
                 });
             }
 
+            Action::VerifyStateRoot {
+                block_hash,
+                parent_state_root,
+                writes_per_cert,
+                expected_root,
+            } => {
+                // Verify root hash by computing from the parent's state root.
+                // This ensures proposer and verifier compute from the same base.
+                let computed_root = self
+                    .storage
+                    .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
+
+                let valid = computed_root == expected_root;
+
+                self.internal_queue
+                    .push_back(Event::StateRootVerified { block_hash, valid });
+            }
+
+            Action::ComputeStateRoot {
+                height,
+                round,
+                parent_state_root,
+                writes_per_cert,
+                timeout: _, // Timeout ignored in parallel simulation
+            } => {
+                // In parallel simulation, JMT commits are synchronous so compute immediately.
+                let current_root = self.storage.current_jmt_root();
+
+                let result = if current_root == parent_state_root {
+                    // JMT is ready - compute speculative root
+                    let state_root = self
+                        .storage
+                        .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
+                    hyperscale_core::StateRootComputeResult::Success { state_root }
+                } else {
+                    // JMT not at expected state - return timeout
+                    hyperscale_core::StateRootComputeResult::Timeout
+                };
+
+                self.internal_queue.push_back(Event::StateRootComputed {
+                    height,
+                    round,
+                    result,
+                });
+            }
+
             // Note: BuildQuorumCertificate replaced by VerifyAndBuildQuorumCertificate above
 
             // Note: View change verification actions removed - using HotStuff-2 implicit rounds
@@ -1309,6 +1355,8 @@ impl ParallelSimulator {
                 timestamp: 0,
                 round: 0,
                 is_fallback: false,
+                state_root: Hash::ZERO,
+                state_version: 0,
             };
             let genesis_block = Block {
                 header: genesis_header,
@@ -1457,6 +1505,8 @@ impl ParallelSimulator {
                 timestamp: 0,
                 round: 0,
                 is_fallback: false,
+                state_root: Hash::ZERO,
+                state_version: 0,
             };
             let genesis_block = Block {
                 header: genesis_header,

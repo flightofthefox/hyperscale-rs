@@ -238,6 +238,8 @@ mod tests {
             timestamp: 0,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         }
     }
 

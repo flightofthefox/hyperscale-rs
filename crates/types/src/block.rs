@@ -14,6 +14,7 @@ use std::sync::Arc;
 /// - Chain position (height, parent hash)
 /// - Proposer identity
 /// - Proof of parent commitment (parent QC)
+/// - State commitment (JMT root after applying committed certificates)
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockHeader {
     /// Block height in the chain (genesis = 0).
@@ -36,6 +37,12 @@ pub struct BlockHeader {
 
     /// Whether this block was created as a fallback when leader timed out.
     pub is_fallback: bool,
+
+    /// JMT state root hash after applying all committed_certificates in this block.
+    pub state_root: Hash,
+
+    /// JMT version corresponding to state_root. Increments by 1 per certificate with state writes.
+    pub state_version: u64,
 }
 
 impl BlockHeader {
@@ -360,6 +367,8 @@ impl Block {
                 timestamp: 0,
                 round: 0,
                 is_fallback: false,
+                state_root: Hash::ZERO,
+                state_version: 0,
             },
             retry_transactions: vec![],
             priority_transactions: vec![],
@@ -552,6 +561,8 @@ mod tests {
             timestamp: 1234567890,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
 
         let hash1 = header.hash();

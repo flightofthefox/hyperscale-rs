@@ -240,6 +240,8 @@ mod tests {
             timestamp: 1234567890,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         let retry_hashes = vec![Hash::from_bytes(b"retry1")];
         let priority_hashes = vec![Hash::from_bytes(b"priority1")];
@@ -268,6 +270,8 @@ mod tests {
             timestamp: 9876543210,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         let transaction_hashes = vec![Hash::from_bytes(b"tx1")];
 
@@ -286,6 +290,8 @@ mod tests {
             timestamp: 0,
             round: 0,
             is_fallback: false,
+            state_root: Hash::ZERO,
+            state_version: 0,
         };
         let retry = Hash::from_bytes(b"retry");
         let priority = Hash::from_bytes(b"priority");
