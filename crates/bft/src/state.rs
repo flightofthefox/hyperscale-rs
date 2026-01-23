@@ -1207,22 +1207,17 @@ impl BftState {
         let timestamp = parent_qc.weighted_timestamp_ms;
 
         // Fallback blocks have no committed_certificates, so state doesn't change.
-        //
-        // CRITICAL: We MUST use get_chain_committed_state_version(), NOT the parent
-        // block's state_version. The parent might be from the speculative QC chain
-        // (certified but not committed), with an inflated state_version.
-        //
-        // Example of the bug this fixes:
-        // - Block A commits with state_version = 5
-        // - Block B gets QC with 40 certs, state_version = 45, but doesn't commit (view change)
-        // - Fallback C extends B: if we inherit parent's 45, we get state_version = 45
-        // - When C commits, last_chain_committed_state_version = 45 (WRONG!)
-        // - JMT is still at 5, but future proposals use base 45 → DEADLOCK
-        //
-        // Fix: Always use committed state version. Since fallback blocks have no certs,
-        // they don't change state, so state_version = committed_state_version is correct.
-        let state_version = self.get_chain_committed_state_version();
-        let (_, state_root) = self.get_local_jmt_state();
+        // We inherit state_root and state_version from the parent block's header.
+        let (parent_state_root, parent_state_version) = self
+            .get_block_by_hash(parent_hash)
+            .map(|b| (b.header.state_root, b.header.state_version))
+            .unwrap_or_else(|| {
+                // Genesis case - use local JMT state
+                let (version, root) = self.get_local_jmt_state();
+                (root, version)
+            });
+        let state_version = parent_state_version;
+        let state_root = parent_state_root;
 
         let header = BlockHeader {
             height: BlockHeight(height),
@@ -1326,16 +1321,17 @@ impl BftState {
         let timestamp = self.now.as_millis() as u64;
 
         // Sync blocks have no committed_certificates, so state doesn't change.
-        //
-        // CRITICAL: We MUST use get_chain_committed_state_version(), NOT the parent
-        // block's state_version. The parent might be from the speculative QC chain
-        // (certified but not committed), with an inflated state_version.
-        //
-        // This is the same fix as for fallback blocks - see comment there for details.
-        // Since sync blocks have no certs, they don't change state, so
-        // state_version = committed_state_version is correct.
-        let state_version = self.get_chain_committed_state_version();
-        let (_, state_root) = self.get_local_jmt_state();
+        // We inherit state_root and state_version from the parent block's header.
+        let (parent_state_root, parent_state_version) = self
+            .get_block_by_hash(parent_hash)
+            .map(|b| (b.header.state_root, b.header.state_version))
+            .unwrap_or_else(|| {
+                // Genesis case - use local JMT state
+                let (version, root) = self.get_local_jmt_state();
+                (root, version)
+            });
+        let state_version = parent_state_version;
+        let state_root = parent_state_root;
 
         let header = BlockHeader {
             height: BlockHeight(height),
