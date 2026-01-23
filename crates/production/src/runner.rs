@@ -2624,10 +2624,13 @@ impl ProductionRunner {
                         }
                     } else {
                         // JMT not ready but we have certificates - drop certificates (timeout)
+                        let current_root = storage.current_jmt_root();
                         tracing::warn!(
                             height = height.0,
                             round = round,
                             dropped_certs = committed_certificates.len(),
+                            ?current_root,
+                            ?parent_state_root,
                             "JMT not ready - building block without certificates"
                         );
 
