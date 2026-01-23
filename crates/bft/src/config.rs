@@ -97,7 +97,7 @@ impl Default for BftConfig {
             certificate_fetch_timeout: Duration::from_millis(500),
             cleanup_interval: Duration::from_secs(1),
             min_block_interval: Duration::from_millis(150),
-            state_root_compute_timeout: Duration::from_millis(500),
+            state_root_compute_timeout: Duration::from_millis(100),
         }
     }
 }
