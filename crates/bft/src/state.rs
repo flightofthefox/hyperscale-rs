@@ -131,16 +131,10 @@ struct PendingStateRootVerification {
     certificates: Vec<std::sync::Arc<hyperscale_types::TransactionCertificate>>,
 }
 
-/// Pending proposal waiting for the runner to build the block.
-///
-/// When proposing a block with certificates, we emit `Action::BuildProposal`
-/// and store this to correlate the `Event::ProposalBuilt` callback.
-/// The runner builds the complete block and caches the WriteBatch.
+/// Tracks in-flight proposal for correlating `Event::ProposalBuilt` callback.
 #[derive(Debug, Clone)]
 struct PendingProposal {
-    /// Block height being proposed.
     height: BlockHeight,
-    /// Round being proposed.
     round: u64,
 }
 
@@ -269,19 +263,10 @@ pub struct BftState {
     /// verifications can now proceed.
     pending_state_root_verifications: HashMap<Hash, PendingStateRootVerification>,
 
-    /// Last committed JMT state (version, root).
+    /// Last committed JMT state (version, root). Updated via StateCommitComplete.
     ///
-    /// Updated when StateCommitComplete is received. This represents the actual
-    /// local JMT state after async certificate commits.
-    ///
-    /// Used for: Determining when state root verification can proceed (verifier
-    /// needs JMT at the required version to compute the root).
-    ///
-    /// NOT used for: Determining state_version in block headers (use
-    /// `last_chain_committed_state_version` instead).
-    ///
-    /// - `version`: JMT version after the last committed block's certificates
-    /// - `root`: JMT root hash after the last committed block's certificates
+    /// Used to check if JMT is ready for state root verification.
+    /// NOT used for block header state_version (use `last_chain_committed_state_version`).
     last_committed_jmt_state: (u64, Hash),
 
     /// State version from the most recently COMMITTED block's header.
@@ -306,14 +291,10 @@ pub struct BftState {
     /// Fix: Use committed state_version (9) as base, not parent's speculative version.
     last_chain_committed_state_version: u64,
 
-    /// Cache of successfully verified state roots.
-    /// When state root verification completes successfully, the block hash is added here
-    /// so we don't re-verify when try_vote_on_block is called again.
+    /// Blocks with verified state roots (prevents re-verification).
     verified_state_roots: HashSet<Hash>,
 
-    /// Cache of successfully verified CycleProofs.
-    /// When all CycleProof verifications complete successfully, the block hash is added here
-    /// so we don't re-verify when try_vote_on_block is called again.
+    /// Blocks with verified CycleProofs (prevents re-verification).
     verified_cycle_proofs: HashSet<Hash>,
 
     /// Cache of already-verified QC signatures.
@@ -344,14 +325,7 @@ pub struct BftState {
     /// transactions), we buffer the commit here and retry when the data arrives.
     pending_commits_awaiting_data: HashMap<Hash, (u64, QuorumCertificate)>,
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Pending Proposal
-    // ═══════════════════════════════════════════════════════════════════════════
-    /// Pending proposal waiting for the runner to build the block.
-    ///
-    /// When proposing a block with certificates, we emit `Action::BuildProposal`
-    /// and store height/round here for correlation. Once `Event::ProposalBuilt`
-    /// arrives, we store the block and broadcast it.
+    /// In-flight proposal awaiting `Event::ProposalBuilt` callback.
     pending_proposal: Option<PendingProposal>,
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -567,19 +541,16 @@ impl BftState {
     /// Looks up the block in certified_blocks, pending_blocks, or genesis.
     /// Used to walk the QC chain when computing state_version for proposals.
     fn get_block_by_hash(&self, block_hash: Hash) -> Option<Block> {
-        // Check certified_blocks (stores Block directly)
         if let Some((block, _)) = self.certified_blocks.get(&block_hash) {
             return Some(block.clone());
         }
 
-        // Check pending_blocks (stores Arc<Block>)
         if let Some(pending) = self.pending_blocks.get(&block_hash) {
             if let Some(block) = pending.block() {
                 return Some((*block).clone());
             }
         }
 
-        // Check genesis (stores Block directly)
         if let Some(genesis) = &self.genesis_block {
             if genesis.hash() == block_hash {
                 return Some(genesis.clone());
@@ -1094,12 +1065,10 @@ impl BftState {
                 break;
             }
 
-            // Collect certificate hashes from this block
             for cert in &block.committed_certificates {
                 qc_chain_cert_hashes.insert(cert.transaction_hash);
             }
 
-            // Move to parent
             current_hash = block.header.parent_hash;
         }
 
@@ -2072,22 +2041,17 @@ impl BftState {
     /// Returns true if the block has any deferrals with CycleProofs that haven't
     /// been verified yet.
     fn block_needs_cycle_proof_verification(&self, block: &Block) -> bool {
-        // Check if block has any deferrals that need verification
         if block.deferred.is_empty() {
             return false;
         }
 
         let block_hash = block.hash();
 
-        // If already verified, don't re-verify
-        if self.verified_cycle_proofs.contains(&block_hash) {
-            return false;
-        }
-
-        // If verification is pending, don't re-initiate
-        if self
-            .pending_cycle_proof_verifications
-            .contains_key(&block_hash)
+        // Skip if already verified or verification in progress
+        if self.verified_cycle_proofs.contains(&block_hash)
+            || self
+                .pending_cycle_proof_verifications
+                .contains_key(&block_hash)
         {
             return false;
         }
@@ -2234,30 +2198,20 @@ impl BftState {
     /// Returns true if the block has committed_certificates (which change state)
     /// and we haven't already verified or initiated verification.
     fn block_needs_state_root_verification(&self, block: &Block) -> bool {
-        // If no certificates, state doesn't change - nothing to verify
         if block.committed_certificates.is_empty() {
             return false;
         }
 
         let block_hash = block.hash();
 
-        // If already verified, don't re-verify
-        if self.verified_state_roots.contains(&block_hash) {
-            return false;
-        }
-
-        // If verification is in-flight, don't re-initiate
-        if self
-            .state_root_verifications_in_flight
-            .contains(&block_hash)
-        {
-            return false;
-        }
-
-        // If queued waiting for JMT, don't re-queue
-        if self
-            .pending_state_root_verifications
-            .contains_key(&block_hash)
+        // Skip if already verified, in-flight, or queued
+        if self.verified_state_roots.contains(&block_hash)
+            || self
+                .state_root_verifications_in_flight
+                .contains(&block_hash)
+            || self
+                .pending_state_root_verifications
+                .contains_key(&block_hash)
         {
             return false;
         }
@@ -3053,15 +3007,12 @@ impl BftState {
             return vec![];
         }
 
-        // Mark as verified
         self.verified_cycle_proofs.insert(block_hash);
 
         debug!(
             block_hash = ?block_hash,
             "All CycleProofs verified successfully"
         );
-
-        // Get block for checking if all verifications complete
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
             warn!(
                 block_hash = ?block_hash,
@@ -3111,15 +3062,12 @@ impl BftState {
             return vec![];
         }
 
-        // Mark as verified
         self.verified_state_roots.insert(block_hash);
 
         debug!(
             block_hash = ?block_hash,
             "State root verified successfully"
         );
-
-        // Get block for checking if all verifications complete
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
             warn!(
                 block_hash = ?block_hash,

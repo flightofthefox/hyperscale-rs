@@ -2978,7 +2978,7 @@ impl ProductionRunner {
                     tokio::task::spawn_blocking(move || {
                         // Try to use cached BlockCommitCache from verification (fast path).
                         // Falls back to per-certificate commits if no cache present
-                        // (proposer case, cache eviction, or sync).
+                        // (cache eviction or synced blocks).
                         if let Some(cache) = storage.take_block_commit_cache(block_hash) {
                             // FAST PATH: Apply the pre-built WriteBatch with a single fsync,
                             // then apply the precomputed JMT snapshot (in-memory).
@@ -2993,8 +2993,10 @@ impl ProductionRunner {
                             );
                         } else {
                             // SLOW PATH: recompute per-certificate (N fsyncs)
-                            // This happens for proposers (who don't verify their own blocks)
-                            // or when cache is evicted.
+                            // This happens when the cache is evicted (LRU overflow) or for
+                            // synced blocks. Proposers cache during BuildProposal, and
+                            // verifiers cache during VerifyStateRoot, so both normally
+                            // get the fast path.
                             let mut applied_count = 0u32;
                             let mut empty_count = 0u32;
                             for cert in &block_for_commit.committed_certificates {

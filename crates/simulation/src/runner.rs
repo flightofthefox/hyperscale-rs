@@ -1777,8 +1777,8 @@ impl SimulationRunner {
                 let block_hash = block.hash();
 
                 // Try to use cached JMT snapshot from verification (fast path).
-                // Falls back to per-certificate commits if no cache present (proposer case)
-                // or if the JMT has advanced since verification (stale cache).
+                // Falls back to per-certificate commits if no cache present (cache miss,
+                // stale cache, or synced blocks).
                 let snapshot = self.jmt_cache.remove(&(from, block_hash));
                 let use_fast_path = snapshot.as_ref().is_some_and(|s| {
                     // Snapshot is only valid if JMT is still at the expected base state.
@@ -1806,7 +1806,7 @@ impl SimulationRunner {
                         storage.commit_substate_data_only(cert, writes);
                     }
                 } else {
-                    // Slow path: recompute per-certificate (proposer case, cache miss, or stale cache)
+                    // Slow path: recompute per-certificate (cache miss, stale cache, or synced blocks)
                     // Always commit every certificate to advance JMT version.
                     // This ensures JMT version matches certificates.len() used in state_version.
                     for cert in &block.committed_certificates {
