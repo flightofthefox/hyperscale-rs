@@ -274,15 +274,11 @@ pub enum Action {
     /// This ensures proposer and verifier compute from the same base state.
     VerifyStateRoot {
         block_hash: Hash,
-        /// The state root of the parent block. Verifier must wait for local JMT
-        /// to reach this root before computing. This ensures all validators
-        /// compute from the same base state regardless of commit timing.
+        /// Base state root to verify from (must match local JMT before computing).
         parent_state_root: Hash,
-        /// The expected state root after applying all certificate writes.
+        /// Expected state root after applying certificate writes.
         expected_root: Hash,
-        /// The certificates to commit. State writes are extracted from these.
-        /// Also used to pre-build the RocksDB WriteBatch during verification
-        /// for efficient single-fsync commit later.
+        /// Certificates whose writes will be applied to compute the new root.
         certificates: Vec<Arc<TransactionCertificate>>,
     },
 
@@ -298,38 +294,23 @@ pub enum Action {
     /// This combines state root computation and block building into a single
     /// round-trip, enabling the proposer to use the fast commit path (1 fsync).
     BuildProposal {
-        /// Proposer's validator ID (for block header).
         proposer: ValidatorId,
-        /// Block height being proposed.
         height: BlockHeight,
-        /// Round being proposed.
         round: u64,
-        /// Parent block hash.
         parent_hash: Hash,
-        /// Parent QC (included in block header).
         parent_qc: QuorumCertificate,
-        /// Block timestamp.
         timestamp: u64,
-        /// Whether this is a fallback block.
         is_fallback: bool,
-        /// The state root of the parent block. If local JMT matches this root,
-        /// certificates can be included. Otherwise, block is built without certs.
+        /// Parent's state root. Certs included only if local JMT matches this.
         parent_state_root: Hash,
-        /// Parent's state version (for computing new state_version).
+        /// Parent's state version (base for computing new state_version).
         parent_state_version: u64,
-        /// Retry transactions (highest priority).
         retry_transactions: Vec<Arc<RoutableTransaction>>,
-        /// Priority transactions (cross-shard with commitment proofs).
         priority_transactions: Vec<Arc<RoutableTransaction>>,
-        /// Other transactions (normal priority).
         transactions: Vec<Arc<RoutableTransaction>>,
-        /// Committed certificates to include (if JMT is ready).
         committed_certificates: Vec<Arc<TransactionCertificate>>,
-        /// Commitment proofs for cross-shard transactions.
         commitment_proofs: HashMap<Hash, CommitmentProof>,
-        /// Deferred transactions.
         deferred: Vec<TransactionDefer>,
-        /// Aborted transactions.
         aborted: Vec<TransactionAbort>,
     },
 

@@ -25,7 +25,7 @@ use im::OrdMap;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 
-/// Shared JMT state for safe access via Arc.
+/// JMT state bundled for thread-safe access.
 pub(crate) struct SharedJmtState {
     tree_store: Mutex<TypedInMemoryTreeStore>,
     current_version: Mutex<u64>,
@@ -202,10 +202,9 @@ pub struct SimStorage {
     data: Arc<RwLock<OrdMap<Vec<u8>, Vec<u8>>>>,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // JMT state tracking (shared via Arc for safe StateRootComputer access)
+    // JMT state tracking
     // ═══════════════════════════════════════════════════════════════════════
-    /// Shared JMT state that can be accessed via Arc from StateRootComputer.
-    /// This allows safe, lock-free sharing without raw pointers.
+    /// JMT state (tree store, version, root hash).
     jmt: Arc<SharedJmtState>,
 
     // ═══════════════════════════════════════════════════════════════════════
