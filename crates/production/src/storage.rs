@@ -13,16 +13,17 @@
 
 use crate::metrics;
 use hyperscale_engine::{
-    keys, put_at_next_version, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates,
-    DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot, OverlayTreeStore,
-    PartitionDatabaseUpdates, PartitionEntry, StateRootHash, SubstateDatabase, SubstateStore,
-    TypedInMemoryTreeStore, WriteableTreeStore,
+    encode_jmt_key, keys, put_at_next_version, AssociatedSubstateValue,
+    CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
+    DbSubstateValue, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry, ReadableTreeStore,
+    StaleTreePart, StateRootHash, StoredTreeNodeKey, SubstateDatabase, SubstateStore, TreeNode,
+    VersionedTreeNode, WriteableTreeStore,
 };
 use hyperscale_types::NodeId;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, Snapshot, WriteBatch, DB};
 use sbor::prelude::*;
-use std::cell::UnsafeCell;
-use std::collections::{HashMap, VecDeque};
+use std::cell::{RefCell, UnsafeCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -106,9 +107,10 @@ impl BlockCommitCacheLru {
 }
 
 /// JMT state bundled together for atomic updates.
+///
+/// JMT tree nodes are stored in the `jmt_nodes` column family in RocksDB.
+/// This struct only tracks the current version and root hash for efficient access.
 struct JmtState {
-    /// In-memory JMT tree store.
-    tree_store: Arc<TypedInMemoryTreeStore>,
     /// Current state version (persisted to DB).
     current_version: u64,
     /// Current JMT state root hash (persisted to DB).
@@ -129,9 +131,9 @@ struct JmtState {
 ///
 /// # JMT State Tracking
 ///
-/// Uses an in-memory `TypedInMemoryTreeStore` for JMT computation. The JMT state
-/// (version and root hash) is persisted to RocksDB on each commit for crash recovery.
-/// On startup, the JMT is rebuilt from the persisted state.
+/// JMT tree nodes are persisted to RocksDB in the `jmt_nodes` column family.
+/// The JMT metadata (version and root hash) is persisted separately for fast access.
+/// On startup, only the metadata is loaded - tree nodes are read on demand from RocksDB.
 pub struct RocksDbStorage {
     db: Arc<DB>,
 
@@ -217,7 +219,6 @@ impl RocksDbStorage {
         Ok(Self {
             db: Arc::new(db),
             jmt: RwLock::new(JmtState {
-                tree_store: Arc::new(TypedInMemoryTreeStore::new().with_pruning_enabled()),
                 current_version: version,
                 current_root_hash: root_hash,
             }),
@@ -252,21 +253,6 @@ impl RocksDbStorage {
             .unwrap_or(StateRootHash([0u8; 32]));
 
         (version, root_hash)
-    }
-
-    /// Persist JMT state to the database.
-    fn persist_jmt_state(&self, version: u64, root_hash: StateRootHash) {
-        // Persist to default CF with sync for durability
-        let mut batch = WriteBatch::default();
-        batch.put(b"jmt:version", version.to_be_bytes());
-        batch.put(b"jmt:root_hash", root_hash.0);
-
-        let mut write_opts = rocksdb::WriteOptions::default();
-        write_opts.set_sync(true);
-
-        if let Err(e) = self.db.write_opt(batch, &write_opts) {
-            tracing::error!("Failed to persist JMT state: {}", e);
-        }
     }
 
     /// Get a column family handle by name.
@@ -360,6 +346,134 @@ impl SubstateDatabase for RocksDbStorage {
     }
 }
 
+/// Column family name for JMT tree nodes.
+const JMT_NODES_CF: &str = "jmt_nodes";
+
+impl ReadableTreeStore for RocksDbStorage {
+    fn get_node(&self, key: &StoredTreeNodeKey) -> Option<TreeNode> {
+        let cf = self.db.cf_handle(JMT_NODES_CF)?;
+        let encoded_key = encode_jmt_key(key);
+        self.db
+            .get_cf(cf, &encoded_key)
+            .ok()
+            .flatten()
+            .and_then(|bytes| sbor::basic_decode::<VersionedTreeNode>(&bytes).ok())
+            .map(|versioned| versioned.fully_update_and_into_latest_version())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Overlay tree store for speculative JMT computation
+// ═══════════════════════════════════════════════════════════════════════
+
+/// An overlay tree store that captures writes without modifying the underlying RocksDB.
+///
+/// Reads check the overlay first, then fall through to RocksDB.
+/// Writes only go to the overlay and are discarded when the overlay is dropped.
+///
+/// This enables speculative JMT root computation where we need to compute what
+/// the root WOULD be without actually persisting any nodes. Multiple concurrent
+/// speculative computations can run without corrupting each other.
+pub struct OverlayTreeStore<'a> {
+    /// The underlying RocksDB storage (read-only access).
+    base: &'a RocksDbStorage,
+
+    /// Overlay of node insertions. Maps key -> node.
+    /// Nodes inserted during speculative computation are stored here.
+    inserted_nodes: RefCell<HashMap<StoredTreeNodeKey, TreeNode>>,
+
+    /// Set of keys that have been marked as stale (deleted) in the overlay.
+    /// Lookups for these keys return None even if they exist in the base store.
+    stale_keys: RefCell<HashSet<StoredTreeNodeKey>>,
+
+    /// Stale tree parts for pruning on commit.
+    stale_tree_parts: RefCell<Vec<StaleTreePart>>,
+}
+
+impl<'a> OverlayTreeStore<'a> {
+    /// Create a new overlay wrapping the given RocksDB storage.
+    pub fn new(base: &'a RocksDbStorage) -> Self {
+        Self {
+            base,
+            inserted_nodes: RefCell::new(HashMap::new()),
+            stale_keys: RefCell::new(HashSet::new()),
+            stale_tree_parts: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Convert this overlay into a snapshot that can be applied later.
+    ///
+    /// Consumes the overlay and extracts the captured nodes into a [`JmtSnapshot`].
+    /// The snapshot can be cached and applied to the real JMT during block commit,
+    /// avoiding redundant recomputation of the same tree updates.
+    pub fn into_snapshot(
+        self,
+        base_root: StateRootHash,
+        base_version: u64,
+        result_root: StateRootHash,
+        num_versions: u64,
+    ) -> JmtSnapshot {
+        let inserted_nodes = self.inserted_nodes.into_inner();
+        let stale_tree_parts = self.stale_tree_parts.into_inner();
+
+        JmtSnapshot {
+            base_root,
+            base_version,
+            result_root,
+            num_versions,
+            nodes: inserted_nodes,
+            stale_tree_parts,
+        }
+    }
+}
+
+impl ReadableTreeStore for OverlayTreeStore<'_> {
+    fn get_node(&self, key: &StoredTreeNodeKey) -> Option<TreeNode> {
+        // Check if the key was marked as stale (deleted)
+        if self.stale_keys.borrow().contains(key) {
+            return None;
+        }
+
+        // Check overlay first
+        if let Some(node) = self.inserted_nodes.borrow().get(key) {
+            return Some(node.clone());
+        }
+
+        // Fall through to RocksDB
+        self.base.get_node(key)
+    }
+}
+
+impl WriteableTreeStore for OverlayTreeStore<'_> {
+    fn insert_node(&self, key: StoredTreeNodeKey, node: TreeNode) {
+        // Remove from stale set if it was previously marked stale
+        self.stale_keys.borrow_mut().remove(&key);
+        // Insert into overlay
+        self.inserted_nodes.borrow_mut().insert(key, node);
+    }
+
+    fn associate_substate(
+        &self,
+        _state_tree_leaf_key: &StoredTreeNodeKey,
+        _partition_key: &DbPartitionKey,
+        _sort_key: &DbSortKey,
+        _substate_value: AssociatedSubstateValue,
+    ) {
+        // No-op for speculative computation.
+        // Substate associations are only needed for historical queries.
+    }
+
+    fn record_stale_tree_part(&self, part: StaleTreePart) {
+        // Track stale key for overlay reads, and full part for later pruning.
+        let key = match &part {
+            StaleTreePart::Node(k) => k.clone(),
+            StaleTreePart::Subtree(k) => k.clone(),
+        };
+        self.stale_keys.borrow_mut().insert(key);
+        self.stale_tree_parts.borrow_mut().push(part);
+    }
+}
+
 impl RocksDbStorage {
     /// Commit database updates using a shared reference.
     ///
@@ -436,31 +550,63 @@ impl RocksDbStorage {
             }
         }
 
-        // Write batch atomically - RocksDB handles internal synchronization
+        // Compute JMT updates using an overlay
+        let (base_version, base_root) = {
+            let jmt = self.jmt.read().unwrap();
+            (jmt.current_version, jmt.current_root_hash)
+        };
+
+        let overlay = OverlayTreeStore::new(self);
+        let parent_version = if base_version == 0 {
+            None
+        } else {
+            Some(base_version)
+        };
+        let new_root = put_at_next_version(&overlay, parent_version, updates);
+        let new_version = base_version + 1;
+        let snapshot = overlay.into_snapshot(base_root, base_version, new_root, 1);
+
+        // Add JMT nodes to the batch
+        let jmt_cf = self
+            .db
+            .cf_handle(JMT_NODES_CF)
+            .expect("jmt_nodes column family must exist");
+
+        for (key, node) in &snapshot.nodes {
+            let encoded_key = encode_jmt_key(key);
+            let encoded_node =
+                sbor::basic_encode(&VersionedTreeNode::from_latest_version(node.clone()))
+                    .expect("JMT node encoding must succeed");
+            batch.put_cf(jmt_cf, encoded_key, encoded_node);
+        }
+
+        // Delete stale nodes
+        for stale_part in &snapshot.stale_tree_parts {
+            match stale_part {
+                StaleTreePart::Node(key) => {
+                    batch.delete_cf(jmt_cf, encode_jmt_key(key));
+                }
+                StaleTreePart::Subtree(key) => {
+                    batch.delete_cf(jmt_cf, encode_jmt_key(key));
+                }
+            }
+        }
+
+        // Add JMT metadata to the batch
+        batch.put(b"jmt:version", new_version.to_be_bytes());
+        batch.put(b"jmt:root_hash", new_root.0);
+
+        // Write everything atomically - RocksDB handles internal synchronization
         self.db
             .write(batch)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
-        // Update JMT and compute new root hash
-        let (new_version, new_root) = {
+        // Update in-memory JMT state
+        {
             let mut jmt = self.jmt.write().unwrap();
-            let parent_version = if jmt.current_version == 0 {
-                None
-            } else {
-                Some(jmt.current_version)
-            };
-            let new_root = put_at_next_version(&*jmt.tree_store, parent_version, updates);
-            let new_version = jmt.current_version + 1;
-
-            // Update in-memory state
             jmt.current_version = new_version;
             jmt.current_root_hash = new_root;
-
-            (new_version, new_root)
-        };
-
-        // Persist JMT state
-        self.persist_jmt_state(new_version, new_root);
+        }
 
         let elapsed = start.elapsed();
         metrics::record_rocksdb_write(elapsed.as_secs_f64());
@@ -570,13 +716,9 @@ impl RocksDbStorage {
         expected_base_root: hyperscale_types::Hash,
         writes_per_cert: &[Vec<hyperscale_types::SubstateWrite>],
     ) -> (hyperscale_types::Hash, JmtSnapshot) {
-        let (tree_store, base_version, base_root) = {
+        let (base_version, base_root) = {
             let jmt = self.jmt.read().unwrap();
-            (
-                jmt.tree_store.clone(),
-                jmt.current_version,
-                jmt.current_root_hash,
-            )
+            (jmt.current_version, jmt.current_root_hash)
         };
 
         let current_root = hyperscale_types::Hash::from_bytes(&base_root.0);
@@ -588,7 +730,7 @@ impl RocksDbStorage {
                 base_version,
                 result_root: base_root,
                 num_versions: 0,
-                nodes: std::collections::HashMap::new(),
+                nodes: HashMap::new(),
                 stale_tree_parts: Vec::new(),
             };
             return (current_root, snapshot);
@@ -603,9 +745,9 @@ impl RocksDbStorage {
             );
         }
 
-        // Expensive computation runs without holding the outer lock.
-        // The tree_store has internal RwLocks for thread-safe access.
-        let overlay = OverlayTreeStore::new(&tree_store);
+        // Expensive computation runs without holding the JMT lock.
+        // The overlay reads from RocksDB (which is thread-safe) and captures writes in memory.
+        let overlay = OverlayTreeStore::new(self);
 
         let mut current_version = base_version;
         let mut root = base_root;
@@ -731,16 +873,79 @@ impl RocksDbStorage {
     ///
     /// This is the fast path for block commit when we have a cached BlockCommitCache
     /// from verification. Applies the pre-built WriteBatch atomically with one fsync,
-    /// then applies the JMT snapshot to update the in-memory Merkle tree.
+    /// including all JMT nodes from the snapshot.
     ///
     /// # Panics
     ///
     /// Panics if the current JMT root doesn't match the snapshot's base_root,
     /// or if the RocksDB write fails.
-    pub fn apply_block_commit_cache(&self, cache: BlockCommitCache) {
+    pub fn apply_block_commit_cache(&self, mut cache: BlockCommitCache) {
         let start = Instant::now();
 
-        // 1. Apply the pre-built WriteBatch with a single fsync
+        // Verify we're applying to the expected base state BEFORE writing anything.
+        // Must check BOTH root AND version. Root can be unchanged with empty commits
+        // (same root, different version), but the nodes are keyed by version.
+        {
+            let jmt = self.jmt.read().unwrap();
+            if jmt.current_root_hash != cache.jmt_snapshot.base_root {
+                panic!(
+                    "JMT snapshot base ROOT mismatch: expected {:?}, got {:?}. \
+                     This is a bug - snapshot was computed from different JMT state.",
+                    cache.jmt_snapshot.base_root, jmt.current_root_hash
+                );
+            }
+            if jmt.current_version != cache.jmt_snapshot.base_version {
+                panic!(
+                    "JMT snapshot base VERSION mismatch: expected {}, got {}. \
+                     The root matched but version didn't - this can happen with empty commits. \
+                     Snapshot nodes are keyed by version, so this snapshot cannot be applied.",
+                    cache.jmt_snapshot.base_version, jmt.current_version
+                );
+            }
+        }
+
+        // Add JMT nodes to the WriteBatch so everything is written atomically
+        let jmt_cf = self
+            .db
+            .cf_handle(JMT_NODES_CF)
+            .expect("jmt_nodes column family must exist");
+
+        let nodes_count = cache.jmt_snapshot.nodes.len();
+        for (key, node) in &cache.jmt_snapshot.nodes {
+            let encoded_key = encode_jmt_key(key);
+            let encoded_node =
+                sbor::basic_encode(&VersionedTreeNode::from_latest_version(node.clone()))
+                    .expect("JMT node encoding must succeed");
+            cache.write_batch.put_cf(jmt_cf, encoded_key, encoded_node);
+        }
+
+        // Delete stale nodes
+        let stale_count = cache.jmt_snapshot.stale_tree_parts.len();
+        for stale_part in &cache.jmt_snapshot.stale_tree_parts {
+            match stale_part {
+                StaleTreePart::Node(key) => {
+                    cache.write_batch.delete_cf(jmt_cf, encode_jmt_key(key));
+                }
+                StaleTreePart::Subtree(key) => {
+                    // For subtrees, we only delete the root node directly.
+                    // The children are orphaned but will be cleaned up by RocksDB compaction
+                    // or a background GC process. This is acceptable because:
+                    // 1. Version-qualified keys prevent conflicts with new nodes
+                    // 2. Full recursive deletion would be expensive and slow down commits
+                    cache.write_batch.delete_cf(jmt_cf, encode_jmt_key(key));
+                }
+            }
+        }
+
+        // Add JMT metadata to the batch
+        let new_version = cache.jmt_snapshot.base_version + cache.jmt_snapshot.num_versions;
+        let new_root = cache.jmt_snapshot.result_root;
+        cache
+            .write_batch
+            .put(b"jmt:version", new_version.to_be_bytes());
+        cache.write_batch.put(b"jmt:root_hash", new_root.0);
+
+        // Apply everything atomically with a single fsync
         let mut write_opts = rocksdb::WriteOptions::default();
         write_opts.set_sync(true);
 
@@ -750,51 +955,12 @@ impl RocksDbStorage {
 
         let rocksdb_elapsed = start.elapsed();
 
-        // 2. Apply the JMT snapshot
-        let mut jmt = self.jmt.write().unwrap();
-
-        // Verify we're applying to the expected base state.
-        // Must check BOTH root AND version. Root can be unchanged with empty commits
-        // (same root, different version), but the nodes are keyed by version.
-        if jmt.current_root_hash != cache.jmt_snapshot.base_root {
-            panic!(
-                "JMT snapshot base ROOT mismatch: expected {:?}, got {:?}. \
-                 This is a bug - snapshot was computed from different JMT state.",
-                cache.jmt_snapshot.base_root, jmt.current_root_hash
-            );
+        // Update in-memory JMT state
+        {
+            let mut jmt = self.jmt.write().unwrap();
+            jmt.current_version = new_version;
+            jmt.current_root_hash = new_root;
         }
-        if jmt.current_version != cache.jmt_snapshot.base_version {
-            panic!(
-                "JMT snapshot base VERSION mismatch: expected {}, got {}. \
-                 The root matched but version didn't - this can happen with empty commits. \
-                 Snapshot nodes are keyed by version, so this snapshot cannot be applied.",
-                cache.jmt_snapshot.base_version, jmt.current_version
-            );
-        }
-
-        // Insert all captured nodes directly into the tree store
-        let nodes_count = cache.jmt_snapshot.nodes.len();
-        for (key, node) in cache.jmt_snapshot.nodes {
-            jmt.tree_store.insert_node(key, node);
-        }
-
-        // Prune stale nodes
-        let stale_count = cache.jmt_snapshot.stale_tree_parts.len();
-        for stale_part in cache.jmt_snapshot.stale_tree_parts {
-            jmt.tree_store.record_stale_tree_part(stale_part);
-        }
-
-        // Advance version and update root
-        jmt.current_version += cache.jmt_snapshot.num_versions;
-        jmt.current_root_hash = cache.jmt_snapshot.result_root;
-
-        let new_version = jmt.current_version;
-        let new_root = jmt.current_root_hash;
-        let tree_node_count = jmt.tree_store.tree_nodes.read().unwrap().len();
-        drop(jmt); // Release lock before I/O
-
-        // 3. Persist the new JMT state
-        self.persist_jmt_state(new_version, new_root);
 
         let total_elapsed = start.elapsed();
         metrics::record_rocksdb_write(rocksdb_elapsed.as_secs_f64());
@@ -805,7 +971,6 @@ impl RocksDbStorage {
             new_root = %hex::encode(new_root.0),
             nodes_count,
             stale_count,
-            tree_node_count,
             rocksdb_ms = rocksdb_elapsed.as_millis(),
             total_ms = total_elapsed.as_millis(),
             "Applied block commit cache (single fsync)"
@@ -1619,7 +1784,53 @@ impl RocksDbStorage {
             }
         }
 
-        // 3. Write batch atomically with sync for durability
+        // 3. Compute JMT updates using an overlay
+        let (base_version, base_root) = {
+            let jmt = self.jmt.read().unwrap();
+            (jmt.current_version, jmt.current_root_hash)
+        };
+
+        let overlay = OverlayTreeStore::new(self);
+        let parent_version = if base_version == 0 {
+            None
+        } else {
+            Some(base_version)
+        };
+        let new_root = put_at_next_version(&overlay, parent_version, &updates);
+        let new_version = base_version + 1;
+        let snapshot = overlay.into_snapshot(base_root, base_version, new_root, 1);
+
+        // 4. Add JMT nodes to the batch
+        let jmt_cf = self
+            .db
+            .cf_handle(JMT_NODES_CF)
+            .expect("jmt_nodes column family must exist");
+
+        for (key, node) in &snapshot.nodes {
+            let encoded_key = encode_jmt_key(key);
+            let encoded_node =
+                sbor::basic_encode(&VersionedTreeNode::from_latest_version(node.clone()))
+                    .expect("JMT node encoding must succeed");
+            batch.put_cf(jmt_cf, encoded_key, encoded_node);
+        }
+
+        // Delete stale nodes
+        for stale_part in &snapshot.stale_tree_parts {
+            match stale_part {
+                StaleTreePart::Node(key) => {
+                    batch.delete_cf(jmt_cf, encode_jmt_key(key));
+                }
+                StaleTreePart::Subtree(key) => {
+                    batch.delete_cf(jmt_cf, encode_jmt_key(key));
+                }
+            }
+        }
+
+        // Add JMT metadata to the batch
+        batch.put(b"jmt:version", new_version.to_be_bytes());
+        batch.put(b"jmt:root_hash", new_root.0);
+
+        // 5. Write batch atomically with sync for durability
         let mut write_opts = rocksdb::WriteOptions::default();
         write_opts.set_sync(true);
 
@@ -1627,26 +1838,12 @@ impl RocksDbStorage {
             "BFT SAFETY CRITICAL: certificate commit failed - node state would diverge from network",
         );
 
-        // 4. Update JMT and compute new root hash
-        let (new_version, new_root) = {
+        // 6. Update in-memory JMT state
+        {
             let mut jmt = self.jmt.write().unwrap();
-            let parent_version = if jmt.current_version == 0 {
-                None
-            } else {
-                Some(jmt.current_version)
-            };
-            let new_root = put_at_next_version(&*jmt.tree_store, parent_version, &updates);
-            let new_version = jmt.current_version + 1;
-
-            // Update in-memory state
             jmt.current_version = new_version;
             jmt.current_root_hash = new_root;
-
-            (new_version, new_root)
-        };
-
-        // 5. Persist JMT state
-        self.persist_jmt_state(new_version, new_root);
+        }
 
         tracing::debug!(
             tx_hash = %certificate.transaction_hash,
@@ -1895,7 +2092,8 @@ impl Default for RocksDbConfig {
                 "transactions".to_string(),
                 "state".to_string(),
                 "certificates".to_string(),
-                "votes".to_string(), // BFT safety critical - stores own votes
+                "votes".to_string(),     // BFT safety critical - stores own votes
+                "jmt_nodes".to_string(), // JMT tree nodes for state commitment
             ],
         }
     }

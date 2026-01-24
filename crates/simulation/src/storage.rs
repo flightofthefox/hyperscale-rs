@@ -13,17 +13,100 @@
 //! simulation has identical JMT behavior to production.
 
 use hyperscale_engine::{
-    keys, put_at_next_version, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates,
-    DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot, OverlayTreeStore,
-    PartitionDatabaseUpdates, PartitionEntry, StateRootHash, SubstateDatabase, SubstateStore,
-    TypedInMemoryTreeStore, WriteableTreeStore,
+    keys, put_at_next_version, AssociatedSubstateValue, CommittableSubstateDatabase,
+    DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot,
+    PartitionDatabaseUpdates, PartitionEntry, ReadableTreeStore, StaleTreePart, StateRootHash,
+    StoredTreeNodeKey, SubstateDatabase, SubstateStore, TreeNode, TypedInMemoryTreeStore,
+    WriteableTreeStore,
 };
 use hyperscale_types::{
     Block, BlockHeight, Hash, NodeId, QuorumCertificate, SubstateWrite, TransactionCertificate,
 };
 use im::OrdMap;
-use std::collections::{BTreeMap, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
+
+// ═══════════════════════════════════════════════════════════════════════
+// Overlay tree store for speculative JMT computation
+// ═══════════════════════════════════════════════════════════════════════
+
+/// An overlay tree store that captures writes without modifying the underlying store.
+///
+/// Reads check the overlay first, then fall through to the base store.
+/// Writes only go to the overlay and are discarded when the overlay is dropped.
+struct OverlayTreeStore<'a> {
+    base: &'a TypedInMemoryTreeStore,
+    inserted_nodes: RefCell<HashMap<StoredTreeNodeKey, TreeNode>>,
+    stale_keys: RefCell<HashSet<StoredTreeNodeKey>>,
+    stale_tree_parts: RefCell<Vec<StaleTreePart>>,
+}
+
+impl<'a> OverlayTreeStore<'a> {
+    fn new(base: &'a TypedInMemoryTreeStore) -> Self {
+        Self {
+            base,
+            inserted_nodes: RefCell::new(HashMap::new()),
+            stale_keys: RefCell::new(HashSet::new()),
+            stale_tree_parts: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn into_snapshot(
+        self,
+        base_root: StateRootHash,
+        base_version: u64,
+        result_root: StateRootHash,
+        num_versions: u64,
+    ) -> JmtSnapshot {
+        JmtSnapshot {
+            base_root,
+            base_version,
+            result_root,
+            num_versions,
+            nodes: self.inserted_nodes.into_inner(),
+            stale_tree_parts: self.stale_tree_parts.into_inner(),
+        }
+    }
+}
+
+impl ReadableTreeStore for OverlayTreeStore<'_> {
+    fn get_node(&self, key: &StoredTreeNodeKey) -> Option<TreeNode> {
+        if self.stale_keys.borrow().contains(key) {
+            return None;
+        }
+        if let Some(node) = self.inserted_nodes.borrow().get(key) {
+            return Some(node.clone());
+        }
+        self.base.get_node(key)
+    }
+}
+
+impl WriteableTreeStore for OverlayTreeStore<'_> {
+    fn insert_node(&self, key: StoredTreeNodeKey, node: TreeNode) {
+        self.stale_keys.borrow_mut().remove(&key);
+        self.inserted_nodes.borrow_mut().insert(key, node);
+    }
+
+    fn associate_substate(
+        &self,
+        _state_tree_leaf_key: &StoredTreeNodeKey,
+        _partition_key: &DbPartitionKey,
+        _sort_key: &DbSortKey,
+        _substate_value: AssociatedSubstateValue,
+    ) {
+        // No-op for speculative computation.
+    }
+
+    fn record_stale_tree_part(&self, part: StaleTreePart) {
+        let key = match &part {
+            StaleTreePart::Node(k) => k.clone(),
+            StaleTreePart::Subtree(k) => k.clone(),
+        };
+        self.stale_keys.borrow_mut().insert(key);
+        self.stale_tree_parts.borrow_mut().push(part);
+    }
+}
 
 /// JMT state bundled for thread-safe access.
 pub(crate) struct SharedJmtState {

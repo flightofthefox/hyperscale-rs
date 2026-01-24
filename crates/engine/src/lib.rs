@@ -15,7 +15,7 @@
 //!      │                                    │
 //!      ├─► Action::ExecuteTransactions ────►│ calls executor.execute(&storage, ...)
 //!      │                                    │
-//!      │◄─ Event::TransactionsExecuted ◄───┤ (returns results)
+//!      │◄─ Event::TransactionsExecuted  ◄───┤ (returns results)
 //! ```
 //!
 //! # Simulation vs Production
@@ -50,7 +50,7 @@ mod error;
 mod execution;
 mod executor;
 mod genesis;
-mod overlay;
+mod jmt_snapshot;
 mod result;
 mod storage;
 mod validation;
@@ -58,7 +58,7 @@ mod validation;
 pub use execution::{substate_writes_to_database_updates, ProvisionedSnapshot};
 pub use executor::RadixExecutor;
 pub use genesis::GenesisConfig;
-pub use overlay::{JmtSnapshot, OverlayTreeStore};
+pub use jmt_snapshot::JmtSnapshot;
 pub use storage::{keys, SubstateStore, RADIX_PREFIX};
 pub use validation::TransactionValidation;
 
@@ -74,6 +74,7 @@ pub use radix_substate_store_interface::interface::{
 // Re-export JMT types for storage implementations
 pub use radix_substate_store_impls::state_tree::put_at_next_version;
 pub use radix_substate_store_impls::state_tree::tree_store::{
-    AssociatedSubstateValue, ReadableTreeStore, StaleTreePart, StoredTreeNodeKey, TreeNode,
-    TypedInMemoryTreeStore, Version as StateVersion, WriteableTreeStore,
+    encode_key as encode_jmt_key, AssociatedSubstateValue, ReadableTreeStore, StaleTreePart,
+    StoredTreeNodeKey, TreeNode, TypedInMemoryTreeStore, Version as StateVersion,
+    VersionedTreeNode, WriteableTreeStore,
 };
