@@ -395,6 +395,39 @@ impl<'a> SnapshotTreeStore<'a> {
             db,
         }
     }
+
+    /// Read the JMT version and root hash from this snapshot.
+    ///
+    /// This reads the `jmt:version` and `jmt:root_hash` keys from the snapshot,
+    /// ensuring the returned version is consistent with the nodes visible through
+    /// this snapshot.
+    ///
+    /// Returns `(version, root_hash)`. For an empty/uninitialized JMT, returns `(0, [0; 32])`.
+    pub fn read_jmt_metadata(&self) -> (u64, StateRootHash) {
+        let version = self
+            .snapshot
+            .get(b"jmt:version")
+            .ok()
+            .flatten()
+            .and_then(|bytes| {
+                let arr: [u8; 8] = bytes.as_slice().try_into().ok()?;
+                Some(u64::from_be_bytes(arr))
+            })
+            .unwrap_or(0);
+
+        let root_hash = self
+            .snapshot
+            .get(b"jmt:root_hash")
+            .ok()
+            .flatten()
+            .and_then(|bytes| {
+                let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
+                Some(StateRootHash(arr))
+            })
+            .unwrap_or(StateRootHash([0u8; 32]));
+
+        (version, root_hash)
+    }
 }
 
 impl ReadableTreeStore for SnapshotTreeStore<'_> {
@@ -769,10 +802,17 @@ impl RocksDbStorage {
         expected_base_root: hyperscale_types::Hash,
         writes_per_cert: &[Vec<hyperscale_types::SubstateWrite>],
     ) -> (hyperscale_types::Hash, JmtSnapshot) {
-        let (base_version, base_root) = {
-            let jmt = self.jmt.read().unwrap();
-            (jmt.current_version, jmt.current_root_hash)
-        };
+        // This computation runs on the consensus-crypto thread pool, concurrent with
+        // block commits on the tokio runtime threads. Block commits delete stale JMT
+        // nodes from RocksDB. Without a snapshot, this computation could read nodes
+        // that are deleted mid-computation, causing a panic in the Radix JMT code.
+        //
+        // The snapshot provides a consistent view of RocksDB at this moment. Even if
+        // another thread deletes nodes, our reads through the snapshot still see them.
+        // The snapshot is lightweight (just a version marker) and automatically releases
+        // when dropped at the end of this function.
+        let snapshot_store = SnapshotTreeStore::new(&self.db);
+        let (base_version, base_root) = snapshot_store.read_jmt_metadata();
 
         let current_root = hyperscale_types::Hash::from_bytes(&base_root.0);
 
@@ -798,18 +838,6 @@ impl RocksDbStorage {
             );
         }
 
-        // CRITICAL: Use a RocksDB snapshot for point-in-time isolation.
-        //
-        // This computation runs on the consensus-crypto thread pool, concurrent with
-        // block commits on the state machine thread. Block commits delete stale JMT
-        // nodes from RocksDB. Without a snapshot, this computation could read nodes
-        // that are deleted mid-computation, causing a panic in the Radix JMT code.
-        //
-        // The snapshot provides a consistent view of RocksDB at this moment. Even if
-        // another thread deletes nodes, our reads through the snapshot still see them.
-        // The snapshot is lightweight (just a version marker) and automatically releases
-        // when dropped at the end of this function.
-        let snapshot_store = SnapshotTreeStore::new(&self.db);
         let overlay = OverlayTreeStore::new(&snapshot_store);
 
         let mut current_version = base_version;
