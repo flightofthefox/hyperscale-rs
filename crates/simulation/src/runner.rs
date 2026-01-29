@@ -2294,16 +2294,12 @@ impl SimulationRunner {
             }
         };
 
-        // Look up certificates from proposer's execution state
+        // Look up certificates from proposer's storage
         let mut found_certificates = Vec::new();
-        {
-            let proposer_state = &self.nodes[proposer_node as usize];
-            let execution = proposer_state.execution();
-
-            for cert_hash in &missing_cert_hashes {
-                if let Some(cert) = execution.get_finalized_certificate(cert_hash) {
-                    found_certificates.push((*cert).clone());
-                }
+        let proposer_storage = &self.node_storage[proposer_node as usize];
+        for cert_hash in &missing_cert_hashes {
+            if let Some(cert) = proposer_storage.get_certificate(cert_hash) {
+                found_certificates.push(cert);
             }
         }
 
@@ -2312,7 +2308,7 @@ impl SimulationRunner {
                 node = node,
                 block_hash = ?block_hash,
                 missing_count = missing_cert_hashes.len(),
-                "Certificate fetch: no certificates found in proposer's execution state"
+                "Certificate fetch: no certificates found in proposer's storage"
             );
             return;
         }

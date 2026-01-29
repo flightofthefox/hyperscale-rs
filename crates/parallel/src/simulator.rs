@@ -1998,14 +1998,12 @@ impl ParallelSimulator {
             None => return,
         };
 
-        // Look up certificates from proposer's execution state
+        // Look up certificates from proposer's storage
         let mut found_certificates = Vec::new();
-        {
-            let execution = self.nodes[proposer_node as usize].state.execution();
-            for cert_hash in &cert_hashes {
-                if let Some(cert) = execution.get_finalized_certificate(cert_hash) {
-                    found_certificates.push((*cert).clone());
-                }
+        let proposer_storage = &self.nodes[proposer_node as usize].storage;
+        for cert_hash in &cert_hashes {
+            if let Some(cert) = proposer_storage.get_certificate(cert_hash) {
+                found_certificates.push(cert);
             }
         }
 

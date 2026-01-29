@@ -593,7 +593,7 @@ impl StateMachine for NodeStateMachine {
                 // Also invalidate any speculative results that conflict with these writes
                 for cert in &block.certificates {
                     self.execution
-                        .remove_finalized_certificate(&cert.transaction_hash, *height);
+                        .remove_finalized_certificate(&cert.transaction_hash);
                     // Invalidate speculative results that read from nodes being written
                     self.execution.invalidate_speculative_on_commit(cert);
                 }
