@@ -1336,6 +1336,12 @@ impl ProductionRunner {
         let mut metrics_tick = tokio::time::interval(Duration::from_secs(1));
         metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // JMT garbage collection tick interval (30 seconds)
+        // GC deletes stale JMT nodes older than state_version_history_length.
+        // Runs in spawn_blocking to avoid blocking the async runtime.
+        let mut gc_tick = tokio::time::interval(Duration::from_secs(30));
+        gc_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             // Use biased select for priority ordering:
             // 1. Shutdown (always first)
@@ -1932,6 +1938,15 @@ impl ProductionRunner {
                     // Tick both managers to process pending fetches
                     self.sync_manager.tick().await;
                     self.fetch_manager.tick().await;
+                }
+
+                // Periodic JMT garbage collection (low priority, runs in background)
+                // Deletes stale JMT nodes older than state_version_history_length.
+                _ = gc_tick.tick() => {
+                    let storage = self.storage.clone();
+                    tokio::task::spawn_blocking(move || {
+                        storage.run_jmt_gc();
+                    });
                 }
 
                 // Transaction status updates (non-consensus-critical)

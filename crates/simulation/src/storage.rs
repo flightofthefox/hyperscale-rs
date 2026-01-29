@@ -15,9 +15,9 @@
 use hyperscale_engine::{
     keys, put_at_next_version, AssociatedSubstateValue, CommittableSubstateDatabase,
     DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot,
-    PartitionDatabaseUpdates, PartitionEntry, ReadableTreeStore, StaleTreePart, StateRootHash,
-    StoredTreeNodeKey, SubstateDatabase, SubstateStore, TreeNode, TypedInMemoryTreeStore,
-    WriteableTreeStore,
+    LeafSubstateKeyAssociation, PartitionDatabaseUpdates, PartitionEntry, ReadableTreeStore,
+    StaleTreePart, StateRootHash, StoredTreeNodeKey, SubstateDatabase, SubstateStore, TreeNode,
+    TypedInMemoryTreeStore, WriteableTreeStore,
 };
 use hyperscale_types::{
     Block, BlockHeight, Hash, NodeId, QuorumCertificate, SubstateWrite, TransactionCertificate,
@@ -35,20 +35,31 @@ use std::sync::{Arc, Mutex, RwLock};
 ///
 /// Reads check the overlay first, then fall through to the base store.
 /// Writes only go to the overlay and are discarded when the overlay is dropped.
+///
+/// # Historical State Support
+///
+/// The simulation overlay always collects leaf-to-substate associations for
+/// historical state queries. This is useful for testing and debugging.
 struct OverlayTreeStore<'a> {
     base: &'a TypedInMemoryTreeStore,
+    /// Reference to the substate database for looking up unchanged values.
+    substate_db: &'a dyn SubstateDatabase,
     inserted_nodes: RefCell<HashMap<StoredTreeNodeKey, TreeNode>>,
     stale_keys: RefCell<HashSet<StoredTreeNodeKey>>,
     stale_tree_parts: RefCell<Vec<StaleTreePart>>,
+    /// Associations between JMT leaf nodes and their substate values.
+    leaf_substate_associations: RefCell<Vec<LeafSubstateKeyAssociation>>,
 }
 
 impl<'a> OverlayTreeStore<'a> {
-    fn new(base: &'a TypedInMemoryTreeStore) -> Self {
+    fn new(base: &'a TypedInMemoryTreeStore, substate_db: &'a dyn SubstateDatabase) -> Self {
         Self {
             base,
+            substate_db,
             inserted_nodes: RefCell::new(HashMap::new()),
             stale_keys: RefCell::new(HashSet::new()),
             stale_tree_parts: RefCell::new(Vec::new()),
+            leaf_substate_associations: RefCell::new(Vec::new()),
         }
     }
 
@@ -66,6 +77,7 @@ impl<'a> OverlayTreeStore<'a> {
             num_versions,
             nodes: self.inserted_nodes.into_inner(),
             stale_tree_parts: self.stale_tree_parts.into_inner(),
+            leaf_substate_associations: self.leaf_substate_associations.into_inner(),
         }
     }
 }
@@ -90,12 +102,35 @@ impl WriteableTreeStore for OverlayTreeStore<'_> {
 
     fn associate_substate(
         &self,
-        _state_tree_leaf_key: &StoredTreeNodeKey,
-        _partition_key: &DbPartitionKey,
-        _sort_key: &DbSortKey,
-        _substate_value: AssociatedSubstateValue,
+        state_tree_leaf_key: &StoredTreeNodeKey,
+        partition_key: &DbPartitionKey,
+        sort_key: &DbSortKey,
+        substate_value: AssociatedSubstateValue,
     ) {
-        // No-op for speculative computation.
+        // Simulation always collects associations for testing/debugging
+        let value = match substate_value {
+            AssociatedSubstateValue::Upserted(v) => v.to_vec(),
+            AssociatedSubstateValue::Unchanged => {
+                // Look up the unchanged value from the substate database.
+                // This may fail if the substate was created earlier in the same batch
+                // (not yet committed). In that case, skip the association -
+                // we'll have captured it when it was originally created.
+                match self
+                    .substate_db
+                    .get_raw_substate_by_db_key(partition_key, sort_key)
+                {
+                    Some(v) => v,
+                    None => return,
+                }
+            }
+        };
+
+        self.leaf_substate_associations
+            .borrow_mut()
+            .push(LeafSubstateKeyAssociation {
+                tree_node_key: state_tree_leaf_key.clone(),
+                substate_value: value,
+            });
     }
 
     fn record_stale_tree_part(&self, part: StaleTreePart) {
@@ -146,10 +181,16 @@ impl SharedJmtState {
     ///
     /// Returns both the computed state root AND a snapshot of the JMT nodes
     /// created during computation, which can be applied during commit.
+    ///
+    /// # Arguments
+    /// * `expected_base_root` - The expected JMT root to verify against
+    /// * `writes_per_cert` - Writes for each certificate in the block
+    /// * `substate_db` - Reference to the substate database for looking up unchanged values
     fn compute_speculative_root_from_base(
         &self,
         expected_base_root: Hash,
         writes_per_cert: &[Vec<SubstateWrite>],
+        substate_db: &dyn SubstateDatabase,
     ) -> (Hash, JmtSnapshot) {
         let base_root = *self.current_root_hash.lock().unwrap();
         let current_root_hash = Hash::from_bytes(&base_root.0);
@@ -162,6 +203,7 @@ impl SharedJmtState {
                 num_versions: 0,
                 nodes: std::collections::HashMap::new(),
                 stale_tree_parts: Vec::new(),
+                leaf_substate_associations: Vec::new(),
             };
             return (current_root_hash, snapshot);
         }
@@ -175,7 +217,7 @@ impl SharedJmtState {
             );
         }
 
-        let overlay = OverlayTreeStore::new(&self.tree_store);
+        let overlay = OverlayTreeStore::new(&self.tree_store, substate_db);
 
         let base_version = *self.current_version.lock().unwrap();
         let mut current_version = base_version;
@@ -283,6 +325,7 @@ impl SharedJmtState {
 /// - Transaction certificates indexed by hash
 /// - Chain metadata (committed height)
 /// - Own votes (for BFT safety across restarts)
+/// - Historical substate value associations (for historical queries)
 pub struct SimStorage {
     /// Radix substate data.
     data: Arc<RwLock<OrdMap<Vec<u8>, Vec<u8>>>>,
@@ -292,6 +335,11 @@ pub struct SimStorage {
     // ═══════════════════════════════════════════════════════════════════════
     /// JMT state (tree store, version, root hash).
     jmt: Arc<SharedJmtState>,
+
+    /// Historical substate value associations.
+    /// Maps JMT leaf node keys to substate values for historical queries.
+    /// Simulation always collects these for testing/debugging.
+    associated_state_tree_values: Arc<RwLock<HashMap<StoredTreeNodeKey, Vec<u8>>>>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Consensus storage
@@ -319,6 +367,7 @@ impl SimStorage {
         Self {
             data: Arc::new(RwLock::new(OrdMap::new())),
             jmt: Arc::new(SharedJmtState::new()),
+            associated_state_tree_values: Arc::new(RwLock::new(HashMap::new())),
             blocks: BTreeMap::new(),
             committed_height: BlockHeight(0),
             certificates: HashMap::new(),
@@ -341,6 +390,7 @@ impl SimStorage {
         self.data.write().unwrap().clear();
         // Replace the shared JMT state with a fresh one
         self.jmt = Arc::new(SharedJmtState::new());
+        self.associated_state_tree_values.write().unwrap().clear();
         self.blocks.clear();
         self.committed_height = BlockHeight(0);
         self.certificates.clear();
@@ -728,16 +778,50 @@ impl SimStorage {
         expected_base_root: Hash,
         writes_per_cert: &[Vec<SubstateWrite>],
     ) -> (Hash, JmtSnapshot) {
-        self.jmt
-            .compute_speculative_root_from_base(expected_base_root, writes_per_cert)
+        // Create a snapshot of the substate data for looking up unchanged values
+        let data_snapshot = SimSnapshot {
+            data: self.data.read().unwrap().clone(),
+        };
+        self.jmt.compute_speculative_root_from_base(
+            expected_base_root,
+            writes_per_cert,
+            &data_snapshot,
+        )
     }
 
     /// Apply a JMT snapshot directly, inserting precomputed nodes.
     ///
     /// This is the fast path for block commit when we have a cached snapshot
-    /// from verification.
+    /// from verification. Also stores leaf-to-substate associations for
+    /// historical queries.
     pub fn apply_jmt_snapshot(&self, snapshot: JmtSnapshot) {
+        // Store associations for historical queries
+        {
+            let mut assoc = self.associated_state_tree_values.write().unwrap();
+            for a in &snapshot.leaf_substate_associations {
+                assoc.insert(a.tree_node_key.clone(), a.substate_value.clone());
+            }
+        }
+
+        // Apply JMT nodes
         self.jmt.apply_snapshot(snapshot);
+    }
+
+    /// Get a historical substate value by its JMT leaf node key.
+    ///
+    /// This enables querying the value of a substate at any historical
+    /// state version (as long as the associations have been collected).
+    pub fn get_associated_value(&self, tree_node_key: &StoredTreeNodeKey) -> Option<Vec<u8>> {
+        self.associated_state_tree_values
+            .read()
+            .unwrap()
+            .get(tree_node_key)
+            .cloned()
+    }
+
+    /// Get the number of stored historical associations.
+    pub fn associated_values_count(&self) -> usize {
+        self.associated_state_tree_values.read().unwrap().len()
     }
 }
 

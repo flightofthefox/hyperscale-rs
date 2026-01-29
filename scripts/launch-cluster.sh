@@ -39,6 +39,8 @@ NODE_HOSTNAME="${NODE_HOSTNAME:-localhost}"     # Hostname for spammer endpoints
 TCP_FALLBACK_ENABLED="${TCP_FALLBACK_ENABLED:-false}" # Enable TCP fallback transport (default: false)
 NETWORK_LATENCY_MS=""                           # Network latency in milliseconds (empty = disabled)
 PACKET_LOSS_PERCENT=""                          # Packet loss percentage (empty = disabled)
+ENABLE_HISTORICAL_STATE=false                   # Enable historical substate values storage
+STATE_VERSION_HISTORY_LENGTH=60000              # Number of state versions to retain (default: 60000)
 
 # Mempool configuration
 MEMPOOL_MAX_IN_FLIGHT=512                       # Soft limit on in-flight transactions
@@ -125,6 +127,14 @@ while [[ $# -gt 0 ]]; do
             MEMPOOL_MAX_PENDING="$2"
             shift 2
             ;;
+        --historical-state)
+            ENABLE_HISTORICAL_STATE=true
+            shift
+            ;;
+        --state-history-length)
+            STATE_VERSION_HISTORY_LENGTH="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean] [--monitoring] [--log-level LEVEL] [--smoke-timeout DURATION] [--node-hostname HOST] [--no-tcp-fallback]"
             echo ""
@@ -147,6 +157,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --mempool-max-in-flight N          Soft limit on in-flight transactions (default: 512)"
             echo "  --mempool-max-in-flight-hard-limit N  Hard limit on in-flight transactions (default: 1024)"
             echo "  --mempool-max-pending N  Max pending transactions before RPC backpressure (default: 2048)"
+            echo "  --historical-state       Enable historical substate values storage (for Mesh API, state queries)"
+            echo "  --state-history-length N Number of state versions to retain (default: 60000)"
             echo ""
             echo "Environment Variables:"
             echo "  VALIDATOR_BIN            Path to validator binary (default: ./target/release/hyperscale-validator)"
@@ -440,6 +452,8 @@ pin_cores = false
 max_background_jobs = 2
 write_buffer_mb = 64
 block_cache_mb = 256
+enable_historical_substate_values = $ENABLE_HISTORICAL_STATE
+state_version_history_length = $STATE_VERSION_HISTORY_LENGTH
 
 [mempool]
 max_in_flight = $MEMPOOL_MAX_IN_FLIGHT

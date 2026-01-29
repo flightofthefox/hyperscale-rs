@@ -15,9 +15,9 @@ use crate::metrics;
 use hyperscale_engine::{
     encode_jmt_key, keys, put_at_next_version, AssociatedSubstateValue,
     CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry, ReadableTreeStore,
-    StaleTreePart, StateRootHash, StoredTreeNodeKey, SubstateDatabase, SubstateStore, TreeNode,
-    VersionedTreeNode, WriteableTreeStore,
+    DbSubstateValue, JmtSnapshot, LeafSubstateKeyAssociation, PartitionDatabaseUpdates,
+    PartitionEntry, ReadableTreeStore, StaleTreePart, StateRootHash, StoredTreeNodeKey,
+    SubstateDatabase, SubstateStore, TreeNode, VersionedTreeNode, WriteableTreeStore,
 };
 use hyperscale_types::NodeId;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, Snapshot, WriteBatch, DB};
@@ -152,6 +152,12 @@ pub struct RocksDbStorage {
     /// Uses LRU eviction to bound memory usage. Maximum size is
     /// [`BLOCK_COMMIT_CACHE_MAX_SIZE`] (32 entries).
     block_commit_cache: Mutex<BlockCommitCacheLru>,
+
+    /// Whether to persist historical substate values for historical queries.
+    enable_historical_substate_values: bool,
+
+    /// Number of state versions to retain before garbage collection.
+    state_version_history_length: u64,
 }
 
 /// Error type for storage operations.
@@ -223,7 +229,19 @@ impl RocksDbStorage {
                 current_root_hash: root_hash,
             }),
             block_commit_cache: Mutex::new(BlockCommitCacheLru::new()),
+            enable_historical_substate_values: config.enable_historical_substate_values,
+            state_version_history_length: config.state_version_history_length,
         })
+    }
+
+    /// Check if historical substate values are enabled.
+    pub fn is_historical_substate_values_enabled(&self) -> bool {
+        self.enable_historical_substate_values
+    }
+
+    /// Get the configured state version history length.
+    pub fn state_version_history_length(&self) -> u64 {
+        self.state_version_history_length
     }
 
     /// Load JMT state from the database.
@@ -349,6 +367,15 @@ impl SubstateDatabase for RocksDbStorage {
 /// Column family name for JMT tree nodes.
 const JMT_NODES_CF: &str = "jmt_nodes";
 
+/// Column family name for associated state tree values.
+/// Used for historical substate queries - maps JMT leaf node keys to substate values.
+const ASSOCIATED_STATE_TREE_VALUES_CF: &str = "associated_state_tree_values";
+
+/// Column family name for stale state hash tree parts.
+/// Stores stale JMT nodes/subtrees keyed by the version at which they became stale.
+/// A background GC process deletes these after the retention window expires.
+const STALE_STATE_HASH_TREE_PARTS_CF: &str = "stale_state_hash_tree_parts";
+
 impl ReadableTreeStore for RocksDbStorage {
     fn get_node(&self, key: &StoredTreeNodeKey) -> Option<TreeNode> {
         let cf = self.db.cf_handle(JMT_NODES_CF)?;
@@ -394,6 +421,24 @@ impl<'a> SnapshotTreeStore<'a> {
             snapshot: db.snapshot(),
             db,
         }
+    }
+
+    /// Read a substate value from this snapshot.
+    ///
+    /// Used by [`OverlayTreeStore`] to look up unchanged substate values when
+    /// collecting historical state associations.
+    pub fn get_substate(
+        &self,
+        partition_key: &DbPartitionKey,
+        sort_key: &DbSortKey,
+    ) -> Option<Vec<u8>> {
+        let cf = self.db.cf_handle("state")?;
+        let key = keys::to_storage_key(partition_key, sort_key);
+        self.snapshot
+            .get_cf(cf, &key)
+            .ok()
+            .flatten()
+            .map(|v| v.to_vec())
     }
 
     /// Read the JMT version and root hash from this snapshot.
@@ -460,6 +505,12 @@ impl ReadableTreeStore for SnapshotTreeStore<'_> {
 /// `B` is the base store type, which must implement `ReadableTreeStore`. This is
 /// typically either `RocksDbStorage` (for direct reads) or `SnapshotTreeStore`
 /// (for snapshot-isolated reads that are immune to concurrent deletions).
+///
+/// # Historical State Support
+///
+/// When `enable_historical_values` is true, the overlay collects associations
+/// between JMT leaf nodes and their substate values. This requires a
+/// `SnapshotTreeStore` base to enable substate lookups for unchanged values.
 pub struct OverlayTreeStore<'a, B: ReadableTreeStore> {
     /// The underlying store (read-only access).
     base: &'a B,
@@ -474,16 +525,33 @@ pub struct OverlayTreeStore<'a, B: ReadableTreeStore> {
 
     /// Stale tree parts for pruning on commit.
     stale_tree_parts: RefCell<Vec<StaleTreePart>>,
+
+    /// Associations between JMT leaf nodes and their substate values.
+    /// Only populated when `enable_historical_values` is true.
+    leaf_substate_associations: RefCell<Vec<LeafSubstateKeyAssociation>>,
+
+    /// Whether to collect leaf-to-substate associations for historical queries.
+    enable_historical_values: bool,
+
+    /// Optional reference to snapshot for looking up unchanged substate values.
+    /// Required when `enable_historical_values` is true.
+    substate_snapshot: Option<&'a SnapshotTreeStore<'a>>,
 }
 
 impl<'a, B: ReadableTreeStore> OverlayTreeStore<'a, B> {
     /// Create a new overlay wrapping the given base store.
+    ///
+    /// Historical value collection is disabled. Use [`with_historical_values`]
+    /// to enable it.
     pub fn new(base: &'a B) -> Self {
         Self {
             base,
             inserted_nodes: RefCell::new(HashMap::new()),
             stale_keys: RefCell::new(HashSet::new()),
             stale_tree_parts: RefCell::new(Vec::new()),
+            leaf_substate_associations: RefCell::new(Vec::new()),
+            enable_historical_values: false,
+            substate_snapshot: None,
         }
     }
 
@@ -492,6 +560,9 @@ impl<'a, B: ReadableTreeStore> OverlayTreeStore<'a, B> {
     /// Consumes the overlay and extracts the captured nodes into a [`JmtSnapshot`].
     /// The snapshot can be cached and applied to the real JMT during block commit,
     /// avoiding redundant recomputation of the same tree updates.
+    ///
+    /// If historical value collection was enabled, the snapshot will also contain
+    /// leaf-to-substate associations.
     pub fn into_snapshot(
         self,
         base_root: StateRootHash,
@@ -501,6 +572,7 @@ impl<'a, B: ReadableTreeStore> OverlayTreeStore<'a, B> {
     ) -> JmtSnapshot {
         let inserted_nodes = self.inserted_nodes.into_inner();
         let stale_tree_parts = self.stale_tree_parts.into_inner();
+        let leaf_substate_associations = self.leaf_substate_associations.into_inner();
 
         JmtSnapshot {
             base_root,
@@ -509,7 +581,24 @@ impl<'a, B: ReadableTreeStore> OverlayTreeStore<'a, B> {
             num_versions,
             nodes: inserted_nodes,
             stale_tree_parts,
+            leaf_substate_associations,
         }
+    }
+}
+
+impl<'a> OverlayTreeStore<'a, SnapshotTreeStore<'a>> {
+    /// Enable historical value collection.
+    ///
+    /// When enabled, the overlay will collect associations between JMT leaf nodes
+    /// and their substate values. This requires the snapshot to look up unchanged
+    /// values.
+    ///
+    /// # Arguments
+    /// * `snapshot` - The snapshot to use for looking up unchanged substate values
+    pub fn with_historical_values(mut self, snapshot: &'a SnapshotTreeStore<'a>) -> Self {
+        self.enable_historical_values = true;
+        self.substate_snapshot = Some(snapshot);
+        self
     }
 }
 
@@ -540,13 +629,42 @@ impl<B: ReadableTreeStore> WriteableTreeStore for OverlayTreeStore<'_, B> {
 
     fn associate_substate(
         &self,
-        _state_tree_leaf_key: &StoredTreeNodeKey,
-        _partition_key: &DbPartitionKey,
-        _sort_key: &DbSortKey,
-        _substate_value: AssociatedSubstateValue,
+        state_tree_leaf_key: &StoredTreeNodeKey,
+        partition_key: &DbPartitionKey,
+        sort_key: &DbSortKey,
+        substate_value: AssociatedSubstateValue,
     ) {
-        // No-op for speculative computation.
-        // Substate associations are only needed for historical queries.
+        if !self.enable_historical_values {
+            return;
+        }
+
+        let value = match substate_value {
+            AssociatedSubstateValue::Upserted(v) => v.to_vec(),
+            AssociatedSubstateValue::Unchanged => {
+                // Look up the unchanged value from the snapshot.
+                // This may fail if the substate was created earlier in the same batch
+                // (not yet persisted to RocksDB). In that case, skip the association -
+                // we'll have captured it when it was originally created.
+                let snapshot = self
+                    .substate_snapshot
+                    .expect("substate_snapshot required when enable_historical_values is true");
+                match snapshot.get_substate(partition_key, sort_key) {
+                    Some(v) => v,
+                    None => {
+                        // Substate not in snapshot - likely created earlier in this batch.
+                        // Skip this association; the value was captured when it was upserted.
+                        return;
+                    }
+                }
+            }
+        };
+
+        self.leaf_substate_associations
+            .borrow_mut()
+            .push(LeafSubstateKeyAssociation {
+                tree_node_key: state_tree_leaf_key.clone(),
+                substate_value: value,
+            });
     }
 
     fn record_stale_tree_part(&self, part: StaleTreePart) {
@@ -666,15 +784,28 @@ impl RocksDbStorage {
             batch.put_cf(jmt_cf, encoded_key, encoded_node);
         }
 
-        // Delete stale nodes
-        for stale_part in &snapshot.stale_tree_parts {
-            match stale_part {
-                StaleTreePart::Node(key) => {
-                    batch.delete_cf(jmt_cf, encode_jmt_key(key));
-                }
-                StaleTreePart::Subtree(key) => {
-                    batch.delete_cf(jmt_cf, encode_jmt_key(key));
-                }
+        // Queue stale parts for deferred GC instead of deleting immediately
+        if !snapshot.stale_tree_parts.is_empty() {
+            let stale_cf = self
+                .db
+                .cf_handle(STALE_STATE_HASH_TREE_PARTS_CF)
+                .expect("stale_state_hash_tree_parts column family must exist");
+
+            let version_key = new_version.to_be_bytes();
+            let encoded_parts = sbor::basic_encode(&snapshot.stale_tree_parts)
+                .expect("encoding stale parts must succeed");
+            batch.put_cf(stale_cf, version_key, encoded_parts);
+        }
+
+        // Persist associations if enabled
+        if self.enable_historical_substate_values {
+            let assoc_cf = self
+                .db
+                .cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)
+                .expect("associated_state_tree_values column family must exist");
+            for assoc in &snapshot.leaf_substate_associations {
+                let encoded_key = encode_jmt_key(&assoc.tree_node_key);
+                batch.put_cf(assoc_cf, encoded_key, &assoc.substate_value);
             }
         }
 
@@ -825,6 +956,7 @@ impl RocksDbStorage {
                 num_versions: 0,
                 nodes: HashMap::new(),
                 stale_tree_parts: Vec::new(),
+                leaf_substate_associations: Vec::new(),
             };
             return (current_root, snapshot);
         }
@@ -838,7 +970,12 @@ impl RocksDbStorage {
             );
         }
 
-        let overlay = OverlayTreeStore::new(&snapshot_store);
+        // Create overlay, optionally enabling historical value collection
+        let overlay = if self.enable_historical_substate_values {
+            OverlayTreeStore::new(&snapshot_store).with_historical_values(&snapshot_store)
+        } else {
+            OverlayTreeStore::new(&snapshot_store)
+        };
 
         let mut current_version = base_version;
         let mut root = base_root;
@@ -1020,23 +1157,45 @@ impl RocksDbStorage {
             cache.write_batch.put_cf(jmt_cf, encoded_key, encoded_node);
         }
 
-        // Delete stale nodes
+        // Queue stale parts for deferred GC instead of deleting immediately.
+        // This makes commits faster and enables configurable history retention.
         let stale_count = cache.jmt_snapshot.stale_tree_parts.len();
-        for stale_part in &cache.jmt_snapshot.stale_tree_parts {
-            match stale_part {
-                StaleTreePart::Node(key) => {
-                    cache.write_batch.delete_cf(jmt_cf, encode_jmt_key(key));
-                }
-                StaleTreePart::Subtree(key) => {
-                    // For subtrees, we only delete the root node directly.
-                    // The children are orphaned but will be cleaned up by RocksDB compaction
-                    // or a background GC process. This is acceptable because:
-                    // 1. Version-qualified keys prevent conflicts with new nodes
-                    // 2. Full recursive deletion would be expensive and slow down commits
-                    cache.write_batch.delete_cf(jmt_cf, encode_jmt_key(key));
-                }
-            }
+        if !cache.jmt_snapshot.stale_tree_parts.is_empty() {
+            let stale_cf = self
+                .db
+                .cf_handle(STALE_STATE_HASH_TREE_PARTS_CF)
+                .expect("stale_state_hash_tree_parts column family must exist");
+
+            // Key by the version at which these parts became stale (the new version)
+            let stale_version = cache.jmt_snapshot.base_version + cache.jmt_snapshot.num_versions;
+            let version_key = stale_version.to_be_bytes();
+
+            // Encode the stale parts list
+            let encoded_parts = sbor::basic_encode(&cache.jmt_snapshot.stale_tree_parts)
+                .expect("encoding stale parts must succeed");
+
+            cache
+                .write_batch
+                .put_cf(stale_cf, version_key, encoded_parts);
         }
+
+        // Persist historical substate value associations if enabled
+        let associations_count = if self.enable_historical_substate_values {
+            let assoc_cf = self
+                .db
+                .cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)
+                .expect("associated_state_tree_values column family must exist");
+            let count = cache.jmt_snapshot.leaf_substate_associations.len();
+            for assoc in &cache.jmt_snapshot.leaf_substate_associations {
+                let encoded_key = encode_jmt_key(&assoc.tree_node_key);
+                cache
+                    .write_batch
+                    .put_cf(assoc_cf, encoded_key, &assoc.substate_value);
+            }
+            count
+        } else {
+            0
+        };
 
         // Add JMT metadata to the batch
         let new_version = cache.jmt_snapshot.base_version + cache.jmt_snapshot.num_versions;
@@ -1072,6 +1231,7 @@ impl RocksDbStorage {
             new_root = %hex::encode(new_root.0),
             nodes_count,
             stale_count,
+            associations_count,
             rocksdb_ms = rocksdb_elapsed.as_millis(),
             total_ms = total_elapsed.as_millis(),
             "Applied block commit cache (single fsync)"
@@ -1917,15 +2077,28 @@ impl RocksDbStorage {
             batch.put_cf(jmt_cf, encoded_key, encoded_node);
         }
 
-        // Delete stale nodes
-        for stale_part in &snapshot.stale_tree_parts {
-            match stale_part {
-                StaleTreePart::Node(key) => {
-                    batch.delete_cf(jmt_cf, encode_jmt_key(key));
-                }
-                StaleTreePart::Subtree(key) => {
-                    batch.delete_cf(jmt_cf, encode_jmt_key(key));
-                }
+        // Queue stale parts for deferred GC instead of deleting immediately
+        if !snapshot.stale_tree_parts.is_empty() {
+            let stale_cf = self
+                .db
+                .cf_handle(STALE_STATE_HASH_TREE_PARTS_CF)
+                .expect("stale_state_hash_tree_parts column family must exist");
+
+            let version_key = new_version.to_be_bytes();
+            let encoded_parts = sbor::basic_encode(&snapshot.stale_tree_parts)
+                .expect("encoding stale parts must succeed");
+            batch.put_cf(stale_cf, version_key, encoded_parts);
+        }
+
+        // Persist associations if enabled
+        if self.enable_historical_substate_values {
+            let assoc_cf = self
+                .db
+                .cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)
+                .expect("associated_state_tree_values column family must exist");
+            for assoc in &snapshot.leaf_substate_associations {
+                let encoded_key = encode_jmt_key(&assoc.tree_node_key);
+                batch.put_cf(assoc_cf, encoded_key, &assoc.substate_value);
             }
         }
 
@@ -2128,6 +2301,196 @@ impl RocksDbStorage {
             jmt_state,
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // JMT Garbage Collection
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Run garbage collection for stale JMT nodes.
+    ///
+    /// This deletes JMT nodes (and their associations) that became stale at versions
+    /// older than `current_version - state_version_history_length`.
+    ///
+    /// # When to Call
+    ///
+    /// Call this periodically (e.g., after each block commit, or on a timer).
+    /// It's safe to call concurrently with commits - GC only touches old data
+    /// that's no longer reachable from the current state root.
+    ///
+    /// # Returns
+    ///
+    /// The number of stale parts entries processed (each entry may contain
+    /// multiple nodes/subtrees).
+    pub fn run_jmt_gc(&self) -> usize {
+        let start = Instant::now();
+
+        let current_version = self.jmt.read().unwrap().current_version;
+
+        // Calculate the cutoff version - delete stale parts older than this
+        let cutoff_version = current_version.saturating_sub(self.state_version_history_length);
+
+        if cutoff_version == 0 {
+            // Nothing to GC yet - we haven't accumulated enough history
+            return 0;
+        }
+
+        let stale_cf = match self.db.cf_handle(STALE_STATE_HASH_TREE_PARTS_CF) {
+            Some(cf) => cf,
+            None => return 0,
+        };
+
+        let jmt_cf = match self.db.cf_handle(JMT_NODES_CF) {
+            Some(cf) => cf,
+            None => return 0,
+        };
+
+        let assoc_cf = if self.enable_historical_substate_values {
+            self.db.cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)
+        } else {
+            None
+        };
+
+        // Iterate through stale parts older than the cutoff
+        let mut iter = self.db.raw_iterator_cf(stale_cf);
+        iter.seek_to_first();
+
+        let mut processed_count = 0;
+        let mut deleted_nodes = 0;
+        let mut batch = WriteBatch::default();
+
+        while iter.valid() {
+            let version_key = match iter.key() {
+                Some(k) if k.len() == 8 => k,
+                _ => {
+                    iter.next();
+                    continue;
+                }
+            };
+
+            let version = u64::from_be_bytes(version_key.try_into().unwrap());
+
+            // Stop if we've reached versions we want to keep
+            if version >= cutoff_version {
+                break;
+            }
+
+            // Decode the stale parts
+            if let Some(value) = iter.value() {
+                if let Ok(stale_parts) = sbor::basic_decode::<Vec<StaleTreePart>>(value) {
+                    for stale_part in stale_parts {
+                        match stale_part {
+                            StaleTreePart::Node(key) => {
+                                let encoded_key = encode_jmt_key(&key);
+                                batch.delete_cf(jmt_cf, &encoded_key);
+                                if let Some(cf) = assoc_cf {
+                                    batch.delete_cf(cf, &encoded_key);
+                                }
+                                deleted_nodes += 1;
+                            }
+                            StaleTreePart::Subtree(key) => {
+                                // For subtrees, we recursively delete all nodes.
+                                // This is more expensive but ensures proper cleanup.
+                                self.delete_subtree_recursive(
+                                    &key,
+                                    jmt_cf,
+                                    assoc_cf,
+                                    &mut batch,
+                                    &mut deleted_nodes,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Delete the stale parts entry itself
+            batch.delete_cf(stale_cf, version_key);
+            processed_count += 1;
+
+            iter.next();
+        }
+
+        // Apply all deletions
+        if !batch.is_empty() {
+            if let Err(e) = self.db.write(batch) {
+                tracing::error!("JMT GC write failed: {}", e);
+                return 0;
+            }
+        }
+
+        let elapsed = start.elapsed();
+        if processed_count > 0 {
+            tracing::debug!(
+                processed_count,
+                deleted_nodes,
+                cutoff_version,
+                current_version,
+                elapsed_ms = elapsed.as_millis(),
+                "JMT GC completed"
+            );
+        }
+
+        processed_count
+    }
+
+    /// Recursively delete a subtree and its associations.
+    fn delete_subtree_recursive(
+        &self,
+        root_key: &StoredTreeNodeKey,
+        jmt_cf: &ColumnFamily,
+        assoc_cf: Option<&ColumnFamily>,
+        batch: &mut WriteBatch,
+        deleted_count: &mut usize,
+    ) {
+        // Read the root node to find its children
+        let encoded_key = encode_jmt_key(root_key);
+        let node = match self.db.get_cf(jmt_cf, &encoded_key) {
+            Ok(Some(bytes)) => {
+                match sbor::basic_decode::<VersionedTreeNode>(&bytes) {
+                    Ok(versioned) => versioned.fully_update_and_into_latest_version(),
+                    Err(_) => {
+                        // Can't decode - just delete the root
+                        batch.delete_cf(jmt_cf, &encoded_key);
+                        if let Some(cf) = assoc_cf {
+                            batch.delete_cf(cf, &encoded_key);
+                        }
+                        *deleted_count += 1;
+                        return;
+                    }
+                }
+            }
+            _ => {
+                // Node doesn't exist (already deleted in a previous GC run)
+                return;
+            }
+        };
+
+        // Process children first (post-order traversal)
+        match &node {
+            TreeNode::Internal(internal) => {
+                for child in &internal.children {
+                    let child_key = root_key.gen_child_node_key(child.version, child.nibble);
+                    self.delete_subtree_recursive(
+                        &child_key,
+                        jmt_cf,
+                        assoc_cf,
+                        batch,
+                        deleted_count,
+                    );
+                }
+            }
+            TreeNode::Leaf(_) | TreeNode::Null => {
+                // Leaf nodes have no children
+            }
+        }
+
+        // Delete this node
+        batch.delete_cf(jmt_cf, &encoded_key);
+        if let Some(cf) = assoc_cf {
+            batch.delete_cf(cf, &encoded_key);
+        }
+        *deleted_count += 1;
+    }
 }
 
 /// Compression type for RocksDB.
@@ -2176,6 +2539,26 @@ pub struct RocksDbConfig {
     pub keep_log_file_num: usize,
     /// Column families to create
     pub column_families: Vec<String>,
+    /// Enable historical substate values storage.
+    ///
+    /// When enabled, the storage will persist associations between JMT leaf nodes
+    /// and their substate values. This enables historical state queries - looking
+    /// up substate values at any past state version (within the retention window).
+    ///
+    /// This adds storage overhead proportional to the number of substates modified.
+    /// Defaults to `false` for minimal overhead; enable for Mesh API compatibility
+    /// or when historical state queries are needed.
+    pub enable_historical_substate_values: bool,
+
+    /// Number of state versions to retain before garbage collection.
+    ///
+    /// Stale JMT nodes and their associations are kept for this many versions
+    /// before being eligible for deletion. This enables historical queries within
+    /// this window.
+    ///
+    /// Set to 0 for immediate deletion (no history retention).
+    /// Defaults to 60,000 versions (matching Babylon's default).
+    pub state_version_history_length: u64,
 }
 
 impl Default for RocksDbConfig {
@@ -2197,7 +2580,11 @@ impl Default for RocksDbConfig {
                 "certificates".to_string(),
                 "votes".to_string(),     // BFT safety critical - stores own votes
                 "jmt_nodes".to_string(), // JMT tree nodes for state commitment
+                "associated_state_tree_values".to_string(), // Historical substate values (leaf key -> value)
+                "stale_state_hash_tree_parts".to_string(),  // Deferred GC queue for stale JMT nodes
             ],
+            enable_historical_substate_values: false, // Disabled by default, like Babylon
+            state_version_history_length: 60_000,     // Match Babylon's default
         }
     }
 }

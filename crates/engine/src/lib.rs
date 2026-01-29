@@ -58,7 +58,7 @@ mod validation;
 pub use execution::{substate_writes_to_database_updates, ProvisionedSnapshot};
 pub use executor::RadixExecutor;
 pub use genesis::GenesisConfig;
-pub use jmt_snapshot::JmtSnapshot;
+pub use jmt_snapshot::{JmtSnapshot, LeafSubstateKeyAssociation};
 pub use storage::{keys, SubstateStore, RADIX_PREFIX};
 pub use validation::TransactionValidation;
 
