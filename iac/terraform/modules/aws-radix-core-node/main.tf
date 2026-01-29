@@ -42,33 +42,22 @@ resource "aws_instance" "nodes" {
   vpc_security_group_ids = var.vpc_security_group_ids
   tags = merge(
     {
-      Name                               = "${var.radix_network_name}_${each.key}"
-      "radixdlt:node-regional-index"     = "${each.key}"
-      "radixdlt:core-private-ip"         = lookup(each.value, "core_private_ip", null)
-      "radixdlt:faucet"                  = lookup(each.value, "enable_faucet", null)
-      "radixdlt:enable-transactions-api" = lookup(each.value, "enable_transactions_api", null)
-      "radixdlt:non-archive-node"        = lookup(each.value, "non_archive_node", null)
-      "radixdlt:enable-health-api"       = lookup(each.value, "enable_health", null)
-      "radixdlt:enable-metrics-api"      = lookup(each.value, "enable_metrics", null)
-      "radixdlt:enable-construct-api"    = lookup(each.value, "enable_construct", null)
-      "radixdlt:enable-system-api"       = lookup(each.value, "enable_system", null)
-      "radixdlt:enable-validation-api"   = lookup(each.value, "enable_validation", null)
-      "radixdlt:enable-version-api"      = lookup(each.value, "enable_version", null)
-      "radixdlt:latest-rc-code"          = lookup(each.value, "latest_rc_code", null)
-      "radixdlt:enable-universe-api"     = lookup(each.value, "enable_universe_api", null)
-      "radixdlt:enable-chaos-api"        = lookup(each.value, "enable_chaos_api", null)
-      "radixdlt:backup-ledger-node"      = lookup(each.value, "backup_ledger_node", null)
-      "radixdlt:non-archive-node"        = lookup(each.value, "non-archive-node", null)
-      "radixdlt:enable-jmx-exporter"     = lookup(each.value, "enable_jmx_exporter", null)
-      "radixdlt:internal-archive"        = lookup(each.value, "internal_archive", null)
-      "radixdlt:extra-archive"           = lookup(each.value, "extra_archive", null)
-      "radixdlt:dns-subdomain"           = lookup(each.value, "dns_subdomain", null)
-      "radixdlt:explicit-instance-type"  = lookup(each.value, "explicit_instance_type", null)
-      "radixdlt:genesis-validator"       = lookup(each.value, "genesis_validator", null)
-      "radixdlt:migration-aux-node"      = lookup(each.value, "migration_aux_node", null)
-      "radixdlt:access-type"             = lookup(each.value, "access_type", null)
-      "radixdlt:collect-metrics"         = lookup(each.value, "collect_metrics", null)
-      "radixdlt:collect-logs"            = lookup(each.value, "collect_logs", null)
+      Name                              = "${var.radix_network_name}_${each.key}"
+      "radixdlt:node-regional-index"    = "${each.key}"
+      "radixdlt:core-private-ip"        = lookup(each.value, "core_private_ip", null)
+      "radixdlt:enable-health-api"      = lookup(each.value, "enable_health", null)
+      "radixdlt:enable-metrics-api"     = lookup(each.value, "enable_metrics", null)
+      "radixdlt:enable-validation-api"  = lookup(each.value, "enable_validation", null)
+      "radixdlt:enable-version-api"     = lookup(each.value, "enable_version", null)
+      "radixdlt:enable-jmx-exporter"    = lookup(each.value, "enable_jmx_exporter", null)
+      "radixdlt:extra-archive"          = lookup(each.value, "extra_archive", null)
+      "radixdlt:dns-subdomain"          = lookup(each.value, "dns_subdomain", null)
+      "radixdlt:explicit-instance-type" = lookup(each.value, "explicit_instance_type", null)
+      "radixdlt:genesis-validator"      = lookup(each.value, "genesis_validator", null)
+      "radixdlt:migration-aux-node"     = lookup(each.value, "migration_aux_node", null)
+      "radixdlt:access-type"            = lookup(each.value, "access_type", null)
+      "radixdlt:collect-metrics"        = lookup(each.value, "collect_metrics", null)
+      "radixdlt:collect-logs"           = lookup(each.value, "collect_logs", null)
     },
     var.node_tags
   )

@@ -43,26 +43,6 @@ output "public_fullnode_instance_ips" {
   depends_on = [aws_eip.public_fullnode_instances]
 }
 
-module "public_fullnode_instances_archive_nodes" {
-  source          = "./tags-vars"
-  nodes_with_tags = aws_eip.public_fullnode_instances
-}
-
-output "public_non_archive_instance_ips" {
-  value = {
-    for key, val in module.public_fullnode_instances.out-vars-from-tags : key => val
-    if val.non_archive_node == "true"
-  }
-  depends_on = [aws_eip.public_fullnode_instances]
-}
-
-output "gateway_node_instance_ips" {
-  value = {
-    for key, val in module.public_fullnode_instances.out-vars-from-tags : key => val
-    if val.enable_transactions_api == "true"
-  }
-  depends_on = [aws_eip.public_fullnode_instances]
-}
 output "public_witnessnode_instance_ips" {
   value = {
     for key, val in aws_eip.public_witnessnode_instances : key => {
