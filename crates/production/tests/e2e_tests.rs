@@ -92,6 +92,7 @@ async fn test_storage_operations() {
         is_fallback: false,
         state_root: Hash::ZERO,
         state_version: 0,
+        transaction_root: Hash::ZERO,
     };
 
     let block = Block {

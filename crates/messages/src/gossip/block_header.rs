@@ -242,6 +242,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         let retry_hashes = vec![Hash::from_bytes(b"retry1")];
         let priority_hashes = vec![Hash::from_bytes(b"priority1")];
@@ -272,6 +273,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         let transaction_hashes = vec![Hash::from_bytes(b"tx1")];
 
@@ -292,6 +294,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         let retry = Hash::from_bytes(b"retry");
         let priority = Hash::from_bytes(b"priority");
