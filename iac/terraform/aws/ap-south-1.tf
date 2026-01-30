@@ -221,4 +221,5 @@ module "ap_south_1" {
   vpc_tags = {
     "radixdlt:managed_by" = "terraform"
   }
+  additional_ssh_keys = local.additional_ssh_keys
 }

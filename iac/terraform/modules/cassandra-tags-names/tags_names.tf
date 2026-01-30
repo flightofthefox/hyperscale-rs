@@ -32,10 +32,10 @@ locals {
           for node, values in nodes : {
             tag    = "${replace(var.region, "-", "_")}_${node_type}${bootstrap}"
             values = values
-          }
-        ])
-        if node_type == "bootstrap"
+        }
       ])
+      if node_type == "bootstrap"
+    ])
     ]) :
     item.tag => { for field in module.field_mapping.fields : field => lookup(item.values, field, null) }
   }
@@ -49,10 +49,10 @@ locals {
           for node, values in nodes : {
             tag    = "${replace(var.region, "-", "_")}_${node_type}${spam}"
             values = values
-          }
-        ])
-        if node_type == "spam"
+        }
       ])
+      if node_type == "spam"
+    ])
     ]) :
     item.tag => { for field in module.field_mapping.fields : field => lookup(item.values, field, null) }
   }
@@ -66,10 +66,10 @@ locals {
           for node, values in nodes : {
             tag    = "${replace(var.region, "-", "_")}_${node_type}${validator}"
             values = values
-          }
-        ])
-        if node_type == "validator"
+        }
       ])
+      if node_type == "validator"
+    ])
     ]) :
     item.tag => { for field in module.field_mapping.fields : field => lookup(item.values, field, null) }
   }

@@ -136,3 +136,9 @@ variable "running_or_stopped" {
 variable "ec2_tenancy" {
   default = "dedicated"
 }
+
+variable "additional_ssh_keys" {
+  description = "List of additional SSH public keys to add to instances"
+  type        = list(string)
+  default     = []
+}

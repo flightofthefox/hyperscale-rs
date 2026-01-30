@@ -37,14 +37,3 @@ create_frankfurt_nodes = false
 create_mumbai_nodes    = false
 create_us_east_nodes   = false
 create_us_west_nodes   = false
-
-# Since nodes have built-in dashboard when app is running we create Route53 records so it's easier to remember
-# node name to access dashboard rather than remembering public IP that gets destroyed with node.
-# Format is:
-
-{network_name}-{region}-{node_type}{node_number}.sandbox.extratools.works
-
-hyperscalers-test-eu-west-1-bootstrap0.sandbox.extratools.works
-hyperscalers-test-ap-south-1-spam20.sandbox.extratools.works
-hyperscalers-test-us-wast-1-validator39.sandbox.extratools.works ...
-```
