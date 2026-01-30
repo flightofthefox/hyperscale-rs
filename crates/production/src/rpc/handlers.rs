@@ -331,14 +331,17 @@ fn format_transaction_status(
         TransactionStatus::Committed(height) => {
             ("committed".to_string(), Some(height.0), None, None, None)
         }
-        TransactionStatus::Executed(decision) => {
+        TransactionStatus::Executed {
+            decision,
+            committed_at,
+        } => {
             let decision_str = match decision {
                 TransactionDecision::Accept => "accept",
                 TransactionDecision::Reject => "reject",
             };
             (
                 "executed".to_string(),
-                None,
+                Some(committed_at.0),
                 Some(decision_str.to_string()),
                 None,
                 None,
@@ -518,9 +521,12 @@ mod tests {
     #[test]
     fn test_format_executed_accept() {
         let (status, height, decision, deferred_by, retry_tx) =
-            format_transaction_status(&TransactionStatus::Executed(TransactionDecision::Accept));
+            format_transaction_status(&TransactionStatus::Executed {
+                decision: TransactionDecision::Accept,
+                committed_at: BlockHeight(5),
+            });
         assert_eq!(status, "executed");
-        assert!(height.is_none());
+        assert_eq!(height, Some(5));
         assert_eq!(decision, Some("accept".to_string()));
         assert!(deferred_by.is_none());
         assert!(retry_tx.is_none());
@@ -529,9 +535,12 @@ mod tests {
     #[test]
     fn test_format_executed_reject() {
         let (status, height, decision, deferred_by, retry_tx) =
-            format_transaction_status(&TransactionStatus::Executed(TransactionDecision::Reject));
+            format_transaction_status(&TransactionStatus::Executed {
+                decision: TransactionDecision::Reject,
+                committed_at: BlockHeight(10),
+            });
         assert_eq!(status, "executed");
-        assert!(height.is_none());
+        assert_eq!(height, Some(10));
         assert_eq!(decision, Some("reject".to_string()));
         assert!(deferred_by.is_none());
         assert!(retry_tx.is_none());

@@ -783,7 +783,14 @@ pub enum TransactionStatus {
     /// transaction is waiting for the certificate to be committed.
     ///
     /// Still holds state locks until Completed.
-    Executed(TransactionDecision),
+    Executed {
+        decision: TransactionDecision,
+        /// Block height when the transaction was originally committed.
+        /// Preserved from Committed state for timeout tracking - cross-shard
+        /// transactions can get stuck in Executed state if certificate inclusion
+        /// fails on another shard.
+        committed_at: BlockHeight,
+    },
 
     /// Transaction has been fully processed and can be evicted.
     ///
@@ -865,7 +872,7 @@ impl TransactionStatus {
     pub fn holds_state_lock(&self) -> bool {
         matches!(
             self,
-            TransactionStatus::Committed(_) | TransactionStatus::Executed(_)
+            TransactionStatus::Committed(_) | TransactionStatus::Executed { .. }
         )
     }
 
@@ -920,7 +927,7 @@ impl TransactionStatus {
         match self {
             TransactionStatus::Pending => 0,
             TransactionStatus::Committed(_) => 1,
-            TransactionStatus::Executed(_) => 2,
+            TransactionStatus::Executed { .. } => 2,
             TransactionStatus::Completed(_) => 3,
             TransactionStatus::Deferred { .. } => 4,
             TransactionStatus::Retried { .. } => 5,
@@ -943,7 +950,7 @@ impl TransactionStatus {
             (Pending, Deferred { .. }) => true,
 
             // Committed → Executed (execution complete, certificate created)
-            (Committed(_), Executed(_)) => true,
+            (Committed(_), Executed { .. }) => true,
 
             // Committed → Deferred (deferred due to conflict)
             (Committed(_), Deferred { .. }) => true,
@@ -955,10 +962,10 @@ impl TransactionStatus {
             (Committed(_), Aborted { .. }) => true,
 
             // Executed → Completed (certificate committed in block)
-            (Executed(_), Completed(_)) => true,
+            (Executed { .. }, Completed(_)) => true,
 
             // Executed → Aborted (execution rejected or timeout)
-            (Executed(_), Aborted { .. }) => true,
+            (Executed { .. }, Aborted { .. }) => true,
 
             // Deferred → Retried (when winner completes, loser gets a retry)
             (Deferred { .. }, Retried { .. }) => true,
@@ -977,10 +984,16 @@ impl std::fmt::Display for TransactionStatus {
         match self {
             TransactionStatus::Pending => write!(f, "pending"),
             TransactionStatus::Committed(height) => write!(f, "committed({})", height.0),
-            TransactionStatus::Executed(TransactionDecision::Accept) => {
+            TransactionStatus::Executed {
+                decision: TransactionDecision::Accept,
+                ..
+            } => {
                 write!(f, "executed(accept)")
             }
-            TransactionStatus::Executed(TransactionDecision::Reject) => {
+            TransactionStatus::Executed {
+                decision: TransactionDecision::Reject,
+                ..
+            } => {
                 write!(f, "executed(reject)")
             }
             TransactionStatus::Completed(TransactionDecision::Accept) => {
@@ -1030,7 +1043,13 @@ impl std::str::FromStr for TransactionStatus {
                 let decision = parse_decision(inner.ok_or_else(|| {
                     TransactionStatusParseError::MissingValue("executed".into())
                 })?)?;
-                Ok(TransactionStatus::Executed(decision))
+                // Note: committed_at is not preserved in string representation as it's
+                // internal state for timeout tracking. Use 0 as placeholder - this status
+                // parsed from strings won't be used for timeout calculations anyway.
+                Ok(TransactionStatus::Executed {
+                    decision,
+                    committed_at: BlockHeight(0),
+                })
             }
             "completed" => {
                 let decision = parse_decision(inner.ok_or_else(|| {

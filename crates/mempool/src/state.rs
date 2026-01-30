@@ -440,7 +440,7 @@ impl MempoolState {
                 TransactionStatus::Committed(_) => {
                     self.committed_count = self.committed_count.saturating_sub(1);
                 }
-                TransactionStatus::Executed(_) => {
+                TransactionStatus::Executed { .. } => {
                     self.executed_count = self.executed_count.saturating_sub(1);
                 }
                 _ => {}
@@ -683,7 +683,7 @@ impl MempoolState {
                         TransactionStatus::Committed(_) => {
                             self.committed_count = self.committed_count.saturating_sub(1);
                         }
-                        TransactionStatus::Executed(_) => {
+                        TransactionStatus::Executed { .. } => {
                             self.executed_count = self.executed_count.saturating_sub(1);
                         }
                         _ => {}
@@ -1052,16 +1052,31 @@ impl MempoolState {
             let cross_shard = entry.cross_shard;
             let submitted_locally = entry.submitted_locally;
 
-            // Update counters for Committed → Executed transition
-            if matches!(entry.status, TransactionStatus::Committed(_)) {
-                self.committed_count = self.committed_count.saturating_sub(1);
-                self.executed_count += 1;
-            }
+            // Extract committed_at height before transitioning to Executed.
+            // This is needed for timeout tracking - cross-shard transactions can get
+            // stuck in Executed state if certificate inclusion fails on another shard.
+            let committed_at = match entry.status {
+                TransactionStatus::Committed(height) => {
+                    self.committed_count = self.committed_count.saturating_sub(1);
+                    self.executed_count += 1;
+                    height
+                }
+                // If already Executed (idempotent call), preserve existing committed_at
+                TransactionStatus::Executed { committed_at, .. } => committed_at,
+                // Unexpected state - use current height as fallback
+                _ => self.current_height,
+            };
 
-            entry.status = TransactionStatus::Executed(decision);
+            entry.status = TransactionStatus::Executed {
+                decision,
+                committed_at,
+            };
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
-                status: TransactionStatus::Executed(decision),
+                status: TransactionStatus::Executed {
+                    decision,
+                    committed_at,
+                },
                 added_at,
                 cross_shard,
                 submitted_locally,
@@ -1229,14 +1244,14 @@ impl MempoolState {
                 }
                 match (&old_status, &new_status) {
                     // Entering Executed
-                    (_, TransactionStatus::Executed(_))
-                        if !matches!(old_status, TransactionStatus::Executed(_)) =>
+                    (_, TransactionStatus::Executed { .. })
+                        if !matches!(old_status, TransactionStatus::Executed { .. }) =>
                     {
                         self.executed_count += 1;
                     }
                     // Leaving Executed
-                    (TransactionStatus::Executed(_), _)
-                        if !matches!(new_status, TransactionStatus::Executed(_)) =>
+                    (TransactionStatus::Executed { .. }, _)
+                        if !matches!(new_status, TransactionStatus::Executed { .. }) =>
                     {
                         self.executed_count = self.executed_count.saturating_sub(1);
                     }
@@ -1749,7 +1764,7 @@ impl MempoolState {
             .filter(|(_, entry)| {
                 !matches!(
                     entry.status,
-                    TransactionStatus::Executed(_) | TransactionStatus::Completed(_)
+                    TransactionStatus::Executed { .. } | TransactionStatus::Completed(_)
                 )
             })
             .map(|(hash, entry)| (*hash, entry.status.clone(), Arc::clone(&entry.tx)))
@@ -1777,38 +1792,44 @@ impl MempoolState {
         let mut aborts = Vec::new();
 
         for (hash, entry) in &self.pool {
-            // Skip transactions that are already finalized or completed
-            if matches!(
-                entry.status,
-                TransactionStatus::Executed(_) | TransactionStatus::Completed(_)
-            ) {
+            // Skip transactions that are already finalized (Completed is terminal)
+            if matches!(entry.status, TransactionStatus::Completed(_)) {
                 continue;
             }
 
             // Check for execution timeout (TX stuck in lock-holding state too long)
-            if let TransactionStatus::Committed(committed_at) = &entry.status {
+            // Both Committed and Executed states hold locks and need timeout checks.
+            // Cross-shard transactions can get stuck in Executed state if certificate
+            // inclusion fails on another shard (e.g., the other shard aborted first).
+            let committed_at = match &entry.status {
+                TransactionStatus::Committed(height) => Some(*height),
+                TransactionStatus::Executed { committed_at, .. } => Some(*committed_at),
+                _ => None,
+            };
+
+            if let Some(committed_at) = committed_at {
                 let blocks_elapsed = current_height.0.saturating_sub(committed_at.0);
                 if blocks_elapsed >= timeout_blocks {
+                    let status_name = match &entry.status {
+                        TransactionStatus::Committed(_) => "Committed",
+                        TransactionStatus::Executed { .. } => "Executed",
+                        _ => "Unknown",
+                    };
                     tracing::debug!(
                         tx_hash = %hash,
                         committed_at = committed_at.0,
                         current_height = current_height.0,
                         blocks_elapsed = blocks_elapsed,
-                        "Transaction timed out waiting for execution"
+                        status = status_name,
+                        "Transaction timed out waiting for completion"
                     );
                     aborts.push(TransactionAbort {
                         tx_hash: *hash,
-                        reason: AbortReason::ExecutionTimeout {
-                            committed_at: *committed_at,
-                        },
+                        reason: AbortReason::ExecutionTimeout { committed_at },
                         block_height: BlockHeight(0), // Filled in by proposer
                     });
                 }
             }
-
-            // Note: Executed transactions also hold locks but don't have a
-            // committed height embedded. For simplicity, we only timeout from
-            // Committed state. Executed→Completed should happen quickly anyway.
 
             // Check for too many retries
             if entry.tx.exceeds_max_retries(max_retries) {
@@ -2146,6 +2167,58 @@ mod tests {
         assert!(matches!(
             aborts[0].reason,
             AbortReason::ExecutionTimeout { .. }
+        ));
+    }
+
+    #[test]
+    fn test_executed_transaction_timeout() {
+        // Tests that transactions in Executed state can also timeout.
+        // This is critical for cross-shard transactions that get stuck when
+        // certificate inclusion fails on another shard.
+        let mut mempool = MempoolState::new(make_test_topology());
+
+        // Create and commit a TX
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+        mempool.on_submit_transaction(tx.clone());
+
+        let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
+        mempool.on_block_committed_full(&commit_block);
+
+        // Simulate committed status from execution
+        mempool.update_status(&tx_hash, TransactionStatus::Committed(BlockHeight(1)));
+
+        // Now simulate execution completing (moves to Executed status)
+        // This preserves the committed_at height for timeout tracking
+        let _actions = mempool.on_transaction_executed(tx_hash, true);
+
+        // Verify it's in Executed state with preserved committed_at
+        let status = mempool.status(&tx_hash).unwrap();
+        assert!(
+            matches!(
+                status,
+                TransactionStatus::Executed {
+                    decision: TransactionDecision::Accept,
+                    committed_at: BlockHeight(1)
+                }
+            ),
+            "Expected Executed status with committed_at=1, got {:?}",
+            status
+        );
+
+        // Check for timeouts - not enough blocks elapsed
+        let aborts = mempool.get_timed_out_transactions(BlockHeight(20), 30, 3);
+        assert!(aborts.is_empty(), "Should not timeout yet");
+
+        // Check for timeouts - now enough blocks (31 blocks since committed at height 1)
+        let aborts = mempool.get_timed_out_transactions(BlockHeight(35), 30, 3);
+        assert_eq!(aborts.len(), 1, "Executed transaction should timeout");
+        assert_eq!(aborts[0].tx_hash, tx_hash);
+        assert!(matches!(
+            aborts[0].reason,
+            AbortReason::ExecutionTimeout {
+                committed_at: BlockHeight(1)
+            }
         ));
     }
 
@@ -2915,7 +2988,10 @@ mod tests {
         // Execute the cross-shard TX - should still count (Executed holds locks)
         mempool.update_status(
             &cross_hash,
-            TransactionStatus::Executed(TransactionDecision::Accept),
+            TransactionStatus::Executed {
+                decision: TransactionDecision::Accept,
+                committed_at: BlockHeight(1),
+            },
         );
         assert_eq!(mempool.in_flight(), 2, "Executed TX should still count");
 
@@ -2929,7 +3005,10 @@ mod tests {
         // Execute then complete the single-shard TX
         mempool.update_status(
             &single_hash,
-            TransactionStatus::Executed(TransactionDecision::Accept),
+            TransactionStatus::Executed {
+                decision: TransactionDecision::Accept,
+                committed_at: BlockHeight(1),
+            },
         );
         assert_eq!(
             mempool.in_flight(),

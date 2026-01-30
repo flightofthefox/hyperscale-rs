@@ -108,7 +108,10 @@ impl TransactionStatusResponse {
             "committed" => Some(TransactionStatus::Committed(BlockHeight(
                 self.committed_height.unwrap_or(0),
             ))),
-            "executed" => Some(TransactionStatus::Executed(decision()?)),
+            "executed" => Some(TransactionStatus::Executed {
+                decision: decision()?,
+                committed_at: BlockHeight(self.committed_height.unwrap_or(0)),
+            }),
             "completed" => Some(TransactionStatus::Completed(decision()?)),
             "deferred" => {
                 let hash = Hash::from_hex(self.deferred_by.as_deref()?).ok()?;

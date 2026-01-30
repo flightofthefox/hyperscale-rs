@@ -319,12 +319,18 @@ mod tests {
         // Committed -> Executed
         cache.update(
             tx_hash,
-            TransactionStatus::Executed(TransactionDecision::Accept),
+            TransactionStatus::Executed {
+                decision: TransactionDecision::Accept,
+                committed_at: BlockHeight(1),
+            },
         );
         let cached = cache.get(&tx_hash).unwrap();
         assert!(matches!(
             cached.status,
-            TransactionStatus::Executed(TransactionDecision::Accept)
+            TransactionStatus::Executed {
+                decision: TransactionDecision::Accept,
+                ..
+            }
         ));
 
         // Executed -> Completed
