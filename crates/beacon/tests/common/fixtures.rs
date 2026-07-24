@@ -2,8 +2,8 @@
 //! signing-context builders.
 
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, PcContext, SpcView, ValidatorId,
-    bls_keypair_from_seed, pc_context, spc_context,
+    Bls12381G1PrivateKey, ConsensusPublicKey, Epoch, PcContext, SpcView, ValidatorId,
+    bls_keypair_from_seed, pc_context, pk_from_bls, spc_context,
 };
 
 /// A small in-test validator committee — deterministic keys derived
@@ -15,7 +15,7 @@ pub struct Committee {
     /// Per-validator `(ValidatorId, public_key)` pairs, indexed
     /// positionally and in the same order as `keys`. Suitable for
     /// passing straight into the PC verifier API.
-    pub members: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    pub members: Vec<(ValidatorId, ConsensusPublicKey)>,
 }
 
 impl Committee {
@@ -32,7 +32,7 @@ impl Committee {
             bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
             let sk = bls_keypair_from_seed(&bytes);
             let id = ValidatorId::new(i as u64);
-            let pk = sk.public_key();
+            let pk = pk_from_bls(&sk.public_key());
             keys.push(sk);
             members.push((id, pk));
         }

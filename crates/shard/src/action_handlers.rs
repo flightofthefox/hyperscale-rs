@@ -16,9 +16,9 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRootContext, Block, BlockHash, BlockHeader, BlockHeight,
-    BlockVote, Bls12381G1PublicKey, CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, ConsensusReceipt, FinalizedWave, Hash, InFlightCount,
-    LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
+    BlockVote, CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
+    CertifiedHeaderVerifyError, ConsensusPublicKey, ConsensusReceipt, FinalizedWave, Hash,
+    InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
     ReshapeTrigger, Round, RoutableTransaction, SettledWavesRoot, ShardId, SplitChildRoots,
@@ -27,7 +27,7 @@ use hyperscale_types::{
     VrfProof, WeightedTimestamp, WitnessSources, block_header_message, block_vote_message,
     certified_block_header_message, commit_witness_window, compute_waves, derive_leaves,
     local_settled_wave_ids, missed_proposals_since_prev_commit, ready_signal_message,
-    shard_reveal_sign,
+    shard_reveal_sign, sig_from_bls,
 };
 
 /// Result of QC verification and assembly.
@@ -67,7 +67,7 @@ pub fn verify_and_build_qc(
     round: Round,
     parent_block_hash: BlockHash,
     parent_weighted_timestamp: WeightedTimestamp,
-    votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey)>,
+    votes_to_verify: Vec<(usize, BlockVote, ConsensusPublicKey)>,
     already_verified: Vec<(usize, Verified<BlockVote>)>,
     total_votes: VoteCount,
 ) -> QcVerificationResult {
@@ -123,7 +123,7 @@ pub fn verify_and_build_qc(
 pub fn verify_vote_batch(
     block_hash: BlockHash,
     signing_message: &[u8],
-    votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey)>,
+    votes_to_verify: Vec<(usize, BlockVote, ConsensusPublicKey)>,
     already_verified: Vec<(usize, Verified<BlockVote>)>,
 ) -> Vec<(usize, Verified<BlockVote>)> {
     let mut all_verified = already_verified;
@@ -136,7 +136,7 @@ pub fn verify_vote_batch(
     // failure logging) alongside the `(vote, pubkey)` pairs the typed
     // verifier consumes.
     let mut bookkeeping: Vec<(usize, ValidatorId)> = Vec::with_capacity(votes_to_verify.len());
-    let mut to_verify: Vec<(BlockVote, Bls12381G1PublicKey)> =
+    let mut to_verify: Vec<(BlockVote, ConsensusPublicKey)> =
         Vec::with_capacity(votes_to_verify.len());
     for (idx, vote, pk) in votes_to_verify {
         bookkeeping.push((idx, vote.voter()));
@@ -844,7 +844,7 @@ where
                 &block_hash,
             );
             let sig = ctx.signing_key.sign_v1(&msg);
-            let gossip = BlockHeaderNotification::new(*header, *manifest, sig);
+            let gossip = BlockHeaderNotification::new(*header, *manifest, sig_from_bls(&sig));
             let local_peers: Vec<ValidatorId> = ctx
                 .topology_snapshot
                 .committee_for_shard(ctx.shard)
@@ -924,7 +924,13 @@ where
                 wt_window_end,
             );
             let sig = ctx.signing_key.sign_v1(&msg);
-            let signal = ReadySignal::new(ctx.me, shard, wt_window_start, wt_window_end, sig);
+            let signal = ReadySignal::new(
+                ctx.me,
+                shard,
+                wt_window_start,
+                wt_window_end,
+                sig_from_bls(&sig),
+            );
             // No local feedback: the sender is outside the consensus
             // subset, so it never proposes and its own pool entry would
             // never drain — only the recipients' pools matter.
@@ -967,7 +973,7 @@ where
                     certified_header,
                 )),
                 sender: ctx.me,
-                sender_signature: sig,
+                sender_signature: sig_from_bls(&sig),
             };
             ctx.network.broadcast_global(&gossip);
         }
@@ -991,7 +997,7 @@ mod tests {
     use hyperscale_types::{
         Bls12381G1PrivateKey, CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError, generate_bls_keypair,
-        routable_from_notarized_v1,
+        pk_from_bls, routable_from_notarized_v1,
     };
 
     use super::*;
@@ -1066,7 +1072,7 @@ mod tests {
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
-                (i, vote, keys[i].public_key())
+                (i, vote, pk_from_bls(&keys[i].public_key()))
             })
             .collect();
 
@@ -1108,13 +1114,13 @@ mod tests {
             (
                 0usize,
                 make_vote(&keys, 0, block_hash, height, round, 1000),
-                keys[0].public_key(),
+                pk_from_bls(&keys[0].public_key()),
             ),
-            (1usize, bad_vote, keys[1].public_key()),
+            (1usize, bad_vote, pk_from_bls(&keys[1].public_key())),
             (
                 2usize,
                 make_vote(&keys, 2, block_hash, height, round, 1000),
-                keys[2].public_key(),
+                pk_from_bls(&keys[2].public_key()),
             ),
         ];
 
@@ -1138,7 +1144,7 @@ mod tests {
                     Round::INITIAL,
                     1000,
                 );
-                (i, vote, keys[i].public_key())
+                (i, vote, pk_from_bls(&keys[i].public_key()))
             })
             .collect();
         let out = verify_vote_batch(block_hash, wrong_msg, to_verify, Vec::new());
@@ -1179,7 +1185,10 @@ mod tests {
         // "votes pre-verified + quorum confirmed" trust source, so the
         // returned QC must round-trip through the Verify impl when fed
         // back its committee context.
-        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let pubs: Vec<_> = keys
+            .iter()
+            .map(|sk| pk_from_bls(&sk.public_key()))
+            .collect();
         let net = net();
         let qc_ctx = QcContext {
             network: &net,
@@ -1358,7 +1367,7 @@ mod tests {
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
-                (i, vote, keys[i].public_key())
+                (i, vote, pk_from_bls(&keys[i].public_key()))
             })
             .collect();
 
@@ -1388,7 +1397,7 @@ mod tests {
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
-                (i, vote, keys[i].public_key())
+                (i, vote, pk_from_bls(&keys[i].public_key()))
             })
             .collect();
 

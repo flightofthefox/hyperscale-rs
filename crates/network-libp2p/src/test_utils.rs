@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, GenesisValidators, NetworkDefinition, ValidatorId,
-    ValidatorInfo, ValidatorSet, bls_keypair_from_seed,
+    Bls12381G1PrivateKey, ConsensusPublicKey, GenesisValidators, NetworkDefinition, ValidatorId,
+    ValidatorInfo, ValidatorSet, bls_keypair_from_seed, pk_from_bls,
 };
 use libp2p::PeerId;
 use libp2p::identity::Keypair;
@@ -87,9 +87,9 @@ impl TestFixtures {
 
         let (bls_keys, ed25519_keys) = derive_keypairs(seed, num_validators);
 
-        let public_keys: Vec<Bls12381G1PublicKey> = bls_keys
+        let public_keys: Vec<ConsensusPublicKey> = bls_keys
             .iter()
-            .map(Bls12381G1PrivateKey::public_key)
+            .map(|sk| pk_from_bls(&sk.public_key()))
             .collect();
 
         let validators: Vec<ValidatorInfo> = (0..num_validators)

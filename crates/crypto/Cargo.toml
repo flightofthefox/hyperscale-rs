@@ -1,0 +1,21 @@
+[package]
+name = "hyperscale-crypto"
+version.workspace = true
+edition.workspace = true
+description = "Consensus crypto interface: role newtypes and Signer/Verifier traits"
+
+[features]
+# Exposes the scheme conformance battery for impl crates' test suites.
+test-utils = []
+
+[dependencies]
+# Interface-only crate: an external verifier must be able to depend on this
+# plus one impl crate without dragging in the workspace. Keep it this way.
+sbor.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
+
+[lints]
+workspace = true

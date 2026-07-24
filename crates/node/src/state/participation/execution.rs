@@ -123,9 +123,9 @@ mod tests {
 
     use hyperscale_core::{Action, ProtocolEvent, StateMachine};
     use hyperscale_types::{
-        BlockHeight, Bls12381G2Signature, ExecutionCertificate, ExecutionOutcome,
-        GlobalReceiptRoot, LocalTimestamp, ShardId, SignerBitfield, TxHash, TxOutcome, Verified,
-        WaveId, WeightedTimestamp,
+        AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptRoot,
+        LocalTimestamp, ShardId, SignerBitfield, TxHash, TxOutcome, Verified, WaveId,
+        WeightedTimestamp,
     };
 
     use crate::state::test_support::TestNode;
@@ -143,7 +143,7 @@ mod tests {
             WeightedTimestamp::from_millis(0),
             GlobalReceiptRoot::ZERO,
             outcomes,
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         )))
     }

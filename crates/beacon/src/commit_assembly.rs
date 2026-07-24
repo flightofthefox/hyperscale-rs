@@ -258,7 +258,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_types::{
-        PcQc2, PcQc3, PcSignerLengths, PcXpProof, SignerBitfield, SpcView, VrfProof,
+        PcQc2, PcQc3, PcSignerLengths, PcXpProof, SignerBitfield, SpcView, VrfProof, agg_from_bls,
         zero_bls_signature,
     };
 
@@ -293,7 +293,7 @@ mod tests {
         let qc2 = PcQc2::new(
             PcVector::empty(),
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             PcXpProof::Full,
         );
         let qc3 = PcQc3::new(
@@ -303,7 +303,7 @@ mod tests {
             None,
             SignerBitfield::empty(),
             PcSignerLengths::Uniform(0),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
         );
         Verified::new_unchecked_for_test(SpcCert::Direct {
             prev_view: SpcView::new(0),

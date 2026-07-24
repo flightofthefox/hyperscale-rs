@@ -7,9 +7,9 @@ use std::time::Duration;
 use hyperscale_dispatch::DispatchPool;
 use hyperscale_types::{
     BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
-    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PublicKey,
-    CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
-    CertifiedBlockHeader, Epoch, ExecutionCertificate, ExecutionVote, FinalizedWave,
+    BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
+    CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader,
+    ConsensusPublicKey, Epoch, ExecutionCertificate, ExecutionVote, FinalizedWave,
     GlobalReceiptRoot, Hash, HeaderFetchCount, InFlightCount, LocalReceiptRoot, NodeId, PcQc1,
     PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp,
     ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase,
@@ -411,7 +411,7 @@ pub enum Action {
         parent_weighted_timestamp: WeightedTimestamp,
         /// Votes to verify and potentially aggregate.
         /// Each tuple is (`committee_index`, vote, `public_key`).
-        votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey)>,
+        votes_to_verify: Vec<(usize, BlockVote, ConsensusPublicKey)>,
         /// Already-verified votes (e.g., our own vote).
         /// Each tuple is (`committee_index`, vote).
         verified_votes: Vec<(usize, Verified<BlockVote>)>,
@@ -461,7 +461,7 @@ pub enum Action {
         /// Block hash for correlation.
         block_hash: BlockHash,
         /// Votes to verify with their public keys.
-        votes: Vec<(ExecutionVote, Bls12381G1PublicKey)>,
+        votes: Vec<(ExecutionVote, ConsensusPublicKey)>,
     },
 
     /// Verify an execution certificate's aggregated signature.
@@ -474,7 +474,7 @@ pub enum Action {
         /// verification.
         certificate: Verifiable<ExecutionCertificate>,
         /// Public keys of the signers (in committee order).
-        public_keys: Vec<Bls12381G1PublicKey>,
+        public_keys: Vec<ConsensusPublicKey>,
     },
 
     /// Verify every EC inside a fetched [`FinalizedWave`] in one async dispatch.
@@ -490,7 +490,7 @@ pub enum Action {
         wave: Arc<Verifiable<FinalizedWave>>,
         /// Public keys for each EC, indexed parallel to
         /// `wave.execution_certificates()`.
-        ec_public_keys: Vec<Vec<Bls12381G1PublicKey>>,
+        ec_public_keys: Vec<Vec<ConsensusPublicKey>>,
     },
 
     /// Verify a Quorum Certificate's aggregated BLS signature **and**
@@ -510,7 +510,7 @@ pub enum Action {
         /// verified result without rerunning BLS aggregation.
         qc: Verifiable<QuorumCertificate>,
         /// Public keys of the signers (pre-resolved by state machine from QC's signer bitfield).
-        public_keys: Vec<Bls12381G1PublicKey>,
+        public_keys: Vec<ConsensusPublicKey>,
         /// Quorum threshold for the QC's shard.
         quorum_threshold: VoteCount,
         /// The block hash this QC verification is associated with (for correlation).
@@ -531,7 +531,7 @@ pub enum Action {
         timeout: Timeout,
         /// The voter's BLS public key, pre-resolved by the state machine from
         /// the topology (where the committee-membership gate also runs).
-        voter_public_key: Bls12381G1PublicKey,
+        voter_public_key: ConsensusPublicKey,
     },
 
     /// Verify a remote block header's QC for cross-shard deferral validation.
@@ -549,7 +549,7 @@ pub enum Action {
         /// from its pending map on error.
         sender: ValidatorId,
         /// Public keys for the remote shard's committee (from topology).
-        committee_public_keys: Vec<Bls12381G1PublicKey>,
+        committee_public_keys: Vec<ConsensusPublicKey>,
         /// Quorum threshold for the remote shard.
         quorum_threshold: VoteCount,
         /// Remote shard ID (for correlation in callback).
@@ -584,7 +584,7 @@ pub enum Action {
         evidence: Box<ShardVoteEquivocation>,
         /// The accused validator's registered pubkey, resolved by the
         /// state machine from its topology.
-        pubkey: Bls12381G1PublicKey,
+        pubkey: ConsensusPublicKey,
     },
 
     /// Verify a block's local-receipt root and state root against the JMT.
@@ -1319,16 +1319,16 @@ pub enum Action {
         /// Beacon committee for the block's epoch — the SPC cert's
         /// signer base. Positional ordering matches the cert's
         /// bitfields.
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
         /// Active validator pool at the anchor's epoch — the ratify
         /// cert's signer base. Positional ordering matches the cert's
         /// bitfield.
-        active_pool: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        active_pool: Vec<(ValidatorId, ConsensusPublicKey)>,
         /// Pubkeys for the validators referenced by embedded
         /// `PcVoteEquivocation` evidence. Empty when the block
         /// carries no equivocations. Lookup-shape, order doesn't
         /// matter.
-        equivocation_signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        equivocation_signers: Vec<(ValidatorId, ConsensusPublicKey)>,
     },
 
     /// Sign and broadcast a [`RatifyVote`] globally. The action handler
@@ -1363,7 +1363,7 @@ pub enum Action {
         /// short-circuits dispatch.
         vote: Box<Verifiable<RatifyVote>>,
         /// Active validator pool used to look up the signer's pubkey.
-        signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        signers: Vec<(ValidatorId, ConsensusPublicKey)>,
     },
 
     /// Broadcast an SPC-certified [`CandidateBeaconBlock`] over the
@@ -1387,11 +1387,11 @@ pub enum Action {
         candidate: Arc<Verifiable<CandidateBeaconBlock>>,
         /// Beacon committee for the candidate's epoch, in positional
         /// order matching the SPC cert's signer bitfields.
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
         /// Pubkeys for the validators referenced by embedded
         /// `PcVoteEquivocation` evidence. Empty when the candidate
         /// carries no equivocations.
-        equivocation_signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        equivocation_signers: Vec<(ValidatorId, ConsensusPublicKey)>,
     },
 
     /// Verify a round-1 PC vote against its `(epoch, view)` committee.
@@ -1406,7 +1406,7 @@ pub enum Action {
         /// short-circuits BLS dispatch.
         vote: Verifiable<PcVote1>,
         /// Beacon committee at `epoch`, positional order.
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     },
 
     /// Verify a round-2 PC vote against its `(epoch, view)` committee.
@@ -1421,7 +1421,7 @@ pub enum Action {
         /// marker shortcuts its sub-check.
         vote: Box<Verifiable<PcVote2>>,
         /// Beacon committee at `epoch`, positional order.
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     },
 
     /// Verify a round-3 PC vote against its `(epoch, view)` committee.
@@ -1436,7 +1436,7 @@ pub enum Action {
         /// marker shortcuts its sub-check.
         vote: Box<Verifiable<PcVote3>>,
         /// Beacon committee at `epoch`, positional order.
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     },
 
     /// Verify an SPC `NewView` proposal object. Result returns via
@@ -1451,7 +1451,7 @@ pub enum Action {
         /// wrapper short-circuits the dispatch.
         proposal: Box<Verifiable<SpcProposalObject>>,
         /// Beacon committee at `epoch`, positional order.
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     },
 
     /// Verify an SPC `NewCommit` message. Result returns via
@@ -1469,7 +1469,7 @@ pub enum Action {
         /// shortcuts its sub-check.
         msg: Box<Verifiable<SpcNewCommitMsg>>,
         /// Beacon committee at `epoch`, positional order.
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     },
 
     /// Verify an empty-view attestation (sig + embedded reported QC3).
@@ -1481,7 +1481,7 @@ pub enum Action {
         /// short-circuits dispatch.
         msg: Box<Verifiable<SpcEmptyViewMsg>>,
         /// Beacon committee at `epoch`, positional order.
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     },
 
     /// Persist a committed beacon block + its resulting `BeaconState`

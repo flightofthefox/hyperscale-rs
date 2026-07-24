@@ -83,7 +83,7 @@ impl EquivocationObservations {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Bls12381G2Signature, Epoch, PcValueElement, PcVector, PcVoteRound, SpcView, ValidatorId,
+        ConsensusSignature, Epoch, PcValueElement, PcVector, PcVoteRound, SpcView, ValidatorId,
     };
 
     use super::*;
@@ -97,9 +97,9 @@ mod tests {
             view: SpcView::new(1),
             round: PcVoteRound::Vote1,
             value_a: PcVector::new(std::iter::once(element_a)),
-            sig_a: Bls12381G2Signature([0x11; 96]),
+            sig_a: ConsensusSignature::new([0x11; 96]),
             value_b: PcVector::new(std::iter::once(element_b)),
-            sig_b: Bls12381G2Signature([0x22; 96]),
+            sig_b: ConsensusSignature::new([0x22; 96]),
         }
     }
 

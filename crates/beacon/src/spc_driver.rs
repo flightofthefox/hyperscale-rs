@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Epoch, MIN_BEACON_COMMITTEE_SIZE, PcQc3, PcVector, PcVote1,
+    ConsensusPublicKey, Epoch, MIN_BEACON_COMMITTEE_SIZE, PcQc3, PcVector, PcVote1,
     PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteRound,
     SPC_VIEW_TIMEOUT, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
     SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
@@ -125,7 +125,7 @@ impl SpcDriver {
     pub fn bootstrap(
         &mut self,
         next_epoch: Epoch,
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     ) {
         if committee.len() < MIN_BEACON_COMMITTEE_SIZE {
             warn!(
@@ -676,7 +676,7 @@ impl SpcDriver {
         view: SpcView,
         kind: &'static str,
         skip_quorum: bool,
-    ) -> Option<(Epoch, Vec<(ValidatorId, Bls12381G1PublicKey)>)> {
+    ) -> Option<(Epoch, Vec<(ValidatorId, ConsensusPublicKey)>)> {
         let Some(spc) = self.spc.as_ref() else {
             trace!(
                 ?signer,
@@ -753,7 +753,7 @@ impl SpcDriver {
 mod tests {
     use hyperscale_types::{
         Bls12381G1PrivateKey, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement,
-        bls_keypair_from_seed, pc_context, sign_vote1, spc_context,
+        bls_keypair_from_seed, pc_context, pk_from_bls, sign_vote1, spc_context,
     };
 
     use super::*;
@@ -771,9 +771,9 @@ mod tests {
 
     /// An `n`-member committee with ids `0..n` and matching deterministic
     /// keys, in the shape `bootstrap` consumes.
-    fn committee(n: u64) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
+    fn committee(n: u64) -> Vec<(ValidatorId, ConsensusPublicKey)> {
         (0..n)
-            .map(|i| (ValidatorId::new(i), bls_sk(i).public_key()))
+            .map(|i| (ValidatorId::new(i), pk_from_bls(&bls_sk(i).public_key())))
             .collect()
     }
 

@@ -200,7 +200,7 @@ mod tests {
     use hyperscale_types::{
         BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot,
         Hash, ShardId, SignerBitfield, TxHash, TxOutcome, Verified, WeightedTimestamp,
-        zero_bls_signature,
+        agg_from_bls, zero_bls_signature,
     };
 
     use super::*;
@@ -234,7 +234,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             tx_outcomes,
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::new(4),
         );
         let cert = WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)]);

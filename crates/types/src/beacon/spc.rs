@@ -37,11 +37,12 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, DOMAIN_PC_EMPTY_VIEW, Hash,
-    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVoteVerifyContext, PositionalBundle,
-    SignerBitfield, SpcContext, SpcView, ValidatorId, Verifiable, Verified, Verify,
-    aggregate_verify_bls_different_messages, byzantine_threshold, pc_context,
-    pc_vote_signing_message, verify_qc3,
+    AggregateSignature, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
+    ConsensusPublicKey, ConsensusSignature, DOMAIN_PC_EMPTY_VIEW, Hash, NetworkDefinition, PcQc3,
+    PcValueElement, PcVector, PcVoteVerifyContext, PositionalBundle, SignerBitfield, SpcContext,
+    SpcView, ValidatorId, Verifiable, Verified, Verify, agg_from_bls,
+    aggregate_verify_bls_different_messages, bls_agg, bls_pk, bls_sig, byzantine_threshold,
+    pc_context, pc_vote_signing_message, sig_from_bls, verify_qc3,
 };
 
 /// `(view, value, proof)` — a verifiable high triple.
@@ -81,7 +82,7 @@ pub struct SpcEmptyViewMsg {
     /// Sender's validator id.
     pub signer: ValidatorId,
     /// Sender's BLS signature over the empty-view signing bytes.
-    pub sig: Bls12381G2Signature,
+    pub sig: ConsensusSignature,
 }
 
 /// One signer's contribution to an [`SpcCert::Indirect`].
@@ -154,7 +155,7 @@ pub enum SpcCert {
         skip_reports: PositionalBundle<SkipReport>,
         /// Different-messages BLS aggregate over each signer's BLS
         /// signature on their canonical skip-target bytes.
-        skip_aggregate_sig: Bls12381G2Signature,
+        skip_aggregate_sig: AggregateSignature,
     },
 }
 
@@ -261,9 +262,9 @@ const HIGH_VALUE_DOMAIN: &[u8] = b"hyperscale-spc-high-value-v1";
 /// Resolve a committee signer's public key, or return `None` if they
 /// aren't in the committee. Linear scan — committee sizes are small.
 fn pubkey_in_committee(
-    committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
     validator: ValidatorId,
-) -> Option<Bls12381G1PublicKey> {
+) -> Option<ConsensusPublicKey> {
     committee
         .iter()
         .find(|(id, _)| *id == validator)
@@ -317,7 +318,7 @@ pub fn verify_empty_view_msg(
     msg: &SpcEmptyViewMsg,
     network: &NetworkDefinition,
     spc_ctx: &SpcContext,
-    committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
 ) -> Result<(), SpcEmptyViewMsgVerifyError> {
     let Some(pk) = pubkey_in_committee(committee, msg.signer) else {
         return Err(SpcEmptyViewMsgVerifyError::SignerNotInCommittee);
@@ -344,7 +345,11 @@ pub fn verify_empty_view_msg(
     let value_hash = hash_high_value(&msg.reported.value);
     let target = skip_target(msg.view, msg.reported.view, value_hash);
     let signed = pc_vote_signing_message(network, DOMAIN_PC_EMPTY_VIEW, spc_ctx, &target);
-    if aggregate_verify_bls_different_messages(&[signed.as_slice()], &msg.sig, &[pk]) {
+    if aggregate_verify_bls_different_messages(
+        &[signed.as_slice()],
+        &bls_sig(&msg.sig),
+        &[bls_pk(&pk)],
+    ) {
         Ok(())
     } else {
         Err(SpcEmptyViewMsgVerifyError::BadSignature)
@@ -368,7 +373,7 @@ pub fn verify_block_cert(
     cert: &SpcCert,
     network: &NetworkDefinition,
     spc_ctx: &SpcContext,
-    committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
 ) -> Result<(), SpcCertVerifyError> {
     match cert {
         SpcCert::Direct { prev_view, .. } => {
@@ -398,7 +403,7 @@ pub fn verify_cert(
     entering_view: SpcView,
     network: &NetworkDefinition,
     spc_ctx: &SpcContext,
-    committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
 ) -> Result<(), SpcCertVerifyError> {
     match cert {
         SpcCert::Direct {
@@ -444,7 +449,7 @@ fn verify_direct_cert(
     entering_view: SpcView,
     network: &NetworkDefinition,
     spc_ctx: &SpcContext,
-    committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
 ) -> Result<(), SpcCertVerifyError> {
     // `prev_view + 1 == entering_view`, guarded against u32 overflow.
     let Some(expected) = prev_view.inner().checked_add(1) else {
@@ -475,11 +480,11 @@ fn verify_indirect_cert(
     target_value: &PcVector,
     target_proof: &Verifiable<PcQc3>,
     skip_reports: &PositionalBundle<SkipReport>,
-    skip_aggregate_sig: Bls12381G2Signature,
+    skip_aggregate_sig: AggregateSignature,
     entering_view: SpcView,
     network: &NetworkDefinition,
     spc_ctx: &SpcContext,
-    committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
 ) -> Result<(), SpcCertVerifyError> {
     // Indirect certs only make sense at entering_view >= 2 (view 1
     // has no prior empty view to skip).
@@ -528,10 +533,10 @@ fn verify_indirect_cert(
             spc_ctx,
             &target,
         ));
-        pks.push(*pk);
+        pks.push(bls_pk(pk));
     }
     let messages: Vec<&[u8]> = messages_owned.iter().map(Vec::as_slice).collect();
-    if !aggregate_verify_bls_different_messages(&messages, &skip_aggregate_sig, &pks) {
+    if !aggregate_verify_bls_different_messages(&messages, &bls_agg(&skip_aggregate_sig), &pks) {
         return Err(SpcCertVerifyError::IndirectBadAggregateSignature);
     }
     // Target proof verifies under target_view's PC ctx, and its x_pe
@@ -567,7 +572,7 @@ pub fn verify_proposal_object(
     po: &SpcProposalObject,
     network: &NetworkDefinition,
     spc_ctx: &SpcContext,
-    committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
 ) -> Result<(), SpcProposalObjectVerifyError> {
     verify_cert(&po.cert, po.view, network, spc_ctx, committee)
         .map_err(SpcProposalObjectVerifyError)
@@ -594,7 +599,7 @@ pub fn sign_empty_view_msg(
     let value_hash = hash_high_value(&reported.value);
     let target = skip_target(empty_view, reported.view, value_hash);
     let msg = pc_vote_signing_message(network, DOMAIN_PC_EMPTY_VIEW, spc_ctx, &target);
-    let sig = sk.sign_v1(&msg);
+    let sig = sig_from_bls(&sk.sign_v1(&msg));
     SpcEmptyViewMsg {
         view: empty_view,
         reported,
@@ -630,7 +635,7 @@ pub fn sign_empty_view_msg(
 pub fn build_indirect_cert(
     empty_view: SpcView,
     empty_view_msgs: &[SpcEmptyViewMsg],
-    committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
 ) -> Option<SpcCert> {
     if empty_view_msgs.is_empty() {
         return None;
@@ -661,12 +666,12 @@ pub fn build_indirect_cert(
             reported_view: m.reported.view,
             reported_value_hash: hash_high_value(&m.reported.value),
         };
-        indexed.push((pos, report, m.sig));
+        indexed.push((pos, report, bls_sig(&m.sig)));
     }
     indexed.sort_by_key(|(pos, _, _)| *pos);
     let reports: Vec<SkipReport> = indexed.iter().map(|(_, r, _)| r.clone()).collect();
     let sigs: Vec<Bls12381G2Signature> = indexed.iter().map(|(_, _, s)| *s).collect();
-    let skip_aggregate_sig = Bls12381G2Signature::aggregate(&sigs, true).ok()?;
+    let skip_aggregate_sig = agg_from_bls(&Bls12381G2Signature::aggregate(&sigs, true).ok()?);
 
     Some(SpcCert::Indirect {
         for_view,
@@ -693,7 +698,7 @@ pub struct SpcVerifyContext<'a> {
     /// Canonical SPC signing context every signer was bound to.
     pub spc_ctx: &'a SpcContext,
     /// Committee membership and pubkeys.
-    pub committee: &'a [(ValidatorId, Bls12381G1PublicKey)],
+    pub committee: &'a [(ValidatorId, ConsensusPublicKey)],
 }
 
 /// Failure modes of an empty-view attestation.
@@ -962,7 +967,7 @@ impl Verified<SpcCert> {
     pub fn from_skip_reports(
         empty_view: SpcView,
         empty_view_msgs: &[&Verified<SpcEmptyViewMsg>],
-        committee: &[(ValidatorId, Bls12381G1PublicKey)],
+        committee: &[(ValidatorId, ConsensusPublicKey)],
     ) -> Option<Self> {
         let raw: Vec<SpcEmptyViewMsg> = empty_view_msgs
             .iter()
@@ -1086,7 +1091,7 @@ mod tests {
         let qc2 = PcQc2::new(
             PcVector::empty(),
             signers.clone(),
-            Bls12381G2Signature([0x11; 96]),
+            AggregateSignature::new([0x11; 96]),
             PcXpProof::Full,
         );
         PcQc3::new(
@@ -1096,7 +1101,7 @@ mod tests {
             None,
             signers,
             PcSignerLengths::Uniform(0),
-            Bls12381G2Signature([0x33; 96]),
+            AggregateSignature::new([0x33; 96]),
         )
     }
 
@@ -1126,7 +1131,7 @@ mod tests {
             view: SpcView::new(5),
             reported: sample_high_triple(),
             signer: ValidatorId::new(2),
-            sig: Bls12381G2Signature([0x44; 96]),
+            sig: ConsensusSignature::new([0x44; 96]),
         };
         let bytes = basic_encode(&m).unwrap();
         let decoded: SpcEmptyViewMsg = basic_decode(&bytes).unwrap();
@@ -1166,7 +1171,7 @@ mod tests {
             target_value: sample_pc_vector(2),
             target_proof: sample_pc_qc3().into(),
             skip_reports: PositionalBundle::new(signers, reports),
-            skip_aggregate_sig: Bls12381G2Signature([0xCC; 96]),
+            skip_aggregate_sig: AggregateSignature::new([0xCC; 96]),
         };
         let bytes = basic_encode(&c).unwrap();
         let decoded: SpcCert = basic_decode(&bytes).unwrap();
@@ -1190,11 +1195,16 @@ mod tests {
 
     // ─── Verifier / builder tests ──────────────────────────────────────
 
-    use crate::{Epoch, generate_bls_keypair, spc_context};
+    use crate::{Epoch, generate_bls_keypair, pk_from_bls, spc_context};
 
-    fn committee(n: usize) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
+    fn committee(n: usize) -> Vec<(ValidatorId, ConsensusPublicKey)> {
         (0..n as u64)
-            .map(|i| (ValidatorId::new(i), generate_bls_keypair().public_key()))
+            .map(|i| {
+                (
+                    ValidatorId::new(i),
+                    pk_from_bls(&generate_bls_keypair().public_key()),
+                )
+            })
             .collect()
     }
 
@@ -1247,7 +1257,7 @@ mod tests {
             target_value: PcVector::empty(),
             target_proof: sample_pc_qc3().into(),
             skip_reports: PositionalBundle::empty(),
-            skip_aggregate_sig: generate_bls_keypair().sign_v1(b"unused"),
+            skip_aggregate_sig: agg_from_bls(&generate_bls_keypair().sign_v1(b"unused")),
         };
         assert!(verify_cert(&cert, SpcView::new(1), &net(), &ctx(), &c).is_err());
     }
@@ -1268,7 +1278,7 @@ mod tests {
             target_value: PcVector::empty(),
             target_proof: sample_pc_qc3().into(),
             skip_reports: PositionalBundle::new(signers, reports),
-            skip_aggregate_sig: generate_bls_keypair().sign_v1(b"unused"),
+            skip_aggregate_sig: agg_from_bls(&generate_bls_keypair().sign_v1(b"unused")),
         };
         assert!(verify_cert(&cert, SpcView::new(2), &net(), &ctx(), &c).is_err());
     }
@@ -1295,7 +1305,7 @@ mod tests {
                 proof: sample_pc_qc3().into(),
             },
             signer: ValidatorId::new(0),
-            sig: kp.sign_v1(b"unused"),
+            sig: sig_from_bls(&kp.sign_v1(b"unused")),
         };
         // Caller asks for empty_view = 3 but supplies a msg for view 2.
         assert!(build_indirect_cert(SpcView::new(3), std::slice::from_ref(&msg), &c).is_none());
@@ -1317,7 +1327,7 @@ mod tests {
                 proof: sample_pc_qc3().into(),
             },
             signer: ValidatorId::new(signer),
-            sig: sk.sign_v1(b"unused"),
+            sig: sig_from_bls(&sk.sign_v1(b"unused")),
         };
         let msgs = vec![mk(0, 2, &kp_a), mk(1, 4, &kp_b), mk(2, 3, &kp_c)];
         let cert = build_indirect_cert(SpcView::new(5), &msgs, &c).expect("build succeeds");

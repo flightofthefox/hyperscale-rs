@@ -823,7 +823,7 @@ mod tests {
     use super::*;
     use crate::{
         BlockHeight, CompletedRecovery, NetworkDefinition, RecoveryCause, ShardRecovery,
-        ValidatorSet,
+        ValidatorSet, pk_from_bls,
     };
 
     fn snapshot() -> Arc<TopologySnapshot> {
@@ -1179,7 +1179,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: generate_bls_keypair().public_key(),
+                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
             })
             .collect();
         let set = ValidatorSet::new(validators);
@@ -1223,7 +1223,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..12)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: generate_bls_keypair().public_key(),
+                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
             })
             .collect();
         let set = ValidatorSet::new(validators);
@@ -1273,7 +1273,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..8)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: generate_bls_keypair().public_key(),
+                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
             })
             .collect();
         let set = ValidatorSet::new(validators);
@@ -1401,7 +1401,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..12)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: generate_bls_keypair().public_key(),
+                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
             })
             .collect();
         let set = ValidatorSet::new(validators);

@@ -193,7 +193,8 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockManifest, BoundedVec,
         CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield, TransactionRoot,
-        ValidatorId, Verifiable, WeightedTimestamp, WitnessSources, test_utils, zero_bls_signature,
+        ValidatorId, Verifiable, WeightedTimestamp, WitnessSources, agg_from_bls, test_utils,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -481,7 +482,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(1000),
         );
         // SAFETY: synthetic test fixture, no real signature.

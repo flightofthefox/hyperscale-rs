@@ -94,6 +94,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::agg_from_bls;
 
     #[test]
     fn test_empty_response() {
@@ -165,7 +166,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         );
         let source_header = Arc::new(CertifiedBlockHeader::new(header, qc));

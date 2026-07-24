@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_network::ValidatorKeyMap;
-use hyperscale_types::{Bls12381G1PrivateKey, ValidatorId, generate_bls_keypair};
+use hyperscale_types::{Bls12381G1PrivateKey, ValidatorId, generate_bls_keypair, pk_from_bls};
 
 /// Budget for a transport connection / validator-bind handshake to complete
 /// over localhost QUIC.
@@ -26,6 +26,6 @@ pub fn test_bind_args(
     let bls_key = generate_bls_keypair();
     let pubkey = bls_key.public_key();
     let mut keys = ValidatorKeyMap::new();
-    keys.insert(validator_id, pubkey);
+    keys.insert(validator_id, pk_from_bls(&pubkey));
     (Arc::new(bls_key), Arc::new(keys))
 }

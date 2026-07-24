@@ -20,19 +20,19 @@ use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_core::{Action, FetchRequest};
 use hyperscale_types::{
-    BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig, BeaconProposal,
-    BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
-    BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CandidateBeaconBlock,
-    CandidateVerifyContext, CertificateRoot, CertifiedBeaconBlock,
-    CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader, Epoch, GenesisPool, GenesisValidator,
-    Hash, InFlightCount, LeafIndex, LocalReceiptRoot, LocalTimestamp, MIN_STAKE_FLOOR,
-    NetworkDefinition, PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
-    PcVoteVerifyContext, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness,
-    RatifyPhase, RatifyRound, RatifyVerifyContext, RatifyVote, Round, SKIP_TIMEOUT, ShardId,
-    ShardVoteEquivocation, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield,
-    SpcEmptyViewMsg, SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView, Stake,
-    StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    bls_keypair_from_seed, compute_merkle_root_with_proof, genesis_config_hash, pc_context,
+    AggregateSignature, BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig,
+    BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
+    BlockHeight, BlockVote, Bls12381G1PrivateKey, CandidateBeaconBlock, CandidateVerifyContext,
+    CertificateRoot, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader,
+    ConsensusPublicKey, Epoch, GenesisPool, GenesisValidator, Hash, InFlightCount, LeafIndex,
+    LocalReceiptRoot, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, PcValueElement, PcVector,
+    PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteVerifyContext, ProposerTimestamp,
+    ProvisionsRoot, QuorumCertificate, Randomness, RatifyPhase, RatifyRound, RatifyVerifyContext,
+    RatifyVote, Round, SKIP_TIMEOUT, ShardId, ShardVoteEquivocation, ShardWitness,
+    ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SpcEmptyViewMsg, SpcNewCommitMsg,
+    SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, bls_keypair_from_seed,
+    compute_merkle_root_with_proof, genesis_config_hash, pc_context, pk_from_bls,
     sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3, spc_context, vrf_sign,
     zero_bls_signature,
 };
@@ -122,7 +122,7 @@ enum SimEvent {
 /// actions between them.
 pub struct CoordinatorSim {
     pub coordinators: Vec<BeaconCoordinator>,
-    pub members: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    pub members: Vec<(ValidatorId, ConsensusPublicKey)>,
     sks: Vec<Bls12381G1PrivateKey>,
     network: NetworkDefinition,
     /// Per-replica committed (block, state) tuples, ordered by capture
@@ -209,7 +209,7 @@ impl CoordinatorSim {
             bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
             let sk = bls_keypair_from_seed(&bytes);
             let id = ValidatorId::new(i as u64);
-            members.push((id, sk.public_key()));
+            members.push((id, pk_from_bls(&sk.public_key())));
             sks.push(sk);
         }
 
@@ -469,7 +469,7 @@ impl CoordinatorSim {
             b.header().parent_block_hash(),
             Round::INITIAL,
             signers,
-            zero_bls_signature(),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(b_wt),
         );
         self.deliver_crossing_pair(shard, &b, b_height, forged_qc, &witnesses)
@@ -1559,7 +1559,7 @@ fn make_source_header_with_parent_qc(
         parent_hash,
         Round::INITIAL,
         SignerBitfield::new(4),
-        zero_bls_signature(),
+        AggregateSignature::ZERO,
         parent_wt,
     );
     Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
@@ -1589,7 +1589,7 @@ fn make_linked_source_header(
         BlockHash::ZERO,
         Round::INITIAL,
         SignerBitfield::new(4),
-        zero_bls_signature(),
+        AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(parent_wt),
     );
     make_source_header_with_parent_qc(

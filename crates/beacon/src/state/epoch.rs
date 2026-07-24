@@ -1242,7 +1242,6 @@ fn compose_merge_parent(
 
 #[cfg(test)]
 mod tests {
-
     use std::collections::BTreeMap;
 
     use hyperscale_types::test_utils::TestCommittee;
@@ -1254,7 +1253,7 @@ mod tests {
         ShardForkProof, ShardId, ShardRecovery, ShardWitness, ShardWitnessPayload,
         ShardWitnessProof, SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId,
         StateRoot, TransactionRoot, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
-        compute_merkle_root_with_proof, zero_bls_signature,
+        agg_from_bls, compute_merkle_root_with_proof, zero_bls_signature,
     };
 
     use super::*;
@@ -1298,7 +1297,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(pred_wt),
         );
         BlockHeader::new(
@@ -1437,7 +1436,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(wt),
         )
     }

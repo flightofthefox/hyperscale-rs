@@ -11,7 +11,7 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    Bls12381G1PublicKey, BoundedVec, ConsensusReceipt, ExecutionCertificate,
+    BoundedVec, ConsensusPublicKey, ConsensusReceipt, ExecutionCertificate,
     ExecutionCertificateContext, ExecutionCertificateVerifyError, ExecutionOutcome,
     GlobalReceiptHash, MAX_TXS_PER_BLOCK, NetworkDefinition, StoredReceipt, TransactionDecision,
     TxHash, TxOutcome, Verifiable, Verified, Verify, WaveCertificate, WaveId,
@@ -337,7 +337,7 @@ pub struct FinalizedWaveContext<'a> {
     /// Committee public keys for each EC, parallel to
     /// `wave.execution_certificates()`. Each inner slice is the
     /// committee for that EC's shard, in committee order.
-    pub ec_public_keys: &'a [Vec<Bls12381G1PublicKey>],
+    pub ec_public_keys: &'a [Vec<ConsensusPublicKey>],
 }
 
 /// Failure modes of [`FinalizedWave`] verification.
@@ -464,8 +464,9 @@ impl Verified<FinalizedWave> {
 mod tests {
     use super::*;
     use crate::{
-        BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature, ExecutionVote, Hash,
+        AggregateSignature, BlockHash, BlockHeight, Bls12381G1PrivateKey, ExecutionVote, Hash,
         ShardId, ValidatorId, WeightedTimestamp, compute_global_receipt_root, generate_bls_keypair,
+        pk_from_bls,
     };
 
     fn make_outcome(seed: u8) -> TxOutcome {
@@ -529,13 +530,13 @@ mod tests {
             (0..2).map(|_| generate_bls_keypair()).collect();
         let shard1_signers: Vec<Bls12381G1PrivateKey> =
             (0..2).map(|_| generate_bls_keypair()).collect();
-        let shard0_pks: Vec<Bls12381G1PublicKey> = shard0_signers
+        let shard0_pks: Vec<ConsensusPublicKey> = shard0_signers
             .iter()
-            .map(Bls12381G1PrivateKey::public_key)
+            .map(|sk| pk_from_bls(&sk.public_key()))
             .collect();
-        let shard1_pks: Vec<Bls12381G1PublicKey> = shard1_signers
+        let shard1_pks: Vec<ConsensusPublicKey> = shard1_signers
             .iter()
-            .map(Bls12381G1PrivateKey::public_key)
+            .map(|sk| pk_from_bls(&sk.public_key()))
             .collect();
 
         let local_outcomes = vec![make_outcome(1), make_outcome(2)];
@@ -572,13 +573,13 @@ mod tests {
             (0..2).map(|_| generate_bls_keypair()).collect();
         let shard1_signers: Vec<Bls12381G1PrivateKey> =
             (0..2).map(|_| generate_bls_keypair()).collect();
-        let shard0_pks: Vec<Bls12381G1PublicKey> = shard0_signers
+        let shard0_pks: Vec<ConsensusPublicKey> = shard0_signers
             .iter()
-            .map(Bls12381G1PrivateKey::public_key)
+            .map(|sk| pk_from_bls(&sk.public_key()))
             .collect();
-        let shard1_pks: Vec<Bls12381G1PublicKey> = shard1_signers
+        let shard1_pks: Vec<ConsensusPublicKey> = shard1_signers
             .iter()
-            .map(Bls12381G1PrivateKey::public_key)
+            .map(|sk| pk_from_bls(&sk.public_key()))
             .collect();
 
         let local_outcomes = vec![make_outcome(1)];
@@ -594,7 +595,7 @@ mod tests {
             remote_ec.vote_anchor_ts(),
             remote_ec.global_receipt_root(),
             remote_ec.tx_outcomes().clone(),
-            Bls12381G2Signature([0xFF; 96]),
+            AggregateSignature::new([0xFF; 96]),
             remote_ec.signers().clone(),
         );
 
@@ -651,7 +652,7 @@ mod tests {
         let wave = FinalizedWave::new(wc, vec![]);
 
         // Supply two public-key vectors for a single-EC wave.
-        let ec_pks: Vec<Vec<Bls12381G1PublicKey>> = vec![vec![], vec![]];
+        let ec_pks: Vec<Vec<ConsensusPublicKey>> = vec![vec![], vec![]];
         let ctx = FinalizedWaveContext {
             network: &net,
             ec_public_keys: &ec_pks,

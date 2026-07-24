@@ -424,13 +424,13 @@ mod tests {
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
-        Bls12381G2Signature, BoundedVec, CertificateRoot, ChainOrigin, ConsensusReceipt,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
+        BlockHeader, BoundedVec, CertificateRoot, ChainOrigin, ConsensusReceipt,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
         TxOutcome, ValidatorId, Verifiable, WaveCertificate, WaveId, WeightedTimestamp,
-        WitnessSources, zero_bls_signature,
+        WitnessSources,
     };
 
     use super::*;
@@ -503,7 +503,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(0),
-            zero_bls_signature(),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         )
     }
@@ -536,7 +536,7 @@ mod tests {
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
             vec![outcome],
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         );
         let receipt = StoredReceipt {
@@ -615,7 +615,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(0),
-            zero_bls_signature(),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
         let _ = CertifiedBlock::new_unchecked(block, qc);
@@ -637,7 +637,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(0),
-            zero_bls_signature(),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -729,7 +729,7 @@ mod tests {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
             )],
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         );
         let receipt = StoredReceipt {

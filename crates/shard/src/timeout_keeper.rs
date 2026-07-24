@@ -107,7 +107,7 @@ impl TimeoutKeeper {
 mod tests {
     use hyperscale_types::{
         BlockHash, BlockHeight, NetworkDefinition, ShardId, SignerBitfield, Timeout,
-        WeightedTimestamp, generate_bls_keypair, zero_bls_signature,
+        WeightedTimestamp, agg_from_bls, generate_bls_keypair, zero_bls_signature,
     };
 
     use super::*;
@@ -122,7 +122,7 @@ mod tests {
             BlockHash::ZERO,
             Round::new(round),
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         )
     }

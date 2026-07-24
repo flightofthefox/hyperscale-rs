@@ -11,7 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hyperscale_network::Topic;
 use hyperscale_network::compression::compress;
 use hyperscale_types::network::gossip::{MAX_ANNOUNCED_ADDRESSES, ValidatorAddressGossip};
-use hyperscale_types::{NetworkDefinition, NetworkMessage, validator_address_message};
+use hyperscale_types::{
+    NetworkDefinition, NetworkMessage, sig_from_bls, validator_address_message,
+};
 use libp2p::gossipsub::{IdentTopic, PublishError};
 use libp2p::{Multiaddr, Swarm};
 use sbor::basic_encode;
@@ -69,7 +71,7 @@ pub(super) fn announce_validator_addresses(
             peer_id: peer_bytes.clone(),
             addresses: address_bytes.clone(),
             sequence,
-            signature,
+            signature: sig_from_bls(&signature),
         };
         let data = match basic_encode(&gossip) {
             Ok(bytes) => compress(&bytes),

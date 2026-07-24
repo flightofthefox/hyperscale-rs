@@ -25,8 +25,8 @@ use std::collections::HashMap;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature,
-    Round, ShardId, ShardVoteEquivocation, TopologySnapshot, ValidatorId, Verified,
+    BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G2Signature, ConsensusPublicKey, Round,
+    ShardId, ShardVoteEquivocation, TopologySnapshot, ValidatorId, Verified, bls_sig, sig_from_bls,
 };
 use tracing::{info, trace, warn};
 
@@ -67,7 +67,7 @@ const MAX_VOTE_HEIGHT_LOOKAHEAD: u64 = 256;
 /// Shared per-vote lookup result from [`VoteKeeper::preflight`].
 struct VotePreflight {
     voter_index: usize,
-    public_key: Bls12381G1PublicKey,
+    public_key: ConsensusPublicKey,
 }
 
 /// Top-level vote accounting state.
@@ -427,7 +427,7 @@ impl VoteKeeper {
             block_hash,
             parent_block_hash,
             round: vote.round(),
-            signature: vote.signature(),
+            signature: bls_sig(&vote.signature()),
         };
         match self.record_received_vote(vote.height(), vote.voter(), incoming) {
             RecordResult::Accepted | RecordResult::Duplicate => None,
@@ -448,7 +448,7 @@ impl VoteKeeper {
                     round: vote.round(),
                     block_hash_a: existing.block_hash,
                     parent_block_hash_a: parent_a,
-                    sig_a: existing.signature,
+                    sig_a: sig_from_bls(&existing.signature),
                     block_hash_b: block_hash,
                     parent_block_hash_b: parent_b,
                     sig_b: vote.signature(),
@@ -570,7 +570,8 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, CertificateRoot,
         ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
         ProvisionsRoot, QuorumCertificate, ShardId, StateRoot, TransactionRoot, ValidatorId,
-        ValidatorInfo, ValidatorSet, generate_bls_keypair, verify_shard_vote_equivocation,
+        ValidatorInfo, ValidatorSet, generate_bls_keypair, pk_from_bls,
+        verify_shard_vote_equivocation,
     };
 
     use super::*;
@@ -788,7 +789,10 @@ mod tests {
         assert_eq!(ev.shard, shard);
         assert_eq!(ev.block_hash_a, ba);
         assert_eq!(ev.block_hash_b, bb);
-        assert_eq!(verify_shard_vote_equivocation(&ev, &net, &pk), Ok(()));
+        assert_eq!(
+            verify_shard_vote_equivocation(&ev, &net, &pk_from_bls(&pk)),
+            Ok(())
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -802,7 +806,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(u64::try_from(i).unwrap_or(u64::MAX)),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let topo = TopologySnapshot::new(

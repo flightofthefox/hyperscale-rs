@@ -26,10 +26,10 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeader, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature,
-    CertifiedBlockHeader, NetworkDefinition, QcContext, QcVerifyError, QuorumCertificate, Round,
+    BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ConsensusPublicKey,
+    ConsensusSignature, NetworkDefinition, QcContext, QcVerifyError, QuorumCertificate, Round,
     ShardId, TopologySchedule, ValidatorId, Verified, Verify, VoteCount, block_vote_message,
-    verify_bls12381_v1,
+    bls_pk, bls_sig, verify_bls12381_v1,
 };
 
 /// Cap on a [`CommitProof`]'s ancestry-link length.
@@ -64,13 +64,13 @@ pub struct ShardVoteEquivocation {
     /// First side's parent hash, bound into the signing message.
     pub parent_block_hash_a: BlockHash,
     /// First side's BLS signature over `block_vote_message` for side A.
-    pub sig_a: Bls12381G2Signature,
+    pub sig_a: ConsensusSignature,
     /// Second side's voted block (must differ from `block_hash_a`).
     pub block_hash_b: BlockHash,
     /// Second side's parent hash, bound into the signing message.
     pub parent_block_hash_b: BlockHash,
     /// Second side's BLS signature over `block_vote_message` for side B.
-    pub sig_b: Bls12381G2Signature,
+    pub sig_b: ConsensusSignature,
 }
 
 /// Failure modes of shard vote-equivocation evidence.
@@ -102,7 +102,7 @@ pub enum ShardVoteEquivocationVerifyError {
 pub fn verify_shard_vote_equivocation(
     ev: &ShardVoteEquivocation,
     network: &NetworkDefinition,
-    pubkey: &Bls12381G1PublicKey,
+    pubkey: &ConsensusPublicKey,
 ) -> Result<(), ShardVoteEquivocationVerifyError> {
     if ev.block_hash_a == ev.block_hash_b {
         return Err(ShardVoteEquivocationVerifyError::BlocksEqual);
@@ -123,8 +123,9 @@ pub fn verify_shard_vote_equivocation(
         &ev.block_hash_b,
         &ev.parent_block_hash_b,
     );
-    if verify_bls12381_v1(&msg_a, pubkey, &ev.sig_a)
-        && verify_bls12381_v1(&msg_b, pubkey, &ev.sig_b)
+    let pk = bls_pk(pubkey);
+    if verify_bls12381_v1(&msg_a, &pk, &bls_sig(&ev.sig_a))
+        && verify_bls12381_v1(&msg_b, &pk, &bls_sig(&ev.sig_b))
     {
         Ok(())
     } else {
@@ -139,7 +140,7 @@ pub struct ShardVoteEquivocationContext<'a> {
     /// Network the votes were bound to.
     pub network: &'a NetworkDefinition,
     /// The accused validator's registered pubkey.
-    pub pubkey: &'a Bls12381G1PublicKey,
+    pub pubkey: &'a ConsensusPublicKey,
 }
 
 impl Verify<&ShardVoteEquivocationContext<'_>> for ShardVoteEquivocation {
@@ -178,7 +179,7 @@ impl Verify<&ShardVoteEquivocationContext<'_>> for Box<ShardVoteEquivocation> {
 pub struct ResolvedCommittee {
     /// Committee public keys, positionally aligned to the QC's signer
     /// bitfield.
-    pub public_keys: Vec<Bls12381G1PublicKey>,
+    pub public_keys: Vec<ConsensusPublicKey>,
     /// Quorum threshold for the shard at the QC's window.
     pub quorum_threshold: VoteCount,
 }
@@ -548,7 +549,7 @@ mod tests {
     use radix_common::crypto::Bls12381G1PrivateKey;
 
     use super::*;
-    use crate::{BlockVote, Hash, ProposerTimestamp, generate_bls_keypair};
+    use crate::{BlockVote, Hash, ProposerTimestamp, generate_bls_keypair, pk_from_bls};
 
     /// Sign a real block vote and return `(block_hash, parent_hash, sig)`
     /// so tests assemble evidence from genuine signatures.
@@ -560,7 +561,7 @@ mod tests {
         round: Round,
         block_hash: BlockHash,
         parent_block_hash: BlockHash,
-    ) -> (BlockHash, BlockHash, Bls12381G2Signature) {
+    ) -> (BlockHash, BlockHash, ConsensusSignature) {
         let vote = BlockVote::new(
             network,
             block_hash,
@@ -616,7 +617,10 @@ mod tests {
             parent_block_hash_b: pb,
             sig_b: sb,
         };
-        assert_eq!(verify_shard_vote_equivocation(&ev, &net, &pk), Ok(()));
+        assert_eq!(
+            verify_shard_vote_equivocation(&ev, &net, &pk_from_bls(&pk)),
+            Ok(())
+        );
     }
 
     /// Same block on both sides is a duplicate, not a contradiction —
@@ -649,7 +653,7 @@ mod tests {
             sig_b: sa,
         };
         assert_eq!(
-            verify_shard_vote_equivocation(&ev, &net, &pk),
+            verify_shard_vote_equivocation(&ev, &net, &pk_from_bls(&pk)),
             Err(ShardVoteEquivocationVerifyError::BlocksEqual)
         );
     }
@@ -696,7 +700,7 @@ mod tests {
             sig_b: sb,
         };
         assert_eq!(
-            verify_shard_vote_equivocation(&ev, &net, &pk),
+            verify_shard_vote_equivocation(&ev, &net, &pk_from_bls(&pk)),
             Err(ShardVoteEquivocationVerifyError::BadSignature)
         );
     }
@@ -712,10 +716,10 @@ mod tests {
             round: Round::INITIAL,
             block_hash_a: hash(b"block-a"),
             parent_block_hash_a: hash(b"parent-a"),
-            sig_a: Bls12381G2Signature([1u8; 96]),
+            sig_a: ConsensusSignature::new([1u8; 96]),
             block_hash_b: hash(b"block-b"),
             parent_block_hash_b: hash(b"parent-b"),
-            sig_b: Bls12381G2Signature([2u8; 96]),
+            sig_b: ConsensusSignature::new([2u8; 96]),
         };
         let bytes = basic_encode(&ev).unwrap();
         let decoded: ShardVoteEquivocation = basic_decode(&bytes).unwrap();

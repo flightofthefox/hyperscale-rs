@@ -19,11 +19,11 @@
 //! verifier looks up the proposer's key directly, while sender-attested
 //! messages first check that the sender is in the relevant shard committee.
 //! That policy belongs at the handler, so [`SignedContext`] takes a
-//! pre-resolved [`Bls12381G1PublicKey`] and the trait stays out of topology.
+//! pre-resolved [`ConsensusPublicKey`] and the trait stays out of topology.
 
 use crate::{
-    Bls12381G1PublicKey, Bls12381G2Signature, NetworkDefinition, ValidatorId, Verified, Verify,
-    verify_bls12381_v1,
+    ConsensusPublicKey, ConsensusSignature, NetworkDefinition, ValidatorId, Verified, Verify,
+    bls_pk, bls_sig, verify_bls12381_v1,
 };
 
 /// A wire message that carries its own signer identity, BLS signature, and
@@ -37,7 +37,7 @@ pub trait Signed {
     fn signer(&self) -> ValidatorId;
 
     /// BLS signature carried on the message.
-    fn signature(&self) -> &Bls12381G2Signature;
+    fn signature(&self) -> &ConsensusSignature;
 
     /// Domain-separated bytes the signature is over. Reconstructed at
     /// verify time from the payload's own fields.
@@ -54,7 +54,7 @@ pub trait Signed {
     /// signature does not validate.
     fn verify_signature(&self, ctx: &SignedContext<'_>) -> Result<(), SignedVerifyError> {
         let msg = self.signing_message(ctx.network);
-        if verify_bls12381_v1(&msg, ctx.public_key, self.signature()) {
+        if verify_bls12381_v1(&msg, &bls_pk(ctx.public_key), &bls_sig(self.signature())) {
             Ok(())
         } else {
             Err(SignedVerifyError::InvalidSignature)
@@ -70,7 +70,7 @@ pub struct SignedContext<'a> {
     /// cross-network replay protection.
     pub network: &'a NetworkDefinition,
     /// Pre-resolved BLS public key of the claimed signer.
-    pub public_key: &'a Bls12381G1PublicKey,
+    pub public_key: &'a ConsensusPublicKey,
 }
 
 /// Failure modes for [`Signed`] verification.

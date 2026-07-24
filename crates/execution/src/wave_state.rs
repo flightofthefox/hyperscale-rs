@@ -911,7 +911,7 @@ impl WaveState {
 mod tests {
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
     use hyperscale_types::{
-        Bls12381G2Signature, BoundedVec, ConsensusReceipt, GlobalReceiptHash, Hash, SignerBitfield,
+        AggregateSignature, BoundedVec, ConsensusReceipt, GlobalReceiptHash, Hash, SignerBitfield,
         SubstateEntry,
     };
 
@@ -1034,7 +1034,7 @@ mod tests {
             WeightedTimestamp::from_millis(wave_id.block_height().inner() + 1),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"global_receipt_root")),
             outcomes,
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         )))
     }
@@ -1288,7 +1288,7 @@ mod tests {
             WeightedTimestamp::from_millis(WAVE_START.inner() + 1),
             divergent_root,
             outcomes,
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         )));
 
@@ -1313,7 +1313,7 @@ mod tests {
             WeightedTimestamp::from_millis(WAVE_START.inner() + 1),
             local_root,
             outcomes,
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         )));
         w.add_execution_certificate(ec_local);
@@ -1339,7 +1339,7 @@ mod tests {
             WeightedTimestamp::from_millis(WAVE_START.inner() + 1),
             ec_root,
             vec![TxOutcome::new(h0, executed(true))],
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         )));
         w.add_execution_certificate(ec_local);
@@ -1458,7 +1458,7 @@ mod tests {
             WeightedTimestamp::from_millis(w.wave_id().block_height().inner() + 1),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"gr")),
             std::mem::take(&mut outcomes),
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         )));
         w.add_execution_certificate(ec_remote);

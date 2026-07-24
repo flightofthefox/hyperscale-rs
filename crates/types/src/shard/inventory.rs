@@ -442,7 +442,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, BloomFilter, BoundedVec,
         CertificateRoot, ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
         ProvisionsRoot, Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, ValidatorId,
-        WeightedTimestamp, zero_bls_signature,
+        WeightedTimestamp, agg_from_bls, zero_bls_signature,
     };
 
     fn create_test_block() -> Block {
@@ -487,7 +487,7 @@ mod tests {
             block.header().parent_block_hash(),
             block.header().round(),
             SignerBitfield::new(0),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         )
     }

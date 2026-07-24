@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sbor::prelude::BasicSbor;
 
 use crate::{
-    Bls12381G2Signature, DOMAIN_SPC_NEW_COMMIT, Epoch, MessageClass, NetworkDefinition,
+    ConsensusSignature, DOMAIN_SPC_NEW_COMMIT, Epoch, MessageClass, NetworkDefinition,
     NetworkMessage, Signed, SpcNewCommitMsg, ValidatorId, Verifiable, spc_relay_signing_message,
 };
 
@@ -30,7 +30,7 @@ pub struct SpcNewCommitNotification {
     pub sender: ValidatorId,
     /// BLS signature over `spc_relay_signing_message(network,
     /// DOMAIN_SPC_NEW_COMMIT, epoch, msg.view, msg.hash())`.
-    pub sender_signature: Bls12381G2Signature,
+    pub sender_signature: ConsensusSignature,
     /// The committed new-commit message.
     pub msg: Arc<Verifiable<SpcNewCommitMsg>>,
 }
@@ -44,7 +44,7 @@ impl SpcNewCommitNotification {
     pub fn new(
         epoch: Epoch,
         sender: ValidatorId,
-        sender_signature: Bls12381G2Signature,
+        sender_signature: ConsensusSignature,
         msg: impl Into<Arc<Verifiable<SpcNewCommitMsg>>>,
     ) -> Self {
         Self {
@@ -75,7 +75,7 @@ impl Signed for SpcNewCommitNotification {
         self.sender
     }
 
-    fn signature(&self) -> &Bls12381G2Signature {
+    fn signature(&self) -> &ConsensusSignature {
         &self.sender_signature
     }
 
@@ -106,7 +106,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bls12381G2Signature, Epoch, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof,
+        AggregateSignature, Epoch, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof,
         SignerBitfield, SpcView, ValidatorId,
     };
 
@@ -116,7 +116,7 @@ mod tests {
         let qc2 = PcQc2::new(
             PcVector::empty(),
             signers,
-            Bls12381G2Signature([0x11; 96]),
+            AggregateSignature::new([0x11; 96]),
             PcXpProof::Full,
         );
         PcQc3::new(
@@ -126,7 +126,7 @@ mod tests {
             None,
             SignerBitfield::new(4),
             PcSignerLengths::Uniform(0),
-            Bls12381G2Signature([0x33; 96]),
+            AggregateSignature::new([0x33; 96]),
         )
     }
 
@@ -143,7 +143,7 @@ mod tests {
         let n = SpcNewCommitNotification::new(
             Epoch::new(7),
             ValidatorId::new(3),
-            Bls12381G2Signature([0x55; 96]),
+            ConsensusSignature::new([0x55; 96]),
             Arc::new(Verifiable::from(sample_msg())),
         );
         let bytes = basic_encode(&n).unwrap();

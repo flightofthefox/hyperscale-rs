@@ -3,7 +3,7 @@
 use sbor::prelude::BasicSbor;
 
 use crate::{
-    Bls12381G2Signature, ExecutionCertificate, MessageClass, NetworkDefinition, NetworkMessage,
+    ConsensusSignature, ExecutionCertificate, MessageClass, NetworkDefinition, NetworkMessage,
     ShardId, Signed, ValidatorId, exec_cert_batch_message,
 };
 
@@ -19,7 +19,7 @@ pub struct ExecutionCertificatesNotification {
     /// The validator who sent this batch.
     pub sender: ValidatorId,
     /// BLS signature over the domain-separated signing message, by the sender.
-    pub sender_signature: Bls12381G2Signature,
+    pub sender_signature: ConsensusSignature,
 }
 
 impl ExecutionCertificatesNotification {
@@ -28,7 +28,7 @@ impl ExecutionCertificatesNotification {
     pub const fn new(
         certificates: Vec<ExecutionCertificate>,
         sender: ValidatorId,
-        sender_signature: Bls12381G2Signature,
+        sender_signature: ConsensusSignature,
     ) -> Self {
         Self {
             certificates,
@@ -67,7 +67,7 @@ impl Signed for ExecutionCertificatesNotification {
         self.sender
     }
 
-    fn signature(&self) -> &Bls12381G2Signature {
+    fn signature(&self) -> &ConsensusSignature {
         &self.sender_signature
     }
 

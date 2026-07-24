@@ -17,10 +17,11 @@ use std::time::Duration;
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use hyperscale_types::{
-    AwaitingTopologyBuffer, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, CommitProof, CompletedRecovery, Epoch, ForkFence, HeaderFetchCount,
-    InFlightCount, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, ScheduleLookup, ShardForkProof,
-    ShardId, TopologySchedule, TopologySnapshot, ValidatorId, Verified, WeightedTimestamp,
+    AwaitingTopologyBuffer, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
+    CertifiedHeaderVerifyError, CommitProof, CompletedRecovery, ConsensusPublicKey, Epoch,
+    ForkFence, HeaderFetchCount, InFlightCount, REMOTE_HEADER_RETENTION, RETENTION_HORIZON,
+    ScheduleLookup, ShardForkProof, ShardId, TopologySchedule, TopologySnapshot, ValidatorId,
+    Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -1503,7 +1504,7 @@ impl RemoteHeaderCoordinator {
         certified_header: Arc<CertifiedBlockHeader>,
     ) -> Vec<Action> {
         let committee = topology_snapshot.consensus_committee_for_shard(shard);
-        let committee_public_keys: Vec<Bls12381G1PublicKey> = committee
+        let committee_public_keys: Vec<ConsensusPublicKey> = committee
             .iter()
             .map(|v| {
                 topology_snapshot
@@ -1557,8 +1558,8 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, CertificateRoot,
         ChainOrigin, Epoch, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield,
-        StateRoot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
-        bls_keypair_from_seed, zero_bls_signature,
+        StateRoot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, agg_from_bls,
+        bls_keypair_from_seed, pk_from_bls, zero_bls_signature,
     };
 
     use super::*;
@@ -1609,7 +1610,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         );
 
@@ -1645,7 +1646,7 @@ mod tests {
                 seed[8] = variant;
                 ValidatorInfo {
                     validator_id: ValidatorId::new(id),
-                    public_key: bls_keypair_from_seed(&seed).public_key(),
+                    public_key: pk_from_bls(&bls_keypair_from_seed(&seed).public_key()),
                 }
             })
             .collect();
@@ -1671,7 +1672,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(parent_qc_wt),
         );
         let header = BlockHeader::new(
@@ -1704,13 +1705,13 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(parent_qc_wt),
         );
         Arc::new(CertifiedBlockHeader::new(header, qc))
     }
 
-    fn verify_qc_keys(actions: &[Action]) -> Option<&Vec<Bls12381G1PublicKey>> {
+    fn verify_qc_keys(actions: &[Action]) -> Option<&Vec<ConsensusPublicKey>> {
         actions.iter().find_map(|a| match a {
             Action::VerifyRemoteHeaderQc {
                 committee_public_keys,
@@ -1731,7 +1732,7 @@ mod tests {
 
         let snap_a = shard_snapshot(2, &ids, 0);
         let snap_b = shard_snapshot(2, &ids, 1);
-        let expected_b: Vec<Bls12381G1PublicKey> = snap_b
+        let expected_b: Vec<ConsensusPublicKey> = snap_b
             .committee_for_shard(remote)
             .iter()
             .map(|v| snap_b.public_key(*v).unwrap())
@@ -2022,7 +2023,7 @@ mod tests {
             BlockHash::ZERO,
             Round::new(round.saturating_sub(1)),
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(height * 1_000),
         );
         let header = BlockHeader::new(
@@ -2055,7 +2056,7 @@ mod tests {
             parent_hash,
             Round::new(round),
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(height * 1_000),
         );
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(

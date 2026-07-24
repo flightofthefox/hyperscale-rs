@@ -68,7 +68,7 @@ impl BeaconCert {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BeaconBlockHash, Bls12381G2Signature, Epoch, Hash, RatifyRound, SignerBitfield};
+    use crate::{AggregateSignature, BeaconBlockHash, Epoch, Hash, RatifyRound, SignerBitfield};
 
     fn sample_ratify_cert() -> RatifyCert {
         let mut signers = SignerBitfield::new(4);
@@ -81,7 +81,7 @@ mod tests {
             RatifyRound::INITIAL,
             BeaconBlockHash::from_raw(Hash::from_bytes(b"block")),
             signers,
-            Bls12381G2Signature([0x22; 96]),
+            AggregateSignature::new([0x22; 96]),
         )
     }
 

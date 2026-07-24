@@ -8,9 +8,9 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, Epoch, MIN_BEACON_COMMITTEE_SIZE, PcQc1, PcQc2,
-    PcQc3, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, SpcView,
-    ValidatorId, Verified, byzantine_threshold,
+    ConsensusPublicKey, ConsensusSignature, Epoch, MIN_BEACON_COMMITTEE_SIZE, PcQc1, PcQc2, PcQc3,
+    PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, SpcView, ValidatorId,
+    Verified, byzantine_threshold,
 };
 
 /// What `PcInstance::handle` tells its parent.
@@ -82,7 +82,7 @@ pub enum PcEvent {
 pub struct PcInstance {
     epoch: Epoch,
     view: SpcView,
-    committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    committee: Vec<(ValidatorId, ConsensusPublicKey)>,
 
     vote1_pool: BTreeMap<ValidatorId, Verified<PcVote1>>,
     vote2_pool: BTreeMap<ValidatorId, Verified<PcVote2>>,
@@ -111,7 +111,7 @@ impl PcInstance {
     pub fn new(
         epoch: Epoch,
         view: SpcView,
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     ) -> Self {
         assert!(
             committee.len() >= MIN_BEACON_COMMITTEE_SIZE,
@@ -311,9 +311,9 @@ impl PcInstance {
         equivocator: ValidatorId,
         round: PcVoteRound,
         value_a: PcVector,
-        sig_a: Bls12381G2Signature,
+        sig_a: ConsensusSignature,
         value_b: PcVector,
-        sig_b: Bls12381G2Signature,
+        sig_b: ConsensusSignature,
     ) -> PcVoteEquivocation {
         PcVoteEquivocation {
             validator: equivocator,
@@ -331,13 +331,13 @@ impl PcInstance {
 /// Pull the round-1 vote's "primary" sig — the sig over the full
 /// `v_in` vector, sitting at `prefix_sigs[v_in.len()]`. This is the
 /// sig the slim wire form carries.
-fn prefix_top_sig(v: &PcVote1) -> Bls12381G2Signature {
+fn prefix_top_sig(v: &PcVote1) -> ConsensusSignature {
     v.prefix_sigs()[v.v_in().len()]
 }
 
 /// Pull the round-2 vote's "primary" sig — the sig over the full
 /// `x` vector at `prefix_sigs[x.len()]`.
-fn vote2_top_sig(v: &PcVote2) -> Bls12381G2Signature {
+fn vote2_top_sig(v: &PcVote2) -> ConsensusSignature {
     v.prefix_sigs()[v.x().len()]
 }
 
@@ -347,7 +347,8 @@ mod tests {
 
     use hyperscale_types::{
         Bls12381G1PrivateKey, Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement,
-        PcVector, PcVoteRound, SpcView, bls_keypair_from_seed, pc_context, spc_context,
+        PcVector, PcVoteRound, SpcView, bls_keypair_from_seed, pc_context, pk_from_bls,
+        spc_context,
     };
 
     use super::*;
@@ -364,7 +365,7 @@ mod tests {
         n: usize,
     ) -> (
         Vec<Arc<Bls12381G1PrivateKey>>,
-        Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        Vec<(ValidatorId, ConsensusPublicKey)>,
     ) {
         let mut sks = Vec::with_capacity(n);
         let mut members = Vec::with_capacity(n);
@@ -372,7 +373,7 @@ mod tests {
             let mut seed = [0u8; 32];
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
             let sk = bls_keypair_from_seed(&seed);
-            let pk = sk.public_key();
+            let pk = pk_from_bls(&sk.public_key());
             members.push((ValidatorId::new(i as u64), pk));
             sks.push(Arc::new(sk));
         }

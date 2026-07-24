@@ -10,8 +10,8 @@
 //! [`VoteSet::add_verified_vote`] since we just signed them.
 
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Round, Verified,
-    VoteCount, WeightedTimestamp,
+    BlockHash, BlockHeader, BlockHeight, BlockVote, ConsensusPublicKey, Round, Verified, VoteCount,
+    WeightedTimestamp,
 };
 
 /// Votes for a specific block.
@@ -58,7 +58,7 @@ pub struct VoteSet {
     // ═══════════════════════════════════════════════════════════════════════
     /// Unverified votes buffered for batch verification.
     /// Each tuple is (`committee_index`, vote, `public_key`).
-    unverified_votes: Vec<(usize, BlockVote, Bls12381G1PublicKey)>,
+    unverified_votes: Vec<(usize, BlockVote, ConsensusPublicKey)>,
 
     /// Number of unverified votes buffered.
     unverified_power: VoteCount,
@@ -148,7 +148,7 @@ impl VoteSet {
         &mut self,
         committee_index: usize,
         vote: BlockVote,
-        public_key: Bls12381G1PublicKey,
+        public_key: ConsensusPublicKey,
     ) -> bool {
         // Reject malformed index: with no dedup slot we couldn't track the
         // vote, so a Byzantine sender could buffer arbitrarily many copies.
@@ -201,7 +201,7 @@ impl VoteSet {
     ///
     /// Returns the votes and marks the vote set as pending verification.
     /// Each tuple is (`committee_index`, vote, `public_key`).
-    pub fn take_unverified_votes(&mut self) -> Vec<(usize, BlockVote, Bls12381G1PublicKey)> {
+    pub fn take_unverified_votes(&mut self) -> Vec<(usize, BlockVote, ConsensusPublicKey)> {
         self.pending_verification = true;
         self.unverified_power = VoteCount::ZERO;
         // Reopen the buffered slots: these votes are now in the batch, and only
@@ -326,7 +326,9 @@ impl VoteSet {
 
 #[cfg(test)]
 mod test_helpers {
-    use hyperscale_types::{Bls12381G2Signature, QuorumCertificate, ShardId, SignerBitfield};
+    use hyperscale_types::{
+        Bls12381G2Signature, QuorumCertificate, ShardId, SignerBitfield, agg_from_bls, bls_sig,
+    };
 
     use super::*;
 
@@ -374,11 +376,13 @@ mod test_helpers {
             let signatures: Vec<Bls12381G2Signature> = self
                 .verified_votes
                 .iter()
-                .map(|(_, v)| v.signature())
+                .map(|(_, v)| bls_sig(&v.signature()))
                 .collect();
 
-            let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true)
-                .map_err(|e| format!("failed to aggregate signatures: {e:?}"))?;
+            let aggregated_signature = agg_from_bls(
+                &Bls12381G2Signature::aggregate(&signatures, true)
+                    .map_err(|e| format!("failed to aggregate signatures: {e:?}"))?,
+            );
 
             // Mean of the clamped vote timestamps — every vote weighs one.
             let weighted_timestamp_ms = if self.verified_power == VoteCount::ZERO {
@@ -421,7 +425,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, CertificateRoot,
         ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
         ProvisionsRoot, QuorumCertificate, ShardId, StateRoot, TransactionRoot, ValidatorId,
-        generate_bls_keypair,
+        generate_bls_keypair, pk_from_bls,
     };
 
     use super::*;
@@ -485,21 +489,21 @@ mod tests {
         // Buffer first vote
         let vote0 = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
         let pk0 = keys[0].public_key();
-        assert!(vote_set.buffer_unverified_vote(0, vote0, pk0));
+        assert!(vote_set.buffer_unverified_vote(0, vote0, pk_from_bls(&pk0)));
         assert_eq!(vote_set.unverified_power(), VoteCount::new(1));
         assert_eq!(vote_set.verified_power(), VoteCount::ZERO);
 
         // Buffer duplicate (should fail)
         let vote0_dup = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
         let pk0_dup = keys[0].public_key();
-        assert!(!vote_set.buffer_unverified_vote(0, vote0_dup, pk0_dup));
+        assert!(!vote_set.buffer_unverified_vote(0, vote0_dup, pk_from_bls(&pk0_dup)));
         assert_eq!(vote_set.unverified_power(), VoteCount::new(1));
 
         // Buffer more votes
         let vote1 = make_vote(&keys, 1, block_hash, BlockHeight::new(1));
         let vote2 = make_vote(&keys, 2, block_hash, BlockHeight::new(1));
-        assert!(vote_set.buffer_unverified_vote(1, vote1, keys[1].public_key()));
-        assert!(vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key()));
+        assert!(vote_set.buffer_unverified_vote(1, vote1, pk_from_bls(&keys[1].public_key())));
+        assert!(vote_set.buffer_unverified_vote(2, vote2, pk_from_bls(&keys[2].public_key())));
         assert_eq!(vote_set.unverified_power(), VoteCount::new(3));
     }
 
@@ -514,17 +518,17 @@ mod tests {
 
         // Not enough votes yet
         let vote0 = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
-        vote_set.buffer_unverified_vote(0, vote0, keys[0].public_key());
+        vote_set.buffer_unverified_vote(0, vote0, pk_from_bls(&keys[0].public_key()));
         assert!(!vote_set.should_trigger_verification(total_power));
 
         // Still not enough
         let vote1 = make_vote(&keys, 1, block_hash, BlockHeight::new(1));
-        vote_set.buffer_unverified_vote(1, vote1, keys[1].public_key());
+        vote_set.buffer_unverified_vote(1, vote1, pk_from_bls(&keys[1].public_key()));
         assert!(!vote_set.should_trigger_verification(total_power));
 
         // Now we have quorum potential (3/4 > 2/3)
         let vote2 = make_vote(&keys, 2, block_hash, BlockHeight::new(1));
-        vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key());
+        vote_set.buffer_unverified_vote(2, vote2, pk_from_bls(&keys[2].public_key()));
         assert!(vote_set.should_trigger_verification(total_power));
     }
 
@@ -567,7 +571,7 @@ mod tests {
 
         // Attacker buffers a (would-be-forged) vote attributed to validator 0.
         let forged = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
-        assert!(vote_set.buffer_unverified_vote(0, forged, keys[0].public_key(),));
+        assert!(vote_set.buffer_unverified_vote(0, forged, pk_from_bls(&keys[0].public_key()),));
         // Buffering alone does not count the voter as verified.
         assert!(!vote_set.has_seen_validator(0));
 
@@ -577,7 +581,7 @@ mod tests {
 
         // Validator 0's genuine vote is not blocked by the failed forgery.
         let genuine = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
-        assert!(vote_set.buffer_unverified_vote(0, genuine, keys[0].public_key(),));
+        assert!(vote_set.buffer_unverified_vote(0, genuine, pk_from_bls(&keys[0].public_key()),));
     }
 
     #[test]

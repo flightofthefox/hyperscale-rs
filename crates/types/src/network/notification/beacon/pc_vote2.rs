@@ -64,8 +64,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bls12381G2Signature, PcCompactVote, PcQc1, PcVector, PositionalBundle, SignerBitfield,
-        SpcView, ValidatorId,
+        AggregateSignature, ConsensusSignature, PcCompactVote, PcQc1, PcVector, PositionalBundle,
+        SignerBitfield, SpcView, ValidatorId,
     };
 
     fn sample_qc1() -> PcQc1 {
@@ -74,7 +74,7 @@ mod tests {
         PcQc1::new(
             PcVector::empty(),
             PositionalBundle::new(signers, vec![PcCompactVote::new(0, None)]),
-            Bls12381G2Signature([0xAA; 96]),
+            AggregateSignature::new([0xAA; 96]),
         )
     }
 
@@ -82,9 +82,9 @@ mod tests {
         PcVote2::new(
             ValidatorId::new(2),
             PcVector::empty(),
-            vec![Bls12381G2Signature([0x11; 96])],
+            vec![ConsensusSignature::new([0x11; 96])],
             sample_qc1(),
-            Bls12381G2Signature([0x22; 96]),
+            ConsensusSignature::new([0x22; 96]),
         )
     }
 

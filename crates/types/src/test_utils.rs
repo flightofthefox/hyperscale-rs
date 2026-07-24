@@ -16,15 +16,16 @@ use radix_transactions::model::{
 use radix_transactions::prelude::PreparationSettings;
 
 use crate::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, BoundedVec, CertificateRoot,
-    CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof, ExecutionCertificate,
-    ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount,
-    LocalReceiptRoot, NetworkDefinition, NodeId, ProposerTimestamp, ProvisionsRoot,
-    QuorumCertificate, Round, RoutableTransaction, ShardForkProof, ShardId, SignerBitfield,
-    StateRoot, TimestampRange, TopologySnapshot, TransactionDecision, TransactionRoot, TxHash,
-    TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WaveCertificate,
-    WaveId, WeightedTimestamp, WitnessSources, block_vote_message, bls_keypair_from_seed,
+    AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
+    BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature, BoundedVec, CertificateRoot,
+    CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof, ConsensusPublicKey,
+    ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot,
+    Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition, NodeId, ProposerTimestamp,
+    ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardForkProof, ShardId,
+    SignerBitfield, StateRoot, TimestampRange, TopologySnapshot, TransactionDecision,
+    TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+    Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources, agg_from_bls,
+    block_vote_message, bls_keypair_from_seed, pk_from_bls,
 };
 
 /// Create a test `NodeId` from a seed byte.
@@ -179,7 +180,7 @@ pub fn verified_test_transaction(seed: u8) -> Verified<RoutableTransaction> {
 /// with zero signatures.
 pub struct TestCommittee {
     keypairs: Vec<Bls12381G1PrivateKey>,
-    public_keys: Vec<Bls12381G1PublicKey>,
+    public_keys: Vec<ConsensusPublicKey>,
     validator_ids: Vec<ValidatorId>,
 }
 
@@ -214,7 +215,7 @@ impl TestCommittee {
             seed_bytes[16..24].copy_from_slice(&seed.to_le_bytes());
 
             let kp = bls_keypair_from_seed(&seed_bytes);
-            let pk = kp.public_key();
+            let pk = pk_from_bls(&kp.public_key());
 
             keypairs.push(kp);
             public_keys.push(pk);
@@ -268,7 +269,7 @@ impl TestCommittee {
     ///
     /// Panics if `idx >= size()`.
     #[must_use]
-    pub fn public_key(&self, idx: usize) -> &Bls12381G1PublicKey {
+    pub fn public_key(&self, idx: usize) -> &ConsensusPublicKey {
         &self.public_keys[idx]
     }
 
@@ -284,7 +285,7 @@ impl TestCommittee {
 
     /// Get all public keys.
     #[must_use]
-    pub fn public_keys(&self) -> &[Bls12381G1PublicKey] {
+    pub fn public_keys(&self) -> &[ConsensusPublicKey] {
         &self.public_keys
     }
 
@@ -588,7 +589,7 @@ pub(crate) fn certify_header(
         header.parent_block_hash(),
         header.round(),
         signer_bits,
-        agg,
+        agg_from_bls(&agg),
         WeightedTimestamp::from_millis(header.height().inner() * 1_000),
     );
     CertifiedBlockHeader::new(header, qc)
@@ -708,7 +709,7 @@ fn anchor_qc(shard: ShardId, wt: WeightedTimestamp) -> QuorumCertificate {
         zero,
         Round::new(0),
         SignerBitfield::new(0),
-        Bls12381G2Signature([0u8; 96]),
+        AggregateSignature::new([0u8; 96]),
         wt,
     )
 }
@@ -744,7 +745,7 @@ fn live_certify(
         header.parent_block_hash(),
         header.round(),
         signer_bits,
-        agg,
+        agg_from_bls(&agg),
         wt,
     );
     CertifiedBlockHeader::new(header, qc)
@@ -870,7 +871,7 @@ pub fn make_finalized_wave(
         WeightedTimestamp::from_millis(block_height.inner() + 1),
         GlobalReceiptRoot::ZERO,
         vec![TxOutcome::new(tx_hash, outcome)],
-        Bls12381G2Signature([0u8; 96]),
+        AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
     FinalizedWave::new(
@@ -882,7 +883,7 @@ pub fn make_finalized_wave(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verify_bls12381_v1;
+    use crate::{bls_pk, verify_bls12381_v1};
 
     #[test]
     fn test_committee_creation() {
@@ -900,7 +901,7 @@ mod tests {
 
         // Same seed should produce same keys
         for i in 0..4 {
-            assert_eq!(c1.public_key(i).0, c2.public_key(i).0);
+            assert_eq!(c1.public_key(i), c2.public_key(i));
         }
     }
 
@@ -910,7 +911,7 @@ mod tests {
         let c2 = TestCommittee::new(4, 43);
 
         // Different seeds should produce different keys
-        assert_ne!(c1.public_key(0).0, c2.public_key(0).0);
+        assert_ne!(c1.public_key(0), c2.public_key(0));
     }
 
     #[test]
@@ -949,14 +950,14 @@ mod tests {
         // Verify with the corresponding public key
         assert!(verify_bls12381_v1(
             message,
-            committee.public_key(0),
+            &bls_pk(committee.public_key(0)),
             &signature
         ));
 
         // Should not verify with different public key
         assert!(!verify_bls12381_v1(
             message,
-            committee.public_key(1),
+            &bls_pk(committee.public_key(1)),
             &signature
         ));
     }

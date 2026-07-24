@@ -19,7 +19,7 @@ use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView, VersionedSto
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
     BlockHeight, Provisions, ProvisionsContext, ShardId, ValidatorId, Verifiable, Verified, Verify,
-    state_provisions_message,
+    sig_from_bls, state_provisions_message,
 };
 use tracing::warn;
 
@@ -158,7 +158,7 @@ where
                 let notification = ProvisionsNotification::new(
                     Arc::new(Verifiable::from((*verified).clone())),
                     validator_id,
-                    sig,
+                    sig_from_bls(&sig),
                 );
                 ctx.network.notify(&recipients, &notification);
             }

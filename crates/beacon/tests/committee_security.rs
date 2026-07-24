@@ -39,7 +39,7 @@ use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, PendingReshape,
     Randomness, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, ValidatorId,
-    ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
+    ValidatorRecord, ValidatorStatus, bls_keypair_from_seed, pk_from_bls,
 };
 
 // ─── The analysis note's chain (committee_security.py §2) ───────────────────
@@ -210,7 +210,7 @@ fn mc_state(cell: &Cell) -> BeaconState {
                 pool: pool_id,
                 status,
                 registered_at_epoch: Epoch::GENESIS,
-                pubkey,
+                pubkey: pk_from_bls(&pubkey),
             },
         );
         pool_validators.insert(id);

@@ -105,13 +105,13 @@ mod tests {
     use hyperscale_storage::test_helpers::make_test_certified;
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
-        BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
-        BlockHeader, BlockHeight, Bls12381G2Signature, BoundedVec, CertificateRoot,
-        ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield,
-        StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-        WaveCertificate, WaveId, WeightedTimestamp, WitnessSources, settled_waves_root_from_ids,
+        AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
+        BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot, ExecutionCertificate,
+        ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON,
+        Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
+        Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources,
+        settled_waves_root_from_ids,
     };
 
     use super::*;
@@ -137,7 +137,7 @@ mod tests {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
             )],
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         );
         Arc::new(Verifiable::from(FinalizedWave::new(
@@ -160,7 +160,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             WeightedTimestamp::from_millis(pred_wt),
         );
         let header = BlockHeader::new(

@@ -47,7 +47,7 @@ mod tests {
     use sbor::{basic_decode, basic_encode};
 
     use super::*;
-    use crate::{Bls12381G2Signature, ShardId, ValidatorId, WeightedTimestamp};
+    use crate::{ConsensusSignature, ShardId, ValidatorId, WeightedTimestamp};
 
     fn sample_signal() -> ReadySignal {
         ReadySignal::new(
@@ -55,7 +55,7 @@ mod tests {
             ShardId::ROOT,
             WeightedTimestamp::from_millis(100),
             WeightedTimestamp::from_millis(228),
-            Bls12381G2Signature([0x42; 96]),
+            ConsensusSignature::new([0x42; 96]),
         )
     }
 

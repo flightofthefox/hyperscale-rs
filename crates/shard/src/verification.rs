@@ -2071,7 +2071,7 @@ impl VerificationPipeline {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::WitnessSources;
+    use hyperscale_types::{WitnessSources, agg_from_bls};
 
     fn disabled_count_source() -> SubstateCountSource<'static> {
         static EMPTY: std::sync::OnceLock<HashMap<BlockHash, i64>> = std::sync::OnceLock::new();
@@ -2363,7 +2363,7 @@ mod tests {
             committed_hash,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         );
         let certified = HashMap::from([(
@@ -2539,7 +2539,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         )
     }

@@ -20,18 +20,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, Bls12381G1PublicKey, Epoch, MIN_STAKE_FLOOR, NetworkDefinition,
+    BeaconChainConfig, BeaconState, ConsensusPublicKey, Epoch, MIN_STAKE_FLOOR, NetworkDefinition,
     Randomness, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, ValidatorId,
-    ValidatorRecord, ValidatorStatus, bls_keypair_from_seed,
+    ValidatorRecord, ValidatorStatus, bls_keypair_from_seed, pk_from_bls,
 };
 
 const V: usize = 3;
 const EPOCHS: u64 = 50;
 
-fn pubkey(seed: u64) -> Bls12381G1PublicKey {
+fn pubkey(seed: u64) -> ConsensusPublicKey {
     let mut s = [0u8; 32];
     s[..8].copy_from_slice(&seed.to_le_bytes());
-    bls_keypair_from_seed(&s).public_key()
+    pk_from_bls(&bls_keypair_from_seed(&s).public_key())
 }
 
 /// Initial state: 10 validators in one pool — 8 placed `OnShard` ready

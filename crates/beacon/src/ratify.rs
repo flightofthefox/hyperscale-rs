@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    BeaconBlock, BeaconBlockHash, Bls12381G1PublicKey, Epoch, RatifyCert, RatifyPhase, RatifyRound,
+    BeaconBlock, BeaconBlockHash, ConsensusPublicKey, Epoch, RatifyCert, RatifyPhase, RatifyRound,
     RatifyVote, RatifyVoteRecord, ValidatorId, Verified, ratify_quorum,
 };
 
@@ -85,7 +85,7 @@ pub struct RatifyTracker {
     /// Active pool for the epoch, in the positional order every cert
     /// bitfield indexes. Fixed at construction — the pool derives from
     /// the anchor's state, common to every candidate outcome.
-    pool: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    pool: Vec<(ValidatorId, ConsensusPublicKey)>,
     /// Canonical skip-block hash — computed once; prevoting "skip" is
     /// prevoting this.
     skip_hash: BeaconBlockHash,
@@ -119,7 +119,7 @@ impl RatifyTracker {
     pub fn new(
         anchor: BeaconBlockHash,
         epoch: Epoch,
-        pool: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        pool: Vec<(ValidatorId, ConsensusPublicKey)>,
     ) -> Self {
         Self {
             anchor,
@@ -421,7 +421,8 @@ impl RatifyTracker {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Bls12381G1PrivateKey, Hash, NetworkDefinition, bls_keypair_from_seed, verify_ratify_cert,
+        Bls12381G1PrivateKey, Hash, NetworkDefinition, bls_keypair_from_seed, pk_from_bls,
+        verify_ratify_cert,
     };
 
     use super::*;
@@ -439,14 +440,14 @@ mod tests {
     fn pool(
         n: u64,
     ) -> (
-        Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        Vec<(ValidatorId, ConsensusPublicKey)>,
         Vec<Bls12381G1PrivateKey>,
     ) {
         let mut active = Vec::new();
         let mut keys = Vec::new();
         for i in 0..n {
             let sk = signing_key(i);
-            active.push((ValidatorId::new(i), sk.public_key()));
+            active.push((ValidatorId::new(i), pk_from_bls(&sk.public_key())));
             keys.push(sk);
         }
         (active, keys)

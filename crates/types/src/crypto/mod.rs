@@ -5,11 +5,10 @@
 //!
 //! - [`keys`]: random and seeded keypair generation, zero-signature placeholders.
 //! - [`batch_verify`]: efficient batch verification for Ed25519 and BLS12-381.
-//! - [`vrf`]: VRF output and proof newtypes used by beacon proposals.
 
 pub mod batch_verify;
+pub mod bls_interop;
 pub mod keys;
-pub mod vrf;
 
 pub use radix_common::crypto::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Ed25519PrivateKey,

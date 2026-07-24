@@ -13,8 +13,8 @@
 use blake3::Hasher;
 
 use crate::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Epoch, NetworkDefinition,
-    VrfOutput, VrfProof, verify_bls12381_v1,
+    Bls12381G1PrivateKey, Bls12381G2Signature, ConsensusPublicKey, Epoch, NetworkDefinition,
+    VrfOutput, VrfProof, bls_pk, verify_bls12381_v1,
 };
 
 /// Domain tag for beacon VRF reveals.
@@ -77,19 +77,20 @@ pub fn vrf_sign(sk: &Bls12381G1PrivateKey, network: &NetworkDefinition, epoch: E
 /// produced by [`vrf_reveal_message`] at `(network, epoch)`.
 #[must_use]
 pub fn vrf_verify(
-    pk: &Bls12381G1PublicKey,
+    pk: &ConsensusPublicKey,
     network: &NetworkDefinition,
     epoch: Epoch,
     proof: &VrfProof,
 ) -> bool {
     let msg = vrf_reveal_message(network, epoch);
     let sig = Bls12381G2Signature(*proof.as_bytes());
-    verify_bls12381_v1(&msg, pk, &sig)
+    verify_bls12381_v1(&msg, &bls_pk(pk), &sig)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pk_from_bls;
     use crate::signing::{DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1};
 
     fn net() -> NetworkDefinition {
@@ -161,7 +162,12 @@ mod tests {
     fn vrf_sign_verify_round_trip() {
         let sk = keypair(3);
         let proof = vrf_sign(&sk, &net(), Epoch::new(42));
-        assert!(vrf_verify(&sk.public_key(), &net(), Epoch::new(42), &proof));
+        assert!(vrf_verify(
+            &pk_from_bls(&sk.public_key()),
+            &net(),
+            Epoch::new(42),
+            &proof
+        ));
     }
 
     /// Deterministic: same inputs → same proof across replicas.
@@ -180,7 +186,7 @@ mod tests {
         let sk_b = keypair(4);
         let proof = vrf_sign(&sk_a, &net(), Epoch::new(42));
         assert!(!vrf_verify(
-            &sk_b.public_key(),
+            &pk_from_bls(&sk_b.public_key()),
             &net(),
             Epoch::new(42),
             &proof
@@ -194,7 +200,7 @@ mod tests {
         let sk = keypair(3);
         let proof = vrf_sign(&sk, &net(), Epoch::new(42));
         assert!(!vrf_verify(
-            &sk.public_key(),
+            &pk_from_bls(&sk.public_key()),
             &net(),
             Epoch::new(43),
             &proof
@@ -209,7 +215,7 @@ mod tests {
         let sk = keypair(3);
         let proof = vrf_sign(&sk, &NetworkDefinition::mainnet(), Epoch::new(42));
         assert!(!vrf_verify(
-            &sk.public_key(),
+            &pk_from_bls(&sk.public_key()),
             &NetworkDefinition::stokenet(),
             Epoch::new(42),
             &proof,
@@ -227,7 +233,7 @@ mod tests {
         bytes[0] ^= 1;
         let proof = VrfProof::new(bytes);
         assert!(!vrf_verify(
-            &sk.public_key(),
+            &pk_from_bls(&sk.public_key()),
             &net(),
             Epoch::new(42),
             &proof

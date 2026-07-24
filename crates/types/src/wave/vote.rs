@@ -11,9 +11,10 @@ use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
-    BoundedVec, GlobalReceiptRoot, MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, TxOutcome,
-    ValidatorId, Verified, Verify, WaveId, WeightedTimestamp, batch_verify_bls_same_message,
-    compute_global_receipt_root, exec_vote_message, verify_bls12381_v1,
+    BoundedVec, ConsensusPublicKey, ConsensusSignature, GlobalReceiptRoot, MAX_TXS_PER_BLOCK,
+    NetworkDefinition, ShardId, TxOutcome, ValidatorId, Verified, Verify, WaveId,
+    WeightedTimestamp, batch_verify_bls_same_message, bls_pk, bls_sig, compute_global_receipt_root,
+    exec_vote_message, sig_from_bls, verify_bls12381_v1,
 };
 
 /// A validator's vote on all transactions in an execution wave.
@@ -32,7 +33,7 @@ pub struct ExecutionVote {
     tx_count: u32,
     tx_outcomes: BoundedVec<TxOutcome, MAX_TXS_PER_BLOCK>,
     validator: ValidatorId,
-    signature: Bls12381G2Signature,
+    signature: ConsensusSignature,
 }
 
 impl ExecutionVote {
@@ -53,7 +54,7 @@ impl ExecutionVote {
         tx_count: u32,
         tx_outcomes: Vec<TxOutcome>,
         validator: ValidatorId,
-        signature: Bls12381G2Signature,
+        signature: ConsensusSignature,
     ) -> Self {
         Self {
             block_hash,
@@ -136,7 +137,7 @@ impl ExecutionVote {
 
     /// BLS signature over the vote signing message.
     #[must_use]
-    pub const fn signature(&self) -> Bls12381G2Signature {
+    pub const fn signature(&self) -> ConsensusSignature {
         self.signature
     }
 
@@ -155,7 +156,7 @@ impl ExecutionVote {
         u32,
         Vec<TxOutcome>,
         ValidatorId,
-        Bls12381G2Signature,
+        ConsensusSignature,
     ) {
         (
             self.block_hash,
@@ -195,7 +196,7 @@ pub struct ExecutionVoteContext<'a> {
     /// Network identifier — feeds the domain-separated signing message.
     pub network: &'a NetworkDefinition,
     /// BLS public key of the validator who cast this vote.
-    pub voter_public_key: &'a Bls12381G1PublicKey,
+    pub voter_public_key: &'a ConsensusPublicKey,
 }
 
 /// Failure modes of [`ExecutionVote`] verification.
@@ -246,7 +247,11 @@ impl Verify<&ExecutionVoteContext<'_>> for ExecutionVote {
             return Err(ExecutionVoteVerifyError::OutcomesRootMismatch);
         }
         let message = self.signing_message(ctx.network);
-        if !verify_bls12381_v1(&message, ctx.voter_public_key, &self.signature) {
+        if !verify_bls12381_v1(
+            &message,
+            &bls_pk(ctx.voter_public_key),
+            &bls_sig(&self.signature),
+        ) {
             return Err(ExecutionVoteVerifyError::InvalidSignature);
         }
         Ok(Verified::new_unchecked(self.clone()))
@@ -288,7 +293,7 @@ impl Verified<ExecutionVote> {
             &global_receipt_root,
             tx_count,
         );
-        let signature = signing_key.sign_v1(&message);
+        let signature = sig_from_bls(&signing_key.sign_v1(&message));
         // SAFETY: outcomes-root binding holds by construction
         // (root is derived from `tx_outcomes` above); BLS signature
         // is produced by `signing_key` over the canonical
@@ -333,7 +338,7 @@ impl Verified<ExecutionVote> {
     #[must_use]
     pub fn verify_batch(
         network: &NetworkDefinition,
-        votes: Vec<(ExecutionVote, Bls12381G1PublicKey)>,
+        votes: Vec<(ExecutionVote, ConsensusPublicKey)>,
     ) -> Vec<Self> {
         let votes: Vec<_> = votes
             .into_iter()
@@ -344,7 +349,7 @@ impl Verified<ExecutionVote> {
             return Vec::new();
         }
 
-        let mut by_message: HashMap<Vec<u8>, Vec<(ExecutionVote, Bls12381G1PublicKey)>> =
+        let mut by_message: HashMap<Vec<u8>, Vec<(ExecutionVote, ConsensusPublicKey)>> =
             HashMap::new();
         for (vote, pk) in votes {
             let msg = vote.signing_message(network);
@@ -355,8 +360,9 @@ impl Verified<ExecutionVote> {
 
         for (message, group) in by_message {
             let signatures: Vec<Bls12381G2Signature> =
-                group.iter().map(|(v, _)| v.signature()).collect();
-            let pubkeys: Vec<Bls12381G1PublicKey> = group.iter().map(|(_, pk)| *pk).collect();
+                group.iter().map(|(v, _)| bls_sig(&v.signature())).collect();
+            let pubkeys: Vec<Bls12381G1PublicKey> =
+                group.iter().map(|(_, pk)| bls_pk(pk)).collect();
 
             if group.len() >= 2 && batch_verify_bls_same_message(&message, &signatures, &pubkeys) {
                 // SAFETY: outcomes-root binding was filtered above;
@@ -367,7 +373,7 @@ impl Verified<ExecutionVote> {
                 }
             } else {
                 for (vote, pk) in group {
-                    if verify_bls12381_v1(&message, &pk, &vote.signature()) {
+                    if verify_bls12381_v1(&message, &bls_pk(&pk), &bls_sig(&vote.signature())) {
                         // SAFETY: outcomes-root binding was filtered
                         // above; individual BLS verify just ran the
                         // signature half of the predicate.
@@ -389,7 +395,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::{ExecutionOutcome, GlobalReceiptHash, Hash, TxHash, generate_bls_keypair};
+    use crate::{
+        ExecutionOutcome, GlobalReceiptHash, Hash, TxHash, generate_bls_keypair, pk_from_bls,
+    };
 
     fn sample_outcome(seed: u8) -> TxOutcome {
         TxOutcome::new(
@@ -416,7 +424,7 @@ mod tests {
             u32::try_from(outcomes.len()).unwrap(),
             outcomes,
             ValidatorId::new(3),
-            Bls12381G2Signature([0u8; 96]),
+            ConsensusSignature::new([0u8; 96]),
         )
     }
 
@@ -453,7 +461,7 @@ mod tests {
             &global_receipt_root,
             tx_count,
         );
-        let signature = signing_key.sign_v1(&message);
+        let signature = sig_from_bls(&signing_key.sign_v1(&message));
         ExecutionVote::new(
             block_hash,
             block_height,
@@ -479,7 +487,7 @@ mod tests {
 
         let ctx = ExecutionVoteContext {
             network: &net,
-            voter_public_key: &pk,
+            voter_public_key: &pk_from_bls(&pk),
         };
         let verified = vote.verify(&ctx).expect("honest vote must verify");
         assert_eq!(verified.as_ref().validator(), ValidatorId::new(3));
@@ -525,7 +533,7 @@ mod tests {
 
         let ctx = ExecutionVoteContext {
             network: &net,
-            voter_public_key: &pk,
+            voter_public_key: &pk_from_bls(&pk),
         };
         assert_eq!(
             tampered.verify(&ctx),
@@ -545,7 +553,7 @@ mod tests {
         let intruder_pk = intruder.public_key();
         let ctx = ExecutionVoteContext {
             network: &net,
-            voter_public_key: &intruder_pk,
+            voter_public_key: &pk_from_bls(&intruder_pk),
         };
         assert_eq!(
             vote.verify(&ctx),
@@ -563,7 +571,7 @@ mod tests {
         let votes: Vec<_> = (0..3u64)
             .map(|i| {
                 let sk = generate_bls_keypair();
-                let pk = sk.public_key();
+                let pk = pk_from_bls(&sk.public_key());
                 let vote = sign_sample_vote(&net, outcomes.clone(), i, &sk);
                 (vote, pk)
             })
@@ -581,16 +589,16 @@ mod tests {
         let net = NetworkDefinition::simulator();
         let outcomes = vec![sample_outcome(9), sample_outcome(10)];
 
-        let mut votes: Vec<(ExecutionVote, Bls12381G1PublicKey)> = (0..3u64)
+        let mut votes: Vec<(ExecutionVote, ConsensusPublicKey)> = (0..3u64)
             .map(|i| {
                 let sk = generate_bls_keypair();
-                let pk = sk.public_key();
+                let pk = pk_from_bls(&sk.public_key());
                 let vote = sign_sample_vote(&net, outcomes.clone(), i, &sk);
                 (vote, pk)
             })
             .collect();
 
-        let intruder_pk = generate_bls_keypair().public_key();
+        let intruder_pk = pk_from_bls(&generate_bls_keypair().public_key());
         votes[1].1 = intruder_pk;
 
         let verified = Verified::<ExecutionVote>::verify_batch(&net, votes);
@@ -632,7 +640,8 @@ mod tests {
             signature,
         );
 
-        let verified = Verified::<ExecutionVote>::verify_batch(&net, vec![(tampered, pk)]);
+        let verified =
+            Verified::<ExecutionVote>::verify_batch(&net, vec![(tampered, pk_from_bls(&pk))]);
         assert!(verified.is_empty());
     }
 
@@ -671,7 +680,7 @@ mod tests {
 
         let ctx = ExecutionVoteContext {
             network: &net,
-            voter_public_key: &pk,
+            voter_public_key: &pk_from_bls(&pk),
         };
         let raw = verified.into_inner();
         raw.verify(&ctx)

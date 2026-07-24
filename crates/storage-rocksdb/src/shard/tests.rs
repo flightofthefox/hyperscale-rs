@@ -15,12 +15,12 @@ use hyperscale_storage::{
     SubstateDatabase, SubstateStore, VersionedStore, merge_database_updates, merge_into,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
-    Bls12381G2Signature, BoundedVec, CertifiedBlock, ChainOrigin, ConsensusReceipt,
-    ExecutionCertificate, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
-    ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, ShardId, SignerBitfield,
-    StateRoot, StoredReceipt, SyncHint, TxHash, ValidatorId, Verifiable, Verified, WaveCertificate,
-    WaveId, WeightedTimestamp, WitnessSources,
+    AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
+    BoundedVec, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
+    GlobalReceiptHash, GlobalReceiptRoot, Hash, ProposerTimestamp, QuorumCertificate, Round,
+    SafeVoteRegisters, ShardId, SignerBitfield, StateRoot, StoredReceipt, SyncHint, TxHash,
+    ValidatorId, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources,
+    agg_from_bls,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -37,7 +37,7 @@ fn placeholder_local_ec(shard: ShardId, height: BlockHeight) -> Arc<ExecutionCer
         WeightedTimestamp::from_millis(0),
         GlobalReceiptRoot::ZERO,
         Vec::new(),
-        Bls12381G2Signature([0u8; 96]),
+        AggregateSignature::new([0u8; 96]),
         SignerBitfield::empty(),
     ))
 }
@@ -384,7 +384,7 @@ fn test_recovery_with_qc() {
             BlockHash::from_raw(Hash::from_bytes(&[98; 32])),
             Round::new(5),
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(100_000),
         );
         storage.set_chain_metadata(BlockHeight::new(100), Some(expected_raw), Some(&qc));

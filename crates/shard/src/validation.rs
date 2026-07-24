@@ -479,8 +479,8 @@ mod tests {
         MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry, Provisions,
         ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield,
         StateRoot, TransactionDecision, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
-        Verifiable, WeightedTimestamp, WitnessSources, bls_keypair_from_seed, compute_waves,
-        test_utils, zero_bls_signature,
+        Verifiable, WeightedTimestamp, WitnessSources, agg_from_bls, bls_keypair_from_seed,
+        compute_waves, pk_from_bls, test_utils, zero_bls_signature,
     };
 
     use super::*;
@@ -760,7 +760,7 @@ mod tests {
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(0),
             signers,
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(weighted_ms),
         )
     }
@@ -880,7 +880,7 @@ mod tests {
                 seed[..8].copy_from_slice(&id.to_le_bytes());
                 ValidatorInfo {
                     validator_id: ValidatorId::new(id),
-                    public_key: bls_keypair_from_seed(&seed).public_key(),
+                    public_key: pk_from_bls(&bls_keypair_from_seed(&seed).public_key()),
                 }
             })
             .collect();
@@ -903,7 +903,7 @@ mod tests {
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(0),
             signers,
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(weighted_ms),
         )
     }

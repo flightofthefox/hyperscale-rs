@@ -13,9 +13,9 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeader, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, BoundedVec,
-    CertifiedBlockHeader, Hash, LeafIndex, MAX_WITNESS_PROOF_DEPTH, ParamVote, Round, ShardId,
-    Stake, StakePoolId, ValidatorId, Verified, Verify, VrfOutput, verify_merkle_inclusion,
+    BlockHash, BlockHeader, BlockHeight, BoundedVec, CertifiedBlockHeader, ConsensusPublicKey,
+    ConsensusSignature, Hash, LeafIndex, MAX_WITNESS_PROOF_DEPTH, ParamVote, Round, ShardId, Stake,
+    StakePoolId, ValidatorId, Verified, Verify, VrfOutput, verify_merkle_inclusion,
 };
 
 /// Domain tag for accumulator leaf hashing.
@@ -71,13 +71,13 @@ pub enum ShardWitnessPayload {
         /// Identifier the validator will be known by.
         validator_id: ValidatorId,
         /// 48-byte compressed BLS pubkey.
-        pubkey: Bls12381G1PublicKey,
+        pubkey: ConsensusPublicKey,
         /// Proof-of-possession: the registrant's signature over
         /// `validator_possession_proof_message(network, validator_id, pubkey)` under
         /// `pubkey` itself. Verified by the beacon fold before the key
         /// enters the registry — the rogue-key defense every
         /// aggregate-signature verifier relies on.
-        possession_proof: Bls12381G2Signature,
+        possession_proof: ConsensusSignature,
     },
     /// The pool operator deactivates one of their validator nodes.
     /// Transitions the validator out of any active role; if currently
@@ -234,10 +234,10 @@ pub enum BeaconWitnessEvent {
         /// Identifier the validator will be known by.
         validator_id: ValidatorId,
         /// 48-byte compressed BLS pubkey.
-        pubkey: Bls12381G1PublicKey,
+        pubkey: ConsensusPublicKey,
         /// Proof-of-possession of `pubkey`; see
         /// [`ShardWitnessPayload::RegisterValidator`].
-        possession_proof: Bls12381G2Signature,
+        possession_proof: ConsensusSignature,
     },
     /// Mirrors [`ShardWitnessPayload::DeactivateValidator`].
     DeactivateValidator {
@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn shard_witness_payload_sbor_round_trip_all_variants() {
-        let pubkey = Bls12381G1PublicKey([0xAB; 48]);
+        let pubkey = ConsensusPublicKey::new([0xAB; 48]);
         let payloads = vec![
             ShardWitnessPayload::StakeDeposit {
                 pool_id: StakePoolId::new(1),
@@ -469,7 +469,7 @@ mod tests {
                 pool_id: StakePoolId::new(3),
                 validator_id: ValidatorId::new(7),
                 pubkey,
-                possession_proof: Bls12381G2Signature([0xAB; 96]),
+                possession_proof: ConsensusSignature::new([0xAB; 96]),
             },
             ShardWitnessPayload::DeactivateValidator {
                 validator_id: ValidatorId::new(8),
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn beacon_witness_event_sbor_round_trip_all_variants() {
-        let pubkey = Bls12381G1PublicKey([0xCD; 48]);
+        let pubkey = ConsensusPublicKey::new([0xCD; 48]);
         let events = vec![
             BeaconWitnessEvent::StakeDeposit {
                 pool_id: StakePoolId::new(1),
@@ -599,7 +599,7 @@ mod tests {
                 pool_id: StakePoolId::new(3),
                 validator_id: ValidatorId::new(7),
                 pubkey,
-                possession_proof: Bls12381G2Signature([0xCD; 96]),
+                possession_proof: ConsensusSignature::new([0xCD; 96]),
             },
             BeaconWitnessEvent::DeactivateValidator {
                 validator_id: ValidatorId::new(8),
@@ -623,7 +623,7 @@ mod tests {
 
     #[test]
     fn beacon_witness_event_converts_to_shard_witness_payload() {
-        let pubkey = Bls12381G1PublicKey([0xEF; 48]);
+        let pubkey = ConsensusPublicKey::new([0xEF; 48]);
         let cases: Vec<(BeaconWitnessEvent, ShardWitnessPayload)> = vec![
             (
                 BeaconWitnessEvent::StakeDeposit {
@@ -650,13 +650,13 @@ mod tests {
                     pool_id: StakePoolId::new(3),
                     validator_id: ValidatorId::new(7),
                     pubkey,
-                    possession_proof: Bls12381G2Signature([0xEF; 96]),
+                    possession_proof: ConsensusSignature::new([0xEF; 96]),
                 },
                 ShardWitnessPayload::RegisterValidator {
                     pool_id: StakePoolId::new(3),
                     validator_id: ValidatorId::new(7),
                     pubkey,
-                    possession_proof: Bls12381G2Signature([0xEF; 96]),
+                    possession_proof: ConsensusSignature::new([0xEF; 96]),
                 },
             ),
             (

@@ -25,7 +25,7 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionVote, FinalizedWaveContext, NodeId,
     RoutableTransaction, ShardId, ShardTrie, StoredReceipt, Verifiable, Verified,
-    exec_cert_batch_message, exec_vote_batch_message,
+    exec_cert_batch_message, exec_vote_batch_message, sig_from_bls,
 };
 
 // ============================================================================
@@ -344,7 +344,7 @@ where
                 let batch = ExecutionVotesNotification::new(
                     vec![Verifiable::from(verified.clone())],
                     validator_id,
-                    batch_sig,
+                    sig_from_bls(&batch_sig),
                 );
                 ctx.network.notify(&[leader], &batch);
             }
@@ -369,7 +369,8 @@ where
                 std::slice::from_ref(&cert),
             );
             let sig = ctx.signing_key.sign_v1(&msg);
-            let batch = ExecutionCertificatesNotification::new(vec![cert], ctx.me, sig);
+            let batch =
+                ExecutionCertificatesNotification::new(vec![cert], ctx.me, sig_from_bls(&sig));
             ctx.network.notify(&recipients, &batch);
         }
 

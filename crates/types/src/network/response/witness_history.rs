@@ -79,7 +79,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
         ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, ShardId, SignerBitfield, Stake, StakePoolId, StateRoot,
-        TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
+        TransactionRoot, ValidatorId, WeightedTimestamp, agg_from_bls, zero_bls_signature,
     };
 
     fn make_header() -> BlockHeader {
@@ -127,7 +127,7 @@ mod tests {
             header.parent_block_hash(),
             Round::INITIAL,
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         );
         let response = GetWitnessHistoryResponse {

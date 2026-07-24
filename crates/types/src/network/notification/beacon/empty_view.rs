@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sbor::prelude::BasicSbor;
 
 use crate::{
-    Bls12381G2Signature, DOMAIN_PC_EMPTY_VIEW, Epoch, MessageClass, NetworkDefinition,
+    ConsensusSignature, DOMAIN_PC_EMPTY_VIEW, Epoch, MessageClass, NetworkDefinition,
     NetworkMessage, Signed, SpcEmptyViewMsg, ValidatorId, Verifiable, hash_high_value,
     pc_vote_signing_message, skip_target, spc_context,
 };
@@ -68,7 +68,7 @@ impl Signed for SpcEmptyViewMsgNotification {
         self.msg.as_unverified().signer
     }
 
-    fn signature(&self) -> &Bls12381G2Signature {
+    fn signature(&self) -> &ConsensusSignature {
         &self.msg.as_unverified().sig
     }
 
@@ -97,10 +97,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bls12381G1PrivateKey, Bls12381G2Signature, Epoch, NetworkDefinition, PcQc2, PcQc3,
+        AggregateSignature, Bls12381G1PrivateKey, Epoch, NetworkDefinition, PcQc2, PcQc3,
         PcSignerLengths, PcVector, PcXpProof, SignedContext, SignedVerifyError, SignerBitfield,
-        SpcHighTriple, SpcView, ValidatorId, bls_keypair_from_seed, sign_empty_view_msg,
-        spc_context,
+        SpcHighTriple, SpcView, ValidatorId, bls_keypair_from_seed, pk_from_bls,
+        sign_empty_view_msg, spc_context,
     };
 
     fn sample_pc_qc3() -> PcQc3 {
@@ -109,7 +109,7 @@ mod tests {
         let qc2 = PcQc2::new(
             PcVector::empty(),
             signers,
-            Bls12381G2Signature([0x11; 96]),
+            AggregateSignature::new([0x11; 96]),
             PcXpProof::Full,
         );
         PcQc3::new(
@@ -119,7 +119,7 @@ mod tests {
             None,
             SignerBitfield::new(4),
             PcSignerLengths::Uniform(0),
-            Bls12381G2Signature([0x33; 96]),
+            AggregateSignature::new([0x33; 96]),
         )
     }
 
@@ -132,7 +132,7 @@ mod tests {
                 proof: sample_pc_qc3().into(),
             },
             signer: ValidatorId::new(2),
-            sig: Bls12381G2Signature([0x44; 96]),
+            sig: ConsensusSignature::new([0x44; 96]),
         }
     }
 
@@ -195,7 +195,7 @@ mod tests {
         assert!(
             n.verify_signature(&SignedContext {
                 network: &NetworkDefinition::simulator(),
-                public_key: &pk,
+                public_key: &pk_from_bls(&pk),
             })
             .is_ok()
         );
@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(
             n.verify_signature(&SignedContext {
                 network: &NetworkDefinition::simulator(),
-                public_key: &honest_pk,
+                public_key: &pk_from_bls(&honest_pk),
             }),
             Err(SignedVerifyError::InvalidSignature),
         );
@@ -229,7 +229,7 @@ mod tests {
         assert_eq!(
             n.verify_signature(&SignedContext {
                 network: &NetworkDefinition::simulator(),
-                public_key: &pk,
+                public_key: &pk_from_bls(&pk),
             }),
             Err(SignedVerifyError::InvalidSignature),
         );

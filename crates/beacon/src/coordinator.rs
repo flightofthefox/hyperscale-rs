@@ -26,9 +26,9 @@ use hyperscale_core::{
 };
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
-    BeaconState, BlockHash, BlockHeight, Bls12381G1PublicKey, CandidateBeaconBlock,
-    CandidateBeaconBlockVerifyError, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError,
-    CertifiedBlockHeader, Epoch, GenesisConfigHash, LeafIndex, LocalTimestamp,
+    BeaconState, BlockHash, BlockHeight, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
+    CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, CertifiedBlockHeader,
+    ConsensusPublicKey, Epoch, GenesisConfigHash, LeafIndex, LocalTimestamp,
     MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_WITNESSES_PER_FETCH, NetworkDefinition, PcValueElement,
     PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
     PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT,
@@ -167,11 +167,11 @@ pub struct BeaconCoordinator {
     /// have rotated. On a restart the constructor recovers this from
     /// the penultimate history state when one is loaded; otherwise the
     /// live state stands in until the next commit.
-    tip_epoch_committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    tip_epoch_committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     /// Active pool that governed the tip epoch — the signer base for a
     /// competing block's ratify cert. Same capture discipline as
     /// `tip_epoch_committee`.
-    tip_epoch_pool: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    tip_epoch_pool: Vec<(ValidatorId, ConsensusPublicKey)>,
 
     /// SPC consensus-plane driver: the optional current-epoch instance
     /// plus the PC-vote and SPC-message verification slot pools. Bare
@@ -1152,7 +1152,7 @@ impl BeaconCoordinator {
     /// registry. Resolves ex-members and revoked keys alike — exactly
     /// what double-vote evidence about a rotated-out signer needs.
     #[must_use]
-    pub fn validator_pubkey(&self, validator: ValidatorId) -> Option<Bls12381G1PublicKey> {
+    pub fn validator_pubkey(&self, validator: ValidatorId) -> Option<ConsensusPublicKey> {
         self.state.validators.get(&validator).map(|r| r.pubkey)
     }
 
@@ -1222,7 +1222,7 @@ impl BeaconCoordinator {
     /// [`MAX_INPUT_DWELL_REARMS`] elapse.
     fn bootstrap_spc_with_committee(
         &mut self,
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     ) -> Vec<Action> {
         self.spc
             .bootstrap(self.state.current_epoch.next(), committee);
@@ -1402,8 +1402,8 @@ impl BeaconCoordinator {
     fn equivocation_signers_for(
         &self,
         block: &BeaconBlock,
-    ) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
-        let mut signers: Vec<(ValidatorId, Bls12381G1PublicKey)> = Vec::new();
+    ) -> Vec<(ValidatorId, ConsensusPublicKey)> {
+        let mut signers: Vec<(ValidatorId, ConsensusPublicKey)> = Vec::new();
         let mut seen: BTreeSet<ValidatorId> = BTreeSet::new();
         for (_, proposal) in block.committed_proposals() {
             for ev in proposal.equivocations().iter() {
@@ -1424,9 +1424,9 @@ impl BeaconCoordinator {
     fn dispatch_block_verification(
         &mut self,
         block: Arc<Verifiable<CertifiedBeaconBlock>>,
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
-        active_pool: Vec<(ValidatorId, Bls12381G1PublicKey)>,
-        equivocation_signers: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
+        active_pool: Vec<(ValidatorId, ConsensusPublicKey)>,
+        equivocation_signers: Vec<(ValidatorId, ConsensusPublicKey)>,
     ) -> Vec<Action> {
         if !self.verification.mark_block_in_flight(block.block_hash()) {
             return Vec::new();
@@ -2602,17 +2602,17 @@ mod tests {
     use hyperscale_types::{
         BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig,
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
-        Bls12381G1PublicKey, BoundedVec, CertificateRoot, CertifiedBlockHeader, ChainOrigin, Epoch,
-        GenesisConfigHash, GenesisPool, GenesisValidator, Hash, InFlightCount, JailReason,
-        KeptSeat, LeafIndex, LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR,
-        NetworkDefinition, ObserverSeat, PcVector, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Randomness, Round, ShardBoundary, ShardCommittee,
-        ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
-        SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
-        ValidatorId, VrfProof, WeightedTimestamp, bls_keypair_from_seed, build_qc1, build_qc2,
-        build_qc3, build_ratify_cert, compute_merkle_root_with_proof, genesis_config_hash,
-        pc_context, sign_ratify_vote, sign_vote1, sign_vote2, sign_vote3, spc_context,
-        zero_bls_signature,
+        BoundedVec, CertificateRoot, CertifiedBlockHeader, ChainOrigin, ConsensusPublicKey,
+        ConsensusSignature, Epoch, GenesisConfigHash, GenesisPool, GenesisValidator, Hash,
+        InFlightCount, JailReason, KeptSeat, LeafIndex, LocalReceiptRoot,
+        MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition, ObserverSeat, PcVector,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardBoundary,
+        ShardCommittee, ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload,
+        ShardWitnessProof, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
+        TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp, agg_from_bls,
+        bls_keypair_from_seed, build_qc1, build_qc2, build_qc3, build_ratify_cert,
+        compute_merkle_root_with_proof, genesis_config_hash, pc_context, pk_from_bls,
+        sign_ratify_vote, sign_vote1, sign_vote2, sign_vote3, spc_context, zero_bls_signature,
     };
 
     use super::*;
@@ -2624,8 +2624,8 @@ mod tests {
         bls_keypair_from_seed(&s)
     }
 
-    fn pubkey(seed: u64) -> Bls12381G1PublicKey {
-        keypair(seed).public_key()
+    fn pubkey(seed: u64) -> ConsensusPublicKey {
+        pk_from_bls(&keypair(seed).public_key())
     }
 
     /// 4 validators, all on the beacon committee, all placed on the ROOT
@@ -2723,7 +2723,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(pred_wt),
         );
         let header = BlockHeader::new(
@@ -2757,7 +2757,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(pred_wt),
         );
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
@@ -2852,7 +2852,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(parent_wt),
         );
         let header = BlockHeader::new(
@@ -2886,7 +2886,7 @@ mod tests {
             parent_hash,
             Round::INITIAL,
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(parent_wt),
         );
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
@@ -2906,7 +2906,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(wt),
         )
     }
@@ -3130,7 +3130,7 @@ mod tests {
             .committee
             .iter()
             .copied()
-            .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
+            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
             .collect();
         let signer_positions: Vec<usize> = (0..n - (n - 1) / 3).collect();
         let cert = build_direct_cert(
@@ -3427,12 +3427,12 @@ mod tests {
 
     #[test]
     fn on_pc_vote_received_drops_when_no_spc_instance() {
-        use hyperscale_types::{Bls12381G2Signature, PcVote1};
+        use hyperscale_types::PcVote1;
         let mut coord = fresh_coord();
         let vote = PcVote1::new(
             ValidatorId::new(1),
             PcVector::empty(),
-            vec![Bls12381G2Signature([0u8; 96])],
+            vec![ConsensusSignature::new([0u8; 96])],
         );
         let actions = coord.on_pc_vote1_received(SpcView::new(1), vote);
         assert!(actions.is_empty());
@@ -3442,14 +3442,14 @@ mod tests {
     /// before the BLS dispatch, so it can't mint a verification slot.
     #[test]
     fn pc_vote_from_non_committee_signer_dropped_before_dispatch() {
-        use hyperscale_types::{Bls12381G2Signature, PcVote1};
+        use hyperscale_types::PcVote1;
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
         // The committee is validators 0..4; 9 is not a member.
         let vote = PcVote1::new(
             ValidatorId::new(9),
             PcVector::empty(),
-            vec![Bls12381G2Signature([0u8; 96])],
+            vec![ConsensusSignature::new([0u8; 96])],
         );
         let actions = coord.on_pc_vote1_received(SpcView::new(1), vote);
         assert!(actions.is_empty());
@@ -3460,14 +3460,14 @@ mod tests {
     /// MAX_PENDING_EMPTY_VIEW_AHEAD]` is dropped before dispatch.
     #[test]
     fn pc_vote_for_out_of_window_view_dropped_before_dispatch() {
-        use hyperscale_types::{Bls12381G2Signature, PcVote1};
+        use hyperscale_types::PcVote1;
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
         // current_view is 1; the window is [1, 5], so view 6 is out.
         let vote = PcVote1::new(
             ValidatorId::new(1),
             PcVector::empty(),
-            vec![Bls12381G2Signature([0u8; 96])],
+            vec![ConsensusSignature::new([0u8; 96])],
         );
         let actions = coord.on_pc_vote1_received(SpcView::new(6), vote);
         assert!(actions.is_empty());
@@ -3478,13 +3478,13 @@ mod tests {
     /// and dispatches a verification (one in-flight slot).
     #[test]
     fn pc_vote_from_committee_in_window_dispatches_verification() {
-        use hyperscale_types::{Bls12381G2Signature, PcVote1};
+        use hyperscale_types::PcVote1;
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
         let vote = PcVote1::new(
             ValidatorId::new(1),
             PcVector::empty(),
-            vec![Bls12381G2Signature([0u8; 96])],
+            vec![ConsensusSignature::new([0u8; 96])],
         );
         let actions = coord.on_pc_vote1_received(SpcView::new(1), vote);
         assert_eq!(actions.len(), 1);
@@ -3520,10 +3520,10 @@ mod tests {
     #[test]
     fn bootstrap_below_bft_minimum_declines_without_panicking() {
         let mut coord = fresh_coord();
-        let undersized: Vec<(ValidatorId, Bls12381G1PublicKey)> = (0u64
-            ..(MIN_BEACON_COMMITTEE_SIZE as u64 - 1))
-            .map(|i| (ValidatorId::new(i), pubkey(i)))
-            .collect();
+        let undersized: Vec<(ValidatorId, ConsensusPublicKey)> =
+            (0u64..(MIN_BEACON_COMMITTEE_SIZE as u64 - 1))
+                .map(|i| (ValidatorId::new(i), pubkey(i)))
+                .collect();
         coord.bootstrap_spc_with_committee(undersized);
         assert!(!coord.spc.is_bootstrapped());
     }
@@ -3532,7 +3532,7 @@ mod tests {
     #[test]
     fn bootstrap_at_bft_minimum_creates_instance() {
         let mut coord = fresh_coord();
-        let committee: Vec<(ValidatorId, Bls12381G1PublicKey)> = (0u64..MIN_BEACON_COMMITTEE_SIZE
+        let committee: Vec<(ValidatorId, ConsensusPublicKey)> = (0u64..MIN_BEACON_COMMITTEE_SIZE
             as u64)
             .map(|i| (ValidatorId::new(i), pubkey(i)))
             .collect();
@@ -3547,7 +3547,6 @@ mod tests {
     /// extra in-flight BLS checks.
     #[test]
     fn ratify_vote_verification_keys_on_signer_not_signature() {
-        use hyperscale_types::Bls12381G2Signature;
         let mut coord = fresh_coord();
         let anchor = coord.latest_block().block_hash();
         let epoch = coord.current_epoch().next();
@@ -3562,7 +3561,7 @@ mod tests {
                 RatifyPhase::Prevote,
                 skip_hash,
                 signer,
-                Bls12381G2Signature([sig_byte; 96]),
+                ConsensusSignature::new([sig_byte; 96]),
             )))
         };
 
@@ -3584,7 +3583,6 @@ mod tests {
     /// in-flight and block their honest vote from ever being verified.
     #[test]
     fn failed_ratify_vote_verification_releases_slot() {
-        use hyperscale_types::Bls12381G2Signature;
         let mut coord = fresh_coord();
         let anchor = coord.latest_block().block_hash();
         let epoch = coord.current_epoch().next();
@@ -3598,7 +3596,7 @@ mod tests {
             RatifyPhase::Prevote,
             skip_hash,
             signer,
-            Bls12381G2Signature([0u8; 96]), // garbage sig — fails BLS verify
+            ConsensusSignature::new([0u8; 96]), // garbage sig — fails BLS verify
         )));
         let dispatched = coord.on_unverified_ratify_vote_received(forged);
         assert_eq!(coord.verifications_in_flight(), 1);
@@ -3616,7 +3614,7 @@ mod tests {
             RatifyPhase::Prevote,
             skip_hash,
             signer,
-            Bls12381G2Signature([2u8; 96]),
+            ConsensusSignature::new([2u8; 96]),
         )));
         let redispatched = coord.on_unverified_ratify_vote_received(retry);
         assert_eq!(redispatched.len(), 1);
@@ -3888,7 +3886,7 @@ mod tests {
 
     #[test]
     fn try_propose_drains_buffered_equivocations_into_witnesses() {
-        use hyperscale_types::{Bls12381G2Signature, PcVoteEquivocation, PcVoteRound};
+        use hyperscale_types::{PcVoteEquivocation, PcVoteRound};
         let mut coord = fresh_coord();
         coord.bootstrap_spc_for_next_epoch();
 
@@ -3898,9 +3896,9 @@ mod tests {
             view: SpcView::new(1),
             round: PcVoteRound::Vote1,
             value_a: PcVector::empty(),
-            sig_a: Bls12381G2Signature([0x11; 96]),
+            sig_a: ConsensusSignature::new([0x11; 96]),
             value_b: PcVector::empty(),
-            sig_b: Bls12381G2Signature([0x22; 96]),
+            sig_b: ConsensusSignature::new([0x22; 96]),
         };
         assert!(coord.equivocations.record_pc_equivocation(evidence));
 
@@ -4018,7 +4016,7 @@ mod tests {
         prev_view: SpcView,
         epoch: Epoch,
         keys: &[Bls12381G1PrivateKey],
-        committee: &[(ValidatorId, Bls12381G1PublicKey)],
+        committee: &[(ValidatorId, ConsensusPublicKey)],
         signer_positions: &[usize],
         v_in: &PcVector,
     ) -> SpcCert {
@@ -4092,7 +4090,7 @@ mod tests {
             .committee
             .iter()
             .copied()
-            .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
+            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
             .collect();
         let signer_positions: Vec<usize> = (0..q).collect();
         let cert = build_direct_cert(
@@ -4134,7 +4132,7 @@ mod tests {
             .committee
             .iter()
             .copied()
-            .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
+            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
             .collect();
         let signer_positions: Vec<usize> = (0..q).collect();
         let proposal = BeaconProposal::new(
@@ -4499,7 +4497,7 @@ mod tests {
     /// space. Evidence for other validators stays buffered.
     #[test]
     fn adopt_prunes_evidence_for_revoked_validators() {
-        use hyperscale_types::{Bls12381G2Signature, PcVoteRound};
+        use hyperscale_types::PcVoteRound;
         let mut coord = fresh_coord();
         let evidence = |v: u64| PcVoteEquivocation {
             validator: ValidatorId::new(v),
@@ -4507,9 +4505,9 @@ mod tests {
             view: SpcView::new(1),
             round: PcVoteRound::Vote1,
             value_a: PcVector::empty(),
-            sig_a: Bls12381G2Signature([0x11; 96]),
+            sig_a: ConsensusSignature::new([0x11; 96]),
             value_b: PcVector::empty(),
-            sig_b: Bls12381G2Signature([0x22; 96]),
+            sig_b: ConsensusSignature::new([0x22; 96]),
         };
         assert!(coord.equivocations.record_pc_equivocation(evidence(1)));
         assert!(coord.equivocations.record_pc_equivocation(evidence(2)));
@@ -4617,7 +4615,7 @@ mod tests {
         let cert_committee: Vec<_> = committee
             .iter()
             .copied()
-            .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
+            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
             .collect();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;
@@ -4688,7 +4686,7 @@ mod tests {
             .committee
             .iter()
             .copied()
-            .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
+            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
             .collect();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;
@@ -4761,7 +4759,7 @@ mod tests {
             .committee
             .iter()
             .copied()
-            .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
+            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
             .collect();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;
@@ -4967,7 +4965,6 @@ mod tests {
 
     #[test]
     fn on_ratify_vote_drops_invalid_sig_via_async_result() {
-        use hyperscale_types::Bls12381G2Signature;
         let mut coord = fresh_coord();
         let skip_hash = coord.ratify.skip_block_hash();
         // Signer 0 is in the pool, but sig is all-zeros — verification
@@ -4979,7 +4976,7 @@ mod tests {
             RatifyPhase::Prevote,
             skip_hash,
             ValidatorId::new(0),
-            Bls12381G2Signature([0u8; 96]),
+            ConsensusSignature::new([0u8; 96]),
         )));
         let dispatched = coord.on_unverified_ratify_vote_received(vote);
         // Synchronous validation passes (signer in pool, anchor + epoch
@@ -5229,7 +5226,7 @@ mod tests {
             parent_block_hash,
             Round::INITIAL,
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(1_000),
         );
         let certified_header = Arc::new(Verified::new_unchecked_for_test(
@@ -5592,7 +5589,7 @@ mod tests {
             .committee
             .iter()
             .copied()
-            .zip(keys.iter().map(Bls12381G1PrivateKey::public_key))
+            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
             .collect();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;

@@ -36,9 +36,9 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block, BlockHash,
-    BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    Bls12381G2Signature, CertRootVerifyError, CertificateRoot, CertificateRootContext,
-    CertifiedBlock, ConsensusReceipt, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot,
+    BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G2Signature,
+    CertRootVerifyError, CertificateRoot, CertificateRootContext, CertifiedBlock,
+    ConsensusPublicKey, ConsensusReceipt, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot,
     LocalReceiptRootContext, LocalReceiptRootVerifyError, LocalTimestamp, NetworkDefinition,
     ProposerTimestamp, ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
@@ -47,7 +47,7 @@ use hyperscale_types::{
     StoredReceipt, Timeout, TimeoutContext, TopologySchedule, TransactionRoot,
     TransactionRootContext, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify,
     VoteCount, VrfProof, WeightedTimestamp, local_settled_wave_ids, ready_signal_message,
-    shard_reveal_sign,
+    shard_reveal_sign, sig_from_bls,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -301,7 +301,7 @@ pub struct ShardCoordinatorSim {
     /// One coordinator per replica.
     pub coordinators: Vec<ShardCoordinator>,
     /// `(validator_id, pubkey)` per replica.
-    pub members: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    pub members: Vec<(ValidatorId, ConsensusPublicKey)>,
     /// BLS signing keys per replica.
     sks: Vec<Arc<Bls12381G1PrivateKey>>,
     /// In-memory shard storage per replica. Exposed for test
@@ -730,7 +730,13 @@ impl ShardCoordinatorSim {
             wt_window_end,
         );
         let sig = Bls12381G2Signature(sk.sign_v1(&msg).0);
-        let signal = ReadySignal::new(validator, shard, wt_window_start, wt_window_end, sig);
+        let signal = ReadySignal::new(
+            validator,
+            shard,
+            wt_window_start,
+            wt_window_end,
+            sig_from_bls(&sig),
+        );
         for idx in 0..self.n() {
             self.coordinators[idx]
                 .on_ready_signal_received(&self.topology_schedule, signal.clone());

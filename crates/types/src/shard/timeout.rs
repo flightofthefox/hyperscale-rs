@@ -14,9 +14,9 @@
 use thiserror::Error;
 
 use crate::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, NetworkDefinition,
-    QuorumCertificate, Round, ShardId, ValidatorId, Verified, Verify, timeout_message,
-    verify_bls12381_v1,
+    Bls12381G1PrivateKey, ConsensusPublicKey, ConsensusSignature, NetworkDefinition,
+    QuorumCertificate, Round, ShardId, ValidatorId, Verified, Verify, bls_pk, bls_sig,
+    sig_from_bls, timeout_message, verify_bls12381_v1,
 };
 
 /// A validator's timeout for a shard consensus round.
@@ -31,7 +31,7 @@ pub struct Timeout {
     round: Round,
     high_qc: QuorumCertificate,
     voter: ValidatorId,
-    signature: Bls12381G2Signature,
+    signature: ConsensusSignature,
 }
 
 impl Timeout {
@@ -46,7 +46,7 @@ impl Timeout {
         signing_key: &Bls12381G1PrivateKey,
     ) -> Self {
         let message = timeout_message(network, shard_id, round);
-        let signature = signing_key.sign_v1(&message);
+        let signature = sig_from_bls(&signing_key.sign_v1(&message));
         Self {
             shard_id,
             round,
@@ -64,7 +64,7 @@ impl Timeout {
         round: Round,
         high_qc: QuorumCertificate,
         voter: ValidatorId,
-        signature: Bls12381G2Signature,
+        signature: ConsensusSignature,
     ) -> Self {
         Self {
             shard_id,
@@ -108,7 +108,7 @@ impl Timeout {
 
     /// BLS signature over the domain-separated signing message.
     #[must_use]
-    pub const fn signature(&self) -> Bls12381G2Signature {
+    pub const fn signature(&self) -> ConsensusSignature {
         self.signature
     }
 
@@ -121,7 +121,7 @@ impl Timeout {
         Round,
         QuorumCertificate,
         ValidatorId,
-        Bls12381G2Signature,
+        ConsensusSignature,
     ) {
         (
             self.shard_id,
@@ -150,7 +150,7 @@ pub struct TimeoutContext<'a> {
     /// Network identifier — feeds the domain-separated signing message.
     pub network: &'a NetworkDefinition,
     /// BLS public key of the validator who timed out.
-    pub voter_public_key: &'a Bls12381G1PublicKey,
+    pub voter_public_key: &'a ConsensusPublicKey,
 }
 
 /// Failure modes of [`Timeout`] verification.
@@ -178,7 +178,11 @@ impl Verify<&TimeoutContext<'_>> for Timeout {
 
     fn verify(&self, ctx: &TimeoutContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let message = self.signing_message(ctx.network);
-        if !verify_bls12381_v1(&message, ctx.voter_public_key, &self.signature) {
+        if !verify_bls12381_v1(
+            &message,
+            &bls_pk(ctx.voter_public_key),
+            &bls_sig(&self.signature),
+        ) {
             return Err(TimeoutVerifyError::InvalidSignature);
         }
         Ok(Verified::new_unchecked(self.clone()))
@@ -219,8 +223,8 @@ impl Verified<Timeout> {
 mod tests {
     use super::*;
     use crate::{
-        BlockHash, BlockHeight, SignerBitfield, WeightedTimestamp, generate_bls_keypair,
-        zero_bls_signature,
+        BlockHash, BlockHeight, SignerBitfield, WeightedTimestamp, agg_from_bls,
+        generate_bls_keypair, pk_from_bls, zero_bls_signature,
     };
 
     const SHARD: ShardId = ShardId::ROOT;
@@ -233,7 +237,7 @@ mod tests {
             BlockHash::ZERO,
             Round::new(round),
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         )
     }
@@ -259,7 +263,7 @@ mod tests {
             timeout
                 .verify(&TimeoutContext {
                     network: &net,
-                    voter_public_key: &pk,
+                    voter_public_key: &pk_from_bls(&pk),
                 })
                 .is_ok()
         );
@@ -282,7 +286,7 @@ mod tests {
         assert!(matches!(
             timeout.verify(&TimeoutContext {
                 network: &net,
-                voter_public_key: &intruder,
+                voter_public_key: &pk_from_bls(&intruder),
             }),
             Err(TimeoutVerifyError::InvalidSignature),
         ));

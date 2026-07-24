@@ -27,7 +27,7 @@ use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
 };
 use hyperscale_types::network::response::GetProvisionResponse;
-use hyperscale_types::{ExecutionCertificate, ShardId, Verifiable, ready_signal_message};
+use hyperscale_types::{ExecutionCertificate, ShardId, Verifiable, bls_sig, ready_signal_message};
 use tracing::warn;
 
 use crate::beacon::gossip::register_beacon_gossip_handlers;
@@ -133,7 +133,7 @@ where
                             certified_header: gossip.certified_header,
                             sender,
                             public_key,
-                            sender_signature: gossip.sender_signature,
+                            sender_signature: bls_sig(&gossip.sender_signature),
                         },
                     );
                     GossipVerdict::Accept
@@ -506,7 +506,12 @@ where
                         signal.wt_window_start(),
                         signal.wt_window_end(),
                     );
-                    if !verify_bls_with_metrics(&msg, &public_key, &signal.sig(), "ready_signal") {
+                    if !verify_bls_with_metrics(
+                        &msg,
+                        &public_key,
+                        &bls_sig(&signal.sig()),
+                        "ready_signal",
+                    ) {
                         warn!(
                             sender = sender.inner(),
                             "Ready signal BLS verify failed — dropping"

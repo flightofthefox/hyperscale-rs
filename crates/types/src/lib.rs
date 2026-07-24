@@ -74,16 +74,19 @@ pub use crypto::batch_verify::{
     batch_verify_bls_different_messages_all_or_nothing, batch_verify_bls_same_message,
     batch_verify_ed25519,
 };
+pub use crypto::bls_interop::{agg_from_bls, bls_agg, bls_pk, bls_sig, pk_from_bls, sig_from_bls};
 pub use crypto::keys::{
     bls_keypair_from_seed, ed25519_keypair_from_seed, generate_bls_keypair,
     generate_ed25519_keypair, zero_bls_signature, zero_ed25519_signature,
 };
-pub use crypto::vrf::{
-    RANDOMNESS_BYTES, Randomness, VRF_OUTPUT_BYTES, VRF_PROOF_BYTES, VrfOutput, VrfProof,
-};
 pub use crypto::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Ed25519PrivateKey,
     Ed25519PublicKey, Ed25519Signature, verify_bls12381_v1, verify_ed25519,
+};
+pub use hyperscale_crypto::{
+    AGGREGATE_SIGNATURE_BYTES, AggregateError, AggregateSignature, CONSENSUS_PUBLIC_KEY_BYTES,
+    CONSENSUS_SIGNATURE_BYTES, ConsensusPublicKey, ConsensusSignature, SignError, Signer,
+    VRF_OUTPUT_BYTES, VRF_PROOF_BYTES, Verifier, VrfOutput, VrfProof,
 };
 pub use network::{
     GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,
@@ -106,6 +109,7 @@ pub use primitives::merkle::{
     compute_merkle_root, compute_merkle_root_with_proof, verify_merkle_inclusion,
 };
 pub use primitives::positional_bundle::PositionalBundle;
+pub use primitives::randomness::{RANDOMNESS_BYTES, Randomness};
 pub use primitives::signer_bitfield::SignerBitfield;
 pub use provisioning::entry::ProvisionEntry;
 pub use provisioning::limits::{

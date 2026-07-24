@@ -259,7 +259,7 @@ mod tests {
 
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
-        BeaconWitnessRoot, BlockHeight, Bls12381G2Signature, NetworkDefinition, ReadySignal,
+        BeaconWitnessRoot, BlockHeight, ConsensusSignature, NetworkDefinition, ReadySignal,
         ReshapeTrigger, Round, Stake, StakePoolId, TopologySnapshot, ValidatorId, ValidatorInfo,
         ValidatorSet, VrfProof, WeightedTimestamp, WitnessSources, compute_merkle_root,
     };
@@ -316,7 +316,7 @@ mod tests {
             ShardId::ROOT,
             WeightedTimestamp::from_millis(1),
             WeightedTimestamp::from_millis(100),
-            Bls12381G2Signature([0x42; 96]),
+            ConsensusSignature::new([0x42; 96]),
         )
     }
 

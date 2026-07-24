@@ -16,8 +16,8 @@
 //! different network.
 
 use crate::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, NetworkDefinition, ValidatorId,
-    verify_bls12381_v1,
+    Bls12381G1PrivateKey, ConsensusPublicKey, ConsensusSignature, NetworkDefinition, ValidatorId,
+    bls_pk, bls_sig, pk_from_bls, sig_from_bls, verify_bls12381_v1,
 };
 
 /// Domain tag for validator BLS proof-of-possession.
@@ -32,13 +32,13 @@ pub const DOMAIN_VALIDATOR_POSSESSION_PROOF: &[u8] = b"HYPERSCALE_VALIDATOR_POSS
 pub fn validator_possession_proof_message(
     network: &NetworkDefinition,
     validator_id: ValidatorId,
-    pubkey: &Bls12381G1PublicKey,
+    pubkey: &ConsensusPublicKey,
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(DOMAIN_VALIDATOR_POSSESSION_PROOF.len() + 1 + 8 + 48);
     out.extend_from_slice(DOMAIN_VALIDATOR_POSSESSION_PROOF);
     out.push(network.id);
     out.extend_from_slice(&validator_id.to_le_bytes());
-    out.extend_from_slice(&pubkey.0);
+    out.extend_from_slice(pubkey.as_bytes());
     out
 }
 
@@ -52,9 +52,10 @@ pub fn validator_possession_proof_sign(
     sk: &Bls12381G1PrivateKey,
     network: &NetworkDefinition,
     validator_id: ValidatorId,
-) -> Bls12381G2Signature {
-    let msg = validator_possession_proof_message(network, validator_id, &sk.public_key());
-    sk.sign_v1(&msg)
+) -> ConsensusSignature {
+    let msg =
+        validator_possession_proof_message(network, validator_id, &pk_from_bls(&sk.public_key()));
+    sig_from_bls(&sk.sign_v1(&msg))
 }
 
 /// Verify that `possession_proof` proves possession of `pubkey` claimed under
@@ -63,11 +64,11 @@ pub fn validator_possession_proof_sign(
 pub fn validator_possession_proof_verify(
     network: &NetworkDefinition,
     validator_id: ValidatorId,
-    pubkey: &Bls12381G1PublicKey,
-    possession_proof: &Bls12381G2Signature,
+    pubkey: &ConsensusPublicKey,
+    possession_proof: &ConsensusSignature,
 ) -> bool {
     let msg = validator_possession_proof_message(network, validator_id, pubkey);
-    verify_bls12381_v1(&msg, pubkey, possession_proof)
+    verify_bls12381_v1(&msg, &bls_pk(pubkey), &bls_sig(possession_proof))
 }
 
 #[cfg(test)]
@@ -79,7 +80,7 @@ mod tests {
 
     use super::*;
     use crate::signing::{DOMAIN_READY_SIGNAL, DOMAIN_SHARD_REVEAL};
-    use crate::{bls_keypair_from_seed, zero_bls_signature};
+    use crate::{Bls12381G1PublicKey, bls_keypair_from_seed, zero_bls_signature};
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
@@ -96,7 +97,7 @@ mod tests {
     /// fails this test.
     #[test]
     fn validator_possession_proof_message_byte_layout_is_pinned() {
-        let pk = keypair(1).public_key();
+        let pk = pk_from_bls(&keypair(1).public_key());
         let id = ValidatorId::new(0x0123_4567_89AB_CDEF);
         let bytes = validator_possession_proof_message(&net(), id, &pk);
 
@@ -104,7 +105,7 @@ mod tests {
         expected.extend_from_slice(DOMAIN_VALIDATOR_POSSESSION_PROOF);
         expected.push(net().id);
         expected.extend_from_slice(&id.to_le_bytes());
-        expected.extend_from_slice(&pk.0);
+        expected.extend_from_slice(pk.as_bytes());
 
         assert_eq!(bytes, expected);
         assert_eq!(
@@ -117,7 +118,7 @@ mod tests {
     /// a different `ValidatorId` must not verify.
     #[test]
     fn validator_possession_proof_message_differs_across_ids() {
-        let pk = keypair(1).public_key();
+        let pk = pk_from_bls(&keypair(1).public_key());
         let a = validator_possession_proof_message(&net(), ValidatorId::new(1), &pk);
         let b = validator_possession_proof_message(&net(), ValidatorId::new(2), &pk);
         assert_ne!(a, b);
@@ -127,7 +128,7 @@ mod tests {
     /// different networks must produce different signing bytes.
     #[test]
     fn validator_possession_proof_message_differs_across_networks() {
-        let pk = keypair(1).public_key();
+        let pk = pk_from_bls(&keypair(1).public_key());
         let id = ValidatorId::new(7);
         let mainnet = validator_possession_proof_message(&NetworkDefinition::mainnet(), id, &pk);
         let stokenet = validator_possession_proof_message(&NetworkDefinition::stokenet(), id, &pk);
@@ -150,7 +151,7 @@ mod tests {
         assert!(validator_possession_proof_verify(
             &net(),
             id,
-            &sk.public_key(),
+            &pk_from_bls(&sk.public_key()),
             &proof
         ));
     }
@@ -165,7 +166,7 @@ mod tests {
         assert!(!validator_possession_proof_verify(
             &net(),
             id,
-            &sk_b.public_key(),
+            &pk_from_bls(&sk_b.public_key()),
             &proof
         ));
     }
@@ -179,7 +180,7 @@ mod tests {
         assert!(!validator_possession_proof_verify(
             &net(),
             ValidatorId::new(43),
-            &sk.public_key(),
+            &pk_from_bls(&sk.public_key()),
             &proof
         ));
     }
@@ -191,8 +192,8 @@ mod tests {
         assert!(!validator_possession_proof_verify(
             &net(),
             id,
-            &sk.public_key(),
-            &zero_bls_signature()
+            &pk_from_bls(&sk.public_key()),
+            &sig_from_bls(&zero_bls_signature())
         ));
     }
 
@@ -257,20 +258,20 @@ mod tests {
 
         // The adversary's available forgeries: sign the rogue key's PoP
         // message with each secret it could hold. None verifies.
-        let msg = validator_possession_proof_message(&net(), id, &rogue_pk);
+        let msg = validator_possession_proof_message(&net(), id, &pk_from_bls(&rogue_pk));
         let forged_with_r = r.sign_v1(&msg);
         assert!(!validator_possession_proof_verify(
             &net(),
             id,
-            &rogue_pk,
-            &forged_with_r
+            &pk_from_bls(&rogue_pk),
+            &sig_from_bls(&forged_with_r)
         ));
         let forged_with_honest = honest.sign_v1(&msg);
         assert!(!validator_possession_proof_verify(
             &net(),
             id,
-            &rogue_pk,
-            &forged_with_honest
+            &pk_from_bls(&rogue_pk),
+            &sig_from_bls(&forged_with_honest)
         ));
     }
 }

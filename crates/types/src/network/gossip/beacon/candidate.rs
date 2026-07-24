@@ -77,7 +77,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        BeaconBlock, BeaconBlockHash, Bls12381G2Signature, Epoch, Hash, PcQc2, PcQc3,
+        AggregateSignature, BeaconBlock, BeaconBlockHash, Epoch, Hash, PcQc2, PcQc3,
         PcSignerLengths, PcVector, PcXpProof, SignerBitfield, SpcCert, SpcView,
     };
 
@@ -85,7 +85,7 @@ mod tests {
         let qc2 = PcQc2::new(
             PcVector::empty(),
             SignerBitfield::new(4),
-            Bls12381G2Signature([0x11; 96]),
+            AggregateSignature::new([0x11; 96]),
             PcXpProof::Full,
         );
         let qc3 = PcQc3::new(
@@ -95,7 +95,7 @@ mod tests {
             None,
             SignerBitfield::new(4),
             PcSignerLengths::Uniform(0),
-            Bls12381G2Signature([0x11; 96]),
+            AggregateSignature::new([0x11; 96]),
         );
         CandidateBeaconBlock::new(
             BeaconBlock::new(

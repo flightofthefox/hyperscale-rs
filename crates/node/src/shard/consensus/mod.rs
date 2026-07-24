@@ -20,7 +20,7 @@ pub use block::{
 };
 pub use block_serve::serve_block_request;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, LocalTimestamp, ValidatorId,
+    Bls12381G2Signature, CertifiedBlockHeader, ConsensusPublicKey, LocalTimestamp, ValidatorId,
     Verifiable,
 };
 
@@ -38,7 +38,7 @@ use crate::config::NodeConfig;
 pub type CertifiedHeaderVerificationItem = (
     Arc<Verifiable<CertifiedBlockHeader>>,
     ValidatorId,
-    Bls12381G1PublicKey,
+    ConsensusPublicKey,
     Bls12381G2Signature,
 );
 

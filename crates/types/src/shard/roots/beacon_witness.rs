@@ -443,7 +443,7 @@ mod tests {
     use super::*;
     use crate::{
         Bls12381G1PrivateKey, NetworkDefinition, ValidatorId, ValidatorInfo, ValidatorSet,
-        VrfProof, bls_keypair_from_seed, shard_reveal_sign,
+        VrfProof, bls_keypair_from_seed, pk_from_bls, shard_reveal_sign, sig_from_bls,
     };
 
     /// The single committee member's key. Deterministic so a test can both
@@ -477,7 +477,7 @@ mod tests {
     ) -> TopologySnapshot {
         let validators = vec![ValidatorInfo {
             validator_id: ValidatorId::new(0),
-            public_key: proposer_sk().public_key(),
+            public_key: pk_from_bls(&proposer_sk().public_key()),
         }];
         let vs = ValidatorSet::new(validators);
         TopologySnapshot::from_explicit_committees(
@@ -508,7 +508,7 @@ mod tests {
     ) -> TopologySnapshot {
         let validators = vec![ValidatorInfo {
             validator_id: ValidatorId::new(0),
-            public_key: proposer_sk().public_key(),
+            public_key: pk_from_bls(&proposer_sk().public_key()),
         }];
         let vs = ValidatorSet::new(validators);
         TopologySnapshot::from_explicit_committees(
@@ -720,7 +720,7 @@ mod tests {
             child,
             WeightedTimestamp::from_millis(0),
             WeightedTimestamp::from_millis(10),
-            zero_bls_signature(),
+            sig_from_bls(&zero_bls_signature()),
         )];
         let leaf = ShardWitnessPayload::ReshapeReady {
             validator: observer,
@@ -760,7 +760,7 @@ mod tests {
             child,
             WeightedTimestamp::from_millis(0),
             WeightedTimestamp::from_millis(10),
-            zero_bls_signature(),
+            sig_from_bls(&zero_bls_signature()),
         )];
         let leaf = ShardWitnessPayload::ReshapeReady {
             validator: keeper,

@@ -77,7 +77,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        BeaconBlockHash, Bls12381G2Signature, Epoch, Hash, RatifyPhase, RatifyRound, ValidatorId,
+        BeaconBlockHash, ConsensusSignature, Epoch, Hash, RatifyPhase, RatifyRound, ValidatorId,
     };
 
     fn sample_vote() -> RatifyVote {
@@ -88,7 +88,7 @@ mod tests {
             RatifyPhase::Precommit,
             BeaconBlockHash::from_raw(Hash::from_bytes(b"block")),
             ValidatorId::new(3),
-            Bls12381G2Signature([0x33; 96]),
+            ConsensusSignature::new([0x33; 96]),
         )
     }
 

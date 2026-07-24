@@ -179,7 +179,7 @@ impl ReadySignalPool {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Bls12381G2Signature, ShardId};
+    use hyperscale_types::{ConsensusSignature, ShardId};
 
     use super::*;
 
@@ -189,7 +189,7 @@ mod tests {
             ShardId::ROOT,
             WeightedTimestamp::from_millis(start),
             WeightedTimestamp::from_millis(end),
-            Bls12381G2Signature([0xAB; 96]),
+            ConsensusSignature::new([0xAB; 96]),
         )
     }
 

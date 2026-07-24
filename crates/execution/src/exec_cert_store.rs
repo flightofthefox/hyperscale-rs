@@ -99,7 +99,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use hyperscale_types::{
-        BlockHeight, GlobalReceiptRoot, ShardId, SignerBitfield, WeightedTimestamp,
+        BlockHeight, GlobalReceiptRoot, ShardId, SignerBitfield, WeightedTimestamp, agg_from_bls,
         zero_bls_signature,
     };
 
@@ -116,7 +116,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::new(4),
         )))
     }

@@ -13,8 +13,8 @@ use blake3::Hasher;
 use sbor::prelude::*;
 
 use crate::{
-    BEACON_SIGNER_COUNT, Bls12381G1PublicKey, EPOCH_DURATION, EpochWindows, GenesisConfigHash,
-    Hash, IMPOUND_EPOCHS_DEFAULT, NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness,
+    BEACON_SIGNER_COUNT, ConsensusPublicKey, EPOCH_DURATION, EpochWindows, GenesisConfigHash, Hash,
+    IMPOUND_EPOCHS_DEFAULT, NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness,
     ReshapeThresholds, SHARD_CAPACITY, SHUFFLE_SYNC_HEADROOM, Stake, StakePoolId, ValidatorId,
 };
 
@@ -174,7 +174,7 @@ pub struct GenesisValidator {
     /// Pool this validator operates under.
     pub pool: StakePoolId,
     /// Compressed BLS pubkey.
-    pub pubkey: Bls12381G1PublicKey,
+    pub pubkey: ConsensusPublicKey,
 }
 
 /// One stake pool as supplied at genesis.
@@ -257,12 +257,12 @@ pub fn genesis_config_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bls_keypair_from_seed;
+    use crate::{bls_keypair_from_seed, pk_from_bls};
 
-    fn pubkey(seed: u64) -> Bls12381G1PublicKey {
+    fn pubkey(seed: u64) -> ConsensusPublicKey {
         let mut s = [0u8; 32];
         s[..8].copy_from_slice(&seed.to_le_bytes());
-        bls_keypair_from_seed(&s).public_key()
+        pk_from_bls(&bls_keypair_from_seed(&s).public_key())
     }
 
     fn sample_config() -> BeaconGenesisConfig {

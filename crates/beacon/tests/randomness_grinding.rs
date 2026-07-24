@@ -50,7 +50,7 @@ use hyperscale_types::{
     BeaconChainConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey, Epoch, MIN_STAKE_FLOOR,
     NetworkDefinition, Randomness, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
     ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed, byzantine_threshold,
-    vrf_sign,
+    pk_from_bls, vrf_sign,
 };
 
 // ─── Analytic model (ported from committee_security.py) ──────────────────────
@@ -260,7 +260,7 @@ fn build_state(
                 pool: pool_id,
                 status,
                 registered_at_epoch: Epoch::GENESIS,
-                pubkey: keys[usize::try_from(i).expect("id fits")].public_key(),
+                pubkey: pk_from_bls(&keys[usize::try_from(i).expect("id fits")].public_key()),
             },
         );
         pool_validators.insert(id);

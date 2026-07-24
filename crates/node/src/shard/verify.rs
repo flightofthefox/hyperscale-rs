@@ -2,20 +2,20 @@
 
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, ShardId, Signed, SignedContext, TopologySnapshot,
-    ValidatorId, verify_bls12381_v1,
+    Bls12381G2Signature, ConsensusPublicKey, ShardId, Signed, SignedContext, TopologySnapshot,
+    ValidatorId, bls_pk, verify_bls12381_v1,
 };
 use tracing::warn;
 
 /// Verify a BLS12-381 signature and record latency metrics.
 pub fn verify_bls_with_metrics(
     msg: &[u8],
-    public_key: &Bls12381G1PublicKey,
+    public_key: &ConsensusPublicKey,
     signature: &Bls12381G2Signature,
     label: &str,
 ) -> bool {
     let start = std::time::Instant::now();
-    let valid = verify_bls12381_v1(msg, public_key, signature);
+    let valid = verify_bls12381_v1(msg, &bls_pk(public_key), signature);
     record_signature_verification_latency(label, start.elapsed().as_secs_f64());
     valid
 }
@@ -29,7 +29,7 @@ pub fn resolve_sender_key(
     sender: ValidatorId,
     shard: ShardId,
     context: &str,
-) -> Option<Bls12381G1PublicKey> {
+) -> Option<ConsensusPublicKey> {
     let committee = topology_snapshot.committee_for_shard(shard);
     if !committee.contains(&sender) {
         warn!(

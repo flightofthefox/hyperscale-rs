@@ -3,7 +3,7 @@
 use sbor::prelude::BasicSbor;
 
 use crate::{
-    Bls12381G2Signature, ExecutionVote, MessageClass, NetworkDefinition, NetworkMessage, ShardId,
+    ConsensusSignature, ExecutionVote, MessageClass, NetworkDefinition, NetworkMessage, ShardId,
     Signed, ValidatorId, Verifiable, exec_vote_batch_message,
 };
 
@@ -20,7 +20,7 @@ pub struct ExecutionVotesNotification {
     /// The validator who sent this batch.
     pub sender: ValidatorId,
     /// BLS signature over the domain-separated signing message, by the sender.
-    pub sender_signature: Bls12381G2Signature,
+    pub sender_signature: ConsensusSignature,
 }
 
 impl ExecutionVotesNotification {
@@ -29,7 +29,7 @@ impl ExecutionVotesNotification {
     pub const fn new(
         votes: Vec<Verifiable<ExecutionVote>>,
         sender: ValidatorId,
-        sender_signature: Bls12381G2Signature,
+        sender_signature: ConsensusSignature,
     ) -> Self {
         Self {
             votes,
@@ -68,7 +68,7 @@ impl Signed for ExecutionVotesNotification {
         self.sender
     }
 
-    fn signature(&self) -> &Bls12381G2Signature {
+    fn signature(&self) -> &ConsensusSignature {
         &self.sender_signature
     }
 

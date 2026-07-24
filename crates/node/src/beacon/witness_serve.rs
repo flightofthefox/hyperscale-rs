@@ -140,12 +140,12 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
     use hyperscale_types::{
-        BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
-        BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock, ChainOrigin, Hash,
-        InFlightCount, LeafIndex, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId,
-        StateRoot, TransactionRoot, ValidatorId, Verified, WeightedTimestamp, WitnessSources,
-        compute_merkle_root, verify_merkle_inclusion, zero_bls_signature,
+        AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
+        BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock,
+        ChainOrigin, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionsRoot, QuorumCertificate, Round, ShardId, ShardWitnessPayload, SignerBitfield,
+        Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verified, WeightedTimestamp,
+        WitnessSources, compute_merkle_root, verify_merkle_inclusion,
     };
 
     use super::*;
@@ -197,7 +197,7 @@ mod tests {
             block.header().parent_block_hash(),
             Round::INITIAL,
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),
         )
     }

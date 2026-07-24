@@ -296,7 +296,8 @@ mod tests {
     use hyperscale_types::{
         BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot, Hash,
         NetworkDefinition, RETENTION_HORIZON, ShardId, SignerBitfield, TxHash, TxOutcome,
-        ValidatorId, bls_keypair_from_seed, exec_vote_message, zero_bls_signature,
+        ValidatorId, agg_from_bls, bls_keypair_from_seed, exec_vote_message, sig_from_bls,
+        zero_bls_signature,
     };
     use proptest::collection::vec as prop_vec;
 
@@ -338,7 +339,7 @@ mod tests {
             vote_anchor_ts,
             GlobalReceiptRoot::ZERO,
             outcomes,
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::new(4),
         )))
     }
@@ -366,7 +367,7 @@ mod tests {
             u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
             tx_outcomes,
             ValidatorId::new(0),
-            signature,
+            sig_from_bls(&signature),
         )
     }
 
@@ -383,7 +384,7 @@ mod tests {
             0,
             vec![],
             ValidatorId::new(0),
-            zero_bls_signature(),
+            sig_from_bls(&zero_bls_signature()),
         )
         .into()
     }

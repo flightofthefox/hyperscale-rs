@@ -23,7 +23,7 @@ use hyperscale_types::{
     BeaconProposal, CandidateVerifyContext, CertifiedBeaconBlockVerifyContext,
     DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext,
     RatifyVerifyContext, RatifyVote, SpcEmptyViewMsg, SpcVerifyContext, Verifiable, Verified,
-    pc_context, spc_context, spc_relay_signing_message,
+    pc_context, sig_from_bls, spc_context, spc_relay_signing_message,
 };
 
 /// Dispatch a beacon-owned [`Action`] on the consensus pool. Panics on
@@ -134,7 +134,12 @@ where
             let sig = ctx.signing_key.sign_v1(&signing_msg);
             ctx.network.notify(
                 &recipients,
-                &SpcNewViewNotification::new(epoch, me, sig, Arc::new(Verifiable::from(*proposal))),
+                &SpcNewViewNotification::new(
+                    epoch,
+                    me,
+                    sig_from_bls(&sig),
+                    Arc::new(Verifiable::from(*proposal)),
+                ),
             );
         }
         Action::BroadcastSpcNewCommit {
@@ -149,7 +154,12 @@ where
             let sig = ctx.signing_key.sign_v1(&signing_msg);
             ctx.network.notify(
                 &recipients,
-                &SpcNewCommitNotification::new(epoch, me, sig, Arc::new(Verifiable::from(*msg))),
+                &SpcNewCommitNotification::new(
+                    epoch,
+                    me,
+                    sig_from_bls(&sig),
+                    Arc::new(Verifiable::from(*msg)),
+                ),
             );
         }
         Action::BuildAndBroadcastBeaconProposal {

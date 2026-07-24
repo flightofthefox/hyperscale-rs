@@ -2667,10 +2667,10 @@ mod tests {
         certify as test_certify, make_live_block as helpers_make_live_block, test_transaction,
     };
     use hyperscale_types::{
-        Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedVec, ConsensusReceipt, Epoch,
+        Bls12381G1PrivateKey, BoundedVec, ConsensusPublicKey, ConsensusReceipt, Epoch,
         ExecutionOutcome, GlobalReceiptHash, Hash, NetworkDefinition, QuorumCertificate,
-        RecoveryCause, ShardRecovery, SignerBitfield, ValidatorInfo, ValidatorSet,
-        generate_bls_keypair, zero_bls_signature,
+        RecoveryCause, ShardRecovery, SignerBitfield, ValidatorInfo, ValidatorSet, agg_from_bls,
+        generate_bls_keypair, pk_from_bls, sig_from_bls, zero_bls_signature,
     };
 
     use super::*;
@@ -2683,7 +2683,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -2705,7 +2705,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let mut recoveries = BTreeMap::new();
@@ -2809,7 +2809,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -2928,7 +2928,7 @@ mod tests {
             1,
             vec![],
             leader,
-            zero_bls_signature(),
+            sig_from_bls(&zero_bls_signature()),
         );
 
         state_non.on_unverified_execution_vote(&topo_non, fake_vote);
@@ -2966,7 +2966,7 @@ mod tests {
             0,
             vec![],
             outsider,
-            zero_bls_signature(),
+            sig_from_bls(&zero_bls_signature()),
         );
 
         let actions = state.on_unverified_execution_vote(&topo, vote);
@@ -3073,7 +3073,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         );
         state.on_certificate_verified(&topo, Ok(Arc::new(Verified::new_unchecked_for_test(cert))));
@@ -3109,7 +3109,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         ));
 
@@ -3153,7 +3153,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         ));
 
@@ -3206,7 +3206,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::new(4),
         );
 
@@ -3263,7 +3263,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         ));
         let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
@@ -3296,7 +3296,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::new(4),
         ));
         let wave = Arc::new(FinalizedWave::new(
@@ -3345,7 +3345,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         ));
         let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
@@ -3397,7 +3397,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         ));
         let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
@@ -3438,7 +3438,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::new(4),
         ));
         let wave = Arc::new(Verified::new_unchecked_for_test(FinalizedWave::new(
@@ -3471,7 +3471,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         );
 
@@ -3508,7 +3508,7 @@ mod tests {
                 WeightedTimestamp::ZERO,
                 GlobalReceiptRoot::ZERO,
                 vec![],
-                zero_bls_signature(),
+                agg_from_bls(&zero_bls_signature()),
                 signers.clone(),
             )
         };
@@ -3558,7 +3558,7 @@ mod tests {
                 TxHash::from_raw(Hash::from_bytes(b"deferred_tx")),
                 ExecutionOutcome::Aborted,
             )],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::new(4),
         );
 
@@ -3608,7 +3608,7 @@ mod tests {
                     TxHash::from_raw(Hash::from_bytes(&height.to_le_bytes())),
                     ExecutionOutcome::Aborted,
                 )],
-                zero_bls_signature(),
+                agg_from_bls(&zero_bls_signature()),
                 SignerBitfield::new(4),
             )
         };
@@ -3650,7 +3650,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         );
         let actions = state.on_wave_certificate(&topo, cert.into());
@@ -3678,7 +3678,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         );
 
@@ -3718,7 +3718,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         );
         state
@@ -3756,7 +3756,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers_a,
         );
         let incoming = ExecutionCertificate::new(
@@ -3764,7 +3764,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers_b,
         );
         assert_ne!(cached.wire_hash(), incoming.wire_hash());
@@ -3797,7 +3797,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         ));
         let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
@@ -3829,7 +3829,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         ));
         let raw_wave = FinalizedWave::new(
@@ -3862,7 +3862,7 @@ mod tests {
             WeightedTimestamp::from_millis(1_000_000),
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::empty(), // no signers — far below 2f+1
         ));
         let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
@@ -3923,7 +3923,7 @@ mod tests {
             WeightedTimestamp::from_millis(1_000_000),
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::new(4),
         );
         let _ = state.on_wave_certificate(&topo, cert.clone().into());
@@ -3976,7 +3976,7 @@ mod tests {
                 TxHash::from_raw(Hash::from_bytes(b"untracked_tx")),
                 ExecutionOutcome::Aborted,
             )],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::new(4),
         );
 
@@ -4013,7 +4013,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         TopologySchedule::single(Arc::new(TopologySnapshot::new(
@@ -4037,7 +4037,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -4078,14 +4078,14 @@ mod tests {
 
     /// A uniform-power committee over `ids`, one shard, plus its public keys in
     /// committee order (what `committee_public_keys_for_shard` returns).
-    fn committee_snapshot(ids: &[u64]) -> (TopologySnapshot, Vec<Bls12381G1PublicKey>) {
+    fn committee_snapshot(ids: &[u64]) -> (TopologySnapshot, Vec<ConsensusPublicKey>) {
         let validators: Vec<ValidatorInfo> = ids
             .iter()
             .map(|&id| {
                 let k = generate_bls_keypair();
                 ValidatorInfo {
                     validator_id: ValidatorId::new(id),
-                    public_key: k.public_key(),
+                    public_key: pk_from_bls(&k.public_key()),
                 }
             })
             .collect();
@@ -4120,7 +4120,7 @@ mod tests {
             WeightedTimestamp::from_millis(ED), // epoch 1
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::new(4),
         );
 
@@ -4188,7 +4188,7 @@ mod tests {
                 1,
                 vec![],
                 ValidatorId::new(v),
-                zero_bls_signature(),
+                sig_from_bls(&zero_bls_signature()),
             );
             actions.extend(
                 coord.on_verified_execution_vote(&schedule, Verified::new_unchecked_for_test(vote)),
@@ -4226,7 +4226,7 @@ mod tests {
             WeightedTimestamp::from_millis(5 * ED), // epoch 5, past the head
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::new(4),
         );
 
@@ -4270,7 +4270,7 @@ mod tests {
             WeightedTimestamp::from_millis(5 * ED), // epoch 5, past the head
             GlobalReceiptRoot::ZERO,
             vec![],
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             signers,
         ));
         let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
@@ -4451,7 +4451,7 @@ mod tests {
             WeightedTimestamp::from_millis(1_000),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"global_receipt_root")),
             tx_outcomes,
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             SignerBitfield::new(4),
         )));
         wave.add_execution_certificate(local_ec);
@@ -4513,7 +4513,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let final_window = Arc::new(TopologySnapshot::new(
@@ -4547,7 +4547,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let pre_split = Arc::new(TopologySnapshot::new(
@@ -4591,7 +4591,7 @@ mod tests {
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
                 )],
-                zero_bls_signature(),
+                agg_from_bls(&zero_bls_signature()),
                 SignerBitfield::new(4),
             )
         };
@@ -4749,7 +4749,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let final_window = Arc::new(TopologySnapshot::new(

@@ -76,10 +76,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
-        ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardId, SignerBitfield, SplitChildRoots, StateRoot,
-        TransactionRoot, ValidatorId, WeightedTimestamp, zero_bls_signature,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
+        CertificateRoot, ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, SplitChildRoots,
+        StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -118,7 +118,7 @@ mod tests {
             terminal.parent_block_hash(),
             Round::new(9),
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(wt),
         )
     }

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use sbor::prelude::BasicSbor;
 
-use crate::{Bls12381G2Signature, ShardId, ValidatorId, WeightedTimestamp};
+use crate::{ConsensusSignature, ShardId, ValidatorId, WeightedTimestamp};
 
 /// The weighted-time span a [`ReadySignal`]'s `[start, end]` validity
 /// window covers, scaled to the running network's `epoch_duration_ms`.
@@ -64,7 +64,7 @@ pub struct ReadySignal {
     /// uncollected.
     wt_window_end: WeightedTimestamp,
     /// BLS sig over [`crate::signing::ready_signal_message`].
-    sig: Bls12381G2Signature,
+    sig: ConsensusSignature,
 }
 
 impl ReadySignal {
@@ -75,7 +75,7 @@ impl ReadySignal {
         shard: ShardId,
         wt_window_start: WeightedTimestamp,
         wt_window_end: WeightedTimestamp,
-        sig: Bls12381G2Signature,
+        sig: ConsensusSignature,
     ) -> Self {
         Self {
             validator_id,
@@ -112,7 +112,7 @@ impl ReadySignal {
 
     /// BLS signature over the canonical signing bytes.
     #[must_use]
-    pub const fn sig(&self) -> Bls12381G2Signature {
+    pub const fn sig(&self) -> ConsensusSignature {
         self.sig
     }
 }
@@ -130,7 +130,7 @@ mod tests {
             ShardId::ROOT,
             WeightedTimestamp::from_millis(100),
             WeightedTimestamp::from_millis(228),
-            Bls12381G2Signature([0xAB; 96]),
+            ConsensusSignature::new([0xAB; 96]),
         );
         let bytes = basic_encode(&signal).unwrap();
         let decoded: ReadySignal = basic_decode(&bytes).unwrap();
@@ -145,12 +145,12 @@ mod tests {
             shard,
             WeightedTimestamp::from_millis(50),
             WeightedTimestamp::from_millis(99),
-            Bls12381G2Signature([0xCD; 96]),
+            ConsensusSignature::new([0xCD; 96]),
         );
         assert_eq!(signal.validator_id(), ValidatorId::new(3));
         assert_eq!(signal.shard(), shard);
         assert_eq!(signal.wt_window_start(), WeightedTimestamp::from_millis(50));
         assert_eq!(signal.wt_window_end(), WeightedTimestamp::from_millis(99));
-        assert_eq!(signal.sig(), Bls12381G2Signature([0xCD; 96]));
+        assert_eq!(signal.sig(), ConsensusSignature::new([0xCD; 96]));
     }
 }

@@ -38,7 +38,7 @@ use crate::beacon::params::{NetworkParams, ParamProposal};
 use crate::topology::snapshot::{ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, Epoch, RETENTION_HORIZON,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, RETENTION_HORIZON,
     Randomness, SettledWavesRoot, ShardId, Stake, StakePoolId, StateRoot, ValidatorId,
     WeightedTimestamp,
 };
@@ -231,7 +231,7 @@ pub struct ValidatorRecord {
     /// registry. Lifted verbatim from
     /// `ShardWitnessPayload::RegisterValidator` at registration and
     /// from the genesis input at chain bootstrap.
-    pub pubkey: Bls12381G1PublicKey,
+    pub pubkey: ConsensusPublicKey,
 }
 
 // ─── shard committee ─────────────────────────────────────────────────────────
@@ -1255,7 +1255,7 @@ impl BeaconState {
     /// invariant violation; this function does not panic so callers can
     /// make their own decision.
     #[must_use]
-    pub fn derive_beacon_committee(&self) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
+    pub fn derive_beacon_committee(&self) -> Vec<(ValidatorId, ConsensusPublicKey)> {
         self.committee
             .iter()
             .filter_map(|id| self.validators.get(id).map(|r| (*id, r.pubkey)))
@@ -1563,7 +1563,7 @@ impl BeaconState {
     /// pool followers drop ratify actions — a pool member serving no
     /// shard would silently lose its vote.
     #[must_use]
-    pub fn derive_active_pool(&self) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
+    pub fn derive_active_pool(&self) -> Vec<(ValidatorId, ConsensusPublicKey)> {
         self.beacon_eligible()
             .into_iter()
             .filter_map(|id| self.validators.get(&id).map(|r| (id, r.pubkey)))
@@ -1682,12 +1682,12 @@ impl BeaconState {
 mod tests {
     use super::*;
     use crate::crypto::keys::bls_keypair_from_seed;
-    use crate::{Hash, JailReason};
+    use crate::{Hash, JailReason, pk_from_bls};
 
-    fn pubkey(seed: u64) -> Bls12381G1PublicKey {
+    fn pubkey(seed: u64) -> ConsensusPublicKey {
         let mut s = [0u8; 32];
         s[..8].copy_from_slice(&seed.to_le_bytes());
-        bls_keypair_from_seed(&s).public_key()
+        pk_from_bls(&bls_keypair_from_seed(&s).public_key())
     }
 
     fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> ValidatorRecord {

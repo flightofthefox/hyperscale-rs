@@ -15,7 +15,7 @@ use hyperscale_types::{
     InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash,
     ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TopologySchedule,
     TopologySnapshot, TransactionRoot, ValidatorId, Verified, WaveId, WeightedTimestamp,
-    WitnessSources, zero_bls_signature,
+    WitnessSources, agg_from_bls, zero_bls_signature,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -124,7 +124,7 @@ fn make_remote_header_targeting(
         BlockHash::ZERO,
         Round::INITIAL,
         SignerBitfield::empty(),
-        zero_bls_signature(),
+        agg_from_bls(&zero_bls_signature()),
         WeightedTimestamp::ZERO,
     );
     Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(

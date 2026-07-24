@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sbor::prelude::BasicSbor;
 
 use crate::{
-    Bls12381G2Signature, MessageClass, NetworkDefinition, NetworkMessage, Provisions, Signed,
+    ConsensusSignature, MessageClass, NetworkDefinition, NetworkMessage, Provisions, Signed,
     ValidatorId, Verifiable, state_provisions_message,
 };
 
@@ -24,7 +24,7 @@ pub struct ProvisionsNotification {
     /// The validator who sent this notification.
     pub sender: ValidatorId,
     /// BLS signature over the domain-separated signing message, by the sender.
-    pub sender_signature: Bls12381G2Signature,
+    pub sender_signature: ConsensusSignature,
 }
 
 impl ProvisionsNotification {
@@ -33,7 +33,7 @@ impl ProvisionsNotification {
     pub fn new(
         provisions: impl Into<Arc<Verifiable<Provisions>>>,
         sender: ValidatorId,
-        sender_signature: Bls12381G2Signature,
+        sender_signature: ConsensusSignature,
     ) -> Self {
         Self {
             provisions: provisions.into(),
@@ -48,7 +48,7 @@ impl Signed for ProvisionsNotification {
         self.sender
     }
 
-    fn signature(&self) -> &Bls12381G2Signature {
+    fn signature(&self) -> &ConsensusSignature {
         &self.sender_signature
     }
 

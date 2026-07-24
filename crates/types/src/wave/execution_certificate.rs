@@ -17,10 +17,11 @@ use thiserror::Error;
 
 use crate::sbor_codec::decode_bounded_vec;
 use crate::{
-    BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, ExecutionVote, GlobalReceiptRoot, Hash,
-    MAX_TXS_PER_BLOCK, NetworkDefinition, RETENTION_HORIZON, ShardId, SignerBitfield, TxOutcome,
-    ValidatorId, Verified, Verify, WaveId, WeightedTimestamp, compute_global_receipt_root,
-    exec_vote_message, verify_bls12381_v1, zero_bls_signature,
+    AggregateSignature, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, ConsensusPublicKey,
+    ExecutionVote, GlobalReceiptRoot, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition,
+    RETENTION_HORIZON, ShardId, SignerBitfield, TxOutcome, ValidatorId, Verified, Verify, WaveId,
+    WeightedTimestamp, agg_from_bls, bls_agg, bls_pk, bls_sig, compute_global_receipt_root,
+    exec_vote_message, verify_bls12381_v1,
 };
 
 /// Aggregated certificate for an execution wave.
@@ -32,7 +33,7 @@ pub struct ExecutionCertificate {
     vote_anchor_ts: WeightedTimestamp,
     global_receipt_root: GlobalReceiptRoot,
     tx_outcomes: Vec<TxOutcome>,
-    aggregated_signature: Bls12381G2Signature,
+    aggregated_signature: AggregateSignature,
     signers: SignerBitfield,
     /// Cached SBOR-encoded bytes. Populated at construction or after
     /// deserialization to avoid re-serialization on storage writes.
@@ -114,7 +115,7 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for ExecutionCe
         let vote_anchor_ts: WeightedTimestamp = decoder.decode()?;
         let global_receipt_root: GlobalReceiptRoot = decoder.decode()?;
         let tx_outcomes = decode_bounded_vec::<_, TxOutcome>(decoder, MAX_TXS_PER_BLOCK)?;
-        let aggregated_signature: Bls12381G2Signature = decoder.decode()?;
+        let aggregated_signature: AggregateSignature = decoder.decode()?;
         let signers: SignerBitfield = decoder.decode()?;
         // The BLS aggregate only commits to (global_receipt_root, tx_count),
         // not to tx_outcomes content. Without this check a Byzantine
@@ -161,7 +162,7 @@ impl ExecutionCertificate {
         vote_anchor_ts: WeightedTimestamp,
         global_receipt_root: GlobalReceiptRoot,
         tx_outcomes: Vec<TxOutcome>,
-        aggregated_signature: Bls12381G2Signature,
+        aggregated_signature: AggregateSignature,
         signers: SignerBitfield,
     ) -> Self {
         let mut ec = Self {
@@ -206,7 +207,7 @@ impl ExecutionCertificate {
 
     /// BLS aggregated signature from 2f+1 validators.
     #[must_use]
-    pub const fn aggregated_signature(&self) -> Bls12381G2Signature {
+    pub const fn aggregated_signature(&self) -> AggregateSignature {
         self.aggregated_signature
     }
 
@@ -295,7 +296,7 @@ pub struct ExecutionCertificateContext<'a> {
     pub network: &'a NetworkDefinition,
     /// Committee public keys in committee order. The certificate's
     /// `signers` bitfield indexes into this slice.
-    pub public_keys: &'a [Bls12381G1PublicKey],
+    pub public_keys: &'a [ConsensusPublicKey],
 }
 
 /// Failure modes of [`ExecutionCertificate`] verification.
@@ -340,11 +341,11 @@ impl Verify<&ExecutionCertificateContext<'_>> for ExecutionCertificate {
             .iter()
             .enumerate()
             .filter(|(i, _)| self.signers.is_set(*i))
-            .map(|(_, pk)| *pk)
+            .map(|(_, pk)| bls_pk(pk))
             .collect();
 
         if signer_keys.is_empty() {
-            if self.aggregated_signature == zero_bls_signature() {
+            if self.aggregated_signature == AggregateSignature::ZERO {
                 return Ok(Verified::new_unchecked(self.clone()));
             }
             return Err(ExecutionCertificateVerifyError::EmptySignersWithNonZeroSignature);
@@ -353,7 +354,11 @@ impl Verify<&ExecutionCertificateContext<'_>> for ExecutionCertificate {
         let aggregated_pk = Bls12381G1PublicKey::aggregate(&signer_keys, false)
             .map_err(|_| ExecutionCertificateVerifyError::BadAggregatedSignature)?;
         let message = self.signing_message(ctx.network);
-        if !verify_bls12381_v1(&message, &aggregated_pk, &self.aggregated_signature) {
+        if !verify_bls12381_v1(
+            &message,
+            &aggregated_pk,
+            &bls_agg(&self.aggregated_signature),
+        ) {
             return Err(ExecutionCertificateVerifyError::BadAggregatedSignature);
         }
         Ok(Verified::new_unchecked(self.clone()))
@@ -402,13 +407,17 @@ impl Verified<ExecutionCertificate> {
             .filter(|vote| seen_validators.insert(vote.validator()))
             .collect();
 
-        let bls_signatures: Vec<Bls12381G2Signature> =
-            unique_votes.iter().map(|vote| vote.signature()).collect();
+        let bls_signatures: Vec<Bls12381G2Signature> = unique_votes
+            .iter()
+            .map(|vote| bls_sig(&vote.signature()))
+            .collect();
         let aggregated_signature = if bls_signatures.is_empty() {
-            zero_bls_signature()
+            AggregateSignature::ZERO
         } else {
-            Bls12381G2Signature::aggregate(&bls_signatures, true)
-                .expect("aggregation of upstream-verified BLS signatures cannot fail")
+            agg_from_bls(
+                &Bls12381G2Signature::aggregate(&bls_signatures, true)
+                    .expect("aggregation of upstream-verified BLS signatures cannot fail"),
+            )
         };
 
         let committee_index: HashMap<ValidatorId, usize> = committee
@@ -467,7 +476,7 @@ mod tests {
     use super::*;
     use crate::{
         BlockHash, BlockHeight, Bls12381G1PrivateKey, ExecutionOutcome, GlobalReceiptHash, TxHash,
-        generate_bls_keypair,
+        generate_bls_keypair, pk_from_bls,
     };
 
     fn outcome(seed: u8) -> TxOutcome {
@@ -517,8 +526,8 @@ mod tests {
         let net = NetworkDefinition::simulator();
         let committee: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
         let sks: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let pks: Vec<Bls12381G1PublicKey> =
-            sks.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let pks: Vec<ConsensusPublicKey> =
+            sks.iter().map(|sk| pk_from_bls(&sk.public_key())).collect();
         let outcomes = vec![outcome(1), outcome(2)];
         let root = compute_global_receipt_root(&outcomes);
 
@@ -545,8 +554,8 @@ mod tests {
         let net = NetworkDefinition::simulator();
         let committee: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
         let sks: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let pks: Vec<Bls12381G1PublicKey> =
-            sks.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let pks: Vec<ConsensusPublicKey> =
+            sks.iter().map(|sk| pk_from_bls(&sk.public_key())).collect();
         let outcomes = vec![outcome(1)];
         let root = compute_global_receipt_root(&outcomes);
 
@@ -562,7 +571,7 @@ mod tests {
             cert.vote_anchor_ts(),
             cert.global_receipt_root(),
             cert.tx_outcomes().clone(),
-            Bls12381G2Signature([0xFF; 96]),
+            AggregateSignature::new([0xFF; 96]),
             cert.signers().clone(),
         );
 
@@ -581,8 +590,8 @@ mod tests {
     #[test]
     fn verify_rejects_empty_signers_with_nonzero_signature() {
         let net = NetworkDefinition::simulator();
-        let pks: Vec<Bls12381G1PublicKey> = (0..4)
-            .map(|_| generate_bls_keypair().public_key())
+        let pks: Vec<ConsensusPublicKey> = (0..4)
+            .map(|_| pk_from_bls(&generate_bls_keypair().public_key()))
             .collect();
 
         let outcomes = vec![outcome(1)];
@@ -592,7 +601,7 @@ mod tests {
             WeightedTimestamp::from_millis(11),
             root,
             outcomes,
-            Bls12381G2Signature([0xAA; 96]),
+            AggregateSignature::new([0xAA; 96]),
             SignerBitfield::new(4),
         );
 
@@ -612,8 +621,8 @@ mod tests {
     #[test]
     fn verify_accepts_empty_signers_with_zero_signature() {
         let net = NetworkDefinition::simulator();
-        let pks: Vec<Bls12381G1PublicKey> = (0..4)
-            .map(|_| generate_bls_keypair().public_key())
+        let pks: Vec<ConsensusPublicKey> = (0..4)
+            .map(|_| pk_from_bls(&generate_bls_keypair().public_key()))
             .collect();
 
         let outcomes = vec![outcome(1)];
@@ -623,7 +632,7 @@ mod tests {
             WeightedTimestamp::from_millis(11),
             root,
             outcomes,
-            zero_bls_signature(),
+            AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
 
@@ -704,8 +713,8 @@ mod tests {
             Verified::<ExecutionCertificate>::aggregate(&wave_id(), root, &votes, &committee)
                 .into_inner();
 
-        let wrong_pks: Vec<Bls12381G1PublicKey> = (0..2)
-            .map(|_| generate_bls_keypair().public_key())
+        let wrong_pks: Vec<ConsensusPublicKey> = (0..2)
+            .map(|_| pk_from_bls(&generate_bls_keypair().public_key()))
             .collect();
         let ctx = ExecutionCertificateContext {
             network: &net,

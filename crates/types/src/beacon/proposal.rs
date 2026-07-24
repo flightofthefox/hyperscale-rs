@@ -11,7 +11,7 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, BoundedBTreeMap, BoundedVec, Epoch,
+    Bls12381G1PrivateKey, BoundedBTreeMap, BoundedVec, ConsensusPublicKey, Epoch,
     MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_SHARDS, NetworkDefinition, PC_VALUE_ELEMENT_BYTES,
     PcValueElement, PcVoteEquivocation, QuorumCertificate, ShardForkProof, ShardId,
     ShardVoteEquivocation, Verifiable, Verified, Verify, VrfOutput, VrfProof,
@@ -208,7 +208,7 @@ pub struct BeaconProposalVerifyContext<'a> {
     /// bytes.
     pub epoch: Epoch,
     /// Proposer's BLS public key — the VRF reveal verifies under this.
-    pub sender_pk: Bls12381G1PublicKey,
+    pub sender_pk: ConsensusPublicKey,
 }
 
 /// Failure modes of a beacon proposal.
@@ -333,8 +333,8 @@ impl Verified<BeaconProposal> {
 mod tests {
     use super::*;
     use crate::{
-        ChainOrigin, PcValueElement, PcVector, PcVoteRound, ShardId, SpcView, ValidatorId,
-        zero_bls_signature,
+        ChainOrigin, ConsensusSignature, PcValueElement, PcVector, PcVoteRound, ShardId, SpcView,
+        ValidatorId,
     };
 
     fn sample_boundary_qcs() -> BTreeMap<ShardId, Option<QuorumCertificate>> {
@@ -358,9 +358,9 @@ mod tests {
             view: SpcView::new(0),
             round: PcVoteRound::Vote1,
             value_a,
-            sig_a: zero_bls_signature(),
+            sig_a: ConsensusSignature::ZERO,
             value_b,
-            sig_b: zero_bls_signature(),
+            sig_b: ConsensusSignature::ZERO,
         }
     }
 

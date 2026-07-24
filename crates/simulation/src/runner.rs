@@ -31,9 +31,10 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
-    BeaconChainConfig, Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, GenesisConfigHash,
+    BeaconChainConfig, Bls12381G1PrivateKey, ConsensusPublicKey, Epoch, GenesisConfigHash,
     GenesisValidators, LocalTimestamp, ShardId, TopologySnapshot, TransactionStatus, TxHash,
-    ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed, shard_prefix_path,
+    ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed, pk_from_bls,
+    shard_prefix_path,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -297,8 +298,10 @@ impl SimulationRunner {
                 Arc::new(bls_keypair_from_seed(&seed_bytes))
             })
             .collect();
-        let public_keys: Vec<Bls12381G1PublicKey> =
-            signing_keys.iter().map(|key| key.public_key()).collect();
+        let public_keys: Vec<ConsensusPublicKey> = signing_keys
+            .iter()
+            .map(|key| pk_from_bls(&key.public_key()))
+            .collect();
 
         // Build global validator set (pool extras included — fold-derived
         // snapshots carry every registered validator, so genesis matches)

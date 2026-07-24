@@ -27,8 +27,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, CertifiedBlockHeader, ShardForkProof,
-    ShardVoteEquivocation, Signed, SignedContext, ValidatorId, Verifiable,
+    Bls12381G2Signature, CertifiedBlockHeader, ConsensusPublicKey, ShardForkProof,
+    ShardVoteEquivocation, Signed, SignedContext, ValidatorId, Verifiable, sig_from_bls,
 };
 
 use super::CertifiedHeaderVerificationItem;
@@ -47,7 +47,7 @@ where
         &mut self,
         certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
         sender: ValidatorId,
-        public_key: Bls12381G1PublicKey,
+        public_key: ConsensusPublicKey,
         sender_signature: Bls12381G2Signature,
     ) {
         let item: CertifiedHeaderVerificationItem =
@@ -142,7 +142,7 @@ where
                     let gossip = CertifiedBlockHeaderGossip {
                         certified_header,
                         sender,
-                        sender_signature,
+                        sender_signature: sig_from_bls(&sender_signature),
                     };
                     let start = std::time::Instant::now();
                     let valid = gossip

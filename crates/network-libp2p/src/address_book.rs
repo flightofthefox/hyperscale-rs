@@ -174,7 +174,8 @@ impl AddressBook {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Bls12381G1PrivateKey, bls_keypair_from_seed, validator_address_message,
+        Bls12381G1PrivateKey, bls_keypair_from_seed, pk_from_bls, sig_from_bls,
+        validator_address_message,
     };
 
     use super::*;
@@ -206,13 +207,13 @@ mod tests {
             peer_id: peer_bytes,
             addresses,
             sequence,
-            signature,
+            signature: sig_from_bls(&signature),
         }
     }
 
     fn keys_for(vid: ValidatorId) -> ValidatorKeyMap {
         let mut keys = ValidatorKeyMap::new();
-        keys.insert(vid, keypair().public_key());
+        keys.insert(vid, pk_from_bls(&keypair().public_key()));
         keys
     }
 
@@ -279,7 +280,7 @@ mod tests {
         let keys = {
             let mut keys = ValidatorKeyMap::new();
             for vid in [bound_vid, cohost_a, cohost_b] {
-                keys.insert(vid, keypair().public_key());
+                keys.insert(vid, pk_from_bls(&keypair().public_key()));
             }
             keys
         };
@@ -344,7 +345,7 @@ mod tests {
             peer_id: bogus_peer_bytes,
             addresses,
             sequence: 3,
-            signature,
+            signature: sig_from_bls(&signature),
         };
         assert_eq!(
             book.ingest(&net(), &keys, &unparseable),

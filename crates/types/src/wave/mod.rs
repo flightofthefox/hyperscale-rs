@@ -41,14 +41,14 @@ mod tests {
 
     use crate::test_utils::test_transaction_with_nodes;
     use crate::{
-        Attempt, BlockHeight, Bls12381G2Signature, BoundedVec, ConsensusReceipt, DatabaseUpdates,
+        AggregateSignature, Attempt, BlockHeight, BoundedVec, ConsensusReceipt, DatabaseUpdates,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, NetworkDefinition, NodeId, ProvisionTxRoot, ProvisionTxRootsMap,
         RETENTION_HORIZON, ReceiptValidationError, ShardId, SignerBitfield, StoredReceipt,
         TopologySnapshot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
         Verified, WaveCertificate, WaveId, WaveReceiptHash, WeightedTimestamp,
         compute_global_receipt_root, compute_global_receipt_root_with_proof, compute_merkle_root,
-        generate_bls_keypair, tx_outcome_leaf, verify_merkle_inclusion, wave_leader,
+        generate_bls_keypair, pk_from_bls, tx_outcome_leaf, verify_merkle_inclusion, wave_leader,
         wave_leader_at,
     };
 
@@ -57,7 +57,7 @@ mod tests {
         let validators: Vec<_> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: generate_bls_keypair().public_key(),
+                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
             })
             .collect();
         TopologySnapshot::new(
@@ -295,7 +295,7 @@ mod tests {
             WeightedTimestamp::from_millis(43),
             global_receipt_root,
             outcomes,
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         ))
     }
@@ -580,7 +580,7 @@ mod tests {
             WeightedTimestamp::from_millis(wave_id.block_height().inner() + 1),
             compute_global_receipt_root(&outcomes),
             outcomes,
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         ))
     }

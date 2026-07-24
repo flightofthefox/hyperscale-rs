@@ -13,11 +13,11 @@ use std::sync::Arc;
 use common::{ByzantineBehaviour, CoordinatorSim};
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BeaconBlock, BeaconCert, BeaconProposal, BeaconWitnessLeafCount, BlockHash, BlockHeight,
-    Bls12381G2Signature, CandidateBeaconBlock, Epoch, Hash, PcQc2, PcQc3, PcSignerLengths,
-    PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound, PcXpProof, Round, ShardId,
-    ShardVoteEquivocation, SignerBitfield, SpcCert, SpcView, StakePoolId, StateRoot, ValidatorId,
-    ValidatorStatus, Verified, VrfProof, zero_bls_signature,
+    AggregateSignature, BeaconBlock, BeaconCert, BeaconProposal, BeaconWitnessLeafCount, BlockHash,
+    BlockHeight, CandidateBeaconBlock, ConsensusSignature, Epoch, Hash, PcQc2, PcQc3,
+    PcSignerLengths, PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound, PcXpProof, Round,
+    ShardId, ShardVoteEquivocation, SignerBitfield, SpcCert, SpcView, StakePoolId, StateRoot,
+    ValidatorId, ValidatorStatus, Verified, VrfProof, sig_from_bls, zero_bls_signature,
 };
 
 /// Three epochs is enough to exercise the closed loop more than once:
@@ -507,9 +507,9 @@ fn forged_equivocation_witness_cannot_jail_or_fork() {
         view: SpcView::INITIAL,
         round: PcVoteRound::Vote1,
         value_a: PcVector::new(vec![PcValueElement::new([0x11; 32])]),
-        sig_a: zero_bls_signature(),
+        sig_a: ConsensusSignature::ZERO,
         value_b: PcVector::new(vec![PcValueElement::new([0x22; 32])]),
-        sig_b: zero_bls_signature(),
+        sig_b: ConsensusSignature::ZERO,
     };
     sim.inject_equivocations(Epoch::new(1), vec![forged]);
     sim.kick_off();
@@ -628,10 +628,10 @@ fn forged_vote_equivocation_cannot_convict() {
         round: Round::new(2),
         block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"a")),
         parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"pa")),
-        sig_a: zero_bls_signature(),
+        sig_a: sig_from_bls(&zero_bls_signature()),
         block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"b")),
         parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"pb")),
-        sig_b: zero_bls_signature(),
+        sig_b: sig_from_bls(&zero_bls_signature()),
     };
     sim.inject_vote_equivocations(Epoch::new(1), vec![forged]);
     sim.kick_off();
@@ -996,7 +996,7 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
     let qc2 = PcQc2::new(
         PcVector::empty(),
         SignerBitfield::new(4),
-        Bls12381G2Signature([0x11; 96]),
+        AggregateSignature::new([0x11; 96]),
         PcXpProof::Full,
     );
     let qc3 = PcQc3::new(
@@ -1006,7 +1006,7 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
         None,
         SignerBitfield::new(4),
         PcSignerLengths::Uniform(0),
-        Bls12381G2Signature([0x11; 96]),
+        AggregateSignature::new([0x11; 96]),
     );
     let proposal = BeaconProposal::new(
         std::iter::once((ShardId::ROOT, None)).collect(),

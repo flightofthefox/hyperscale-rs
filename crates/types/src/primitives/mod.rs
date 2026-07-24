@@ -14,4 +14,5 @@ pub mod hash_kinds;
 pub mod identifiers;
 pub mod merkle;
 pub mod positional_bundle;
+pub mod randomness;
 pub mod signer_bitfield;

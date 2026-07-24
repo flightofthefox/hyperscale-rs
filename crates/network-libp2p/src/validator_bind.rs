@@ -42,7 +42,7 @@ use dashmap::DashMap;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G2Signature, NetworkDefinition, VALIDATOR_BIND_NONCE_LEN,
-    ValidatorId, validator_bind_message, verify_bls12381_v1,
+    ValidatorId, bls_pk, validator_bind_message, verify_bls12381_v1,
 };
 use libp2p::{PeerId as Libp2pPeerId, Stream, StreamProtocol};
 use libp2p_stream::{Control, IncomingStreams};
@@ -230,7 +230,7 @@ fn verify_bind(
         .ok_or(BindError::UnknownValidator(claimed_vid))?;
 
     let message = validator_bind_message(network, &peer_id.to_bytes(), nonce);
-    if verify_bls12381_v1(&message, pubkey, signature) {
+    if verify_bls12381_v1(&message, &bls_pk(pubkey), signature) {
         Ok(())
     } else {
         Err(BindError::InvalidSignature(claimed_vid))
@@ -617,12 +617,14 @@ async fn handle_outbound(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Bls12381G1PublicKey, generate_bls_keypair, zero_bls_signature};
+    use hyperscale_types::{
+        ConsensusPublicKey, generate_bls_keypair, pk_from_bls, zero_bls_signature,
+    };
 
     use super::*;
 
     /// Build a single-validator key map for bind tests.
-    fn make_bind_keys(vid: ValidatorId, pubkey: Bls12381G1PublicKey) -> ValidatorKeyMap {
+    fn make_bind_keys(vid: ValidatorId, pubkey: ConsensusPublicKey) -> ValidatorKeyMap {
         let mut keys = ValidatorKeyMap::new();
         keys.insert(vid, pubkey);
         keys
@@ -747,8 +749,8 @@ mod tests {
         let bad_sig = zero_bls_signature();
 
         let mut keys = ValidatorKeyMap::new();
-        keys.insert(good_vid, keypair.public_key());
-        keys.insert(bad_vid, keypair.public_key());
+        keys.insert(good_vid, pk_from_bls(&keypair.public_key()));
+        keys.insert(bad_vid, pk_from_bls(&keypair.public_key()));
 
         let attestations = vec![(good_vid, good_sig), (bad_vid, bad_sig)];
         assert!(matches!(
@@ -766,7 +768,7 @@ mod tests {
     #[test]
     fn verify_bind_accepts_valid_signature_over_nonce() {
         let keypair = generate_bls_keypair();
-        let pubkey = keypair.public_key();
+        let pubkey = pk_from_bls(&keypair.public_key());
         let peer_id = Libp2pPeerId::random();
         let vid = ValidatorId::new(7);
         let nonce = [9u8; VALIDATOR_BIND_NONCE_LEN];
@@ -797,7 +799,7 @@ mod tests {
         // verify against nonce_b. This is what makes replay across sessions
         // impossible.
         let keypair = generate_bls_keypair();
-        let pubkey = keypair.public_key();
+        let pubkey = pk_from_bls(&keypair.public_key());
         let peer_id = Libp2pPeerId::random();
         let vid = ValidatorId::new(7);
 
@@ -830,7 +832,7 @@ mod tests {
     #[test]
     fn verify_bind_rejects_wrong_peer_id() {
         let keypair = generate_bls_keypair();
-        let pubkey = keypair.public_key();
+        let pubkey = pk_from_bls(&keypair.public_key());
         let peer_a = Libp2pPeerId::random();
         let peer_b = Libp2pPeerId::random();
         let vid = ValidatorId::new(7);
@@ -860,7 +862,7 @@ mod tests {
     #[test]
     fn verify_bind_rejects_unknown_validator() {
         let keypair = generate_bls_keypair();
-        let pubkey = keypair.public_key();
+        let pubkey = pk_from_bls(&keypair.public_key());
         let peer_id = Libp2pPeerId::random();
         let nonce = [4u8; VALIDATOR_BIND_NONCE_LEN];
 
@@ -900,7 +902,7 @@ mod tests {
             &nonce,
         ));
 
-        let keys = make_bind_keys(vid, keypair_b.public_key());
+        let keys = make_bind_keys(vid, pk_from_bls(&keypair_b.public_key()));
         assert!(matches!(
             verify_bind(
                 &NetworkDefinition::simulator(),

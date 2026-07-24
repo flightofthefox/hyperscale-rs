@@ -27,7 +27,7 @@ use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeRespons
 use hyperscale_types::{
     BlockHash, BlockHeight, Bls12381G1PrivateKey, NetworkDefinition, ReadySignal, ShardAnchor,
     ShardId, StateRoot, StoredReceipt, ValidatorId, ready_signal_message, ready_signal_window,
-    shard_prefix_path,
+    shard_prefix_path, sig_from_bls,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
@@ -56,7 +56,13 @@ pub fn observer_ready_signal(
     let start = anchor.weighted_timestamp;
     let end = start.plus(ready_signal_window(epoch_duration_ms));
     let msg = ready_signal_message(network, validator, child, start, end);
-    ReadySignal::new(validator, child, start, end, signing_key.sign_v1(&msg))
+    ReadySignal::new(
+        validator,
+        child,
+        start,
+        end,
+        sig_from_bls(&signing_key.sign_v1(&msg)),
+    )
 }
 
 enum Phase {

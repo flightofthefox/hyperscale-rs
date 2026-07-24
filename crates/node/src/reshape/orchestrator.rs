@@ -1229,7 +1229,7 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BlockHash, BlockHeight, Hash, NetworkDefinition, ShardAnchor,
         ShardId, StateRoot, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
-        WeightedTimestamp, generate_bls_keypair,
+        WeightedTimestamp, generate_bls_keypair, pk_from_bls,
     };
 
     use super::{
@@ -1302,7 +1302,7 @@ mod tests {
             .iter()
             .map(|&id| ValidatorInfo {
                 validator_id: vid(id),
-                public_key: generate_bls_keypair().public_key(),
+                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
             })
             .collect();
         let committee_map: HashMap<ShardId, Vec<ValidatorId>> = committees

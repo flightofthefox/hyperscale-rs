@@ -506,7 +506,8 @@ mod tests {
         CertificateRoot, CertifiedBlockHeader, Hash, InFlightCount, LeafIndex, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId, ShardWitness,
         ShardWitnessPayload, ShardWitnessProof, SignerBitfield, Stake, StakePoolId, StateRoot,
-        TransactionRoot, ValidatorId, Verified, WeightedTimestamp, zero_bls_signature,
+        TransactionRoot, ValidatorId, Verified, WeightedTimestamp, agg_from_bls,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -533,7 +534,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(parent_wt),
         );
         let header = BlockHeader::new(
@@ -567,7 +568,7 @@ mod tests {
             parent_hash,
             Round::INITIAL,
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(parent_wt),
         );
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(

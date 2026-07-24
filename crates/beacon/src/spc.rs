@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use blake3::Hasher;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Epoch, MAX_VOTE_VECTOR_LEN, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcQc3,
+    ConsensusPublicKey, Epoch, MAX_VOTE_VECTOR_LEN, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcQc3,
     PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, SpcCert,
     SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView, ValidatorId, Verified,
     byzantine_threshold,
@@ -298,11 +298,7 @@ struct ViewState {
 }
 
 impl ViewState {
-    fn new(
-        epoch: Epoch,
-        view: SpcView,
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
-    ) -> Self {
+    fn new(epoch: Epoch, view: SpcView, committee: Vec<(ValidatorId, ConsensusPublicKey)>) -> Self {
         Self {
             vpc: PcInstance::new(epoch, view, committee),
             proposal_objects: BTreeMap::new(),
@@ -340,7 +336,7 @@ const MAX_PENDING_COMMITS: usize = 64;
 /// ahead).
 pub struct SpcInstance {
     epoch: Epoch,
-    committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     me: ValidatorId,
     view_timeout: Duration,
 
@@ -402,7 +398,7 @@ impl SpcInstance {
     #[must_use]
     pub fn new(
         epoch: Epoch,
-        committee: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
         me: ValidatorId,
         view_timeout: Duration,
     ) -> Self {
@@ -450,7 +446,7 @@ impl SpcInstance {
     /// Beacon committee driving this instance, positional order matching
     /// every embedded signer bitfield.
     #[must_use]
-    pub fn committee(&self) -> &[(ValidatorId, Bls12381G1PublicKey)] {
+    pub fn committee(&self) -> &[(ValidatorId, ConsensusPublicKey)] {
         &self.committee
     }
 
@@ -1155,9 +1151,9 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_types::{
-        Bls12381G1PrivateKey, Bls12381G2Signature, Epoch, NetworkDefinition, PcQc2, PcQc3,
-        PcSignerLengths, PcVote1, PcXpProof, SignerBitfield, bls_keypair_from_seed,
-        generate_bls_keypair, spc_context,
+        Bls12381G1PrivateKey, ConsensusSignature, Epoch, NetworkDefinition, PcQc2, PcQc3,
+        PcSignerLengths, PcVote1, PcXpProof, SignerBitfield, agg_from_bls, bls_keypair_from_seed,
+        generate_bls_keypair, pk_from_bls, spc_context,
     };
 
     use super::*;
@@ -1170,7 +1166,7 @@ mod tests {
         let qc2 = PcQc2::new(
             PcVector::empty(),
             SignerBitfield::new(4),
-            generate_bls_keypair().sign_v1(b"unused"),
+            agg_from_bls(&generate_bls_keypair().sign_v1(b"unused")),
             PcXpProof::Full,
         );
         PcQc3::new(
@@ -1180,7 +1176,7 @@ mod tests {
             None,
             SignerBitfield::new(4),
             PcSignerLengths::Uniform(0),
-            generate_bls_keypair().sign_v1(b"unused"),
+            agg_from_bls(&generate_bls_keypair().sign_v1(b"unused")),
         )
     }
 
@@ -1203,7 +1199,7 @@ mod tests {
         n: usize,
     ) -> (
         Vec<Arc<Bls12381G1PrivateKey>>,
-        Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        Vec<(ValidatorId, ConsensusPublicKey)>,
     ) {
         let mut sks = Vec::with_capacity(n);
         let mut members = Vec::with_capacity(n);
@@ -1211,7 +1207,7 @@ mod tests {
             let mut seed = [0u8; 32];
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
             let sk = bls_keypair_from_seed(&seed);
-            members.push((ValidatorId::new(i as u64), sk.public_key()));
+            members.push((ValidatorId::new(i as u64), pk_from_bls(&sk.public_key())));
             sks.push(Arc::new(sk));
         }
         (sks, members)
@@ -1316,7 +1312,7 @@ mod tests {
         let dummy = Verified::<PcVote1>::new_unchecked_for_test(PcVote1::new(
             members[1].0,
             PcVector::empty(),
-            vec![Bls12381G2Signature([0u8; 96])],
+            vec![ConsensusSignature::new([0u8; 96])],
         ));
         let effects = fsm.on_pc_vote1_verified(SpcView::new(99), dummy);
         assert!(effects.is_empty());
@@ -1328,7 +1324,7 @@ mod tests {
         let qc2 = PcQc2::new(
             value.clone(),
             SignerBitfield::new(4),
-            generate_bls_keypair().sign_v1(b"unused"),
+            agg_from_bls(&generate_bls_keypair().sign_v1(b"unused")),
             PcXpProof::Full,
         );
         PcQc3::new(
@@ -1338,7 +1334,7 @@ mod tests {
             None,
             SignerBitfield::new(4),
             PcSignerLengths::Uniform(0),
-            generate_bls_keypair().sign_v1(b"unused"),
+            agg_from_bls(&generate_bls_keypair().sign_v1(b"unused")),
         )
     }
 

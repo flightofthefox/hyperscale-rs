@@ -14,7 +14,7 @@ use std::sync::Arc;
 // `hyperscale_types`.
 pub use hyperscale_types::TopicScope;
 use hyperscale_types::{
-    Bls12381G1PublicKey, GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees,
+    ConsensusPublicKey, GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees,
     ShardId, TopologySnapshot, ValidatorId,
 };
 
@@ -22,7 +22,7 @@ use hyperscale_types::{
 ///
 /// Derived from the topology snapshot inside network impls when
 /// [`Network::update_topology`] is called.
-pub type ValidatorKeyMap = HashMap<ValidatorId, Bls12381G1PublicKey>;
+pub type ValidatorKeyMap = HashMap<ValidatorId, ConsensusPublicKey>;
 
 /// Error returned when a network request fails.
 #[derive(Debug, thiserror::Error)]

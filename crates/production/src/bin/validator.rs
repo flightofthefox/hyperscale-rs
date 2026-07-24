@@ -71,9 +71,9 @@ use hyperscale_storage_rocksdb::{
     RocksDbShardStorage,
 };
 use hyperscale_types::{
-    BeaconChainConfig, Bls12381G1PrivateKey, Bls12381G1PublicKey, GenesisValidators, ShardId,
+    BeaconChainConfig, Bls12381G1PrivateKey, ConsensusPublicKey, GenesisValidators, ShardId,
     ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed, generate_bls_keypair,
-    shard_prefix_path,
+    pk_from_bls, shard_prefix_path,
 };
 use igd_next::aio::tokio::search_gateway;
 use igd_next::{PortMappingProtocol, SearchOptions};
@@ -592,8 +592,8 @@ impl ValidatorConfig {
 }
 
 /// Format a public key as a hex string.
-fn format_public_key(pk: &Bls12381G1PublicKey) -> String {
-    hex_encode(pk.to_vec())
+fn format_public_key(pk: &ConsensusPublicKey) -> String {
+    hex_encode(pk.as_bytes())
 }
 
 /// Load or generate a signing keypair.
@@ -675,7 +675,7 @@ fn build_genesis_validators(
         let (validator_id, keypair) = local_keypairs.first().expect("at least one hosted vnode");
         vec![ValidatorInfo {
             validator_id: *validator_id,
-            public_key: keypair.public_key(),
+            public_key: pk_from_bls(&keypair.public_key()),
         }]
     } else {
         genesis
@@ -684,7 +684,7 @@ fn build_genesis_validators(
             .map(|v| {
                 let validator_id = ValidatorId::new(v.id);
                 let public_key = if let Some(keypair) = lookup_local(validator_id) {
-                    keypair.public_key()
+                    pk_from_bls(&keypair.public_key())
                 } else {
                     let key_bytes = hex_decode(&v.public_key).with_context(|| {
                         format!("Invalid hex public key for validator {}", v.id)
@@ -696,9 +696,9 @@ fn build_genesis_validators(
                             key_bytes.len()
                         );
                     }
-                    Bls12381G1PublicKey::try_from(key_bytes.as_slice()).map_err(|_| {
-                        anyhow::anyhow!("Invalid BLS public key for validator {}", v.id)
-                    })?
+                    let mut key_arr = [0u8; 48];
+                    key_arr.copy_from_slice(&key_bytes);
+                    ConsensusPublicKey::new(key_arr)
                 };
                 Ok(ValidatorInfo {
                     validator_id,
@@ -1176,7 +1176,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         let keypair = load_or_generate_keypair(Some(&entry.key_path))?;
         info!(
             validator_id = entry.validator_id,
-            public_key = %format_public_key(&keypair.public_key()),
+            public_key = %format_public_key(&pk_from_bls(&keypair.public_key())),
             "Loaded vnode signing keypair"
         );
         hosted_keypairs.push((ValidatorId::new(entry.validator_id), Arc::new(keypair)));

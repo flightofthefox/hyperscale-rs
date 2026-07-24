@@ -5,7 +5,7 @@
 //! the coordinator so the topology-only parts are unit-testable without a
 //! full driver fixture.
 
-use hyperscale_types::{Bls12381G1PublicKey, Round, ShardId, TopologySnapshot, ValidatorId};
+use hyperscale_types::{ConsensusPublicKey, Round, ShardId, TopologySnapshot, ValidatorId};
 
 /// Recipients for a vote cast in `round`.
 ///
@@ -64,7 +64,7 @@ pub fn vote_recipients(
 pub fn committee_public_keys(
     topology_snapshot: &TopologySnapshot,
     shard: ShardId,
-) -> Vec<Bls12381G1PublicKey> {
+) -> Vec<ConsensusPublicKey> {
     topology_snapshot
         .consensus_committee_for_shard(shard)
         .iter()

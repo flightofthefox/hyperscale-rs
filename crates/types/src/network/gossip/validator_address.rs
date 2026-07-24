@@ -4,7 +4,7 @@ use sbor::prelude::BasicSbor;
 
 use crate::network::{GossipMessage, TopicScope};
 use crate::{
-    Bls12381G2Signature, MessageClass, NetworkDefinition, NetworkMessage, ShardId, Signed,
+    ConsensusSignature, MessageClass, NetworkDefinition, NetworkMessage, ShardId, Signed,
     ValidatorId, validator_address_message,
 };
 
@@ -47,7 +47,7 @@ pub struct ValidatorAddressGossip {
     pub sequence: u64,
     /// BLS signature over the domain-separated signing message, by
     /// `validator`.
-    pub signature: Bls12381G2Signature,
+    pub signature: ConsensusSignature,
 }
 
 impl Signed for ValidatorAddressGossip {
@@ -55,7 +55,7 @@ impl Signed for ValidatorAddressGossip {
         self.validator
     }
 
-    fn signature(&self) -> &Bls12381G2Signature {
+    fn signature(&self) -> &ConsensusSignature {
         &self.signature
     }
 
@@ -97,13 +97,15 @@ impl GossipMessage for ValidatorAddressGossip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Bls12381G1PublicKey, SignedContext, bls_keypair_from_seed};
+    use crate::{
+        ConsensusPublicKey, SignedContext, bls_keypair_from_seed, pk_from_bls, sig_from_bls,
+    };
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
     }
 
-    fn signed_record(sequence: u64) -> (ValidatorAddressGossip, Bls12381G1PublicKey) {
+    fn signed_record(sequence: u64) -> (ValidatorAddressGossip, ConsensusPublicKey) {
         let key = bls_keypair_from_seed(&[7u8; 32]);
         let peer_id = b"peer-id".to_vec();
         let addresses = vec![b"addr".to_vec()];
@@ -113,9 +115,9 @@ mod tests {
             peer_id,
             addresses,
             sequence,
-            signature: key.sign_v1(&message),
+            signature: sig_from_bls(&key.sign_v1(&message)),
         };
-        (gossip, key.public_key())
+        (gossip, pk_from_bls(&key.public_key()))
     }
 
     #[test]

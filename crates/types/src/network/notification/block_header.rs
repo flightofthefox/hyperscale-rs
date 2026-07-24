@@ -5,7 +5,7 @@ use std::sync::Arc;
 use sbor::prelude::BasicSbor;
 
 use crate::{
-    BlockHeader, BlockManifest, Bls12381G2Signature, MessageClass, NetworkDefinition,
+    BlockHeader, BlockManifest, ConsensusSignature, MessageClass, NetworkDefinition,
     NetworkMessage, Signed, ValidatorId, block_header_message,
 };
 
@@ -24,7 +24,7 @@ pub struct BlockHeaderNotification {
 
     /// BLS signature by the proposer over the domain-separated block header message.
     /// Verifies that the claimed proposer actually created this proposal.
-    pub proposer_signature: Bls12381G2Signature,
+    pub proposer_signature: ConsensusSignature,
 }
 
 impl BlockHeaderNotification {
@@ -33,7 +33,7 @@ impl BlockHeaderNotification {
     pub fn new(
         header: impl Into<Arc<BlockHeader>>,
         manifest: BlockManifest,
-        proposer_signature: Bls12381G2Signature,
+        proposer_signature: ConsensusSignature,
     ) -> Self {
         Self {
             header: header.into(),
@@ -44,7 +44,7 @@ impl BlockHeaderNotification {
 
     /// Consume and return header (as `Arc`), manifest, and proposer signature.
     #[must_use]
-    pub fn into_parts(self) -> (Arc<BlockHeader>, BlockManifest, Bls12381G2Signature) {
+    pub fn into_parts(self) -> (Arc<BlockHeader>, BlockManifest, ConsensusSignature) {
         (self.header, self.manifest, self.proposer_signature)
     }
 }
@@ -57,7 +57,7 @@ impl Signed for BlockHeaderNotification {
         self.header.proposer()
     }
 
-    fn signature(&self) -> &Bls12381G2Signature {
+    fn signature(&self) -> &ConsensusSignature {
         &self.proposer_signature
     }
 
@@ -120,8 +120,8 @@ mod tests {
         )
     }
 
-    fn zero_sig() -> Bls12381G2Signature {
-        Bls12381G2Signature([0u8; Bls12381G2Signature::LENGTH])
+    fn zero_sig() -> ConsensusSignature {
+        ConsensusSignature::ZERO
     }
 
     #[test]

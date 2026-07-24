@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, Bls12381G1PublicKey, CertifiedBlock, QuorumCertificate,
+    Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, QuorumCertificate,
     ValidatorId, Verified, VoteCount,
 };
 use tracing::{debug, info, warn};
@@ -429,7 +429,7 @@ impl BlockSyncManager {
     pub fn register_for_verification(
         &mut self,
         certified: CertifiedBlock,
-        public_keys: Vec<Bls12381G1PublicKey>,
+        public_keys: Vec<ConsensusPublicKey>,
         quorum_threshold: VoteCount,
     ) -> Action {
         let block_hash = certified.block().hash();
@@ -841,7 +841,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BoundedVec, CertificateRoot,
         ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
-        WitnessSources, zero_bls_signature,
+        WitnessSources, agg_from_bls, zero_bls_signature,
     };
 
     use super::*;
@@ -887,7 +887,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         );
         CertifiedBlock::new_unchecked(block, qc)
@@ -1444,7 +1444,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         )
     }

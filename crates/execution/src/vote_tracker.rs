@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use hyperscale_types::{
-    BlockHash, Bls12381G1PublicKey, ExecutionVote, GlobalReceiptRoot, ValidatorId, Verified,
+    BlockHash, ConsensusPublicKey, ExecutionVote, GlobalReceiptRoot, ValidatorId, Verified,
     VoteCount, WaveId, WeightedTimestamp,
 };
 
@@ -58,7 +58,7 @@ pub struct VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
     /// Unverified votes buffered for batch verification.
     /// Each entry is (vote, `public_key`).
-    unverified_votes: Vec<(ExecutionVote, Bls12381G1PublicKey)>,
+    unverified_votes: Vec<(ExecutionVote, ConsensusPublicKey)>,
     /// Number of unverified votes buffered.
     unverified_power: VoteCount,
     /// Validators we've already seen votes from at each `vote_anchor_ts` (dedup).
@@ -109,7 +109,7 @@ impl VoteTracker {
     pub fn buffer_unverified_vote(
         &mut self,
         vote: ExecutionVote,
-        public_key: Bls12381G1PublicKey,
+        public_key: ConsensusPublicKey,
     ) -> bool {
         let dedup_key = (vote.validator(), vote.vote_anchor_ts());
 
@@ -149,7 +149,7 @@ impl VoteTracker {
     /// Take unverified votes for batch verification.
     ///
     /// Marks verification as pending. Call `on_verification_complete` when done.
-    pub fn take_unverified_votes(&mut self) -> Vec<(ExecutionVote, Bls12381G1PublicKey)> {
+    pub fn take_unverified_votes(&mut self) -> Vec<(ExecutionVote, ConsensusPublicKey)> {
         self.pending_verification = true;
         self.unverified_power = VoteCount::ZERO;
         std::mem::take(&mut self.unverified_votes)
@@ -276,12 +276,15 @@ impl VoteTracker {
 mod tests {
     use std::collections::BTreeSet;
 
-    use hyperscale_types::{BlockHeight, Hash, ShardId, generate_bls_keypair, zero_bls_signature};
+    use hyperscale_types::{
+        BlockHeight, Hash, ShardId, generate_bls_keypair, pk_from_bls, sig_from_bls,
+        zero_bls_signature,
+    };
 
     use super::*;
 
-    fn make_test_public_key() -> Bls12381G1PublicKey {
-        generate_bls_keypair().public_key()
+    fn make_test_public_key() -> ConsensusPublicKey {
+        pk_from_bls(&generate_bls_keypair().public_key())
     }
 
     fn make_vote(validator: u64, global_receipt_root: GlobalReceiptRoot) -> ExecutionVote {
@@ -295,7 +298,7 @@ mod tests {
             5,
             vec![],
             ValidatorId::new(validator),
-            zero_bls_signature(),
+            sig_from_bls(&zero_bls_signature()),
         )
     }
 

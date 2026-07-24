@@ -207,8 +207,7 @@ impl OutboundExecutionCertificateTracker {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BlockHeight, Bls12381G2Signature, GlobalReceiptRoot, Hash, RETENTION_HORIZON,
-        SignerBitfield,
+        AggregateSignature, BlockHeight, GlobalReceiptRoot, Hash, RETENTION_HORIZON, SignerBitfield,
     };
 
     use super::*;
@@ -235,7 +234,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::from_raw(Hash::ZERO),
             Vec::new(),
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         )))
     }

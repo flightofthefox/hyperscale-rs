@@ -2,7 +2,7 @@
 
 use sbor::prelude::BasicSbor;
 
-use crate::{BlockHeight, Bls12381G2Signature, MessageClass, NetworkMessage, ValidatorId};
+use crate::{BlockHeight, ConsensusSignature, MessageClass, NetworkMessage, ValidatorId};
 
 /// Broadcast that validator has caught up to network head and is ready to participate.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
@@ -14,7 +14,7 @@ pub struct SyncCompleteAnnouncement {
     pub validator: ValidatorId,
 
     /// Signature proving this is authentic (BLS for aggregatable consensus)
-    pub signature: Bls12381G2Signature,
+    pub signature: ConsensusSignature,
 }
 
 impl SyncCompleteAnnouncement {
@@ -23,7 +23,7 @@ impl SyncCompleteAnnouncement {
     pub const fn new(
         synced_height: BlockHeight,
         validator: ValidatorId,
-        signature: Bls12381G2Signature,
+        signature: ConsensusSignature,
     ) -> Self {
         Self {
             synced_height,
@@ -47,14 +47,14 @@ impl NetworkMessage for SyncCompleteAnnouncement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zero_bls_signature;
+    use crate::{sig_from_bls, zero_bls_signature};
 
     #[test]
     fn test_sync_complete_announcement() {
         let announcement = SyncCompleteAnnouncement::new(
             BlockHeight::new(100),
             ValidatorId::new(1),
-            zero_bls_signature(),
+            sig_from_bls(&zero_bls_signature()),
         );
         assert_eq!(announcement.synced_height, BlockHeight::new(100));
         assert_eq!(announcement.validator, ValidatorId::new(1));

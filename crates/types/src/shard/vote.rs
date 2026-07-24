@@ -9,8 +9,9 @@ use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
-    NetworkDefinition, ProposerTimestamp, Round, ShardId, ValidatorId, Verified, Verify,
-    batch_verify_bls_same_message, block_vote_message, verify_bls12381_v1,
+    ConsensusPublicKey, ConsensusSignature, NetworkDefinition, ProposerTimestamp, Round, ShardId,
+    ValidatorId, Verified, Verify, batch_verify_bls_same_message, block_vote_message, bls_pk,
+    bls_sig, sig_from_bls, verify_bls12381_v1,
 };
 
 /// Block vote for shard consensus.
@@ -21,7 +22,7 @@ pub struct BlockVote {
     height: BlockHeight,
     round: Round,
     voter: ValidatorId,
-    signature: Bls12381G2Signature,
+    signature: ConsensusSignature,
     timestamp: ProposerTimestamp,
 }
 
@@ -48,7 +49,7 @@ impl BlockVote {
             &block_hash,
             &parent_block_hash,
         );
-        let signature = signing_key.sign_v1(&message);
+        let signature = sig_from_bls(&signing_key.sign_v1(&message));
         Self {
             block_hash,
             shard_id,
@@ -69,7 +70,7 @@ impl BlockVote {
         height: BlockHeight,
         round: Round,
         voter: ValidatorId,
-        signature: Bls12381G2Signature,
+        signature: ConsensusSignature,
         timestamp: ProposerTimestamp,
     ) -> Self {
         Self {
@@ -115,7 +116,7 @@ impl BlockVote {
 
     /// BLS signature over the domain-separated signing message.
     #[must_use]
-    pub const fn signature(&self) -> Bls12381G2Signature {
+    pub const fn signature(&self) -> ConsensusSignature {
         self.signature
     }
 
@@ -136,7 +137,7 @@ impl BlockVote {
         BlockHeight,
         Round,
         ValidatorId,
-        Bls12381G2Signature,
+        ConsensusSignature,
         ProposerTimestamp,
     ) {
         (
@@ -181,7 +182,7 @@ pub struct BlockVoteContext<'a> {
     /// Network identifier — feeds the domain-separated signing message.
     pub network: &'a NetworkDefinition,
     /// BLS public key of the voter who cast this vote.
-    pub voter_public_key: &'a Bls12381G1PublicKey,
+    pub voter_public_key: &'a ConsensusPublicKey,
     /// Parent of the voted block (from its header), bound into the signing message.
     pub parent_block_hash: BlockHash,
 }
@@ -213,7 +214,11 @@ impl Verify<&BlockVoteContext<'_>> for BlockVote {
 
     fn verify(&self, ctx: &BlockVoteContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let message = self.signing_message(ctx.network, &ctx.parent_block_hash);
-        if !verify_bls12381_v1(&message, ctx.voter_public_key, &self.signature) {
+        if !verify_bls12381_v1(
+            &message,
+            &bls_pk(ctx.voter_public_key),
+            &bls_sig(&self.signature),
+        ) {
             return Err(BlockVoteVerifyError::InvalidSignature);
         }
         Ok(Verified::new_unchecked(self.clone()))
@@ -279,15 +284,16 @@ impl Verified<BlockVote> {
     #[must_use]
     pub fn verify_batch(
         signing_message: &[u8],
-        votes: Vec<(BlockVote, Bls12381G1PublicKey)>,
+        votes: Vec<(BlockVote, ConsensusPublicKey)>,
     ) -> Vec<Option<Self>> {
         if votes.is_empty() {
             return Vec::new();
         }
 
         let signatures: Vec<Bls12381G2Signature> =
-            votes.iter().map(|(v, _)| v.signature()).collect();
-        let public_keys: Vec<Bls12381G1PublicKey> = votes.iter().map(|(_, pk)| *pk).collect();
+            votes.iter().map(|(v, _)| bls_sig(&v.signature())).collect();
+        let public_keys: Vec<Bls12381G1PublicKey> =
+            votes.iter().map(|(_, pk)| bls_pk(pk)).collect();
 
         if batch_verify_bls_same_message(signing_message, &signatures, &public_keys) {
             // SAFETY: BLS same-message batch verify just confirmed every
@@ -304,7 +310,7 @@ impl Verified<BlockVote> {
         votes
             .into_iter()
             .map(|(vote, pk)| {
-                if verify_bls12381_v1(signing_message, &pk, &vote.signature()) {
+                if verify_bls12381_v1(signing_message, &bls_pk(&pk), &bls_sig(&vote.signature())) {
                     // SAFETY: individual BLS verify just re-ran the
                     // `BlockVote::verify` predicate against the voter's
                     // pubkey.
@@ -320,7 +326,7 @@ impl Verified<BlockVote> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Hash, generate_bls_keypair};
+    use crate::{Hash, generate_bls_keypair, pk_from_bls};
 
     /// All-valid batch verifies via the fast path and yields one
     /// `Some(verified)` per input position.
@@ -339,14 +345,14 @@ mod tests {
             .map(|i| {
                 let sk = generate_bls_keypair();
                 let signature = sk.sign_v1(&message);
-                let pk = sk.public_key();
+                let pk = pk_from_bls(&sk.public_key());
                 let vote = BlockVote::from_parts(
                     BlockHash::from_raw(Hash::from_bytes(&[1u8; 32])),
                     ShardId::ROOT,
                     BlockHeight::new(1),
                     Round::INITIAL,
                     ValidatorId::new(i),
-                    signature,
+                    sig_from_bls(&signature),
                     ProposerTimestamp::ZERO,
                 );
                 (vote, pk)
@@ -372,7 +378,7 @@ mod tests {
             &BlockHash::from_raw(Hash::from_bytes(&[2u8; 32])),
             &BlockHash::from_raw(Hash::from_bytes(b"parent")),
         );
-        let mut votes: Vec<(BlockVote, Bls12381G1PublicKey)> = Vec::new();
+        let mut votes: Vec<(BlockVote, ConsensusPublicKey)> = Vec::new();
         for i in 0..3u64 {
             let sk = generate_bls_keypair();
             let signature = sk.sign_v1(&message);
@@ -383,16 +389,16 @@ mod tests {
                 BlockHeight::new(1),
                 Round::INITIAL,
                 ValidatorId::new(i),
-                signature,
+                sig_from_bls(&signature),
                 ProposerTimestamp::ZERO,
             );
-            votes.push((vote, pk));
+            votes.push((vote, pk_from_bls(&pk)));
         }
 
         // Replace the middle vote's pubkey with a fresh unrelated one so the
         // signature no longer validates.
         let intruder_sk = generate_bls_keypair();
-        votes[1].1 = intruder_sk.public_key();
+        votes[1].1 = pk_from_bls(&intruder_sk.public_key());
 
         let results = Verified::<BlockVote>::verify_batch(&message, votes);
         assert_eq!(results.len(), 3);

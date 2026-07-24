@@ -35,10 +35,11 @@ use thiserror::Error;
 
 use super::certified::verify_committed_proposal_binding;
 use crate::{
-    BeaconBlock, BeaconBlockHash, BeaconProposal, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    Bls12381G2Signature, Epoch, NetworkDefinition, RatifyRound, ShardEpochContribution, ShardId,
-    SignerBitfield, SpcCert, ValidatorId, Verified, Verify,
-    aggregate_verify_bls_different_messages, ratify_vote_message, spc_context, verify_block_cert,
+    AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconProposal, Bls12381G1PrivateKey,
+    Bls12381G1PublicKey, Bls12381G2Signature, ConsensusPublicKey, ConsensusSignature, Epoch,
+    NetworkDefinition, RatifyRound, ShardEpochContribution, ShardId, SignerBitfield, SpcCert,
+    ValidatorId, Verified, Verify, agg_from_bls, aggregate_verify_bls_different_messages, bls_agg,
+    bls_pk, bls_sig, ratify_vote_message, sig_from_bls, spc_context, verify_block_cert,
     verify_bls12381_v1, verify_vote_equivocation,
 };
 
@@ -153,7 +154,7 @@ pub struct RatifyVote {
     phase: RatifyPhase,
     block_hash: BeaconBlockHash,
     signer: ValidatorId,
-    sig: Bls12381G2Signature,
+    sig: ConsensusSignature,
 }
 
 impl RatifyVote {
@@ -166,7 +167,7 @@ impl RatifyVote {
         phase: RatifyPhase,
         block_hash: BeaconBlockHash,
         signer: ValidatorId,
-        sig: Bls12381G2Signature,
+        sig: ConsensusSignature,
     ) -> Self {
         Self {
             anchor_hash,
@@ -218,7 +219,7 @@ impl RatifyVote {
 
     /// BLS signature over the canonical signing message.
     #[must_use]
-    pub const fn sig(&self) -> Bls12381G2Signature {
+    pub const fn sig(&self) -> ConsensusSignature {
         self.sig
     }
 }
@@ -244,7 +245,7 @@ pub struct RatifyCert {
     round: RatifyRound,
     block_hash: BeaconBlockHash,
     signers: SignerBitfield,
-    aggregate_sig: Bls12381G2Signature,
+    aggregate_sig: AggregateSignature,
 }
 
 impl RatifyCert {
@@ -256,7 +257,7 @@ impl RatifyCert {
         round: RatifyRound,
         block_hash: BeaconBlockHash,
         signers: SignerBitfield,
-        aggregate_sig: Bls12381G2Signature,
+        aggregate_sig: AggregateSignature,
     ) -> Self {
         Self {
             anchor_hash,
@@ -302,7 +303,7 @@ impl RatifyCert {
     /// Aggregated BLS signature over the canonical precommit signing
     /// bytes, verifying under the union of [`Self::signers`]' pubkeys.
     #[must_use]
-    pub const fn aggregate_sig(&self) -> Bls12381G2Signature {
+    pub const fn aggregate_sig(&self) -> AggregateSignature {
         self.aggregate_sig
     }
 
@@ -344,7 +345,7 @@ pub const fn ratify_quorum(pool_size: usize) -> usize {
 pub fn verify_ratify_vote(
     vote: &RatifyVote,
     network: &NetworkDefinition,
-    active_pool: &[(ValidatorId, Bls12381G1PublicKey)],
+    active_pool: &[(ValidatorId, ConsensusPublicKey)],
 ) -> Result<(), RatifyVoteVerifyError> {
     let Some(signer_pk) = active_pool
         .iter()
@@ -361,7 +362,7 @@ pub fn verify_ratify_vote(
         vote.phase(),
         &vote.block_hash(),
     );
-    if verify_bls12381_v1(&msg, &signer_pk, &vote.sig()) {
+    if verify_bls12381_v1(&msg, &bls_pk(&signer_pk), &bls_sig(&vote.sig())) {
         Ok(())
     } else {
         Err(RatifyVoteVerifyError::BadSignature)
@@ -390,7 +391,7 @@ pub fn verify_ratify_vote(
 pub fn verify_ratify_cert(
     cert: &RatifyCert,
     network: &NetworkDefinition,
-    active_pool: &[(ValidatorId, Bls12381G1PublicKey)],
+    active_pool: &[(ValidatorId, ConsensusPublicKey)],
 ) -> Result<(), RatifyCertVerifyError> {
     let pool_size = active_pool.len();
     if cert.signers().num_validators() != pool_size {
@@ -403,7 +404,7 @@ pub fn verify_ratify_cert(
     let signer_pks: Vec<Bls12381G1PublicKey> = cert
         .signers()
         .set_indices()
-        .map(|i| active_pool[i].1)
+        .map(|i| bls_pk(&active_pool[i].1))
         .collect();
     if signer_pks.is_empty() {
         return Err(RatifyCertVerifyError::EmptySignerSet);
@@ -417,7 +418,8 @@ pub fn verify_ratify_cert(
         &cert.block_hash(),
     );
     let msgs: Vec<&[u8]> = std::iter::repeat_n(msg.as_slice(), signer_pks.len()).collect();
-    if aggregate_verify_bls_different_messages(&msgs, &cert.aggregate_sig(), &signer_pks) {
+    if aggregate_verify_bls_different_messages(&msgs, &bls_agg(&cert.aggregate_sig()), &signer_pks)
+    {
         Ok(())
     } else {
         Err(RatifyCertVerifyError::BadAggregateSignature)
@@ -440,7 +442,7 @@ pub fn sign_ratify_vote(
     block_hash: BeaconBlockHash,
 ) -> RatifyVote {
     let msg = ratify_vote_message(network, &anchor_hash, epoch, round, phase, &block_hash);
-    let sig = sk.sign_v1(&msg);
+    let sig = sig_from_bls(&sk.sign_v1(&msg));
     RatifyVote::new(anchor_hash, epoch, round, phase, block_hash, signer, sig)
 }
 
@@ -462,7 +464,7 @@ pub fn sign_ratify_vote(
 #[must_use]
 pub fn build_ratify_cert(
     votes: &[RatifyVote],
-    active_pool: &[(ValidatorId, Bls12381G1PublicKey)],
+    active_pool: &[(ValidatorId, ConsensusPublicKey)],
 ) -> Option<RatifyCert> {
     let first = votes.first()?;
     let anchor_hash = first.anchor_hash();
@@ -487,7 +489,7 @@ pub fn build_ratify_cert(
             && !signers.is_set(pos)
         {
             signers.set(pos);
-            sigs.push(vote.sig());
+            sigs.push(bls_sig(&vote.sig()));
         }
     }
 
@@ -495,7 +497,7 @@ pub fn build_ratify_cert(
         return None;
     }
 
-    let aggregate_sig = Bls12381G2Signature::aggregate(&sigs, true).ok()?;
+    let aggregate_sig = agg_from_bls(&Bls12381G2Signature::aggregate(&sigs, true).ok()?);
     Some(RatifyCert::new(
         anchor_hash,
         epoch,
@@ -585,7 +587,7 @@ pub struct RatifyVerifyContext<'a> {
     pub network: &'a NetworkDefinition,
     /// Active validator pool at verification time. Positional ordering
     /// matches the cert's signer bitfield.
-    pub active_pool: &'a [(ValidatorId, Bls12381G1PublicKey)],
+    pub active_pool: &'a [(ValidatorId, ConsensusPublicKey)],
 }
 
 /// Failure modes of a single ratify vote.
@@ -653,10 +655,10 @@ pub struct CandidateVerifyContext<'a> {
     /// Network the cert and equivocation evidence were bound to.
     pub network: &'a NetworkDefinition,
     /// Beacon committee for the candidate's epoch, in positional order.
-    pub committee: &'a [(ValidatorId, Bls12381G1PublicKey)],
+    pub committee: &'a [(ValidatorId, ConsensusPublicKey)],
     /// Pubkeys for the validators referenced by embedded
     /// `PcVoteEquivocation` evidence.
-    pub equivocation_signers: &'a [(ValidatorId, Bls12381G1PublicKey)],
+    pub equivocation_signers: &'a [(ValidatorId, ConsensusPublicKey)],
 }
 
 /// Failure modes of a candidate beacon block.
@@ -760,7 +762,7 @@ impl Verified<RatifyCert> {
     #[must_use]
     pub fn from_verified_votes(
         votes: &[&Verified<RatifyVote>],
-        active_pool: &[(ValidatorId, Bls12381G1PublicKey)],
+        active_pool: &[(ValidatorId, ConsensusPublicKey)],
     ) -> Option<Self> {
         let raw: Vec<RatifyVote> = votes.iter().map(|v| (*v).as_ref().clone()).collect();
         build_ratify_cert(&raw, active_pool).map(Self::new_unchecked)
@@ -811,7 +813,7 @@ impl Verified<CandidateBeaconBlock> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Hash, bls_keypair_from_seed};
+    use crate::{Hash, bls_keypair_from_seed, pk_from_bls};
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
@@ -834,14 +836,14 @@ mod tests {
     fn pool(
         n: u64,
     ) -> (
-        Vec<(ValidatorId, Bls12381G1PublicKey)>,
+        Vec<(ValidatorId, ConsensusPublicKey)>,
         Vec<Bls12381G1PrivateKey>,
     ) {
         let mut active = Vec::new();
         let mut keys = Vec::new();
         for i in 0..n {
             let sk = signing_key(i);
-            active.push((ValidatorId::new(i), sk.public_key()));
+            active.push((ValidatorId::new(i), pk_from_bls(&sk.public_key())));
             keys.push(sk);
         }
         (active, keys)
@@ -868,7 +870,7 @@ mod tests {
             RatifyPhase::Prevote,
             block_hash(),
             ValidatorId::new(3),
-            Bls12381G2Signature([0x33; 96]),
+            ConsensusSignature::new([0x33; 96]),
         )
     }
 
@@ -883,7 +885,7 @@ mod tests {
             RatifyRound::INITIAL,
             block_hash(),
             signers,
-            Bls12381G2Signature([0x22; 96]),
+            AggregateSignature::new([0x22; 96]),
         )
     }
 
@@ -948,8 +950,9 @@ mod tests {
     fn verify_ratify_vote_rejects_tampered_sig() {
         let (active, keys) = pool(4);
         let vote = precommit(&keys, 2, RatifyRound::INITIAL);
-        let mut sig = vote.sig();
-        sig.0[0] ^= 1;
+        let mut sig_bytes = *vote.sig().as_bytes();
+        sig_bytes[0] ^= 1;
+        let sig = ConsensusSignature::new(sig_bytes);
         let tampered = RatifyVote::new(
             vote.anchor_hash(),
             vote.epoch(),
@@ -1029,6 +1032,7 @@ mod tests {
                 )
                 .sig()
             })
+            .map(|s| bls_sig(&s))
             .collect();
         let mut signers = SignerBitfield::new(7);
         for i in 0..6 {
@@ -1041,7 +1045,7 @@ mod tests {
             RatifyRound::INITIAL,
             block_hash(),
             signers,
-            aggregate,
+            agg_from_bls(&aggregate),
         );
         assert_eq!(
             verify_ratify_cert(&forged, &net(), &active),
@@ -1113,8 +1117,9 @@ mod tests {
             .map(|i| precommit(&keys, i, RatifyRound::INITIAL))
             .collect();
         let cert = build_ratify_cert(&votes, &active).expect("quorum met");
-        let mut bad_sig = cert.aggregate_sig();
-        bad_sig.0[0] ^= 1;
+        let mut bad_bytes = *cert.aggregate_sig().as_bytes();
+        bad_bytes[0] ^= 1;
+        let bad_sig = AggregateSignature::new(bad_bytes);
         let tampered = RatifyCert::new(
             cert.anchor_hash(),
             cert.epoch(),
@@ -1156,7 +1161,7 @@ mod tests {
         let qc2 = PcQc2::new(
             PcVector::empty(),
             SignerBitfield::new(4),
-            Bls12381G2Signature([0x11; 96]),
+            AggregateSignature::new([0x11; 96]),
             PcXpProof::Full,
         );
         let qc3 = PcQc3::new(
@@ -1166,7 +1171,7 @@ mod tests {
             None,
             SignerBitfield::new(4),
             PcSignerLengths::Uniform(0),
-            Bls12381G2Signature([0x11; 96]),
+            AggregateSignature::new([0x11; 96]),
         );
         Box::new(SpcCert::Direct {
             prev_view: SpcView::INITIAL,

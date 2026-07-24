@@ -10,9 +10,9 @@ use std::sync::Arc;
 use hyperscale_jmt::TreeReader;
 use hyperscale_types::test_utils::test_event_type_identifier;
 use hyperscale_types::{
-    ApplicationEvent, BeaconBlock, BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState,
-    BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
-    BlockHeight, Bls12381G2Signature, BoundedVec, CertificateRoot, CertifiedBeaconBlock,
+    AggregateSignature, ApplicationEvent, BeaconBlock, BeaconBlockHash, BeaconCert,
+    BeaconChainConfig, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
+    Block, BlockHash, BlockHeader, BlockHeight, BoundedVec, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBlock, ChainOrigin, ConsensusReceipt, Epoch, EventData, ExecutionCertificate,
     ExecutionMetadata, ExecutionOutcome, FeeSummary, FinalizedWave, GlobalReceiptHash,
     GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, LogLevel, NodeId, PcQc2, PcQc3,
@@ -20,8 +20,8 @@ use hyperscale_types::{
     Randomness, RatifyCert, RatifyRound, Round, ShardAnchor, ShardId, ShardWitnessPayload,
     SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StoredReceipt,
     TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
-    WeightedTimestamp, WitnessSources, compute_global_receipt_root, compute_merkle_root,
-    zero_bls_signature,
+    WeightedTimestamp, WitnessSources, agg_from_bls, compute_global_receipt_root,
+    compute_merkle_root, zero_bls_signature,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -151,7 +151,7 @@ pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardId) -> WaveCe
         WeightedTimestamp::from_millis(0),
         GlobalReceiptRoot::ZERO,
         Vec::new(),
-        Bls12381G2Signature([0u8; 96]),
+        AggregateSignature::new([0u8; 96]),
         SignerBitfield::empty(),
     ));
     WaveCertificate::new(wave_id, vec![local_ec])
@@ -226,7 +226,7 @@ pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
         block.header().parent_block_hash(),
         Round::INITIAL,
         SignerBitfield::new(4),
-        zero_bls_signature(),
+        agg_from_bls(&zero_bls_signature()),
         WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),
     ))
 }
@@ -260,7 +260,7 @@ fn placeholder_cert() -> SpcCert {
     let qc2 = PcQc2::new(
         PcVector::empty(),
         SignerBitfield::new(4),
-        Bls12381G2Signature([0x11; 96]),
+        AggregateSignature::new([0x11; 96]),
         PcXpProof::Full,
     );
     let proof = PcQc3::new(
@@ -270,7 +270,7 @@ fn placeholder_cert() -> SpcCert {
         None,
         SignerBitfield::new(4),
         PcSignerLengths::Uniform(0),
-        Bls12381G2Signature([0x33; 96]),
+        AggregateSignature::new([0x33; 96]),
     );
     SpcCert::Direct {
         prev_view: SpcView::new(1),
@@ -298,7 +298,7 @@ pub fn make_test_beacon_block(epoch: u64, tag: &[u8]) -> Arc<Verified<CertifiedB
         RatifyRound::INITIAL,
         block.block_hash(),
         SignerBitfield::new(4),
-        Bls12381G2Signature([0x22; 96]),
+        AggregateSignature::new([0x22; 96]),
     );
     Arc::new(Verified::new_unchecked_for_test(
         CertifiedBeaconBlock::new_unchecked(
@@ -407,7 +407,7 @@ pub fn make_test_execution_certificate(
         WeightedTimestamp::from_millis(block_height.inner() + 1),
         global_receipt_root,
         outcomes,
-        Bls12381G2Signature([0u8; 96]),
+        AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     )
 }

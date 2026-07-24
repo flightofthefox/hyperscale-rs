@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/beacon",
     "crates/core",
+    "crates/crypto",
     "crates/dispatch",
     "crates/dispatch-pooled",
     "crates/dispatch-sync",
@@ -39,6 +40,7 @@ edition = "2024"
 # Internal crates
 hyperscale-beacon = { path = "crates/beacon" }
 hyperscale-core = { path = "crates/core" }
+hyperscale-crypto = { path = "crates/crypto" }
 hyperscale-dispatch = { path = "crates/dispatch" }
 hyperscale-dispatch-pooled = { path = "crates/dispatch-pooled" }
 hyperscale-dispatch-sync = { path = "crates/dispatch-sync" }

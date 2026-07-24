@@ -627,7 +627,7 @@ mod tests {
 
     use hyperscale_types::{
         NetworkDefinition, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
-        ValidatorInfo, ValidatorSet, generate_bls_keypair,
+        ValidatorInfo, ValidatorSet, generate_bls_keypair, pk_from_bls,
     };
 
     use super::{host_holds_seat, host_in_committee, shard_retired};
@@ -650,7 +650,7 @@ mod tests {
             .iter()
             .map(|&validator_id| ValidatorInfo {
                 validator_id,
-                public_key: generate_bls_keypair().public_key(),
+                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
             })
             .collect();
         TopologySnapshot::from_explicit_committees(

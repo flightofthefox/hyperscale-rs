@@ -2,7 +2,7 @@
 
 use sbor::prelude::*;
 
-use crate::{Bls12381G1PublicKey, ValidatorId, VoteCount};
+use crate::{ConsensusPublicKey, ValidatorId, VoteCount};
 
 /// Information about a validator.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
@@ -11,7 +11,7 @@ pub struct ValidatorInfo {
     pub validator_id: ValidatorId,
 
     /// Public key for signature verification (BLS for aggregatable consensus).
-    pub public_key: Bls12381G1PublicKey,
+    pub public_key: ConsensusPublicKey,
 }
 
 /// A set of validators.
@@ -71,7 +71,7 @@ impl ValidatorSet {
 
     /// Get all public keys.
     #[must_use]
-    pub fn public_keys(&self) -> Vec<Bls12381G1PublicKey> {
+    pub fn public_keys(&self) -> Vec<ConsensusPublicKey> {
         self.validators.iter().map(|v| v.public_key).collect()
     }
 }
@@ -79,12 +79,12 @@ impl ValidatorSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generate_bls_keypair;
+    use crate::{generate_bls_keypair, pk_from_bls};
 
     fn make_validator(id: u64) -> ValidatorInfo {
         ValidatorInfo {
             validator_id: ValidatorId::new(id),
-            public_key: generate_bls_keypair().public_key(),
+            public_key: pk_from_bls(&generate_bls_keypair().public_key()),
         }
     }
 

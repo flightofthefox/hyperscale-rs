@@ -56,8 +56,8 @@ mod tests {
     use super::*;
     use crate::test_utils::test_validity_range;
     use crate::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
-        Bls12381G2Signature, BoundedVec, CertificateRoot, ChainOrigin, ExecutionCertificate,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
+        BlockHeight, BoundedVec, CertificateRoot, ChainOrigin, ExecutionCertificate,
         ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount,
         LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId,
         SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
@@ -166,7 +166,7 @@ mod tests {
                         )),
                     },
                 )],
-                Bls12381G2Signature([0u8; 96]),
+                AggregateSignature::new([0u8; 96]),
                 SignerBitfield::new(4),
             ));
             Arc::new(
@@ -204,7 +204,7 @@ mod tests {
                     receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"rh")),
                 },
             )],
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         ));
         let cert = Arc::new(WaveCertificate::new(

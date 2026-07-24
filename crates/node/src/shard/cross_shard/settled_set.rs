@@ -233,8 +233,8 @@ mod tests {
     use hyperscale_storage::{PendingChain, ShardChainWriter};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
-        BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
-        BlockHeader, Bls12381G2Signature, BoundedVec, CertificateRoot, ExecutionCertificate,
+        AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
+        BlockHash, BlockHeader, BoundedVec, CertificateRoot, ExecutionCertificate,
         ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount,
         LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId,
         SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
@@ -259,7 +259,7 @@ mod tests {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
             )],
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         );
         Arc::new(Verifiable::from(FinalizedWave::new(
@@ -284,7 +284,7 @@ mod tests {
                 BlockHash::ZERO,
                 Round::INITIAL,
                 SignerBitfield::new(4),
-                Bls12381G2Signature([0u8; 96]),
+                AggregateSignature::new([0u8; 96]),
                 WeightedTimestamp::from_millis(1_000 * h),
             );
             let header = BlockHeader::new(

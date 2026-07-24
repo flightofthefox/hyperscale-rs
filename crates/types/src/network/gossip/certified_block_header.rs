@@ -6,7 +6,7 @@ use sbor::prelude::BasicSbor;
 
 use crate::network::{GossipMessage, TopicScope};
 use crate::{
-    Bls12381G2Signature, CertifiedBlockHeader, MessageClass, NetworkDefinition, NetworkMessage,
+    CertifiedBlockHeader, ConsensusSignature, MessageClass, NetworkDefinition, NetworkMessage,
     ShardId, Signed, ValidatorId, Verifiable, certified_block_header_message,
 };
 
@@ -25,7 +25,7 @@ pub struct CertifiedBlockHeaderGossip {
     /// The validator who sent this gossip (should be the block proposer).
     pub sender: ValidatorId,
     /// BLS signature over the domain-separated signing message, by the sender.
-    pub sender_signature: Bls12381G2Signature,
+    pub sender_signature: ConsensusSignature,
 }
 
 impl Signed for CertifiedBlockHeaderGossip {
@@ -33,7 +33,7 @@ impl Signed for CertifiedBlockHeaderGossip {
         self.sender
     }
 
-    fn signature(&self) -> &Bls12381G2Signature {
+    fn signature(&self) -> &ConsensusSignature {
         &self.sender_signature
     }
 
@@ -84,7 +84,7 @@ mod tests {
     use sbor::{basic_decode, basic_encode};
 
     use super::*;
-    use crate::{BlockHash, InFlightCount, ProposerTimestamp};
+    use crate::{BlockHash, InFlightCount, ProposerTimestamp, sig_from_bls};
 
     #[test]
     fn test_message_type_id() {
@@ -130,7 +130,7 @@ mod tests {
         let gossip = CertifiedBlockHeaderGossip {
             certified_header: Arc::new(Verifiable::from(CertifiedBlockHeader::new(header, qc))),
             sender: ValidatorId::new(0),
-            sender_signature: zero_bls_signature(),
+            sender_signature: sig_from_bls(&zero_bls_signature()),
         };
 
         let encoded = basic_encode(&gossip).unwrap();

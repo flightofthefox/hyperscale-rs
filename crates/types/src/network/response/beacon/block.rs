@@ -56,7 +56,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        BeaconBlock, BeaconBlockHash, BeaconCert, Bls12381G2Signature, Epoch, Hash, RatifyCert,
+        AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconCert, Epoch, Hash, RatifyCert,
         RatifyRound, SignerBitfield,
     };
 
@@ -71,7 +71,7 @@ mod tests {
             RatifyRound::INITIAL,
             block.block_hash(),
             SignerBitfield::new(4),
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
         );
         Arc::new(Verifiable::from(CertifiedBeaconBlock::new_unchecked(
             block,

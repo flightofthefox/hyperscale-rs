@@ -10,9 +10,8 @@ use std::collections::BTreeSet;
 
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, Epoch, PendingReshape, ShardId, Stake, StakePool,
-    StakePoolId, StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
-    ValidatorStatus,
+    BlockHeight, ConsensusPublicKey, Epoch, PendingReshape, ShardId, Stake, StakePool, StakePoolId,
+    StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
 };
 
 use super::Cluster;
@@ -153,7 +152,7 @@ pub fn validator_status<C: Cluster>(c: &C, id: ValidatorId) -> Option<ValidatorS
 
 /// The registered BLS public key of validator `id`, or `None` if unregistered.
 #[must_use]
-pub fn validator_pubkey<C: Cluster>(c: &C, id: ValidatorId) -> Option<Bls12381G1PublicKey> {
+pub fn validator_pubkey<C: Cluster>(c: &C, id: ValidatorId) -> Option<ConsensusPublicKey> {
     c.beacon_state()
         .and_then(|state| state.validators.get(&id).map(|r| r.pubkey))
 }

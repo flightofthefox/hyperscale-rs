@@ -8,9 +8,10 @@ use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, ChainOrigin,
-    NetworkDefinition, Round, ShardId, SignerBitfield, Verified, Verify, VoteCount,
-    WeightedTimestamp, block_vote_message, verify_bls12381_v1, zero_bls_signature,
+    AggregateSignature, BlockHash, BlockHeight, BlockVote, Bls12381G1PublicKey,
+    Bls12381G2Signature, ChainOrigin, ConsensusPublicKey, NetworkDefinition, Round, ShardId,
+    SignerBitfield, Verified, Verify, VoteCount, WeightedTimestamp, agg_from_bls,
+    block_vote_message, bls_agg, bls_pk, bls_sig, verify_bls12381_v1,
 };
 
 /// A quorum certificate proving 2f+1 validators voted for a block.
@@ -24,7 +25,7 @@ pub struct QuorumCertificate {
     parent_block_hash: BlockHash,
     round: Round,
     signers: SignerBitfield,
-    aggregated_signature: Bls12381G2Signature,
+    aggregated_signature: AggregateSignature,
     weighted_timestamp: WeightedTimestamp,
 }
 
@@ -39,7 +40,7 @@ impl QuorumCertificate {
         parent_block_hash: BlockHash,
         round: Round,
         signers: SignerBitfield,
-        aggregated_signature: Bls12381G2Signature,
+        aggregated_signature: AggregateSignature,
         weighted_timestamp: WeightedTimestamp,
     ) -> Self {
         Self {
@@ -79,7 +80,7 @@ impl QuorumCertificate {
             parent_block_hash: BlockHash::ZERO,
             round: Round::INITIAL,
             signers: SignerBitfield::empty(),
-            aggregated_signature: zero_bls_signature(),
+            aggregated_signature: AggregateSignature::ZERO,
             weighted_timestamp: origin.anchor_wt,
         }
     }
@@ -122,7 +123,7 @@ impl QuorumCertificate {
 
     /// Aggregated BLS signature from all signers.
     #[must_use]
-    pub const fn aggregated_signature(&self) -> Bls12381G2Signature {
+    pub const fn aggregated_signature(&self) -> AggregateSignature {
         self.aggregated_signature
     }
 
@@ -144,7 +145,7 @@ impl QuorumCertificate {
         BlockHash,
         Round,
         SignerBitfield,
-        Bls12381G2Signature,
+        AggregateSignature,
         WeightedTimestamp,
     ) {
         (
@@ -244,7 +245,7 @@ pub struct QcContext<'a> {
     /// Network identifier — feeds the domain-separated signing message.
     pub network: &'a NetworkDefinition,
     /// BLS public keys for every validator in this QC's committee.
-    pub public_keys: &'a [Bls12381G1PublicKey],
+    pub public_keys: &'a [ConsensusPublicKey],
     /// Minimum vote count required to constitute a quorum.
     pub quorum_threshold: VoteCount,
 }
@@ -340,9 +341,12 @@ impl Verified<QuorumCertificate> {
         let mut sorted: Vec<_> = verified_votes.to_vec();
         sorted.sort_by_key(|(idx, _)| *idx);
 
-        let signatures: Vec<Bls12381G2Signature> =
-            sorted.iter().map(|(_, v)| v.signature()).collect();
-        let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true).ok()?;
+        let signatures: Vec<Bls12381G2Signature> = sorted
+            .iter()
+            .map(|(_, v)| bls_sig(&v.signature()))
+            .collect();
+        let aggregated_signature =
+            agg_from_bls(&Bls12381G2Signature::aggregate(&signatures, true).ok()?);
 
         let floor_ms = parent_weighted_timestamp.as_millis();
         let max_idx = sorted.iter().map(|(idx, _)| *idx).max().unwrap_or(0);
@@ -417,7 +421,7 @@ impl Verify<&QcContext<'_>> for QuorumCertificate {
             .iter()
             .enumerate()
             .filter(|(i, _)| self.signers.is_set(*i))
-            .map(|(_, pk)| *pk)
+            .map(|(_, pk)| bls_pk(pk))
             .collect();
         if signer_keys.is_empty() {
             return Err(QcVerifyError::NoSigners);
@@ -426,7 +430,11 @@ impl Verify<&QcContext<'_>> for QuorumCertificate {
         let signing_message = self.signing_message(ctx.network);
         let aggregated_pk = Bls12381G1PublicKey::aggregate(&signer_keys, false)
             .map_err(|_| QcVerifyError::PublicKeyAggregationFailed)?;
-        if !verify_bls12381_v1(&signing_message, &aggregated_pk, &self.aggregated_signature) {
+        if !verify_bls12381_v1(
+            &signing_message,
+            &aggregated_pk,
+            &bls_agg(&self.aggregated_signature),
+        ) {
             return Err(QcVerifyError::InvalidSignature);
         }
 
@@ -447,7 +455,7 @@ impl Verify<&QcContext<'_>> for QuorumCertificate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Hash;
+    use crate::{Hash, pk_from_bls};
 
     #[test]
     fn test_genesis_qc() {
@@ -476,7 +484,7 @@ mod tests {
             parent_block_hash,
             Round::INITIAL,
             signers,
-            zero_bls_signature(),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1000),
         );
 
@@ -525,14 +533,14 @@ mod tests {
             BlockHash::ZERO,
             round,
             signers,
-            agg_sig,
+            agg_from_bls(&agg_sig),
             WeightedTimestamp::ZERO,
         )
     }
 
     fn ctx<'a>(
         net: &'a NetworkDefinition,
-        public_keys: &'a [Bls12381G1PublicKey],
+        public_keys: &'a [ConsensusPublicKey],
         quorum_threshold: VoteCount,
     ) -> QcContext<'a> {
         QcContext {
@@ -545,7 +553,10 @@ mod tests {
     #[test]
     fn verify_accepts_valid_qc_with_quorum_signers() {
         let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let pubs: Vec<_> = keys
+            .iter()
+            .map(|sk| pk_from_bls(&sk.public_key()))
+            .collect();
 
         let qc = signed_qc(
             &keys,
@@ -564,7 +575,10 @@ mod tests {
     #[test]
     fn verify_rejects_tampered_signature() {
         let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let pubs: Vec<_> = keys
+            .iter()
+            .map(|sk| pk_from_bls(&sk.public_key()))
+            .collect();
 
         let mut qc = signed_qc(
             &keys,
@@ -593,7 +607,14 @@ mod tests {
         let bad_agg = Bls12381G2Signature::aggregate(&bad_sigs, true).unwrap();
         let (block_hash, shard, height, parent, round, signers, _sig, ts) = qc.clone().into_parts();
         qc = QuorumCertificate::new(
-            block_hash, shard, height, parent, round, signers, bad_agg, ts,
+            block_hash,
+            shard,
+            height,
+            parent,
+            round,
+            signers,
+            agg_from_bls(&bad_agg),
+            ts,
         );
 
         let err = qc.verify(&ctx(&net, &pubs, VoteCount::new(3))).unwrap_err();
@@ -606,7 +627,10 @@ mod tests {
         // commit rule. Repointing it at a sibling — the forged-parent fork —
         // must fail verification now that the field is in the signed message.
         let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let pubs: Vec<_> = keys
+            .iter()
+            .map(|sk| pk_from_bls(&sk.public_key()))
+            .collect();
 
         // `signed_qc` signs over parent = ZERO; keep the genuine signature but
         // repoint the parent at a sibling block.
@@ -640,7 +664,10 @@ mod tests {
     #[test]
     fn verify_rejects_under_quorum_signer_set() {
         let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let pubs: Vec<_> = keys
+            .iter()
+            .map(|sk| pk_from_bls(&sk.public_key()))
+            .collect();
 
         // Only two of four sign — quorum is three. Signatures themselves
         // are valid; the stake total falls short.
@@ -667,7 +694,10 @@ mod tests {
     #[test]
     fn verify_rejects_qc_with_no_signers() {
         let keys: Vec<_> = (0..2).map(|_| generate_bls_keypair()).collect();
-        let pubs: Vec<_> = keys.iter().map(Bls12381G1PrivateKey::public_key).collect();
+        let pubs: Vec<_> = keys
+            .iter()
+            .map(|sk| pk_from_bls(&sk.public_key()))
+            .collect();
 
         let qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"b")),
@@ -676,7 +706,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(2),
-            zero_bls_signature(),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
 

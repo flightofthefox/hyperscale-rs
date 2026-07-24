@@ -5680,7 +5680,8 @@ mod tests {
         MAX_TIMESTAMP_RUSH, NetworkDefinition, ProvisionsRoot, RETENTION_HORIZON,
         RoutableTransaction, ShardId, SignerBitfield, TopologySchedule, TopologySnapshot,
         TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
-        WitnessSources, generate_bls_keypair, test_utils, zero_bls_signature,
+        WitnessSources, agg_from_bls, generate_bls_keypair, pk_from_bls, sig_from_bls, test_utils,
+        zero_bls_signature,
     };
 
     use super::*;
@@ -5714,7 +5715,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -5802,7 +5803,7 @@ mod tests {
             .iter()
             .map(|&id| ValidatorInfo {
                 validator_id: ValidatorId::new(id),
-                public_key: generate_bls_keypair().public_key(),
+                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
             })
             .collect();
         TopologySnapshot::new(
@@ -5826,7 +5827,7 @@ mod tests {
             BlockHash::ZERO,
             Round::new(0),
             signers,
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(parent_weighted_ms),
         );
         let header = BlockHeader::new(
@@ -5942,7 +5943,7 @@ mod tests {
                 parent.header().parent_block_hash(),
                 Round::new(5),
                 signers,
-                zero_bls_signature(),
+                agg_from_bls(&zero_bls_signature()),
                 WeightedTimestamp::from_millis(weighted_ms),
             );
             let header = BlockHeader::new(
@@ -6038,7 +6039,7 @@ mod tests {
             BlockHash::ZERO,
             Round::new(0),
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(100_000),
         ))
     }
@@ -6140,7 +6141,7 @@ mod tests {
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(9),
             SignerBitfield::new(4),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(50_000),
         );
         let header = BlockHeader::new(
@@ -6481,7 +6482,7 @@ mod tests {
                 BlockHash::ZERO,
                 Round::new(round),
                 signers,
-                zero_bls_signature(),
+                agg_from_bls(&zero_bls_signature()),
                 WeightedTimestamp::from_millis(now_ms - 5_000),
             );
             BlockHeader::new(
@@ -7015,7 +7016,7 @@ mod tests {
                 BlockHash::ZERO,
                 Round::new(5),
                 SignerBitfield::empty(),
-                zero_bls_signature(),
+                agg_from_bls(&zero_bls_signature()),
                 WeightedTimestamp::from_millis(100_000),
             ));
         state.on_committed_state_restored(
@@ -7287,7 +7288,7 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"retained-parent")),
                 Round::new(1),
                 SignerBitfield::new(4),
-                zero_bls_signature(),
+                agg_from_bls(&zero_bls_signature()),
                 WeightedTimestamp::ZERO,
             );
             let timeout = Timeout::new(
@@ -7357,7 +7358,7 @@ mod tests {
                 block.header().parent_block_hash(),
                 Round::new(5),
                 signers,
-                zero_bls_signature(),
+                agg_from_bls(&zero_bls_signature()),
                 WeightedTimestamp::ZERO,
             );
             let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -7406,7 +7407,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -7442,7 +7443,7 @@ mod tests {
             height,
             Round::new(0),
             voter,
-            zero_bls_signature(),
+            sig_from_bls(&zero_bls_signature()),
             ProposerTimestamp::from_millis(100_000),
         );
 
@@ -7670,7 +7671,7 @@ mod tests {
             committable_hash,
             Round::new(0),
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(100_000),
         ));
 
@@ -8178,7 +8179,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let pre_split = Arc::new(TopologySnapshot::new(
@@ -8237,7 +8238,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: generate_bls_keypair().public_key(),
+                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
             })
             .collect();
         let vs = ValidatorSet::new(validators);
@@ -8274,7 +8275,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: generate_bls_keypair().public_key(),
+                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
             })
             .collect();
         let vs = ValidatorSet::new(validators);
@@ -8401,7 +8402,7 @@ mod tests {
             block.header().parent_block_hash(),
             block.header().round(),
             signers,
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(5 * ED),
         );
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -8525,7 +8526,7 @@ mod tests {
                 block.header().parent_block_hash(),
                 block.header().round(),
                 signers,
-                zero_bls_signature(),
+                agg_from_bls(&zero_bls_signature()),
                 WeightedTimestamp::from_millis(ts),
             );
             let actions = state.on_sync_block_ready_to_apply(
@@ -8594,7 +8595,7 @@ mod tests {
                 block.header().parent_block_hash(),
                 block.header().round(),
                 signers,
-                zero_bls_signature(),
+                agg_from_bls(&zero_bls_signature()),
                 WeightedTimestamp::from_millis(ts),
             );
             let actions = state.on_sync_block_ready_to_apply(
@@ -9247,7 +9248,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let final_window = Arc::new(TopologySnapshot::new(
@@ -9275,7 +9276,7 @@ mod tests {
             (0..n)
                 .map(|i| ValidatorInfo {
                     validator_id: ValidatorId::new(i as u64),
-                    public_key: generate_bls_keypair().public_key(),
+                    public_key: pk_from_bls(&generate_bls_keypair().public_key()),
                 })
                 .collect(),
         );
@@ -9299,7 +9300,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: k.public_key(),
+                public_key: pk_from_bls(&k.public_key()),
             })
             .collect();
         let pre_merge = Arc::new(TopologySnapshot::new(
@@ -9436,7 +9437,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, k)| ValidatorInfo {
                     validator_id: ValidatorId::new(i as u64),
-                    public_key: k.public_key(),
+                    public_key: pk_from_bls(&k.public_key()),
                 })
                 .collect();
             let window = Arc::new(TopologySnapshot::new(
@@ -9491,7 +9492,7 @@ mod tests {
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
                 )],
-                zero_bls_signature(),
+                agg_from_bls(&zero_bls_signature()),
                 SignerBitfield::new(4),
             )
         };
@@ -9635,7 +9636,7 @@ mod tests {
             BlockHash::ZERO,
             Round::new(0),
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::from_millis(1500),
         );
         let header = BlockHeader::new(

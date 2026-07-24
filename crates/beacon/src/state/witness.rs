@@ -725,7 +725,7 @@ pub(super) fn defer_reshape_ttls(state: &mut BeaconState) {
 
 #[cfg(test)]
 mod tests {
-
+    use hyperscale_types::sig_from_bls;
     // ─── witness fold framework + stake variants ─────────────────────────
     use hyperscale_types::{
         BlockHash, BlockHeight, BlockVote, CohortSeat, EMISSIONS_PER_EPOCH, Epoch, Hash,
@@ -907,7 +907,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: pubkey(5),
-                possession_proof: possession_proof(5, new_id),
+                possession_proof: sig_from_bls(&possession_proof(5, new_id)),
             }],
         );
 
@@ -1031,10 +1031,10 @@ mod tests {
             round: Round::new(2),
             block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"a")),
             parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"pa")),
-            sig_a: zero_bls_signature(),
+            sig_a: sig_from_bls(&zero_bls_signature()),
             block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"b")),
             parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"pb")),
-            sig_b: zero_bls_signature(),
+            sig_b: sig_from_bls(&zero_bls_signature()),
         };
         let target_epoch = state.current_epoch.next();
         let mut committed = vec![(
@@ -1105,7 +1105,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: new_pubkey,
-                possession_proof: possession_proof(5, new_id),
+                possession_proof: sig_from_bls(&possession_proof(5, new_id)),
             }],
         );
 
@@ -1138,7 +1138,7 @@ mod tests {
                 pool_id,
                 validator_id: existing_id,
                 pubkey: pubkey(99),
-                possession_proof: possession_proof(99, existing_id),
+                possession_proof: sig_from_bls(&possession_proof(99, existing_id)),
             }],
         );
 
@@ -1159,7 +1159,7 @@ mod tests {
                 pool_id: StakePoolId::new(0),
                 validator_id: ValidatorId::new(5),
                 pubkey: pubkey(5),
-                possession_proof: possession_proof(5, ValidatorId::new(5)),
+                possession_proof: sig_from_bls(&possession_proof(5, ValidatorId::new(5))),
             }],
         );
 
@@ -1187,7 +1187,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: pubkey(5),
-                possession_proof: possession_proof(6, new_id),
+                possession_proof: sig_from_bls(&possession_proof(6, new_id)),
             }],
         );
 
@@ -1214,7 +1214,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: pubkey(5),
-                possession_proof: possession_proof(5, ValidatorId::new(6)),
+                possession_proof: sig_from_bls(&possession_proof(5, ValidatorId::new(6))),
             }],
         );
 
@@ -1239,7 +1239,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: pubkey(5),
-                possession_proof: zero_bls_signature(),
+                possession_proof: sig_from_bls(&zero_bls_signature()),
             }],
         );
 
@@ -2072,9 +2072,9 @@ mod tests {
             view,
             round: PcVoteRound::Vote1,
             value_a,
-            sig_a: sk.sign_v1(&msg_a),
+            sig_a: sig_from_bls(&sk.sign_v1(&msg_a)),
             value_b,
-            sig_b: sk.sign_v1(&msg_b),
+            sig_b: sig_from_bls(&sk.sign_v1(&msg_b)),
         }
     }
 

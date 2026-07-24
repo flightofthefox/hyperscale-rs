@@ -63,13 +63,13 @@ mod tests {
     use sbor::prelude::*;
 
     use super::*;
-    use crate::{Bls12381G2Signature, PcVector, ValidatorId};
+    use crate::{ConsensusSignature, PcVector, ValidatorId};
 
     fn sample_vote() -> PcVote1 {
         PcVote1::new(
             ValidatorId::new(2),
             PcVector::empty(),
-            vec![Bls12381G2Signature([0x11; 96])],
+            vec![ConsensusSignature::new([0x11; 96])],
         )
     }
 

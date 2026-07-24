@@ -97,7 +97,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, CertificateRoot,
         ChainOrigin, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Round, SignerBitfield, StateRoot, TransactionRoot, ValidatorId,
-        WeightedTimestamp, zero_bls_signature,
+        WeightedTimestamp, agg_from_bls, zero_bls_signature,
     };
 
     use super::*;
@@ -134,7 +134,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         );
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(

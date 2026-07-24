@@ -11,7 +11,7 @@ use std::sync::Arc;
 use blake3::hash as blake3_hash;
 
 use crate::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, Bls12381G1PublicKey, CompletedRecovery,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
     NetworkDefinition, NetworkParams, NodeId, ReshapeThresholds, Round, RoutableTransaction,
     SettledWavesRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, ValidatorId, ValidatorSet,
     VoteCount, WeightedTimestamp,
@@ -185,7 +185,7 @@ pub struct TopologySnapshot {
     /// the same `reshape_thresholds` for a block off its weighted-time-bound
     /// snapshot rather than a live head value that skews across folds.
     params: NetworkParams,
-    validator_pubkeys: HashMap<ValidatorId, Bls12381G1PublicKey>,
+    validator_pubkeys: HashMap<ValidatorId, ConsensusPublicKey>,
     global_validator_set: Arc<ValidatorSet>,
 }
 
@@ -750,7 +750,7 @@ impl TopologySnapshot {
 
     /// Get the public key for a validator.
     #[must_use]
-    pub fn public_key(&self, validator_id: ValidatorId) -> Option<Bls12381G1PublicKey> {
+    pub fn public_key(&self, validator_id: ValidatorId) -> Option<ConsensusPublicKey> {
         self.validator_pubkeys.get(&validator_id).copied()
     }
 
@@ -962,7 +962,7 @@ impl std::fmt::Debug for TopologySnapshot {
 
 fn build_validator_pubkeys(
     validator_set: &ValidatorSet,
-) -> HashMap<ValidatorId, Bls12381G1PublicKey> {
+) -> HashMap<ValidatorId, ConsensusPublicKey> {
     validator_set
         .validators
         .iter()
@@ -993,12 +993,12 @@ fn empty_committees(num_shards: u64) -> HashMap<ShardId, ShardCommittee> {
 mod tests {
     use super::*;
     use crate::test_utils::{test_node, test_transaction_with_nodes};
-    use crate::{Hash, ValidatorInfo, generate_bls_keypair};
+    use crate::{Hash, ValidatorInfo, generate_bls_keypair, pk_from_bls};
 
     fn make_test_validator(id: u64) -> ValidatorInfo {
         ValidatorInfo {
             validator_id: ValidatorId::new(id),
-            public_key: generate_bls_keypair().public_key(),
+            public_key: pk_from_bls(&generate_bls_keypair().public_key()),
         }
     }
 

@@ -439,7 +439,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        Round, ShardId, SignerBitfield, StateRoot, ValidatorId, WeightedTimestamp,
+        Round, ShardId, SignerBitfield, StateRoot, ValidatorId, WeightedTimestamp, agg_from_bls,
         zero_bls_signature,
     };
 
@@ -463,7 +463,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         );
 
@@ -495,7 +495,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         );
         // SAFETY: synthetic test fixture.
@@ -525,7 +525,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            zero_bls_signature(),
+            agg_from_bls(&zero_bls_signature()),
             WeightedTimestamp::ZERO,
         );
         // SAFETY: synthetic test fixture.

@@ -10,14 +10,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot,
-    BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    Bls12381G2Signature, CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex, LocalReceiptRoot,
+    BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature,
+    CertificateRoot, ConsensusPublicKey, Epoch, Hash, InFlightCount, LeafIndex, LocalReceiptRoot,
     MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp,
     ProvisionsRoot, QuorumCertificate, Round, ShardCommittee, ShardEpochContribution, ShardId,
     ShardVoteEquivocation, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield,
     SlotEffects, Stake, StakePool, StakePoolId, StateRoot, TransactionRoot, ValidatorId,
-    ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp, bls_keypair_from_seed,
-    compute_merkle_root_with_proof, validator_possession_proof_sign, vrf_sign, zero_bls_signature,
+    ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp, agg_from_bls,
+    bls_keypair_from_seed, bls_sig, compute_merkle_root_with_proof, pk_from_bls,
+    validator_possession_proof_sign, vrf_sign, zero_bls_signature,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
@@ -28,8 +29,8 @@ pub fn keypair(seed: u64) -> Bls12381G1PrivateKey {
     bls_keypair_from_seed(&s)
 }
 
-pub fn pubkey(seed: u64) -> Bls12381G1PublicKey {
-    keypair(seed).public_key()
+pub fn pubkey(seed: u64) -> ConsensusPublicKey {
+    pk_from_bls(&keypair(seed).public_key())
 }
 
 pub fn net() -> NetworkDefinition {
@@ -38,7 +39,7 @@ pub fn net() -> NetworkDefinition {
 
 /// A valid proof-of-possession for `pubkey(seed)` claimed under `id`.
 pub fn possession_proof(seed: u64, id: ValidatorId) -> Bls12381G2Signature {
-    validator_possession_proof_sign(&keypair(seed), &net(), id)
+    bls_sig(&validator_possession_proof_sign(&keypair(seed), &net(), id))
 }
 
 /// Build an honest VRF-signed empty `BeaconProposal` for validator
@@ -279,7 +280,7 @@ pub fn apply_witness_chunk(
         header.parent_block_hash(),
         Round::INITIAL,
         SignerBitfield::new(4),
-        zero_bls_signature(),
+        agg_from_bls(&zero_bls_signature()),
         WeightedTimestamp::from_millis(dur + 1),
     );
     // Every beacon committee member proposes (each with its own valid
@@ -342,7 +343,7 @@ fn boundary_header(shard: ShardId, root: BeaconWitnessRoot, leaf_count: u64) -> 
         BlockHash::ZERO,
         Round::INITIAL,
         SignerBitfield::new(4),
-        zero_bls_signature(),
+        agg_from_bls(&zero_bls_signature()),
         WeightedTimestamp::from_millis(1),
     );
     BlockHeader::new(

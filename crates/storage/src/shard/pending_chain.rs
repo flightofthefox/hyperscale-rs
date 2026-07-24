@@ -1132,7 +1132,7 @@ mod tests {
     use std::sync::PoisonError;
 
     use hyperscale_types::{
-        Block, Bls12381G2Signature, BoundedVec, CertifiedBlock, CertifiedBlockHeader,
+        AggregateSignature, Block, BoundedVec, CertifiedBlock, CertifiedBlockHeader,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, Round, RoutableTransaction, SignerBitfield, TxHash, TxOutcome,
         WaveCertificate, WaveId, WitnessSources,
@@ -1817,7 +1817,7 @@ mod tests {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
             )],
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         ))
     }
@@ -1861,7 +1861,7 @@ mod tests {
             block.header().parent_block_hash(),
             Round::INITIAL,
             SignerBitfield::new(4),
-            Bls12381G2Signature([0u8; 96]),
+            AggregateSignature::new([0u8; 96]),
             WeightedTimestamp::from_millis(wt_ms.saturating_add(1_000_000)),
         );
         BlockForSync {

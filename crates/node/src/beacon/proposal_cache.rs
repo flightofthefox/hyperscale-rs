@@ -14,7 +14,7 @@ use hyperscale_beacon::proposal_pool::BeaconProposalPool;
 use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
 use hyperscale_types::network::response::beacon::GetBeaconProposalResponse;
 use hyperscale_types::{
-    BeaconProposal, BeaconProposalVerifyContext, Bls12381G1PublicKey, Epoch, NetworkDefinition,
+    BeaconProposal, BeaconProposalVerifyContext, ConsensusPublicKey, Epoch, NetworkDefinition,
     ValidatorId, Verifiable, Verified, Verify,
 };
 
@@ -65,7 +65,7 @@ impl BeaconProposalCache {
         from: ValidatorId,
         epoch: Epoch,
         proposal: &Verifiable<BeaconProposal>,
-        sender_pk: Bls12381G1PublicKey,
+        sender_pk: ConsensusPublicKey,
     ) {
         let verified = if let Some(verified) = proposal.verified() {
             verified.clone()

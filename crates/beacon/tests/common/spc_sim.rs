@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use hyperscale_beacon::spc::{SpcEffect, SpcEvent, SpcInstance};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Epoch, NetworkDefinition, PcVector, PcVote1,
-    PcVote2, PcVote3, SpcCert, SpcEmptyViewMsg, SpcView, ValidatorId, Verified,
-    bls_keypair_from_seed, pc_context, spc_context,
+    Bls12381G1PrivateKey, ConsensusPublicKey, Epoch, NetworkDefinition, PcVector, PcVote1, PcVote2,
+    PcVote3, SpcCert, SpcEmptyViewMsg, SpcView, ValidatorId, Verified, bls_keypair_from_seed,
+    pc_context, pk_from_bls, spc_context,
 };
 
 /// One pending event in the network: an `SpcEvent` addressed to a
@@ -59,7 +59,7 @@ pub enum Trace {
 
 pub struct SpcSim {
     pub instances: Vec<SpcInstance>,
-    pub members: Vec<(ValidatorId, Bls12381G1PublicKey)>,
+    pub members: Vec<(ValidatorId, ConsensusPublicKey)>,
     pub sks: Vec<Arc<Bls12381G1PrivateKey>>,
     network: NetworkDefinition,
     epoch: Epoch,
@@ -87,7 +87,7 @@ impl SpcSim {
             bytes[..8].copy_from_slice(&seed.to_le_bytes());
             bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
             let sk = bls_keypair_from_seed(&bytes);
-            members.push((ValidatorId::new(i as u64), sk.public_key()));
+            members.push((ValidatorId::new(i as u64), pk_from_bls(&sk.public_key())));
             sks.push(Arc::new(sk));
         }
         let instances: Vec<SpcInstance> = (0..n)

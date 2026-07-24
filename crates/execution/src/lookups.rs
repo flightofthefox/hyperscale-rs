@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, NodeId, RoutableTransaction, ShardId,
+    BlockHeight, ConsensusPublicKey, ExecutionCertificate, NodeId, RoutableTransaction, ShardId,
     TopologySnapshot, ValidatorId, Verifiable, VoteCount, WaveId,
 };
 
@@ -76,7 +76,7 @@ pub fn ec_has_shard_quorum_power(
 pub fn committee_public_keys_for_shard(
     topology_snapshot: &TopologySnapshot,
     shard: ShardId,
-) -> Option<Vec<Bls12381G1PublicKey>> {
+) -> Option<Vec<ConsensusPublicKey>> {
     let committee = topology_snapshot.consensus_committee_for_shard(shard);
     let mut pubkeys = Vec::with_capacity(committee.len());
     for &vid in committee {

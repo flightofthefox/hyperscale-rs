@@ -26,7 +26,7 @@ use sbor::{
 use thiserror::Error;
 
 use crate::{
-    BeaconBlock, BeaconBlockHash, BeaconCert, Bls12381G1PublicKey, CandidateBeaconBlock, Epoch,
+    BeaconBlock, BeaconBlockHash, BeaconCert, CandidateBeaconBlock, ConsensusPublicKey, Epoch,
     GenesisConfigHash, NetworkDefinition, PcValueElement, RatifyCert, SpcCert, ValidatorId,
     Verified, Verify, spc_context, verify_block_cert, verify_ratify_cert, verify_vote_equivocation,
 };
@@ -215,8 +215,8 @@ impl CertifiedBeaconBlock {
 pub fn verify_certified(
     block: &CertifiedBeaconBlock,
     network: &NetworkDefinition,
-    committee: &[(ValidatorId, Bls12381G1PublicKey)],
-    active_pool: &[(ValidatorId, Bls12381G1PublicKey)],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
+    active_pool: &[(ValidatorId, ConsensusPublicKey)],
 ) -> bool {
     match block.cert() {
         BeaconCert::Normal { spc, ratify } => {
@@ -241,7 +241,7 @@ pub fn verify_certified(
 pub fn verify_block_equivocations(
     block: &CertifiedBeaconBlock,
     network: &NetworkDefinition,
-    signers: &[(ValidatorId, Bls12381G1PublicKey)],
+    signers: &[(ValidatorId, ConsensusPublicKey)],
 ) -> bool {
     for (_, proposal) in block.block().committed_proposals() {
         for ev in proposal.equivocations().iter() {
@@ -268,15 +268,15 @@ pub struct CertifiedBeaconBlockVerifyContext<'a> {
     pub network: &'a NetworkDefinition,
     /// Beacon committee for the block's epoch — the SPC cert's signer
     /// base. Positional ordering matches the SPC cert's bitfields.
-    pub committee: &'a [(ValidatorId, Bls12381G1PublicKey)],
+    pub committee: &'a [(ValidatorId, ConsensusPublicKey)],
     /// Active validator pool at the anchor's epoch — the ratify cert's
     /// signer base. Positional ordering matches the cert's bitfield.
-    pub active_pool: &'a [(ValidatorId, Bls12381G1PublicKey)],
+    pub active_pool: &'a [(ValidatorId, ConsensusPublicKey)],
     /// Pubkeys for the validators referenced by embedded
     /// `PcVoteEquivocation` evidence. The coordinator filters
     /// `state.validators` down to the referenced subset; an evidence
     /// signer missing from this lookup rejects the block.
-    pub equivocation_signers: &'a [(ValidatorId, Bls12381G1PublicKey)],
+    pub equivocation_signers: &'a [(ValidatorId, ConsensusPublicKey)],
 }
 
 /// Bind a block's committed proposals to the value its SPC cert
@@ -300,7 +300,7 @@ pub struct CertifiedBeaconBlockVerifyContext<'a> {
 pub fn verify_committed_proposal_binding(
     block: &BeaconBlock,
     cert: &SpcCert,
-    committee: &[(ValidatorId, Bls12381G1PublicKey)],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
 ) -> bool {
     let certified: Vec<PcValueElement> = cert.committed_value().iter().copied().collect();
     let epoch = block.epoch();
@@ -492,9 +492,9 @@ impl Describe<NoCustomTypeKind> for CertifiedBeaconBlock {
 mod tests {
     use super::*;
     use crate::{
-        BeaconBlockHash, BeaconProposal, Bls12381G2Signature, Hash, PcQc2, PcQc3, PcSignerLengths,
+        AggregateSignature, BeaconBlockHash, BeaconProposal, Hash, PcQc2, PcQc3, PcSignerLengths,
         PcVector, PcXpProof, RatifyRound, SignerBitfield, SpcCert, SpcView, VRF_PROOF_BYTES,
-        ValidatorId, VrfProof, bls_keypair_from_seed,
+        ValidatorId, VrfProof, bls_keypair_from_seed, pk_from_bls,
     };
 
     fn proposal(seed: u8) -> BeaconProposal {
@@ -511,7 +511,7 @@ mod tests {
         let qc2 = PcQc2::new(
             PcVector::empty(),
             SignerBitfield::new(4),
-            Bls12381G2Signature([0x11; 96]),
+            AggregateSignature::new([0x11; 96]),
             PcXpProof::Full,
         );
         let proof = PcQc3::new(
@@ -521,7 +521,7 @@ mod tests {
             None,
             SignerBitfield::new(4),
             PcSignerLengths::Uniform(0),
-            Bls12381G2Signature([0x33; 96]),
+            AggregateSignature::new([0x33; 96]),
         );
         SpcCert::Direct {
             prev_view: SpcView::new(1),
@@ -530,14 +530,14 @@ mod tests {
         }
     }
 
-    fn committee_of(n: u64) -> Vec<(ValidatorId, Bls12381G1PublicKey)> {
+    fn committee_of(n: u64) -> Vec<(ValidatorId, ConsensusPublicKey)> {
         (0..n)
             .map(|i| {
                 let mut seed = [0u8; 32];
                 seed[..8].copy_from_slice(&i.to_le_bytes());
                 (
                     ValidatorId::new(i),
-                    bls_keypair_from_seed(&seed).public_key(),
+                    pk_from_bls(&bls_keypair_from_seed(&seed).public_key()),
                 )
             })
             .collect()
@@ -557,7 +557,7 @@ mod tests {
             RatifyRound::INITIAL,
             block.block_hash(),
             signers,
-            Bls12381G2Signature([0x22; 96]),
+            AggregateSignature::new([0x22; 96]),
         )
     }
 
@@ -570,7 +570,7 @@ mod tests {
         let qc2 = PcQc2::new(
             value.clone(),
             SignerBitfield::new(4),
-            Bls12381G2Signature([0x11; 96]),
+            AggregateSignature::new([0x11; 96]),
             PcXpProof::Full,
         );
         let proof = PcQc3::new(
@@ -580,7 +580,7 @@ mod tests {
             None,
             SignerBitfield::new(4),
             PcSignerLengths::Uniform(0),
-            Bls12381G2Signature([0x33; 96]),
+            AggregateSignature::new([0x33; 96]),
         );
         BeaconCert::Normal {
             spc: Box::new(SpcCert::Direct {
@@ -700,7 +700,7 @@ mod tests {
             RatifyRound::INITIAL,
             block_a.block_hash(),
             signers_a,
-            Bls12381G2Signature([0x22; 96]),
+            AggregateSignature::new([0x22; 96]),
         );
 
         let mut signers_b = SignerBitfield::new(4);
@@ -713,7 +713,7 @@ mod tests {
             RatifyRound::new(2),
             block_b.block_hash(),
             signers_b,
-            Bls12381G2Signature([0x44; 96]),
+            AggregateSignature::new([0x44; 96]),
         );
 
         let pair_a = CertifiedBeaconBlock::new_checked(block_a, BeaconCert::Skip(cert_a)).unwrap();
