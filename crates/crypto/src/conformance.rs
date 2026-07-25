@@ -37,8 +37,12 @@ where
         "signer construction must be deterministic in the seed"
     );
 
+    // Equal length, differing content: a scheme that binds only to
+    // message length must fail the rejection axes below, not sail
+    // through them.
     let message = b"conformance: canonical message".as_slice();
-    let other_message = b"conformance: a different message".as_slice();
+    let other_message = b"conformance: different message".as_slice();
+    assert_eq!(message.len(), other_message.len());
 
     // Single-signature accept and reject axes.
     let sig = signers[0].sign(message).expect("sign must succeed");
@@ -127,9 +131,19 @@ where
         !verifier.verify_aggregate_different_messages(&message_refs, &dm_agg, &swapped_keys),
         "swapped pubkeys must break the per-signer message binding"
     );
+    let mut swapped_messages = message_refs.clone();
+    swapped_messages.swap(0, 1);
+    assert!(
+        !verifier.verify_aggregate_different_messages(&swapped_messages, &dm_agg, &keys),
+        "swapped messages must break the per-signer message binding"
+    );
     assert!(
         !verifier.verify_aggregate_different_messages(&message_refs[..3], &dm_agg, &keys),
         "message/key length mismatch must reject"
+    );
+    assert!(
+        !verifier.verify_aggregate_different_messages(&[], &dm_agg, &[]),
+        "different-messages aggregate against empty input must reject"
     );
 
     // Batch verification: per-item verdicts.
@@ -147,6 +161,11 @@ where
         "batch with one bad triple must single it out, got {verdicts:?}"
     );
     let mismatched = verifier.batch_verify(&message_refs[..2], &dm_sigs, &keys);
+    assert_eq!(
+        mismatched.len(),
+        signers.len(),
+        "batch length mismatch must return a verdict per input, got {mismatched:?}"
+    );
     assert!(
         mismatched.iter().all(|ok| !ok),
         "batch length mismatch must be all-false"
@@ -154,6 +173,18 @@ where
     assert!(
         verifier.batch_verify(&[], &[], &[]).is_empty(),
         "empty batch must be empty"
+    );
+
+    // A batch over one shared message: the uniform case consensus
+    // votes take, and a separate code path from the distinct-message
+    // one above in schemes that aggregate.
+    let same_refs = vec![message; signers.len()];
+    let mut one_forged = sigs;
+    one_forged[1] = ConsensusSignature::new([0x5a; 96]);
+    let same_verdicts = verifier.batch_verify(&same_refs, &one_forged, &keys);
+    assert!(
+        same_verdicts[0] && !same_verdicts[1] && same_verdicts[2] && same_verdicts[3],
+        "same-message batch with one forged signature must single it out, got {same_verdicts:?}"
     );
 
     // VRF: determinism, verification, and output binding.
@@ -196,12 +227,32 @@ mod tests {
     use super::*;
     use crate::{AggregateSignature, ConsensusPublicKey, SignError, VrfProof};
 
+    /// A property the throwaway scheme breaks on purpose.
+    ///
+    /// Every variant but [`Mutation::None`] is a scheme a battery with a
+    /// hole in it would admit; each has a `#[should_panic]` test naming
+    /// the assertion that must catch it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Mutation {
+        /// Honest scheme.
+        None,
+        /// `verify` accepts every triple.
+        VerifyAcceptsEverything,
+        /// Signatures bind the message's length, not its content.
+        SignBindsLengthOnly,
+        /// Empty different-messages input verifies.
+        EmptyDifferentMessagesVerifies,
+        /// Batch length mismatch yields no verdicts at all.
+        BatchMismatchReturnsEmpty,
+    }
+
     /// Throwaway keyed-hash scheme, exercised only to prove the battery
     /// itself runs and discriminates. Not exported; the real mock lives
     /// in its own impl crate.
     #[derive(Debug)]
     struct TestSigner {
         pk: ConsensusPublicKey,
+        mutation: Mutation,
     }
 
     fn derive_pk(seed: &[u8; 32]) -> ConsensusPublicKey {
@@ -211,11 +262,20 @@ mod tests {
         ConsensusPublicKey::new(pk)
     }
 
-    fn derive_sig(pk: &ConsensusPublicKey, domain: u8, message: &[u8]) -> [u8; 96] {
+    fn derive_sig(
+        pk: &ConsensusPublicKey,
+        domain: u8,
+        message: &[u8],
+        mutation: Mutation,
+    ) -> [u8; 96] {
         let mut hasher = Hasher::new();
         hasher.update(&[domain]);
         hasher.update(pk.as_bytes());
-        hasher.update(message);
+        if mutation == Mutation::SignBindsLengthOnly {
+            hasher.update(&message.len().to_le_bytes());
+        } else {
+            hasher.update(message);
+        }
         let digest = hasher.finalize();
         let mut sig = [0u8; 96];
         sig[..32].copy_from_slice(digest.as_bytes());
@@ -227,15 +287,27 @@ mod tests {
             self.pk
         }
         fn sign(&self, message: &[u8]) -> Result<ConsensusSignature, SignError> {
-            Ok(ConsensusSignature::new(derive_sig(&self.pk, 0, message)))
+            Ok(ConsensusSignature::new(derive_sig(
+                &self.pk,
+                0,
+                message,
+                self.mutation,
+            )))
         }
         fn vrf_sign(&self, message: &[u8]) -> Result<VrfProof, SignError> {
-            Ok(VrfProof::new(derive_sig(&self.pk, 1, message)))
+            Ok(VrfProof::new(derive_sig(
+                &self.pk,
+                1,
+                message,
+                self.mutation,
+            )))
         }
     }
 
     #[derive(Debug)]
-    struct TestVerifier;
+    struct TestVerifier {
+        mutation: Mutation,
+    }
 
     fn fold(sigs: &[ConsensusSignature]) -> AggregateSignature {
         let mut hasher = Hasher::new();
@@ -254,7 +326,8 @@ mod tests {
             message: &[u8],
             sig: &ConsensusSignature,
         ) -> bool {
-            sig.as_bytes() == &derive_sig(key, 0, message)
+            self.mutation == Mutation::VerifyAcceptsEverything
+                || sig.as_bytes() == &derive_sig(key, 0, message, self.mutation)
         }
         fn aggregate(
             &self,
@@ -276,7 +349,7 @@ mod tests {
             }
             let sigs: Vec<_> = keys
                 .iter()
-                .map(|k| ConsensusSignature::new(derive_sig(k, 0, message)))
+                .map(|k| ConsensusSignature::new(derive_sig(k, 0, message, self.mutation)))
                 .collect();
             fold(&sigs) == *agg
         }
@@ -286,13 +359,16 @@ mod tests {
             agg: &AggregateSignature,
             keys: &[ConsensusPublicKey],
         ) -> bool {
+            if messages.is_empty() && keys.is_empty() {
+                return self.mutation == Mutation::EmptyDifferentMessagesVerifies;
+            }
             if keys.is_empty() || messages.len() != keys.len() {
                 return false;
             }
             let sigs: Vec<_> = keys
                 .iter()
                 .zip(messages)
-                .map(|(k, m)| ConsensusSignature::new(derive_sig(k, 0, m)))
+                .map(|(k, m)| ConsensusSignature::new(derive_sig(k, 0, m, self.mutation)))
                 .collect();
             fold(&sigs) == *agg
         }
@@ -304,6 +380,9 @@ mod tests {
         ) -> Vec<bool> {
             let len = messages.len().max(sigs.len()).max(keys.len());
             if messages.len() != sigs.len() || sigs.len() != keys.len() {
+                if self.mutation == Mutation::BatchMismatchReturnsEmpty {
+                    return Vec::new();
+                }
                 return vec![false; len];
             }
             messages
@@ -314,21 +393,51 @@ mod tests {
                 .collect()
         }
         fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {
-            proof.as_bytes() == &derive_sig(key, 1, message)
+            proof.as_bytes() == &derive_sig(key, 1, message, self.mutation)
         }
     }
 
-    #[test]
-    fn battery_passes_on_a_discriminating_scheme() {
+    /// Run the battery against the throwaway scheme under `mutation`.
+    fn run_battery(mutation: Mutation) {
         run_conformance_suite(
             |seed_index| {
                 let mut seed = [0u8; 32];
                 seed[0] = seed_index;
                 TestSigner {
                     pk: derive_pk(&seed),
+                    mutation,
                 }
             },
-            &TestVerifier,
+            &TestVerifier { mutation },
         );
+    }
+
+    #[test]
+    fn battery_passes_on_a_discriminating_scheme() {
+        run_battery(Mutation::None);
+    }
+
+    #[test]
+    #[should_panic(expected = "wrong message must reject")]
+    fn battery_catches_a_verifier_that_accepts_everything() {
+        run_battery(Mutation::VerifyAcceptsEverything);
+    }
+
+    #[test]
+    #[should_panic(expected = "wrong message must reject")]
+    fn battery_catches_signatures_that_bind_only_message_length() {
+        run_battery(Mutation::SignBindsLengthOnly);
+    }
+
+    #[test]
+    #[should_panic(expected = "different-messages aggregate against empty input must reject")]
+    fn battery_catches_an_empty_different_messages_aggregate_verifying() {
+        run_battery(Mutation::EmptyDifferentMessagesVerifies);
+    }
+
+    #[test]
+    #[should_panic(expected = "batch length mismatch must return a verdict per input")]
+    fn battery_catches_a_batch_mismatch_returning_no_verdicts() {
+        run_battery(Mutation::BatchMismatchReturnsEmpty);
     }
 }
