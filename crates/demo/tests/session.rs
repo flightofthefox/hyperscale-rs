@@ -194,6 +194,64 @@ fn the_root_shard_splits_while_the_session_is_being_watched() {
 }
 
 #[test]
+fn transfers_reach_a_terminal_outcome_on_either_side_of_a_split() {
+    // Status is per host and a host only tracks the shards it serves, so a
+    // session that polls one host reports nothing for transactions routed to
+    // the other child — they look stuck in flight forever when they in fact
+    // settled. Every submission here must reach a terminal outcome.
+    let mut session = Session::new(
+        SessionConfig {
+            max_shards: 2,
+            ..SessionConfig::default()
+        },
+        42,
+    );
+
+    let mut events = Vec::new();
+    for _ in 0..440 {
+        events.extend(session.step(500));
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.kind, TraceKind::TopologyChanged { .. })),
+        "the split must have happened before transactions are submitted",
+    );
+
+    let mut submitted = 0;
+    for i in 0..460 {
+        if i % 25 == 0 {
+            session.submit_transfer();
+            submitted += 1;
+        }
+        events.extend(session.step(500));
+    }
+
+    let mut outcome: BTreeMap<String, String> = BTreeMap::new();
+    for event in &events {
+        match &event.kind {
+            TraceKind::TxSubmitted { tx } => {
+                outcome.insert(tx.0.clone(), "never reported".to_string());
+            }
+            TraceKind::TxStatusChanged { tx, status, .. } => {
+                outcome.insert(tx.0.clone(), (*status).to_string());
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(outcome.len(), submitted, "every submission is reported");
+    let unresolved: Vec<_> = outcome
+        .iter()
+        .filter(|(_, s)| !matches!(s.as_str(), "succeeded" | "aborted" | "rejected"))
+        .collect();
+    assert!(
+        unresolved.is_empty(),
+        "every transfer settles on whichever child owns it; unresolved: {unresolved:?}",
+    );
+}
+
+#[test]
 fn shard_paths_spell_the_trie_so_a_parent_prefixes_its_children() {
     let root = ShardPath::from(ShardId::ROOT).0;
     let left = ShardPath::from(ShardId::leaf(1, 0)).0;

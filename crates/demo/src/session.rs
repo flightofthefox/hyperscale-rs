@@ -45,6 +45,16 @@ fn validity_around(now: Duration) -> TimestampRange {
 /// looks like a stall to anyone watching.
 const ACCOUNTS: u8 = 8;
 
+/// How far a status has progressed, for picking the best of several hosts'
+/// answers. A terminal decision beats an ordering, which beats admission.
+const fn status_rank(status: &TransactionStatus) -> u8 {
+    match status {
+        TransactionStatus::Pending => 0,
+        TransactionStatus::Committed(_) => 1,
+        TransactionStatus::Completed(_) => 2,
+    }
+}
+
 /// The terminal outcome, in the vocabulary the docs use.
 const fn decision_label(decision: TransactionDecision) -> &'static str {
     match decision {
@@ -275,8 +285,24 @@ impl Session {
     fn drain_tx_status(&mut self) -> Vec<TraceEvent> {
         let wt = self.attested_wt;
         let mut events = Vec::new();
-        for (hash, last) in &mut self.tracked {
-            let current = self.runner.tx_status(0, hash);
+        // Ask every host and keep the furthest-progressed answer. Status is
+        // per host, and a host only tracks transactions on the shards it
+        // serves — so after a split, whichever child this host does not carry
+        // would report nothing at all and its transactions would appear to
+        // hang in pending forever.
+        let latest: Vec<(TxHash, Option<TransactionStatus>)> = self
+            .tracked
+            .keys()
+            .map(|hash| {
+                let best = (0..self.runner.num_hosts())
+                    .filter_map(|host| self.runner.tx_status(host, hash))
+                    .max_by_key(status_rank);
+                (*hash, best)
+            })
+            .collect();
+
+        for (hash, current) in latest {
+            let last = self.tracked.get_mut(&hash).expect("hash came from tracked");
             if current.as_ref() == last.as_ref() {
                 continue;
             }
@@ -286,7 +312,7 @@ impl Session {
                     TransactionStatus::Committed(h) => ("committed", Some(h.inner())),
                     TransactionStatus::Completed(decision) => (decision_label(*decision), None),
                 };
-                events.push(TraceEvent::tx_status(wt, *hash, label, height));
+                events.push(TraceEvent::tx_status(wt, hash, label, height));
             }
             *last = current;
         }
