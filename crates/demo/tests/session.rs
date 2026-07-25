@@ -3,7 +3,7 @@
 //! Runs natively: the derivation is target independent, so the properties the
 //! browser depends on are checked without a wasm toolchain.
 
-use hyperscale_demo::{Session, ShardPath, TraceKind};
+use hyperscale_demo::{Session, ShardPath, TraceEvent, TraceKind};
 use hyperscale_simulation::SimConfig;
 use hyperscale_types::ShardId;
 
@@ -15,7 +15,7 @@ fn config() -> SimConfig {
 }
 
 /// Drive a session for `steps` half-second steps, returning every event.
-fn run(seed: u64, steps: usize) -> Vec<hyperscale_demo::TraceEvent> {
+fn run(seed: u64, steps: usize) -> Vec<TraceEvent> {
     let mut session = Session::new(&config(), seed);
     (0..steps).flat_map(|_| session.step(500)).collect()
 }
@@ -39,8 +39,9 @@ fn a_session_commits_blocks_and_reports_them_in_weighted_time_order() {
     // every committed height exactly once, never skipping or repeating.
     let heights: Vec<u64> = events
         .iter()
-        .map(|event| match event.kind {
-            TraceKind::BlockCommitted { height, .. } => height,
+        .filter_map(|event| match event.kind {
+            TraceKind::BlockCommitted { height, .. } => Some(height),
+            _ => None,
         })
         .collect();
     let first = heights[0];
@@ -53,11 +54,71 @@ fn one_seed_replays_to_the_same_event_stream() {
     let first = run(42, 20);
     let second = run(42, 20);
 
-    let render = |events: &[hyperscale_demo::TraceEvent]| format!("{events:?}");
+    let render = |events: &[TraceEvent]| format!("{events:?}");
     assert_eq!(
         render(&first),
         render(&second),
         "a seeded session must replay identically",
+    );
+}
+
+#[test]
+fn a_submitted_transfer_settles_and_reports_every_transition() {
+    let mut session = Session::new(&config(), 42);
+    let mut events = Vec::new();
+
+    // Submit a few transfers early, then let them run to a terminal outcome.
+    for _ in 0..3 {
+        session.submit_transfer();
+        events.extend(session.step(500));
+    }
+    for _ in 0..60 {
+        events.extend(session.step(500));
+    }
+
+    let submitted = events
+        .iter()
+        .filter(|e| matches!(e.kind, TraceKind::TxSubmitted { .. }))
+        .count();
+    assert_eq!(submitted, 3, "every submission is reported");
+
+    let statuses: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            TraceKind::TxStatusChanged { status, .. } => Some(*status),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        statuses.contains(&"committed"),
+        "a transfer must be ordered into a block, saw {statuses:?}",
+    );
+    assert!(
+        statuses.contains(&"succeeded"),
+        "a funded transfer must reach a terminal success, saw {statuses:?}",
+    );
+
+    // Every transaction reaches a terminal outcome — nothing is left in
+    // flight once the wave deadline has long passed (INV-EXEC-5).
+    let terminal = statuses
+        .iter()
+        .filter(|s| matches!(**s, "succeeded" | "aborted" | "rejected"))
+        .count();
+    assert_eq!(terminal, 3, "every submission terminates, saw {statuses:?}");
+
+    // A single-shard topology opens no cross-shard waves: that header field
+    // exists to tell remote shards which certificates to expect.
+    assert!(
+        events.iter().all(|e| matches!(
+            e.kind,
+            TraceKind::BlockCommitted {
+                cross_shard_waves: 0,
+                ..
+            } | TraceKind::TxSubmitted { .. }
+                | TraceKind::TxStatusChanged { .. }
+        )),
+        "one shard means no cross-shard waves",
     );
 }
 

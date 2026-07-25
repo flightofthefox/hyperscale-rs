@@ -4,7 +4,7 @@
 //! JavaScript values and never hashed, signed, or gossiped, so the ordered
 //! collection discipline the wire types carry does not apply here.
 
-use hyperscale_types::{BlockHeight, Round, ShardId};
+use hyperscale_types::{BlockHeight, Round, ShardId, TxHash};
 use serde::Serialize;
 
 /// One observation, stamped with the BFT-attested time it happened at.
@@ -58,8 +58,40 @@ pub enum TraceKind {
         /// why the timeline draws it differently from a normal block.
         fallback: bool,
         proposer: u64,
-        wave_count: u32,
+        /// Cross-shard execution waves this block opens. Single-shard
+        /// transactions never appear here — the header field exists so
+        /// remote shards know which certificates to expect — so this stays
+        /// zero until the topology has more than one shard.
+        cross_shard_waves: u32,
     },
+    #[serde(rename_all = "camelCase")]
+    TxSubmitted { tx: TxLabel },
+    #[serde(rename_all = "camelCase")]
+    TxStatusChanged {
+        tx: TxLabel,
+        /// `pending`, `committed`, or a terminal `succeeded` / `aborted` /
+        /// `rejected` — the outcome every participating shard agrees on
+        /// (INV-EXEC-1).
+        status: &'static str,
+        /// Set once the transaction is ordered: the height that committed it.
+        height: Option<u64>,
+    },
+}
+
+/// A transaction hash, shortened to the prefix a reader can match by eye.
+#[derive(Debug, Clone, Serialize)]
+pub struct TxLabel(pub String);
+
+impl From<TxHash> for TxLabel {
+    fn from(hash: TxHash) -> Self {
+        let rendered = format!("{hash}");
+        let short: String = rendered
+            .trim_start_matches("TxHash(")
+            .chars()
+            .take(8)
+            .collect();
+        Self(short)
+    }
 }
 
 impl TraceEvent {
@@ -70,7 +102,7 @@ impl TraceEvent {
         round: Round,
         fallback: bool,
         proposer: u64,
-        wave_count: u32,
+        cross_shard_waves: u32,
     ) -> Self {
         Self {
             wt,
@@ -80,7 +112,30 @@ impl TraceEvent {
                 round: round.inner(),
                 fallback,
                 proposer,
-                wave_count,
+                cross_shard_waves,
+            },
+        }
+    }
+
+    pub(crate) fn tx_submitted(wt: u64, tx: TxHash) -> Self {
+        Self {
+            wt,
+            kind: TraceKind::TxSubmitted { tx: tx.into() },
+        }
+    }
+
+    pub(crate) fn tx_status(
+        wt: u64,
+        tx: TxHash,
+        status: &'static str,
+        height: Option<u64>,
+    ) -> Self {
+        Self {
+            wt,
+            kind: TraceKind::TxStatusChanged {
+                tx: tx.into(),
+                status,
+                height,
             },
         }
     }

@@ -1,41 +1,163 @@
 //! The simulation session and its event derivation.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
-use hyperscale_types::{BlockHeight, ShardId};
+use hyperscale_types::{
+    BlockHeight, ShardId, TimestampRange, TransactionDecision, TransactionStatus, TxHash,
+    WeightedTimestamp, build_transfer_tx,
+};
+use radix_common::crypto::Ed25519PrivateKey;
+use radix_common::math::Decimal;
+use radix_common::network::NetworkDefinition;
+use radix_common::types::ComponentAddress;
 
 use crate::event::TraceEvent;
 
-/// A running simulation plus the watermark of what has been reported.
+/// The signer for demo account `seed`, and the preallocated account it
+/// controls. Deterministic so a seeded session funds and spends the same
+/// accounts every run.
+fn signer_from_seed(seed: u8) -> Ed25519PrivateKey {
+    Ed25519PrivateKey::from_bytes(&[seed; 32]).expect("32 bytes is a valid Ed25519 key")
+}
+
+fn account_from_seed(seed: u8) -> ComponentAddress {
+    ComponentAddress::preallocated_account_from_public_key(&signer_from_seed(seed).public_key())
+}
+
+/// A validity window bracketing `now`, wide enough that a transaction stays
+/// valid while it waits out ordering and settlement.
+fn validity_around(now: Duration) -> TimestampRange {
+    TimestampRange::new(
+        WeightedTimestamp::ZERO.plus(now.saturating_sub(Duration::from_secs(5))),
+        WeightedTimestamp::ZERO.plus(now + Duration::from_secs(150)),
+    )
+}
+
+/// Genesis-funded accounts the load generator draws from. Small enough that
+/// every transfer pair is visually distinguishable, large enough that
+/// consecutive transfers rarely contend on the same account — contending
+/// transfers are held by the ready set (INV-EXEC-3) rather than run, which
+/// looks like a stall to anyone watching.
+const ACCOUNTS: u8 = 8;
+
+/// The terminal outcome, in the vocabulary the docs use.
+const fn decision_label(decision: TransactionDecision) -> &'static str {
+    match decision {
+        TransactionDecision::Accept => "succeeded",
+        TransactionDecision::Reject => "rejected",
+        TransactionDecision::Aborted => "aborted",
+    }
+}
+
+/// A running simulation plus the watermarks of what has been reported.
 pub struct Session {
     runner: SimulationRunner,
     now: Duration,
     /// Highest height already emitted per shard. A shard absent from the map
     /// has had nothing emitted yet.
     reported_through: BTreeMap<ShardId, BlockHeight>,
+    /// Submitted transactions and the last status reported for each, so a
+    /// step emits only transitions.
+    tracked: BTreeMap<TxHash, Option<TransactionStatus>>,
+    /// Events raised between steps — submissions happen on the caller's
+    /// clock, not the simulation's, so they wait here for the next drain.
+    pending: Vec<TraceEvent>,
+    nonce: u32,
 }
 
 impl Session {
-    /// Build a cluster at `seed` and run genesis.
+    /// Build a cluster at `seed`, fund [`ACCOUNTS`] accounts, and run genesis.
     #[must_use]
     pub fn new(config: &SimConfig, seed: u64) -> Self {
         let mut runner = SimulationRunner::new(config, seed);
-        runner.initialize_genesis();
+        let balances: Vec<_> = (1..=ACCOUNTS)
+            .map(|s| (account_from_seed(s), Decimal::from(100_000)))
+            .collect();
+        runner.initialize_genesis_with_balances(&balances);
         Self {
             runner,
             now: Duration::ZERO,
             reported_through: BTreeMap::new(),
+            tracked: BTreeMap::new(),
+            pending: Vec::new(),
+            nonce: 0,
         }
+    }
+
+    /// Submit an XRD transfer between two funded accounts, returning its hash.
+    ///
+    /// Payer and payee rotate with the nonce, so a caller driving a steady
+    /// rate spreads load across accounts instead of serializing on one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the transfer fails to build, which for genesis-funded demo
+    /// accounts means a malformed manifest — a programming error, not input.
+    pub fn submit_transfer(&mut self) -> TxHash {
+        let from = u8::try_from(self.nonce % u32::from(ACCOUNTS)).unwrap_or(0) + 1;
+        let to = (from % ACCOUNTS) + 1;
+        let tx = build_transfer_tx(
+            &signer_from_seed(from),
+            account_from_seed(from),
+            account_from_seed(to),
+            Decimal::from(1),
+            &NetworkDefinition::simulator(),
+            self.nonce,
+            validity_around(self.now),
+        )
+        .expect("a transfer between funded demo accounts builds");
+        let hash = tx.hash();
+        self.runner.schedule_initial_event(
+            0,
+            Duration::from_millis(1),
+            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx: Arc::new(tx) }),
+        );
+        self.nonce += 1;
+        self.tracked.insert(hash, None);
+        let wt = u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX);
+        self.pending.push(TraceEvent::tx_submitted(wt, hash));
+        hash
     }
 
     /// Advance simulated time by `ms` and return everything observed.
     pub fn step(&mut self, ms: u64) -> Vec<TraceEvent> {
         self.now += Duration::from_millis(ms);
         self.runner.run_until(self.now);
-        self.drain_committed()
+        let mut events = std::mem::take(&mut self.pending);
+        events.extend(self.drain_committed());
+        events.extend(self.drain_tx_status());
+        events
+    }
+
+    /// Report every tracked transaction whose status moved this step.
+    ///
+    /// Polled rather than pushed: status is a projection of committed chain
+    /// content, so reading it back is an observation, not a hook into the
+    /// path that produces it.
+    fn drain_tx_status(&mut self) -> Vec<TraceEvent> {
+        let wt = u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX);
+        let mut events = Vec::new();
+        for (hash, last) in &mut self.tracked {
+            let current = self.runner.tx_status(0, hash);
+            if current.as_ref() == last.as_ref() {
+                continue;
+            }
+            if let Some(status) = current.clone() {
+                let (label, height) = match &status {
+                    TransactionStatus::Pending => ("pending", None),
+                    TransactionStatus::Committed(h) => ("committed", Some(h.inner())),
+                    TransactionStatus::Completed(decision) => (decision_label(*decision), None),
+                };
+                events.push(TraceEvent::tx_status(wt, *hash, label, height));
+            }
+            *last = current;
+        }
+        events
     }
 
     /// Shards with at least one host serving them, in trie order.
