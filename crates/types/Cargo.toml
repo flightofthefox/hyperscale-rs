@@ -8,7 +8,6 @@ description = "Core types for Hyperscale consensus"
 # Cryptographic primitives
 blake3.workspace = true
 hex.workspace = true
-ed25519-dalek = { workspace = true, features = ["batch"] }
 rand.workspace = true
 
 # Consensus crypto interface (role newtypes, Signer/Verifier)

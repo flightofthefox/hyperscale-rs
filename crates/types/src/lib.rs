@@ -69,7 +69,6 @@ pub use beacon::{
     verify_qc2, verify_qc3, verify_ratify_cert, verify_ratify_vote, verify_vote_equivocation,
     verify_vote1, verify_vote2, verify_vote3,
 };
-pub use crypto::batch_verify::batch_verify_ed25519;
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
 pub use crypto::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature, verify_ed25519};
 pub use hyperscale_crypto::{
