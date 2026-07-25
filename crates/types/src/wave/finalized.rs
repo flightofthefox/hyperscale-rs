@@ -422,7 +422,7 @@ impl Verified<FinalizedWave> {
     ///
     /// Trust source: every EC in the wrapped `WaveCertificate` was
     /// produced from a quorum of verified votes on this validator, so
-    /// the predicate (per-EC BLS verify against the matching committee)
+    /// the predicate (per-EC signature verify against the matching committee)
     /// holds by construction. Used at the [`WaveState::into_finalized`]
     /// boundary.
     ///
@@ -432,7 +432,7 @@ impl Verified<FinalizedWave> {
         // SAFETY: every EC in `wave.execution_certificates()` was
         // built by the local aggregator from verified votes (see
         // `Verified::<ExecutionCertificate>::aggregate`); the per-EC
-        // BLS verify against the matching committee pubkey vector
+        // signature verify against the matching committee pubkey vector
         // holds by construction.
         Self::new_unchecked(wave)
     }
@@ -444,7 +444,7 @@ impl Verified<FinalizedWave> {
     /// signed over `block.hash()`, which commits to every contained
     /// wave via the header's `certificate_root` and to each wave's
     /// receipt set via `local_receipt_root`. Honest signers ran the
-    /// per-EC BLS predicate before voting, so the predicate
+    /// per-EC signature predicate before voting, so the predicate
     /// [`<FinalizedWave as Verify>::verify`] would run is
     /// BFT-transitively attested by that committee.
     ///
@@ -626,7 +626,7 @@ mod tests {
     /// byte-equal to the input — the gate names the trust source, it
     /// does not modify the wave. Honest signers behind a real
     /// `Verified<CertifiedBlock>` would have already cleared every
-    /// contained EC's BLS predicate; this test pins the gate's
+    /// contained EC's signature predicate; this test pins the gate's
     /// no-op-on-content shape.
     #[test]
     fn from_committed_block_wraps_input_without_modification() {

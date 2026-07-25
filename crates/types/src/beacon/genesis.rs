@@ -173,7 +173,7 @@ pub struct GenesisValidator {
     pub id: ValidatorId,
     /// Pool this validator operates under.
     pub pool: StakePoolId,
-    /// Compressed BLS pubkey.
+    /// Compressed consensus pubkey.
     pub pubkey: ConsensusPublicKey,
 }
 

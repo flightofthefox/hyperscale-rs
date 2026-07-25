@@ -55,7 +55,7 @@ pub enum ThreadPoolError {
     CorePinningError(String),
 }
 
-/// Default stack size for consensus-pool workers (BLS verifies, JMT roots).
+/// Default stack size for consensus-pool workers (verifies, JMT roots).
 const DEFAULT_CONSENSUS_STACK_SIZE: usize = 2 * 1024 * 1024;
 /// Default stack size for throughput-pool workers (Radix Engine needs more).
 const DEFAULT_THROUGHPUT_STACK_SIZE: usize = 8 * 1024 * 1024;

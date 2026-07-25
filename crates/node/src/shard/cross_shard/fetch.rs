@@ -181,7 +181,7 @@ impl FetchBinding for FinalizedWaveBinding {
                         );
                     }
                     // Reject responses with unsolicited waves (peer scoring;
-                    // also avoids wasted BLS verification on items we never
+                    // also avoids wasted signature verification on items we never
                     // asked for) or with any missing requested id.
                     if split.unsolicited > 0 || had_misses {
                         ResponseVerdict::Reject
@@ -257,7 +257,7 @@ impl FetchBinding for ExecCertBinding {
                         );
                     }
                     // Reject the response if the peer shipped unsolicited
-                    // ECs (peer scoring; also avoids wasted BLS verification
+                    // ECs (peer scoring; also avoids wasted signature verification
                     // on items we never asked for) or any missing id.
                     if split.unsolicited > 0 || had_misses {
                         ResponseVerdict::Reject

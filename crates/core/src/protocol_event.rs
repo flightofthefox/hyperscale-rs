@@ -89,18 +89,18 @@ pub enum ProtocolEvent {
     /// wire decode always lands the wrapper in `Verifiable::Unverified`.
     ///
     /// The `sender` field is the authenticated sender identity — `IoLoop`
-    /// verified the sender's BLS signature before admitting this event.
+    /// verified the sender's signature before admitting this event.
     UnverifiedRemoteHeaderReceived {
         /// Header + QC bundle from the remote shard.
         certified_header: Arc<CertifiedBlockHeader>,
-        /// Authenticated sender identity (BLS-verified by `IoLoop`).
+        /// Authenticated sender identity (signature-verified by `IoLoop`).
         sender: ValidatorId,
     },
 
     /// Received a committed block header whose composite predicate already
     /// holds — produced only by the local-dispatch fast path when a
     /// colocated proposer's broadcast carries `Verifiable::Verified`.
-    /// The recipient skips both the envelope BLS check and
+    /// The recipient skips both the envelope signature check and
     /// `Action::VerifyRemoteHeaderQc`, admitting the header directly.
     VerifiedRemoteHeaderReceived {
         /// Header + QC bundle, sealed via
@@ -110,7 +110,7 @@ pub enum ProtocolEvent {
         sender: ValidatorId,
     },
 
-    /// Received a block vote whose BLS signature has already been
+    /// Received a block vote whose signature has already been
     /// established at emit time.
     ///
     /// Produced only by the local sign-and-send handler, which routes
@@ -124,7 +124,7 @@ pub enum ProtocolEvent {
         vote: Verified<BlockVote>,
     },
 
-    /// Received a block vote whose BLS signature still needs to be
+    /// Received a block vote whose signature still needs to be
     /// checked. Produced by the gossip handler after sender-batch
     /// authentication.
     UnverifiedBlockVoteReceived {
@@ -142,7 +142,7 @@ pub enum ProtocolEvent {
         timeout: Verified<Timeout>,
     },
 
-    /// Received a timeout whose BLS share still needs to be checked. Produced
+    /// Received a timeout whose signature share still needs to be checked. Produced
     /// by the gossip handler. The carried `high_qc` is verified separately
     /// (as a QC) only if it would advance the local `high_qc`.
     UnverifiedTimeoutReceived {
@@ -152,7 +152,7 @@ pub enum ProtocolEvent {
 
     /// Received a validator's "ready on shard" signal.
     ///
-    /// The sender's BLS signature over the signal has already been
+    /// The sender's signature over the signal has already been
     /// verified by `IoLoop` against their pubkey before this event is
     /// pushed. Admission to the shard coordinator's `ReadySignalPool`
     /// is a pure local-state update; the next proposer drains
@@ -195,7 +195,7 @@ pub enum ProtocolEvent {
         /// [`Verified<CertifiedBlock>`] so consumers see the typestate
         /// claim that the block, the QC, and the linkage are all
         /// verified — header verified, every applicable per-root
-        /// verifier succeeded, QC's BLS aggregate cleared the quorum
+        /// verifier succeeded, QC's signature aggregate cleared the quorum
         /// threshold, and `qc.block_hash == block.hash()`. State-root
         /// verification rides the parallel pipeline path (see the doc
         /// on [`VerifiedBlock`](hyperscale_types::VerifiedBlock)).
@@ -536,7 +536,7 @@ pub enum ProtocolEvent {
         tx_outcomes: Vec<TxOutcome>,
     },
 
-    /// Received an execution vote whose BLS signature has already been
+    /// Received an execution vote whose signature has already been
     /// established at emit time.
     ///
     /// Produced only by the local sign-and-send handler when this node
@@ -548,7 +548,7 @@ pub enum ProtocolEvent {
         vote: Verified<ExecutionVote>,
     },
 
-    /// Received an execution vote whose BLS signature still needs to be
+    /// Received an execution vote whose signature still needs to be
     /// checked. Produced by the wire handler after sender-batch
     /// authentication.
     UnverifiedExecutionVoteReceived {
@@ -583,7 +583,7 @@ pub enum ProtocolEvent {
     ExecutionCertificatesReceived {
         /// Execution certificates to admit. Wire-decoded entries land
         /// `Unverified`; a [`Verifiable::Verified`] entry short-circuits
-        /// BLS dispatch at the coordinator.
+        /// verify dispatch at the coordinator.
         certificates: Vec<Verifiable<ExecutionCertificate>>,
     },
 
@@ -597,7 +597,7 @@ pub enum ProtocolEvent {
         >,
     },
 
-    /// All BLS verifications for a fetched [`FinalizedWave`] completed.
+    /// All signature verifications for a fetched [`FinalizedWave`] completed.
     ///
     /// Routed to `ExecutionCoordinator::on_finalized_wave_verified`, which
     /// emits the matching `Continuation(FinalizedWavesAdmitted)` only when
@@ -612,7 +612,7 @@ pub enum ProtocolEvent {
     /// An execution certificate was just admitted to the canonical EC store.
     ///
     /// Emitted by `ExecutionCoordinator::on_certificate_verified` only when
-    /// the aggregated BLS signature passes verification. Drives state-machine
+    /// the aggregated signature passes verification. Drives state-machine
     /// fan-out (cross-shard ACK observation, vote-action re-scan).
     ExecutionCertificateAdmitted {
         /// The admitted execution certificate.
@@ -627,7 +627,7 @@ pub enum ProtocolEvent {
     FinalizedWavesReceived {
         /// Finalized waves returned by the peer. Wire-decoded entries
         /// land `Unverified`; a [`Verifiable::Verified`] entry
-        /// short-circuits BLS dispatch at the coordinator.
+        /// short-circuits verify dispatch at the coordinator.
         waves: Vec<Arc<Verifiable<FinalizedWave>>>,
     },
 
@@ -936,7 +936,7 @@ pub enum ProtocolEvent {
 
     /// A locally-signed [`RatifyVote`] arrived via the
     /// [`Action::SignAndBroadcastRatifyVote`] self-loopback path. The
-    /// signing validator produced the BLS sig, so the vote is verified
+    /// signing validator produced the signature, so the vote is verified
     /// by construction — coordinator skips
     /// [`Action::VerifyRatifyVote`] and pools it directly.
     ///

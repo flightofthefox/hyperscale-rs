@@ -35,7 +35,7 @@ pub const MIN_READY_SIGNAL_DWELL: Duration = Duration::from_millis(150);
 /// members before the signal is binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingReadySignal {
-    /// The signal itself — carries validator id, height window, BLS sig.
+    /// The signal itself — carries validator id, height window, signature.
     pub signal: ReadySignal,
     /// When this node accepted the signal into the pool.
     pub received_at: LocalTimestamp,
@@ -87,7 +87,7 @@ impl ReadySignalPool {
     /// [`Self::drain_eligible`] would never collect the signal and the
     /// cohort's `ReshapeReady` would never commit.
     ///
-    /// Caller is responsible for any cryptographic verification (BLS
+    /// Caller is responsible for any cryptographic verification (the
     /// sig over [`crate::signing::ready_signal_message`]) before
     /// calling — the pool trusts what it's given and only enforces
     /// pool-shape invariants.

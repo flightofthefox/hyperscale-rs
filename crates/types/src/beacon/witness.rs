@@ -7,7 +7,7 @@
 //! [`BeaconProposal`](crate::BeaconProposal) carries a list of these
 //! alongside its equivocation evidence (a
 //! [`PcVoteEquivocation`](crate::PcVoteEquivocation), which is
-//! self-authenticating from its embedded BLS sigs).
+//! self-authenticating from its embedded signatures).
 
 use sbor::prelude::*;
 use thiserror::Error;
@@ -70,7 +70,7 @@ pub enum ShardWitnessPayload {
         pool_id: StakePoolId,
         /// Identifier the validator will be known by.
         validator_id: ValidatorId,
-        /// 48-byte compressed BLS pubkey.
+        /// 48-byte consensus public key.
         pubkey: ConsensusPublicKey,
         /// Proof-of-possession: the registrant's signature over
         /// `validator_possession_proof_message(network, validator_id, pubkey)` under
@@ -233,7 +233,7 @@ pub enum BeaconWitnessEvent {
         pool_id: StakePoolId,
         /// Identifier the validator will be known by.
         validator_id: ValidatorId,
-        /// 48-byte compressed BLS pubkey.
+        /// 48-byte consensus public key.
         pubkey: ConsensusPublicKey,
         /// Proof-of-possession of `pubkey`; see
         /// [`ShardWitnessPayload::RegisterValidator`].

@@ -24,7 +24,7 @@ pub struct CertifiedBlockHeaderGossip {
     pub certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
     /// The validator who sent this gossip (should be the block proposer).
     pub sender: ValidatorId,
-    /// BLS signature over the domain-separated signing message, by the sender.
+    /// Signature over the domain-separated signing message, by the sender.
     pub sender_signature: ConsensusSignature,
 }
 

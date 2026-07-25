@@ -9,7 +9,7 @@
 //! for cold links, with the Identify → validator-bind path taking over once
 //! the dialed connection lands.
 //!
-//! Records are self-signed: only the named validator's BLS key can produce
+//! Records are self-signed: only the named validator's consensus key can produce
 //! one, so a book entry is exactly as trustworthy as the bind handshake's
 //! attestation. A replayed stale record can only point a dial at an address
 //! the validator once announced; the per-validator sequence keeps the
@@ -63,7 +63,7 @@ pub struct AddressBook {
 impl AddressBook {
     /// Verify one gossiped announcement and store it if it is the newest
     /// for its validator. Caps are enforced before the signature check so
-    /// oversized spam never reaches BLS verification.
+    /// oversized spam never reaches signature verification.
     #[must_use]
     pub fn ingest(
         &self,

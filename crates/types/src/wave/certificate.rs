@@ -99,7 +99,7 @@ impl WaveCertificate {
     }
 
     /// Build a `WaveCertificate` from execution certificates that have
-    /// already cleared their per-EC BLS predicate, carrying the
+    /// already cleared their per-EC signature predicate, carrying the
     /// [`Verifiable::Verified`] marker on each.
     ///
     /// Used by `WaveCertificateTracker::create_wave_certificate`, whose

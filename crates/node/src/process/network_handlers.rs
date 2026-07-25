@@ -225,7 +225,7 @@ where
         //
         // Wire decode lands the wrapper as `Verifiable::Unverified`;
         // local-dispatched sends from a colocated voter arrive already
-        // verified and skip the state machine's BLS round-trip.
+        // verified and skip the state machine's verify round-trip.
 
         let senders = self.process.shard_event_senders.clone();
         self.process
@@ -315,7 +315,7 @@ where
         // local-dispatched sends from a colocated source-shard proposer
         // arrive already verified and skip the state machine's
         // `Action::VerifyProvisions` dispatch. The verified arm also
-        // skips the envelope BLS check — same-process delivery means
+        // skips the envelope signature check — same-process delivery means
         // the sender is us, and sender identity is already implicit.
 
         let senders = self.process.shard_event_senders.clone();
@@ -327,7 +327,7 @@ where
                 move |notification: ProvisionsNotification| {
                     let target_shard = notification.provisions.target_shard();
                     // Drop provisions not destined for any hosted shard before
-                    // paying the BLS verification cost.
+                    // paying the signature verification cost.
                     let senders = senders.load();
                     let Some(tx) = senders.get(&target_shard) else {
                         warn!(
@@ -385,7 +385,7 @@ where
                     // Votes in a batch all carry the same shard (sender's
                     // local shard) by construction. Use the first vote's
                     // shard to identify the target hosted shard and gate
-                    // before paying the BLS verification cost.
+                    // before paying the signature verification cost.
                     let target_shard = batch.votes[0].shard_id();
                     let senders = senders.load();
                     let Some(tx) = senders.get(&target_shard) else {
@@ -410,7 +410,7 @@ where
 
                     // Wire decode lands each vote as `Verifiable::Unverified`;
                     // local-dispatched batches from a colocated voter arrive
-                    // already verified and skip the state machine's BLS
+                    // already verified and skip the state machine's verify
                     // round-trip.
                     for vote in batch.into_votes() {
                         let event = match vote.into_verified() {
@@ -489,7 +489,7 @@ where
                 },
             );
 
-        // ── ready_signal → verify sender BLS sig, then ProtocolEvent::ReadySignalReceived ─
+        // ── ready_signal → verify sender signature, then ProtocolEvent::ReadySignalReceived ─
         //
         // The signal doesn't carry shard provenance — its only identity
         // is the sender's `validator_id`. Fan out to every hosted shard
@@ -529,7 +529,7 @@ where
                     ) {
                         warn!(
                             sender = sender.inner(),
-                            "Ready signal BLS verify failed — dropping"
+                            "Ready signal signature verify failed — dropping"
                         );
                         return;
                     }
@@ -648,7 +648,7 @@ where
         // the wrapper sig attributes "this validator relayed it" so the
         // coordinator can key per-`(epoch, view, sender)` pipeline slots.
         // We verify the sig under the sender's pubkey before fanning in;
-        // BLS check fails → drop (`verify_signed_by_proposer` already
+        // signature check fails → drop (`verify_signed_by_proposer` already
         // warns).
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();

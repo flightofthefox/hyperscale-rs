@@ -32,7 +32,7 @@ async fn test_validator_bind_success() {
 
     // Node 0
     let keypair0 = fixtures.ed25519_keypair(0);
-    let bind_sig0 = fixtures.bind_signing_key(0);
+    let bind_sig0 = fixtures.signer(0);
     let config0 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -56,7 +56,7 @@ async fn test_validator_bind_success() {
 
     // Node 1 — bootstrap to node 0
     let keypair1 = fixtures.ed25519_keypair(1);
-    let bind_sig1 = fixtures.bind_signing_key(1);
+    let bind_sig1 = fixtures.signer(1);
     let config1 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![node0_addr],
@@ -109,7 +109,7 @@ async fn test_validator_bind_rejects_wrong_key() {
 
     // Node 0 — legitimate
     let keypair0 = fixtures.ed25519_keypair(0);
-    let bind_sig0 = fixtures.bind_signing_key(0);
+    let bind_sig0 = fixtures.signer(0);
     let config0 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -188,7 +188,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
 
     // Node 0
     let keypair0 = fixtures.ed25519_keypair(0);
-    let bind_sig0 = fixtures.bind_signing_key(0);
+    let bind_sig0 = fixtures.signer(0);
     let config0 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -212,7 +212,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
 
     // Node 1
     let keypair1 = fixtures.ed25519_keypair(1);
-    let bind_sig1 = fixtures.bind_signing_key(1);
+    let bind_sig1 = fixtures.signer(1);
     let config1 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![node0_addr],

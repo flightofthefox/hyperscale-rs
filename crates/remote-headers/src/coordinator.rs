@@ -313,7 +313,7 @@ impl RemoteHeaderCoordinator {
 
     /// Handle a committed block header received from a remote shard (gossip or fetch).
     ///
-    /// The sender's BLS signature was already verified by `IoLoop`.
+    /// The sender's signature was already verified by `IoLoop`.
     /// Performs structural pre-checks, stores as pending, and dispatches
     /// `VerifyRemoteHeaderQc` for async QC verification.
     pub fn on_remote_header_received(

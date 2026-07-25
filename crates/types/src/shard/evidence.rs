@@ -5,7 +5,7 @@
 //! different blocks at the same `(shard, height, round)` — a violation
 //! of the one-vote-per-round rule (INV-SHARD-2) no honest key with the
 //! safe-vote lock can produce. It carries the cryptographic minimum that
-//! reconstructs both signing messages and runs BLS verify under the
+//! reconstructs both signing messages and runs signature verify under the
 //! signer's pubkey, so it can ride into the beacon's jail mechanism the
 //! same way a beacon PC double-sign
 //! ([`PcVoteEquivocation`](crate::PcVoteEquivocation)) does.
@@ -45,7 +45,7 @@ pub const MAX_COMMIT_PROOF_ANCESTRY: usize = 256;
 ///
 /// Each side carries the block it voted, the parent hash the vote bound
 /// in (needed to reconstruct the signing message —
-/// [`block_vote_message`] binds the parent), and the BLS signature. The
+/// [`block_vote_message`] binds the parent), and the signature. The
 /// contradiction is `block_hash_a != block_hash_b`: an honest validator
 /// votes at most once per round, so two valid signatures over different
 /// block hashes at the same slot prove the key voted twice.
@@ -63,13 +63,13 @@ pub struct ShardVoteEquivocation {
     pub block_hash_a: BlockHash,
     /// First side's parent hash, bound into the signing message.
     pub parent_block_hash_a: BlockHash,
-    /// First side's BLS signature over `block_vote_message` for side A.
+    /// First side's signature over `block_vote_message` for side A.
     pub sig_a: ConsensusSignature,
     /// Second side's voted block (must differ from `block_hash_a`).
     pub block_hash_b: BlockHash,
     /// Second side's parent hash, bound into the signing message.
     pub parent_block_hash_b: BlockHash,
-    /// Second side's BLS signature over `block_vote_message` for side B.
+    /// Second side's signature over `block_vote_message` for side B.
     pub sig_b: ConsensusSignature,
 }
 
@@ -172,7 +172,7 @@ impl Verify<&ShardVoteEquivocationContext<'_>> for Box<ShardVoteEquivocation> {
 /// Signer public keys in committee (bitfield) order, plus the quorum
 /// threshold. Produced by [`ShardForkProof::resolve_committees`] from the
 /// topology schedule so an off-thread verifier
-/// ([`ShardForkProof::verify_resolved`]) runs the BLS work without the
+/// ([`ShardForkProof::verify_resolved`]) runs the signature work without the
 /// schedule in hand — the same emitter-resolves pattern the beacon-block
 /// verify action uses.
 #[derive(Debug, Clone)]
@@ -236,7 +236,7 @@ pub enum CommitProofVerifyError {
     /// The ancestry link exceeds [`MAX_COMMIT_PROOF_ANCESTRY`].
     #[error("commit proof ancestry link is too long")]
     AncestryTooLong,
-    /// A member QC failed BLS verification against its committee.
+    /// A member QC failed signature verification against its committee.
     #[error("commit proof QC verification failed: {0}")]
     Qc(#[from] QcVerifyError),
 }
@@ -344,7 +344,7 @@ impl CommitProof {
         Ok(())
     }
 
-    /// BLS-verify both member QCs against their resolved committees.
+    /// Verify both member QCs against their resolved committees.
     /// `committees` is `[certified_committee, child_committee]`.
     fn verify_qcs(
         &self,
@@ -490,7 +490,7 @@ impl ShardForkProof {
     }
 
     /// Verify against pre-resolved committees (positionally aligned to
-    /// [`Self::qc_headers`]). Runs structure, BLS, and the contradiction
+    /// [`Self::qc_headers`]). Runs structure, signatures, and the contradiction
     /// check.
     ///
     /// # Errors

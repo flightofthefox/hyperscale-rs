@@ -45,7 +45,7 @@ pub struct ValidatorAddressGossip {
     /// sequence per validator, so a re-announce after a peer-id or address
     /// change supersedes older records everywhere.
     pub sequence: u64,
-    /// BLS signature over the domain-separated signing message, by
+    /// Signature over the domain-separated signing message, by
     /// `validator`.
     pub signature: ConsensusSignature,
 }

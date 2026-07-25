@@ -172,7 +172,7 @@ impl VoteKeeper {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Admit a locally-produced, already-verified block vote into the
-    /// block's [`VoteSet`] without re-checking the BLS signature, then
+    /// block's [`VoteSet`] without re-checking the signature, then
     /// fire batch verification if the combined power can now reach
     /// quorum. `header_for_vote` carries the height/round/parent metadata
     /// the [`VoteSet`] needs to build a QC; a vote whose header hasn't
@@ -224,7 +224,7 @@ impl VoteKeeper {
     /// Accept a wire-arrived block vote: buffer its signature into the
     /// block's [`VoteSet`] and fire batch verification once combined
     /// power can reach quorum. Wire-arrived votes that claim our own
-    /// validator id take the same BLS batch route as any other voter —
+    /// validator id take the same batch-verify route as any other voter —
     /// the in-process verified path is only reachable through
     /// [`Self::accept_verified_vote`].
     pub fn accept_unverified_vote(

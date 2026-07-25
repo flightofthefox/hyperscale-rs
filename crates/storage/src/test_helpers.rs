@@ -212,7 +212,7 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
 ///
 /// The signature is the zero placeholder — these fixtures don't drive real
 /// verification, they exercise storage and pipeline shapes. The `Verified`
-/// wrapper is `new_unchecked` because the test cluster predates a real BLS
+/// wrapper is `new_unchecked` because the test cluster predates a real
 /// signing path; consumers downstream of storage and the commit pipeline
 /// require the verified marker.
 #[must_use]

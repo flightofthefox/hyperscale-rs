@@ -48,7 +48,7 @@ pub struct BeaconWitnessRootContext<'a> {
     pub receipts: &'a [StoredReceipt],
     /// The block's carried witness sources. Each claim is re-verified
     /// before its leaf folds: every equivocation entry against the
-    /// equivocator's registered key (two BLS checks, so the QC attests
+    /// equivocator's registered key (two signature checks, so the QC attests
     /// the evidence is genuine and the beacon jails on it without
     /// re-verifying), the reshape assertion against the load predicate
     /// recomputed from `substate_bytes` + `thresholds`, and the
@@ -348,7 +348,7 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
             tracing::warn!(
                 height = ctx.height.inner(),
                 round = ctx.round.inner(),
-                "Randomness reveal BLS verification FAILED"
+                "Randomness reveal signature verification FAILED"
             );
             return Err(BeaconWitnessRootVerifyError::RevealInvalid);
         }

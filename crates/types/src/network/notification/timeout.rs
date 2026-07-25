@@ -8,7 +8,7 @@ use crate::{MessageClass, NetworkMessage, Timeout, Verifiable};
 /// drive a synchronised view change.
 ///
 /// Broadcast to the local-shard committee. The inner [`Timeout`] carries the
-/// voter identity, its BLS share, and the signer's `high_qc`, so it is
+/// voter identity, its signature share, and the signer's `high_qc`, so it is
 /// self-authenticating.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct TimeoutNotification {

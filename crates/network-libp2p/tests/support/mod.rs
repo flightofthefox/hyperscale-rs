@@ -18,7 +18,7 @@ use hyperscale_types::{Signer, ValidatorId};
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Create a dummy bind signing key + validator key map for tests that create
-/// adapters directly. Returns the BLS signing key (consumed by the
+/// adapters directly. Returns the consensus signer (consumed by the
 /// validator-bind service to produce per-session signatures) plus the keymap
 /// that will verify signatures from this validator.
 pub fn test_bind_args(validator_id: ValidatorId) -> (Arc<dyn Signer>, Arc<ValidatorKeyMap>) {

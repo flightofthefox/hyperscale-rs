@@ -186,7 +186,7 @@ impl<'a> IntoIterator for &'a PcVector {
 pub struct PcVote1 {
     validator: ValidatorId,
     v_in: PcVector,
-    /// `prefix_sigs[k]` is the signer's BLS sig over `v_in[..k]`.
+    /// `prefix_sigs[k]` is the signer's signature over `v_in[..k]`.
     /// Length is `v_in.len() + 1`.
     prefix_sigs: BoundedVec<ConsensusSignature, MAX_PREFIX_SIGS>,
 }
@@ -222,7 +222,7 @@ impl PcVote1 {
         &self.v_in
     }
 
-    /// Per-prefix BLS signatures over `v_in[..k]`, indexed by prefix length.
+    /// Per-prefix signatures over `v_in[..k]`, indexed by prefix length.
     #[must_use]
     pub const fn prefix_sigs(&self) -> &BoundedVec<ConsensusSignature, MAX_PREFIX_SIGS> {
         &self.prefix_sigs
@@ -276,7 +276,7 @@ impl PcCompactVote {
 
 /// Round-1 QC: the certified prefix `x` together with a compact view of
 /// every round-1 signer's `v_in_i` relative to `x`, aggregated into a
-/// single BLS signature.
+/// single signature.
 ///
 /// `x` is the longest prefix attained by some `(f+1)`-subset of
 /// round-1's signer set; the verifier reconstructs each signer's
@@ -321,7 +321,7 @@ impl PcQc1 {
         &self.x_signers
     }
 
-    /// Different-messages BLS aggregate over the signers' `sig_i(v'_i)`.
+    /// Different-messages signature aggregate over the signers' `sig_i(v'_i)`.
     #[must_use]
     pub const fn x_agg_sig(&self) -> AggregateSignature {
         self.x_agg_sig
@@ -390,7 +390,7 @@ impl PcVote2 {
         &self.x
     }
 
-    /// Per-prefix BLS signatures over `x[..k]`, indexed by prefix length.
+    /// Per-prefix signatures over `x[..k]`, indexed by prefix length.
     #[must_use]
     pub const fn prefix_sigs(&self) -> &BoundedVec<ConsensusSignature, MAX_PREFIX_SIGS> {
         &self.prefix_sigs
@@ -487,7 +487,7 @@ pub struct PcQc2 {
     /// `n - f` signers in the quorum (positional against the
     /// committee enumeration).
     signers: SignerBitfield,
-    /// BLS aggregate signature. Coverage depends on [`PcQc2::pi`] —
+    /// aggregate signature. Coverage depends on [`PcQc2::pi`] —
     /// see the type-level comment.
     combined_sig: AggregateSignature,
     /// Proof that `x_p` is in fact the mcp.
@@ -523,7 +523,7 @@ impl PcQc2 {
         &self.signers
     }
 
-    /// Combined BLS signature; see the type-level comment for what it
+    /// Combined signature; see the type-level comment for what it
     /// covers per `pi` variant.
     #[must_use]
     pub const fn combined_sig(&self) -> AggregateSignature {
@@ -787,7 +787,7 @@ impl PcQc3 {
 
 /// Which PC round a [`PcVoteEquivocation`] references.
 ///
-/// Determines the BLS signing tag the verifier uses to reconstruct the
+/// Determines the signing tag the verifier uses to reconstruct the
 /// canonical message bytes for each side of the evidence.
 ///
 /// No `Vote2Length` variant: the length attestation signs a length-1
@@ -812,7 +812,7 @@ pub enum PcVoteRound {
 /// Carries two `(value, sig)` pairs the equivocator signed at the same
 /// round. The slim wire form — fat votes don't need to ride into the
 /// beacon's jail mechanism, just the cryptographic minimum that
-/// reconstructs the canonical signing bytes and runs BLS verify under
+/// reconstructs the canonical signing bytes and runs signature verify under
 /// the equivocator's pubkey. Both sides must verify and the values
 /// must differ.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
@@ -824,16 +824,16 @@ pub struct PcVoteEquivocation {
     /// SPC view at which the instance was running.
     pub view: SpcView,
     /// Round of the inner Prefix Consensus at which the double-sign
-    /// occurred — selects the BLS signing tag.
+    /// occurred — selects the signing tag.
     pub round: PcVoteRound,
     /// First side's signed value.
     pub value_a: PcVector,
-    /// First side's BLS signature over the canonical signing bytes
+    /// First side's signature over the canonical signing bytes
     /// for `value_a` under the tag implied by `round`.
     pub sig_a: ConsensusSignature,
     /// Second side's signed value (must differ from `value_a`).
     pub value_b: PcVector,
-    /// Second side's BLS signature over the canonical signing bytes
+    /// Second side's signature over the canonical signing bytes
     /// for `value_b` under the tag implied by `round`.
     pub sig_b: ConsensusSignature,
 }
@@ -1846,7 +1846,7 @@ pub enum PcVote1VerifyError {
     /// Per-prefix sig aggregation produced an invalid element.
     #[error("prefix-sig aggregation failed")]
     BadSignatureAggregate,
-    /// Aggregate BLS check rejected the prefix-sig bundle.
+    /// Aggregate signature check rejected the prefix-sig bundle.
     #[error("prefix-sig aggregate did not verify under signer pubkey")]
     BadSignature,
 }
@@ -1869,7 +1869,7 @@ pub enum PcQc1VerifyError {
     /// A compact-vote encoding did not reconstruct cleanly.
     #[error("malformed compact-vote encoding")]
     MalformedCompactVote,
-    /// Aggregate BLS check rejected the prefix-sig bundle.
+    /// Aggregate signature check rejected the prefix-sig bundle.
     #[error("x-aggregate signature did not verify")]
     BadAggregateSignature,
     /// `qc1_certify` of the reconstructed inputs did not produce `qc1.x`.
@@ -1901,7 +1901,7 @@ pub enum PcVote2VerifyError {
     /// Per-prefix sig aggregation produced an invalid element.
     #[error("prefix-sig aggregation failed")]
     BadSignatureAggregate,
-    /// Aggregate BLS check rejected the prefix-sig bundle.
+    /// Aggregate signature check rejected the prefix-sig bundle.
     #[error("prefix-sig aggregate did not verify under signer pubkey")]
     BadSignature,
 }
@@ -1918,7 +1918,7 @@ pub enum PcQc2VerifyError {
     /// A signer index points outside the committee.
     #[error("signer index out of committee range")]
     SignerOutOfRange,
-    /// Combined-sig aggregate BLS check rejected the bundle.
+    /// Combined-sig aggregate signature check rejected the bundle.
     #[error("combined signature did not verify")]
     BadCombinedSignature,
     /// `Diverging` witness substructure did not validate (bad indices,
@@ -1990,7 +1990,7 @@ pub enum PcQc3VerifyError {
     /// `min(lengths) != |x_pp|` or `max(lengths) != |x_pe|`.
     #[error("min/max signer length does not match x_pp/x_pe lengths")]
     MinMaxLengthMismatch,
-    /// Aggregate BLS check rejected the per-signer sig bundle.
+    /// Aggregate signature check rejected the per-signer sig bundle.
     #[error("aggregate signature did not verify")]
     BadAggregateSignature,
 }

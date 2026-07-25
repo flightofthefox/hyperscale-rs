@@ -172,7 +172,7 @@ impl SpcDriver {
     }
 
     /// A peer's round-1 PC vote arrived. Gate on instance/skip-quorum,
-    /// mark the slot in-flight, and dispatch the BLS check. Admission
+    /// mark the slot in-flight, and dispatch the signature check. Admission
     /// happens in [`Self::on_pc_vote1_verified`] when the result lands.
     pub fn on_pc_vote1_received(
         &mut self,
@@ -252,7 +252,7 @@ impl SpcDriver {
     }
 
     /// A peer's SPC `new-view` arrived. Gate, mark the slot in-flight, and
-    /// dispatch the cert BLS check.
+    /// dispatch the cert signature check.
     pub fn on_spc_new_view_received(
         &mut self,
         from: ValidatorId,
@@ -279,7 +279,7 @@ impl SpcDriver {
     }
 
     /// A peer's SPC `new-commit` arrived. Gate, mark the slot in-flight,
-    /// and dispatch the embedded QC3's BLS check.
+    /// and dispatch the embedded QC3's signature check.
     pub fn on_spc_new_commit_received(
         &mut self,
         from: ValidatorId,
@@ -306,7 +306,7 @@ impl SpcDriver {
     }
 
     /// A peer's SPC `empty-view` attestation arrived. Gate, mark the slot
-    /// in-flight (keyed by the embedded signer), and dispatch the BLS
+    /// in-flight (keyed by the embedded signer), and dispatch the
     /// check.
     pub fn on_unverified_spc_empty_view_received(
         &mut self,
@@ -334,7 +334,7 @@ impl SpcDriver {
 
     /// A locally-signed empty-view attestation arrived via the
     /// `Action::SignAndBroadcastEmptyView` self-loopback path. The
-    /// signing-key holder produced the BLS sig over a verified high
+    /// signing-key holder produced the signature over a verified high
     /// triple, so the message is verified by construction — feed it
     /// directly into the FSM without the verify round-trip.
     pub fn on_verified_spc_empty_view_received(
@@ -488,7 +488,7 @@ impl SpcDriver {
                     view = view.inner(),
                     ?signer,
                     ?err,
-                    "PC vote-1 BLS verification failed — dropping",
+                    "PC vote-1 signature verification failed — dropping",
                 );
                 return Vec::new();
             }
@@ -525,7 +525,7 @@ impl SpcDriver {
                     view = view.inner(),
                     ?signer,
                     ?err,
-                    "PC vote-2 BLS verification failed — dropping",
+                    "PC vote-2 signature verification failed — dropping",
                 );
                 return Vec::new();
             }
@@ -562,7 +562,7 @@ impl SpcDriver {
                     view = view.inner(),
                     ?signer,
                     ?err,
-                    "PC vote-3 BLS verification failed — dropping",
+                    "PC vote-3 signature verification failed — dropping",
                 );
                 return Vec::new();
             }
@@ -663,7 +663,7 @@ impl SpcDriver {
 
     /// Common gating for the receive entries: returns `(epoch, committee)`
     /// if admissible, else logs and returns `None`. Four gates, all cheap
-    /// and applied before the BLS dispatch so a flood can't mint slots:
+    /// and applied before the verify dispatch so a flood can't mint slots:
     ///
     /// 1. The local SPC instance is bootstrapped.
     /// 2. Skip-quorum hasn't been reached at the local tip (`skip_quorum`).

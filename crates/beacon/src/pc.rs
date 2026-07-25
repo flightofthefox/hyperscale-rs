@@ -56,7 +56,7 @@ pub enum PcEffect {
 /// Events `PcInstance::handle` consumes.
 ///
 /// Peer votes flow in as `Vote*Verified` carrying `Verified<PcVoteN>`
-/// — the marker is produced by the BLS dispatch through the crypto pool
+/// — the marker is produced by the verify dispatch through the crypto pool
 /// (`Action::VerifyPcVote{1,2,3}` → `ProtocolEvent::PcVote{1,2,3}Verified`)
 /// and threaded through the coordinator into the FSM. There is no
 /// `*Received` admission path; the type system forbids passing an
@@ -66,11 +66,11 @@ pub enum PcEvent {
     /// The local validator's input vector. Idempotent: subsequent
     /// inputs after the first are dropped.
     Input(PcVector),
-    /// A BLS-verified round-1 vote, ready for admission to the pool.
+    /// A signature-verified round-1 vote, ready for admission to the pool.
     Vote1Verified(Verified<PcVote1>),
-    /// A BLS-verified round-2 vote.
+    /// A signature-verified round-2 vote.
     Vote2Verified(Box<Verified<PcVote2>>),
-    /// A BLS-verified round-3 vote.
+    /// A signature-verified round-3 vote.
     Vote3Verified(Box<Verified<PcVote3>>),
 }
 
@@ -175,7 +175,7 @@ impl PcInstance {
         effects
     }
 
-    /// Admit a BLS-verified round-1 vote. The type system guarantees
+    /// Admit a signature-verified round-1 vote. The type system guarantees
     /// the sig check has cleared; this entry runs the pool /
     /// equivocation logic.
     pub(crate) fn on_vote1_verified(&mut self, v1: Verified<PcVote1>) -> Vec<PcEffect> {
@@ -199,7 +199,7 @@ impl PcInstance {
         self.maybe_advance_to_round2()
     }
 
-    /// Admit a BLS-verified round-2 vote.
+    /// Admit a signature-verified round-2 vote.
     pub(crate) fn on_vote2_verified(&mut self, v2: Verified<PcVote2>) -> Vec<PcEffect> {
         let from = v2.validator();
         if let Some(existing) = self.vote2_pool.get(&from) {
@@ -223,7 +223,7 @@ impl PcInstance {
         self.maybe_advance_to_round3()
     }
 
-    /// Admit a BLS-verified round-3 vote.
+    /// Admit a signature-verified round-3 vote.
     pub(crate) fn on_vote3_verified(&mut self, v3: Verified<PcVote3>) -> Vec<PcEffect> {
         let from = v3.validator();
         if let Some(existing) = self.vote3_pool.get(&from) {
@@ -299,7 +299,7 @@ impl PcInstance {
     /// Re-emit the sign intents this instance has already produced,
     /// verbatim, for retransmission of rounds a peer may have lost.
     /// Vote2/vote3 re-carry the QC recorded at emission; deterministic
-    /// BLS then reproduces the original signature bit-for-bit, so a
+    /// the deterministic signing core then reproduces the original signature bit-for-bit, so a
     /// replay can never equivocate. Pure read — pools and latches are
     /// untouched.
     pub(crate) fn replay_sign_intents(&self) -> Vec<PcEffect> {

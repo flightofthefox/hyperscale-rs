@@ -7,7 +7,7 @@ use crate::{MessageClass, NetworkMessage, ReadySignal};
 /// Fire-and-forget broadcast of a [`ReadySignal`] from the emitting
 /// validator to every member of their shard committee.
 ///
-/// Recipients validate the signal (BLS sig + window) and pool it
+/// Recipients validate the signal (signature + window) and pool it
 /// locally; the next proposer drains dwell-eligible signals into the
 /// block's
 /// [`BlockManifest::ready_signals`](crate::BlockManifest::ready_signals).
@@ -20,7 +20,7 @@ use crate::{MessageClass, NetworkMessage, ReadySignal};
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ReadySignalNotification {
     /// The signal being submitted. Carries its own validator id +
-    /// height window + BLS sig.
+    /// height window + signature.
     pub signal: ReadySignal,
 }
 

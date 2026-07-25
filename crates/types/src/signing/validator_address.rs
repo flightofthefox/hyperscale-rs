@@ -9,7 +9,7 @@ use crate::NetworkDefinition;
 /// Format: `VALIDATOR_ADDRESS` || `network.id` || `sequence` (8 bytes LE) ||
 /// `H(peer_id, addresses)` (32 bytes)
 ///
-/// Signed by a validator's BLS key over the libp2p peer id and listen
+/// Signed by a validator's consensus key over the libp2p peer id and listen
 /// addresses it gossips for itself, so any node can authenticate a
 /// `ValidatorId → (PeerId, addresses)` record — and dial the validator —
 /// without a prior connection. The sequence orders announcements from the

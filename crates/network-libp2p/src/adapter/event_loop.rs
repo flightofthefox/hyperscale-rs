@@ -295,7 +295,7 @@ pub(super) async fn run(
 
                         if version_interop_mode.check(local_version, remote_version) {
                             // Version OK — trigger the validator-bind protocol.
-                            // The bind service will open a stream, exchange BLS-signed
+                            // The bind service will open a stream, exchange signed
                             // PeerId proofs, and register the ValidatorId → PeerId
                             // mapping on success.
                             let _ = bind_trigger_tx.send(*peer_id);

@@ -10,7 +10,7 @@
 //!   shard tag — inputs that fan out across every hosted shard.
 //! - [`HostEvent::Shard`] carries a [`ShardScopedInput`] tagged with
 //!   the hosted-shard id it routes to. Every shard-coherent input
-//!   (gossip, sync, fetch results, BLS-verified headers, protocol
+//!   (gossip, sync, fetch results, signature-verified headers, protocol
 //!   events) lives here.
 //!
 //! The typed sum lets `step()` dispatch via exhaustive match without a
@@ -338,7 +338,7 @@ pub enum ShardScopedInput {
 
     /// A committed block header gossip that has passed pre-filtering
     /// (sender committee check + public key resolution) but still needs
-    /// batched BLS signature verification.
+    /// batched signature verification.
     CommittedBlockGossipReceived {
         /// Header carried in the gossip envelope. Wrapped as `Verifiable`
         /// so a colocated proposer's local-dispatched broadcast can ride

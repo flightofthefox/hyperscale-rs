@@ -16,7 +16,7 @@ use crate::{
 /// embedded `PcQc3` — verifiers check the committee aggregate in the
 /// proof and that `proof.x_pp() == value`. `sender` +
 /// `sender_signature` ride on the wrapper for relay accountability:
-/// the signature is a BLS sig under the sender's key over `(network,
+/// the signature is a signature under the sender's key over `(network,
 /// epoch, view, msg.hash())`, used to key per-`(epoch, view, sender)`
 /// pipeline slots. Wire decode lands the inner wrapper as
 /// `Verifiable::Unverified`; locally-dispatched sends preserve the
@@ -28,7 +28,7 @@ pub struct SpcNewCommitNotification {
     /// Validator relaying this commit — the implicit signer of
     /// `sender_signature`.
     pub sender: ValidatorId,
-    /// BLS signature over `spc_relay_signing_message(network,
+    /// signature over `spc_relay_signing_message(network,
     /// DOMAIN_SPC_NEW_COMMIT, epoch, msg.view, msg.hash())`.
     pub sender_signature: ConsensusSignature,
     /// The committed new-commit message.

@@ -205,17 +205,17 @@ pub struct ExecutionCoordinator {
     /// `remove_finalized_wave` once the containing block commits.
     exec_certs: Arc<ExecCertStore>,
 
-    /// In-flight EC BLS-verifications, keyed by a content hash over the
-    /// cached SBOR bytes. A flooding peer would otherwise re-trigger a BLS
+    /// In-flight EC verifications, keyed by a content hash over the
+    /// cached SBOR bytes. A flooding peer would otherwise re-trigger a
     /// dispatch on every byte-identical retransmit. Different aggregations
     /// of the same logical EC produce distinct wire bytes and so still
     /// dispatch — important when a first aggregation's signature is bad and
     /// a peer follows up with a valid one.
     pending_ec_verifications: HashSet<Hash>,
 
-    /// In-flight `FinalizedWave` BLS-verifications, keyed by `WaveId`. The
+    /// In-flight `FinalizedWave` verifications, keyed by `WaveId`. The
     /// wave is content-addressed by id (one wave per `WaveId`), so a second
-    /// fetch arrival for the same wave can short-circuit the BLS pool.
+    /// fetch arrival for the same wave can short-circuit the crypto pool.
     pending_finalized_wave_verifications: HashSet<WaveId>,
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -801,7 +801,7 @@ impl ExecutionCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Handle a locally-produced, pre-verified execution vote.
-    /// Bypasses the BLS batch path and lands directly in the verified
+    /// Bypasses the batch-verify path and lands directly in the verified
     /// tally. See [`Self::dispatch_execution_vote`] for the leader,
     /// fallback, and early-buffer routing rules.
     pub fn on_verified_execution_vote(
@@ -812,7 +812,7 @@ impl ExecutionCoordinator {
         self.dispatch_execution_vote(topology_schedule, vote.into())
     }
 
-    /// Handle a wire-arrived execution vote. Buffered for batch BLS
+    /// Handle a wire-arrived execution vote. Buffered for batch
     /// verification once combined power could reach quorum. See
     /// [`Self::dispatch_execution_vote`] for the full routing rules.
     pub fn on_unverified_execution_vote(
@@ -860,7 +860,7 @@ impl ExecutionCoordinator {
         // Only votes from local-committee members count. A globally-known
         // validator outside this shard's committee whose vote pooled into
         // `unverified_power` would puff up the tracker into early
-        // aggregation, producing an EC whose BLS aggregate carries
+        // aggregation, producing an EC whose signature aggregate carries
         // signatures the verifier's bitfield-derived pubkey pool excludes
         // — guaranteed to fail verification and waste a leader rotation.
         // Mirrors `vote_keeper::record_received_vote`.
@@ -1099,7 +1099,7 @@ impl ExecutionCoordinator {
             block_hash = ?block_hash,
             wave = %wave_id,
             votes = votes.len(),
-            "Delegating BLS aggregation to crypto pool"
+            "Delegating signature aggregation to crypto pool"
         );
 
         // Stamp phase times for txs covered by the new local EC. Pure
@@ -1128,7 +1128,7 @@ impl ExecutionCoordinator {
 
     /// Handle execution certificate aggregation completed.
     ///
-    /// Called when the crypto pool finishes BLS aggregation for a wave's votes.
+    /// Called when the crypto pool finishes signature aggregation for a wave's votes.
     /// Only the wave leader (primary or fallback) reaches this path.
     /// Broadcasts the EC to all local peers and remote participating shards,
     /// then feeds it to the wave-level certificate tracker for finalization.
@@ -1194,7 +1194,7 @@ impl ExecutionCoordinator {
 
     /// Handle an execution certificate received from another validator.
     ///
-    /// Always dispatches BLS signature verification before the cert can
+    /// Always dispatches signature verification before the cert can
     /// influence any wave state. Routing (and any buffering for txs whose
     /// blocks haven't committed yet) happens in `on_certificate_verified`
     /// once the crypto pool confirms the signature — buffering here without
@@ -1214,19 +1214,19 @@ impl ExecutionCoordinator {
         // before the gossip arrives. A wire-hash match against the
         // cached entry means this is the same aggregation we already
         // verified and routed; a mismatch is a different aggregation
-        // of the same logical EC and still needs its own BLS check.
+        // of the same logical EC and still needs its own signature check.
         if let Some(cached) = self.exec_certs.get(cert.wave_id())
             && cached.wire_hash() == wire_hash
         {
             tracing::debug!(
                 shard = shard.inner(),
                 wave = %cert.wave_id(),
-                "Cached verified EC matches incoming wire hash — skipping BLS dispatch"
+                "Cached verified EC matches incoming wire hash — skipping verify dispatch"
             );
             return vec![];
         }
 
-        // Skip BLS dispatch for byte-identical retransmits while a
+        // Skip verify dispatch for byte-identical retransmits while a
         // verification is already in flight. Different aggregations of the
         // same logical EC produce distinct wire bytes, so the legitimate
         // case of "first aggregation invalid, second valid" is preserved.
@@ -2227,7 +2227,7 @@ impl ExecutionCoordinator {
     /// sourced) finalized waves.
     ///
     /// Runs the cheap synchronous gates inline (per-EC quorum power and
-    /// committee-key resolution) and dispatches BLS verification to the
+    /// committee-key resolution) and dispatches signature verification to the
     /// crypto pool via [`Action::VerifyFinalizedWave`]. The matching
     /// [`ProtocolEvent::FinalizedWaveVerified`] feeds
     /// [`Self::on_finalized_wave_verified`], which emits
@@ -2250,7 +2250,7 @@ impl ExecutionCoordinator {
         let wave_id = wave.wave_id().clone();
 
         // Already-finalized short-circuit — a second fetch arrival for a
-        // wave we've already admitted is wasted BLS work.
+        // wave we've already admitted is wasted verification work.
         if self.finalized.contains(&wave_id) {
             tracing::debug!(
                 wave = %wave_id,
@@ -2376,7 +2376,7 @@ impl ExecutionCoordinator {
     }
 
     /// Handle the result of [`Action::VerifyFinalizedWave`]. Emits the
-    /// admission continuation only when every EC's BLS signature passed.
+    /// admission continuation only when every EC's signature passed.
     #[must_use]
     pub fn on_finalized_wave_verified(
         &mut self,
@@ -2952,7 +2952,7 @@ mod tests {
         // committee must be rejected at the top of on_execution_vote, with
         // no early-buffer or tracker side effect. Otherwise the vote could
         // pool its cross-shard power into the tracker and trigger premature
-        // aggregation that produces an EC the BLS verifier will reject.
+        // aggregation that produces an EC the verifier will reject.
         let topo = make_two_shard_topology();
         let local = topo.head().committee_for_shard(ShardId::leaf(1, 0));
         let outsider = (0u64..4)
@@ -3096,7 +3096,7 @@ mod tests {
 
     #[test]
     fn on_certificate_verified_rejects_subquorum_ec() {
-        // A single Byzantine signer can produce a BLS-valid EC. Without a
+        // A single Byzantine signer can produce a signature-valid EC. Without a
         // quorum-power gate, that sub-quorum EC would clear the expected-
         // cert tombstone, populate the local-shard fallback-serving cache,
         // and feed wave attestation. The rejection now also emits an
@@ -3143,7 +3143,7 @@ mod tests {
 
     #[test]
     fn on_certificate_verified_invalid_sig_abandons_fetch() {
-        // BLS signature verification returns `valid=false`. The cert is
+        // signature verification returns `valid=false`. The cert is
         // dropped without admission, and the FSM is told to release the
         // in-flight slot.
         let topo = make_test_topology();
@@ -3250,7 +3250,7 @@ mod tests {
     }
 
     /// `admit_finalized_wave` must NOT emit `FinalizedWavesAdmitted`
-    /// inline — that would mean BLS verification ran on the state-machine
+    /// inline — that would mean signature verification ran on the state-machine
     /// thread, bringing back the pre-async stall on the consensus path.
     /// The expected output is a single `VerifyFinalizedWave` action; the
     /// admission continuation only fires once the verify event lands.
@@ -3321,7 +3321,7 @@ mod tests {
                 a,
                 Action::AbandonFetch(FetchAbandon::FinalizedWaves { ids }) if ids == &vec![wave_id.clone()]
             )),
-            "BLS-invalid drop must emit AbandonFetch::FinalizedWaves, got: {actions:?}"
+            "Signature-invalid drop must emit AbandonFetch::FinalizedWaves, got: {actions:?}"
         );
         assert!(
             !actions.iter().any(|a| matches!(
@@ -3461,7 +3461,7 @@ mod tests {
 
     /// Two byte-identical EC arrivals while the first is still in flight
     /// must produce only one `VerifyExecutionCertificateSignature`
-    /// dispatch. This shields the BLS pool from a flooding peer.
+    /// dispatch. This shields the crypto pool from a flooding peer.
     #[test]
     fn on_wave_certificate_dedups_byte_identical_retransmit() {
         let topo = make_test_topology();
@@ -3544,7 +3544,7 @@ mod tests {
 
     /// A cross-shard EC defers on its source block's commit proof: a bare
     /// QC-certified header is not consumability, and the committed event
-    /// replays the deferred EC into BLS dispatch.
+    /// replays the deferred EC into verify dispatch.
     #[test]
     fn on_wave_certificate_defers_until_source_block_commit_proven() {
         let topo = make_two_shard_topology();
@@ -3689,7 +3689,7 @@ mod tests {
         );
 
         let _ = state.on_wave_certificate(&topo, cert.clone().into());
-        // Simulate the BLS pool returning an invalid result. The slot is
+        // Simulate the crypto pool returning an invalid result. The slot is
         // released so a follow-up arrival can re-dispatch.
         let _ = state.on_certificate_verified(
             &topo,
@@ -3708,7 +3708,7 @@ mod tests {
 
     /// An EC already in `exec_certs` (placed there by a co-hosted vnode's
     /// aggregation, or by an earlier verification of the same wire bytes)
-    /// short-circuits the BLS dispatch on a wire-hash match.
+    /// short-circuits the verify dispatch on a wire-hash match.
     #[test]
     fn on_wave_certificate_skips_dispatch_on_cached_wire_hash_match() {
         let topo = make_test_topology();
@@ -3741,7 +3741,7 @@ mod tests {
     /// A different aggregation of the same logical EC (same `WaveId` but
     /// distinct signers / signature, hence distinct wire bytes) is not
     /// short-circuited by an earlier cache entry — it still needs its own
-    /// BLS check.
+    /// signature check.
     #[test]
     fn on_wave_certificate_falls_through_on_cached_wave_id_with_wire_hash_mismatch() {
         let topo = make_test_topology();
@@ -3819,7 +3819,7 @@ mod tests {
     }
 
     /// A `FinalizedWave` already in the canonical store short-circuits
-    /// before any BLS dispatch.
+    /// before any verify dispatch.
     #[test]
     fn admit_finalized_wave_skips_when_already_finalized() {
         let topo = make_test_topology();
@@ -3900,7 +3900,7 @@ mod tests {
     }
 
     /// Receipt of a cross-shard EC must NOT mark its expectation
-    /// fulfilled until the BLS signature has been verified. Otherwise a
+    /// fulfilled until the signature has been verified. Otherwise a
     /// Byzantine peer can ship a forged EC, the tombstone is set with
     /// `vote_anchor_ts + RETENTION_HORIZON` (peer-controlled), legitimate
     /// fallback fetches are suppressed, and the verify pool's silent
@@ -3957,7 +3957,7 @@ mod tests {
         assert_eq!(state.expected_certs.fulfilled_len(), 0);
     }
 
-    /// A received cross-shard EC must always dispatch BLS verification
+    /// A received cross-shard EC must always dispatch signature verification
     /// before any wave state sees it — including when no local wave tracks
     /// any tx in the cert. Without that, a Byzantine remote could buffer
     /// forged `tx_outcomes` that the replay path later trusts at commit
@@ -3986,7 +3986,7 @@ mod tests {
             SignerBitfield::new(4),
         );
 
-        // The source block is commit-proven; the gate under test is BLS
+        // The source block is commit-proven; the gate under test is verify
         // dispatch without a local tracker, not the commit-proof gate.
         state.on_committed_remote_header(
             &topo,
@@ -3999,7 +3999,7 @@ mod tests {
             actions
                 .iter()
                 .any(|a| matches!(a, Action::VerifyExecutionCertificateSignature { .. })),
-            "must dispatch BLS verification even when no local tracker matches"
+            "must dispatch signature verification even when no local tracker matches"
         );
         // Nothing lands in the early-arrival buffer until verification passes.
         assert_eq!(state.memory_stats().pending_routing, 0);
@@ -4110,7 +4110,7 @@ mod tests {
 
     /// Committee A governs epoch 0 (the routing head); committee B, with
     /// disjoint signing keys, governs epoch 1. A remote EC whose
-    /// `vote_anchor_ts` lands in epoch 1 must dispatch BLS verification against
+    /// `vote_anchor_ts` lands in epoch 1 must dispatch signature verification against
     /// B's keys — the committee seated at the EC's anchor — not the head.
     #[test]
     fn remote_ec_verification_resolves_committee_at_its_vote_anchor() {

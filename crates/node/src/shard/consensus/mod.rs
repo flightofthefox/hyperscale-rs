@@ -50,7 +50,7 @@ pub struct ConsensusState {
     /// height by fetching and committing missing blocks.
     pub block_sync: BlockSync,
 
-    /// Pending remote-certified header gossip awaiting batched BLS
+    /// Pending remote-certified header gossip awaiting batched
     /// sender-signature verification on the crypto pool.
     pub certified_header_batch: BatchAccumulator<CertifiedHeaderVerificationItem>,
 }

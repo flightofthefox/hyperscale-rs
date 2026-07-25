@@ -216,7 +216,7 @@ pub enum SpcEffect {
 /// Events [`SpcInstance::handle`] consumes.
 ///
 /// Peer messages flow in as `*Verified` variants carrying `Verified<T>`
-/// — the marker is produced by the BLS dispatch through the crypto pool
+/// — the marker is produced by the verify dispatch through the crypto pool
 /// and threaded through the coordinator into the FSM. There is no
 /// unverified admission path; the type system forbids passing an
 /// unverified message into `handle`.
@@ -224,7 +224,7 @@ pub enum SpcEffect {
 pub enum SpcEvent {
     /// The local validator's input vector for view 1.
     Input(PcVector),
-    /// A BLS-verified inner-PC round-1 vote, tagged with the SPC view
+    /// A signature-verified inner-PC round-1 vote, tagged with the SPC view
     /// it belongs to. Routed to the right view's `PcInstance::handle`.
     PcVote1Verified {
         /// SPC view whose inner PC produced this vote.
@@ -232,21 +232,21 @@ pub enum SpcEvent {
         /// The verified vote.
         vote: Verified<PcVote1>,
     },
-    /// A BLS-verified inner-PC round-2 vote.
+    /// A signature-verified inner-PC round-2 vote.
     PcVote2Verified {
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
         /// The verified vote.
         vote: Box<Verified<PcVote2>>,
     },
-    /// A BLS-verified inner-PC round-3 vote.
+    /// A signature-verified inner-PC round-3 vote.
     PcVote3Verified {
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
         /// The verified vote.
         vote: Box<Verified<PcVote3>>,
     },
-    /// BLS-verified `new-view` from a peer entering `view` under `cert`.
+    /// signature-verified `new-view` from a peer entering `view` under `cert`.
     ///
     /// `from` is the transport-level sender id. `NewView` isn't
     /// sender-signed (the cert authenticates the parent claim
@@ -262,7 +262,7 @@ pub enum SpcEvent {
         /// Cert backing the entry.
         cert: Box<Verified<SpcCert>>,
     },
-    /// BLS-verified `new-commit` from a peer. Self-authenticating via
+    /// signature-verified `new-commit` from a peer. Self-authenticating via
     /// the embedded `proof`; sender label isn't load-bearing.
     NewCommitVerified {
         /// View whose inner PC produced this commit.
@@ -272,7 +272,7 @@ pub enum SpcEvent {
         /// PC round-3 cert anchoring `value` as `proof.x_pp`.
         proof: Box<Verified<PcQc3>>,
     },
-    /// BLS-verified `empty-view` attestation from a peer.
+    /// signature-verified `empty-view` attestation from a peer.
     EmptyViewVerified(Box<Verified<SpcEmptyViewMsg>>),
     /// Timer for `view` fired — its leader's grace period elapsed.
     /// Drives `RunVPC(view)` even on a partial proposal-object
@@ -324,7 +324,7 @@ impl ViewState {
 /// Also the forward edge of the coordinator's pre-verification view
 /// window (see `BeaconCoordinator::spc_admission_ctx`): a message for a
 /// view beyond `current + MAX_PENDING_EMPTY_VIEW_AHEAD` is one the FSM
-/// wouldn't act on, so it's dropped before the BLS dispatch.
+/// wouldn't act on, so it's dropped before the verify dispatch.
 pub(crate) const MAX_PENDING_EMPTY_VIEW_AHEAD: u32 = 4;
 
 /// Bound on `pending_commits`. Distinct blocked walks are

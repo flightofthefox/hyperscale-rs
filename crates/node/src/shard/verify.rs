@@ -1,4 +1,4 @@
-//! Common BLS signature verification helpers.
+//! Common signature verification helpers.
 
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_types::{
@@ -52,7 +52,7 @@ pub fn resolve_sender_key(
 }
 
 /// Resolve a signer's public key from topology (without a committee
-/// membership check) and verify the BLS signature on a [`Signed`] wire
+/// membership check) and verify the signature on a [`Signed`] wire
 /// message. Used for block-header proposals, where the proposer identity
 /// is the consensus-determined leader rather than a sender claim that
 /// needs committee gating.
@@ -91,7 +91,7 @@ pub fn verify_signed_by_proposer<T: Signed>(
 
 /// Verify a [`Signed`] wire message whose signer must be a current member
 /// of `shard`'s committee. Combines [`resolve_sender_key`] (committee
-/// membership gate + key lookup) with the BLS check from the [`Signed`]
+/// membership gate + key lookup) with the signature check from the [`Signed`]
 /// trait.
 ///
 /// Returns `false` (with warnings) on any failure.

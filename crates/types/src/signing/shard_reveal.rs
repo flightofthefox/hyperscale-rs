@@ -2,13 +2,13 @@
 //!
 //! Every shard block proposer signs `(network, shard, height)` under
 //! [`DOMAIN_SHARD_REVEAL`] to produce an unforgeable, unchooseable VRF
-//! reveal. The 96-byte BLS signature is the [`VrfProof`](crate::VrfProof);
+//! reveal. The 96-byte signature is the [`VrfProof`](crate::VrfProof);
 //! its digest ([`vrf_output_from_proof`](crate::vrf_output_from_proof)) is
 //! the [`VrfOutput`](crate::VrfOutput) that rides the beacon-witness
 //! accumulator and folds into the next epoch's randomness.
 //!
 //! The VRF property — uniquely determined by `(secret_key, message)` —
-//! follows from BLS signatures being deterministic in min-pk mode, so the
+//! follows from signatures being deterministic in min-pk mode, so the
 //! proposer decides only *whether* its reveal lands (governed by the fold's
 //! accumulator range), never its value. The input binds `(shard, height)`
 //! and nothing else: no round, so a same-proposer re-proposal after a view
@@ -16,7 +16,7 @@
 //! chaining, which would hand a neighbouring proposer a lever into the value
 //! and buys nothing here (the co-inputs a key-grind would target are
 //! unknowable at registration). Domain separation keeps a reveal from being
-//! confused with a block vote or header sig, which reuse the same BLS keys.
+//! confused with a block vote or header sig, which reuse the same consensus keys.
 
 use hyperscale_crypto::{SignError, Signer, Verifier};
 
@@ -71,7 +71,7 @@ pub fn shard_reveal_sign(
 ///
 /// The reveal output is a pure function of the proof
 /// ([`vrf_output_from_proof`](crate::vrf_output_from_proof)), so there is
-/// nothing to grind and only one check: the proof, as a BLS sig, verifies
+/// nothing to grind and only one check: the proof, as a signature, verifies
 /// against `pk` over the bytes produced by [`shard_reveal_message`].
 #[must_use]
 pub fn shard_reveal_verify(
@@ -246,9 +246,9 @@ mod tests {
         ));
     }
 
-    /// Tampered proof (BLS sig invalid) must reject. The output can't be
+    /// Tampered proof (signature invalid) must reject. The output can't be
     /// tampered independently — it's derived from the proof — so the proof's
-    /// BLS check is the whole predicate.
+    /// signature check is the whole predicate.
     #[test]
     fn shard_reveal_verify_rejects_tampered_proof() {
         let signer = signer(3);

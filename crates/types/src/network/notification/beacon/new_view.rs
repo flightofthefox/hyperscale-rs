@@ -21,7 +21,7 @@ use crate::{
 /// need a sender signature for content authentication.
 ///
 /// `sender` + `sender_signature` ride on the wrapper for relay
-/// accountability: the signature is a BLS sig under the sender's key
+/// accountability: the signature is a signature under the sender's key
 /// over `(network, epoch, view, proposal.hash())`. The receiver uses
 /// the verified sender to key per-`(epoch, view, sender)` pipeline
 /// slots; peer-scoring + topology committee-membership gates ride on
@@ -37,7 +37,7 @@ pub struct SpcNewViewNotification {
     /// Validator relaying this proposal — the implicit signer of
     /// `sender_signature`.
     pub sender: ValidatorId,
-    /// BLS signature over `spc_relay_signing_message(network,
+    /// signature over `spc_relay_signing_message(network,
     /// DOMAIN_SPC_NEW_VIEW, epoch, proposal.view, proposal.hash())`.
     pub sender_signature: ConsensusSignature,
     /// The proposal object.

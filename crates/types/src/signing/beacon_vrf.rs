@@ -1,14 +1,14 @@
 //! Domain-separated signing for beacon-chain VRF reveals.
 //!
 //! Each committee member signs `(network, epoch)` under [`DOMAIN_PC_VRF`]
-//! to produce a epoch-bound VRF reveal. The 96-byte BLS signature is the
+//! to produce a epoch-bound VRF reveal. The 96-byte signature is the
 //! [`VrfProof`](crate::VrfProof); its digest is the
 //! [`VrfOutput`](crate::VrfOutput) mixed into beacon randomness.
 //!
 //! The VRF property — uniquely determined by `(secret_key, message)` —
-//! follows from BLS signatures being deterministic in min-pk mode. Domain
+//! follows from signatures being deterministic in min-pk mode. Domain
 //! separation here keeps a VRF reveal from being confused with a PC vote
-//! or a block header sig, both of which reuse the same BLS keys.
+//! or a block header sig, both of which reuse the same consensus keys.
 
 pub use hyperscale_crypto::vrf_output_from_proof;
 use hyperscale_crypto::{SignError, Signer, Verifier};
@@ -56,7 +56,7 @@ pub fn vrf_sign(
 ///
 /// The VRF output is a pure function of the proof
 /// ([`vrf_output_from_proof`]), so there is nothing to grind and only one
-/// check: the proof, as a BLS sig, verifies against `pk` over the bytes
+/// check: the proof, as a signature, verifies against `pk` over the bytes
 /// produced by [`vrf_reveal_message`] at `(network, epoch)`.
 #[must_use]
 pub fn vrf_verify(
@@ -210,9 +210,9 @@ mod tests {
         ));
     }
 
-    /// Tampered proof (BLS sig invalid) must reject. The output can't be
+    /// Tampered proof (signature invalid) must reject. The output can't be
     /// tampered independently — it's derived from the proof — so the
-    /// proof's BLS check is the whole predicate.
+    /// proof's signature check is the whole predicate.
     #[test]
     fn vrf_verify_rejects_tampered_proof() {
         let signer = signer(3);

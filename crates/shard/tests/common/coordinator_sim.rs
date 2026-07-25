@@ -322,7 +322,7 @@ pub struct ShardCoordinatorSim {
     /// schedule — the sim runs within one epoch, so every weighted timestamp
     /// resolves to the same committee.
     pub topology_schedule: TopologySchedule,
-    /// Network definition used as the BLS signing domain.
+    /// Network definition used as the signing domain.
     network: NetworkDefinition,
     /// The single shard this sim hosts.
     pub shard: ShardId,
@@ -1429,7 +1429,7 @@ impl ShardCoordinatorSim {
                     ready_signals,
                     reshape_trigger,
                     // Sign a genuine reveal with the proposer's key so the
-                    // block's leaf 0 passes the BLS gate `verify` now runs;
+                    // block's leaf 0 passes the signature gate `verify` now runs;
                     // `VrfProof::ZERO` would fail it. The proposer leads
                     // this round, so it matches `proposer_for` at verify.
                     shard_reveal_sign(

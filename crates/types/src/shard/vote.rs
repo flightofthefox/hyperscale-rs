@@ -116,7 +116,7 @@ impl BlockVote {
         self.voter
     }
 
-    /// BLS signature over the domain-separated signing message.
+    /// Signature over the domain-separated signing message.
     #[must_use]
     pub const fn signature(&self) -> ConsensusSignature {
         self.signature
@@ -194,22 +194,22 @@ pub struct BlockVoteContext<'a> {
 /// Failure modes of [`BlockVote`] verification.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum BlockVoteVerifyError {
-    /// The BLS signature did not validate against the voter's public key
+    /// The signature did not validate against the voter's public key
     /// for the vote's domain-separated signing message.
-    #[error("BLS signature invalid")]
+    #[error("signature invalid")]
     InvalidSignature,
 }
 
-/// Construction asserts: the BLS signature on the vote validates against
+/// Construction asserts: the signature on the vote validates against
 /// the voter's public key for the domain-separated signing message
 /// `block_vote_message(network, shard, height, round, block_hash)`.
 ///
 /// Construction goes through one of three gates:
 ///
-/// - [`<BlockVote as Verify>::verify`](Verify::verify) — runs the BLS
+/// - [`<BlockVote as Verify>::verify`](Verify::verify) — runs the
 ///   signature check against the voter's public key.
 /// - [`Verified::<BlockVote>::verify_batch`] — runs the same predicate
-///   over a slice using the BLS same-message batch optimisation, with
+///   over a slice using the same-message batch optimisation, with
 ///   individual-verify fallback when the batch fails.
 /// - [`Verified::<BlockVote>::sign_local`] — signs a fresh vote with
 ///   the caller's key; the act of signing is the predicate witness.
@@ -274,7 +274,7 @@ impl Verified<BlockVote> {
     }
 
     /// Verify a slice of `(vote, pubkey)` pairs against a single
-    /// `signing_message` using the BLS same-message batch optimisation.
+    /// `signing_message` using the same-message batch optimisation.
     ///
     /// Every vote in the batch must have been signed over `signing_message`
     /// (the canonical [`block_vote_message`] for some `block_hash`,

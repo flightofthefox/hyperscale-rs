@@ -122,7 +122,7 @@ pub fn verify_and_build_qc(
 ///
 /// Wraps [`Verified::<BlockVote>::verify_batch`] with the committee
 /// bookkeeping (`(idx, vote, pubkey)` tuples → `(idx, verified)`); the typed
-/// batch verifier owns the BLS work and the individual-verify fallback.
+/// batch verifier owns the verification work and the individual-verify fallback.
 pub fn verify_vote_batch(
     verifier: &dyn Verifier,
     block_hash: BlockHash,
@@ -424,7 +424,7 @@ where
                 quorum_threshold,
             };
             // The verified arm short-circuits inside `upgrade`; only the
-            // unverified arm performs BLS work, so we gate the latency
+            // unverified arm performs signature work, so we gate the latency
             // metric on `is_verified` to keep the histogram aligned with
             // actual aggregation calls.
             let measured = !qc.is_verified();
@@ -611,7 +611,7 @@ where
                 thresholds,
                 topology_snapshot: &topology_snapshot,
             };
-            // `verify` gates the reveal's BLS validity (leaf 0's proof by
+            // `verify` gates the reveal's signature validity (leaf 0's proof by
             // the block's proposer) before folding its digest, so an
             // unverified reveal can never reach the root — the grind check
             // lives inside the shared verifier, off the main loop on the
@@ -977,7 +977,7 @@ where
                     });
                 }
                 Err(_) => {
-                    tracing::warn!(voter = ?timeout.voter(), "Dropping timeout with invalid BLS share");
+                    tracing::warn!(voter = ?timeout.voter(), "Dropping timeout with an invalid signature share");
                 }
             }
         }

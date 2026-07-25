@@ -12,7 +12,7 @@ use crate::{
 /// Notifies committee members of a block proposal (header + manifest, not full block).
 /// Validators construct the full Block locally from header + mempool transactions.
 ///
-/// The `proposer_signature` is a BLS signature by the proposer over a domain-separated
+/// The `proposer_signature` is a signature by the proposer over a domain-separated
 /// message, ensuring that block proposals cannot be forged by non-proposers.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockHeaderNotification {
@@ -22,7 +22,7 @@ pub struct BlockHeaderNotification {
     /// Block contents manifest (transaction hashes, certificates, deferrals, etc.)
     pub manifest: BlockManifest,
 
-    /// BLS signature by the proposer over the domain-separated block header message.
+    /// signature by the proposer over the domain-separated block header message.
     /// Verifies that the claimed proposer actually created this proposal.
     pub proposer_signature: ConsensusSignature,
 }

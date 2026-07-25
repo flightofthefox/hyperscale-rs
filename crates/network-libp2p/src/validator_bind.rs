@@ -1,7 +1,7 @@
 //! Validator-bind protocol: cryptographic `ValidatorId` ↔ `PeerId` binding.
 //!
 //! After libp2p's Noise transport proves `PeerId` ownership, this protocol
-//! proves the peer also controls the BLS signing key for a given `ValidatorId`
+//! proves the peer also controls the consensus signing key for a given `ValidatorId`
 //! (as known from the topology).
 //!
 //! # Protocol
@@ -25,10 +25,10 @@
 //! Each side attests as **every** validator it hosts in one handshake: a
 //! multi-vnode process emits one `(validator_id, signature)` pair per hosted
 //! vnode. The verifier checks every signature against the corresponding
-//! validator's BLS pubkey from the topology; any failure rejects the whole
+//! validator's consensus pubkey from the topology; any failure rejects the whole
 //! exchange.
 //!
-//! Where `sig_x_i = BLS_sign(x_i_key, "VALIDATOR_BIND" || x_peer_id ||
+//! Where `sig_x_i = sign(x_i_key, "VALIDATOR_BIND" || x_peer_id ||
 //! their_nonce)`. Each side signs over the **other** side's nonce, so
 //! signatures are fresh per session and cannot be replayed against the same
 //! `(validator_id, peer_id)` pair across different sessions.
@@ -63,7 +63,7 @@ use crate::stream_framing;
 pub type LocalVnodeIdentity = (ValidatorId, Arc<dyn Signer>);
 
 /// List of `(validator_id, signature)` attestations carried in one bind
-/// frame. Each entry proves that the holder of `validator_id`'s BLS key
+/// frame. Each entry proves that the holder of `validator_id`'s consensus key
 /// signed `("VALIDATOR_BIND" || peer_id || nonce)` for this session.
 type Attestations = Vec<(ValidatorId, ConsensusSignature)>;
 
@@ -79,7 +79,7 @@ const BIND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum frame size for bind messages. Sized to fit a fully-populated
 /// attestation list at the per-bind cap plus framing overhead, with margin
-/// for the LZ4 wrapper (BLS sigs barely compress).
+/// for the LZ4 wrapper (signatures barely compress).
 const MAX_BIND_FRAME: usize = 64 * 1024;
 
 /// Maximum number of retry attempts for a failed outbound bind.
@@ -212,7 +212,7 @@ fn fresh_nonce() -> [u8; VALIDATOR_BIND_NONCE_LEN] {
 
 // ─── Verification ───────────────────────────────────────────────────────
 
-/// Verify a bind signature: the BLS signature over `("VALIDATOR_BIND" ||
+/// Verify a bind signature: the signature over `("VALIDATOR_BIND" ||
 /// peer_id_bytes || nonce)` must be valid for the claimed `ValidatorId`'s
 /// public key.
 ///
@@ -255,7 +255,7 @@ impl std::fmt::Display for BindError {
         match self {
             Self::UnknownValidator(v) => write!(f, "unknown validator {}", v.inner()),
             Self::InvalidSignature(v) => {
-                write!(f, "invalid BLS signature for validator {}", v.inner())
+                write!(f, "invalid signature for validator {}", v.inner())
             }
             Self::InvalidMessage => write!(f, "malformed bind message"),
             Self::StreamOpen(e) => write!(f, "stream open failed: {e}"),
@@ -274,14 +274,14 @@ impl std::fmt::Display for BindError {
 /// field is `Clone`-cheap (`Arc` or `Copy`).
 #[derive(Clone)]
 struct BindContext {
-    /// Radix network identity, bound into every BLS-signed bind message.
+    /// Radix network identity, bound into every signed bind message.
     network: NetworkDefinition,
     /// Per-vnode signing identities. One `(validator_id, signature)` pair
     /// is produced per entry on every bind exchange. Must be non-empty.
     local_vnodes: Arc<[LocalVnodeIdentity]>,
     /// Local libp2p peer id, signed over to bind it to every hosted vnode.
     local_peer_id: Libp2pPeerId,
-    /// Validator BLS key map (consulted to verify remote signatures).
+    /// Validator consensus-key map (consulted to verify remote signatures).
     validator_keys: SharedValidatorKeys,
     /// Validator-id → peer-id map populated on successful bind.
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,

@@ -294,7 +294,7 @@ impl SimulationRunner {
                 continue;
             }
             let signer = Arc::clone(
-                &self.signing_keys[usize::try_from(validator.inner()).expect("id fits usize")],
+                &self.signers[usize::try_from(validator.inner()).expect("id fits usize")],
             ) as Arc<dyn Signer>;
             let init = seat_follower(SeatFollower {
                 verifier: Arc::clone(&self.verifier),
@@ -411,9 +411,9 @@ impl SimulationRunner {
     ) -> VnodeInit {
         let host = &self.hosts[host as usize];
         let now = self.local_now();
-        let signer = Arc::clone(
-            &self.signing_keys[usize::try_from(validator.inner()).expect("id fits usize")],
-        ) as Arc<dyn Signer>;
+        let signer =
+            Arc::clone(&self.signers[usize::try_from(validator.inner()).expect("id fits usize")])
+                as Arc<dyn Signer>;
         seat_vnode_group(SeatVnodeGroup {
             verifier: Arc::clone(&self.verifier),
             beacon_storage: host.beacon_storage().as_ref(),

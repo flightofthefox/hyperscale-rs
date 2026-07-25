@@ -76,7 +76,7 @@ impl Eq for RoutableTransaction {}
 
 // Manual Clone - OnceLock doesn't implement Clone. Every populated cache
 // is copied so the clone doesn't pay first-access cost twice; in
-// particular `validated` rides across clones so the BLS-sig validation a
+// particular `validated` rides across clones so the signature validation a
 // fresh tx incurs at admission is amortized over every later raw clone
 // (wave-state extract, mempool block-commit lift, proposal build).
 impl Clone for RoutableTransaction {

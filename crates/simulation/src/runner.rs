@@ -174,7 +174,7 @@ pub struct SimulationRunner {
 
     /// Signing keys for every registered validator, retained so a
     /// relocated vnode's state machine can be rebuilt on its new shard.
-    signing_keys: Vec<Arc<dyn Signer>>,
+    signers: Vec<Arc<dyn Signer>>,
 
     /// Scheme verifier every simulated coordinator runs, per
     /// [`SimConfig::crypto_scheme`]. Cloned into runtime-built
@@ -335,7 +335,7 @@ impl SimulationRunner {
         let registered_validators = committee_size + network_config.pool_surplus;
         let crypto_scheme = network_config.crypto_scheme;
         let verifier: Arc<dyn Verifier> = scheme_verifier(crypto_scheme);
-        let signing_keys: Vec<Arc<dyn Signer>> = (0..registered_validators)
+        let signers: Vec<Arc<dyn Signer>> = (0..registered_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
                 let key_seed = seed
@@ -347,7 +347,7 @@ impl SimulationRunner {
             })
             .collect();
         let public_keys: Vec<ConsensusPublicKey> =
-            signing_keys.iter().map(|key| key.public_key()).collect();
+            signers.iter().map(|key| key.public_key()).collect();
 
         // Build global validator set (pool extras included — fold-derived
         // snapshots carry every registered validator, so genesis matches)
@@ -418,7 +418,7 @@ impl SimulationRunner {
                     .map(|&idx| {
                         (
                             ValidatorId::new(u64::from(idx)),
-                            Arc::clone(&signing_keys[idx as usize]),
+                            Arc::clone(&signers[idx as usize]),
                         )
                     })
                     .collect();
@@ -437,7 +437,7 @@ impl SimulationRunner {
                 }));
             }
             for &validator_idx in &plan.followers {
-                let signer = Arc::clone(&signing_keys[validator_idx as usize]);
+                let signer = Arc::clone(&signers[validator_idx as usize]);
                 vnode_inits.push(seat_follower(SeatFollower {
                     verifier: Arc::clone(&verifier),
                     beacon_storage: beacon_storage.as_ref(),
@@ -533,7 +533,7 @@ impl SimulationRunner {
             hosts,
             event_rxs,
             event_txs: host_event_txs,
-            signing_keys,
+            signers,
             verifier,
             crypto_scheme,
             beacon_config_hash,
@@ -719,8 +719,8 @@ impl SimulationRunner {
     /// [`TestCommittee`](hyperscale_types::test_utils)'s keys would not match
     /// the seated committee.
     #[must_use]
-    pub fn validator_signing_key(&self, validator: ValidatorId) -> Option<Arc<dyn Signer>> {
-        self.signing_keys
+    pub fn validator_signer(&self, validator: ValidatorId) -> Option<Arc<dyn Signer>> {
+        self.signers
             .get(usize::try_from(validator.inner()).ok()?)
             .map(Arc::clone)
     }

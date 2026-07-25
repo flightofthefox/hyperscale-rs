@@ -1,18 +1,18 @@
 //! Committed-block-gossip step handlers.
 //!
 //! Gossip-delivered committed block headers go through a sender-signature
-//! BLS verification pass before reaching the state machine. The flow is:
+//! signature verification pass before reaching the state machine. The flow is:
 //!
 //! 1. `CommittedBlockGossipReceived` — the inbound handler closure has
 //!    already verified the sender's committee membership and resolved the
 //!    public key. The header is queued in a batch accumulator for amortized
-//!    BLS verification.
+//!    signature verification.
 //! 2. `flush_certified_header_verifications` — fires when the batch fills
 //!    or its window expires. Verified-marked items (local-dispatched from
 //!    a colocated proposer) emit directly as
 //!    `ProtocolEvent::VerifiedRemoteHeaderReceived` — the typestate
 //!    marker rides through. Unverified items are queued on the crypto
-//!    pool for envelope BLS verification; on success they emit as
+//!    pool for envelope signature verification; on success they emit as
 //!    `ProtocolEvent::UnverifiedRemoteHeaderReceived` (the marker tracks
 //!    the QC predicate, which the envelope check doesn't establish), and
 //!    the state machine still dispatches `Action::VerifyRemoteHeaderQc`
@@ -41,7 +41,7 @@ where
     D: Dispatch,
 {
     /// Inbound handler closure already verified sender's committee
-    /// membership and resolved the public key. Queue for batched BLS
+    /// membership and resolved the public key. Queue for batched
     /// verification; fires `flush_certified_header_verifications` when full.
     pub(crate) fn handle_committed_block_gossip_received(
         &mut self,
@@ -91,7 +91,7 @@ where
     ///
     /// Partitions the batch on `is_verified()`: verified items
     /// (local-dispatched from a colocated proposer) emit directly as
-    /// `VerifiedRemoteHeaderReceived`, skipping the envelope BLS check.
+    /// `VerifiedRemoteHeaderReceived`, skipping the envelope signature check.
     /// Unverified items go to the crypto pool for batched signature
     /// verification; valid ones emit as `UnverifiedRemoteHeaderReceived`,
     /// invalid ones are warn-dropped.
@@ -113,7 +113,7 @@ where
 
         let shard = self.shard;
 
-        // Fast path: emit verified items synchronously — no BLS work.
+        // Fast path: emit verified items synchronously — no signature work.
         for (certified_header, sender, _public_key, _sender_signature) in verified_items {
             let verified_header = Arc::unwrap_or_clone(certified_header)
                 .into_verified()

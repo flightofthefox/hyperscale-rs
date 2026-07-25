@@ -198,7 +198,7 @@ pub struct ValidatorConfig {
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     /// Radix network this node is configured for. Bound into every
-    /// BLS-signed consensus message to prevent cross-network replay.
+    /// signed consensus message to prevent cross-network replay.
     /// Parsed from a network name (`"mainnet"`, `"stokenet"`,
     /// `"simulator"`, etc.) via [`NetworkDefinition::from_str`].
     #[serde(default = "default_network", with = "network_serde")]
@@ -600,7 +600,7 @@ fn format_public_key(pk: &ConsensusPublicKey) -> String {
 ///
 /// The key file stores a 32-byte seed that deterministically generates the keypair.
 /// This seed can be stored as raw bytes or hex-encoded.
-fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<BlsSigner> {
+fn load_or_generate_signer(key_path: Option<&PathBuf>) -> Result<BlsSigner> {
     use rand::{Rng, rng};
 
     let Some(path) = key_path else {
@@ -651,7 +651,7 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<BlsSigner> {
 /// Build the genesis validators the runner projects the host's topology
 /// snapshot from.
 ///
-/// `local_keypairs` carries every hosted vnode's (`validator_id`, private key)
+/// `local_signers` carries every hosted vnode's (`validator_id`, private key)
 /// in `config.vnodes` order. For each genesis validator whose id matches a
 /// hosted vnode, the public key is taken from the local keypair rather than
 /// parsed from the genesis hex — keeping the set consistent with what this
@@ -664,17 +664,17 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<BlsSigner> {
 fn build_genesis_validators(
     network: NetworkDefinition,
     genesis: &GenesisConfig,
-    local_keypairs: &[(ValidatorId, Arc<BlsSigner>)],
+    local_signers: &[(ValidatorId, Arc<BlsSigner>)],
 ) -> Result<GenesisValidators> {
     let lookup_local = |id: ValidatorId| -> Option<&Arc<BlsSigner>> {
-        local_keypairs
+        local_signers
             .iter()
             .find_map(|(vid, k)| (*vid == id).then_some(k))
     };
 
     let validators: Vec<ValidatorInfo> = if genesis.validators.is_empty() {
         warn!("No validators in genesis config, running in single-validator mode");
-        let (validator_id, keypair) = local_keypairs.first().expect("at least one hosted vnode");
+        let (validator_id, keypair) = local_signers.first().expect("at least one hosted vnode");
         vec![ValidatorInfo {
             validator_id: *validator_id,
             public_key: keypair.public_key(),
@@ -1172,16 +1172,16 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // can substitute trusted local public keys for genesis-hex pubkeys.
     // Ordered Vec — single-validator mode picks the first entry, so source
     // order must be the same as config.vnodes.
-    let mut hosted_keypairs: Vec<(ValidatorId, Arc<BlsSigner>)> =
+    let mut hosted_signers: Vec<(ValidatorId, Arc<BlsSigner>)> =
         Vec::with_capacity(config.vnodes.len());
     for entry in &config.vnodes {
-        let keypair = load_or_generate_keypair(Some(&entry.key_path))?;
+        let keypair = load_or_generate_signer(Some(&entry.key_path))?;
         info!(
             validator_id = entry.validator_id,
             public_key = %format_public_key(&keypair.public_key()),
             "Loaded vnode signing keypair"
         );
-        hosted_keypairs.push((ValidatorId::new(entry.validator_id), Arc::new(keypair)));
+        hosted_signers.push((ValidatorId::new(entry.validator_id), Arc::new(keypair)));
     }
 
     // Build the host's genesis validators. Genesis is always a single ROOT
@@ -1190,13 +1190,13 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let genesis_validators = build_genesis_validators(
         config.node.network.clone(),
         &config.genesis,
-        &hosted_keypairs,
+        &hosted_signers,
     )?;
 
     // The validators this host runs. Shard participation is not named here —
     // the runner derives each validator's seat (or pool membership) from the
     // committed beacon state and opens any seated shard's storage itself.
-    let validators: Vec<LocalValidator> = hosted_keypairs
+    let validators: Vec<LocalValidator> = hosted_signers
         .iter()
         .map(|(validator_id, signer)| LocalValidator {
             validator_id: *validator_id,

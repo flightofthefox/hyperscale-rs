@@ -7,7 +7,7 @@ use crate::{BlockVote, MessageClass, NetworkMessage, Verifiable};
 /// Vote on a block proposal. 2f+1 matching votes create a `QuorumCertificate`.
 ///
 /// Sent via unicast notification to committee members. The inner `BlockVote`
-/// contains the voter identity and BLS signature, making it self-authenticating.
+/// contains the voter identity and signature, making it self-authenticating.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockVoteNotification {
     /// The block vote — wire bytes always land in [`Verifiable::Unverified`];

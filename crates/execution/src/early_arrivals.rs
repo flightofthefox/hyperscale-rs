@@ -33,7 +33,7 @@
 //!   committed locally. Cleanup at commit time drops older entries since
 //!   failure to commit past this window signals shard consensus is broken.
 //! - [`MAX_BUFFERED_EARLY_VOTES`]: a hard ceiling on total buffered votes.
-//!   Early votes are committee-gated at ingress but not BLS-verified until a
+//!   Early votes are committee-gated at ingress but not signature-verified until a
 //!   vote tracker exists, so without a size bound a Byzantine committee
 //!   member could flood votes for fabricated `WaveId`s up to the time-based
 //!   sweep. Past the ceiling new early votes are dropped; the voter's own
@@ -65,7 +65,7 @@ pub const EARLY_VOTE_RETENTION: Duration = WAVE_TIMEOUT;
 
 /// Hard ceiling on early votes buffered across all waves.
 ///
-/// Early votes are committee-gated at ingress but their per-vote BLS
+/// Early votes are committee-gated at ingress but their per-vote
 /// signatures aren't checked until a vote tracker spins up, so a Byzantine
 /// committee member could otherwise grow the buffer without bound by
 /// flooding votes for fabricated `WaveId`s until the [`EARLY_VOTE_RETENTION`]
@@ -371,7 +371,7 @@ mod tests {
         )
     }
 
-    /// A vote with a zero signature — cheap to build (no BLS signing), for
+    /// A vote with a zero signature — cheap to build (no signing), for
     /// exercising the buffer's size cap at scale.
     fn cheap_vote(wave_id: WaveId) -> Verifiable<ExecutionVote> {
         ExecutionVote::new(

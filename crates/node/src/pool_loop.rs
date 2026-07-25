@@ -10,7 +10,7 @@
 //! A follower's entire action set is handled **inline**. The delegated-dispatch
 //! path a `ShardLoop` uses is unbuildable here anyway (its `ActionContext` needs
 //! a `PendingChain` a shard-less host has no storage for), and a follower's
-//! actions are cheap: a beacon block's cert verifies with one BLS aggregate
+//! actions are cheap: a beacon block's cert verifies with one signature aggregate
 //! check, and adoption only touches process-shared state (the beacon commit
 //! dedup, the topology `ArcSwap`). Because a pooled vnode no-ops
 //! `BeaconBlockPersisted` (it has no shard coordinators to replay into), the
@@ -210,7 +210,7 @@ where
                 active_pool,
                 equivocation_signers,
             } => {
-                // Inline BLS verify of the block's certs — no off-thread
+                // Inline signature verify of the block's certs — no off-thread
                 // dispatch. The result re-enters the same vnode as a
                 // continuation so adoption runs within this cascade.
                 let coordinator = self.vnodes[vnode_idx].state.beacon_coordinator();

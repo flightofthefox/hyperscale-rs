@@ -9,7 +9,7 @@ use crate::{MessageClass, NetworkMessage, PcVote2, SpcView, Verifiable};
 /// PC round-2 vote sent via unicast to peers in the slot's committee.
 ///
 /// The inner [`PcVote2`] is self-authenticating — it carries the signer
-/// id, one BLS signature per prefix of `x`, the round-1 QC the signer
+/// id, one signature per prefix of `x`, the round-1 QC the signer
 /// is building on, and a length attestation pinning `|x|`. The wrapping
 /// `view` rides alongside because PC votes don't carry their SPC view
 /// internally. Wire decode lands the wrapper as `Verifiable::Unverified`;

@@ -216,7 +216,7 @@ impl RatifyVote {
         self.signer
     }
 
-    /// BLS signature over the canonical signing message.
+    /// signature over the canonical signing message.
     #[must_use]
     pub const fn sig(&self) -> ConsensusSignature {
         self.sig
@@ -299,7 +299,7 @@ impl RatifyCert {
         &self.signers
     }
 
-    /// Aggregated BLS signature over the canonical precommit signing
+    /// Aggregated signature over the canonical precommit signing
     /// bytes, verifying under the union of [`Self::signers`]' pubkeys.
     #[must_use]
     pub const fn aggregate_sig(&self) -> AggregateSignature {
@@ -331,7 +331,7 @@ pub const fn ratify_quorum(pool_size: usize) -> usize {
 ///
 /// Checks:
 /// - Signer is a member of `active_pool`.
-/// - BLS signature verifies under the signer's pubkey over the canonical
+/// - signature verifies under the signer's pubkey over the canonical
 ///   ratify-vote signing bytes.
 ///
 /// The vote's `anchor_hash`, `epoch`, and `round` are not validated
@@ -467,7 +467,7 @@ pub fn sign_ratify_vote(
 ///   `(anchor_hash, epoch, round, block_hash)`.
 /// - The set of distinct signers from `active_pool` meets
 ///   [`ratify_quorum`].
-/// - BLS aggregation succeeds.
+/// - signature aggregation succeeds.
 ///
 /// Returns `None` if the inputs are inconsistent, sub-quorum, or
 /// aggregation fails. The assembled cert is self-verifying via
@@ -615,7 +615,7 @@ pub enum RatifyVoteVerifyError {
     /// `signer` is not in the active validator pool.
     #[error("signer not in active pool")]
     SignerNotInPool,
-    /// BLS sig did not verify under the signer's pubkey.
+    /// signature did not verify under the signer's pubkey.
     #[error("signature did not verify")]
     BadSignature,
 }
@@ -632,7 +632,7 @@ pub enum RatifyCertVerifyError {
     /// Empty signer set after pool intersection.
     #[error("no signers after pool intersection")]
     EmptySignerSet,
-    /// Aggregate BLS check rejected the signature bundle.
+    /// Aggregate signature check rejected the signature bundle.
     #[error("aggregate signature did not verify")]
     BadAggregateSignature,
 }
@@ -640,7 +640,7 @@ pub enum RatifyCertVerifyError {
 impl Verify<&RatifyVerifyContext<'_>> for RatifyVote {
     type Error = RatifyVoteVerifyError;
 
-    /// Ratify-vote predicate: signer is in `active_pool` and the BLS
+    /// Ratify-vote predicate: signer is in `active_pool` and the
     /// signature verifies under the signer's pubkey over the canonical
     /// ratify-vote signing bytes.
     fn verify(&self, ctx: &RatifyVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {

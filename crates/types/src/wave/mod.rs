@@ -3,7 +3,7 @@
 //! Transactions in a block are partitioned into waves by their provision
 //! dependency set (the set of remote shards they need provisions from).
 //! All validators compute identical wave assignments from block contents,
-//! enabling wave-level BLS signature aggregation instead of per-transaction
+//! enabling wave-level signature aggregation instead of per-transaction
 //! signatures.
 //!
 //! # Wave Assignment
@@ -17,7 +17,7 @@
 //! # Wave Lifecycle
 //!
 //! 1. [`id::WaveId`] — identity, computed from block contents
-//! 2. [`vote::ExecutionVote`] — per-validator BLS vote on wave outcomes
+//! 2. [`vote::ExecutionVote`] — per-validator signed vote on wave outcomes
 //! 3. [`execution_certificate::ExecutionCertificate`] — aggregated 2f+1 shard-local certificate
 //! 4. [`certificate::WaveCertificate`] — cross-shard proof of finalization (holds ECs directly)
 //! 5. [`finalized::FinalizedWave`] — all data needed for block commit
@@ -444,7 +444,7 @@ mod tests {
         use crate::{AggregateSignature, GlobalReceiptRoot, SignerBitfield, TxOutcome};
 
         // Encode an EC where global_receipt_root is ZERO but tx_outcomes is
-        // a non-empty list whose merkle root is non-zero. The BLS aggregate
+        // a non-empty list whose merkle root is non-zero. The signature aggregate
         // commits only to (root, count); without the decode-time check a
         // peer could ship this through every downstream consumer.
         let wave_id = make_wave_id(0, BlockHeight::new(7), &[1]);

@@ -17,7 +17,7 @@ use crate::{MessageClass, NetworkMessage, RatifyVote, Verifiable};
 /// the inner vote.
 ///
 /// The inner [`RatifyVote`] is self-authenticating — it carries the
-/// signer id and a BLS signature. Each validator publishes a distinct
+/// signer id and a signature. Each validator publishes a distinct
 /// vote with their own signature, so per-publisher bytes differ and
 /// gossipsub's bytes-id dedup handles accidental re-publications
 /// without an explicit content-key dedup.

@@ -248,7 +248,7 @@ pub struct ShardCoordinator {
     latest_qc: Option<Verified<QuorumCertificate>>,
 
     /// The snap-synced boundary anchor's QC, structurally bound to the
-    /// beacon-attested anchor by the bootstrap but not yet BLS-verified.
+    /// beacon-attested anchor by the bootstrap but not yet signature-verified.
     /// Verified against the schedule-resolved committee and adopted as
     /// `latest_qc` on the first opportunity — the parent QC the fresh
     /// committee's first block past the anchor extends. Cleared on
@@ -2009,7 +2009,7 @@ impl ShardCoordinator {
             actions = self.start_block_sync(parent_height);
         }
 
-        // Defer adoption until the BLS signature has been verified. Without
+        // Defer adoption until the signature has been verified. Without
         // this gate a Byzantine proposer can pass `validate_header` (which
         // only checks signer-power, not signatures) and have us unlock vote
         // locks / fire two-chain commit on a forged QC. The vote-flow path
@@ -2103,7 +2103,7 @@ impl ShardCoordinator {
 
     /// Adopt `qc` as the new `high_qc` (`latest_qc`) if it sits in a higher
     /// round than the one we hold, advance the view past it, and fire
-    /// two-chain commit. Caller MUST have confirmed the QC's BLS signature (or
+    /// two-chain commit. Caller MUST have confirmed the QC's signature (or
     /// it's the genesis QC) — see [`Self::absorb_parent_qc_from_header`] for
     /// the consensus-path entry and [`Self::on_qc_signature_verified`] for the
     /// post-verify entry.
@@ -2206,7 +2206,7 @@ impl ShardCoordinator {
         // quorum pre-check (`None`) when the parent QC is genesis (no quorum to
         // check) or when `h-1`'s header hasn't arrived, so its committee can't
         // be resolved. The pre-check is a cheap DoS filter; the parent QC is
-        // fully BLS-verified against the exact committee before this node votes,
+        // fully signature-verified against the exact committee before this node votes,
         // once `h-1` lands. Substituting `committee(h)` here would run the
         // pre-check against the wrong committee at an epoch boundary.
         let parent_committee = (!header.parent_qc().is_genesis())
@@ -2426,7 +2426,7 @@ impl ShardCoordinator {
             // Check if we've already verified this exact QC. The cache hit
             // must match byte-for-byte, not just by `block_hash` — see
             // `absorb_parent_qc_from_header` for the same trust gap. A
-            // mismatch falls through to BLS verification rather than being
+            // mismatch falls through to signature verification rather than being
             // accepted.
             let qc_block_hash = header.parent_qc().block_hash();
             if self
@@ -2823,7 +2823,7 @@ impl ShardCoordinator {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Handle a locally-produced, pre-verified block vote. Skips the
-    /// BLS batch path — the vote is admitted directly to the verified
+    /// batch-verify path — the vote is admitted directly to the verified
     /// tally. Wire-arrived votes route through
     /// [`Self::on_unverified_block_vote`].
     #[instrument(skip(self, topology_schedule, vote), fields(
@@ -2908,7 +2908,7 @@ impl ShardCoordinator {
 
     /// Admit a validator's "ready on shard" signal into the local pool.
     ///
-    /// `IoLoop` has already BLS-verified the signal against the sender's
+    /// `IoLoop` has already signature-verified the signal against the sender's
     /// pubkey. This call gates on local-shard membership (a multi-shard
     /// host's `IoLoop` fans the notification out to every hosted shard;
     /// the wrong shard's pool drops here) and on the signal's window
@@ -4385,7 +4385,7 @@ impl ShardCoordinator {
             }
         };
 
-        // Quorum-power gate: `VerifyQcSignature` only checks the BLS
+        // Quorum-power gate: `VerifyQcSignature` only checks the
         // aggregation, not whether the signers represent ≥ 2f+1 of voting
         // power. Without this check a single Byzantine signer suffices to
         // pass and fork the local chain. Mirrors the consensus-path gate
@@ -4806,7 +4806,7 @@ impl ShardCoordinator {
         }))
     }
 
-    /// Screen a wire timeout, then delegate its BLS share verification to the
+    /// Screen a wire timeout, then delegate its signature share verification to the
     /// consensus crypto pool. The verified share returns as
     /// `ProtocolEvent::VerifiedTimeoutReceived` and is tallied by
     /// [`Self::on_verified_timeout`] — keeping per-timeout pairing checks off
@@ -4830,7 +4830,7 @@ impl ShardCoordinator {
             return Vec::new();
         };
         // Only this shard's committee drives its pacemaker. Reject outsiders
-        // before spending a BLS verify on them; `on_verified_timeout` re-checks
+        // before spending a signature verify on them; `on_verified_timeout` re-checks
         // the same bound for locally echoed timeouts.
         if self
             .committee_timeout_power(committee, timeout.voter())
@@ -4994,7 +4994,7 @@ impl ShardCoordinator {
         let Some(committee) = self.tip_committee(topology_schedule) else {
             return Vec::new();
         };
-        // A verified BLS share proves who signed, not that the signer sits in
+        // A verified signature share proves who signed, not that the signer sits in
         // the committee whose 2f+1 the pacemaker measures against. Restrict the
         // tally to the local committee: the quorum total is committee-scoped, so
         // a globally-registered validator from another shard must not count
@@ -6552,7 +6552,7 @@ mod tests {
     }
 
     /// `absorb_parent_qc_from_header` must NOT mutate `latest_qc` until the
-    /// parent QC's BLS signature has been verified — otherwise a Byzantine
+    /// parent QC's signature has been verified — otherwise a Byzantine
     /// proposer can forge a signers-pass-but-signature-invalid QC and have
     /// us advance the chain (and the view, via `advance_view_for_qc`) on a
     /// non-existent quorum.
@@ -6620,7 +6620,7 @@ mod tests {
         );
 
         // latest_qc must still be the pre-header value — adoption is gated
-        // on BLS verification, which hasn't happened yet.
+        // on signature verification, which hasn't happened yet.
         assert_eq!(
             state.latest_qc.as_deref().map(QuorumCertificate::height),
             prior_latest_qc.as_deref().map(QuorumCertificate::height),
@@ -6628,7 +6628,7 @@ mod tests {
         );
     }
 
-    /// After successful BLS verification, the deferred `latest_qc`
+    /// After successful signature verification, the deferred `latest_qc`
     /// adoption should run as part of `on_qc_signature_verified` — so
     /// adoption is just one verify-round late, not lost entirely.
     #[test]
@@ -7203,8 +7203,8 @@ mod tests {
 
     #[test]
     fn on_unverified_timeout_delegates_committee_share() {
-        // Wire timeouts are screened on the shard loop thread, then their BLS
-        // share is verified off-thread via `Action::VerifyTimeout`. Outsiders,
+        // Wire timeouts are screened on the shard loop thread, then their
+        // signature share is verified off-thread via `Action::VerifyTimeout`. Outsiders,
         // stale rounds, and already-tallied voters are dropped before delegating
         // — no pairing check is spent on a share that would be discarded.
         let (mut state, topology_schedule) = make_test_state();
@@ -7977,13 +7977,13 @@ mod tests {
             |_| None,
         );
 
-        // The forged QC must trigger BLS verification rather than being
+        // The forged QC must trigger signature verification rather than being
         // accepted as a cache hit.
         assert!(
             actions
                 .iter()
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
-            "forged QC reusing cached block_hash must still trigger BLS verification"
+            "forged QC reusing cached block_hash must still trigger signature verification"
         );
 
         // And `latest_qc` must not have been mutated to reflect the forged
@@ -8759,7 +8759,7 @@ mod tests {
     fn test_sync_block_with_subquorum_qc_is_rejected_before_verification() {
         // A synced block whose QC has only one signer in a 4-validator
         // committee (1f+1, not 2f+1) must be rejected before reaching the
-        // BLS-only `VerifyQcSignature` action. Without this gate a Byzantine
+        // signature-only `VerifyQcSignature` action. Without this gate a Byzantine
         // peer can fork the local chain by serving a self-signed block.
         let (mut state, topology_schedule) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
@@ -8822,7 +8822,7 @@ mod tests {
             !actions
                 .iter()
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
-            "must not reach BLS verification with sub-quorum signers"
+            "must not reach signature verification with sub-quorum signers"
         );
     }
 

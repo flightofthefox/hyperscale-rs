@@ -58,7 +58,7 @@ pub fn vrf_proposal(id: u64, epoch: Epoch) -> BeaconProposal {
 }
 
 /// Build a `BeaconProposal` whose VRF proof has been tampered with so
-/// verification fails — the BLS sig is broken. The derived output
+/// verification fails — the signature is broken. The derived output
 /// tracks the tampered proof automatically.
 pub fn malformed_vrf_proposal(id: u64, epoch: Epoch) -> BeaconProposal {
     let p = vrf_proposal(id, epoch);

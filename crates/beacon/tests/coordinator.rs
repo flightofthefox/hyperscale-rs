@@ -49,7 +49,7 @@ fn four_party_cluster_converges_on_per_epoch_state() {
     // validator id), and lands at byte-identical `BeaconState`. The
     // wrapping SPC cert is a different aggregate per replica (each
     // assembles its own QC3 from the first quorum it sees, so the
-    // BLS aggregate differs) and therefore the surrounding
+    // signature aggregate differs) and therefore the surrounding
     // `block_hash` also differs — but the consensus output and
     // post-apply state are what the chain depends on.
     for e in 0..TARGET_COMMITS {

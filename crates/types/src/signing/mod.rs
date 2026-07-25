@@ -25,7 +25,7 @@
 //! | `HYPERSCALE_PC_VRF_v1` | Beacon VRF reveal (per-epoch randomness contribution) |
 //! | `HYPERSCALE_RATIFY_VOTE_v1` | Epoch ratification vote + aggregated ratify cert sig |
 //! | `HYPERSCALE_READY_SIGNAL_v1` | Validator "ready on shard" signals |
-//! | `HYPERSCALE_VALIDATOR_POSSESSION_PROOF_v1` | Validator BLS proof-of-possession at registration |
+//! | `HYPERSCALE_VALIDATOR_POSSESSION_PROOF_v1` | Validator proof-of-possession at registration |
 //!
 //! # Usage
 //!

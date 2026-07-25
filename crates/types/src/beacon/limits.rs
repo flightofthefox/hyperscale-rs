@@ -48,7 +48,7 @@ pub const MAX_WITNESSES_PER_SHARD: usize = 4096;
 /// [`BeaconProposal`](crate::BeaconProposal).
 ///
 /// Slashing evidence rides its own reserved slots so a flood of routine
-/// shard witnesses can't crowd it out. Each entry costs two BLS verifies
+/// shard witnesses can't crowd it out. Each entry costs two verifies
 /// at admission; the cap times the committee size — gated to one
 /// evaluation per proposer per epoch by the coordinator's dedup — bounds
 /// a Byzantine proposer's forged-evidence verification cost.

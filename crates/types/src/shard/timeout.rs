@@ -5,7 +5,7 @@
 //! certified block. Its verified form is `Verified<Timeout>`; predicate at
 //! [`impl Verify<&TimeoutContext<'_>>`](Verify::verify) below.
 //!
-//! The BLS share covers only `(shard, round)`. The carried `high_qc` is a
+//! The signature share covers only `(shard, round)`. The carried `high_qc` is a
 //! self-authenticating quorum certificate (its own 2f+1 aggregate), so a
 //! recipient verifies it as a QC against the committee rather than trusting a
 //! field bound in the timeout signature — which is what lets HotStuff-2's
@@ -109,7 +109,7 @@ impl Timeout {
         self.voter
     }
 
-    /// BLS signature over the domain-separated signing message.
+    /// Signature over the domain-separated signing message.
     #[must_use]
     pub const fn signature(&self) -> ConsensusSignature {
         self.signature
@@ -145,7 +145,7 @@ impl Timeout {
 /// Inputs the [`Timeout`] verifier reads against. Borrows everything; nothing
 /// is consumed.
 ///
-/// Note this checks only the timeout's *own* BLS share. The carried `high_qc`
+/// Note this checks only the timeout's *own* signature share. The carried `high_qc`
 /// is a QC and must be verified separately (against the committee) before it
 /// is adopted — see the pacemaker.
 #[derive(Debug, Clone, Copy)]
@@ -161,20 +161,20 @@ pub struct TimeoutContext<'a> {
 /// Failure modes of [`Timeout`] verification.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum TimeoutVerifyError {
-    /// The BLS signature did not validate against the voter's public key
+    /// The signature did not validate against the voter's public key
     /// for the timeout's domain-separated signing message.
-    #[error("BLS signature invalid")]
+    #[error("signature invalid")]
     InvalidSignature,
 }
 
-/// Construction asserts: the BLS signature on the timeout validates against
+/// Construction asserts: the signature on the timeout validates against
 /// the voter's public key for the domain-separated signing message
 /// `timeout_message(network, shard, round)`. It does **not** assert anything
 /// about the carried `high_qc` — that is verified as a QC where it is adopted.
 ///
 /// Construction goes through one of two gates:
 ///
-/// - [`<Timeout as Verify>::verify`](Verify::verify) — runs the BLS signature
+/// - [`<Timeout as Verify>::verify`](Verify::verify) — runs the signature
 ///   check against the voter's public key.
 /// - [`Verified::<Timeout>::sign_local`] — signs a fresh timeout with the
 ///   caller's key; the act of signing is the predicate witness.

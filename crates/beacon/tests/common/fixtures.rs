@@ -10,7 +10,7 @@ use hyperscale_types::{
 /// from a `(test_seed, validator_id)` pair so each test gets a stable
 /// set of keypairs without persistent fixture files.
 pub struct Committee {
-    /// Per-validator BLS secret keys, indexed positionally.
+    /// Per-validator BLS signers, indexed positionally.
     pub keys: Vec<BlsSigner>,
     /// Per-validator `(ValidatorId, public_key)` pairs, indexed
     /// positionally and in the same order as `keys`. Suitable for
@@ -20,7 +20,7 @@ pub struct Committee {
 
 impl Committee {
     /// Construct an `n`-member committee whose validator ids are
-    /// `0..n` and whose BLS keys are deterministic functions of
+    /// `0..n` and whose consensus keys are deterministic functions of
     /// `(seed, validator_id)`.
     #[must_use]
     pub fn new(n: usize, seed: u64) -> Self {

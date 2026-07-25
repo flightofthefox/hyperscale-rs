@@ -65,7 +65,7 @@ enum RootStage {
 /// Block header pending QC signature verification.
 ///
 /// When we receive a block header with a non-genesis `parent_qc`, we need to
-/// verify the QC's aggregated BLS signature before voting. This struct
+/// verify the QC's aggregated signature before voting. This struct
 /// tracks the block header while waiting for verification.
 #[derive(Debug, Clone)]
 pub struct PendingQcVerification {
@@ -256,7 +256,7 @@ pub struct VerificationPipeline {
     /// Cache of already-verified QCs, keyed by the QC's `block_hash` (the
     /// block the QC certifies). Stores the full canonical QC so cache hits
     /// can confirm the candidate QC is byte-equal to the verified one before
-    /// skipping BLS verification — without this, a Byzantine peer could
+    /// skipping signature verification — without this, a Byzantine peer could
     /// reuse a known-cached `block_hash` while fabricating `signers`,
     /// `round`, or `parent_block_hash` and have those fields adopted into
     /// `latest_qc` / drive view sync without re-verification.

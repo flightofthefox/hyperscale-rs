@@ -1,4 +1,4 @@
-//! [`ExecutionCertificate`] — aggregated 2f+1 BLS signature over a wave's
+//! [`ExecutionCertificate`] — aggregated 2f+1 signature over a wave's
 //! per-tx outcomes.
 //!
 //! [`ExecutionCertificate`] is the raw wire form. Its verified form is
@@ -26,7 +26,7 @@ use crate::{
 
 /// Aggregated certificate for an execution wave.
 ///
-/// Contains the BLS aggregated signature from 2f+1 validators plus per-tx
+/// Contains the signature aggregated signature from 2f+1 validators plus per-tx
 /// outcomes so remote shards can extract individual transaction results.
 pub struct ExecutionCertificate {
     wave_id: WaveId,
@@ -117,7 +117,7 @@ impl<D: Decoder<NoCustomValueKind>> Decode<NoCustomValueKind, D> for ExecutionCe
         let tx_outcomes = decode_bounded_vec::<_, TxOutcome>(decoder, MAX_TXS_PER_BLOCK)?;
         let aggregated_signature: AggregateSignature = decoder.decode()?;
         let signers: SignerBitfield = decoder.decode()?;
-        // The BLS aggregate only commits to (global_receipt_root, tx_count),
+        // The signature aggregate only commits to (global_receipt_root, tx_count),
         // not to tx_outcomes content. Without this check a Byzantine
         // aggregator could ship a signature-valid EC whose outcomes don't
         // hash to the signed root, slipping bogus per-tx results past every
@@ -187,7 +187,7 @@ impl ExecutionCertificate {
     /// Consensus height at which quorum was reached.
     ///
     /// Must match the `vote_anchor_ts` in the aggregated votes. Needed to
-    /// reconstruct the BLS signing message for signature verification.
+    /// reconstruct the signing message for signature verification.
     #[must_use]
     pub const fn vote_anchor_ts(&self) -> WeightedTimestamp {
         self.vote_anchor_ts
@@ -205,7 +205,7 @@ impl ExecutionCertificate {
         &self.tx_outcomes
     }
 
-    /// BLS aggregated signature from 2f+1 validators.
+    /// signature aggregated signature from 2f+1 validators.
     #[must_use]
     pub const fn aggregated_signature(&self) -> AggregateSignature {
         self.aggregated_signature
@@ -309,14 +309,14 @@ pub enum ExecutionCertificateVerifyError {
     /// signature; any other pairing is ill-formed.
     #[error("empty signer set paired with non-zero aggregated signature")]
     EmptySignersWithNonZeroSignature,
-    /// The aggregated BLS signature did not validate against the
+    /// The aggregated signature did not validate against the
     /// aggregated public key derived from `signers` over the canonical
     /// signing message. Also covers public-key aggregation failures.
-    #[error("aggregated BLS signature invalid")]
+    #[error("aggregated signature invalid")]
     BadAggregatedSignature,
 }
 
-/// Construction asserts: the aggregated BLS signature validates against
+/// Construction asserts: the aggregated signature validates against
 /// the public key formed by aggregating `public_keys[i]` for every `i`
 /// set in `signers`, over the canonical [`exec_vote_message`] derived
 /// from the certificate's `(vote_anchor_ts, wave_id, shard_id,
@@ -383,10 +383,10 @@ impl Verified<ExecutionCertificate> {
     ///
     /// # Panics
     ///
-    /// Panics if `votes` is empty, or if BLS aggregation of the
+    /// Panics if `votes` is empty, or if signature aggregation of the
     /// individually-verified signatures fails — both indicate an
     /// upstream invariant violation (predicate bypass, sub-quorum
-    /// input, or BLS library bug).
+    /// input, or scheme library bug).
     #[must_use]
     pub fn aggregate(
         verifier: &dyn Verifier,
@@ -450,7 +450,7 @@ impl Verified<ExecutionCertificate> {
         // those signatures and mirroring the committee indices in
         // `signers` produces an EC whose predicate is structurally
         // equivalent: the aggregated pubkey at verify time recombines
-        // the same per-validator pubkeys, and BLS aggregate-verify
+        // the same per-validator pubkeys, and signature aggregate-verify
         // succeeds.
         Self::new_unchecked(ExecutionCertificate::new(
             wave_id.clone(),
@@ -466,7 +466,7 @@ impl Verified<ExecutionCertificate> {
     /// time. ECs ride into storage embedded inside `Verified<FinalizedWave>`
     /// values inside the `Verified<CertifiedBlock>` argument to
     /// `commit_block`, so unverified ECs can't reach the write path.
-    /// Storage rehydration paths use this gate to avoid re-running BLS
+    /// Storage rehydration paths use this gate to avoid re-running
     /// aggregation on every load.
     #[must_use]
     pub const fn from_persisted(cert: ExecutionCertificate) -> Self {
@@ -563,7 +563,7 @@ mod tests {
     }
 
     /// A certificate whose `aggregated_signature` was tampered with
-    /// fails the BLS check; the verifier returns `BadAggregatedSignature`.
+    /// fails the signature check; the verifier returns `BadAggregatedSignature`.
     #[test]
     fn verify_rejects_bad_aggregated_signature() {
         let net = NetworkDefinition::simulator();
@@ -608,7 +608,7 @@ mod tests {
     }
 
     /// A certificate with an empty signer set but a non-zero aggregated
-    /// signature is ill-formed and rejected before the BLS check runs.
+    /// signature is ill-formed and rejected before the signature check runs.
     #[test]
     fn verify_rejects_empty_signers_with_nonzero_signature() {
         let net = NetworkDefinition::simulator();
@@ -729,7 +729,7 @@ mod tests {
     }
 
     /// An EC verified against a public-key slice that doesn't match the
-    /// signing committee fails the BLS check.
+    /// signing committee fails the signature check.
     #[test]
     fn verify_rejects_wrong_public_keys() {
         let net = NetworkDefinition::simulator();

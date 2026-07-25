@@ -18,7 +18,7 @@ use hyperscale_types::{
     ShardId, TopologySnapshot, ValidatorId,
 };
 
-/// Maps `ValidatorId` to BLS public key for identity verification (e.g. validator-bind).
+/// Maps `ValidatorId` to consensus public key for identity verification (e.g. validator-bind).
 ///
 /// Derived from the topology snapshot inside network impls when
 /// [`Network::update_topology`] is called.
@@ -249,7 +249,7 @@ pub trait Network: Send + Sync + 'static {
     /// verification.
     ///
     /// Called by the `io_loop` when topology changes. The network impl reads
-    /// shard committees, validator BLS pubkeys, and the local validator set
+    /// shard committees, validator consensus pubkeys, and the local validator set
     /// from the snapshot — callers don't pass any of that explicitly.
     ///
     /// Default is a no-op (simulation impls without committee routing don't

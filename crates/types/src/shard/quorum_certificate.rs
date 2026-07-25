@@ -16,7 +16,7 @@ use crate::{
 
 /// A quorum certificate proving 2f+1 validators voted for a block.
 ///
-/// Contains an aggregated BLS signature from the voting validators.
+/// Contains an aggregated signature from the voting validators.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct QuorumCertificate {
     block_hash: BlockHash,
@@ -121,7 +121,7 @@ impl QuorumCertificate {
         &self.signers
     }
 
-    /// Aggregated BLS signature from all signers.
+    /// Aggregated signature from all signers.
     #[must_use]
     pub const fn aggregated_signature(&self) -> AggregateSignature {
         self.aggregated_signature
@@ -260,14 +260,14 @@ pub enum QcVerifyError {
     /// `verify` via [`VerifiedQuorumCertificate::genesis`].
     #[error("QC has no signers")]
     NoSigners,
-    /// Aggregating the selected signer public keys failed (the BLS
+    /// Aggregating the selected signer public keys failed (the scheme
     /// library rejected the input — typically an empty aggregate or an
     /// internal validation failure).
     #[error("failed to aggregate signer public keys")]
     PublicKeyAggregationFailed,
     /// The aggregated signature did not validate against the aggregated
     /// public keys for the QC's signing message.
-    #[error("aggregated BLS signature invalid")]
+    #[error("aggregated signature invalid")]
     InvalidSignature,
     /// The signers' combined voting power is below the quorum threshold.
     #[error("insufficient quorum power: have {have:?}, need {need:?}")]
@@ -309,7 +309,7 @@ impl Verified<QuorumCertificate> {
     /// Aggregate a verified vote set into a `Verified<QuorumCertificate>`.
     ///
     /// Sorts by committee index so the signer bitfield matches the order
-    /// the verifier will use, aggregates the BLS signatures, and computes
+    /// the verifier will use, aggregates the signatures, and computes
     /// the stake-weighted timestamp clamped to `parent_weighted_timestamp`
     /// (so the resulting QC's `weighted_timestamp` is monotonically `>=`
     /// the parent's).
@@ -317,7 +317,7 @@ impl Verified<QuorumCertificate> {
     /// Construction asserts:
     /// 1. Every vote was verified — witnessed by the typed
     ///    `Verified<BlockVote>` input.
-    /// 2. BLS aggregation over the votes' signatures succeeded.
+    /// 2. signature aggregation over the votes' signatures succeeded.
     ///
     /// The caller is responsible for ensuring `verified_votes` is
     /// non-empty and that the combined voting power clears the quorum
@@ -327,7 +327,7 @@ impl Verified<QuorumCertificate> {
     /// aggregated-signature check and a quorum-power check, so the
     /// caller's quorum pre-check is what makes the typed result honest.
     ///
-    /// Returns `None` when the BLS aggregation library rejects the
+    /// Returns `None` when the signature aggregation library rejects the
     /// signature set (empty input or internal validation failure).
     #[must_use]
     #[allow(clippy::too_many_arguments)] // mirrors the QC's signed-over fields
@@ -372,8 +372,8 @@ impl Verified<QuorumCertificate> {
         };
 
         // SAFETY: every vote in `verified_votes` carries a type-level
-        // claim that its BLS signature validates against the voter's
-        // pubkey for `block_vote_message`. The BLS aggregation just
+        // claim that its signature validates against the voter's
+        // pubkey for `block_vote_message`. The signature aggregation just
         // succeeded against those same signatures, so the resulting
         // aggregated signature verifies against the matching
         // aggregated public key. Quorum is the caller's precondition.
@@ -390,7 +390,7 @@ impl Verified<QuorumCertificate> {
     }
 }
 
-/// Construction asserts: the aggregated BLS signature over the QC's
+/// Construction asserts: the aggregated signature over the QC's
 /// signing message validates against the aggregated public keys selected
 /// by the signer bitfield, **and** the signers' combined voting power
 /// meets the quorum threshold. The QC↔block linkage check
@@ -588,7 +588,7 @@ mod tests {
         );
 
         // Tamper: replace the aggregated signature with one signed over a
-        // different message, so the BLS check fails on aggregation.
+        // different message, so the signature check fails on aggregation.
         let net = NetworkDefinition::simulator();
         let wrong_msg = block_vote_message(
             &net,

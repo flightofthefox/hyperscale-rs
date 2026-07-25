@@ -3,7 +3,7 @@
 //! Implements the transaction execution layer as a pure, synchronous state
 //! machine. The [`ExecutionCoordinator`] consumes `ProtocolEvent`s from the
 //! shard consensus layer and the network, drives the wave/EC lifecycle, and emits
-//! `Action`s for asynchronous work (BLS verification, state provisioning,
+//! `Action`s for asynchronous work (signature verification, state provisioning,
 //! transaction execution against substate).
 //!
 //! # Wave lifecycle

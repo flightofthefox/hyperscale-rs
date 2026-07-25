@@ -6,7 +6,7 @@
 //! ## Round Voting
 //!
 //! Validators vote at each block commit where their wave is complete.
-//! Votes include `vote_anchor_ts` in the BLS-signed message, so votes at
+//! Votes include `vote_anchor_ts` in the signed message, so votes at
 //! different heights have different signatures and cannot be aggregated.
 //! The tracker groups by `(global_receipt_root, vote_anchor_ts)` and checks quorum
 //! per group.
@@ -26,7 +26,7 @@ use hyperscale_types::{
 
 /// Key for grouping votes: `(global_receipt_root, vote_anchor_ts)`.
 ///
-/// Votes at different heights have different BLS signatures and cannot be
+/// Votes at different heights have different signatures and cannot be
 /// aggregated together. This prevents stale votes from combining with new
 /// ones if an abort intent changes the `global_receipt_root` between heights.
 type VoteKey = (GlobalReceiptRoot, WeightedTimestamp);
@@ -35,7 +35,7 @@ type VoteKey = (GlobalReceiptRoot, WeightedTimestamp);
 ///
 /// After executing all transactions in a wave, validators create an execution
 /// vote on the receipt root. This tracker collects votes and determines when
-/// quorum is reached for BLS signature aggregation into an execution certificate.
+/// quorum is reached for signature aggregation into an execution certificate.
 #[derive(Debug)]
 pub struct VoteTracker {
     /// Wave identifier.

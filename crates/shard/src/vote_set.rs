@@ -285,7 +285,7 @@ impl VoteSet {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Add an already-verified vote to the set — used for own votes, which
-    /// we just signed and so can treat as verified without a BLS check.
+    /// we just signed and so can treat as verified without a signature check.
     /// Also used by tests that want to seed verified state directly.
     /// Returns true on insertion, false if rejected (out-of-range committee
     /// index or duplicate).

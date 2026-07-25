@@ -1,7 +1,7 @@
 //! Pure execution functions invoked from the node's delegated-action dispatcher.
 //!
 //! These functions implement the asynchronous side of the execution
-//! state machine: BLS verification, execution-vote aggregation into
+//! state machine: signature verification, execution-vote aggregation into
 //! [`ExecutionCertificate`]s, transaction execution against a
 //! [`SubstateView`], and cross-shard provisioning requests. They are
 //! kept free of node/runner concerns so the dispatcher only handles
@@ -344,7 +344,7 @@ where
 
             // Send vote to the wave leader (unicast). When the leader is a
             // colocated vnode the local-dispatch fast path preserves the
-            // `Verifiable::Verified` marker, letting the handler skip BLS
+            // `Verifiable::Verified` marker, letting the handler skip
             // re-verification of our own signature.
             if leader != validator_id {
                 let batch_msg =

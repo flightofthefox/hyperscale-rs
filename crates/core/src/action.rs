@@ -436,7 +436,7 @@ pub enum Action {
 
     /// Aggregate execution votes into an `ExecutionCertificate` (quorum reached).
     ///
-    /// Performs BLS signature aggregation on execution votes.
+    /// Performs signature aggregation on execution votes.
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::ExecutionCertificateAggregated` when complete.
     AggregateExecutionCertificate {
@@ -470,7 +470,7 @@ pub enum Action {
     /// Returns `ProtocolEvent::ExecutionCertificateSignatureVerified` when complete.
     VerifyExecutionCertificateSignature {
         /// The execution certificate to verify. A
-        /// [`Verifiable::Verified`] wrapper short-circuits BLS
+        /// [`Verifiable::Verified`] wrapper short-circuits
         /// verification.
         certificate: Verifiable<ExecutionCertificate>,
         /// Public keys of the signers (in committee order).
@@ -480,12 +480,12 @@ pub enum Action {
     /// Verify every EC inside a fetched [`FinalizedWave`] in one async dispatch.
     ///
     /// Used by `ExecutionCoordinator::admit_finalized_wave` to keep the
-    /// state-machine call off the BLS verification critical path. Carries
+    /// state-machine call off the signature verification critical path. Carries
     /// per-EC public-key vectors aligned with `wave.execution_certificates()`.
     /// Returns `ProtocolEvent::FinalizedWaveVerified` when complete.
     VerifyFinalizedWave {
-        /// The wave whose every EC needs BLS verification before admission.
-        /// A [`Verifiable::Verified`] wrapper short-circuits BLS
+        /// The wave whose every EC needs signature verification before admission.
+        /// A [`Verifiable::Verified`] wrapper short-circuits
         /// verification.
         wave: Arc<Verifiable<FinalizedWave>>,
         /// Public keys for each EC, indexed parallel to
@@ -493,7 +493,7 @@ pub enum Action {
         ec_public_keys: Vec<Vec<ConsensusPublicKey>>,
     },
 
-    /// Verify a Quorum Certificate's aggregated BLS signature **and**
+    /// Verify a Quorum Certificate's aggregated signature **and**
     /// confirm the signers carry quorum-meeting voting power. Both checks
     /// together constitute the [`Verified<QuorumCertificate>`] predicate.
     ///
@@ -507,7 +507,7 @@ pub enum Action {
         /// verification). When the wrapper is already
         /// [`Verifiable::Verified`] — e.g. the caller hit a cached
         /// verified value — the handler short-circuits and emits the
-        /// verified result without rerunning BLS aggregation.
+        /// verified result without rerunning signature aggregation.
         qc: Verifiable<QuorumCertificate>,
         /// Public keys of the signers (pre-resolved by state machine from QC's signer bitfield).
         public_keys: Vec<ConsensusPublicKey>,
@@ -518,7 +518,7 @@ pub enum Action {
         block_hash: BlockHash,
     },
 
-    /// Verify a wire timeout's BLS share off-thread, then tally it.
+    /// Verify a wire timeout's signature share off-thread, then tally it.
     ///
     /// Emitted by the state machine after the cheap committee/shard screen
     /// passes. The consensus crypto pool checks the share against
@@ -529,14 +529,14 @@ pub enum Action {
     VerifyTimeout {
         /// The unverified timeout share to check.
         timeout: Timeout,
-        /// The voter's BLS public key, pre-resolved by the state machine from
+        /// The voter's public key, pre-resolved by the state machine from
         /// the topology (where the committee-membership gate also runs).
         voter_public_key: ConsensusPublicKey,
     },
 
     /// Verify a remote block header's QC for cross-shard deferral validation.
     ///
-    /// Verifies the aggregated BLS signature on the QC, checks voting power meets
+    /// Verifies the aggregated signature on the QC, checks voting power meets
     /// quorum, and confirms `block_hash` matches `hash(header)`.
     ///
     /// Delegated to `ConsensusCrypto` thread pool.
@@ -564,7 +564,7 @@ pub enum Action {
     /// proofs would stall the state machine if run inline. The dispatcher
     /// (which holds the topology schedule) resolves each QC's committee via
     /// [`ShardForkProof::resolve_committees`] and passes them here so the
-    /// handler runs pure BLS — the same emitter-resolves shape as
+    /// handler runs pure signature verification — the same emitter-resolves shape as
     /// [`Self::VerifyBeaconBlock`].
     ///
     /// Delegated to the consensus crypto pool. Returns
@@ -1181,7 +1181,7 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     /// Sign a PC round-1 vote over `v_in` and broadcast it to the SPC
     /// committee. Handler reconstructs the canonical signing bytes
-    /// from `(epoch, view, v_in)`, signs with the local BLS key,
+    /// from `(epoch, view, v_in)`, signs with the local signer,
     /// broadcasts the wire-form vote, and feeds the signed vote back
     /// to the state machine via `ProtocolEvent::PcVoteReceived` with
     /// `from = local validator`.
@@ -1332,7 +1332,7 @@ pub enum Action {
     },
 
     /// Sign and broadcast a [`RatifyVote`] globally. The action handler
-    /// signs the vote using the runner-held BLS key (the coordinator
+    /// signs the vote using the runner-held signer (the coordinator
     /// has no signing material), broadcasts the result over the global
     /// beacon-ratify topic, and loops the verified vote back to the
     /// state machine so the local ratification tracker pools its own
@@ -1355,7 +1355,7 @@ pub enum Action {
         block_hash: BeaconBlockHash,
     },
 
-    /// Verify a single-signer [`RatifyVote`] BLS signature. The result
+    /// Verify a single-signer [`RatifyVote`] signature. The result
     /// returns to the state machine carrying the typed verified handle
     /// on success.
     VerifyRatifyVote {
@@ -1403,7 +1403,7 @@ pub enum Action {
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
         /// Vote to verify. A [`Verifiable::Verified`] wrapper
-        /// short-circuits BLS dispatch.
+        /// short-circuits verify dispatch.
         vote: Verifiable<PcVote1>,
         /// Beacon committee at `epoch`, positional order.
         committee: Vec<(ValidatorId, ConsensusPublicKey)>,
@@ -1417,7 +1417,7 @@ pub enum Action {
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
         /// Vote to verify. A [`Verifiable::Verified`] wrapper
-        /// short-circuits BLS dispatch; the embedded round-1 QC's
+        /// short-circuits verify dispatch; the embedded round-1 QC's
         /// marker shortcuts its sub-check.
         vote: Box<Verifiable<PcVote2>>,
         /// Beacon committee at `epoch`, positional order.
@@ -1432,7 +1432,7 @@ pub enum Action {
         /// SPC view whose inner PC produced this vote.
         view: SpcView,
         /// Vote to verify. A [`Verifiable::Verified`] wrapper
-        /// short-circuits BLS dispatch; the embedded round-2 QC's
+        /// short-circuits verify dispatch; the embedded round-2 QC's
         /// marker shortcuts its sub-check.
         vote: Box<Verifiable<PcVote3>>,
         /// Beacon committee at `epoch`, positional order.

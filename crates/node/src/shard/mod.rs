@@ -337,7 +337,7 @@ where
 {
     /// Sender for this shard's own event channel — the destination for
     /// every callback this loop spawns (block-commit completions, fetch
-    /// results, BLS-verify outcomes) and every protocol event it pushes
+    /// results, signature-verify outcomes) and every protocol event it pushes
     /// back to itself.
     pub(crate) const fn event_sender(&self) -> &Sender<HostEvent> {
         &self.event_tx
@@ -500,7 +500,7 @@ where
                 self.drive_fetch::<BeaconProposalBinding>(FetchInput::Admitted { ids });
             }
 
-            // ── Certified header (gossip → BLS verify → state machine) ──
+            // ── Certified header (gossip → signature verify → state machine) ──
             ShardScopedInput::CommittedBlockGossipReceived {
                 certified_header,
                 sender,

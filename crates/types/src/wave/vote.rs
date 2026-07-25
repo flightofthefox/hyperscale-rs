@@ -84,7 +84,7 @@ impl ExecutionVote {
     /// BFT-authenticated anchor at which this vote was cast.
     ///
     /// Validators vote at each block commit where the wave is complete.
-    /// Including `vote_anchor_ts` in the BLS-signed message prevents
+    /// Including `vote_anchor_ts` in the signed message prevents
     /// cross-height aggregation, ensuring that if an abort intent changes
     /// the `global_receipt_root` between heights, stale votes cannot combine.
     #[must_use]
@@ -120,7 +120,7 @@ impl ExecutionVote {
     ///
     /// Carried alongside the vote so any aggregator can extract `tx_outcomes`
     /// directly from quorum votes when building the EC. Not included in the
-    /// BLS-signed message (`global_receipt_root` already commits to the content).
+    /// signed message (`global_receipt_root` already commits to the content).
     /// This avoids relying on each aggregator's local accumulator, which may
     /// have diverged due to different abort timing.
     #[must_use]
@@ -134,7 +134,7 @@ impl ExecutionVote {
         self.validator
     }
 
-    /// BLS signature over the vote signing message.
+    /// signature over the vote signing message.
     #[must_use]
     pub const fn signature(&self) -> ConsensusSignature {
         self.signature
@@ -205,7 +205,7 @@ pub struct ExecutionVoteContext<'a> {
 pub enum ExecutionVoteVerifyError {
     /// `tx_outcomes` does not hash to the claimed `global_receipt_root`.
     ///
-    /// The BLS signature covers `(root, count)` but not the unsigned
+    /// The signature covers `(root, count)` but not the unsigned
     /// `tx_outcomes` payload, so a Byzantine validator could otherwise
     /// ship tampered outcomes alongside an honest signed root. Catching
     /// the binding mismatch here keeps the verified-vote invariant
@@ -213,9 +213,9 @@ pub enum ExecutionVoteVerifyError {
     /// produce its claimed root.
     #[error("tx_outcomes do not hash to the claimed global_receipt_root")]
     OutcomesRootMismatch,
-    /// The BLS signature did not validate against the voter's public
+    /// The signature did not validate against the voter's public
     /// key for the vote's domain-separated signing message.
-    #[error("BLS signature invalid")]
+    #[error("signature invalid")]
     InvalidSignature,
 }
 
@@ -224,7 +224,7 @@ pub enum ExecutionVoteVerifyError {
 /// 1. `compute_global_receipt_root(self.tx_outcomes()) ==
 ///    self.global_receipt_root()` — binds the unsigned outcomes
 ///    payload to the signed root.
-/// 2. The BLS signature validates against the voter's public key for
+/// 2. The signature validates against the voter's public key for
 ///    the canonical [`exec_vote_message`].
 ///
 /// Construction goes through one of three gates:
@@ -233,7 +233,7 @@ pub enum ExecutionVoteVerifyError {
 ///   both checks against a single voter.
 /// - [`Verified::<ExecutionVote>::verify_batch`] — runs the same
 ///   predicate over a heterogeneous batch (votes may have different
-///   signing messages); uses the BLS same-message batch optimisation
+///   signing messages); uses the same-message batch optimisation
 ///   per signing-message group, with individual-verify fallback when
 ///   the group's batch verify fails.
 /// - [`Verified::<ExecutionVote>::sign_local`] — signs a fresh vote
@@ -322,14 +322,14 @@ impl Verified<ExecutionVote> {
     /// different `(vote_anchor_ts, wave_id, global_receipt_root,
     /// tx_count)` produce different signing messages — so the batch
     /// is internally grouped by signing message before running the
-    /// BLS same-message batch optimisation per group. On per-group
+    /// same-message batch optimisation per group. On per-group
     /// batch failure the implementation falls back to individual
     /// [`Verify::verify`] calls so a single forged signature doesn't
     /// poison the whole group.
     ///
     /// Votes whose `tx_outcomes` don't hash to their claimed
     /// `global_receipt_root` are dropped before signature
-    /// verification: the BLS signature only commits to `(root,
+    /// verification: the signature only commits to `(root,
     /// tx_count)`, so a vote that signs an honest root while
     /// shipping tampered outcomes is self-inconsistent. Filtering
     /// here (rather than defending at aggregation) keeps the
@@ -472,7 +472,7 @@ mod tests {
         )
     }
 
-    /// Honest vote: outcomes hash to the claimed root and the BLS
+    /// Honest vote: outcomes hash to the claimed root and the
     /// signature validates against the voter's key.
     #[test]
     fn verify_accepts_honest_vote() {
@@ -490,7 +490,7 @@ mod tests {
     }
 
     /// Outcomes whose merkle root doesn't match the claimed
-    /// `global_receipt_root` are rejected before the BLS check runs.
+    /// `global_receipt_root` are rejected before the signature check runs.
     #[test]
     fn verify_rejects_outcomes_root_mismatch() {
         let net = NetworkDefinition::simulator();
@@ -538,7 +538,7 @@ mod tests {
     }
 
     /// A vote signed by one key but presented with a different
-    /// public key fails the BLS check.
+    /// public key fails the signature check.
     #[test]
     fn verify_rejects_bad_signature() {
         let net = NetworkDefinition::simulator();

@@ -443,7 +443,7 @@ impl CoordinatorSim {
 
     /// Like [`Self::deliver_boundary_crossing`], but `C`'s parent QC over
     /// `B` carries a **forged** aggregate signature — signer bits set, but
-    /// a zero BLS aggregate that no committee actually produced. The
+    /// a zero signature aggregate that no committee actually produced. The
     /// crossing detector still records it (linkage and timestamps are
     /// well-formed), so a proposer reports it, but the beacon's `2f+1`
     /// admission check rejects every peer's proposal carrying it. Models a
@@ -513,7 +513,7 @@ impl CoordinatorSim {
     }
 
     /// Build a genuine canonical QC over boundary block `b` — a real
-    /// `2f+1` BLS aggregate of `shard`'s committee, the form the beacon's
+    /// `2f+1` signature aggregate of `shard`'s committee, the form the beacon's
     /// boundary-QC admission verification authenticates. The committee is
     /// resolved at `b`'s parent-QC weighted timestamp (the window `b` was
     /// produced in), matching how the beacon resolves it. Every member
@@ -1590,7 +1590,7 @@ fn make_source_header_with_parent_qc(
 
 /// Build a verified source-shard `CertifiedBlockHeader` whose `parent_qc`
 /// names `parent_hash` and carries `parent_wt`, the parent's canonical
-/// weighted timestamp — a placeholder parent QC (not BLS-genuine) used for
+/// weighted timestamp — a placeholder parent QC (not cryptographically genuine) used for
 /// the boundary block `B`, whose own QC the beacon doesn't verify (only
 /// the canonical QC over `B`, supplied as its child's `parent_qc`, is).
 /// `witness_root` commits the block's beacon-witness accumulator.

@@ -499,7 +499,7 @@ impl TopologySnapshot {
     /// Get the Radix network this topology is operating on.
     ///
     /// Used by signing-message construction sites to bind `network.id`
-    /// into BLS-signed consensus messages, so signatures don't replay
+    /// into signed consensus messages, so signatures don't replay
     /// across networks.
     #[must_use]
     pub const fn network(&self) -> &NetworkDefinition {

@@ -14,7 +14,7 @@ use crate::{
 /// times out on a view without observing a leader proposal.
 ///
 /// The inner [`SpcEmptyViewMsg`] is content-signed — it carries the
-/// signer id and a BLS signature over the canonical empty-view signing
+/// signer id and a signature over the canonical empty-view signing
 /// bytes (`skip_target` under [`DOMAIN_PC_EMPTY_VIEW`], bound to the
 /// epoch via `spc_context`). The wrapper carries `epoch` so the relay
 /// edge can reconstruct that signing message and authenticate the

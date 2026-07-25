@@ -588,7 +588,7 @@ mod tests {
     /// `value`. The binding check only reads `committed_value()`, so
     /// the embedded proof is a placeholder — this exercises
     /// `verify_committed_proposal_binding` in isolation, not the
-    /// cert's BLS verification.
+    /// cert's signature verification.
     fn normal_cert_with_value(value: PcVector, block: &BeaconBlock) -> BeaconCert {
         let qc2 = PcQc2::new(
             value.clone(),

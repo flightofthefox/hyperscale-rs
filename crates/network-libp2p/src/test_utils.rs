@@ -20,7 +20,7 @@ use libp2p::identity::ed25519::{Keypair as Ed25519Keypair, SecretKey};
 /// Generate `num_validators` deterministic BLS (consensus) and Ed25519
 /// (libp2p) keypairs from `seed`, on independent derivation paths.
 fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<BlsSigner>, Vec<Keypair>) {
-    let bls_keys = (0..num_validators)
+    let bls_signers = (0..num_validators)
         .map(|i| {
             let mut seed_bytes = [0u8; 32];
             let key_seed = seed
@@ -46,7 +46,7 @@ fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<BlsSigner>, Vec<Keypa
         })
         .collect();
 
-    (bls_keys, ed25519_keys)
+    (bls_signers, ed25519_keys)
 }
 
 /// Test fixtures for deterministic test setup.
@@ -55,7 +55,7 @@ fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<BlsSigner>, Vec<Keypa
 /// for libp2p networking, all derived from a seed for reproducibility.
 pub struct TestFixtures {
     /// BLS keypairs for consensus (one per validator).
-    pub bls_keys: Vec<BlsSigner>,
+    pub bls_signers: Vec<BlsSigner>,
 
     /// Ed25519 keypairs for libp2p (one per validator).
     pub ed25519_keys: Vec<Keypair>,
@@ -70,7 +70,7 @@ pub struct TestFixtures {
 
 impl TestFixtures {
     /// Deterministic fixtures seating every validator in the single genesis
-    /// ROOT committee. Derives both BLS and Ed25519 keys from `seed`.
+    /// ROOT committee. Derives both consensus and Ed25519 transport keys from `seed`.
     #[must_use]
     pub fn new(seed: u64, num_validators: u32) -> Self {
         Self::with_surplus(seed, num_validators, 0)
@@ -86,10 +86,10 @@ impl TestFixtures {
     pub fn with_surplus(seed: u64, committee_size: u32, surplus: u32) -> Self {
         let num_validators = committee_size + surplus;
 
-        let (bls_keys, ed25519_keys) = derive_keypairs(seed, num_validators);
+        let (bls_signers, ed25519_keys) = derive_keypairs(seed, num_validators);
 
         let public_keys: Vec<ConsensusPublicKey> =
-            bls_keys.iter().map(BlsSigner::public_key).collect();
+            bls_signers.iter().map(BlsSigner::public_key).collect();
 
         let validators: Vec<ValidatorInfo> = (0..num_validators)
             .map(|i| ValidatorInfo {
@@ -106,7 +106,7 @@ impl TestFixtures {
             GenesisValidators::new(NetworkDefinition::simulator(), validator_set, committee);
 
         Self {
-            bls_keys,
+            bls_signers,
             ed25519_keys,
             genesis,
             num_validators,
@@ -133,14 +133,14 @@ impl TestFixtures {
         )
     }
 
-    /// Get the BLS signing key for a validator.
+    /// Get the consensus signer for a validator.
     ///
     /// # Panics
     ///
     /// Panics if `index` is out of range.
     #[must_use]
-    pub fn signing_key(&self, index: u32) -> Arc<dyn Signer> {
-        Arc::new(self.bls_keys[index as usize].clone())
+    pub fn signer(&self, index: u32) -> Arc<dyn Signer> {
+        Arc::new(self.bls_signers[index as usize].clone())
     }
 
     /// Get the Ed25519 keypair for a validator.
@@ -154,12 +154,6 @@ impl TestFixtures {
     pub fn peer_id(&self, index: u32) -> PeerId {
         PeerId::from(self.ed25519_keys[index as usize].public())
     }
-
-    /// Alias of [`Self::signing_key`] reserved for bind-test call sites.
-    #[must_use]
-    pub fn bind_signing_key(&self, index: u32) -> Arc<dyn Signer> {
-        self.signing_key(index)
-    }
 }
 
 #[cfg(test)]
@@ -171,7 +165,7 @@ mod tests {
         let fixtures = TestFixtures::new(42, 4);
 
         assert_eq!(fixtures.num_validators, 4);
-        assert_eq!(fixtures.bls_keys.len(), 4);
+        assert_eq!(fixtures.bls_signers.len(), 4);
         assert_eq!(fixtures.ed25519_keys.len(), 4);
     }
 
@@ -183,8 +177,8 @@ mod tests {
         // BLS keys should be identical
         for i in 0..4 {
             assert_eq!(
-                fixtures1.bls_keys[i].public_key(),
-                fixtures2.bls_keys[i].public_key()
+                fixtures1.bls_signers[i].public_key(),
+                fixtures2.bls_signers[i].public_key()
             );
         }
 
@@ -209,7 +203,7 @@ mod tests {
         let fixtures = TestFixtures::with_surplus(42, 4, 2);
 
         assert_eq!(fixtures.num_validators, 6);
-        assert_eq!(fixtures.bls_keys.len(), 6);
+        assert_eq!(fixtures.bls_signers.len(), 6);
 
         let genesis = fixtures.genesis_validators();
         assert_eq!(

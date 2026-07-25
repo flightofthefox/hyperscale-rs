@@ -173,7 +173,7 @@ impl TransactionValidation {
     ///
     /// # Note
     ///
-    /// Unlike BLS signature aggregation, Ed25519/secp256k1 signature
+    /// Unlike signature aggregation, Ed25519/secp256k1 signature
     /// verification cannot be meaningfully batched at the crypto level.
     /// However, this method allows the caller to process multiple
     /// transactions in a single call for convenience.

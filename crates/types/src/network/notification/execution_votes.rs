@@ -19,7 +19,7 @@ pub struct ExecutionVotesNotification {
     pub votes: Vec<Verifiable<ExecutionVote>>,
     /// The validator who sent this batch.
     pub sender: ValidatorId,
-    /// BLS signature over the domain-separated signing message, by the sender.
+    /// Signature over the domain-separated signing message, by the sender.
     pub sender_signature: ConsensusSignature,
 }
 

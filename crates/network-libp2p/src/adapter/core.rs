@@ -76,7 +76,7 @@ pub struct Libp2pAdapter {
     /// Cloneable and thread-safe.
     stream_control: StreamControl,
 
-    /// Validator BLS public keys for identity verification.
+    /// Validator consensus public keys for identity verification.
     /// Shared with the validator-bind service; updated on topology changes.
     validator_keys: Arc<ArcSwap<ValidatorKeyMap>>,
 
@@ -263,7 +263,7 @@ impl Libp2pAdapter {
         let shared_keys = Arc::new(ArcSwap::from(validator_keys));
 
         // Spawn the validator-bind service. This handles cryptographic
-        // ValidatorId ↔ PeerId binding via BLS signatures.
+        // ValidatorId ↔ PeerId binding via signatures.
         let bind_handle = spawn_validator_bind_service(
             stream_control.clone(),
             network.clone(),

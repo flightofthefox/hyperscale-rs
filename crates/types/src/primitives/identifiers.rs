@@ -579,7 +579,7 @@ impl SpcView {
         Self(value)
     }
 
-    /// Inner `u32`. Use sparingly — at boundaries (display, BLS
+    /// Inner `u32`. Use sparingly — at boundaries (display,
     /// signing-bytes construction, structured log fields) only.
     #[must_use]
     pub const fn inner(self) -> u32 {
@@ -625,7 +625,7 @@ impl RatifyRound {
         Self(value)
     }
 
-    /// Inner `u32`. Use sparingly — at boundaries (display, BLS
+    /// Inner `u32`. Use sparingly — at boundaries (display,
     /// signing-bytes construction, structured log fields) only.
     #[must_use]
     pub const fn inner(self) -> u32 {

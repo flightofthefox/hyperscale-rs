@@ -1137,7 +1137,7 @@ impl ProductionRunner {
 
 struct NetworkBuildArgs {
     network_config: Libp2pConfig,
-    /// Radix network identity, bound into BLS-signed bind handshake
+    /// Radix network identity, bound into signed bind handshake
     /// messages so a signature collected on one network can't validate
     /// on another.
     network: NetworkDefinition,

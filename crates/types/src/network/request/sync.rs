@@ -13,7 +13,7 @@ pub struct SyncCompleteAnnouncement {
     /// Validator announcing sync completion
     pub validator: ValidatorId,
 
-    /// Signature proving this is authentic (BLS for aggregatable consensus)
+    /// Signature proving this is authentic
     pub signature: ConsensusSignature,
 }
 

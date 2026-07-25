@@ -135,7 +135,7 @@ async fn pooled_validator_boots_as_follower_only_host() {
             vnodes: vec![VnodeConfig {
                 validator_id: surplus,
                 local_shard: ShardId::ROOT,
-                signer: fixtures.signing_key(1),
+                signer: fixtures.signer(1),
             }],
         })
         .await
@@ -183,7 +183,7 @@ async fn shard_rejoin_reopens_the_store_after_leave() {
         vnodes: vec![VnodeConfig {
             validator_id: surplus,
             local_shard: ShardId::ROOT,
-            signer: fixtures.signing_key(1),
+            signer: fixtures.signer(1),
         }],
     };
 

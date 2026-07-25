@@ -233,7 +233,7 @@ fn equivocation_round_trip_round1() {
     let vote_b = sign_vote1(cm.sk(0), cm.id(0), &network, &ctx, value_b.clone()).expect("sign");
 
     // Slim wire-form pulls the primary sig from `prefix_sigs[|v_in|]`
-    // — the BLS sig over the full vector.
+    // — the signature over the full vector.
     let ev = PcVoteEquivocation {
         validator: cm.id(0),
         epoch,

@@ -7,9 +7,9 @@ use crate::NetworkDefinition;
 /// Format: `VALIDATOR_BIND` || `network.id` || `peer_id_bytes` || `nonce`
 /// (32 bytes)
 ///
-/// Signed by a validator's BLS key to cryptographically bind their
+/// Signed by a validator's consensus key to cryptographically bind their
 /// consensus identity (`ValidatorId`) to their ephemeral libp2p `PeerId`.
-/// Verified by peers using the BLS public key from the topology.
+/// Verified by peers using the consensus public key from the topology.
 ///
 /// The nonce is supplied by the *verifier* in a challenge-response exchange,
 /// so the signature is fresh per session and cannot be replayed against the
@@ -21,9 +21,9 @@ pub const VALIDATOR_BIND_NONCE_LEN: usize = 32;
 
 /// Build the signing message for the validator-bind protocol.
 ///
-/// Binds a validator's BLS identity to their ephemeral libp2p `PeerId` over a
+/// Binds a validator's consensus identity to their ephemeral libp2p `PeerId` over a
 /// per-session `nonce` chosen by the verifier. The Noise handshake proves
-/// `PeerId` ownership; this signature proves the BLS key holder authorised
+/// `PeerId` ownership; this signature proves the consensus-key holder authorised
 /// that `PeerId` *for this specific session*.
 #[must_use]
 pub fn validator_bind_message(

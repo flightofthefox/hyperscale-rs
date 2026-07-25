@@ -79,7 +79,7 @@ impl TimeoutKeeper {
     /// Every `high_qc` carried by a timeout for `round`, sorted by QC round
     /// descending. The pacemaker walks these and adopts the highest that
     /// *verifies*: a Byzantine timeout's `high_qc` is unverified here (only its
-    /// BLS share was checked at intake), so a forged high-round QC would sort
+    /// signature share was checked at intake), so a forged high-round QC would sort
     /// first — returning the whole list, rather than just the max, lets the
     /// caller skip it and still reach the genuine quorum-max an honest timeout
     /// carries. Empty if no timeouts seen.

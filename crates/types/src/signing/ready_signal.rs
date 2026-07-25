@@ -12,7 +12,7 @@ use crate::{NetworkDefinition, ShardId, ValidatorId, WeightedTimestamp};
 /// so a signal from a validator's prior reshape seat cannot be re-credited
 /// to a seat on a different shard. The proposer includes valid dwell-eligible
 /// signals in the next block's manifest; verifiers re-derive these bytes to
-/// check the BLS sig before admitting the signal to their local pool. The
+/// check the signature before admitting the signal to their local pool. The
 /// weighted-time window bounds replay surface — a signal hoarded past `end`
 /// no longer validates.
 pub const DOMAIN_READY_SIGNAL: &[u8] = b"HYPERSCALE_READY_SIGNAL_v1";

@@ -558,7 +558,7 @@ pub(crate) fn fork_header(
 }
 
 /// Pair a fork-fixture header with a genuine QC signed by `committee`'s
-/// `signers` (committee indices), so the resulting two-chain BLS-verifies.
+/// `signers` (committee indices), so the resulting two-chain verifies.
 pub(crate) fn certify_header(
     committee: &TestCommittee,
     header: BlockHeader,
@@ -741,7 +741,7 @@ fn anchor_qc(shard: ShardId, wt: WeightedTimestamp) -> QuorumCertificate {
 
 /// Pair a header with a genuine QC signed by every key in `committee_keys`
 /// (bitfield position `p` set to `committee_keys[p]`'s signature), stamped at
-/// `wt`, so the two-chain BLS-verifies against the seated committee.
+/// `wt`, so the two-chain verifies against the seated committee.
 fn live_certify(
     verifier: &dyn Verifier,
     committee_keys: &[Arc<dyn Signer>],
@@ -878,7 +878,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
 /// The wave is anchored on `ShardId::ROOT` with `block_height` as its
 /// identity and no remote shard dependencies — sufficient for driving
 /// `on_block_committed` when tests only care about tx-terminal-state side
-/// effects. The inner EC carries a zeroed BLS signature and a 4-seat
+/// effects. The inner EC carries a zeroed signature and a 4-seat
 /// signer bitfield, so callers should not feed the result through
 /// verification paths.
 #[must_use]

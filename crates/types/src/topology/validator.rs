@@ -10,7 +10,7 @@ pub struct ValidatorInfo {
     /// Unique identifier for this validator.
     pub validator_id: ValidatorId,
 
-    /// Public key for signature verification (BLS for aggregatable consensus).
+    /// Public key for signature verification.
     pub public_key: ConsensusPublicKey,
 }
 

@@ -27,7 +27,7 @@ use crate::commit_dedup::CommitDedupIndex;
 /// True if `qc.signers()` represents at least 2f+1 of the local committee's
 /// voting power. The synced-block apply path and consensus pre-vote path
 /// both call this — without it, a single Byzantine signer suffices to pass
-/// the BLS-only `VerifyQcSignature` check that follows.
+/// the signature-only `VerifyQcSignature` check that follows.
 #[must_use]
 pub fn qc_has_local_quorum_power(
     topology_snapshot: &TopologySnapshot,
@@ -134,7 +134,7 @@ pub fn validate_header(
         // The parent QC's signing committee is `committee(h-1)`. When the
         // caller can't resolve it (we don't hold `h-1`'s header yet), skip the
         // quorum **pre-check** — it's a cheap DoS filter, and the parent QC is
-        // fully BLS-verified against the exact committee before we ever vote,
+        // fully signature-verified against the exact committee before we ever vote,
         // once `h-1` arrives. The structural checks below need no committee.
         if let Some(parent_committee) = parent_committee
             && !qc_has_local_quorum_power(parent_committee, local_shard, header.parent_qc())
@@ -989,7 +989,7 @@ mod tests {
     fn validate_header_skips_parent_quorum_when_committee_unresolved() {
         // When `h-1`'s header hasn't arrived its committee can't be resolved, so
         // the caller passes `None` and the cheap quorum pre-check is skipped —
-        // the parent QC is still fully BLS-verified against the exact committee
+        // the parent QC is still fully signature-verified against the exact committee
         // before this node votes. A resolved committee runs the pre-check and
         // rejects a sub-quorum parent QC.
         let topo = topology_snapshot();

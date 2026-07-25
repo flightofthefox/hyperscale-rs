@@ -230,7 +230,7 @@ pub struct BeaconCoordinator {
     /// vnode has already run the witness-admission gate over, regardless
     /// of outcome. Bounds the per-epoch verification work to one
     /// evaluation per committee member so a peer flooding distinct
-    /// forged proposals can't force unbounded BLS/merkle checks. Cleared
+    /// forged proposals can't force unbounded signature/merkle checks. Cleared
     /// on `adopt_block` alongside the proposal-pool reset.
     evaluated_proposers: BTreeSet<ValidatorId>,
 
@@ -672,7 +672,7 @@ impl BeaconCoordinator {
     }
 
     /// A peer's round-1 PC vote arrived. Gate, dedup, and dispatch the
-    /// BLS check via the [`SpcDriver`]. Admission happens in
+    /// signature check via the [`SpcDriver`]. Admission happens in
     /// [`Self::on_pc_vote1_verified`] when the result lands.
     pub fn on_pc_vote1_received(&mut self, view: SpcView, vote: PcVote1) -> Vec<Action> {
         let skip = self.ratify_settled_at_tip();
@@ -692,7 +692,7 @@ impl BeaconCoordinator {
     }
 
     /// A peer's SPC `new-view` arrived. Gate on instance/skip-quorum,
-    /// mark the slot in-flight, and dispatch the cert BLS check to the
+    /// mark the slot in-flight, and dispatch the cert signature check to the
     /// crypto pool. Admission happens in [`Self::on_spc_new_view_verified`]
     /// when the result lands.
     pub fn on_spc_new_view_received(
@@ -999,7 +999,7 @@ impl BeaconCoordinator {
     /// Verify the equivocation evidence embedded in `proposal` and
     /// return the proposal with each `Verifiable` marker upgraded in
     /// place, or `None` if any entry is unverifiable. An entry verifies
-    /// when both BLS sigs check out under the named validator's pubkey
+    /// when both signatures check out under the named validator's pubkey
     /// (from `state.validators`); evidence naming an unknown validator
     /// is unverifiable. A forged sig can't be made to pass, so an honest
     /// node never votes for it. The upgraded markers ride the pooled
@@ -1453,7 +1453,7 @@ impl BeaconCoordinator {
     }
 
     /// A peer's [`RatifyVote`] arrived via gossip. Validate the
-    /// non-crypto fields and dispatch BLS verification to the crypto
+    /// non-crypto fields and dispatch signature verification to the crypto
     /// pool. Admission to the [`RatifyTracker`] happens in
     /// [`Self::on_ratify_vote_verified`] once the result lands; polka
     /// reactions, cert assembly, and adoption follow from there.
@@ -1466,7 +1466,7 @@ impl BeaconCoordinator {
     ///   epoch.
     /// - Signer must sit in the active-duty pool
     ///   ([`derive_active_pool`]); off-pool votes can't contribute to
-    ///   quorum so the BLS check is pointless.
+    ///   quorum so the signature check is pointless.
     ///
     /// No deadline gate: prevotes for the candidate are the happy path
     /// *before* the deadline. A premature skip-hash vote is harmless —
@@ -1474,7 +1474,7 @@ impl BeaconCoordinator {
     /// (and the polkas they enable) still pace to the local clock.
     ///
     /// Async (on the crypto pool):
-    /// - BLS sig verifies against the canonical
+    /// - signature verifies against the canonical
     ///   [`ratify_vote_message`](hyperscale_types::ratify_vote_message)
     ///   under the signer's pubkey.
     pub fn on_unverified_ratify_vote_received(
@@ -1536,7 +1536,7 @@ impl BeaconCoordinator {
 
     /// A locally-signed [`RatifyVote`] arrived via the
     /// `Action::SignAndBroadcastRatifyVote` self-loopback path. The
-    /// signing validator produced the BLS sig, so the vote is verified
+    /// signing validator produced the signature, so the vote is verified
     /// by construction — skip the verify dispatch and pool directly.
     pub fn on_verified_ratify_vote_received(
         &mut self,
@@ -1693,7 +1693,7 @@ impl BeaconCoordinator {
             Ok(v) => v,
             Err(err) => {
                 self.verification.forget_ratify_vote(key);
-                warn!(%err, "RatifyVote BLS verification failed — dropping");
+                warn!(%err, "RatifyVote signature verification failed — dropping");
                 return Vec::new();
             }
         };
@@ -1701,7 +1701,7 @@ impl BeaconCoordinator {
         self.admit_verified_ratify_vote(vote)
     }
 
-    /// A [`RatifyVote`] has passed BLS verification: pool it and lift
+    /// A [`RatifyVote`] has passed signature verification: pool it and lift
     /// whatever it completes — a polka into the local precommit, a
     /// precommit quorum into the epoch's commit certificate.
     fn admit_verified_ratify_vote(&mut self, vote: Verified<RatifyVote>) -> Vec<Action> {
@@ -2925,7 +2925,7 @@ mod tests {
 
     /// A structural QC naming `block_hash` at weighted timestamp `wt`.
     /// `build_shard_contributions` and `contributions_well_formed` project
-    /// and bind cert-bound QCs without re-running BLS (the `2f+1` is the
+    /// and bind cert-bound QCs without re-running verification (the `2f+1` is the
     /// admission gate's job), so a structural QC suffices for them.
     fn qc_naming(block_hash: BlockHash, shard: ShardId, height: u64, wt: u64) -> QuorumCertificate {
         QuorumCertificate::new(
@@ -3474,7 +3474,7 @@ mod tests {
     }
 
     /// A PC vote whose claimed signer is outside the committee is dropped
-    /// before the BLS dispatch, so it can't mint a verification slot.
+    /// before the verify dispatch, so it can't mint a verification slot.
     #[test]
     fn pc_vote_from_non_committee_signer_dropped_before_dispatch() {
         use hyperscale_types::PcVote1;
@@ -3579,7 +3579,7 @@ mod tests {
     /// but with different signature bytes collapse to one verification
     /// slot: the slot key is `(anchor, epoch, round, phase, signer)`,
     /// not the encoded-vote hash, so a forged-sig flood can't mint
-    /// extra in-flight BLS checks.
+    /// extra in-flight signature checks.
     #[test]
     fn ratify_vote_verification_keys_on_signer_not_signature() {
         let mut coord = fresh_coord();
@@ -3612,7 +3612,7 @@ mod tests {
         assert_eq!(coord.verifications_in_flight(), 1);
     }
 
-    /// A ratify vote that fails BLS verification releases its slot, so
+    /// A ratify vote that fails signature verification releases its slot, so
     /// a later vote for the same tuple re-dispatches. Without clearing
     /// on the failure arm, a forged vote could pin a signer's slot
     /// in-flight and block their honest vote from ever being verified.
@@ -3631,7 +3631,7 @@ mod tests {
             RatifyPhase::Prevote,
             skip_hash,
             signer,
-            ConsensusSignature::new([0u8; 96]), // garbage sig — fails BLS verify
+            ConsensusSignature::new([0u8; 96]), // garbage sig — fails verification
         )));
         let dispatched = coord.on_unverified_ratify_vote_received(forged);
         assert_eq!(coord.verifications_in_flight(), 1);

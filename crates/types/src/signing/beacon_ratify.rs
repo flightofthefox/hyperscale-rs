@@ -8,7 +8,7 @@
 //! [`RatifyCert`](crate::RatifyCert) committing the block.
 //!
 //! Domain separation here keeps a ratify sig from being confused with
-//! a PC vote, a VRF reveal, or any other BLS message reusing the same
+//! a PC vote, a VRF reveal, or any other consensus message reusing the same
 //! key material.
 
 use crate::{BeaconBlockHash, Epoch, NetworkDefinition, RatifyPhase, RatifyRound};
@@ -161,7 +161,7 @@ mod tests {
     }
 
     /// Domain separation: a ratify sig must not collide with a VRF
-    /// reveal (or any other beacon BLS message reusing the same key
+    /// reveal (or any other beacon message reusing the same key
     /// material) — distinct domain tags guarantee the prefixes diverge.
     #[test]
     fn ratify_vote_message_differs_from_other_beacon_domains() {

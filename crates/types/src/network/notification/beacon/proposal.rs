@@ -11,7 +11,7 @@ use crate::{BeaconProposal, Epoch, MessageClass, NetworkMessage, ValidatorId, Ve
 /// beacon committee for the current epoch.
 ///
 /// The proposal is self-authenticating via its embedded VRF reveal —
-/// `proposal.vrf_proof()` is a BLS signature over `(network, epoch)`
+/// `proposal.vrf_proof()` is a signature over `(network, epoch)`
 /// verifiable under `sender`'s pubkey. Receivers gate admission on
 /// the verify result; a tampered `sender` or `epoch` shifts the
 /// signing bytes and the VRF check fails.

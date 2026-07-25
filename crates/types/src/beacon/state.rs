@@ -225,7 +225,7 @@ pub struct ValidatorRecord {
     pub status: ValidatorStatus,
     /// Epoch when registration was applied.
     pub registered_at_epoch: Epoch,
-    /// Compressed BLS pubkey. Carried in the on-chain record so
+    /// Compressed consensus pubkey. Carried in the on-chain record so
     /// verifiers (committee aggregates, VRF reveals, light clients)
     /// read it from state instead of relying on any side-channel
     /// registry. Lifted verbatim from

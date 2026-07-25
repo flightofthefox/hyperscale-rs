@@ -68,7 +68,7 @@ pub struct SpcHighTriple {
 /// without observing a leader proposal, reporting their current
 /// `max_high` triple so the next leader can build an indirect cert.
 ///
-/// `sig` is the sender's BLS signature over the canonical
+/// `sig` is the sender's signature over the canonical
 /// `(skip_target, EmptyView_tag)` bytes for `view` and
 /// `reported.view`. Aggregating `f+1` of these into an
 /// [`SpcCert::Indirect`] authorises entry to view `view + 1`.
@@ -80,7 +80,7 @@ pub struct SpcEmptyViewMsg {
     pub reported: SpcHighTriple,
     /// Sender's validator id.
     pub signer: ValidatorId,
-    /// Sender's BLS signature over the empty-view signing bytes.
+    /// Sender's signature over the empty-view signing bytes.
     pub sig: ConsensusSignature,
 }
 
@@ -93,7 +93,7 @@ pub struct SpcEmptyViewMsg {
 /// arbitrary valid `PcQc3` at `reported_view`.
 ///
 /// Validator identity is carried positionally by the enclosing
-/// [`PositionalBundle`] in [`SpcCert::Indirect::skip_reports`]; the BLS
+/// [`PositionalBundle`] in [`SpcCert::Indirect::skip_reports`]; the
 /// signature is folded into the cert-level
 /// [`SpcCert::Indirect::skip_aggregate_sig`].
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
@@ -152,7 +152,7 @@ pub enum SpcCert {
         /// `Σ` — `f+1` skip statements, paired positionally with the
         /// signers' committee positions via the bundle's bitfield.
         skip_reports: PositionalBundle<SkipReport>,
-        /// Different-messages BLS aggregate over each signer's BLS
+        /// Different-messages signature aggregate over each signer's
         /// signature on their canonical skip-target bytes.
         skip_aggregate_sig: AggregateSignature,
     },
@@ -632,7 +632,7 @@ pub fn sign_empty_view_msg(
 /// to resolve `ValidatorId`s to positional bits in the cert's signer
 /// bitfield. The cert targets the triple whose `reported_view` is the
 /// maximum across the inputs — per the protocol invariant — and folds
-/// every signer's individual BLS sig into a single different-messages
+/// every signer's individual signature into a single different-messages
 /// aggregate.
 ///
 /// Returns `None` when:
@@ -730,7 +730,7 @@ pub enum SpcEmptyViewMsgVerifyError {
     /// `reported.proof.x_pe() != reported.value`.
     #[error("reported.proof.x_pe does not match reported.value")]
     ReportedValueMismatch,
-    /// BLS sig over the canonical skip-target did not verify.
+    /// signature over the canonical skip-target did not verify.
     #[error("skip-target signature did not verify")]
     BadSignature,
 }

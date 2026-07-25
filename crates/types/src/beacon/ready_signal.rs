@@ -8,7 +8,7 @@
 //! `OnShard { ready: false }` to `OnShard { ready: true }` once the
 //! shard's beacon-witness accumulator surfaces it.
 //!
-//! The signal is BLS-signed over canonical bytes whose layout lives in
+//! The signal is signed over canonical bytes whose layout lives in
 //! [`crate::signing::ready_signal_message`].
 
 use std::time::Duration;
@@ -63,7 +63,7 @@ pub struct ReadySignal {
     /// [`ready_signal_window`]; validators re-emit if the window passes
     /// uncollected.
     wt_window_end: WeightedTimestamp,
-    /// BLS sig over [`crate::signing::ready_signal_message`].
+    /// signature over [`crate::signing::ready_signal_message`].
     sig: ConsensusSignature,
 }
 
@@ -110,7 +110,7 @@ impl ReadySignal {
         self.wt_window_end
     }
 
-    /// BLS signature over the canonical signing bytes.
+    /// signature over the canonical signing bytes.
     #[must_use]
     pub const fn sig(&self) -> ConsensusSignature {
         self.sig

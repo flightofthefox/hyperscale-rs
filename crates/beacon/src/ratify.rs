@@ -23,7 +23,7 @@
 //! at a newer round fast-forwards to it. Voting into rounds already
 //! left would let one validator's signatures straddle two quorums.
 //!
-//! No topology, no BLS, no clocks — pure data structure; the
+//! No topology, no crypto, no clocks — pure data structure; the
 //! coordinator feeds verified votes and timer edges in, and lifts the
 //! typed [`RatifyEffect`]s into actions. Tests need validator keypairs
 //! and an anchor, nothing more.

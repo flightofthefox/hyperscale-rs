@@ -150,7 +150,7 @@ pub fn validator_status<C: Cluster>(c: &C, id: ValidatorId) -> Option<ValidatorS
         .and_then(|state| state.validators.get(&id).map(|r| r.status))
 }
 
-/// The registered BLS public key of validator `id`, or `None` if unregistered.
+/// The registered consensus public key of validator `id`, or `None` if unregistered.
 #[must_use]
 pub fn validator_pubkey<C: Cluster>(c: &C, id: ValidatorId) -> Option<ConsensusPublicKey> {
     c.beacon_state()

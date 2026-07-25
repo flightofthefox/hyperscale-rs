@@ -328,7 +328,7 @@ fn shard_fork_drives_committee_recovery_sim() {
             .iter()
             .map(|v| {
                 runner
-                    .validator_signing_key(*v)
+                    .validator_signer(*v)
                     .expect("seated validator has a signing key")
             })
             .collect();
@@ -426,7 +426,7 @@ fn shard_fork_drives_committee_recovery_sim() {
         .map(|(&voter, qc)| {
             let key = cluster
                 .runner()
-                .validator_signing_key(voter)
+                .validator_signer(voter)
                 .expect("retained validator has a signing key");
             Timeout::new(&net, shard, Round::new(1), qc.clone(), voter, key.as_ref()).expect("sign")
         })

@@ -18,7 +18,7 @@ pub struct ExecutionCertificatesNotification {
     pub certificates: Vec<ExecutionCertificate>,
     /// The validator who sent this batch.
     pub sender: ValidatorId,
-    /// BLS signature over the domain-separated signing message, by the sender.
+    /// Signature over the domain-separated signing message, by the sender.
     pub sender_signature: ConsensusSignature,
 }
 

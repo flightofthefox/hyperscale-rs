@@ -405,7 +405,7 @@ pub struct Partition<T, Id> {
 /// Split a fetch response into solicited / missing / unsolicited buckets.
 ///
 /// Per-binding admit handlers downstream check binding-specific invariants
-/// (mempool dedup + validity range for txs, BLS quorum for ECs, merkle
+/// (mempool dedup + validity range for txs, signature quorum for ECs, merkle
 /// proof for provisions) but none of them ask "did we request this?".
 /// Filtering at the response boundary keeps unsolicited items from
 /// reaching pre-verification state mutations and from racing the legitimate
