@@ -403,6 +403,10 @@ pub enum PendingReshape {
         /// identical selection and child assignment (given an unchanged
         /// free pool) — an observer's synced child never moves under it.
         cohort_seed: Randomness,
+        /// The parent's final epoch window, stamped once the readiness
+        /// gate passes and never moved after. `None` while the split is
+        /// admitted but unscheduled.
+        scheduled_terminal: Option<Epoch>,
     },
     /// The target parent's two children merge back under it. The merge
     /// is paired — keepers drawn, eligible for execution — once both
@@ -423,7 +427,34 @@ pub enum PendingReshape {
         /// Epoch the merge paired and drew its keepers — starts the
         /// readiness TTL. `None` until paired.
         admitted_at: Option<Epoch>,
+        /// The children's final epoch window, stamped once the readiness
+        /// gate passes and never moved after — both children share it, so
+        /// they leave the trie on the same cut. `None` while the merge is
+        /// paired but unscheduled.
+        scheduled_terminal: Option<Epoch>,
     },
+}
+
+impl PendingReshape {
+    /// The final epoch window this reshape's terminating leaves are
+    /// scheduled to leave the trie at, or `None` while the readiness gate
+    /// has yet to pass.
+    ///
+    /// A `Some` answer is irrevocable: the schedule reaches the affected
+    /// shards' proposers a window before the fold that applies it, and they
+    /// stamp their boundary verdict from it, so neither the readiness TTL
+    /// nor a trigger going quiet may retract it.
+    #[must_use]
+    pub const fn scheduled_terminal(&self) -> Option<Epoch> {
+        match self {
+            Self::Split {
+                scheduled_terminal, ..
+            }
+            | Self::Merge {
+                scheduled_terminal, ..
+            } => *scheduled_terminal,
+        }
+    }
 }
 
 /// Why a shard's committee was recovered. Fence, re-draw, retention,
@@ -621,6 +652,17 @@ pub struct BeaconState {
     /// predicate reads it to answer "no split lands at this window's
     /// end" without the next window's entry.
     pub split_pending_window: BTreeSet<ShardId>,
+    /// Each terminating leaf's scheduled final window as of this epoch's
+    /// promotion, frozen under the [`Self::split_pending_window`]
+    /// discipline. The affirmative counterpart of `split_pending_window`:
+    /// the schedule's boundary predicates read it to answer "this window
+    /// *is* the shard's last" without the next window's entry.
+    ///
+    /// Soundness rests on no fold scheduling a terminal for the window it
+    /// opens. The freeze runs before the reshape folds, so a self-naming
+    /// schedule would land after this snapshot and diverge a window's
+    /// lookahead entry from its re-derived active one.
+    pub terminal_epoch_window: BTreeMap<ShardId, Epoch>,
     /// Each terminating leaf's settled-waves window floor as of this
     /// epoch's promotion, frozen under the [`Self::split_pending_window`]
     /// discipline: pending split targets and paired merge children from
@@ -971,6 +1013,7 @@ struct WindowProjection {
     /// snapshots project the same map.
     reshape_parent_halves: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
     split_pending: BTreeSet<ShardId>,
+    scheduled_terminals: BTreeMap<ShardId, Epoch>,
     settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
     /// Governable params for this window: `params` (head) or `next_params`
     /// (lookahead). Frozen one epoch ahead like the committee.
@@ -1001,6 +1044,7 @@ impl BeaconState {
             shard_consensus_members: BTreeMap::new(),
             witness_window_bases: BTreeMap::new(),
             split_pending_window: BTreeSet::new(),
+            terminal_epoch_window: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             reshape_observers_window: BTreeMap::new(),
             reshape_keepers_window: BTreeMap::new(),
@@ -1284,6 +1328,7 @@ impl BeaconState {
                 reshape_keepers: self.reshape_keepers_window.clone(),
                 reshape_parent_halves: self.reshape_parent_halves.clone(),
                 split_pending: self.split_pending_window.clone(),
+                scheduled_terminals: self.terminal_epoch_window.clone(),
                 settled_window_floors: self.settled_window_floors.clone(),
                 params: self.params,
             },
@@ -1309,6 +1354,7 @@ impl BeaconState {
                 reshape_keepers: self.live_reshape_keepers(),
                 reshape_parent_halves: self.reshape_parent_halves.clone(),
                 split_pending: self.live_split_pending(),
+                scheduled_terminals: self.live_scheduled_terminals(),
                 settled_window_floors: self.live_settled_window_floors(),
                 params: self.next_params,
             },
@@ -1369,6 +1415,37 @@ impl BeaconState {
             .filter(|(_, r)| matches!(r, PendingReshape::Split { .. }))
             .map(|(target, _)| *target)
             .collect()
+    }
+
+    /// Each terminating leaf's scheduled final window as state stands
+    /// right now, keyed by the leaf that leaves the trie: a split's
+    /// parent, or both of a merge's children. Empty until the readiness
+    /// gate passes, since an admitted reshape carries no cut yet.
+    ///
+    /// The value the next promotion freezes into
+    /// [`Self::terminal_epoch_window`], and what the lookahead snapshot
+    /// projects — the two must agree, so both read this one source.
+    #[must_use]
+    pub fn live_scheduled_terminals(&self) -> BTreeMap<ShardId, Epoch> {
+        let mut scheduled = BTreeMap::new();
+        for (target, reshape) in &self.pending_reshapes {
+            let Some(terminal) = reshape.scheduled_terminal() else {
+                continue;
+            };
+            // A split's parent is the terminating leaf; a merge's are its
+            // two children, which share the cut their parent forms on.
+            match reshape {
+                PendingReshape::Split { .. } => {
+                    scheduled.insert(*target, terminal);
+                }
+                PendingReshape::Merge { .. } => {
+                    for child in <[ShardId; 2]>::from(target.children()) {
+                        scheduled.insert(child, terminal);
+                    }
+                }
+            }
+        }
+        scheduled
     }
 
     /// Each terminating leaf's settled-waves window floor as state stands
@@ -1466,6 +1543,7 @@ impl BeaconState {
             reshape_keepers,
             reshape_parent_halves,
             split_pending,
+            scheduled_terminals,
             settled_window_floors,
             params,
         } = projection;
@@ -1531,6 +1609,7 @@ impl BeaconState {
             split_pending,
         )
         .with_params(params)
+        .with_scheduled_terminals(scheduled_terminals)
         .with_settled_window_floors(settled_window_floors)
         .with_advanced(self.advanced.iter().copied().collect())
         .with_pending_recoveries(self.pending_recoveries.clone())
@@ -1873,6 +1952,7 @@ mod tests {
                 admitted_at: Epoch::new(1),
                 cohort: BTreeMap::new(),
                 cohort_seed: Randomness::ZERO,
+                scheduled_terminal: None,
             },
         );
 
@@ -1914,6 +1994,7 @@ mod tests {
                 halves: BTreeMap::new(),
                 keepers: BTreeMap::new(),
                 admitted_at: None,
+                scheduled_terminal: None,
             },
         );
 
@@ -2210,6 +2291,7 @@ mod tests {
                     },
                 )]),
                 cohort_seed: Randomness::ZERO,
+                scheduled_terminal: None,
             },
         );
 

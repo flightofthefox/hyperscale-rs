@@ -793,6 +793,7 @@ fn shuffle_skips_split_pending_shard() {
                     admitted_at: Epoch::new(e),
                     cohort: BTreeMap::new(),
                     cohort_seed: Randomness::new([0xaa; 32]),
+                    scheduled_terminal: None,
                 },
             );
         } else {

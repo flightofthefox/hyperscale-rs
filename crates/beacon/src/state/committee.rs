@@ -684,6 +684,7 @@ mod tests {
                 admitted_at: Epoch::GENESIS,
                 cohort: BTreeMap::new(),
                 cohort_seed: state.randomness,
+                scheduled_terminal: None,
             },
         );
 
@@ -982,6 +983,7 @@ mod tests {
                 admitted_at: Epoch::new(shuffle_interval()),
                 cohort: BTreeMap::new(),
                 cohort_seed: state.randomness,
+                scheduled_terminal: None,
             },
         );
         let before = state.next_shard_committees[&splitting].members.clone();

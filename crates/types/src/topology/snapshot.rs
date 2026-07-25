@@ -11,7 +11,7 @@ use std::sync::Arc;
 use blake3::hash as blake3_hash;
 
 use crate::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey, Epoch,
     NetworkDefinition, NetworkParams, NodeId, ReshapeThresholds, Round, RoutableTransaction,
     SettledWavesRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, ValidatorId, ValidatorSet,
     VoteCount, WeightedTimestamp,
@@ -155,6 +155,12 @@ pub struct TopologySnapshot {
     ///
     /// [`TopologySchedule::split_at_next_boundary`]: crate::TopologySchedule::split_at_next_boundary
     split_pending: BTreeSet<ShardId>,
+    /// Each terminating leaf's scheduled final window as of this window's
+    /// committee freeze — a split's parent, or both of a merge's
+    /// children. Frozen with the same discipline as `split_pending`, and
+    /// the affirmative half of the same question: `split_pending` rules a
+    /// boundary out, this rules one in.
+    scheduled_terminals: BTreeMap<ShardId, Epoch>,
     /// Each terminating leaf's settled-waves window floor as of this
     /// window's committee freeze — pending split targets, paired merge
     /// children, and shards coasting to their terminal block, each mapped
@@ -227,6 +233,7 @@ impl TopologySnapshot {
             reshape_keepers: BTreeMap::new(),
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
+            scheduled_terminals: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
@@ -273,6 +280,7 @@ impl TopologySnapshot {
             reshape_keepers: BTreeMap::new(),
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
+            scheduled_terminals: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
@@ -328,6 +336,7 @@ impl TopologySnapshot {
             reshape_keepers: BTreeMap::new(),
             reshape_parent_halves: BTreeMap::new(),
             split_pending: BTreeSet::new(),
+            scheduled_terminals: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
@@ -418,6 +427,7 @@ impl TopologySnapshot {
             reshape_keepers,
             reshape_parent_halves,
             split_pending,
+            scheduled_terminals: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             advanced: BTreeSet::new(),
             pending_recoveries: BTreeMap::new(),
@@ -487,6 +497,20 @@ impl TopologySnapshot {
         settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
     ) -> Self {
         self.settled_window_floors = settled_window_floors;
+        self
+    }
+
+    /// Set each terminating leaf's scheduled final window (see
+    /// [`Self::scheduled_terminal`]). Defaults empty; the beacon
+    /// projection supplies the frozen (active) or live (lookahead) value.
+    /// Builder-set rather than a constructor argument under the
+    /// [`Self::with_settled_window_floors`] rationale.
+    #[must_use]
+    pub fn with_scheduled_terminals(
+        mut self,
+        scheduled_terminals: BTreeMap<ShardId, Epoch>,
+    ) -> Self {
+        self.scheduled_terminals = scheduled_terminals;
         self
     }
 }
@@ -573,6 +597,21 @@ impl TopologySnapshot {
     #[must_use]
     pub fn split_pending(&self, shard: ShardId) -> bool {
         self.split_pending.contains(&shard)
+    }
+
+    /// The epoch window `shard` is scheduled to leave the trie at — via a
+    /// split into its children or a merge into its parent — as of this
+    /// window's committee freeze, or `None` when no cut is scheduled.
+    ///
+    /// Definitive in both directions, which is what lets a proposer decide
+    /// its boundary verdict from this window alone. No fold schedules a
+    /// terminal for the window it opens, so the earliest fold a reader has
+    /// not yet seen cannot have scheduled a cut at this window's end:
+    /// `None` means no cut lands here, and a `Some` naming a later window
+    /// means the same.
+    #[must_use]
+    pub fn scheduled_terminal(&self, shard: ShardId) -> Option<Epoch> {
+        self.scheduled_terminals.get(&shard).copied()
     }
 
     /// Whether `shard` is a constituent of an admitted, paired merge as of

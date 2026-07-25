@@ -517,6 +517,7 @@ pub(super) fn apply_shard_payload(
                     admitted_at: state.current_epoch,
                     cohort,
                     cohort_seed,
+                    scheduled_terminal: None,
                 },
             );
             None
@@ -584,6 +585,7 @@ pub(super) fn apply_shard_payload(
                     halves: BTreeMap::from([(source_shard, state.current_epoch)]),
                     keepers: BTreeMap::new(),
                     admitted_at: None,
+                    scheduled_terminal: None,
                 },
             );
             None

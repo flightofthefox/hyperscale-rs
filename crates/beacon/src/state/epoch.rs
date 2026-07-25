@@ -156,6 +156,12 @@ pub fn apply_epoch(
     // resolved from the lookahead schedule entry or the re-derived
     // active one.
     state.split_pending_window = state.live_split_pending();
+    // The affirmative half of the same freeze, and the reason no fold may
+    // schedule a terminal for the window it opens: a schedule stamped
+    // after this point would miss the snapshot a window's active entry
+    // re-derives from, while the lookahead written at the end of this fold
+    // would carry it — the two writes of one window's entry would disagree.
+    state.terminal_epoch_window = state.live_scheduled_terminals();
     state.settled_window_floors = state.live_settled_window_floors();
     // Freeze the reshape-seat projections under the same discipline.
     // The execution fold flips a split's observer cohort to `OnShard`
