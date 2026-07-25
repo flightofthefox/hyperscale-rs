@@ -316,15 +316,21 @@ impl SimulationRunner {
     /// across the serving hosts; a rejected chunk simply re-arms and
     /// the rotation retries it elsewhere.
     ///
-    /// Returns `None` when no serving host still pins the attested
-    /// boundary's state — a transient beacon-fold freeze at a reshape
-    /// boundary can leave a shard's attested anchor stale while its tip
-    /// runs on, so every serving member evicts the anchor's state from its
-    /// pin ring before the snap-sync can read it. The caller defers the
-    /// seat and retries next slice, when the fold has recovered and the
-    /// anchor advanced — the deterministic counterpart of production's
-    /// async `bootstrap_shard_state`, which restarts against the advanced
-    /// anchor the moment it observes the boundary move.
+    /// Returns `None` when the shard cannot be read from a peer yet, in
+    /// either of two transient shapes. No serving host holds it at all: a
+    /// freshly seeded split child is a trie leaf with a committee before
+    /// any of its members has mounted its vnode, so for a moment nobody
+    /// can serve it. Or a serving host holds it but no longer pins the
+    /// attested boundary's state — a beacon-fold freeze at a reshape
+    /// boundary can leave the anchor stale while the tip runs on, so every
+    /// serving member evicts the anchor's state from its pin ring before
+    /// the snap-sync can read it.
+    ///
+    /// Either way the caller defers the seat and retries next slice, when
+    /// the committee has mounted or the anchor advanced — the
+    /// deterministic counterpart of production's async
+    /// `bootstrap_shard_state`, which restarts against the advanced anchor
+    /// the moment it observes the boundary move.
     fn bootstrap_from_committee(
         &self,
         host: NodeIndex,
@@ -335,10 +341,9 @@ impl SimulationRunner {
         let serving: Vec<usize> = (0..self.hosts.len())
             .filter(|&i| i != host as usize && self.hosts[i].hosted_shards().any(|s| s == shard))
             .collect();
-        assert!(
-            !serving.is_empty(),
-            "no serving host for shard {shard:?} — snap-sync needs a live committee",
-        );
+        if serving.is_empty() {
+            return None;
+        }
 
         // Defer if the attested anchor's state has aged out of every serving
         // member's pin ring; the join retries against the advanced anchor.

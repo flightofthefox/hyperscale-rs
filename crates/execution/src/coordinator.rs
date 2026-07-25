@@ -4516,11 +4516,17 @@ mod tests {
                 public_key: k.public_key(),
             })
             .collect();
-        let final_window = Arc::new(TopologySnapshot::new(
-            NetworkDefinition::simulator(),
-            1,
-            ValidatorSet::new(validators.clone()),
-        ));
+        // The cut rides the final window's own entry — the boundary
+        // predicates read the scheduled terminal rather than comparing
+        // this window's trie against the next.
+        let final_window = Arc::new(
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                1,
+                ValidatorSet::new(validators.clone()),
+            )
+            .with_scheduled_terminals(BTreeMap::from([(ShardId::ROOT, Epoch::new(0))])),
+        );
         let post_split = Arc::new(TopologySnapshot::new(
             NetworkDefinition::simulator(),
             2,
@@ -4752,11 +4758,17 @@ mod tests {
                 public_key: k.public_key(),
             })
             .collect();
-        let final_window = Arc::new(TopologySnapshot::new(
-            NetworkDefinition::simulator(),
-            1,
-            ValidatorSet::new(validators.clone()),
-        ));
+        // The cut rides the final window's own entry — the boundary
+        // predicates read the scheduled terminal rather than comparing
+        // this window's trie against the next.
+        let final_window = Arc::new(
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                1,
+                ValidatorSet::new(validators.clone()),
+            )
+            .with_scheduled_terminals(BTreeMap::from([(ShardId::ROOT, Epoch::new(0))])),
+        );
         let post_split = Arc::new(TopologySnapshot::new(
             NetworkDefinition::simulator(),
             2,

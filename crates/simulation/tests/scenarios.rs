@@ -207,7 +207,7 @@ const fn halt_recovery_config() -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
-        pool_surplus: 10,
+        pool_surplus: 14,
         num_shards: 1,
         split_bytes: 800_000,
         latency: Duration::from_millis(150),
