@@ -203,6 +203,7 @@ pub use transaction::system_action::{
     SYSTEM_ACTION_TAG, decode_system_action, encode_system_action, plaintext_message_bytes,
     system_action,
 };
+pub use transaction::transfer::build_transfer_tx;
 pub use verifiable::{Verifiable, Verified, Verify};
 pub use wave::certificate::{
     MAX_EXECUTION_CERTIFICATES_PER_WAVE, WaveCertificate, wave_receipt_hash,

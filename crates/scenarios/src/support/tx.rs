@@ -11,11 +11,10 @@ use std::time::Duration;
 use hyperscale_types::{
     BeaconWitnessEvent, Ed25519PrivateKey, Epoch, NetworkParams, NodeId, NotarizeOptions,
     ParamProposal, ParamVote, ReshapeThresholds, RoutableTransaction, ShardId, StakePoolId,
-    TimestampRange, WeightedTimestamp, ed25519_keypair_from_seed, encode_system_action,
-    routable_from_notarized_v1, sign_and_notarize, sign_and_notarize_with_options,
-    uniform_shard_for_node,
+    TimestampRange, WeightedTimestamp, build_transfer_tx as build_transfer,
+    ed25519_keypair_from_seed, encode_system_action, routable_from_notarized_v1, sign_and_notarize,
+    sign_and_notarize_with_options, uniform_shard_for_node,
 };
-use radix_common::constants::XRD;
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
@@ -477,13 +476,7 @@ pub fn build_transfer_tx(
     nonce: u32,
     validity: TimestampRange,
 ) -> RoutableTransaction {
-    let manifest = ManifestBuilder::new()
-        .lock_fee(from, Decimal::from(10))
-        .withdraw_from_account(from, XRD, amount)
-        .try_deposit_entire_worktop_or_abort(to, None)
-        .build();
-    let notarized = sign_and_notarize(manifest, network, nonce, payer).expect("transfer signs");
-    routable_from_notarized_v1(notarized, validity).expect("transfer is routable")
+    build_transfer(payer, from, to, amount, network, nonce, validity).expect("transfer builds")
 }
 
 /// Build a system-action transaction reporting `event` to the beacon.

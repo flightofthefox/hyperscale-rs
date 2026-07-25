@@ -2,13 +2,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hyperscale_types::{
-    RoutableTransaction, ShardId, routable_from_notarized_v1, sign_and_notarize,
-};
-use radix_common::constants::XRD;
+use hyperscale_types::{RoutableTransaction, ShardId, build_transfer_tx};
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
-use radix_transactions::builder::ManifestBuilder;
 use rand::{Rng, RngExt};
 use tracing::warn;
 
@@ -120,37 +116,22 @@ impl TransferWorkload {
         from: &FundedAccount,
         to: &FundedAccount,
     ) -> Option<RoutableTransaction> {
-        let manifest = ManifestBuilder::new()
-            .lock_fee(from.address, Decimal::from(10u32))
-            .withdraw_from_account(from.address, XRD, self.amount)
-            .try_deposit_entire_worktop_or_abort(to.address, None)
-            .build();
-
         let nonce = from.next_nonce();
-
-        let notarized = match sign_and_notarize(
-            manifest,
+        match build_transfer_tx(
+            &from.keypair,
+            from.address,
+            to.address,
+            self.amount,
             &self.network,
             u32::try_from(nonce).unwrap_or(u32::MAX),
-            &from.keypair,
+            (self.validity_clock)(),
         ) {
-            Ok(n) => n,
+            Ok(tx) => Some(tx),
             Err(e) => {
-                warn!(error = ?e, "Failed to sign transaction");
-                return None;
+                warn!(error = ?e, "Failed to build transfer transaction");
+                None
             }
-        };
-
-        let tx: RoutableTransaction =
-            match routable_from_notarized_v1(notarized, (self.validity_clock)()) {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(error = ?e, "Failed to convert to RoutableTransaction");
-                    return None;
-                }
-            };
-
-        Some(tx)
+        }
     }
 
     /// Generate one transaction (internal helper for trait impl).
