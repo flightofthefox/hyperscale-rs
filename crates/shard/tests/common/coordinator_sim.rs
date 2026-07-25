@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{Action, CommitSource, FetchAbandon, TimerId};
-use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
@@ -303,7 +303,7 @@ pub struct ShardCoordinatorSim {
     /// `(validator_id, pubkey)` per replica.
     pub members: Vec<(ValidatorId, ConsensusPublicKey)>,
     /// Signing identities per replica.
-    sks: Vec<Arc<BlsSigner>>,
+    sks: Vec<Arc<dyn Signer>>,
     /// In-memory shard storage per replica. Exposed for test
     /// introspection (e.g. asserting JMT roots).
     pub storages: Vec<Arc<SimShardStorage>>,
@@ -399,7 +399,7 @@ impl ShardCoordinatorSim {
         let mut coordinators = Vec::with_capacity(n);
 
         for idx in 0..n {
-            let sk = Arc::new(committee.signer(idx).clone());
+            let sk = committee.signer(idx);
             let id = committee.validator_id(idx);
             members.push((id, *committee.public_key(idx)));
             sks.push(sk);

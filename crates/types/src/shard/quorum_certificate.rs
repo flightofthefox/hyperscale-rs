@@ -260,11 +260,6 @@ pub enum QcVerifyError {
     /// `verify` via [`VerifiedQuorumCertificate::genesis`].
     #[error("QC has no signers")]
     NoSigners,
-    /// Aggregating the selected signer public keys failed (the scheme
-    /// library rejected the input — typically an empty aggregate or an
-    /// internal validation failure).
-    #[error("failed to aggregate signer public keys")]
-    PublicKeyAggregationFailed,
     /// The aggregated signature did not validate against the aggregated
     /// public keys for the QC's signing message.
     #[error("aggregated signature invalid")]

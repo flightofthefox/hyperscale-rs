@@ -19,7 +19,7 @@ use libp2p::identity::ed25519::{Keypair as Ed25519Keypair, SecretKey};
 
 /// Generate `num_validators` deterministic BLS (consensus) and Ed25519
 /// (libp2p) keypairs from `seed`, on independent derivation paths.
-fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<BlsSigner>, Vec<Keypair>) {
+fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<Arc<BlsSigner>>, Vec<Keypair>) {
     let bls_signers = (0..num_validators)
         .map(|i| {
             let mut seed_bytes = [0u8; 32];
@@ -28,7 +28,7 @@ fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<BlsSigner>, Vec<Keypa
                 .wrapping_mul(0x517c_c1b7_2722_0a95);
             seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
             seed_bytes[8..16].copy_from_slice(&u64::from(i).to_le_bytes());
-            BlsSigner::from_seed(&seed_bytes)
+            Arc::new(BlsSigner::from_seed(&seed_bytes))
         })
         .collect();
 
@@ -55,7 +55,7 @@ fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<BlsSigner>, Vec<Keypa
 /// for libp2p networking, all derived from a seed for reproducibility.
 pub struct TestFixtures {
     /// BLS keypairs for consensus (one per validator).
-    pub bls_signers: Vec<BlsSigner>,
+    pub bls_signers: Vec<Arc<BlsSigner>>,
 
     /// Ed25519 keypairs for libp2p (one per validator).
     pub ed25519_keys: Vec<Keypair>,
@@ -89,7 +89,7 @@ impl TestFixtures {
         let (bls_signers, ed25519_keys) = derive_keypairs(seed, num_validators);
 
         let public_keys: Vec<ConsensusPublicKey> =
-            bls_signers.iter().map(BlsSigner::public_key).collect();
+            bls_signers.iter().map(|s| s.public_key()).collect();
 
         let validators: Vec<ValidatorInfo> = (0..num_validators)
             .map(|i| ValidatorInfo {
@@ -140,7 +140,8 @@ impl TestFixtures {
     /// Panics if `index` is out of range.
     #[must_use]
     pub fn signer(&self, index: u32) -> Arc<dyn Signer> {
-        Arc::new(self.bls_signers[index as usize].clone())
+        let signer: Arc<BlsSigner> = Arc::clone(&self.bls_signers[index as usize]);
+        signer
     }
 
     /// Get the Ed25519 keypair for a validator.

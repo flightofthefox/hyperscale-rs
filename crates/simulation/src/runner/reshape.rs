@@ -41,6 +41,7 @@ use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ChainOrigin, ShardId, ValidatorId, Verified,
     shard_prefix_path,
 };
+use tracing::error;
 
 use super::SimulationRunner;
 
@@ -163,7 +164,7 @@ impl SimulationRunner {
                 if broadcasted.insert(validator)
                     && let Some(sender) = self.reshape_notify_origin(&recipients)
                 {
-                    let signal = observer_ready_signal(
+                    let Ok(signal) = observer_ready_signal(
                         &self.beacon_network,
                         validator,
                         child,
@@ -171,8 +172,13 @@ impl SimulationRunner {
                             .as_ref(),
                         anchor,
                         self.epoch_duration_ms,
-                    )
-                    .expect("stateless signer never fails");
+                    ) else {
+                        error!(
+                            validator = validator.inner(),
+                            "cannot sign reshape ready signal; skipping"
+                        );
+                        return None;
+                    };
                     self.hosts[sender as usize]
                         .network()
                         .notify(&recipients, &ReadySignalNotification::new(signal));

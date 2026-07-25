@@ -180,7 +180,7 @@ pub fn verified_test_transaction(seed: u8) -> Verified<RoutableTransaction> {
 /// and verify against real cryptographic paths rather than bypassing them
 /// with zero signatures.
 pub struct TestCommittee {
-    signers: Vec<BlsSigner>,
+    signers: Vec<Arc<BlsSigner>>,
     public_keys: Vec<ConsensusPublicKey>,
     validator_ids: Vec<ValidatorId>,
 }
@@ -218,7 +218,7 @@ impl TestCommittee {
             let signer = BlsSigner::from_seed(&seed_bytes);
             let pk = signer.public_key();
 
-            signers.push(signer);
+            signers.push(Arc::new(signer));
             public_keys.push(pk);
             validator_ids.push(ValidatorId::new(i as u64));
         }
@@ -260,8 +260,9 @@ impl TestCommittee {
     ///
     /// Panics if `idx >= size()`.
     #[must_use]
-    pub fn signer(&self, idx: usize) -> &BlsSigner {
-        &self.signers[idx]
+    pub fn signer(&self, idx: usize) -> Arc<dyn Signer> {
+        let signer: Arc<BlsSigner> = Arc::clone(&self.signers[idx]);
+        signer
     }
 
     /// Get a public key by index.

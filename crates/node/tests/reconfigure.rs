@@ -143,7 +143,7 @@ impl Fixture {
         );
         VnodeInit {
             state,
-            signer: Arc::new(self.committee.signer(idx).clone()),
+            signer: self.committee.signer(idx),
         }
     }
 
@@ -162,7 +162,7 @@ impl Fixture {
         );
         VnodeInit {
             state: NodeStateMachine::follower(me, beacon),
-            signer: Arc::new(self.committee.signer(idx).clone()),
+            signer: self.committee.signer(idx),
         }
     }
 }

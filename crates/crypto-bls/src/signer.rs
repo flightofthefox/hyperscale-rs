@@ -21,18 +21,6 @@ impl std::fmt::Debug for BlsSigner {
     }
 }
 
-// Manual impl because the radix key type is not `Clone`; a BLS key is a
-// stateless scalar, so duplicating it is sound (unlike a stateful
-// one-time-key scheme, which must not get a `Clone`).
-impl Clone for BlsSigner {
-    fn clone(&self) -> Self {
-        Self {
-            key: Bls12381G1PrivateKey::from_bytes(&self.key.to_bytes())
-                .expect("bytes of an existing key are a valid scalar"),
-        }
-    }
-}
-
 impl BlsSigner {
     /// Derive a signer from a 32-byte seed (deterministic; tests and
     /// simulation).
