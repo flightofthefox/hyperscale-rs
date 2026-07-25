@@ -1,11 +1,9 @@
 //! [`Verifier`] over BLS12-381 (min-pk) signatures.
 
-use blake3::Hasher;
 use blst::min_pk::{PublicKey as BlstPublicKey, Signature as BlstSignature};
 use blst::{BLST_ERROR, blst_scalar, blst_scalar_from_bendian};
 use hyperscale_crypto::{
-    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, Verifier,
-    VrfOutput, VrfProof,
+    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, Verifier, VrfProof,
 };
 use radix_common::crypto::{
     BLS12381_CIPHERSITE_V1, Bls12381G1PublicKey, Bls12381G2Signature, aggregate_verify_bls12381_v1,
@@ -13,12 +11,6 @@ use radix_common::crypto::{
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng, rng};
-
-/// Domain tag for hashing a [`VrfProof`] into its [`VrfOutput`]. Binds
-/// the output to the specific proof bytes so a forged output paired
-/// with a valid proof (which would otherwise pass the signature check)
-/// fails verification.
-const DOMAIN_VRF_OUTPUT: &[u8] = b"HYPERSCALE_VRF_OUTPUT_v1";
 
 /// BLS verification.
 ///
@@ -202,13 +194,6 @@ impl Verifier for BlsVerifier {
 
     fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {
         verify_bls12381_v1(message, &pk(key), &Bls12381G2Signature(*proof.as_bytes()))
-    }
-
-    fn vrf_output(&self, proof: &VrfProof) -> VrfOutput {
-        let mut h = Hasher::new();
-        h.update(DOMAIN_VRF_OUTPUT);
-        h.update(proof.as_bytes());
-        VrfOutput::new(*h.finalize().as_bytes())
     }
 }
 

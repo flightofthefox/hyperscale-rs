@@ -10,19 +10,13 @@
 //! separation here keeps a VRF reveal from being confused with a PC vote
 //! or a block header sig, both of which reuse the same BLS keys.
 
-use blake3::Hasher;
+pub use hyperscale_crypto::vrf_output_from_proof;
 use hyperscale_crypto::{SignError, Signer, Verifier};
 
-use crate::{ConsensusPublicKey, Epoch, NetworkDefinition, VrfOutput, VrfProof};
+use crate::{ConsensusPublicKey, Epoch, NetworkDefinition, VrfProof};
 
 /// Domain tag for beacon VRF reveals.
 pub const DOMAIN_PC_VRF: &[u8] = b"HYPERSCALE_PC_VRF_v1";
-
-/// Domain tag for hashing a [`VrfProof`] into its [`VrfOutput`]. Binds
-/// the output to the specific proof bytes so a forged output paired
-/// with a valid proof (which would otherwise pass the BLS sig check)
-/// fails verification.
-const DOMAIN_VRF_OUTPUT: &[u8] = b"HYPERSCALE_VRF_OUTPUT_v1";
 
 /// Build the canonical signing bytes for a VRF reveal at `epoch` under
 /// `network`.
@@ -36,21 +30,6 @@ pub fn vrf_reveal_message(network: &NetworkDefinition, epoch: Epoch) -> Vec<u8> 
     out.push(network.id);
     out.extend_from_slice(&epoch.to_le_bytes());
     out
-}
-
-/// Derive the [`VrfOutput`] for a [`VrfProof`] under the canonical
-/// proof-to-output binding.
-///
-/// `BLAKE3(DOMAIN_VRF_OUTPUT ‖ proof_bytes)`. The domain tag keeps the
-/// hash distinct from any other 32-byte BLAKE3 digest in the
-/// codebase. Called by both [`vrf_sign`] (to populate the output) and
-/// [`vrf_verify`] (to check the supplied output against the proof).
-#[must_use]
-pub fn vrf_output_from_proof(proof: &VrfProof) -> VrfOutput {
-    let mut h = Hasher::new();
-    h.update(DOMAIN_VRF_OUTPUT);
-    h.update(proof.as_bytes());
-    VrfOutput::new(*h.finalize().as_bytes())
 }
 
 /// Sign `(network, epoch)` and return the VRF proof. The output is

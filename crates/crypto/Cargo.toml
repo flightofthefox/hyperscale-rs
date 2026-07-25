@@ -10,12 +10,11 @@ test-utils = []
 
 [dependencies]
 # Interface-only crate: an external verifier must be able to depend on this
-# plus one impl crate without dragging in the workspace. Keep it this way.
+# plus one impl crate without dragging in the workspace. Keep it this way —
+# blake3 is here for the canonical proof-to-output VRF digest, nothing else.
+blake3.workspace = true
 sbor.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-blake3.workspace = true
 
 [lints]
 workspace = true

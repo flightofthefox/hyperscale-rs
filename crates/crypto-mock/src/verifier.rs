@@ -1,18 +1,10 @@
 //! [`Verifier`] over the keyed-hash mock scheme.
 
-use blake3::Hasher;
 use hyperscale_crypto::{
-    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, Verifier,
-    VrfOutput, VrfProof,
+    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, Verifier, VrfProof,
 };
 
 use crate::derive;
-
-/// Domain tag for hashing a [`VrfProof`] into its [`VrfOutput`].
-/// Byte-identical to the BLS impl's binding (and to the canonical
-/// `vrf_output_from_proof` in `types`), so mixed call sites derive the
-/// same output regardless of which path computes it.
-const DOMAIN_VRF_OUTPUT: &[u8] = b"HYPERSCALE_VRF_OUTPUT_v1";
 
 /// Mock verification: every check recomputes the expected signature
 /// from the public key and compares bytes. Aggregate checks refold the
@@ -85,13 +77,6 @@ impl Verifier for MockVerifier {
     fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {
         *derive::signature(key, message).as_bytes() == *proof.as_bytes()
     }
-
-    fn vrf_output(&self, proof: &VrfProof) -> VrfOutput {
-        let mut h = Hasher::new();
-        h.update(DOMAIN_VRF_OUTPUT);
-        h.update(proof.as_bytes());
-        VrfOutput::new(*h.finalize().as_bytes())
-    }
 }
 
 #[cfg(test)]
@@ -143,21 +128,6 @@ mod tests {
         assert_ne!(
             agg, permuted_agg,
             "permuted input signatures must fold to a different aggregate"
-        );
-    }
-
-    /// The proof-to-output binding matches the canonical digest used by
-    /// the BLS impl and `types::vrf_output_from_proof`, so mixed call
-    /// sites agree on the output bytes.
-    #[test]
-    fn vrf_output_matches_canonical_binding() {
-        let proof = signer(1).vrf_sign(b"vrf").expect("mock sign cannot fail");
-        let mut h = Hasher::new();
-        h.update(b"HYPERSCALE_VRF_OUTPUT_v1");
-        h.update(proof.as_bytes());
-        assert_eq!(
-            MockVerifier.vrf_output(&proof),
-            VrfOutput::new(*h.finalize().as_bytes())
         );
     }
 }

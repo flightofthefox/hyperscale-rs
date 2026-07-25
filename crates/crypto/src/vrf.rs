@@ -13,7 +13,28 @@
 //! the type system catches accidental conflation with block-vote
 //! signatures or general-purpose digests at every call site.
 
+use blake3::Hasher;
 use sbor::prelude::*;
+
+/// Domain tag for hashing a [`VrfProof`] into its [`VrfOutput`]. Binds
+/// the output to the specific proof bytes so a forged output paired
+/// with a valid proof (which would otherwise pass the signature check)
+/// fails verification.
+const DOMAIN_VRF_OUTPUT: &[u8] = b"HYPERSCALE_VRF_OUTPUT_v1";
+
+/// Derive the [`VrfOutput`] for a [`VrfProof`] under the canonical
+/// proof-to-output binding: `BLAKE3(DOMAIN_VRF_OUTPUT ‖ proof_bytes)`.
+///
+/// Scheme-independent — the proof is opaque bytes here, so every scheme
+/// shares one binding and mixed call sites (protocol folds, verifiers,
+/// fixtures) always agree on the output.
+#[must_use]
+pub fn vrf_output_from_proof(proof: &VrfProof) -> VrfOutput {
+    let mut h = Hasher::new();
+    h.update(DOMAIN_VRF_OUTPUT);
+    h.update(proof.as_bytes());
+    VrfOutput::new(*h.finalize().as_bytes())
+}
 
 /// Wire length of a `VrfOutput` in bytes.
 pub const VRF_OUTPUT_BYTES: usize = 32;
@@ -37,11 +58,10 @@ impl VrfOutput {
     /// has signed).
     pub const ZERO: Self = Self([0u8; VRF_OUTPUT_BYTES]);
 
-    /// Build a `VrfOutput` from a raw 32-byte digest. The
-    /// proof-to-output binding lives in
-    /// [`Verifier::vrf_output`](crate::Verifier::vrf_output); this
-    /// constructor takes the digest directly for wire deserialisation
-    /// and adversarial test setup.
+    /// Build a `VrfOutput` from a raw 32-byte digest. Honest derivation
+    /// goes through [`vrf_output_from_proof`]; this constructor takes
+    /// the digest directly for wire deserialisation and adversarial
+    /// test setup.
     #[must_use]
     pub const fn new(bytes: [u8; VRF_OUTPUT_BYTES]) -> Self {
         Self(bytes)
@@ -59,8 +79,7 @@ impl VrfOutput {
 ///
 /// Verifiable by anyone holding the signer's pubkey. The proof's digest
 /// is the corresponding [`VrfOutput`]; the pair-binding lives in
-/// [`Verifier::vrf_output`](crate::Verifier::vrf_output), not at the
-/// type level.
+/// [`vrf_output_from_proof`], not at the type level.
 ///
 /// Distinct from [`ConsensusSignature`](crate::ConsensusSignature) at
 /// the type level — VRF proofs and block-vote signatures share the same
@@ -110,6 +129,17 @@ mod tests {
         let bytes = basic_encode(&original).unwrap();
         let decoded: VrfProof = basic_decode(&bytes).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn output_is_a_pure_domain_tagged_digest_of_the_proof() {
+        let proof = VrfProof::new([0xEE; VRF_PROOF_BYTES]);
+        assert_eq!(vrf_output_from_proof(&proof), vrf_output_from_proof(&proof));
+        assert_ne!(
+            vrf_output_from_proof(&proof),
+            vrf_output_from_proof(&VrfProof::new([0xEF; VRF_PROOF_BYTES])),
+            "distinct proofs must yield distinct outputs"
+        );
     }
 
     #[test]

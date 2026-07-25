@@ -180,27 +180,21 @@ where
         !verifier.verify_vrf(&keys[0], message, &proof),
         "VRF proof against the wrong message must reject"
     );
-    assert_eq!(
-        verifier.vrf_output(&proof),
-        verifier.vrf_output(&proof),
-        "vrf_output must be a pure function of the proof"
-    );
     let other_proof = signers[1]
         .vrf_sign(vrf_message)
         .expect("vrf_sign must succeed");
     assert_ne!(
-        verifier.vrf_output(&proof),
-        verifier.vrf_output(&other_proof),
-        "distinct proofs must yield distinct outputs"
+        proof, other_proof,
+        "distinct keys must yield distinct proofs"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use blake3::{Hasher, hash, keyed_hash};
+    use blake3::{Hasher, keyed_hash};
 
     use super::*;
-    use crate::{AggregateSignature, ConsensusPublicKey, SignError, VrfOutput, VrfProof};
+    use crate::{AggregateSignature, ConsensusPublicKey, SignError, VrfProof};
 
     /// Throwaway keyed-hash scheme, exercised only to prove the battery
     /// itself runs and discriminates. Not exported; the real mock lives
@@ -321,9 +315,6 @@ mod tests {
         }
         fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {
             proof.as_bytes() == &derive_sig(key, 1, message)
-        }
-        fn vrf_output(&self, proof: &VrfProof) -> VrfOutput {
-            VrfOutput::new(*hash(proof.as_bytes()).as_bytes())
         }
     }
 

@@ -5,7 +5,6 @@ edition.workspace = true
 description = "BLS12-381 implementation of the consensus crypto interface"
 
 [dependencies]
-blake3.workspace = true
 blst.workspace = true
 hyperscale-crypto.workspace = true
 radix-common.workspace = true

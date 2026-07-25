@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::{AggregateSignature, ConsensusPublicKey, ConsensusSignature, VrfOutput, VrfProof};
+use crate::{AggregateSignature, ConsensusPublicKey, ConsensusSignature, VrfProof};
 
 /// Signing failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -116,9 +116,9 @@ pub trait Verifier: Send + Sync + std::fmt::Debug {
 
     /// Is `proof` the holder of `key`'s deterministic signature over
     /// `message`?
+    ///
+    /// The proof-to-output binding is not a scheme op: every scheme
+    /// shares [`vrf_output_from_proof`](crate::vrf_output_from_proof),
+    /// a pure digest of the opaque proof bytes.
     fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool;
-
-    /// The 32-byte output a proof commits to. Pure digest — callers
-    /// must have verified the proof first.
-    fn vrf_output(&self, proof: &VrfProof) -> VrfOutput;
 }

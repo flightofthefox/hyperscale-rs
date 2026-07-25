@@ -20,7 +20,7 @@ pub use role::{
     CONSENSUS_SIGNATURE_BYTES, ConsensusPublicKey, ConsensusSignature,
 };
 pub use traits::{AggregateError, SignError, Signer, Verifier};
-pub use vrf::{VRF_OUTPUT_BYTES, VRF_PROOF_BYTES, VrfOutput, VrfProof};
+pub use vrf::{VRF_OUTPUT_BYTES, VRF_PROOF_BYTES, VrfOutput, VrfProof, vrf_output_from_proof};
 
 #[cfg(any(test, feature = "test-utils"))]
 mod conformance;
