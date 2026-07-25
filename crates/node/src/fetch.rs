@@ -14,7 +14,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
-use std::time::Instant;
 
 use crossbeam::channel::Sender;
 use hyperscale_metrics::{
@@ -22,7 +21,7 @@ use hyperscale_metrics::{
 };
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::{MessageClass, ShardId, ValidatorId};
+use hyperscale_types::{MessageClass, ShardId, Stopwatch, ValidatorId};
 use tracing::{debug, trace};
 
 use crate::shard::{HostEvent, ShardIo};
@@ -120,11 +119,11 @@ struct Entry {
     in_flight: bool,
     /// When the entry most recently transitioned to `in_flight=true`.
     /// `None` while the entry is awaiting dispatch. Wall-clock-derived
-    /// (`Instant`) because this is observability-only: an alert on
+    /// because this is observability-only: an alert on
     /// `oldest_in_flight_age_ms` fires when admission stops happening,
     /// catching novel pin scenarios the existing per-drop notifications
     /// haven't been wired for yet.
-    dispatched_at: Option<Instant>,
+    dispatched_at: Option<Stopwatch>,
 }
 
 /// Why an id is being removed from the pending set — drives which counter
@@ -205,10 +204,12 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
     /// provision-fetch robustness work in the first place.
     #[must_use]
     pub fn oldest_in_flight_age_ms(&self) -> u64 {
-        let oldest = self.pending.values().filter_map(|e| e.dispatched_at).min();
-        oldest.map_or(0, |t| {
-            u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
-        })
+        let oldest = self
+            .pending
+            .values()
+            .filter_map(|e| e.dispatched_at.map(|t| t.elapsed()))
+            .max();
+        oldest.map_or(0, |age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX))
     }
 
     fn handle_request(
@@ -324,7 +325,7 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
                 if chunks_emitted >= self.config.parallel_chunks_per_tick {
                     break 'outer;
                 }
-                let dispatched_at = Instant::now();
+                let dispatched_at = Stopwatch::start();
                 for id in chunk {
                     if let Some(entry) = self.pending.get_mut(id) {
                         entry.in_flight = true;

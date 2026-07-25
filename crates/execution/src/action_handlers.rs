@@ -24,7 +24,7 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionVote, FinalizedWaveContext, NodeId,
-    RoutableTransaction, ShardId, ShardTrie, StoredReceipt, Verifiable, Verified,
+    RoutableTransaction, ShardId, ShardTrie, Stopwatch, StoredReceipt, Verifiable, Verified,
     exec_cert_batch_message, exec_vote_batch_message,
 };
 
@@ -185,7 +185,7 @@ where
             transactions,
             state_root: _,
         } => {
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let local_shard = ctx.shard;
             let shard_trie = ctx.topology_snapshot.shard_trie();
             let view = ctx.pending_chain.view_at(block_hash, block_height);
@@ -233,7 +233,7 @@ where
             block_height,
             requests,
         } => {
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let local_shard = ctx.shard;
             let shard_trie = ctx.topology_snapshot.shard_trie();
             let view = ctx.pending_chain.view_at(block_hash, block_height);

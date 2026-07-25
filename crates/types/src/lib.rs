@@ -167,6 +167,7 @@ pub use state_key::{MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN};
 pub use time::epoch_windows::EpochWindows;
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};
+pub use time::stopwatch::Stopwatch;
 pub use time::timeouts::{
     EPOCH_DURATION, MAX_PROGRESS_WAIT, RATIFY_ROUND_TIMEOUT, REMOTE_HEADER_RETENTION,
     RETENTION_HORIZON, SKIP_TIMEOUT, VIEW_CHANGE_TIMEOUT, VIEW_CHANGE_TIMEOUT_INCREMENT,

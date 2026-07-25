@@ -2,8 +2,8 @@
 
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_types::{
-    ConsensusPublicKey, ConsensusSignature, ShardId, Signed, SignedContext, TopologySnapshot,
-    ValidatorId, Verifier,
+    ConsensusPublicKey, ConsensusSignature, ShardId, Signed, SignedContext, Stopwatch,
+    TopologySnapshot, ValidatorId, Verifier,
 };
 use tracing::warn;
 
@@ -15,7 +15,7 @@ pub fn verify_sig_with_metrics(
     signature: &ConsensusSignature,
     label: &str,
 ) -> bool {
-    let start = std::time::Instant::now();
+    let start = Stopwatch::start();
     let valid = verifier.verify(public_key, msg, signature);
     record_signature_verification_latency(label, start.elapsed().as_secs_f64());
     valid
@@ -71,7 +71,7 @@ pub fn verify_signed_by_proposer<T: Signed>(
         warn!(signer = signer.inner(), "Unknown proposer for {}", context);
         return false;
     };
-    let start = std::time::Instant::now();
+    let start = Stopwatch::start();
     let valid = notification
         .verify_signature(&SignedContext {
             network: topology_snapshot.network(),
@@ -107,7 +107,7 @@ pub fn verify_signed_by_committee<T: Signed>(
     let Some(public_key) = resolve_sender_key(topology_snapshot, signer, shard, context) else {
         return false;
     };
-    let start = std::time::Instant::now();
+    let start = Stopwatch::start();
     let valid = notification
         .verify_signature(&SignedContext {
             network: topology_snapshot.network(),

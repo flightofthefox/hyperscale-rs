@@ -18,10 +18,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use hyperscale_storage::{SubstateDatabase, SubstateStore};
-use hyperscale_types::{BlockHeight, NodeId, RoutableTransaction, SubstateEntry};
+use hyperscale_types::{BlockHeight, NodeId, RoutableTransaction, Stopwatch, SubstateEntry};
 use radix_common::network::NetworkDefinition;
 use radix_common::types::NodeId as RadixNodeId;
 use radix_engine::transaction::{ExecutionConfig, execute_transaction};
@@ -138,7 +137,7 @@ impl RadixExecutor {
         snapshot: &D,
         tx: &RoutableTransaction,
     ) -> CachedVmOutput {
-        let start = Instant::now();
+        let start = Stopwatch::start();
         let Some(validated) = tx.get_or_validate(&self.caches.validator) else {
             return CachedVmOutput::validation_failed(tx.hash());
         };
@@ -189,7 +188,7 @@ impl RadixExecutor {
         provisions: &[Arc<Vec<SubstateEntry>>],
         ownership: &HashMap<NodeId, NodeId>,
     ) -> CachedVmOutput {
-        let start = Instant::now();
+        let start = Stopwatch::start();
         let Some(validated) = tx.get_or_validate(&self.caches.validator) else {
             return CachedVmOutput::validation_failed(tx.hash());
         };

@@ -22,9 +22,9 @@ use hyperscale_types::{
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
     ReshapeTrigger, Round, RoutableTransaction, SettledWavesRoot, ShardId, SplitChildRoots,
-    StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext, TopologySnapshot,
-    TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified, Verifier, Verify,
-    VoteCount, VrfProof, WeightedTimestamp, WitnessSources, block_header_message,
+    StateRoot, StateRootContext, Stopwatch, StoredReceipt, Timeout, TimeoutContext,
+    TopologySnapshot, TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified,
+    Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, block_header_message,
     block_vote_message, certified_block_header_message, commit_witness_window, compute_waves,
     derive_leaves, local_settled_wave_ids, missed_proposals_since_prev_commit,
     ready_signal_message, shard_reveal_sign,
@@ -389,7 +389,7 @@ where
             verified_votes,
             total_votes,
         } => {
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let result = verify_and_build_qc(
                 ctx.verifier,
                 ctx.topology_snapshot.network(),
@@ -428,7 +428,7 @@ where
             // metric on `is_verified` to keep the histogram aligned with
             // actual aggregation calls.
             let measured = !qc.is_verified();
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let result = qc.upgrade(&qc_ctx).map_err(|(_, err)| err);
             if measured {
                 record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
@@ -444,7 +444,7 @@ where
             shard,
             height,
         } => {
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let qc_ctx = QcContext {
                 verifier: ctx.verifier,
                 network: ctx.topology_snapshot.network(),
@@ -480,7 +480,7 @@ where
         }
 
         Action::VerifyShardForkProof { proof, committees } => {
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let verified = proof
                 .verify_resolved(ctx.verifier, ctx.topology_snapshot.network(), &committees)
                 .is_ok();
@@ -497,7 +497,7 @@ where
             transactions,
             validity_anchor,
         } => {
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let tx_ctx = TransactionRootContext {
                 transactions: &transactions,
                 validity_anchor,
@@ -519,7 +519,7 @@ where
             transactions,
             topology_snapshot,
         } => {
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let ptx_ctx = ProvisionTxRootsContext {
                 local_shard: ctx.shard,
                 topology_snapshot: &topology_snapshot,
@@ -541,7 +541,7 @@ where
             expected_root,
             batch_hashes,
         } => {
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let raw_batch_hashes: Vec<Hash> = batch_hashes.iter().map(|h| h.into_raw()).collect();
             let pr_ctx = ProvisionsRootContext {
                 batch_hashes: &raw_batch_hashes,
@@ -559,7 +559,7 @@ where
             expected_root,
             certificates,
         } => {
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let cert_ctx = CertificateRootContext {
                 certificates: &certificates,
             };
@@ -590,7 +590,7 @@ where
             finalized_waves,
             topology_snapshot,
         } => {
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let receipts: Vec<StoredReceipt> = finalized_waves
                 .iter()
                 .flat_map(|fw| fw.receipts().iter().cloned())
@@ -651,7 +651,7 @@ where
                 .flat_map(|fw| fw.receipts().iter().cloned())
                 .collect();
 
-            let receipt_start = std::time::Instant::now();
+            let receipt_start = Stopwatch::start();
             let receipt_ctx = LocalReceiptRootContext {
                 receipts: &stored_receipts,
             };
@@ -673,7 +673,7 @@ where
                 return;
             }
 
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let view = ctx
                 .pending_chain
                 .view_at(parent_block_hash, parent_block_height);
@@ -963,7 +963,7 @@ where
             timeout,
             voter_public_key,
         } => {
-            let start = std::time::Instant::now();
+            let start = Stopwatch::start();
             let result = timeout.verify(&TimeoutContext {
                 verifier: ctx.verifier,
                 network: ctx.topology_snapshot.network(),

@@ -28,7 +28,7 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
 use hyperscale_types::{
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ShardForkProof,
-    ShardVoteEquivocation, Signed, SignedContext, ValidatorId, Verifiable,
+    ShardVoteEquivocation, Signed, SignedContext, Stopwatch, ValidatorId, Verifiable,
 };
 
 use super::CertifiedHeaderVerificationItem;
@@ -145,7 +145,7 @@ where
                         sender,
                         sender_signature,
                     };
-                    let start = std::time::Instant::now();
+                    let start = Stopwatch::start();
                     let valid = gossip
                         .verify_signature(&SignedContext {
                             network: topo.network(),

@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::sync::Arc;
-use std::time::Instant;
 
 use hyperscale_core::{Action, ActionContext, ProtocolEvent, ProvisionsRequest};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
@@ -18,8 +17,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView, VersionedStore};
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
-    BlockHeight, Provisions, ProvisionsContext, ShardId, ValidatorId, Verifiable, Verified, Verify,
-    state_provisions_message,
+    BlockHeight, Provisions, ProvisionsContext, ShardId, Stopwatch, ValidatorId, Verifiable,
+    Verified, Verify, state_provisions_message,
 };
 use tracing::warn;
 
@@ -79,7 +78,7 @@ where
             provisions,
             certified_header,
         } => {
-            let merkle_start = Instant::now();
+            let merkle_start = Stopwatch::start();
             let ctx_verify = ProvisionsContext {
                 certified_header: &certified_header,
             };
