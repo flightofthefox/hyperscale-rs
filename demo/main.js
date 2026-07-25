@@ -19,6 +19,9 @@ const WINDOW_MS = 45_000;
 // simulated minute and never gives it back. Stop at a bound rather than let
 // a tab left open overnight take the browser down with it.
 const MAX_SIM_MS = 20 * 60_000;
+// Wall-clock spend per frame. Under a 60fps budget of ~16ms, this leaves
+// room for rendering after the simulation has had its turn.
+const FRAME_BUDGET_MS = 8;
 
 // Colour by trie path so a shard keeps its identity across a split; the two
 // children of a shard never collide because their paths differ in the last bit.
@@ -295,9 +298,22 @@ function render() {
 // ── main loop ────────────────────────────────────────────────────────────
 function frame() {
   if (state.playing && state.session) {
-    let events;
+    let events = [];
     try {
-      events = state.session.step(STEP_MS * state.speed);
+      // Advance in slices under a wall-clock budget rather than demanding a
+      // fixed span of simulated time per frame. Beacon epochs are bursty by
+      // construction — an all-to-all protocol that runs once per epoch — so a
+      // fixed span costs ~1ms most frames and ~50ms at every epoch tick,
+      // which reads as a stutter. Under a budget the timeline simply advances
+      // more slowly across the burst, which is honest: the x-axis is attested
+      // time, not wall time.
+      const want = STEP_MS * state.speed;
+      const slice = Math.max(50, want / 8);
+      const deadline = performance.now() + FRAME_BUDGET_MS;
+      for (let done = 0; done < want; done += slice) {
+        events = events.concat(state.session.step(Math.min(slice, want - done)));
+        if (performance.now() >= deadline) break;
+      }
     } catch (err) {
       state.playing = false;
       const msg = last_panic() || String(err);
