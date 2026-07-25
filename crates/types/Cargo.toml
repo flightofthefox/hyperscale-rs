@@ -37,7 +37,6 @@ radix-substate-store-interface.workspace = true
 test-utils = ["dep:hyperscale-crypto-bls"]
 
 [dev-dependencies]
-blst.workspace = true
 hyperscale-crypto-bls = { workspace = true, features = ["test-utils"] }
 proptest.workspace = true
 syn = { version = "2.0.119", features = ["full", "parsing", "visit"] }

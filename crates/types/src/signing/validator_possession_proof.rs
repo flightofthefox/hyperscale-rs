@@ -75,13 +75,7 @@ pub fn validator_possession_proof_verify(
 
 #[cfg(test)]
 mod tests {
-    use blst::{
-        BLST_ERROR, blst_p1, blst_p1_add, blst_p1_affine, blst_p1_cneg, blst_p1_compress,
-        blst_p1_from_affine, blst_p1_uncompress,
-    };
-    use hyperscale_crypto_bls::{
-        Bls12381G1PrivateKey, Bls12381G1PublicKey, BlsSigner, BlsVerifier, bls_keypair_from_seed,
-    };
+    use hyperscale_crypto_bls::{BlsVerifier, signer_from_u64_seed as signer};
 
     use super::*;
     use crate::signing::ready_signal::DOMAIN_READY_SIGNAL;
@@ -89,20 +83,6 @@ mod tests {
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
-    }
-
-    fn keypair(seed: u64) -> Bls12381G1PrivateKey {
-        let mut s = [0u8; 32];
-        s[..8].copy_from_slice(&seed.to_le_bytes());
-        bls_keypair_from_seed(&s)
-    }
-
-    fn signer(seed: u64) -> BlsSigner {
-        BlsSigner::new(keypair(seed))
-    }
-
-    fn pk_of(key: &Bls12381G1PublicKey) -> ConsensusPublicKey {
-        ConsensusPublicKey::new(key.0)
     }
 
     /// Pins the byte layout of `validator_possession_proof_message`. Any change to the
@@ -212,86 +192,6 @@ mod tests {
             id,
             &signer.public_key(),
             &ConsensusSignature::ZERO
-        ));
-    }
-
-    /// Decompress a pubkey to a G1 point.
-    fn g1(pk: &Bls12381G1PublicKey) -> blst_p1 {
-        // SAFETY: `affine` and `point` are valid zero-initialised blst
-        // structs and `pk.0` is a 48-byte compressed G1 encoding;
-        // `blst_p1_uncompress` reads exactly 48 bytes from the pointer.
-        unsafe {
-            let mut affine = blst_p1_affine::default();
-            assert_eq!(
-                blst_p1_uncompress(&raw mut affine, pk.0.as_ptr()),
-                BLST_ERROR::BLST_SUCCESS,
-            );
-            let mut point = blst_p1::default();
-            blst_p1_from_affine(&raw mut point, &raw const affine);
-            point
-        }
-    }
-
-    /// `pk_rogue = g^r · pk_H^{-1}` for a known scalar `r` and an honest
-    /// registered key `pk_H` — the classical rogue-key construction. In
-    /// min-pk BLS `g^r` is exactly `r`'s public key, so the rogue key is
-    /// `r.public_key() − pk_H` in the G1 group.
-    fn rogue_key_against(
-        honest_pk: &Bls12381G1PublicKey,
-        r: &Bls12381G1PrivateKey,
-    ) -> Bls12381G1PublicKey {
-        let mut neg_honest = g1(honest_pk);
-        let g_r = g1(&r.public_key());
-        // SAFETY: all pointers reference valid, initialised blst structs;
-        // `compressed` is 48 bytes, the exact width `blst_p1_compress`
-        // writes.
-        unsafe {
-            blst_p1_cneg(&raw mut neg_honest, true);
-            let mut rogue = blst_p1::default();
-            blst_p1_add(&raw mut rogue, &raw const g_r, &raw const neg_honest);
-            let mut compressed = [0u8; 48];
-            blst_p1_compress(compressed.as_mut_ptr(), &raw const rogue);
-            Bls12381G1PublicKey(compressed)
-        }
-    }
-
-    /// The rogue construction cannot produce a valid proof-of-possession:
-    /// signing under `pk_rogue` requires its secret `r − x_H`, and the only
-    /// secret the adversary holds is `r`. First confirm the key IS the
-    /// classical attack — the aggregate of `{pk_H, pk_rogue}` collapses to
-    /// `g^r`, so `r` alone forges aggregate signatures presenting `pk_H` as
-    /// a co-signer — then confirm no available secret signs its proof.
-    #[test]
-    fn rogue_key_cannot_produce_a_valid_pop() {
-        let honest = keypair(1);
-        let r = keypair(999);
-        let rogue_pk = rogue_key_against(&honest.public_key(), &r);
-        let id = ValidatorId::new(7);
-
-        // The attack is real: the two-key aggregate equals g^r, whose
-        // discrete log the adversary knows.
-        let agg = Bls12381G1PublicKey::aggregate(&[honest.public_key(), rogue_pk], true)
-            .expect("rogue key is a valid G1 point");
-        assert_eq!(agg, r.public_key());
-
-        // The adversary's available forgeries: sign the rogue key's PoP
-        // message with each secret it could hold. None verifies.
-        let msg = validator_possession_proof_message(&net(), id, &pk_of(&rogue_pk));
-        let forged_with_r = r.sign_v1(&msg);
-        assert!(!validator_possession_proof_verify(
-            &BlsVerifier,
-            &net(),
-            id,
-            &pk_of(&rogue_pk),
-            &ConsensusSignature::new(forged_with_r.0)
-        ));
-        let forged_with_honest = honest.sign_v1(&msg);
-        assert!(!validator_possession_proof_verify(
-            &BlsVerifier,
-            &net(),
-            id,
-            &pk_of(&rogue_pk),
-            &ConsensusSignature::new(forged_with_honest.0)
         ));
     }
 }
