@@ -3,7 +3,7 @@
 use hyperscale_crypto::{ConsensusPublicKey, ConsensusSignature, SignError, Signer, VrfProof};
 use radix_common::crypto::Bls12381G1PrivateKey;
 
-use crate::bls_keypair_from_seed;
+use crate::{bls_keypair_from_seed, generate_bls_keypair};
 
 /// A validator's BLS signing identity.
 ///
@@ -31,10 +31,12 @@ impl BlsSigner {
         }
     }
 
-    /// Wrap an already-constructed private key.
+    /// Mint a signer over a fresh random key.
     #[must_use]
-    pub const fn new(key: Bls12381G1PrivateKey) -> Self {
-        Self { key }
+    pub fn generate() -> Self {
+        Self {
+            key: generate_bls_keypair(),
+        }
     }
 }
 

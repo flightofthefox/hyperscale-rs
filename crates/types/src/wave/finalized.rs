@@ -467,7 +467,7 @@ impl Verified<FinalizedWave> {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto::Signer;
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
     use crate::{
@@ -533,12 +533,8 @@ mod tests {
         let local_wid = wave_id(0, 7, &[1]);
         let remote_wid = wave_id(1, 7, &[0]);
 
-        let shard0_signers: Vec<BlsSigner> = (0..2)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
-        let shard1_signers: Vec<BlsSigner> = (0..2)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let shard0_signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
+        let shard1_signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
         let shard0_pks: Vec<ConsensusPublicKey> =
             shard0_signers.iter().map(BlsSigner::public_key).collect();
         let shard1_pks: Vec<ConsensusPublicKey> =
@@ -575,12 +571,8 @@ mod tests {
         let local_wid = wave_id(0, 7, &[1]);
         let remote_wid = wave_id(1, 7, &[0]);
 
-        let shard0_signers: Vec<BlsSigner> = (0..2)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
-        let shard1_signers: Vec<BlsSigner> = (0..2)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let shard0_signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
+        let shard1_signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
         let shard0_pks: Vec<ConsensusPublicKey> =
             shard0_signers.iter().map(BlsSigner::public_key).collect();
         let shard1_pks: Vec<ConsensusPublicKey> =
@@ -632,9 +624,7 @@ mod tests {
     fn from_committed_block_wraps_input_without_modification() {
         let net = NetworkDefinition::simulator();
         let local_wid = wave_id(0, 7, &[]);
-        let sks: Vec<BlsSigner> = (0..2)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let sks: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
         let outcomes = vec![make_outcome(1)];
         let ec = make_verified_ec(&net, &local_wid, &outcomes, &sks).into_inner();
 
@@ -650,9 +640,7 @@ mod tests {
     fn verify_rejects_mismatched_public_key_vector_length() {
         let net = NetworkDefinition::simulator();
         let local_wid = wave_id(0, 7, &[]);
-        let sks: Vec<BlsSigner> = (0..2)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let sks: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
 
         let outcomes = vec![make_outcome(1)];
         let ec = make_verified_ec(&net, &local_wid, &outcomes, &sks).into_inner();

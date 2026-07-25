@@ -448,7 +448,7 @@ impl Verify<&QcContext<'_>> for QuorumCertificate {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto::Signer;
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
     use crate::Hash;
@@ -547,9 +547,7 @@ mod tests {
 
     #[test]
     fn verify_accepts_valid_qc_with_quorum_signers() {
-        let keys: Vec<_> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<_> = (0..4).map(|_| BlsSigner::generate()).collect();
         let pubs: Vec<_> = keys.iter().map(BlsSigner::public_key).collect();
 
         let qc = signed_qc(
@@ -568,9 +566,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_tampered_signature() {
-        let keys: Vec<_> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<_> = (0..4).map(|_| BlsSigner::generate()).collect();
         let pubs: Vec<_> = keys.iter().map(BlsSigner::public_key).collect();
 
         let mut qc = signed_qc(
@@ -612,9 +608,7 @@ mod tests {
         // `parent_block_hash` selects the committable block under the two-chain
         // commit rule. Repointing it at a sibling — the forged-parent fork —
         // must fail verification now that the field is in the signed message.
-        let keys: Vec<_> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<_> = (0..4).map(|_| BlsSigner::generate()).collect();
         let pubs: Vec<_> = keys.iter().map(BlsSigner::public_key).collect();
 
         // `signed_qc` signs over parent = ZERO; keep the genuine signature but
@@ -648,9 +642,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_under_quorum_signer_set() {
-        let keys: Vec<_> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<_> = (0..4).map(|_| BlsSigner::generate()).collect();
         let pubs: Vec<_> = keys.iter().map(BlsSigner::public_key).collect();
 
         // Only two of four sign — quorum is three. Signatures themselves
@@ -677,9 +669,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_qc_with_no_signers() {
-        let keys: Vec<_> = (0..2)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<_> = (0..2).map(|_| BlsSigner::generate()).collect();
         let pubs: Vec<_> = keys.iter().map(BlsSigner::public_key).collect();
 
         let qc = QuorumCertificate::new(

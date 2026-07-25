@@ -318,7 +318,7 @@ impl Verified<BlockVote> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
     use crate::Hash;
@@ -338,7 +338,7 @@ mod tests {
         );
         let votes: Vec<_> = (0..3)
             .map(|i| {
-                let signer = BlsSigner::new(generate_bls_keypair());
+                let signer = BlsSigner::generate();
                 let signature = signer.sign(&message).expect("sign");
                 let pk = signer.public_key();
                 let vote = BlockVote::from_parts(
@@ -375,7 +375,7 @@ mod tests {
         );
         let mut votes: Vec<(BlockVote, ConsensusPublicKey)> = Vec::new();
         for i in 0..3u64 {
-            let signer = BlsSigner::new(generate_bls_keypair());
+            let signer = BlsSigner::generate();
             let signature = signer.sign(&message).expect("sign");
             let vote = BlockVote::from_parts(
                 BlockHash::from_raw(Hash::from_bytes(&[2u8; 32])),
@@ -391,7 +391,7 @@ mod tests {
 
         // Replace the middle vote's pubkey with a fresh unrelated one so the
         // signature no longer validates.
-        let intruder = BlsSigner::new(generate_bls_keypair());
+        let intruder = BlsSigner::generate();
         votes[1].1 = intruder.public_key();
 
         let results = Verified::<BlockVote>::verify_batch(&BlsVerifier, &message, votes);

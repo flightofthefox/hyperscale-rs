@@ -129,7 +129,7 @@ impl<'a> ReshapeView<'a> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
+    use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BlockHash, BlockHeight, Hash, NetworkDefinition, ShardAnchor,
         ShardId, Signer, StateRoot, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
@@ -188,7 +188,7 @@ mod tests {
         let validator = ValidatorId::new(1);
         let validators = ValidatorSet::new(vec![ValidatorInfo {
             validator_id: validator,
-            public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+            public_key: BlsSigner::generate().public_key(),
         }]);
         let composed = TopologySnapshot::from_explicit_committees(
             NetworkDefinition::simulator(),

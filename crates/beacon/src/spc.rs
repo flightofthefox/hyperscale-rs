@@ -1176,7 +1176,7 @@ impl SpcInstance {
 mod tests {
     use std::sync::Arc;
 
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{
         AggregateSignature, ConsensusSignature, Epoch, NetworkDefinition, PcQc2, PcQc3,
         PcSignerLengths, PcVote1, PcXpProof, Signer, SignerBitfield, spc_context,
@@ -1193,7 +1193,7 @@ mod tests {
             PcVector::empty(),
             SignerBitfield::new(4),
             AggregateSignature::new(
-                *BlsSigner::new(generate_bls_keypair())
+                *BlsSigner::generate()
                     .sign(b"unused")
                     .expect("sign")
                     .as_bytes(),
@@ -1208,7 +1208,7 @@ mod tests {
             SignerBitfield::new(4),
             PcSignerLengths::Uniform(0),
             AggregateSignature::new(
-                *BlsSigner::new(generate_bls_keypair())
+                *BlsSigner::generate()
                     .sign(b"unused")
                     .expect("sign")
                     .as_bytes(),
@@ -1357,7 +1357,7 @@ mod tests {
             value.clone(),
             SignerBitfield::new(4),
             AggregateSignature::new(
-                *BlsSigner::new(generate_bls_keypair())
+                *BlsSigner::generate()
                     .sign(b"unused")
                     .expect("sign")
                     .as_bytes(),
@@ -1372,7 +1372,7 @@ mod tests {
             SignerBitfield::new(4),
             PcSignerLengths::Uniform(0),
             AggregateSignature::new(
-                *BlsSigner::new(generate_bls_keypair())
+                *BlsSigner::generate()
                     .sign(b"unused")
                     .expect("sign")
                     .as_bytes(),

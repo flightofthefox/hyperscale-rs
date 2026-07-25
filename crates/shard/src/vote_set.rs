@@ -421,7 +421,7 @@ mod test_helpers {
 mod tests {
     use std::collections::BTreeMap;
 
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, CertificateRoot, ChainOrigin, Hash,
         InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionsRoot,
@@ -482,9 +482,7 @@ mod tests {
 
     #[test]
     fn test_buffer_unverified_votes() {
-        let keys: Vec<BlsSigner> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(&header), 4);
@@ -512,9 +510,7 @@ mod tests {
 
     #[test]
     fn test_should_trigger_verification() {
-        let keys: Vec<BlsSigner> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(&header), 4);
@@ -539,9 +535,7 @@ mod tests {
 
     #[test]
     fn test_add_verified_votes() {
-        let keys: Vec<BlsSigner> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(&header), 4);
@@ -577,9 +571,7 @@ mod tests {
         // A vote buffered with a bad signature must not permanently occupy its
         // voter's slot: once the batch drains and the signature fails, the
         // genuine vote from the same validator is still admissible.
-        let keys: Vec<BlsSigner> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(&header), 4);
@@ -603,9 +595,7 @@ mod tests {
     fn on_votes_verified_skips_already_counted_voter() {
         // A voter counted via its own verified vote must not be tallied a
         // second time when an overlapping batch result reports it again.
-        let keys: Vec<BlsSigner> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let header = make_header(BlockHeight::new(1));
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(&header), 4);

@@ -5680,7 +5680,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use hyperscale_core::Action;
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BoundedVec, CertificateRoot,
         ConsensusSignature, Epoch, Hash, InFlightCount, LocalReceiptRoot, MAX_TIMESTAMP_DELAY,
@@ -5714,9 +5714,7 @@ mod tests {
         n: usize,
         config: ShardConsensusConfig,
     ) -> (ShardCoordinator, TopologySchedule) {
-        let keys: Vec<BlsSigner> = (0..n)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<BlsSigner> = (0..n).map(|_| BlsSigner::generate()).collect();
 
         let validators: Vec<ValidatorInfo> = keys
             .iter()
@@ -5812,7 +5810,7 @@ mod tests {
             .iter()
             .map(|&id| ValidatorInfo {
                 validator_id: ValidatorId::new(id),
-                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+                public_key: BlsSigner::generate().public_key(),
             })
             .collect();
         TopologySnapshot::new(
@@ -7064,7 +7062,7 @@ mod tests {
                 round,
                 QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
                 ValidatorId::new(voter),
-                &BlsSigner::new(generate_bls_keypair()),
+                &BlsSigner::generate(),
             )
             .expect("sign")
         };
@@ -7113,7 +7111,7 @@ mod tests {
             far,
             QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
             ValidatorId::new(1),
-            &BlsSigner::new(generate_bls_keypair()),
+            &BlsSigner::generate(),
         )
         .expect("sign");
 
@@ -7218,7 +7216,7 @@ mod tests {
                 round,
                 QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
                 ValidatorId::new(voter),
-                &BlsSigner::new(generate_bls_keypair()),
+                &BlsSigner::generate(),
             )
             .expect("sign")
         };
@@ -7263,7 +7261,7 @@ mod tests {
                 round,
                 QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
                 ValidatorId::new(2),
-                &BlsSigner::new(generate_bls_keypair()),
+                &BlsSigner::generate(),
             )
             .expect("sign"),
             VoteCount::new(1),
@@ -7314,7 +7312,7 @@ mod tests {
                 Round::new(2),
                 carried,
                 ValidatorId::new(9),
-                &BlsSigner::new(generate_bls_keypair()),
+                &BlsSigner::generate(),
             )
             .expect("sign");
             state.on_unverified_timeout(&schedule, &timeout)
@@ -7415,9 +7413,7 @@ mod tests {
     fn make_multi_validator_state_with_keys(
         local_idx: u32,
     ) -> (ShardCoordinator, TopologySchedule, Vec<BlsSigner>) {
-        let keys: Vec<BlsSigner> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -8190,9 +8186,7 @@ mod tests {
 
         // Epoch 0 carries ROOT (one shard) — the proposal's anchor; epoch 1
         // splits it (two shards) and is installed as the flipped head.
-        let keys: Vec<BlsSigner> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -8257,7 +8251,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+                public_key: BlsSigner::generate().public_key(),
             })
             .collect();
         let vs = ValidatorSet::new(validators);
@@ -8294,7 +8288,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+                public_key: BlsSigner::generate().public_key(),
             })
             .collect();
         let vs = ValidatorSet::new(validators);
@@ -9263,9 +9257,7 @@ mod tests {
     /// children instead — `ROOT`'s terminal window is 0 and any weighted
     /// timestamp past 1000ms is coast territory.
     fn make_terminating_schedule(n: usize) -> TopologySchedule {
-        let keys: Vec<BlsSigner> = (0..n)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<BlsSigner> = (0..n).map(|_| BlsSigner::generate()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -9299,7 +9291,7 @@ mod tests {
             (0..n)
                 .map(|i| ValidatorInfo {
                     validator_id: ValidatorId::new(i as u64),
-                    public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+                    public_key: BlsSigner::generate().public_key(),
                 })
                 .collect(),
         );
@@ -9317,9 +9309,7 @@ mod tests {
     /// [`make_terminating_schedule`]: the final window carries both children,
     /// the next carries only the parent.
     fn make_merging_schedule(n: usize) -> TopologySchedule {
-        let keys: Vec<BlsSigner> = (0..n)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<BlsSigner> = (0..n).map(|_| BlsSigner::generate()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -9459,9 +9449,7 @@ mod tests {
         // A shard present in both the current and the next window never
         // terminates at the boundary, so the quiesce stays inert.
         let stable = {
-            let keys: Vec<BlsSigner> = (0..4)
-                .map(|_| BlsSigner::new(generate_bls_keypair()))
-                .collect();
+            let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
             let validators: Vec<ValidatorInfo> = keys
                 .iter()
                 .enumerate()

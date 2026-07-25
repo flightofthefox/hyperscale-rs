@@ -481,7 +481,7 @@ impl Verified<ExecutionCertificate> {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto::Signer;
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
     use crate::{BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, TxHash};
@@ -533,9 +533,7 @@ mod tests {
     fn aggregate_roundtrips_through_verify() {
         let net = NetworkDefinition::simulator();
         let committee: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
-        let sks: Vec<BlsSigner> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let sks: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let pks: Vec<ConsensusPublicKey> = sks.iter().map(BlsSigner::public_key).collect();
         let outcomes = vec![outcome(1), outcome(2)];
         let root = compute_global_receipt_root(&outcomes);
@@ -568,9 +566,7 @@ mod tests {
     fn verify_rejects_bad_aggregated_signature() {
         let net = NetworkDefinition::simulator();
         let committee: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
-        let sks: Vec<BlsSigner> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let sks: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let pks: Vec<ConsensusPublicKey> = sks.iter().map(BlsSigner::public_key).collect();
         let outcomes = vec![outcome(1)];
         let root = compute_global_receipt_root(&outcomes);
@@ -612,9 +608,8 @@ mod tests {
     #[test]
     fn verify_rejects_empty_signers_with_nonzero_signature() {
         let net = NetworkDefinition::simulator();
-        let pks: Vec<ConsensusPublicKey> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()).public_key())
-            .collect();
+        let pks: Vec<ConsensusPublicKey> =
+            (0..4).map(|_| BlsSigner::generate().public_key()).collect();
 
         let outcomes = vec![outcome(1)];
         let root = compute_global_receipt_root(&outcomes);
@@ -644,9 +639,8 @@ mod tests {
     #[test]
     fn verify_accepts_empty_signers_with_zero_signature() {
         let net = NetworkDefinition::simulator();
-        let pks: Vec<ConsensusPublicKey> = (0..4)
-            .map(|_| BlsSigner::new(generate_bls_keypair()).public_key())
-            .collect();
+        let pks: Vec<ConsensusPublicKey> =
+            (0..4).map(|_| BlsSigner::generate().public_key()).collect();
 
         let outcomes = vec![outcome(1)];
         let root = compute_global_receipt_root(&outcomes);
@@ -675,8 +669,8 @@ mod tests {
     fn aggregate_produces_signer_bitfield_in_committee_order() {
         let net = NetworkDefinition::simulator();
         let committee: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
-        let sk1 = BlsSigner::new(generate_bls_keypair());
-        let sk3 = BlsSigner::new(generate_bls_keypair());
+        let sk1 = BlsSigner::generate();
+        let sk3 = BlsSigner::generate();
         let outcomes = vec![outcome(1)];
         let root = compute_global_receipt_root(&outcomes);
 
@@ -706,7 +700,7 @@ mod tests {
     fn aggregate_dedups_votes_from_same_validator() {
         let net = NetworkDefinition::simulator();
         let committee = vec![ValidatorId::new(0), ValidatorId::new(1)];
-        let sk0 = BlsSigner::new(generate_bls_keypair());
+        let sk0 = BlsSigner::generate();
         let outcomes = vec![outcome(1)];
         let root = compute_global_receipt_root(&outcomes);
 
@@ -734,8 +728,8 @@ mod tests {
     fn verify_rejects_wrong_public_keys() {
         let net = NetworkDefinition::simulator();
         let committee = vec![ValidatorId::new(0), ValidatorId::new(1)];
-        let sk0 = BlsSigner::new(generate_bls_keypair());
-        let sk1 = BlsSigner::new(generate_bls_keypair());
+        let sk0 = BlsSigner::generate();
+        let sk1 = BlsSigner::generate();
         let outcomes = vec![outcome(1)];
         let root = compute_global_receipt_root(&outcomes);
 
@@ -752,9 +746,8 @@ mod tests {
         )
         .into_inner();
 
-        let wrong_pks: Vec<ConsensusPublicKey> = (0..2)
-            .map(|_| BlsSigner::new(generate_bls_keypair()).public_key())
-            .collect();
+        let wrong_pks: Vec<ConsensusPublicKey> =
+            (0..2).map(|_| BlsSigner::generate().public_key()).collect();
         let ctx = ExecutionCertificateContext {
             verifier: &BlsVerifier,
             network: &net,

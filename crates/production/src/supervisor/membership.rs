@@ -625,7 +625,7 @@ fn host_holds_seat(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
+    use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
         NetworkDefinition, RoutingCommittees, ShardId, Signer, TopologySnapshot, ValidatorId,
         ValidatorInfo, ValidatorSet,
@@ -651,7 +651,7 @@ mod tests {
             .iter()
             .map(|&validator_id| ValidatorInfo {
                 validator_id,
-                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+                public_key: BlsSigner::generate().public_key(),
             })
             .collect();
         TopologySnapshot::from_explicit_committees(

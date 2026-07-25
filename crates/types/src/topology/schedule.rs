@@ -821,7 +821,7 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
 
     use hyperscale_crypto::Signer;
-    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
+    use hyperscale_crypto_bls::BlsSigner;
 
     use super::*;
     use crate::{
@@ -1182,7 +1182,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+                public_key: BlsSigner::generate().public_key(),
             })
             .collect();
         let set = ValidatorSet::new(validators);
@@ -1226,7 +1226,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..12)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+                public_key: BlsSigner::generate().public_key(),
             })
             .collect();
         let set = ValidatorSet::new(validators);
@@ -1276,7 +1276,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..8)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+                public_key: BlsSigner::generate().public_key(),
             })
             .collect();
         let set = ValidatorSet::new(validators);
@@ -1404,7 +1404,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..12)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+                public_key: BlsSigner::generate().public_key(),
             })
             .collect();
         let set = ValidatorSet::new(validators);

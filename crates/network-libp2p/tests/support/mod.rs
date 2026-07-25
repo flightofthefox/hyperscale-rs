@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
+use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::{Signer, ValidatorId};
 
@@ -22,7 +22,7 @@ pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 /// validator-bind service to produce per-session signatures) plus the keymap
 /// that will verify signatures from this validator.
 pub fn test_bind_args(validator_id: ValidatorId) -> (Arc<dyn Signer>, Arc<ValidatorKeyMap>) {
-    let bls_key = BlsSigner::new(generate_bls_keypair());
+    let bls_key = BlsSigner::generate();
     let pubkey = bls_key.public_key();
     let mut keys = ValidatorKeyMap::new();
     keys.insert(validator_id, pubkey);

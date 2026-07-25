@@ -566,7 +566,7 @@ pub enum RecordResult {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, CertificateRoot, ChainOrigin, Hash,
         InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionsRoot,
@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn track_assembles_verifiable_evidence_on_conflicting_votes() {
         let net = NetworkDefinition::simulator();
-        let sk = BlsSigner::new(generate_bls_keypair());
+        let sk = BlsSigner::generate();
         let pk = sk.public_key();
         let (shard, height, round) = (ShardId::ROOT, BlockHeight::new(5), Round::new(2));
         let voter = ValidatorId::new(3);
@@ -801,9 +801,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════
 
     fn keys_and_topology(n: u64) -> (Vec<BlsSigner>, TopologySnapshot) {
-        let keys: Vec<BlsSigner> = (0..n)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect();
+        let keys: Vec<BlsSigner> = (0..n).map(|_| BlsSigner::generate()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()

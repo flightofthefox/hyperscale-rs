@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_libp2p::test_utils::TestFixtures;
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
@@ -138,7 +138,7 @@ async fn test_validator_bind_rejects_wrong_key() {
     // The bind service will produce per-session sigs under this wrong key, and
     // every verification in the peer's topology lookup will fail.
     let keypair1 = fixtures.ed25519_keypair(1);
-    let wrong_signing_key = Arc::new(BlsSigner::new(generate_bls_keypair()));
+    let wrong_signing_key = Arc::new(BlsSigner::generate());
     let config1 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![node0_addr],

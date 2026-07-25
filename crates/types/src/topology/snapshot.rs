@@ -992,7 +992,7 @@ fn empty_committees(num_shards: u64) -> HashMap<ShardId, ShardCommittee> {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto::Signer;
-    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
+    use hyperscale_crypto_bls::BlsSigner;
 
     use super::*;
     use crate::test_utils::{test_node, test_transaction_with_nodes};
@@ -1001,7 +1001,7 @@ mod tests {
     fn make_test_validator(id: u64) -> ValidatorInfo {
         ValidatorInfo {
             validator_id: ValidatorId::new(id),
-            public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+            public_key: BlsSigner::generate().public_key(),
         }
     }
 

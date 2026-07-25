@@ -1226,7 +1226,7 @@ fn advance_keeper_half(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
+    use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BlockHash, BlockHeight, Hash, NetworkDefinition, ShardAnchor,
         ShardId, Signer, StateRoot, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
@@ -1303,7 +1303,7 @@ mod tests {
             .iter()
             .map(|&id| ValidatorInfo {
                 validator_id: vid(id),
-                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+                public_key: BlsSigner::generate().public_key(),
             })
             .collect();
         let committee_map: HashMap<ShardId, Vec<ValidatorId>> = committees

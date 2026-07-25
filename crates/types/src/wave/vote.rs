@@ -386,7 +386,7 @@ impl Verified<ExecutionVote> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use sbor::{
         BASIC_SBOR_V1_MAX_DEPTH, BASIC_SBOR_V1_PAYLOAD_PREFIX, Categorize, DecodeError, Encoder,
         NoCustomValueKind, ValueKind, VecEncoder, basic_decode, basic_encode,
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn verify_accepts_honest_vote() {
         let net = NetworkDefinition::simulator();
-        let signer = BlsSigner::new(generate_bls_keypair());
+        let signer = BlsSigner::generate();
         let vote = sign_sample_vote(&net, vec![sample_outcome(1), sample_outcome(2)], 3, &signer);
 
         let ctx = ExecutionVoteContext {
@@ -494,7 +494,7 @@ mod tests {
     #[test]
     fn verify_rejects_outcomes_root_mismatch() {
         let net = NetworkDefinition::simulator();
-        let signer = BlsSigner::new(generate_bls_keypair());
+        let signer = BlsSigner::generate();
         let honest = sign_sample_vote(&net, vec![sample_outcome(1)], 3, &signer);
 
         // Swap in a wrong root while leaving the (honestly-signed)
@@ -542,8 +542,8 @@ mod tests {
     #[test]
     fn verify_rejects_bad_signature() {
         let net = NetworkDefinition::simulator();
-        let signer = BlsSigner::new(generate_bls_keypair());
-        let intruder = BlsSigner::new(generate_bls_keypair());
+        let signer = BlsSigner::generate();
+        let intruder = BlsSigner::generate();
         let vote = sign_sample_vote(&net, vec![sample_outcome(1)], 3, &signer);
 
         let ctx = ExecutionVoteContext {
@@ -566,7 +566,7 @@ mod tests {
 
         let votes: Vec<_> = (0..3u64)
             .map(|i| {
-                let signer = BlsSigner::new(generate_bls_keypair());
+                let signer = BlsSigner::generate();
                 let pk = signer.public_key();
                 let vote = sign_sample_vote(&net, outcomes.clone(), i, &signer);
                 (vote, pk)
@@ -587,14 +587,14 @@ mod tests {
 
         let mut votes: Vec<(ExecutionVote, ConsensusPublicKey)> = (0..3u64)
             .map(|i| {
-                let signer = BlsSigner::new(generate_bls_keypair());
+                let signer = BlsSigner::generate();
                 let pk = signer.public_key();
                 let vote = sign_sample_vote(&net, outcomes.clone(), i, &signer);
                 (vote, pk)
             })
             .collect();
 
-        let intruder_pk = BlsSigner::new(generate_bls_keypair()).public_key();
+        let intruder_pk = BlsSigner::generate().public_key();
         votes[1].1 = intruder_pk;
 
         let verified = Verified::<ExecutionVote>::verify_batch(&BlsVerifier, &net, votes);
@@ -607,7 +607,7 @@ mod tests {
     #[test]
     fn verify_batch_drops_outcomes_root_mismatch() {
         let net = NetworkDefinition::simulator();
-        let signer = BlsSigner::new(generate_bls_keypair());
+        let signer = BlsSigner::generate();
         let vote = sign_sample_vote(&net, vec![sample_outcome(11)], 0, &signer);
 
         let (
@@ -657,7 +657,7 @@ mod tests {
     #[test]
     fn sign_local_roundtrips_through_verify() {
         let net = NetworkDefinition::simulator();
-        let signer = BlsSigner::new(generate_bls_keypair());
+        let signer = BlsSigner::generate();
 
         let verified = Verified::<ExecutionVote>::sign_local(
             &net,

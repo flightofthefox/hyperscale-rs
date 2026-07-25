@@ -638,7 +638,7 @@ async fn handle_outbound(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::ConsensusPublicKey;
 
     use super::*;
@@ -755,7 +755,7 @@ mod tests {
 
     #[test]
     fn verify_all_rejects_when_any_signature_fails() {
-        let keypair = BlsSigner::new(generate_bls_keypair());
+        let keypair = BlsSigner::generate();
         let peer_id = Libp2pPeerId::random();
         let nonce = [4u8; VALIDATOR_BIND_NONCE_LEN];
         let good_vid = ValidatorId::new(1);
@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn verify_bind_accepts_valid_signature_over_nonce() {
-        let keypair = BlsSigner::new(generate_bls_keypair());
+        let keypair = BlsSigner::generate();
         let pubkey = keypair.public_key();
         let peer_id = Libp2pPeerId::random();
         let vid = ValidatorId::new(7);
@@ -824,7 +824,7 @@ mod tests {
         // Forward-security check: a signature produced over nonce_a must NOT
         // verify against nonce_b. This is what makes replay across sessions
         // impossible.
-        let keypair = BlsSigner::new(generate_bls_keypair());
+        let keypair = BlsSigner::generate();
         let pubkey = keypair.public_key();
         let peer_id = Libp2pPeerId::random();
         let vid = ValidatorId::new(7);
@@ -860,7 +860,7 @@ mod tests {
 
     #[test]
     fn verify_bind_rejects_wrong_peer_id() {
-        let keypair = BlsSigner::new(generate_bls_keypair());
+        let keypair = BlsSigner::generate();
         let pubkey = keypair.public_key();
         let peer_a = Libp2pPeerId::random();
         let peer_b = Libp2pPeerId::random();
@@ -893,7 +893,7 @@ mod tests {
 
     #[test]
     fn verify_bind_rejects_unknown_validator() {
-        let keypair = BlsSigner::new(generate_bls_keypair());
+        let keypair = BlsSigner::generate();
         let pubkey = keypair.public_key();
         let peer_id = Libp2pPeerId::random();
         let nonce = [4u8; VALIDATOR_BIND_NONCE_LEN];
@@ -924,8 +924,8 @@ mod tests {
 
     #[test]
     fn verify_bind_rejects_wrong_key() {
-        let keypair_a = BlsSigner::new(generate_bls_keypair());
-        let keypair_b = BlsSigner::new(generate_bls_keypair());
+        let keypair_a = BlsSigner::generate();
+        let keypair_b = BlsSigner::generate();
         let peer_id = Libp2pPeerId::random();
         let vid = ValidatorId::new(7);
         let nonce = [5u8; VALIDATOR_BIND_NONCE_LEN];

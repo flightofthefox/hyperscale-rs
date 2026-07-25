@@ -1125,7 +1125,7 @@ impl Verified<SpcNewCommitMsg> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
     use crate::{PcQc2, PcSignerLengths, PcValueElement, PcXpProof, SignerBitfield};
@@ -1245,12 +1245,7 @@ mod tests {
 
     fn committee(n: usize) -> Vec<(ValidatorId, ConsensusPublicKey)> {
         (0..n as u64)
-            .map(|i| {
-                (
-                    ValidatorId::new(i),
-                    BlsSigner::new(generate_bls_keypair()).public_key(),
-                )
-            })
+            .map(|i| (ValidatorId::new(i), BlsSigner::generate().public_key()))
             .collect()
     }
 
@@ -1304,7 +1299,7 @@ mod tests {
             target_proof: sample_pc_qc3().into(),
             skip_reports: PositionalBundle::empty(),
             skip_aggregate_sig: AggregateSignature::new(
-                *BlsSigner::new(generate_bls_keypair())
+                *BlsSigner::generate()
                     .sign(b"unused")
                     .expect("sign")
                     .as_bytes(),
@@ -1330,7 +1325,7 @@ mod tests {
             target_proof: sample_pc_qc3().into(),
             skip_reports: PositionalBundle::new(signers, reports),
             skip_aggregate_sig: AggregateSignature::new(
-                *BlsSigner::new(generate_bls_keypair())
+                *BlsSigner::generate()
                     .sign(b"unused")
                     .expect("sign")
                     .as_bytes(),
@@ -1352,7 +1347,7 @@ mod tests {
     #[test]
     fn build_indirect_cert_rejects_mismatched_view() {
         let c = committee(4);
-        let kp = BlsSigner::new(generate_bls_keypair());
+        let kp = BlsSigner::generate();
         let msg = SpcEmptyViewMsg {
             view: SpcView::new(2),
             reported: SpcHighTriple {
@@ -1380,9 +1375,9 @@ mod tests {
     #[test]
     fn build_indirect_cert_targets_max_reported() {
         let c = committee(4);
-        let kp_a = BlsSigner::new(generate_bls_keypair());
-        let kp_b = BlsSigner::new(generate_bls_keypair());
-        let kp_c = BlsSigner::new(generate_bls_keypair());
+        let kp_a = BlsSigner::generate();
+        let kp_b = BlsSigner::generate();
+        let kp_c = BlsSigner::generate();
         let mk = |signer: u64, reported_view: u32, sk: &BlsSigner| SpcEmptyViewMsg {
             view: SpcView::new(5),
             reported: SpcHighTriple {

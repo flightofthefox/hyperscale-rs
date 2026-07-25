@@ -224,7 +224,7 @@ impl Verified<Timeout> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
     use crate::{AggregateSignature, BlockHash, BlockHeight, SignerBitfield, WeightedTimestamp};
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn sign_local_roundtrips_through_verify() {
         let net = NetworkDefinition::simulator();
-        let signer = BlsSigner::new(generate_bls_keypair());
+        let signer = BlsSigner::generate();
         let timeout = Verified::<Timeout>::sign_local(
             &net,
             SHARD,
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn verify_rejects_wrong_signer() {
         let net = NetworkDefinition::simulator();
-        let signer = BlsSigner::new(generate_bls_keypair());
+        let signer = BlsSigner::generate();
         let timeout = Timeout::new(
             &net,
             SHARD,
@@ -286,7 +286,7 @@ mod tests {
         )
         .expect("sign");
 
-        let intruder = BlsSigner::new(generate_bls_keypair());
+        let intruder = BlsSigner::generate();
         assert!(matches!(
             timeout.verify(&TimeoutContext {
                 verifier: &BlsVerifier,

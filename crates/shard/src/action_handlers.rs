@@ -1018,7 +1018,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::test_utils::test_notarized_transaction_v1;
     use hyperscale_types::{
         CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Signer,
@@ -1059,9 +1059,7 @@ mod tests {
     }
 
     fn keypairs(n: usize) -> Vec<BlsSigner> {
-        (0..n)
-            .map(|_| BlsSigner::new(generate_bls_keypair()))
-            .collect()
+        (0..n).map(|_| BlsSigner::generate()).collect()
     }
 
     // ─── verify_vote_batch ──────────────────────────────────────────────

@@ -554,7 +554,7 @@ impl ShardForkProof {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto::Signer;
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
     use crate::{BlockVote, Hash, ProposerTimestamp};
@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn genuine_double_vote_verifies() {
         let net = NetworkDefinition::simulator();
-        let sk = BlsSigner::new(generate_bls_keypair());
+        let sk = BlsSigner::generate();
         let pk = sk.public_key();
         let (shard, height, round) = (ShardId::ROOT, BlockHeight::new(4), Round::INITIAL);
         let (ba, pa, sa) = signed_side(
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn equal_blocks_rejected() {
         let net = NetworkDefinition::simulator();
-        let sk = BlsSigner::new(generate_bls_keypair());
+        let sk = BlsSigner::generate();
         let pk = sk.public_key();
         let (shard, height, round) = (ShardId::ROOT, BlockHeight::new(4), Round::INITIAL);
         let (ba, pa, sa) = signed_side(
@@ -672,9 +672,9 @@ mod tests {
     #[test]
     fn bad_signature_rejected() {
         let net = NetworkDefinition::simulator();
-        let sk = BlsSigner::new(generate_bls_keypair());
+        let sk = BlsSigner::generate();
         let pk = sk.public_key();
-        let intruder = BlsSigner::new(generate_bls_keypair());
+        let intruder = BlsSigner::generate();
         let (shard, height, round) = (ShardId::ROOT, BlockHeight::new(4), Round::INITIAL);
         let (ba, pa, sa) = signed_side(
             &net,

@@ -37,7 +37,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_crypto::Signer;
-    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
+    use hyperscale_crypto_bls::BlsSigner;
     use sbor::BASIC_SBOR_V1_MAX_DEPTH;
     use sbor::prelude::*;
 
@@ -58,7 +58,7 @@ mod tests {
         let validators: Vec<_> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
+                public_key: BlsSigner::generate().public_key(),
             })
             .collect();
         TopologySnapshot::new(
