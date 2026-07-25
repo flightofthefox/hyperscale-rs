@@ -52,17 +52,28 @@ pub mod system_action;
 
 /// Consensus crypto scheme the simulated validators run.
 ///
-/// Concrete choice at the runner, never a feature flag — mirrors the
-/// storage/dispatch/network seams. The production-harness ci sims run
-/// real BLS by construction and are the standing BLS integration
-/// canary, so protocol-logic suites default to the mock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Every scheme is constructible on any build; the feature only moves the
+/// default, so a test that targets the signature path can name [`Self::Bls`]
+/// outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoScheme {
     /// Deterministic keyed-hash mock — constant-cost sign/verify.
-    #[default]
     Mock,
     /// Real BLS12-381, for tests that target the signature path itself.
     Bls,
+}
+
+impl Default for CryptoScheme {
+    /// Real BLS under the `ci` feature, which runs the sims at production
+    /// parity; the constant-cost mock otherwise, so local runs finish
+    /// quickly.
+    fn default() -> Self {
+        if cfg!(feature = "ci") {
+            Self::Bls
+        } else {
+            Self::Mock
+        }
+    }
 }
 
 /// The verifier `scheme` selects.

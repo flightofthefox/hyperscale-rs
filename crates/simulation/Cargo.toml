@@ -5,8 +5,9 @@ edition.workspace = true
 description = "Simulation runner"
 
 [features]
-# Run the sims at the production 5-minute beacon epoch. Off by default so
-# local runs use a fast 30s epoch; CI turns it on for production parity.
+# Run the sims at production parity: the 5-minute beacon epoch and real BLS
+# signatures. Off by default so local runs use a fast 30s epoch and the
+# constant-cost mock scheme.
 ci = []
 
 [dependencies]
