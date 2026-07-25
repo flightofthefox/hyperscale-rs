@@ -123,6 +123,12 @@ impl Session {
             // needs one spare cohort per split or the readiness gate never
             // passes (INV-RESHAPE-1).
             pool_surplus: splits * config.shard_size,
+            // One validator per host, pool included. Co-hosting is a real
+            // deployment shape, but it means a split's observers snap-sync on
+            // the same hosts that are running the parent's consensus — which
+            // is not what a network of distinct operators looks like, and
+            // muddies anything the demo shows about reshape cost.
+            dedicated_pool_hosts: true,
             beacon_chain_config: Some(BeaconChainConfig {
                 shard_size: config.shard_size,
                 // The default five-minute epoch makes a split span thousands
