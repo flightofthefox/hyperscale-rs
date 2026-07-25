@@ -3,7 +3,7 @@
 //! This crate provides the foundational types used throughout the consensus
 //! implementation:
 //!
-//! - **Primitives**: Hash, cryptographic keys and signatures
+//! - **Primitives**: hashes, merkle roots, signer bitfields, randomness
 //! - **Identifiers**: `ValidatorId`, `ShardId`, `BlockHeight`, etc.
 //! - **Consensus types**: Block, `BlockHeader`, `QuorumCertificate`, etc.
 //! - **Wave types**: `WaveId`, `ExecutionVote`, `ExecutionCertificate`, `WaveCertificate`, etc.
@@ -11,8 +11,11 @@
 //!
 //! # Design Philosophy
 //!
-//! This crate is self-contained with minimal dependencies. It does not depend on
-//! any other workspace crates, making it the foundation layer.
+//! The foundation layer: every wire struct and the [`Verify`] predicate that
+//! admits it live here. Signature checks route through the injected
+//! [`Verifier`], so no scheme is named anywhere in the crate — its only
+//! workspace dependencies are that crypto interface and the JMT whose
+//! inclusion proofs the provisioning types verify.
 
 mod crypto;
 pub mod network;

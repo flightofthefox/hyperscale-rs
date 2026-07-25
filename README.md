@@ -22,6 +22,9 @@ Rust implementation of the Hyperscale protocol: a sharded smart-contract network
 |-------|---------|
 | [`beacon`](crates/beacon) | Beacon-chain coordinator (PC/SPC/MSC consensus, validator-set + topology source) |
 | [`core`](crates/core) | The `StateMachine` and `SubStateMachine` traits that everything implements |
+| [`crypto`](crates/crypto) | Consensus crypto interface: `Signer`/`Verifier` traits and related abstractions |
+| [`crypto-bls`](crates/crypto-bls) | Production BLS12-381 signing, verification, and certificate aggregation |
+| [`crypto-mock`](crates/crypto-mock) | Deterministic keyed-hash scheme for simulation with constant-cost sign and verify |
 | [`dispatch`](crates/dispatch) | Abstract trait for scheduling CPU-intensive work across priority-isolated pools |
 | [`dispatch-pooled`](crates/dispatch-pooled) | Production dispatch using rayon thread pools with core allocation and pinning |
 | [`dispatch-sync`](crates/dispatch-sync) | Deterministic inline dispatch for simulation (runs closures on calling thread) |
@@ -47,7 +50,7 @@ Rust implementation of the Hyperscale protocol: a sharded smart-contract network
 | [`storage`](crates/storage) | Storage trait abstractions (SubstateStore, CommitStore, ConsensusStore) and JMT integration |
 | [`storage-memory`](crates/storage-memory) | In-memory storage using persistent data structures for deterministic simulation |
 | [`storage-rocksdb`](crates/storage-rocksdb) | Production RocksDB storage with JMT state roots and snapshot isolation |
-| [`types`](crates/types) | Core types: hashes, blocks, votes, QCs, keys, transactions, topology |
+| [`types`](crates/types) | Core wire types — hashes, blocks, votes, QCs, transactions, topology — and their verification predicates |
 
 ## Installation
 
