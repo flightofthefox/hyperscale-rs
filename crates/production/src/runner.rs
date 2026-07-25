@@ -571,6 +571,7 @@ impl ProductionRunnerBuilder {
             self.provision_config,
             beacon_network,
             beacon_config_hash,
+            Arc::new(BlsVerifier),
             TokioHandle::current(),
             self.publishers.clone(),
             Arc::clone(&storages),

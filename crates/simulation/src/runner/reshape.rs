@@ -76,7 +76,7 @@ impl SimulationRunner {
         let mut events = std::mem::take(&mut self.reshape_pending[host as usize]);
         let mut retries: Vec<ReshapeEvent> = Vec::new();
         for _ in 0..MAX_FIXPOINT_ROUNDS {
-            let requests = orch.step(&view, std::mem::take(&mut events));
+            let requests = orch.step(&view, self.verifier.as_ref(), std::mem::take(&mut events));
             let mut progressed = false;
             for request in requests {
                 if let Some(event) =

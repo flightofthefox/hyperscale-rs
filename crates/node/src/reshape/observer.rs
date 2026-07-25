@@ -25,9 +25,10 @@
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, NetworkDefinition, ReadySignal,
-    ShardAnchor, ShardId, SignError, Signer, StateRoot, StoredReceipt, ValidatorId,
-    WeightedTimestamp, ready_signal_message, ready_signal_window, shard_prefix_path,
+    Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin, CommitProof,
+    NetworkDefinition, ReadySignal, ResolvedCommittee, ShardAnchor, ShardId, SignError, Signer,
+    StateRoot, StoredReceipt, ValidatorId, WeightedTimestamp, ready_signal_message,
+    ready_signal_window, shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
@@ -271,6 +272,12 @@ pub struct TerminalSighting {
     /// `split_child_roots` pair or one that fails to compose to its own
     /// state root.
     pub genesis: Option<DerivedGenesis>,
+    /// The two-chain proving the terminal *committed* rather than merely
+    /// certified, with the committee its QCs verify against. Absent when
+    /// the follow never captured the parent's committee, or when the
+    /// block after the terminal is not round-contiguous with it — a view
+    /// change between them means no direct commit to prove here.
+    pub commit_proof: Option<(CommitProof, ResolvedCommittee)>,
 }
 
 /// A child genesis derived locally from the parent's terminal block.
@@ -348,6 +355,9 @@ pub struct ObserverTail {
     /// next block — and the genesis derivation needs the terminal header
     /// itself, so the follow keeps one block of history.
     prev: Option<BlockHeader>,
+    /// The parent's consensus committee, captured while it was still
+    /// live so the terminal's QCs stay verifiable after the head moves on.
+    parent_committee: Option<ResolvedCommittee>,
     /// The terminal block, once the follow has walked past it.
     terminal: Option<TerminalSighting>,
     /// The store's root after the last application (the imported root
@@ -387,6 +397,7 @@ impl ObserverTail {
             apply_in_flight: false,
             terminal_cut: None,
             prev: None,
+            parent_committee: None,
             terminal: None,
         }
     }
@@ -396,6 +407,21 @@ impl ObserverTail {
     /// re-supplies it every step, and a scheduled cut never moves.
     pub const fn set_terminal_cut(&mut self, cut: Option<WeightedTimestamp>) {
         self.terminal_cut = cut;
+    }
+
+    /// Capture the parent's consensus committee while it is still live, so
+    /// the terminal's QCs can be verified after the head has moved on.
+    ///
+    /// The driver re-supplies it every step and the last non-empty capture
+    /// wins: a split parent leaves the head's committee set the moment its
+    /// applying fold lands, which is around when the follow reaches its
+    /// terminal, so resolving on demand would come up empty exactly when
+    /// the proof is needed. Committees are frozen per window, so the copy
+    /// taken during the final window is the set that signed it.
+    pub fn capture_committee(&mut self, committee: Option<ResolvedCommittee>) {
+        if let Some(committee) = committee {
+            self.parent_committee = Some(committee);
+        }
     }
 
     /// The parent's terminal block, once the follow has walked one block
@@ -461,11 +487,29 @@ impl ObserverTail {
             && terminal.parent_qc().weighted_timestamp().as_millis() <= cut.as_millis()
             && parent_qc_wt.as_millis() > cut.as_millis()
         {
+            // The two-chain that commits the terminal: its own certificate
+            // is this block's parent QC, and this block carries the QC over
+            // itself. Only a round-contiguous pair is a direct commit; a
+            // view change between them leaves nothing to prove here.
+            let commit_proof = self
+                .parent_committee
+                .clone()
+                .filter(|_| header.round() == terminal.round().next())
+                .map(|committee| {
+                    (
+                        CommitProof::direct(
+                            CertifiedBlockHeader::new(terminal.clone(), header.parent_qc().clone()),
+                            CertifiedBlockHeader::new(header.clone(), certified.qc().clone()),
+                        ),
+                        committee,
+                    )
+                });
             self.terminal = Some(TerminalSighting {
                 height: terminal.height(),
                 hash: terminal.hash(),
                 canonical_wt: parent_qc_wt,
                 genesis: derive_child_genesis(self.child, terminal, parent_qc_wt),
+                commit_proof,
             });
         }
         self.prev = Some(header.clone());

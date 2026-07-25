@@ -34,7 +34,9 @@ use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
-use hyperscale_types::{GenesisConfigHash, NetworkDefinition, ShardId, Signer, ValidatorId};
+use hyperscale_types::{
+    GenesisConfigHash, NetworkDefinition, ShardId, Signer, ValidatorId, Verifier,
+};
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -153,6 +155,9 @@ pub struct ShardSupervisor {
     provision_config: ProvisionConfig,
     beacon_network: NetworkDefinition,
     beacon_config_hash: GenesisConfigHash,
+    /// Verifies the commit proofs a split child's follower assembles from
+    /// the parent chain it tails.
+    verifier: Arc<dyn Verifier>,
     tokio_handle: TokioHandle,
     publishers: RpcPublishers,
     /// Per-shard `RocksDB` handles, shared with the runner's GC tick.
@@ -235,6 +240,7 @@ impl ShardSupervisor {
         provision_config: ProvisionConfig,
         beacon_network: NetworkDefinition,
         beacon_config_hash: GenesisConfigHash,
+        verifier: Arc<dyn Verifier>,
         tokio_handle: TokioHandle,
         publishers: RpcPublishers,
         storages: Arc<Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>,
@@ -256,6 +262,7 @@ impl ShardSupervisor {
             provision_config,
             beacon_network,
             beacon_config_hash,
+            verifier,
             tokio_handle,
             publishers,
             storages,

@@ -344,6 +344,29 @@ impl CommitProof {
         Ok(())
     }
 
+    /// Verify this proof standalone: the two-chain's structure, then both
+    /// member QCs against their resolved committees (`[certified, child]`,
+    /// positionally aligned to the two-chain).
+    ///
+    /// [`ShardForkProof`] verifies its two member proofs through the same
+    /// checks; this is the entry for a consumer holding a single proof —
+    /// a split child's follower establishing that the parent's terminal
+    /// block *committed* rather than merely certified, which a bare QC
+    /// cannot show.
+    ///
+    /// # Errors
+    ///
+    /// A [`CommitProofVerifyError`] naming the failing check.
+    pub fn verify_resolved(
+        &self,
+        verifier: &dyn Verifier,
+        network: &NetworkDefinition,
+        committees: &[ResolvedCommittee; 2],
+    ) -> Result<(), CommitProofVerifyError> {
+        self.verify_structure()?;
+        self.verify_qcs(verifier, network, committees)
+    }
+
     /// Verify both member QCs against their resolved committees.
     /// `committees` is `[certified_committee, child_committee]`.
     fn verify_qcs(

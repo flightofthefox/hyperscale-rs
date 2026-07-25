@@ -14,7 +14,8 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    EpochWindows, ShardAnchor, ShardId, TopologySnapshot, ValidatorId, WeightedTimestamp,
+    EpochWindows, NetworkDefinition, ResolvedCommittee, ShardAnchor, ShardId, TopologySnapshot,
+    ValidatorId, WeightedTimestamp,
 };
 
 /// Reshape gate predicates over one host's [`TopologySnapshot`] — the
@@ -60,10 +61,43 @@ impl<'a> ReshapeView<'a> {
         )
     }
 
+    /// The chain's network definition — the domain every signature and QC
+    /// verification binds to.
+    #[must_use]
+    pub const fn network(&self) -> &NetworkDefinition {
+        self.topology_snapshot.network()
+    }
+
     /// The shard's beacon-attested boundary anchor, or `None` until it seeds.
     #[must_use]
     pub fn boundary(&self, shard: ShardId) -> Option<ShardAnchor> {
         self.topology_snapshot.boundary(shard)
+    }
+
+    /// `shard`'s consensus committee resolved for QC verification — its
+    /// members' public keys and the shard's quorum threshold. `None` once
+    /// the shard has left the head's committee set.
+    ///
+    /// Callers that must verify a *terminating* shard's QCs capture this
+    /// while the shard is still live, rather than resolving it after the
+    /// fact: the applying fold drops a split parent from the lookahead, so
+    /// the moment the head advances past its cut there is no committee
+    /// left to resolve — precisely when a follower reaches its terminal.
+    /// Committees are frozen per window, so a copy taken during the final
+    /// window is exactly the set that signed that window's QCs.
+    #[must_use]
+    pub fn resolved_committee(&self, shard: ShardId) -> Option<ResolvedCommittee> {
+        let members = self.topology_snapshot.consensus_committee_for_shard(shard);
+        if members.is_empty() {
+            return None;
+        }
+        Some(ResolvedCommittee {
+            public_keys: members
+                .iter()
+                .map(|v| self.topology_snapshot.public_key(*v))
+                .collect::<Option<Vec<_>>>()?,
+            quorum_threshold: self.topology_snapshot.quorum_threshold_for_shard(shard),
+        })
     }
 
     /// The shard's full committee — the ready-signal broadcast recipients.

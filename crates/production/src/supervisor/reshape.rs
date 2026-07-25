@@ -145,7 +145,7 @@ impl ShardSupervisor {
         let requests = {
             let topology_snapshot = self.process.topology_snapshot().load_full();
             let view = ReshapeView::new(&topology_snapshot, self.epoch_duration_ms);
-            self.reshape.step(&view, events)
+            self.reshape.step(&view, self.verifier.as_ref(), events)
         };
         for request in requests {
             self.dispatch_reshape(request);
