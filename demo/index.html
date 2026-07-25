@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hyperscale — live network</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <p class="eyebrow">deterministic simulation &middot; running in this tab</p>
+      <h1>HYPERSCALE <em>// LIVE NETWORK</em></h1>
+      <span class="badge" id="badge">booting&hellip;</span>
+    </div>
+    <div class="transport">
+      <button id="play">&#10074;&#10074; PAUSE</button>
+      <button id="speed">1&times;</button>
+      <button id="submit">SUBMIT TX</button>
+      <div class="time">
+        <b id="wt">WT 00:00.000</b><br>
+        <span id="meta">seed 42 &middot; 4 validators per shard</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="main">
+    <section class="panel">
+      <h2>SHARD TRIE <span id="shardcount">&mdash;</span></h2>
+      <svg id="trie" viewBox="0 0 300 200" aria-label="Shard topology"></svg>
+      <p class="cap" id="triecap"></p>
+    </section>
+
+    <section class="panel lanes">
+      <h2>CHAINS <span>x = weighted time, BFT-attested</span></h2>
+      <svg id="lanes" aria-label="Per-shard block lanes"></svg>
+      <div class="legend" id="legend"></div>
+    </section>
+  </div>
+
+  <div class="bottom">
+    <section class="panel">
+      <h2>TRANSACTIONS <span>real Radix transfers</span></h2>
+      <div class="txs" id="txs"><p class="empty">none yet &mdash; press SUBMIT TX</p></div>
+    </section>
+    <section class="panel">
+      <h2>EVENT LOG <span id="evcount"></span></h2>
+      <div class="log" id="log"></div>
+    </section>
+  </div>
+
+  <footer>
+    Every mark is derived from committed chain content in a real
+    <code>SimulationRunner</code> compiled to WebAssembly and stepped from this page's
+    animation frame &mdash; not a recording. Same seed, same run, byte for byte.
+  </footer>
+</div>
+<script type="module" src="./main.js"></script>
+</body>
+</html>

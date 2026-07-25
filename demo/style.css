@@ -1,0 +1,155 @@
+:root {
+  --bg: #0B1017; --panel: #111826; --panel2: #0E141F;
+  --line: #24303F; --line2: #314052;
+  --ink: #DCE6F2; --ink2: #8CA0B8; --muted: #5C7086;
+  --ok: #46B86B; --bad: #D95757; --warn: #D99C3A; --run: #3E8DCB;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #F4F7FB; --panel: #FFFFFF; --panel2: #ECF1F7;
+    --line: #D8E0EA; --line2: #C4CFDC;
+    --ink: #17202B; --ink2: #4E6076; --muted: #7E8FA3;
+    --ok: #1E7E3E; --bad: #B3382E; --warn: #9A6D10; --run: #2374B5;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--ink);
+  font-family: var(--sans); font-size: 14px; line-height: 1.5;
+}
+.wrap { max-width: 1280px; margin: 0 auto; padding: 18px 20px 40px; }
+
+button {
+  font-family: var(--mono); font-size: 13px; color: var(--ink);
+  background: var(--panel); border: 1px solid var(--line2);
+  border-radius: 6px; padding: 6px 12px; cursor: pointer;
+}
+button:hover { border-color: var(--ink2); }
+button:focus-visible { outline: 2px solid var(--run); outline-offset: 2px; }
+
+header {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap; margin-bottom: 14px;
+}
+.eyebrow {
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--muted); margin: 0 0 4px;
+}
+h1 {
+  font-family: var(--mono); font-size: 20px; font-weight: 600;
+  letter-spacing: .04em; margin: 0;
+}
+h1 em { font-style: normal; color: var(--ink2); }
+.badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em;
+  color: var(--ok); border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
+  border-radius: 20px; padding: 3px 10px; margin-top: 7px;
+}
+.badge::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%;
+  background: currentColor;
+}
+.badge.boot { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+.transport { display: flex; align-items: center; gap: 8px; }
+.transport .time {
+  font-family: var(--mono); font-size: 13px; color: var(--ink2);
+  font-variant-numeric: tabular-nums; min-width: 210px; text-align: right;
+}
+.transport .time b { color: var(--ink); font-weight: 600; }
+#play { min-width: 92px; }
+
+.main { display: grid; grid-template-columns: 300px 1fr; gap: 14px; margin-bottom: 14px; }
+.bottom { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.panel {
+  border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel); overflow: hidden; min-width: 0;
+}
+.panel h2 {
+  font-family: var(--mono); font-size: 10.5px; font-weight: 600;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--muted);
+  margin: 0; padding: 10px 14px 8px;
+  display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+}
+.panel h2 span { color: var(--ink2); letter-spacing: .04em; text-transform: none; }
+.cap {
+  padding: 2px 14px 12px; margin: 0;
+  font-family: var(--mono); font-size: 10.5px; color: var(--ink2); min-height: 32px;
+}
+.cap .good { color: var(--ok); }
+
+#trie { display: block; width: 100%; height: auto; }
+.tnode rect { fill: var(--panel2); stroke-width: 2; rx: 6; }
+.tnode text {
+  font-family: var(--mono); font-size: 12px; fill: var(--ink);
+  text-anchor: middle; font-weight: 600;
+}
+.tnode .sub { font-size: 8.5px; fill: var(--muted); font-weight: 400; letter-spacing: .08em; }
+.tnode.dead rect { fill: transparent; stroke-dasharray: 2 3; }
+.tnode.dead text { fill: var(--muted); }
+.tedge { stroke: var(--line2); stroke-width: 1.6; fill: none; }
+
+.lanes { display: flex; flex-direction: column; }
+#lanes { display: block; width: 100%; }
+.lane-label {
+  font-family: var(--mono); font-size: 10px; font-weight: 700;
+  letter-spacing: .1em; dominant-baseline: middle;
+}
+.baseline { stroke-width: 1.4; opacity: .45; }
+.blk { rx: 2; }
+.blk.fallback { fill: transparent !important; stroke-width: 1.2; }
+.gridline { stroke: var(--line); stroke-width: 1; opacity: .5; }
+.gridlab { font-family: var(--mono); font-size: 9px; fill: var(--muted); }
+.splitmark { stroke: var(--warn); stroke-width: 1.6; stroke-dasharray: 3 3; }
+.splitlab {
+  font-family: var(--mono); font-size: 9px; letter-spacing: .1em;
+  fill: var(--warn); text-anchor: middle;
+}
+
+.legend {
+  display: flex; flex-wrap: wrap; gap: 4px 16px;
+  padding: 8px 14px 10px; border-top: 1px solid var(--line);
+  font-family: var(--mono); font-size: 10px; color: var(--ink2);
+}
+.legend .k { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 10px; height: 10px; border-radius: 2.5px; display: inline-block; }
+
+.txs { padding: 10px 14px 14px; display: flex; flex-direction: column; gap: 7px;
+  max-height: 210px; overflow-y: auto; }
+.txs .empty { color: var(--muted); font-family: var(--mono); font-size: 11.5px; margin: 4px 0; }
+.tx {
+  display: grid; grid-template-columns: 78px 1fr auto; align-items: center;
+  gap: 10px; font-family: var(--mono); font-size: 12px;
+}
+.tx .id { font-weight: 700; }
+.tx .bar { height: 4px; border-radius: 2px; background: var(--line); position: relative; }
+.tx .bar i { position: absolute; inset: 0 auto 0 0; border-radius: 2px; background: var(--run); }
+.pill {
+  font-size: 9.5px; letter-spacing: .08em; padding: 2.5px 8px;
+  border-radius: 10px; border: 1px solid var(--line2); color: var(--muted);
+  white-space: nowrap;
+}
+.pill.succeeded { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 50%, transparent); }
+.pill.aborted, .pill.rejected { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 50%, transparent); }
+.pill.committed { color: var(--run); border-color: color-mix(in srgb, var(--run) 50%, transparent); }
+.pill.pending { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
+
+.log {
+  padding: 8px 14px 12px; font-family: var(--mono); font-size: 10.5px;
+  line-height: 1.75; color: var(--muted); height: 210px; overflow-y: auto;
+}
+.log div b { color: var(--ink2); font-weight: 600; }
+.log .hl { color: var(--ink); }
+.log .split { color: var(--warn); }
+.log .ok { color: var(--ok); }
+
+footer { margin-top: 16px; color: var(--muted); font-size: 12.5px; max-width: 80ch; }
+footer code { font-family: var(--mono); font-size: 11px; }
+
+@media (max-width: 980px) {
+  .main, .bottom { grid-template-columns: 1fr; }
+  .transport .time { text-align: left; }
+}
