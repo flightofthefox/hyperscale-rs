@@ -1554,13 +1554,13 @@ impl RemoteHeaderCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::bls_keypair_from_seed;
+    use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         CertificateRoot, ChainOrigin, Epoch, Hash, InFlightCount, LocalReceiptRoot,
         NetworkDefinition, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId,
-        SignerBitfield, StateRoot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
-        pk_from_bls,
+        Signer, SignerBitfield, StateRoot, TransactionRoot, ValidatorId, ValidatorInfo,
+        ValidatorSet,
     };
 
     use super::*;
@@ -1647,7 +1647,7 @@ mod tests {
                 seed[8] = variant;
                 ValidatorInfo {
                     validator_id: ValidatorId::new(id),
-                    public_key: pk_from_bls(&bls_keypair_from_seed(&seed).public_key()),
+                    public_key: BlsSigner::from_seed(&seed).public_key(),
                 }
             })
             .collect();

@@ -5680,14 +5680,14 @@ mod tests {
     use std::collections::BTreeSet;
 
     use hyperscale_core::Action;
-    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey,
-        BoundedVec, CertificateRoot, ConsensusSignature, Epoch, Hash, InFlightCount,
-        LocalReceiptRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition,
-        ProvisionsRoot, RETENTION_HORIZON, RoutableTransaction, ShardId, SignerBitfield,
-        TopologySchedule, TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo,
-        ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources, pk_from_bls, test_utils,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BoundedVec, CertificateRoot,
+        ConsensusSignature, Epoch, Hash, InFlightCount, LocalReceiptRoot, MAX_TIMESTAMP_DELAY,
+        MAX_TIMESTAMP_RUSH, NetworkDefinition, ProvisionsRoot, RETENTION_HORIZON,
+        RoutableTransaction, ShardId, Signer, SignerBitfield, TopologySchedule, TopologySnapshot,
+        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
+        WitnessSources, test_utils,
     };
 
     use super::*;
@@ -5714,14 +5714,16 @@ mod tests {
         n: usize,
         config: ShardConsensusConfig,
     ) -> (ShardCoordinator, TopologySchedule) {
-        let keys: Vec<Bls12381G1PrivateKey> = (0..n).map(|_| generate_bls_keypair()).collect();
+        let keys: Vec<BlsSigner> = (0..n)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
 
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -5810,7 +5812,7 @@ mod tests {
             .iter()
             .map(|&id| ValidatorInfo {
                 validator_id: ValidatorId::new(id),
-                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
+                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
             })
             .collect();
         TopologySnapshot::new(
@@ -7062,8 +7064,9 @@ mod tests {
                 round,
                 QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
                 ValidatorId::new(voter),
-                &generate_bls_keypair(),
+                &BlsSigner::new(generate_bls_keypair()),
             )
+            .expect("sign")
         };
 
         // Outsider (not in the 4-member committee): dropped, nothing recorded.
@@ -7110,8 +7113,9 @@ mod tests {
             far,
             QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
             ValidatorId::new(1),
-            &generate_bls_keypair(),
-        );
+            &BlsSigner::new(generate_bls_keypair()),
+        )
+        .expect("sign");
 
         assert!(
             state
@@ -7152,7 +7156,8 @@ mod tests {
                     ValidatorId::new(idx as u64),
                     &keys[idx],
                     ProposerTimestamp::from_millis(100_000),
-                );
+                )
+                .expect("sign");
                 (idx, vote)
             })
             .collect();
@@ -7176,7 +7181,8 @@ mod tests {
             (*missed_qc).clone(),
             ValidatorId::new(1),
             &keys[1],
-        );
+        )
+        .expect("sign");
 
         assert!(state.latest_qc().is_none());
         let _ = state.on_verified_timeout(&topology_schedule, timeout);
@@ -7212,8 +7218,9 @@ mod tests {
                 round,
                 QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
                 ValidatorId::new(voter),
-                &generate_bls_keypair(),
+                &BlsSigner::new(generate_bls_keypair()),
             )
+            .expect("sign")
         };
 
         // Committee member, current round: delegated for off-thread verify.
@@ -7256,8 +7263,9 @@ mod tests {
                 round,
                 QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
                 ValidatorId::new(2),
-                &generate_bls_keypair(),
-            ),
+                &BlsSigner::new(generate_bls_keypair()),
+            )
+            .expect("sign"),
             VoteCount::new(1),
         );
         assert!(
@@ -7306,8 +7314,9 @@ mod tests {
                 Round::new(2),
                 carried,
                 ValidatorId::new(9),
-                &generate_bls_keypair(),
-            );
+                &BlsSigner::new(generate_bls_keypair()),
+            )
+            .expect("sign");
             state.on_unverified_timeout(&schedule, &timeout)
         };
 
@@ -7405,18 +7414,16 @@ mod tests {
 
     fn make_multi_validator_state_with_keys(
         local_idx: u32,
-    ) -> (
-        ShardCoordinator,
-        TopologySchedule,
-        Vec<Bls12381G1PrivateKey>,
-    ) {
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+    ) -> (ShardCoordinator, TopologySchedule, Vec<BlsSigner>) {
+        let keys: Vec<BlsSigner> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -8183,13 +8190,15 @@ mod tests {
 
         // Epoch 0 carries ROOT (one shard) — the proposal's anchor; epoch 1
         // splits it (two shards) and is installed as the flipped head.
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let keys: Vec<BlsSigner> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let pre_split = Arc::new(TopologySnapshot::new(
@@ -8248,7 +8257,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
+                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
             })
             .collect();
         let vs = ValidatorSet::new(validators);
@@ -8285,7 +8294,7 @@ mod tests {
         let validators: Vec<ValidatorInfo> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
+                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
             })
             .collect();
         let vs = ValidatorSet::new(validators);
@@ -9254,13 +9263,15 @@ mod tests {
     /// children instead — `ROOT`'s terminal window is 0 and any weighted
     /// timestamp past 1000ms is coast territory.
     fn make_terminating_schedule(n: usize) -> TopologySchedule {
-        let keys: Vec<Bls12381G1PrivateKey> = (0..n).map(|_| generate_bls_keypair()).collect();
+        let keys: Vec<BlsSigner> = (0..n)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let final_window = Arc::new(TopologySnapshot::new(
@@ -9288,7 +9299,7 @@ mod tests {
             (0..n)
                 .map(|i| ValidatorInfo {
                     validator_id: ValidatorId::new(i as u64),
-                    public_key: pk_from_bls(&generate_bls_keypair().public_key()),
+                    public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
                 })
                 .collect(),
         );
@@ -9306,13 +9317,15 @@ mod tests {
     /// [`make_terminating_schedule`]: the final window carries both children,
     /// the next carries only the parent.
     fn make_merging_schedule(n: usize) -> TopologySchedule {
-        let keys: Vec<Bls12381G1PrivateKey> = (0..n).map(|_| generate_bls_keypair()).collect();
+        let keys: Vec<BlsSigner> = (0..n)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let pre_merge = Arc::new(TopologySnapshot::new(
@@ -9446,13 +9459,15 @@ mod tests {
         // A shard present in both the current and the next window never
         // terminates at the boundary, so the quiesce stays inert.
         let stable = {
-            let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+            let keys: Vec<BlsSigner> = (0..4)
+                .map(|_| BlsSigner::new(generate_bls_keypair()))
+                .collect();
             let validators: Vec<ValidatorInfo> = keys
                 .iter()
                 .enumerate()
                 .map(|(i, k)| ValidatorInfo {
                     validator_id: ValidatorId::new(i as u64),
-                    public_key: pk_from_bls(&k.public_key()),
+                    public_key: k.public_key(),
                 })
                 .collect();
             let window = Arc::new(TopologySnapshot::new(

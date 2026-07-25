@@ -40,7 +40,7 @@ use hyperscale_storage::ShardChainReader;
 use hyperscale_types::test_utils::shard_fork_proof_signed_by;
 use hyperscale_types::{
     BlockHash, BlockHeight, NetworkDefinition, RecoveryCause, Round, ShardForkProof, ShardId,
-    Timeout,
+    Signer, Timeout,
 };
 use support::SimCluster;
 
@@ -330,7 +330,7 @@ fn shard_fork_drives_committee_recovery_sim() {
             .map(|v| {
                 runner
                     .validator_signing_key(*v)
-                    .expect("seated validator has a signing key")
+                    .expect("seated validator has a signing key") as Arc<dyn Signer>
             })
             .collect();
         let proof = shard_fork_proof_signed_by(&keys, shard, BlockHeight::new(frozen + 1), wt);
@@ -422,7 +422,7 @@ fn shard_fork_drives_committee_recovery_sim() {
                 .runner()
                 .validator_signing_key(voter)
                 .expect("retained validator has a signing key");
-            Timeout::new(&net, shard, Round::new(1), qc.clone(), voter, &key)
+            Timeout::new(&net, shard, Round::new(1), qc.clone(), voter, key.as_ref()).expect("sign")
         })
         .collect();
     let resumed = (0..10).any(|_| {

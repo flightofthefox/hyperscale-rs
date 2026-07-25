@@ -96,17 +96,18 @@ impl GossipMessage for ValidatorAddressGossip {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+    use hyperscale_crypto::Signer;
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
-    use crate::{ConsensusPublicKey, SignedContext, pk_from_bls, sig_from_bls};
+    use crate::{ConsensusPublicKey, SignedContext};
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
     }
 
     fn signed_record(sequence: u64) -> (ValidatorAddressGossip, ConsensusPublicKey) {
-        let key = bls_keypair_from_seed(&[7u8; 32]);
+        let key = BlsSigner::from_seed(&[7u8; 32]);
         let peer_id = b"peer-id".to_vec();
         let addresses = vec![b"addr".to_vec()];
         let message = validator_address_message(&net(), &peer_id, &addresses, sequence);
@@ -115,9 +116,9 @@ mod tests {
             peer_id,
             addresses,
             sequence,
-            signature: sig_from_bls(&key.sign_v1(&message)),
+            signature: key.sign(&message).expect("sign"),
         };
-        (gossip, pk_from_bls(&key.public_key()))
+        (gossip, key.public_key())
     }
 
     #[test]

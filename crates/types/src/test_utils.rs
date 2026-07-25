@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use hyperscale_crypto_bls::bls_keypair_from_seed;
+use hyperscale_crypto::{Signer, Verifier};
+use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use radix_common::constants::PACKAGE_PACKAGE;
 use radix_common::crypto::{Ed25519PrivateKey, IsHash, PublicKey as RadixPublicKey};
 use radix_common::prelude::Epoch;
@@ -18,15 +19,14 @@ use radix_transactions::prelude::PreparationSettings;
 
 use crate::{
     AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
-    BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature, BoundedVec, CertificateRoot,
-    CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof, ConsensusPublicKey,
-    ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot,
-    Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition, NodeId, ProposerTimestamp,
-    ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardForkProof, ShardId,
-    SignerBitfield, StateRoot, TimestampRange, TopologySnapshot, TransactionDecision,
-    TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-    Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources, agg_from_bls,
-    block_vote_message, pk_from_bls,
+    BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
+    CommitProof, ConsensusPublicKey, ConsensusSignature, ExecutionCertificate, ExecutionOutcome,
+    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot,
+    NetworkDefinition, NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
+    RoutableTransaction, ShardForkProof, ShardId, SignerBitfield, StateRoot, TimestampRange,
+    TopologySnapshot, TransactionDecision, TransactionRoot, TxHash, TxOutcome, ValidatorId,
+    ValidatorInfo, ValidatorSet, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
+    WitnessSources, block_vote_message,
 };
 
 /// Create a test `NodeId` from a seed byte.
@@ -180,7 +180,7 @@ pub fn verified_test_transaction(seed: u8) -> Verified<RoutableTransaction> {
 /// and verify against real cryptographic paths rather than bypassing them
 /// with zero signatures.
 pub struct TestCommittee {
-    keypairs: Vec<Bls12381G1PrivateKey>,
+    signers: Vec<BlsSigner>,
     public_keys: Vec<ConsensusPublicKey>,
     validator_ids: Vec<ValidatorId>,
 }
@@ -188,7 +188,7 @@ pub struct TestCommittee {
 impl std::fmt::Debug for TestCommittee {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TestCommittee")
-            .field("size", &self.keypairs.len())
+            .field("size", &self.signers.len())
             .field("validator_ids", &self.validator_ids)
             .finish_non_exhaustive()
     }
@@ -201,7 +201,7 @@ impl TestCommittee {
     /// Different seeds produce different committees.
     #[must_use]
     pub fn new(size: usize, seed: u64) -> Self {
-        let mut keypairs = Vec::with_capacity(size);
+        let mut signers = Vec::with_capacity(size);
         let mut public_keys = Vec::with_capacity(size);
         let mut validator_ids = Vec::with_capacity(size);
 
@@ -215,16 +215,16 @@ impl TestCommittee {
             seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
             seed_bytes[16..24].copy_from_slice(&seed.to_le_bytes());
 
-            let kp = bls_keypair_from_seed(&seed_bytes);
-            let pk = pk_from_bls(&kp.public_key());
+            let signer = BlsSigner::from_seed(&seed_bytes);
+            let pk = signer.public_key();
 
-            keypairs.push(kp);
+            signers.push(signer);
             public_keys.push(pk);
             validator_ids.push(ValidatorId::new(i as u64));
         }
 
         Self {
-            keypairs,
+            signers,
             public_keys,
             validator_ids,
         }
@@ -251,17 +251,17 @@ impl TestCommittee {
     /// Get the number of validators in the committee.
     #[must_use]
     pub const fn size(&self) -> usize {
-        self.keypairs.len()
+        self.signers.len()
     }
 
-    /// Get a keypair by index.
+    /// Get a signer by index.
     ///
     /// # Panics
     ///
     /// Panics if `idx >= size()`.
     #[must_use]
-    pub fn keypair(&self, idx: usize) -> &Bls12381G1PrivateKey {
-        &self.keypairs[idx]
+    pub fn signer(&self, idx: usize) -> &BlsSigner {
+        &self.signers[idx]
     }
 
     /// Get a public key by index.
@@ -574,11 +574,11 @@ pub(crate) fn certify_header(
         &block_hash,
         &header.parent_block_hash(),
     );
-    let sigs: Vec<Bls12381G2Signature> = signers
+    let sigs: Vec<ConsensusSignature> = signers
         .iter()
-        .map(|&i| committee.keypair(i).sign_v1(&msg))
+        .map(|&i| committee.signer(i).sign(&msg).expect("sign"))
         .collect();
-    let agg = Bls12381G2Signature::aggregate(&sigs, true).expect("aggregate");
+    let agg = BlsVerifier.aggregate(&sigs).expect("aggregate");
     let mut signer_bits = SignerBitfield::new(committee.size());
     for &i in signers {
         signer_bits.set(i);
@@ -590,7 +590,7 @@ pub(crate) fn certify_header(
         header.parent_block_hash(),
         header.round(),
         signer_bits,
-        agg_from_bls(&agg),
+        agg,
         WeightedTimestamp::from_millis(header.height().inner() * 1_000),
     );
     CertifiedBlockHeader::new(header, qc)
@@ -616,7 +616,7 @@ pub(crate) fn certify_header(
 /// timestamp guarantees it.
 #[must_use]
 pub fn shard_fork_proof_signed_by(
-    committee_keys: &[Arc<Bls12381G1PrivateKey>],
+    committee_keys: &[Arc<dyn Signer>],
     shard: ShardId,
     height: BlockHeight,
     wt: WeightedTimestamp,
@@ -633,7 +633,7 @@ pub fn shard_fork_proof_signed_by(
 /// A direct-commit [`CommitProof`] whose two-chain is signed by
 /// `committee_keys` (all seats) at `wt`.
 fn live_commit_proof(
-    committee_keys: &[Arc<Bls12381G1PrivateKey>],
+    committee_keys: &[Arc<dyn Signer>],
     shard: ShardId,
     height: BlockHeight,
     round: Round,
@@ -719,7 +719,7 @@ fn anchor_qc(shard: ShardId, wt: WeightedTimestamp) -> QuorumCertificate {
 /// (bitfield position `p` set to `committee_keys[p]`'s signature), stamped at
 /// `wt`, so the two-chain BLS-verifies against the seated committee.
 fn live_certify(
-    committee_keys: &[Arc<Bls12381G1PrivateKey>],
+    committee_keys: &[Arc<dyn Signer>],
     header: BlockHeader,
     wt: WeightedTimestamp,
 ) -> CertifiedBlockHeader {
@@ -733,8 +733,11 @@ fn live_certify(
         &block_hash,
         &header.parent_block_hash(),
     );
-    let sigs: Vec<Bls12381G2Signature> = committee_keys.iter().map(|k| k.sign_v1(&msg)).collect();
-    let agg = Bls12381G2Signature::aggregate(&sigs, true).expect("aggregate");
+    let sigs: Vec<ConsensusSignature> = committee_keys
+        .iter()
+        .map(|k| k.sign(&msg).expect("sign"))
+        .collect();
+    let agg = BlsVerifier.aggregate(&sigs).expect("aggregate");
     let mut signer_bits = SignerBitfield::new(committee_keys.len());
     for p in 0..committee_keys.len() {
         signer_bits.set(p);
@@ -746,7 +749,7 @@ fn live_certify(
         header.parent_block_hash(),
         header.round(),
         signer_bits,
-        agg_from_bls(&agg),
+        agg,
         wt,
     );
     CertifiedBlockHeader::new(header, qc)
@@ -883,11 +886,7 @@ pub fn make_finalized_wave(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto::Verifier;
-    use hyperscale_crypto_bls::BlsVerifier;
-
     use super::*;
-    use crate::sig_from_bls;
 
     #[test]
     fn test_committee_creation() {
@@ -949,7 +948,7 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
 
         let message = b"test message";
-        let signature = sig_from_bls(&committee.keypair(0).sign_v1(message));
+        let signature = committee.signer(0).sign(message).expect("sign");
 
         // Verify with the corresponding public key
         assert!(BlsVerifier.verify(committee.public_key(0), message, &signature));

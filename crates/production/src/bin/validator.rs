@@ -54,7 +54,7 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use clap::Parser;
 use hex::{decode as hex_decode, encode as hex_encode};
-use hyperscale_crypto_bls::{bls_keypair_from_seed, generate_bls_keypair};
+use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
 use hyperscale_mempool::MempoolConfig;
@@ -72,8 +72,8 @@ use hyperscale_storage_rocksdb::{
     RocksDbShardStorage,
 };
 use hyperscale_types::{
-    BeaconChainConfig, Bls12381G1PrivateKey, ConsensusPublicKey, GenesisValidators, ShardId,
-    ValidatorId, ValidatorInfo, ValidatorSet, pk_from_bls, shard_prefix_path,
+    BeaconChainConfig, ConsensusPublicKey, GenesisValidators, ShardId, Signer, ValidatorId,
+    ValidatorInfo, ValidatorSet, shard_prefix_path,
 };
 use igd_next::aio::tokio::search_gateway;
 use igd_next::{PortMappingProtocol, SearchOptions};
@@ -600,12 +600,14 @@ fn format_public_key(pk: &ConsensusPublicKey) -> String {
 ///
 /// The key file stores a 32-byte seed that deterministically generates the keypair.
 /// This seed can be stored as raw bytes or hex-encoded.
-fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1PrivateKey> {
+fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<BlsSigner> {
     use rand::{Rng, rng};
 
     let Some(path) = key_path else {
         warn!("No key path specified, generating ephemeral keypair");
-        return Ok(generate_bls_keypair());
+        let mut seed = [0u8; 32];
+        rng().fill_bytes(&mut seed);
+        return Ok(BlsSigner::from_seed(&seed));
     };
 
     if path.exists() {
@@ -627,14 +629,14 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1Priv
             .try_into()
             .map_err(|_| anyhow::anyhow!("Key must be exactly 32 bytes"))?;
 
-        Ok(bls_keypair_from_seed(&seed))
+        Ok(BlsSigner::from_seed(&seed))
     } else {
         info!("Key file not found, generating new keypair");
 
         let mut seed = [0u8; 32];
         rng().fill_bytes(&mut seed);
 
-        let keypair = bls_keypair_from_seed(&seed);
+        let keypair = BlsSigner::from_seed(&seed);
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -662,9 +664,9 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1Priv
 fn build_genesis_validators(
     network: NetworkDefinition,
     genesis: &GenesisConfig,
-    local_keypairs: &[(ValidatorId, Arc<Bls12381G1PrivateKey>)],
+    local_keypairs: &[(ValidatorId, Arc<BlsSigner>)],
 ) -> Result<GenesisValidators> {
-    let lookup_local = |id: ValidatorId| -> Option<&Arc<Bls12381G1PrivateKey>> {
+    let lookup_local = |id: ValidatorId| -> Option<&Arc<BlsSigner>> {
         local_keypairs
             .iter()
             .find_map(|(vid, k)| (*vid == id).then_some(k))
@@ -675,7 +677,7 @@ fn build_genesis_validators(
         let (validator_id, keypair) = local_keypairs.first().expect("at least one hosted vnode");
         vec![ValidatorInfo {
             validator_id: *validator_id,
-            public_key: pk_from_bls(&keypair.public_key()),
+            public_key: keypair.public_key(),
         }]
     } else {
         genesis
@@ -684,7 +686,7 @@ fn build_genesis_validators(
             .map(|v| {
                 let validator_id = ValidatorId::new(v.id);
                 let public_key = if let Some(keypair) = lookup_local(validator_id) {
-                    pk_from_bls(&keypair.public_key())
+                    keypair.public_key()
                 } else {
                     let key_bytes = hex_decode(&v.public_key).with_context(|| {
                         format!("Invalid hex public key for validator {}", v.id)
@@ -1170,13 +1172,13 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // can substitute trusted local public keys for genesis-hex pubkeys.
     // Ordered Vec — single-validator mode picks the first entry, so source
     // order must be the same as config.vnodes.
-    let mut hosted_keypairs: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)> =
+    let mut hosted_keypairs: Vec<(ValidatorId, Arc<BlsSigner>)> =
         Vec::with_capacity(config.vnodes.len());
     for entry in &config.vnodes {
         let keypair = load_or_generate_keypair(Some(&entry.key_path))?;
         info!(
             validator_id = entry.validator_id,
-            public_key = %format_public_key(&pk_from_bls(&keypair.public_key())),
+            public_key = %format_public_key(&keypair.public_key()),
             "Loaded vnode signing keypair"
         );
         hosted_keypairs.push((ValidatorId::new(entry.validator_id), Arc::new(keypair)));
@@ -1196,9 +1198,9 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // committed beacon state and opens any seated shard's storage itself.
     let validators: Vec<LocalValidator> = hosted_keypairs
         .iter()
-        .map(|(validator_id, signing_key)| LocalValidator {
+        .map(|(validator_id, signer)| LocalValidator {
             validator_id: *validator_id,
-            signing_key: Arc::clone(signing_key),
+            signer: Arc::clone(signer) as Arc<dyn Signer>,
         })
         .collect();
 

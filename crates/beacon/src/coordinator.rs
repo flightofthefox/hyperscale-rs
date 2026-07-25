@@ -2627,33 +2627,33 @@ impl std::fmt::Debug for BeaconCoordinator {
 mod tests {
     use std::collections::BTreeMap;
 
-    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{
         AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig,
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
-        BoundedVec, CertificateRoot, CertifiedBlockHeader, ChainOrigin, ConsensusPublicKey,
-        ConsensusSignature, Epoch, GenesisConfigHash, GenesisPool, GenesisValidator, Hash,
-        InFlightCount, JailReason, KeptSeat, LeafIndex, LocalReceiptRoot,
-        MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition, ObserverSeat, PcVector,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardBoundary,
-        ShardCommittee, ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload,
-        ShardWitnessProof, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-        TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp, build_qc1, build_qc2, build_qc3,
+        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, BoundedVec,
+        CertificateRoot, CertifiedBlockHeader, ChainOrigin, ConsensusPublicKey, ConsensusSignature,
+        Epoch, GenesisConfigHash, GenesisPool, GenesisValidator, Hash, InFlightCount, JailReason,
+        KeptSeat, LeafIndex, LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR,
+        NetworkDefinition, ObserverSeat, PcVector, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, Randomness, Round, ShardBoundary, ShardCommittee,
+        ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
+        Signer, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
+        ValidatorId, VrfProof, WeightedTimestamp, build_qc1, build_qc2, build_qc3,
         build_ratify_cert, compute_merkle_root_with_proof, genesis_config_hash, pc_context,
-        pk_from_bls, sign_ratify_vote, sign_vote1, sign_vote2, sign_vote3, spc_context,
+        sign_ratify_vote, sign_vote1, sign_vote2, sign_vote3, spc_context,
     };
 
     use super::*;
     use crate::genesis::build_genesis_beacon_state;
 
-    fn keypair(seed: u64) -> Bls12381G1PrivateKey {
+    fn keypair(seed: u64) -> BlsSigner {
         let mut s = [0u8; 32];
         s[..8].copy_from_slice(&seed.to_le_bytes());
-        bls_keypair_from_seed(&s)
+        BlsSigner::from_seed(&s)
     }
 
     fn pubkey(seed: u64) -> ConsensusPublicKey {
-        pk_from_bls(&keypair(seed).public_key())
+        keypair(seed).public_key()
     }
 
     /// 4 validators, all on the beacon committee, all placed on the ROOT
@@ -3159,7 +3159,7 @@ mod tests {
             .committee
             .iter()
             .copied()
-            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
+            .zip(keys.iter().map(BlsSigner::public_key))
             .collect();
         let signer_positions: Vec<usize> = (0..n - (n - 1) / 3).collect();
         let cert = build_direct_cert(
@@ -4052,7 +4052,7 @@ mod tests {
     fn build_direct_cert(
         prev_view: SpcView,
         epoch: Epoch,
-        keys: &[Bls12381G1PrivateKey],
+        keys: &[BlsSigner],
         committee: &[(ValidatorId, ConsensusPublicKey)],
         signer_positions: &[usize],
         v_in: &PcVector,
@@ -4062,19 +4062,25 @@ mod tests {
         let pc_ctx = pc_context(&spc_ctx, prev_view);
         let v1s: Vec<_> = signer_positions
             .iter()
-            .map(|&i| sign_vote1(&keys[i], committee[i].0, &net, &pc_ctx, v_in.clone()))
+            .map(|&i| {
+                sign_vote1(&keys[i], committee[i].0, &net, &pc_ctx, v_in.clone()).expect("sign")
+            })
             .collect();
         let v1_refs: Vec<&_> = v1s.iter().collect();
         let qc1 = build_qc1(&BlsVerifier, &v1_refs, committee);
         let v2s: Vec<_> = signer_positions
             .iter()
-            .map(|&i| sign_vote2(&keys[i], committee[i].0, &net, &pc_ctx, qc1.clone()))
+            .map(|&i| {
+                sign_vote2(&keys[i], committee[i].0, &net, &pc_ctx, qc1.clone()).expect("sign")
+            })
             .collect();
         let v2_refs: Vec<&_> = v2s.iter().collect();
         let qc2 = build_qc2(&BlsVerifier, &v2_refs, committee);
         let v3s: Vec<_> = signer_positions
             .iter()
-            .map(|&i| sign_vote3(&keys[i], committee[i].0, &net, &pc_ctx, qc2.clone()))
+            .map(|&i| {
+                sign_vote3(&keys[i], committee[i].0, &net, &pc_ctx, qc2.clone()).expect("sign")
+            })
             .collect();
         let v3_refs: Vec<&_> = v3s.iter().collect();
         let qc3 = build_qc3(&BlsVerifier, &v3_refs, committee);
@@ -4105,6 +4111,7 @@ mod tests {
                     RatifyPhase::Precommit,
                     block.block_hash(),
                 )
+                .expect("sign")
             })
             .collect();
         build_ratify_cert(&BlsVerifier, &votes, &pool).expect("full pool meets quorum")
@@ -4127,7 +4134,7 @@ mod tests {
             .committee
             .iter()
             .copied()
-            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
+            .zip(keys.iter().map(BlsSigner::public_key))
             .collect();
         let signer_positions: Vec<usize> = (0..q).collect();
         let cert = build_direct_cert(
@@ -4169,7 +4176,7 @@ mod tests {
             .committee
             .iter()
             .copied()
-            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
+            .zip(keys.iter().map(BlsSigner::public_key))
             .collect();
         let signer_positions: Vec<usize> = (0..q).collect();
         let proposal = BeaconProposal::new(
@@ -4248,16 +4255,19 @@ mod tests {
         phase: RatifyPhase,
         block_hash: BeaconBlockHash,
     ) -> Arc<Verified<RatifyVote>> {
-        Arc::new(Verified::<RatifyVote>::sign_local(
-            &keypair(signer),
-            ValidatorId::new(signer),
-            &NetworkDefinition::simulator(),
-            coord.latest_block.block_hash(),
-            coord.state.current_epoch.next(),
-            round,
-            phase,
-            block_hash,
-        ))
+        Arc::new(
+            Verified::<RatifyVote>::sign_local(
+                &keypair(signer),
+                ValidatorId::new(signer),
+                &NetworkDefinition::simulator(),
+                coord.latest_block.block_hash(),
+                coord.state.current_epoch.next(),
+                round,
+                phase,
+                block_hash,
+            )
+            .expect("sign"),
+        )
     }
 
     /// Drive `coord` through the skip outcome for the pending epoch:
@@ -4652,7 +4662,7 @@ mod tests {
         let cert_committee: Vec<_> = committee
             .iter()
             .copied()
-            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
+            .zip(keys.iter().map(BlsSigner::public_key))
             .collect();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;
@@ -4723,7 +4733,7 @@ mod tests {
             .committee
             .iter()
             .copied()
-            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
+            .zip(keys.iter().map(BlsSigner::public_key))
             .collect();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;
@@ -4796,7 +4806,7 @@ mod tests {
             .committee
             .iter()
             .copied()
-            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
+            .zip(keys.iter().map(BlsSigner::public_key))
             .collect();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;
@@ -5627,7 +5637,7 @@ mod tests {
             .committee
             .iter()
             .copied()
-            .zip(keys.iter().map(|sk| pk_from_bls(&sk.public_key())))
+            .zip(keys.iter().map(BlsSigner::public_key))
             .collect();
         let f = n.saturating_sub(1) / 3;
         let q = n - f;

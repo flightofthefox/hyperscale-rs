@@ -2663,28 +2663,29 @@ impl std::fmt::Debug for ExecutionCoordinator {
 mod tests {
     use std::collections::BTreeMap;
 
-    use hyperscale_crypto_bls::generate_bls_keypair;
+    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
     use hyperscale_types::test_utils::{
         certify as test_certify, make_live_block as helpers_make_live_block, test_transaction,
     };
     use hyperscale_types::{
-        AggregateSignature, Bls12381G1PrivateKey, BoundedVec, ConsensusPublicKey, ConsensusReceipt,
-        ConsensusSignature, Epoch, ExecutionOutcome, GlobalReceiptHash, Hash, NetworkDefinition,
-        QuorumCertificate, RecoveryCause, ShardRecovery, SignerBitfield, ValidatorInfo,
-        ValidatorSet, pk_from_bls,
+        AggregateSignature, BoundedVec, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
+        Epoch, ExecutionOutcome, GlobalReceiptHash, Hash, NetworkDefinition, QuorumCertificate,
+        RecoveryCause, ShardRecovery, Signer, SignerBitfield, ValidatorInfo, ValidatorSet,
     };
 
     use super::*;
 
     fn make_test_topology() -> TopologySchedule {
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let keys: Vec<BlsSigner> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
 
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -2700,13 +2701,15 @@ mod tests {
     /// `frontier`: an old-committee EC from that shard above the frontier is
     /// the orphan the cross-shard freeze must fence.
     fn make_test_topology_recovering(shard: ShardId, frontier: BlockHeight) -> TopologySchedule {
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let keys: Vec<BlsSigner> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let mut recoveries = BTreeMap::new();
@@ -2804,13 +2807,15 @@ mod tests {
     }
 
     fn make_topology() -> TopologySchedule {
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let keys: Vec<BlsSigner> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -4008,13 +4013,15 @@ mod tests {
     /// Multi-shard topology for expected-cert tests: 4 validators, 2 shards.
     /// Local is validator 0 (shard 0); shard 1 = {1, 3}.
     fn make_two_shard_topology() -> TopologySchedule {
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let keys: Vec<BlsSigner> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         TopologySchedule::single(Arc::new(TopologySnapshot::new(
@@ -4032,13 +4039,15 @@ mod tests {
     ) -> TopologySchedule {
         use hyperscale_types::{BeaconWitnessLeafCount, BlockHash, ShardAnchor, StateRoot};
 
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let keys: Vec<BlsSigner> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
@@ -4083,10 +4092,10 @@ mod tests {
         let validators: Vec<ValidatorInfo> = ids
             .iter()
             .map(|&id| {
-                let k = generate_bls_keypair();
+                let k = BlsSigner::new(generate_bls_keypair());
                 ValidatorInfo {
                     validator_id: ValidatorId::new(id),
-                    public_key: pk_from_bls(&k.public_key()),
+                    public_key: k.public_key(),
                 }
             })
             .collect();
@@ -4508,13 +4517,15 @@ mod tests {
     /// whose next window (epoch 1) splits it into two children — so any
     /// weighted timestamp in epoch 1 is past `ROOT`'s terminal window.
     fn terminating_schedule() -> TopologySchedule {
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let keys: Vec<BlsSigner> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let final_window = Arc::new(TopologySnapshot::new(
@@ -4542,13 +4553,15 @@ mod tests {
         let state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
         // Epoch 0 carries ROOT (one shard) — the block's anchor; epoch 1
         // splits it (two shards) and is installed as the flipped head.
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let keys: Vec<BlsSigner> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let pre_split = Arc::new(TopologySnapshot::new(
@@ -4744,13 +4757,15 @@ mod tests {
         // governs — the shape a terminating shard's multi-epoch coast has
         // at production epoch length.
         let epoch_ms = 2 * RETENTION_HORIZON.as_secs() * 1000;
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let keys: Vec<BlsSigner> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(i as u64),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let final_window = Arc::new(TopologySnapshot::new(

@@ -70,12 +70,8 @@ pub use beacon::{
     verify_vote1, verify_vote2, verify_vote3,
 };
 pub use crypto::batch_verify::batch_verify_ed25519;
-pub use crypto::bls_interop::{agg_from_bls, bls_agg, bls_pk, bls_sig, pk_from_bls, sig_from_bls};
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
-pub use crypto::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Ed25519PrivateKey,
-    Ed25519PublicKey, Ed25519Signature, verify_ed25519,
-};
+pub use crypto::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature, verify_ed25519};
 pub use hyperscale_crypto::{
     AGGREGATE_SIGNATURE_BYTES, AggregateError, AggregateSignature, CONSENSUS_PUBLIC_KEY_BYTES,
     CONSENSUS_SIGNATURE_BYTES, ConsensusPublicKey, ConsensusSignature, SignError, Signer,

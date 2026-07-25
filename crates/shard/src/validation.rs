@@ -472,16 +472,16 @@ fn verify_hash_sorted(
 mod tests {
     use std::collections::BTreeSet;
 
-    use hyperscale_crypto_bls::bls_keypair_from_seed;
+    use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::test_utils::{TestCommittee, make_finalized_wave};
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         BoundedVec, CertificateRoot, ChainOrigin, FinalizedWave, Hash, InFlightCount,
         LocalReceiptRoot, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp,
         ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction,
-        ShardId, SignerBitfield, StateRoot, TransactionDecision, TransactionRoot, ValidatorId,
-        ValidatorInfo, ValidatorSet, Verifiable, WeightedTimestamp, WitnessSources, compute_waves,
-        pk_from_bls, test_utils,
+        ShardId, Signer, SignerBitfield, StateRoot, TransactionDecision, TransactionRoot,
+        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, WeightedTimestamp, WitnessSources,
+        compute_waves, test_utils,
     };
 
     use super::*;
@@ -881,7 +881,7 @@ mod tests {
                 seed[..8].copy_from_slice(&id.to_le_bytes());
                 ValidatorInfo {
                     validator_id: ValidatorId::new(id),
-                    public_key: pk_from_bls(&bls_keypair_from_seed(&seed).public_key()),
+                    public_key: BlsSigner::from_seed(&seed).public_key(),
                 }
             })
             .collect();

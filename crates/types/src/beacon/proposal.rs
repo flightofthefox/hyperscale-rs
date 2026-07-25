@@ -7,16 +7,15 @@
 //! [`BeaconBlock::committed_proposals`](crate::BeaconBlock).
 
 use blake3::Hasher;
-use hyperscale_crypto::Verifier;
+use hyperscale_crypto::{SignError, Signer, Verifier};
 use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    Bls12381G1PrivateKey, BoundedBTreeMap, BoundedVec, ConsensusPublicKey, Epoch,
-    MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_SHARDS, NetworkDefinition, PC_VALUE_ELEMENT_BYTES,
-    PcValueElement, PcVoteEquivocation, QuorumCertificate, ShardForkProof, ShardId,
-    ShardVoteEquivocation, Verifiable, Verified, Verify, VrfOutput, VrfProof,
-    vrf_output_from_proof, vrf_sign, vrf_verify,
+    BoundedBTreeMap, BoundedVec, ConsensusPublicKey, Epoch, MAX_EQUIVOCATIONS_PER_PROPOSER,
+    MAX_SHARDS, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement, PcVoteEquivocation,
+    QuorumCertificate, ShardForkProof, ShardId, ShardVoteEquivocation, Verifiable, Verified,
+    Verify, VrfOutput, VrfProof, vrf_output_from_proof, vrf_sign, vrf_verify,
 };
 
 /// One committee member's slot submission.
@@ -262,28 +261,31 @@ impl Verified<BeaconProposal> {
     /// produce a `Verified<BeaconProposal>` whose VRF predicate holds by
     /// construction.
     ///
+    /// # Errors
+    ///
+    /// Propagates [`SignError`] when the signer cannot sign.
+    ///
     /// # Panics
     ///
     /// Panics if any list or map exceeds its per-proposer cap (inherited
     /// from [`BeaconProposal::new`]).
-    #[must_use]
     pub fn sign_local(
-        sk: &Bls12381G1PrivateKey,
+        signer: &dyn Signer,
         network: &NetworkDefinition,
         epoch: Epoch,
         boundary_qcs: BTreeMap<ShardId, Option<QuorumCertificate>>,
         equivocations: Vec<PcVoteEquivocation>,
         fork_proofs: BTreeMap<ShardId, ShardForkProof>,
         vote_equivocations: Vec<ShardVoteEquivocation>,
-    ) -> Self {
-        let vrf_proof = vrf_sign(sk, network, epoch);
-        Self::new_unchecked(BeaconProposal::new(
+    ) -> Result<Self, SignError> {
+        let vrf_proof = vrf_sign(signer, network, epoch)?;
+        Ok(Self::new_unchecked(BeaconProposal::new(
             boundary_qcs,
             equivocations,
             fork_proofs,
             vote_equivocations,
             vrf_proof,
-        ))
+        )))
     }
 
     /// Rebind the proposal's equivocation list to its marker-upgraded

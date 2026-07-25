@@ -566,12 +566,12 @@ pub enum RecordResult {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, CertificateRoot,
-        ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, ShardId, StateRoot, TransactionRoot, ValidatorId,
-        ValidatorInfo, ValidatorSet, pk_from_bls, verify_shard_vote_equivocation,
+        BeaconWitnessLeafCount, BeaconWitnessRoot, CertificateRoot, ChainOrigin, Hash,
+        InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, ShardId, Signer, StateRoot, TransactionRoot, ValidatorId, ValidatorInfo,
+        ValidatorSet, verify_shard_vote_equivocation,
     };
 
     use super::*;
@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn track_assembles_verifiable_evidence_on_conflicting_votes() {
         let net = NetworkDefinition::simulator();
-        let sk = generate_bls_keypair();
+        let sk = BlsSigner::new(generate_bls_keypair());
         let pk = sk.public_key();
         let (shard, height, round) = (ShardId::ROOT, BlockHeight::new(5), Round::new(2));
         let voter = ValidatorId::new(3);
@@ -773,7 +773,8 @@ mod tests {
                 voter,
                 &sk,
                 ProposerTimestamp::ZERO,
-            );
+            )
+            .expect("sign");
             (block_hash, parent_hash, vote)
         };
         let (ba, pa, va) = signed(b"block-a", b"parent-a");
@@ -790,7 +791,7 @@ mod tests {
         assert_eq!(ev.block_hash_a, ba);
         assert_eq!(ev.block_hash_b, bb);
         assert_eq!(
-            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk_from_bls(&pk)),
+            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk),
             Ok(())
         );
     }
@@ -799,14 +800,16 @@ mod tests {
     // Vote-set growth bounds
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn keys_and_topology(n: u64) -> (Vec<Bls12381G1PrivateKey>, TopologySnapshot) {
-        let keys: Vec<Bls12381G1PrivateKey> = (0..n).map(|_| generate_bls_keypair()).collect();
+    fn keys_and_topology(n: u64) -> (Vec<BlsSigner>, TopologySnapshot) {
+        let keys: Vec<BlsSigner> = (0..n)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 validator_id: ValidatorId::new(u64::try_from(i).unwrap_or(u64::MAX)),
-                public_key: pk_from_bls(&k.public_key()),
+                public_key: k.public_key(),
             })
             .collect();
         let topo = TopologySnapshot::new(
@@ -817,7 +820,7 @@ mod tests {
         (keys, topo)
     }
 
-    fn wire_vote(keys: &[Bls12381G1PrivateKey], voter: usize, height: BlockHeight) -> BlockVote {
+    fn wire_vote(keys: &[BlsSigner], voter: usize, height: BlockHeight) -> BlockVote {
         BlockVote::new(
             &NetworkDefinition::simulator(),
             BlockHash::from_raw(Hash::from_bytes(&height.inner().to_le_bytes())),
@@ -829,6 +832,7 @@ mod tests {
             &keys[voter],
             ProposerTimestamp::from_millis(1_000),
         )
+        .expect("sign")
     }
 
     #[test]

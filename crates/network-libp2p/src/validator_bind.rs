@@ -42,8 +42,8 @@ use dashmap::DashMap;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G2Signature, NetworkDefinition, VALIDATOR_BIND_NONCE_LEN,
-    ValidatorId, Verifier as _, sig_from_bls, validator_bind_message,
+    ConsensusSignature, NetworkDefinition, Signer, VALIDATOR_BIND_NONCE_LEN, ValidatorId,
+    Verifier as _, validator_bind_message,
 };
 use libp2p::{PeerId as Libp2pPeerId, Stream, StreamProtocol};
 use libp2p_stream::{Control, IncomingStreams};
@@ -60,12 +60,12 @@ use crate::stream_framing;
 /// hosted validator. A multi-vnode host supplies one entry per vnode; each
 /// entry contributes one `(validator_id, signature)` pair to the attestation
 /// list on every bind exchange.
-pub type LocalVnodeIdentity = (ValidatorId, Arc<Bls12381G1PrivateKey>);
+pub type LocalVnodeIdentity = (ValidatorId, Arc<dyn Signer>);
 
 /// List of `(validator_id, signature)` attestations carried in one bind
 /// frame. Each entry proves that the holder of `validator_id`'s BLS key
 /// signed `("VALIDATOR_BIND" || peer_id || nonce)` for this session.
-type Attestations = Vec<(ValidatorId, Bls12381G2Signature)>;
+type Attestations = Vec<(ValidatorId, ConsensusSignature)>;
 
 /// Shared validator key map, updated atomically on topology changes.
 type SharedValidatorKeys = Arc<ArcSwap<ValidatorKeyMap>>;
@@ -121,12 +121,12 @@ const fn decode_challenge(data: &[u8]) -> Option<[u8; VALIDATOR_BIND_NONCE_LEN]>
 }
 
 /// Append one attestation list to `buf`: `[2-byte LE count][count × pair]`.
-fn write_attestations(buf: &mut Vec<u8>, attestations: &[(ValidatorId, Bls12381G2Signature)]) {
+fn write_attestations(buf: &mut Vec<u8>, attestations: &[(ValidatorId, ConsensusSignature)]) {
     let count = u16::try_from(attestations.len()).expect("caller bounds attestations by u16::MAX");
     buf.extend_from_slice(&count.to_le_bytes());
     for (vid, sig) in attestations {
         buf.extend_from_slice(&vid.to_le_bytes());
-        buf.extend_from_slice(&sig.0);
+        buf.extend_from_slice(sig.as_bytes());
     }
 }
 
@@ -159,7 +159,7 @@ fn read_attestations(data: &[u8]) -> Option<(Attestations, &[u8])> {
         }
         let mut sig_bytes = [0u8; 96];
         sig_bytes.copy_from_slice(&data[cursor + 8..cursor + PAIR_LEN]);
-        pairs.push((vid, Bls12381G2Signature(sig_bytes)));
+        pairs.push((vid, ConsensusSignature::new(sig_bytes)));
         cursor += PAIR_LEN;
     }
     Some((pairs, &data[total..]))
@@ -168,7 +168,7 @@ fn read_attestations(data: &[u8]) -> Option<(Attestations, &[u8])> {
 /// Encode the listener's response:
 /// `[2-byte LE count][count × (8-byte LE vid)(96-byte sig)][32-byte nonce]`.
 fn encode_response(
-    attestations: &[(ValidatorId, Bls12381G2Signature)],
+    attestations: &[(ValidatorId, ConsensusSignature)],
     nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(2 + attestations.len() * PAIR_LEN + VALIDATOR_BIND_NONCE_LEN);
@@ -190,7 +190,7 @@ fn decode_response(data: &[u8]) -> Option<(Attestations, [u8; VALIDATOR_BIND_NON
 
 /// Encode the initiator's final response:
 /// `[2-byte LE count][count × (8-byte LE vid)(96-byte sig)]`.
-fn encode_final(attestations: &[(ValidatorId, Bls12381G2Signature)]) -> Vec<u8> {
+fn encode_final(attestations: &[(ValidatorId, ConsensusSignature)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(2 + attestations.len() * PAIR_LEN);
     write_attestations(&mut buf, attestations);
     buf
@@ -223,7 +223,7 @@ fn verify_bind(
     peer_id: &Libp2pPeerId,
     claimed_vid: ValidatorId,
     nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
-    signature: &Bls12381G2Signature,
+    signature: &ConsensusSignature,
     keys: &ValidatorKeyMap,
 ) -> Result<(), BindError> {
     let pubkey = keys
@@ -231,7 +231,7 @@ fn verify_bind(
         .ok_or(BindError::UnknownValidator(claimed_vid))?;
 
     let message = validator_bind_message(network, &peer_id.to_bytes(), nonce);
-    if BlsVerifier.verify(pubkey, &message, &sig_from_bls(signature)) {
+    if BlsVerifier.verify(pubkey, &message, signature) {
         Ok(())
     } else {
         Err(BindError::InvalidSignature(claimed_vid))
@@ -288,13 +288,25 @@ struct BindContext {
 }
 
 impl BindContext {
-    /// Sign over `peer_id || remote_nonce` once per hosted vnode.
+    /// Sign over `peer_id || remote_nonce` once per hosted vnode. A vnode
+    /// whose signer cannot sign contributes no attestation (logged at
+    /// error level); the exchange proceeds with the rest.
     fn sign_all(&self, remote_nonce: &[u8; VALIDATOR_BIND_NONCE_LEN]) -> Attestations {
         let message =
             validator_bind_message(&self.network, &self.local_peer_id.to_bytes(), remote_nonce);
         self.local_vnodes
             .iter()
-            .map(|(vid, key)| (*vid, key.sign_v1(&message)))
+            .filter_map(|(vid, key)| match key.sign(&message) {
+                Ok(sig) => Some((*vid, sig)),
+                Err(err) => {
+                    error!(
+                        validator = vid.inner(),
+                        ?err,
+                        "cannot sign bind attestation"
+                    );
+                    None
+                }
+            })
             .collect()
     }
 }
@@ -305,7 +317,7 @@ fn verify_all(
     network: &NetworkDefinition,
     peer_id: &Libp2pPeerId,
     nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
-    attestations: &[(ValidatorId, Bls12381G2Signature)],
+    attestations: &[(ValidatorId, ConsensusSignature)],
     keys: &ValidatorKeyMap,
 ) -> Result<(), BindError> {
     for (vid, sig) in attestations {
@@ -618,8 +630,8 @@ async fn handle_outbound(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::generate_bls_keypair;
-    use hyperscale_types::{ConsensusPublicKey, pk_from_bls};
+    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
+    use hyperscale_types::ConsensusPublicKey;
 
     use super::*;
 
@@ -632,10 +644,10 @@ mod tests {
 
     /// Build a distinct `(ValidatorId, sig)` pair for each `i` so duplicate
     /// detection in `read_attestations` has a stable test surface.
-    fn pair_for(i: u64) -> (ValidatorId, Bls12381G2Signature) {
+    fn pair_for(i: u64) -> (ValidatorId, ConsensusSignature) {
         let mut sig_bytes = [0u8; 96];
         sig_bytes[..8].copy_from_slice(&i.to_le_bytes());
-        (ValidatorId::new(i), Bls12381G2Signature(sig_bytes))
+        (ValidatorId::new(i), ConsensusSignature::new(sig_bytes))
     }
 
     #[test]
@@ -661,7 +673,7 @@ mod tests {
         assert_eq!(decoded_pairs.len(), pairs.len());
         for ((dv, ds), (ov, os)) in decoded_pairs.iter().zip(pairs.iter()) {
             assert_eq!(dv, ov);
-            assert_eq!(ds.0, os.0);
+            assert_eq!(ds.as_bytes(), os.as_bytes());
         }
         assert_eq!(decoded_nonce, nonce);
     }
@@ -677,7 +689,7 @@ mod tests {
         assert_eq!(decoded_pairs.len(), pairs.len());
         for ((dv, ds), (ov, os)) in decoded_pairs.iter().zip(pairs.iter()) {
             assert_eq!(dv, ov);
-            assert_eq!(ds.0, os.0);
+            assert_eq!(ds.as_bytes(), os.as_bytes());
         }
     }
 
@@ -735,22 +747,24 @@ mod tests {
 
     #[test]
     fn verify_all_rejects_when_any_signature_fails() {
-        let keypair = generate_bls_keypair();
+        let keypair = BlsSigner::new(generate_bls_keypair());
         let peer_id = Libp2pPeerId::random();
         let nonce = [4u8; VALIDATOR_BIND_NONCE_LEN];
         let good_vid = ValidatorId::new(1);
         let bad_vid = ValidatorId::new(2);
 
-        let good_sig = keypair.sign_v1(&validator_bind_message(
-            &NetworkDefinition::simulator(),
-            &peer_id.to_bytes(),
-            &nonce,
-        ));
-        let bad_sig = Bls12381G2Signature([0u8; 96]);
+        let good_sig = keypair
+            .sign(&validator_bind_message(
+                &NetworkDefinition::simulator(),
+                &peer_id.to_bytes(),
+                &nonce,
+            ))
+            .expect("sign");
+        let bad_sig = ConsensusSignature::ZERO;
 
         let mut keys = ValidatorKeyMap::new();
-        keys.insert(good_vid, pk_from_bls(&keypair.public_key()));
-        keys.insert(bad_vid, pk_from_bls(&keypair.public_key()));
+        keys.insert(good_vid, keypair.public_key());
+        keys.insert(bad_vid, keypair.public_key());
 
         let attestations = vec![(good_vid, good_sig), (bad_vid, bad_sig)];
         assert!(matches!(
@@ -767,17 +781,19 @@ mod tests {
 
     #[test]
     fn verify_bind_accepts_valid_signature_over_nonce() {
-        let keypair = generate_bls_keypair();
-        let pubkey = pk_from_bls(&keypair.public_key());
+        let keypair = BlsSigner::new(generate_bls_keypair());
+        let pubkey = keypair.public_key();
         let peer_id = Libp2pPeerId::random();
         let vid = ValidatorId::new(7);
         let nonce = [9u8; VALIDATOR_BIND_NONCE_LEN];
 
-        let sig = keypair.sign_v1(&validator_bind_message(
-            &NetworkDefinition::simulator(),
-            &peer_id.to_bytes(),
-            &nonce,
-        ));
+        let sig = keypair
+            .sign(&validator_bind_message(
+                &NetworkDefinition::simulator(),
+                &peer_id.to_bytes(),
+                &nonce,
+            ))
+            .expect("sign");
 
         let keys = make_bind_keys(vid, pubkey);
         assert!(
@@ -798,8 +814,8 @@ mod tests {
         // Forward-security check: a signature produced over nonce_a must NOT
         // verify against nonce_b. This is what makes replay across sessions
         // impossible.
-        let keypair = generate_bls_keypair();
-        let pubkey = pk_from_bls(&keypair.public_key());
+        let keypair = BlsSigner::new(generate_bls_keypair());
+        let pubkey = keypair.public_key();
         let peer_id = Libp2pPeerId::random();
         let vid = ValidatorId::new(7);
 
@@ -807,11 +823,13 @@ mod tests {
         let nonce_b = [2u8; VALIDATOR_BIND_NONCE_LEN];
 
         // Sign over nonce_a — what the remote would have produced in session A.
-        let sig = keypair.sign_v1(&validator_bind_message(
-            &NetworkDefinition::simulator(),
-            &peer_id.to_bytes(),
-            &nonce_a,
-        ));
+        let sig = keypair
+            .sign(&validator_bind_message(
+                &NetworkDefinition::simulator(),
+                &peer_id.to_bytes(),
+                &nonce_a,
+            ))
+            .expect("sign");
 
         // Verifier in session B challenged with nonce_b, so they verify the
         // replayed signature against nonce_b and reject.
@@ -831,19 +849,21 @@ mod tests {
 
     #[test]
     fn verify_bind_rejects_wrong_peer_id() {
-        let keypair = generate_bls_keypair();
-        let pubkey = pk_from_bls(&keypair.public_key());
+        let keypair = BlsSigner::new(generate_bls_keypair());
+        let pubkey = keypair.public_key();
         let peer_a = Libp2pPeerId::random();
         let peer_b = Libp2pPeerId::random();
         let vid = ValidatorId::new(7);
         let nonce = [3u8; VALIDATOR_BIND_NONCE_LEN];
 
         // Sign peer_a's id but try to verify as peer_b.
-        let sig = keypair.sign_v1(&validator_bind_message(
-            &NetworkDefinition::simulator(),
-            &peer_a.to_bytes(),
-            &nonce,
-        ));
+        let sig = keypair
+            .sign(&validator_bind_message(
+                &NetworkDefinition::simulator(),
+                &peer_a.to_bytes(),
+                &nonce,
+            ))
+            .expect("sign");
 
         let keys = make_bind_keys(vid, pubkey);
         assert!(
@@ -861,16 +881,18 @@ mod tests {
 
     #[test]
     fn verify_bind_rejects_unknown_validator() {
-        let keypair = generate_bls_keypair();
-        let pubkey = pk_from_bls(&keypair.public_key());
+        let keypair = BlsSigner::new(generate_bls_keypair());
+        let pubkey = keypair.public_key();
         let peer_id = Libp2pPeerId::random();
         let nonce = [4u8; VALIDATOR_BIND_NONCE_LEN];
 
-        let sig = keypair.sign_v1(&validator_bind_message(
-            &NetworkDefinition::simulator(),
-            &peer_id.to_bytes(),
-            &nonce,
-        ));
+        let sig = keypair
+            .sign(&validator_bind_message(
+                &NetworkDefinition::simulator(),
+                &peer_id.to_bytes(),
+                &nonce,
+            ))
+            .expect("sign");
 
         // Key map has validator 7 but we claim to be validator 99.
         let keys = make_bind_keys(ValidatorId::new(7), pubkey);
@@ -889,20 +911,22 @@ mod tests {
 
     #[test]
     fn verify_bind_rejects_wrong_key() {
-        let keypair_a = generate_bls_keypair();
-        let keypair_b = generate_bls_keypair();
+        let keypair_a = BlsSigner::new(generate_bls_keypair());
+        let keypair_b = BlsSigner::new(generate_bls_keypair());
         let peer_id = Libp2pPeerId::random();
         let vid = ValidatorId::new(7);
         let nonce = [5u8; VALIDATOR_BIND_NONCE_LEN];
 
         // Sign with key_a but key map has key_b for this validator.
-        let sig = keypair_a.sign_v1(&validator_bind_message(
-            &NetworkDefinition::simulator(),
-            &peer_id.to_bytes(),
-            &nonce,
-        ));
+        let sig = keypair_a
+            .sign(&validator_bind_message(
+                &NetworkDefinition::simulator(),
+                &peer_id.to_bytes(),
+                &nonce,
+            ))
+            .expect("sign");
 
-        let keys = make_bind_keys(vid, pk_from_bls(&keypair_b.public_key()));
+        let keys = make_bind_keys(vid, keypair_b.public_key());
         assert!(matches!(
             verify_bind(
                 &NetworkDefinition::simulator(),

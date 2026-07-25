@@ -11,11 +11,9 @@
 //! or a block header sig, both of which reuse the same BLS keys.
 
 use blake3::Hasher;
-use hyperscale_crypto::Verifier;
+use hyperscale_crypto::{SignError, Signer, Verifier};
 
-use crate::{
-    Bls12381G1PrivateKey, ConsensusPublicKey, Epoch, NetworkDefinition, VrfOutput, VrfProof,
-};
+use crate::{ConsensusPublicKey, Epoch, NetworkDefinition, VrfOutput, VrfProof};
 
 /// Domain tag for beacon VRF reveals.
 pub const DOMAIN_PC_VRF: &[u8] = b"HYPERSCALE_PC_VRF_v1";
@@ -59,14 +57,20 @@ pub fn vrf_output_from_proof(proof: &VrfProof) -> VrfOutput {
 /// [`vrf_output_from_proof`] of the result — a pure function of the
 /// proof, never stored separately.
 ///
-/// Deterministic — BLS sigs in min-pk mode are a function of `(sk,
-/// message)` only, so the same `(sk, network, epoch)` always produces
-/// the same proof.
-#[must_use]
-pub fn vrf_sign(sk: &Bls12381G1PrivateKey, network: &NetworkDefinition, epoch: Epoch) -> VrfProof {
+/// Deterministic — [`Signer::vrf_sign`] guarantees the proof is a
+/// function of `(key, message)` only, so the same `(signer, network,
+/// epoch)` always produces the same proof.
+///
+/// # Errors
+///
+/// Propagates [`SignError`] when the signer cannot sign.
+pub fn vrf_sign(
+    signer: &dyn Signer,
+    network: &NetworkDefinition,
+    epoch: Epoch,
+) -> Result<VrfProof, SignError> {
     let msg = vrf_reveal_message(network, epoch);
-    let sig = sk.sign_v1(&msg);
-    VrfProof::new(sig.0)
+    signer.vrf_sign(&msg)
 }
 
 /// Verify that `proof` was produced by `pk` over `(network, epoch)`.
@@ -92,7 +96,6 @@ mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
 
     use super::*;
-    use crate::pk_from_bls;
     use crate::signing::{DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1};
 
     fn net() -> NetworkDefinition {
@@ -152,21 +155,21 @@ mod tests {
 
     // ─── sign / verify round trip and adversarial cases ──────────────────
 
-    use hyperscale_crypto_bls::bls_keypair_from_seed;
+    use hyperscale_crypto_bls::BlsSigner;
 
-    fn keypair(seed: u64) -> Bls12381G1PrivateKey {
+    fn signer(seed: u64) -> BlsSigner {
         let mut s = [0u8; 32];
         s[..8].copy_from_slice(&seed.to_le_bytes());
-        bls_keypair_from_seed(&s)
+        BlsSigner::from_seed(&s)
     }
 
     #[test]
     fn vrf_sign_verify_round_trip() {
-        let sk = keypair(3);
-        let proof = vrf_sign(&sk, &net(), Epoch::new(42));
+        let signer = signer(3);
+        let proof = vrf_sign(&signer, &net(), Epoch::new(42)).expect("sign");
         assert!(vrf_verify(
             &BlsVerifier,
-            &pk_from_bls(&sk.public_key()),
+            &signer.public_key(),
             &net(),
             Epoch::new(42),
             &proof
@@ -176,21 +179,21 @@ mod tests {
     /// Deterministic: same inputs → same proof across replicas.
     #[test]
     fn vrf_sign_is_deterministic() {
-        let sk = keypair(7);
-        let a = vrf_sign(&sk, &net(), Epoch::new(100));
-        let b = vrf_sign(&sk, &net(), Epoch::new(100));
+        let signer = signer(7);
+        let a = vrf_sign(&signer, &net(), Epoch::new(100)).expect("sign");
+        let b = vrf_sign(&signer, &net(), Epoch::new(100)).expect("sign");
         assert_eq!(a, b);
     }
 
     /// A reveal from party A doesn't verify under party B's pubkey.
     #[test]
     fn vrf_verify_rejects_cross_party() {
-        let sk_a = keypair(3);
-        let sk_b = keypair(4);
-        let proof = vrf_sign(&sk_a, &net(), Epoch::new(42));
+        let signer_a = signer(3);
+        let signer_b = signer(4);
+        let proof = vrf_sign(&signer_a, &net(), Epoch::new(42)).expect("sign");
         assert!(!vrf_verify(
             &BlsVerifier,
-            &pk_from_bls(&sk_b.public_key()),
+            &signer_b.public_key(),
             &net(),
             Epoch::new(42),
             &proof
@@ -201,11 +204,11 @@ mod tests {
     /// is bound into the signing message.
     #[test]
     fn vrf_verify_rejects_wrong_slot() {
-        let sk = keypair(3);
-        let proof = vrf_sign(&sk, &net(), Epoch::new(42));
+        let signer = signer(3);
+        let proof = vrf_sign(&signer, &net(), Epoch::new(42)).expect("sign");
         assert!(!vrf_verify(
             &BlsVerifier,
-            &pk_from_bls(&sk.public_key()),
+            &signer.public_key(),
             &net(),
             Epoch::new(43),
             &proof
@@ -217,11 +220,11 @@ mod tests {
     /// the epoch matches.
     #[test]
     fn vrf_verify_rejects_cross_network() {
-        let sk = keypair(3);
-        let proof = vrf_sign(&sk, &NetworkDefinition::mainnet(), Epoch::new(42));
+        let signer = signer(3);
+        let proof = vrf_sign(&signer, &NetworkDefinition::mainnet(), Epoch::new(42)).expect("sign");
         assert!(!vrf_verify(
             &BlsVerifier,
-            &pk_from_bls(&sk.public_key()),
+            &signer.public_key(),
             &NetworkDefinition::stokenet(),
             Epoch::new(42),
             &proof,
@@ -233,14 +236,14 @@ mod tests {
     /// proof's BLS check is the whole predicate.
     #[test]
     fn vrf_verify_rejects_tampered_proof() {
-        let sk = keypair(3);
-        let proof = vrf_sign(&sk, &net(), Epoch::new(42));
+        let signer = signer(3);
+        let proof = vrf_sign(&signer, &net(), Epoch::new(42)).expect("sign");
         let mut bytes = *proof.as_bytes();
         bytes[0] ^= 1;
         let proof = VrfProof::new(bytes);
         assert!(!vrf_verify(
             &BlsVerifier,
-            &pk_from_bls(&sk.public_key()),
+            &signer.public_key(),
             &net(),
             Epoch::new(42),
             &proof

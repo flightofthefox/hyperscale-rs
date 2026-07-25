@@ -23,7 +23,7 @@ use hyperscale_types::{
     BeaconProposal, CandidateVerifyContext, CertifiedBeaconBlockVerifyContext,
     DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW, PcVote1, PcVote2, PcVote3, PcVoteVerifyContext,
     RatifyVerifyContext, RatifyVote, SpcEmptyViewMsg, SpcVerifyContext, Verifiable, Verified,
-    pc_context, sig_from_bls, spc_context, spc_relay_signing_message,
+    pc_context, spc_context, spc_relay_signing_message,
 };
 
 /// Dispatch a beacon-owned [`Action`] on the consensus pool. Panics on
@@ -44,8 +44,12 @@ where
             recipients,
         } => {
             let pc_ctx = pc_context(&spc_context(epoch), view);
-            let verified =
-                Verified::<PcVote1>::sign_local(ctx.signing_key, me, network, &pc_ctx, v_in);
+            let Ok(verified) =
+                Verified::<PcVote1>::sign_local(ctx.signer.as_ref(), me, network, &pc_ctx, v_in)
+            else {
+                tracing::error!(?view, "cannot sign PC vote1; abstaining");
+                return;
+            };
             ctx.network.notify(
                 &recipients,
                 &PcVote1Notification::new(view, Arc::new(Verifiable::from(verified.clone()))),
@@ -62,8 +66,12 @@ where
             recipients,
         } => {
             let pc_ctx = pc_context(&spc_context(epoch), view);
-            let verified =
-                Verified::<PcVote2>::sign_local(ctx.signing_key, me, network, &pc_ctx, *qc1);
+            let Ok(verified) =
+                Verified::<PcVote2>::sign_local(ctx.signer.as_ref(), me, network, &pc_ctx, *qc1)
+            else {
+                tracing::error!(?view, "cannot sign PC vote2; abstaining");
+                return;
+            };
             ctx.network.notify(
                 &recipients,
                 &PcVote2Notification::new(view, Arc::new(Verifiable::from(verified.clone()))),
@@ -80,8 +88,12 @@ where
             recipients,
         } => {
             let pc_ctx = pc_context(&spc_context(epoch), view);
-            let verified =
-                Verified::<PcVote3>::sign_local(ctx.signing_key, me, network, &pc_ctx, *qc2);
+            let Ok(verified) =
+                Verified::<PcVote3>::sign_local(ctx.signer.as_ref(), me, network, &pc_ctx, *qc2)
+            else {
+                tracing::error!(?view, "cannot sign PC vote3; abstaining");
+                return;
+            };
             ctx.network.notify(
                 &recipients,
                 &PcVote3Notification::new(view, Arc::new(Verifiable::from(verified.clone()))),
@@ -98,14 +110,17 @@ where
             recipients,
         } => {
             let spc_ctx = spc_context(epoch);
-            let verified = Verified::<SpcEmptyViewMsg>::sign_local(
-                ctx.signing_key,
+            let Ok(verified) = Verified::<SpcEmptyViewMsg>::sign_local(
+                ctx.signer.as_ref(),
                 me,
                 network,
                 &spc_ctx,
                 view,
                 *reported,
-            );
+            ) else {
+                tracing::error!(?view, "cannot sign empty-view attestation; abstaining");
+                return;
+            };
             ctx.network.notify(
                 &recipients,
                 &SpcEmptyViewMsgNotification::new(
@@ -131,15 +146,13 @@ where
                 view,
                 &proposal_hash,
             );
-            let sig = ctx.signing_key.sign_v1(&signing_msg);
+            let Ok(sig) = ctx.signer.sign(&signing_msg) else {
+                tracing::error!(?view, "cannot sign SPC new-view relay; skipping");
+                return;
+            };
             ctx.network.notify(
                 &recipients,
-                &SpcNewViewNotification::new(
-                    epoch,
-                    me,
-                    sig_from_bls(&sig),
-                    Arc::new(Verifiable::from(*proposal)),
-                ),
+                &SpcNewViewNotification::new(epoch, me, sig, Arc::new(Verifiable::from(*proposal))),
             );
         }
         Action::BroadcastSpcNewCommit {
@@ -151,15 +164,13 @@ where
             let msg_hash = msg.hash();
             let signing_msg =
                 spc_relay_signing_message(network, DOMAIN_SPC_NEW_COMMIT, epoch, view, &msg_hash);
-            let sig = ctx.signing_key.sign_v1(&signing_msg);
+            let Ok(sig) = ctx.signer.sign(&signing_msg) else {
+                tracing::error!(?view, "cannot sign SPC new-commit relay; skipping");
+                return;
+            };
             ctx.network.notify(
                 &recipients,
-                &SpcNewCommitNotification::new(
-                    epoch,
-                    me,
-                    sig_from_bls(&sig),
-                    Arc::new(Verifiable::from(*msg)),
-                ),
+                &SpcNewCommitNotification::new(epoch, me, sig, Arc::new(Verifiable::from(*msg))),
             );
         }
         Action::BuildAndBroadcastBeaconProposal {
@@ -170,15 +181,18 @@ where
             vote_equivocations,
             recipients,
         } => {
-            let verified = Verified::<BeaconProposal>::sign_local(
-                ctx.signing_key,
+            let Ok(verified) = Verified::<BeaconProposal>::sign_local(
+                ctx.signer.as_ref(),
                 network,
                 epoch,
                 boundary_qcs,
                 equivocations,
                 fork_proofs,
                 vote_equivocations,
-            );
+            ) else {
+                tracing::error!(?epoch, "cannot sign beacon proposal; skipping");
+                return;
+            };
             let proposal = Arc::new(verified);
             (ctx.cache_beacon_proposal)(me, epoch, Arc::clone(&proposal));
             ctx.network.notify(
@@ -213,8 +227,8 @@ where
             // at most an abstention, never a double-vote or a lost lock.
             ctx.ratify_registers
                 .record_ratify_vote(me, epoch, round, phase, block_hash);
-            let verified = Verified::<RatifyVote>::sign_local(
-                ctx.signing_key,
+            let Ok(verified) = Verified::<RatifyVote>::sign_local(
+                ctx.signer.as_ref(),
                 me,
                 network,
                 anchor,
@@ -222,7 +236,10 @@ where
                 round,
                 phase,
                 block_hash,
-            );
+            ) else {
+                tracing::error!(?epoch, ?round, "cannot sign ratify vote; abstaining");
+                return;
+            };
             let vote = Arc::new(verified);
             ctx.network
                 .broadcast_global(&RatifyVoteGossip::new(Arc::new(Verifiable::from(

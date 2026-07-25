@@ -30,16 +30,16 @@
 
 use std::collections::{BTreeMap, btree_map};
 
-use hyperscale_crypto::Verifier;
+use hyperscale_crypto::{SignError, Signer, Verifier};
 use sbor::prelude::*;
 use thiserror::Error;
 
 use super::certified::verify_committed_proposal_binding;
 use crate::{
-    AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconProposal, Bls12381G1PrivateKey,
-    ConsensusPublicKey, ConsensusSignature, Epoch, NetworkDefinition, RatifyRound,
-    ShardEpochContribution, ShardId, SignerBitfield, SpcCert, ValidatorId, Verified, Verify,
-    ratify_vote_message, sig_from_bls, spc_context, verify_block_cert, verify_vote_equivocation,
+    AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconProposal, ConsensusPublicKey,
+    ConsensusSignature, Epoch, NetworkDefinition, RatifyRound, ShardEpochContribution, ShardId,
+    SignerBitfield, SpcCert, ValidatorId, Verified, Verify, ratify_vote_message, spc_context,
+    verify_block_cert, verify_vote_equivocation,
 };
 
 /// Which of the two ratification vote kinds a signature commits to.
@@ -429,21 +429,32 @@ pub fn verify_ratify_cert(
 // ─── Signing ───────────────────────────────────────────────────────────────
 
 /// Build and sign a [`RatifyVote`] under `network`'s domain.
-#[must_use]
+///
+/// # Errors
+///
+/// Propagates [`SignError`] when the signer cannot sign.
 #[allow(clippy::too_many_arguments)] // one parameter per signed field
 pub fn sign_ratify_vote(
-    sk: &Bls12381G1PrivateKey,
-    signer: ValidatorId,
+    signer: &dyn Signer,
+    validator: ValidatorId,
     network: &NetworkDefinition,
     anchor_hash: BeaconBlockHash,
     epoch: Epoch,
     round: RatifyRound,
     phase: RatifyPhase,
     block_hash: BeaconBlockHash,
-) -> RatifyVote {
+) -> Result<RatifyVote, SignError> {
     let msg = ratify_vote_message(network, &anchor_hash, epoch, round, phase, &block_hash);
-    let sig = sig_from_bls(&sk.sign_v1(&msg));
-    RatifyVote::new(anchor_hash, epoch, round, phase, block_hash, signer, sig)
+    let sig = signer.sign(&msg)?;
+    Ok(RatifyVote::new(
+        anchor_hash,
+        epoch,
+        round,
+        phase,
+        block_hash,
+        validator,
+        sig,
+    ))
 }
 
 // ─── Build ─────────────────────────────────────────────────────────────────
@@ -733,31 +744,34 @@ impl Verify<&CandidateVerifyContext<'_>> for CandidateBeaconBlock {
 // ─── Named gates ────────────────────────────────────────────────────────────
 
 impl Verified<RatifyVote> {
-    /// Sign a ratify vote locally. The signer's own BLS sig holds by
-    /// definition under the private key, so the produced vote is
-    /// verified by construction.
-    #[must_use]
+    /// Sign a ratify vote locally. The signer's own sig holds by
+    /// definition under its key, so the produced vote is verified by
+    /// construction.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SignError`] when the signer cannot sign.
     #[allow(clippy::too_many_arguments)] // one parameter per signed field
     pub fn sign_local(
-        sk: &Bls12381G1PrivateKey,
-        signer: ValidatorId,
+        signer: &dyn Signer,
+        validator: ValidatorId,
         network: &NetworkDefinition,
         anchor_hash: BeaconBlockHash,
         epoch: Epoch,
         round: RatifyRound,
         phase: RatifyPhase,
         block_hash: BeaconBlockHash,
-    ) -> Self {
-        Self::new_unchecked(sign_ratify_vote(
-            sk,
+    ) -> Result<Self, SignError> {
+        Ok(Self::new_unchecked(sign_ratify_vote(
             signer,
+            validator,
             network,
             anchor_hash,
             epoch,
             round,
             phase,
             block_hash,
-        ))
+        )?))
     }
 }
 
@@ -820,10 +834,10 @@ impl Verified<CandidateBeaconBlock> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
-    use crate::{Bls12381G2Signature, Hash, agg_from_bls, bls_sig, pk_from_bls};
+    use crate::Hash;
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
@@ -837,29 +851,24 @@ mod tests {
         BeaconBlockHash::from_raw(Hash::from_bytes(b"block"))
     }
 
-    fn signing_key(seed: u64) -> Bls12381G1PrivateKey {
+    fn signing_key(seed: u64) -> BlsSigner {
         let mut s = [0u8; 32];
         s[..8].copy_from_slice(&seed.to_le_bytes());
-        bls_keypair_from_seed(&s)
+        BlsSigner::from_seed(&s)
     }
 
-    fn pool(
-        n: u64,
-    ) -> (
-        Vec<(ValidatorId, ConsensusPublicKey)>,
-        Vec<Bls12381G1PrivateKey>,
-    ) {
+    fn pool(n: u64) -> (Vec<(ValidatorId, ConsensusPublicKey)>, Vec<BlsSigner>) {
         let mut active = Vec::new();
         let mut keys = Vec::new();
         for i in 0..n {
             let sk = signing_key(i);
-            active.push((ValidatorId::new(i), pk_from_bls(&sk.public_key())));
+            active.push((ValidatorId::new(i), sk.public_key()));
             keys.push(sk);
         }
         (active, keys)
     }
 
-    fn precommit(keys: &[Bls12381G1PrivateKey], i: u64, round: RatifyRound) -> RatifyVote {
+    fn precommit(keys: &[BlsSigner], i: u64, round: RatifyRound) -> RatifyVote {
         sign_ratify_vote(
             &keys[usize::try_from(i).unwrap()],
             ValidatorId::new(i),
@@ -870,6 +879,7 @@ mod tests {
             RatifyPhase::Precommit,
             block_hash(),
         )
+        .expect("sign")
     }
 
     fn sample_vote() -> RatifyVote {
@@ -952,7 +962,8 @@ mod tests {
             RatifyRound::INITIAL,
             RatifyPhase::Prevote,
             block_hash(),
-        );
+        )
+        .expect("sign");
         assert!(verify_ratify_vote(&BlsVerifier, &vote, &net(), &active).is_err());
     }
 
@@ -1016,6 +1027,7 @@ mod tests {
                     RatifyPhase::Prevote,
                     block_hash(),
                 )
+                .expect("sign")
             })
             .collect();
         assert!(build_ratify_cert(&BlsVerifier, &votes, &active).is_none());
@@ -1028,7 +1040,7 @@ mod tests {
     #[test]
     fn verify_ratify_cert_rejects_prevote_aggregate_forgery() {
         let (active, keys) = pool(7);
-        let prevote_sigs: Vec<Bls12381G2Signature> = (0..6u64)
+        let prevote_sigs: Vec<ConsensusSignature> = (0..6u64)
             .map(|i| {
                 sign_ratify_vote(
                     &keys[usize::try_from(i).unwrap()],
@@ -1040,22 +1052,22 @@ mod tests {
                     RatifyPhase::Prevote,
                     block_hash(),
                 )
+                .expect("sign")
                 .sig()
             })
-            .map(|s| bls_sig(&s))
             .collect();
         let mut signers = SignerBitfield::new(7);
         for i in 0..6 {
             signers.set(i);
         }
-        let aggregate = Bls12381G2Signature::aggregate(&prevote_sigs, true).unwrap();
+        let aggregate = BlsVerifier.aggregate(&prevote_sigs).unwrap();
         let forged = RatifyCert::new(
             anchor(),
             Epoch::new(9),
             RatifyRound::INITIAL,
             block_hash(),
             signers,
-            agg_from_bls(&aggregate),
+            aggregate,
         );
         assert_eq!(
             verify_ratify_cert(&BlsVerifier, &forged, &net(), &active),
@@ -1089,7 +1101,8 @@ mod tests {
             RatifyRound::INITIAL,
             RatifyPhase::Precommit,
             other,
-        );
+        )
+        .expect("sign");
         assert!(build_ratify_cert(&BlsVerifier, &votes, &active).is_none());
     }
 

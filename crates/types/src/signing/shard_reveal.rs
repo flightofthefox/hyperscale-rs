@@ -18,11 +18,9 @@
 //! unknowable at registration). Domain separation keeps a reveal from being
 //! confused with a block vote or header sig, which reuse the same BLS keys.
 
-use hyperscale_crypto::Verifier;
+use hyperscale_crypto::{SignError, Signer, Verifier};
 
-use crate::{
-    BlockHeight, Bls12381G1PrivateKey, ConsensusPublicKey, NetworkDefinition, ShardId, VrfProof,
-};
+use crate::{BlockHeight, ConsensusPublicKey, NetworkDefinition, ShardId, VrfProof};
 
 /// Domain tag for per-block shard randomness reveals.
 pub const DOMAIN_SHARD_REVEAL: &[u8] = b"HYPERSCALE_SHARD_REVEAL_v1";
@@ -50,20 +48,23 @@ pub fn shard_reveal_message(
 ///
 /// The output is [`vrf_output_from_proof`](crate::vrf_output_from_proof) of
 /// the result — a pure function of the proof, never stored separately.
-/// Deterministic — BLS sigs in min-pk mode are a function of `(sk, message)`
-/// only, so the same `(sk, network, shard, height)` always produces the same
-/// proof. That is what makes a view-change re-proposal by the same proposer
-/// carry an identical reveal (no self-re-roll).
-#[must_use]
+/// Deterministic — [`Signer::vrf_sign`] guarantees the proof is a function
+/// of `(key, message)` only, so the same `(signer, network, shard, height)`
+/// always produces the same proof. That is what makes a view-change
+/// re-proposal by the same proposer carry an identical reveal (no
+/// self-re-roll).
+///
+/// # Errors
+///
+/// Propagates [`SignError`] when the signer cannot sign.
 pub fn shard_reveal_sign(
-    sk: &Bls12381G1PrivateKey,
+    signer: &dyn Signer,
     network: &NetworkDefinition,
     shard: ShardId,
     height: BlockHeight,
-) -> VrfProof {
+) -> Result<VrfProof, SignError> {
     let msg = shard_reveal_message(network, shard, height);
-    let sig = sk.sign_v1(&msg);
-    VrfProof::new(sig.0)
+    signer.vrf_sign(&msg)
 }
 
 /// Verify that `proof` was produced by `pk` over `(network, shard, height)`.
@@ -87,20 +88,20 @@ pub fn shard_reveal_verify(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
     use crate::signing::{DOMAIN_BLOCK_HEADER, DOMAIN_PC_VRF};
-    use crate::{pk_from_bls, vrf_output_from_proof};
+    use crate::vrf_output_from_proof;
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
     }
 
-    fn keypair(seed: u64) -> Bls12381G1PrivateKey {
+    fn signer(seed: u64) -> BlsSigner {
         let mut s = [0u8; 32];
         s[..8].copy_from_slice(&seed.to_le_bytes());
-        bls_keypair_from_seed(&s)
+        BlsSigner::from_seed(&s)
     }
 
     /// Pins the byte layout of `shard_reveal_message`. Any change to the
@@ -169,11 +170,12 @@ mod tests {
 
     #[test]
     fn shard_reveal_sign_verify_round_trip() {
-        let sk = keypair(3);
-        let proof = shard_reveal_sign(&sk, &net(), ShardId::leaf(1, 1), BlockHeight::new(42));
+        let signer = signer(3);
+        let proof = shard_reveal_sign(&signer, &net(), ShardId::leaf(1, 1), BlockHeight::new(42))
+            .expect("sign");
         assert!(shard_reveal_verify(
             &BlsVerifier,
-            &pk_from_bls(&sk.public_key()),
+            &signer.public_key(),
             &net(),
             ShardId::leaf(1, 1),
             BlockHeight::new(42),
@@ -185,9 +187,11 @@ mod tests {
     /// replicas. A re-proposal at the same `(shard, height)` is byte-identical.
     #[test]
     fn shard_reveal_sign_is_deterministic() {
-        let sk = keypair(7);
-        let a = shard_reveal_sign(&sk, &net(), ShardId::leaf(1, 0), BlockHeight::new(100));
-        let b = shard_reveal_sign(&sk, &net(), ShardId::leaf(1, 0), BlockHeight::new(100));
+        let signer = signer(7);
+        let a = shard_reveal_sign(&signer, &net(), ShardId::leaf(1, 0), BlockHeight::new(100))
+            .expect("sign");
+        let b = shard_reveal_sign(&signer, &net(), ShardId::leaf(1, 0), BlockHeight::new(100))
+            .expect("sign");
         assert_eq!(a, b);
         assert_eq!(vrf_output_from_proof(&a), vrf_output_from_proof(&b));
     }
@@ -196,12 +200,13 @@ mod tests {
     /// value is bound to the signer's key, so a proposer can't lift another's.
     #[test]
     fn shard_reveal_verify_rejects_cross_party() {
-        let sk_a = keypair(3);
-        let sk_b = keypair(4);
-        let proof = shard_reveal_sign(&sk_a, &net(), ShardId::leaf(1, 0), BlockHeight::new(42));
+        let signer_a = signer(3);
+        let signer_b = signer(4);
+        let proof = shard_reveal_sign(&signer_a, &net(), ShardId::leaf(1, 0), BlockHeight::new(42))
+            .expect("sign");
         assert!(!shard_reveal_verify(
             &BlsVerifier,
-            &pk_from_bls(&sk_b.public_key()),
+            &signer_b.public_key(),
             &net(),
             ShardId::leaf(1, 0),
             BlockHeight::new(42),
@@ -212,11 +217,12 @@ mod tests {
     /// A reveal for height N doesn't verify against height M ≠ N.
     #[test]
     fn shard_reveal_verify_rejects_wrong_height() {
-        let sk = keypair(3);
-        let proof = shard_reveal_sign(&sk, &net(), ShardId::leaf(1, 0), BlockHeight::new(42));
+        let signer = signer(3);
+        let proof = shard_reveal_sign(&signer, &net(), ShardId::leaf(1, 0), BlockHeight::new(42))
+            .expect("sign");
         assert!(!shard_reveal_verify(
             &BlsVerifier,
-            &pk_from_bls(&sk.public_key()),
+            &signer.public_key(),
             &net(),
             ShardId::leaf(1, 0),
             BlockHeight::new(43),
@@ -227,11 +233,12 @@ mod tests {
     /// A reveal for shard S doesn't verify against shard T ≠ S.
     #[test]
     fn shard_reveal_verify_rejects_wrong_shard() {
-        let sk = keypair(3);
-        let proof = shard_reveal_sign(&sk, &net(), ShardId::leaf(1, 0), BlockHeight::new(42));
+        let signer = signer(3);
+        let proof = shard_reveal_sign(&signer, &net(), ShardId::leaf(1, 0), BlockHeight::new(42))
+            .expect("sign");
         assert!(!shard_reveal_verify(
             &BlsVerifier,
-            &pk_from_bls(&sk.public_key()),
+            &signer.public_key(),
             &net(),
             ShardId::leaf(1, 1),
             BlockHeight::new(42),
@@ -244,14 +251,15 @@ mod tests {
     /// BLS check is the whole predicate.
     #[test]
     fn shard_reveal_verify_rejects_tampered_proof() {
-        let sk = keypair(3);
-        let proof = shard_reveal_sign(&sk, &net(), ShardId::leaf(1, 0), BlockHeight::new(42));
+        let signer = signer(3);
+        let proof = shard_reveal_sign(&signer, &net(), ShardId::leaf(1, 0), BlockHeight::new(42))
+            .expect("sign");
         let mut bytes = *proof.as_bytes();
         bytes[0] ^= 1;
         let proof = VrfProof::new(bytes);
         assert!(!shard_reveal_verify(
             &BlsVerifier,
-            &pk_from_bls(&sk.public_key()),
+            &signer.public_key(),
             &net(),
             ShardId::leaf(1, 0),
             BlockHeight::new(42),

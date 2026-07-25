@@ -36,11 +36,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
-use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, PendingReshape,
-    Randomness, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, ValidatorId,
-    ValidatorRecord, ValidatorStatus, pk_from_bls,
+    Randomness, ShardCommittee, ShardId, Signer, Stake, StakePool, StakePoolId, ValidatorId,
+    ValidatorRecord, ValidatorStatus,
 };
 
 // ─── The analysis note's chain (committee_security.py §2) ───────────────────
@@ -170,7 +170,7 @@ fn shard_ids(shards: u64) -> Vec<ShardId> {
 /// VRF/signature verification paths, which empty `committed` never
 /// reaches.
 fn mc_state(cell: &Cell) -> BeaconState {
-    let pubkey = bls_keypair_from_seed(&[0x5e; 32]).public_key();
+    let pubkey = BlsSigner::from_seed(&[0x5e; 32]).public_key();
     let pool_id = StakePoolId::new(0);
     let ids = shard_ids(cell.shards);
     let seats_total = cell.shards * u64::from(cell.shard_size);
@@ -211,7 +211,7 @@ fn mc_state(cell: &Cell) -> BeaconState {
                 pool: pool_id,
                 status,
                 registered_at_epoch: Epoch::GENESIS,
-                pubkey: pk_from_bls(&pubkey),
+                pubkey,
             },
         );
         pool_validators.insert(id);

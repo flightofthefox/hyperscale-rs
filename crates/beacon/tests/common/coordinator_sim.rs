@@ -19,22 +19,22 @@ use std::sync::Arc;
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_core::{Action, FetchRequest};
-use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_types::{
     AggregateSignature, BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig,
     BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-    BlockHeight, BlockVote, Bls12381G1PrivateKey, CandidateBeaconBlock, CandidateVerifyContext,
-    CertificateRoot, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader,
+    BlockHeight, BlockVote, CandidateBeaconBlock, CandidateVerifyContext, CertificateRoot,
+    CertifiedBeaconBlock, CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader,
     ConsensusPublicKey, Epoch, GenesisPool, GenesisValidator, Hash, InFlightCount, LeafIndex,
     LocalReceiptRoot, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, PcValueElement, PcVector,
     PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteVerifyContext, ProposerTimestamp,
     ProvisionsRoot, QuorumCertificate, Randomness, RatifyPhase, RatifyRound, RatifyVerifyContext,
     RatifyVote, Round, SKIP_TIMEOUT, ShardId, ShardVoteEquivocation, ShardWitness,
-    ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SpcEmptyViewMsg, SpcNewCommitMsg,
-    SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, compute_merkle_root_with_proof,
-    genesis_config_hash, pc_context, pk_from_bls, sign_empty_view_msg, sign_vote1, sign_vote2,
-    sign_vote3, spc_context, vrf_sign,
+    ShardWitnessPayload, ShardWitnessProof, Signer, SignerBitfield, SpcEmptyViewMsg,
+    SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot,
+    TransactionRoot, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    compute_merkle_root_with_proof, genesis_config_hash, pc_context, sign_empty_view_msg,
+    sign_vote1, sign_vote2, sign_vote3, spc_context, vrf_sign,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -123,7 +123,7 @@ enum SimEvent {
 pub struct CoordinatorSim {
     pub coordinators: Vec<BeaconCoordinator>,
     pub members: Vec<(ValidatorId, ConsensusPublicKey)>,
-    sks: Vec<Bls12381G1PrivateKey>,
+    sks: Vec<BlsSigner>,
     network: NetworkDefinition,
     /// Per-replica committed (block, state) tuples, ordered by capture
     /// time. One push per `Action::CommitBeaconBlock` the replica
@@ -207,9 +207,9 @@ impl CoordinatorSim {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&seed.to_le_bytes());
             bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
-            let sk = bls_keypair_from_seed(&bytes);
+            let sk = BlsSigner::from_seed(&bytes);
             let id = ValidatorId::new(i as u64);
-            members.push((id, pk_from_bls(&sk.public_key())));
+            members.push((id, sk.public_key()));
             sks.push(sk);
         }
 
@@ -337,7 +337,7 @@ impl CoordinatorSim {
     /// The signing key of the replica at `idx` — lets tests forge
     /// genuine double-signs from a registered validator's own key.
     #[must_use]
-    pub fn sk_of(&self, idx: usize) -> &Bls12381G1PrivateKey {
+    pub fn sk_of(&self, idx: usize) -> &BlsSigner {
         &self.sks[idx]
     }
 
@@ -551,7 +551,8 @@ impl CoordinatorSim {
                     *validator,
                     sk,
                     ProposerTimestamp::from_millis(b_wt),
-                );
+                )
+                .expect("sign");
                 (idx, Verified::<BlockVote>::new_unchecked_for_test(vote))
             })
             .collect();
@@ -907,7 +908,7 @@ impl CoordinatorSim {
                     vote_equivocations.extend(extra);
                 }
                 let sk = &self.sks[emitter_idx];
-                let vrf_proof = vrf_sign(sk, &self.network, epoch);
+                let vrf_proof = vrf_sign(sk, &self.network, epoch).expect("sign");
                 let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
                     boundary_qcs,
                     equivocations,
@@ -992,7 +993,8 @@ impl CoordinatorSim {
                     &self.network,
                     &pc_ctx,
                     v_in.clone(),
-                );
+                )
+                .expect("sign");
                 self.queue_pc_vote1(emitter_idx, me, &recipients, view, vote);
                 // Byzantine equivocation at round 1: sign and broadcast
                 // a second vote over a perturbed `v_in` so the same
@@ -1012,7 +1014,8 @@ impl CoordinatorSim {
                         &self.network,
                         &pc_ctx,
                         conflicting_v_in,
-                    );
+                    )
+                    .expect("sign");
                     self.queue_pc_vote1(emitter_idx, me, &recipients, view, conflicting_vote);
                 }
             }
@@ -1023,7 +1026,8 @@ impl CoordinatorSim {
                 recipients,
             } => {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
-                let vote = sign_vote2(&self.sks[emitter_idx], me, &self.network, &pc_ctx, *qc1);
+                let vote = sign_vote2(&self.sks[emitter_idx], me, &self.network, &pc_ctx, *qc1)
+                    .expect("sign");
                 self.queue_pc_vote2(emitter_idx, me, &recipients, view, Box::new(vote));
             }
             Action::SignAndBroadcastPcVote3 {
@@ -1033,7 +1037,8 @@ impl CoordinatorSim {
                 recipients,
             } => {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
-                let vote = sign_vote3(&self.sks[emitter_idx], me, &self.network, &pc_ctx, *qc2);
+                let vote = sign_vote3(&self.sks[emitter_idx], me, &self.network, &pc_ctx, *qc2)
+                    .expect("sign");
                 self.queue_pc_vote3(emitter_idx, me, &recipients, view, Box::new(vote));
             }
             Action::SignAndBroadcastEmptyView {
@@ -1050,7 +1055,8 @@ impl CoordinatorSim {
                     &spc_ctx,
                     view,
                     *reported,
-                );
+                )
+                .expect("sign");
                 let msg = Arc::new(Verifiable::from(verified));
                 for rcpt in &recipients {
                     let to_idx = self.idx_of(*rcpt);
@@ -1152,7 +1158,8 @@ impl CoordinatorSim {
                     round,
                     phase,
                     block_hash,
-                );
+                )
+                .expect("sign");
                 let vote = Arc::new(verified);
                 // Local loopback: the tracker expects to see its own
                 // verified contribution to the vote pool.

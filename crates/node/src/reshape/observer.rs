@@ -25,9 +25,9 @@
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
-    BlockHash, BlockHeight, Bls12381G1PrivateKey, NetworkDefinition, ReadySignal, ShardAnchor,
-    ShardId, StateRoot, StoredReceipt, ValidatorId, ready_signal_message, ready_signal_window,
-    shard_prefix_path, sig_from_bls,
+    BlockHash, BlockHeight, NetworkDefinition, ReadySignal, ShardAnchor, ShardId, SignError,
+    Signer, StateRoot, StoredReceipt, ValidatorId, ready_signal_message, ready_signal_window,
+    shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
@@ -44,25 +44,22 @@ use crate::bootstrap::{BootstrapRequest, SPLIT_BITS, STATE_CHUNK_LIMIT};
 /// passes uncollected is re-emitted against a newer anchor. At the
 /// committee, the signal classifies as a `ReshapeReady` witness leaf —
 /// the sender's observer seat rides the window's topology snapshot.
-#[must_use]
+/// # Errors
+///
+/// Propagates [`SignError`] when the signer cannot sign.
 pub fn observer_ready_signal(
     network: &NetworkDefinition,
     validator: ValidatorId,
     child: ShardId,
-    signing_key: &Bls12381G1PrivateKey,
+    signer: &dyn Signer,
     anchor: ShardAnchor,
     epoch_duration_ms: u64,
-) -> ReadySignal {
+) -> Result<ReadySignal, SignError> {
     let start = anchor.weighted_timestamp;
     let end = start.plus(ready_signal_window(epoch_duration_ms));
     let msg = ready_signal_message(network, validator, child, start, end);
-    ReadySignal::new(
-        validator,
-        child,
-        start,
-        end,
-        sig_from_bls(&signing_key.sign_v1(&msg)),
-    )
+    let sig = signer.sign(&msg)?;
+    Ok(ReadySignal::new(validator, child, start, end, sig))
 }
 
 enum Phase {

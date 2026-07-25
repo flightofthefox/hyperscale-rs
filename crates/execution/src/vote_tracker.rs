@@ -276,13 +276,13 @@ impl VoteTracker {
 mod tests {
     use std::collections::BTreeSet;
 
-    use hyperscale_crypto_bls::generate_bls_keypair;
-    use hyperscale_types::{BlockHeight, ConsensusSignature, Hash, ShardId, pk_from_bls};
+    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
+    use hyperscale_types::{BlockHeight, ConsensusSignature, Hash, ShardId, Signer};
 
     use super::*;
 
     fn make_test_public_key() -> ConsensusPublicKey {
-        pk_from_bls(&generate_bls_keypair().public_key())
+        BlsSigner::new(generate_bls_keypair()).public_key()
     }
 
     fn make_vote(validator: u64, global_receipt_root: GlobalReceiptRoot) -> ExecutionVote {

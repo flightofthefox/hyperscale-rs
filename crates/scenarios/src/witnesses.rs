@@ -15,10 +15,10 @@
 
 use std::sync::Arc;
 
-use hyperscale_crypto_bls::bls_keypair_from_seed;
+use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_types::{
-    BeaconWitnessEvent, ConsensusPublicKey, Stake, StakePoolId, UNBONDING_WINDOW_EPOCHS,
-    ValidatorId, ValidatorStatus, pk_from_bls, validator_possession_proof_sign,
+    BeaconWitnessEvent, ConsensusPublicKey, Signer, Stake, StakePoolId, UNBONDING_WINDOW_EPOCHS,
+    ValidatorId, ValidatorStatus, validator_possession_proof_sign,
 };
 use radix_common::network::NetworkDefinition;
 
@@ -56,7 +56,7 @@ fn submit_action<C: Cluster>(c: &mut C, nonce: u32, event: &BeaconWitnessEvent) 
 /// A well-formed BLS pubkey for a registration. No host runs the registered
 /// validator, so any deterministic key serves.
 fn dummy_pubkey(seed: u8) -> ConsensusPublicKey {
-    pk_from_bls(&bls_keypair_from_seed(&[seed; 32]).public_key())
+    BlsSigner::from_seed(&[seed; 32]).public_key()
 }
 
 /// A `RegisterValidator` event for `dummy_pubkey(seed)` under
@@ -67,16 +67,17 @@ fn dummy_registration(
     pool_id: StakePoolId,
     validator_id: ValidatorId,
 ) -> BeaconWitnessEvent {
-    let keypair = bls_keypair_from_seed(&[seed; 32]);
+    let keypair = BlsSigner::from_seed(&[seed; 32]);
     BeaconWitnessEvent::RegisterValidator {
         pool_id,
         validator_id,
-        pubkey: pk_from_bls(&keypair.public_key()),
+        pubkey: keypair.public_key(),
         possession_proof: validator_possession_proof_sign(
             &keypair,
             &NetworkDefinition::simulator(),
             validator_id,
-        ),
+        )
+        .expect("sign"),
     }
 }
 

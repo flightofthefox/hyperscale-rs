@@ -525,13 +525,11 @@ impl ShardSupervisor {
         topology_snapshot
             .seatable_committee_for_shard(shard)
             .filter_map(|validator| {
-                self.vnode_keys
-                    .get(&validator)
-                    .map(|signing_key| VnodeConfig {
-                        validator_id: validator,
-                        local_shard: shard,
-                        signing_key: Arc::clone(signing_key),
-                    })
+                self.vnode_keys.get(&validator).map(|signer| VnodeConfig {
+                    validator_id: validator,
+                    local_shard: shard,
+                    signer: Arc::clone(signer),
+                })
             })
             .collect()
     }
@@ -558,7 +556,7 @@ impl ShardSupervisor {
             provision_config: self.provision_config,
             vnodes: vnodes
                 .iter()
-                .map(|cfg| (cfg.validator_id, Arc::clone(&cfg.signing_key)))
+                .map(|cfg| (cfg.validator_id, Arc::clone(&cfg.signer)))
                 .collect(),
         })
     }
@@ -627,10 +625,10 @@ fn host_holds_seat(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-    use hyperscale_crypto_bls::generate_bls_keypair;
+    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
     use hyperscale_types::{
-        NetworkDefinition, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
-        ValidatorInfo, ValidatorSet, pk_from_bls,
+        NetworkDefinition, RoutingCommittees, ShardId, Signer, TopologySnapshot, ValidatorId,
+        ValidatorInfo, ValidatorSet,
     };
 
     use super::{host_holds_seat, host_in_committee, shard_retired};
@@ -653,7 +651,7 @@ mod tests {
             .iter()
             .map(|&validator_id| ValidatorInfo {
                 validator_id,
-                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
+                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
             })
             .collect();
         TopologySnapshot::from_explicit_committees(

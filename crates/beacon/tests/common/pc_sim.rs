@@ -11,11 +11,10 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use hyperscale_beacon::pc::{PcEffect, PcEvent, PcInstance};
-use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, ConsensusPublicKey, Epoch, NetworkDefinition, PcContext, PcQc3, PcVector,
-    PcVote1, PcVote2, PcVote3, SpcView, ValidatorId, Verified, pc_context, pk_from_bls,
-    spc_context,
+    ConsensusPublicKey, Epoch, NetworkDefinition, PcContext, PcQc3, PcVector, PcVote1, PcVote2,
+    PcVote3, Signer, SpcView, ValidatorId, Verified, pc_context, spc_context,
 };
 
 /// One pending message in the network: a vote event addressed to a
@@ -28,7 +27,7 @@ struct Envelope {
 pub struct PcSim {
     pub instances: Vec<PcInstance>,
     pub members: Vec<(ValidatorId, ConsensusPublicKey)>,
-    pub sks: Vec<Arc<Bls12381G1PrivateKey>>,
+    pub sks: Vec<Arc<BlsSigner>>,
     network: NetworkDefinition,
     pc_ctx: PcContext,
     pending: VecDeque<Envelope>,
@@ -48,8 +47,8 @@ impl PcSim {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&seed.to_le_bytes());
             bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
-            let sk = bls_keypair_from_seed(&bytes);
-            members.push((ValidatorId::new(i as u64), pk_from_bls(&sk.public_key())));
+            let sk = BlsSigner::from_seed(&bytes);
+            members.push((ValidatorId::new(i as u64), sk.public_key()));
             sks.push(Arc::new(sk));
         }
         let instances: Vec<PcInstance> = (0..n)
@@ -72,10 +71,7 @@ impl PcSim {
     /// used by SPC tests that need to sign empty-view messages with
     /// the same keys PC used.
     #[must_use]
-    pub fn sks_for_indices(
-        &self,
-        indices: &[usize],
-    ) -> Vec<(Arc<Bls12381G1PrivateKey>, ValidatorId)> {
+    pub fn sks_for_indices(&self, indices: &[usize]) -> Vec<(Arc<BlsSigner>, ValidatorId)> {
         indices
             .iter()
             .map(|&i| (Arc::clone(&self.sks[i]), self.members[i].0))
@@ -143,32 +139,35 @@ impl PcSim {
             match effect {
                 PcEffect::SignAndBroadcastVote1 { v_in } => {
                     let vote = Verified::<PcVote1>::sign_local(
-                        &sk,
+                        sk.as_ref(),
                         sender,
                         &self.network,
                         &self.pc_ctx,
                         v_in,
-                    );
+                    )
+                    .expect("sign");
                     self.deliver_to_all(&PcEvent::Vote1Verified(vote));
                 }
                 PcEffect::SignAndBroadcastVote2 { qc1 } => {
                     let vote = Verified::<PcVote2>::sign_local(
-                        &sk,
+                        sk.as_ref(),
                         sender,
                         &self.network,
                         &self.pc_ctx,
                         *qc1,
-                    );
+                    )
+                    .expect("sign");
                     self.deliver_to_all(&PcEvent::Vote2Verified(Box::new(vote)));
                 }
                 PcEffect::SignAndBroadcastVote3 { qc2 } => {
                     let vote = Verified::<PcVote3>::sign_local(
-                        &sk,
+                        sk.as_ref(),
                         sender,
                         &self.network,
                         &self.pc_ctx,
                         *qc2,
-                    );
+                    )
+                    .expect("sign");
                     self.deliver_to_all(&PcEvent::Vote3Verified(Box::new(vote)));
                 }
                 PcEffect::EquivocationObserved(_) => {

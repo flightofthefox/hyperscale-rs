@@ -19,7 +19,7 @@ use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView, VersionedSto
 use hyperscale_types::network::notification::ProvisionsNotification;
 use hyperscale_types::{
     BlockHeight, Provisions, ProvisionsContext, ShardId, ValidatorId, Verifiable, Verified, Verify,
-    sig_from_bls, state_provisions_message,
+    state_provisions_message,
 };
 use tracing::warn;
 
@@ -142,7 +142,10 @@ where
                 )));
 
                 let msg = state_provisions_message(ctx.topology_snapshot.network(), &verified);
-                let sig = ctx.signing_key.sign_v1(&msg);
+                let Ok(sig) = ctx.signer.sign(&msg) else {
+                    tracing::error!("cannot sign provisions broadcast; skipping");
+                    return;
+                };
 
                 // Register with the outbound tracker (populates the
                 // serving cache) on the main thread. A peer's
@@ -158,7 +161,7 @@ where
                 let notification = ProvisionsNotification::new(
                     Arc::new(Verifiable::from((*verified).clone())),
                     validator_id,
-                    sig_from_bls(&sig),
+                    sig,
                 );
                 ctx.network.notify(&recipients, &notification);
             }

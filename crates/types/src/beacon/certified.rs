@@ -510,13 +510,14 @@ impl Describe<NoCustomTypeKind> for CertifiedBeaconBlock {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::bls_keypair_from_seed;
+    use hyperscale_crypto::Signer;
+    use hyperscale_crypto_bls::BlsSigner;
 
     use super::*;
     use crate::{
         AggregateSignature, BeaconBlockHash, BeaconProposal, Hash, PcQc2, PcQc3, PcSignerLengths,
         PcVector, PcXpProof, RatifyRound, SignerBitfield, SpcCert, SpcView, VRF_PROOF_BYTES,
-        ValidatorId, VrfProof, pk_from_bls,
+        ValidatorId, VrfProof,
     };
 
     fn proposal(seed: u8) -> BeaconProposal {
@@ -559,7 +560,7 @@ mod tests {
                 seed[..8].copy_from_slice(&i.to_le_bytes());
                 (
                     ValidatorId::new(i),
-                    pk_from_bls(&bls_keypair_from_seed(&seed).public_key()),
+                    BlsSigner::from_seed(&seed).public_key(),
                 )
             })
             .collect()

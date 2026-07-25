@@ -425,10 +425,8 @@ impl RatifyTracker {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
-    use hyperscale_types::{
-        Bls12381G1PrivateKey, Hash, NetworkDefinition, pk_from_bls, verify_ratify_cert,
-    };
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_types::{Hash, NetworkDefinition, Signer, verify_ratify_cert};
 
     use super::*;
 
@@ -436,23 +434,18 @@ mod tests {
         NetworkDefinition::simulator()
     }
 
-    fn signing_key(seed: u64) -> Bls12381G1PrivateKey {
+    fn signing_key(seed: u64) -> BlsSigner {
         let mut s = [0u8; 32];
         s[..8].copy_from_slice(&seed.to_le_bytes());
-        bls_keypair_from_seed(&s)
+        BlsSigner::from_seed(&s)
     }
 
-    fn pool(
-        n: u64,
-    ) -> (
-        Vec<(ValidatorId, ConsensusPublicKey)>,
-        Vec<Bls12381G1PrivateKey>,
-    ) {
+    fn pool(n: u64) -> (Vec<(ValidatorId, ConsensusPublicKey)>, Vec<BlsSigner>) {
         let mut active = Vec::new();
         let mut keys = Vec::new();
         for i in 0..n {
             let sk = signing_key(i);
-            active.push((ValidatorId::new(i), pk_from_bls(&sk.public_key())));
+            active.push((ValidatorId::new(i), sk.public_key()));
             keys.push(sk);
         }
         (active, keys)
@@ -470,7 +463,7 @@ mod tests {
         BeaconBlockHash::from_raw(Hash::from_bytes(b"candidate"))
     }
 
-    fn tracker(n: u64) -> (RatifyTracker, Vec<Bls12381G1PrivateKey>) {
+    fn tracker(n: u64) -> (RatifyTracker, Vec<BlsSigner>) {
         let (active, keys) = pool(n);
         (
             RatifyTracker::new(Arc::new(BlsVerifier), anchor(), epoch(), active),
@@ -479,7 +472,7 @@ mod tests {
     }
 
     fn vote(
-        keys: &[Bls12381G1PrivateKey],
+        keys: &[BlsSigner],
         signer: u64,
         round: u32,
         phase: RatifyPhase,
@@ -495,6 +488,7 @@ mod tests {
             phase,
             block_hash,
         )
+        .expect("sign")
     }
 
     fn sign_prevote_round(effects: &[RatifyEffect]) -> Option<(u32, BeaconBlockHash)> {
@@ -605,7 +599,8 @@ mod tests {
             RatifyRound::INITIAL,
             RatifyPhase::Prevote,
             candidate_hash(),
-        );
+        )
+        .expect("sign");
         let foreign_epoch = Verified::<RatifyVote>::sign_local(
             &keys[0],
             ValidatorId::new(0),
@@ -615,7 +610,8 @@ mod tests {
             RatifyRound::INITIAL,
             RatifyPhase::Prevote,
             candidate_hash(),
-        );
+        )
+        .expect("sign");
         let far_future = vote(
             &keys,
             0,

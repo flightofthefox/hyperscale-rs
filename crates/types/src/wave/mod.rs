@@ -36,7 +36,8 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use hyperscale_crypto_bls::generate_bls_keypair;
+    use hyperscale_crypto::Signer;
+    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
     use sbor::BASIC_SBOR_V1_MAX_DEPTH;
     use sbor::prelude::*;
 
@@ -49,7 +50,7 @@ mod tests {
         TopologySnapshot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
         Verified, WaveCertificate, WaveId, WaveReceiptHash, WeightedTimestamp,
         compute_global_receipt_root, compute_global_receipt_root_with_proof, compute_merkle_root,
-        pk_from_bls, tx_outcome_leaf, verify_merkle_inclusion, wave_leader, wave_leader_at,
+        tx_outcome_leaf, verify_merkle_inclusion, wave_leader, wave_leader_at,
     };
 
     /// Build a 2-shard topology with validator 0 on shard 0.
@@ -57,7 +58,7 @@ mod tests {
         let validators: Vec<_> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
-                public_key: pk_from_bls(&generate_bls_keypair().public_key()),
+                public_key: BlsSigner::new(generate_bls_keypair()).public_key(),
             })
             .collect();
         TopologySnapshot::new(
@@ -440,7 +441,7 @@ mod tests {
             VecEncoder, basic_decode,
         };
 
-        use crate::{Bls12381G2Signature, GlobalReceiptRoot, SignerBitfield, TxOutcome};
+        use crate::{AggregateSignature, GlobalReceiptRoot, SignerBitfield, TxOutcome};
 
         // Encode an EC where global_receipt_root is ZERO but tx_outcomes is
         // a non-empty list whose merkle root is non-zero. The BLS aggregate
@@ -467,7 +468,7 @@ mod tests {
             for outcome in &outcomes {
                 enc.encode_deeper_body(outcome).unwrap();
             }
-            enc.encode(&Bls12381G2Signature([0u8; 96])).unwrap();
+            enc.encode(&AggregateSignature::ZERO).unwrap();
             enc.encode(&SignerBitfield::new(4)).unwrap();
         }
         let err = basic_decode::<ExecutionCertificate>(&buf).unwrap_err();

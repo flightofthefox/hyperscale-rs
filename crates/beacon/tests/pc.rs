@@ -28,7 +28,7 @@ fn round1_quorum(
     v_in: &PcVector,
 ) -> Vec<PcVote1> {
     (0..quorum)
-        .map(|i| sign_vote1(cm.sk(i), cm.id(i), network, ctx, v_in.clone()))
+        .map(|i| sign_vote1(cm.sk(i), cm.id(i), network, ctx, v_in.clone()).expect("sign"))
         .collect()
 }
 
@@ -42,7 +42,7 @@ fn round2_quorum(
     qc1: &PcQc1,
 ) -> Vec<PcVote2> {
     (0..quorum)
-        .map(|i| sign_vote2(cm.sk(i), cm.id(i), network, ctx, qc1.clone()))
+        .map(|i| sign_vote2(cm.sk(i), cm.id(i), network, ctx, qc1.clone()).expect("sign"))
         .collect()
 }
 
@@ -55,7 +55,7 @@ fn round3_quorum(
     qc2: &PcQc2,
 ) -> Vec<PcVote3> {
     (0..quorum)
-        .map(|i| sign_vote3(cm.sk(i), cm.id(i), network, ctx, qc2.clone()))
+        .map(|i| sign_vote3(cm.sk(i), cm.id(i), network, ctx, qc2.clone()).expect("sign"))
         .collect()
 }
 
@@ -229,8 +229,8 @@ fn equivocation_round_trip_round1() {
     let value_a = PcVector::new([elem(1), elem(2)]);
     let value_b = PcVector::new([elem(1), elem(3)]);
 
-    let vote_a = sign_vote1(cm.sk(0), cm.id(0), &network, &ctx, value_a.clone());
-    let vote_b = sign_vote1(cm.sk(0), cm.id(0), &network, &ctx, value_b.clone());
+    let vote_a = sign_vote1(cm.sk(0), cm.id(0), &network, &ctx, value_a.clone()).expect("sign");
+    let vote_b = sign_vote1(cm.sk(0), cm.id(0), &network, &ctx, value_b.clone()).expect("sign");
 
     // Slim wire-form pulls the primary sig from `prefix_sigs[|v_in|]`
     // — the BLS sig over the full vector.
@@ -352,9 +352,9 @@ fn build_qc2_produces_diverging_proof_under_divergent_round1_inputs() {
     let qc1_a = qc1_over(&cm, &network, &ctx, 3, &x_a);
     let qc1_b = qc1_over(&cm, &network, &ctx, 3, &x_b);
 
-    let v2_0 = sign_vote2(cm.sk(0), cm.id(0), &network, &ctx, qc1_a.clone());
-    let v2_1 = sign_vote2(cm.sk(1), cm.id(1), &network, &ctx, qc1_a);
-    let v2_2 = sign_vote2(cm.sk(2), cm.id(2), &network, &ctx, qc1_b);
+    let v2_0 = sign_vote2(cm.sk(0), cm.id(0), &network, &ctx, qc1_a.clone()).expect("sign");
+    let v2_1 = sign_vote2(cm.sk(1), cm.id(1), &network, &ctx, qc1_a).expect("sign");
+    let v2_2 = sign_vote2(cm.sk(2), cm.id(2), &network, &ctx, qc1_b).expect("sign");
 
     let refs: Vec<&PcVote2> = vec![&v2_0, &v2_1, &v2_2];
     let qc2 = build_qc2(&BlsVerifier, &refs, &cm.members);
@@ -384,11 +384,11 @@ fn build_qc2_produces_short_witness_proof_when_one_signer_is_short() {
     let qc1_short = qc1_over(&cm, &network, &ctx, 5, &x_short);
 
     let v2s = [
-        sign_vote2(cm.sk(0), cm.id(0), &network, &ctx, qc1_long.clone()),
-        sign_vote2(cm.sk(1), cm.id(1), &network, &ctx, qc1_long.clone()),
-        sign_vote2(cm.sk(2), cm.id(2), &network, &ctx, qc1_long.clone()),
-        sign_vote2(cm.sk(3), cm.id(3), &network, &ctx, qc1_long),
-        sign_vote2(cm.sk(4), cm.id(4), &network, &ctx, qc1_short),
+        sign_vote2(cm.sk(0), cm.id(0), &network, &ctx, qc1_long.clone()).expect("sign"),
+        sign_vote2(cm.sk(1), cm.id(1), &network, &ctx, qc1_long.clone()).expect("sign"),
+        sign_vote2(cm.sk(2), cm.id(2), &network, &ctx, qc1_long.clone()).expect("sign"),
+        sign_vote2(cm.sk(3), cm.id(3), &network, &ctx, qc1_long).expect("sign"),
+        sign_vote2(cm.sk(4), cm.id(4), &network, &ctx, qc1_short).expect("sign"),
     ];
     let refs: Vec<&PcVote2> = v2s.iter().collect();
     let qc2 = build_qc2(&BlsVerifier, &refs, &cm.members);
@@ -415,10 +415,11 @@ fn equivocation_rejected_when_one_side_signed_by_other_validator() {
     let value_a = PcVector::new([elem(1), elem(2)]);
     let value_b = PcVector::new([elem(1), elem(3)]);
 
-    let vote_a = sign_vote1(cm.sk(0), cm.id(0), &network, &ctx, value_a.clone());
+    let vote_a = sign_vote1(cm.sk(0), cm.id(0), &network, &ctx, value_a.clone()).expect("sign");
     // Validator 1 signs the other vote — there's no contradiction
     // from validator 0's perspective.
-    let vote_b_by_other = sign_vote1(cm.sk(1), cm.id(0), &network, &ctx, value_b.clone());
+    let vote_b_by_other =
+        sign_vote1(cm.sk(1), cm.id(0), &network, &ctx, value_b.clone()).expect("sign");
 
     let ev = PcVoteEquivocation {
         validator: cm.id(0),

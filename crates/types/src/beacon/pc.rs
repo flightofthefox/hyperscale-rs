@@ -14,18 +14,18 @@
 use std::collections::BTreeSet;
 
 use blake3::Hasher;
-use hyperscale_crypto::Verifier;
+use hyperscale_crypto::{SignError, Signer, Verifier};
 use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::beacon::prefix_ops::{mce, mcp, qc1_certify};
 use crate::primitives::signer_bitfield::MAX_SIGNERS;
 use crate::{
-    AggregateSignature, Bls12381G1PrivateKey, BoundedVec, ConsensusPublicKey, ConsensusSignature,
-    DOMAIN_PC_VOTE1, DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, Epoch,
-    MAX_PREFIX_SIGS, MAX_VOTE_VECTOR_LEN, NetworkDefinition, PcContext, PositionalBundle,
-    SignerBitfield, SpcNewCommitMsg, SpcView, ValidatorId, Verifiable, Verified, Verify,
-    byzantine_threshold, pc_context, pc_vote_signing_message, sig_from_bls, spc_context,
+    AggregateSignature, BoundedVec, ConsensusPublicKey, ConsensusSignature, DOMAIN_PC_VOTE1,
+    DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, Epoch, MAX_PREFIX_SIGS,
+    MAX_VOTE_VECTOR_LEN, NetworkDefinition, PcContext, PositionalBundle, SignerBitfield,
+    SpcNewCommitMsg, SpcView, ValidatorId, Verifiable, Verified, Verify, byzantine_threshold,
+    pc_context, pc_vote_signing_message, spc_context,
 };
 
 // ── ValueElement and Vector ──────────────────────────────────────────────────
@@ -1422,16 +1422,19 @@ pub fn verify_vote_equivocation(
 /// Sign one signer's round-1 vote — produces `|v_in| + 1` prefix
 /// signatures over `v_in[..k]` for `k ∈ 0..=|v_in|`, packaged as a
 /// `PcVote1`.
-#[must_use]
+///
+/// # Errors
+///
+/// Propagates [`SignError`] when the signer cannot sign.
 pub fn sign_vote1(
-    sk: &Bls12381G1PrivateKey,
+    signer: &dyn Signer,
     validator: ValidatorId,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
     v_in: PcVector,
-) -> PcVote1 {
-    let prefix_sigs = sign_all_prefixes(sk, network, pc_ctx, &v_in, DOMAIN_PC_VOTE1);
-    PcVote1::new(validator, v_in, prefix_sigs)
+) -> Result<PcVote1, SignError> {
+    let prefix_sigs = sign_all_prefixes(signer, network, pc_ctx, &v_in, DOMAIN_PC_VOTE1)?;
+    Ok(PcVote1::new(validator, v_in, prefix_sigs))
 }
 
 /// Sign one signer's round-2 vote.
@@ -1443,20 +1446,28 @@ pub fn sign_vote1(
 ///
 /// Accepts either a raw `PcQc1` or a `Verified<PcQc1>` — the wrapper
 /// preserves the marker through `PcVote2.qc1`.
-#[must_use]
+///
+/// # Errors
+///
+/// Propagates [`SignError`] when the signer cannot sign.
 pub fn sign_vote2(
-    sk: &Bls12381G1PrivateKey,
+    signer: &dyn Signer,
     validator: ValidatorId,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
     qc1: impl Into<Verifiable<PcQc1>>,
-) -> PcVote2 {
+) -> Result<PcVote2, SignError> {
     let qc1: Verifiable<PcQc1> = qc1.into();
     let x = qc1.x().clone();
-    let prefix_sigs = sign_all_prefixes(sk, network, pc_ctx, &x, DOMAIN_PC_VOTE2);
-    let length_attestation =
-        sig_from_bls(&sk.sign_v1(&length_attestation_message(network, pc_ctx, x.len())));
-    PcVote2::new(validator, x, prefix_sigs, qc1, length_attestation)
+    let prefix_sigs = sign_all_prefixes(signer, network, pc_ctx, &x, DOMAIN_PC_VOTE2)?;
+    let length_attestation = signer.sign(&length_attestation_message(network, pc_ctx, x.len()))?;
+    Ok(PcVote2::new(
+        validator,
+        x,
+        prefix_sigs,
+        qc1,
+        length_attestation,
+    ))
 }
 
 /// Sign one signer's round-3 vote.
@@ -1465,37 +1476,40 @@ pub fn sign_vote2(
 /// rides separately from the per-prefix fan-out used in rounds 1/2
 /// (round 3 only needs the single `x_p` commitment). Accepts either
 /// a raw `PcQc2` or a `Verified<PcQc2>`.
-#[must_use]
+///
+/// # Errors
+///
+/// Propagates [`SignError`] when the signer cannot sign.
 pub fn sign_vote3(
-    sk: &Bls12381G1PrivateKey,
+    signer: &dyn Signer,
     validator: ValidatorId,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
     qc2: impl Into<Verifiable<PcQc2>>,
-) -> PcVote3 {
+) -> Result<PcVote3, SignError> {
     let qc2: Verifiable<PcQc2> = qc2.into();
     let x_p = qc2.x_p().clone();
-    let sig_xp = sig_from_bls(&sk.sign_v1(&pc_vote_signing_message(
+    let sig_xp = signer.sign(&pc_vote_signing_message(
         network,
         DOMAIN_PC_VOTE3,
         pc_ctx,
         &x_p,
-    )));
-    PcVote3::new(validator, x_p, sig_xp, qc2)
+    ))?;
+    Ok(PcVote3::new(validator, x_p, sig_xp, qc2))
 }
 
 /// Produce all `|v| + 1` prefix signatures, one per length `k ∈ 0..=|v|`.
 fn sign_all_prefixes(
-    sk: &Bls12381G1PrivateKey,
+    signer: &dyn Signer,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
     v: &PcVector,
     domain: &[u8],
-) -> Vec<ConsensusSignature> {
+) -> Result<Vec<ConsensusSignature>, SignError> {
     (0..=v.len())
         .map(|k| {
             let prefix = PcVector::new(v.iter().take(k).copied());
-            sig_from_bls(&sk.sign_v1(&pc_vote_signing_message(network, domain, pc_ctx, &prefix)))
+            signer.sign(&pc_vote_signing_message(network, domain, pc_ctx, &prefix))
         })
         .collect()
 }
@@ -2086,16 +2100,21 @@ impl Verify<&PcVoteEquivocationContext<'_>> for PcVoteEquivocation {
 impl Verified<PcVote1> {
     /// Sign a round-1 vote locally. The result is verified by
     /// construction — the signer's own sigs hold by definition under
-    /// the private key.
-    #[must_use]
+    /// its key.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SignError`] when the signer cannot sign.
     pub fn sign_local(
-        sk: &Bls12381G1PrivateKey,
+        signer: &dyn Signer,
         validator: ValidatorId,
         network: &NetworkDefinition,
         pc_ctx: &PcContext,
         v_in: PcVector,
-    ) -> Self {
-        Self::new_unchecked(sign_vote1(sk, validator, network, pc_ctx, v_in))
+    ) -> Result<Self, SignError> {
+        Ok(Self::new_unchecked(sign_vote1(
+            signer, validator, network, pc_ctx, v_in,
+        )?))
     }
 }
 
@@ -2103,29 +2122,39 @@ impl Verified<PcVote2> {
     /// Sign a round-2 vote locally, anchored on a verified round-1 QC.
     /// The embedded `qc1` carries its `Verified` marker through into
     /// the produced `PcVote2`, so re-verification short-circuits.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SignError`] when the signer cannot sign.
     pub fn sign_local(
-        sk: &Bls12381G1PrivateKey,
+        signer: &dyn Signer,
         validator: ValidatorId,
         network: &NetworkDefinition,
         pc_ctx: &PcContext,
         qc1: Verified<PcQc1>,
-    ) -> Self {
-        Self::new_unchecked(sign_vote2(sk, validator, network, pc_ctx, qc1))
+    ) -> Result<Self, SignError> {
+        Ok(Self::new_unchecked(sign_vote2(
+            signer, validator, network, pc_ctx, qc1,
+        )?))
     }
 }
 
 impl Verified<PcVote3> {
     /// Sign a round-3 vote locally, anchored on a verified round-2 QC.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SignError`] when the signer cannot sign.
     pub fn sign_local(
-        sk: &Bls12381G1PrivateKey,
+        signer: &dyn Signer,
         validator: ValidatorId,
         network: &NetworkDefinition,
         pc_ctx: &PcContext,
         qc2: Verified<PcQc2>,
-    ) -> Self {
-        Self::new_unchecked(sign_vote3(sk, validator, network, pc_ctx, qc2))
+    ) -> Result<Self, SignError> {
+        Ok(Self::new_unchecked(sign_vote3(
+            signer, validator, network, pc_ctx, qc2,
+        )?))
     }
 }
 

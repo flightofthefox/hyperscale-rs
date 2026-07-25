@@ -105,7 +105,7 @@ impl TimeoutKeeper {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::generate_bls_keypair;
+    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
     use hyperscale_types::{
         AggregateSignature, BlockHash, BlockHeight, NetworkDefinition, ShardId, SignerBitfield,
         Timeout, WeightedTimestamp,
@@ -130,7 +130,7 @@ mod tests {
 
     fn timeout(round: u64, high_qc_round: u64, voter: u64) -> Verified<Timeout> {
         let net = NetworkDefinition::simulator();
-        let key = generate_bls_keypair();
+        let key = BlsSigner::new(generate_bls_keypair());
         Verified::<Timeout>::sign_local(
             &net,
             SHARD,
@@ -139,6 +139,7 @@ mod tests {
             ValidatorId::new(voter),
             &key,
         )
+        .expect("sign")
     }
 
     #[test]

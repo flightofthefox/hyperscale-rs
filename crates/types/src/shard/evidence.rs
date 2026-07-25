@@ -553,17 +553,17 @@ impl ShardForkProof {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
-    use radix_common::crypto::Bls12381G1PrivateKey;
+    use hyperscale_crypto::Signer;
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
 
     use super::*;
-    use crate::{BlockVote, Hash, ProposerTimestamp, pk_from_bls};
+    use crate::{BlockVote, Hash, ProposerTimestamp};
 
     /// Sign a real block vote and return `(block_hash, parent_hash, sig)`
     /// so tests assemble evidence from genuine signatures.
     fn signed_side(
         network: &NetworkDefinition,
-        sk: &Bls12381G1PrivateKey,
+        sk: &BlsSigner,
         shard: ShardId,
         height: BlockHeight,
         round: Round,
@@ -580,7 +580,8 @@ mod tests {
             ValidatorId::new(7),
             sk,
             ProposerTimestamp::ZERO,
-        );
+        )
+        .expect("sign");
         (block_hash, parent_block_hash, vote.signature())
     }
 
@@ -592,7 +593,7 @@ mod tests {
     #[test]
     fn genuine_double_vote_verifies() {
         let net = NetworkDefinition::simulator();
-        let sk = generate_bls_keypair();
+        let sk = BlsSigner::new(generate_bls_keypair());
         let pk = sk.public_key();
         let (shard, height, round) = (ShardId::ROOT, BlockHeight::new(4), Round::INITIAL);
         let (ba, pa, sa) = signed_side(
@@ -626,7 +627,7 @@ mod tests {
             sig_b: sb,
         };
         assert_eq!(
-            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk_from_bls(&pk)),
+            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk),
             Ok(())
         );
     }
@@ -636,7 +637,7 @@ mod tests {
     #[test]
     fn equal_blocks_rejected() {
         let net = NetworkDefinition::simulator();
-        let sk = generate_bls_keypair();
+        let sk = BlsSigner::new(generate_bls_keypair());
         let pk = sk.public_key();
         let (shard, height, round) = (ShardId::ROOT, BlockHeight::new(4), Round::INITIAL);
         let (ba, pa, sa) = signed_side(
@@ -661,7 +662,7 @@ mod tests {
             sig_b: sa,
         };
         assert_eq!(
-            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk_from_bls(&pk)),
+            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk),
             Err(ShardVoteEquivocationVerifyError::BlocksEqual)
         );
     }
@@ -671,9 +672,9 @@ mod tests {
     #[test]
     fn bad_signature_rejected() {
         let net = NetworkDefinition::simulator();
-        let sk = generate_bls_keypair();
+        let sk = BlsSigner::new(generate_bls_keypair());
         let pk = sk.public_key();
-        let intruder = generate_bls_keypair();
+        let intruder = BlsSigner::new(generate_bls_keypair());
         let (shard, height, round) = (ShardId::ROOT, BlockHeight::new(4), Round::INITIAL);
         let (ba, pa, sa) = signed_side(
             &net,
@@ -708,7 +709,7 @@ mod tests {
             sig_b: sb,
         };
         assert_eq!(
-            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk_from_bls(&pk)),
+            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk),
             Err(ShardVoteEquivocationVerifyError::BadSignature)
         );
     }

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{Action, CommitSource, FetchAbandon, TimerId};
-use hyperscale_crypto_bls::BlsVerifier;
+use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
@@ -37,18 +37,17 @@ use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block, BlockHash,
-    BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G2Signature,
-    CertRootVerifyError, CertificateRoot, CertificateRootContext, CertifiedBlock,
-    ConsensusPublicKey, ConsensusReceipt, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot,
-    LocalReceiptRootContext, LocalReceiptRootVerifyError, LocalTimestamp, NetworkDefinition,
-    ProposerTimestamp, ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
-    QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardId,
-    ShardVoteEquivocation, ShardWitnessPayload, StateRoot, StateRootContext, StateRootVerifyError,
-    StoredReceipt, Timeout, TimeoutContext, TopologySchedule, TransactionRoot,
-    TransactionRootContext, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify,
-    VoteCount, VrfProof, WeightedTimestamp, local_settled_wave_ids, ready_signal_message,
-    shard_reveal_sign, sig_from_bls,
+    BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot,
+    CertificateRootContext, CertifiedBlock, ConsensusPublicKey, ConsensusReceipt, FinalizedWave,
+    Hash, InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, LocalReceiptRootVerifyError,
+    LocalTimestamp, NetworkDefinition, ProposerTimestamp, ProvisionRootVerifyError,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
+    ProvisionsRoot, ProvisionsRootContext, QcContext, QcVerifyError, QuorumCertificate,
+    ReadySignal, Round, RoutableTransaction, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
+    Signer, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, Timeout,
+    TimeoutContext, TopologySchedule, TransactionRoot, TransactionRootContext, TxHash,
+    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof,
+    WeightedTimestamp, local_settled_wave_ids, ready_signal_message, shard_reveal_sign,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -303,8 +302,8 @@ pub struct ShardCoordinatorSim {
     pub coordinators: Vec<ShardCoordinator>,
     /// `(validator_id, pubkey)` per replica.
     pub members: Vec<(ValidatorId, ConsensusPublicKey)>,
-    /// BLS signing keys per replica.
-    sks: Vec<Arc<Bls12381G1PrivateKey>>,
+    /// Signing identities per replica.
+    sks: Vec<Arc<BlsSigner>>,
     /// In-memory shard storage per replica. Exposed for test
     /// introspection (e.g. asserting JMT roots).
     pub storages: Vec<Arc<SimShardStorage>>,
@@ -400,9 +399,7 @@ impl ShardCoordinatorSim {
         let mut coordinators = Vec::with_capacity(n);
 
         for idx in 0..n {
-            let sk_bytes = committee.keypair(idx).to_bytes();
-            let sk =
-                Arc::new(Bls12381G1PrivateKey::from_bytes(&sk_bytes).expect("valid bls key bytes"));
+            let sk = Arc::new(committee.signer(idx).clone());
             let id = committee.validator_id(idx);
             members.push((id, *committee.public_key(idx)));
             sks.push(sk);
@@ -604,9 +601,10 @@ impl ShardCoordinatorSim {
             height,
             round,
             signer,
-            &self.sks[idx],
+            self.sks[idx].as_ref(),
             ProposerTimestamp::ZERO,
         )
+        .expect("sign")
     }
 
     /// Drive `verified_vote` through `aggregator`'s real QC-result path with
@@ -732,14 +730,8 @@ impl ShardCoordinatorSim {
             wt_window_start,
             wt_window_end,
         );
-        let sig = Bls12381G2Signature(sk.sign_v1(&msg).0);
-        let signal = ReadySignal::new(
-            validator,
-            shard,
-            wt_window_start,
-            wt_window_end,
-            sig_from_bls(&sig),
-        );
+        let sig = sk.as_ref().sign(&msg).expect("sign");
+        let signal = ReadySignal::new(validator, shard, wt_window_start, wt_window_end, sig);
         for idx in 0..self.n() {
             self.coordinators[idx]
                 .on_ready_signal_received(&self.topology_schedule, signal.clone());
@@ -1248,9 +1240,10 @@ impl ShardCoordinatorSim {
                     height,
                     round,
                     me,
-                    &self.sks[emitter_idx],
+                    self.sks[emitter_idx].as_ref(),
                     timestamp,
-                );
+                )
+                .expect("sign");
                 for &recipient in &next_proposers {
                     if recipient == me {
                         continue;
@@ -1290,8 +1283,9 @@ impl ShardCoordinatorSim {
                     round,
                     high_qc,
                     me,
-                    &self.sks[emitter_idx],
-                );
+                    self.sks[emitter_idx].as_ref(),
+                )
+                .expect("sign");
                 for &recipient in &recipients {
                     if recipient == me {
                         continue;
@@ -1439,11 +1433,12 @@ impl ShardCoordinatorSim {
                     // `VrfProof::ZERO` would fail it. The proposer leads
                     // this round, so it matches `proposer_for` at verify.
                     shard_reveal_sign(
-                        &self.sks[self.idx_of(proposer)],
+                        self.sks[self.idx_of(proposer)].as_ref(),
                         &self.network,
                         shard_id,
                         height,
-                    ),
+                    )
+                    .expect("sign"),
                     &parent_witness_leaves,
                     beacon_witness_base,
                     carry_split_child_roots,

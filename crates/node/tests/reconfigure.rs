@@ -30,11 +30,11 @@ use hyperscale_types::network::gossip::beacon::BeaconBlockGossip;
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::test_utils::{TestCommittee, test_transaction};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, Bls12381G1PrivateKey,
-    CertifiedBeaconBlock, GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp,
-    MIN_STAKE_FLOOR, NetworkDefinition, Randomness, ShardId, Stake, StakePoolId, TopologySnapshot,
-    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
-    genesis_config_hash, shard_prefix_path,
+    BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
+    GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
+    NetworkDefinition, Randomness, ShardId, Stake, StakePoolId, TopologySnapshot, ValidatorId,
+    ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp, genesis_config_hash,
+    shard_prefix_path,
 };
 
 const SHARD_A: ShardId = ShardId::leaf(1, 0);
@@ -143,10 +143,7 @@ impl Fixture {
         );
         VnodeInit {
             state,
-            signing_key: Arc::new(
-                Bls12381G1PrivateKey::from_bytes(&self.committee.keypair(idx).to_bytes())
-                    .expect("valid key bytes"),
-            ),
+            signer: Arc::new(self.committee.signer(idx).clone()),
         }
     }
 
@@ -165,10 +162,7 @@ impl Fixture {
         );
         VnodeInit {
             state: NodeStateMachine::follower(me, beacon),
-            signing_key: Arc::new(
-                Bls12381G1PrivateKey::from_bytes(&self.committee.keypair(idx).to_bytes())
-                    .expect("valid key bytes"),
-            ),
+            signer: Arc::new(self.committee.signer(idx).clone()),
         }
     }
 }

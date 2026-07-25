@@ -11,7 +11,7 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_beacon::genesis::build_genesis;
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
-use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{GenesisConfig, RadixExecutor, TransactionValidation};
 use hyperscale_mempool::MempoolConfig;
@@ -32,9 +32,9 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
-    BeaconChainConfig, Bls12381G1PrivateKey, ConsensusPublicKey, Epoch, GenesisConfigHash,
-    GenesisValidators, LocalTimestamp, ShardId, TopologySnapshot, TransactionStatus, TxHash,
-    ValidatorId, ValidatorInfo, ValidatorSet, pk_from_bls, shard_prefix_path,
+    BeaconChainConfig, ConsensusPublicKey, Epoch, GenesisConfigHash, GenesisValidators,
+    LocalTimestamp, ShardId, Signer, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
+    ValidatorInfo, ValidatorSet, shard_prefix_path,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -139,7 +139,7 @@ pub struct SimulationRunner {
 
     /// Signing keys for every registered validator, retained so a
     /// relocated vnode's state machine can be rebuilt on its new shard.
-    signing_keys: Vec<Arc<Bls12381G1PrivateKey>>,
+    signing_keys: Vec<Arc<BlsSigner>>,
 
     /// Beacon genesis config hash, retained for runtime-built
     /// `BeaconCoordinator`s.
@@ -287,7 +287,7 @@ impl SimulationRunner {
         // `Pooled`, giving the shuffle refill stock) but run no host.
         let committee_size = network_config.shard_size;
         let registered_validators = committee_size + network_config.pool_surplus;
-        let signing_keys: Vec<Arc<Bls12381G1PrivateKey>> = (0..registered_validators)
+        let signing_keys: Vec<Arc<BlsSigner>> = (0..registered_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
                 let key_seed = seed
@@ -295,13 +295,11 @@ impl SimulationRunner {
                     .wrapping_mul(0x517c_c1b7_2722_0a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
                 seed_bytes[8..16].copy_from_slice(&u64::from(i).to_le_bytes());
-                Arc::new(bls_keypair_from_seed(&seed_bytes))
+                Arc::new(BlsSigner::from_seed(&seed_bytes))
             })
             .collect();
-        let public_keys: Vec<ConsensusPublicKey> = signing_keys
-            .iter()
-            .map(|key| pk_from_bls(&key.public_key()))
-            .collect();
+        let public_keys: Vec<ConsensusPublicKey> =
+            signing_keys.iter().map(|key| key.public_key()).collect();
 
         // Build global validator set (pool extras included — fold-derived
         // snapshots carry every registered validator, so genesis matches)
@@ -367,12 +365,12 @@ impl SimulationRunner {
             let mut vnode_inits: Vec<VnodeInit> =
                 Vec::with_capacity(plan.seated.len() + plan.followers.len());
             for (shard, validator_idxs) in &by_shard {
-                let vnodes: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)> = validator_idxs
+                let vnodes: Vec<(ValidatorId, Arc<dyn Signer>)> = validator_idxs
                     .iter()
                     .map(|&idx| {
                         (
                             ValidatorId::new(u64::from(idx)),
-                            Arc::clone(&signing_keys[idx as usize]),
+                            Arc::clone(&signing_keys[idx as usize]) as Arc<dyn Signer>,
                         )
                     })
                     .collect();
@@ -391,7 +389,7 @@ impl SimulationRunner {
                 }));
             }
             for &validator_idx in &plan.followers {
-                let signing_key = Arc::clone(&signing_keys[validator_idx as usize]);
+                let signer = Arc::clone(&signing_keys[validator_idx as usize]) as Arc<dyn Signer>;
                 vnode_inits.push(seat_follower(SeatFollower {
                     verifier: Arc::new(BlsVerifier),
                     beacon_storage: beacon_storage.as_ref(),
@@ -399,7 +397,7 @@ impl SimulationRunner {
                     beacon_config_hash,
                     now: LocalTimestamp::ZERO,
                     validator: ValidatorId::new(u64::from(validator_idx)),
-                    signing_key,
+                    signer,
                 }));
             }
             let topology_arc_for_host = Arc::new(ArcSwap::from(Arc::clone(&shared_topology)));
@@ -671,10 +669,7 @@ impl SimulationRunner {
     /// [`TestCommittee`](hyperscale_types::test_utils)'s keys would not match
     /// the seated committee.
     #[must_use]
-    pub fn validator_signing_key(
-        &self,
-        validator: ValidatorId,
-    ) -> Option<Arc<Bls12381G1PrivateKey>> {
+    pub fn validator_signing_key(&self, validator: ValidatorId) -> Option<Arc<BlsSigner>> {
         self.signing_keys
             .get(usize::try_from(validator.inner()).ok()?)
             .map(Arc::clone)

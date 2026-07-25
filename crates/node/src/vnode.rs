@@ -22,8 +22,8 @@ use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_types::{
-    BeaconState, Bls12381G1PrivateKey, GenesisConfigHash, LocalTimestamp, NetworkDefinition,
-    ShardId, ValidatorId, Verifier, WeightedTimestamp,
+    BeaconState, GenesisConfigHash, LocalTimestamp, NetworkDefinition, ShardId, Signer,
+    ValidatorId, Verifier, WeightedTimestamp,
 };
 
 use crate::NodeStateMachine;
@@ -36,11 +36,11 @@ pub struct VnodeInit {
     /// `TopologyCoordinator` (the constructor reads `validator_id`
     /// and `local_shard` from there).
     pub state: NodeStateMachine,
-    /// BLS signing key for this validator's votes and proposals.
+    /// Signing identity for this validator's votes and proposals.
     /// Shared with the validator-bind service (production) by `Arc`
     /// so the key has exactly one allocation regardless of how many
     /// off-thread consumers hold it.
-    pub signing_key: Arc<Bls12381G1PrivateKey>,
+    pub signer: Arc<dyn Signer>,
 }
 
 impl VnodeInit {
@@ -50,7 +50,7 @@ impl VnodeInit {
         Vnode {
             validator_id: self.state.validator_id(),
             state: self.state,
-            signing_key: self.signing_key,
+            signer: self.signer,
         }
     }
 }
@@ -81,8 +81,8 @@ pub struct SeatVnodeGroup<'a> {
     pub mempool_config: MempoolConfig,
     /// Provision coordinator knobs.
     pub provision_config: ProvisionConfig,
-    /// `(validator, signing key)` per seated vnode.
-    pub vnodes: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)>,
+    /// `(validator, signer)` per seated vnode.
+    pub vnodes: Vec<(ValidatorId, Arc<dyn Signer>)>,
 }
 
 /// Build one [`VnodeInit`] per vnode in a same-shard group: a beacon
@@ -134,7 +134,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
 
     args.vnodes
         .into_iter()
-        .map(|(validator, signing_key)| {
+        .map(|(validator, signer)| {
             let mut beacon_coordinator = BeaconCoordinator::new(
                 Arc::clone(&args.verifier),
                 Arc::clone(&latest_block),
@@ -164,7 +164,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
                 Arc::clone(&exec_cert_store),
                 Arc::clone(&finalized_wave_store),
             );
-            VnodeInit { state, signing_key }
+            VnodeInit { state, signer }
         })
         .collect()
 }
@@ -186,10 +186,10 @@ pub struct SeatFollower<'a> {
     pub now: LocalTimestamp,
     /// The validator this host follows the beacon for.
     pub validator: ValidatorId,
-    /// Its signing key. A follower never signs (it is never
-    /// `beacon_eligible`), but the bundle carries the real key so a later
-    /// seat does not have to thread one in separately.
-    pub signing_key: Arc<Bls12381G1PrivateKey>,
+    /// Its signer. A follower never signs (it is never
+    /// `beacon_eligible`), but the bundle carries the real signer so a
+    /// later seat does not have to thread one in separately.
+    pub signer: Arc<dyn Signer>,
 }
 
 /// Build one shard-less beacon-follower [`VnodeInit`].
@@ -236,7 +236,7 @@ pub fn seat_follower(args: SeatFollower<'_>) -> VnodeInit {
     }
     VnodeInit {
         state: NodeStateMachine::follower(args.validator, beacon_coordinator),
-        signing_key: args.signing_key,
+        signer: args.signer,
     }
 }
 
@@ -252,8 +252,8 @@ pub struct Vnode {
     /// never touch it.
     pub state: NodeStateMachine,
 
-    /// BLS signing key for votes and proposals. Shared with
+    /// Signing identity for votes and proposals. Shared with
     /// `DispatchHandles` via `Arc` so delegated handlers running on
     /// thread pools can sign without re-entering the pinned thread.
-    pub signing_key: Arc<Bls12381G1PrivateKey>,
+    pub signer: Arc<dyn Signer>,
 }

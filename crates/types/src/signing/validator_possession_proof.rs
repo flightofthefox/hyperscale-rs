@@ -15,12 +15,9 @@
 //! replayed to register the same key under a different identity or on a
 //! different network.
 
-use hyperscale_crypto::Verifier;
+use hyperscale_crypto::{SignError, Signer, Verifier};
 
-use crate::{
-    Bls12381G1PrivateKey, ConsensusPublicKey, ConsensusSignature, NetworkDefinition, ValidatorId,
-    pk_from_bls, sig_from_bls,
-};
+use crate::{ConsensusPublicKey, ConsensusSignature, NetworkDefinition, ValidatorId};
 
 /// Domain tag for validator BLS proof-of-possession.
 pub const DOMAIN_VALIDATOR_POSSESSION_PROOF: &[u8] = b"HYPERSCALE_VALIDATOR_POSSESSION_PROOF_v1";
@@ -44,20 +41,22 @@ pub fn validator_possession_proof_message(
     out
 }
 
-/// Sign the proof-of-possession for `sk`'s public key claimed under
+/// Sign the proof-of-possession for `signer`'s public key claimed under
 /// `validator_id` on `network`.
 ///
-/// The message covers `sk.public_key()` itself, so the proof is bound to
-/// exactly the key that signs it.
-#[must_use]
+/// The message covers `signer.public_key()` itself, so the proof is
+/// bound to exactly the key that signs it.
+///
+/// # Errors
+///
+/// Propagates [`SignError`] when the signer cannot sign.
 pub fn validator_possession_proof_sign(
-    sk: &Bls12381G1PrivateKey,
+    signer: &dyn Signer,
     network: &NetworkDefinition,
     validator_id: ValidatorId,
-) -> ConsensusSignature {
-    let msg =
-        validator_possession_proof_message(network, validator_id, &pk_from_bls(&sk.public_key()));
-    sig_from_bls(&sk.sign_v1(&msg))
+) -> Result<ConsensusSignature, SignError> {
+    let msg = validator_possession_proof_message(network, validator_id, &signer.public_key());
+    signer.sign(&msg)
 }
 
 /// Verify that `possession_proof` proves possession of `pubkey` claimed under
@@ -80,10 +79,11 @@ mod tests {
         BLST_ERROR, blst_p1, blst_p1_add, blst_p1_affine, blst_p1_cneg, blst_p1_compress,
         blst_p1_from_affine, blst_p1_uncompress,
     };
-    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+    use hyperscale_crypto_bls::{
+        Bls12381G1PrivateKey, Bls12381G1PublicKey, BlsSigner, BlsVerifier, bls_keypair_from_seed,
+    };
 
     use super::*;
-    use crate::Bls12381G1PublicKey;
     use crate::signing::{DOMAIN_READY_SIGNAL, DOMAIN_SHARD_REVEAL};
 
     fn net() -> NetworkDefinition {
@@ -96,12 +96,20 @@ mod tests {
         bls_keypair_from_seed(&s)
     }
 
+    fn signer(seed: u64) -> BlsSigner {
+        BlsSigner::new(keypair(seed))
+    }
+
+    fn pk_of(key: &Bls12381G1PublicKey) -> ConsensusPublicKey {
+        ConsensusPublicKey::new(key.0)
+    }
+
     /// Pins the byte layout of `validator_possession_proof_message`. Any change to the
     /// encoder — field order, width, domain tag — shifts these bytes and
     /// fails this test.
     #[test]
     fn validator_possession_proof_message_byte_layout_is_pinned() {
-        let pk = pk_from_bls(&keypair(1).public_key());
+        let pk = signer(1).public_key();
         let id = ValidatorId::new(0x0123_4567_89AB_CDEF);
         let bytes = validator_possession_proof_message(&net(), id, &pk);
 
@@ -122,7 +130,7 @@ mod tests {
     /// a different `ValidatorId` must not verify.
     #[test]
     fn validator_possession_proof_message_differs_across_ids() {
-        let pk = pk_from_bls(&keypair(1).public_key());
+        let pk = signer(1).public_key();
         let a = validator_possession_proof_message(&net(), ValidatorId::new(1), &pk);
         let b = validator_possession_proof_message(&net(), ValidatorId::new(2), &pk);
         assert_ne!(a, b);
@@ -132,7 +140,7 @@ mod tests {
     /// different networks must produce different signing bytes.
     #[test]
     fn validator_possession_proof_message_differs_across_networks() {
-        let pk = pk_from_bls(&keypair(1).public_key());
+        let pk = signer(1).public_key();
         let id = ValidatorId::new(7);
         let mainnet = validator_possession_proof_message(&NetworkDefinition::mainnet(), id, &pk);
         let stokenet = validator_possession_proof_message(&NetworkDefinition::stokenet(), id, &pk);
@@ -149,14 +157,14 @@ mod tests {
 
     #[test]
     fn validator_possession_proof_sign_verify_round_trip() {
-        let sk = keypair(3);
+        let signer = signer(3);
         let id = ValidatorId::new(42);
-        let proof = validator_possession_proof_sign(&sk, &net(), id);
+        let proof = validator_possession_proof_sign(&signer, &net(), id).expect("sign");
         assert!(validator_possession_proof_verify(
             &BlsVerifier,
             &net(),
             id,
-            &pk_from_bls(&sk.public_key()),
+            &signer.public_key(),
             &proof
         ));
     }
@@ -164,15 +172,15 @@ mod tests {
     /// A proof signed by one key does not prove possession of another.
     #[test]
     fn validator_possession_proof_verify_rejects_cross_key() {
-        let sk_a = keypair(3);
-        let sk_b = keypair(4);
+        let signer_a = signer(3);
+        let signer_b = signer(4);
         let id = ValidatorId::new(42);
-        let proof = validator_possession_proof_sign(&sk_a, &net(), id);
+        let proof = validator_possession_proof_sign(&signer_a, &net(), id).expect("sign");
         assert!(!validator_possession_proof_verify(
             &BlsVerifier,
             &net(),
             id,
-            &pk_from_bls(&sk_b.public_key()),
+            &signer_b.public_key(),
             &proof
         ));
     }
@@ -181,26 +189,27 @@ mod tests {
     /// captured proof against a different `ValidatorId` fails.
     #[test]
     fn validator_possession_proof_verify_rejects_wrong_id() {
-        let sk = keypair(3);
-        let proof = validator_possession_proof_sign(&sk, &net(), ValidatorId::new(42));
+        let signer = signer(3);
+        let proof =
+            validator_possession_proof_sign(&signer, &net(), ValidatorId::new(42)).expect("sign");
         assert!(!validator_possession_proof_verify(
             &BlsVerifier,
             &net(),
             ValidatorId::new(43),
-            &pk_from_bls(&sk.public_key()),
+            &signer.public_key(),
             &proof
         ));
     }
 
     #[test]
     fn validator_possession_proof_verify_rejects_zero_signature() {
-        let sk = keypair(3);
+        let signer = signer(3);
         let id = ValidatorId::new(42);
         assert!(!validator_possession_proof_verify(
             &BlsVerifier,
             &net(),
             id,
-            &pk_from_bls(&sk.public_key()),
+            &signer.public_key(),
             &ConsensusSignature::ZERO
         ));
     }
@@ -266,22 +275,22 @@ mod tests {
 
         // The adversary's available forgeries: sign the rogue key's PoP
         // message with each secret it could hold. None verifies.
-        let msg = validator_possession_proof_message(&net(), id, &pk_from_bls(&rogue_pk));
+        let msg = validator_possession_proof_message(&net(), id, &pk_of(&rogue_pk));
         let forged_with_r = r.sign_v1(&msg);
         assert!(!validator_possession_proof_verify(
             &BlsVerifier,
             &net(),
             id,
-            &pk_from_bls(&rogue_pk),
-            &sig_from_bls(&forged_with_r)
+            &pk_of(&rogue_pk),
+            &ConsensusSignature::new(forged_with_r.0)
         ));
         let forged_with_honest = honest.sign_v1(&msg);
         assert!(!validator_possession_proof_verify(
             &BlsVerifier,
             &net(),
             id,
-            &pk_from_bls(&rogue_pk),
-            &sig_from_bls(&forged_with_honest)
+            &pk_of(&rogue_pk),
+            &ConsensusSignature::new(forged_with_honest.0)
         ));
     }
 }

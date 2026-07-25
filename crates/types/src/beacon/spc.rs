@@ -33,16 +33,15 @@
 //!   won't verify.
 
 use blake3::Hasher;
-use hyperscale_crypto::Verifier;
+use hyperscale_crypto::{SignError, Signer, Verifier};
 use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    AggregateSignature, Bls12381G1PrivateKey, ConsensusPublicKey, ConsensusSignature,
-    DOMAIN_PC_EMPTY_VIEW, Hash, NetworkDefinition, PcQc3, PcValueElement, PcVector,
-    PcVoteVerifyContext, PositionalBundle, SignerBitfield, SpcContext, SpcView, ValidatorId,
-    Verifiable, Verified, Verify, byzantine_threshold, pc_context, pc_vote_signing_message,
-    sig_from_bls, verify_qc3,
+    AggregateSignature, ConsensusPublicKey, ConsensusSignature, DOMAIN_PC_EMPTY_VIEW, Hash,
+    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVoteVerifyContext, PositionalBundle,
+    SignerBitfield, SpcContext, SpcView, ValidatorId, Verifiable, Verified, Verify,
+    byzantine_threshold, pc_context, pc_vote_signing_message, verify_qc3,
 };
 
 /// `(view, value, proof)` — a verifiable high triple.
@@ -600,25 +599,27 @@ pub fn verify_proposal_object(
 /// `skip_target(empty_view, reported.view, hash_high_value(&reported.value))`
 /// under [`DOMAIN_PC_EMPTY_VIEW`], so the indirect-cert verifier can
 /// reconstruct the canonical preimage on aggregation.
-#[must_use]
+/// # Errors
+///
+/// Propagates [`SignError`] when the signer cannot sign.
 pub fn sign_empty_view_msg(
-    sk: &Bls12381G1PrivateKey,
-    signer: ValidatorId,
+    signer: &dyn Signer,
+    validator: ValidatorId,
     network: &NetworkDefinition,
     spc_ctx: &SpcContext,
     empty_view: SpcView,
     reported: SpcHighTriple,
-) -> SpcEmptyViewMsg {
+) -> Result<SpcEmptyViewMsg, SignError> {
     let value_hash = hash_high_value(&reported.value);
     let target = skip_target(empty_view, reported.view, value_hash);
     let msg = pc_vote_signing_message(network, DOMAIN_PC_EMPTY_VIEW, spc_ctx, &target);
-    let sig = sig_from_bls(&sk.sign_v1(&msg));
-    SpcEmptyViewMsg {
+    let sig = signer.sign(&msg)?;
+    Ok(SpcEmptyViewMsg {
         view: empty_view,
         reported,
-        signer,
+        signer: validator,
         sig,
-    }
+    })
 }
 
 // ─── Build ─────────────────────────────────────────────────────────────────
@@ -960,26 +961,29 @@ impl Verify<&SpcVerifyContext<'_>> for SpcNewCommitMsg {
 
 impl Verified<SpcEmptyViewMsg> {
     /// Sign an empty-view attestation locally over a verified high
-    /// triple. The signer's own sig holds by definition under the
-    /// private key; the embedded reported triple was already verified
-    /// upstream, so the produced message is verified by construction.
-    #[must_use]
+    /// triple. The signer's own sig holds by definition under its key;
+    /// the embedded reported triple was already verified upstream, so
+    /// the produced message is verified by construction.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SignError`] when the signer cannot sign.
     pub fn sign_local(
-        sk: &Bls12381G1PrivateKey,
-        signer: ValidatorId,
+        signer: &dyn Signer,
+        validator: ValidatorId,
         network: &NetworkDefinition,
         spc_ctx: &SpcContext,
         empty_view: SpcView,
         reported: Verified<SpcHighTriple>,
-    ) -> Self {
-        Self::new_unchecked(sign_empty_view_msg(
-            sk,
+    ) -> Result<Self, SignError> {
+        Ok(Self::new_unchecked(sign_empty_view_msg(
             signer,
+            validator,
             network,
             spc_ctx,
             empty_view,
             reported.into_inner(),
-        ))
+        )?))
     }
 }
 
@@ -1120,10 +1124,10 @@ impl Verified<SpcNewCommitMsg> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
 
     use super::*;
-    use crate::{PcQc2, PcSignerLengths, PcValueElement, PcXpProof, SignerBitfield, agg_from_bls};
+    use crate::{PcQc2, PcSignerLengths, PcValueElement, PcXpProof, SignerBitfield};
 
     fn sample_pc_qc3() -> PcQc3 {
         let mut signers = SignerBitfield::new(4);
@@ -1236,14 +1240,14 @@ mod tests {
 
     // ─── Verifier / builder tests ──────────────────────────────────────
 
-    use crate::{Epoch, pk_from_bls, spc_context};
+    use crate::{Epoch, spc_context};
 
     fn committee(n: usize) -> Vec<(ValidatorId, ConsensusPublicKey)> {
         (0..n as u64)
             .map(|i| {
                 (
                     ValidatorId::new(i),
-                    pk_from_bls(&generate_bls_keypair().public_key()),
+                    BlsSigner::new(generate_bls_keypair()).public_key(),
                 )
             })
             .collect()
@@ -1298,7 +1302,12 @@ mod tests {
             target_value: PcVector::empty(),
             target_proof: sample_pc_qc3().into(),
             skip_reports: PositionalBundle::empty(),
-            skip_aggregate_sig: agg_from_bls(&generate_bls_keypair().sign_v1(b"unused")),
+            skip_aggregate_sig: AggregateSignature::new(
+                *BlsSigner::new(generate_bls_keypair())
+                    .sign(b"unused")
+                    .expect("sign")
+                    .as_bytes(),
+            ),
         };
         assert!(verify_cert(&BlsVerifier, &cert, SpcView::new(1), &net(), &ctx(), &c).is_err());
     }
@@ -1319,7 +1328,12 @@ mod tests {
             target_value: PcVector::empty(),
             target_proof: sample_pc_qc3().into(),
             skip_reports: PositionalBundle::new(signers, reports),
-            skip_aggregate_sig: agg_from_bls(&generate_bls_keypair().sign_v1(b"unused")),
+            skip_aggregate_sig: AggregateSignature::new(
+                *BlsSigner::new(generate_bls_keypair())
+                    .sign(b"unused")
+                    .expect("sign")
+                    .as_bytes(),
+            ),
         };
         assert!(verify_cert(&BlsVerifier, &cert, SpcView::new(2), &net(), &ctx(), &c).is_err());
     }
@@ -1337,7 +1351,7 @@ mod tests {
     #[test]
     fn build_indirect_cert_rejects_mismatched_view() {
         let c = committee(4);
-        let kp = generate_bls_keypair();
+        let kp = BlsSigner::new(generate_bls_keypair());
         let msg = SpcEmptyViewMsg {
             view: SpcView::new(2),
             reported: SpcHighTriple {
@@ -1346,7 +1360,7 @@ mod tests {
                 proof: sample_pc_qc3().into(),
             },
             signer: ValidatorId::new(0),
-            sig: sig_from_bls(&kp.sign_v1(b"unused")),
+            sig: kp.sign(b"unused").expect("sign"),
         };
         // Caller asks for empty_view = 3 but supplies a msg for view 2.
         assert!(
@@ -1365,10 +1379,10 @@ mod tests {
     #[test]
     fn build_indirect_cert_targets_max_reported() {
         let c = committee(4);
-        let kp_a = generate_bls_keypair();
-        let kp_b = generate_bls_keypair();
-        let kp_c = generate_bls_keypair();
-        let mk = |signer: u64, reported_view: u32, sk: &Bls12381G1PrivateKey| SpcEmptyViewMsg {
+        let kp_a = BlsSigner::new(generate_bls_keypair());
+        let kp_b = BlsSigner::new(generate_bls_keypair());
+        let kp_c = BlsSigner::new(generate_bls_keypair());
+        let mk = |signer: u64, reported_view: u32, sk: &BlsSigner| SpcEmptyViewMsg {
             view: SpcView::new(5),
             reported: SpcHighTriple {
                 view: SpcView::new(reported_view),
@@ -1376,7 +1390,7 @@ mod tests {
                 proof: sample_pc_qc3().into(),
             },
             signer: ValidatorId::new(signer),
-            sig: sig_from_bls(&sk.sign_v1(b"unused")),
+            sig: sk.sign(b"unused").expect("sign"),
         };
         let msgs = vec![mk(0, 2, &kp_a), mk(1, 4, &kp_b), mk(2, 3, &kp_c)];
         let cert =

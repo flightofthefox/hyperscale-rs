@@ -167,11 +167,13 @@ impl SimulationRunner {
                         &self.beacon_network,
                         validator,
                         child,
-                        &self.signing_keys
-                            [usize::try_from(validator.inner()).expect("id fits usize")],
+                        self.signing_keys
+                            [usize::try_from(validator.inner()).expect("id fits usize")]
+                        .as_ref(),
                         anchor,
                         self.epoch_duration_ms,
-                    );
+                    )
+                    .expect("BLS signer never fails");
                     self.hosts[sender as usize]
                         .network()
                         .notify(&recipients, &ReadySignalNotification::new(signal));

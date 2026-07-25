@@ -36,7 +36,7 @@ use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BoundaryStore, RecoveredState};
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::{BlockHeight, ShardAnchor, ShardId, ValidatorId, shard_prefix_path};
+use hyperscale_types::{BlockHeight, ShardAnchor, ShardId, Signer, ValidatorId, shard_prefix_path};
 
 use super::SimulationRunner;
 
@@ -294,9 +294,9 @@ impl SimulationRunner {
             if self.hosts[host as usize].hosts_validator(validator) {
                 continue;
             }
-            let signing_key = Arc::clone(
+            let signer = Arc::clone(
                 &self.signing_keys[usize::try_from(validator.inner()).expect("id fits usize")],
-            );
+            ) as Arc<dyn Signer>;
             let init = seat_follower(SeatFollower {
                 verifier: Arc::new(BlsVerifier),
                 beacon_storage: self.hosts[host as usize].beacon_storage().as_ref(),
@@ -304,7 +304,7 @@ impl SimulationRunner {
                 beacon_config_hash: self.beacon_config_hash,
                 now,
                 validator,
-                signing_key,
+                signer,
             });
             self.hosts[host as usize].add_pooled_vnode(init);
         }
@@ -412,9 +412,9 @@ impl SimulationRunner {
     ) -> VnodeInit {
         let host = &self.hosts[host as usize];
         let now = self.local_now();
-        let signing_key = Arc::clone(
+        let signer = Arc::clone(
             &self.signing_keys[usize::try_from(validator.inner()).expect("id fits usize")],
-        );
+        ) as Arc<dyn Signer>;
         seat_vnode_group(SeatVnodeGroup {
             verifier: Arc::new(BlsVerifier),
             beacon_storage: host.beacon_storage().as_ref(),
@@ -426,7 +426,7 @@ impl SimulationRunner {
             shard_config: &ShardConsensusConfig::default(),
             mempool_config: MempoolConfig::default(),
             provision_config: ProvisionConfig::default(),
-            vnodes: vec![(validator, signing_key)],
+            vnodes: vec![(validator, signer)],
         })
         .pop()
         .expect("one vnode in, one init out")

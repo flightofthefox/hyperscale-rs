@@ -1176,11 +1176,10 @@ impl SpcInstance {
 mod tests {
     use std::sync::Arc;
 
-    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
     use hyperscale_types::{
-        Bls12381G1PrivateKey, ConsensusSignature, Epoch, NetworkDefinition, PcQc2, PcQc3,
-        PcSignerLengths, PcVote1, PcXpProof, SignerBitfield, agg_from_bls, pk_from_bls,
-        spc_context,
+        AggregateSignature, ConsensusSignature, Epoch, NetworkDefinition, PcQc2, PcQc3,
+        PcSignerLengths, PcVote1, PcXpProof, Signer, SignerBitfield, spc_context,
     };
 
     use super::*;
@@ -1193,7 +1192,12 @@ mod tests {
         let qc2 = PcQc2::new(
             PcVector::empty(),
             SignerBitfield::new(4),
-            agg_from_bls(&generate_bls_keypair().sign_v1(b"unused")),
+            AggregateSignature::new(
+                *BlsSigner::new(generate_bls_keypair())
+                    .sign(b"unused")
+                    .expect("sign")
+                    .as_bytes(),
+            ),
             PcXpProof::Full,
         );
         PcQc3::new(
@@ -1203,7 +1207,12 @@ mod tests {
             None,
             SignerBitfield::new(4),
             PcSignerLengths::Uniform(0),
-            agg_from_bls(&generate_bls_keypair().sign_v1(b"unused")),
+            AggregateSignature::new(
+                *BlsSigner::new(generate_bls_keypair())
+                    .sign(b"unused")
+                    .expect("sign")
+                    .as_bytes(),
+            ),
         )
     }
 
@@ -1222,19 +1231,14 @@ mod tests {
 
     // ─── FSM tests ─────────────────────────────────────────────────────
 
-    fn fsm_committee(
-        n: usize,
-    ) -> (
-        Vec<Arc<Bls12381G1PrivateKey>>,
-        Vec<(ValidatorId, ConsensusPublicKey)>,
-    ) {
+    fn fsm_committee(n: usize) -> (Vec<Arc<BlsSigner>>, Vec<(ValidatorId, ConsensusPublicKey)>) {
         let mut sks = Vec::with_capacity(n);
         let mut members = Vec::with_capacity(n);
         for i in 0..n {
             let mut seed = [0u8; 32];
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            let sk = bls_keypair_from_seed(&seed);
-            members.push((ValidatorId::new(i as u64), pk_from_bls(&sk.public_key())));
+            let sk = BlsSigner::from_seed(&seed);
+            members.push((ValidatorId::new(i as u64), sk.public_key()));
             sks.push(Arc::new(sk));
         }
         (sks, members)
@@ -1352,7 +1356,12 @@ mod tests {
         let qc2 = PcQc2::new(
             value.clone(),
             SignerBitfield::new(4),
-            agg_from_bls(&generate_bls_keypair().sign_v1(b"unused")),
+            AggregateSignature::new(
+                *BlsSigner::new(generate_bls_keypair())
+                    .sign(b"unused")
+                    .expect("sign")
+                    .as_bytes(),
+            ),
             PcXpProof::Full,
         );
         PcQc3::new(
@@ -1362,7 +1371,12 @@ mod tests {
             None,
             SignerBitfield::new(4),
             PcSignerLengths::Uniform(0),
-            agg_from_bls(&generate_bls_keypair().sign_v1(b"unused")),
+            AggregateSignature::new(
+                *BlsSigner::new(generate_bls_keypair())
+                    .sign(b"unused")
+                    .expect("sign")
+                    .as_bytes(),
+            ),
         )
     }
 
@@ -1810,13 +1824,14 @@ mod tests {
             proof: dummy_pc_qc3().into(),
         };
         let own = Verified::<SpcEmptyViewMsg>::sign_local(
-            &sks[0],
+            sks[0].as_ref(),
             members[0].0,
             &net(),
             &spc_ctx,
             SpcView::new(2),
             Verified::<SpcHighTriple>::new_unchecked_for_test(reported.clone()),
-        );
+        )
+        .expect("sign");
         let _ = fsm.handle(SpcEvent::EmptyViewVerified(Box::new(own)));
 
         // First expiry force-feeds the input; the second replays.
@@ -1913,13 +1928,14 @@ mod tests {
         };
         // View 3 < reported view 5 — rejected.
         let msg = Verified::<SpcEmptyViewMsg>::sign_local(
-            &sks[1],
+            sks[1].as_ref(),
             members[1].0,
             &net(),
             &spc_ctx,
             SpcView::new(3),
             Verified::<SpcHighTriple>::new_unchecked_for_test(reported),
-        );
+        )
+        .expect("sign");
         let effects = fsm.handle(SpcEvent::EmptyViewVerified(Box::new(msg)));
         assert!(effects.is_empty());
     }

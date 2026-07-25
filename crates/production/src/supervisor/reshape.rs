@@ -536,21 +536,27 @@ impl ShardSupervisor {
         anchor: ShardAnchor,
         recipients: &[ValidatorId],
     ) {
-        let Some(signing_key) = self.vnode_keys.get(&validator) else {
+        let Some(signer) = self.vnode_keys.get(&validator) else {
             warn!(
                 validator = validator.inner(),
                 "Reshape ready signal for a validator without a local key; ignored"
             );
             return;
         };
-        let signal = observer_ready_signal(
+        let Ok(signal) = observer_ready_signal(
             &self.beacon_network,
             validator,
             child,
-            signing_key,
+            signer.as_ref(),
             anchor,
             self.epoch_duration_ms,
-        );
+        ) else {
+            tracing::error!(
+                validator = validator.inner(),
+                "cannot sign reshape ready signal; skipping"
+            );
+            return;
+        };
         self.process
             .network()
             .notify(recipients, &ReadySignalNotification::new(signal));

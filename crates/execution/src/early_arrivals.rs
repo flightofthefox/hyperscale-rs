@@ -293,11 +293,11 @@ impl EarlyArrivalBuffer {
 mod tests {
     use std::collections::BTreeSet;
 
-    use hyperscale_crypto_bls::bls_keypair_from_seed;
+    use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
         AggregateSignature, BlockHash, BlockHeight, ConsensusSignature, ExecutionOutcome,
         GlobalReceiptHash, GlobalReceiptRoot, Hash, NetworkDefinition, RETENTION_HORIZON, ShardId,
-        SignerBitfield, TxHash, TxOutcome, ValidatorId, exec_vote_message, sig_from_bls,
+        Signer, SignerBitfield, TxHash, TxOutcome, ValidatorId, exec_vote_message,
     };
     use proptest::collection::vec as prop_vec;
 
@@ -355,8 +355,8 @@ mod tests {
             &global_receipt_root,
             u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
         );
-        let kp = bls_keypair_from_seed(&[7u8; 32]);
-        let signature = kp.sign_v1(&msg);
+        let kp = BlsSigner::from_seed(&[7u8; 32]);
+        let signature = kp.sign(&msg).expect("sign");
         ExecutionVote::new(
             BlockHash::ZERO,
             BlockHeight::new(1),
@@ -367,7 +367,7 @@ mod tests {
             u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
             tx_outcomes,
             ValidatorId::new(0),
-            sig_from_bls(&signature),
+            signature,
         )
     }
 

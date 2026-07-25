@@ -452,10 +452,11 @@ impl Verify<&QcContext<'_>> for QuorumCertificate {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto::Signer;
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
 
     use super::*;
-    use crate::{Bls12381G2Signature, Hash, agg_from_bls, pk_from_bls};
+    use crate::Hash;
 
     #[test]
     fn test_genesis_qc() {
@@ -497,14 +498,12 @@ mod tests {
 
     // ─── Verify impl tests ──────────────────────────────────────────────
 
-    use crate::Bls12381G1PrivateKey;
-
     /// Build a QC with `signer_indices` of the `n`-validator committee
     /// signing it. Each signer signs the canonical `block_vote_message`,
     /// and the resulting signatures are aggregated into the QC. Returns
     /// the QC and the committee's public keys (in committee order).
     fn signed_qc(
-        keys: &[Bls12381G1PrivateKey],
+        keys: &[BlsSigner],
         signer_indices: &[usize],
         block_hash: BlockHash,
         shard: ShardId,
@@ -515,11 +514,11 @@ mod tests {
         // Sign over the same parent the QC carries, so the aggregate verifies.
         let message = block_vote_message(&net, shard, height, round, &block_hash, &BlockHash::ZERO);
 
-        let sigs: Vec<Bls12381G2Signature> = signer_indices
+        let sigs: Vec<ConsensusSignature> = signer_indices
             .iter()
-            .map(|&i| keys[i].sign_v1(&message))
+            .map(|&i| keys[i].sign(&message).expect("sign"))
             .collect();
-        let agg_sig = Bls12381G2Signature::aggregate(&sigs, true).expect("aggregate sigs");
+        let agg_sig = BlsVerifier.aggregate(&sigs).expect("aggregate sigs");
 
         let mut signers = SignerBitfield::new(keys.len());
         for &i in signer_indices {
@@ -533,7 +532,7 @@ mod tests {
             BlockHash::ZERO,
             round,
             signers,
-            agg_from_bls(&agg_sig),
+            agg_sig,
             WeightedTimestamp::ZERO,
         )
     }
@@ -553,11 +552,10 @@ mod tests {
 
     #[test]
     fn verify_accepts_valid_qc_with_quorum_signers() {
-        let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let pubs: Vec<_> = keys
-            .iter()
-            .map(|sk| pk_from_bls(&sk.public_key()))
+        let keys: Vec<_> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
             .collect();
+        let pubs: Vec<_> = keys.iter().map(BlsSigner::public_key).collect();
 
         let qc = signed_qc(
             &keys,
@@ -575,11 +573,10 @@ mod tests {
 
     #[test]
     fn verify_rejects_tampered_signature() {
-        let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let pubs: Vec<_> = keys
-            .iter()
-            .map(|sk| pk_from_bls(&sk.public_key()))
+        let keys: Vec<_> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
             .collect();
+        let pubs: Vec<_> = keys.iter().map(BlsSigner::public_key).collect();
 
         let mut qc = signed_qc(
             &keys,
@@ -603,19 +600,12 @@ mod tests {
         );
         let bad_sigs: Vec<_> = [0, 1, 2]
             .iter()
-            .map(|&i| keys[i].sign_v1(&wrong_msg))
+            .map(|&i| keys[i].sign(&wrong_msg).expect("sign"))
             .collect();
-        let bad_agg = Bls12381G2Signature::aggregate(&bad_sigs, true).unwrap();
+        let bad_agg = BlsVerifier.aggregate(&bad_sigs).unwrap();
         let (block_hash, shard, height, parent, round, signers, _sig, ts) = qc.clone().into_parts();
         qc = QuorumCertificate::new(
-            block_hash,
-            shard,
-            height,
-            parent,
-            round,
-            signers,
-            agg_from_bls(&bad_agg),
-            ts,
+            block_hash, shard, height, parent, round, signers, bad_agg, ts,
         );
 
         let err = qc.verify(&ctx(&net, &pubs, VoteCount::new(3))).unwrap_err();
@@ -627,11 +617,10 @@ mod tests {
         // `parent_block_hash` selects the committable block under the two-chain
         // commit rule. Repointing it at a sibling — the forged-parent fork —
         // must fail verification now that the field is in the signed message.
-        let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let pubs: Vec<_> = keys
-            .iter()
-            .map(|sk| pk_from_bls(&sk.public_key()))
+        let keys: Vec<_> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
             .collect();
+        let pubs: Vec<_> = keys.iter().map(BlsSigner::public_key).collect();
 
         // `signed_qc` signs over parent = ZERO; keep the genuine signature but
         // repoint the parent at a sibling block.
@@ -664,11 +653,10 @@ mod tests {
 
     #[test]
     fn verify_rejects_under_quorum_signer_set() {
-        let keys: Vec<_> = (0..4).map(|_| generate_bls_keypair()).collect();
-        let pubs: Vec<_> = keys
-            .iter()
-            .map(|sk| pk_from_bls(&sk.public_key()))
+        let keys: Vec<_> = (0..4)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
             .collect();
+        let pubs: Vec<_> = keys.iter().map(BlsSigner::public_key).collect();
 
         // Only two of four sign — quorum is three. Signatures themselves
         // are valid; the stake total falls short.
@@ -694,11 +682,10 @@ mod tests {
 
     #[test]
     fn verify_rejects_qc_with_no_signers() {
-        let keys: Vec<_> = (0..2).map(|_| generate_bls_keypair()).collect();
-        let pubs: Vec<_> = keys
-            .iter()
-            .map(|sk| pk_from_bls(&sk.public_key()))
+        let keys: Vec<_> = (0..2)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
             .collect();
+        let pubs: Vec<_> = keys.iter().map(BlsSigner::public_key).collect();
 
         let qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"b")),

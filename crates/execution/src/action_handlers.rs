@@ -25,7 +25,7 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionVote, FinalizedWaveContext, NodeId,
     RoutableTransaction, ShardId, ShardTrie, StoredReceipt, Verifiable, Verified,
-    exec_cert_batch_message, exec_vote_batch_message, sig_from_bls,
+    exec_cert_batch_message, exec_vote_batch_message,
 };
 
 // ============================================================================
@@ -327,7 +327,7 @@ where
             let validator_id = ctx.me;
             let network = ctx.topology_snapshot.network();
 
-            let verified = Verified::<ExecutionVote>::sign_local(
+            let Ok(verified) = Verified::<ExecutionVote>::sign_local(
                 network,
                 block_hash,
                 block_height,
@@ -336,8 +336,11 @@ where
                 local_shard,
                 tx_outcomes,
                 validator_id,
-                ctx.signing_key,
-            );
+                ctx.signer.as_ref(),
+            ) else {
+                tracing::error!(?block_hash, "cannot sign execution vote; abstaining");
+                return;
+            };
 
             // Send vote to the wave leader (unicast). When the leader is a
             // colocated vnode the local-dispatch fast path preserves the
@@ -346,11 +349,17 @@ where
             if leader != validator_id {
                 let batch_msg =
                     exec_vote_batch_message(network, local_shard, std::iter::once(&*verified));
-                let batch_sig = ctx.signing_key.sign_v1(&batch_msg);
+                let Ok(batch_sig) = ctx.signer.sign(&batch_msg) else {
+                    tracing::error!(
+                        ?block_hash,
+                        "cannot sign execution vote batch; skipping send"
+                    );
+                    return;
+                };
                 let batch = ExecutionVotesNotification::new(
                     vec![Verifiable::from(verified.clone())],
                     validator_id,
-                    sig_from_bls(&batch_sig),
+                    batch_sig,
                 );
                 ctx.network.notify(&[leader], &batch);
             }
@@ -374,9 +383,11 @@ where
                 cert.shard_id(),
                 std::slice::from_ref(&cert),
             );
-            let sig = ctx.signing_key.sign_v1(&msg);
-            let batch =
-                ExecutionCertificatesNotification::new(vec![cert], ctx.me, sig_from_bls(&sig));
+            let Ok(sig) = ctx.signer.sign(&msg) else {
+                tracing::error!("cannot sign execution certificate batch; skipping broadcast");
+                return;
+            };
+            let batch = ExecutionCertificatesNotification::new(vec![cert], ctx.me, sig);
             ctx.network.notify(&recipients, &batch);
         }
 

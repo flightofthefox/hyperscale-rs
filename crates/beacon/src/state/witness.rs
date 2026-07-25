@@ -752,7 +752,7 @@ mod tests {
         Randomness, Round, ShardCommittee, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
         Stake, StakePool, StakePoolId, ValidatorId, ValidatorStatus,
     };
-    use hyperscale_types::{ConsensusSignature, sig_from_bls};
+    use hyperscale_types::{ConsensusSignature, Signer};
 
     use super::*;
     use crate::rules::contribution_chunk_valid;
@@ -926,7 +926,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: pubkey(5),
-                possession_proof: sig_from_bls(&possession_proof(5, new_id)),
+                possession_proof: possession_proof(5, new_id),
             }],
         );
 
@@ -1124,7 +1124,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: new_pubkey,
-                possession_proof: sig_from_bls(&possession_proof(5, new_id)),
+                possession_proof: possession_proof(5, new_id),
             }],
         );
 
@@ -1157,7 +1157,7 @@ mod tests {
                 pool_id,
                 validator_id: existing_id,
                 pubkey: pubkey(99),
-                possession_proof: sig_from_bls(&possession_proof(99, existing_id)),
+                possession_proof: possession_proof(99, existing_id),
             }],
         );
 
@@ -1178,7 +1178,7 @@ mod tests {
                 pool_id: StakePoolId::new(0),
                 validator_id: ValidatorId::new(5),
                 pubkey: pubkey(5),
-                possession_proof: sig_from_bls(&possession_proof(5, ValidatorId::new(5))),
+                possession_proof: possession_proof(5, ValidatorId::new(5)),
             }],
         );
 
@@ -1206,7 +1206,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: pubkey(5),
-                possession_proof: sig_from_bls(&possession_proof(6, new_id)),
+                possession_proof: possession_proof(6, new_id),
             }],
         );
 
@@ -1233,7 +1233,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: pubkey(5),
-                possession_proof: sig_from_bls(&possession_proof(5, ValidatorId::new(6))),
+                possession_proof: possession_proof(5, ValidatorId::new(6)),
             }],
         );
 
@@ -2013,7 +2013,8 @@ mod tests {
                 voter,
                 &sk,
                 ProposerTimestamp::ZERO,
-            );
+            )
+            .expect("sign");
             (block_hash, parent_hash, vote.signature())
         };
         let (block_hash_a, parent_block_hash_a, sig_a) = sign(b"equiv-block-a", b"equiv-parent-a");
@@ -2091,9 +2092,9 @@ mod tests {
             view,
             round: PcVoteRound::Vote1,
             value_a,
-            sig_a: sig_from_bls(&sk.sign_v1(&msg_a)),
+            sig_a: sk.sign(&msg_a).expect("sign"),
             value_b,
-            sig_b: sig_from_bls(&sk.sign_v1(&msg_b)),
+            sig_b: sk.sign(&msg_b).expect("sign"),
         }
     }
 

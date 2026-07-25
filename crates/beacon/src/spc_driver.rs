@@ -755,10 +755,10 @@ impl SpcDriver {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{
-        Bls12381G1PrivateKey, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement,
-        pc_context, pk_from_bls, sign_vote1, spc_context,
+        NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement, Signer, pc_context, sign_vote1,
+        spc_context,
     };
 
     use super::*;
@@ -768,17 +768,17 @@ mod tests {
     const EPOCH: u64 = 7;
 
     /// Deterministic BLS key for validator index `i`.
-    fn bls_sk(i: u64) -> Bls12381G1PrivateKey {
+    fn bls_sk(i: u64) -> BlsSigner {
         let mut bytes = [0u8; 32];
         bytes[..8].copy_from_slice(&i.to_le_bytes());
-        bls_keypair_from_seed(&bytes)
+        BlsSigner::from_seed(&bytes)
     }
 
     /// An `n`-member committee with ids `0..n` and matching deterministic
     /// keys, in the shape `bootstrap` consumes.
     fn committee(n: u64) -> Vec<(ValidatorId, ConsensusPublicKey)> {
         (0..n)
-            .map(|i| (ValidatorId::new(i), pk_from_bls(&bls_sk(i).public_key())))
+            .map(|i| (ValidatorId::new(i), bls_sk(i).public_key()))
             .collect()
     }
 
@@ -806,6 +806,7 @@ mod tests {
             &ctx,
             v_in,
         )
+        .expect("sign")
     }
 
     /// Assert `actions` is exactly one `VerifyPcVote1` carrying the

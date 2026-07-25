@@ -34,9 +34,7 @@ use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
-use hyperscale_types::{
-    Bls12381G1PrivateKey, GenesisConfigHash, NetworkDefinition, ShardId, ValidatorId,
-};
+use hyperscale_types::{GenesisConfigHash, NetworkDefinition, ShardId, Signer, ValidatorId};
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -225,7 +223,7 @@ pub struct ShardSupervisor {
     /// Signing keys for the host's local validators, used to build a
     /// follower when a validator drains off its last shard. A follower
     /// never signs, but the bundle carries the real key for the later seat.
-    vnode_keys: HashMap<ValidatorId, Arc<Bls12381G1PrivateKey>>,
+    vnode_keys: HashMap<ValidatorId, Arc<dyn Signer>>,
 }
 
 impl ShardSupervisor {
@@ -247,7 +245,7 @@ impl ShardSupervisor {
         epoch_duration_ms: u64,
         genesis_offset_ms: u64,
         beacon_event_rx: Receiver<HostEvent>,
-        vnode_keys: HashMap<ValidatorId, Arc<Bls12381G1PrivateKey>>,
+        vnode_keys: HashMap<ValidatorId, Arc<dyn Signer>>,
     ) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         Self {

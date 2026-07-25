@@ -14,8 +14,8 @@ use hyperscale_storage::{
     JmtSnapshot, PendingChain, RatifyRegisterStore, SafeVoteRegisterStore, ShardStorage,
 };
 use hyperscale_types::{
-    BeaconProposal, BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, Epoch,
-    PreparedCommit, ShardId, TopologySnapshot, ValidatorId, Verified, Verifier, WaveId,
+    BeaconProposal, BlockHash, BlockHeight, ConsensusReceipt, Epoch, PreparedCommit, ShardId,
+    Signer, TopologySnapshot, ValidatorId, Verified, Verifier, WaveId,
 };
 
 use crate::ProtocolEvent;
@@ -57,9 +57,9 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     pub execution_cache: &'a Arc<ProcessExecutionCache>,
     /// Network handle for broadcast/notify/request actions.
     pub network: &'a Arc<N>,
-    /// Local validator's BLS signing key. Used by handlers that sign
+    /// Local validator's signing identity. Used by handlers that sign
     /// votes/headers before broadcast.
-    pub signing_key: &'a Arc<Bls12381G1PrivateKey>,
+    pub signer: &'a Arc<dyn Signer>,
     /// Scheme verifier for signature and certificate checks.
     pub verifier: &'a dyn Verifier,
     /// Send a [`ProtocolEvent`] back to the state machine. The single

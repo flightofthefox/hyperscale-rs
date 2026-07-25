@@ -8,30 +8,29 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_types::{
     AggregateSignature, BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount,
-    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
-    Bls12381G2Signature, CertificateRoot, ConsensusPublicKey, Epoch, Hash, InFlightCount,
-    LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation,
-    PendingWithdrawal, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardCommittee,
-    ShardEpochContribution, ShardId, ShardVoteEquivocation, ShardWitness, ShardWitnessPayload,
-    ShardWitnessProof, SignerBitfield, SlotEffects, Stake, StakePool, StakePoolId, StateRoot,
-    TransactionRoot, ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp,
-    bls_sig, compute_merkle_root_with_proof, pk_from_bls, validator_possession_proof_sign,
-    vrf_sign,
+    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, CertificateRoot, ConsensusPublicKey,
+    ConsensusSignature, Epoch, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR,
+    NetworkDefinition, PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp, ProvisionsRoot,
+    QuorumCertificate, Round, ShardCommittee, ShardEpochContribution, ShardId,
+    ShardVoteEquivocation, ShardWitness, ShardWitnessPayload, ShardWitnessProof, Signer,
+    SignerBitfield, SlotEffects, Stake, StakePool, StakePoolId, StateRoot, TransactionRoot,
+    ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp,
+    compute_merkle_root_with_proof, validator_possession_proof_sign, vrf_sign,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
 
-pub fn keypair(seed: u64) -> Bls12381G1PrivateKey {
+pub fn keypair(seed: u64) -> BlsSigner {
     let mut s = [0u8; 32];
     s[..8].copy_from_slice(&seed.to_le_bytes());
-    bls_keypair_from_seed(&s)
+    BlsSigner::from_seed(&s)
 }
 
 pub fn pubkey(seed: u64) -> ConsensusPublicKey {
-    pk_from_bls(&keypair(seed).public_key())
+    keypair(seed).public_key()
 }
 
 pub fn net() -> NetworkDefinition {
@@ -39,8 +38,8 @@ pub fn net() -> NetworkDefinition {
 }
 
 /// A valid proof-of-possession for `pubkey(seed)` claimed under `id`.
-pub fn possession_proof(seed: u64, id: ValidatorId) -> Bls12381G2Signature {
-    bls_sig(&validator_possession_proof_sign(&keypair(seed), &net(), id))
+pub fn possession_proof(seed: u64, id: ValidatorId) -> ConsensusSignature {
+    validator_possession_proof_sign(&keypair(seed), &net(), id).expect("sign")
 }
 
 /// Build an honest VRF-signed empty `BeaconProposal` for validator
@@ -48,7 +47,7 @@ pub fn possession_proof(seed: u64, id: ValidatorId) -> Bls12381G2Signature {
 /// stage); just a deterministic VRF reveal.
 pub fn vrf_proposal(id: u64, epoch: Epoch) -> BeaconProposal {
     let sk = keypair(id);
-    let proof = vrf_sign(&sk, &net(), epoch);
+    let proof = vrf_sign(&sk, &net(), epoch).expect("sign");
     BeaconProposal::new(
         BTreeMap::new(),
         Vec::new(),
@@ -171,7 +170,7 @@ pub fn vrf_proposal_with_equivocations(
     equivocations: Vec<PcVoteEquivocation>,
 ) -> BeaconProposal {
     let sk = keypair(id);
-    let proof = vrf_sign(&sk, &net(), epoch);
+    let proof = vrf_sign(&sk, &net(), epoch).expect("sign");
     BeaconProposal::new(
         BTreeMap::new(),
         equivocations,
@@ -189,7 +188,7 @@ pub fn vrf_proposal_with_vote_equivocations(
     vote_equivocations: Vec<ShardVoteEquivocation>,
 ) -> BeaconProposal {
     let sk = keypair(id);
-    let proof = vrf_sign(&sk, &net(), epoch);
+    let proof = vrf_sign(&sk, &net(), epoch).expect("sign");
     BeaconProposal::new(
         BTreeMap::new(),
         Vec::new(),
@@ -307,7 +306,7 @@ pub fn apply_witness_chunk(
                     Vec::new(),
                     BTreeMap::new(),
                     Vec::new(),
-                    vrf_sign(&keypair(id.inner()), &net(), next_epoch),
+                    vrf_sign(&keypair(id.inner()), &net(), next_epoch).expect("sign"),
                 ),
             )
         })

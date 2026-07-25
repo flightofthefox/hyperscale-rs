@@ -573,7 +573,8 @@ fn gossiped_vote_equivocation_convicts_through_a_committed_proposal() {
             accused,
             sim.sk_of(accused_idx),
             ProposerTimestamp::ZERO,
-        );
+        )
+        .expect("sign");
         (block_hash, parent_hash, vote.signature())
     };
     let (block_hash_a, parent_block_hash_a, sig_a) = sign(b"branch-a", b"parent-a");

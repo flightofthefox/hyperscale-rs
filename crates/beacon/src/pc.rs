@@ -355,10 +355,10 @@ fn vote2_top_sig(v: &PcVote2) -> ConsensusSignature {
 mod tests {
     use std::sync::Arc;
 
-    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{
-        Bls12381G1PrivateKey, Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement,
-        PcVector, PcVoteRound, SpcView, pc_context, pk_from_bls, spc_context,
+        Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement, PcVector, PcVoteRound,
+        Signer, SpcView, pc_context, spc_context,
     };
 
     use super::*;
@@ -371,19 +371,14 @@ mod tests {
         PcValueElement::new([b; PC_VALUE_ELEMENT_BYTES])
     }
 
-    fn fsm_committee(
-        n: usize,
-    ) -> (
-        Vec<Arc<Bls12381G1PrivateKey>>,
-        Vec<(ValidatorId, ConsensusPublicKey)>,
-    ) {
+    fn fsm_committee(n: usize) -> (Vec<Arc<BlsSigner>>, Vec<(ValidatorId, ConsensusPublicKey)>) {
         let mut sks = Vec::with_capacity(n);
         let mut members = Vec::with_capacity(n);
         for i in 0..n {
             let mut seed = [0u8; 32];
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            let sk = bls_keypair_from_seed(&seed);
-            let pk = pk_from_bls(&sk.public_key());
+            let sk = BlsSigner::from_seed(&seed);
+            let pk = sk.public_key();
             members.push((ValidatorId::new(i as u64), pk));
             sks.push(Arc::new(sk));
         }
@@ -463,7 +458,14 @@ mod tests {
         // Quorum (3 of 4) of round-1 votes from members 1..=3 forms
         // qc1 over exactly that subset.
         let vote1 = |i: usize| {
-            Verified::<PcVote1>::sign_local(&sks[i], members[i].0, &net(), &pc_ctx_bytes, v.clone())
+            Verified::<PcVote1>::sign_local(
+                sks[i].as_ref(),
+                members[i].0,
+                &net(),
+                &pc_ctx_bytes,
+                v.clone(),
+            )
+            .expect("sign")
         };
         let _ = fsm.handle(PcEvent::Vote1Verified(vote1(1)));
         let _ = fsm.handle(PcEvent::Vote1Verified(vote1(2)));
@@ -516,10 +518,22 @@ mod tests {
         let pc_ctx_bytes = pc_context(&spc_context(Epoch::new(1)), SpcView::new(0));
         let v_a = PcVector::new(std::iter::once(elem(1)));
         let v_b = PcVector::new(std::iter::once(elem(2)));
-        let vote_a =
-            Verified::<PcVote1>::sign_local(&sks[1], members[1].0, &net(), &pc_ctx_bytes, v_a);
-        let vote_b =
-            Verified::<PcVote1>::sign_local(&sks[1], members[1].0, &net(), &pc_ctx_bytes, v_b);
+        let vote_a = Verified::<PcVote1>::sign_local(
+            sks[1].as_ref(),
+            members[1].0,
+            &net(),
+            &pc_ctx_bytes,
+            v_a,
+        )
+        .expect("sign");
+        let vote_b = Verified::<PcVote1>::sign_local(
+            sks[1].as_ref(),
+            members[1].0,
+            &net(),
+            &pc_ctx_bytes,
+            v_b,
+        )
+        .expect("sign");
 
         let effects_a = fsm.handle(PcEvent::Vote1Verified(vote_a));
         assert!(effects_a.is_empty(), "first vote pools without effect");

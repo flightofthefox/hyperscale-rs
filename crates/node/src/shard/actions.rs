@@ -774,7 +774,7 @@ where
         }
         let topology_snapshot = Arc::clone(vnode.state.topology_arc());
         let event_tx = self.event_sender().clone();
-        let signing_key = Arc::clone(&vnode.signing_key);
+        let signer = Arc::clone(&vnode.signer);
         let verifier = Arc::clone(&self.process.verifier);
         let par = self.process.dispatch.parallelism();
 
@@ -808,7 +808,7 @@ where
                 ratify_registers: handles.beacon_storage.as_ref(),
                 execution_cache: &handles.execution_cache,
                 network: &handles.network,
-                signing_key: &signing_key,
+                signer: &signer,
                 verifier: verifier.as_ref(),
                 notify,
                 commit_prepared: &commit_prepared,

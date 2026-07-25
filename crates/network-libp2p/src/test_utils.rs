@@ -7,11 +7,11 @@
 
 use std::sync::Arc;
 
-use hyperscale_crypto_bls::bls_keypair_from_seed;
+use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::{
-    Bls12381G1PrivateKey, ConsensusPublicKey, GenesisValidators, NetworkDefinition, ValidatorId,
-    ValidatorInfo, ValidatorSet, pk_from_bls,
+    ConsensusPublicKey, GenesisValidators, NetworkDefinition, Signer, ValidatorId, ValidatorInfo,
+    ValidatorSet,
 };
 use libp2p::PeerId;
 use libp2p::identity::Keypair;
@@ -19,7 +19,7 @@ use libp2p::identity::ed25519::{Keypair as Ed25519Keypair, SecretKey};
 
 /// Generate `num_validators` deterministic BLS (consensus) and Ed25519
 /// (libp2p) keypairs from `seed`, on independent derivation paths.
-fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<Bls12381G1PrivateKey>, Vec<Keypair>) {
+fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<BlsSigner>, Vec<Keypair>) {
     let bls_keys = (0..num_validators)
         .map(|i| {
             let mut seed_bytes = [0u8; 32];
@@ -28,7 +28,7 @@ fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<Bls12381G1PrivateKey>
                 .wrapping_mul(0x517c_c1b7_2722_0a95);
             seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
             seed_bytes[8..16].copy_from_slice(&u64::from(i).to_le_bytes());
-            bls_keypair_from_seed(&seed_bytes)
+            BlsSigner::from_seed(&seed_bytes)
         })
         .collect();
 
@@ -55,7 +55,7 @@ fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<Bls12381G1PrivateKey>
 /// for libp2p networking, all derived from a seed for reproducibility.
 pub struct TestFixtures {
     /// BLS keypairs for consensus (one per validator).
-    pub bls_keys: Vec<Bls12381G1PrivateKey>,
+    pub bls_keys: Vec<BlsSigner>,
 
     /// Ed25519 keypairs for libp2p (one per validator).
     pub ed25519_keys: Vec<Keypair>,
@@ -88,10 +88,8 @@ impl TestFixtures {
 
         let (bls_keys, ed25519_keys) = derive_keypairs(seed, num_validators);
 
-        let public_keys: Vec<ConsensusPublicKey> = bls_keys
-            .iter()
-            .map(|sk| pk_from_bls(&sk.public_key()))
-            .collect();
+        let public_keys: Vec<ConsensusPublicKey> =
+            bls_keys.iter().map(BlsSigner::public_key).collect();
 
         let validators: Vec<ValidatorInfo> = (0..num_validators)
             .map(|i| ValidatorInfo {
@@ -141,9 +139,8 @@ impl TestFixtures {
     ///
     /// Panics if `index` is out of range.
     #[must_use]
-    pub fn signing_key(&self, index: u32) -> Arc<Bls12381G1PrivateKey> {
-        let key_bytes = self.bls_keys[index as usize].to_bytes();
-        Arc::new(Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"))
+    pub fn signing_key(&self, index: u32) -> Arc<dyn Signer> {
+        Arc::new(self.bls_keys[index as usize].clone())
     }
 
     /// Get the Ed25519 keypair for a validator.
@@ -160,7 +157,7 @@ impl TestFixtures {
 
     /// Alias of [`Self::signing_key`] reserved for bind-test call sites.
     #[must_use]
-    pub fn bind_signing_key(&self, index: u32) -> Arc<Bls12381G1PrivateKey> {
+    pub fn bind_signing_key(&self, index: u32) -> Arc<dyn Signer> {
         self.signing_key(index)
     }
 }

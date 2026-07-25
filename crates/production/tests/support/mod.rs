@@ -56,7 +56,7 @@ pub fn build_runner(
         .iter()
         .map(|&i| LocalValidator {
             validator_id: ValidatorId::new(u64::from(i)),
-            signing_key: fixtures.signing_key(i),
+            signer: fixtures.signing_key(i),
         })
         .collect();
     let beacon_reader: Arc<dyn BeaconStorage> = beacon_storage.clone();

@@ -1,10 +1,9 @@
 //! Deterministic fixtures — committees keyed off a seed, plus PC
 //! signing-context builders.
 
-use hyperscale_crypto_bls::bls_keypair_from_seed;
+use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_types::{
-    Bls12381G1PrivateKey, ConsensusPublicKey, Epoch, PcContext, SpcView, ValidatorId, pc_context,
-    pk_from_bls, spc_context,
+    ConsensusPublicKey, Epoch, PcContext, Signer, SpcView, ValidatorId, pc_context, spc_context,
 };
 
 /// A small in-test validator committee — deterministic keys derived
@@ -12,7 +11,7 @@ use hyperscale_types::{
 /// set of keypairs without persistent fixture files.
 pub struct Committee {
     /// Per-validator BLS secret keys, indexed positionally.
-    pub keys: Vec<Bls12381G1PrivateKey>,
+    pub keys: Vec<BlsSigner>,
     /// Per-validator `(ValidatorId, public_key)` pairs, indexed
     /// positionally and in the same order as `keys`. Suitable for
     /// passing straight into the PC verifier API.
@@ -31,9 +30,9 @@ impl Committee {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&seed.to_le_bytes());
             bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
-            let sk = bls_keypair_from_seed(&bytes);
+            let sk = BlsSigner::from_seed(&bytes);
             let id = ValidatorId::new(i as u64);
-            let pk = pk_from_bls(&sk.public_key());
+            let pk = sk.public_key();
             keys.push(sk);
             members.push((id, pk));
         }
@@ -52,7 +51,7 @@ impl Committee {
     ///
     /// Panics if `i >= self.len()`.
     #[must_use]
-    pub fn sk(&self, i: usize) -> &Bls12381G1PrivateKey {
+    pub fn sk(&self, i: usize) -> &BlsSigner {
         &self.keys[i]
     }
 

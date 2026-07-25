@@ -175,10 +175,8 @@ impl AddressBook {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::bls_keypair_from_seed;
-    use hyperscale_types::{
-        Bls12381G1PrivateKey, pk_from_bls, sig_from_bls, validator_address_message,
-    };
+    use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_types::{Signer, validator_address_message};
 
     use super::*;
 
@@ -186,8 +184,8 @@ mod tests {
         NetworkDefinition::simulator()
     }
 
-    fn keypair() -> Bls12381G1PrivateKey {
-        bls_keypair_from_seed(&[9u8; 32])
+    fn keypair() -> BlsSigner {
+        BlsSigner::from_seed(&[9u8; 32])
     }
 
     fn announce(vid: ValidatorId, peer_id: &Libp2pPeerId, sequence: u64) -> ValidatorAddressGossip {
@@ -198,24 +196,26 @@ mod tests {
                 .unwrap()
                 .to_vec(),
         ];
-        let signature = keypair().sign_v1(&validator_address_message(
-            &net(),
-            &peer_bytes,
-            &addresses,
-            sequence,
-        ));
+        let signature = keypair()
+            .sign(&validator_address_message(
+                &net(),
+                &peer_bytes,
+                &addresses,
+                sequence,
+            ))
+            .expect("sign");
         ValidatorAddressGossip {
             validator: vid,
             peer_id: peer_bytes,
             addresses,
             sequence,
-            signature: sig_from_bls(&signature),
+            signature,
         }
     }
 
     fn keys_for(vid: ValidatorId) -> ValidatorKeyMap {
         let mut keys = ValidatorKeyMap::new();
-        keys.insert(vid, pk_from_bls(&keypair().public_key()));
+        keys.insert(vid, keypair().public_key());
         keys
     }
 
@@ -282,7 +282,7 @@ mod tests {
         let keys = {
             let mut keys = ValidatorKeyMap::new();
             for vid in [bound_vid, cohost_a, cohost_b] {
-                keys.insert(vid, pk_from_bls(&keypair().public_key()));
+                keys.insert(vid, keypair().public_key());
             }
             keys
         };
@@ -336,18 +336,20 @@ mod tests {
                 .unwrap()
                 .to_vec(),
         ];
-        let signature = keypair().sign_v1(&validator_address_message(
-            &net(),
-            &bogus_peer_bytes,
-            &addresses,
-            3,
-        ));
+        let signature = keypair()
+            .sign(&validator_address_message(
+                &net(),
+                &bogus_peer_bytes,
+                &addresses,
+                3,
+            ))
+            .expect("sign");
         let unparseable = ValidatorAddressGossip {
             validator: vid,
             peer_id: bogus_peer_bytes,
             addresses,
             sequence: 3,
-            signature: sig_from_bls(&signature),
+            signature,
         };
         assert_eq!(
             book.ingest(&net(), &keys, &unparseable),

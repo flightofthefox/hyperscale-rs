@@ -27,7 +27,7 @@ use hyperscale_types::{
     VoteCount, VrfProof, WeightedTimestamp, WitnessSources, block_header_message,
     block_vote_message, certified_block_header_message, commit_witness_window, compute_waves,
     derive_leaves, local_settled_wave_ids, missed_proposals_since_prev_commit,
-    ready_signal_message, shard_reveal_sign, sig_from_bls,
+    ready_signal_message, shard_reveal_sign,
 };
 
 /// Result of QC verification and assembly.
@@ -768,12 +768,19 @@ where
             // the dispatch pool — so the sans-io coordinator holds no key. Its
             // digest is leaf 0 of the block's beacon-witness leaves; the proof
             // rides the block body and manifest for the verifier's re-check.
-            let randomness_reveal = shard_reveal_sign(
-                ctx.signing_key,
+            let Ok(randomness_reveal) = shard_reveal_sign(
+                ctx.signer.as_ref(),
                 ctx.topology_snapshot.network(),
                 shard_id,
                 height,
-            );
+            ) else {
+                tracing::error!(
+                    ?shard_id,
+                    height = height.inner(),
+                    "cannot sign randomness reveal; skipping proposal"
+                );
+                return;
+            };
             let view = ctx
                 .pending_chain
                 .view_at(parent_block_hash, parent_block_height);
@@ -851,8 +858,11 @@ where
                 header.round(),
                 &block_hash,
             );
-            let sig = ctx.signing_key.sign_v1(&msg);
-            let gossip = BlockHeaderNotification::new(*header, *manifest, sig_from_bls(&sig));
+            let Ok(sig) = ctx.signer.sign(&msg) else {
+                tracing::error!(?block_hash, "cannot sign block header; skipping broadcast");
+                return;
+            };
+            let gossip = BlockHeaderNotification::new(*header, *manifest, sig);
             let local_peers: Vec<ValidatorId> = ctx
                 .topology_snapshot
                 .committee_for_shard(ctx.shard)
@@ -877,7 +887,7 @@ where
             // an abstention, never a second vote in a consumed round.
             ctx.vote_registers
                 .persist_safe_vote_registers(ctx.me, registers);
-            let verified = Verified::<BlockVote>::sign_local(
+            let Ok(verified) = Verified::<BlockVote>::sign_local(
                 ctx.topology_snapshot.network(),
                 block_hash,
                 parent_block_hash,
@@ -885,9 +895,12 @@ where
                 height,
                 round,
                 ctx.me,
-                ctx.signing_key,
+                ctx.signer.as_ref(),
                 timestamp,
-            );
+            ) else {
+                tracing::error!(?block_hash, "cannot sign block vote; abstaining");
+                return;
+            };
             let gossip = BlockVoteNotification::new(verified.clone());
             ctx.network.notify(&next_proposers, &gossip);
             // Feed our own signed vote back for local VoteSet tracking.
@@ -904,14 +917,17 @@ where
             // is durable before the timeout signature exists.
             ctx.vote_registers
                 .persist_safe_vote_registers(ctx.me, registers);
-            let verified = Verified::<Timeout>::sign_local(
+            let Ok(verified) = Verified::<Timeout>::sign_local(
                 ctx.topology_snapshot.network(),
                 ctx.shard,
                 round,
                 high_qc,
                 ctx.me,
-                ctx.signing_key,
-            );
+                ctx.signer.as_ref(),
+            ) else {
+                tracing::error!(?round, "cannot sign timeout; abstaining");
+                return;
+            };
             let gossip = TimeoutNotification::new(verified.clone());
             ctx.network.notify(&recipients, &gossip);
             // Feed our own signed timeout back for local TimeoutKeeper tracking.
@@ -931,14 +947,11 @@ where
                 wt_window_start,
                 wt_window_end,
             );
-            let sig = ctx.signing_key.sign_v1(&msg);
-            let signal = ReadySignal::new(
-                ctx.me,
-                shard,
-                wt_window_start,
-                wt_window_end,
-                sig_from_bls(&sig),
-            );
+            let Ok(sig) = ctx.signer.sign(&msg) else {
+                tracing::error!(?shard, "cannot sign ready signal; skipping");
+                return;
+            };
+            let signal = ReadySignal::new(ctx.me, shard, wt_window_start, wt_window_end, sig);
             // No local feedback: the sender is outside the consensus
             // subset, so it never proposes and its own pool entry would
             // never drain — only the recipients' pools matter.
@@ -976,13 +989,16 @@ where
                 certified_header.header().height(),
                 &certified_header.header().hash(),
             );
-            let sig = ctx.signing_key.sign_v1(&msg);
+            let Ok(sig) = ctx.signer.sign(&msg) else {
+                tracing::error!("cannot sign certified header gossip; skipping");
+                return;
+            };
             let gossip = CertifiedBlockHeaderGossip {
                 certified_header: Arc::new(Verifiable::<CertifiedBlockHeader>::from(
                     certified_header,
                 )),
                 sender: ctx.me,
-                sender_signature: sig_from_bls(&sig),
+                sender_signature: sig,
             };
             ctx.network.broadcast_global(&gossip);
         }
@@ -1002,11 +1018,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
     use hyperscale_types::test_utils::test_notarized_transaction_v1;
     use hyperscale_types::{
-        Bls12381G1PrivateKey, CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError, pk_from_bls,
+        CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Signer,
+        StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError,
         routable_from_notarized_v1,
     };
 
@@ -1021,7 +1037,7 @@ mod tests {
     }
 
     fn make_vote(
-        keys: &[Bls12381G1PrivateKey],
+        keys: &[BlsSigner],
         voter_index: usize,
         block_hash: BlockHash,
         height: BlockHeight,
@@ -1039,10 +1055,13 @@ mod tests {
             &keys[voter_index],
             ProposerTimestamp::from_millis(timestamp_ms),
         )
+        .expect("sign")
     }
 
-    fn keypairs(n: usize) -> Vec<Bls12381G1PrivateKey> {
-        (0..n).map(|_| generate_bls_keypair()).collect()
+    fn keypairs(n: usize) -> Vec<BlsSigner> {
+        (0..n)
+            .map(|_| BlsSigner::new(generate_bls_keypair()))
+            .collect()
     }
 
     // ─── verify_vote_batch ──────────────────────────────────────────────
@@ -1088,7 +1107,7 @@ mod tests {
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
-                (i, vote, pk_from_bls(&keys[i].public_key()))
+                (i, vote, keys[i].public_key())
             })
             .collect();
 
@@ -1130,13 +1149,13 @@ mod tests {
             (
                 0usize,
                 make_vote(&keys, 0, block_hash, height, round, 1000),
-                pk_from_bls(&keys[0].public_key()),
+                keys[0].public_key(),
             ),
-            (1usize, bad_vote, pk_from_bls(&keys[1].public_key())),
+            (1usize, bad_vote, keys[1].public_key()),
             (
                 2usize,
                 make_vote(&keys, 2, block_hash, height, round, 1000),
-                pk_from_bls(&keys[2].public_key()),
+                keys[2].public_key(),
             ),
         ];
 
@@ -1160,7 +1179,7 @@ mod tests {
                     Round::INITIAL,
                     1000,
                 );
-                (i, vote, pk_from_bls(&keys[i].public_key()))
+                (i, vote, keys[i].public_key())
             })
             .collect();
         let out = verify_vote_batch(&BlsVerifier, block_hash, wrong_msg, to_verify, Vec::new());
@@ -1202,10 +1221,7 @@ mod tests {
         // "votes pre-verified + quorum confirmed" trust source, so the
         // returned QC must round-trip through the Verify impl when fed
         // back its committee context.
-        let pubs: Vec<_> = keys
-            .iter()
-            .map(|sk| pk_from_bls(&sk.public_key()))
-            .collect();
+        let pubs: Vec<_> = keys.iter().map(BlsSigner::public_key).collect();
         let net = net();
         let qc_ctx = QcContext {
             verifier: &BlsVerifier,
@@ -1388,7 +1404,7 @@ mod tests {
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
-                (i, vote, pk_from_bls(&keys[i].public_key()))
+                (i, vote, keys[i].public_key())
             })
             .collect();
 
@@ -1419,7 +1435,7 @@ mod tests {
         let to_verify: Vec<_> = (0..3)
             .map(|i| {
                 let vote = make_vote(&keys, i, block_hash, height, round, 1000);
-                (i, vote, pk_from_bls(&keys[i].public_key()))
+                (i, vote, keys[i].public_key())
             })
             .collect();
 

@@ -444,22 +444,23 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+    use hyperscale_crypto::Signer;
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
     use crate::{
-        Bls12381G1PrivateKey, ConsensusSignature, NetworkDefinition, ValidatorId, ValidatorInfo,
-        ValidatorSet, VrfProof, pk_from_bls, shard_reveal_sign,
+        ConsensusSignature, NetworkDefinition, ValidatorId, ValidatorInfo, ValidatorSet, VrfProof,
+        shard_reveal_sign,
     };
 
     /// The single committee member's key. Deterministic so a test can both
     /// seat its public key on the snapshot and sign a valid reveal with the
     /// matching secret — the block's proposer (`proposer_for` over the
     /// one-member committee) is always this validator.
-    fn proposer_sk() -> Bls12381G1PrivateKey {
+    fn proposer_sk() -> BlsSigner {
         let mut seed = [0u8; 32];
         seed[..8].copy_from_slice(&7u64.to_le_bytes());
-        bls_keypair_from_seed(&seed)
+        BlsSigner::from_seed(&seed)
     }
 
     /// A valid reveal for `shard` at the height `context_with` verifies at,
@@ -471,6 +472,7 @@ mod tests {
             shard,
             BlockHeight::new(5),
         )
+        .expect("sign")
     }
 
     /// A snapshot whose `witness_base(shard)` answers `base` for one
@@ -483,7 +485,7 @@ mod tests {
     ) -> TopologySnapshot {
         let validators = vec![ValidatorInfo {
             validator_id: ValidatorId::new(0),
-            public_key: pk_from_bls(&proposer_sk().public_key()),
+            public_key: proposer_sk().public_key(),
         }];
         let vs = ValidatorSet::new(validators);
         TopologySnapshot::from_explicit_committees(
@@ -514,7 +516,7 @@ mod tests {
     ) -> TopologySnapshot {
         let validators = vec![ValidatorInfo {
             validator_id: ValidatorId::new(0),
-            public_key: pk_from_bls(&proposer_sk().public_key()),
+            public_key: proposer_sk().public_key(),
         }];
         let vs = ValidatorSet::new(validators);
         TopologySnapshot::from_explicit_committees(
@@ -813,13 +815,14 @@ mod tests {
         // "some valid VRF".
         let mut wrong_seed = [0u8; 32];
         wrong_seed[..8].copy_from_slice(&99u64.to_le_bytes());
-        let impostor = bls_keypair_from_seed(&wrong_seed);
+        let impostor = BlsSigner::from_seed(&wrong_seed);
         let impostor_reveal = shard_reveal_sign(
             &impostor,
             &NetworkDefinition::simulator(),
             shard,
             BlockHeight::new(5),
-        );
+        )
+        .expect("sign");
         let wrong_ws = WitnessSources::new(Vec::new(), None, impostor_reveal);
         let wrong_key = context_with(&topology_snapshot, &wrong_ws, shard, 0, Vec::new(), 0);
         assert_eq!(

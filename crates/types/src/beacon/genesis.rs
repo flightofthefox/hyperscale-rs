@@ -256,15 +256,15 @@ pub fn genesis_config_hash(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::bls_keypair_from_seed;
+    use hyperscale_crypto::Signer;
+    use hyperscale_crypto_bls::BlsSigner;
 
     use super::*;
-    use crate::pk_from_bls;
 
     fn pubkey(seed: u64) -> ConsensusPublicKey {
         let mut s = [0u8; 32];
         s[..8].copy_from_slice(&seed.to_le_bytes());
-        pk_from_bls(&bls_keypair_from_seed(&s).public_key())
+        BlsSigner::from_seed(&s).public_key()
     }
 
     fn sample_config() -> BeaconGenesisConfig {

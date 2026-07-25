@@ -11,13 +11,12 @@
 //! field bound in the timeout signature — which is what lets HotStuff-2's
 //! pacemaker work without a timeout certificate on the wire.
 
-use hyperscale_crypto::Verifier;
+use hyperscale_crypto::{SignError, Signer, Verifier};
 use thiserror::Error;
 
 use crate::{
-    Bls12381G1PrivateKey, ConsensusPublicKey, ConsensusSignature, NetworkDefinition,
-    QuorumCertificate, Round, ShardId, ValidatorId, Verified, Verify, sig_from_bls,
-    timeout_message,
+    ConsensusPublicKey, ConsensusSignature, NetworkDefinition, QuorumCertificate, Round, ShardId,
+    ValidatorId, Verified, Verify, timeout_message,
 };
 
 /// A validator's timeout for a shard consensus round.
@@ -37,24 +36,27 @@ pub struct Timeout {
 
 impl Timeout {
     /// Create a new timeout with domain-separated signing over `(shard, round)`.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SignError`] when the signer cannot sign.
     pub fn new(
         network: &NetworkDefinition,
         shard_id: ShardId,
         round: Round,
         high_qc: QuorumCertificate,
         voter: ValidatorId,
-        signing_key: &Bls12381G1PrivateKey,
-    ) -> Self {
+        signer: &dyn Signer,
+    ) -> Result<Self, SignError> {
         let message = timeout_message(network, shard_id, round);
-        let signature = sig_from_bls(&signing_key.sign_v1(&message));
-        Self {
+        let signature = signer.sign(&message)?;
+        Ok(Self {
             shard_id,
             round,
             high_qc,
             voter,
             signature,
-        }
+        })
     }
 
     /// Build a `Timeout` from its parts without re-signing. Caller is
@@ -192,43 +194,39 @@ impl Verify<&TimeoutContext<'_>> for Timeout {
 }
 
 impl Verified<Timeout> {
-    /// Sign a fresh [`Timeout`] with `signing_key` and return its verified form.
+    /// Sign a fresh [`Timeout`] with `signer` and return its verified form.
     ///
-    /// The predicate holds by construction: the BLS signature over the
-    /// canonical `timeout_message` is produced from `signing_key` inside this
+    /// The predicate holds by construction: the signature over the
+    /// canonical `timeout_message` is produced by `signer` inside this
     /// call. Used at the pacemaker site that echoes the signed timeout back to
     /// the local `TimeoutKeeper`.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SignError`] when the signer cannot sign.
     pub fn sign_local(
         network: &NetworkDefinition,
         shard_id: ShardId,
         round: Round,
         high_qc: QuorumCertificate,
         voter: ValidatorId,
-        signing_key: &Bls12381G1PrivateKey,
-    ) -> Self {
-        // SAFETY: the BLS signature is produced by `signing_key` over the
+        signer: &dyn Signer,
+    ) -> Result<Self, SignError> {
+        // SAFETY: the signature is produced by `signer` over the
         // canonical `timeout_message`, which is exactly the `Timeout::verify`
         // predicate's check against this voter's matching pubkey.
-        Self::new_unchecked(Timeout::new(
-            network,
-            shard_id,
-            round,
-            high_qc,
-            voter,
-            signing_key,
-        ))
+        Ok(Self::new_unchecked(Timeout::new(
+            network, shard_id, round, high_qc, voter, signer,
+        )?))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
 
     use super::*;
-    use crate::{
-        AggregateSignature, BlockHash, BlockHeight, SignerBitfield, WeightedTimestamp, pk_from_bls,
-    };
+    use crate::{AggregateSignature, BlockHash, BlockHeight, SignerBitfield, WeightedTimestamp};
 
     const SHARD: ShardId = ShardId::ROOT;
 
@@ -248,26 +246,26 @@ mod tests {
     #[test]
     fn sign_local_roundtrips_through_verify() {
         let net = NetworkDefinition::simulator();
-        let key = generate_bls_keypair();
+        let signer = BlsSigner::new(generate_bls_keypair());
         let timeout = Verified::<Timeout>::sign_local(
             &net,
             SHARD,
             Round::new(7),
             high_qc_at(3),
             ValidatorId::new(2),
-            &key,
+            &signer,
         )
+        .expect("sign")
         .into_inner();
 
         assert_eq!(timeout.round(), Round::new(7));
         assert_eq!(timeout.high_qc_round(), Round::new(3));
-        let pk = key.public_key();
         assert!(
             timeout
                 .verify(&TimeoutContext {
                     verifier: &BlsVerifier,
                     network: &net,
-                    voter_public_key: &pk_from_bls(&pk),
+                    voter_public_key: &signer.public_key(),
                 })
                 .is_ok()
         );
@@ -276,22 +274,23 @@ mod tests {
     #[test]
     fn verify_rejects_wrong_signer() {
         let net = NetworkDefinition::simulator();
-        let key = generate_bls_keypair();
+        let signer = BlsSigner::new(generate_bls_keypair());
         let timeout = Timeout::new(
             &net,
             SHARD,
             Round::new(5),
             high_qc_at(1),
             ValidatorId::new(0),
-            &key,
-        );
+            &signer,
+        )
+        .expect("sign");
 
-        let intruder = generate_bls_keypair().public_key();
+        let intruder = BlsSigner::new(generate_bls_keypair());
         assert!(matches!(
             timeout.verify(&TimeoutContext {
                 verifier: &BlsVerifier,
                 network: &net,
-                voter_public_key: &pk_from_bls(&intruder),
+                voter_public_key: &intruder.public_key(),
             }),
             Err(TimeoutVerifyError::InvalidSignature),
         ));

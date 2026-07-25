@@ -284,11 +284,11 @@ impl ConflictDetector {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::bls_keypair_from_seed;
+    use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
         BlockHeight, Hash, MerkleInclusionProof, NetworkDefinition, NodeId, ProvisionEntry,
-        ShardId, SubstateEntry, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
-        pk_from_bls, uniform_shard_for_node,
+        ShardId, Signer, SubstateEntry, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
+        uniform_shard_for_node,
     };
 
     use super::*;
@@ -326,10 +326,10 @@ mod tests {
     fn make_topology() -> TopologySnapshot {
         let mut seed = [0u8; 32];
         seed[0] = 42;
-        let kp = bls_keypair_from_seed(&seed);
+        let kp = BlsSigner::from_seed(&seed);
         let vs = ValidatorSet::new(vec![ValidatorInfo {
             validator_id: ValidatorId::new(0),
-            public_key: pk_from_bls(&kp.public_key()),
+            public_key: kp.public_key(),
         }]);
         // Local shard = 0, 2 shards total
         TopologySnapshot::single_shard(NetworkDefinition::simulator(), ShardId::leaf(1, 0), 2, vs)

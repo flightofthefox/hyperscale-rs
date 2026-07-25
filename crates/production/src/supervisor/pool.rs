@@ -107,7 +107,7 @@ impl ShardSupervisor {
     /// beacon storage. `None` when the validator has no local signing key
     /// (it isn't ours to follow for).
     fn build_follower(&self, validator: ValidatorId) -> Option<VnodeInit> {
-        let signing_key = self.vnode_keys.get(&validator).cloned().or_else(|| {
+        let signer = self.vnode_keys.get(&validator).cloned().or_else(|| {
             warn!(
                 validator = validator.inner(),
                 "No local signing key for a drained validator; not following it"
@@ -121,7 +121,7 @@ impl ShardSupervisor {
             beacon_config_hash: self.beacon_config_hash,
             now: consensus_clock(self.genesis_offset_ms),
             validator,
-            signing_key,
+            signer,
         }))
     }
 

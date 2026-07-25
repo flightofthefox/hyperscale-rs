@@ -52,8 +52,8 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, Bls12381G1PrivateKey, GenesisValidators, InFlightCount,
-    LocalTimestamp, MAX_TX_IN_FLIGHT, RoutableTransaction, ShardId, ValidatorId, ValidatorStatus,
+    BeaconChainConfig, BlockHeight, GenesisValidators, InFlightCount, LocalTimestamp,
+    MAX_TX_IN_FLIGHT, RoutableTransaction, ShardId, Signer, ValidatorId, ValidatorStatus,
 };
 use libp2p::identity::Keypair;
 use thiserror::Error;
@@ -137,11 +137,11 @@ pub struct VnodeConfig {
     pub validator_id: ValidatorId,
     /// This vnode's home shard.
     pub local_shard: ShardId,
-    /// BLS signing key for this validator's votes, proposals, and the
+    /// Signing identity for this validator's votes, proposals, and the
     /// per-session validator-bind attestation. Held by `Arc` so the same
     /// allocation is shared between the bind service, the state machine,
     /// and delegated dispatch closures.
-    pub signing_key: Arc<Bls12381G1PrivateKey>,
+    pub signer: Arc<dyn Signer>,
 }
 
 /// One validator a host runs, as supplied to the runner at startup.
@@ -157,11 +157,14 @@ pub struct VnodeConfig {
 pub struct LocalValidator {
     /// The validator identity this host runs.
     pub validator_id: ValidatorId,
-    /// BLS signing key for votes, proposals, and the validator-bind
+    /// Signing identity for votes, proposals, and the validator-bind
     /// attestation. `Arc` so the bind service, state machine, and dispatch
     /// closures share one allocation.
-    pub signing_key: Arc<Bls12381G1PrivateKey>,
+    pub signer: Arc<dyn Signer>,
 }
+
+/// The `(validator, signer)` pairs seated together on one shard.
+type ShardVnodes = Vec<(ValidatorId, Arc<dyn Signer>)>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ProductionRunnerBuilder
@@ -353,9 +356,9 @@ impl ProductionRunnerBuilder {
         let validators = self.validators;
         // Per-validator signing keys, retained so a placement delta can be
         // translated into a `ShardCommand::Join` for the moved validator.
-        let vnode_keys: HashMap<ValidatorId, Arc<Bls12381G1PrivateKey>> = validators
+        let vnode_keys: HashMap<ValidatorId, Arc<dyn Signer>> = validators
             .iter()
-            .map(|v| (v.validator_id, Arc::clone(&v.signing_key)))
+            .map(|v| (v.validator_id, Arc::clone(&v.signer)))
             .collect();
         let genesis_validators = self.genesis_validators;
         let shard_config = self.shard_config;
@@ -401,9 +404,9 @@ impl ProductionRunnerBuilder {
 
         // `Arc::clone` lets the bind service and the state machine share the
         // single key allocation each validator carries.
-        let bind_vnodes: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)> = validators
+        let bind_vnodes: Vec<(ValidatorId, Arc<dyn Signer>)> = validators
             .iter()
-            .map(|v| (v.validator_id, Arc::clone(&v.signing_key)))
+            .map(|v| (v.validator_id, Arc::clone(&v.signer)))
             .collect();
 
         // Participation is a projection of the committed beacon state: a
@@ -414,9 +417,8 @@ impl ProductionRunnerBuilder {
             .beacon_storage
             .latest_committed()
             .expect("beacon chain is non-empty after the genesis commit above");
-        let mut seated_by_shard: BTreeMap<ShardId, Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)>> =
-            BTreeMap::new();
-        let mut pooled: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)> = Vec::new();
+        let mut seated_by_shard: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
+        let mut pooled: Vec<(ValidatorId, Arc<dyn Signer>)> = Vec::new();
         for v in &validators {
             match beacon_state
                 .validators
@@ -426,8 +428,8 @@ impl ProductionRunnerBuilder {
                 Some(ValidatorStatus::OnShard { shard, .. }) => seated_by_shard
                     .entry(shard)
                     .or_default()
-                    .push((v.validator_id, Arc::clone(&v.signing_key))),
-                _ => pooled.push((v.validator_id, Arc::clone(&v.signing_key))),
+                    .push((v.validator_id, Arc::clone(&v.signer))),
+                _ => pooled.push((v.validator_id, Arc::clone(&v.signer))),
             }
         }
         let local_shards: HashSet<ShardId> = seated_by_shard.keys().copied().collect();
@@ -476,7 +478,7 @@ impl ProductionRunnerBuilder {
                 vnodes: shard_vnodes.clone(),
             }));
         }
-        for (validator, signing_key) in pooled {
+        for (validator, signer) in pooled {
             vnode_inits.push(seat_follower(SeatFollower {
                 verifier: Arc::new(BlsVerifier),
                 beacon_storage: self.beacon_storage.as_ref(),
@@ -484,7 +486,7 @@ impl ProductionRunnerBuilder {
                 beacon_config_hash,
                 now,
                 validator,
-                signing_key,
+                signer,
             }));
         }
 
@@ -652,7 +654,7 @@ pub struct ProductionRunner {
     participation_rx: Option<mpsc::UnboundedReceiver<ParticipationChange>>,
     /// Per-validator signing keys for every vnode this runner was built
     /// with, keyed for the placement-delta translation.
-    vnode_keys: HashMap<ValidatorId, Arc<Bls12381G1PrivateKey>>,
+    vnode_keys: HashMap<ValidatorId, Arc<dyn Signer>>,
 
     /// Libp2p network adapter (shared with `InboundRouter`, `RequestManager`).
     network: Arc<Libp2pAdapter>,
@@ -1041,7 +1043,7 @@ impl ProductionRunner {
         let Some(shard) = change.join else {
             return;
         };
-        let Some(signing_key) = self.vnode_keys.get(&change.validator) else {
+        let Some(signer) = self.vnode_keys.get(&change.validator) else {
             warn!(
                 validator = change.validator.inner(),
                 "Placement change for a validator without a local signing key; ignored"
@@ -1053,7 +1055,7 @@ impl ProductionRunner {
             vnodes: vec![VnodeConfig {
                 validator_id: change.validator,
                 local_shard: shard,
-                signing_key: Arc::clone(signing_key),
+                signer: Arc::clone(signer),
             }],
         });
     }
@@ -1143,9 +1145,9 @@ struct NetworkBuildArgs {
     /// Shards hosted by this host. Drives per-shard request stream
     /// protocols and gossipsub subscriptions on the adapter.
     local_shards: HashSet<ShardId>,
-    /// One `(validator_id, signing_key)` per hosted vnode. The bind
+    /// One `(validator_id, signer)` per hosted vnode. The bind
     /// service attests as every entry on each handshake.
-    bind_vnodes: Vec<(ValidatorId, Arc<Bls12381G1PrivateKey>)>,
+    bind_vnodes: Vec<(ValidatorId, Arc<dyn Signer>)>,
     initial_validator_keys: Arc<ValidatorKeyMap>,
     /// Topology snapshot shared with `Libp2pNetwork` for shard-based
     /// peer resolution on outbound `Network::request` calls.

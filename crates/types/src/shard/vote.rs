@@ -4,14 +4,13 @@
 //! `Verified<BlockVote>`; predicate at
 //! [`impl Verify<&BlockVoteContext<'_>>`](Verify::verify) below.
 
-use hyperscale_crypto::Verifier;
+use hyperscale_crypto::{SignError, Signer, Verifier};
 use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusPublicKey, ConsensusSignature,
-    NetworkDefinition, ProposerTimestamp, Round, ShardId, ValidatorId, Verified, Verify,
-    block_vote_message, sig_from_bls,
+    BlockHash, BlockHeight, ConsensusPublicKey, ConsensusSignature, NetworkDefinition,
+    ProposerTimestamp, Round, ShardId, ValidatorId, Verified, Verify, block_vote_message,
 };
 
 /// Block vote for shard consensus.
@@ -28,7 +27,10 @@ pub struct BlockVote {
 
 impl BlockVote {
     /// Create a new block vote with domain-separated signing.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SignError`] when the signer cannot sign.
     #[allow(clippy::too_many_arguments)] // mirrors the 7 stored fields plus the network identity
     pub fn new(
         network: &NetworkDefinition,
@@ -38,9 +40,9 @@ impl BlockVote {
         height: BlockHeight,
         round: Round,
         voter: ValidatorId,
-        signing_key: &Bls12381G1PrivateKey,
+        signer: &dyn Signer,
         timestamp: ProposerTimestamp,
-    ) -> Self {
+    ) -> Result<Self, SignError> {
         let message = block_vote_message(
             network,
             shard_id,
@@ -49,8 +51,8 @@ impl BlockVote {
             &block_hash,
             &parent_block_hash,
         );
-        let signature = sig_from_bls(&signing_key.sign_v1(&message));
-        Self {
+        let signature = signer.sign(&message)?;
+        Ok(Self {
             block_hash,
             shard_id,
             height,
@@ -58,7 +60,7 @@ impl BlockVote {
             voter,
             signature,
             timestamp,
-        }
+        })
     }
 
     /// Build a `BlockVote` from its parts without re-signing. Caller is
@@ -227,18 +229,21 @@ impl Verify<&BlockVoteContext<'_>> for BlockVote {
 }
 
 impl Verified<BlockVote> {
-    /// Sign a fresh [`BlockVote`] with `signing_key` and return its
-    /// verified form.
+    /// Sign a fresh [`BlockVote`] with `signer` and return its verified
+    /// form.
     ///
-    /// The predicate holds by construction: the BLS signature over the
-    /// canonical `block_vote_message` is produced from `signing_key`
-    /// inside this call, so any later
+    /// The predicate holds by construction: the signature over the
+    /// canonical `block_vote_message` is produced by `signer` inside
+    /// this call, so any later
     /// [`<BlockVote as Verify>::verify`](Verify::verify) call against
     /// the matching public key would succeed. Used at proposer/voter
     /// sites that need the verified value immediately for local-fast-
     /// path consumers (e.g. echoing the signed vote back to the local
     /// [`VoteSet`](crate::Verified)).
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SignError`] when the signer cannot sign.
     #[allow(clippy::too_many_arguments)] // mirrors the 7 stored fields plus the network identity
     pub fn sign_local(
         network: &NetworkDefinition,
@@ -248,14 +253,14 @@ impl Verified<BlockVote> {
         height: BlockHeight,
         round: Round,
         voter: ValidatorId,
-        signing_key: &Bls12381G1PrivateKey,
+        signer: &dyn Signer,
         timestamp: ProposerTimestamp,
-    ) -> Self {
-        // SAFETY: the BLS signature is produced by `signing_key` over
-        // the canonical `block_vote_message`, which is exactly the
+    ) -> Result<Self, SignError> {
+        // SAFETY: the signature is produced by `signer` over the
+        // canonical `block_vote_message`, which is exactly the
         // `BlockVote::verify` predicate's check against this voter's
         // matching pubkey.
-        Self::new_unchecked(BlockVote::new(
+        Ok(Self::new_unchecked(BlockVote::new(
             network,
             block_hash,
             parent_block_hash,
@@ -263,9 +268,9 @@ impl Verified<BlockVote> {
             height,
             round,
             voter,
-            signing_key,
+            signer,
             timestamp,
-        ))
+        )?))
     }
 
     /// Verify a slice of `(vote, pubkey)` pairs against a single
@@ -313,10 +318,10 @@ impl Verified<BlockVote> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
 
     use super::*;
-    use crate::{Hash, pk_from_bls};
+    use crate::Hash;
 
     /// All-valid batch verifies via the fast path and yields one
     /// `Some(verified)` per input position.
@@ -333,16 +338,16 @@ mod tests {
         );
         let votes: Vec<_> = (0..3)
             .map(|i| {
-                let sk = generate_bls_keypair();
-                let signature = sk.sign_v1(&message);
-                let pk = pk_from_bls(&sk.public_key());
+                let signer = BlsSigner::new(generate_bls_keypair());
+                let signature = signer.sign(&message).expect("sign");
+                let pk = signer.public_key();
                 let vote = BlockVote::from_parts(
                     BlockHash::from_raw(Hash::from_bytes(&[1u8; 32])),
                     ShardId::ROOT,
                     BlockHeight::new(1),
                     Round::INITIAL,
                     ValidatorId::new(i),
-                    sig_from_bls(&signature),
+                    signature,
                     ProposerTimestamp::ZERO,
                 );
                 (vote, pk)
@@ -370,25 +375,24 @@ mod tests {
         );
         let mut votes: Vec<(BlockVote, ConsensusPublicKey)> = Vec::new();
         for i in 0..3u64 {
-            let sk = generate_bls_keypair();
-            let signature = sk.sign_v1(&message);
-            let pk = sk.public_key();
+            let signer = BlsSigner::new(generate_bls_keypair());
+            let signature = signer.sign(&message).expect("sign");
             let vote = BlockVote::from_parts(
                 BlockHash::from_raw(Hash::from_bytes(&[2u8; 32])),
                 ShardId::ROOT,
                 BlockHeight::new(1),
                 Round::INITIAL,
                 ValidatorId::new(i),
-                sig_from_bls(&signature),
+                signature,
                 ProposerTimestamp::ZERO,
             );
-            votes.push((vote, pk_from_bls(&pk)));
+            votes.push((vote, signer.public_key()));
         }
 
         // Replace the middle vote's pubkey with a fresh unrelated one so the
         // signature no longer validates.
-        let intruder_sk = generate_bls_keypair();
-        votes[1].1 = pk_from_bls(&intruder_sk.public_key());
+        let intruder = BlsSigner::new(generate_bls_keypair());
+        votes[1].1 = intruder.public_key();
 
         let results = Verified::<BlockVote>::verify_batch(&BlsVerifier, &message, votes);
         assert_eq!(results.len(), 3);

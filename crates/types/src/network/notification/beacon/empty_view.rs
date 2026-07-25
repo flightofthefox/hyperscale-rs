@@ -93,14 +93,15 @@ impl NetworkMessage for SpcEmptyViewMsgNotification {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+    use hyperscale_crypto::Signer;
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use sbor::prelude::*;
 
     use super::*;
     use crate::{
-        AggregateSignature, Bls12381G1PrivateKey, Epoch, NetworkDefinition, PcQc2, PcQc3,
-        PcSignerLengths, PcVector, PcXpProof, SignedContext, SignedVerifyError, SignerBitfield,
-        SpcHighTriple, SpcView, ValidatorId, pk_from_bls, sign_empty_view_msg, spc_context,
+        AggregateSignature, Epoch, NetworkDefinition, PcQc2, PcQc3, PcSignerLengths, PcVector,
+        PcXpProof, SignedContext, SignedVerifyError, SignerBitfield, SpcHighTriple, SpcView,
+        ValidatorId, sign_empty_view_msg, spc_context,
     };
 
     fn sample_pc_qc3() -> PcQc3 {
@@ -136,10 +137,10 @@ mod tests {
         }
     }
 
-    fn signing_key(seed: u64) -> Bls12381G1PrivateKey {
+    fn signing_key(seed: u64) -> BlsSigner {
         let mut s = [0u8; 32];
         s[..8].copy_from_slice(&seed.to_le_bytes());
-        bls_keypair_from_seed(&s)
+        BlsSigner::from_seed(&s)
     }
 
     /// Build a notification whose inner empty-view is signed by
@@ -163,7 +164,8 @@ mod tests {
             &spc_context(epoch),
             SpcView::new(5),
             reported,
-        );
+        )
+        .expect("sign");
         SpcEmptyViewMsgNotification::new(epoch, Arc::new(Verifiable::from(msg)))
     }
 
@@ -196,7 +198,7 @@ mod tests {
             n.verify_signature(&SignedContext {
                 verifier: &BlsVerifier,
                 network: &NetworkDefinition::simulator(),
-                public_key: &pk_from_bls(&pk),
+                public_key: &pk,
             })
             .is_ok()
         );
@@ -214,7 +216,7 @@ mod tests {
             n.verify_signature(&SignedContext {
                 verifier: &BlsVerifier,
                 network: &NetworkDefinition::simulator(),
-                public_key: &pk_from_bls(&honest_pk),
+                public_key: &honest_pk,
             }),
             Err(SignedVerifyError::InvalidSignature),
         );
@@ -232,7 +234,7 @@ mod tests {
             n.verify_signature(&SignedContext {
                 verifier: &BlsVerifier,
                 network: &NetworkDefinition::simulator(),
-                public_key: &pk_from_bls(&pk),
+                public_key: &pk,
             }),
             Err(SignedVerifyError::InvalidSignature),
         );

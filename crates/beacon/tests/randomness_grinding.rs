@@ -46,11 +46,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
-use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey, Epoch, MIN_STAKE_FLOOR,
-    NetworkDefinition, Randomness, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
-    ValidatorId, ValidatorRecord, ValidatorStatus, byzantine_threshold, pk_from_bls, vrf_sign,
+    BeaconChainConfig, BeaconProposal, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition,
+    Randomness, ShardCommittee, ShardId, Signer, Stake, StakePool, StakePoolId, ValidatorId,
+    ValidatorRecord, ValidatorStatus, byzantine_threshold, vrf_sign,
 };
 
 // ─── Analytic model (ported from committee_security.py) ──────────────────────
@@ -159,9 +159,9 @@ fn seed_bytes(x: u64) -> [u8; 32] {
 /// One BLS keypair per validator id, so each validator's VRF output is
 /// distinct — the grind's `2^t` seeds collapse to one if the grinders
 /// share a key.
-fn signing_keys(population: u64) -> Vec<Bls12381G1PrivateKey> {
+fn signing_keys(population: u64) -> Vec<BlsSigner> {
     (0..population)
-        .map(|i| bls_keypair_from_seed(&seed_bytes(i)))
+        .map(|i| BlsSigner::from_seed(&seed_bytes(i)))
         .collect()
 }
 
@@ -222,7 +222,7 @@ fn build_state(
     grinders: u32,
     honest: u32,
     population: u64,
-    keys: &[Bls12381G1PrivateKey],
+    keys: &[BlsSigner],
     randomness: [u8; 32],
 ) -> BeaconState {
     let pool_id = StakePoolId::new(0);
@@ -260,7 +260,7 @@ fn build_state(
                 pool: pool_id,
                 status,
                 registered_at_epoch: Epoch::GENESIS,
-                pubkey: pk_from_bls(&keys[usize::try_from(i).expect("id fits")].public_key()),
+                pubkey: keys[usize::try_from(i).expect("id fits")].public_key(),
             },
         );
         pool_validators.insert(id);
@@ -315,7 +315,7 @@ fn build_state(
 /// membership ([`renormalize`]).
 struct Ctx {
     corrupt: BTreeSet<ValidatorId>,
-    keys: Vec<Bls12381G1PrivateKey>,
+    keys: Vec<BlsSigner>,
     net: NetworkDefinition,
     n: u32,
     grinders: u32,
@@ -422,13 +422,13 @@ fn target_corrupt(state: &BeaconState, corrupt: &BTreeSet<ValidatorId>) -> u32 {
 }
 
 fn proposal(
-    keys: &[Bls12381G1PrivateKey],
+    keys: &[BlsSigner],
     net: &NetworkDefinition,
     id: ValidatorId,
     epoch: Epoch,
 ) -> BeaconProposal {
     let sk = &keys[usize::try_from(id.inner()).expect("id fits")];
-    BeaconProposal::vrf_only(vrf_sign(sk, net, epoch))
+    BeaconProposal::vrf_only(vrf_sign(sk, net, epoch).expect("sign"))
 }
 
 /// The committed proposal set for a grinder subset `mask`: the honest

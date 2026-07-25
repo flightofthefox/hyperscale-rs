@@ -96,13 +96,14 @@ fn indirect_cert_round_trip() {
         .iter()
         .map(|(sk, validator)| {
             sign_empty_view_msg(
-                sk,
+                sk.as_ref(),
                 *validator,
                 &network,
                 &spc_ctx,
                 empty_view,
                 reported.clone(),
             )
+            .expect("sign")
         })
         .collect();
 
@@ -157,13 +158,14 @@ fn indirect_cert_with_swapped_target_value_rejected() {
         .iter()
         .map(|(sk, validator)| {
             sign_empty_view_msg(
-                sk,
+                sk.as_ref(),
                 *validator,
                 &network,
                 &spc_ctx,
                 empty_view,
                 reported_a.clone(),
             )
+            .expect("sign")
         })
         .collect();
     let real_cert =
@@ -419,7 +421,15 @@ fn spc_empty_view_rejected_under_different_network() {
     };
     let empty_view = SpcView::new(5);
     let (sk, validator) = sim.sks_for_indices(&[0]).into_iter().next().unwrap();
-    let msg = sign_empty_view_msg(&sk, validator, &network, &spc_ctx, empty_view, reported);
+    let msg = sign_empty_view_msg(
+        sk.as_ref(),
+        validator,
+        &network,
+        &spc_ctx,
+        empty_view,
+        reported,
+    )
+    .expect("sign");
 
     assert!(verify_empty_view_msg(&BlsVerifier, &msg, &network, &spc_ctx, &sim.members).is_ok());
     assert!(

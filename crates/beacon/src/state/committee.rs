@@ -497,7 +497,7 @@ mod tests {
         BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch,
         HALT_THRESHOLD_EPOCHS, Hash, JailReason, MIN_STAKE_FLOOR, PendingReshape, Randomness,
         ShardBoundary, ShardCommittee, ShardId, ShardWitnessPayload, Stake, StakePool, StakePoolId,
-        StateRoot, TransitionCause, ValidatorId, ValidatorStatus, WeightedTimestamp, sig_from_bls,
+        StateRoot, TransitionCause, ValidatorId, ValidatorStatus, WeightedTimestamp,
     };
 
     use super::{recover_committees, resample_beacon_committee};
@@ -1419,7 +1419,7 @@ mod tests {
                     pool_id: StakePoolId::new(0),
                     validator_id: ValidatorId::new(77),
                     pubkey: state.validators[&ValidatorId::new(0)].pubkey,
-                    possession_proof: sig_from_bls(&possession_proof(0, ValidatorId::new(77))),
+                    possession_proof: possession_proof(0, ValidatorId::new(77)),
                 }],
             );
             for _ in 0..4 {
