@@ -64,6 +64,18 @@ pub enum TraceKind {
         /// zero until the topology has more than one shard.
         cross_shard_waves: u32,
     },
+    /// The keyspace partition changed — a split seated its children, or a
+    /// merge composed its parent. Carries the whole new partition rather
+    /// than a delta so a viewer that joined late still renders correctly.
+    #[serde(rename_all = "camelCase")]
+    TopologyChanged {
+        shards: Vec<ShardPath>,
+        /// Leaves that were not in the previous partition.
+        appeared: Vec<ShardPath>,
+        /// Leaves that were in it and are not now — a split parent, or the
+        /// children a merge composed away.
+        retired: Vec<ShardPath>,
+    },
     #[serde(rename_all = "camelCase")]
     TxSubmitted { tx: TxLabel },
     #[serde(rename_all = "camelCase")]
@@ -113,6 +125,23 @@ impl TraceEvent {
                 fallback,
                 proposer,
                 cross_shard_waves,
+            },
+        }
+    }
+
+    pub(crate) fn topology_changed(
+        wt: u64,
+        shards: &[ShardId],
+        appeared: Vec<ShardId>,
+        retired: Vec<ShardId>,
+    ) -> Self {
+        let paths = |ids: Vec<ShardId>| ids.into_iter().map(ShardPath::from).collect();
+        Self {
+            wt,
+            kind: TraceKind::TopologyChanged {
+                shards: shards.iter().copied().map(ShardPath::from).collect(),
+                appeared: paths(appeared),
+                retired: paths(retired),
             },
         }
     }

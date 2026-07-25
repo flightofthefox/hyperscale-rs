@@ -51,9 +51,15 @@ impl DemoSession {
     /// epoch budget.
     #[wasm_bindgen(constructor)]
     #[must_use]
-    pub fn new(seed: u32, shard_size: u32, shards: u32) -> Self {
+    pub fn new(seed: u32, shard_size: u32, max_shards: u32) -> Self {
         Self {
-            inner: Session::new(SessionConfig { shard_size, shards }, u64::from(seed)),
+            inner: Session::new(
+                SessionConfig {
+                    shard_size,
+                    max_shards,
+                },
+                u64::from(seed),
+            ),
         }
     }
 

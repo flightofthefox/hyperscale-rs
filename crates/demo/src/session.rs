@@ -59,18 +59,23 @@ const fn decision_label(decision: TransactionDecision) -> &'static str {
 pub struct SessionConfig {
     /// Validators per shard committee.
     pub shard_size: u32,
-    /// Leaves to grow the topology to before the session opens. Must be a
-    /// power of two. Genesis is always a single ROOT shard, so anything
-    /// above one is reached the way the network reaches it — by splitting,
-    /// through the real reshape lifecycle.
-    pub shards: u32,
+    /// Leaves the topology may grow to. Must be a power of two.
+    ///
+    /// The session always *starts* at a single ROOT shard, because that is
+    /// where every network starts. Above one, the split trigger is armed and
+    /// the pool is staffed for the splits it allows, so the topology grows
+    /// while the session runs and a viewer sees the reshape happen rather
+    /// than arriving after it. Growth stops on its own once the pool can no
+    /// longer staff a child committee: admission is gated on a deep enough
+    /// free pool, so the surplus is the ceiling.
+    pub max_shards: u32,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             shard_size: 4,
-            shards: 1,
+            max_shards: 1,
         }
     }
 }
@@ -82,6 +87,8 @@ pub struct Session {
     /// Highest height already emitted per shard. A shard absent from the map
     /// has had nothing emitted yet.
     reported_through: BTreeMap<ShardId, BlockHeight>,
+    /// The partition as last reported, so a step emits only changes.
+    reported_shards: Vec<ShardId>,
     /// Submitted transactions and the last status reported for each, so a
     /// step emits only transitions.
     tracked: BTreeMap<TxHash, Option<TransactionStatus>>,
@@ -92,16 +99,14 @@ pub struct Session {
 }
 
 impl Session {
-    /// Build a cluster at `seed`, fund [`ACCOUNTS`] accounts, run genesis, and
-    /// grow to `config.shards` leaves.
+    /// Build a single-shard cluster at `seed`, fund [`ACCOUNTS`] accounts, and
+    /// run genesis.
     ///
-    /// # Panics
-    ///
-    /// Panics if `config.shards` is not a power of two, or if the grow misses
-    /// its epoch budget.
+    /// The topology grows from here as the session steps, up to
+    /// [`SessionConfig::max_shards`].
     #[must_use]
     pub fn new(config: SessionConfig, seed: u64) -> Self {
-        let splits = config.shards.saturating_sub(1);
+        let splits = config.max_shards.saturating_sub(1);
         let sim_config = SimConfig {
             shard_size: config.shard_size,
             // Each split staffs its children from the free pool, so the grow
@@ -128,15 +133,17 @@ impl Session {
             .map(|s| (account_from_seed(s), Decimal::from(100_000)))
             .collect();
         runner.initialize_genesis_with_balances(&balances);
-        if config.shards > 1 {
-            runner.grow_to(config.shards);
-        }
-        // The grow burns epochs, so the session's clock starts where the
-        // runner's actually is rather than at zero.
-        let now = runner.now();
+        // Seed the partition watermark with the genesis topology, so the
+        // first change reported is a real one rather than the session
+        // announcing the shard it opened on.
+        let opening = (0..runner.num_hosts())
+            .find_map(|host| runner.host_topology(host))
+            .map(|topology| topology.shard_trie().leaves().collect())
+            .unwrap_or_default();
         Self {
             runner,
-            now,
+            now: Duration::ZERO,
+            reported_shards: opening,
             reported_through: BTreeMap::new(),
             tracked: BTreeMap::new(),
             pending: Vec::new(),
@@ -181,12 +188,44 @@ impl Session {
 
     /// Advance simulated time by `ms` and return everything observed.
     pub fn step(&mut self, ms: u64) -> Vec<TraceEvent> {
+        // Reshape duties are driven by the harness, not by the event queue:
+        // an orchestrator only advances on a step. Driving it here is what
+        // lets a split unfold across the session instead of being completed
+        // before the first frame.
+        self.runner.reshape_step();
         self.now += Duration::from_millis(ms);
         self.runner.run_until(self.now);
         let mut events = std::mem::take(&mut self.pending);
+        events.extend(self.drain_topology());
         events.extend(self.drain_committed());
         events.extend(self.drain_tx_status());
+        // One batch, one timeline: the viewer renders in weighted-time order
+        // regardless of which derivation produced an event.
+        events.sort_by_key(|event| event.wt);
         events
+    }
+
+    /// Report a partition change, if the trie's leaves moved this step.
+    fn drain_topology(&mut self) -> Vec<TraceEvent> {
+        let current = self.live_shards();
+        if current == self.reported_shards {
+            return Vec::new();
+        }
+        let appeared = current
+            .iter()
+            .filter(|s| !self.reported_shards.contains(s))
+            .copied()
+            .collect();
+        let retired = self
+            .reported_shards
+            .iter()
+            .filter(|s| !current.contains(s))
+            .copied()
+            .collect();
+        let wt = u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX);
+        let event = TraceEvent::topology_changed(wt, &current, appeared, retired);
+        self.reported_shards = current;
+        vec![event]
     }
 
     /// Report every tracked transaction whose status moved this step.

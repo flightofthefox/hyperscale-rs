@@ -108,52 +108,88 @@ fn a_submitted_transfer_settles_and_reports_every_transition() {
     // A single-shard topology opens no cross-shard waves: that header field
     // exists to tell remote shards which certificates to expect.
     assert!(
-        events.iter().all(|e| matches!(
+        events.iter().all(|e| !matches!(
             e.kind,
             TraceKind::BlockCommitted {
-                cross_shard_waves: 0,
+                cross_shard_waves: 1..,
                 ..
-            } | TraceKind::TxSubmitted { .. }
-                | TraceKind::TxStatusChanged { .. }
+            }
         )),
         "one shard means no cross-shard waves",
     );
 }
 
 #[test]
-fn growing_to_two_shards_splits_the_root_into_its_children() {
+fn the_root_shard_splits_while_the_session_is_being_watched() {
     let mut session = Session::new(
         SessionConfig {
-            shards: 2,
+            max_shards: 2,
             ..SessionConfig::default()
         },
         42,
     );
 
-    let shards: Vec<String> = session
-        .live_shards()
-        .into_iter()
-        .map(|s| ShardPath::from(s).0)
-        .collect();
+    // The session opens on a single ROOT shard — the split has not happened
+    // yet, which is the whole point: a viewer sees it occur.
     assert_eq!(
-        shards,
-        vec!["0".to_string(), "1".to_string()],
-        "a grown topology is the root's two children, not the root",
+        session
+            .live_shards()
+            .into_iter()
+            .map(|s| ShardPath::from(s).0)
+            .collect::<Vec<_>>(),
+        vec![String::new()],
+        "a session opens at genesis, on one shard",
     );
 
-    // Both children must be producing blocks of their own, not merely seated.
+    // The split lands about six epochs in — trigger, admission, cohort
+    // draw, snap-sync, readiness gate, flip — so give it headroom.
+    let mut events = Vec::new();
+    for _ in 0..600 {
+        events.extend(session.step(500));
+    }
+
+    let splits: Vec<(Vec<String>, Vec<String>)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            TraceKind::TopologyChanged {
+                appeared, retired, ..
+            } => Some((
+                appeared.iter().map(|s| s.0.clone()).collect(),
+                retired.iter().map(|s| s.0.clone()).collect(),
+            )),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        splits.len(),
+        1,
+        "exactly one partition change, saw {splits:?}"
+    );
+    let (appeared, retired) = &splits[0];
+    assert_eq!(appeared, &["0".to_string(), "1".to_string()]);
+    assert_eq!(
+        retired,
+        &[String::new()],
+        "the root retires into its children"
+    );
+
+    // Blocks must be reported on the root before the split and on both
+    // children after it — the timeline needs all three lanes.
     let mut per_shard: BTreeMap<String, u32> = BTreeMap::new();
-    for _ in 0..40 {
-        for event in session.step(500) {
-            if let TraceKind::BlockCommitted { shard, .. } = event.kind {
-                *per_shard.entry(shard.0).or_default() += 1;
-            }
+    for event in &events {
+        if let TraceKind::BlockCommitted { shard, .. } = &event.kind {
+            *per_shard.entry(shard.0.clone()).or_default() += 1;
         }
     }
-    assert_eq!(per_shard.len(), 2, "both children commit blocks");
+    assert_eq!(
+        per_shard.len(),
+        3,
+        "root then both children, saw {per_shard:?}"
+    );
     assert!(
         per_shard.values().all(|n| *n > 3),
-        "each child runs its own chain, saw {per_shard:?}",
+        "every lane runs a real chain, saw {per_shard:?}",
     );
 }
 
