@@ -1747,8 +1747,14 @@ impl ShardCoordinator {
                     ?blocking,
                     "Substate count unavailable at proposal; deferring until the ancestor delta lands"
                 );
-                return vec![];
                 self.verification.defer_proposal_on_substate(blocking);
+                // The blocking ancestor's delta needs its state root, which
+                // needs its content. Ask for whatever is still missing now
+                // rather than on the next cleanup tick — the tick's interval
+                // is many block times, and nothing else is going to run while
+                // the proposal is parked. Idempotent and deduped in flight,
+                // so forcing a block that is merely slow costs nothing.
+                return self.check_pending_block_fetches(true);
             }
         };
         let preview = self.preview_witness_commitment(
