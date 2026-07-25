@@ -37,11 +37,12 @@ use hyperscale_crypto::{SignError, Signer, Verifier};
 use sbor::prelude::*;
 use thiserror::Error;
 
+use crate::signing::{DOMAIN_PC_EMPTY_VIEW, SpcContext};
 use crate::{
-    AggregateSignature, ConsensusPublicKey, ConsensusSignature, DOMAIN_PC_EMPTY_VIEW, Hash,
-    NetworkDefinition, PcQc3, PcValueElement, PcVector, PcVoteVerifyContext, PositionalBundle,
-    SignerBitfield, SpcContext, SpcView, ValidatorId, Verifiable, Verified, Verify,
-    byzantine_threshold, pc_context, pc_vote_signing_message, verify_qc3,
+    AggregateSignature, ConsensusPublicKey, ConsensusSignature, Hash, NetworkDefinition, PcQc3,
+    PcValueElement, PcVector, PcVoteVerifyContext, PositionalBundle, SignerBitfield, SpcView,
+    ValidatorId, Verifiable, Verified, Verify, byzantine_threshold, pc_context,
+    pc_vote_signing_message, verify_qc3,
 };
 
 /// `(view, value, proof)` — a verifiable high triple.

@@ -91,7 +91,8 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
-    use crate::signing::{DOMAIN_BLOCK_HEADER, DOMAIN_PC_VRF};
+    use crate::signing::beacon_vrf::DOMAIN_PC_VRF;
+    use crate::signing::shard::DOMAIN_BLOCK_HEADER;
     use crate::vrf_output_from_proof;
 
     fn net() -> NetworkDefinition {

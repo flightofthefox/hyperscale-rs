@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use sbor::prelude::BasicSbor;
 
+use crate::signing::DOMAIN_PC_EMPTY_VIEW;
 use crate::{
-    ConsensusSignature, DOMAIN_PC_EMPTY_VIEW, Epoch, MessageClass, NetworkDefinition,
-    NetworkMessage, Signed, SpcEmptyViewMsg, ValidatorId, Verifiable, hash_high_value,
-    pc_vote_signing_message, skip_target, spc_context,
+    ConsensusSignature, Epoch, MessageClass, NetworkDefinition, NetworkMessage, Signed,
+    SpcEmptyViewMsg, ValidatorId, Verifiable, hash_high_value, pc_vote_signing_message,
+    skip_target, spc_context,
 };
 
 /// SPC empty-view declaration sent via unicast when a participant

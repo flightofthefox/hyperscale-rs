@@ -20,12 +20,12 @@ use thiserror::Error;
 
 use crate::beacon::prefix_ops::{mce, mcp, qc1_certify};
 use crate::primitives::signer_bitfield::MAX_SIGNERS;
+use crate::signing::{DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3};
 use crate::{
-    AggregateSignature, BoundedVec, ConsensusPublicKey, ConsensusSignature, DOMAIN_PC_VOTE1,
-    DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, Epoch, MAX_PREFIX_SIGS,
-    MAX_VOTE_VECTOR_LEN, NetworkDefinition, PcContext, PositionalBundle, SignerBitfield,
-    SpcNewCommitMsg, SpcView, ValidatorId, Verifiable, Verified, Verify, byzantine_threshold,
-    pc_context, pc_vote_signing_message, spc_context,
+    AggregateSignature, BoundedVec, ConsensusPublicKey, ConsensusSignature, DOMAIN_PC_VOTE1, Epoch,
+    MAX_PREFIX_SIGS, MAX_VOTE_VECTOR_LEN, NetworkDefinition, PcContext, PositionalBundle,
+    SignerBitfield, SpcNewCommitMsg, SpcView, ValidatorId, Verifiable, Verified, Verify,
+    byzantine_threshold, pc_context, pc_vote_signing_message, spc_context,
 };
 
 // ── ValueElement and Vector ──────────────────────────────────────────────────

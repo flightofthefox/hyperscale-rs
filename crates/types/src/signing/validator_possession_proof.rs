@@ -84,7 +84,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::signing::{DOMAIN_READY_SIGNAL, DOMAIN_SHARD_REVEAL};
+    use crate::signing::ready_signal::DOMAIN_READY_SIGNAL;
+    use crate::signing::shard_reveal::DOMAIN_SHARD_REVEAL;
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()

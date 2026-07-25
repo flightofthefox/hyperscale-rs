@@ -4,11 +4,12 @@
 use hyperscale_crypto::Verifier;
 use thiserror::Error;
 
+use crate::signing::shard_reveal_verify;
 use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, Hash, ReadySignal,
     ReshapeThresholds, ReshapeTrigger, Round, ShardId, ShardWitnessPayload, StoredReceipt,
     TopologySnapshot, ValidatorId, Verified, Verify, WitnessSources, compute_merkle_root,
-    shard_reveal_verify, vrf_output_from_proof,
+    vrf_output_from_proof,
 };
 
 /// Inputs the [`BeaconWitnessRoot`] verifier reads against.

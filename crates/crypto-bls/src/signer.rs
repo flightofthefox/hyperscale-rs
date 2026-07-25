@@ -31,36 +31,12 @@ impl BlsSigner {
         }
     }
 
-    /// Load a signer from a stored 32-byte BLS scalar (production key
-    /// loading).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` when the bytes are not a valid BLS scalar.
-    pub fn from_key_bytes(bytes: &[u8]) -> Result<Self, InvalidKeyBytes> {
-        Bls12381G1PrivateKey::from_bytes(bytes)
-            .map(|key| Self { key })
-            .map_err(|()| InvalidKeyBytes)
-    }
-
     /// Wrap an already-constructed private key.
     #[must_use]
     pub const fn new(key: Bls12381G1PrivateKey) -> Self {
         Self { key }
     }
 }
-
-/// The provided bytes are not a valid BLS private-key scalar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidKeyBytes;
-
-impl std::fmt::Display for InvalidKeyBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("invalid BLS private key bytes")
-    }
-}
-
-impl std::error::Error for InvalidKeyBytes {}
 
 impl Signer for BlsSigner {
     fn public_key(&self) -> ConsensusPublicKey {

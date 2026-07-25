@@ -48,7 +48,7 @@ pub fn ratify_vote_message(
 mod tests {
     use super::*;
     use crate::Hash;
-    use crate::signing::DOMAIN_PC_VRF;
+    use crate::signing::beacon_vrf::DOMAIN_PC_VRF;
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()

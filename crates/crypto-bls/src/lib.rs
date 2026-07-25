@@ -13,6 +13,6 @@ mod signer;
 mod verifier;
 
 pub use keys::{bls_keypair_from_seed, generate_bls_keypair};
-pub use radix_common::crypto::{Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature};
-pub use signer::{BlsSigner, InvalidKeyBytes};
+pub use radix_common::crypto::{Bls12381G1PrivateKey, Bls12381G1PublicKey};
+pub use signer::BlsSigner;
 pub use verifier::BlsVerifier;

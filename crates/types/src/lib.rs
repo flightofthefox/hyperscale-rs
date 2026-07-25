@@ -69,12 +69,11 @@ pub use beacon::{
     verify_qc2, verify_qc3, verify_ratify_cert, verify_ratify_vote, verify_vote_equivocation,
     verify_vote1, verify_vote2, verify_vote3,
 };
+pub use crypto::Ed25519PrivateKey;
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
-pub use crypto::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature, verify_ed25519};
 pub use hyperscale_crypto::{
-    AGGREGATE_SIGNATURE_BYTES, AggregateError, AggregateSignature, CONSENSUS_PUBLIC_KEY_BYTES,
-    CONSENSUS_SIGNATURE_BYTES, ConsensusPublicKey, ConsensusSignature, SignError, Signer,
-    VRF_OUTPUT_BYTES, VRF_PROOF_BYTES, Verifier, VrfOutput, VrfProof,
+    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, SignError, Signer,
+    VRF_PROOF_BYTES, Verifier, VrfOutput, VrfProof,
 };
 pub use network::{
     GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,
@@ -152,20 +151,14 @@ pub use shard::{
     VerifiedBlockAssembleError, WitnessSources, shared_transactions_from_raw,
 };
 pub use signing::{
-    DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,
-    DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1,
-    DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, DOMAIN_PC_VRF, DOMAIN_RATIFY_VOTE,
-    DOMAIN_READY_SIGNAL, DOMAIN_SHARD_REVEAL, DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW,
-    DOMAIN_STATE_PROVISION_BATCH, DOMAIN_TIMEOUT, DOMAIN_VALIDATOR_ADDRESS, DOMAIN_VALIDATOR_BIND,
-    DOMAIN_VALIDATOR_POSSESSION_PROOF, PcContext, SpcContext, VALIDATOR_BIND_NONCE_LEN,
-    block_header_message, block_vote_message, certified_block_header_message,
-    exec_cert_batch_message, exec_vote_batch_message, exec_vote_message, pc_context,
-    pc_vote_signing_message, ratify_vote_message, ready_signal_message, shard_reveal_message,
-    shard_reveal_sign, shard_reveal_verify, spc_context, spc_relay_signing_message,
-    state_provisions_message, timeout_message, validator_address_message, validator_bind_message,
-    validator_possession_proof_message, validator_possession_proof_sign,
-    validator_possession_proof_verify, vrf_output_from_proof, vrf_reveal_message, vrf_sign,
-    vrf_verify,
+    DOMAIN_PC_VOTE1, DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW, PcContext,
+    VALIDATOR_BIND_NONCE_LEN, block_header_message, block_vote_message,
+    certified_block_header_message, exec_cert_batch_message, exec_vote_batch_message,
+    exec_vote_message, pc_context, pc_vote_signing_message, ratify_vote_message,
+    ready_signal_message, shard_reveal_sign, spc_context, spc_relay_signing_message,
+    state_provisions_message, validator_address_message, validator_bind_message,
+    validator_possession_proof_sign, validator_possession_proof_verify, vrf_output_from_proof,
+    vrf_sign, vrf_verify,
 };
 pub use state_key::{MAX_STATE_ENTRY_KEY_LEN, MAX_STATE_ENTRY_VALUE_LEN};
 pub use time::epoch_windows::EpochWindows;

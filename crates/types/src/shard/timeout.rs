@@ -14,9 +14,10 @@
 use hyperscale_crypto::{SignError, Signer, Verifier};
 use thiserror::Error;
 
+use crate::signing::timeout_message;
 use crate::{
     ConsensusPublicKey, ConsensusSignature, NetworkDefinition, QuorumCertificate, Round, ShardId,
-    ValidatorId, Verified, Verify, timeout_message,
+    ValidatorId, Verified, Verify,
 };
 
 /// A validator's timeout for a shard consensus round.

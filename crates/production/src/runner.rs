@@ -77,12 +77,6 @@ use crate::supervisor::{ShardCommand, ShardSupervisor, StorageDirResolver, Stora
 /// Errors from the production runner.
 #[derive(Debug, Error)]
 pub enum RunnerError {
-    /// The event channel into the pinned thread was closed.
-    #[error("Event channel closed")]
-    ChannelClosed,
-    /// A pending request was dropped before completion.
-    #[error("Request dropped")]
-    RequestDropped,
     /// Catch-all setup or send failure (e.g. missing builder field).
     #[error("Send error: {0}")]
     SendError(String),

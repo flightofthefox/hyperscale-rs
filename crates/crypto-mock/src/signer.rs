@@ -4,13 +4,13 @@ use hyperscale_crypto::{ConsensusPublicKey, ConsensusSignature, SignError, Signe
 
 use crate::derive;
 
-/// A validator's mock signing identity: the 32-byte seed is the private
-/// key.
+/// A validator's mock signing identity, derived from a 32-byte seed.
 ///
-/// Stateless and infallible, like BLS. Signatures are deterministic in
+/// Only the public key is retained: the scheme recomputes signatures
+/// from it, so it doubles as the signing secret. Stateless and
+/// infallible, like BLS. Signatures are deterministic in
 /// `(key, message)`, which is what lets [`Signer::vrf_sign`] reuse the
 /// plain signing core.
-#[derive(Clone)]
 pub struct MockSigner {
     pk: ConsensusPublicKey,
 }

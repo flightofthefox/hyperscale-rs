@@ -50,26 +50,17 @@ pub use beacon_pc::{
     DOMAIN_PC_VOTE3, DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW, PcContext, SpcContext, pc_context,
     pc_vote_signing_message, spc_context, spc_relay_signing_message,
 };
-pub use beacon_ratify::{DOMAIN_RATIFY_VOTE, ratify_vote_message};
-pub use beacon_vrf::{
-    DOMAIN_PC_VRF, vrf_output_from_proof, vrf_reveal_message, vrf_sign, vrf_verify,
-};
-pub use execution::{
-    DOMAIN_EXEC_CERT_BATCH, DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, exec_cert_batch_message,
-    exec_vote_batch_message, exec_vote_message,
-};
-pub use provisions::{DOMAIN_STATE_PROVISION_BATCH, state_provisions_message};
-pub use ready_signal::{DOMAIN_READY_SIGNAL, ready_signal_message};
+pub use beacon_ratify::ratify_vote_message;
+pub use beacon_vrf::{vrf_output_from_proof, vrf_sign, vrf_verify};
+pub use execution::{exec_cert_batch_message, exec_vote_batch_message, exec_vote_message};
+pub use provisions::state_provisions_message;
+pub use ready_signal::ready_signal_message;
 pub use shard::{
-    DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_TIMEOUT,
     block_header_message, block_vote_message, certified_block_header_message, timeout_message,
 };
-pub use shard_reveal::{
-    DOMAIN_SHARD_REVEAL, shard_reveal_message, shard_reveal_sign, shard_reveal_verify,
-};
-pub use validator_address::{DOMAIN_VALIDATOR_ADDRESS, validator_address_message};
-pub use validator_bind::{DOMAIN_VALIDATOR_BIND, VALIDATOR_BIND_NONCE_LEN, validator_bind_message};
+pub use shard_reveal::{shard_reveal_sign, shard_reveal_verify};
+pub use validator_address::validator_address_message;
+pub use validator_bind::{VALIDATOR_BIND_NONCE_LEN, validator_bind_message};
 pub use validator_possession_proof::{
-    DOMAIN_VALIDATOR_POSSESSION_PROOF, validator_possession_proof_message,
     validator_possession_proof_sign, validator_possession_proof_verify,
 };
