@@ -146,14 +146,13 @@ pub struct TopologySnapshot {
     /// reshape orchestrator can discover and seat the parent halves from the
     /// committed view rather than a one-shot placement delta.
     reshape_parent_halves: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
-    /// Shards with an admitted, not-yet-executed split as of this
-    /// window's committee freeze. Frozen with the same discipline as
-    /// `witness_bases`, so both writes of a window's schedule entry
-    /// carry the same set — [`TopologySchedule::split_at_next_boundary`]
-    /// reads it to tell "no split lands at this window's end" apart from
-    /// "the next window's entry isn't committed locally yet".
-    ///
-    /// [`TopologySchedule::split_at_next_boundary`]: crate::TopologySchedule::split_at_next_boundary
+    /// Shards with an admitted, not-yet-applied split as of this window's
+    /// committee freeze. Frozen with the same discipline as
+    /// `witness_bases`, so both writes of a window's schedule entry carry
+    /// the same set. Distinguishes which reshape a scheduled cut belongs
+    /// to — a terminating shard splits into its children if this holds
+    /// and merges into its parent otherwise — and marks the shards whose
+    /// settled-waves window is fenced open.
     split_pending: BTreeSet<ShardId>,
     /// Each terminating leaf's scheduled final window as of this window's
     /// committee freeze — a split's parent, or both of a merge's
@@ -590,10 +589,14 @@ impl TopologySnapshot {
             .copied()
     }
 
-    /// Whether `shard` had an admitted, not-yet-executed split as of this
-    /// window's committee freeze — i.e. whether the trie *might* replace
-    /// it with its children at the end of this window. `false` is
-    /// definitive: no split can land at this window's boundary.
+    /// Whether `shard` had an admitted, not-yet-applied split as of this
+    /// window's committee freeze.
+    ///
+    /// Which reshape a shard is terminating into, not whether it is:
+    /// [`scheduled_terminal`](Self::scheduled_terminal) answers that. A
+    /// shard whose cut falls at this window's end splits into its
+    /// children when this holds, and merges into its parent when it does
+    /// not.
     #[must_use]
     pub fn split_pending(&self, shard: ShardId) -> bool {
         self.split_pending.contains(&shard)

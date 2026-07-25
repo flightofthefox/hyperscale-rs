@@ -1038,7 +1038,17 @@ mod tests {
             })
             .collect();
         let effects = apply_witness_chunk(&mut state, 0, ready_leaves);
-        assert!(state.pending_reshapes.is_empty(), "the gate must fire");
+        assert!(
+            state.pending_reshapes[&p].scheduled_terminal().is_some(),
+            "the gate must fire"
+        );
+        assert!(effects.observers_released.is_empty());
+
+        // The cut lands at the next fold: the record clears and the
+        // children ride that fold's lookahead. The seats were consumed
+        // there, not released.
+        let effects = apply_witness_chunk(&mut state, 0, Vec::new());
+        assert!(state.pending_reshapes.is_empty(), "the cut must apply");
         assert!(effects.observers_released.is_empty());
         let (left, right) = p.children();
         assert!(effects.shard_committee_transitions.contains_key(&left));
@@ -1093,8 +1103,9 @@ mod tests {
         let consensus_during_grow = state.shard_consensus_members.clone();
 
         // The next epoch folds every observer's ReshapeReady; the gate
-        // fires inside the same apply and the children ride this
-        // fold's lookahead.
+        // fires inside that apply and schedules the cut a window out.
+        // The fold at the cut is the one whose lookahead carries the
+        // children.
         let ready_leaves: Vec<ShardWitnessPayload> = cohort_of(&state, p)
             .iter()
             .map(|(v, seat)| ShardWitnessPayload::ReshapeReady {
@@ -1103,6 +1114,8 @@ mod tests {
             })
             .collect();
         apply_witness_chunk(&mut state, 0, ready_leaves);
+        assert!(state.pending_reshapes[&p].scheduled_terminal().is_some());
+        apply_witness_chunk(&mut state, 0, Vec::new());
         assert!(state.pending_reshapes.is_empty());
 
         let active = state.derive_topology_snapshot(net());
