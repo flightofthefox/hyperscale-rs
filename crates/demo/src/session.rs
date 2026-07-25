@@ -89,6 +89,16 @@ pub struct Session {
     reported_through: BTreeMap<ShardId, BlockHeight>,
     /// The partition as last reported, so a step emits only changes.
     reported_shards: Vec<ShardId>,
+    /// Highest beacon epoch already reported.
+    reported_epoch: Option<u64>,
+    /// Highest canonical weighted timestamp any shard has reported.
+    ///
+    /// Derived events — a transaction's status, a partition change — are
+    /// observations *of* committed chain content, so they are stamped here
+    /// rather than on the session's own clock. Mixing the two would put a
+    /// derived event ahead of the blocks it was derived from, because
+    /// attested time necessarily trails the clock the harness is stepping.
+    attested_wt: u64,
     /// Submitted transactions and the last status reported for each, so a
     /// step emits only transitions.
     tracked: BTreeMap<TxHash, Option<TransactionStatus>>,
@@ -144,6 +154,8 @@ impl Session {
             runner,
             now: Duration::ZERO,
             reported_shards: opening,
+            reported_epoch: None,
+            attested_wt: 0,
             reported_through: BTreeMap::new(),
             tracked: BTreeMap::new(),
             pending: Vec::new(),
@@ -181,8 +193,8 @@ impl Session {
         );
         self.nonce += 1;
         self.tracked.insert(hash, None);
-        let wt = u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX);
-        self.pending.push(TraceEvent::tx_submitted(wt, hash));
+        self.pending
+            .push(TraceEvent::tx_submitted(self.attested_wt, hash));
         hash
     }
 
@@ -195,14 +207,36 @@ impl Session {
         self.runner.reshape_step();
         self.now += Duration::from_millis(ms);
         self.runner.run_until(self.now);
-        let mut events = std::mem::take(&mut self.pending);
+        // Blocks first: they carry attested time, and everything else is
+        // stamped against the frontier they establish.
+        let mut events = self.drain_committed();
+        events.extend(std::mem::take(&mut self.pending));
+        events.extend(self.drain_beacon());
         events.extend(self.drain_topology());
-        events.extend(self.drain_committed());
         events.extend(self.drain_tx_status());
         // One batch, one timeline: the viewer renders in weighted-time order
         // regardless of which derivation produced an event.
         events.sort_by_key(|event| event.wt);
         events
+    }
+
+    /// Report each beacon epoch committed since the last step.
+    fn drain_beacon(&mut self) -> Vec<TraceEvent> {
+        let Some(latest) = (0..self.runner.num_hosts())
+            .find_map(|host| self.runner.beacon_storage(host))
+            .and_then(|storage| storage.latest_committed_epoch())
+        else {
+            return Vec::new();
+        };
+        let latest = latest.inner();
+        let from = self.reported_epoch.map_or(0, |e| e + 1);
+        self.reported_epoch = Some(latest);
+        // An epoch's own time is its wall-clock pacing: the beacon refuses to
+        // start an epoch before `epoch × epoch_duration_ms`, so that product
+        // is the instant it belongs at on the timeline.
+        (from..=latest)
+            .map(|epoch| TraceEvent::beacon_block(epoch * EPOCH_MS, epoch))
+            .collect()
     }
 
     /// Report a partition change, if the trie's leaves moved this step.
@@ -222,8 +256,7 @@ impl Session {
             .filter(|s| !current.contains(s))
             .copied()
             .collect();
-        let wt = u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX);
-        let event = TraceEvent::topology_changed(wt, &current, appeared, retired);
+        let event = TraceEvent::topology_changed(self.attested_wt, &current, appeared, retired);
         self.reported_shards = current;
         vec![event]
     }
@@ -234,7 +267,7 @@ impl Session {
     /// content, so reading it back is an observation, not a hook into the
     /// path that produces it.
     fn drain_tx_status(&mut self) -> Vec<TraceEvent> {
-        let wt = u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX);
+        let wt = self.attested_wt;
         let mut events = Vec::new();
         for (hash, last) in &mut self.tracked {
             let current = self.runner.tx_status(0, hash);
@@ -282,6 +315,7 @@ impl Session {
     fn drain_committed(&mut self) -> Vec<TraceEvent> {
         let mut events = Vec::new();
         let mut watermarks: Vec<(ShardId, BlockHeight)> = Vec::new();
+        let mut frontier = self.attested_wt;
 
         for shard in self.live_shards() {
             // Hosts of one shard agree on committed content, so the first
@@ -317,13 +351,15 @@ impl Session {
                     break;
                 };
                 let header = header.as_ref().header();
+                let wt = child
+                    .as_ref()
+                    .header()
+                    .parent_qc()
+                    .weighted_timestamp()
+                    .as_millis();
+                frontier = frontier.max(wt);
                 events.push(TraceEvent::block_committed(
-                    child
-                        .as_ref()
-                        .header()
-                        .parent_qc()
-                        .weighted_timestamp()
-                        .as_millis(),
+                    wt,
                     shard,
                     header.height(),
                     header.round(),
@@ -338,6 +374,7 @@ impl Session {
         for (shard, height) in watermarks {
             self.reported_through.insert(shard, height);
         }
+        self.attested_wt = self.attested_wt.max(frontier);
         events.sort_by_key(|event| event.wt);
         events
     }

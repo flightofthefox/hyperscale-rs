@@ -64,6 +64,11 @@ pub enum TraceKind {
         /// zero until the topology has more than one shard.
         cross_shard_waves: u32,
     },
+    /// The beacon committed an epoch. One block per epoch, wall-clock paced,
+    /// carrying no transactions: it decides validator set and topology, and
+    /// every shard resolves its committee from the schedule this produces.
+    #[serde(rename_all = "camelCase")]
+    BeaconBlockCommitted { epoch: u64 },
     /// The keyspace partition changed — a split seated its children, or a
     /// merge composed its parent. Carries the whole new partition rather
     /// than a delta so a viewer that joined late still renders correctly.
@@ -126,6 +131,13 @@ impl TraceEvent {
                 proposer,
                 cross_shard_waves,
             },
+        }
+    }
+
+    pub(crate) const fn beacon_block(wt: u64, epoch: u64) -> Self {
+        Self {
+            wt,
+            kind: TraceKind::BeaconBlockCommitted { epoch },
         }
     }
 
