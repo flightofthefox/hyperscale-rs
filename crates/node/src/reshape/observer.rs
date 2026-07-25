@@ -25,9 +25,9 @@
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
-    BlockHash, BlockHeight, NetworkDefinition, ReadySignal, ShardAnchor, ShardId, SignError,
-    Signer, StateRoot, StoredReceipt, ValidatorId, WeightedTimestamp, ready_signal_message,
-    ready_signal_window, shard_prefix_path,
+    Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, NetworkDefinition, ReadySignal,
+    ShardAnchor, ShardId, SignError, Signer, StateRoot, StoredReceipt, ValidatorId,
+    WeightedTimestamp, ready_signal_message, ready_signal_window, shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
@@ -242,7 +242,8 @@ pub enum TailOutcome {
     Rejected(&'static str),
 }
 
-/// The parent's terminal block, recognised by a follower as it passes.
+/// The parent's terminal block, recognised by a follower as it passes,
+/// with the child genesis derived from it.
 ///
 /// A block `B` is the terminal crossing when its parent QC sits at or
 /// before the cut and the QC certifying `B` sits past it. The certifying
@@ -250,7 +251,14 @@ pub enum TailOutcome {
 /// `B`'s committed child, the next block the follow accepts — never the
 /// QC served alongside `B`, which may be a higher-round re-certification
 /// from the parent's coast and stamps a different weighted timestamp.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The genesis is derived from `B` alone: its `split_child_roots` pair
+/// verified to compose to its own committed `state_root`, so a parent
+/// cannot name a child subtree its terminal root doesn't contain, and
+/// the canonical timestamp as the child clock's start anchor. That is
+/// the same derivation the beacon fold performs an epoch later when it
+/// seeds the child's anchor.
+#[derive(Debug, Clone)]
 pub struct TerminalSighting {
     /// Height of the terminal block.
     pub height: BlockHeight,
@@ -259,6 +267,49 @@ pub struct TerminalSighting {
     /// The canonical weighted timestamp certifying it — the child clock's
     /// start anchor.
     pub canonical_wt: WeightedTimestamp,
+    /// The derived child genesis, absent when the terminal carried no
+    /// `split_child_roots` pair or one that fails to compose to its own
+    /// state root.
+    pub genesis: Option<DerivedGenesis>,
+}
+
+/// A child genesis derived locally from the parent's terminal block.
+#[derive(Debug, Clone)]
+pub struct DerivedGenesis {
+    /// The genesis block the child adopts.
+    pub block: Block,
+    /// The chain origin it starts from.
+    pub origin: ChainOrigin,
+}
+
+/// Derive `child`'s genesis from the parent's terminal header.
+///
+/// `None` when the terminal carries no `split_child_roots` pair, or one
+/// that does not compose to the terminal's own committed `state_root` —
+/// collision resistance makes the composition check enough on its own,
+/// so a parent cannot name a child subtree its terminal root doesn't
+/// contain.
+fn derive_child_genesis(
+    child: ShardId,
+    terminal: &BlockHeader,
+    canonical_wt: WeightedTimestamp,
+) -> Option<DerivedGenesis> {
+    let pair = terminal.split_child_roots()?;
+    if !pair.composes_to(terminal.state_root()) {
+        return None;
+    }
+    let child_root = if child.path() & 1 == 0 {
+        pair.left
+    } else {
+        pair.right
+    };
+    Some(DerivedGenesis {
+        block: Block::split_child_genesis(child, child_root, terminal, canonical_wt),
+        origin: ChainOrigin {
+            genesis_height: terminal.height().next(),
+            anchor_wt: canonical_wt,
+        },
+    })
 }
 
 /// Sans-io tail-follower keeping an observer's synced child store
@@ -292,10 +343,11 @@ pub struct ObserverTail {
     /// The parent's scheduled cut, once the beacon has published one.
     /// `None` while the split is admitted but unscheduled.
     terminal_cut: Option<WeightedTimestamp>,
-    /// The previously accepted block, as `(height, hash, its parent QC's
-    /// weighted timestamp)`. The crossing test for a block needs the QC
-    /// that certifies it, which only arrives with the next block.
-    prev: Option<(BlockHeight, BlockHash, WeightedTimestamp)>,
+    /// The previously accepted block's header. The crossing test for a
+    /// block needs the QC that certifies it, which only arrives with the
+    /// next block — and the genesis derivation needs the terminal header
+    /// itself, so the follow keeps one block of history.
+    prev: Option<BlockHeader>,
     /// The terminal block, once the follow has walked past it.
     terminal: Option<TerminalSighting>,
     /// The store's root after the last application (the imported root
@@ -349,8 +401,8 @@ impl ObserverTail {
     /// The parent's terminal block, once the follow has walked one block
     /// past it. `None` until then.
     #[must_use]
-    pub const fn terminal(&self) -> Option<TerminalSighting> {
-        self.terminal
+    pub const fn terminal(&self) -> Option<&TerminalSighting> {
+        self.terminal.as_ref()
     }
 
     /// The next block fetch, when none is outstanding and nothing is
@@ -405,17 +457,18 @@ impl ObserverTail {
         let parent_qc_wt = header.parent_qc().weighted_timestamp();
         if let Some(cut) = self.terminal_cut
             && self.terminal.is_none()
-            && let Some((height, hash, prev_parent_qc_wt)) = self.prev
-            && prev_parent_qc_wt.as_millis() <= cut.as_millis()
+            && let Some(terminal) = &self.prev
+            && terminal.parent_qc().weighted_timestamp().as_millis() <= cut.as_millis()
             && parent_qc_wt.as_millis() > cut.as_millis()
         {
             self.terminal = Some(TerminalSighting {
-                height,
-                hash,
+                height: terminal.height(),
+                hash: terminal.hash(),
                 canonical_wt: parent_qc_wt,
+                genesis: derive_child_genesis(self.child, terminal, parent_qc_wt),
             });
         }
-        self.prev = Some((header.height(), certified.block().hash(), parent_qc_wt));
+        self.prev = Some(header.clone());
 
         self.pending = Some(PendingFollow {
             height: header.height(),

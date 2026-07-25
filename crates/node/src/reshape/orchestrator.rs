@@ -31,7 +31,7 @@ use hyperscale_types::{
 
 use crate::bootstrap::{BootstrapRequest, ShardBootstrap, StateRangeOutcome};
 use crate::reshape::merge_flip::merge_genesis_from_terminals;
-use crate::reshape::observer::{ObserverBootstrap, ObserverTail};
+use crate::reshape::observer::{ObserverBootstrap, ObserverTail, TerminalSighting};
 use crate::reshape::split_flip::split_genesis_from_terminal;
 use crate::reshape::view::ReshapeView;
 
@@ -842,6 +842,7 @@ impl ReshapeOrchestrator {
                 if let Some(anchor) = child_anchor
                     && tail.next_height() >= anchor.height
                 {
+                    compare_derived_genesis(child, tail.terminal(), anchor);
                     duty.phase = ObserverPhase::FetchingTerminal {
                         anchor,
                         requested: false,
@@ -1180,6 +1181,50 @@ impl ReshapeOrchestrator {
 }
 
 /// A ready signal's recipients — `shard`'s committee minus the signer.
+/// Check a locally derived child genesis against the beacon's anchor for
+/// the same child, once that anchor lands.
+///
+/// The two are computed from the same terminal block by different parties
+/// — the follower from the chain it tailed, the beacon fold from the
+/// terminal contribution it committed — so they must agree byte for byte.
+/// A disagreement means the local parent chain and the network disagree
+/// about a committed block. Reported only; the flip still adopts against
+/// the anchor, so the derivation is proven across real runs before
+/// anything depends on it.
+fn compare_derived_genesis(
+    child: ShardId,
+    sighting: Option<&TerminalSighting>,
+    anchor: ShardAnchor,
+) {
+    let Some(sighting) = sighting else {
+        tracing::debug!(
+            ?child,
+            "child anchor seeded before the follow recognised the parent's terminal"
+        );
+        return;
+    };
+    let Some(derived) = &sighting.genesis else {
+        tracing::warn!(
+            ?child,
+            terminal_height = sighting.height.inner(),
+            "the parent's terminal carried no composable split child roots"
+        );
+        return;
+    };
+    let derived_hash = derived.block.hash();
+    if derived_hash == anchor.block_hash {
+        tracing::debug!(?child, "derived child genesis matches the beacon anchor");
+    } else {
+        tracing::error!(
+            ?child,
+            ?derived_hash,
+            anchored = ?anchor.block_hash,
+            terminal_height = sighting.height.inner(),
+            "derived child genesis disagrees with the beacon anchor"
+        );
+    }
+}
+
 fn recipients_for(view: &ReshapeView, shard: ShardId, validator: ValidatorId) -> Vec<ValidatorId> {
     view.committee(shard)
         .iter()
