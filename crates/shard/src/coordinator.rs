@@ -1748,6 +1748,7 @@ impl ShardCoordinator {
                     "Substate count unavailable at proposal; deferring until the ancestor delta lands"
                 );
                 return vec![];
+                self.verification.defer_proposal_on_substate(blocking);
             }
         };
         let preview = self.preview_witness_commitment(
@@ -3631,6 +3632,7 @@ impl ShardCoordinator {
         let mut actions = Vec::new();
         if block_height > self.substate_bytes_frontier.0 {
             self.substate_bytes_frontier = (block_height, substate_bytes);
+            self.verification.release_substate_park_on_reconcile();
             if topology_schedule.reshape_thresholds() != ReshapeThresholds::DISABLED {
                 for parent in self.verification.deferred_beacon_witness_parents() {
                     actions.extend(self.retry_deferred_beacon_witness(topology_schedule, parent));
@@ -5684,7 +5686,7 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BoundedVec, CertificateRoot,
         ConsensusSignature, Epoch, Hash, InFlightCount, LocalReceiptRoot, MAX_TIMESTAMP_DELAY,
-        MAX_TIMESTAMP_RUSH, NetworkDefinition, ProvisionsRoot, RETENTION_HORIZON,
+        MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, ProvisionsRoot, RETENTION_HORIZON,
         RoutableTransaction, ShardId, Signer, SignerBitfield, TopologySchedule, TopologySnapshot,
         TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
         WitnessSources, test_utils,
@@ -7755,6 +7757,69 @@ mod tests {
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
             ),
             "third try_propose should dispatch the BuildProposal"
+        );
+    }
+
+    /// A proposal whose reshape substate walk cannot resolve must park and
+    /// resume the moment the walk's inputs land — here a byte frontier
+    /// lagging the committed tip, reconciled from storage on persistence.
+    /// Nothing else re-drives it: the parked height is the one whose QC
+    /// would advance the chain, so no commit, QC, or admission follows to
+    /// latch a retry, and the round would otherwise burn its full
+    /// view-change timeout on a fallback.
+    #[test]
+    fn substate_walk_park_resumes_the_proposal_when_the_frontier_reconciles() {
+        let (mut state, _) = make_test_state();
+        // The walk is inert with reshaping disabled, so arm the thresholds.
+        let snapshot = TopologySchedule::single(Arc::new(
+            make_test_state()
+                .1
+                .head()
+                .as_ref()
+                .clone()
+                .with_params(NetworkParams {
+                    reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
+                    ..NetworkParams::default()
+                }),
+        ));
+        state.set_time(LocalTimestamp::from_millis(100_000));
+
+        // Rounds increase per block, so (h=4, r=4) puts ValidatorId(0) — the
+        // local validator — in the proposer slot.
+        let parent_block_hash = BlockHash::from_raw(Hash::from_bytes(b"lagging_frontier"));
+        state.committed_height = BlockHeight::new(3);
+        state.committed_hash = parent_block_hash;
+        state.latest_qc = Some(make_test_qc(parent_block_hash, BlockHeight::new(3)));
+        state.view_change.view = Round::new(4);
+        // The frontier still sits at genesis while the chain committed to 3 —
+        // the sync-commit shape, whose commits carry no byte delta.
+        assert_ne!(state.substate_bytes_frontier.0, state.committed_height);
+
+        let first = state.try_propose(&snapshot, &[], vec![], vec![]);
+        assert!(
+            first
+                .iter()
+                .all(|a| !matches!(a, Action::BuildProposal { .. })),
+            "an unresolvable substate walk must park, not dispatch"
+        );
+        assert!(
+            !state.take_ready_proposal(),
+            "parking alone must not latch a retry"
+        );
+
+        // Persistence reconciles the frontier from storage.
+        let _ = state.on_block_persisted(&snapshot, BlockHeight::new(3), 4_096);
+        assert!(
+            state.take_ready_proposal(),
+            "the reconcile must latch a proposal retry"
+        );
+
+        let second = state.try_propose(&snapshot, &[], vec![], vec![]);
+        assert!(
+            second.iter().any(
+                |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
+            ),
+            "the retry must dispatch the BuildProposal the park was holding"
         );
     }
 

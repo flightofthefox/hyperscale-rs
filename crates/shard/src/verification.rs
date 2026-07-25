@@ -281,6 +281,18 @@ pub struct VerificationPipeline {
     /// committed between deferral and dispatch.
     deferred_proposal: Option<(BlockHash, BlockHeight)>,
 
+    /// Ancestor whose substate byte delta a deferred proposal is parked on.
+    ///
+    /// The reshape load predicate sums per-block deltas along the pending
+    /// chain behind the proposal parent, and a block whose state root has
+    /// not verified locally yet contributes none, so the build defers.
+    /// Nothing else re-drives it: the parked height is the one whose QC
+    /// would commit that ancestor, so no commit, QC, or admission follows
+    /// to latch a retry and the round runs out its view-change timeout
+    /// instead. Released when the delta lands, when the ancestor commits,
+    /// or when the byte frontier reconciles from storage.
+    deferred_substate_ancestor: Option<BlockHash>,
+
     /// Highest persisted height — parent trees at or below this height
     /// are readable from disk, so child verifications for blocks beyond
     /// this height must defer until either parent persists, parent is
@@ -364,6 +376,7 @@ impl VerificationPipeline {
             state_roots: HashMap::new(),
             deferred_state_root_verifications: HashMap::new(),
             deferred_proposal: None,
+            deferred_substate_ancestor: None,
             ready_state_root_verifications: Vec::new(),
             proposal_unblocked: false,
             last_persisted_height: persisted_height,
@@ -1075,6 +1088,9 @@ impl VerificationPipeline {
 
             // Unblock deferred proposal if it was waiting for this parent.
             self.try_unblock_proposal(block_hash);
+            // A verified state root also supplies the block's substate byte
+            // delta, which a proposal's reshape predicate may be parked on.
+            self.release_substate_park(block_hash);
         } else {
             self.state_roots.remove(&block_hash);
             warn!(block_hash = ?block_hash, "State root verification FAILED");
@@ -1839,7 +1855,14 @@ impl VerificationPipeline {
     /// Returns `true` once, then resets. Caller re-enters `try_propose` with
     /// fresh transaction selection.
     pub fn take_ready_proposal(&mut self) -> bool {
-        std::mem::take(&mut self.proposal_unblocked)
+        let ready = std::mem::take(&mut self.proposal_unblocked);
+        if ready {
+            // The re-entry re-runs the substate walk from the committed tip
+            // and parks again on whatever is still outstanding, so any
+            // existing park is stale.
+            self.deferred_substate_ancestor = None;
+        }
+        ready
     }
 
     /// Latch a proposal-retry attempt for after the current dispatch.
@@ -1883,6 +1906,40 @@ impl VerificationPipeline {
         if matches!(&self.deferred_proposal, Some((parent, _)) if *parent == unblocked_hash) {
             self.deferred_proposal.take();
             debug!(parent_block_hash = ?unblocked_hash, "Unblocking deferred proposal");
+            self.proposal_unblocked = true;
+        }
+    }
+
+    /// Record that a proposal is parked on `ancestor`'s substate byte delta.
+    /// Replaces any prior park: a released walk re-runs from the committed
+    /// tip and blocks on whichever ancestor is still outstanding, which may
+    /// be an earlier one than last time.
+    pub fn defer_proposal_on_substate(&mut self, ancestor: BlockHash) {
+        debug!(
+            ancestor = ?ancestor,
+            "Parking proposal — substate byte delta outstanding"
+        );
+        self.deferred_substate_ancestor = Some(ancestor);
+    }
+
+    /// `block_hash`'s substate byte delta is now resolvable — its state root
+    /// verified, or it committed. Release a proposal parked on it.
+    fn release_substate_park(&mut self, block_hash: BlockHash) {
+        if self.deferred_substate_ancestor == Some(block_hash) {
+            self.deferred_substate_ancestor = None;
+            debug!(ancestor = ?block_hash, "Unparking proposal — substate delta landed");
+            self.proposal_unblocked = true;
+        }
+    }
+
+    /// The substate byte frontier reconciled from storage. Releases the park
+    /// unconditionally: a walk blocked on a frontier lagging the committed
+    /// tip names that tip, not a block whose delta this could be matched
+    /// against. Sync commits carry no delta, so this is the only edge that
+    /// resolves a proposal parked behind one.
+    pub fn release_substate_park_on_reconcile(&mut self) {
+        if self.deferred_substate_ancestor.take().is_some() {
+            debug!("Unparking proposal — substate frontier reconciled");
             self.proposal_unblocked = true;
         }
     }
@@ -1972,6 +2029,10 @@ impl VerificationPipeline {
         }
 
         self.try_unblock_proposal(block_hash);
+        // A sync-admitted block is never locally executed, so no delta can
+        // land for it; its commit reconciles the frontier from storage
+        // instead, which is the only edge that resolves a walk parked there.
+        self.release_substate_park(block_hash);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -2692,6 +2753,77 @@ mod tests {
                 Verified::<StateRoot>::new_unchecked_for_test(StateRoot::ZERO),
             )
             .is_none()
+        );
+    }
+
+    // ─── substate-walk proposal park ────────────────────────────────────
+
+    /// A proposal parked on an ancestor's substate byte delta resumes when
+    /// that block's state root verifies. Nothing else re-drives it: the
+    /// parked height is the one whose QC would commit the ancestor, so
+    /// without this edge the round runs out its view-change timeout.
+    #[test]
+    fn substate_park_releases_when_the_ancestor_state_root_verifies() {
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let ancestor = bh(b"outstanding-delta");
+
+        vp.defer_proposal_on_substate(ancestor);
+        assert!(
+            !vp.take_ready_proposal(),
+            "parking alone must not latch a retry"
+        );
+
+        vp.on_state_root_verified(bh(b"some-other-block"), true);
+        assert!(
+            !vp.take_ready_proposal(),
+            "an unrelated state root leaves the park in place"
+        );
+
+        vp.on_state_root_verified(ancestor, true);
+        assert!(
+            vp.take_ready_proposal(),
+            "the parked ancestor's delta must latch a retry"
+        );
+        assert!(
+            !vp.take_ready_proposal(),
+            "the latch is consumed once, and the park with it"
+        );
+    }
+
+    /// A sync-admitted ancestor is never executed locally, so no delta can
+    /// land for it — its commit is the release.
+    #[test]
+    fn substate_park_releases_when_the_ancestor_commits() {
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let ancestor = bh(b"sync-admitted");
+
+        vp.defer_proposal_on_substate(ancestor);
+        vp.on_block_committed(ancestor);
+
+        assert!(
+            vp.take_ready_proposal(),
+            "committing the parked ancestor must latch a retry"
+        );
+    }
+
+    /// A walk blocked on a frontier lagging the committed tip names that
+    /// tip, not a block whose delta could be matched — the storage
+    /// reconcile releases the park unconditionally.
+    #[test]
+    fn substate_park_releases_when_the_frontier_reconciles() {
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+
+        vp.release_substate_park_on_reconcile();
+        assert!(
+            !vp.take_ready_proposal(),
+            "a reconcile with nothing parked latches nothing"
+        );
+
+        vp.defer_proposal_on_substate(bh(b"lagging-frontier-tip"));
+        vp.release_substate_park_on_reconcile();
+        assert!(
+            vp.take_ready_proposal(),
+            "the reconcile must latch a retry for the parked proposal"
         );
     }
 }
