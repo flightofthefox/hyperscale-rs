@@ -512,7 +512,7 @@ where
     // buckets in parallel. Below it, fall through to the sequential
     // cursor walk — avoiding both the offset pre-pass and rayon spawn
     // overhead on small subtrees.
-    #[cfg(feature = "parallel")]
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
     if claims.len() >= 32 {
         use rayon::prelude::*;
 
@@ -577,7 +577,7 @@ where
 }
 
 /// Count the siblings a non-empty subtree consumes when verified.
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 fn siblings_needed<const ARITY_BITS: u8>(claims: &[ProofClaim], depth: u16) -> usize {
     debug_assert!(!claims.is_empty());
     if claims.iter().all(|c| c.depth_bits == depth) {

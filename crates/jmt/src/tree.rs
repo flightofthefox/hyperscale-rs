@@ -362,7 +362,9 @@ where
     result
 }
 
-#[cfg(feature = "parallel")]
+// wasm32 has no threads for rayon to spawn onto, so the parallel bucket
+// recursion is compiled out there and the sequential walk always runs.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 type BucketResult = Result<(u8, Option<Node>, TreeUpdateBatch), UpdateError>;
 
 /// Update an existing internal node against a batch of sorted kvs.
@@ -427,7 +429,7 @@ where
     // walk buckets in place against `batch` directly with a single shared
     // path buffer (truncate + push_bits) instead of cloning `parent_path`
     // per bucket.
-    #[cfg(feature = "parallel")]
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
     let updated: Vec<(u8, Option<Node>)> = if kvs.len() >= 4096 {
         use rayon::prelude::*;
 
@@ -466,7 +468,7 @@ where
             .collect::<Result<Vec<_>, _>>()?
     };
 
-    #[cfg(not(feature = "parallel"))]
+    #[cfg(any(not(feature = "parallel"), target_arch = "wasm32"))]
     let updated: Vec<(u8, Option<Node>)> = {
         let mut path_buf = parent_path.clone();
         let base_bits = path_buf.len();
@@ -563,7 +565,7 @@ fn build_fresh_multi<H: Hasher, const ARITY_BITS: u8>(
     // parent's batch after the join. Below it, fall through to the
     // in-place sequential loop that writes directly into `batch`,
     // avoiding the extra allocations.
-    #[cfg(feature = "parallel")]
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
     if present.len() >= 4096 {
         use rayon::prelude::*;
 
