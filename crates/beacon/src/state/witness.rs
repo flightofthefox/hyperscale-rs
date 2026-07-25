@@ -517,7 +517,7 @@ pub(super) fn apply_shard_payload(
                     admitted_at: state.current_epoch,
                     cohort,
                     cohort_seed,
-                    scheduled_terminal: None,
+                    scheduled: None,
                 },
             );
             None
@@ -650,6 +650,15 @@ pub(super) fn prune_stale_reshapes(state: &mut BeaconState) {
     let mut removed: Vec<(ShardId, &str)> = Vec::new();
     let mut lapsed: Vec<ShardId> = Vec::new();
     for (target, reshape) in &mut state.pending_reshapes {
+        // A scheduled cut is irrevocable. Its window's proposers have the
+        // schedule frozen into their topology snapshot and stamp their
+        // boundary verdicts from it, so retracting it here would leave
+        // them carrying a verdict for a cut that never lands while the
+        // shard stays in the trie. The readiness TTL governs
+        // admission-to-scheduling and stops there.
+        if reshape.scheduled_terminal().is_some() {
+            continue;
+        }
         match reshape {
             PendingReshape::Split {
                 last_asserted,

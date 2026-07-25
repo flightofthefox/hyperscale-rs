@@ -24,7 +24,9 @@ use crate::state::committee::{
 use crate::state::conviction::convict_pool;
 use crate::state::governance::tally_param_votes;
 use crate::state::lifecycle::{auto_reactivate, auto_ready_timeout, distribute_epoch_rewards};
-use crate::state::reshape::{execute_ready_merges, execute_ready_splits};
+use crate::state::reshape::{
+    apply_scheduled_merges, apply_scheduled_splits, schedule_ready_merges, schedule_ready_splits,
+};
 use crate::state::vrf::filter_and_roll_randomness;
 use crate::state::withdrawals::complete_pending_withdrawals;
 use crate::state::witness::{
@@ -264,10 +266,17 @@ pub fn apply_epoch(
     // epoch after they form; before the resample so freshly placed
     // ready members enter this epoch's beacon-eligible set like any
     // witness-readied validator.
-    execute_ready_splits(state);
+    // Reshapes fold in two steps a window apart. Apply first, so a cut
+    // scheduled by an earlier fold lands on the window it named; then
+    // gate the rest, which can only schedule for the window after this
+    // one. A record cannot pass both in the same fold — scheduling always
+    // names a later epoch than the fold that stamps it.
+    apply_scheduled_splits(state);
+    schedule_ready_splits(state);
     // Merges fold the same way, inverted: two children collapse into
     // their parent once the keeper committee is ready.
-    execute_ready_merges(state);
+    apply_scheduled_merges(state);
+    schedule_ready_merges(state);
     // Halt detection reads the settled reshape state: a shard whose reshape
     // executed this epoch is already terminal-marked or placeholder-fresh,
     // so it reads as legitimately quiet. Recovery runs before the top-up

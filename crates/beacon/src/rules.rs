@@ -58,10 +58,14 @@ pub(crate) fn crossing_already_recorded(
     shard: ShardId,
     block_hash: BlockHash,
 ) -> bool {
-    state
-        .boundaries
-        .get(&shard)
-        .is_some_and(|b| b.terminal_epoch.is_none() && b.block_hash == block_hash)
+    // A mark for a cut that hasn't arrived yet describes a chain that is
+    // still live and producing, so it re-sources and re-folds its recorded
+    // crossing like any other — only a chain that has actually terminated
+    // takes the exemption.
+    let scheduled_unapplied = state.terminal_scheduled_unapplied(shard);
+    state.boundaries.get(&shard).is_some_and(|b| {
+        (b.terminal_epoch.is_none() || scheduled_unapplied) && b.block_hash == block_hash
+    })
 }
 
 /// Whether the recorded live crossing is fully folded — recorded per

@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 use blake3::Hasher;
 use hyperscale_types::{
     BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, CohortSeat, Epoch, KeeperSeat,
-    PendingReshape, Randomness, ShardBoundary, ShardCommittee, ShardId, StateRoot, ValidatorId,
-    ValidatorStatus, WeightedTimestamp, byzantine_threshold,
+    PendingReshape, Randomness, ScheduledSplit, ShardBoundary, ShardCommittee, ShardId, StateRoot,
+    ValidatorId, ValidatorStatus, WeightedTimestamp, byzantine_threshold,
 };
 use rand::RngExt;
 use rand_chacha::ChaCha20Rng;
@@ -200,8 +200,8 @@ pub(super) fn lapse_split(state: &mut BeaconState, target: ShardId) {
     release_cohort(state, target, &drained);
 }
 
-/// Execute every pending split whose readiness gate is met, mutating
-/// the trie into the lookahead committee set.
+/// Schedule every pending split whose readiness gate is met, fixing the
+/// cut one window out.
 ///
 /// Per pending split, each fold: the parent half is computed here, over
 /// the then-current consensus membership (shuffle, refill, and jail
@@ -209,30 +209,63 @@ pub(super) fn lapse_split(state: &mut BeaconState, target: ShardId) {
 /// no dangling assignments to repair), and the gate asks that each
 /// child's ready membership — its parent half, ready by construction,
 /// plus its ready cohort seats — reach `2f+1` of the committee target.
-/// On the first fold where both children pass, the parent's lookahead
-/// committee is replaced by the two children's: parent-half members
-/// keep their ready flag and placement epoch under the new shard,
-/// cohort members are placed with the readiness their `ReshapeReady`
-/// folded (stragglers complete via the normal `Ready` path after the
-/// boundary). The children gain pending placeholder boundary records —
-/// the beacon cannot derive child state roots (`r_p` is a one-way hash
-/// of them), so the records fill from the parent's final-epoch
-/// `split_child_roots` delivery; until then they don't project as
-/// snap-sync anchors. The parent's boundary record stays for its
-/// terminal-epoch contribution and witness drain.
+/// On the first fold where both children pass, the carve and the cut are
+/// frozen onto the record and the parent's boundary takes its terminal
+/// mark; [`apply_scheduled_splits`] does the rest a window later.
+///
+/// The cut is the *next* window, never this one. A proposer decides
+/// whether to stamp its boundary verdicts from its own window's frozen
+/// projection, so a cut named for the window this fold opens would reach
+/// that window's proposers only after they had already needed it — and
+/// would land after the promotion freeze that window's schedule entry is
+/// re-derived from.
 ///
 /// Runs after the shuffle step so the assignment reads post-rotation
 /// membership and the children first shuffle one epoch after they
 /// form; reads the epoch's freshly rolled randomness.
-pub(super) fn execute_ready_splits(state: &mut BeaconState) {
+pub(super) fn schedule_ready_splits(state: &mut BeaconState) {
     let targets: Vec<ShardId> = state
         .pending_reshapes
         .iter()
-        .filter(|(_, r)| matches!(r, PendingReshape::Split { .. }))
+        .filter(|(_, r)| {
+            matches!(r, PendingReshape::Split { .. }) && r.scheduled_terminal().is_none()
+        })
         .map(|(target, _)| *target)
         .collect();
     for target in targets {
-        try_execute_split(state, target);
+        try_schedule_split(state, target);
+    }
+}
+
+/// Apply every scheduled split whose cut has arrived, mutating the trie
+/// into the lookahead committee set.
+///
+/// The parent's lookahead committee is replaced by the two children's:
+/// parent-half members keep their ready flag and placement epoch under
+/// the new shard, cohort members are placed with the readiness their
+/// `ReshapeReady` folded (stragglers complete via the normal `Ready` path
+/// after the boundary). The children gain pending placeholder boundary
+/// records — the beacon cannot derive child state roots (`r_p` is a
+/// one-way hash of them), so the records fill from the parent's
+/// final-epoch `split_child_roots` delivery; until then they don't
+/// project as snap-sync anchors. The parent's boundary record stays for
+/// its terminal-epoch contribution and witness drain.
+///
+/// This fold owns the parent's final window, so the children enter the
+/// lookahead for the window that opens at the parent's cut.
+pub(super) fn apply_scheduled_splits(state: &mut BeaconState) {
+    let due: Vec<ShardId> = state
+        .pending_reshapes
+        .iter()
+        .filter(|(_, r)| {
+            matches!(r, PendingReshape::Split { .. })
+                && r.scheduled_terminal()
+                    .is_some_and(|terminal| terminal <= state.current_epoch)
+        })
+        .map(|(target, _)| *target)
+        .collect();
+    for target in due {
+        apply_scheduled_split(state, target);
     }
 }
 
@@ -259,7 +292,7 @@ const fn pending_placeholder_boundary(epoch: Epoch) -> ShardBoundary {
     }
 }
 
-fn try_execute_split(state: &mut BeaconState, target: ShardId) {
+fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
     let Some(PendingReshape::Split { cohort, .. }) = state.pending_reshapes.get(&target) else {
         return;
     };
@@ -304,26 +337,33 @@ fn try_execute_split(state: &mut BeaconState, target: ShardId) {
     {
         return;
     }
-    tracing::info!(shard = ?target, "Shard split readiness gate met; reshaping the trie");
+    let terminal = state.current_epoch.next();
+    tracing::info!(
+        shard = ?target,
+        terminal = terminal.inner(),
+        "Shard split readiness gate met; scheduling the cut"
+    );
 
-    let halves = [(left, left_half.to_vec()), (right, right_half.to_vec())];
+    let halves = BTreeMap::from([(left, left_half.to_vec()), (right, right_half.to_vec())]);
     let Some(PendingReshape::Split {
-        cohort,
+        scheduled,
         admitted_at,
         ..
-    }) = state.pending_reshapes.remove(&target)
+    }) = state.pending_reshapes.get_mut(&target)
     else {
         unreachable!("pending split read above");
     };
-    state.next_shard_committees.remove(&target);
+    let admitted_at = *admitted_at;
+    *scheduled = Some(ScheduledSplit { terminal, halves });
 
-    // The epoch this fold starts is the parent's final one: its chain
-    // terminates at the epoch's cut and the children take over from the
-    // lookahead. The terminal mark keeps the boundary record sourced
-    // (for the terminal contribution that seeds the children, and the
-    // witness drain) without counting the dead chain as missing.
+    // The parent's chain terminates at `terminal`'s cut and the children
+    // take over from the lookahead. The mark keeps the boundary record
+    // sourced (for the terminal contribution that seeds the children, and
+    // the witness drain) without counting the dead chain as missing — and
+    // it is what the window projection freezes for the parent's proposers
+    // to stamp their boundary verdicts from.
     if let Some(boundary) = state.boundaries.get_mut(&target) {
-        boundary.terminal_epoch = Some(state.current_epoch);
+        boundary.terminal_epoch = Some(terminal);
         boundary.reshape_admitted_epoch = Some(admitted_at);
     } else {
         tracing::warn!(
@@ -331,41 +371,67 @@ fn try_execute_split(state: &mut BeaconState, target: ShardId) {
             "splitting shard has no boundary record; children must seed from their own contributions"
         );
     }
+}
+
+fn apply_scheduled_split(state: &mut BeaconState, target: ShardId) {
+    let Some(PendingReshape::Split {
+        cohort,
+        scheduled: Some(ScheduledSplit { halves, .. }),
+        ..
+    }) = state.pending_reshapes.remove(&target)
+    else {
+        unreachable!("scheduled split read above");
+    };
+    tracing::info!(shard = ?target, "Shard split cut reached; reshaping the trie");
+    state.next_shard_committees.remove(&target);
 
     for (child, half) in halves {
         // Child committee: the parent half in assignment order, then
-        // the cohort half in id order.
-        let mut members = half;
-        for (id, seat) in &cohort {
-            if seat.child == child {
-                members.push(*id);
-            }
-        }
+        // the cohort half in id order. A half member jailed or withdrawn
+        // since the carve was frozen is dropped here rather than moved —
+        // the schedule cannot be retracted to re-gate around it, so the
+        // child seats short and `top_up_committees` backfills it this
+        // same fold.
+        let assigned: Vec<ValidatorId> = half
+            .into_iter()
+            .chain(
+                cohort
+                    .iter()
+                    .filter(|(_, seat)| seat.child == child)
+                    .map(|(id, _)| *id),
+            )
+            .collect();
 
-        for id in &members {
+        let mut members: Vec<ValidatorId> = Vec::with_capacity(assigned.len());
+        for id in assigned {
             let rec = state
                 .validators
-                .get_mut(id)
+                .get_mut(&id)
                 .expect("members come from committee/cohort state, must be in validators");
             rec.status = match rec.status {
                 ValidatorStatus::OnShard {
+                    shard,
                     ready,
                     placed_at_epoch,
-                    ..
-                } => ValidatorStatus::OnShard {
+                } if shard == target => ValidatorStatus::OnShard {
                     shard: child,
                     ready,
                     placed_at_epoch,
                 },
                 ValidatorStatus::Observing { .. } => ValidatorStatus::OnShard {
                     shard: child,
-                    ready: cohort[id].ready,
+                    ready: cohort[&id].ready,
                     placed_at_epoch: state.current_epoch,
                 },
-                other => unreachable!("split moved a {other:?} validator"),
+                // Jailed, withdrawn, or rotated away since the carve was
+                // frozen. The schedule cannot be retracted to re-gate
+                // around it, so the child seats short and
+                // `top_up_committees` backfills it this same fold.
+                _ => continue,
             };
+            members.push(id);
             // Placement changed: the per-placement miss scope ends here.
-            state.miss_counters.remove(id);
+            state.miss_counters.remove(&id);
         }
 
         state
@@ -378,21 +444,20 @@ fn try_execute_split(state: &mut BeaconState, target: ShardId) {
     }
 }
 
-/// Execute every paired merge whose readiness gate is met, mutating the
-/// trie into the lookahead committee set.
+/// Schedule every paired merge whose readiness gate is met, fixing the
+/// cut one window out.
 ///
-/// Symmetric to [`execute_ready_splits`], inverted: a merge keeps no
+/// Symmetric to [`schedule_ready_splits`], inverted: a merge keeps no
 /// committee-liveness half — every keeper must sync the sibling half — so
 /// the gate is simply the merged committee's ready keepers reaching
-/// `2f+1` of the target. On the first fold that passes, the parent's two
-/// children leave the lookahead and the parent takes their place: keepers
-/// flip `OnShard` onto the parent with the readiness their `ReshapeReady`
-/// folded (stragglers complete via the normal `Ready` path), and the
-/// non-keeper half of each child returns to the pool. Both children's
-/// boundary records are marked terminal so their chains drain and the
-/// beacon composes the parent anchor from them; the parent gains a
-/// pending placeholder until that composition lands.
-pub(super) fn execute_ready_merges(state: &mut BeaconState) {
+/// `2f+1` of the target. On the first fold that passes, both children's
+/// boundaries take the same terminal mark, so they leave the trie on one
+/// cut; [`apply_scheduled_merges`] does the rest a window later.
+///
+/// Only the cut is frozen here. A split must also freeze its carve, but a
+/// merge's keepers were drawn when the halves paired and already live on
+/// the record, and rotation skips them until the merge applies.
+pub(super) fn schedule_ready_merges(state: &mut BeaconState) {
     let targets: Vec<ShardId> = state
         .pending_reshapes
         .iter()
@@ -401,6 +466,7 @@ pub(super) fn execute_ready_merges(state: &mut BeaconState) {
                 r,
                 PendingReshape::Merge {
                     admitted_at: Some(_),
+                    scheduled_terminal: None,
                     ..
                 }
             )
@@ -408,11 +474,36 @@ pub(super) fn execute_ready_merges(state: &mut BeaconState) {
         .map(|(target, _)| *target)
         .collect();
     for target in targets {
-        try_execute_merge(state, target);
+        try_schedule_merge(state, target);
     }
 }
 
-fn try_execute_merge(state: &mut BeaconState, parent: ShardId) {
+/// Apply every scheduled merge whose cut has arrived, mutating the trie
+/// into the lookahead committee set.
+///
+/// The parent's two children leave the lookahead and the parent takes
+/// their place: keepers flip `OnShard` onto the parent with the readiness
+/// their `ReshapeReady` folded (stragglers complete via the normal
+/// `Ready` path), and the non-keeper half of each child returns to the
+/// pool. The parent gains a pending placeholder until the beacon composes
+/// its anchor from both children's terminal contributions.
+pub(super) fn apply_scheduled_merges(state: &mut BeaconState) {
+    let due: Vec<ShardId> = state
+        .pending_reshapes
+        .iter()
+        .filter(|(_, r)| {
+            matches!(r, PendingReshape::Merge { .. })
+                && r.scheduled_terminal()
+                    .is_some_and(|terminal| terminal <= state.current_epoch)
+        })
+        .map(|(target, _)| *target)
+        .collect();
+    for target in due {
+        apply_scheduled_merge(state, target);
+    }
+}
+
+fn try_schedule_merge(state: &mut BeaconState, parent: ShardId) {
     let Some(PendingReshape::Merge { keepers, .. }) = state.pending_reshapes.get(&parent) else {
         return;
     };
@@ -420,27 +511,53 @@ fn try_execute_merge(state: &mut BeaconState, parent: ShardId) {
     if keepers.values().filter(|seat| seat.ready).count() < quorum {
         return;
     }
+    let terminal = state.current_epoch.next();
     tracing::info!(
         ?parent,
-        "Shard merge readiness gate met; reshaping the trie"
+        terminal = terminal.inner(),
+        "Shard merge readiness gate met; scheduling the cut"
     );
 
     let Some(PendingReshape::Merge {
-        keepers,
+        scheduled_terminal,
         admitted_at,
         ..
-    }) = state.pending_reshapes.remove(&parent)
+    }) = state.pending_reshapes.get_mut(&parent)
     else {
         unreachable!("pending merge read above");
     };
+    let admitted_at = *admitted_at;
+    *scheduled_terminal = Some(terminal);
+
+    // Both children terminate on the same cut. The mark keeps each
+    // boundary record sourced (for the contribution the beacon composes
+    // into the parent anchor and the witness drain) without counting the
+    // dead chain as missing, and is what each child's proposers read to
+    // stamp their boundary verdicts.
+    let children: [ShardId; 2] = parent.children().into();
+    for child in children {
+        if let Some(boundary) = state.boundaries.get_mut(&child) {
+            boundary.terminal_epoch = Some(terminal);
+            boundary.reshape_admitted_epoch = admitted_at;
+        } else {
+            tracing::warn!(
+                shard = ?child,
+                "merging child has no boundary record; the parent must seed from its own contribution"
+            );
+        }
+    }
+}
+
+fn apply_scheduled_merge(state: &mut BeaconState, parent: ShardId) {
+    let Some(PendingReshape::Merge { keepers, .. }) = state.pending_reshapes.remove(&parent) else {
+        unreachable!("scheduled merge read above");
+    };
+    tracing::info!(?parent, "Shard merge cut reached; reshaping the trie");
 
     // Drop the children from the lookahead: keepers move to the parent
     // below, the rest return to the pool. The children's chains keep
     // running their in-flight window from the frozen active committee
-    // until their terminal block — the terminal mark keeps each boundary
-    // record sourced (for the contribution the beacon composes into the
-    // parent anchor and the witness drain) without counting the dead
-    // chain as missing.
+    // until their terminal block.
     let children: [ShardId; 2] = parent.children().into();
     for child in children {
         if let Some(committee) = state.next_shard_committees.remove(&child) {
@@ -454,20 +571,15 @@ fn try_execute_merge(state: &mut BeaconState, parent: ShardId) {
                 state.miss_counters.remove(&id);
             }
         }
-        if let Some(boundary) = state.boundaries.get_mut(&child) {
-            boundary.terminal_epoch = Some(state.current_epoch);
-            boundary.reshape_admitted_epoch = admitted_at;
-        } else {
-            tracing::warn!(
-                shard = ?child,
-                "merging child has no boundary record; the parent must seed from its own contribution"
-            );
-        }
     }
 
     // The merged committee, keepers in id order, each now `OnShard` on
-    // the parent carrying the readiness its `ReshapeReady` folded.
-    let members: Vec<ValidatorId> = keepers.keys().copied().collect();
+    // the parent carrying the readiness its `ReshapeReady` folded. A
+    // keeper jailed or withdrawn since the cut was scheduled is dropped
+    // rather than moved — the schedule cannot be retracted to re-gate
+    // around it, so the parent seats short and `top_up_committees`
+    // backfills it this same fold.
+    let mut members: Vec<ValidatorId> = Vec::with_capacity(keepers.len());
     for (id, seat) in &keepers {
         let rec = state
             .validators
@@ -479,17 +591,18 @@ fn try_execute_merge(state: &mut BeaconState, parent: ShardId) {
         // committee (the `beacon_eligible` pending-anchor rule), which
         // would otherwise strand the beacon with no eligible signers the
         // moment every member left the children.
-        let placed_at_epoch = match rec.status {
-            ValidatorStatus::OnShard {
-                placed_at_epoch, ..
-            } => placed_at_epoch,
-            other => unreachable!("merge moved a {other:?} validator"),
+        let ValidatorStatus::OnShard {
+            placed_at_epoch, ..
+        } = rec.status
+        else {
+            continue;
         };
         rec.status = ValidatorStatus::OnShard {
             shard: parent,
             ready: seat.ready,
             placed_at_epoch,
         };
+        members.push(*id);
         // Placement changed: the per-placement miss scope ends here.
         state.miss_counters.remove(id);
     }
@@ -584,6 +697,42 @@ mod tests {
             .expect("cohort halves cover both children")
     }
 
+    /// Drive a split through both of its folds: the readiness gate at the
+    /// current epoch, then the trie change at the cut it schedules one
+    /// window out. The epoch advances between them, as it does in
+    /// `apply_epoch`, so a gate that holds simply leaves the record
+    /// untouched and a gate that passes lands its reshape here.
+    fn fold_split(state: &mut BeaconState) {
+        schedule_ready_splits(state);
+        if advance_to_scheduled_cut(state) {
+            apply_scheduled_splits(state);
+        }
+    }
+
+    /// The merge counterpart of [`fold_split`].
+    fn fold_merge(state: &mut BeaconState) {
+        schedule_ready_merges(state);
+        if advance_to_scheduled_cut(state) {
+            apply_scheduled_merges(state);
+        }
+    }
+
+    /// Step to the cut a reshape just scheduled, reporting whether there
+    /// was one. A gate that held schedules nothing and leaves the epoch
+    /// where it was, so repeated folds don't drift it.
+    fn advance_to_scheduled_cut(state: &mut BeaconState) -> bool {
+        let Some(cut) = state
+            .pending_reshapes
+            .values()
+            .filter_map(PendingReshape::scheduled_terminal)
+            .max()
+        else {
+            return false;
+        };
+        state.current_epoch = cut;
+        true
+    }
+
     fn mark_ready(state: &mut BeaconState, target: ShardId, observer: ValidatorId) {
         let child = cohort_of(state, target)[&observer].child;
         apply_shard_payload(
@@ -621,20 +770,20 @@ mod tests {
         state.miss_counters.insert(ValidatorId::new(0), 2);
 
         // Nobody ready: each child sees only its parent half (2 < 3).
-        execute_ready_splits(&mut state);
+        fold_split(&mut state);
         assert!(state.pending_reshapes.contains_key(&p));
         assert!(state.next_shard_committees.contains_key(&p));
 
         // One child at quorum, the other not: still held.
         let left_observer = observer_for(&state, p, left);
         mark_ready(&mut state, p, left_observer);
-        execute_ready_splits(&mut state);
+        fold_split(&mut state);
         assert!(state.pending_reshapes.contains_key(&p));
 
         // Both children at 2 + 1 = 3 of 4: the trie reshapes.
         let right_observer = observer_for(&state, p, right);
         mark_ready(&mut state, p, right_observer);
-        execute_ready_splits(&mut state);
+        fold_split(&mut state);
 
         assert!(state.pending_reshapes.is_empty());
         assert!(!state.next_shard_committees.contains_key(&p));
@@ -670,7 +819,7 @@ mod tests {
                         ValidatorStatus::OnShard {
                             shard: child,
                             ready: id == &left_observer || id == &right_observer,
-                            placed_at_epoch: Epoch::new(5),
+                            placed_at_epoch: Epoch::new(6),
                         },
                     );
                 }
@@ -684,7 +833,7 @@ mod tests {
         for child in [left, right] {
             let boundary = state.boundaries[&child];
             assert_eq!(boundary.block_hash, BlockHash::ZERO);
-            assert_eq!(boundary.last_live_epoch, Epoch::new(5));
+            assert_eq!(boundary.last_live_epoch, Epoch::new(6));
         }
     }
 
@@ -743,7 +892,7 @@ mod tests {
         mark_ready(&mut state, p, left_observer);
         let right_observer = observer_for(&state, p, right);
         mark_ready(&mut state, p, right_observer);
-        execute_ready_splits(&mut state);
+        fold_split(&mut state);
 
         assert!(state.pending_reshapes.is_empty());
         assert_eq!(
@@ -780,7 +929,7 @@ mod tests {
             mark_ready(&mut state, p, observer);
         }
 
-        execute_ready_splits(&mut state);
+        fold_split(&mut state);
 
         assert!(state.pending_reshapes.is_empty());
         let ValidatorStatus::OnShard {
@@ -815,7 +964,7 @@ mod tests {
             for observer in observers {
                 mark_ready(state, p, observer);
             }
-            execute_ready_splits(state);
+            fold_split(state);
         }
         assert_eq!(a.next_shard_committees, b.next_shard_committees);
         assert_eq!(a.validators, b.validators);
@@ -1358,7 +1507,7 @@ mod tests {
                 },
             );
         }
-        execute_ready_merges(&mut state);
+        fold_merge(&mut state);
         assert!(state.pending_reshapes.contains_key(&parent));
         assert!(state.next_shard_committees.contains_key(&left));
 
@@ -1375,7 +1524,7 @@ mod tests {
                 child: keepers[&third].child,
             },
         );
-        execute_ready_merges(&mut state);
+        fold_merge(&mut state);
 
         assert!(state.pending_reshapes.is_empty());
         assert!(!state.next_shard_committees.contains_key(&left));
@@ -1406,10 +1555,10 @@ mod tests {
         }
         // Both children terminal; the parent is a pending placeholder
         // that can't project as a snap-sync anchor.
-        assert_eq!(state.boundaries[&left].terminal_epoch, Some(Epoch::new(5)));
-        assert_eq!(state.boundaries[&right].terminal_epoch, Some(Epoch::new(5)));
+        assert_eq!(state.boundaries[&left].terminal_epoch, Some(Epoch::new(6)));
+        assert_eq!(state.boundaries[&right].terminal_epoch, Some(Epoch::new(6)));
         assert_eq!(state.boundaries[&parent].block_hash, BlockHash::ZERO);
-        assert_eq!(state.boundaries[&parent].last_live_epoch, Epoch::new(5));
+        assert_eq!(state.boundaries[&parent].last_live_epoch, Epoch::new(6));
         // The mover shed its per-placement miss scope.
         assert!(!state.miss_counters.contains_key(&keeper_ids[0]));
     }
@@ -1465,7 +1614,7 @@ mod tests {
         for id in observers {
             mark_ready(&mut state, p, id);
         }
-        execute_ready_splits(&mut state);
+        fold_split(&mut state);
         assert!(state.pending_reshapes.is_empty());
         assert_eq!(
             state.next_shard_committees[&left].members.len()
@@ -1522,7 +1671,7 @@ mod tests {
                 },
             );
         }
-        execute_ready_merges(&mut state);
+        fold_merge(&mut state);
 
         assert!(state.pending_reshapes.is_empty());
         let merged = state.next_shard_committees[&parent].members.clone();
@@ -1565,7 +1714,7 @@ mod tests {
                     },
                 );
             }
-            execute_ready_merges(state);
+            fold_merge(state);
         }
         assert_eq!(a.next_shard_committees, b.next_shard_committees);
         assert_eq!(a.validators, b.validators);
@@ -1628,7 +1777,7 @@ mod tests {
                 },
             );
         }
-        execute_ready_merges(&mut state);
+        fold_merge(&mut state);
         assert!(state.pending_reshapes.is_empty());
 
         let active = state.derive_topology_snapshot(net());
@@ -1733,7 +1882,7 @@ mod tests {
                 },
             );
         }
-        execute_ready_merges(&mut state);
+        fold_merge(&mut state);
         assert!(state.pending_reshapes.is_empty());
 
         // The keeper committee seated on the reunified parent — a 2+2 mix

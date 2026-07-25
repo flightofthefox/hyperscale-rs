@@ -382,6 +382,10 @@ pub struct KeeperSeat {
 /// admission, which also bounds how long a lapsed record (and its seed)
 /// survives. A merge child that goes quiet for the trigger TTL cancels
 /// the paired merge outright, returning its keepers to rotation.
+///
+/// Once the readiness gate passes the record is *scheduled*: its cut is
+/// fixed a window out and neither TTL can retract it. The fold at that
+/// cut consumes the record and applies the reshape.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub enum PendingReshape {
     /// The target shard splits into its two children.
@@ -403,10 +407,10 @@ pub enum PendingReshape {
         /// identical selection and child assignment (given an unchanged
         /// free pool) — an observer's synced child never moves under it.
         cohort_seed: Randomness,
-        /// The parent's final epoch window, stamped once the readiness
+        /// The cut this split will land on, stamped once the readiness
         /// gate passes and never moved after. `None` while the split is
         /// admitted but unscheduled.
-        scheduled_terminal: Option<Epoch>,
+        scheduled: Option<ScheduledSplit>,
     },
     /// The target parent's two children merge back under it. The merge
     /// is paired — keepers drawn, eligible for execution — once both
@@ -435,6 +439,24 @@ pub enum PendingReshape {
     },
 }
 
+/// A split whose readiness gate has passed: its cut is fixed and the
+/// parent's committee is already carved between the two children.
+///
+/// Both halves are frozen here rather than recomputed when the split
+/// applies. The gate approves one specific partition — each child's
+/// parent half plus its ready cohort seats reaching `2f+1` — and the
+/// schedule is irrevocable, so there is no second gate to re-approve a
+/// different carve. Membership holds still across the scheduled window
+/// because rotation skips a shard with a live split record.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct ScheduledSplit {
+    /// The parent's final epoch window — the cut its chain terminates on
+    /// and the children take over at.
+    pub terminal: Epoch,
+    /// Each child's half of the parent committee, in assignment order.
+    pub halves: BTreeMap<ShardId, Vec<ValidatorId>>,
+}
+
 impl PendingReshape {
     /// The final epoch window this reshape's terminating leaves are
     /// scheduled to leave the trie at, or `None` while the readiness gate
@@ -445,12 +467,10 @@ impl PendingReshape {
     /// stamp their boundary verdict from it, so neither the readiness TTL
     /// nor a trigger going quiet may retract it.
     #[must_use]
-    pub const fn scheduled_terminal(&self) -> Option<Epoch> {
+    pub fn scheduled_terminal(&self) -> Option<Epoch> {
         match self {
-            Self::Split {
-                scheduled_terminal, ..
-            }
-            | Self::Merge {
+            Self::Split { scheduled, .. } => scheduled.as_ref().map(|s| s.terminal),
+            Self::Merge {
                 scheduled_terminal, ..
             } => *scheduled_terminal,
         }
@@ -1417,6 +1437,30 @@ impl BeaconState {
             .collect()
     }
 
+    /// Whether `shard`'s cut is scheduled but its reshape has not applied
+    /// — its boundary already carries the terminal mark, yet its chain is
+    /// still live in the trie and producing normally.
+    ///
+    /// The mark alone cannot answer this: it lands a window before the
+    /// fold that applies the reshape, so between the two a terminal
+    /// `boundary.terminal_epoch` describes a shard that has not stopped.
+    /// Readers asking "has this chain terminated" must exclude the shards
+    /// this returns `true` for. The reshape record's survival is the
+    /// signal — the applying fold consumes it.
+    #[must_use]
+    pub fn terminal_scheduled_unapplied(&self, shard: ShardId) -> bool {
+        let scheduled_merge = |parent: ShardId| {
+            matches!(
+                self.pending_reshapes.get(&parent),
+                Some(r @ PendingReshape::Merge { .. }) if r.scheduled_terminal().is_some()
+            )
+        };
+        matches!(
+            self.pending_reshapes.get(&shard),
+            Some(r @ PendingReshape::Split { .. }) if r.scheduled_terminal().is_some()
+        ) || shard.parent().is_some_and(scheduled_merge)
+    }
+
     /// Each terminating leaf's scheduled final window as state stands
     /// right now, keyed by the leaf that leaves the trie: a split's
     /// parent, or both of a merge's children. Empty until the readiness
@@ -1952,7 +1996,7 @@ mod tests {
                 admitted_at: Epoch::new(1),
                 cohort: BTreeMap::new(),
                 cohort_seed: Randomness::ZERO,
-                scheduled_terminal: None,
+                scheduled: None,
             },
         );
 
@@ -2291,7 +2335,7 @@ mod tests {
                     },
                 )]),
                 cohort_seed: Randomness::ZERO,
-                scheduled_terminal: None,
+                scheduled: None,
             },
         );
 
