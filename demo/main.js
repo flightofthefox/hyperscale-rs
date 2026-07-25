@@ -55,6 +55,11 @@ const state = {
   session: null,
   playing: true,
   lastClock: null,
+  // The viewport's own clock. Advanced by the simulated span every frame,
+  // where `wt` only moves when an event happens to arrive — roughly every
+  // 293ms of attested time. Panning on `wt` makes the timeline hop between
+  // block arrivals; panning on this makes it glide.
+  viewWt: 0,
   speed: SPEEDS.includes(Number(params.get("speed"))) ? Number(params.get("speed")) : 1,
   wt: 0,
   shards: [],           // live trie leaves, in order
@@ -85,6 +90,7 @@ function note(wt, text, cls = "") {
 function apply(event) {
   state.events++;
   state.wt = Math.max(state.wt, event.wt);
+  state.viewWt = Math.max(state.viewWt, state.wt);
   const k = event.kind;
   switch (k.type) {
     case "blockCommitted": {
@@ -178,20 +184,32 @@ function renderTrie() {
   }
 }
 
+// Reading clientWidth right before writing viewBox forces a layout every
+// frame. Cache the measurement and refresh it only when the window resizes.
+let laneWidth = 0;
+let laneViewBox = "";
+const measureLanes = () => { laneWidth = $("lanes").clientWidth || 900; };
+window.addEventListener("resize", () => { laneWidth = 0; });
+
 function renderLanes() {
   const svg = $("lanes");
-  const width = svg.clientWidth || 900;
+  if (!laneWidth) measureLanes();
+  const width = laneWidth;
   const paths = [...state.lanes.keys()];
   const rowH = 46;
   // The beacon gets its own lane above the shards: it is the chain that
   // decides who governs them, and it ticks once an epoch rather than
   // continuously, so it reads as a different kind of thing.
   const height = Math.max(120, 26 + (paths.length + 1) * rowH);
-  svg.setAttribute("height", height);
-  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  const viewBox = `0 0 ${width} ${height}`;
+  if (viewBox !== laneViewBox) {
+    laneViewBox = viewBox;
+    svg.setAttribute("height", height);
+    svg.setAttribute("viewBox", viewBox);
+  }
   svg.replaceChildren();
 
-  const t1 = Math.max(state.wt, WINDOW_MS);
+  const t1 = Math.max(state.viewWt, state.wt, WINDOW_MS);
   const t0 = t1 - WINDOW_MS;
   const x = (wt) => 46 + ((wt - t0) / WINDOW_MS) * (width - 60);
 
@@ -296,12 +314,18 @@ function renderLegend() {
   }));
 }
 
-function render() {
+let lastPanels = 0;
+function render(clock = 0) {
   if (dirtyTopology) { renderTrie(); renderLegend(); dirtyTopology = false; }
   renderLanes();
-  renderTxs();
-  renderLog();
-  renderChrome();
+  // Text panels change far slower than the timeline pans, and rebuilding them
+  // costs layout on every row. 8Hz is past the point anyone reads a difference.
+  if (clock - lastPanels > 125) {
+    lastPanels = clock;
+    renderTxs();
+    renderLog();
+    renderChrome();
+  }
 }
 
 // ── main loop ────────────────────────────────────────────────────────────
@@ -316,6 +340,7 @@ function frame(clock) {
     // A backgrounded tab stops firing frames; on return the gap would be
     // seconds. Cap it so the session resumes rather than lurching forward.
     const simMs = Math.min(elapsed, MAX_CATCHUP_MS) * state.speed;
+    state.viewWt += simMs;
 
     let events = [];
     try {
@@ -340,7 +365,7 @@ function frame(clock) {
     if (state.shards.length !== before || events.some((e) => e.kind.type === "topologyChanged")) {
       dirtyTopology = true;
     }
-    render();
+    render(clock);
   }
   requestAnimationFrame(frame);
 }
