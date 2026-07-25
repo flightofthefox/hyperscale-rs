@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::FutureExt;
+use hyperscale_crypto::Verifier;
 use hyperscale_metrics::{record_libp2p_bandwidth, record_network_message_sent};
 #[cfg(feature = "test-utils")]
 use hyperscale_network::fault::HostId;
@@ -79,6 +80,8 @@ pub struct Libp2pAdapter {
     /// Validator consensus public keys for identity verification.
     /// Shared with the validator-bind service; updated on topology changes.
     validator_keys: Arc<ArcSwap<ValidatorKeyMap>>,
+    /// Scheme verifier for signed gossip and bind attestations.
+    verifier: Arc<dyn Verifier>,
 
     /// Chain network identity, bound into every locally signed and verified
     /// address announcement.
@@ -132,7 +135,11 @@ impl Libp2pAdapter {
     // `config` is taken by value: every caller constructs a fresh config and hands
     // it over, and the body picks fields out, so converting to `&Libp2pConfig`
     // would just force the body to copy each scalar field.
-    #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::needless_pass_by_value,
+        clippy::too_many_arguments // one setup path; each argument is a distinct collaborator
+    )]
     pub fn new(
         config: Libp2pConfig,
         network: NetworkDefinition,
@@ -141,6 +148,7 @@ impl Libp2pAdapter {
         local_shards: HashSet<ShardId>,
         registry: Arc<HandlerRegistry>,
         validator_keys: Arc<ValidatorKeyMap>,
+        verifier: Arc<dyn Verifier>,
     ) -> Result<Arc<Self>, NetworkError> {
         assert!(
             !vnodes.is_empty(),
@@ -271,6 +279,7 @@ impl Libp2pAdapter {
             Arc::clone(&vnodes),
             local_peer_id,
             Arc::clone(&shared_keys),
+            Arc::clone(&verifier),
         );
 
         let adapter = Arc::new(Self {
@@ -283,6 +292,7 @@ impl Libp2pAdapter {
             cached_peer_count: cached_peer_count.clone(),
             stream_control,
             validator_keys: shared_keys,
+            verifier,
             network: network.clone(),
             address_book: Arc::new(AddressBook::default()),
             wanted_validators: Arc::new(ArcSwap::from_pointee(HashSet::new())),
@@ -580,8 +590,12 @@ impl Libp2pAdapter {
     /// validator.
     #[must_use]
     pub fn ingest_validator_address(&self, gossip: &ValidatorAddressGossip) -> IngestOutcome {
-        self.address_book
-            .ingest(&self.network, &self.validator_keys.load(), gossip)
+        self.address_book.ingest(
+            self.verifier.as_ref(),
+            &self.network,
+            &self.validator_keys.load(),
+            gossip,
+        )
     }
 
     /// Replace the set of validators this host must hold unicast

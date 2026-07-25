@@ -19,7 +19,7 @@ use std::collections::HashSet;
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use hyperscale_crypto_bls::BlsVerifier;
+use hyperscale_crypto::Verifier;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::network::gossip::{
     MAX_ANNOUNCED_ADDRESS_BYTES, MAX_ANNOUNCED_ADDRESSES, MAX_ANNOUNCED_PEER_ID_BYTES,
@@ -67,6 +67,7 @@ impl AddressBook {
     #[must_use]
     pub fn ingest(
         &self,
+        verifier: &dyn Verifier,
         network: &NetworkDefinition,
         keys: &ValidatorKeyMap,
         gossip: &ValidatorAddressGossip,
@@ -86,7 +87,7 @@ impl AddressBook {
             return IngestOutcome::UnknownValidator;
         };
         let ctx = SignedContext {
-            verifier: &BlsVerifier,
+            verifier,
             network,
             public_key,
         };
@@ -175,7 +176,7 @@ impl AddressBook {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{Signer, validator_address_message};
 
     use super::*;
@@ -227,21 +228,21 @@ mod tests {
         let peer = Libp2pPeerId::random();
 
         assert_eq!(
-            book.ingest(&net(), &keys, &announce(vid, &peer, 5)),
+            book.ingest(&BlsVerifier, &net(), &keys, &announce(vid, &peer, 5)),
             IngestOutcome::Recorded
         );
         assert_eq!(
-            book.ingest(&net(), &keys, &announce(vid, &peer, 5)),
+            book.ingest(&BlsVerifier, &net(), &keys, &announce(vid, &peer, 5)),
             IngestOutcome::Stale
         );
         assert_eq!(
-            book.ingest(&net(), &keys, &announce(vid, &peer, 4)),
+            book.ingest(&BlsVerifier, &net(), &keys, &announce(vid, &peer, 4)),
             IngestOutcome::Stale
         );
 
         let newer_peer = Libp2pPeerId::random();
         assert_eq!(
-            book.ingest(&net(), &keys, &announce(vid, &newer_peer, 6)),
+            book.ingest(&BlsVerifier, &net(), &keys, &announce(vid, &newer_peer, 6)),
             IngestOutcome::Recorded
         );
         let record = book.get(vid).unwrap();
@@ -260,13 +261,13 @@ mod tests {
         let mut tampered = announce(vid, &peer, 1);
         tampered.sequence = 2;
         assert_eq!(
-            book.ingest(&net(), &keys, &tampered),
+            book.ingest(&BlsVerifier, &net(), &keys, &tampered),
             IngestOutcome::Invalid
         );
 
         let unknown = announce(ValidatorId::new(99), &peer, 1);
         assert_eq!(
-            book.ingest(&net(), &keys, &unknown),
+            book.ingest(&BlsVerifier, &net(), &keys, &unknown),
             IngestOutcome::UnknownValidator
         );
         assert!(book.is_empty());
@@ -295,7 +296,7 @@ mod tests {
             (cohost_b, &cohost_peer),
         ] {
             assert_eq!(
-                book.ingest(&net(), &keys, &announce(vid, peer, 1)),
+                book.ingest(&BlsVerifier, &net(), &keys, &announce(vid, peer, 1)),
                 IngestOutcome::Recorded
             );
         }
@@ -323,7 +324,7 @@ mod tests {
         let mut oversized = announce(vid, &peer, 1);
         oversized.addresses = vec![vec![0u8; MAX_ANNOUNCED_ADDRESS_BYTES + 1]];
         assert_eq!(
-            book.ingest(&net(), &keys, &oversized),
+            book.ingest(&BlsVerifier, &net(), &keys, &oversized),
             IngestOutcome::Invalid
         );
 
@@ -352,7 +353,7 @@ mod tests {
             signature,
         };
         assert_eq!(
-            book.ingest(&net(), &keys, &unparseable),
+            book.ingest(&BlsVerifier, &net(), &keys, &unparseable),
             IngestOutcome::Invalid
         );
     }

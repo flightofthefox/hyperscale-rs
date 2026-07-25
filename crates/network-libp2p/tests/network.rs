@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
@@ -45,6 +46,7 @@ async fn test_network_adapter_starts() {
         HashSet::from([shard]),
         Arc::new(HandlerRegistry::default()),
         topo,
+        Arc::new(BlsVerifier),
     )
     .unwrap();
 
@@ -80,6 +82,7 @@ async fn test_two_node_connection() {
         HashSet::from([ShardId::ROOT]),
         Arc::new(HandlerRegistry::default()),
         topo1,
+        Arc::new(BlsVerifier),
     )
     .unwrap();
 
@@ -106,6 +109,7 @@ async fn test_two_node_connection() {
         HashSet::from([ShardId::ROOT]),
         Arc::new(HandlerRegistry::default()),
         topo2,
+        Arc::new(BlsVerifier),
     )
     .unwrap();
 
@@ -157,6 +161,7 @@ async fn test_topic_subscription() {
         HashSet::from([ShardId::ROOT]),
         Arc::new(HandlerRegistry::default()),
         topo,
+        Arc::new(BlsVerifier),
     )
     .unwrap();
 

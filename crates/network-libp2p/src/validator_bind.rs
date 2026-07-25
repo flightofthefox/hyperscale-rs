@@ -39,11 +39,11 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use hyperscale_crypto_bls::BlsVerifier;
+use hyperscale_crypto::Verifier;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::{
     ConsensusSignature, NetworkDefinition, Signer, VALIDATOR_BIND_NONCE_LEN, ValidatorId,
-    Verifier as _, validator_bind_message,
+    validator_bind_message,
 };
 use libp2p::{PeerId as Libp2pPeerId, Stream, StreamProtocol};
 use libp2p_stream::{Control, IncomingStreams};
@@ -219,6 +219,7 @@ fn fresh_nonce() -> [u8; VALIDATOR_BIND_NONCE_LEN] {
 /// `nonce` must be the one *we* generated and sent to the remote — verifying
 /// against a remote-supplied nonce defeats replay protection.
 fn verify_bind(
+    verifier: &dyn Verifier,
     network: &NetworkDefinition,
     peer_id: &Libp2pPeerId,
     claimed_vid: ValidatorId,
@@ -231,7 +232,7 @@ fn verify_bind(
         .ok_or(BindError::UnknownValidator(claimed_vid))?;
 
     let message = validator_bind_message(network, &peer_id.to_bytes(), nonce);
-    if BlsVerifier.verify(pubkey, &message, signature) {
+    if verifier.verify(pubkey, &message, signature) {
         Ok(())
     } else {
         Err(BindError::InvalidSignature(claimed_vid))
@@ -283,6 +284,8 @@ struct BindContext {
     local_peer_id: Libp2pPeerId,
     /// Validator consensus-key map (consulted to verify remote signatures).
     validator_keys: SharedValidatorKeys,
+    /// Scheme verifier every inbound bind attestation is checked against.
+    verifier: Arc<dyn Verifier>,
     /// Validator-id → peer-id map populated on successful bind.
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
 }
@@ -314,6 +317,7 @@ impl BindContext {
 /// Verify every `(vid, sig)` claim against the local-chosen nonce. All must
 /// verify — any failure rejects the whole bind.
 fn verify_all(
+    verifier: &dyn Verifier,
     network: &NetworkDefinition,
     peer_id: &Libp2pPeerId,
     nonce: &[u8; VALIDATOR_BIND_NONCE_LEN],
@@ -321,7 +325,7 @@ fn verify_all(
     keys: &ValidatorKeyMap,
 ) -> Result<(), BindError> {
     for (vid, sig) in attestations {
-        verify_bind(network, peer_id, *vid, nonce, sig, keys)?;
+        verify_bind(verifier, network, peer_id, *vid, nonce, sig, keys)?;
     }
     Ok(())
 }
@@ -355,6 +359,7 @@ pub fn spawn_validator_bind_service(
     local_vnodes: Arc<[LocalVnodeIdentity]>,
     local_peer_id: Libp2pPeerId,
     validator_keys: SharedValidatorKeys,
+    verifier: Arc<dyn Verifier>,
 ) -> ValidatorBindHandle {
     assert!(
         !local_vnodes.is_empty(),
@@ -373,6 +378,7 @@ pub fn spawn_validator_bind_service(
         local_vnodes,
         local_peer_id,
         validator_keys,
+        verifier,
         validator_peers,
     };
 
@@ -549,6 +555,7 @@ async fn handle_inbound(
 
         let keys_guard = ctx.validator_keys.load();
         verify_all(
+            ctx.verifier.as_ref(),
             &ctx.network,
             &peer_id,
             &our_nonce,
@@ -602,6 +609,7 @@ async fn handle_outbound(
 
         let keys_guard = ctx.validator_keys.load();
         verify_all(
+            ctx.verifier.as_ref(),
             &ctx.network,
             &peer_id,
             &our_nonce,
@@ -630,7 +638,7 @@ async fn handle_outbound(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsSigner, generate_bls_keypair};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, generate_bls_keypair};
     use hyperscale_types::ConsensusPublicKey;
 
     use super::*;
@@ -769,6 +777,7 @@ mod tests {
         let attestations = vec![(good_vid, good_sig), (bad_vid, bad_sig)];
         assert!(matches!(
             verify_all(
+                &BlsVerifier,
                 &NetworkDefinition::simulator(),
                 &peer_id,
                 &nonce,
@@ -798,6 +807,7 @@ mod tests {
         let keys = make_bind_keys(vid, pubkey);
         assert!(
             verify_bind(
+                &BlsVerifier,
                 &NetworkDefinition::simulator(),
                 &peer_id,
                 vid,
@@ -836,6 +846,7 @@ mod tests {
         let keys = make_bind_keys(vid, pubkey);
         assert!(matches!(
             verify_bind(
+                &BlsVerifier,
                 &NetworkDefinition::simulator(),
                 &peer_id,
                 vid,
@@ -868,6 +879,7 @@ mod tests {
         let keys = make_bind_keys(vid, pubkey);
         assert!(
             verify_bind(
+                &BlsVerifier,
                 &NetworkDefinition::simulator(),
                 &peer_b,
                 vid,
@@ -898,6 +910,7 @@ mod tests {
         let keys = make_bind_keys(ValidatorId::new(7), pubkey);
         assert!(matches!(
             verify_bind(
+                &BlsVerifier,
                 &NetworkDefinition::simulator(),
                 &peer_id,
                 ValidatorId::new(99),
@@ -929,6 +942,7 @@ mod tests {
         let keys = make_bind_keys(vid, keypair_b.public_key());
         assert!(matches!(
             verify_bind(
+                &BlsVerifier,
                 &NetworkDefinition::simulator(),
                 &peer_id,
                 vid,

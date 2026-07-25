@@ -53,7 +53,7 @@ use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, GenesisValidators, InFlightCount, LocalTimestamp,
-    MAX_TX_IN_FLIGHT, RoutableTransaction, ShardId, Signer, ValidatorId, ValidatorStatus,
+    MAX_TX_IN_FLIGHT, RoutableTransaction, ShardId, Signer, ValidatorId, ValidatorStatus, Verifier,
 };
 use libp2p::identity::Keypair;
 use thiserror::Error;
@@ -508,6 +508,7 @@ impl ProductionRunnerBuilder {
             bind_vnodes,
             initial_validator_keys,
             topology_snapshot: topology_snapshot.clone(),
+            verifier: Arc::new(BlsVerifier),
         })?;
 
         // The bootstrap identity replicated into every fresh store the
@@ -1143,6 +1144,8 @@ struct NetworkBuildArgs {
     /// service attests as every entry on each handshake.
     bind_vnodes: Vec<(ValidatorId, Arc<dyn Signer>)>,
     initial_validator_keys: Arc<ValidatorKeyMap>,
+    /// Scheme verifier for signed gossip and bind attestations.
+    verifier: Arc<dyn Verifier>,
     /// Topology snapshot shared with `Libp2pNetwork` for shard-based
     /// peer resolution on outbound `Network::request` calls.
     topology_snapshot: SharedTopologySnapshot,
@@ -1170,6 +1173,7 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
         args.local_shards,
         registry.clone(),
         args.initial_validator_keys,
+        args.verifier,
     )?;
 
     let request_pool = Arc::new(RequestStreamPool::new(
