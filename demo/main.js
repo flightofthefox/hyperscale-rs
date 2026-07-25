@@ -12,10 +12,11 @@ const MAX_SHARDS = 2;
 // Largest real gap a single frame may replay, so returning to a backgrounded
 // tab resumes instead of lurching through minutes of simulated time at once.
 const MAX_CATCHUP_MS = 250;
-// Width of the visible weighted-time window. A shard commits roughly three
-// blocks a second of attested time, so much past this and the marks merge
-// into a bar instead of reading as discrete blocks.
-const WINDOW_MS = 45_000;
+// Width of the visible weighted-time window. A shard commits roughly 3.5
+// blocks per second of attested time, so this holds ~50 blocks per lane —
+// wide enough to show a lane's rhythm and a split's before-and-after, narrow
+// enough that each block is still a block rather than a pixel in a bar.
+const WINDOW_MS = Number(new URLSearchParams(location.search).get("window")) * 1000 || 15_000;
 // The simulation keeps every committed block in memory — the in-memory
 // storage backend has no GC — so a session grows by roughly 7 MiB per
 // simulated minute and never gives it back. Stop at a bound rather than let
@@ -67,7 +68,7 @@ const state = {
 
 function laneFor(path) {
   if (!state.lanes.has(path)) {
-    state.lanes.set(path, { blocks: [], retiredAt: null });
+    state.lanes.set(path, { blocks: [], retiredAt: null, height: 0 });
     // A child's lane appears when it commits its first block, which is later
     // than the partition change that created it — so the trie and legend key
     // off lanes rather than off topology events alone.
@@ -89,6 +90,7 @@ function apply(event) {
     case "blockCommitted": {
       const lane = laneFor(k.shard);
       lane.blocks.push({ wt: event.wt, fallback: k.fallback });
+      lane.height = k.height;
       // Drop what has scrolled off: this page is meant to run for hours.
       const floor = state.wt - WINDOW_MS * 2;
       if (lane.blocks.length > 64 && lane.blocks[0].wt < floor) {
@@ -193,9 +195,10 @@ function renderLanes() {
   const t0 = t1 - WINDOW_MS;
   const x = (wt) => 46 + ((wt - t0) / WINDOW_MS) * (width - 60);
 
-  // Time grid every 15s of weighted time.
-  const firstTick = Math.ceil(t0 / 15000) * 15000;
-  for (let t = firstTick; t <= t1; t += 15000) {
+  // Grid roughly every fifth of the window, on a round number of seconds.
+  const gridStep = Math.max(1000, Math.round(WINDOW_MS / 5 / 1000) * 1000);
+  const firstTick = Math.ceil(t0 / gridStep) * gridStep;
+  for (let t = firstTick; t <= t1; t += gridStep) {
     el("line", { class: "gridline", x1: x(t), y1: 16, x2: x(t), y2: height - 4 }, svg);
     el("text", { class: "gridlab", x: x(t) + 3, y: 12 }, svg).textContent = `${Math.round(t / 1000)}s`;
   }
@@ -226,9 +229,15 @@ function renderLanes() {
       if (b.wt < t0) continue;
       el("rect", {
         class: `blk${b.fallback ? " fallback" : ""}`,
-        x: x(b.wt) - 2, y: y - 7, width: 4, height: 14,
+        x: x(b.wt) - 3, y: y - 8, width: 6, height: 16,
         fill: c, stroke: c,
       }, svg);
+    }
+    // The tip height, so the lane carries scale: marks show rhythm, this
+    // shows how far the chain has actually got.
+    if (lane.height) {
+      el("text", { class: "tip", x: width - 6, y: y - 12, fill: c }, svg)
+        .textContent = `h${lane.height}`;
     }
   });
 

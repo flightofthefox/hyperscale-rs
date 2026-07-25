@@ -103,6 +103,10 @@ h1 em { font-style: normal; color: var(--ink2); }
 .blk.fallback { fill: transparent !important; stroke-width: 1.2; }
 .gridline { stroke: var(--line); stroke-width: 1; opacity: .5; }
 .gridlab { font-family: var(--mono); font-size: 9px; fill: var(--muted); }
+.tip {
+  font-family: var(--mono); font-size: 9px; font-weight: 600;
+  text-anchor: end; opacity: .75;
+}
 .splitmark { stroke: var(--warn); stroke-width: 1.6; stroke-dasharray: 3 3; }
 .splitlab {
   font-family: var(--mono); font-size: 9px; letter-spacing: .1em;
