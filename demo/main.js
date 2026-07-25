@@ -9,7 +9,9 @@ import init, { DemoSession, last_panic } from "./vendor/hyperscale_demo.js";
 const SEED = 42;
 const SHARD_SIZE = 4;
 const MAX_SHARDS = 2;
-const STEP_MS = 500;      // simulated ms per animation frame at 1x
+// Largest real gap a single frame may replay, so returning to a backgrounded
+// tab resumes instead of lurching through minutes of simulated time at once.
+const MAX_CATCHUP_MS = 250;
 // Width of the visible weighted-time window. A shard commits roughly three
 // blocks a second of attested time, so much past this and the marks merge
 // into a bar instead of reading as discrete blocks.
@@ -19,9 +21,6 @@ const WINDOW_MS = 45_000;
 // simulated minute and never gives it back. Stop at a bound rather than let
 // a tab left open overnight take the browser down with it.
 const MAX_SIM_MS = 20 * 60_000;
-// Wall-clock spend per frame. Under a 60fps budget of ~16ms, this leaves
-// room for rendering after the simulation has had its turn.
-const FRAME_BUDGET_MS = 8;
 
 // Colour by trie path so a shard keeps its identity across a split; the two
 // children of a shard never collide because their paths differ in the last bit.
@@ -49,11 +48,12 @@ const fmtWt = (ms) => {
 
 let dirtyTopology = true;
 const params = new URLSearchParams(location.search);
-const SPEEDS = [1, 2, 4, 8, 16];
+const SPEEDS = [1, 2, 4, 8, 16, 32, 64];
 
 const state = {
   session: null,
   playing: true,
+  lastClock: null,
   speed: SPEEDS.includes(Number(params.get("speed"))) ? Number(params.get("speed")) : 1,
   wt: 0,
   shards: [],           // live trie leaves, in order
@@ -296,24 +296,21 @@ function render() {
 }
 
 // ── main loop ────────────────────────────────────────────────────────────
-function frame() {
+function frame(clock) {
   if (state.playing && state.session) {
+    // Advance by the real time this frame actually took, so 1× is wall clock:
+    // a second of attested time per second of watching. A fixed span per frame
+    // would instead run at whatever multiple the frame rate implied, which
+    // compressed each beacon epoch's work into a visible hitch.
+    const elapsed = state.lastClock == null ? 0 : clock - state.lastClock;
+    state.lastClock = clock;
+    // A backgrounded tab stops firing frames; on return the gap would be
+    // seconds. Cap it so the session resumes rather than lurching forward.
+    const simMs = Math.min(elapsed, MAX_CATCHUP_MS) * state.speed;
+
     let events = [];
     try {
-      // Advance in slices under a wall-clock budget rather than demanding a
-      // fixed span of simulated time per frame. Beacon epochs are bursty by
-      // construction — an all-to-all protocol that runs once per epoch — so a
-      // fixed span costs ~1ms most frames and ~50ms at every epoch tick,
-      // which reads as a stutter. Under a budget the timeline simply advances
-      // more slowly across the burst, which is honest: the x-axis is attested
-      // time, not wall time.
-      const want = STEP_MS * state.speed;
-      const slice = Math.max(50, want / 8);
-      const deadline = performance.now() + FRAME_BUDGET_MS;
-      for (let done = 0; done < want; done += slice) {
-        events = events.concat(state.session.step(Math.min(slice, want - done)));
-        if (performance.now() >= deadline) break;
-      }
+      if (simMs > 0) events = state.session.step(Math.round(simMs));
     } catch (err) {
       state.playing = false;
       const msg = last_panic() || String(err);
@@ -362,8 +359,8 @@ async function main() {
   if (warmup > 0) {
     $("badge").textContent = `skipping to ${warmup}s…`;
     $("badge").className = "badge boot";
-    for (let t = 0; t < warmup * 1000; t += STEP_MS * 8) {
-      for (const e of state.session.step(STEP_MS * 8)) apply(e);
+    for (let t = 0; t < warmup * 1000; t += 4000) {
+      for (const e of state.session.step(4000)) apply(e);
     }
     dirtyTopology = true;
     $("badge").textContent = `LIVE — skipped to ${warmup}s`;
@@ -375,6 +372,8 @@ async function main() {
 
 $("play").addEventListener("click", () => {
   state.playing = !state.playing;
+  // Drop the gap the pause opened up rather than replaying it on resume.
+  state.lastClock = null;
   $("play").innerHTML = state.playing ? "&#10074;&#10074; PAUSE" : "&#9654; PLAY";
 });
 $("speed").addEventListener("click", () => {
