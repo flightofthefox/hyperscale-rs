@@ -20,4 +20,4 @@ pub use behaviour::{NOTIFY_PROTOCOL, request_protocol};
 pub use error::NetworkError;
 pub use identity::generate_random_keypair;
 
-pub use self::core::Libp2pAdapter;
+pub use self::core::{Libp2pAdapter, Libp2pAdapterArgs};

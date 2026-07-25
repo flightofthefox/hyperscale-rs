@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_network::HandlerRegistry;
-use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
+use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pAdapterArgs, Libp2pConfig};
 use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
 use libp2p::identity::Keypair;
 use serial_test::serial;
@@ -38,16 +38,16 @@ async fn test_network_adapter_starts() {
     };
 
     let (bind_sig, topo) = test_bind_args(validator_id);
-    let adapter = Libp2pAdapter::new(
+    let adapter = Libp2pAdapter::new(Libp2pAdapterArgs {
         config,
-        NetworkDefinition::simulator(),
+        network: NetworkDefinition::simulator(),
         keypair,
-        vec![(validator_id, bind_sig)],
-        HashSet::from([shard]),
-        Arc::new(HandlerRegistry::default()),
-        topo,
-        Arc::new(BlsVerifier),
-    )
+        vnodes: vec![(validator_id, bind_sig)],
+        local_shards: HashSet::from([shard]),
+        registry: Arc::new(HandlerRegistry::default()),
+        validator_keys: topo,
+        verifier: Arc::new(BlsVerifier),
+    })
     .unwrap();
 
     // Verify adapter state
@@ -74,16 +74,16 @@ async fn test_two_node_connection() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let adapter1 = Libp2pAdapter::new(
-        config1,
-        NetworkDefinition::simulator(),
-        keypair1,
-        vec![(ValidatorId::new(0), bind_sig1)],
-        HashSet::from([ShardId::ROOT]),
-        Arc::new(HandlerRegistry::default()),
-        topo1,
-        Arc::new(BlsVerifier),
-    )
+    let adapter1 = Libp2pAdapter::new(Libp2pAdapterArgs {
+        config: config1,
+        network: NetworkDefinition::simulator(),
+        keypair: keypair1,
+        vnodes: vec![(ValidatorId::new(0), bind_sig1)],
+        local_shards: HashSet::from([ShardId::ROOT]),
+        registry: Arc::new(HandlerRegistry::default()),
+        validator_keys: topo1,
+        verifier: Arc::new(BlsVerifier),
+    })
     .unwrap();
 
     // Wait for node 1 to be ready and get its address
@@ -101,16 +101,16 @@ async fn test_two_node_connection() {
         bootstrap_peers: vec![node1_addr.clone()],
         ..Default::default()
     };
-    let adapter2 = Libp2pAdapter::new(
-        config2,
-        NetworkDefinition::simulator(),
-        keypair2,
-        vec![(ValidatorId::new(1), bind_sig2)],
-        HashSet::from([ShardId::ROOT]),
-        Arc::new(HandlerRegistry::default()),
-        topo2,
-        Arc::new(BlsVerifier),
-    )
+    let adapter2 = Libp2pAdapter::new(Libp2pAdapterArgs {
+        config: config2,
+        network: NetworkDefinition::simulator(),
+        keypair: keypair2,
+        vnodes: vec![(ValidatorId::new(1), bind_sig2)],
+        local_shards: HashSet::from([ShardId::ROOT]),
+        registry: Arc::new(HandlerRegistry::default()),
+        validator_keys: topo2,
+        verifier: Arc::new(BlsVerifier),
+    })
     .unwrap();
 
     // Wait for connection to establish
@@ -153,16 +153,16 @@ async fn test_topic_subscription() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let adapter = Libp2pAdapter::new(
+    let adapter = Libp2pAdapter::new(Libp2pAdapterArgs {
         config,
-        NetworkDefinition::simulator(),
+        network: NetworkDefinition::simulator(),
         keypair,
-        vec![(ValidatorId::new(0), bind_sig)],
-        HashSet::from([ShardId::ROOT]),
-        Arc::new(HandlerRegistry::default()),
-        topo,
-        Arc::new(BlsVerifier),
-    )
+        vnodes: vec![(ValidatorId::new(0), bind_sig)],
+        local_shards: HashSet::from([ShardId::ROOT]),
+        registry: Arc::new(HandlerRegistry::default()),
+        validator_keys: topo,
+        verifier: Arc::new(BlsVerifier),
+    })
     .unwrap();
 
     // Subscribe to a topic via subscribe_topic (individual subscription)

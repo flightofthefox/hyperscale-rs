@@ -18,7 +18,7 @@ mod request_pool;
 mod stream_framing;
 mod validator_bind;
 
-pub use adapter::{Libp2pAdapter, NetworkError, generate_random_keypair};
+pub use adapter::{Libp2pAdapter, Libp2pAdapterArgs, NetworkError, generate_random_keypair};
 pub use address_book::{AddressBook, AddressRecord, IngestOutcome};
 pub use config::{Libp2pConfig, VersionInteroperabilityMode};
 pub use network::Libp2pNetwork;

@@ -14,7 +14,7 @@ use std::time::Duration;
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_libp2p::test_utils::TestFixtures;
-use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
+use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pAdapterArgs, Libp2pConfig};
 use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
 use serial_test::serial;
 use support::CONNECTION_TIMEOUT;
@@ -38,16 +38,16 @@ async fn test_validator_bind_success() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let adapter0 = Libp2pAdapter::new(
-        config0,
-        NetworkDefinition::simulator(),
-        keypair0,
-        vec![(ValidatorId::new(0), bind_sig0)],
-        HashSet::from([ShardId::ROOT]),
-        Arc::new(HandlerRegistry::default()),
-        fixtures.validator_key_map(),
-        Arc::new(BlsVerifier),
-    )
+    let adapter0 = Libp2pAdapter::new(Libp2pAdapterArgs {
+        config: config0,
+        network: NetworkDefinition::simulator(),
+        keypair: keypair0,
+        vnodes: vec![(ValidatorId::new(0), bind_sig0)],
+        local_shards: HashSet::from([ShardId::ROOT]),
+        registry: Arc::new(HandlerRegistry::default()),
+        validator_keys: fixtures.validator_key_map(),
+        verifier: Arc::new(BlsVerifier),
+    })
     .unwrap();
 
     sleep(Duration::from_millis(200)).await;
@@ -63,16 +63,16 @@ async fn test_validator_bind_success() {
         bootstrap_peers: vec![node0_addr],
         ..Default::default()
     };
-    let adapter1 = Libp2pAdapter::new(
-        config1,
-        NetworkDefinition::simulator(),
-        keypair1,
-        vec![(ValidatorId::new(1), bind_sig1)],
-        HashSet::from([ShardId::ROOT]),
-        Arc::new(HandlerRegistry::default()),
-        fixtures.validator_key_map(),
-        Arc::new(BlsVerifier),
-    )
+    let adapter1 = Libp2pAdapter::new(Libp2pAdapterArgs {
+        config: config1,
+        network: NetworkDefinition::simulator(),
+        keypair: keypair1,
+        vnodes: vec![(ValidatorId::new(1), bind_sig1)],
+        local_shards: HashSet::from([ShardId::ROOT]),
+        registry: Arc::new(HandlerRegistry::default()),
+        validator_keys: fixtures.validator_key_map(),
+        verifier: Arc::new(BlsVerifier),
+    })
     .unwrap();
 
     // Wait for validator-bind to complete on both sides.
@@ -117,16 +117,16 @@ async fn test_validator_bind_rejects_wrong_key() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let adapter0 = Libp2pAdapter::new(
-        config0,
-        NetworkDefinition::simulator(),
-        keypair0,
-        vec![(ValidatorId::new(0), bind_sig0)],
-        HashSet::from([ShardId::ROOT]),
-        Arc::new(HandlerRegistry::default()),
-        fixtures.validator_key_map(),
-        Arc::new(BlsVerifier),
-    )
+    let adapter0 = Libp2pAdapter::new(Libp2pAdapterArgs {
+        config: config0,
+        network: NetworkDefinition::simulator(),
+        keypair: keypair0,
+        vnodes: vec![(ValidatorId::new(0), bind_sig0)],
+        local_shards: HashSet::from([ShardId::ROOT]),
+        registry: Arc::new(HandlerRegistry::default()),
+        validator_keys: fixtures.validator_key_map(),
+        verifier: Arc::new(BlsVerifier),
+    })
     .unwrap();
 
     sleep(Duration::from_millis(200)).await;
@@ -144,16 +144,16 @@ async fn test_validator_bind_rejects_wrong_key() {
         bootstrap_peers: vec![node0_addr],
         ..Default::default()
     };
-    let adapter1 = Libp2pAdapter::new(
-        config1,
-        NetworkDefinition::simulator(),
-        keypair1,
-        vec![(ValidatorId::new(1), wrong_signing_key)],
-        HashSet::from([ShardId::ROOT]),
-        Arc::new(HandlerRegistry::default()),
-        fixtures.validator_key_map(),
-        Arc::new(BlsVerifier),
-    )
+    let adapter1 = Libp2pAdapter::new(Libp2pAdapterArgs {
+        config: config1,
+        network: NetworkDefinition::simulator(),
+        keypair: keypair1,
+        vnodes: vec![(ValidatorId::new(1), wrong_signing_key)],
+        local_shards: HashSet::from([ShardId::ROOT]),
+        registry: Arc::new(HandlerRegistry::default()),
+        validator_keys: fixtures.validator_key_map(),
+        verifier: Arc::new(BlsVerifier),
+    })
     .unwrap();
 
     // Wait for transport connection to establish.
@@ -198,16 +198,16 @@ async fn test_validator_bind_evicted_on_disconnect() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let adapter0 = Libp2pAdapter::new(
-        config0,
-        NetworkDefinition::simulator(),
-        keypair0,
-        vec![(ValidatorId::new(0), bind_sig0)],
-        HashSet::from([ShardId::ROOT]),
-        Arc::new(HandlerRegistry::default()),
-        fixtures.validator_key_map(),
-        Arc::new(BlsVerifier),
-    )
+    let adapter0 = Libp2pAdapter::new(Libp2pAdapterArgs {
+        config: config0,
+        network: NetworkDefinition::simulator(),
+        keypair: keypair0,
+        vnodes: vec![(ValidatorId::new(0), bind_sig0)],
+        local_shards: HashSet::from([ShardId::ROOT]),
+        registry: Arc::new(HandlerRegistry::default()),
+        validator_keys: fixtures.validator_key_map(),
+        verifier: Arc::new(BlsVerifier),
+    })
     .unwrap();
 
     sleep(Duration::from_millis(200)).await;
@@ -223,16 +223,16 @@ async fn test_validator_bind_evicted_on_disconnect() {
         bootstrap_peers: vec![node0_addr],
         ..Default::default()
     };
-    let adapter1 = Libp2pAdapter::new(
-        config1,
-        NetworkDefinition::simulator(),
-        keypair1,
-        vec![(ValidatorId::new(1), bind_sig1)],
-        HashSet::from([ShardId::ROOT]),
-        Arc::new(HandlerRegistry::default()),
-        fixtures.validator_key_map(),
-        Arc::new(BlsVerifier),
-    )
+    let adapter1 = Libp2pAdapter::new(Libp2pAdapterArgs {
+        config: config1,
+        network: NetworkDefinition::simulator(),
+        keypair: keypair1,
+        vnodes: vec![(ValidatorId::new(1), bind_sig1)],
+        local_shards: HashSet::from([ShardId::ROOT]),
+        registry: Arc::new(HandlerRegistry::default()),
+        validator_keys: fixtures.validator_key_map(),
+        verifier: Arc::new(BlsVerifier),
+    })
     .unwrap();
 
     // Wait for bind to complete.

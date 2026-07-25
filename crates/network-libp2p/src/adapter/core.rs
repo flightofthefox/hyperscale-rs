@@ -103,20 +103,31 @@ pub struct Libp2pAdapter {
     fault_gate: Arc<FaultState>,
 }
 
+/// Everything [`Libp2pAdapter::new`] needs to stand a host's networking up.
+pub struct Libp2pAdapterArgs {
+    /// Transport, gossipsub, and discovery configuration.
+    pub config: Libp2pConfig,
+    /// Radix network identity, bound into every signed bind message.
+    pub network: NetworkDefinition,
+    /// Ed25519 keypair for libp2p transport encryption.
+    pub keypair: Keypair,
+    /// One `(validator_id, signer)` per hosted vnode. The bind service
+    /// attests as every entry on each handshake. Must be non-empty.
+    pub vnodes: Vec<LocalVnodeIdentity>,
+    /// Shards hosted by this peer. The adapter registers one inbound
+    /// request accept loop per shard and subscribes to per-shard gossipsub
+    /// topics for the union.
+    pub local_shards: HashSet<ShardId>,
+    /// Shared handler registry for per-type message dispatch.
+    pub registry: Arc<HandlerRegistry>,
+    /// Initial validator key map for bind verification.
+    pub validator_keys: Arc<ValidatorKeyMap>,
+    /// Scheme verifier for signed gossip and bind attestations.
+    pub verifier: Arc<dyn Verifier>,
+}
+
 impl Libp2pAdapter {
     /// Create a new libp2p network adapter.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Network configuration
-    /// * `keypair` - Ed25519 keypair for libp2p transport encryption
-    /// * `vnodes` - One `(validator_id, signing_key)` per hosted vnode.
-    ///   The bind service attests as every entry on each handshake.
-    /// * `local_shards` - Shards hosted by this peer. The adapter
-    ///   registers one inbound request accept loop per shard and
-    ///   subscribes to per-shard gossipsub topics for the union.
-    /// * `registry` - Shared handler registry for per-type message dispatch
-    /// * `validator_keys` - Initial validator key map for bind verification
     ///
     /// # Returns
     ///
@@ -132,24 +143,21 @@ impl Libp2pAdapter {
     /// shard-less beacon-follower (pool-only) host hosts no shard and joins
     /// shards at runtime via [`Self::add_local_shard`].
     // Single setup path mirroring the libp2p builder structure.
-    // `config` is taken by value: every caller constructs a fresh config and hands
-    // it over, and the body picks fields out, so converting to `&Libp2pConfig`
-    // would just force the body to copy each scalar field.
-    #[allow(
-        clippy::too_many_lines,
-        clippy::needless_pass_by_value,
-        clippy::too_many_arguments // one setup path; each argument is a distinct collaborator
-    )]
-    pub fn new(
-        config: Libp2pConfig,
-        network: NetworkDefinition,
-        keypair: Keypair,
-        vnodes: Vec<LocalVnodeIdentity>,
-        local_shards: HashSet<ShardId>,
-        registry: Arc<HandlerRegistry>,
-        validator_keys: Arc<ValidatorKeyMap>,
-        verifier: Arc<dyn Verifier>,
-    ) -> Result<Arc<Self>, NetworkError> {
+    // `args` is taken by value: every caller constructs a fresh one and hands it
+    // over, and the body picks fields out, so borrowing would just force the
+    // body to copy each scalar field.
+    #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+    pub fn new(args: Libp2pAdapterArgs) -> Result<Arc<Self>, NetworkError> {
+        let Libp2pAdapterArgs {
+            config,
+            network,
+            keypair,
+            vnodes,
+            local_shards,
+            registry,
+            validator_keys,
+            verifier,
+        } = args;
         assert!(
             !vnodes.is_empty(),
             "Libp2pAdapter needs at least one hosted vnode"

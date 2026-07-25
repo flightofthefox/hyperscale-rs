@@ -37,8 +37,8 @@ use hyperscale_metrics::{set_libp2p_peers, set_pool_queue_depths};
 use hyperscale_metrics_prometheus::install;
 use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
 use hyperscale_network_libp2p::{
-    Libp2pAdapter, Libp2pConfig, Libp2pNetwork, NetworkError, RequestManager, RequestManagerConfig,
-    RequestStreamPool, generate_random_keypair,
+    Libp2pAdapter, Libp2pAdapterArgs, Libp2pConfig, Libp2pNetwork, NetworkError, RequestManager,
+    RequestManagerConfig, RequestStreamPool, generate_random_keypair,
 };
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::pool_loop::{POOL_FETCH_TICK_INTERVAL, PoolLoop};
@@ -1165,16 +1165,16 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
     // every outbound send path so test clusters pace to a simulated RTT.
     let simulated_outbound_latency = args.network_config.simulated_outbound_latency;
 
-    let adapter = Libp2pAdapter::new(
-        args.network_config,
-        args.network,
-        args.ed25519_keypair,
-        args.bind_vnodes,
-        args.local_shards,
-        registry.clone(),
-        args.initial_validator_keys,
-        args.verifier,
-    )?;
+    let adapter = Libp2pAdapter::new(Libp2pAdapterArgs {
+        config: args.network_config,
+        network: args.network,
+        keypair: args.ed25519_keypair,
+        vnodes: args.bind_vnodes,
+        local_shards: args.local_shards,
+        registry: registry.clone(),
+        validator_keys: args.initial_validator_keys,
+        verifier: args.verifier,
+    })?;
 
     let request_pool = Arc::new(RequestStreamPool::new(
         adapter.clone(),
