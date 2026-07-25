@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use hyperscale_crypto::Verifier;
 use sbor::prelude::*;
 use thiserror::Error;
 
@@ -338,6 +339,8 @@ pub struct FinalizedWaveContext<'a> {
     /// `wave.execution_certificates()`. Each inner slice is the
     /// committee for that EC's shard, in committee order.
     pub ec_public_keys: &'a [Vec<ConsensusPublicKey>],
+    /// Scheme verifier the EC checks run through.
+    pub verifier: &'a dyn Verifier,
 }
 
 /// Failure modes of [`FinalizedWave`] verification.
@@ -403,6 +406,7 @@ impl Verify<&FinalizedWaveContext<'_>> for FinalizedWave {
             let ec_ctx = ExecutionCertificateContext {
                 network: ctx.network,
                 public_keys: pks,
+                verifier: ctx.verifier,
             };
             ec.as_unverified().verify(&ec_ctx).map_err(|source| {
                 FinalizedWaveVerifyError::ExecutionCertificate { index, source }
@@ -462,11 +466,12 @@ impl Verified<FinalizedWave> {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
+
     use super::*;
     use crate::{
         AggregateSignature, BlockHash, BlockHeight, Bls12381G1PrivateKey, ExecutionVote, Hash,
-        ShardId, ValidatorId, WeightedTimestamp, compute_global_receipt_root, generate_bls_keypair,
-        pk_from_bls,
+        ShardId, ValidatorId, WeightedTimestamp, compute_global_receipt_root, pk_from_bls,
     };
 
     fn make_outcome(seed: u8) -> TxOutcome {
@@ -515,7 +520,7 @@ mod tests {
                 )
             })
             .collect();
-        Verified::<ExecutionCertificate>::aggregate(wave_id, root, &votes, &committee)
+        Verified::<ExecutionCertificate>::aggregate(&BlsVerifier, wave_id, root, &votes, &committee)
     }
 
     /// Honest path: every EC verifies under its committee PKs.
@@ -554,6 +559,7 @@ mod tests {
 
         let ec_pks = vec![shard0_pks, shard1_pks];
         let ctx = FinalizedWaveContext {
+            verifier: &BlsVerifier,
             network: &net,
             ec_public_keys: &ec_pks,
         };
@@ -607,6 +613,7 @@ mod tests {
 
         let ec_pks = vec![shard0_pks, shard1_pks];
         let ctx = FinalizedWaveContext {
+            verifier: &BlsVerifier,
             network: &net,
             ec_public_keys: &ec_pks,
         };
@@ -654,6 +661,7 @@ mod tests {
         // Supply two public-key vectors for a single-EC wave.
         let ec_pks: Vec<Vec<ConsensusPublicKey>> = vec![vec![], vec![]];
         let ctx = FinalizedWaveContext {
+            verifier: &BlsVerifier,
             network: &net,
             ec_public_keys: &ec_pks,
         };

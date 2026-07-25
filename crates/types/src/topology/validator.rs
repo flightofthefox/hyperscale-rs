@@ -78,8 +78,10 @@ impl ValidatorSet {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::generate_bls_keypair;
+
     use super::*;
-    use crate::{generate_bls_keypair, pk_from_bls};
+    use crate::pk_from_bls;
 
     fn make_validator(id: u64) -> ValidatorInfo {
         ValidatorInfo {

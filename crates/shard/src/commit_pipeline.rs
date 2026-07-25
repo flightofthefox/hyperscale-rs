@@ -66,8 +66,8 @@ impl CommitPipeline {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        Block, BlockHash, ChainOrigin, QuorumCertificate, Round, ShardId, SignerBitfield,
-        StateRoot, ValidatorId, WeightedTimestamp, agg_from_bls, zero_bls_signature,
+        AggregateSignature, Block, BlockHash, ChainOrigin, QuorumCertificate, Round, ShardId,
+        SignerBitfield, StateRoot, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -86,7 +86,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
         // SAFETY: synthetic test fixture, no real signature.
@@ -140,8 +140,8 @@ mod tests {
 #[cfg(test)]
 mod properties {
     use hyperscale_types::{
-        Block, BlockHash, ChainOrigin, QuorumCertificate, Round, ShardId, SignerBitfield,
-        StateRoot, ValidatorId, WeightedTimestamp, agg_from_bls, zero_bls_signature,
+        AggregateSignature, Block, BlockHash, ChainOrigin, QuorumCertificate, Round, ShardId,
+        SignerBitfield, StateRoot, ValidatorId, WeightedTimestamp,
     };
     use proptest::prelude::*;
 
@@ -161,7 +161,7 @@ mod properties {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
         // SAFETY: synthetic test fixture, no real signature.

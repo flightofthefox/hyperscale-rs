@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use hyperscale_crypto_bls::bls_keypair_from_seed;
 use radix_common::constants::PACKAGE_PACKAGE;
 use radix_common::crypto::{Ed25519PrivateKey, IsHash, PublicKey as RadixPublicKey};
 use radix_common::prelude::Epoch;
@@ -25,7 +26,7 @@ use crate::{
     SignerBitfield, StateRoot, TimestampRange, TopologySnapshot, TransactionDecision,
     TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
     Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources, agg_from_bls,
-    block_vote_message, bls_keypair_from_seed, pk_from_bls,
+    block_vote_message, pk_from_bls,
 };
 
 /// Create a test `NodeId` from a seed byte.
@@ -882,8 +883,11 @@ pub fn make_finalized_wave(
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto::Verifier;
+    use hyperscale_crypto_bls::BlsVerifier;
+
     use super::*;
-    use crate::{bls_pk, verify_bls12381_v1};
+    use crate::sig_from_bls;
 
     #[test]
     fn test_committee_creation() {
@@ -945,20 +949,12 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
 
         let message = b"test message";
-        let signature = committee.keypair(0).sign_v1(message);
+        let signature = sig_from_bls(&committee.keypair(0).sign_v1(message));
 
         // Verify with the corresponding public key
-        assert!(verify_bls12381_v1(
-            message,
-            &bls_pk(committee.public_key(0)),
-            &signature
-        ));
+        assert!(BlsVerifier.verify(committee.public_key(0), message, &signature));
 
         // Should not verify with different public key
-        assert!(!verify_bls12381_v1(
-            message,
-            &bls_pk(committee.public_key(1)),
-            &signature
-        ));
+        assert!(!BlsVerifier.verify(committee.public_key(1), message, &signature));
     }
 }

@@ -820,6 +820,8 @@ impl TopologySchedule {
 mod tests {
     use std::collections::{BTreeSet, HashMap};
 
+    use hyperscale_crypto_bls::generate_bls_keypair;
+
     use super::*;
     use crate::{
         BlockHeight, CompletedRecovery, NetworkDefinition, RecoveryCause, ShardRecovery,
@@ -1174,7 +1176,7 @@ mod tests {
 
     #[test]
     fn routing_committees_retains_a_drained_parent() {
-        use crate::{ValidatorInfo, generate_bls_keypair};
+        use crate::ValidatorInfo;
 
         let validators: Vec<ValidatorInfo> = (0..4)
             .map(|i| ValidatorInfo {
@@ -1218,7 +1220,7 @@ mod tests {
     /// entries are untouched.
     #[test]
     fn routing_committees_unions_a_recovering_shards_retained_committee() {
-        use crate::{ValidatorInfo, generate_bls_keypair};
+        use crate::ValidatorInfo;
 
         let validators: Vec<ValidatorInfo> = (0..12)
             .map(|i| ValidatorInfo {
@@ -1268,7 +1270,7 @@ mod tests {
     /// recovery both resolutions are the plain anchor lookup.
     #[test]
     fn recovery_bridge_splits_live_and_certified_resolution() {
-        use crate::{ValidatorInfo, generate_bls_keypair};
+        use crate::ValidatorInfo;
 
         let validators: Vec<ValidatorInfo> = (0..8)
             .map(|i| ValidatorInfo {
@@ -1396,7 +1398,7 @@ mod tests {
     /// to the plain anchor lookup, and the pending-scoped fences go inert.
     #[test]
     fn recovery_bridge_binding_survives_the_pending_records_clear() {
-        use crate::{ValidatorInfo, generate_bls_keypair};
+        use crate::ValidatorInfo;
 
         let validators: Vec<ValidatorInfo> = (0..12)
             .map(|i| ValidatorInfo {

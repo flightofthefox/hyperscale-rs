@@ -7,7 +7,7 @@
 use std::env;
 
 use hex::{decode, encode};
-use hyperscale_types::{bls_keypair_from_seed, generate_bls_keypair};
+use hyperscale_crypto_bls::{bls_keypair_from_seed, generate_bls_keypair};
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
 

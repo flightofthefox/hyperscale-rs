@@ -58,9 +58,7 @@ mod tests {
     use sbor::{basic_decode, basic_encode};
 
     use super::*;
-    use crate::{
-        BlockHash, BlockHeight, Hash, Round, ValidatorId, sig_from_bls, zero_bls_signature,
-    };
+    use crate::{BlockHash, BlockHeight, ConsensusSignature, Hash, Round, ValidatorId};
 
     fn sample() -> ShardVoteEquivocation {
         ShardVoteEquivocation {
@@ -70,10 +68,10 @@ mod tests {
             round: Round::new(2),
             block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"a")),
             parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"pa")),
-            sig_a: sig_from_bls(&zero_bls_signature()),
+            sig_a: ConsensusSignature::ZERO,
             block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"b")),
             parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"pb")),
-            sig_b: sig_from_bls(&zero_bls_signature()),
+            sig_b: ConsensusSignature::ZERO,
         }
     }
 

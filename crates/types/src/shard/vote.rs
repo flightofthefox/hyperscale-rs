@@ -4,14 +4,14 @@
 //! `Verified<BlockVote>`; predicate at
 //! [`impl Verify<&BlockVoteContext<'_>>`](Verify::verify) below.
 
+use hyperscale_crypto::Verifier;
 use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    BlockHash, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
-    ConsensusPublicKey, ConsensusSignature, NetworkDefinition, ProposerTimestamp, Round, ShardId,
-    ValidatorId, Verified, Verify, batch_verify_bls_same_message, block_vote_message, bls_pk,
-    bls_sig, sig_from_bls, verify_bls12381_v1,
+    BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusPublicKey, ConsensusSignature,
+    NetworkDefinition, ProposerTimestamp, Round, ShardId, ValidatorId, Verified, Verify,
+    block_vote_message, sig_from_bls,
 };
 
 /// Block vote for shard consensus.
@@ -181,10 +181,12 @@ impl BlockVote {
 pub struct BlockVoteContext<'a> {
     /// Network identifier — feeds the domain-separated signing message.
     pub network: &'a NetworkDefinition,
-    /// BLS public key of the voter who cast this vote.
+    /// Public key of the voter who cast this vote.
     pub voter_public_key: &'a ConsensusPublicKey,
     /// Parent of the voted block (from its header), bound into the signing message.
     pub parent_block_hash: BlockHash,
+    /// Scheme verifier the signature check runs through.
+    pub verifier: &'a dyn Verifier,
 }
 
 /// Failure modes of [`BlockVote`] verification.
@@ -214,11 +216,10 @@ impl Verify<&BlockVoteContext<'_>> for BlockVote {
 
     fn verify(&self, ctx: &BlockVoteContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let message = self.signing_message(ctx.network, &ctx.parent_block_hash);
-        if !verify_bls12381_v1(
-            &message,
-            &bls_pk(ctx.voter_public_key),
-            &bls_sig(&self.signature),
-        ) {
+        if !ctx
+            .verifier
+            .verify(ctx.voter_public_key, &message, &self.signature)
+        {
             return Err(BlockVoteVerifyError::InvalidSignature);
         }
         Ok(Verified::new_unchecked(self.clone()))
@@ -283,6 +284,7 @@ impl Verified<BlockVote> {
     /// votes whose signature didn't validate.
     #[must_use]
     pub fn verify_batch(
+        verifier: &dyn Verifier,
         signing_message: &[u8],
         votes: Vec<(BlockVote, ConsensusPublicKey)>,
     ) -> Vec<Option<Self>> {
@@ -290,43 +292,31 @@ impl Verified<BlockVote> {
             return Vec::new();
         }
 
-        let signatures: Vec<Bls12381G2Signature> =
-            votes.iter().map(|(v, _)| bls_sig(&v.signature())).collect();
-        let public_keys: Vec<Bls12381G1PublicKey> =
-            votes.iter().map(|(_, pk)| bls_pk(pk)).collect();
+        let messages: Vec<&[u8]> = vec![signing_message; votes.len()];
+        let signatures: Vec<ConsensusSignature> =
+            votes.iter().map(|(v, _)| v.signature()).collect();
+        let public_keys: Vec<ConsensusPublicKey> = votes.iter().map(|(_, pk)| *pk).collect();
 
-        if batch_verify_bls_same_message(signing_message, &signatures, &public_keys) {
-            // SAFETY: BLS same-message batch verify just confirmed every
-            // signature in this batch against its paired public key over
-            // `signing_message`, which is exactly the `BlockVote::verify`
-            // predicate (the caller's contract is to pass votes that
-            // share that signing message).
-            return votes
-                .into_iter()
-                .map(|(vote, _)| Some(Self::new_unchecked(vote)))
-                .collect();
-        }
-
+        // SAFETY (both arms): the scheme batch verify confirms each
+        // signature against its paired public key over `signing_message`,
+        // which is exactly the `BlockVote::verify` predicate (the
+        // caller's contract is to pass votes that share that signing
+        // message).
+        let verdicts = verifier.batch_verify(&messages, &signatures, &public_keys);
         votes
             .into_iter()
-            .map(|(vote, pk)| {
-                if verify_bls12381_v1(signing_message, &bls_pk(&pk), &bls_sig(&vote.signature())) {
-                    // SAFETY: individual BLS verify just re-ran the
-                    // `BlockVote::verify` predicate against the voter's
-                    // pubkey.
-                    Some(Self::new_unchecked(vote))
-                } else {
-                    None
-                }
-            })
+            .zip(verdicts)
+            .map(|((vote, _), ok)| ok.then(|| Self::new_unchecked(vote)))
             .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
+
     use super::*;
-    use crate::{Hash, generate_bls_keypair, pk_from_bls};
+    use crate::{Hash, pk_from_bls};
 
     /// All-valid batch verifies via the fast path and yields one
     /// `Some(verified)` per input position.
@@ -359,7 +349,7 @@ mod tests {
             })
             .collect();
 
-        let results = Verified::<BlockVote>::verify_batch(&message, votes);
+        let results = Verified::<BlockVote>::verify_batch(&BlsVerifier, &message, votes);
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(Option::is_some));
     }
@@ -400,7 +390,7 @@ mod tests {
         let intruder_sk = generate_bls_keypair();
         votes[1].1 = pk_from_bls(&intruder_sk.public_key());
 
-        let results = Verified::<BlockVote>::verify_batch(&message, votes);
+        let results = Verified::<BlockVote>::verify_batch(&BlsVerifier, &message, votes);
         assert_eq!(results.len(), 3);
         assert!(results[0].is_some());
         assert!(results[1].is_none());
@@ -410,7 +400,7 @@ mod tests {
     /// Empty input produces an empty output (no allocation, no fallback).
     #[test]
     fn verify_batch_empty_input_returns_empty() {
-        let results = Verified::<BlockVote>::verify_batch(b"unused", Vec::new());
+        let results = Verified::<BlockVote>::verify_batch(&BlsVerifier, b"unused", Vec::new());
         assert!(results.is_empty());
     }
 }

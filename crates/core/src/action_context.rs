@@ -15,7 +15,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BeaconProposal, BlockHash, BlockHeight, Bls12381G1PrivateKey, ConsensusReceipt, Epoch,
-    PreparedCommit, ShardId, TopologySnapshot, ValidatorId, Verified, WaveId,
+    PreparedCommit, ShardId, TopologySnapshot, ValidatorId, Verified, Verifier, WaveId,
 };
 
 use crate::ProtocolEvent;
@@ -60,6 +60,8 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     /// Local validator's BLS signing key. Used by handlers that sign
     /// votes/headers before broadcast.
     pub signing_key: &'a Arc<Bls12381G1PrivateKey>,
+    /// Scheme verifier for signature and certificate checks.
+    pub verifier: &'a dyn Verifier,
     /// Send a [`ProtocolEvent`] back to the state machine. The single
     /// sink for delegated-action outcomes — the dispatch wrapper at
     /// the I/O loop boundary stamps the emitting vnode's shard and

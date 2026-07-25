@@ -162,6 +162,7 @@ where
         tx_validator: Arc<TransactionValidation>,
     ) -> Self {
         assert!(!vnodes.is_empty(), "NodeHost requires at least one Vnode");
+        let process_verifier = Arc::clone(vnodes[0].state.beacon_coordinator().verifier());
 
         let network = Arc::new(network);
 
@@ -220,6 +221,7 @@ where
         }
         let process = Arc::new(ProcessIo::new(
             network,
+            process_verifier,
             dispatch,
             shard_event_senders,
             beacon_event_sender,

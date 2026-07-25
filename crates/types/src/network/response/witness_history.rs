@@ -76,10 +76,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
-        ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardId, SignerBitfield, Stake, StakePoolId, StateRoot,
-        TransactionRoot, ValidatorId, WeightedTimestamp, agg_from_bls, zero_bls_signature,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
+        CertificateRoot, ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, Stake, StakePoolId,
+        StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
     };
 
     fn make_header() -> BlockHeader {
@@ -127,7 +127,7 @@ mod tests {
             header.parent_block_hash(),
             Round::INITIAL,
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
         let response = GetWitnessHistoryResponse {

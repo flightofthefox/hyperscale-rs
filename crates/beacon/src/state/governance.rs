@@ -83,6 +83,7 @@ pub(super) fn tally_param_votes(state: &mut BeaconState) {
 mod tests {
     use std::collections::BTreeSet;
 
+    use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
         BeaconState, Epoch, NetworkParams, ParamProposal, ParamVote, ReshapeThresholds, ShardId,
         ShardWitnessPayload, Stake, StakePool, StakePoolId,
@@ -126,6 +127,7 @@ mod tests {
 
     fn cast(state: &mut BeaconState, pool: u32, proposal: Option<ParamProposal>) {
         apply_shard_payload(
+            &BlsVerifier,
             state,
             &net(),
             ShardId::ROOT,

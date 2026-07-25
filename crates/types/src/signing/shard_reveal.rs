@@ -18,9 +18,10 @@
 //! unknowable at registration). Domain separation keeps a reveal from being
 //! confused with a block vote or header sig, which reuse the same BLS keys.
 
+use hyperscale_crypto::Verifier;
+
 use crate::{
-    BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature, ConsensusPublicKey, NetworkDefinition,
-    ShardId, VrfProof, bls_pk, verify_bls12381_v1,
+    BlockHeight, Bls12381G1PrivateKey, ConsensusPublicKey, NetworkDefinition, ShardId, VrfProof,
 };
 
 /// Domain tag for per-block shard randomness reveals.
@@ -73,6 +74,7 @@ pub fn shard_reveal_sign(
 /// against `pk` over the bytes produced by [`shard_reveal_message`].
 #[must_use]
 pub fn shard_reveal_verify(
+    verifier: &dyn Verifier,
     pk: &ConsensusPublicKey,
     network: &NetworkDefinition,
     shard: ShardId,
@@ -80,15 +82,16 @@ pub fn shard_reveal_verify(
     proof: &VrfProof,
 ) -> bool {
     let msg = shard_reveal_message(network, shard, height);
-    let sig = Bls12381G2Signature(*proof.as_bytes());
-    verify_bls12381_v1(&msg, &bls_pk(pk), &sig)
+    verifier.verify_vrf(pk, &msg, proof)
 }
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+
     use super::*;
     use crate::signing::{DOMAIN_BLOCK_HEADER, DOMAIN_PC_VRF};
-    use crate::{bls_keypair_from_seed, pk_from_bls, vrf_output_from_proof};
+    use crate::{pk_from_bls, vrf_output_from_proof};
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
@@ -169,6 +172,7 @@ mod tests {
         let sk = keypair(3);
         let proof = shard_reveal_sign(&sk, &net(), ShardId::leaf(1, 1), BlockHeight::new(42));
         assert!(shard_reveal_verify(
+            &BlsVerifier,
             &pk_from_bls(&sk.public_key()),
             &net(),
             ShardId::leaf(1, 1),
@@ -196,6 +200,7 @@ mod tests {
         let sk_b = keypair(4);
         let proof = shard_reveal_sign(&sk_a, &net(), ShardId::leaf(1, 0), BlockHeight::new(42));
         assert!(!shard_reveal_verify(
+            &BlsVerifier,
             &pk_from_bls(&sk_b.public_key()),
             &net(),
             ShardId::leaf(1, 0),
@@ -210,6 +215,7 @@ mod tests {
         let sk = keypair(3);
         let proof = shard_reveal_sign(&sk, &net(), ShardId::leaf(1, 0), BlockHeight::new(42));
         assert!(!shard_reveal_verify(
+            &BlsVerifier,
             &pk_from_bls(&sk.public_key()),
             &net(),
             ShardId::leaf(1, 0),
@@ -224,6 +230,7 @@ mod tests {
         let sk = keypair(3);
         let proof = shard_reveal_sign(&sk, &net(), ShardId::leaf(1, 0), BlockHeight::new(42));
         assert!(!shard_reveal_verify(
+            &BlsVerifier,
             &pk_from_bls(&sk.public_key()),
             &net(),
             ShardId::leaf(1, 1),
@@ -243,6 +250,7 @@ mod tests {
         bytes[0] ^= 1;
         let proof = VrfProof::new(bytes);
         assert!(!shard_reveal_verify(
+            &BlsVerifier,
             &pk_from_bls(&sk.public_key()),
             &net(),
             ShardId::leaf(1, 0),

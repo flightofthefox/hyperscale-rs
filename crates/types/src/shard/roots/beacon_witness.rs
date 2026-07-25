@@ -1,6 +1,7 @@
 //! [`BeaconWitnessRoot`] verification, plus the canonical leaf-derivation
 //! helpers shared by proposer and verifier.
 
+use hyperscale_crypto::Verifier;
 use thiserror::Error;
 
 use crate::{
@@ -69,6 +70,8 @@ pub struct BeaconWitnessRootContext<'a> {
     /// Topology snapshot anchoring the proposer-rotation rule the
     /// missed-round walk reads.
     pub topology_snapshot: &'a TopologySnapshot,
+    /// Scheme verifier the randomness-reveal VRF check runs through.
+    pub verifier: &'a dyn Verifier,
 }
 
 /// Failure modes of [`BeaconWitnessRoot`] verification.
@@ -333,6 +336,7 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
             .public_key(proposer)
             .is_some_and(|pk| {
                 shard_reveal_verify(
+                    ctx.verifier,
                     &pk,
                     ctx.topology_snapshot.network(),
                     ctx.shard,
@@ -440,10 +444,12 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+
     use super::*;
     use crate::{
-        Bls12381G1PrivateKey, NetworkDefinition, ValidatorId, ValidatorInfo, ValidatorSet,
-        VrfProof, bls_keypair_from_seed, pk_from_bls, shard_reveal_sign, sig_from_bls,
+        Bls12381G1PrivateKey, ConsensusSignature, NetworkDefinition, ValidatorId, ValidatorInfo,
+        ValidatorSet, VrfProof, pk_from_bls, shard_reveal_sign,
     };
 
     /// The single committee member's key. Deterministic so a test can both
@@ -540,6 +546,7 @@ mod tests {
         expected_leaf_count: u64,
     ) -> BeaconWitnessRootContext<'a> {
         BeaconWitnessRootContext {
+            verifier: &BlsVerifier,
             expected_leaf_count: BeaconWitnessLeafCount::new(expected_leaf_count),
             claimed_base: BeaconWitnessLeafCount::new(claimed_base),
             parent_leaves_start: BeaconWitnessLeafCount::ZERO,
@@ -710,7 +717,7 @@ mod tests {
     fn observer_signals_classify_as_reshape_ready_leaves() {
         use std::collections::BTreeMap;
 
-        use crate::{ReadySignal, WeightedTimestamp, zero_bls_signature};
+        use crate::{ReadySignal, WeightedTimestamp};
 
         let shard = ShardId::ROOT;
         let observer = ValidatorId::new(0);
@@ -720,7 +727,7 @@ mod tests {
             child,
             WeightedTimestamp::from_millis(0),
             WeightedTimestamp::from_millis(10),
-            sig_from_bls(&zero_bls_signature()),
+            ConsensusSignature::ZERO,
         )];
         let leaf = ShardWitnessPayload::ReshapeReady {
             validator: observer,
@@ -750,7 +757,7 @@ mod tests {
     fn keeper_signals_classify_as_reshape_ready_leaves() {
         use std::collections::BTreeMap;
 
-        use crate::{ReadySignal, WeightedTimestamp, zero_bls_signature};
+        use crate::{ReadySignal, WeightedTimestamp};
 
         let child = ShardId::leaf(1, 0);
         let parent = ShardId::ROOT;
@@ -760,7 +767,7 @@ mod tests {
             child,
             WeightedTimestamp::from_millis(0),
             WeightedTimestamp::from_millis(10),
-            sig_from_bls(&zero_bls_signature()),
+            ConsensusSignature::ZERO,
         )];
         let leaf = ShardWitnessPayload::ReshapeReady {
             validator: keeper,

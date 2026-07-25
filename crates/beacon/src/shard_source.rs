@@ -502,12 +502,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BoundedVec,
-        CertificateRoot, CertifiedBlockHeader, Hash, InFlightCount, LeafIndex, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId, ShardWitness,
-        ShardWitnessPayload, ShardWitnessProof, SignerBitfield, Stake, StakePoolId, StateRoot,
-        TransactionRoot, ValidatorId, Verified, WeightedTimestamp, agg_from_bls,
-        zero_bls_signature,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
+        BlockHeight, BoundedVec, CertificateRoot, CertifiedBlockHeader, Hash, InFlightCount,
+        LeafIndex, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
+        ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, Stake,
+        StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verified, WeightedTimestamp,
     };
 
     use super::*;
@@ -534,7 +533,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_wt),
         );
         let header = BlockHeader::new(
@@ -568,7 +567,7 @@ mod tests {
             parent_hash,
             Round::INITIAL,
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_wt),
         );
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(

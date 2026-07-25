@@ -120,6 +120,7 @@ where
             committee,
         } => {
             let certificate = Verified::<ExecutionCertificate>::aggregate(
+                ctx.verifier,
                 &wave_id,
                 global_receipt_root,
                 &votes,
@@ -135,8 +136,11 @@ where
             block_hash,
             votes,
         } => {
-            let verified_votes =
-                Verified::<ExecutionVote>::verify_batch(ctx.topology_snapshot.network(), votes);
+            let verified_votes = Verified::<ExecutionVote>::verify_batch(
+                ctx.verifier,
+                ctx.topology_snapshot.network(),
+                votes,
+            );
             ctx.notify_protocol(ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                 wave_id,
                 block_hash,
@@ -149,6 +153,7 @@ where
             ..
         } => {
             let ctx_ec = ExecutionCertificateContext {
+                verifier: ctx.verifier,
                 network: ctx.topology_snapshot.network(),
                 public_keys: &public_keys,
             };
@@ -163,6 +168,7 @@ where
             ec_public_keys,
         } => {
             let fw_ctx = FinalizedWaveContext {
+                verifier: ctx.verifier,
                 network: ctx.topology_snapshot.network(),
                 ec_public_keys: &ec_public_keys,
             };

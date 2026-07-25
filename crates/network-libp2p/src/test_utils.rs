@@ -7,10 +7,11 @@
 
 use std::sync::Arc;
 
+use hyperscale_crypto_bls::bls_keypair_from_seed;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::{
     Bls12381G1PrivateKey, ConsensusPublicKey, GenesisValidators, NetworkDefinition, ValidatorId,
-    ValidatorInfo, ValidatorSet, bls_keypair_from_seed, pk_from_bls,
+    ValidatorInfo, ValidatorSet, pk_from_bls,
 };
 use libp2p::PeerId;
 use libp2p::identity::Keypair;

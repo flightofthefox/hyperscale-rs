@@ -39,10 +39,11 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G2Signature, NetworkDefinition, VALIDATOR_BIND_NONCE_LEN,
-    ValidatorId, bls_pk, validator_bind_message, verify_bls12381_v1,
+    ValidatorId, Verifier as _, sig_from_bls, validator_bind_message,
 };
 use libp2p::{PeerId as Libp2pPeerId, Stream, StreamProtocol};
 use libp2p_stream::{Control, IncomingStreams};
@@ -230,7 +231,7 @@ fn verify_bind(
         .ok_or(BindError::UnknownValidator(claimed_vid))?;
 
     let message = validator_bind_message(network, &peer_id.to_bytes(), nonce);
-    if verify_bls12381_v1(&message, &bls_pk(pubkey), signature) {
+    if BlsVerifier.verify(pubkey, &message, &sig_from_bls(signature)) {
         Ok(())
     } else {
         Err(BindError::InvalidSignature(claimed_vid))
@@ -617,9 +618,8 @@ async fn handle_outbound(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{
-        ConsensusPublicKey, generate_bls_keypair, pk_from_bls, zero_bls_signature,
-    };
+    use hyperscale_crypto_bls::generate_bls_keypair;
+    use hyperscale_types::{ConsensusPublicKey, pk_from_bls};
 
     use super::*;
 
@@ -746,7 +746,7 @@ mod tests {
             &peer_id.to_bytes(),
             &nonce,
         ));
-        let bad_sig = zero_bls_signature();
+        let bad_sig = Bls12381G2Signature([0u8; 96]);
 
         let mut keys = ValidatorKeyMap::new();
         keys.insert(good_vid, pk_from_bls(&keypair.public_key()));

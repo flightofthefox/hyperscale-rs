@@ -54,6 +54,7 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use clap::Parser;
 use hex::{decode as hex_decode, encode as hex_encode};
+use hyperscale_crypto_bls::{bls_keypair_from_seed, generate_bls_keypair};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
 use hyperscale_mempool::MempoolConfig;
@@ -72,8 +73,7 @@ use hyperscale_storage_rocksdb::{
 };
 use hyperscale_types::{
     BeaconChainConfig, Bls12381G1PrivateKey, ConsensusPublicKey, GenesisValidators, ShardId,
-    ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed, generate_bls_keypair,
-    pk_from_bls, shard_prefix_path,
+    ValidatorId, ValidatorInfo, ValidatorSet, pk_from_bls, shard_prefix_path,
 };
 use igd_next::aio::tokio::search_gateway;
 use igd_next::{PortMappingProtocol, SearchOptions};

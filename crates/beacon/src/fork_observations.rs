@@ -111,6 +111,7 @@ impl ForkProofObservations {
 mod tests {
     use std::sync::Arc;
 
+    use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::test_utils::{TestCommittee, shard_fork_proof};
     use hyperscale_types::{BlockHeight, TopologySchedule};
 
@@ -159,7 +160,7 @@ mod tests {
         assert_eq!(drained.len(), 1);
         // The drained proof still verifies against the committee's schedule.
         let schedule = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
-        assert!(drained[&SHARD].verify(&schedule).is_ok());
+        assert!(drained[&SHARD].verify(&BlsVerifier, &schedule).is_ok());
         // Drained but unconfirmed: held in flight (deduping re-observation),
         // out of the next build until restored.
         assert!(f.contains(SHARD));

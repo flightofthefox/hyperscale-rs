@@ -10,12 +10,12 @@ use std::sync::Arc;
 use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-    BoundedVec, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash,
-    InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash,
+    AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
+    BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
+    Hash, InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash,
     ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TopologySchedule,
     TopologySnapshot, TransactionRoot, ValidatorId, Verified, WaveId, WeightedTimestamp,
-    WitnessSources, agg_from_bls, zero_bls_signature,
+    WitnessSources,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -124,7 +124,7 @@ fn make_remote_header_targeting(
         BlockHash::ZERO,
         Round::INITIAL,
         SignerBitfield::empty(),
-        agg_from_bls(&zero_bls_signature()),
+        AggregateSignature::ZERO,
         WeightedTimestamp::ZERO,
     );
     Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(

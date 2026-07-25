@@ -73,9 +73,7 @@ impl VoteEquivocationObservations {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{
-        BlockHash, BlockHeight, Hash, Round, ShardId, sig_from_bls, zero_bls_signature,
-    };
+    use hyperscale_types::{BlockHash, BlockHeight, ConsensusSignature, Hash, Round, ShardId};
 
     use super::*;
 
@@ -87,10 +85,10 @@ mod tests {
             round: Round::new(2),
             block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"a")),
             parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"pa")),
-            sig_a: sig_from_bls(&zero_bls_signature()),
+            sig_a: ConsensusSignature::ZERO,
             block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"b")),
             parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"pb")),
-            sig_b: sig_from_bls(&zero_bls_signature()),
+            sig_b: ConsensusSignature::ZERO,
         }
     }
 

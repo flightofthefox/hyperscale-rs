@@ -15,10 +15,10 @@
 
 use std::sync::Arc;
 
+use hyperscale_crypto_bls::bls_keypair_from_seed;
 use hyperscale_types::{
     BeaconWitnessEvent, ConsensusPublicKey, Stake, StakePoolId, UNBONDING_WINDOW_EPOCHS,
-    ValidatorId, ValidatorStatus, bls_keypair_from_seed, pk_from_bls,
-    validator_possession_proof_sign,
+    ValidatorId, ValidatorStatus, pk_from_bls, validator_possession_proof_sign,
 };
 use radix_common::network::NetworkDefinition;
 

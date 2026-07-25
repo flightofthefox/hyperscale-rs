@@ -284,10 +284,11 @@ impl ConflictDetector {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::bls_keypair_from_seed;
     use hyperscale_types::{
         BlockHeight, Hash, MerkleInclusionProof, NetworkDefinition, NodeId, ProvisionEntry,
         ShardId, SubstateEntry, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
-        bls_keypair_from_seed, pk_from_bls, uniform_shard_for_node,
+        pk_from_bls, uniform_shard_for_node,
     };
 
     use super::*;

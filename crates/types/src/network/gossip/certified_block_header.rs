@@ -84,7 +84,7 @@ mod tests {
     use sbor::{basic_decode, basic_encode};
 
     use super::*;
-    use crate::{BlockHash, InFlightCount, ProposerTimestamp, sig_from_bls};
+    use crate::{BlockHash, InFlightCount, ProposerTimestamp};
 
     #[test]
     fn test_message_type_id() {
@@ -99,7 +99,7 @@ mod tests {
         use crate::{
             BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, CertificateRoot,
             ChainOrigin, Hash, LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, Round, ShardId,
-            StateRoot, TransactionRoot, ValidatorId, zero_bls_signature,
+            StateRoot, TransactionRoot, ValidatorId,
         };
 
         let header = BlockHeader::new(
@@ -130,7 +130,7 @@ mod tests {
         let gossip = CertifiedBlockHeaderGossip {
             certified_header: Arc::new(Verifiable::from(CertifiedBlockHeader::new(header, qc))),
             sender: ValidatorId::new(0),
-            sender_signature: sig_from_bls(&zero_bls_signature()),
+            sender_signature: ConsensusSignature::ZERO,
         };
 
         let encoded = basic_encode(&gossip).unwrap();

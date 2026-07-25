@@ -46,11 +46,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
+use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
 use hyperscale_types::{
     BeaconChainConfig, BeaconProposal, BeaconState, Bls12381G1PrivateKey, Epoch, MIN_STAKE_FLOOR,
     NetworkDefinition, Randomness, ShardCommittee, ShardId, Stake, StakePool, StakePoolId,
-    ValidatorId, ValidatorRecord, ValidatorStatus, bls_keypair_from_seed, byzantine_threshold,
-    pk_from_bls, vrf_sign,
+    ValidatorId, ValidatorRecord, ValidatorStatus, byzantine_threshold, pk_from_bls, vrf_sign,
 };
 
 // ─── Analytic model (ported from committee_security.py) ──────────────────────
@@ -548,6 +548,7 @@ fn grind_event(
         let committed = committed_for(&honest_props, &grinder_props, mask);
         let mut probe = state.clone();
         apply_epoch(
+            &BlsVerifier,
             &mut probe,
             &ctx.net,
             epoch,
@@ -572,6 +573,7 @@ fn grind_event(
 
     let committed = committed_for(&honest_props, &grinder_props, best_mask);
     let effects = apply_epoch(
+        &BlsVerifier,
         state,
         &ctx.net,
         epoch,

@@ -382,7 +382,7 @@ pub enum Action {
     /// Verify block votes and build a Quorum Certificate if quorum is reached.
     ///
     /// This combines vote verification and QC building into a single operation:
-    /// 1. Batch-verifies all vote signatures using `batch_verify_bls_same_message`
+    /// 1. Batch-verifies all vote signatures through the scheme verifier
     /// 2. If enough valid votes for quorum: aggregates signatures into a QC
     /// 3. If not enough valid votes: returns the verified votes so state machine
     ///    can wait for more votes

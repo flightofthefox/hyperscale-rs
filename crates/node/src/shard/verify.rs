@@ -2,20 +2,21 @@
 
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_types::{
-    Bls12381G2Signature, ConsensusPublicKey, ShardId, Signed, SignedContext, TopologySnapshot,
-    ValidatorId, bls_pk, verify_bls12381_v1,
+    ConsensusPublicKey, ConsensusSignature, ShardId, Signed, SignedContext, TopologySnapshot,
+    ValidatorId, Verifier,
 };
 use tracing::warn;
 
-/// Verify a BLS12-381 signature and record latency metrics.
-pub fn verify_bls_with_metrics(
+/// Verify a consensus signature and record latency metrics.
+pub fn verify_sig_with_metrics(
+    verifier: &dyn Verifier,
     msg: &[u8],
     public_key: &ConsensusPublicKey,
-    signature: &Bls12381G2Signature,
+    signature: &ConsensusSignature,
     label: &str,
 ) -> bool {
     let start = std::time::Instant::now();
-    let valid = verify_bls12381_v1(msg, &bls_pk(public_key), signature);
+    let valid = verifier.verify(public_key, msg, signature);
     record_signature_verification_latency(label, start.elapsed().as_secs_f64());
     valid
 }
@@ -59,6 +60,7 @@ pub fn resolve_sender_key(
 /// Returns `false` (with warnings) when the proposer's key cannot be
 /// resolved or the signature fails to validate.
 pub fn verify_signed_by_proposer<T: Signed>(
+    verifier: &dyn Verifier,
     topology_snapshot: &TopologySnapshot,
     notification: &T,
     metric_label: &str,
@@ -74,6 +76,7 @@ pub fn verify_signed_by_proposer<T: Signed>(
         .verify_signature(&SignedContext {
             network: topology_snapshot.network(),
             public_key: &public_key,
+            verifier,
         })
         .is_ok();
     record_signature_verification_latency(metric_label, start.elapsed().as_secs_f64());
@@ -93,6 +96,7 @@ pub fn verify_signed_by_proposer<T: Signed>(
 ///
 /// Returns `false` (with warnings) on any failure.
 pub fn verify_signed_by_committee<T: Signed>(
+    verifier: &dyn Verifier,
     topology_snapshot: &TopologySnapshot,
     shard: ShardId,
     notification: &T,
@@ -108,6 +112,7 @@ pub fn verify_signed_by_committee<T: Signed>(
         .verify_signature(&SignedContext {
             network: topology_snapshot.network(),
             public_key: &public_key,
+            verifier,
         })
         .is_ok();
     record_signature_verification_latency(metric_label, start.elapsed().as_secs_f64());

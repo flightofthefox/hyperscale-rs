@@ -94,10 +94,10 @@ impl VerifiedHeaderBuffer {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, CertificateRoot,
-        ChainOrigin, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, SignerBitfield, StateRoot, TransactionRoot, ValidatorId,
-        WeightedTimestamp, agg_from_bls, zero_bls_signature,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
+        CertificateRoot, ChainOrigin, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionsRoot, QuorumCertificate, Round, SignerBitfield, StateRoot, TransactionRoot,
+        ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -134,7 +134,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(

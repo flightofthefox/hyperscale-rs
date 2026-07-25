@@ -4,6 +4,7 @@ members = [
     "crates/beacon",
     "crates/core",
     "crates/crypto",
+    "crates/crypto-bls",
     "crates/dispatch",
     "crates/dispatch-pooled",
     "crates/dispatch-sync",
@@ -41,6 +42,7 @@ edition = "2024"
 hyperscale-beacon = { path = "crates/beacon" }
 hyperscale-core = { path = "crates/core" }
 hyperscale-crypto = { path = "crates/crypto" }
+hyperscale-crypto-bls = { path = "crates/crypto-bls" }
 hyperscale-dispatch = { path = "crates/dispatch" }
 hyperscale-dispatch-pooled = { path = "crates/dispatch-pooled" }
 hyperscale-dispatch-sync = { path = "crates/dispatch-sync" }

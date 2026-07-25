@@ -20,8 +20,7 @@ use hyperscale_types::{
     Randomness, RatifyCert, RatifyRound, Round, ShardAnchor, ShardId, ShardWitnessPayload,
     SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StoredReceipt,
     TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
-    WeightedTimestamp, WitnessSources, agg_from_bls, compute_global_receipt_root,
-    compute_merkle_root, zero_bls_signature,
+    WeightedTimestamp, WitnessSources, compute_global_receipt_root, compute_merkle_root,
 };
 use indexmap::IndexMap;
 use radix_common::math::Decimal;
@@ -226,7 +225,7 @@ pub fn make_test_qc(block: &Block) -> Verified<QuorumCertificate> {
         block.header().parent_block_hash(),
         Round::INITIAL,
         SignerBitfield::new(4),
-        agg_from_bls(&zero_bls_signature()),
+        AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(block.header().timestamp().as_millis()),
     ))
 }

@@ -11,10 +11,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use hyperscale_beacon::pc::{PcEffect, PcEvent, PcInstance};
+use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
 use hyperscale_types::{
     Bls12381G1PrivateKey, ConsensusPublicKey, Epoch, NetworkDefinition, PcContext, PcQc3, PcVector,
-    PcVote1, PcVote2, PcVote3, SpcView, ValidatorId, Verified, bls_keypair_from_seed, pc_context,
-    pk_from_bls, spc_context,
+    PcVote1, PcVote2, PcVote3, SpcView, ValidatorId, Verified, pc_context, pk_from_bls,
+    spc_context,
 };
 
 /// One pending message in the network: a vote event addressed to a
@@ -52,7 +53,7 @@ impl PcSim {
             sks.push(Arc::new(sk));
         }
         let instances: Vec<PcInstance> = (0..n)
-            .map(|_| PcInstance::new(epoch, view, members.clone()))
+            .map(|_| PcInstance::new(Arc::new(BlsVerifier), epoch, view, members.clone()))
             .collect();
         let decided = vec![None; n];
         let pc_ctx = pc_context(&spc_context(epoch), view);

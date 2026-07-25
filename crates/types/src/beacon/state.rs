@@ -1680,8 +1680,9 @@ impl BeaconState {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::bls_keypair_from_seed;
+
     use super::*;
-    use crate::crypto::keys::bls_keypair_from_seed;
     use crate::{Hash, JailReason, pk_from_bls};
 
     fn pubkey(seed: u64) -> ConsensusPublicKey {

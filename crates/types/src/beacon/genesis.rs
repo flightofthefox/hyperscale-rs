@@ -256,8 +256,10 @@ pub fn genesis_config_hash(
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::bls_keypair_from_seed;
+
     use super::*;
-    use crate::{bls_keypair_from_seed, pk_from_bls};
+    use crate::pk_from_bls;
 
     fn pubkey(seed: u64) -> ConsensusPublicKey {
         let mut s = [0u8; 32];

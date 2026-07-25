@@ -4,14 +4,14 @@
 //! `Verified<QuorumCertificate>`; predicate at
 //! [`impl Verify<&QcContext<'_>>`](Verify::verify) below.
 
+use hyperscale_crypto::Verifier;
 use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::{
-    AggregateSignature, BlockHash, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, ChainOrigin, ConsensusPublicKey, NetworkDefinition, Round, ShardId,
-    SignerBitfield, Verified, Verify, VoteCount, WeightedTimestamp, agg_from_bls,
-    block_vote_message, bls_agg, bls_pk, bls_sig, verify_bls12381_v1,
+    AggregateSignature, BlockHash, BlockHeight, BlockVote, ChainOrigin, ConsensusPublicKey,
+    ConsensusSignature, NetworkDefinition, Round, ShardId, SignerBitfield, Verified, Verify,
+    VoteCount, WeightedTimestamp, block_vote_message,
 };
 
 /// A quorum certificate proving 2f+1 validators voted for a block.
@@ -244,10 +244,12 @@ impl QuorumCertificate {
 pub struct QcContext<'a> {
     /// Network identifier — feeds the domain-separated signing message.
     pub network: &'a NetworkDefinition,
-    /// BLS public keys for every validator in this QC's committee.
+    /// Public keys for every validator in this QC's committee.
     pub public_keys: &'a [ConsensusPublicKey],
     /// Minimum vote count required to constitute a quorum.
     pub quorum_threshold: VoteCount,
+    /// Scheme verifier the aggregate check runs through.
+    pub verifier: &'a dyn Verifier,
 }
 
 /// Failure modes of [`QuorumCertificate`] verification.
@@ -330,6 +332,7 @@ impl Verified<QuorumCertificate> {
     #[must_use]
     #[allow(clippy::too_many_arguments)] // mirrors the QC's signed-over fields
     pub fn from_verified_votes(
+        verifier: &dyn Verifier,
         block_hash: BlockHash,
         shard_id: ShardId,
         height: BlockHeight,
@@ -341,12 +344,9 @@ impl Verified<QuorumCertificate> {
         let mut sorted: Vec<_> = verified_votes.to_vec();
         sorted.sort_by_key(|(idx, _)| *idx);
 
-        let signatures: Vec<Bls12381G2Signature> = sorted
-            .iter()
-            .map(|(_, v)| bls_sig(&v.signature()))
-            .collect();
-        let aggregated_signature =
-            agg_from_bls(&Bls12381G2Signature::aggregate(&signatures, true).ok()?);
+        let signatures: Vec<ConsensusSignature> =
+            sorted.iter().map(|(_, v)| v.signature()).collect();
+        let aggregated_signature = verifier.aggregate(&signatures).ok()?;
 
         let floor_ms = parent_weighted_timestamp.as_millis();
         let max_idx = sorted.iter().map(|(idx, _)| *idx).max().unwrap_or(0);
@@ -416,24 +416,22 @@ impl Verify<&QcContext<'_>> for QuorumCertificate {
     type Error = QcVerifyError;
 
     fn verify(&self, ctx: &QcContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        let signer_keys: Vec<Bls12381G1PublicKey> = ctx
+        let signer_keys: Vec<ConsensusPublicKey> = ctx
             .public_keys
             .iter()
             .enumerate()
             .filter(|(i, _)| self.signers.is_set(*i))
-            .map(|(_, pk)| bls_pk(pk))
+            .map(|(_, pk)| *pk)
             .collect();
         if signer_keys.is_empty() {
             return Err(QcVerifyError::NoSigners);
         }
 
         let signing_message = self.signing_message(ctx.network);
-        let aggregated_pk = Bls12381G1PublicKey::aggregate(&signer_keys, false)
-            .map_err(|_| QcVerifyError::PublicKeyAggregationFailed)?;
-        if !verify_bls12381_v1(
+        if !ctx.verifier.verify_aggregate_same_message(
             &signing_message,
-            &aggregated_pk,
-            &bls_agg(&self.aggregated_signature),
+            &self.aggregated_signature,
+            &signer_keys,
         ) {
             return Err(QcVerifyError::InvalidSignature);
         }
@@ -454,8 +452,10 @@ impl Verify<&QcContext<'_>> for QuorumCertificate {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
+
     use super::*;
-    use crate::{Hash, pk_from_bls};
+    use crate::{Bls12381G2Signature, Hash, agg_from_bls, pk_from_bls};
 
     #[test]
     fn test_genesis_qc() {
@@ -497,7 +497,7 @@ mod tests {
 
     // ─── Verify impl tests ──────────────────────────────────────────────
 
-    use crate::{Bls12381G1PrivateKey, generate_bls_keypair};
+    use crate::Bls12381G1PrivateKey;
 
     /// Build a QC with `signer_indices` of the `n`-validator committee
     /// signing it. Each signer signs the canonical `block_vote_message`,
@@ -544,6 +544,7 @@ mod tests {
         quorum_threshold: VoteCount,
     ) -> QcContext<'a> {
         QcContext {
+            verifier: &BlsVerifier,
             network: net,
             public_keys,
             quorum_threshold,

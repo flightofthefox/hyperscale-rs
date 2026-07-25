@@ -10,6 +10,7 @@ description = "Simulation runner"
 ci = []
 
 [dependencies]
+hyperscale-crypto-bls.workspace = true
 arc-swap.workspace = true
 crossbeam.workspace = true
 hyperscale-beacon.workspace = true

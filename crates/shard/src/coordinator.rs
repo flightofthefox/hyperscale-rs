@@ -88,8 +88,8 @@ use hyperscale_types::{
     ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
     QcVerifyError, QuorumCertificate, RecoveryCause, Round, RoutableTransaction, SafeVoteRegisters,
     StateRoot, StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, TransactionRoot,
-    TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, derive_leaves,
-    missed_proposals_since_prev_commit, ready_leaf_payload,
+    TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
+    derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -195,6 +195,9 @@ struct WitnessCommitmentPreview {
 /// 4. **QC Formed** → Update chain state, commit if ready (two-chain rule)
 /// 5. **View Change Timer** → Initiate view change if no progress
 pub struct ShardCoordinator {
+    /// Scheme verifier for local (non-delegated) signature checks.
+    verifier: Arc<dyn Verifier>,
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Chain State
     // ═══════════════════════════════════════════════════════════════════════════
@@ -386,6 +389,7 @@ impl ShardCoordinator {
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     #[must_use]
     pub fn new(
+        verifier: Arc<dyn Verifier>,
         me: ValidatorId,
         local_shard: ShardId,
         config: ShardConsensusConfig,
@@ -414,6 +418,7 @@ impl ShardCoordinator {
             .copied()
             .unwrap_or_default();
         Self {
+            verifier,
             view_change: ViewChangeController::new(initial_view),
             committed_height: recovered.committed_height,
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
@@ -5147,6 +5152,7 @@ impl ShardCoordinator {
         let committee = self.committee_of_qc(topology_schedule, qc)?;
         let public_keys = committee_public_keys(committee, self.local_shard);
         let ctx = QcContext {
+            verifier: self.verifier.as_ref(),
             network: committee.network(),
             public_keys: &public_keys,
             quorum_threshold: committee.quorum_threshold_for_shard(self.local_shard),
@@ -5674,14 +5680,14 @@ mod tests {
     use std::collections::BTreeSet;
 
     use hyperscale_core::Action;
+    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, BoundedVec,
-        CertificateRoot, Epoch, Hash, InFlightCount, LocalReceiptRoot, MAX_TIMESTAMP_DELAY,
-        MAX_TIMESTAMP_RUSH, NetworkDefinition, ProvisionsRoot, RETENTION_HORIZON,
-        RoutableTransaction, ShardId, SignerBitfield, TopologySchedule, TopologySnapshot,
-        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
-        WitnessSources, agg_from_bls, generate_bls_keypair, pk_from_bls, sig_from_bls, test_utils,
-        zero_bls_signature,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey,
+        BoundedVec, CertificateRoot, ConsensusSignature, Epoch, Hash, InFlightCount,
+        LocalReceiptRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition,
+        ProvisionsRoot, RETENTION_HORIZON, RoutableTransaction, ShardId, SignerBitfield,
+        TopologySchedule, TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo,
+        ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources, pk_from_bls, test_utils,
     };
 
     use super::*;
@@ -5723,6 +5729,7 @@ mod tests {
             TopologySnapshot::new(NetworkDefinition::simulator(), 1, validator_set);
 
         let state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             ValidatorId::new(0),
             ShardId::ROOT,
             config,
@@ -5827,7 +5834,7 @@ mod tests {
             BlockHash::ZERO,
             Round::new(0),
             signers,
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_weighted_ms),
         );
         let header = BlockHeader::new(
@@ -5880,6 +5887,7 @@ mod tests {
         schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
 
         let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             ValidatorId::new(0),
             shard,
             ShardConsensusConfig::default(),
@@ -5943,7 +5951,7 @@ mod tests {
                 parent.header().parent_block_hash(),
                 Round::new(5),
                 signers,
-                agg_from_bls(&zero_bls_signature()),
+                AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(weighted_ms),
             );
             let header = BlockHeader::new(
@@ -6039,7 +6047,7 @@ mod tests {
             BlockHash::ZERO,
             Round::new(0),
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100_000),
         ))
     }
@@ -6141,7 +6149,7 @@ mod tests {
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(9),
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(50_000),
         );
         let header = BlockHeader::new(
@@ -6482,7 +6490,7 @@ mod tests {
                 BlockHash::ZERO,
                 Round::new(round),
                 signers,
-                agg_from_bls(&zero_bls_signature()),
+                AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(now_ms - 5_000),
             );
             BlockHeader::new(
@@ -7016,7 +7024,7 @@ mod tests {
                 BlockHash::ZERO,
                 Round::new(5),
                 SignerBitfield::empty(),
-                agg_from_bls(&zero_bls_signature()),
+                AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(100_000),
             ));
         state.on_committed_state_restored(
@@ -7149,6 +7157,7 @@ mod tests {
             })
             .collect();
         let missed_qc = Verified::<QuorumCertificate>::from_verified_votes(
+            &BlsVerifier,
             block.hash(),
             ShardId::ROOT,
             BlockHeight::new(1),
@@ -7288,7 +7297,7 @@ mod tests {
                 BlockHash::from_raw(Hash::from_bytes(b"retained-parent")),
                 Round::new(1),
                 SignerBitfield::new(4),
-                agg_from_bls(&zero_bls_signature()),
+                AggregateSignature::ZERO,
                 WeightedTimestamp::ZERO,
             );
             let timeout = Timeout::new(
@@ -7358,7 +7367,7 @@ mod tests {
                 block.header().parent_block_hash(),
                 Round::new(5),
                 signers,
-                agg_from_bls(&zero_bls_signature()),
+                AggregateSignature::ZERO,
                 WeightedTimestamp::ZERO,
             );
             let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -7414,6 +7423,7 @@ mod tests {
         let topology_snapshot =
             TopologySnapshot::new(NetworkDefinition::simulator(), 1, validator_set);
         let state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             ValidatorId::new(u64::from(local_idx)),
             ShardId::ROOT,
             ShardConsensusConfig::default(),
@@ -7443,7 +7453,7 @@ mod tests {
             height,
             Round::new(0),
             voter,
-            sig_from_bls(&zero_bls_signature()),
+            ConsensusSignature::ZERO,
             ProposerTimestamp::from_millis(100_000),
         );
 
@@ -7671,7 +7681,7 @@ mod tests {
             committable_hash,
             Round::new(0),
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100_000),
         ));
 
@@ -8379,6 +8389,7 @@ mod tests {
         let mut schedule = TopologySchedule::new(ED, Epoch::new(0), epoch0);
 
         let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             ValidatorId::new(0),
             ShardId::ROOT,
             ShardConsensusConfig::default(),
@@ -8402,7 +8413,7 @@ mod tests {
             block.header().parent_block_hash(),
             block.header().round(),
             signers,
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(5 * ED),
         );
         let certified = CertifiedBlock::new_unchecked(block, qc);
@@ -8449,6 +8460,7 @@ mod tests {
         let mut schedule = TopologySchedule::new(ED, Epoch::new(0), epoch0);
 
         let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             ValidatorId::new(0),
             ShardId::ROOT,
             ShardConsensusConfig::default(),
@@ -8526,7 +8538,7 @@ mod tests {
                 block.header().parent_block_hash(),
                 block.header().round(),
                 signers,
-                agg_from_bls(&zero_bls_signature()),
+                AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(ts),
             );
             let actions = state.on_sync_block_ready_to_apply(
@@ -8595,7 +8607,7 @@ mod tests {
                 block.header().parent_block_hash(),
                 block.header().round(),
                 signers,
-                agg_from_bls(&zero_bls_signature()),
+                AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(ts),
             );
             let actions = state.on_sync_block_ready_to_apply(
@@ -9324,6 +9336,7 @@ mod tests {
             ..RecoveredState::default()
         };
         ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             ValidatorId::new(0),
             ShardId::ROOT,
             ShardConsensusConfig::default(),
@@ -9401,6 +9414,7 @@ mod tests {
         // 0 ms).
         let splitting = make_terminating_schedule(4);
         let root = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             ValidatorId::new(0),
             ShardId::ROOT,
             ShardConsensusConfig::default(),
@@ -9418,6 +9432,7 @@ mod tests {
         let merging = make_merging_schedule(4);
         let (left, _) = ShardId::ROOT.children();
         let child = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             ValidatorId::new(0),
             left,
             ShardConsensusConfig::default(),
@@ -9461,6 +9476,7 @@ mod tests {
     /// at wt 1000 — so `ROOT` is past-terminal at any later anchor.
     fn fence_coordinator() -> ShardCoordinator {
         ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             ValidatorId::new(0),
             ShardId::leaf(1, 0),
             ShardConsensusConfig::default(),
@@ -9492,7 +9508,7 @@ mod tests {
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
                 )],
-                agg_from_bls(&zero_bls_signature()),
+                AggregateSignature::ZERO,
                 SignerBitfield::new(4),
             )
         };
@@ -9636,7 +9652,7 @@ mod tests {
             BlockHash::ZERO,
             Round::new(0),
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1500),
         );
         let header = BlockHeader::new(
@@ -9682,6 +9698,7 @@ mod tests {
         // Local shard `leaf(1,0)` survives; ROOT is past-terminal at the
         // block's epoch-1 anchor.
         let mut coord = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             ValidatorId::new(0),
             ShardId::leaf(1, 0),
             ShardConsensusConfig::default(),

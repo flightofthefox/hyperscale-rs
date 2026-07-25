@@ -1554,12 +1554,13 @@ impl RemoteHeaderCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::bls_keypair_from_seed;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, CertificateRoot,
-        ChainOrigin, Epoch, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield,
-        StateRoot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, agg_from_bls,
-        bls_keypair_from_seed, pk_from_bls, zero_bls_signature,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
+        CertificateRoot, ChainOrigin, Epoch, Hash, InFlightCount, LocalReceiptRoot,
+        NetworkDefinition, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId,
+        SignerBitfield, StateRoot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
+        pk_from_bls,
     };
 
     use super::*;
@@ -1610,7 +1611,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
 
@@ -1672,7 +1673,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_qc_wt),
         );
         let header = BlockHeader::new(
@@ -1705,7 +1706,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_qc_wt),
         );
         Arc::new(CertifiedBlockHeader::new(header, qc))
@@ -2023,7 +2024,7 @@ mod tests {
             BlockHash::ZERO,
             Round::new(round.saturating_sub(1)),
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(height * 1_000),
         );
         let header = BlockHeader::new(
@@ -2056,7 +2057,7 @@ mod tests {
             parent_hash,
             Round::new(round),
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(height * 1_000),
         );
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(

@@ -9,8 +9,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_crypto_bls::generate_bls_keypair;
 use hyperscale_network::ValidatorKeyMap;
-use hyperscale_types::{Bls12381G1PrivateKey, ValidatorId, generate_bls_keypair, pk_from_bls};
+use hyperscale_types::{Bls12381G1PrivateKey, ValidatorId, pk_from_bls};
 
 /// Budget for a transport connection / validator-bind handshake to complete
 /// over localhost QUIC.

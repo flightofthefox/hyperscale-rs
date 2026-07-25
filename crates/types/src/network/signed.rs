@@ -21,9 +21,10 @@
 //! That policy belongs at the handler, so [`SignedContext`] takes a
 //! pre-resolved [`ConsensusPublicKey`] and the trait stays out of topology.
 
+use hyperscale_crypto::Verifier;
+
 use crate::{
     ConsensusPublicKey, ConsensusSignature, NetworkDefinition, ValidatorId, Verified, Verify,
-    bls_pk, bls_sig, verify_bls12381_v1,
 };
 
 /// A wire message that carries its own signer identity, BLS signature, and
@@ -54,7 +55,7 @@ pub trait Signed {
     /// signature does not validate.
     fn verify_signature(&self, ctx: &SignedContext<'_>) -> Result<(), SignedVerifyError> {
         let msg = self.signing_message(ctx.network);
-        if verify_bls12381_v1(&msg, &bls_pk(ctx.public_key), &bls_sig(self.signature())) {
+        if ctx.verifier.verify(ctx.public_key, &msg, self.signature()) {
             Ok(())
         } else {
             Err(SignedVerifyError::InvalidSignature)
@@ -69,8 +70,10 @@ pub struct SignedContext<'a> {
     /// Active network definition; folded into the signing message for
     /// cross-network replay protection.
     pub network: &'a NetworkDefinition,
-    /// Pre-resolved BLS public key of the claimed signer.
+    /// Pre-resolved public key of the claimed signer.
     pub public_key: &'a ConsensusPublicKey,
+    /// Scheme verifier the signature check runs through.
+    pub verifier: &'a dyn Verifier,
 }
 
 /// Failure modes for [`Signed`] verification.

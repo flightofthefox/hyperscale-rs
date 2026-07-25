@@ -540,6 +540,7 @@ fn shuffle(ids: &mut [ValidatorId], prng: &mut ChaCha20Rng) {
 mod tests {
     use std::collections::BTreeSet;
 
+    use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{Epoch, NodeId, ShardWitnessPayload};
 
     use super::*;
@@ -586,6 +587,7 @@ mod tests {
     fn mark_ready(state: &mut BeaconState, target: ShardId, observer: ValidatorId) {
         let child = cohort_of(state, target)[&observer].child;
         apply_shard_payload(
+            &BlsVerifier,
             state,
             &net(),
             target,
@@ -608,6 +610,7 @@ mod tests {
         let (left, right) = p.children();
         let mut state = grow_state(4);
         apply_shard_payload(
+            &BlsVerifier,
             &mut state,
             &net(),
             p,
@@ -720,6 +723,7 @@ mod tests {
             },
         );
         apply_shard_payload(
+            &BlsVerifier,
             &mut state,
             &net(),
             p,
@@ -765,6 +769,7 @@ mod tests {
             placed_at_epoch: Epoch::new(4),
         };
         apply_shard_payload(
+            &BlsVerifier,
             &mut state,
             &net(),
             p,
@@ -800,6 +805,7 @@ mod tests {
         let mut b = grow_state(4);
         for state in [&mut a, &mut b] {
             apply_shard_payload(
+                &BlsVerifier,
                 state,
                 &net(),
                 p,
@@ -1100,7 +1106,7 @@ mod tests {
         let merge = ShardWitnessPayload::ScheduleMerge { parent };
 
         // The first half waits: no keepers, no readiness clock.
-        apply_shard_payload(&mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         let Some(PendingReshape::Merge {
             keepers,
             admitted_at,
@@ -1113,7 +1119,7 @@ mod tests {
         assert!(admitted_at.is_none());
 
         // The sibling pairs it: keepers drawn on the spot.
-        apply_shard_payload(&mut state, &net(), right, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         let keepers = keepers_of(&state, parent);
         let Some(PendingReshape::Merge { admitted_at, .. }) = state.pending_reshapes.get(&parent)
         else {
@@ -1161,8 +1167,8 @@ mod tests {
         }
 
         let merge = ShardWitnessPayload::ScheduleMerge { parent };
-        apply_shard_payload(&mut state, &net(), left, &merge);
-        apply_shard_payload(&mut state, &net(), right, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
 
         let keepers = keepers_of(&state, parent);
         assert_eq!(
@@ -1186,8 +1192,8 @@ mod tests {
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
         let merge = ShardWitnessPayload::ScheduleMerge { parent };
-        apply_shard_payload(&mut state, &net(), left, &merge);
-        apply_shard_payload(&mut state, &net(), right, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         let keepers = keepers_of(&state, parent);
 
         let lookahead = state.derive_next_topology_snapshot(net());
@@ -1214,8 +1220,8 @@ mod tests {
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
         let merge = ShardWitnessPayload::ScheduleMerge { parent };
-        apply_shard_payload(&mut state, &net(), left, &merge);
-        apply_shard_payload(&mut state, &net(), right, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
 
         let keeper = *keepers_of(&state, parent)
             .iter()
@@ -1229,11 +1235,11 @@ mod tests {
 
         // Wrong chain: a left keeper's signal arriving on the right is
         // ignored.
-        apply_shard_payload(&mut state, &net(), right, &ready);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &ready);
         assert!(!keepers_of(&state, parent)[&keeper].ready);
 
         // Own chain: the seat flips.
-        apply_shard_payload(&mut state, &net(), left, &ready);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &ready);
         assert!(keepers_of(&state, parent)[&keeper].ready);
     }
 
@@ -1248,8 +1254,8 @@ mod tests {
         let mut state = merge_grow_state(4);
         state.current_epoch = Epoch::new(state.chain_config.shuffle_interval_epochs());
         let merge = ShardWitnessPayload::ScheduleMerge { parent };
-        apply_shard_payload(&mut state, &net(), left, &merge);
-        apply_shard_payload(&mut state, &net(), right, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         let keepers = keepers_of(&state, parent);
 
         run_shuffle_step(&mut state);
@@ -1292,14 +1298,14 @@ mod tests {
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
         let merge = ShardWitnessPayload::ScheduleMerge { parent };
-        apply_shard_payload(&mut state, &net(), left, &merge);
-        apply_shard_payload(&mut state, &net(), right, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         assert!(state.pending_reshapes.contains_key(&parent));
 
         // Only the left half keeps re-asserting; the right goes quiet.
         for epoch in 6..(5 + RESHAPE_TRIGGER_TTL_EPOCHS) {
             state.current_epoch = Epoch::new(epoch);
-            apply_shard_payload(&mut state, &net(), left, &merge);
+            apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
             prune_stale_reshapes(&mut state);
             assert!(
                 state.pending_reshapes.contains_key(&parent),
@@ -1307,7 +1313,7 @@ mod tests {
             );
         }
         state.current_epoch = Epoch::new(5 + RESHAPE_TRIGGER_TTL_EPOCHS);
-        apply_shard_payload(&mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         prune_stale_reshapes(&mut state);
         assert!(state.pending_reshapes.is_empty());
         // Keepers returned to ordinary rotation: still OnShard, no longer pinned.
@@ -1327,8 +1333,8 @@ mod tests {
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
         let merge = ShardWitnessPayload::ScheduleMerge { parent };
-        apply_shard_payload(&mut state, &net(), left, &merge);
-        apply_shard_payload(&mut state, &net(), right, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         let keepers = keepers_of(&state, parent);
         let keeper_ids: Vec<ValidatorId> = keepers.keys().copied().collect();
         let non_keepers: Vec<ValidatorId> = (0u64..8)
@@ -1342,6 +1348,7 @@ mod tests {
         for id in &keeper_ids[..quorum - 1] {
             let child = keepers[id].child;
             apply_shard_payload(
+                &BlsVerifier,
                 &mut state,
                 &net(),
                 child,
@@ -1359,6 +1366,7 @@ mod tests {
         // straggler.
         let third = keeper_ids[quorum - 1];
         apply_shard_payload(
+            &BlsVerifier,
             &mut state,
             &net(),
             keepers[&third].child,
@@ -1421,6 +1429,7 @@ mod tests {
         let (left, right) = p.children();
         let mut state = grow_state(6);
         apply_shard_payload(
+            &BlsVerifier,
             &mut state,
             &net(),
             p,
@@ -1478,8 +1487,8 @@ mod tests {
         let (left, right) = parent.children();
         let mut state = merge_grow_state(0);
         let merge = ShardWitnessPayload::ScheduleMerge { parent };
-        apply_shard_payload(&mut state, &net(), left, &merge);
-        apply_shard_payload(&mut state, &net(), right, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         let keepers = keepers_of(&state, parent);
         let keeper_ids: Vec<ValidatorId> = keepers.keys().copied().collect();
 
@@ -1503,6 +1512,7 @@ mod tests {
         for id in &keeper_ids[1..] {
             let child = remaining[id].child;
             apply_shard_payload(
+                &BlsVerifier,
                 &mut state,
                 &net(),
                 child,
@@ -1541,10 +1551,11 @@ mod tests {
         let mut a = merge_grow_state(0);
         let mut b = merge_grow_state(0);
         for state in [&mut a, &mut b] {
-            apply_shard_payload(state, &net(), left, &merge);
-            apply_shard_payload(state, &net(), right, &merge);
+            apply_shard_payload(&BlsVerifier, state, &net(), left, &merge);
+            apply_shard_payload(&BlsVerifier, state, &net(), right, &merge);
             for (id, seat) in keepers_of(state, parent) {
                 apply_shard_payload(
+                    &BlsVerifier,
                     state,
                     &net(),
                     seat.child,
@@ -1603,10 +1614,11 @@ mod tests {
         );
 
         let merge = ShardWitnessPayload::ScheduleMerge { parent };
-        apply_shard_payload(&mut state, &net(), left, &merge);
-        apply_shard_payload(&mut state, &net(), right, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         for (id, seat) in keepers_of(&state, parent) {
             apply_shard_payload(
+                &BlsVerifier,
                 &mut state,
                 &net(),
                 seat.child,
@@ -1707,10 +1719,11 @@ mod tests {
 
         // Drive the merge to execution.
         let merge = ShardWitnessPayload::ScheduleMerge { parent };
-        apply_shard_payload(&mut state, &net(), left, &merge);
-        apply_shard_payload(&mut state, &net(), right, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         for (id, seat) in keepers_of(&state, parent) {
             apply_shard_payload(
+                &BlsVerifier,
                 &mut state,
                 &net(),
                 seat.child,

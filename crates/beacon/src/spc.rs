@@ -22,13 +22,14 @@
 //! per-view scheduling).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use blake3::Hasher;
 use hyperscale_types::{
     ConsensusPublicKey, Epoch, MAX_VOTE_VECTOR_LEN, PC_VALUE_ELEMENT_BYTES, PcQc1, PcQc2, PcQc3,
     PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, SpcCert,
-    SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView, ValidatorId, Verified,
+    SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView, ValidatorId, Verified, Verifier,
     byzantine_threshold,
 };
 
@@ -298,9 +299,14 @@ struct ViewState {
 }
 
 impl ViewState {
-    fn new(epoch: Epoch, view: SpcView, committee: Vec<(ValidatorId, ConsensusPublicKey)>) -> Self {
+    fn new(
+        verifier: Arc<dyn Verifier>,
+        epoch: Epoch,
+        view: SpcView,
+        committee: Vec<(ValidatorId, ConsensusPublicKey)>,
+    ) -> Self {
         Self {
-            vpc: PcInstance::new(epoch, view, committee),
+            vpc: PcInstance::new(verifier, epoch, view, committee),
             proposal_objects: BTreeMap::new(),
             vpc_input_fed: false,
             empty_views: BTreeMap::new(),
@@ -335,6 +341,7 @@ const MAX_PENDING_COMMITS: usize = 64;
 /// view-change (empty-view attestations → indirect cert → skip
 /// ahead).
 pub struct SpcInstance {
+    verifier: Arc<dyn Verifier>,
     epoch: Epoch,
     committee: Vec<(ValidatorId, ConsensusPublicKey)>,
     me: ValidatorId,
@@ -397,6 +404,7 @@ impl SpcInstance {
     /// can't reach this.
     #[must_use]
     pub fn new(
+        verifier: Arc<dyn Verifier>,
         epoch: Epoch,
         committee: Vec<(ValidatorId, ConsensusPublicKey)>,
         me: ValidatorId,
@@ -411,9 +419,15 @@ impl SpcInstance {
         let mut views = BTreeMap::new();
         views.insert(
             SpcView::new(1),
-            ViewState::new(epoch, SpcView::new(1), committee.clone()),
+            ViewState::new(
+                Arc::clone(&verifier),
+                epoch,
+                SpcView::new(1),
+                committee.clone(),
+            ),
         );
         Self {
+            verifier,
             epoch,
             committee,
             me,
@@ -780,10 +794,14 @@ impl SpcInstance {
         let po = Verified::<SpcProposalObject>::from_verified_cert(view, cert);
         let h = hash_proposal_object(po.as_ref());
         self.proposals_by_hash.insert(h, po.clone());
-        let view_state = self
-            .views
-            .entry(view)
-            .or_insert_with(|| ViewState::new(self.epoch, view, self.committee.clone()));
+        let view_state = self.views.entry(view).or_insert_with(|| {
+            ViewState::new(
+                Arc::clone(&self.verifier),
+                self.epoch,
+                view,
+                self.committee.clone(),
+            )
+        });
         // Last-write-wins on `(view, sender)` for proposal objects.
         // The cert authenticates the parent claim, so two distinct
         // valid certs from the "same sender" are valid relays, not
@@ -933,10 +951,14 @@ impl SpcInstance {
 
         self.update_max_high(Verified::<SpcHighTriple>::from_verified_empty_view(&msg));
 
-        let view_state = self
-            .views
-            .entry(view)
-            .or_insert_with(|| ViewState::new(self.epoch, view, self.committee.clone()));
+        let view_state = self.views.entry(view).or_insert_with(|| {
+            ViewState::new(
+                Arc::clone(&self.verifier),
+                self.epoch,
+                view,
+                self.committee.clone(),
+            )
+        });
         if view_state.indirect_cert_built {
             return vec![];
         }
@@ -954,8 +976,12 @@ impl SpcInstance {
         // next view.
         view_state.indirect_cert_built = true;
         let msgs: Vec<&Verified<SpcEmptyViewMsg>> = view_state.empty_views.values().collect();
-        let Some(cert) = Verified::<SpcCert>::from_skip_reports(view, &msgs, &self.committee)
-        else {
+        let Some(cert) = Verified::<SpcCert>::from_skip_reports(
+            self.verifier.as_ref(),
+            view,
+            &msgs,
+            &self.committee,
+        ) else {
             // Shouldn't happen — the threshold check above guarantees
             // non-empty input and `view + 1` overflow is the only
             // other failure mode (only at u32 saturation).
@@ -1150,10 +1176,11 @@ impl SpcInstance {
 mod tests {
     use std::sync::Arc;
 
+    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed, generate_bls_keypair};
     use hyperscale_types::{
         Bls12381G1PrivateKey, ConsensusSignature, Epoch, NetworkDefinition, PcQc2, PcQc3,
-        PcSignerLengths, PcVote1, PcXpProof, SignerBitfield, agg_from_bls, bls_keypair_from_seed,
-        generate_bls_keypair, pk_from_bls, spc_context,
+        PcSignerLengths, PcVote1, PcXpProof, SignerBitfield, agg_from_bls, pk_from_bls,
+        spc_context,
     };
 
     use super::*;
@@ -1216,6 +1243,7 @@ mod tests {
     fn fsm_instance(idx: usize) -> SpcInstance {
         let (_, members) = fsm_committee(4);
         SpcInstance::new(
+            Arc::new(BlsVerifier),
             Epoch::new(1),
             members.clone(),
             members[idx].0,
@@ -1400,6 +1428,7 @@ mod tests {
         let (_, members) = fsm_committee(4);
         let mk = |idx: usize| {
             SpcInstance::new(
+                Arc::new(BlsVerifier),
                 Epoch::new(1),
                 members.clone(),
                 members[idx].0,
@@ -1478,6 +1507,7 @@ mod tests {
     fn unresolved_high_defers_the_advance_without_attesting_empty() {
         let (_, members) = fsm_committee(4);
         let mut fsm = SpcInstance::new(
+            Arc::new(BlsVerifier),
             Epoch::new(1),
             members.clone(),
             members[0].0,
@@ -1522,6 +1552,7 @@ mod tests {
     fn new_view_with_unresolved_parent_claim_is_buffered() {
         let (_, members) = fsm_committee(4);
         let mut fsm = SpcInstance::new(
+            Arc::new(BlsVerifier),
             Epoch::new(1),
             members.clone(),
             members[0].0,
@@ -1816,6 +1847,7 @@ mod tests {
         let (_, members) = fsm_committee(4);
         let mk = |idx: usize| {
             SpcInstance::new(
+                Arc::new(BlsVerifier),
                 Epoch::new(1),
                 members.clone(),
                 members[idx].0,

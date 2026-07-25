@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use hyperscale_types::{
     BeaconProposal, BeaconState, BlockHash, BlockHeader, NetworkDefinition, QcContext,
     QuorumCertificate, ScheduleLookup, ShardEpochContribution, ShardId, TopologySchedule,
-    ValidatorId, Verified, Verify,
+    ValidatorId, Verified, Verifier, Verify,
 };
 use tracing::{debug, warn};
 
@@ -39,6 +39,7 @@ use crate::shard_source::ShardSourceTracker;
 /// commits.
 #[must_use]
 pub fn proposal_boundary_qcs_admissible(
+    verifier: &dyn Verifier,
     proposal: &Verified<BeaconProposal>,
     state: &BeaconState,
     shard_source: &ShardSourceTracker,
@@ -55,6 +56,7 @@ pub fn proposal_boundary_qcs_admissible(
         // path — never trust the marker to skip this gate.
         opt.as_ref().is_none_or(|qc| {
             boundary_qc_admissible(
+                verifier,
                 *shard,
                 qc.as_unverified(),
                 state,
@@ -182,6 +184,7 @@ pub fn build_shard_contributions(
 /// of the governing shard committee, and the block is a real
 /// epoch-boundary crossing.
 fn boundary_qc_admissible(
+    verifier: &dyn Verifier,
     shard: ShardId,
     qc: &QuorumCertificate,
     state: &BeaconState,
@@ -192,7 +195,7 @@ fn boundary_qc_admissible(
     let Some(header) = boundary_header_for(shard_source, shard, qc.block_hash()) else {
         return false;
     };
-    boundary_qc_authentic(shard, header, qc, topology_schedule, network)
+    boundary_qc_authentic(verifier, shard, header, qc, topology_schedule, network)
         && rules::is_boundary_crossing(header, qc, state.chain_config.epoch_windows())
 }
 
@@ -232,6 +235,7 @@ fn boundary_header_for(
 /// completes the recovery — is anchored below the bridge window but
 /// certified at or past it, and verifies against the fresh committee.
 fn boundary_qc_authentic(
+    verifier: &dyn Verifier,
     shard: ShardId,
     boundary_header: &BlockHeader,
     qc: &QuorumCertificate,
@@ -292,6 +296,7 @@ fn boundary_qc_authentic(
         public_keys.push(pk);
     }
     qc.verify(&QcContext {
+        verifier,
         network,
         public_keys: &public_keys,
         quorum_threshold: snapshot.quorum_threshold_for_shard(shard),

@@ -25,7 +25,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, ShardStorage};
 use hyperscale_types::{
     Epoch, RatifyPhase, RatifyRound, RoutableTransaction, RoutingCommittees, ShardId, SpcView,
-    TopologySnapshot, ValidatorId,
+    TopologySnapshot, ValidatorId, Verifier,
 };
 pub(crate) use network_handlers::register_shard_request_handlers;
 pub use tx_status::TxStatusCache;
@@ -131,6 +131,10 @@ where
     /// and dispatch jobs can broadcast / reply without re-entering
     /// the pinned thread.
     pub(crate) network: Arc<N>,
+
+    /// Scheme verifier for inbound signature checks run on the process's
+    /// handlers and thread pools.
+    pub(crate) verifier: Arc<dyn Verifier>,
 
     /// Thread-pool scheduler for off-thread work (crypto verify,
     /// tx validation, block-commit persistence, fetch-serve). Each
@@ -245,6 +249,7 @@ where
     #[allow(clippy::too_many_arguments)] // every field threads through one constructor
     pub(crate) fn new(
         network: Arc<N>,
+        verifier: Arc<dyn Verifier>,
         dispatch: D,
         shard_event_senders: BTreeMap<ShardId, Sender<HostEvent>>,
         beacon_event_sender: Sender<HostEvent>,
@@ -255,6 +260,7 @@ where
     ) -> Self {
         Self {
             network,
+            verifier,
             dispatch,
             shard_event_senders: Arc::new(ArcSwap::from_pointee(shard_event_senders)),
             beacon_event_sender,

@@ -94,7 +94,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::agg_from_bls;
+    use crate::AggregateSignature;
 
     #[test]
     fn test_empty_response() {
@@ -117,7 +117,7 @@ mod tests {
             CertificateRoot, CertifiedBlockHeader, ChainOrigin, Hash, InFlightCount,
             LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry,
             ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
-            TransactionRoot, TxHash, ValidatorId, WeightedTimestamp, zero_bls_signature,
+            TransactionRoot, TxHash, ValidatorId, WeightedTimestamp,
         };
 
         let source_shard = ShardId::leaf(1, 1);
@@ -166,7 +166,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
         let source_header = Arc::new(CertifiedBlockHeader::new(header, qc));

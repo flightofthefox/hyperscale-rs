@@ -7,13 +7,14 @@ description = "Core types for Hyperscale consensus"
 [dependencies]
 # Cryptographic primitives
 blake3.workspace = true
-blst.workspace = true
 hex.workspace = true
 ed25519-dalek = { workspace = true, features = ["batch"] }
 rand.workspace = true
 
 # Consensus crypto interface (role newtypes, Signer/Verifier)
 hyperscale-crypto.workspace = true
+# BLS impl for the test-utils fixtures (deterministic committees)
+hyperscale-crypto-bls = { workspace = true, optional = true }
 
 # Merkle proof verification (Verify<ProvisionsContext>)
 hyperscale-jmt.workspace = true
@@ -34,9 +35,11 @@ radix-transactions.workspace = true
 radix-substate-store-interface.workspace = true
 
 [features]
-test-utils = []
+test-utils = ["dep:hyperscale-crypto-bls"]
 
 [dev-dependencies]
+blst.workspace = true
+hyperscale-crypto-bls.workspace = true
 proptest.workspace = true
 syn = { version = "2.0.119", features = ["full", "parsing", "visit"] }
 

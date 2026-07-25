@@ -23,7 +23,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_types::{
     BeaconState, Bls12381G1PrivateKey, GenesisConfigHash, LocalTimestamp, NetworkDefinition,
-    ShardId, ValidatorId, WeightedTimestamp,
+    ShardId, ValidatorId, Verifier, WeightedTimestamp,
 };
 
 use crate::NodeStateMachine;
@@ -58,6 +58,8 @@ impl VnodeInit {
 /// Everything one same-shard vnode group boots from at seat time —
 /// startup, runtime join, or sim harness alike.
 pub struct SeatVnodeGroup<'a> {
+    /// Scheme verifier shared by every coordinator in the group.
+    pub verifier: Arc<dyn Verifier>,
     /// Host beacon storage; the group's coordinators resume from its
     /// committed tip.
     pub beacon_storage: &'a dyn BeaconStorage,
@@ -134,6 +136,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
         .into_iter()
         .map(|(validator, signing_key)| {
             let mut beacon_coordinator = BeaconCoordinator::new(
+                Arc::clone(&args.verifier),
                 Arc::clone(&latest_block),
                 beacon_history.clone(),
                 validator,
@@ -169,6 +172,8 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
 /// Caller-supplied bundle for constructing one shard-less beacon
 /// follower — the pooled counterpart of [`SeatVnodeGroup`].
 pub struct SeatFollower<'a> {
+    /// Scheme verifier for the follower's beacon coordinator.
+    pub verifier: Arc<dyn Verifier>,
     /// Host beacon storage; the follower's coordinator resumes from its
     /// committed tip and stays warm by committing every block it folds.
     pub beacon_storage: &'a dyn BeaconStorage,
@@ -214,6 +219,7 @@ pub fn seat_follower(args: SeatFollower<'_>) -> VnodeInit {
         .map(|state| state.as_ref().clone())
         .collect();
     let mut beacon_coordinator = BeaconCoordinator::new(
+        args.verifier,
         latest_block,
         beacon_history,
         args.validator,

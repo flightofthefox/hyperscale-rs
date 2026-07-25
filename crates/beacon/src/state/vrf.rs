@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use blake3::Hasher;
 use hyperscale_types::{
     BeaconProposal, BeaconState, Epoch, JailReason, NetworkDefinition, Randomness, ShardId,
-    ValidatorId, ValidatorStatus, VrfOutput, vrf_verify,
+    ValidatorId, ValidatorStatus, Verifier, VrfOutput, vrf_verify,
 };
 
 use crate::state::pool::exit_placement;
@@ -81,6 +81,7 @@ pub(super) struct VrfStageOutcome<'a> {
 /// happen — non-committee filter already ran) silently fail the cascade
 /// gate without jailing.
 pub(super) fn filter_and_roll_randomness<'a>(
+    verifier: &dyn Verifier,
     state: &mut BeaconState,
     network: &NetworkDefinition,
     epoch: Epoch,
@@ -105,7 +106,7 @@ pub(super) fn filter_and_roll_randomness<'a>(
             rejected_reveals.push(*party);
             continue;
         };
-        if vrf_verify(&pk, network, epoch, &prop.vrf_proof()) {
+        if vrf_verify(verifier, &pk, network, epoch, &prop.vrf_proof()) {
             accepted_outputs.push(prop.vrf_output());
             accepted.push(entry);
         } else {
@@ -229,6 +230,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use blake3::Hasher;
+    use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
         BeaconProposal, BeaconState, Epoch, JailReason, MIN_STAKE_FLOOR, Randomness, ShardId,
         Stake, StakePoolId, ValidatorId, ValidatorStatus, VrfOutput,
@@ -553,7 +555,7 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let committed = full_committee_proposals(state);
         let target = state.current_epoch.next();
-        super::filter_and_roll_randomness(state, &net(), target, &committed, reveals);
+        super::filter_and_roll_randomness(&BlsVerifier, state, &net(), target, &committed, reveals);
     }
 
     fn reveal_outputs(seeds: &[u8]) -> Vec<VrfOutput> {
@@ -600,8 +602,8 @@ mod tests {
         let partial: Vec<_> = full.iter().take(2).cloned().collect();
         let mut reveals = BTreeMap::new();
         reveals.insert(ShardId::leaf(1, 0), reveal_outputs(&[1, 2]));
-        super::filter_and_roll_randomness(&mut a, &net(), target, &full, &reveals);
-        super::filter_and_roll_randomness(&mut b, &net(), target, &partial, &reveals);
+        super::filter_and_roll_randomness(&BlsVerifier, &mut a, &net(), target, &full, &reveals);
+        super::filter_and_roll_randomness(&BlsVerifier, &mut b, &net(), target, &partial, &reveals);
         assert_eq!(a.randomness, b.randomness);
     }
 
@@ -615,7 +617,14 @@ mod tests {
         let prev = state.randomness;
         let committed = full_committee_proposals(&state);
         let target = state.current_epoch.next();
-        super::filter_and_roll_randomness(&mut state, &net(), target, &committed, &BTreeMap::new());
+        super::filter_and_roll_randomness(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            target,
+            &committed,
+            &BTreeMap::new(),
+        );
 
         let mut h = Hasher::new();
         h.update(DOMAIN_BEACON_RANDOMNESS);

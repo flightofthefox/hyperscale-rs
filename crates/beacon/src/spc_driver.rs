@@ -23,7 +23,7 @@ use hyperscale_types::{
     PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError, PcVoteRound,
     SPC_VIEW_TIMEOUT, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
     SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
-    ValidatorId, Verifiable, Verified,
+    ValidatorId, Verifiable, Verified, Verifier,
 };
 use tracing::{trace, warn};
 
@@ -54,6 +54,8 @@ pub type SpcMsgSlotKey = (Epoch, SpcView, ValidatorId, SpcMsgKind);
 /// Per-vnode SPC driver: the optional current-epoch [`SpcInstance`] plus
 /// the PC-vote and SPC-message verification slot pools.
 pub struct SpcDriver {
+    /// Scheme verifier handed to each bootstrapped [`SpcInstance`].
+    verifier: Arc<dyn Verifier>,
     /// `None` between bootstrap and the first epoch-boundary trigger, and
     /// again briefly between an epoch's commit and the next bootstrap.
     spc: Option<SpcInstance>,
@@ -65,8 +67,9 @@ pub struct SpcDriver {
 impl SpcDriver {
     /// A driver with no instance bootstrapped.
     #[must_use]
-    pub fn new(me: ValidatorId) -> Self {
+    pub fn new(verifier: Arc<dyn Verifier>, me: ValidatorId) -> Self {
         Self {
+            verifier,
             spc: None,
             pc_votes: VerificationSlots::default(),
             spc_msgs: VerificationSlots::default(),
@@ -140,6 +143,7 @@ impl SpcDriver {
             return;
         }
         self.spc = Some(SpcInstance::new(
+            Arc::clone(&self.verifier),
             next_epoch,
             committee,
             self.me,
@@ -751,9 +755,10 @@ impl SpcDriver {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
     use hyperscale_types::{
         Bls12381G1PrivateKey, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement,
-        bls_keypair_from_seed, pc_context, pk_from_bls, sign_vote1, spc_context,
+        pc_context, pk_from_bls, sign_vote1, spc_context,
     };
 
     use super::*;
@@ -780,7 +785,7 @@ mod tests {
     /// A driver bootstrapped at [`EPOCH`] under a BFT-minimum committee,
     /// with the local validator at id 0. Its instance starts at view 1.
     fn bootstrapped() -> SpcDriver {
-        let mut driver = SpcDriver::new(ValidatorId::new(0));
+        let mut driver = SpcDriver::new(Arc::new(BlsVerifier), ValidatorId::new(0));
         driver.bootstrap(
             Epoch::new(EPOCH),
             committee(MIN_BEACON_COMMITTEE_SIZE as u64),
@@ -839,7 +844,7 @@ mod tests {
 
     #[test]
     fn pc_vote_dropped_when_no_instance_bootstrapped() {
-        let mut driver = SpcDriver::new(ValidatorId::new(0));
+        let mut driver = SpcDriver::new(Arc::new(BlsVerifier), ValidatorId::new(0));
         let actions = driver.on_pc_vote1_received(SpcView::new(1), vote1(1, 1), false);
         assert!(actions.is_empty());
     }

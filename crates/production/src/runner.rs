@@ -28,6 +28,7 @@ use crossbeam::channel::{Receiver, Sender, unbounded};
 use hex::encode as hex_encode;
 use hyperscale_beacon::genesis::build_genesis;
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::{GenesisConfig, NetworkDefinition, RadixExecutor, TransactionValidation};
@@ -462,6 +463,7 @@ impl ProductionRunnerBuilder {
         for (shard, shard_vnodes) in &seated_by_shard {
             let recovered = storages[shard].load_recovered_state();
             vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
+                verifier: Arc::new(BlsVerifier),
                 beacon_storage: self.beacon_storage.as_ref(),
                 beacon_network: beacon_network.clone(),
                 beacon_config_hash,
@@ -476,6 +478,7 @@ impl ProductionRunnerBuilder {
         }
         for (validator, signing_key) in pooled {
             vnode_inits.push(seat_follower(SeatFollower {
+                verifier: Arc::new(BlsVerifier),
                 beacon_storage: self.beacon_storage.as_ref(),
                 beacon_network: beacon_network.clone(),
                 beacon_config_hash,

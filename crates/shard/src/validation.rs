@@ -472,15 +472,16 @@ fn verify_hash_sorted(
 mod tests {
     use std::collections::BTreeSet;
 
+    use hyperscale_crypto_bls::bls_keypair_from_seed;
     use hyperscale_types::test_utils::{TestCommittee, make_finalized_wave};
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BoundedVec,
-        CertificateRoot, ChainOrigin, FinalizedWave, Hash, InFlightCount, LocalReceiptRoot,
-        MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry, Provisions,
-        ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield,
-        StateRoot, TransactionDecision, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
-        Verifiable, WeightedTimestamp, WitnessSources, agg_from_bls, bls_keypair_from_seed,
-        compute_waves, pk_from_bls, test_utils, zero_bls_signature,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
+        BoundedVec, CertificateRoot, ChainOrigin, FinalizedWave, Hash, InFlightCount,
+        LocalReceiptRoot, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp,
+        ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction,
+        ShardId, SignerBitfield, StateRoot, TransactionDecision, TransactionRoot, ValidatorId,
+        ValidatorInfo, ValidatorSet, Verifiable, WeightedTimestamp, WitnessSources, compute_waves,
+        pk_from_bls, test_utils,
     };
 
     use super::*;
@@ -760,7 +761,7 @@ mod tests {
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(0),
             signers,
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(weighted_ms),
         )
     }
@@ -903,7 +904,7 @@ mod tests {
             BlockHash::from_raw(Hash::from_bytes(b"grandparent")),
             Round::new(0),
             signers,
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(weighted_ms),
         )
     }

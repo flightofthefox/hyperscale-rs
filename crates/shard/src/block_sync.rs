@@ -838,10 +838,10 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BoundedVec, CertificateRoot,
-        ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
-        WitnessSources, agg_from_bls, zero_bls_signature,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader,
+        BoundedVec, CertificateRoot, ChainOrigin, Hash, InFlightCount, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, Round, ShardId, SignerBitfield, StateRoot,
+        TransactionRoot, ValidatorId, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -887,7 +887,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
         CertifiedBlock::new_unchecked(block, qc)
@@ -1444,7 +1444,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         )
     }

@@ -19,6 +19,7 @@ path = "src/bin/keygen.rs"
 ci = []
 
 [dependencies]
+hyperscale-crypto-bls.workspace = true
 hyperscale-beacon.workspace = true
 hyperscale-core.workspace = true
 hyperscale-dispatch.workspace = true

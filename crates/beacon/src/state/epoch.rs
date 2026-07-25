@@ -11,7 +11,7 @@ use hyperscale_types::{
     ObserverSeat, PendingReshape, QcContext, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS,
     RETENTION_HORIZON, RecoveryCause, ShardBoundary, ShardEpochContribution, ShardId, ShardWitness,
     ShardWitnessPayload, SlotEffects, SplitChildRoots, TopologySnapshot, TransitionCause,
-    ValidatorId, ValidatorStatus, Verify, VrfOutput, WeightedTimestamp,
+    ValidatorId, ValidatorStatus, Verifier, Verify, VrfOutput, WeightedTimestamp,
 };
 
 use crate::rules::{
@@ -110,6 +110,7 @@ pub fn apply_input_for(block: &CertifiedBeaconBlock) -> ApplyEpochInput<'_> {
 /// strict-linear `epoch == current_epoch + 1`.
 #[allow(clippy::too_many_lines)] // sequential epoch-fold pipeline; each step is already a helper
 pub fn apply_epoch(
+    verifier: &dyn Verifier,
     state: &mut BeaconState,
     network: &NetworkDefinition,
     epoch: Epoch,
@@ -191,7 +192,7 @@ pub fn apply_epoch(
     // newly proven or carried from an earlier fold whose re-draw couldn't
     // stamp — is fenced out of it and nominated for re-draw this pass
     // (see `ingest_fork_proofs`).
-    ingest_fork_proofs(state, network, epoch, committed);
+    ingest_fork_proofs(verifier, state, network, epoch, committed);
     let fork_fenced: BTreeSet<ShardId> = state.fork_flagged.keys().copied().collect();
 
     // Fold this epoch's per-shard boundaries and apply their witness chunks.
@@ -204,6 +205,7 @@ pub fn apply_epoch(
     } = input
     {
         record_boundaries(
+            verifier,
             state,
             network,
             epoch,
@@ -237,10 +239,15 @@ pub fn apply_epoch(
         ApplyEpochInput::Skip => defer_reshape_ttls(state),
     }
 
-    let vrf = filter_and_roll_randomness(state, network, epoch, committed, &reveals);
+    let vrf = filter_and_roll_randomness(verifier, state, network, epoch, committed, &reveals);
     // Equivocation evidence rides committed proposals; shard-witness lifts
     // ride the boundary contributions applied above.
-    witness.extend(ingest_equivocations(state, network, &vrf.accepted));
+    witness.extend(ingest_equivocations(
+        verifier,
+        state,
+        network,
+        &vrf.accepted,
+    ));
     let withdrawal = complete_pending_withdrawals(state);
     let reactivated = auto_reactivate(state);
     let rewards_credited = distribute_epoch_rewards(state);
@@ -657,6 +664,7 @@ fn advance_drain_watermark(state: &mut BeaconState, shard: &ShardId, chunk_end: 
 /// round-invariant consequence; jailing lands only against an attacker who
 /// left a same-round double-sign.
 fn ingest_fork_proofs(
+    verifier: &dyn Verifier,
     state: &mut BeaconState,
     network: &NetworkDefinition,
     epoch: Epoch,
@@ -697,7 +705,7 @@ fn ingest_fork_proofs(
             {
                 let snap =
                     snapshot.get_or_insert_with(|| state.derive_topology_snapshot(network.clone()));
-                revoke_fork_equivocators(state, snap, network, shard, epoch, qc_a, qc_b);
+                revoke_fork_equivocators(verifier, state, snap, network, shard, epoch, qc_a, qc_b);
             }
             // Recovery classification runs once per shard.
             if !seen.insert(shard) {
@@ -737,7 +745,9 @@ fn ingest_fork_proofs(
 /// behind bit `i`. A committee that has rotated beyond what current state
 /// resolves fails the re-verify and is left fence-only. Each signer's
 /// pool is convicted — permanent and idempotent.
+#[allow(clippy::too_many_arguments)] // fold-internal helper mirroring the proof's fields
 fn revoke_fork_equivocators(
+    verifier: &dyn Verifier,
     state: &mut BeaconState,
     snapshot: &TopologySnapshot,
     network: &NetworkDefinition,
@@ -755,6 +765,7 @@ fn revoke_fork_equivocators(
         return;
     };
     let ctx = QcContext {
+        verifier,
         network,
         public_keys: &public_keys,
         quorum_threshold: snapshot.quorum_threshold_for_shard(shard),
@@ -779,6 +790,7 @@ fn revoke_fork_equivocators(
 
 #[allow(clippy::too_many_lines)] // one pass folding every shard's boundary contribution
 fn record_boundaries(
+    verifier: &dyn Verifier,
     state: &mut BeaconState,
     network: &NetworkDefinition,
     epoch: Epoch,
@@ -850,6 +862,7 @@ fn record_boundaries(
             continue;
         }
         if !apply_contribution_witnesses(
+            verifier,
             state,
             network,
             header,
@@ -1244,16 +1257,17 @@ fn compose_merge_parent(
 mod tests {
     use std::collections::BTreeMap;
 
+    use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
-        BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-        BlockHeight, BoundedVec, CertificateRoot, Epoch, Hash, InFlightCount, LeafIndex,
-        LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, ProposerTimestamp,
+        AggregateSignature, BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
+        BlockHeader, BlockHeight, BoundedVec, CertificateRoot, Epoch, Hash, InFlightCount,
+        LeafIndex, LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, ProposerTimestamp,
         ProvisionsRoot, QuorumCertificate, Round, SettledWavesRoot, ShardBoundary, ShardCommittee,
         ShardForkProof, ShardId, ShardRecovery, ShardWitness, ShardWitnessPayload,
         ShardWitnessProof, SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId,
         StateRoot, TransactionRoot, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
-        agg_from_bls, compute_merkle_root_with_proof, zero_bls_signature,
+        compute_merkle_root_with_proof,
     };
 
     use super::*;
@@ -1297,7 +1311,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(pred_wt),
         );
         BlockHeader::new(
@@ -1436,7 +1450,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(wt),
         )
     }
@@ -1471,6 +1485,7 @@ mod tests {
         .collect();
 
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(1),
@@ -1534,7 +1549,7 @@ mod tests {
         let mut state = single_pool_state(4);
         let shard = ShardId::leaf(1, 0);
         let committed = [fork_committed(shard)];
-        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &committed);
+        ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(1), &committed);
         assert_eq!(state.fork_flagged.get(&shard), Some(&BlockHeight::new(5)));
         assert!(state.pending_recoveries.is_empty());
     }
@@ -1550,7 +1565,7 @@ mod tests {
             .pending_recoveries
             .insert(shard, pending_recovery(RecoveryCause::Halt));
         let committed = [fork_committed(shard)];
-        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &committed);
+        ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(1), &committed);
         assert!(!state.fork_flagged.contains_key(&shard));
         let recovery = &state.pending_recoveries[&shard];
         assert_eq!(recovery.cause, RecoveryCause::Fork);
@@ -1568,7 +1583,7 @@ mod tests {
             .pending_recoveries
             .insert(shard, pending_recovery(RecoveryCause::Fork));
         let committed = [fork_committed(shard)];
-        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &committed);
+        ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(1), &committed);
         assert!(!state.fork_flagged.contains_key(&shard));
         assert_eq!(state.pending_recoveries[&shard].cause, RecoveryCause::Fork);
     }
@@ -1594,7 +1609,7 @@ mod tests {
             VrfProof::ZERO,
         );
         let proposals = [(ValidatorId::new(0), proposal)];
-        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
+        ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(1), &proposals);
         assert!(state.fork_flagged.contains_key(&proof_shard));
         assert!(!state.fork_flagged.contains_key(&wrong_key));
     }
@@ -1616,7 +1631,7 @@ mod tests {
             },
         );
         let committed = [fork_committed(shard)];
-        ingest_fork_proofs(&mut state, &net(), Epoch::new(4), &committed);
+        ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(4), &committed);
         assert!(state.fork_flagged.is_empty());
         assert!(state.pending_recoveries.is_empty());
     }
@@ -1635,7 +1650,7 @@ mod tests {
             },
         );
         let committed = [fork_committed(shard)];
-        ingest_fork_proofs(&mut state, &net(), Epoch::new(4), &committed);
+        ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(4), &committed);
         assert!(state.fork_flagged.contains_key(&shard));
     }
 
@@ -1679,7 +1694,13 @@ mod tests {
         }
         state.fork_flagged.insert(shard, BlockHeight::new(6));
 
-        apply_epoch(&mut state, &net(), Epoch::new(1), ApplyEpochInput::Skip);
+        apply_epoch(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            Epoch::new(1),
+            ApplyEpochInput::Skip,
+        );
 
         let recovery = state
             .pending_recoveries
@@ -1744,6 +1765,7 @@ mod tests {
         .collect();
 
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -1849,7 +1871,7 @@ mod tests {
         );
         let proposals = committed_with(shard, proof);
 
-        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
+        ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(1), &proposals);
 
         assert!(revoked(&state, 1));
         assert!(revoked(&state, 2));
@@ -1876,7 +1898,7 @@ mod tests {
         );
         let proposals = committed_with(shard, proof);
 
-        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
+        ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(1), &proposals);
 
         for v in 0..4 {
             assert!(
@@ -1902,7 +1924,7 @@ mod tests {
         let proof = shard_fork_proof(&committee, shard, BlockHeight::new(5));
         let proposals = committed_with(shard, proof);
 
-        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
+        ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(1), &proposals);
 
         assert!(
             state.fork_flagged.contains_key(&shard),
@@ -1934,7 +1956,7 @@ mod tests {
         );
         let proposals = committed_with(shard, proof);
 
-        ingest_fork_proofs(&mut state, &net(), Epoch::new(1), &proposals);
+        ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(1), &proposals);
 
         assert!(
             state.fork_flagged.contains_key(&shard),
@@ -1987,6 +2009,7 @@ mod tests {
         .collect();
 
         let (_, reveals) = record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(1),
@@ -2036,6 +2059,7 @@ mod tests {
         ))
         .collect();
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(1),
@@ -2066,6 +2090,7 @@ mod tests {
         ))
         .collect();
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -2138,6 +2163,7 @@ mod tests {
         ))
         .collect();
         apply_epoch(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(1),
@@ -2159,6 +2185,7 @@ mod tests {
 
         // Window 2's promotion freezes exactly what the lookahead read.
         apply_epoch(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -2223,6 +2250,7 @@ mod tests {
         ))
         .collect();
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(1),
@@ -2289,6 +2317,7 @@ mod tests {
         .collect();
 
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(1),
@@ -2352,6 +2381,7 @@ mod tests {
         // cap-gated — it advances to exactly the cap even though the
         // boundary commits `total > cap` leaves.
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(1),
@@ -2385,6 +2415,7 @@ mod tests {
         // watermark advances, but the re-fold is a miss, not a refresh, and
         // the pending recovery survives.
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -2408,6 +2439,7 @@ mod tests {
         // Epoch 3: the remainder drains; the watermark reaches the
         // boundary's full leaf count while the miss counter keeps climbing.
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(3),
@@ -2482,6 +2514,7 @@ mod tests {
         let (committed, contributions) =
             contribution_for(shard, b.clone(), witnesses[..cap].to_vec(), 1_500);
         let (_, reveals) = record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(1),
@@ -2502,6 +2535,7 @@ mod tests {
         let (committed, contributions) =
             contribution_for(shard, b, witnesses[cap..].to_vec(), 1_500);
         let (_, reveals) = record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -2528,6 +2562,7 @@ mod tests {
         let (committed, contributions) =
             contribution_for(shard, b2, witnesses2[total..].to_vec(), 2_500);
         let (_, reveals) = record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(3),
@@ -2555,6 +2590,7 @@ mod tests {
             boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, reveal_payloads(2));
         let (committed, contributions) = contribution_for(shard, b, witnesses, 1_500);
         let (_, reveals) = record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(1),
@@ -2591,6 +2627,7 @@ mod tests {
         let (committed, contributions) =
             contribution_for(shard, b, witnesses[..cap].to_vec(), 1_500);
         let (_, reveals) = record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(1),
@@ -2618,6 +2655,7 @@ mod tests {
         let (committed, contributions) =
             contribution_for(shard, b2.clone(), witnesses2[cap..band].to_vec(), 2_500);
         let (_, reveals) = record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -2634,6 +2672,7 @@ mod tests {
         let (committed, contributions) =
             contribution_for(shard, b2, witnesses2[band..].to_vec(), 2_500);
         let (_, reveals) = record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(3),
@@ -2750,6 +2789,7 @@ mod tests {
         ))
         .collect();
         let effects = apply_epoch(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(1),
@@ -2790,6 +2830,7 @@ mod tests {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         apply_epoch(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(5),
@@ -2801,6 +2842,7 @@ mod tests {
         // Replay of epoch 5: current_epoch is now 5, so epoch=5 is
         // neither advance nor regression — must panic.
         apply_epoch(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(5),
@@ -2817,6 +2859,7 @@ mod tests {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         apply_epoch(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(5),
@@ -2826,6 +2869,7 @@ mod tests {
             },
         );
         apply_epoch(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(3),
@@ -2841,6 +2885,7 @@ mod tests {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         apply_epoch(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(7),
@@ -2865,7 +2910,13 @@ mod tests {
         let mut state = single_pool_state(4);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let next = state.current_epoch.next();
-        let effects = apply_epoch(&mut state, &net(), next, ApplyEpochInput::Skip);
+        let effects = apply_epoch(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            next,
+            ApplyEpochInput::Skip,
+        );
 
         assert_eq!(state.current_epoch, next);
         let transition = effects
@@ -2888,6 +2939,7 @@ mod tests {
         normal_state.committee = committee.clone();
         let next = normal_state.current_epoch.next();
         let normal_effects = apply_epoch(
+            &BlsVerifier,
             &mut normal_state,
             &net(),
             next,
@@ -2899,7 +2951,13 @@ mod tests {
 
         let mut skip_state = baseline_state;
         skip_state.committee = committee;
-        let skip_effects = apply_epoch(&mut skip_state, &net(), next, ApplyEpochInput::Skip);
+        let skip_effects = apply_epoch(
+            &BlsVerifier,
+            &mut skip_state,
+            &net(),
+            next,
+            ApplyEpochInput::Skip,
+        );
 
         // Post-state should be byte-identical: both runs roll
         // randomness via the empty-VRF hash chain, run the same
@@ -3041,6 +3099,7 @@ mod tests {
         let (committed, contributions) = contribution_for(parent, header.clone(), witnesses, 2_500);
 
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -3086,6 +3145,7 @@ mod tests {
         let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
 
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -3116,6 +3176,7 @@ mod tests {
         let (committed, contributions) = contribution_for(parent, header, witnesses, 1_500);
 
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -3144,6 +3205,7 @@ mod tests {
         let (mut state, parent, _, _) = terminating_state();
 
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -3172,6 +3234,7 @@ mod tests {
         let (committed, contributions) =
             contribution_for(parent, header.clone(), first_chunk, 2_500);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -3195,6 +3258,7 @@ mod tests {
         let rest = witnesses[MAX_WITNESSES_PER_SHARD..].to_vec();
         let (committed, contributions) = contribution_for(parent, header, rest, 2_500);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(3),
@@ -3224,6 +3288,7 @@ mod tests {
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
         let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -3246,6 +3311,7 @@ mod tests {
         // (2000ms at epoch_duration 1000) plus `RETENTION_HORIZON`.
         let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             past,
@@ -3297,6 +3363,7 @@ mod tests {
         // yet, so both children stay on their placeholder anchors.
         let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             past,
@@ -3322,6 +3389,7 @@ mod tests {
         let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
         let later = Epoch::new(RETENTION_HORIZON.as_secs() + 6);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             later,
@@ -3352,6 +3420,7 @@ mod tests {
         }
         let even_later = Epoch::new(RETENTION_HORIZON.as_secs() + 7);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             even_later,
@@ -3372,6 +3441,7 @@ mod tests {
     /// dropping a child on the horizon alone would strand the parent on its
     /// placeholder forever.
     #[test]
+    #[allow(clippy::too_many_lines)] // walks three epochs of merge lifecycle in one scenario
     fn merge_child_outlives_horizon_until_parent_composes() {
         let mut state = single_pool_state(4);
         state.chain_config.epoch_duration_ms = 1_000;
@@ -3433,6 +3503,7 @@ mod tests {
         // composed, so both children's terminal records must be held.
         let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             past,
@@ -3457,6 +3528,7 @@ mod tests {
             .block_hash = BlockHash::from_raw(Hash::from_bytes(b"composed parent"));
         let later = Epoch::new(RETENTION_HORIZON.as_secs() + 6);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             later,
@@ -3476,6 +3548,7 @@ mod tests {
         state.advanced.insert(parent);
         let even_later = Epoch::new(RETENTION_HORIZON.as_secs() + 7);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             even_later,
@@ -3508,6 +3581,7 @@ mod tests {
         let first_chunk = witnesses[..MAX_WITNESSES_PER_SHARD].to_vec();
         let (committed, contributions) = contribution_for(parent, header, first_chunk, 2_500);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -3649,6 +3723,7 @@ mod tests {
         .collect();
 
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -3721,6 +3796,7 @@ mod tests {
         .into_iter()
         .collect();
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -3763,6 +3839,7 @@ mod tests {
         ))
         .collect();
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(3),
@@ -3830,6 +3907,7 @@ mod tests {
         // can't compose without the sibling) and the parent stays pending.
         let (committed, contributions) = contribution_for(left, lh.clone(), lw.clone(), 2_500);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(2),
@@ -3850,6 +3928,7 @@ mod tests {
         // landing in a single fold (the case staggered witness fetches miss).
         let (committed, contributions) = contribution_for(right, rh.clone(), rw.clone(), 2_500);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(3),
@@ -3869,6 +3948,7 @@ mod tests {
         // roots for surviving counterparts) until the retention GC.
         let (committed, contributions) = both(2_500, 2_500);
         record_boundaries(
+            &BlsVerifier,
             &mut state,
             &net(),
             Epoch::new(4),

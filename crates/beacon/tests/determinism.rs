@@ -19,10 +19,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
+use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, ConsensusPublicKey, Epoch, MIN_STAKE_FLOOR, NetworkDefinition,
     Randomness, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, ValidatorId,
-    ValidatorRecord, ValidatorStatus, bls_keypair_from_seed, pk_from_bls,
+    ValidatorRecord, ValidatorStatus, pk_from_bls,
 };
 
 const V: usize = 3;
@@ -132,6 +133,7 @@ fn fifty_epochs_byte_identical_across_replicas() {
         let target = Epoch::new(e);
         for replica in &mut replicas {
             apply_epoch(
+                &BlsVerifier,
                 replica,
                 &network,
                 target,
@@ -176,6 +178,7 @@ fn lookahead_committee_promotes_unchanged_to_active() {
 
     for e in 1..=last {
         apply_epoch(
+            &BlsVerifier,
             &mut state,
             &network,
             Epoch::new(e),

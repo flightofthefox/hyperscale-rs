@@ -21,6 +21,7 @@
 mod common;
 
 use common::{ShardCoordinatorSim, perturb_header_timestamp};
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_types::{
     BlockHeight, NetworkDefinition, ValidatorId, verify_shard_vote_equivocation,
 };
@@ -103,7 +104,7 @@ fn double_vote_emits_one_verifiable_detection() {
         .public_key(equivocator)
         .expect("equivocator is a committee member");
     assert_eq!(
-        verify_shard_vote_equivocation(ev, &NetworkDefinition::simulator(), &pubkey),
+        verify_shard_vote_equivocation(&BlsVerifier, ev, &NetworkDefinition::simulator(), &pubkey),
         Ok(()),
         "the emitted evidence must verify against the double-signer's key",
     );

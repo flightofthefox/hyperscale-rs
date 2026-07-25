@@ -20,7 +20,6 @@ use hyperscale_types::{
     GlobalReceiptHash, GlobalReceiptRoot, Hash, ProposerTimestamp, QuorumCertificate, Round,
     SafeVoteRegisters, ShardId, SignerBitfield, StateRoot, StoredReceipt, SyncHint, TxHash,
     ValidatorId, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources,
-    agg_from_bls,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -369,7 +368,7 @@ fn test_block_range_retrieval() {
 
 #[test]
 fn test_recovery_with_qc() {
-    use hyperscale_types::{SignerBitfield, zero_bls_signature};
+    use hyperscale_types::SignerBitfield;
 
     let temp_dir = TempDir::new().unwrap();
     let expected_raw = Hash::from_hash_bytes(&[99; 32]);
@@ -384,7 +383,7 @@ fn test_recovery_with_qc() {
             BlockHash::from_raw(Hash::from_bytes(&[98; 32])),
             Round::new(5),
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100_000),
         );
         storage.set_chain_metadata(BlockHeight::new(100), Some(expected_raw), Some(&qc));

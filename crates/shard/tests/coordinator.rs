@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats, ShardStats};
 use hyperscale_storage::RecoveredState;
 use hyperscale_types::test_utils::TestCommittee;
@@ -16,6 +17,7 @@ use hyperscale_types::{
 
 fn fresh_coordinator(config: ShardConsensusConfig) -> ShardCoordinator {
     ShardCoordinator::new(
+        Arc::new(BlsVerifier),
         ValidatorId::new(0),
         ShardId::ROOT,
         config,
@@ -117,6 +119,7 @@ fn is_current_proposer_matches_topology() {
         let me = ValidatorId::new(u64::from(local_idx));
         let local_shard = ShardId::ROOT;
         let coordinator = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             me,
             local_shard,
             ShardConsensusConfig::default(),
@@ -146,6 +149,7 @@ fn will_propose_next_is_true_for_exactly_one_validator_in_fresh_committee() {
     for local_idx in 0_u32..4 {
         let topology_schedule = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
         let coordinator = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             ValidatorId::new(u64::from(local_idx)),
             ShardId::ROOT,
             ShardConsensusConfig::default(),
@@ -214,6 +218,7 @@ fn recovered_registers_floor_boot_values() {
     );
 
     let coordinator = ShardCoordinator::new(
+        Arc::new(BlsVerifier),
         me,
         ShardId::ROOT,
         ShardConsensusConfig::default(),
@@ -239,6 +244,7 @@ fn recovered_registers_of_other_validators_are_ignored() {
     );
 
     let coordinator = ShardCoordinator::new(
+        Arc::new(BlsVerifier),
         ValidatorId::new(0),
         ShardId::ROOT,
         ShardConsensusConfig::default(),

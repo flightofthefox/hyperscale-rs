@@ -33,7 +33,7 @@ use hyperscale_provisions::{
 use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator};
 use hyperscale_storage::RecoveredState;
-use hyperscale_types::{BlockHeight, ForkFence, LocalTimestamp, ShardId, ValidatorId};
+use hyperscale_types::{BlockHeight, ForkFence, LocalTimestamp, ShardId, ValidatorId, Verifier};
 
 /// The coordinators a vnode runs while seated on a shard.
 ///
@@ -97,6 +97,7 @@ impl ShardParticipation {
     #[must_use]
     #[allow(clippy::too_many_arguments)] // per-shard-shared stores threaded explicitly
     pub(in crate::state) fn new(
+        verifier: Arc<dyn Verifier>,
         me: ValidatorId,
         local_shard: ShardId,
         shard_config: &ShardConsensusConfig,
@@ -111,6 +112,7 @@ impl ShardParticipation {
         Self {
             local_shard,
             shard_coordinator: ShardCoordinator::new(
+                verifier,
                 me,
                 local_shard,
                 shard_config.clone(),

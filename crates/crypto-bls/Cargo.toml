@@ -1,0 +1,18 @@
+[package]
+name = "hyperscale-crypto-bls"
+version.workspace = true
+edition.workspace = true
+description = "BLS12-381 implementation of the consensus crypto interface"
+
+[dependencies]
+blake3.workspace = true
+blst.workspace = true
+hyperscale-crypto.workspace = true
+radix-common.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+hyperscale-crypto = { workspace = true, features = ["test-utils"] }
+
+[lints]
+workspace = true

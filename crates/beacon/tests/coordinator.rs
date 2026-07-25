@@ -17,7 +17,7 @@ use hyperscale_types::{
     BlockHeight, CandidateBeaconBlock, ConsensusSignature, Epoch, Hash, PcQc2, PcQc3,
     PcSignerLengths, PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound, PcXpProof, Round,
     ShardId, ShardVoteEquivocation, SignerBitfield, SpcCert, SpcView, StakePoolId, StateRoot,
-    ValidatorId, ValidatorStatus, Verified, VrfProof, sig_from_bls, zero_bls_signature,
+    ValidatorId, ValidatorStatus, Verified, VrfProof,
 };
 
 /// Three epochs is enough to exercise the closed loop more than once:
@@ -628,10 +628,10 @@ fn forged_vote_equivocation_cannot_convict() {
         round: Round::new(2),
         block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"a")),
         parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"pa")),
-        sig_a: sig_from_bls(&zero_bls_signature()),
+        sig_a: ConsensusSignature::ZERO,
         block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"b")),
         parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"pb")),
-        sig_b: sig_from_bls(&zero_bls_signature()),
+        sig_b: ConsensusSignature::ZERO,
     };
     sim.inject_vote_equivocations(Epoch::new(1), vec![forged]);
     sim.kick_off();

@@ -439,8 +439,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        Round, ShardId, SignerBitfield, StateRoot, ValidatorId, WeightedTimestamp, agg_from_bls,
-        zero_bls_signature,
+        AggregateSignature, Round, ShardId, SignerBitfield, StateRoot, ValidatorId,
+        WeightedTimestamp,
     };
 
     /// A [`CertifiedBlock`]'s SBOR encoding does not depend on whether its
@@ -463,7 +463,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
 
@@ -495,7 +495,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
         // SAFETY: synthetic test fixture.
@@ -525,7 +525,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
         // SAFETY: synthetic test fixture.

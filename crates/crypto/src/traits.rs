@@ -32,7 +32,9 @@ pub enum AggregateError {
 /// A stateful, fallible object with no exposed private-key type:
 /// construction is per-impl (from a seed or stored key bytes), and
 /// stateful schemes may consume safety-bearing state on every call.
-pub trait Signer: Send + Sync {
+/// `Debug` is required so holders stay derivable; impls must not print
+/// key material.
+pub trait Signer: Send + Sync + std::fmt::Debug {
     /// The public key other validators verify this signer's output
     /// against.
     fn public_key(&self) -> ConsensusPublicKey;
@@ -67,7 +69,7 @@ pub trait Signer: Send + Sync {
 /// Threshold and voting-power checks are committee policy and stay at
 /// call sites; callers select the pubkeys (via signer bitfields) before
 /// calling in.
-pub trait Verifier: Send + Sync {
+pub trait Verifier: Send + Sync + std::fmt::Debug {
     /// Did the holder of `key` sign `message`?
     fn verify(&self, key: &ConsensusPublicKey, message: &[u8], sig: &ConsensusSignature) -> bool;
 

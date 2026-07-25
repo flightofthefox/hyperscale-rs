@@ -991,9 +991,11 @@ fn empty_committees(num_shards: u64) -> HashMap<ShardId, ShardCommittee> {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::generate_bls_keypair;
+
     use super::*;
     use crate::test_utils::{test_node, test_transaction_with_nodes};
-    use crate::{Hash, ValidatorInfo, generate_bls_keypair, pk_from_bls};
+    use crate::{Hash, ValidatorInfo, pk_from_bls};
 
     fn make_test_validator(id: u64) -> ValidatorInfo {
         ValidatorInfo {

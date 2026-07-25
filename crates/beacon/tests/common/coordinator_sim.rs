@@ -19,6 +19,7 @@ use std::sync::Arc;
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_core::{Action, FetchRequest};
+use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
 use hyperscale_types::{
     AggregateSignature, BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig,
     BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
@@ -31,10 +32,9 @@ use hyperscale_types::{
     RatifyVote, Round, SKIP_TIMEOUT, ShardId, ShardVoteEquivocation, ShardWitness,
     ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SpcEmptyViewMsg, SpcNewCommitMsg,
     SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, bls_keypair_from_seed,
-    compute_merkle_root_with_proof, genesis_config_hash, pc_context, pk_from_bls,
-    sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3, spc_context, vrf_sign,
-    zero_bls_signature,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, compute_merkle_root_with_proof,
+    genesis_config_hash, pc_context, pk_from_bls, sign_empty_view_msg, sign_vote1, sign_vote2,
+    sign_vote3, spc_context, vrf_sign,
 };
 
 /// Adversarial transform a flagged replica applies to its next matching
@@ -248,6 +248,7 @@ impl CoordinatorSim {
         let coordinators: Vec<BeaconCoordinator> = (0..pool_n)
             .map(|i| {
                 BeaconCoordinator::new(
+                    Arc::new(BlsVerifier),
                     Arc::clone(&genesis_block),
                     vec![initial_state.clone()],
                     members[i].0,
@@ -555,6 +556,7 @@ impl CoordinatorSim {
             })
             .collect();
         Verified::<QuorumCertificate>::from_verified_votes(
+            &BlsVerifier,
             b_hash,
             shard,
             height,
@@ -616,6 +618,7 @@ impl CoordinatorSim {
                 } => {
                     let result = Arc::unwrap_or_clone(block)
                         .upgrade(&CertifiedBeaconBlockVerifyContext {
+                            verifier: &BlsVerifier,
                             network: &self.network,
                             committee: &committee,
                             active_pool: &active_pool,
@@ -633,6 +636,7 @@ impl CoordinatorSim {
                 } => {
                     let result = Arc::unwrap_or_clone(candidate)
                         .upgrade(&CandidateVerifyContext {
+                            verifier: &BlsVerifier,
                             network: &self.network,
                             committee: &committee,
                             equivocation_signers: &equivocation_signers,
@@ -650,6 +654,7 @@ impl CoordinatorSim {
                     let signer = vote.signer();
                     let result = (*vote)
                         .upgrade(&RatifyVerifyContext {
+                            verifier: &BlsVerifier,
                             network: &self.network,
                             active_pool: &signers,
                         })
@@ -1190,6 +1195,7 @@ impl CoordinatorSim {
                 // reshape envelope-delivery ordering.
                 let result = Arc::unwrap_or_clone(block)
                     .upgrade(&CertifiedBeaconBlockVerifyContext {
+                        verifier: &BlsVerifier,
                         network: &self.network,
                         committee: &committee,
                         active_pool: &active_pool,
@@ -1207,6 +1213,7 @@ impl CoordinatorSim {
             } => {
                 let result = Arc::unwrap_or_clone(candidate)
                     .upgrade(&CandidateVerifyContext {
+                        verifier: &BlsVerifier,
                         network: &self.network,
                         committee: &committee,
                         equivocation_signers: &equivocation_signers,
@@ -1224,6 +1231,7 @@ impl CoordinatorSim {
                 let signer = vote.signer();
                 let result = (*vote)
                     .upgrade(&RatifyVerifyContext {
+                        verifier: &BlsVerifier,
                         network: &self.network,
                         active_pool: &signers,
                     })
@@ -1241,6 +1249,7 @@ impl CoordinatorSim {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
                 let signer = vote.validator();
                 let result = vote.upgrade(&PcVoteVerifyContext {
+                    verifier: &BlsVerifier,
                     network: &self.network,
                     pc_ctx: &pc_ctx,
                     committee: &committee,
@@ -1262,6 +1271,7 @@ impl CoordinatorSim {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
                 let signer = vote.validator();
                 let result = (*vote).upgrade(&PcVoteVerifyContext {
+                    verifier: &BlsVerifier,
                     network: &self.network,
                     pc_ctx: &pc_ctx,
                     committee: &committee,
@@ -1283,6 +1293,7 @@ impl CoordinatorSim {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
                 let signer = vote.validator();
                 let result = (*vote).upgrade(&PcVoteVerifyContext {
+                    verifier: &BlsVerifier,
                     network: &self.network,
                     pc_ctx: &pc_ctx,
                     committee: &committee,
@@ -1304,6 +1315,7 @@ impl CoordinatorSim {
                 let spc_ctx = spc_context(epoch);
                 let view = proposal.view;
                 let result = (*proposal).upgrade(&SpcVerifyContext {
+                    verifier: &BlsVerifier,
                     network: &self.network,
                     spc_ctx: &spc_ctx,
                     committee: &committee,
@@ -1325,6 +1337,7 @@ impl CoordinatorSim {
                 let spc_ctx = spc_context(epoch);
                 let view = msg.view;
                 let result = (*msg).upgrade(&SpcVerifyContext {
+                    verifier: &BlsVerifier,
                     network: &self.network,
                     spc_ctx: &spc_ctx,
                     committee: &committee,
@@ -1346,6 +1359,7 @@ impl CoordinatorSim {
                 let from = msg.signer;
                 let view = msg.view;
                 let result = (*msg).upgrade(&SpcVerifyContext {
+                    verifier: &BlsVerifier,
                     network: &self.network,
                     spc_ctx: &spc_ctx,
                     committee: &committee,

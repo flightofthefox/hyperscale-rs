@@ -11,6 +11,7 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_beacon::genesis::build_genesis;
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
+use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{GenesisConfig, RadixExecutor, TransactionValidation};
 use hyperscale_mempool::MempoolConfig;
@@ -33,8 +34,7 @@ use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, Bls12381G1PrivateKey, ConsensusPublicKey, Epoch, GenesisConfigHash,
     GenesisValidators, LocalTimestamp, ShardId, TopologySnapshot, TransactionStatus, TxHash,
-    ValidatorId, ValidatorInfo, ValidatorSet, bls_keypair_from_seed, pk_from_bls,
-    shard_prefix_path,
+    ValidatorId, ValidatorInfo, ValidatorSet, pk_from_bls, shard_prefix_path,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -377,6 +377,7 @@ impl SimulationRunner {
                     })
                     .collect();
                 vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
+                    verifier: Arc::new(BlsVerifier),
                     beacon_storage: beacon_storage.as_ref(),
                     beacon_network: beacon_network.clone(),
                     beacon_config_hash,
@@ -392,6 +393,7 @@ impl SimulationRunner {
             for &validator_idx in &plan.followers {
                 let signing_key = Arc::clone(&signing_keys[validator_idx as usize]);
                 vnode_inits.push(seat_follower(SeatFollower {
+                    verifier: Arc::new(BlsVerifier),
                     beacon_storage: beacon_storage.as_ref(),
                     beacon_network: beacon_network.clone(),
                     beacon_config_hash,

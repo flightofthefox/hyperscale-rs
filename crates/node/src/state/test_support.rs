@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
@@ -124,6 +125,7 @@ fn test_beacon_coordinator(committee: &TestCommittee, me: ValidatorId) -> Beacon
     let config_hash = genesis_config_hash(&config, &network);
     let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
     BeaconCoordinator::new(
+        Arc::new(BlsVerifier),
         block,
         vec![state],
         me,

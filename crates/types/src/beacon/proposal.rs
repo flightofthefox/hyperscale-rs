@@ -7,6 +7,7 @@
 //! [`BeaconBlock::committed_proposals`](crate::BeaconBlock).
 
 use blake3::Hasher;
+use hyperscale_crypto::Verifier;
 use sbor::prelude::*;
 use thiserror::Error;
 
@@ -207,8 +208,10 @@ pub struct BeaconProposalVerifyContext<'a> {
     /// Epoch the proposal targets — mixed into the VRF reveal's signing
     /// bytes.
     pub epoch: Epoch,
-    /// Proposer's BLS public key — the VRF reveal verifies under this.
+    /// Proposer's public key — the VRF reveal verifies under this.
     pub sender_pk: ConsensusPublicKey,
+    /// Scheme verifier the VRF check runs through.
+    pub verifier: &'a dyn Verifier,
 }
 
 /// Failure modes of a beacon proposal.
@@ -238,7 +241,13 @@ impl Verify<&BeaconProposalVerifyContext<'_>> for BeaconProposal {
     /// `CertifiedBeaconBlock` boundary and isn't part of this
     /// predicate.
     fn verify(&self, ctx: &BeaconProposalVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        if !vrf_verify(&ctx.sender_pk, ctx.network, ctx.epoch, &self.vrf_proof) {
+        if !vrf_verify(
+            ctx.verifier,
+            &ctx.sender_pk,
+            ctx.network,
+            ctx.epoch,
+            &self.vrf_proof,
+        ) {
             return Err(BeaconProposalVerifyError::BadVrfReveal);
         }
         Ok(Verified::new_unchecked(self.clone()))

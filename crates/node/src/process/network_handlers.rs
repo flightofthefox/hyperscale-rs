@@ -27,7 +27,7 @@ use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
 };
 use hyperscale_types::network::response::GetProvisionResponse;
-use hyperscale_types::{ExecutionCertificate, ShardId, Verifiable, bls_sig, ready_signal_message};
+use hyperscale_types::{ExecutionCertificate, ShardId, Verifiable, ready_signal_message};
 use tracing::warn;
 
 use crate::beacon::gossip::register_beacon_gossip_handlers;
@@ -35,7 +35,7 @@ use crate::event::ShardScopedInput;
 use crate::host::NodeHost;
 use crate::process::ProcessIo;
 use crate::shard::verify::{
-    resolve_sender_key, verify_bls_with_metrics, verify_signed_by_committee,
+    resolve_sender_key, verify_sig_with_metrics, verify_signed_by_committee,
     verify_signed_by_proposer,
 };
 use crate::shard::{ShardIo, push_protocol_event, push_shard_input};
@@ -133,7 +133,7 @@ where
                             certified_header: gossip.certified_header,
                             sender,
                             public_key,
-                            sender_signature: bls_sig(&gossip.sender_signature),
+                            sender_signature: gossip.sender_signature,
                         },
                     );
                     GossipVerdict::Accept
@@ -276,6 +276,7 @@ where
 
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
+        let verifier = Arc::clone(&self.process.verifier);
         self.process
             .network
             .register_notification_handler::<BlockHeaderNotification>(
@@ -290,7 +291,13 @@ where
                         return;
                     };
                     let topo = topology_snapshot.load();
-                    if !verify_signed_by_proposer(&topo, &gossip, "block_header", "block header") {
+                    if !verify_signed_by_proposer(
+                        verifier.as_ref(),
+                        &topo,
+                        &gossip,
+                        "block_header",
+                        "block header",
+                    ) {
                         return;
                     }
                     let (header, manifest, _sig) = gossip.into_parts();
@@ -313,6 +320,7 @@ where
 
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
+        let verifier = Arc::clone(&self.process.verifier);
         self.process
             .network
             .register_notification_handler::<ProvisionsNotification>(
@@ -332,17 +340,18 @@ where
 
                     let source_shard = notification.provisions.source_shard();
                     let event = if notification.provisions.is_verified() {
-                        let verified = Arc::unwrap_or_clone(notification.provisions)
+                        let upgraded = Arc::unwrap_or_clone(notification.provisions)
                             .into_verified()
                             .unwrap_or_else(|_| {
                                 unreachable!("is_verified() guards the verified arm")
                             });
                         ProtocolEvent::VerifiedProvisionsReceived {
-                            provisions: Arc::new(verified),
+                            provisions: Arc::new(upgraded),
                         }
                     } else {
                         let topo = topology_snapshot.load();
                         if !verify_signed_by_committee(
+                            verifier.as_ref(),
                             &topo,
                             source_shard,
                             &notification,
@@ -364,6 +373,7 @@ where
 
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
+        let verifier = Arc::clone(&self.process.verifier);
         self.process
             .network
             .register_notification_handler::<ExecutionVotesNotification>(
@@ -388,6 +398,7 @@ where
 
                     let topo = topology_snapshot.load();
                     if !verify_signed_by_committee(
+                        verifier.as_ref(),
                         &topo,
                         target_shard,
                         &batch,
@@ -422,6 +433,7 @@ where
 
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
+        let verifier = Arc::clone(&self.process.verifier);
         self.process
             .network
             .register_notification_handler::<ExecutionCertificatesNotification>(
@@ -446,6 +458,7 @@ where
                     let topo = topology_snapshot.load();
                     // Sender signed with source_shard (their local shard), not our local shard
                     if !verify_signed_by_committee(
+                        verifier.as_ref(),
                         &topo,
                         source_shard,
                         &batch,
@@ -485,6 +498,7 @@ where
 
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
+        let verifier = Arc::clone(&self.process.verifier);
         self.process
             .network
             .register_notification_handler::<ReadySignalNotification>(
@@ -506,10 +520,11 @@ where
                         signal.wt_window_start(),
                         signal.wt_window_end(),
                     );
-                    if !verify_bls_with_metrics(
+                    if !verify_sig_with_metrics(
+                        verifier.as_ref(),
                         &msg,
                         &public_key,
-                        &bls_sig(&signal.sig()),
+                        &signal.sig(),
                         "ready_signal",
                     ) {
                         warn!(
@@ -542,6 +557,7 @@ where
         let senders = self.process.shard_event_senders.clone();
         let proposal_cache = Arc::clone(&self.process.dispatch_handles.beacon_proposal_cache);
         let topology_snapshot = self.process.topology_snapshot.clone();
+        let verifier = Arc::clone(&self.process.verifier);
         self.process
             .network
             .register_notification_handler::<BeaconProposalNotification>(
@@ -549,13 +565,19 @@ where
                     let from = gossip.sender;
                     let epoch = gossip.epoch;
                     if let Some(sender_pk) = topology_snapshot.load().public_key(from) {
-                        proposal_cache.admit_wire(from, epoch, &gossip.proposal, sender_pk);
-                    }
-                    let event = match Arc::unwrap_or_clone(gossip.proposal).into_verified() {
-                        Ok(verified) => ProtocolEvent::VerifiedBeaconProposalReceived {
+                        proposal_cache.admit_wire(
+                            verifier.as_ref(),
                             from,
                             epoch,
-                            proposal: Arc::new(verified),
+                            &gossip.proposal,
+                            sender_pk,
+                        );
+                    }
+                    let event = match Arc::unwrap_or_clone(gossip.proposal).into_verified() {
+                        Ok(upgraded) => ProtocolEvent::VerifiedBeaconProposalReceived {
+                            from,
+                            epoch,
+                            proposal: Arc::new(upgraded),
                         },
                         Err(unverified) => ProtocolEvent::UnverifiedBeaconProposalReceived {
                             from,
@@ -630,12 +652,19 @@ where
         // warns).
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
+        let verifier = Arc::clone(&self.process.verifier);
         self.process
             .network
             .register_notification_handler::<SpcNewViewNotification>(
                 move |gossip: SpcNewViewNotification| {
                     let topo = topology_snapshot.load();
-                    if !verify_signed_by_proposer(&topo, &gossip, "spc_new_view", "SPC new view") {
+                    if !verify_signed_by_proposer(
+                        verifier.as_ref(),
+                        &topo,
+                        &gossip,
+                        "spc_new_view",
+                        "SPC new view",
+                    ) {
                         return;
                     }
                     let from = gossip.sender;
@@ -652,12 +681,14 @@ where
         // ── beacon.spc.new_commit → ProtocolEvent::SpcNewCommitReceived ──
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
+        let verifier = Arc::clone(&self.process.verifier);
         self.process
             .network
             .register_notification_handler::<SpcNewCommitNotification>(
                 move |gossip: SpcNewCommitNotification| {
                     let topo = topology_snapshot.load();
                     if !verify_signed_by_proposer(
+                        verifier.as_ref(),
                         &topo,
                         &gossip,
                         "spc_new_commit",
@@ -687,6 +718,7 @@ where
         // still runs async in the coordinator.
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
+        let verifier = Arc::clone(&self.process.verifier);
         self.process
             .network
             .register_notification_handler::<SpcEmptyViewMsgNotification>(
@@ -694,6 +726,7 @@ where
                     if !gossip.msg.is_verified() {
                         let topo = topology_snapshot.load();
                         if !verify_signed_by_proposer(
+                            verifier.as_ref(),
                             &topo,
                             &gossip,
                             "spc_empty_view",
@@ -703,8 +736,8 @@ where
                         }
                     }
                     let event = match Arc::unwrap_or_clone(gossip.msg).into_verified() {
-                        Ok(verified) => ProtocolEvent::VerifiedSpcEmptyViewReceived {
-                            msg: Box::new(verified),
+                        Ok(upgraded) => ProtocolEvent::VerifiedSpcEmptyViewReceived {
+                            msg: Box::new(upgraded),
                         },
                         Err(unverified) => ProtocolEvent::UnverifiedSpcEmptyViewReceived {
                             msg: Arc::new(unverified.into()),

@@ -9,6 +9,7 @@ default = []
 test-utils = ["hyperscale-network/test-utils", "dep:parking_lot"]
 
 [dependencies]
+hyperscale-crypto-bls.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true
 clap.workspace = true

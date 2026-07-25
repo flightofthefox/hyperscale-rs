@@ -1,9 +1,10 @@
 //! Deterministic fixtures — committees keyed off a seed, plus PC
 //! signing-context builders.
 
+use hyperscale_crypto_bls::bls_keypair_from_seed;
 use hyperscale_types::{
-    Bls12381G1PrivateKey, ConsensusPublicKey, Epoch, PcContext, SpcView, ValidatorId,
-    bls_keypair_from_seed, pc_context, pk_from_bls, spc_context,
+    Bls12381G1PrivateKey, ConsensusPublicKey, Epoch, PcContext, SpcView, ValidatorId, pc_context,
+    pk_from_bls, spc_context,
 };
 
 /// A small in-test validator committee — deterministic keys derived

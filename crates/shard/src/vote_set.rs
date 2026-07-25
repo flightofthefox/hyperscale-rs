@@ -327,7 +327,7 @@ impl VoteSet {
 #[cfg(test)]
 mod test_helpers {
     use hyperscale_types::{
-        Bls12381G2Signature, QuorumCertificate, ShardId, SignerBitfield, agg_from_bls, bls_sig,
+        ConsensusSignature, QuorumCertificate, ShardId, SignerBitfield, Verifier,
     };
 
     use super::*;
@@ -345,6 +345,7 @@ mod test_helpers {
         /// Returns error if called before reaching quorum or with no votes.
         pub fn build_qc(
             &mut self,
+            verifier: &dyn Verifier,
             block_hash: BlockHash,
             shard_id: ShardId,
         ) -> Result<QuorumCertificate, String> {
@@ -373,16 +374,15 @@ mod test_helpers {
                 signers.set(*idx);
             }
 
-            let signatures: Vec<Bls12381G2Signature> = self
+            let signatures: Vec<ConsensusSignature> = self
                 .verified_votes
                 .iter()
-                .map(|(_, v)| bls_sig(&v.signature()))
+                .map(|(_, v)| v.signature())
                 .collect();
 
-            let aggregated_signature = agg_from_bls(
-                &Bls12381G2Signature::aggregate(&signatures, true)
-                    .map_err(|e| format!("failed to aggregate signatures: {e:?}"))?,
-            );
+            let aggregated_signature = verifier
+                .aggregate(&signatures)
+                .map_err(|e| format!("failed to aggregate signatures: {e:?}"))?;
 
             // Mean of the clamped vote timestamps — every vote weighs one.
             let weighted_timestamp_ms = if self.verified_power == VoteCount::ZERO {
@@ -421,11 +421,12 @@ mod test_helpers {
 mod tests {
     use std::collections::BTreeMap;
 
+    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, CertificateRoot,
         ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
         ProvisionsRoot, QuorumCertificate, ShardId, StateRoot, TransactionRoot, ValidatorId,
-        generate_bls_keypair, pk_from_bls,
+        pk_from_bls,
     };
 
     use super::*;
@@ -550,13 +551,19 @@ mod tests {
         assert_eq!(vote_set.verified_power(), VoteCount::new(3));
 
         // Build QC
-        let qc = vote_set.build_qc(block_hash, test_shard_group()).unwrap();
+        let qc = vote_set
+            .build_qc(&BlsVerifier, block_hash, test_shard_group())
+            .unwrap();
         assert_eq!(qc.block_hash(), block_hash);
         assert_eq!(qc.height().inner(), 1);
         assert_eq!(qc.signers().count(), 3);
 
         // Can't build again
-        assert!(vote_set.build_qc(block_hash, test_shard_group()).is_err());
+        assert!(
+            vote_set
+                .build_qc(&BlsVerifier, block_hash, test_shard_group())
+                .is_err()
+        );
     }
 
     #[test]

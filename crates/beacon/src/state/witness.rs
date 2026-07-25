@@ -7,7 +7,7 @@ use hyperscale_types::{
     BeaconProposal, BeaconState, BlockHeader, JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS,
     MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingReshape, PendingWithdrawal,
     RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS, ShardId, ShardWitness,
-    ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord, ValidatorStatus,
+    ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier,
     validator_possession_proof_verify, verify_shard_vote_equivocation, verify_vote_equivocation,
 };
 
@@ -81,6 +81,7 @@ pub(super) enum HostEvent {
 /// (which decodes `Unverified`). Committed evidence is threshold-vouched:
 /// a 2f+1 commit implies ≥ f+1 honest verifiers behind every entry.
 pub(super) fn ingest_equivocations(
+    verifier: &dyn Verifier,
     state: &mut BeaconState,
     network: &NetworkDefinition,
     accepted: &[&(ValidatorId, BeaconProposal)],
@@ -94,8 +95,13 @@ pub(super) fn ingest_equivocations(
                 continue;
             };
             if ev.verified().is_none()
-                && verify_vote_equivocation(evidence, network, &[(validator_id, rec.pubkey)])
-                    .is_err()
+                && verify_vote_equivocation(
+                    verifier,
+                    evidence,
+                    network,
+                    &[(validator_id, rec.pubkey)],
+                )
+                .is_err()
             {
                 continue;
             }
@@ -116,7 +122,7 @@ pub(super) fn ingest_equivocations(
                 continue;
             };
             if ev.verified().is_none()
-                && verify_shard_vote_equivocation(evidence, network, &rec.pubkey).is_err()
+                && verify_shard_vote_equivocation(verifier, evidence, network, &rec.pubkey).is_err()
             {
                 continue;
             }
@@ -140,7 +146,9 @@ pub(super) fn ingest_equivocations(
 /// its validator-level event recorded into `outcome`. Validation runs to
 /// completion before any application, so a malformed chunk never
 /// half-applies.
+#[allow(clippy::too_many_arguments)] // fold-internal helper mirroring the contribution's fields
 pub(super) fn apply_contribution_witnesses(
+    verifier: &dyn Verifier,
     state: &mut BeaconState,
     network: &NetworkDefinition,
     boundary_header: &BlockHeader,
@@ -153,9 +161,13 @@ pub(super) fn apply_contribution_witnesses(
         return false;
     }
     for witness in witnesses {
-        if let Some(event) =
-            apply_shard_payload(state, network, witness.proof.shard_id, &witness.payload)
-        {
+        if let Some(event) = apply_shard_payload(
+            verifier,
+            state,
+            network,
+            witness.proof.shard_id,
+            &witness.payload,
+        ) {
             outcome.record(&event);
         }
     }
@@ -178,6 +190,7 @@ pub(super) fn apply_contribution_witnesses(
 /// currently `OnShard { shard: S, .. }`.
 #[allow(clippy::too_many_lines)] // single dispatch over ShardWitnessPayload variants
 pub(super) fn apply_shard_payload(
+    verifier: &dyn Verifier,
     state: &mut BeaconState,
     network: &NetworkDefinition,
     source_shard: ShardId,
@@ -256,8 +269,13 @@ pub(super) fn apply_shard_payload(
             // valid G1 point verifies no signature, including its own
             // PoP. Failure is a no-op registration, like every other
             // rejected witness.
-            if !validator_possession_proof_verify(network, *validator_id, pubkey, possession_proof)
-            {
+            if !validator_possession_proof_verify(
+                verifier,
+                network,
+                *validator_id,
+                pubkey,
+                possession_proof,
+            ) {
                 return None;
             }
             state.validators.insert(
@@ -725,15 +743,16 @@ pub(super) fn defer_reshape_ttls(state: &mut BeaconState) {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::sig_from_bls;
+    use hyperscale_crypto_bls::BlsVerifier;
     // ─── witness fold framework + stake variants ─────────────────────────
     use hyperscale_types::{
         BlockHash, BlockHeight, BlockVote, CohortSeat, EMISSIONS_PER_EPOCH, Epoch, Hash,
         JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MIN_STAKE_FLOOR,
         MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, PoolConviction, ProposerTimestamp,
         Randomness, Round, ShardCommittee, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
-        Stake, StakePool, StakePoolId, ValidatorId, ValidatorStatus, zero_bls_signature,
+        Stake, StakePool, StakePoolId, ValidatorId, ValidatorStatus,
     };
+    use hyperscale_types::{ConsensusSignature, sig_from_bls};
 
     use super::*;
     use crate::rules::contribution_chunk_valid;
@@ -1031,10 +1050,10 @@ mod tests {
             round: Round::new(2),
             block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"a")),
             parent_block_hash_a: BlockHash::from_raw(Hash::from_bytes(b"pa")),
-            sig_a: sig_from_bls(&zero_bls_signature()),
+            sig_a: ConsensusSignature::ZERO,
             block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"b")),
             parent_block_hash_b: BlockHash::from_raw(Hash::from_bytes(b"pb")),
-            sig_b: sig_from_bls(&zero_bls_signature()),
+            sig_b: ConsensusSignature::ZERO,
         };
         let target_epoch = state.current_epoch.next();
         let mut committed = vec![(
@@ -1239,7 +1258,7 @@ mod tests {
                 pool_id,
                 validator_id: new_id,
                 pubkey: pubkey(5),
-                possession_proof: sig_from_bls(&zero_bls_signature()),
+                possession_proof: ConsensusSignature::ZERO,
             }],
         );
 
@@ -2270,7 +2289,7 @@ mod tests {
     fn split_admission_draws_the_observer_cohort() {
         let p = ShardId::leaf(1, 0);
         let mut state = reshape_state(&[p], 4);
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
 
         let Some(PendingReshape::Split {
             last_asserted,
@@ -2319,8 +2338,8 @@ mod tests {
         let p = ShardId::leaf(1, 0);
         let mut a = reshape_state(&[p], 8);
         let mut b = reshape_state(&[p], 8);
-        apply_shard_payload(&mut a, &net(), p, &split_payload(p));
-        apply_shard_payload(&mut b, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut a, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut b, &net(), p, &split_payload(p));
         assert_eq!(a.pending_reshapes, b.pending_reshapes);
         assert_eq!(a.next_shard_committees, b.next_shard_committees);
         assert_eq!(a.pooled_validators(), b.pooled_validators());
@@ -2334,7 +2353,7 @@ mod tests {
         let p = ShardId::leaf(1, 0);
         let elsewhere = ShardId::leaf(1, 1);
         let mut state = reshape_state(&[p, elsewhere], 4);
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
         let observer = *cohort_of(&state, p).keys().next().unwrap();
         let observer_child = cohort_of(&state, p)[&observer].child;
         let ready = |v: ValidatorId| ShardWitnessPayload::ReshapeReady {
@@ -2343,16 +2362,28 @@ mod tests {
         };
 
         // Wrong source shard: no seat marked.
-        apply_shard_payload(&mut state, &net(), elsewhere, &ready(observer));
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            elsewhere,
+            &ready(observer),
+        );
         assert!(!cohort_of(&state, p)[&observer].ready);
 
         // No seat held: dropped.
-        apply_shard_payload(&mut state, &net(), p, &ready(ValidatorId::new(9_999)));
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ready(ValidatorId::new(9_999)),
+        );
 
         // The shard's own chain marks the seat; re-marking holds.
-        apply_shard_payload(&mut state, &net(), p, &ready(observer));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &ready(observer));
         assert!(cohort_of(&state, p)[&observer].ready);
-        apply_shard_payload(&mut state, &net(), p, &ready(observer));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &ready(observer));
         assert!(cohort_of(&state, p)[&observer].ready);
         let ready_count = cohort_of(&state, p).values().filter(|s| s.ready).count();
         assert_eq!(ready_count, 1);
@@ -2378,7 +2409,7 @@ mod tests {
         }
         let consensus_before = state.ready_consensus_members(&state.next_shard_committees);
 
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
 
         assert_eq!(state.next_shard_committees[&p].members.len(), 8);
         assert_eq!(
@@ -2394,10 +2425,11 @@ mod tests {
     fn observer_attrition_drops_the_seat_without_refill() {
         let p = ShardId::leaf(1, 0);
         let mut state = reshape_state(&[p], 4);
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
         let victim = *cohort_of(&state, p).keys().next().unwrap();
 
         apply_shard_payload(
+            &BlsVerifier,
             &mut state,
             &net(),
             p,
@@ -2430,14 +2462,14 @@ mod tests {
     fn split_rejected_until_pool_can_staff() {
         let p = ShardId::leaf(1, 0);
         let mut state = reshape_state(&[p], 3);
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
         assert!(state.pending_reshapes.is_empty());
 
         state.validators.insert(
             ValidatorId::new(2000),
             validator_record(2000, 0, ValidatorStatus::Pooled),
         );
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
         assert!(state.pending_reshapes.contains_key(&p));
     }
 
@@ -2449,12 +2481,13 @@ mod tests {
         let sibling = ShardId::leaf(1, 1);
         let mut state = reshape_state(&[p, sibling], 4);
 
-        apply_shard_payload(&mut state, &net(), sibling, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), sibling, &split_payload(p));
         assert!(state.pending_reshapes.is_empty());
 
         // A merge under ROOT asserted by a non-child source.
         let stranger = ShardId::leaf(2, 0b11);
         apply_shard_payload(
+            &BlsVerifier,
             &mut state,
             &net(),
             stranger,
@@ -2471,7 +2504,7 @@ mod tests {
         let p = ShardId::leaf(1, 0);
         let elsewhere = ShardId::leaf(1, 1);
         let mut state = reshape_state(&[elsewhere], 4);
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
         assert!(state.pending_reshapes.is_empty());
     }
 
@@ -2483,7 +2516,7 @@ mod tests {
     fn silence_lapses_a_split_and_reassertion_restaffs_it_identically() {
         let p = ShardId::leaf(1, 0);
         let mut state = reshape_state(&[p], 4);
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
         let original = cohort_of(&state, p).clone();
         assert_eq!(original.len(), 4);
 
@@ -2514,7 +2547,7 @@ mod tests {
         // A re-assertion re-staffs the same cohort: the draw seeds on the
         // frozen `cohort_seed` over the now-refilled pool, so an
         // observer's synced child never moves under it.
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
         assert_eq!(cohort_of(&state, p), &original);
         assert!(state.pooled_validators().is_empty());
     }
@@ -2527,7 +2560,7 @@ mod tests {
     fn readiness_ttl_removes_a_lapsed_split_and_a_later_split_reseeds() {
         let p = ShardId::leaf(1, 0);
         let mut state = reshape_state(&[p], 4);
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
 
         // Trigger silence lapses it, then quiet through the readiness TTL
         // removes the lapsed record outright.
@@ -2548,7 +2581,7 @@ mod tests {
         // A later split snapshots the current randomness — proof the seed
         // is freshly drawn, not carried over from the removed record.
         state.randomness = Randomness::new([7u8; 32]);
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
         let Some(PendingReshape::Split { cohort_seed, .. }) = state.pending_reshapes.get(&p) else {
             panic!("re-admitted split not recorded");
         };
@@ -2562,11 +2595,11 @@ mod tests {
     fn stalled_split_abandons_at_the_readiness_ttl() {
         let p = ShardId::leaf(1, 0);
         let mut state = reshape_state(&[p], 4);
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
 
         for epoch in 6..(5 + RESHAPE_READY_TTL_EPOCHS) {
             state.current_epoch = Epoch::new(epoch);
-            apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+            apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
             prune_stale_reshapes(&mut state);
             assert!(
                 state.pending_reshapes.contains_key(&p),
@@ -2574,7 +2607,7 @@ mod tests {
             );
         }
         state.current_epoch = Epoch::new(5 + RESHAPE_READY_TTL_EPOCHS);
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
         prune_stale_reshapes(&mut state);
         assert!(state.pending_reshapes.is_empty());
         assert_eq!(state.pooled_validators().len(), 4);
@@ -2589,7 +2622,7 @@ mod tests {
     fn skip_epochs_defer_the_reshape_ttls() {
         let p = ShardId::leaf(1, 0);
         let mut state = reshape_state(&[p], 4);
-        apply_shard_payload(&mut state, &net(), p, &split_payload(p));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), p, &split_payload(p));
 
         // Stall past the readiness TTL purely on skips; each defers the
         // anchors, so the split is intact when the sweep resumes.
@@ -2628,7 +2661,7 @@ mod tests {
             parent: ShardId::ROOT,
         };
 
-        apply_shard_payload(&mut state, &net(), left, &payload);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &payload);
         let Some(PendingReshape::Merge {
             halves,
             admitted_at,
@@ -2640,7 +2673,7 @@ mod tests {
         assert_eq!(halves.len(), 1);
         assert!(admitted_at.is_none(), "a lone half has not paired");
 
-        apply_shard_payload(&mut state, &net(), right, &payload);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &payload);
         let Some(PendingReshape::Merge {
             halves,
             admitted_at,
@@ -2654,7 +2687,7 @@ mod tests {
 
         // A fresh lone half goes quiet and expires.
         let mut lone = reshape_state(&[left, right], 0);
-        apply_shard_payload(&mut lone, &net(), left, &payload);
+        apply_shard_payload(&BlsVerifier, &mut lone, &net(), left, &payload);
         lone.current_epoch = Epoch::new(5 + RESHAPE_TRIGGER_TTL_EPOCHS);
         prune_stale_reshapes(&mut lone);
         assert!(lone.pending_reshapes.is_empty());
@@ -2671,13 +2704,13 @@ mod tests {
 
         // Only one child active: merge dropped.
         let mut state = reshape_state(&[left], 0);
-        apply_shard_payload(&mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
         assert!(state.pending_reshapes.is_empty());
 
         // Pending split on a child blocks the merge.
         let mut state = reshape_state(&[left, right], 4);
-        apply_shard_payload(&mut state, &net(), left, &split_payload(left));
-        apply_shard_payload(&mut state, &net(), right, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &split_payload(left));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         assert!(matches!(
             state.pending_reshapes.get(&left),
             Some(PendingReshape::Split { .. }),
@@ -2686,8 +2719,14 @@ mod tests {
 
         // Pending merge blocks a child's split.
         let mut state = reshape_state(&[left, right], 4);
-        apply_shard_payload(&mut state, &net(), left, &merge);
-        apply_shard_payload(&mut state, &net(), right, &split_payload(right));
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            right,
+            &split_payload(right),
+        );
         assert!(!state.pending_reshapes.contains_key(&right));
     }
 
@@ -2700,7 +2739,13 @@ mod tests {
             .map(|path| ShardId::leaf(depth, path))
             .collect();
         let mut state = reshape_state(&shards, 8);
-        apply_shard_payload(&mut state, &net(), shards[0], &split_payload(shards[0]));
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            shards[0],
+            &split_payload(shards[0]),
+        );
         assert!(state.pending_reshapes.is_empty());
     }
 }

@@ -12,6 +12,7 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, unbounded};
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{RadixExecutor, TransactionValidation};
 use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
@@ -118,6 +119,7 @@ impl Fixture {
     fn vnode_init(&self, idx: usize, shard: ShardId) -> VnodeInit {
         let me = self.committee.validator_id(idx);
         let beacon = BeaconCoordinator::new(
+            Arc::new(BlsVerifier),
             Arc::clone(&self.genesis_block),
             vec![self.genesis_state.clone()],
             me,
@@ -152,6 +154,7 @@ impl Fixture {
     fn pooled_vnode_init(&self, idx: usize) -> VnodeInit {
         let me = self.committee.validator_id(idx);
         let beacon = BeaconCoordinator::new(
+            Arc::new(BlsVerifier),
             Arc::clone(&self.genesis_block),
             vec![self.genesis_state.clone()],
             me,

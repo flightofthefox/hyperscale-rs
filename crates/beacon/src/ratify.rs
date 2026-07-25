@@ -29,10 +29,11 @@
 //! and an anchor, nothing more.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, ConsensusPublicKey, Epoch, RatifyCert, RatifyPhase, RatifyRound,
-    RatifyVote, RatifyVoteRecord, ValidatorId, Verified, ratify_quorum,
+    RatifyVote, RatifyVoteRecord, ValidatorId, Verified, Verifier, ratify_quorum,
 };
 
 /// Rounds ahead of the current one a vote may reference and still be
@@ -80,6 +81,7 @@ pub enum RatifyEffect {
 /// Ratification state for the epoch pending at one anchor.
 #[derive(Debug)]
 pub struct RatifyTracker {
+    verifier: Arc<dyn Verifier>,
     anchor: BeaconBlockHash,
     epoch: Epoch,
     /// Active pool for the epoch, in the positional order every cert
@@ -117,11 +119,13 @@ impl RatifyTracker {
     /// derived from the anchor's state.
     #[must_use]
     pub fn new(
+        verifier: Arc<dyn Verifier>,
         anchor: BeaconBlockHash,
         epoch: Epoch,
         pool: Vec<(ValidatorId, ConsensusPublicKey)>,
     ) -> Self {
         Self {
+            verifier,
             anchor,
             epoch,
             pool,
@@ -387,7 +391,8 @@ impl RatifyTracker {
             .values()
             .filter(|v| v.block_hash() == block_hash)
             .collect();
-        let cert = Verified::<RatifyCert>::from_verified_votes(&refs, &self.pool)?;
+        let cert =
+            Verified::<RatifyCert>::from_verified_votes(self.verifier.as_ref(), &refs, &self.pool)?;
         self.completed = true;
         Some(RatifyEffect::CertAssembled {
             cert: Box::new(cert),
@@ -420,9 +425,9 @@ impl RatifyTracker {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
     use hyperscale_types::{
-        Bls12381G1PrivateKey, Hash, NetworkDefinition, bls_keypair_from_seed, pk_from_bls,
-        verify_ratify_cert,
+        Bls12381G1PrivateKey, Hash, NetworkDefinition, pk_from_bls, verify_ratify_cert,
     };
 
     use super::*;
@@ -467,7 +472,10 @@ mod tests {
 
     fn tracker(n: u64) -> (RatifyTracker, Vec<Bls12381G1PrivateKey>) {
         let (active, keys) = pool(n);
-        (RatifyTracker::new(anchor(), epoch(), active), keys)
+        (
+            RatifyTracker::new(Arc::new(BlsVerifier), anchor(), epoch(), active),
+            keys,
+        )
     }
 
     fn vote(
@@ -639,7 +647,7 @@ mod tests {
         let cert = cert.expect("quorum of precommits assembles");
         assert_eq!(cert.block_hash(), candidate_hash());
         assert_eq!(cert.signer_count(), 5);
-        assert!(verify_ratify_cert(&cert, &net(), &active).is_ok());
+        assert!(verify_ratify_cert(&BlsVerifier, &cert, &net(), &active).is_ok());
         assert!(t.is_completed());
     }
 

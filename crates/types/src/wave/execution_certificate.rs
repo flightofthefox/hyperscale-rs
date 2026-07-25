@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 
+use hyperscale_crypto::{ConsensusSignature, Verifier};
 use sbor::prelude::*;
 use sbor::{
     Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
@@ -17,11 +18,10 @@ use thiserror::Error;
 
 use crate::sbor_codec::decode_bounded_vec;
 use crate::{
-    AggregateSignature, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, ConsensusPublicKey,
-    ExecutionVote, GlobalReceiptRoot, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition,
-    RETENTION_HORIZON, ShardId, SignerBitfield, TxOutcome, ValidatorId, Verified, Verify, WaveId,
-    WeightedTimestamp, agg_from_bls, bls_agg, bls_pk, bls_sig, compute_global_receipt_root,
-    exec_vote_message, verify_bls12381_v1,
+    AggregateSignature, BlockHeight, ConsensusPublicKey, ExecutionVote, GlobalReceiptRoot, Hash,
+    MAX_TXS_PER_BLOCK, NetworkDefinition, RETENTION_HORIZON, ShardId, SignerBitfield, TxOutcome,
+    ValidatorId, Verified, Verify, WaveId, WeightedTimestamp, compute_global_receipt_root,
+    exec_vote_message,
 };
 
 /// Aggregated certificate for an execution wave.
@@ -297,6 +297,8 @@ pub struct ExecutionCertificateContext<'a> {
     /// Committee public keys in committee order. The certificate's
     /// `signers` bitfield indexes into this slice.
     pub public_keys: &'a [ConsensusPublicKey],
+    /// Scheme verifier the aggregate check runs through.
+    pub verifier: &'a dyn Verifier,
 }
 
 /// Failure modes of [`ExecutionCertificate`] verification.
@@ -336,12 +338,12 @@ impl Verify<&ExecutionCertificateContext<'_>> for ExecutionCertificate {
     type Error = ExecutionCertificateVerifyError;
 
     fn verify(&self, ctx: &ExecutionCertificateContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        let signer_keys: Vec<Bls12381G1PublicKey> = ctx
+        let signer_keys: Vec<ConsensusPublicKey> = ctx
             .public_keys
             .iter()
             .enumerate()
             .filter(|(i, _)| self.signers.is_set(*i))
-            .map(|(_, pk)| bls_pk(pk))
+            .map(|(_, pk)| *pk)
             .collect();
 
         if signer_keys.is_empty() {
@@ -351,13 +353,11 @@ impl Verify<&ExecutionCertificateContext<'_>> for ExecutionCertificate {
             return Err(ExecutionCertificateVerifyError::EmptySignersWithNonZeroSignature);
         }
 
-        let aggregated_pk = Bls12381G1PublicKey::aggregate(&signer_keys, false)
-            .map_err(|_| ExecutionCertificateVerifyError::BadAggregatedSignature)?;
         let message = self.signing_message(ctx.network);
-        if !verify_bls12381_v1(
+        if !ctx.verifier.verify_aggregate_same_message(
             &message,
-            &aggregated_pk,
-            &bls_agg(&self.aggregated_signature),
+            &self.aggregated_signature,
+            &signer_keys,
         ) {
             return Err(ExecutionCertificateVerifyError::BadAggregatedSignature);
         }
@@ -389,6 +389,7 @@ impl Verified<ExecutionCertificate> {
     /// input, or BLS library bug).
     #[must_use]
     pub fn aggregate(
+        verifier: &dyn Verifier,
         wave_id: &WaveId,
         global_receipt_root: GlobalReceiptRoot,
         votes: &[Verified<ExecutionVote>],
@@ -407,17 +408,14 @@ impl Verified<ExecutionCertificate> {
             .filter(|vote| seen_validators.insert(vote.validator()))
             .collect();
 
-        let bls_signatures: Vec<Bls12381G2Signature> = unique_votes
-            .iter()
-            .map(|vote| bls_sig(&vote.signature()))
-            .collect();
-        let aggregated_signature = if bls_signatures.is_empty() {
+        let signatures: Vec<ConsensusSignature> =
+            unique_votes.iter().map(|vote| vote.signature()).collect();
+        let aggregated_signature = if signatures.is_empty() {
             AggregateSignature::ZERO
         } else {
-            agg_from_bls(
-                &Bls12381G2Signature::aggregate(&bls_signatures, true)
-                    .expect("aggregation of upstream-verified BLS signatures cannot fail"),
-            )
+            verifier
+                .aggregate(&signatures)
+                .expect("aggregation of upstream-verified signatures cannot fail")
         };
 
         let committee_index: HashMap<ValidatorId, usize> = committee
@@ -473,10 +471,12 @@ impl Verified<ExecutionCertificate> {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
+
     use super::*;
     use crate::{
         BlockHash, BlockHeight, Bls12381G1PrivateKey, ExecutionOutcome, GlobalReceiptHash, TxHash,
-        generate_bls_keypair, pk_from_bls,
+        pk_from_bls,
     };
 
     fn outcome(seed: u8) -> TxOutcome {
@@ -535,10 +535,16 @@ mod tests {
             .map(|i| signed_vote(&net, &sks[usize::try_from(i).unwrap()], i, outcomes.clone()))
             .collect();
 
-        let cert =
-            Verified::<ExecutionCertificate>::aggregate(&wave_id(), root, &votes, &committee);
+        let cert = Verified::<ExecutionCertificate>::aggregate(
+            &BlsVerifier,
+            &wave_id(),
+            root,
+            &votes,
+            &committee,
+        );
 
         let ctx = ExecutionCertificateContext {
+            verifier: &BlsVerifier,
             network: &net,
             public_keys: &pks,
         };
@@ -562,9 +568,14 @@ mod tests {
         let votes: Vec<Verified<ExecutionVote>> = (0..4)
             .map(|i| signed_vote(&net, &sks[usize::try_from(i).unwrap()], i, outcomes.clone()))
             .collect();
-        let cert =
-            Verified::<ExecutionCertificate>::aggregate(&wave_id(), root, &votes, &committee)
-                .into_inner();
+        let cert = Verified::<ExecutionCertificate>::aggregate(
+            &BlsVerifier,
+            &wave_id(),
+            root,
+            &votes,
+            &committee,
+        )
+        .into_inner();
 
         let tampered = ExecutionCertificate::new(
             cert.wave_id().clone(),
@@ -576,6 +587,7 @@ mod tests {
         );
 
         let ctx = ExecutionCertificateContext {
+            verifier: &BlsVerifier,
             network: &net,
             public_keys: &pks,
         };
@@ -606,6 +618,7 @@ mod tests {
         );
 
         let ctx = ExecutionCertificateContext {
+            verifier: &BlsVerifier,
             network: &net,
             public_keys: &pks,
         };
@@ -637,6 +650,7 @@ mod tests {
         );
 
         let ctx = ExecutionCertificateContext {
+            verifier: &BlsVerifier,
             network: &net,
             public_keys: &pks,
         };
@@ -661,9 +675,14 @@ mod tests {
             signed_vote(&net, &sk3, 3, outcomes.clone()),
         ];
 
-        let cert =
-            Verified::<ExecutionCertificate>::aggregate(&wave_id(), root, &votes, &committee)
-                .into_inner();
+        let cert = Verified::<ExecutionCertificate>::aggregate(
+            &BlsVerifier,
+            &wave_id(),
+            root,
+            &votes,
+            &committee,
+        )
+        .into_inner();
         assert!(cert.signers().is_set(1));
         assert!(cert.signers().is_set(3));
         assert!(!cert.signers().is_set(0));
@@ -686,9 +705,14 @@ mod tests {
             signed_vote(&net, &sk0, 0, outcomes),
         ];
 
-        let cert =
-            Verified::<ExecutionCertificate>::aggregate(&wave_id(), root, &votes, &committee)
-                .into_inner();
+        let cert = Verified::<ExecutionCertificate>::aggregate(
+            &BlsVerifier,
+            &wave_id(),
+            root,
+            &votes,
+            &committee,
+        )
+        .into_inner();
         assert!(cert.signers().is_set(0));
         assert!(!cert.signers().is_set(1));
         assert_eq!(cert.signers().count_ones(), 1);
@@ -709,14 +733,20 @@ mod tests {
             signed_vote(&net, &sk0, 0, outcomes.clone()),
             signed_vote(&net, &sk1, 1, outcomes),
         ];
-        let cert =
-            Verified::<ExecutionCertificate>::aggregate(&wave_id(), root, &votes, &committee)
-                .into_inner();
+        let cert = Verified::<ExecutionCertificate>::aggregate(
+            &BlsVerifier,
+            &wave_id(),
+            root,
+            &votes,
+            &committee,
+        )
+        .into_inner();
 
         let wrong_pks: Vec<ConsensusPublicKey> = (0..2)
             .map(|_| pk_from_bls(&generate_bls_keypair().public_key()))
             .collect();
         let ctx = ExecutionCertificateContext {
+            verifier: &BlsVerifier,
             network: &net,
             public_keys: &wrong_pks,
         };

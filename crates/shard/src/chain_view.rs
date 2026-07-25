@@ -190,11 +190,10 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockManifest, BoundedVec,
-        CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield, TransactionRoot,
-        ValidatorId, Verifiable, WeightedTimestamp, WitnessSources, agg_from_bls, test_utils,
-        zero_bls_signature,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockManifest,
+        BoundedVec, CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp,
+        ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction, ShardId, SignerBitfield,
+        TransactionRoot, ValidatorId, Verifiable, WeightedTimestamp, WitnessSources, test_utils,
     };
 
     use super::*;
@@ -482,7 +481,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1000),
         );
         // SAFETY: synthetic test fixture, no real signature.

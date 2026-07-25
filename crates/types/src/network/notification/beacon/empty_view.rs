@@ -93,14 +93,14 @@ impl NetworkMessage for SpcEmptyViewMsgNotification {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
     use sbor::prelude::*;
 
     use super::*;
     use crate::{
         AggregateSignature, Bls12381G1PrivateKey, Epoch, NetworkDefinition, PcQc2, PcQc3,
         PcSignerLengths, PcVector, PcXpProof, SignedContext, SignedVerifyError, SignerBitfield,
-        SpcHighTriple, SpcView, ValidatorId, bls_keypair_from_seed, pk_from_bls,
-        sign_empty_view_msg, spc_context,
+        SpcHighTriple, SpcView, ValidatorId, pk_from_bls, sign_empty_view_msg, spc_context,
     };
 
     fn sample_pc_qc3() -> PcQc3 {
@@ -194,6 +194,7 @@ mod tests {
         let pk = signing_key(2).public_key();
         assert!(
             n.verify_signature(&SignedContext {
+                verifier: &BlsVerifier,
                 network: &NetworkDefinition::simulator(),
                 public_key: &pk_from_bls(&pk),
             })
@@ -211,6 +212,7 @@ mod tests {
         let honest_pk = signing_key(2).public_key();
         assert_eq!(
             n.verify_signature(&SignedContext {
+                verifier: &BlsVerifier,
                 network: &NetworkDefinition::simulator(),
                 public_key: &pk_from_bls(&honest_pk),
             }),
@@ -228,6 +230,7 @@ mod tests {
         let pk = signing_key(2).public_key();
         assert_eq!(
             n.verify_signature(&SignedContext {
+                verifier: &BlsVerifier,
                 network: &NetworkDefinition::simulator(),
                 public_key: &pk_from_bls(&pk),
             }),

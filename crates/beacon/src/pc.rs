@@ -6,11 +6,12 @@
 //! verify / sign / build helpers live in [`hyperscale_types::beacon::pc`].
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use hyperscale_types::{
     ConsensusPublicKey, ConsensusSignature, Epoch, MIN_BEACON_COMMITTEE_SIZE, PcQc1, PcQc2, PcQc3,
     PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound, SpcView, ValidatorId,
-    Verified, byzantine_threshold,
+    Verified, Verifier, byzantine_threshold,
 };
 
 /// What `PcInstance::handle` tells its parent.
@@ -80,6 +81,7 @@ pub enum PcEvent {
 /// synchronous — every event-handler invocation returns the full set
 /// of effects that follow, and the parent drains them.
 pub struct PcInstance {
+    verifier: Arc<dyn Verifier>,
     epoch: Epoch,
     view: SpcView,
     committee: Vec<(ValidatorId, ConsensusPublicKey)>,
@@ -109,6 +111,7 @@ impl PcInstance {
     /// and `f = (n - 1) / 3`, which collapses to `n >= 4`.
     #[must_use]
     pub fn new(
+        verifier: Arc<dyn Verifier>,
         epoch: Epoch,
         view: SpcView,
         committee: Vec<(ValidatorId, ConsensusPublicKey)>,
@@ -119,6 +122,7 @@ impl PcInstance {
             committee.len()
         );
         Self {
+            verifier,
             epoch,
             view,
             committee,
@@ -250,6 +254,7 @@ impl PcInstance {
         let q = self.quorum();
         let vote1s: Vec<&Verified<PcVote1>> = self.vote1_pool.values().take(q).collect();
         let qc1 = Box::new(Verified::<PcQc1>::from_verified_votes(
+            self.verifier.as_ref(),
             &vote1s,
             &self.committee,
         ));
@@ -266,6 +271,7 @@ impl PcInstance {
         let q = self.quorum();
         let vote2s: Vec<&Verified<PcVote2>> = self.vote2_pool.values().take(q).collect();
         let qc2 = Box::new(Verified::<PcQc2>::from_verified_votes(
+            self.verifier.as_ref(),
             &vote2s,
             &self.committee,
         ));
@@ -281,7 +287,11 @@ impl PcInstance {
         }
         let q = self.quorum();
         let vote3s: Vec<&Verified<PcVote3>> = self.vote3_pool.values().take(q).collect();
-        let qc3 = Verified::<PcQc3>::from_verified_votes(&vote3s, &self.committee);
+        let qc3 = Verified::<PcQc3>::from_verified_votes(
+            self.verifier.as_ref(),
+            &vote3s,
+            &self.committee,
+        );
         self.decided = true;
         vec![PcEffect::Decided(Box::new(qc3))]
     }
@@ -345,10 +355,10 @@ fn vote2_top_sig(v: &PcVote2) -> ConsensusSignature {
 mod tests {
     use std::sync::Arc;
 
+    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
     use hyperscale_types::{
         Bls12381G1PrivateKey, Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement,
-        PcVector, PcVoteRound, SpcView, bls_keypair_from_seed, pc_context, pk_from_bls,
-        spc_context,
+        PcVector, PcVoteRound, SpcView, pc_context, pk_from_bls, spc_context,
     };
 
     use super::*;
@@ -382,7 +392,12 @@ mod tests {
 
     fn fsm_instance() -> PcInstance {
         let (_, members) = fsm_committee(4);
-        PcInstance::new(Epoch::new(1), SpcView::new(0), members)
+        PcInstance::new(
+            Arc::new(BlsVerifier),
+            Epoch::new(1),
+            SpcView::new(0),
+            members,
+        )
     }
 
     /// `PcInstance::new` panics when the committee is too small for
@@ -393,7 +408,12 @@ mod tests {
     #[should_panic(expected = "PC requires n >= 4")]
     fn pc_instance_rejects_undersized_committee() {
         let (_, members) = fsm_committee(3);
-        let _ = PcInstance::new(Epoch::new(1), SpcView::new(0), members);
+        let _ = PcInstance::new(
+            Arc::new(BlsVerifier),
+            Epoch::new(1),
+            SpcView::new(0),
+            members,
+        );
     }
 
     /// First `Input` event emits a sign-and-broadcast intent for
@@ -429,7 +449,12 @@ mod tests {
     #[test]
     fn replay_reemits_recorded_qcs_not_reaggregated() {
         let (sks, members) = fsm_committee(4);
-        let mut fsm = PcInstance::new(Epoch::new(1), SpcView::new(0), members.clone());
+        let mut fsm = PcInstance::new(
+            Arc::new(BlsVerifier),
+            Epoch::new(1),
+            SpcView::new(0),
+            members.clone(),
+        );
         let pc_ctx_bytes = pc_context(&spc_context(Epoch::new(1)), SpcView::new(0));
 
         let v = PcVector::new(std::iter::once(elem(7)));
@@ -480,7 +505,12 @@ mod tests {
     #[test]
     fn pc_observes_round1_equivocation() {
         let (sks, members) = fsm_committee(4);
-        let mut fsm = PcInstance::new(Epoch::new(1), SpcView::new(0), members.clone());
+        let mut fsm = PcInstance::new(
+            Arc::new(BlsVerifier),
+            Epoch::new(1),
+            SpcView::new(0),
+            members.clone(),
+        );
 
         // Two distinct v_ins signed by validator 1 (the equivocator).
         let pc_ctx_bytes = pc_context(&spc_context(Epoch::new(1)), SpcView::new(0));

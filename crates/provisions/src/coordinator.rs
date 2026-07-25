@@ -952,12 +952,12 @@ impl ProvisionCoordinator {
 mod tests {
     use hyperscale_core::FetchRequest;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BoundedVec,
-        CertificateRoot, ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, MerkleInclusionProof,
-        NetworkDefinition, ProposerTimestamp, ProvisionEntry, ProvisionTxRoot, ProvisionsRoot,
-        QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TopologySnapshot,
-        TransactionRoot, TxHash, ValidatorId, ValidatorSet, Verifiable, WaveId, WeightedTimestamp,
-        WitnessSources, agg_from_bls, compute_merkle_root, zero_bls_signature,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
+        BlockHeader, BoundedVec, CertificateRoot, ChainOrigin, Hash, InFlightCount,
+        LocalReceiptRoot, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp,
+        ProvisionEntry, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, Round, ShardId,
+        SignerBitfield, StateRoot, TopologySnapshot, TransactionRoot, TxHash, ValidatorId,
+        ValidatorSet, Verifiable, WaveId, WeightedTimestamp, WitnessSources, compute_merkle_root,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -1944,7 +1944,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         );
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
@@ -2325,7 +2325,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(height.inner() * TEST_BLOCK_INTERVAL_MS),
         );
         CertifiedBlock::new_unchecked(block, qc)

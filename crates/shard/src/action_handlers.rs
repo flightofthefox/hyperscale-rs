@@ -23,11 +23,11 @@ use hyperscale_types::{
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
     ReshapeTrigger, Round, RoutableTransaction, SettledWavesRoot, ShardId, SplitChildRoots,
     StateRoot, StateRootContext, StoredReceipt, Timeout, TimeoutContext, TopologySnapshot,
-    TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified, Verify, VoteCount,
-    VrfProof, WeightedTimestamp, WitnessSources, block_header_message, block_vote_message,
-    certified_block_header_message, commit_witness_window, compute_waves, derive_leaves,
-    local_settled_wave_ids, missed_proposals_since_prev_commit, ready_signal_message,
-    shard_reveal_sign, sig_from_bls,
+    TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified, Verifier, Verify,
+    VoteCount, VrfProof, WeightedTimestamp, WitnessSources, block_header_message,
+    block_vote_message, certified_block_header_message, commit_witness_window, compute_waves,
+    derive_leaves, local_settled_wave_ids, missed_proposals_since_prev_commit,
+    ready_signal_message, shard_reveal_sign, sig_from_bls,
 };
 
 /// Result of QC verification and assembly.
@@ -60,6 +60,7 @@ pub struct QcVerificationResult {
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn verify_and_build_qc(
+    verifier: &dyn Verifier,
     network: &NetworkDefinition,
     block_hash: BlockHash,
     shard_id: ShardId,
@@ -81,6 +82,7 @@ pub fn verify_and_build_qc(
     );
 
     let all_verified = verify_vote_batch(
+        verifier,
         block_hash,
         &signing_message,
         votes_to_verify,
@@ -97,6 +99,7 @@ pub fn verify_and_build_qc(
     }
 
     let qc = Verified::<QuorumCertificate>::from_verified_votes(
+        verifier,
         block_hash,
         shard_id,
         height,
@@ -121,6 +124,7 @@ pub fn verify_and_build_qc(
 /// bookkeeping (`(idx, vote, pubkey)` tuples → `(idx, verified)`); the typed
 /// batch verifier owns the BLS work and the individual-verify fallback.
 pub fn verify_vote_batch(
+    verifier: &dyn Verifier,
     block_hash: BlockHash,
     signing_message: &[u8],
     votes_to_verify: Vec<(usize, BlockVote, ConsensusPublicKey)>,
@@ -143,7 +147,7 @@ pub fn verify_vote_batch(
         to_verify.push((vote, pk));
     }
 
-    let results = Verified::<BlockVote>::verify_batch(signing_message, to_verify);
+    let results = Verified::<BlockVote>::verify_batch(verifier, signing_message, to_verify);
 
     for ((idx, voter), result) in bookkeeping.into_iter().zip(results) {
         if let Some(verified) = result {
@@ -387,6 +391,7 @@ where
         } => {
             let start = std::time::Instant::now();
             let result = verify_and_build_qc(
+                ctx.verifier,
                 ctx.topology_snapshot.network(),
                 block_hash,
                 shard_id,
@@ -413,6 +418,7 @@ where
             block_hash,
         } => {
             let qc_ctx = QcContext {
+                verifier: ctx.verifier,
                 network: ctx.topology_snapshot.network(),
                 public_keys: &public_keys,
                 quorum_threshold,
@@ -440,6 +446,7 @@ where
         } => {
             let start = std::time::Instant::now();
             let qc_ctx = QcContext {
+                verifier: ctx.verifier,
                 network: ctx.topology_snapshot.network(),
                 public_keys: &committee_public_keys,
                 quorum_threshold,
@@ -475,7 +482,7 @@ where
         Action::VerifyShardForkProof { proof, committees } => {
             let start = std::time::Instant::now();
             let verified = proof
-                .verify_resolved(ctx.topology_snapshot.network(), &committees)
+                .verify_resolved(ctx.verifier, ctx.topology_snapshot.network(), &committees)
                 .is_ok();
             record_signature_verification_latency(
                 "shard_fork_proof",
@@ -589,6 +596,7 @@ where
                 .flat_map(|fw| fw.receipts().iter().cloned())
                 .collect();
             let bw_ctx = BeaconWitnessRootContext {
+                verifier: ctx.verifier,
                 expected_leaf_count,
                 claimed_base,
                 parent_leaves_start,
@@ -944,6 +952,7 @@ where
         } => {
             let start = std::time::Instant::now();
             let result = timeout.verify(&TimeoutContext {
+                verifier: ctx.verifier,
                 network: ctx.topology_snapshot.network(),
                 voter_public_key: &voter_public_key,
             });
@@ -993,11 +1002,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
     use hyperscale_types::test_utils::test_notarized_transaction_v1;
     use hyperscale_types::{
         Bls12381G1PrivateKey, CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError, generate_bls_keypair,
-        pk_from_bls, routable_from_notarized_v1,
+        StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError, pk_from_bls,
+        routable_from_notarized_v1,
     };
 
     use super::*;
@@ -1050,7 +1060,13 @@ mod tests {
             1000,
         );
         let already = vec![(0usize, Verified::<BlockVote>::new_unchecked_for_test(v))];
-        let out = verify_vote_batch(block_hash, b"msg", Vec::new(), already.clone());
+        let out = verify_vote_batch(
+            &BlsVerifier,
+            block_hash,
+            b"msg",
+            Vec::new(),
+            already.clone(),
+        );
         assert_eq!(out.len(), already.len());
     }
 
@@ -1076,7 +1092,7 @@ mod tests {
             })
             .collect();
 
-        let out = verify_vote_batch(block_hash, &msg, to_verify, Vec::new());
+        let out = verify_vote_batch(&BlsVerifier, block_hash, &msg, to_verify, Vec::new());
         assert_eq!(out.len(), 3);
     }
 
@@ -1124,7 +1140,7 @@ mod tests {
             ),
         ];
 
-        let out = verify_vote_batch(block_hash, &msg, to_verify, Vec::new());
+        let out = verify_vote_batch(&BlsVerifier, block_hash, &msg, to_verify, Vec::new());
         let indices: Vec<_> = out.iter().map(|(i, _)| *i).collect();
         assert_eq!(indices, vec![0, 2]);
     }
@@ -1147,7 +1163,7 @@ mod tests {
                 (i, vote, pk_from_bls(&keys[i].public_key()))
             })
             .collect();
-        let out = verify_vote_batch(block_hash, wrong_msg, to_verify, Vec::new());
+        let out = verify_vote_batch(&BlsVerifier, block_hash, wrong_msg, to_verify, Vec::new());
         assert!(out.is_empty());
     }
 
@@ -1171,6 +1187,7 @@ mod tests {
             .collect();
 
         let qc = Verified::<QuorumCertificate>::from_verified_votes(
+            &BlsVerifier,
             block_hash,
             shard(),
             height,
@@ -1191,6 +1208,7 @@ mod tests {
             .collect();
         let net = net();
         let qc_ctx = QcContext {
+            verifier: &BlsVerifier,
             network: &net,
             public_keys: &pubs,
             quorum_threshold: VoteCount::new(3),
@@ -1224,6 +1242,7 @@ mod tests {
             .collect();
 
         let qc = Verified::<QuorumCertificate>::from_verified_votes(
+            &BlsVerifier,
             block_hash,
             shard(),
             BlockHeight::new(1),
@@ -1281,6 +1300,7 @@ mod tests {
         ];
 
         let qc = Verified::<QuorumCertificate>::from_verified_votes(
+            &BlsVerifier,
             block_hash,
             shard(),
             BlockHeight::new(1),
@@ -1340,6 +1360,7 @@ mod tests {
 
         let parent_floor = WeightedTimestamp::from_millis(2000);
         let qc = Verified::<QuorumCertificate>::from_verified_votes(
+            &BlsVerifier,
             block_hash,
             shard(),
             BlockHeight::new(1),
@@ -1372,6 +1393,7 @@ mod tests {
             .collect();
 
         let result = verify_and_build_qc(
+            &BlsVerifier,
             &net(),
             block_hash,
             shard(),
@@ -1402,6 +1424,7 @@ mod tests {
             .collect();
 
         let result = verify_and_build_qc(
+            &BlsVerifier,
             &net(),
             block_hash,
             shard(),

@@ -8,17 +8,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot,
-    BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey, Bls12381G2Signature,
-    CertificateRoot, ConsensusPublicKey, Epoch, Hash, InFlightCount, LeafIndex, LocalReceiptRoot,
-    MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp,
-    ProvisionsRoot, QuorumCertificate, Round, ShardCommittee, ShardEpochContribution, ShardId,
-    ShardVoteEquivocation, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield,
-    SlotEffects, Stake, StakePool, StakePoolId, StateRoot, TransactionRoot, ValidatorId,
-    ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp, agg_from_bls,
-    bls_keypair_from_seed, bls_sig, compute_merkle_root_with_proof, pk_from_bls,
-    validator_possession_proof_sign, vrf_sign, zero_bls_signature,
+    AggregateSignature, BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount,
+    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
+    Bls12381G2Signature, CertificateRoot, ConsensusPublicKey, Epoch, Hash, InFlightCount,
+    LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation,
+    PendingWithdrawal, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardCommittee,
+    ShardEpochContribution, ShardId, ShardVoteEquivocation, ShardWitness, ShardWitnessPayload,
+    ShardWitnessProof, SignerBitfield, SlotEffects, Stake, StakePool, StakePoolId, StateRoot,
+    TransactionRoot, ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp,
+    bls_sig, compute_merkle_root_with_proof, pk_from_bls, validator_possession_proof_sign,
+    vrf_sign,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
@@ -142,6 +143,7 @@ pub fn apply_next_epoch(
 ) -> SlotEffects {
     let next = state.current_epoch.next();
     apply_epoch(
+        &BlsVerifier,
         state,
         &net(),
         next,
@@ -280,7 +282,7 @@ pub fn apply_witness_chunk(
         header.parent_block_hash(),
         Round::INITIAL,
         SignerBitfield::new(4),
-        agg_from_bls(&zero_bls_signature()),
+        AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(dur + 1),
     );
     // Every beacon committee member proposes (each with its own valid
@@ -321,6 +323,7 @@ pub fn apply_witness_chunk(
 
     let next = state.current_epoch.next();
     apply_epoch(
+        &BlsVerifier,
         state,
         &net(),
         next,
@@ -343,7 +346,7 @@ fn boundary_header(shard: ShardId, root: BeaconWitnessRoot, leaf_count: u64) -> 
         BlockHash::ZERO,
         Round::INITIAL,
         SignerBitfield::new(4),
-        agg_from_bls(&zero_bls_signature()),
+        AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(1),
     );
     BlockHeader::new(

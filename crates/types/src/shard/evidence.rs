@@ -22,6 +22,7 @@
 //! ([`ShardForkProof::same_round_conflict`]) needs a same-round
 //! sub-structure and is only a bonus.
 
+use hyperscale_crypto::Verifier;
 use sbor::prelude::*;
 use thiserror::Error;
 
@@ -29,7 +30,6 @@ use crate::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ConsensusPublicKey,
     ConsensusSignature, NetworkDefinition, QcContext, QcVerifyError, QuorumCertificate, Round,
     ShardId, TopologySchedule, ValidatorId, Verified, Verify, VoteCount, block_vote_message,
-    bls_pk, bls_sig, verify_bls12381_v1,
 };
 
 /// Cap on a [`CommitProof`]'s ancestry-link length.
@@ -100,6 +100,7 @@ pub enum ShardVoteEquivocationVerifyError {
 /// Returns a [`ShardVoteEquivocationVerifyError`] variant naming the
 /// failing predicate.
 pub fn verify_shard_vote_equivocation(
+    verifier: &dyn Verifier,
     ev: &ShardVoteEquivocation,
     network: &NetworkDefinition,
     pubkey: &ConsensusPublicKey,
@@ -123,10 +124,7 @@ pub fn verify_shard_vote_equivocation(
         &ev.block_hash_b,
         &ev.parent_block_hash_b,
     );
-    let pk = bls_pk(pubkey);
-    if verify_bls12381_v1(&msg_a, &pk, &bls_sig(&ev.sig_a))
-        && verify_bls12381_v1(&msg_b, &pk, &bls_sig(&ev.sig_b))
-    {
+    if verifier.verify(pubkey, &msg_a, &ev.sig_a) && verifier.verify(pubkey, &msg_b, &ev.sig_b) {
         Ok(())
     } else {
         Err(ShardVoteEquivocationVerifyError::BadSignature)
@@ -141,6 +139,8 @@ pub struct ShardVoteEquivocationContext<'a> {
     pub network: &'a NetworkDefinition,
     /// The accused validator's registered pubkey.
     pub pubkey: &'a ConsensusPublicKey,
+    /// Scheme verifier the signature checks run through.
+    pub verifier: &'a dyn Verifier,
 }
 
 impl Verify<&ShardVoteEquivocationContext<'_>> for ShardVoteEquivocation {
@@ -150,7 +150,7 @@ impl Verify<&ShardVoteEquivocationContext<'_>> for ShardVoteEquivocation {
         &self,
         ctx: &ShardVoteEquivocationContext<'_>,
     ) -> Result<Verified<Self>, Self::Error> {
-        verify_shard_vote_equivocation(self, ctx.network, ctx.pubkey)?;
+        verify_shard_vote_equivocation(ctx.verifier, self, ctx.network, ctx.pubkey)?;
         Ok(Verified::new_unchecked(self.clone()))
     }
 }
@@ -162,7 +162,7 @@ impl Verify<&ShardVoteEquivocationContext<'_>> for Box<ShardVoteEquivocation> {
         &self,
         ctx: &ShardVoteEquivocationContext<'_>,
     ) -> Result<Verified<Self>, Self::Error> {
-        verify_shard_vote_equivocation(self, ctx.network, ctx.pubkey)?;
+        verify_shard_vote_equivocation(ctx.verifier, self, ctx.network, ctx.pubkey)?;
         Ok(Verified::new_unchecked(self.clone()))
     }
 }
@@ -348,6 +348,7 @@ impl CommitProof {
     /// `committees` is `[certified_committee, child_committee]`.
     fn verify_qcs(
         &self,
+        verifier: &dyn Verifier,
         network: &NetworkDefinition,
         committees: &[ResolvedCommittee],
     ) -> Result<(), CommitProofVerifyError> {
@@ -356,6 +357,7 @@ impl CommitProof {
                 network,
                 public_keys: &committee.public_keys,
                 quorum_threshold: committee.quorum_threshold,
+                verifier,
             };
             ch.qc().verify(&ctx)?;
         }
@@ -476,11 +478,15 @@ impl ShardForkProof {
     /// [`ShardForkProofVerifyError::CommitteeUnresolved`] if any QC's epoch
     /// is not folded; otherwise the first failing structural, crypto, or
     /// contradiction check.
-    pub fn verify(&self, schedule: &TopologySchedule) -> Result<(), ShardForkProofVerifyError> {
+    pub fn verify(
+        &self,
+        verifier: &dyn Verifier,
+        schedule: &TopologySchedule,
+    ) -> Result<(), ShardForkProofVerifyError> {
         let committees = self
             .resolve_committees(schedule)
             .ok_or(ShardForkProofVerifyError::CommitteeUnresolved)?;
-        self.verify_resolved(schedule.head().network(), &committees)
+        self.verify_resolved(verifier, schedule.head().network(), &committees)
     }
 
     /// Verify against pre-resolved committees (positionally aligned to
@@ -492,6 +498,7 @@ impl ShardForkProof {
     /// A [`ShardForkProofVerifyError`] naming the failing check.
     pub fn verify_resolved(
         &self,
+        verifier: &dyn Verifier,
         network: &NetworkDefinition,
         committees: &[ResolvedCommittee],
     ) -> Result<(), ShardForkProofVerifyError> {
@@ -503,9 +510,9 @@ impl ShardForkProof {
             .map_err(ShardForkProofVerifyError::ProofA)?;
         b.verify_structure()
             .map_err(ShardForkProofVerifyError::ProofB)?;
-        a.verify_qcs(network, &committees[0..2])
+        a.verify_qcs(verifier, network, &committees[0..2])
             .map_err(ShardForkProofVerifyError::ProofA)?;
-        b.verify_qcs(network, &committees[2..4])
+        b.verify_qcs(verifier, network, &committees[2..4])
             .map_err(ShardForkProofVerifyError::ProofB)?;
         if a.shard() != b.shard() {
             return Err(ShardForkProofVerifyError::ShardMismatch);
@@ -546,10 +553,11 @@ impl ShardForkProof {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
     use radix_common::crypto::Bls12381G1PrivateKey;
 
     use super::*;
-    use crate::{BlockVote, Hash, ProposerTimestamp, generate_bls_keypair, pk_from_bls};
+    use crate::{BlockVote, Hash, ProposerTimestamp, pk_from_bls};
 
     /// Sign a real block vote and return `(block_hash, parent_hash, sig)`
     /// so tests assemble evidence from genuine signatures.
@@ -618,7 +626,7 @@ mod tests {
             sig_b: sb,
         };
         assert_eq!(
-            verify_shard_vote_equivocation(&ev, &net, &pk_from_bls(&pk)),
+            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk_from_bls(&pk)),
             Ok(())
         );
     }
@@ -653,7 +661,7 @@ mod tests {
             sig_b: sa,
         };
         assert_eq!(
-            verify_shard_vote_equivocation(&ev, &net, &pk_from_bls(&pk)),
+            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk_from_bls(&pk)),
             Err(ShardVoteEquivocationVerifyError::BlocksEqual)
         );
     }
@@ -700,7 +708,7 @@ mod tests {
             sig_b: sb,
         };
         assert_eq!(
-            verify_shard_vote_equivocation(&ev, &net, &pk_from_bls(&pk)),
+            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk_from_bls(&pk)),
             Err(ShardVoteEquivocationVerifyError::BadSignature)
         );
     }
@@ -730,6 +738,8 @@ mod tests {
 
     mod fork {
         use std::sync::Arc;
+
+        use hyperscale_crypto_bls::BlsVerifier;
 
         use super::super::*;
         use crate::test_utils::{TestCommittee, certify_header, direct_commit_proof, fork_header};
@@ -784,7 +794,7 @@ mod tests {
         fn direct_fork_assembles_and_verifies() {
             let committee = TestCommittee::new(4, 1);
             let proof = conflicting_commits(&committee);
-            assert_eq!(proof.verify(&schedule(&committee)), Ok(()));
+            assert_eq!(proof.verify(&BlsVerifier, &schedule(&committee)), Ok(()));
             assert_eq!(proof.shard(), SHARD);
             assert_eq!(proof.height(), BlockHeight::new(9));
         }
@@ -799,7 +809,7 @@ mod tests {
                 b: direct_proof(&committee, BlockHeight::new(4), Round::new(4), parent, 7),
             };
             assert_eq!(
-                proof.verify(&schedule(&committee)),
+                proof.verify(&BlsVerifier, &schedule(&committee)),
                 Err(ShardForkProofVerifyError::NotConflicting)
             );
         }
@@ -810,7 +820,7 @@ mod tests {
             let proof = conflicting_commits(&committee);
             // Verify against a different committee's keys.
             let other = TestCommittee::new(4, 999);
-            let err = proof.verify(&schedule(&other)).unwrap_err();
+            let err = proof.verify(&BlsVerifier, &schedule(&other)).unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -839,7 +849,7 @@ mod tests {
                 b: good,
             };
             assert_eq!(
-                proof.verify(&schedule(&committee)),
+                proof.verify(&BlsVerifier, &schedule(&committee)),
                 Err(ShardForkProofVerifyError::ProofA(
                     CommitProofVerifyError::NotRoundContiguous
                 ))
@@ -869,7 +879,7 @@ mod tests {
                 b: direct_proof(&committee, BlockHeight::new(5), Round::new(5), parent, 3),
             };
             assert_eq!(
-                proof.verify(&schedule(&committee)),
+                proof.verify(&BlsVerifier, &schedule(&committee)),
                 Err(ShardForkProofVerifyError::ProofA(
                     CommitProofVerifyError::NotAChild
                 ))
@@ -901,7 +911,7 @@ mod tests {
 
             let other = direct_proof(&committee, BlockHeight::new(8), Round::new(8), parent, 99);
             let fork = ShardForkProof::ConflictingCommits { a, b: other };
-            assert_eq!(fork.verify(&schedule(&committee)), Ok(()));
+            assert_eq!(fork.verify(&BlsVerifier, &schedule(&committee)), Ok(()));
         }
 
         #[test]
@@ -932,7 +942,7 @@ mod tests {
             let mut schedule = TopologySchedule::new(1_000, Epoch::new(50), Arc::clone(&snapshot));
             schedule.insert(Epoch::new(50), snapshot);
             assert_eq!(
-                proof.verify(&schedule),
+                proof.verify(&BlsVerifier, &schedule),
                 Err(ShardForkProofVerifyError::CommitteeUnresolved)
             );
         }

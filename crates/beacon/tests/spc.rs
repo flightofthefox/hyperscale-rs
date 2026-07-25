@@ -9,6 +9,7 @@ mod common;
 use std::time::Duration;
 
 use common::{PcSim, SpcSim, Trace};
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_types::{
     Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PRODUCTION_BEACON_COMMITTEE_SIZE, PcQc3,
     PcValueElement, PcVector, SpcCert, SpcEmptyViewMsg, SpcHighTriple, SpcProposalObject, SpcView,
@@ -51,13 +52,23 @@ fn direct_cert_round_trip() {
         proof: qc3.into(),
     };
 
-    assert!(verify_cert(&cert, SpcView::new(4), &network, &spc_ctx, &sim.members).is_ok());
+    assert!(
+        verify_cert(
+            &BlsVerifier,
+            &cert,
+            SpcView::new(4),
+            &network,
+            &spc_ctx,
+            &sim.members
+        )
+        .is_ok()
+    );
     // And the same cert wrapped in a proposal object.
     let po = SpcProposalObject {
         view: SpcView::new(4),
         cert,
     };
-    assert!(verify_proposal_object(&po, &network, &spc_ctx, &sim.members).is_ok());
+    assert!(verify_proposal_object(&BlsVerifier, &po, &network, &spc_ctx, &sim.members).is_ok());
 }
 
 /// Full indirect-cert round-trip: harvest a real `Qc3`, have 2 of
@@ -97,11 +108,22 @@ fn indirect_cert_round_trip() {
 
     // Each empty-view msg must individually verify.
     for m in &msgs {
-        assert!(verify_empty_view_msg(m, &network, &spc_ctx, &sim.members).is_ok());
+        assert!(verify_empty_view_msg(&BlsVerifier, m, &network, &spc_ctx, &sim.members).is_ok());
     }
 
-    let cert = build_indirect_cert(empty_view, &msgs, &sim.members).expect("build succeeds");
-    assert!(verify_cert(&cert, entering_view, &network, &spc_ctx, &sim.members).is_ok());
+    let cert =
+        build_indirect_cert(&BlsVerifier, empty_view, &msgs, &sim.members).expect("build succeeds");
+    assert!(
+        verify_cert(
+            &BlsVerifier,
+            &cert,
+            entering_view,
+            &network,
+            &spc_ctx,
+            &sim.members
+        )
+        .is_ok()
+    );
 }
 
 /// Adversarial: swap an indirect cert's `target_value` for a
@@ -144,7 +166,8 @@ fn indirect_cert_with_swapped_target_value_rejected() {
             )
         })
         .collect();
-    let real_cert = build_indirect_cert(empty_view, &msgs, &sim.members).expect("build succeeds");
+    let real_cert =
+        build_indirect_cert(&BlsVerifier, empty_view, &msgs, &sim.members).expect("build succeeds");
 
     // Swap target_value/target_proof for triple_b's data, keeping
     // the (skip_reports over value_a's hash + aggregate sig) intact.
@@ -167,7 +190,15 @@ fn indirect_cert_with_swapped_target_value_rejected() {
         skip_aggregate_sig,
     };
     assert!(
-        verify_cert(&forged, entering_view, &network, &spc_ctx, &sim.members).is_err(),
+        verify_cert(
+            &BlsVerifier,
+            &forged,
+            entering_view,
+            &network,
+            &spc_ctx,
+            &sim.members
+        )
+        .is_err(),
         "cert with swapped target_value must fail the value-hash binding gate",
     );
 }
@@ -390,8 +421,10 @@ fn spc_empty_view_rejected_under_different_network() {
     let (sk, validator) = sim.sks_for_indices(&[0]).into_iter().next().unwrap();
     let msg = sign_empty_view_msg(&sk, validator, &network, &spc_ctx, empty_view, reported);
 
-    assert!(verify_empty_view_msg(&msg, &network, &spc_ctx, &sim.members).is_ok());
-    assert!(verify_empty_view_msg(&msg, &other_network, &spc_ctx, &sim.members).is_err());
+    assert!(verify_empty_view_msg(&BlsVerifier, &msg, &network, &spc_ctx, &sim.members).is_ok());
+    assert!(
+        verify_empty_view_msg(&BlsVerifier, &msg, &other_network, &spc_ctx, &sim.members).is_err()
+    );
 }
 
 /// A beacon-block `SpcCert::Direct` must reject under a different
@@ -411,6 +444,8 @@ fn spc_block_cert_rejected_under_different_network() {
         value: qc3.x_pe().clone(),
         proof: qc3.into(),
     };
-    assert!(verify_block_cert(&cert, &network, &spc_ctx, &sim.members).is_ok());
-    assert!(verify_block_cert(&cert, &other_network, &spc_ctx, &sim.members).is_err());
+    assert!(verify_block_cert(&BlsVerifier, &cert, &network, &spc_ctx, &sim.members).is_ok());
+    assert!(
+        verify_block_cert(&BlsVerifier, &cert, &other_network, &spc_ctx, &sim.members).is_err()
+    );
 }

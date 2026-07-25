@@ -389,10 +389,10 @@ fn validate_beacon_committee(config: &BeaconGenesisConfig, validator_ids: &BTree
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
     use hyperscale_types::{
         BeaconChainConfig, ConsensusPublicKey, GenesisPool, GenesisValidator, MAX_VOTE_VECTOR_LEN,
-        NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness, bls_keypair_from_seed,
-        pk_from_bls,
+        NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness, pk_from_bls,
     };
 
     use super::*;
@@ -508,6 +508,7 @@ mod tests {
         // epoch 1 is governed by the same configured committee as epoch 0.
         let genesis_lookahead = state.next_shard_committees.clone();
         apply_epoch(
+            &BlsVerifier,
             &mut state,
             &NetworkDefinition::simulator(),
             Epoch::new(1),

@@ -36,10 +36,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
+use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, PendingReshape,
     Randomness, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, ValidatorId,
-    ValidatorRecord, ValidatorStatus, bls_keypair_from_seed, pk_from_bls,
+    ValidatorRecord, ValidatorStatus, pk_from_bls,
 };
 
 // ─── The analysis note's chain (committee_security.py §2) ───────────────────
@@ -306,6 +307,7 @@ fn run_cell(cell: &Cell, corrupt: &BTreeSet<ValidatorId>) -> KernelTally {
     for e in 1..=cell.epochs {
         let before = state.next_shard_committees.clone();
         apply_epoch(
+            &BlsVerifier,
             &mut state,
             &network,
             Epoch::new(e),
@@ -798,6 +800,7 @@ fn shuffle_skips_split_pending_shard() {
         }
         let before = state.next_shard_committees.clone();
         apply_epoch(
+            &BlsVerifier,
             &mut state,
             &network,
             Epoch::new(e),

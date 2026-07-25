@@ -25,8 +25,8 @@ use std::collections::HashMap;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, BlockVote, Bls12381G2Signature, ConsensusPublicKey, Round,
-    ShardId, ShardVoteEquivocation, TopologySnapshot, ValidatorId, Verified, bls_sig, sig_from_bls,
+    BlockHash, BlockHeader, BlockHeight, BlockVote, ConsensusPublicKey, ConsensusSignature, Round,
+    ShardId, ShardVoteEquivocation, TopologySnapshot, ValidatorId, Verified,
 };
 use tracing::{info, trace, warn};
 
@@ -427,7 +427,7 @@ impl VoteKeeper {
             block_hash,
             parent_block_hash,
             round: vote.round(),
-            signature: bls_sig(&vote.signature()),
+            signature: vote.signature(),
         };
         match self.record_received_vote(vote.height(), vote.voter(), incoming) {
             RecordResult::Accepted | RecordResult::Duplicate => None,
@@ -448,7 +448,7 @@ impl VoteKeeper {
                     round: vote.round(),
                     block_hash_a: existing.block_hash,
                     parent_block_hash_a: parent_a,
-                    sig_a: sig_from_bls(&existing.signature),
+                    sig_a: existing.signature,
                     block_hash_b: block_hash,
                     parent_block_hash_b: parent_b,
                     sig_b: vote.signature(),
@@ -542,8 +542,8 @@ pub struct StoredVote {
     pub parent_block_hash: Option<BlockHash>,
     /// Round the vote was cast in.
     pub round: Round,
-    /// The vote's BLS signature.
-    pub signature: Bls12381G2Signature,
+    /// The vote's signature.
+    pub signature: ConsensusSignature,
 }
 
 /// Result of `VoteKeeper::record_received_vote`.
@@ -566,12 +566,12 @@ pub enum RecordResult {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Bls12381G1PrivateKey, CertificateRoot,
         ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp,
         ProvisionsRoot, QuorumCertificate, ShardId, StateRoot, TransactionRoot, ValidatorId,
-        ValidatorInfo, ValidatorSet, generate_bls_keypair, pk_from_bls,
-        verify_shard_vote_equivocation,
+        ValidatorInfo, ValidatorSet, pk_from_bls, verify_shard_vote_equivocation,
     };
 
     use super::*;
@@ -584,7 +584,7 @@ mod tests {
             block_hash,
             parent_block_hash: Some(BlockHash::from_raw(Hash::from_bytes(b"parent"))),
             round,
-            signature: Bls12381G2Signature([0u8; 96]),
+            signature: ConsensusSignature::new([0u8; 96]),
         }
     }
 
@@ -790,7 +790,7 @@ mod tests {
         assert_eq!(ev.block_hash_a, ba);
         assert_eq!(ev.block_hash_b, bb);
         assert_eq!(
-            verify_shard_vote_equivocation(&ev, &net, &pk_from_bls(&pk)),
+            verify_shard_vote_equivocation(&BlsVerifier, &ev, &net, &pk_from_bls(&pk)),
             Ok(())
         );
     }
@@ -952,7 +952,7 @@ mod properties {
             block_hash,
             parent_block_hash: Some(BlockHash::from_raw(Hash::from_bytes(b"parent"))),
             round,
-            signature: Bls12381G2Signature([0u8; 96]),
+            signature: ConsensusSignature::new([0u8; 96]),
         }
     }
 

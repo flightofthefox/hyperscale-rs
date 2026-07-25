@@ -11,12 +11,13 @@
 //! field bound in the timeout signature — which is what lets HotStuff-2's
 //! pacemaker work without a timeout certificate on the wire.
 
+use hyperscale_crypto::Verifier;
 use thiserror::Error;
 
 use crate::{
     Bls12381G1PrivateKey, ConsensusPublicKey, ConsensusSignature, NetworkDefinition,
-    QuorumCertificate, Round, ShardId, ValidatorId, Verified, Verify, bls_pk, bls_sig,
-    sig_from_bls, timeout_message, verify_bls12381_v1,
+    QuorumCertificate, Round, ShardId, ValidatorId, Verified, Verify, sig_from_bls,
+    timeout_message,
 };
 
 /// A validator's timeout for a shard consensus round.
@@ -149,8 +150,10 @@ impl Timeout {
 pub struct TimeoutContext<'a> {
     /// Network identifier — feeds the domain-separated signing message.
     pub network: &'a NetworkDefinition,
-    /// BLS public key of the validator who timed out.
+    /// Public key of the validator who timed out.
     pub voter_public_key: &'a ConsensusPublicKey,
+    /// Scheme verifier the signature check runs through.
+    pub verifier: &'a dyn Verifier,
 }
 
 /// Failure modes of [`Timeout`] verification.
@@ -178,11 +181,10 @@ impl Verify<&TimeoutContext<'_>> for Timeout {
 
     fn verify(&self, ctx: &TimeoutContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let message = self.signing_message(ctx.network);
-        if !verify_bls12381_v1(
-            &message,
-            &bls_pk(ctx.voter_public_key),
-            &bls_sig(&self.signature),
-        ) {
+        if !ctx
+            .verifier
+            .verify(ctx.voter_public_key, &message, &self.signature)
+        {
             return Err(TimeoutVerifyError::InvalidSignature);
         }
         Ok(Verified::new_unchecked(self.clone()))
@@ -221,10 +223,11 @@ impl Verified<Timeout> {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, generate_bls_keypair};
+
     use super::*;
     use crate::{
-        BlockHash, BlockHeight, SignerBitfield, WeightedTimestamp, agg_from_bls,
-        generate_bls_keypair, pk_from_bls, zero_bls_signature,
+        AggregateSignature, BlockHash, BlockHeight, SignerBitfield, WeightedTimestamp, pk_from_bls,
     };
 
     const SHARD: ShardId = ShardId::ROOT;
@@ -237,7 +240,7 @@ mod tests {
             BlockHash::ZERO,
             Round::new(round),
             SignerBitfield::empty(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
         )
     }
@@ -262,6 +265,7 @@ mod tests {
         assert!(
             timeout
                 .verify(&TimeoutContext {
+                    verifier: &BlsVerifier,
                     network: &net,
                     voter_public_key: &pk_from_bls(&pk),
                 })
@@ -285,6 +289,7 @@ mod tests {
         let intruder = generate_bls_keypair().public_key();
         assert!(matches!(
             timeout.verify(&TimeoutContext {
+                verifier: &BlsVerifier,
                 network: &net,
                 voter_public_key: &pk_from_bls(&intruder),
             }),

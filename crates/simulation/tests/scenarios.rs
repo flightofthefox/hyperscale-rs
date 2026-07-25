@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::shard::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
     halt_recovery_genesis_balances, halt_straddler_setup, intershard_partition_genesis_balances,
@@ -334,7 +335,7 @@ fn shard_fork_drives_committee_recovery_sim() {
             .collect();
         let proof = shard_fork_proof_signed_by(&keys, shard, BlockHeight::new(frozen + 1), wt);
         proof
-            .verify(schedule)
+            .verify(&BlsVerifier, schedule)
             .expect("synthesized fork proof verifies against the live schedule");
         proof
     };

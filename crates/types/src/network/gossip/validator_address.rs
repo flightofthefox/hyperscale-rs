@@ -96,10 +96,10 @@ impl GossipMessage for ValidatorAddressGossip {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
+
     use super::*;
-    use crate::{
-        ConsensusPublicKey, SignedContext, bls_keypair_from_seed, pk_from_bls, sig_from_bls,
-    };
+    use crate::{ConsensusPublicKey, SignedContext, pk_from_bls, sig_from_bls};
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
@@ -125,6 +125,7 @@ mod tests {
         let (gossip, public_key) = signed_record(9);
         let network = net();
         let ctx = SignedContext {
+            verifier: &BlsVerifier,
             network: &network,
             public_key: &public_key,
         };
@@ -137,6 +138,7 @@ mod tests {
         gossip.addresses.push(b"injected".to_vec());
         let network = net();
         let ctx = SignedContext {
+            verifier: &BlsVerifier,
             network: &network,
             public_key: &public_key,
         };

@@ -27,8 +27,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
 use hyperscale_types::{
-    Bls12381G2Signature, CertifiedBlockHeader, ConsensusPublicKey, ShardForkProof,
-    ShardVoteEquivocation, Signed, SignedContext, ValidatorId, Verifiable, sig_from_bls,
+    CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ShardForkProof,
+    ShardVoteEquivocation, Signed, SignedContext, ValidatorId, Verifiable,
 };
 
 use super::CertifiedHeaderVerificationItem;
@@ -48,7 +48,7 @@ where
         certified_header: Arc<Verifiable<CertifiedBlockHeader>>,
         sender: ValidatorId,
         public_key: ConsensusPublicKey,
-        sender_signature: Bls12381G2Signature,
+        sender_signature: ConsensusSignature,
     ) {
         let item: CertifiedHeaderVerificationItem =
             (certified_header, sender, public_key, sender_signature);
@@ -101,20 +101,20 @@ where
             return;
         }
 
-        let mut verified = Vec::new();
-        let mut unverified = Vec::new();
+        let mut verified_items = Vec::new();
+        let mut unverified_items = Vec::new();
         for item in items {
             if item.0.is_verified() {
-                verified.push(item);
+                verified_items.push(item);
             } else {
-                unverified.push(item);
+                unverified_items.push(item);
             }
         }
 
         let shard = self.shard;
 
         // Fast path: emit verified items synchronously — no BLS work.
-        for (certified_header, sender, _public_key, _sender_signature) in verified {
+        for (certified_header, sender, _public_key, _sender_signature) in verified_items {
             let verified_header = Arc::unwrap_or_clone(certified_header)
                 .into_verified()
                 .unwrap_or_else(|_| unreachable!("is_verified() guards the verified partition"));
@@ -128,27 +128,29 @@ where
             );
         }
 
-        if unverified.is_empty() {
+        if unverified_items.is_empty() {
             return;
         }
 
         let event_tx = self.event_sender().clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
+        let verifier = Arc::clone(&self.process.verifier);
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
                 let topo = topology_snapshot.load();
-                for (certified_header, sender, public_key, sender_signature) in unverified {
+                for (certified_header, sender, public_key, sender_signature) in unverified_items {
                     let gossip = CertifiedBlockHeaderGossip {
                         certified_header,
                         sender,
-                        sender_signature: sig_from_bls(&sender_signature),
+                        sender_signature,
                     };
                     let start = std::time::Instant::now();
                     let valid = gossip
                         .verify_signature(&SignedContext {
                             network: topo.network(),
                             public_key: &public_key,
+                            verifier: verifier.as_ref(),
                         })
                         .is_ok();
                     record_signature_verification_latency(

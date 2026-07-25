@@ -38,7 +38,7 @@ use hyperscale_types::{
     ShardWitness, SlotEffects, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
     SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
     SpcView, TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable,
-    Verified, Verify, WeightedTimestamp,
+    Verified, Verifier, Verify, WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
@@ -153,6 +153,9 @@ pub fn retention_floor(
 /// share an `Arc<dyn BeaconStorage>` at the runner layer but each
 /// holds an independent coordinator, so determinism is per-vnode.
 pub struct BeaconCoordinator {
+    /// Scheme verifier for proposal, cert, and equivocation checks.
+    verifier: Arc<dyn Verifier>,
+
     state: BeaconState,
 
     /// Latest committed beacon block paired with its authenticating
@@ -311,6 +314,7 @@ impl BeaconCoordinator {
     #[must_use]
     #[allow(clippy::too_many_arguments)] // identity + storage state both threaded explicitly
     pub fn new(
+        verifier: Arc<dyn Verifier>,
         latest_block: Arc<Verified<CertifiedBeaconBlock>>,
         history: Vec<BeaconState>,
         me: ValidatorId,
@@ -369,16 +373,19 @@ impl BeaconCoordinator {
         // (post-fold) state derives — the signer base every candidate
         // outcome at this tip shares.
         let ratify = RatifyTracker::new(
+            Arc::clone(&verifier),
             latest_block.block_hash(),
             state.current_epoch.next(),
             state.derive_active_pool(),
         );
+        let spc = SpcDriver::new(Arc::clone(&verifier), me);
         Self {
+            verifier,
             state,
             latest_block,
             tip_epoch_committee,
             tip_epoch_pool,
-            spc: SpcDriver::new(me),
+            spc,
             verification: BeaconVerificationPipeline::new(),
             shard_source: ShardSourceTracker::new(),
             ratify,
@@ -936,6 +943,7 @@ impl BeaconCoordinator {
                 return Vec::new();
             };
             if !boundary::proposal_boundary_qcs_admissible(
+                self.verifier.as_ref(),
                 &upgraded,
                 &self.state,
                 &self.shard_source,
@@ -1005,6 +1013,7 @@ impl BeaconCoordinator {
             let rec = self.state.validators.get(&ev.validator)?;
             let mut ev = ev.clone();
             ev.upgrade_in_place(&PcVoteEquivocationContext {
+                verifier: self.verifier.as_ref(),
                 network: &self.network,
                 committee: &[(ev.validator, rec.pubkey)],
             })
@@ -1031,6 +1040,7 @@ impl BeaconCoordinator {
             let rec = self.state.validators.get(&ev.validator)?;
             let mut ev = ev.clone();
             ev.upgrade_in_place(&ShardVoteEquivocationContext {
+                verifier: self.verifier.as_ref(),
                 network: &self.network,
                 pubkey: &rec.pubkey,
             })
@@ -1057,7 +1067,10 @@ impl BeaconCoordinator {
     fn fork_proofs_admissible(&self, proposal: &Verified<BeaconProposal>) -> bool {
         proposal.fork_proofs().iter().all(|(shard, proof)| {
             let proof = proof.as_unverified();
-            *shard == proof.shard() && proof.verify(&self.topology_schedule).is_ok()
+            *shard == proof.shard()
+                && proof
+                    .verify(self.verifier.as_ref(), &self.topology_schedule)
+                    .is_ok()
         })
     }
 
@@ -1895,6 +1908,7 @@ impl BeaconCoordinator {
     /// next one at the new tip, over the post-fold pool.
     fn restart_ratification(&mut self) {
         self.ratify = RatifyTracker::new(
+            Arc::clone(&self.verifier),
             self.latest_block.block_hash(),
             self.state.current_epoch.next(),
             self.state.derive_active_pool(),
@@ -1944,7 +1958,13 @@ impl BeaconCoordinator {
         self.tip_epoch_committee = self.state.derive_beacon_committee();
         self.tip_epoch_pool = self.state.derive_active_pool();
         let input = apply_input_for(&block);
-        let effects = apply_epoch(&mut self.state, &self.network, block.epoch(), input);
+        let effects = apply_epoch(
+            self.verifier.as_ref(),
+            &mut self.state,
+            &self.network,
+            block.epoch(),
+            input,
+        );
         self.latest_block = Arc::clone(&block);
         self.spc.clear();
         self.restart_ratification();
@@ -2376,6 +2396,7 @@ impl BeaconCoordinator {
         }
         if let Some(record) = self.state.validators.get(&validator) {
             let ctx = BeaconProposalVerifyContext {
+                verifier: self.verifier.as_ref(),
                 network: &self.network,
                 epoch,
                 sender_pk: record.pubkey,
@@ -2542,6 +2563,13 @@ impl BeaconCoordinator {
         &self.latest_block
     }
 
+    /// Scheme verifier shared with callers that build verify contexts
+    /// outside the coordinator.
+    #[must_use]
+    pub fn verifier(&self) -> &Arc<dyn Verifier> {
+        &self.verifier
+    }
+
     #[must_use]
     pub const fn network_definition(&self) -> &NetworkDefinition {
         &self.network
@@ -2599,8 +2627,9 @@ impl std::fmt::Debug for BeaconCoordinator {
 mod tests {
     use std::collections::BTreeMap;
 
+    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
     use hyperscale_types::{
-        BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig,
+        AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig,
         BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
         BoundedVec, CertificateRoot, CertifiedBlockHeader, ChainOrigin, ConsensusPublicKey,
         ConsensusSignature, Epoch, GenesisConfigHash, GenesisPool, GenesisValidator, Hash,
@@ -2609,10 +2638,9 @@ mod tests {
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, Round, ShardBoundary,
         ShardCommittee, ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload,
         ShardWitnessProof, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-        TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp, agg_from_bls,
-        bls_keypair_from_seed, build_qc1, build_qc2, build_qc3, build_ratify_cert,
-        compute_merkle_root_with_proof, genesis_config_hash, pc_context, pk_from_bls,
-        sign_ratify_vote, sign_vote1, sign_vote2, sign_vote3, spc_context, zero_bls_signature,
+        TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp, build_qc1, build_qc2, build_qc3,
+        build_ratify_cert, compute_merkle_root_with_proof, genesis_config_hash, pc_context,
+        pk_from_bls, sign_ratify_vote, sign_vote1, sign_vote2, sign_vote3, spc_context,
     };
 
     use super::*;
@@ -2671,6 +2699,7 @@ mod tests {
     fn new_coord(me: ValidatorId) -> BeaconCoordinator {
         let (block, state, config_hash) = genesis_trio();
         BeaconCoordinator::new(
+            Arc::new(BlsVerifier),
             block,
             vec![state],
             me,
@@ -2723,7 +2752,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(pred_wt),
         );
         let header = BlockHeader::new(
@@ -2757,7 +2786,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(pred_wt),
         );
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
@@ -2852,7 +2881,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_wt),
         );
         let header = BlockHeader::new(
@@ -2886,7 +2915,7 @@ mod tests {
             parent_hash,
             Round::INITIAL,
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_wt),
         );
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
@@ -2906,7 +2935,7 @@ mod tests {
             BlockHash::ZERO,
             Round::INITIAL,
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(wt),
         )
     }
@@ -3191,6 +3220,7 @@ mod tests {
                 } => {
                     let result = Arc::unwrap_or_clone(block)
                         .upgrade(&CertifiedBeaconBlockVerifyContext {
+                            verifier: &BlsVerifier,
                             network: &net,
                             committee: &committee,
                             active_pool: &active_pool,
@@ -3208,6 +3238,7 @@ mod tests {
                 } => {
                     let result = Arc::unwrap_or_clone(candidate)
                         .upgrade(&CandidateVerifyContext {
+                            verifier: &BlsVerifier,
                             network: &net,
                             committee: &committee,
                             equivocation_signers: &equivocation_signers,
@@ -3225,6 +3256,7 @@ mod tests {
                     let signer = vote.signer();
                     let result = (*vote)
                         .upgrade(&RatifyVerifyContext {
+                            verifier: &BlsVerifier,
                             network: &net,
                             active_pool: &signers,
                         })
@@ -3252,6 +3284,7 @@ mod tests {
         let (block, state, config_hash) = genesis_trio();
         let block_hash = block.block_hash();
         let coord = BeaconCoordinator::new(
+            Arc::new(BlsVerifier),
             Arc::clone(&block),
             vec![state],
             ValidatorId::new(0),
@@ -3271,6 +3304,7 @@ mod tests {
         let (block, mut state, config_hash) = genesis_trio();
         state.current_epoch = Epoch::new(7);
         let coord = BeaconCoordinator::new(
+            Arc::new(BlsVerifier),
             block,
             vec![state],
             ValidatorId::new(0),
@@ -3306,6 +3340,7 @@ mod tests {
             GenesisConfigHash::from_raw(Hash::from_bytes(b"other-config")),
         );
         let _coord = BeaconCoordinator::new(
+            Arc::new(BlsVerifier),
             Arc::new(mismatched_block),
             vec![state],
             ValidatorId::new(0),
@@ -3748,6 +3783,7 @@ mod tests {
         let config_hash = genesis_config_hash(&config, &NetworkDefinition::simulator());
         let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
         let mut coord = BeaconCoordinator::new(
+            Arc::new(BlsVerifier),
             block,
             vec![state],
             ValidatorId::new(0),
@@ -3780,6 +3816,7 @@ mod tests {
             let state = build_genesis_beacon_state(&config);
             let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
             BeaconCoordinator::new(
+                Arc::new(BlsVerifier),
                 block,
                 vec![state],
                 ValidatorId::new(0),
@@ -4028,19 +4065,19 @@ mod tests {
             .map(|&i| sign_vote1(&keys[i], committee[i].0, &net, &pc_ctx, v_in.clone()))
             .collect();
         let v1_refs: Vec<&_> = v1s.iter().collect();
-        let qc1 = build_qc1(&v1_refs, committee);
+        let qc1 = build_qc1(&BlsVerifier, &v1_refs, committee);
         let v2s: Vec<_> = signer_positions
             .iter()
             .map(|&i| sign_vote2(&keys[i], committee[i].0, &net, &pc_ctx, qc1.clone()))
             .collect();
         let v2_refs: Vec<&_> = v2s.iter().collect();
-        let qc2 = build_qc2(&v2_refs, committee);
+        let qc2 = build_qc2(&BlsVerifier, &v2_refs, committee);
         let v3s: Vec<_> = signer_positions
             .iter()
             .map(|&i| sign_vote3(&keys[i], committee[i].0, &net, &pc_ctx, qc2.clone()))
             .collect();
         let v3_refs: Vec<&_> = v3s.iter().collect();
-        let qc3 = build_qc3(&v3_refs, committee);
+        let qc3 = build_qc3(&BlsVerifier, &v3_refs, committee);
         let value = qc3.x_pe().clone();
         SpcCert::Direct {
             prev_view,
@@ -4070,7 +4107,7 @@ mod tests {
                 )
             })
             .collect();
-        build_ratify_cert(&votes, &pool).expect("full pool meets quorum")
+        build_ratify_cert(&BlsVerifier, &votes, &pool).expect("full pool meets quorum")
     }
 
     /// Build a peer `BeaconBlock` at `epoch` that verifies under
@@ -5178,7 +5215,7 @@ mod tests {
             CertificateRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, ProposerTimestamp,
             ProvisionsRoot, QuorumCertificate, Round, ShardWitnessPayload, ShardWitnessProof,
             SignerBitfield, StateRoot, TransactionRoot, WeightedTimestamp,
-            compute_merkle_root_with_proof, zero_bls_signature,
+            compute_merkle_root_with_proof,
         };
         let payload = ShardWitnessPayload::StakeDeposit {
             pool_id: StakePoolId::new(0),
@@ -5226,7 +5263,7 @@ mod tests {
             parent_block_hash,
             Round::INITIAL,
             SignerBitfield::new(4),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(1_000),
         );
         let certified_header = Arc::new(Verified::new_unchecked_for_test(
@@ -5397,6 +5434,7 @@ mod tests {
     fn coord_from_history(history: Vec<BeaconState>) -> BeaconCoordinator {
         let (block, _genesis_state, config_hash) = genesis_trio();
         BeaconCoordinator::new(
+            Arc::new(BlsVerifier),
             block,
             history,
             ValidatorId::new(0),

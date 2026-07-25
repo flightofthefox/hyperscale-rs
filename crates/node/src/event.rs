@@ -21,11 +21,11 @@ use std::sync::Arc;
 use hyperscale_core::{CommitSource, ProtocolEvent};
 use hyperscale_network::RequestError;
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHash, BlockHeight, Bls12381G2Signature, BoundedVec,
-    CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, ConsensusPublicKey,
-    ElidedCertifiedBlock, Epoch, HeaderFetchCount, LeafIndex, MAX_FINALIZED_TX_PER_BLOCK,
-    ProvisionHash, RoutableTransaction, ShardForkProof, ShardId, ShardVoteEquivocation, TxHash,
-    ValidatorId, Verifiable, Verified, WaveId,
+    BeaconWitnessCommit, BlockHash, BlockHeight, BoundedVec, CertifiedBeaconBlock, CertifiedBlock,
+    CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
+    HeaderFetchCount, LeafIndex, MAX_FINALIZED_TX_PER_BLOCK, ProvisionHash, RoutableTransaction,
+    ShardForkProof, ShardId, ShardVoteEquivocation, TxHash, ValidatorId, Verifiable, Verified,
+    WaveId,
 };
 
 use crate::shard::commit::QcOnlyDivergence;
@@ -350,7 +350,7 @@ pub enum ShardScopedInput {
         /// Sender's public key, resolved from topology.
         public_key: ConsensusPublicKey,
         /// Sender's signature over the gossip payload, awaiting batch verify.
-        sender_signature: Bls12381G2Signature,
+        sender_signature: ConsensusSignature,
     },
 
     /// A self-authenticating shard fork proof arrived over global gossip.

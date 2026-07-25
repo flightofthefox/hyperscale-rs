@@ -14,19 +14,18 @@
 use std::collections::BTreeSet;
 
 use blake3::Hasher;
+use hyperscale_crypto::Verifier;
 use sbor::prelude::*;
 use thiserror::Error;
 
 use crate::beacon::prefix_ops::{mce, mcp, qc1_certify};
 use crate::primitives::signer_bitfield::MAX_SIGNERS;
 use crate::{
-    AggregateSignature, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, BoundedVec,
-    ConsensusPublicKey, ConsensusSignature, DOMAIN_PC_VOTE1, DOMAIN_PC_VOTE2,
-    DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, Epoch, MAX_PREFIX_SIGS, MAX_VOTE_VECTOR_LEN,
-    NetworkDefinition, PcContext, PositionalBundle, SignerBitfield, SpcNewCommitMsg, SpcView,
-    ValidatorId, Verifiable, Verified, Verify, agg_from_bls,
-    aggregate_verify_bls_different_messages, bls_agg, bls_pk, bls_sig, byzantine_threshold,
-    pc_context, pc_vote_signing_message, sig_from_bls, spc_context,
+    AggregateSignature, Bls12381G1PrivateKey, BoundedVec, ConsensusPublicKey, ConsensusSignature,
+    DOMAIN_PC_VOTE1, DOMAIN_PC_VOTE2, DOMAIN_PC_VOTE2_LENGTH, DOMAIN_PC_VOTE3, Epoch,
+    MAX_PREFIX_SIGS, MAX_VOTE_VECTOR_LEN, NetworkDefinition, PcContext, PositionalBundle,
+    SignerBitfield, SpcNewCommitMsg, SpcView, ValidatorId, Verifiable, Verified, Verify,
+    byzantine_threshold, pc_context, pc_vote_signing_message, sig_from_bls, spc_context,
 };
 
 // ── ValueElement and Vector ──────────────────────────────────────────────────
@@ -892,14 +891,15 @@ fn length_attestation_message(
 
 /// Verify a round-2 length attestation against a signer's pubkey.
 fn verify_length_attestation(
-    sig: &Bls12381G2Signature,
+    verifier: &dyn Verifier,
+    sig: &ConsensusSignature,
     pk: &ConsensusPublicKey,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
     len: usize,
 ) -> bool {
     let msg = length_attestation_message(network, pc_ctx, len);
-    aggregate_verify_bls_different_messages(&[msg.as_slice()], sig, &[bls_pk(pk)])
+    verifier.verify(pk, &msg, sig)
 }
 
 // ─── Round 1 ───────────────────────────────────────────────────────────────
@@ -910,6 +910,7 @@ fn verify_length_attestation(
 ///
 /// Returns a [`PcVote1VerifyError`] variant naming the failing predicate.
 pub fn verify_vote1(
+    verifier: &dyn Verifier,
     v1: &PcVote1,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
@@ -926,11 +927,11 @@ pub fn verify_vote1(
     }
     let messages_owned = prefix_signing_messages(network, DOMAIN_PC_VOTE1, pc_ctx, v1.v_in());
     let messages: Vec<&[u8]> = messages_owned.iter().map(Vec::as_slice).collect();
-    let pks = vec![bls_pk(&pk); v1.prefix_sigs().len()];
-    let sigs: Vec<Bls12381G2Signature> = v1.prefix_sigs().iter().map(bls_sig).collect();
-    let agg = Bls12381G2Signature::aggregate(&sigs, true)
+    let pks = vec![pk; v1.prefix_sigs().len()];
+    let agg = verifier
+        .aggregate(v1.prefix_sigs())
         .map_err(|_| PcVote1VerifyError::BadSignatureAggregate)?;
-    if aggregate_verify_bls_different_messages(&messages, &agg, &pks) {
+    if verifier.verify_aggregate_different_messages(&messages, &agg, &pks) {
         Ok(())
     } else {
         Err(PcVote1VerifyError::BadSignature)
@@ -952,6 +953,7 @@ pub fn verify_vote1(
 ///
 /// Returns a [`PcQc1VerifyError`] variant naming the failing predicate.
 pub fn verify_qc1(
+    verifier: &dyn Verifier,
     qc1: &PcQc1,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
@@ -970,7 +972,7 @@ pub fn verify_qc1(
 
     let mut seen: BTreeSet<usize> = BTreeSet::new();
     let mut values: Vec<PcVector> = Vec::with_capacity(q);
-    let mut pks: Vec<Bls12381G1PublicKey> = Vec::with_capacity(q);
+    let mut pks: Vec<ConsensusPublicKey> = Vec::with_capacity(q);
     let mut subset_inputs: Vec<PcVector> = Vec::with_capacity(q);
 
     for (idx, cv) in qc1.x_signers().iter() {
@@ -985,7 +987,7 @@ pub fn verify_qc1(
         };
         subset_inputs.push(v_prime.clone());
         values.push(v_prime);
-        pks.push(bls_pk(pk));
+        pks.push(*pk);
     }
 
     let messages_owned: Vec<Vec<u8>> = values
@@ -993,7 +995,7 @@ pub fn verify_qc1(
         .map(|v| pc_vote_signing_message(network, DOMAIN_PC_VOTE1, pc_ctx, v))
         .collect();
     let messages: Vec<&[u8]> = messages_owned.iter().map(Vec::as_slice).collect();
-    if !aggregate_verify_bls_different_messages(&messages, &bls_agg(&qc1.x_agg_sig()), &pks) {
+    if !verifier.verify_aggregate_different_messages(&messages, &qc1.x_agg_sig(), &pks) {
         return Err(PcQc1VerifyError::BadAggregateSignature);
     }
 
@@ -1042,6 +1044,7 @@ fn reconstruct_compact_vote(cv: &PcCompactVote, x: &PcVector) -> Option<PcVector
 ///
 /// Returns a [`PcVote2VerifyError`] variant naming the failing predicate.
 pub fn verify_vote2(
+    verifier: &dyn Verifier,
     v2: &PcVote2,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
@@ -1059,7 +1062,7 @@ pub fn verify_vote2(
     // Embedded QC1: trust the marker when set (sealed construction); otherwise
     // run the full predicate. Same shape as the round-3 / QC-3 composite gates.
     if v2.qc1_verifiable().verified().is_none() {
-        verify_qc1(v2.qc1(), network, pc_ctx, committee)
+        verify_qc1(verifier, v2.qc1(), network, pc_ctx, committee)
             .map_err(|_| PcVote2VerifyError::EmbeddedQc1Rejected)?;
     }
     // Vote2's `x` must be the QC1Certify output of its embedded QC1.
@@ -1067,7 +1070,8 @@ pub fn verify_vote2(
         return Err(PcVote2VerifyError::XMismatch);
     }
     if !verify_length_attestation(
-        &bls_sig(&v2.length_attestation()),
+        verifier,
+        &v2.length_attestation(),
         &pk,
         network,
         pc_ctx,
@@ -1077,11 +1081,11 @@ pub fn verify_vote2(
     }
     let messages_owned = prefix_signing_messages(network, DOMAIN_PC_VOTE2, pc_ctx, v2.x());
     let messages: Vec<&[u8]> = messages_owned.iter().map(Vec::as_slice).collect();
-    let pks = vec![bls_pk(&pk); v2.prefix_sigs().len()];
-    let sigs: Vec<Bls12381G2Signature> = v2.prefix_sigs().iter().map(bls_sig).collect();
-    let agg = Bls12381G2Signature::aggregate(&sigs, true)
+    let pks = vec![pk; v2.prefix_sigs().len()];
+    let agg = verifier
+        .aggregate(v2.prefix_sigs())
         .map_err(|_| PcVote2VerifyError::BadSignatureAggregate)?;
-    if aggregate_verify_bls_different_messages(&messages, &agg, &pks) {
+    if verifier.verify_aggregate_different_messages(&messages, &agg, &pks) {
         Ok(())
     } else {
         Err(PcVote2VerifyError::BadSignature)
@@ -1101,6 +1105,7 @@ pub fn verify_vote2(
 ///
 /// Returns a [`PcQc2VerifyError`] variant naming the failing predicate.
 pub fn verify_qc2(
+    verifier: &dyn Verifier,
     qc2: &PcQc2,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
@@ -1120,10 +1125,8 @@ pub fn verify_qc2(
     if signer_indices.iter().any(|&i| i >= n) {
         return Err(PcQc2VerifyError::SignerOutOfRange);
     }
-    let signer_pks: Vec<Bls12381G1PublicKey> = signer_indices
-        .iter()
-        .map(|&i| bls_pk(&committee[i].1))
-        .collect();
+    let signer_pks: Vec<ConsensusPublicKey> =
+        signer_indices.iter().map(|&i| committee[i].1).collect();
     let signer_ids: BTreeSet<ValidatorId> =
         signer_indices.iter().map(|&i| committee[i].0).collect();
 
@@ -1136,18 +1139,14 @@ pub fn verify_qc2(
             // messages aggregate verifies both attestations in one call.
             let len_msg = length_attestation_message(network, pc_ctx, qc2.x_p().len());
             let mut messages: Vec<&[u8]> = Vec::with_capacity(2 * q);
-            let mut pks: Vec<Bls12381G1PublicKey> = Vec::with_capacity(2 * q);
+            let mut pks: Vec<ConsensusPublicKey> = Vec::with_capacity(2 * q);
             for pk in &signer_pks {
                 messages.push(x_p_message.as_slice());
                 pks.push(*pk);
                 messages.push(len_msg.as_slice());
                 pks.push(*pk);
             }
-            if aggregate_verify_bls_different_messages(
-                &messages,
-                &bls_agg(&qc2.combined_sig()),
-                &pks,
-            ) {
+            if verifier.verify_aggregate_different_messages(&messages, &qc2.combined_sig(), &pks) {
                 Ok(())
             } else {
                 Err(PcQc2VerifyError::BadCombinedSignature)
@@ -1155,14 +1154,22 @@ pub fn verify_qc2(
         }
         PcXpProof::Diverging(proof) => {
             let x_p_messages: Vec<&[u8]> = std::iter::repeat_n(x_p_message.as_slice(), q).collect();
-            if !aggregate_verify_bls_different_messages(
+            if !verifier.verify_aggregate_different_messages(
                 &x_p_messages,
-                &bls_agg(&qc2.combined_sig()),
+                &qc2.combined_sig(),
                 &signer_pks,
             ) {
                 return Err(PcQc2VerifyError::BadCombinedSignature);
             }
-            if verify_diverging_proof(proof, qc2, &signer_ids, network, pc_ctx, committee) {
+            if verify_diverging_proof(
+                verifier,
+                proof,
+                qc2,
+                &signer_ids,
+                network,
+                pc_ctx,
+                committee,
+            ) {
                 Ok(())
             } else {
                 Err(PcQc2VerifyError::BadDivergingProof)
@@ -1170,9 +1177,9 @@ pub fn verify_qc2(
         }
         PcXpProof::ShortWitness { witness } => {
             let x_p_messages: Vec<&[u8]> = std::iter::repeat_n(x_p_message.as_slice(), q).collect();
-            if !aggregate_verify_bls_different_messages(
+            if !verifier.verify_aggregate_different_messages(
                 &x_p_messages,
-                &bls_agg(&qc2.combined_sig()),
+                &qc2.combined_sig(),
                 &signer_pks,
             ) {
                 return Err(PcQc2VerifyError::BadCombinedSignature);
@@ -1183,13 +1190,14 @@ pub fn verify_qc2(
             if witness.x() != qc2.x_p() {
                 return Err(PcQc2VerifyError::BadShortWitnessLinkage);
             }
-            verify_vote2(witness, network, pc_ctx, committee)
+            verify_vote2(verifier, witness, network, pc_ctx, committee)
                 .map_err(|_| PcQc2VerifyError::BadShortWitness)
         }
     }
 }
 
 fn verify_diverging_proof(
+    verifier: &dyn Verifier,
     proof: &PcDivergingProof,
     qc2: &PcQc2,
     signer_ids: &BTreeSet<ValidatorId>,
@@ -1209,8 +1217,8 @@ fn verify_diverging_proof(
     ) else {
         return false;
     };
-    if verify_qc1(&proof.qc1_j, network, pc_ctx, committee).is_err()
-        || verify_qc1(&proof.qc1_k, network, pc_ctx, committee).is_err()
+    if verify_qc1(verifier, &proof.qc1_j, network, pc_ctx, committee).is_err()
+        || verify_qc1(verifier, &proof.qc1_k, network, pc_ctx, committee).is_err()
     {
         return false;
     }
@@ -1227,10 +1235,10 @@ fn verify_diverging_proof(
     }
     let j_msg = pc_vote_signing_message(network, DOMAIN_PC_VOTE2, pc_ctx, &j_vec);
     let k_msg = pc_vote_signing_message(network, DOMAIN_PC_VOTE2, pc_ctx, &k_vec);
-    aggregate_verify_bls_different_messages(
+    verifier.verify_aggregate_different_messages(
         &[j_msg.as_slice(), k_msg.as_slice()],
-        &bls_agg(&proof.combined_sig),
-        &[bls_pk(&pk_j), bls_pk(&pk_k)],
+        &proof.combined_sig,
+        &[pk_j, pk_k],
     )
 }
 
@@ -1244,6 +1252,7 @@ fn verify_diverging_proof(
 ///
 /// Returns a [`PcVote3VerifyError`] variant naming the failing predicate.
 pub fn verify_vote3(
+    verifier: &dyn Verifier,
     v3: &PcVote3,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
@@ -1253,15 +1262,11 @@ pub fn verify_vote3(
         return Err(PcVote3VerifyError::SignerNotInCommittee);
     };
     let msg = pc_vote_signing_message(network, DOMAIN_PC_VOTE3, pc_ctx, v3.x_p());
-    if !aggregate_verify_bls_different_messages(
-        &[msg.as_slice()],
-        &bls_sig(&v3.sig_xp()),
-        &[bls_pk(&pk)],
-    ) {
+    if !verifier.verify(&pk, &msg, &v3.sig_xp()) {
         return Err(PcVote3VerifyError::BadSignatureOverXp);
     }
     if v3.qc2_verifiable().verified().is_none() {
-        verify_qc2(v3.qc2(), network, pc_ctx, committee)
+        verify_qc2(verifier, v3.qc2(), network, pc_ctx, committee)
             .map_err(|_| PcVote3VerifyError::EmbeddedQc2Rejected)?;
     }
     if v3.x_p() == v3.qc2().x_p() {
@@ -1287,6 +1292,7 @@ pub fn verify_vote3(
 ///
 /// Returns a [`PcQc3VerifyError`] variant naming the failing predicate.
 pub fn verify_qc3(
+    verifier: &dyn Verifier,
     qc3: &PcQc3,
     network: &NetworkDefinition,
     pc_ctx: &PcContext,
@@ -1305,11 +1311,11 @@ pub fn verify_qc3(
         return Err(PcQc3VerifyError::XppNotPrefixOfXpe);
     }
     if qc3.qc2_xpp_verifiable().verified().is_none() {
-        verify_qc2(qc3.qc2_xpp(), network, pc_ctx, committee)
+        verify_qc2(verifier, qc3.qc2_xpp(), network, pc_ctx, committee)
             .map_err(|_| PcQc3VerifyError::EmbeddedQc2XppRejected)?;
     }
     if qc3.qc2_xpe_verifiable().verified().is_none() {
-        verify_qc2(qc2_xpe, network, pc_ctx, committee)
+        verify_qc2(verifier, qc2_xpe, network, pc_ctx, committee)
             .map_err(|_| PcQc3VerifyError::EmbeddedQc2XpeRejected)?;
     }
     if qc3.qc2_xpp().x_p() != qc3.x_pp() {
@@ -1329,7 +1335,7 @@ pub fn verify_qc3(
     }
 
     let mut values: Vec<PcVector> = Vec::with_capacity(q);
-    let mut pks: Vec<Bls12381G1PublicKey> = Vec::with_capacity(q);
+    let mut pks: Vec<ConsensusPublicKey> = Vec::with_capacity(q);
     let mut min_len = usize::MAX;
     let mut max_len = 0usize;
     for (k, idx) in qc3.all_signers().set_indices().enumerate() {
@@ -1346,7 +1352,7 @@ pub fn verify_qc3(
         min_len = min_len.min(len);
         max_len = max_len.max(len);
         values.push(PcVector::new(x_pe.as_slice()[..len].iter().copied()));
-        pks.push(bls_pk(pk));
+        pks.push(*pk);
     }
     if min_len != qc3.x_pp().len() || max_len != x_pe.len() {
         return Err(PcQc3VerifyError::MinMaxLengthMismatch);
@@ -1357,7 +1363,7 @@ pub fn verify_qc3(
         .map(|v| pc_vote_signing_message(network, DOMAIN_PC_VOTE3, pc_ctx, v))
         .collect();
     let messages: Vec<&[u8]> = messages_owned.iter().map(Vec::as_slice).collect();
-    if aggregate_verify_bls_different_messages(&messages, &bls_agg(&qc3.agg_sig()), &pks) {
+    if verifier.verify_aggregate_different_messages(&messages, &qc3.agg_sig(), &pks) {
         Ok(())
     } else {
         Err(PcQc3VerifyError::BadAggregateSignature)
@@ -1384,6 +1390,7 @@ pub fn verify_qc3(
 ///
 /// Returns a [`PcVoteEquivocationVerifyError`] variant naming the failing predicate.
 pub fn verify_vote_equivocation(
+    verifier: &dyn Verifier,
     ev: &PcVoteEquivocation,
     network: &NetworkDefinition,
     committee: &[(ValidatorId, ConsensusPublicKey)],
@@ -1403,10 +1410,7 @@ pub fn verify_vote_equivocation(
     let ctx = pc_context(&spc_ctx, ev.view);
     let msg_a = pc_vote_signing_message(network, domain, &ctx, &ev.value_a);
     let msg_b = pc_vote_signing_message(network, domain, &ctx, &ev.value_b);
-    let pk = bls_pk(&pk);
-    if aggregate_verify_bls_different_messages(&[msg_a.as_slice()], &bls_sig(&ev.sig_a), &[pk])
-        && aggregate_verify_bls_different_messages(&[msg_b.as_slice()], &bls_sig(&ev.sig_b), &[pk])
-    {
+    if verifier.verify(&pk, &msg_a, &ev.sig_a) && verifier.verify(&pk, &msg_b, &ev.sig_b) {
         Ok(())
     } else {
         Err(PcVoteEquivocationVerifyError::BadSignature)
@@ -1509,7 +1513,11 @@ fn sign_all_prefixes(
 /// caller is the FSM, which guarantees full `n - f` quorums. Panics
 /// if any signer in `votes` is not present in `committee`.
 #[must_use]
-pub fn build_qc1(votes: &[&PcVote1], committee: &[(ValidatorId, ConsensusPublicKey)]) -> PcQc1 {
+pub fn build_qc1(
+    verifier: &dyn Verifier,
+    votes: &[&PcVote1],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
+) -> PcQc1 {
     let n = committee.len();
     let f = byzantine_threshold(n);
     let raw_inputs: Vec<PcVector> = votes.iter().map(|v| v.v_in().clone()).collect();
@@ -1544,9 +1552,8 @@ pub fn build_qc1(votes: &[&PcVote1], committee: &[(ValidatorId, ConsensusPublicK
     // PositionalBundle items line up with `signers.set_indices()`.
     indexed.sort_by_key(|(pos, _, _)| *pos);
     let x_signers_items: Vec<PcCompactVote> = indexed.iter().map(|(_, cv, _)| cv.clone()).collect();
-    let x_sigs: Vec<Bls12381G2Signature> = indexed.iter().map(|(_, _, sig)| bls_sig(sig)).collect();
-    let x_agg_sig =
-        agg_from_bls(&Bls12381G2Signature::aggregate(&x_sigs, true).expect("non-empty signers"));
+    let x_sigs: Vec<ConsensusSignature> = indexed.iter().map(|(_, _, sig)| *sig).collect();
+    let x_agg_sig = verifier.aggregate(&x_sigs).expect("non-empty signers");
     PcQc1::new(
         x,
         PositionalBundle::new(signers_bf, x_signers_items),
@@ -1564,7 +1571,11 @@ pub fn build_qc1(votes: &[&PcVote1], committee: &[(ValidatorId, ConsensusPublicK
 /// Panics if `votes` is empty, or if any signer in `votes` is not
 /// present in `committee`.
 #[must_use]
-pub fn build_qc2(votes: &[&PcVote2], committee: &[(ValidatorId, ConsensusPublicKey)]) -> PcQc2 {
+pub fn build_qc2(
+    verifier: &dyn Verifier,
+    votes: &[&PcVote2],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
+) -> PcQc2 {
     let n = committee.len();
     let xs: Vec<PcVector> = votes.iter().map(|v| v.x().clone()).collect();
     let x_p = mcp(&xs).expect("build_qc2 caller guarantees non-empty votes");
@@ -1572,7 +1583,7 @@ pub fn build_qc2(votes: &[&PcVote2], committee: &[(ValidatorId, ConsensusPublicK
     // Pull each signer's prefix sig at index |x_p| — covers x[..|x_p|]
     // = x_p (since every x extends x_p).
     let mut signers_bf = SignerBitfield::new(n);
-    let mut x_p_sigs: Vec<Bls12381G2Signature> = Vec::with_capacity(votes.len());
+    let mut x_p_sigs: Vec<ConsensusSignature> = Vec::with_capacity(votes.len());
     for v2 in votes {
         let pos = committee
             .iter()
@@ -1584,7 +1595,7 @@ pub fn build_qc2(votes: &[&PcVote2], committee: &[(ValidatorId, ConsensusPublicK
             .get(x_p.len())
             .copied()
             .expect("vote-2 carries |x|+1 prefix sigs; index ≤ |x_p| ≤ |x|");
-        x_p_sigs.push(bls_sig(&sig));
+        x_p_sigs.push(sig);
     }
 
     // π proof. Three branches:
@@ -1594,26 +1605,24 @@ pub fn build_qc2(votes: &[&PcVote2], committee: &[(ValidatorId, ConsensusPublicK
     //     with different elements at position `|x_p|`.
     //   - ShortWitness: at least one signer's `|x| = |x_p|`, while
     //     extending signers all agree at position `|x_p|`.
-    let pi = build_xp_proof(votes, &x_p);
+    let pi = build_xp_proof(verifier, votes, &x_p);
     let combined_sig = match &pi {
         PcXpProof::Full => {
             let mut all_sigs = x_p_sigs;
             for v2 in votes {
-                all_sigs.push(bls_sig(&v2.length_attestation()));
+                all_sigs.push(v2.length_attestation());
             }
-            agg_from_bls(
-                &Bls12381G2Signature::aggregate(&all_sigs, true).expect("non-empty signers"),
-            )
+            verifier.aggregate(&all_sigs).expect("non-empty signers")
         }
-        PcXpProof::Diverging(_) | PcXpProof::ShortWitness { .. } => agg_from_bls(
-            &Bls12381G2Signature::aggregate(&x_p_sigs, true).expect("non-empty signers"),
-        ),
+        PcXpProof::Diverging(_) | PcXpProof::ShortWitness { .. } => {
+            verifier.aggregate(&x_p_sigs).expect("non-empty signers")
+        }
     };
 
     PcQc2::new(x_p, signers_bf, combined_sig, pi)
 }
 
-fn build_xp_proof(votes: &[&PcVote2], x_p: &PcVector) -> PcXpProof {
+fn build_xp_proof(verifier: &dyn Verifier, votes: &[&PcVote2], x_p: &PcVector) -> PcXpProof {
     let input_len = votes.first().map_or(0, |v| v.x().len());
     let all_equal_length = !votes.is_empty()
         && x_p.len() == input_len
@@ -1640,10 +1649,9 @@ fn build_xp_proof(votes: &[&PcVote2], x_p: &PcVector) -> PcXpProof {
             .get(sig_idx)
             .copied()
             .expect("prefix_sigs has |x|+1 entries; index ≤ |x|");
-        let combined_sig = agg_from_bls(
-            &Bls12381G2Signature::aggregate(&[bls_sig(&j_sig), bls_sig(&k_sig)], true)
-                .expect("two non-zero sigs"),
-        );
+        let combined_sig = verifier
+            .aggregate(&[j_sig, k_sig])
+            .expect("two non-zero sigs");
         return PcXpProof::Diverging(Box::new(PcDivergingProof {
             j: j_vote.validator(),
             j_divergent: j_div,
@@ -1680,7 +1688,11 @@ fn build_xp_proof(votes: &[&PcVote2], x_p: &PcVector) -> PcXpProof {
 /// present in `committee`.
 #[must_use]
 #[allow(clippy::similar_names)] // x_pp / x_pe / qc2_xpp / qc2_xpe match PcQc3's wire-type field names
-pub fn build_qc3(votes: &[&PcVote3], committee: &[(ValidatorId, ConsensusPublicKey)]) -> PcQc3 {
+pub fn build_qc3(
+    verifier: &dyn Verifier,
+    votes: &[&PcVote3],
+    committee: &[(ValidatorId, ConsensusPublicKey)],
+) -> PcQc3 {
     let x_ps: Vec<PcVector> = votes.iter().map(|v| v.x_p().clone()).collect();
     let x_pp = mcp(&x_ps).expect("build_qc3 caller guarantees non-empty votes");
     let x_pe = mce(&x_ps).expect("round-3 x_p values mutually extend");
@@ -1713,10 +1725,9 @@ pub fn build_qc3(votes: &[&PcVote3], committee: &[(ValidatorId, ConsensusPublicK
     }
     indexed.sort_by_key(|(pos, _, _)| *pos);
     let lens: Vec<u32> = indexed.iter().map(|(_, l, _)| *l).collect();
-    let sig_bytes: Vec<Bls12381G2Signature> = indexed.iter().map(|(_, _, s)| bls_sig(s)).collect();
+    let sig_bytes: Vec<ConsensusSignature> = indexed.iter().map(|(_, _, s)| *s).collect();
     let signer_lengths = PcSignerLengths::from_per_signer(lens);
-    let agg_sig =
-        agg_from_bls(&Bls12381G2Signature::aggregate(&sig_bytes, true).expect("non-empty signers"));
+    let agg_sig = verifier.aggregate(&sig_bytes).expect("non-empty signers");
 
     let x_pe_dedup = (x_pp != x_pe).then_some(x_pe);
     let qc2_xpe_dedup = (qc2_xpp != qc2_xpe_full).then_some(qc2_xpe_full);
@@ -1773,6 +1784,8 @@ pub struct PcVoteVerifyContext<'a> {
     pub pc_ctx: &'a PcContext,
     /// Committee membership and pubkeys.
     pub committee: &'a [(ValidatorId, ConsensusPublicKey)],
+    /// Scheme verifier the signature checks run through.
+    pub verifier: &'a dyn Verifier,
 }
 
 /// Verification context for [`PcVoteEquivocation`].
@@ -1785,6 +1798,8 @@ pub struct PcVoteEquivocationContext<'a> {
     pub network: &'a NetworkDefinition,
     /// Committee membership and pubkeys.
     pub committee: &'a [(ValidatorId, ConsensusPublicKey)],
+    /// Scheme verifier the signature checks run through.
+    pub verifier: &'a dyn Verifier,
 }
 
 /// Failure modes of a round-1 vote.
@@ -1969,7 +1984,7 @@ impl Verify<&PcVoteVerifyContext<'_>> for PcVote1 {
     type Error = PcVote1VerifyError;
 
     fn verify(&self, ctx: &PcVoteVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        verify_vote1(self, ctx.network, ctx.pc_ctx, ctx.committee)?;
+        verify_vote1(ctx.verifier, self, ctx.network, ctx.pc_ctx, ctx.committee)?;
         Ok(Verified::new_unchecked(self.clone()))
     }
 }
@@ -1978,7 +1993,7 @@ impl Verify<&PcVoteVerifyContext<'_>> for PcQc1 {
     type Error = PcQc1VerifyError;
 
     fn verify(&self, ctx: &PcVoteVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        verify_qc1(self, ctx.network, ctx.pc_ctx, ctx.committee)?;
+        verify_qc1(ctx.verifier, self, ctx.network, ctx.pc_ctx, ctx.committee)?;
         Ok(Verified::new_unchecked(self.clone()))
     }
 }
@@ -1992,7 +2007,13 @@ impl Verify<&PcVoteVerifyContext<'_>> for PcVote2 {
             .qc1
             .upgrade_in_place(ctx)
             .map_err(|_| PcVote2VerifyError::EmbeddedQc1Rejected)?;
-        verify_vote2(&verified, ctx.network, ctx.pc_ctx, ctx.committee)?;
+        verify_vote2(
+            ctx.verifier,
+            &verified,
+            ctx.network,
+            ctx.pc_ctx,
+            ctx.committee,
+        )?;
         Ok(Verified::new_unchecked(verified))
     }
 }
@@ -2001,7 +2022,7 @@ impl Verify<&PcVoteVerifyContext<'_>> for PcQc2 {
     type Error = PcQc2VerifyError;
 
     fn verify(&self, ctx: &PcVoteVerifyContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        verify_qc2(self, ctx.network, ctx.pc_ctx, ctx.committee)?;
+        verify_qc2(ctx.verifier, self, ctx.network, ctx.pc_ctx, ctx.committee)?;
         Ok(Verified::new_unchecked(self.clone()))
     }
 }
@@ -2015,7 +2036,13 @@ impl Verify<&PcVoteVerifyContext<'_>> for PcVote3 {
             .qc2
             .upgrade_in_place(ctx)
             .map_err(|_| PcVote3VerifyError::EmbeddedQc2Rejected)?;
-        verify_vote3(&verified, ctx.network, ctx.pc_ctx, ctx.committee)?;
+        verify_vote3(
+            ctx.verifier,
+            &verified,
+            ctx.network,
+            ctx.pc_ctx,
+            ctx.committee,
+        )?;
         Ok(Verified::new_unchecked(verified))
     }
 }
@@ -2034,7 +2061,13 @@ impl Verify<&PcVoteVerifyContext<'_>> for PcQc3 {
                 .upgrade_in_place(ctx)
                 .map_err(|_| PcQc3VerifyError::EmbeddedQc2XpeRejected)?;
         }
-        verify_qc3(&verified, ctx.network, ctx.pc_ctx, ctx.committee)?;
+        verify_qc3(
+            ctx.verifier,
+            &verified,
+            ctx.network,
+            ctx.pc_ctx,
+            ctx.committee,
+        )?;
         Ok(Verified::new_unchecked(verified))
     }
 }
@@ -2043,7 +2076,7 @@ impl Verify<&PcVoteEquivocationContext<'_>> for PcVoteEquivocation {
     type Error = PcVoteEquivocationVerifyError;
 
     fn verify(&self, ctx: &PcVoteEquivocationContext<'_>) -> Result<Verified<Self>, Self::Error> {
-        verify_vote_equivocation(self, ctx.network, ctx.committee)?;
+        verify_vote_equivocation(ctx.verifier, self, ctx.network, ctx.committee)?;
         Ok(Verified::new_unchecked(self.clone()))
     }
 }
@@ -2103,11 +2136,12 @@ impl Verified<PcQc1> {
     /// aggregation matching the verifier's reconstruction.
     #[must_use]
     pub fn from_verified_votes(
+        verifier: &dyn Verifier,
         votes: &[&Verified<PcVote1>],
         committee: &[(ValidatorId, ConsensusPublicKey)],
     ) -> Self {
         let raw: Vec<&PcVote1> = votes.iter().map(|v| AsRef::as_ref(*v)).collect();
-        Self::new_unchecked(build_qc1(&raw, committee))
+        Self::new_unchecked(build_qc1(verifier, &raw, committee))
     }
 }
 
@@ -2115,11 +2149,12 @@ impl Verified<PcQc2> {
     /// Aggregate a round-2 quorum into a verified QC.
     #[must_use]
     pub fn from_verified_votes(
+        verifier: &dyn Verifier,
         votes: &[&Verified<PcVote2>],
         committee: &[(ValidatorId, ConsensusPublicKey)],
     ) -> Self {
         let raw: Vec<&PcVote2> = votes.iter().map(|v| AsRef::as_ref(*v)).collect();
-        Self::new_unchecked(build_qc2(&raw, committee))
+        Self::new_unchecked(build_qc2(verifier, &raw, committee))
     }
 }
 
@@ -2129,11 +2164,12 @@ impl Verified<PcQc3> {
     /// marker carried on the input votes' embedded `qc2` fields.
     #[must_use]
     pub fn from_verified_votes(
+        verifier: &dyn Verifier,
         votes: &[&Verified<PcVote3>],
         committee: &[(ValidatorId, ConsensusPublicKey)],
     ) -> Self {
         let raw: Vec<&PcVote3> = votes.iter().map(|v| AsRef::as_ref(*v)).collect();
-        Self::new_unchecked(build_qc3(&raw, committee))
+        Self::new_unchecked(build_qc3(verifier, &raw, committee))
     }
 
     /// Lift the inner proof out of a verified new-commit message. The
@@ -2168,8 +2204,12 @@ mod tests {
         PcVector::new((0..len).map(sample_value))
     }
 
-    fn sample_sig(n: u8) -> Bls12381G2Signature {
-        Bls12381G2Signature([n; 96])
+    fn sample_agg(n: u8) -> AggregateSignature {
+        AggregateSignature::new([n; 96])
+    }
+
+    fn sample_sig(n: u8) -> ConsensusSignature {
+        ConsensusSignature::new([n; 96])
     }
 
     fn sample_qc1() -> PcQc1 {
@@ -2185,7 +2225,7 @@ mod tests {
                     PcCompactVote::new(2, Some(sample_value(99))),
                 ],
             ),
-            agg_from_bls(&sample_sig(0xAA)),
+            sample_agg(0xAA),
         )
     }
 
@@ -2194,12 +2234,7 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        PcQc2::new(
-            sample_vector(2),
-            signers,
-            agg_from_bls(&sample_sig(0xBB)),
-            PcXpProof::Full,
-        )
+        PcQc2::new(sample_vector(2), signers, sample_agg(0xBB), PcXpProof::Full)
     }
 
     #[test]
@@ -2226,12 +2261,7 @@ mod tests {
         let v = PcVote1::new(
             ValidatorId::new(7),
             sample_vector(3),
-            vec![
-                sig_from_bls(&sample_sig(1)),
-                sig_from_bls(&sample_sig(2)),
-                sig_from_bls(&sample_sig(3)),
-                sig_from_bls(&sample_sig(4)),
-            ],
+            vec![sample_sig(1), sample_sig(2), sample_sig(3), sample_sig(4)],
         );
         let bytes = basic_encode(&v).unwrap();
         let decoded: PcVote1 = basic_decode(&bytes).unwrap();
@@ -2243,13 +2273,9 @@ mod tests {
         let v = PcVote2::new(
             ValidatorId::new(7),
             sample_vector(2),
-            vec![
-                sig_from_bls(&sample_sig(1)),
-                sig_from_bls(&sample_sig(2)),
-                sig_from_bls(&sample_sig(3)),
-            ],
+            vec![sample_sig(1), sample_sig(2), sample_sig(3)],
             sample_qc1(),
-            sig_from_bls(&sample_sig(0x55)),
+            sample_sig(0x55),
         );
         let bytes = basic_encode(&v).unwrap();
         let decoded: PcVote2 = basic_decode(&bytes).unwrap();
@@ -2261,7 +2287,7 @@ mod tests {
         let v = PcVote3::new(
             ValidatorId::new(7),
             sample_vector(2),
-            sig_from_bls(&sample_sig(0x77)),
+            sample_sig(0x77),
             sample_qc2(),
         );
         let bytes = basic_encode(&v).unwrap();
@@ -2296,30 +2322,21 @@ mod tests {
                 k: ValidatorId::new(1),
                 k_divergent: sample_value(22),
                 qc1_k: sample_qc1(),
-                combined_sig: agg_from_bls(&sample_sig(0xBB)),
+                combined_sig: sample_agg(0xBB),
             })),
             PcXpProof::ShortWitness {
                 witness: Box::new(PcVote2::new(
                     ValidatorId::new(2),
                     sample_vector(2),
-                    vec![
-                        sig_from_bls(&sample_sig(1)),
-                        sig_from_bls(&sample_sig(2)),
-                        sig_from_bls(&sample_sig(3)),
-                    ],
+                    vec![sample_sig(1), sample_sig(2), sample_sig(3)],
                     sample_qc1(),
-                    sig_from_bls(&sample_sig(0x55)),
+                    sample_sig(0x55),
                 )),
             },
         ];
 
         for pi in variants {
-            let qc = PcQc2::new(
-                sample_vector(2),
-                bitfield.clone(),
-                agg_from_bls(&sample_sig(0xDD)),
-                pi,
-            );
+            let qc = PcQc2::new(sample_vector(2), bitfield.clone(), sample_agg(0xDD), pi);
             let bytes = basic_encode(&qc).unwrap();
             let decoded: PcQc2 = basic_decode(&bytes).unwrap();
             assert_eq!(qc, decoded);
@@ -2343,7 +2360,7 @@ mod tests {
             None,
             signers_bitfield(4, &[0]),
             PcSignerLengths::Uniform(2),
-            agg_from_bls(&sample_sig(0xEE)),
+            sample_agg(0xEE),
         );
         assert_eq!(qc.x_pe(), qc.x_pp());
         assert_eq!(qc.qc2_xpe(), qc.qc2_xpp());
@@ -2355,12 +2372,7 @@ mod tests {
         let high_qc2 = {
             let mut signers = SignerBitfield::new(4);
             signers.set(0);
-            PcQc2::new(
-                high.clone(),
-                signers,
-                agg_from_bls(&sample_sig(0x33)),
-                PcXpProof::Full,
-            )
+            PcQc2::new(high.clone(), signers, sample_agg(0x33), PcXpProof::Full)
         };
         let qc = PcQc3::new(
             sample_vector(2),
@@ -2369,7 +2381,7 @@ mod tests {
             Some(Verifiable::from(high_qc2.clone())),
             signers_bitfield(4, &[0, 1]),
             PcSignerLengths::PerSigner(vec![2u32, 3].into()),
-            agg_from_bls(&sample_sig(0xEE)),
+            sample_agg(0xEE),
         );
         assert_eq!(qc.x_pe(), &high);
         assert_eq!(qc.qc2_xpe(), &high_qc2);
@@ -2384,7 +2396,7 @@ mod tests {
             None,
             signers_bitfield(4, &[0, 1]),
             PcSignerLengths::PerSigner(vec![2u32, 3].into()),
-            agg_from_bls(&sample_sig(0xEE)),
+            sample_agg(0xEE),
         );
         let bytes = basic_encode(&qc).unwrap();
         let decoded: PcQc3 = basic_decode(&bytes).unwrap();
@@ -2442,9 +2454,9 @@ mod tests {
                 view: SpcView::new(3),
                 round,
                 value_a: sample_vector(2),
-                sig_a: sig_from_bls(&sample_sig(0x11)),
+                sig_a: sample_sig(0x11),
                 value_b: sample_vector(3),
-                sig_b: sig_from_bls(&sample_sig(0x22)),
+                sig_b: sample_sig(0x22),
             };
             let bytes = basic_encode(&e).unwrap();
             let decoded: PcVoteEquivocation = basic_decode(&bytes).unwrap();

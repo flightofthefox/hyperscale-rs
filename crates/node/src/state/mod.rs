@@ -105,11 +105,13 @@ impl NodeStateMachine {
         exec_cert_store: Arc<ExecCertStore>,
         finalized_wave_store: Arc<FinalizedWaveStore>,
     ) -> Self {
+        let verifier = Arc::clone(beacon_coordinator.verifier());
         Self {
             beacon_coordinator,
             now: LocalTimestamp::ZERO,
             me,
             shard: Some(ShardParticipation::new(
+                verifier,
                 me,
                 local_shard,
                 shard_config,

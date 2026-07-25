@@ -276,10 +276,8 @@ impl VoteTracker {
 mod tests {
     use std::collections::BTreeSet;
 
-    use hyperscale_types::{
-        BlockHeight, Hash, ShardId, generate_bls_keypair, pk_from_bls, sig_from_bls,
-        zero_bls_signature,
-    };
+    use hyperscale_crypto_bls::generate_bls_keypair;
+    use hyperscale_types::{BlockHeight, ConsensusSignature, Hash, ShardId, pk_from_bls};
 
     use super::*;
 
@@ -298,7 +296,7 @@ mod tests {
             5,
             vec![],
             ValidatorId::new(validator),
-            sig_from_bls(&zero_bls_signature()),
+            ConsensusSignature::ZERO,
         )
     }
 

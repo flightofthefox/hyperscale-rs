@@ -206,6 +206,7 @@ impl NodeStateMachine {
             return Vec::new();
         };
         let ctx = BeaconProposalVerifyContext {
+            verifier: self.beacon_coordinator.verifier().as_ref(),
             network: self.beacon_coordinator.network_definition(),
             epoch,
             sender_pk: record.pubkey,

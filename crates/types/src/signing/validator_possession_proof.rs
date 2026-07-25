@@ -15,9 +15,11 @@
 //! replayed to register the same key under a different identity or on a
 //! different network.
 
+use hyperscale_crypto::Verifier;
+
 use crate::{
     Bls12381G1PrivateKey, ConsensusPublicKey, ConsensusSignature, NetworkDefinition, ValidatorId,
-    bls_pk, bls_sig, pk_from_bls, sig_from_bls, verify_bls12381_v1,
+    pk_from_bls, sig_from_bls,
 };
 
 /// Domain tag for validator BLS proof-of-possession.
@@ -62,13 +64,14 @@ pub fn validator_possession_proof_sign(
 /// `validator_id` on `network`.
 #[must_use]
 pub fn validator_possession_proof_verify(
+    verifier: &dyn Verifier,
     network: &NetworkDefinition,
     validator_id: ValidatorId,
     pubkey: &ConsensusPublicKey,
     possession_proof: &ConsensusSignature,
 ) -> bool {
     let msg = validator_possession_proof_message(network, validator_id, pubkey);
-    verify_bls12381_v1(&msg, &bls_pk(pubkey), &bls_sig(possession_proof))
+    verifier.verify(pubkey, &msg, possession_proof)
 }
 
 #[cfg(test)]
@@ -77,10 +80,11 @@ mod tests {
         BLST_ERROR, blst_p1, blst_p1_add, blst_p1_affine, blst_p1_cneg, blst_p1_compress,
         blst_p1_from_affine, blst_p1_uncompress,
     };
+    use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
 
     use super::*;
+    use crate::Bls12381G1PublicKey;
     use crate::signing::{DOMAIN_READY_SIGNAL, DOMAIN_SHARD_REVEAL};
-    use crate::{Bls12381G1PublicKey, bls_keypair_from_seed, zero_bls_signature};
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
@@ -149,6 +153,7 @@ mod tests {
         let id = ValidatorId::new(42);
         let proof = validator_possession_proof_sign(&sk, &net(), id);
         assert!(validator_possession_proof_verify(
+            &BlsVerifier,
             &net(),
             id,
             &pk_from_bls(&sk.public_key()),
@@ -164,6 +169,7 @@ mod tests {
         let id = ValidatorId::new(42);
         let proof = validator_possession_proof_sign(&sk_a, &net(), id);
         assert!(!validator_possession_proof_verify(
+            &BlsVerifier,
             &net(),
             id,
             &pk_from_bls(&sk_b.public_key()),
@@ -178,6 +184,7 @@ mod tests {
         let sk = keypair(3);
         let proof = validator_possession_proof_sign(&sk, &net(), ValidatorId::new(42));
         assert!(!validator_possession_proof_verify(
+            &BlsVerifier,
             &net(),
             ValidatorId::new(43),
             &pk_from_bls(&sk.public_key()),
@@ -190,10 +197,11 @@ mod tests {
         let sk = keypair(3);
         let id = ValidatorId::new(42);
         assert!(!validator_possession_proof_verify(
+            &BlsVerifier,
             &net(),
             id,
             &pk_from_bls(&sk.public_key()),
-            &sig_from_bls(&zero_bls_signature())
+            &ConsensusSignature::ZERO
         ));
     }
 
@@ -261,6 +269,7 @@ mod tests {
         let msg = validator_possession_proof_message(&net(), id, &pk_from_bls(&rogue_pk));
         let forged_with_r = r.sign_v1(&msg);
         assert!(!validator_possession_proof_verify(
+            &BlsVerifier,
             &net(),
             id,
             &pk_from_bls(&rogue_pk),
@@ -268,6 +277,7 @@ mod tests {
         ));
         let forged_with_honest = honest.sign_v1(&msg);
         assert!(!validator_possession_proof_verify(
+            &BlsVerifier,
             &net(),
             id,
             &pk_from_bls(&rogue_pk),

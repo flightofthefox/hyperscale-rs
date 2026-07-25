@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{Action, CommitSource, FetchAbandon, TimerId};
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
@@ -412,6 +413,7 @@ impl ShardCoordinatorSim {
             storages.push(storage);
 
             let mut coord = ShardCoordinator::new(
+                Arc::new(BlsVerifier),
                 id,
                 shard,
                 ShardConsensusConfig::default(),
@@ -493,6 +495,7 @@ impl ShardCoordinatorSim {
         let idx = self.idx_of(replica);
         let recovered = self.storages[idx].load_recovered_state();
         let mut coord = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
             replica,
             self.shard,
             ShardConsensusConfig::default(),
@@ -1320,6 +1323,7 @@ impl ShardCoordinatorSim {
                 // verifies the share (inline here) and feeds the verified
                 // timeout back to the emitter's `TimeoutKeeper`.
                 if let Ok(verified) = timeout.verify(&TimeoutContext {
+                    verifier: &BlsVerifier,
                     network: &self.network,
                     voter_public_key: &voter_public_key,
                 }) {
@@ -1488,6 +1492,7 @@ impl ShardCoordinatorSim {
                 total_votes,
             } => {
                 let result = verify_and_build_qc(
+                    &BlsVerifier,
                     &self.network,
                     block_hash,
                     shard_id,
@@ -1515,6 +1520,7 @@ impl ShardCoordinatorSim {
                 block_hash,
             } => {
                 let qc_ctx = QcContext {
+                    verifier: &BlsVerifier,
                     network: &self.network,
                     public_keys: &public_keys,
                     quorum_threshold,
@@ -1609,6 +1615,7 @@ impl ShardCoordinatorSim {
                     .flat_map(|fw| fw.receipts().iter().cloned())
                     .collect();
                 let bw_ctx = BeaconWitnessRootContext {
+                    verifier: &BlsVerifier,
                     expected_leaf_count,
                     claimed_base,
                     parent_leaves_start,

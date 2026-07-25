@@ -415,8 +415,8 @@ impl WaveRegistry {
 mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, Hash, ShardId, SignerBitfield,
-        Verifiable, agg_from_bls, zero_bls_signature,
+        AggregateSignature, BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, Hash,
+        ShardId, SignerBitfield, Verifiable,
     };
     use proptest::collection::vec as prop_vec;
 
@@ -460,7 +460,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             tx_hashes.iter().map(|h| make_outcome(*h)).collect(),
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             SignerBitfield::new(4),
         )
     }

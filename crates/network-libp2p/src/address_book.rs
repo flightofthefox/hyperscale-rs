@@ -19,6 +19,7 @@ use std::collections::HashSet;
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::network::gossip::{
     MAX_ANNOUNCED_ADDRESS_BYTES, MAX_ANNOUNCED_ADDRESSES, MAX_ANNOUNCED_PEER_ID_BYTES,
@@ -85,6 +86,7 @@ impl AddressBook {
             return IngestOutcome::UnknownValidator;
         };
         let ctx = SignedContext {
+            verifier: &BlsVerifier,
             network,
             public_key,
         };
@@ -173,9 +175,9 @@ impl AddressBook {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::bls_keypair_from_seed;
     use hyperscale_types::{
-        Bls12381G1PrivateKey, bls_keypair_from_seed, pk_from_bls, sig_from_bls,
-        validator_address_message,
+        Bls12381G1PrivateKey, pk_from_bls, sig_from_bls, validator_address_message,
     };
 
     use super::*;

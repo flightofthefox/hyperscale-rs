@@ -11,10 +11,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_crypto_bls::generate_bls_keypair;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_network_libp2p::test_utils::TestFixtures;
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
-use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId, generate_bls_keypair};
+use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
 use serial_test::serial;
 use support::CONNECTION_TIMEOUT;
 use tokio::time::{sleep, timeout};

@@ -7,6 +7,7 @@
 mod common;
 
 use common::{Committee, PcSim, pc_ctx};
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_types::{
     Epoch, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcContext, PcQc1, PcQc2, PcQc3,
     PcValueElement, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteRound,
@@ -69,9 +70,9 @@ fn qc1_round_trip_n4() {
 
     let votes = round1_quorum(&cm, &network, &ctx, 3, &v_in);
     let refs: Vec<&PcVote1> = votes.iter().collect();
-    let qc1 = build_qc1(&refs, &cm.members);
+    let qc1 = build_qc1(&BlsVerifier, &refs, &cm.members);
 
-    assert!(verify_qc1(&qc1, &network, &ctx, &cm.members).is_ok());
+    assert!(verify_qc1(&BlsVerifier, &qc1, &network, &ctx, &cm.members).is_ok());
 }
 
 /// QC1 verification must reject the same QC1 under a different
@@ -86,10 +87,10 @@ fn qc1_rejected_under_different_network() {
 
     let votes = round1_quorum(&cm, &network, &ctx, 3, &v_in);
     let refs: Vec<&PcVote1> = votes.iter().collect();
-    let qc1 = build_qc1(&refs, &cm.members);
+    let qc1 = build_qc1(&BlsVerifier, &refs, &cm.members);
 
-    assert!(verify_qc1(&qc1, &network, &ctx, &cm.members).is_ok());
-    assert!(verify_qc1(&qc1, &other_network, &ctx, &cm.members).is_err());
+    assert!(verify_qc1(&BlsVerifier, &qc1, &network, &ctx, &cm.members).is_ok());
+    assert!(verify_qc1(&BlsVerifier, &qc1, &other_network, &ctx, &cm.members).is_err());
 }
 
 /// QC2 verification must reject the same QC2 under a different
@@ -104,14 +105,14 @@ fn qc2_rejected_under_different_network() {
 
     let v1s = round1_quorum(&cm, &network, &ctx, 3, &v_in);
     let v1_refs: Vec<&PcVote1> = v1s.iter().collect();
-    let qc1 = build_qc1(&v1_refs, &cm.members);
+    let qc1 = build_qc1(&BlsVerifier, &v1_refs, &cm.members);
 
     let v2s = round2_quorum(&cm, &network, &ctx, 3, &qc1);
     let v2_refs: Vec<&PcVote2> = v2s.iter().collect();
-    let qc2 = build_qc2(&v2_refs, &cm.members);
+    let qc2 = build_qc2(&BlsVerifier, &v2_refs, &cm.members);
 
-    assert!(verify_qc2(&qc2, &network, &ctx, &cm.members).is_ok());
-    assert!(verify_qc2(&qc2, &other_network, &ctx, &cm.members).is_err());
+    assert!(verify_qc2(&BlsVerifier, &qc2, &network, &ctx, &cm.members).is_ok());
+    assert!(verify_qc2(&BlsVerifier, &qc2, &other_network, &ctx, &cm.members).is_err());
 }
 
 /// QC3 verification must reject the same QC3 under a different
@@ -126,18 +127,18 @@ fn qc3_rejected_under_different_network() {
 
     let v1s = round1_quorum(&cm, &network, &ctx, 3, &v_in);
     let v1_refs: Vec<&PcVote1> = v1s.iter().collect();
-    let qc1 = build_qc1(&v1_refs, &cm.members);
+    let qc1 = build_qc1(&BlsVerifier, &v1_refs, &cm.members);
 
     let v2s = round2_quorum(&cm, &network, &ctx, 3, &qc1);
     let v2_refs: Vec<&PcVote2> = v2s.iter().collect();
-    let qc2 = build_qc2(&v2_refs, &cm.members);
+    let qc2 = build_qc2(&BlsVerifier, &v2_refs, &cm.members);
 
     let v3s = round3_quorum(&cm, &network, &ctx, 3, &qc2);
     let v3_refs: Vec<&PcVote3> = v3s.iter().collect();
-    let qc3 = build_qc3(&v3_refs, &cm.members);
+    let qc3 = build_qc3(&BlsVerifier, &v3_refs, &cm.members);
 
-    assert!(verify_qc3(&qc3, &network, &ctx, &cm.members).is_ok());
-    assert!(verify_qc3(&qc3, &other_network, &ctx, &cm.members).is_err());
+    assert!(verify_qc3(&BlsVerifier, &qc3, &network, &ctx, &cm.members).is_ok());
+    assert!(verify_qc3(&BlsVerifier, &qc3, &other_network, &ctx, &cm.members).is_err());
 }
 
 /// QC1 verification must reject the same QC1 under a different PC
@@ -152,10 +153,10 @@ fn qc1_rejected_under_different_view() {
 
     let votes = round1_quorum(&cm, &network, &ctx_v0, 3, &v_in);
     let refs: Vec<&PcVote1> = votes.iter().collect();
-    let qc1 = build_qc1(&refs, &cm.members);
+    let qc1 = build_qc1(&BlsVerifier, &refs, &cm.members);
 
-    assert!(verify_qc1(&qc1, &network, &ctx_v0, &cm.members).is_ok());
-    assert!(verify_qc1(&qc1, &network, &ctx_v1, &cm.members).is_err());
+    assert!(verify_qc1(&BlsVerifier, &qc1, &network, &ctx_v0, &cm.members).is_ok());
+    assert!(verify_qc1(&BlsVerifier, &qc1, &network, &ctx_v1, &cm.members).is_err());
 }
 
 /// Full PC pipeline at n=4 — three rounds, all signers vote the same
@@ -171,20 +172,20 @@ fn qc3_round_trip_n4_all_agree() {
     // Round 1.
     let v1s = round1_quorum(&cm, &network, &ctx, 3, &v_in);
     let v1_refs: Vec<&PcVote1> = v1s.iter().collect();
-    let qc1 = build_qc1(&v1_refs, &cm.members);
-    assert!(verify_qc1(&qc1, &network, &ctx, &cm.members).is_ok());
+    let qc1 = build_qc1(&BlsVerifier, &v1_refs, &cm.members);
+    assert!(verify_qc1(&BlsVerifier, &qc1, &network, &ctx, &cm.members).is_ok());
 
     // Round 2.
     let v2s = round2_quorum(&cm, &network, &ctx, 3, &qc1);
     let v2_refs: Vec<&PcVote2> = v2s.iter().collect();
-    let qc2 = build_qc2(&v2_refs, &cm.members);
-    assert!(verify_qc2(&qc2, &network, &ctx, &cm.members).is_ok());
+    let qc2 = build_qc2(&BlsVerifier, &v2_refs, &cm.members);
+    assert!(verify_qc2(&BlsVerifier, &qc2, &network, &ctx, &cm.members).is_ok());
 
     // Round 3.
     let v3s = round3_quorum(&cm, &network, &ctx, 3, &qc2);
     let v3_refs: Vec<&PcVote3> = v3s.iter().collect();
-    let qc3 = build_qc3(&v3_refs, &cm.members);
-    assert!(verify_qc3(&qc3, &network, &ctx, &cm.members).is_ok());
+    let qc3 = build_qc3(&BlsVerifier, &v3_refs, &cm.members);
+    assert!(verify_qc3(&BlsVerifier, &qc3, &network, &ctx, &cm.members).is_ok());
 }
 
 /// Larger committee (n=7, q=5) exercises the same pipeline at non-
@@ -199,18 +200,18 @@ fn qc3_round_trip_n7_all_agree() {
 
     let v1s = round1_quorum(&cm, &network, &ctx, 5, &v_in);
     let v1_refs: Vec<&PcVote1> = v1s.iter().collect();
-    let qc1 = build_qc1(&v1_refs, &cm.members);
-    assert!(verify_qc1(&qc1, &network, &ctx, &cm.members).is_ok());
+    let qc1 = build_qc1(&BlsVerifier, &v1_refs, &cm.members);
+    assert!(verify_qc1(&BlsVerifier, &qc1, &network, &ctx, &cm.members).is_ok());
 
     let v2s = round2_quorum(&cm, &network, &ctx, 5, &qc1);
     let v2_refs: Vec<&PcVote2> = v2s.iter().collect();
-    let qc2 = build_qc2(&v2_refs, &cm.members);
-    assert!(verify_qc2(&qc2, &network, &ctx, &cm.members).is_ok());
+    let qc2 = build_qc2(&BlsVerifier, &v2_refs, &cm.members);
+    assert!(verify_qc2(&BlsVerifier, &qc2, &network, &ctx, &cm.members).is_ok());
 
     let v3s = round3_quorum(&cm, &network, &ctx, 5, &qc2);
     let v3_refs: Vec<&PcVote3> = v3s.iter().collect();
-    let qc3 = build_qc3(&v3_refs, &cm.members);
-    assert!(verify_qc3(&qc3, &network, &ctx, &cm.members).is_ok());
+    let qc3 = build_qc3(&BlsVerifier, &v3_refs, &cm.members);
+    assert!(verify_qc3(&BlsVerifier, &qc3, &network, &ctx, &cm.members).is_ok());
 }
 
 /// Round-1 equivocation round-trip: have validator 0 sign two
@@ -243,7 +244,7 @@ fn equivocation_round_trip_round1() {
         value_b,
         sig_b: vote_b.prefix_sigs()[vote_b.v_in().len()],
     };
-    assert!(verify_vote_equivocation(&ev, &network, &cm.members).is_ok());
+    assert!(verify_vote_equivocation(&BlsVerifier, &ev, &network, &cm.members).is_ok());
 }
 
 /// Drive a 4-party `PcSim` end-to-end with every party voting the
@@ -334,7 +335,7 @@ fn qc1_over(
 ) -> PcQc1 {
     let votes = round1_quorum(cm, network, ctx, quorum, v_in);
     let refs: Vec<&PcVote1> = votes.iter().collect();
-    build_qc1(&refs, &cm.members)
+    build_qc1(&BlsVerifier, &refs, &cm.members)
 }
 
 /// Two signers vote round-2 over a QC1 with `x = [1, 2]`; one signs
@@ -356,7 +357,7 @@ fn build_qc2_produces_diverging_proof_under_divergent_round1_inputs() {
     let v2_2 = sign_vote2(cm.sk(2), cm.id(2), &network, &ctx, qc1_b);
 
     let refs: Vec<&PcVote2> = vec![&v2_0, &v2_1, &v2_2];
-    let qc2 = build_qc2(&refs, &cm.members);
+    let qc2 = build_qc2(&BlsVerifier, &refs, &cm.members);
 
     assert_eq!(qc2.x_p(), &PcVector::new([elem(1)]));
     assert!(
@@ -364,7 +365,7 @@ fn build_qc2_produces_diverging_proof_under_divergent_round1_inputs() {
         "qc2.pi is {:?}, expected Diverging",
         qc2.pi(),
     );
-    assert!(verify_qc2(&qc2, &network, &ctx, &cm.members).is_ok());
+    assert!(verify_qc2(&BlsVerifier, &qc2, &network, &ctx, &cm.members).is_ok());
 }
 
 /// Four signers vote round-2 over a QC1 with `x = [1, 2]`; one signs
@@ -390,7 +391,7 @@ fn build_qc2_produces_short_witness_proof_when_one_signer_is_short() {
         sign_vote2(cm.sk(4), cm.id(4), &network, &ctx, qc1_short),
     ];
     let refs: Vec<&PcVote2> = v2s.iter().collect();
-    let qc2 = build_qc2(&refs, &cm.members);
+    let qc2 = build_qc2(&BlsVerifier, &refs, &cm.members);
 
     assert_eq!(qc2.x_p(), &PcVector::new([elem(1)]));
     assert!(
@@ -398,7 +399,7 @@ fn build_qc2_produces_short_witness_proof_when_one_signer_is_short() {
         "qc2.pi is {:?}, expected ShortWitness",
         qc2.pi(),
     );
-    assert!(verify_qc2(&qc2, &network, &ctx, &cm.members).is_ok());
+    assert!(verify_qc2(&BlsVerifier, &qc2, &network, &ctx, &cm.members).is_ok());
 }
 
 /// A tampered `sig_b` (signed by a different validator) must not
@@ -429,7 +430,7 @@ fn equivocation_rejected_when_one_side_signed_by_other_validator() {
         value_b,
         sig_b: vote_b_by_other.prefix_sigs()[vote_b_by_other.v_in().len()],
     };
-    assert!(verify_vote_equivocation(&ev, &network, &cm.members).is_err());
+    assert!(verify_vote_equivocation(&BlsVerifier, &ev, &network, &cm.members).is_err());
 }
 
 // ─── QC3 endpoint forgery ──────────────────────────────────────────────────────
@@ -466,7 +467,7 @@ fn forge_qc3_with_empty_xpp_is_rejected() {
 
     // Sanity: the real QC3 verifies and its x_pp matches the input.
     assert_eq!(real.x_pp().as_slice(), &[elem(42), elem(42), elem(42)]);
-    assert!(verify_qc3(&real, &network, &pc_ctx(1, 0), &sim.members).is_ok());
+    assert!(verify_qc3(&BlsVerifier, &real, &network, &pc_ctx(1, 0), &sim.members).is_ok());
 
     // Forge: swap in an empty x_pp while keeping the rest.
     let real_x_pe = real.x_pe().clone();
@@ -482,7 +483,7 @@ fn forge_qc3_with_empty_xpp_is_rejected() {
     );
 
     assert!(
-        verify_qc3(&forged, &network, &pc_ctx(1, 0), &sim.members).is_err(),
+        verify_qc3(&BlsVerifier, &forged, &network, &pc_ctx(1, 0), &sim.members).is_err(),
         "forged QC3 with x_pp=[] but real signers' x_p non-empty must be rejected",
     );
 }
@@ -513,7 +514,7 @@ fn forge_qc3_with_extended_xpe_is_rejected() {
     );
 
     assert!(
-        verify_qc3(&forged, &network, &pc_ctx(2, 0), &sim.members).is_err(),
+        verify_qc3(&BlsVerifier, &forged, &network, &pc_ctx(2, 0), &sim.members).is_err(),
         "forged QC3 with x_pe extended past real mce must be rejected",
     );
 }

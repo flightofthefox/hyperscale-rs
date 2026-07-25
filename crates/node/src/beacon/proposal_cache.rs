@@ -15,7 +15,7 @@ use hyperscale_types::network::request::beacon::GetBeaconProposalRequest;
 use hyperscale_types::network::response::beacon::GetBeaconProposalResponse;
 use hyperscale_types::{
     BeaconProposal, BeaconProposalVerifyContext, ConsensusPublicKey, Epoch, NetworkDefinition,
-    ValidatorId, Verifiable, Verified, Verify,
+    ValidatorId, Verifiable, Verified, Verifier, Verify,
 };
 
 use super::proposal_serve::serve_beacon_proposal_request;
@@ -62,25 +62,27 @@ impl BeaconProposalCache {
     /// drop on failure.
     pub fn admit_wire(
         &self,
+        verifier: &dyn Verifier,
         from: ValidatorId,
         epoch: Epoch,
         proposal: &Verifiable<BeaconProposal>,
         sender_pk: ConsensusPublicKey,
     ) {
-        let verified = if let Some(verified) = proposal.verified() {
+        let admitted = if let Some(verified) = proposal.verified() {
             verified.clone()
         } else {
             let ctx = BeaconProposalVerifyContext {
+                verifier,
                 network: &self.network,
                 epoch,
                 sender_pk,
             };
             match proposal.as_unverified().verify(&ctx) {
-                Ok(verified) => verified,
+                Ok(fresh) => fresh,
                 Err(_) => return,
             }
         };
-        self.admit(from, epoch, Arc::new(verified));
+        self.admit(from, epoch, Arc::new(admitted));
     }
 
     /// Serve an inbound fetch from the cache.

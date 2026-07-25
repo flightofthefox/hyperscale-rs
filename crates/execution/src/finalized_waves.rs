@@ -198,9 +198,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use hyperscale_types::{
-        BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot,
-        Hash, ShardId, SignerBitfield, TxHash, TxOutcome, Verified, WeightedTimestamp,
-        agg_from_bls, zero_bls_signature,
+        AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash,
+        GlobalReceiptRoot, Hash, ShardId, SignerBitfield, TxHash, TxOutcome, Verified,
+        WeightedTimestamp,
     };
 
     use super::*;
@@ -234,7 +234,7 @@ mod tests {
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             tx_outcomes,
-            agg_from_bls(&zero_bls_signature()),
+            AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
         let cert = WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)]);

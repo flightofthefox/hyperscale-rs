@@ -213,12 +213,12 @@ where
                 // Inline BLS verify of the block's certs — no off-thread
                 // dispatch. The result re-enters the same vnode as a
                 // continuation so adoption runs within this cascade.
-                let network = self.vnodes[vnode_idx]
-                    .state
-                    .beacon_coordinator()
-                    .network_definition();
+                let coordinator = self.vnodes[vnode_idx].state.beacon_coordinator();
+                let network = coordinator.network_definition();
+                let verifier = Arc::clone(coordinator.verifier());
                 let result = Arc::unwrap_or_clone(block)
                     .upgrade(&CertifiedBeaconBlockVerifyContext {
+                        verifier: verifier.as_ref(),
                         network,
                         committee: &committee,
                         active_pool: &active_pool,

@@ -12,10 +12,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_beacon::spc::{SpcEffect, SpcEvent, SpcInstance};
+use hyperscale_crypto_bls::{BlsVerifier, bls_keypair_from_seed};
 use hyperscale_types::{
     Bls12381G1PrivateKey, ConsensusPublicKey, Epoch, NetworkDefinition, PcVector, PcVote1, PcVote2,
-    PcVote3, SpcCert, SpcEmptyViewMsg, SpcView, ValidatorId, Verified, bls_keypair_from_seed,
-    pc_context, pk_from_bls, spc_context,
+    PcVote3, SpcCert, SpcEmptyViewMsg, SpcView, ValidatorId, Verified, pc_context, pk_from_bls,
+    spc_context,
 };
 
 /// One pending event in the network: an `SpcEvent` addressed to a
@@ -91,7 +92,15 @@ impl SpcSim {
             sks.push(Arc::new(sk));
         }
         let instances: Vec<SpcInstance> = (0..n)
-            .map(|i| SpcInstance::new(epoch, members.clone(), members[i].0, view_timeout))
+            .map(|i| {
+                SpcInstance::new(
+                    Arc::new(BlsVerifier),
+                    epoch,
+                    members.clone(),
+                    members[i].0,
+                    view_timeout,
+                )
+            })
             .collect();
         let outputs = vec![None; n];
         let output_certs = vec![None; n];

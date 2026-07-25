@@ -36,6 +36,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    use hyperscale_crypto_bls::generate_bls_keypair;
     use sbor::BASIC_SBOR_V1_MAX_DEPTH;
     use sbor::prelude::*;
 
@@ -48,8 +49,7 @@ mod tests {
         TopologySnapshot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
         Verified, WaveCertificate, WaveId, WaveReceiptHash, WeightedTimestamp,
         compute_global_receipt_root, compute_global_receipt_root_with_proof, compute_merkle_root,
-        generate_bls_keypair, pk_from_bls, tx_outcome_leaf, verify_merkle_inclusion, wave_leader,
-        wave_leader_at,
+        pk_from_bls, tx_outcome_leaf, verify_merkle_inclusion, wave_leader, wave_leader_at,
     };
 
     /// Build a 2-shard topology with validator 0 on shard 0.

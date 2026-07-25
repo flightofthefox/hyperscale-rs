@@ -129,10 +129,11 @@ impl<'a> ReshapeView<'a> {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+    use hyperscale_crypto_bls::generate_bls_keypair;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BlockHash, BlockHeight, Hash, NetworkDefinition, ShardAnchor,
         ShardId, StateRoot, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
-        WeightedTimestamp, generate_bls_keypair, pk_from_bls,
+        WeightedTimestamp, pk_from_bls,
     };
 
     use super::ReshapeView;

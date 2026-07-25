@@ -18,6 +18,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, detach_shard};
 use hyperscale_node::{SeatVnodeGroup, VnodeInit, seat_vnode_group};
 use hyperscale_storage::RecoveredState;
@@ -545,6 +546,7 @@ impl ShardSupervisor {
         recovered: &RecoveredState,
     ) -> Vec<VnodeInit> {
         seat_vnode_group(SeatVnodeGroup {
+            verifier: Arc::new(BlsVerifier),
             beacon_storage: self.process.beacon_storage().as_ref(),
             beacon_network: self.beacon_network.clone(),
             beacon_config_hash: self.beacon_config_hash,
@@ -625,9 +627,10 @@ fn host_holds_seat(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+    use hyperscale_crypto_bls::generate_bls_keypair;
     use hyperscale_types::{
         NetworkDefinition, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
-        ValidatorInfo, ValidatorSet, generate_bls_keypair, pk_from_bls,
+        ValidatorInfo, ValidatorSet, pk_from_bls,
     };
 
     use super::{host_holds_seat, host_in_committee, shard_retired};

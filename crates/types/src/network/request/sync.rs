@@ -47,14 +47,13 @@ impl NetworkMessage for SyncCompleteAnnouncement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{sig_from_bls, zero_bls_signature};
 
     #[test]
     fn test_sync_complete_announcement() {
         let announcement = SyncCompleteAnnouncement::new(
             BlockHeight::new(100),
             ValidatorId::new(1),
-            sig_from_bls(&zero_bls_signature()),
+            ConsensusSignature::ZERO,
         );
         assert_eq!(announcement.synced_height, BlockHeight::new(100));
         assert_eq!(announcement.validator, ValidatorId::new(1));

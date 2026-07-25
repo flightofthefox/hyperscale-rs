@@ -244,6 +244,7 @@ where
         } => {
             let result = Arc::unwrap_or_clone(block)
                 .upgrade(&CertifiedBeaconBlockVerifyContext {
+                    verifier: ctx.verifier,
                     network,
                     committee: &committee,
                     active_pool: &active_pool,
@@ -261,6 +262,7 @@ where
             let signer = vote.signer();
             let result = (*vote)
                 .upgrade(&RatifyVerifyContext {
+                    verifier: ctx.verifier,
                     network,
                     active_pool: &signers,
                 })
@@ -281,6 +283,7 @@ where
         } => {
             let result = Arc::unwrap_or_clone(candidate)
                 .upgrade(&CandidateVerifyContext {
+                    verifier: ctx.verifier,
                     network,
                     committee: &committee,
                     equivocation_signers: &equivocation_signers,
@@ -298,6 +301,7 @@ where
             let pc_ctx = pc_context(&spc_context(epoch), view);
             let signer = vote.validator();
             let result = vote.upgrade(&PcVoteVerifyContext {
+                verifier: ctx.verifier,
                 network,
                 pc_ctx: &pc_ctx,
                 committee: &committee,
@@ -318,6 +322,7 @@ where
             let pc_ctx = pc_context(&spc_context(epoch), view);
             let signer = vote.validator();
             let result = (*vote).upgrade(&PcVoteVerifyContext {
+                verifier: ctx.verifier,
                 network,
                 pc_ctx: &pc_ctx,
                 committee: &committee,
@@ -338,6 +343,7 @@ where
             let pc_ctx = pc_context(&spc_context(epoch), view);
             let signer = vote.validator();
             let result = (*vote).upgrade(&PcVoteVerifyContext {
+                verifier: ctx.verifier,
                 network,
                 pc_ctx: &pc_ctx,
                 committee: &committee,
@@ -358,6 +364,7 @@ where
             let spc_ctx = spc_context(epoch);
             let view = proposal.view;
             let result = (*proposal).upgrade(&SpcVerifyContext {
+                verifier: ctx.verifier,
                 network,
                 spc_ctx: &spc_ctx,
                 committee: &committee,
@@ -378,6 +385,7 @@ where
             let spc_ctx = spc_context(epoch);
             let view = msg.view;
             let result = (*msg).upgrade(&SpcVerifyContext {
+                verifier: ctx.verifier,
                 network,
                 spc_ctx: &spc_ctx,
                 committee: &committee,
@@ -398,6 +406,7 @@ where
             let from = msg.signer;
             let view = msg.view;
             let result = (*msg).upgrade(&SpcVerifyContext {
+                verifier: ctx.verifier,
                 network,
                 spc_ctx: &spc_ctx,
                 committee: &committee,

@@ -18,6 +18,7 @@
 //! at SBOR-decode (manual `Decode` impl below). Wire bytes carrying a
 //! mismatched pairing reject with `DecodeError::InvalidCustomValue`.
 
+use hyperscale_crypto::Verifier;
 use sbor::prelude::*;
 use sbor::{
     Categorize, Decode, DecodeError, Decoder, Describe, Encode, EncodeError, Encoder,
@@ -213,6 +214,7 @@ impl CertifiedBeaconBlock {
 /// verification.
 #[must_use]
 pub fn verify_certified(
+    verifier: &dyn Verifier,
     block: &CertifiedBeaconBlock,
     network: &NetworkDefinition,
     committee: &[(ValidatorId, ConsensusPublicKey)],
@@ -220,10 +222,19 @@ pub fn verify_certified(
 ) -> bool {
     match block.cert() {
         BeaconCert::Normal { spc, ratify } => {
-            verify_block_cert(spc, network, &spc_context(block.epoch()), committee).is_ok()
-                && verify_ratify_cert(ratify, network, active_pool).is_ok()
+            verify_block_cert(
+                verifier,
+                spc,
+                network,
+                &spc_context(block.epoch()),
+                committee,
+            )
+            .is_ok()
+                && verify_ratify_cert(verifier, ratify, network, active_pool).is_ok()
         }
-        BeaconCert::Skip(ratify) => verify_ratify_cert(ratify, network, active_pool).is_ok(),
+        BeaconCert::Skip(ratify) => {
+            verify_ratify_cert(verifier, ratify, network, active_pool).is_ok()
+        }
         BeaconCert::Genesis(_) => false,
     }
 }
@@ -239,13 +250,14 @@ pub fn verify_certified(
 /// Returns `true` when the block carries no equivocations.
 #[must_use]
 pub fn verify_block_equivocations(
+    verifier: &dyn Verifier,
     block: &CertifiedBeaconBlock,
     network: &NetworkDefinition,
     signers: &[(ValidatorId, ConsensusPublicKey)],
 ) -> bool {
     for (_, proposal) in block.block().committed_proposals() {
         for ev in proposal.equivocations().iter() {
-            if verify_vote_equivocation(ev.as_unverified(), network, signers).is_err() {
+            if verify_vote_equivocation(verifier, ev.as_unverified(), network, signers).is_err() {
                 return false;
             }
         }
@@ -277,6 +289,8 @@ pub struct CertifiedBeaconBlockVerifyContext<'a> {
     /// `state.validators` down to the referenced subset; an evidence
     /// signer missing from this lookup rejects the block.
     pub equivocation_signers: &'a [(ValidatorId, ConsensusPublicKey)],
+    /// Scheme verifier the certificate checks run through.
+    pub verifier: &'a dyn Verifier,
 }
 
 /// Bind a block's committed proposals to the value its SPC cert
@@ -349,10 +363,16 @@ impl Verify<&CertifiedBeaconBlockVerifyContext<'_>> for CertifiedBeaconBlock {
         &self,
         ctx: &CertifiedBeaconBlockVerifyContext<'_>,
     ) -> Result<Verified<Self>, Self::Error> {
-        if !verify_certified(self, ctx.network, ctx.committee, ctx.active_pool) {
+        if !verify_certified(
+            ctx.verifier,
+            self,
+            ctx.network,
+            ctx.committee,
+            ctx.active_pool,
+        ) {
             return Err(CertifiedBeaconBlockVerifyError::BadCert);
         }
-        if !verify_block_equivocations(self, ctx.network, ctx.equivocation_signers) {
+        if !verify_block_equivocations(ctx.verifier, self, ctx.network, ctx.equivocation_signers) {
             return Err(CertifiedBeaconBlockVerifyError::BadEquivocationWitness);
         }
         // `Skip`/`Genesis` carry no proposals (pairing invariant) and
@@ -490,11 +510,13 @@ impl Describe<NoCustomTypeKind> for CertifiedBeaconBlock {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::bls_keypair_from_seed;
+
     use super::*;
     use crate::{
         AggregateSignature, BeaconBlockHash, BeaconProposal, Hash, PcQc2, PcQc3, PcSignerLengths,
         PcVector, PcXpProof, RatifyRound, SignerBitfield, SpcCert, SpcView, VRF_PROOF_BYTES,
-        ValidatorId, VrfProof, bls_keypair_from_seed, pk_from_bls,
+        ValidatorId, VrfProof, pk_from_bls,
     };
 
     fn proposal(seed: u8) -> BeaconProposal {

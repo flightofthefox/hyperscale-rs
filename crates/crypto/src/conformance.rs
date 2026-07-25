@@ -205,6 +205,7 @@ mod tests {
     /// Throwaway keyed-hash scheme, exercised only to prove the battery
     /// itself runs and discriminates. Not exported; the real mock lives
     /// in its own impl crate.
+    #[derive(Debug)]
     struct TestSigner {
         pk: ConsensusPublicKey,
     }
@@ -239,6 +240,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     struct TestVerifier;
 
     fn fold(sigs: &[ConsensusSignature]) -> AggregateSignature {

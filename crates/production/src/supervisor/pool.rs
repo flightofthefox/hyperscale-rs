@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use crossbeam::channel::{Sender, unbounded};
+use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::pool_loop::PoolLoop;
 use hyperscale_node::{SeatFollower, VnodeInit, seat_follower};
 use hyperscale_types::ValidatorId;
@@ -114,6 +115,7 @@ impl ShardSupervisor {
             None
         })?;
         Some(seat_follower(SeatFollower {
+            verifier: Arc::new(BlsVerifier),
             beacon_storage: self.process.beacon_storage().as_ref(),
             beacon_network: self.beacon_network.clone(),
             beacon_config_hash: self.beacon_config_hash,
