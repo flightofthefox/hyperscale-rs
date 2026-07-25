@@ -12,6 +12,7 @@ use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_beacon::genesis::build_genesis;
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+use hyperscale_crypto_mock::{MockSigner, MockVerifier};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{GenesisConfig, RadixExecutor, TransactionValidation};
 use hyperscale_mempool::MempoolConfig;
@@ -34,7 +35,7 @@ use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, ConsensusPublicKey, Epoch, GenesisConfigHash, GenesisValidators,
     LocalTimestamp, ShardId, Signer, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
-    ValidatorInfo, ValidatorSet, shard_prefix_path,
+    ValidatorInfo, ValidatorSet, Verifier, shard_prefix_path,
 };
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
@@ -48,6 +49,37 @@ use crate::event_queue::EventKey;
 pub mod membership;
 pub mod reshape;
 pub mod system_action;
+
+/// Consensus crypto scheme the simulated validators run.
+///
+/// Concrete choice at the runner, never a feature flag — mirrors the
+/// storage/dispatch/network seams. The production-harness ci sims run
+/// real BLS by construction and are the standing BLS integration
+/// canary, so protocol-logic suites default to the mock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CryptoScheme {
+    /// Deterministic keyed-hash mock — constant-cost sign/verify.
+    #[default]
+    Mock,
+    /// Real BLS12-381, for tests that target the signature path itself.
+    Bls,
+}
+
+/// The verifier `scheme` selects.
+fn scheme_verifier(scheme: CryptoScheme) -> Arc<dyn Verifier> {
+    match scheme {
+        CryptoScheme::Mock => Arc::new(MockVerifier),
+        CryptoScheme::Bls => Arc::new(BlsVerifier),
+    }
+}
+
+/// A deterministic signer for `seed` under `scheme`.
+fn scheme_signer(scheme: CryptoScheme, seed: &[u8; 32]) -> Arc<dyn Signer> {
+    match scheme {
+        CryptoScheme::Mock => Arc::new(MockSigner::from_seed(seed)),
+        CryptoScheme::Bls => Arc::new(BlsSigner::from_seed(seed)),
+    }
+}
 
 /// Cluster and transport configuration for a simulation.
 ///
@@ -85,6 +117,8 @@ pub struct SimConfig {
     pub jitter_fraction: f64,
     /// Packet loss rate (0.0 - 1.0).
     pub packet_loss_rate: f64,
+    /// Consensus crypto scheme every simulated validator runs.
+    pub crypto_scheme: CryptoScheme,
 }
 
 impl Default for SimConfig {
@@ -99,6 +133,7 @@ impl Default for SimConfig {
             cross_shard_latency: Duration::from_millis(150),
             jitter_fraction: 0.1,
             packet_loss_rate: 0.0,
+            crypto_scheme: CryptoScheme::default(),
         }
     }
 }
@@ -139,7 +174,18 @@ pub struct SimulationRunner {
 
     /// Signing keys for every registered validator, retained so a
     /// relocated vnode's state machine can be rebuilt on its new shard.
-    signing_keys: Vec<Arc<BlsSigner>>,
+    signing_keys: Vec<Arc<dyn Signer>>,
+
+    /// Scheme verifier every simulated coordinator runs, per
+    /// [`SimConfig::crypto_scheme`]. Cloned into runtime-built
+    /// coordinators and exposed for fixtures that must aggregate or
+    /// verify with the harness's own scheme.
+    verifier: Arc<dyn Verifier>,
+
+    /// Scheme the runner was configured with, retained so fixtures can
+    /// derive additional signers (e.g. registration scenarios) under
+    /// the same scheme.
+    crypto_scheme: CryptoScheme,
 
     /// Beacon genesis config hash, retained for runtime-built
     /// `BeaconCoordinator`s.
@@ -287,7 +333,9 @@ impl SimulationRunner {
         // `Pooled`, giving the shuffle refill stock) but run no host.
         let committee_size = network_config.shard_size;
         let registered_validators = committee_size + network_config.pool_surplus;
-        let signing_keys: Vec<Arc<BlsSigner>> = (0..registered_validators)
+        let crypto_scheme = network_config.crypto_scheme;
+        let verifier: Arc<dyn Verifier> = scheme_verifier(crypto_scheme);
+        let signing_keys: Vec<Arc<dyn Signer>> = (0..registered_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
                 let key_seed = seed
@@ -295,7 +343,7 @@ impl SimulationRunner {
                     .wrapping_mul(0x517c_c1b7_2722_0a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
                 seed_bytes[8..16].copy_from_slice(&u64::from(i).to_le_bytes());
-                Arc::new(BlsSigner::from_seed(&seed_bytes))
+                scheme_signer(crypto_scheme, &seed_bytes)
             })
             .collect();
         let public_keys: Vec<ConsensusPublicKey> =
@@ -370,12 +418,12 @@ impl SimulationRunner {
                     .map(|&idx| {
                         (
                             ValidatorId::new(u64::from(idx)),
-                            Arc::clone(&signing_keys[idx as usize]) as Arc<dyn Signer>,
+                            Arc::clone(&signing_keys[idx as usize]),
                         )
                     })
                     .collect();
                 vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
-                    verifier: Arc::new(BlsVerifier),
+                    verifier: Arc::clone(&verifier),
                     beacon_storage: beacon_storage.as_ref(),
                     beacon_network: beacon_network.clone(),
                     beacon_config_hash,
@@ -389,9 +437,9 @@ impl SimulationRunner {
                 }));
             }
             for &validator_idx in &plan.followers {
-                let signer = Arc::clone(&signing_keys[validator_idx as usize]) as Arc<dyn Signer>;
+                let signer = Arc::clone(&signing_keys[validator_idx as usize]);
                 vnode_inits.push(seat_follower(SeatFollower {
-                    verifier: Arc::new(BlsVerifier),
+                    verifier: Arc::clone(&verifier),
                     beacon_storage: beacon_storage.as_ref(),
                     beacon_network: beacon_network.clone(),
                     beacon_config_hash,
@@ -486,6 +534,8 @@ impl SimulationRunner {
             event_rxs,
             event_txs: host_event_txs,
             signing_keys,
+            verifier,
+            crypto_scheme,
             beacon_config_hash,
             beacon_network,
             pending_participation_changes: Vec::new(),
@@ -669,10 +719,29 @@ impl SimulationRunner {
     /// [`TestCommittee`](hyperscale_types::test_utils)'s keys would not match
     /// the seated committee.
     #[must_use]
-    pub fn validator_signing_key(&self, validator: ValidatorId) -> Option<Arc<BlsSigner>> {
+    pub fn validator_signing_key(&self, validator: ValidatorId) -> Option<Arc<dyn Signer>> {
         self.signing_keys
             .get(usize::try_from(validator.inner()).ok()?)
             .map(Arc::clone)
+    }
+
+    /// The scheme verifier every simulated coordinator runs — fixtures
+    /// that aggregate or pre-verify artifacts the cluster must accept
+    /// (e.g. forged fork proofs) go through this, not a hardcoded
+    /// scheme.
+    #[must_use]
+    pub fn verifier(&self) -> Arc<dyn Verifier> {
+        Arc::clone(&self.verifier)
+    }
+
+    /// Derive a fresh signer under the runner's configured scheme —
+    /// for scenario fixtures that mint keys outside the registered
+    /// validator set (e.g. validator-registration witnesses whose
+    /// possession proofs the beacon fold verifies with the cluster's
+    /// verifier).
+    #[must_use]
+    pub fn signer_from_seed(&self, seed: &[u8; 32]) -> Arc<dyn Signer> {
+        scheme_signer(self.crypto_scheme, seed)
     }
 
     /// Get a reference to the network.

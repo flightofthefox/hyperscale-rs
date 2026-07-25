@@ -11,6 +11,7 @@ ci = []
 
 [dependencies]
 hyperscale-crypto-bls.workspace = true
+hyperscale-crypto-mock.workspace = true
 arc-swap.workspace = true
 crossbeam.workspace = true
 hyperscale-beacon.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "hyperscale-crypto-mock"
+version.workspace = true
+edition.workspace = true
+description = "Deterministic hash-MAC implementation of the consensus crypto interface for simulation"
+
+[dependencies]
+blake3.workspace = true
+hyperscale-crypto.workspace = true
+
+[dev-dependencies]
+hyperscale-crypto = { workspace = true, features = ["test-utils"] }
+
+[lints]
+workspace = true

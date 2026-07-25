@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
-use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::shard::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
     halt_recovery_genesis_balances, halt_straddler_setup, intershard_partition_genesis_balances,
@@ -40,7 +39,7 @@ use hyperscale_storage::ShardChainReader;
 use hyperscale_types::test_utils::shard_fork_proof_signed_by;
 use hyperscale_types::{
     BlockHash, BlockHeight, NetworkDefinition, RecoveryCause, Round, ShardForkProof, ShardId,
-    Signer, Timeout,
+    Timeout,
 };
 use support::SimCluster;
 
@@ -330,12 +329,19 @@ fn shard_fork_drives_committee_recovery_sim() {
             .map(|v| {
                 runner
                     .validator_signing_key(*v)
-                    .expect("seated validator has a signing key") as Arc<dyn Signer>
+                    .expect("seated validator has a signing key")
             })
             .collect();
-        let proof = shard_fork_proof_signed_by(&keys, shard, BlockHeight::new(frozen + 1), wt);
+        let verifier = runner.verifier();
+        let proof = shard_fork_proof_signed_by(
+            verifier.as_ref(),
+            &keys,
+            shard,
+            BlockHeight::new(frozen + 1),
+            wt,
+        );
         proof
-            .verify(&BlsVerifier, schedule)
+            .verify(verifier.as_ref(), schedule)
             .expect("synthesized fork proof verifies against the live schedule");
         proof
     };

@@ -1594,16 +1594,27 @@ pub fn build_qc2(
     let xs: Vec<PcVector> = votes.iter().map(|v| v.x().clone()).collect();
     let x_p = mcp(&xs).expect("build_qc2 caller guarantees non-empty votes");
 
+    // Canonicalize to bitfield (committee-position) order — the
+    // verifier recomputes the aggregate in set-bit order, and
+    // order-sensitive schemes require the fold to match.
+    let mut ordered: Vec<(usize, &PcVote2)> = votes
+        .iter()
+        .map(|v2| {
+            let pos = committee
+                .iter()
+                .position(|(id, _)| *id == v2.validator())
+                .expect("vote-2 signer must be in committee");
+            (pos, *v2)
+        })
+        .collect();
+    ordered.sort_by_key(|(pos, _)| *pos);
+
     // Pull each signer's prefix sig at index |x_p| — covers x[..|x_p|]
     // = x_p (since every x extends x_p).
     let mut signers_bf = SignerBitfield::new(n);
-    let mut x_p_sigs: Vec<ConsensusSignature> = Vec::with_capacity(votes.len());
-    for v2 in votes {
-        let pos = committee
-            .iter()
-            .position(|(id, _)| *id == v2.validator())
-            .expect("vote-2 signer must be in committee");
-        signers_bf.set(pos);
+    let mut x_p_sigs: Vec<ConsensusSignature> = Vec::with_capacity(ordered.len());
+    for (pos, v2) in &ordered {
+        signers_bf.set(*pos);
         let sig = v2
             .prefix_sigs()
             .get(x_p.len())
@@ -1622,8 +1633,12 @@ pub fn build_qc2(
     let pi = build_xp_proof(verifier, votes, &x_p);
     let combined_sig = match &pi {
         PcXpProof::Full => {
-            let mut all_sigs = x_p_sigs;
-            for v2 in votes {
+            // Interleave `(sig(x_p), length_attestation)` per signer in
+            // bitfield order — exactly the recompute order
+            // `verify_qc2`'s Full arm walks.
+            let mut all_sigs = Vec::with_capacity(2 * ordered.len());
+            for (sig, (_, v2)) in x_p_sigs.iter().zip(&ordered) {
+                all_sigs.push(*sig);
                 all_sigs.push(v2.length_attestation());
             }
             verifier.aggregate(&all_sigs).expect("non-empty signers")

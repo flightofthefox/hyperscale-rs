@@ -21,7 +21,6 @@
 use std::sync::Arc;
 
 use hyperscale_core::ParticipationChange;
-use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_engine::GenesisConfig;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
@@ -298,7 +297,7 @@ impl SimulationRunner {
                 &self.signing_keys[usize::try_from(validator.inner()).expect("id fits usize")],
             ) as Arc<dyn Signer>;
             let init = seat_follower(SeatFollower {
-                verifier: Arc::new(BlsVerifier),
+                verifier: Arc::clone(&self.verifier),
                 beacon_storage: self.hosts[host as usize].beacon_storage().as_ref(),
                 beacon_network: self.beacon_network.clone(),
                 beacon_config_hash: self.beacon_config_hash,
@@ -416,7 +415,7 @@ impl SimulationRunner {
             &self.signing_keys[usize::try_from(validator.inner()).expect("id fits usize")],
         ) as Arc<dyn Signer>;
         seat_vnode_group(SeatVnodeGroup {
-            verifier: Arc::new(BlsVerifier),
+            verifier: Arc::clone(&self.verifier),
             beacon_storage: host.beacon_storage().as_ref(),
             beacon_network: self.beacon_network.clone(),
             beacon_config_hash: self.beacon_config_hash,

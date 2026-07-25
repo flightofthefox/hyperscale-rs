@@ -8,7 +8,7 @@ mod event_queue;
 mod runner;
 
 pub use runner::membership::JoinKind;
-pub use runner::{SimConfig, SimulationRunner};
+pub use runner::{CryptoScheme, SimConfig, SimulationRunner};
 
 /// Beacon epoch length the simulations run at.
 ///

@@ -495,13 +495,13 @@ pub fn build_ratify_cert(
 
     let pool_size = active_pool.len();
     let mut signers = SignerBitfield::new(pool_size);
-    let mut sigs = Vec::new();
+    let mut indexed: Vec<(usize, ConsensusSignature)> = Vec::with_capacity(votes.len());
     for vote in votes {
         if let Some(pos) = active_pool.iter().position(|(id, _)| *id == vote.signer())
             && !signers.is_set(pos)
         {
             signers.set(pos);
-            sigs.push(vote.sig());
+            indexed.push((pos, vote.sig()));
         }
     }
 
@@ -509,6 +509,11 @@ pub fn build_ratify_cert(
         return None;
     }
 
+    // Fold in bitfield (pool-position) order — the verifier recomputes
+    // the aggregate in set-bit order, and order-sensitive schemes
+    // require the fold to match.
+    indexed.sort_by_key(|(pos, _)| *pos);
+    let sigs: Vec<ConsensusSignature> = indexed.iter().map(|(_, sig)| *sig).collect();
     let aggregate_sig = verifier.aggregate(&sigs).ok()?;
     Some(RatifyCert::new(
         anchor_hash,

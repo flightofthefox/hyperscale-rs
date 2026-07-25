@@ -3,8 +3,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_types::{
-    BeaconState, BlockHeight, RoutableTransaction, ShardId, StateRoot, TransactionDecision,
+    BeaconState, BlockHeight, RoutableTransaction, ShardId, Signer, StateRoot, TransactionDecision,
     TransactionStatus, TxHash,
 };
 
@@ -63,6 +64,16 @@ pub trait Cluster {
     /// epoch length to size epoch-denominated vote leads.
     fn vote_fold_budget_ms(&self) -> u64 {
         5_000
+    }
+
+    /// Derive a deterministic signer under the cluster's own crypto
+    /// scheme — for fixtures that mint keys outside the hosted set
+    /// (e.g. validator-registration witnesses, whose possession proofs
+    /// the beacon fold verifies with the cluster's verifier). Defaults
+    /// to BLS, the production scheme; the sim harness overrides per its
+    /// configured scheme.
+    fn signer_from_seed(&self, seed: &[u8; 32]) -> Arc<dyn Signer> {
+        Arc::new(BlsSigner::from_seed(seed))
     }
 
     /// The status of `tx`, if any hosted mempool or execution still tracks it.

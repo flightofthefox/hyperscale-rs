@@ -15,9 +15,8 @@
 
 use std::sync::Arc;
 
-use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_types::{
-    BeaconWitnessEvent, ConsensusPublicKey, Signer, Stake, StakePoolId, UNBONDING_WINDOW_EPOCHS,
+    BeaconWitnessEvent, ConsensusPublicKey, Stake, StakePoolId, UNBONDING_WINDOW_EPOCHS,
     ValidatorId, ValidatorStatus, validator_possession_proof_sign,
 };
 use radix_common::network::NetworkDefinition;
@@ -53,27 +52,30 @@ fn submit_action<C: Cluster>(c: &mut C, nonce: u32, event: &BeaconWitnessEvent) 
     c.submit(Arc::new(tx));
 }
 
-/// A well-formed BLS pubkey for a registration. No host runs the registered
-/// validator, so any deterministic key serves.
-fn dummy_pubkey(seed: u8) -> ConsensusPublicKey {
-    BlsSigner::from_seed(&[seed; 32]).public_key()
+/// A well-formed consensus pubkey for a registration, derived under the
+/// cluster's own scheme. No host runs the registered validator, so any
+/// deterministic key serves.
+fn dummy_pubkey(c: &impl Cluster, seed: u8) -> ConsensusPublicKey {
+    c.signer_from_seed(&[seed; 32]).public_key()
 }
 
 /// A `RegisterValidator` event for `dummy_pubkey(seed)` under
 /// `validator_id`, carrying a genuine proof-of-possession — the fold
-/// rejects a registration whose proof does not verify.
+/// rejects a registration whose proof does not verify, so the signing
+/// scheme must be the cluster's own.
 fn dummy_registration(
+    c: &impl Cluster,
     seed: u8,
     pool_id: StakePoolId,
     validator_id: ValidatorId,
 ) -> BeaconWitnessEvent {
-    let keypair = BlsSigner::from_seed(&[seed; 32]);
+    let keypair = c.signer_from_seed(&[seed; 32]);
     BeaconWitnessEvent::RegisterValidator {
         pool_id,
         validator_id,
         pubkey: keypair.public_key(),
         possession_proof: validator_possession_proof_sign(
-            &keypair,
+            keypair.as_ref(),
             &NetworkDefinition::simulator(),
             validator_id,
         )
@@ -134,7 +136,7 @@ pub fn register_validator_pools_a_node(c: &mut impl Cluster) {
         "deposit never folded",
     );
 
-    submit_action(c, 2, &dummy_registration(9, pool, newcomer));
+    submit_action(c, 2, &dummy_registration(c, 9, pool, newcomer));
     assert!(
         c.run_until(epochs(8), |c| validator_status(c, newcomer)
             == Some(ValidatorStatus::Pooled)),
@@ -169,7 +171,7 @@ pub fn register_without_capacity_is_rejected(c: &mut impl Cluster) {
         "deposit never folded",
     );
 
-    submit_action(c, 2, &dummy_registration(11, pool, newcomer));
+    submit_action(c, 2, &dummy_registration(c, 11, pool, newcomer));
     // Run long enough that the registration has committed and folded; an
     // accepted one would surface within a couple of epochs.
     c.run_until(epochs(5), |_| false);
@@ -256,7 +258,7 @@ pub fn registered_validator_activates_onto_a_shard(c: &mut impl Cluster) {
     );
 
     // Register a new validator; with the committee full it parks in the pool.
-    submit_action(c, 2, &dummy_registration(9, GENESIS_POOL, newcomer));
+    submit_action(c, 2, &dummy_registration(c, 9, GENESIS_POOL, newcomer));
     assert!(
         c.run_until(epochs(8), |c| validator_status(c, newcomer)
             == Some(ValidatorStatus::Pooled)),
@@ -354,7 +356,7 @@ pub fn re_registration_of_a_live_validator_is_a_no_op(c: &mut impl Cluster) {
 
     let pool = StakePoolId::new(7777);
     let id = ValidatorId::new(1000);
-    let first = dummy_pubkey(9);
+    let first = dummy_pubkey(c, 9);
 
     submit_action(
         c,
@@ -369,7 +371,7 @@ pub fn re_registration_of_a_live_validator_is_a_no_op(c: &mut impl Cluster) {
         "deposit never folded",
     );
 
-    submit_action(c, 2, &dummy_registration(9, pool, id));
+    submit_action(c, 2, &dummy_registration(c, 9, pool, id));
     assert!(
         c.run_until(epochs(8), |c| validator_pubkey(c, id) == Some(first)),
         "validator never registered",
@@ -377,7 +379,7 @@ pub fn re_registration_of_a_live_validator_is_a_no_op(c: &mut impl Cluster) {
 
     // Re-register the same id with a different key; the id is dead for the life
     // of the chain, so the record keeps its first key.
-    submit_action(c, 3, &dummy_registration(99, pool, id));
+    submit_action(c, 3, &dummy_registration(c, 99, pool, id));
     c.run_until(epochs(5), |_| false);
     assert_eq!(
         validator_pubkey(c, id),
@@ -423,7 +425,7 @@ pub fn pool_capacity_caps_registrations(c: &mut impl Cluster) {
         submit_action(
             c,
             u32::from(offset) + 2,
-            &dummy_registration(20 + offset, pool, *id),
+            &dummy_registration(c, 20 + offset, pool, *id),
         );
     }
     assert!(

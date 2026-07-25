@@ -401,12 +401,27 @@ impl Verified<ExecutionCertificate> {
             .map(|v| v.tx_outcomes().to_vec())
             .expect("verified votes guarantee at least one with matching outcomes");
 
+        let committee_index: HashMap<ValidatorId, usize> = committee
+            .iter()
+            .enumerate()
+            .map(|(idx, &vid)| (vid, idx))
+            .collect();
+
         let mut seen_validators: std::collections::HashSet<ValidatorId> =
             std::collections::HashSet::new();
-        let unique_votes: Vec<&Verified<ExecutionVote>> = votes
+        let mut unique_votes: Vec<&Verified<ExecutionVote>> = votes
             .iter()
             .filter(|vote| seen_validators.insert(vote.validator()))
             .collect();
+        // Fold in bitfield (committee-position) order — the verifier
+        // recomputes the aggregate in set-bit order, and order-sensitive
+        // schemes require the fold to match.
+        unique_votes.sort_by_key(|vote| {
+            committee_index
+                .get(&vote.validator())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
 
         let signatures: Vec<ConsensusSignature> =
             unique_votes.iter().map(|vote| vote.signature()).collect();
@@ -417,12 +432,6 @@ impl Verified<ExecutionCertificate> {
                 .aggregate(&signatures)
                 .expect("aggregation of upstream-verified signatures cannot fail")
         };
-
-        let committee_index: HashMap<ValidatorId, usize> = committee
-            .iter()
-            .enumerate()
-            .map(|(idx, &vid)| (vid, idx))
-            .collect();
         let mut signers = SignerBitfield::new(committee.len());
         for vote in &unique_votes {
             if let Some(&idx) = committee_index.get(&vote.validator()) {

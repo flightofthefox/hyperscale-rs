@@ -611,11 +611,13 @@ pub(crate) fn certify_header(
 /// Unlike [`shard_fork_proof`], which signs with a self-contained
 /// [`TestCommittee`], this signs with caller-supplied keys — so a harness can
 /// forge a proof that authenticates against a *running* committee, whose keys
-/// a `TestCommittee` cannot reproduce. `wt` must resolve that committee in the
-/// verifier's schedule; sourcing it from the shard's committed-tip anchor
-/// timestamp guarantees it.
+/// a `TestCommittee` cannot reproduce. `verifier` must be the harness's own
+/// scheme (its aggregation builds the QCs the harness will re-verify). `wt`
+/// must resolve that committee in the verifier's schedule; sourcing it from
+/// the shard's committed-tip anchor timestamp guarantees it.
 #[must_use]
 pub fn shard_fork_proof_signed_by(
+    verifier: &dyn Verifier,
     committee_keys: &[Arc<dyn Signer>],
     shard: ShardId,
     height: BlockHeight,
@@ -625,14 +627,34 @@ pub fn shard_fork_proof_signed_by(
     let round_a = Round::new(height.inner().saturating_add(4));
     let round_b = Round::new(height.inner().saturating_add(6));
     ShardForkProof::ConflictingCommits {
-        a: live_commit_proof(committee_keys, shard, height, round_a, parent, wt, 1),
-        b: live_commit_proof(committee_keys, shard, height, round_b, parent, wt, 2),
+        a: live_commit_proof(
+            verifier,
+            committee_keys,
+            shard,
+            height,
+            round_a,
+            parent,
+            wt,
+            1,
+        ),
+        b: live_commit_proof(
+            verifier,
+            committee_keys,
+            shard,
+            height,
+            round_b,
+            parent,
+            wt,
+            2,
+        ),
     }
 }
 
 /// A direct-commit [`CommitProof`] whose two-chain is signed by
 /// `committee_keys` (all seats) at `wt`.
+#[allow(clippy::too_many_arguments)] // fixture internals; mirrors the proof's fields
 fn live_commit_proof(
+    verifier: &dyn Verifier,
     committee_keys: &[Arc<dyn Signer>],
     shard: ShardId,
     height: BlockHeight,
@@ -642,11 +664,13 @@ fn live_commit_proof(
     salt: u64,
 ) -> CommitProof {
     let block = live_certify(
+        verifier,
         committee_keys,
         live_fork_header(shard, height, round, parent, wt, salt),
         wt,
     );
     let child = live_certify(
+        verifier,
         committee_keys,
         live_fork_header(
             shard,
@@ -719,6 +743,7 @@ fn anchor_qc(shard: ShardId, wt: WeightedTimestamp) -> QuorumCertificate {
 /// (bitfield position `p` set to `committee_keys[p]`'s signature), stamped at
 /// `wt`, so the two-chain BLS-verifies against the seated committee.
 fn live_certify(
+    verifier: &dyn Verifier,
     committee_keys: &[Arc<dyn Signer>],
     header: BlockHeader,
     wt: WeightedTimestamp,
@@ -737,7 +762,7 @@ fn live_certify(
         .iter()
         .map(|k| k.sign(&msg).expect("sign"))
         .collect();
-    let agg = BlsVerifier.aggregate(&sigs).expect("aggregate");
+    let agg = verifier.aggregate(&sigs).expect("aggregate");
     let mut signer_bits = SignerBitfield::new(committee_keys.len());
     for p in 0..committee_keys.len() {
         signer_bits.set(p);

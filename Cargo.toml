@@ -5,6 +5,7 @@ members = [
     "crates/core",
     "crates/crypto",
     "crates/crypto-bls",
+    "crates/crypto-mock",
     "crates/dispatch",
     "crates/dispatch-pooled",
     "crates/dispatch-sync",
@@ -43,6 +44,7 @@ hyperscale-beacon = { path = "crates/beacon" }
 hyperscale-core = { path = "crates/core" }
 hyperscale-crypto = { path = "crates/crypto" }
 hyperscale-crypto-bls = { path = "crates/crypto-bls" }
+hyperscale-crypto-mock = { path = "crates/crypto-mock" }
 hyperscale-dispatch = { path = "crates/dispatch" }
 hyperscale-dispatch-pooled = { path = "crates/dispatch-pooled" }
 hyperscale-dispatch-sync = { path = "crates/dispatch-sync" }

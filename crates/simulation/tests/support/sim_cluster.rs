@@ -24,7 +24,7 @@ use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ReshapeThresholds, RoutableTransaction, ShardId,
-    StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    Signer, StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
 };
 use radix_common::math::Decimal;
 use radix_common::types::ComponentAddress;
@@ -215,6 +215,10 @@ fn host_index(host: usize) -> NodeIndex {
 }
 
 impl Cluster for SimCluster {
+    fn signer_from_seed(&self, seed: &[u8; 32]) -> Arc<dyn Signer> {
+        self.runner.signer_from_seed(seed)
+    }
+
     fn submit(&mut self, tx: Arc<RoutableTransaction>) {
         let host = self.host_for_tx(&tx).unwrap_or(0);
         self.runner.schedule_initial_event(
