@@ -44,8 +44,11 @@
 //! peer and dispatch pools.
 
 use std::fs;
+use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -641,11 +644,27 @@ fn load_or_generate_signer(key_path: Option<&PathBuf>) -> Result<BlsSigner> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, seed)?;
+        write_private_seed(path, &seed)
+            .with_context(|| format!("Failed to write key file: {}", path.display()))?;
         info!("Saved new keypair seed to {}", path.display());
 
         Ok(keypair)
     }
+}
+
+/// Write a freshly generated signing seed to `path`.
+///
+/// The file is created owner-only on unix: `fs::write` would take the
+/// process umask, which typically leaves private key material
+/// world-readable. Creation is exclusive, so a key that appeared since
+/// the existence check is an error rather than something to overwrite.
+fn write_private_seed(path: &Path, seed: &[u8; 32]) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)?.write_all(seed)?;
+    Ok(())
 }
 
 /// Build the genesis validators the runner projects the host's topology
@@ -1052,7 +1071,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
                 .to_string();
             let directory = log_file
                 .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
+                .unwrap_or_else(|| Path::new("."))
                 .to_path_buf();
 
             let file_appender = never(directory, file_name);
@@ -1331,6 +1350,32 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_key_file_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("validator.key");
+        let seed = [7u8; 32];
+
+        write_private_seed(&path, &seed).expect("write seed");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "key file must carry no group or other permissions, got {mode:o}"
+        );
+        assert_eq!(fs::read(&path).expect("read back").as_slice(), &seed);
+        assert!(
+            write_private_seed(&path, &[9u8; 32]).is_err(),
+            "an existing key must not be overwritten"
+        );
+    }
 
     #[test]
     fn test_for_core_count() {
