@@ -8,12 +8,11 @@
 
 use std::cell::RefCell;
 
-use hyperscale_simulation::SimConfig;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;
 
 use crate::event::ShardPath;
-use crate::session::Session;
+use crate::session::{Session, SessionConfig};
 
 thread_local! {
     static LAST_PANIC: RefCell<String> = const { RefCell::new(String::new()) };
@@ -43,16 +42,18 @@ pub struct DemoSession {
 
 #[wasm_bindgen]
 impl DemoSession {
-    /// Build a `shard_size`-validator cluster at `seed` and run genesis.
+    /// Build a `shard_size`-validator cluster at `seed`, grown to `shards`
+    /// leaves through the real split lifecycle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shards` is not a power of two, or if the grow misses its
+    /// epoch budget.
     #[wasm_bindgen(constructor)]
     #[must_use]
-    pub fn new(seed: u32, shard_size: u32) -> Self {
-        let config = SimConfig {
-            shard_size,
-            ..Default::default()
-        };
+    pub fn new(seed: u32, shard_size: u32, shards: u32) -> Self {
         Self {
-            inner: Session::new(&config, u64::from(seed)),
+            inner: Session::new(SessionConfig { shard_size, shards }, u64::from(seed)),
         }
     }
 

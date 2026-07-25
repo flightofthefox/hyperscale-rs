@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
-use hyperscale_simulation::{SimConfig, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    BlockHeight, ShardId, TimestampRange, TransactionDecision, TransactionStatus, TxHash,
-    WeightedTimestamp, build_transfer_tx,
+    BeaconChainConfig, BlockHeight, ReshapeThresholds, ShardId, TimestampRange,
+    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, build_transfer_tx,
 };
 use radix_common::crypto::Ed25519PrivateKey;
 use radix_common::math::Decimal;
@@ -54,6 +54,27 @@ const fn decision_label(decision: TransactionDecision) -> &'static str {
     }
 }
 
+/// How the cluster a session opens is shaped.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionConfig {
+    /// Validators per shard committee.
+    pub shard_size: u32,
+    /// Leaves to grow the topology to before the session opens. Must be a
+    /// power of two. Genesis is always a single ROOT shard, so anything
+    /// above one is reached the way the network reaches it — by splitting,
+    /// through the real reshape lifecycle.
+    pub shards: u32,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            shard_size: 4,
+            shards: 1,
+        }
+    }
+}
+
 /// A running simulation plus the watermarks of what has been reported.
 pub struct Session {
     runner: SimulationRunner,
@@ -71,17 +92,51 @@ pub struct Session {
 }
 
 impl Session {
-    /// Build a cluster at `seed`, fund [`ACCOUNTS`] accounts, and run genesis.
+    /// Build a cluster at `seed`, fund [`ACCOUNTS`] accounts, run genesis, and
+    /// grow to `config.shards` leaves.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.shards` is not a power of two, or if the grow misses
+    /// its epoch budget.
     #[must_use]
-    pub fn new(config: &SimConfig, seed: u64) -> Self {
-        let mut runner = SimulationRunner::new(config, seed);
+    pub fn new(config: SessionConfig, seed: u64) -> Self {
+        let splits = config.shards.saturating_sub(1);
+        let sim_config = SimConfig {
+            shard_size: config.shard_size,
+            // Each split staffs its children from the free pool, so the grow
+            // needs one spare cohort per split or the readiness gate never
+            // passes (INV-RESHAPE-1).
+            pool_surplus: splits * config.shard_size,
+            beacon_chain_config: Some(BeaconChainConfig {
+                shard_size: config.shard_size,
+                // The default five-minute epoch makes a split span thousands
+                // of blocks, which is minutes of boot before the page shows
+                // anything. The simulation's own epoch is the shortest value
+                // the recovery timeouts are still sized against.
+                epoch_duration_ms: EPOCH_MS,
+                // Arm the split trigger unconditionally: the demo grows on
+                // demand rather than waiting for a shard to outgrow a byte
+                // threshold in real time.
+                reshape_thresholds: ReshapeThresholds { split_bytes: 0 },
+                ..BeaconChainConfig::default()
+            }),
+            ..SimConfig::default()
+        };
+        let mut runner = SimulationRunner::new(&sim_config, seed);
         let balances: Vec<_> = (1..=ACCOUNTS)
             .map(|s| (account_from_seed(s), Decimal::from(100_000)))
             .collect();
         runner.initialize_genesis_with_balances(&balances);
+        if config.shards > 1 {
+            runner.grow_to(config.shards);
+        }
+        // The grow burns epochs, so the session's clock starts where the
+        // runner's actually is rather than at zero.
+        let now = runner.now();
         Self {
             runner,
-            now: Duration::ZERO,
+            now,
             reported_through: BTreeMap::new(),
             tracked: BTreeMap::new(),
             pending: Vec::new(),
@@ -160,15 +215,20 @@ impl Session {
         events
     }
 
-    /// Shards with at least one host serving them, in trie order.
+    /// The shards the topology currently partitions the keyspace into, in
+    /// trie order.
+    ///
+    /// Read from the beacon-derived topology rather than from what hosts
+    /// happen to store: a split parent's store is retained past its terminal
+    /// block so late joiners and counterparties can still resolve it
+    /// (INV-BEACON-8), so host storage lists shards that no longer exist.
+    /// The trie's leaves are the live partition by definition.
     #[must_use]
     pub fn live_shards(&self) -> Vec<ShardId> {
-        let mut shards: Vec<ShardId> = (0..self.runner.num_hosts())
-            .flat_map(|host| self.runner.hosted_shards_of(host))
-            .collect();
-        shards.sort_unstable();
-        shards.dedup();
-        shards
+        (0..self.runner.num_hosts())
+            .find_map(|host| self.runner.host_topology(host))
+            .map(|topology| topology.shard_trie().leaves().collect())
+            .unwrap_or_default()
     }
 
     /// Walk each shard's newly committed blocks and emit one event apiece.
@@ -185,11 +245,6 @@ impl Session {
         let mut watermarks: Vec<(ShardId, BlockHeight)> = Vec::new();
 
         for shard in self.live_shards() {
-            let reported = self
-                .reported_through
-                .get(&shard)
-                .map_or(0, |h| h.inner().max(1));
-
             // Hosts of one shard agree on committed content, so the first
             // one serving it answers for all of them.
             let Some(storage) =
@@ -198,6 +253,21 @@ impl Session {
                 continue;
             };
             let committed = storage.committed_height().inner();
+
+            // On first sight, start at the tip rather than replaying the
+            // chain: a split child seeds at its parent's terminal height, so
+            // its first height is wherever the parent stopped and heights
+            // below that were never its own. Recorded straight away so the
+            // next step resumes from here instead of treating the shard as
+            // new again and skipping ahead.
+            let reported = self.reported_through.get(&shard).map_or_else(
+                || {
+                    let start = committed.saturating_sub(1);
+                    watermarks.push((shard, BlockHeight::new(start)));
+                    start
+                },
+                |height| height.inner(),
+            );
 
             // The tip has no committing child yet, so stop one short of it.
             for height in (reported + 1)..committed {

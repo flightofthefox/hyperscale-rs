@@ -3,20 +3,18 @@
 //! Runs natively: the derivation is target independent, so the properties the
 //! browser depends on are checked without a wasm toolchain.
 
-use hyperscale_demo::{Session, ShardPath, TraceEvent, TraceKind};
-use hyperscale_simulation::SimConfig;
+use std::collections::BTreeMap;
+
+use hyperscale_demo::{Session, SessionConfig, ShardPath, TraceEvent, TraceKind};
 use hyperscale_types::ShardId;
 
-fn config() -> SimConfig {
-    SimConfig {
-        shard_size: 4,
-        ..Default::default()
-    }
+fn config() -> SessionConfig {
+    SessionConfig::default()
 }
 
 /// Drive a session for `steps` half-second steps, returning every event.
 fn run(seed: u64, steps: usize) -> Vec<TraceEvent> {
-    let mut session = Session::new(&config(), seed);
+    let mut session = Session::new(config(), seed);
     (0..steps).flat_map(|_| session.step(500)).collect()
 }
 
@@ -64,7 +62,7 @@ fn one_seed_replays_to_the_same_event_stream() {
 
 #[test]
 fn a_submitted_transfer_settles_and_reports_every_transition() {
-    let mut session = Session::new(&config(), 42);
+    let mut session = Session::new(config(), 42);
     let mut events = Vec::new();
 
     // Submit a few transfers early, then let them run to a terminal outcome.
@@ -119,6 +117,43 @@ fn a_submitted_transfer_settles_and_reports_every_transition() {
                 | TraceKind::TxStatusChanged { .. }
         )),
         "one shard means no cross-shard waves",
+    );
+}
+
+#[test]
+fn growing_to_two_shards_splits_the_root_into_its_children() {
+    let mut session = Session::new(
+        SessionConfig {
+            shards: 2,
+            ..SessionConfig::default()
+        },
+        42,
+    );
+
+    let shards: Vec<String> = session
+        .live_shards()
+        .into_iter()
+        .map(|s| ShardPath::from(s).0)
+        .collect();
+    assert_eq!(
+        shards,
+        vec!["0".to_string(), "1".to_string()],
+        "a grown topology is the root's two children, not the root",
+    );
+
+    // Both children must be producing blocks of their own, not merely seated.
+    let mut per_shard: BTreeMap<String, u32> = BTreeMap::new();
+    for _ in 0..40 {
+        for event in session.step(500) {
+            if let TraceKind::BlockCommitted { shard, .. } = event.kind {
+                *per_shard.entry(shard.0).or_default() += 1;
+            }
+        }
+    }
+    assert_eq!(per_shard.len(), 2, "both children commit blocks");
+    assert!(
+        per_shard.values().all(|n| *n > 3),
+        "each child runs its own chain, saw {per_shard:?}",
     );
 }
 
