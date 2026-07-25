@@ -1,2 +1,9 @@
 [env]
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+# secp256k1-sys ships its own wasm sysroot whose headers omit a `memmove`
+# declaration that current clang rejects. Only consulted when targeting wasm32.
+CFLAGS_wasm32_unknown_unknown = "-Wno-implicit-function-declaration"
+
+[target.wasm32-unknown-unknown]
+# getrandom needs its backend named at build time, not just feature-enabled.
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

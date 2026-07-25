@@ -6,6 +6,7 @@ members = [
     "crates/crypto",
     "crates/crypto-bls",
     "crates/crypto-mock",
+    "crates/demo",
     "crates/dispatch",
     "crates/dispatch-pooled",
     "crates/dispatch-sync",
@@ -45,6 +46,7 @@ hyperscale-core = { path = "crates/core" }
 hyperscale-crypto = { path = "crates/crypto" }
 hyperscale-crypto-bls = { path = "crates/crypto-bls" }
 hyperscale-crypto-mock = { path = "crates/crypto-mock" }
+hyperscale-demo = { path = "crates/demo" }
 hyperscale-dispatch = { path = "crates/dispatch" }
 hyperscale-dispatch-pooled = { path = "crates/dispatch-pooled" }
 hyperscale-dispatch-sync = { path = "crates/dispatch-sync" }
@@ -101,6 +103,7 @@ rand_chacha = "0.10.0"
 rayon = "1.12.0"
 rocksdb = "0.24.0"
 serde = { version = "1.0.229", features = ["derive"] }
+serde-wasm-bindgen = "0.6.5"
 serde_json = "1.0.151"
 strum = { version = "0.28.0", features = ["derive"] }
 tempfile = "3.27.0"
@@ -111,6 +114,7 @@ tracing = "0.1.44"
 tracing-opentelemetry = "0.33.0"
 tracing-subscriber = "0.3.23"
 tracing-test = "0.2.6"
+wasm-bindgen = "0.2.114"
 
 # Radix dependencies (github.com/hyperscalers/radixdlt-scrypto @ f7fcb1f62f)
 radix-common = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "f7fcb1f62f", default-features = false, features = ["std"] }
@@ -134,6 +138,14 @@ broken_intra_doc_links = "warn"
 invalid_codeblock_attributes = "warn"
 private_intra_doc_links = "allow"
 redundant_explicit_links = "warn"
+
+# Browser profile: the demo ships over the wire, so size beats compile time.
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
 
 # CI test profile: release-grade optimization so the simulation suite runs at
 # full speed, with debug assertions and overflow checks kept on.

@@ -1,0 +1,87 @@
+//! The event stream the viewer renders.
+//!
+//! These are presentation types, not wire types: they are `serde`-encoded to
+//! JavaScript values and never hashed, signed, or gossiped, so the ordered
+//! collection discipline the wire types carry does not apply here.
+
+use hyperscale_types::{BlockHeight, Round, ShardId};
+use serde::Serialize;
+
+/// One observation, stamped with the BFT-attested time it happened at.
+///
+/// `wt` is the canonical weighted timestamp — the value carried in the
+/// committing child's parent QC (INV-SHARD-6), never a served QC's stamp —
+/// so it is monotone along a chain and identical on every replica. It is the
+/// timeline's x-axis.
+#[derive(Debug, Clone, Serialize)]
+#[allow(missing_docs)] // `wt` is described above; `kind` is the payload
+pub struct TraceEvent {
+    pub wt: u64,
+    pub kind: TraceKind,
+}
+
+/// A shard's trie path as a bit string, most significant bit first — `""`
+/// for the root, `"1"` for its right child, `"10"` and `"11"` for that
+/// child's own children.
+///
+/// The viewer derives the whole topology from these: one path is another's
+/// parent exactly when it is a prefix of it, which is the same relation the
+/// keyspace partition uses. `ShardId`'s own `Display` is a debug rendering
+/// and carries no such structure.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShardPath(pub String);
+
+impl From<ShardId> for ShardPath {
+    fn from(shard: ShardId) -> Self {
+        let depth = shard.depth();
+        let path = shard.path();
+        let bits = (0..depth)
+            .rev()
+            .map(|bit| if path >> bit & 1 == 1 { '1' } else { '0' })
+            .collect();
+        Self(bits)
+    }
+}
+
+/// What was observed. Serialized tagged, so the viewer switches on `type`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+#[allow(missing_docs)] // payload fields; their names are the documentation
+pub enum TraceKind {
+    #[serde(rename_all = "camelCase")]
+    BlockCommitted {
+        shard: ShardPath,
+        height: u64,
+        round: u64,
+        /// A fallback block is an empty view-change recovery block: it
+        /// carries no payload and reuses its parent's timestamp, which is
+        /// why the timeline draws it differently from a normal block.
+        fallback: bool,
+        proposer: u64,
+        wave_count: u32,
+    },
+}
+
+impl TraceEvent {
+    pub(crate) fn block_committed(
+        wt: u64,
+        shard: ShardId,
+        height: BlockHeight,
+        round: Round,
+        fallback: bool,
+        proposer: u64,
+        wave_count: u32,
+    ) -> Self {
+        Self {
+            wt,
+            kind: TraceKind::BlockCommitted {
+                shard: shard.into(),
+                height: height.inner(),
+                round: round.inner(),
+                fallback,
+                proposer,
+                wave_count,
+            },
+        }
+    }
+}
