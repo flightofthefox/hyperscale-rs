@@ -21,5 +21,14 @@ radix-engine-interface.workspace = true
 radix-transactions.workspace = true
 radix-substate-store-interface.workspace = true
 
+# The engine requires exactly one substate cache backend. Moka reads a
+# monotonic clock when it builds the cache, which wasm32 does not provide,
+# so that target takes the LRU backend instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+radix-engine = { workspace = true, features = ["moka"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+radix-engine = { workspace = true, features = ["lru"] }
+
 [lints]
 workspace = true
