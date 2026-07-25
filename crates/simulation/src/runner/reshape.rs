@@ -66,7 +66,7 @@ impl SimulationRunner {
         let Some(topology_snapshot) = self.host_topology(host) else {
             return;
         };
-        let view = ReshapeView::new(&topology_snapshot);
+        let view = ReshapeView::new(&topology_snapshot, self.epoch_duration_ms);
         let mut orch = std::mem::take(&mut self.reshape[host as usize]);
         let mut broadcasted: HashSet<ValidatorId> = HashSet::new();
         // Last slice's not-yet-committed block fetches re-arm their sequencers

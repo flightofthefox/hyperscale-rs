@@ -26,8 +26,8 @@ use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
     BlockHash, BlockHeight, NetworkDefinition, ReadySignal, ShardAnchor, ShardId, SignError,
-    Signer, StateRoot, StoredReceipt, ValidatorId, ready_signal_message, ready_signal_window,
-    shard_prefix_path,
+    Signer, StateRoot, StoredReceipt, ValidatorId, WeightedTimestamp, ready_signal_message,
+    ready_signal_window, shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
@@ -242,6 +242,25 @@ pub enum TailOutcome {
     Rejected(&'static str),
 }
 
+/// The parent's terminal block, recognised by a follower as it passes.
+///
+/// A block `B` is the terminal crossing when its parent QC sits at or
+/// before the cut and the QC certifying `B` sits past it. The certifying
+/// QC used here is the *canonical* one — carried as the `parent_qc` of
+/// `B`'s committed child, the next block the follow accepts — never the
+/// QC served alongside `B`, which may be a higher-round re-certification
+/// from the parent's coast and stamps a different weighted timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSighting {
+    /// Height of the terminal block.
+    pub height: BlockHeight,
+    /// Hash of the terminal block.
+    pub hash: BlockHash,
+    /// The canonical weighted timestamp certifying it — the child clock's
+    /// start anchor.
+    pub canonical_wt: WeightedTimestamp,
+}
+
 /// Sans-io tail-follower keeping an observer's synced child store
 /// current with the splitting parent's chain.
 ///
@@ -270,6 +289,15 @@ pub struct ObserverTail {
     last_hash: BlockHash,
     /// Next parent height to fetch.
     next: BlockHeight,
+    /// The parent's scheduled cut, once the beacon has published one.
+    /// `None` while the split is admitted but unscheduled.
+    terminal_cut: Option<WeightedTimestamp>,
+    /// The previously accepted block, as `(height, hash, its parent QC's
+    /// weighted timestamp)`. The crossing test for a block needs the QC
+    /// that certifies it, which only arrives with the next block.
+    prev: Option<(BlockHeight, BlockHash, WeightedTimestamp)>,
+    /// The terminal block, once the follow has walked past it.
+    terminal: Option<TerminalSighting>,
     /// The store's root after the last application (the imported root
     /// until the first one).
     root: StateRoot,
@@ -305,7 +333,24 @@ impl ObserverTail {
             in_flight: false,
             pending: None,
             apply_in_flight: false,
+            terminal_cut: None,
+            prev: None,
+            terminal: None,
         }
+    }
+
+    /// Publish the parent's scheduled cut, so the follow can recognise the
+    /// terminal crossing as it walks past it. Idempotent — the driver
+    /// re-supplies it every step, and a scheduled cut never moves.
+    pub const fn set_terminal_cut(&mut self, cut: Option<WeightedTimestamp>) {
+        self.terminal_cut = cut;
+    }
+
+    /// The parent's terminal block, once the follow has walked one block
+    /// past it. `None` until then.
+    #[must_use]
+    pub const fn terminal(&self) -> Option<TerminalSighting> {
+        self.terminal
     }
 
     /// The next block fetch, when none is outstanding and nothing is
@@ -353,6 +398,25 @@ impl ObserverTail {
                 pair.right
             }
         });
+        // This block's parent QC is the canonical certificate over its
+        // predecessor, so accepting it is what decides whether that
+        // predecessor was the terminal crossing: the predecessor's own
+        // parent QC sits at or before the cut, and this one past it.
+        let parent_qc_wt = header.parent_qc().weighted_timestamp();
+        if let Some(cut) = self.terminal_cut
+            && self.terminal.is_none()
+            && let Some((height, hash, prev_parent_qc_wt)) = self.prev
+            && prev_parent_qc_wt.as_millis() <= cut.as_millis()
+            && parent_qc_wt.as_millis() > cut.as_millis()
+        {
+            self.terminal = Some(TerminalSighting {
+                height,
+                hash,
+                canonical_wt: parent_qc_wt,
+            });
+        }
+        self.prev = Some((header.height(), certified.block().hash(), parent_qc_wt));
+
         self.pending = Some(PendingFollow {
             height: header.height(),
             receipts,

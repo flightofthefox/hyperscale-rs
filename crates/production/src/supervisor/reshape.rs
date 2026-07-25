@@ -126,7 +126,7 @@ impl ShardSupervisor {
     /// otherwise race the reshape duty for the shard's store directory.
     pub(super) fn reshape_owns(&self, shard: ShardId) -> bool {
         let topology_snapshot = self.process.topology_snapshot().load_full();
-        let view = ReshapeView::new(&topology_snapshot);
+        let view = ReshapeView::new(&topology_snapshot, self.epoch_duration_ms);
         host_reshape_owns(
             view.parent_half_cohorts(),
             view.observer_cohorts(),
@@ -144,7 +144,7 @@ impl ShardSupervisor {
         self.resume_pending_reshape_prep();
         let requests = {
             let topology_snapshot = self.process.topology_snapshot().load_full();
-            let view = ReshapeView::new(&topology_snapshot);
+            let view = ReshapeView::new(&topology_snapshot, self.epoch_duration_ms);
             self.reshape.step(&view, events)
         };
         for request in requests {
