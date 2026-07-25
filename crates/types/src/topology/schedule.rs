@@ -55,10 +55,11 @@ pub struct TopologySchedule {
 pub enum SplitAtBoundary {
     /// No split lands at the end of this window — definitive.
     No,
-    /// The window has an admitted split pending and the next window's
-    /// entry hasn't committed locally, so whether the split executes at
-    /// this boundary is genuinely unknown yet. Transient: defer and
-    /// retry once the local beacon catches up.
+    /// The schedule doesn't hold the window the timestamp resolves —
+    /// evicted below the retention floor, or ahead of the newest entry.
+    /// An admitted reshape never lands here: its cut is scheduled a
+    /// window ahead, so the window's own entry decides. Transient only
+    /// insofar as the schedule can still gain the entry.
     Unresolved,
     /// The shard's final epoch: the trie replaces it with these children
     /// at the next boundary.

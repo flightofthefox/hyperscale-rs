@@ -799,10 +799,15 @@ impl ShardCoordinator {
 
     /// Whether a header keyed at `wt` carries `split_child_roots` — the
     /// split-pending shard's final-epoch delivery, identical on the
-    /// build side (carry) and the vote side (required). `None` when the
-    /// window's verdict is locally unresolvable yet
-    /// ([`SplitAtBoundary::Unresolved`]); callers defer and retry once
-    /// the local beacon catches up.
+    /// build side (carry) and the vote side (required).
+    ///
+    /// `None` only when the schedule doesn't hold `wt`'s window at all
+    /// ([`SplitAtBoundary::Unresolved`]). An admitted split no longer
+    /// defers: its cut is scheduled a window ahead, so the window's own
+    /// frozen projection answers. The committee lookup succeeding is not
+    /// enough to rule this out — it resolves the window by `epoch_for`
+    /// while the predicate steps back to the closing window at a boundary
+    /// instant, so the two can want different entries.
     fn split_child_roots_bit(
         &self,
         topology_schedule: &TopologySchedule,
@@ -820,8 +825,7 @@ impl ShardCoordinator {
     /// child's final epoch), identical on the build side (carry) and the
     /// vote side (required). Broader than [`Self::split_child_roots_bit`]: a
     /// merge child terminates without carrying `split_child_roots`. `None`
-    /// when the window's verdict is locally unresolvable yet; callers defer
-    /// and retry once the local beacon catches up.
+    /// under that helper's retention condition, and only that one.
     fn settled_waves_root_bit(
         &self,
         topology_schedule: &TopologySchedule,
@@ -834,10 +838,9 @@ impl ShardCoordinator {
     /// epoch before terminating — a split *or* a merge — anchored on the
     /// proposer's tip. `None` in steady state, so the proposer's quiesce
     /// filter is inert away from a reshape boundary. The cut is the end of
-    /// the tip's epoch window. An unresolved boundary (the local beacon
-    /// hasn't seen the next window yet) yields `None`: the abort backstop
-    /// covers any straddler this lets through, so quiescing on a guess buys
-    /// nothing.
+    /// the tip's epoch window. A window the schedule no longer holds also
+    /// yields `None`: the abort backstop covers any straddler this lets
+    /// through, so quiescing on a guess buys nothing.
     #[must_use]
     pub fn quiesce_cut(&self, topology_schedule: &TopologySchedule) -> Option<QuiesceCut> {
         let now_wt = self.tip_anchor_ts();
@@ -1702,19 +1705,20 @@ impl ShardCoordinator {
             return vec![];
         };
         // The final-epoch headers of a splitting shard carry the root
-        // node's child hashes; the window predicate keys on the same
-        // schedule entry as the committee. Whether this window is the
-        // final one is unknowable until the local beacon commits the
-        // fold that decides it — stall the build (before the witness
-        // preview drains the ready-signal pool) rather than guess a
-        // header replicas would reject.
+        // node's child hashes. Whether this window is the final one is
+        // decided by the window's own frozen schedule entry, so a reshape
+        // in flight resolves here without waiting on the local beacon.
+        // Only a window the schedule has evicted leaves it unanswerable —
+        // stall the build (before the witness preview drains the
+        // ready-signal pool) rather than guess a header replicas would
+        // reject.
         let Some(carry_split_child_roots) =
             self.split_child_roots_bit(topology_schedule, parent_qc.weighted_timestamp())
         else {
             trace!(
                 validator = ?self.me,
                 height = height.inner(),
-                "Split-at-boundary unresolved at proposal; deferring until the beacon catches up"
+                "Split-at-boundary window missing from the schedule; deferring the build"
             );
             return vec![];
         };
@@ -1724,7 +1728,7 @@ impl ShardCoordinator {
             trace!(
                 validator = ?self.me,
                 height = height.inner(),
-                "Termination-at-boundary unresolved at proposal; deferring until the beacon catches up"
+                "Termination-at-boundary window missing from the schedule; deferring the build"
             );
             return vec![];
         };
@@ -2646,10 +2650,11 @@ impl ShardCoordinator {
             };
 
             // Whether this window requires the header's split-child-root
-            // pair is decided by the fold that starts it — locally
-            // unresolvable until that beacon commit lands. Defer the vote
-            // like a missing committee (the block stays pending) rather
-            // than judge the header against a guess.
+            // pair is decided by the window's own frozen schedule entry,
+            // so the voter and the proposer read the same answer without
+            // either waiting on a beacon fold. A window the schedule has
+            // evicted defers the vote like a missing committee (the block
+            // stays pending) rather than judging the header on a guess.
             let Some(split_child_roots_required) = self.split_child_roots_bit(
                 topology_schedule,
                 block.header().parent_qc().weighted_timestamp(),
@@ -2657,7 +2662,7 @@ impl ShardCoordinator {
                 trace!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
-                    "Split-at-boundary unresolved at vote; deferring until the beacon catches up"
+                    "Split-at-boundary window missing from the schedule; deferring the vote"
                 );
                 return vec![];
             };
@@ -2668,7 +2673,7 @@ impl ShardCoordinator {
                 trace!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
-                    "Termination-at-boundary unresolved at vote; deferring until the beacon catches up"
+                    "Termination-at-boundary window missing from the schedule; deferring the vote"
                 );
                 return vec![];
             };
@@ -5685,7 +5690,7 @@ impl ShardCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use hyperscale_core::Action;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
@@ -5862,7 +5867,7 @@ mod tests {
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             Vec::new(),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -5977,7 +5982,7 @@ mod tests {
                 LocalReceiptRoot::ZERO,
                 ProvisionsRoot::ZERO,
                 Vec::new(),
-                std::collections::BTreeMap::new(),
+                BTreeMap::new(),
                 InFlightCount::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -6036,7 +6041,7 @@ mod tests {
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             Vec::new(),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -6175,7 +6180,7 @@ mod tests {
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             Vec::new(),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -6224,7 +6229,7 @@ mod tests {
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             Vec::new(),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -6383,7 +6388,7 @@ mod tests {
                 LocalReceiptRoot::ZERO,
                 ProvisionsRoot::ZERO,
                 Vec::new(),
-                std::collections::BTreeMap::new(),
+                BTreeMap::new(),
                 InFlightCount::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -6437,7 +6442,7 @@ mod tests {
                 LocalReceiptRoot::ZERO,
                 ProvisionsRoot::ZERO,
                 Vec::new(),
-                std::collections::BTreeMap::new(),
+                BTreeMap::new(),
                 InFlightCount::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -6516,7 +6521,7 @@ mod tests {
                 LocalReceiptRoot::ZERO,
                 ProvisionsRoot::ZERO,
                 Vec::new(),
-                std::collections::BTreeMap::new(),
+                BTreeMap::new(),
                 InFlightCount::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -9337,11 +9342,17 @@ mod tests {
                 public_key: k.public_key(),
             })
             .collect();
-        let final_window = Arc::new(TopologySnapshot::new(
-            NetworkDefinition::simulator(),
-            1,
-            ValidatorSet::new(validators.clone()),
-        ));
+        // The cut is carried by the final window's own entry, scheduled
+        // there by an earlier fold — the boundary predicates read it
+        // rather than comparing tries.
+        let final_window = Arc::new(
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                1,
+                ValidatorSet::new(validators.clone()),
+            )
+            .with_scheduled_terminals(BTreeMap::from([(ShardId::ROOT, Epoch::new(0))])),
+        );
         let post_split = Arc::new(TopologySnapshot::new(
             NetworkDefinition::simulator(),
             2,
@@ -9389,11 +9400,20 @@ mod tests {
                 public_key: k.public_key(),
             })
             .collect();
-        let pre_merge = Arc::new(TopologySnapshot::new(
-            NetworkDefinition::simulator(),
-            2,
-            ValidatorSet::new(validators.clone()),
-        ));
+        // Both children carry the same cut — a merge terminates them on
+        // one boundary.
+        let (left, right) = ShardId::ROOT.children();
+        let pre_merge = Arc::new(
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                2,
+                ValidatorSet::new(validators.clone()),
+            )
+            .with_scheduled_terminals(BTreeMap::from([
+                (left, Epoch::new(0)),
+                (right, Epoch::new(0)),
+            ])),
+        );
         let post_merge = Arc::new(TopologySnapshot::new(
             NetworkDefinition::simulator(),
             1,
@@ -9744,7 +9764,7 @@ mod tests {
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             Vec::new(),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             InFlightCount::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
