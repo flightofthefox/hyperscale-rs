@@ -28,6 +28,12 @@ jobs:
         run: cargo fmt --all --check
       - name: Cargo Clippy
         run: cargo clippy --no-deps -- -D warnings
+      - name: No Mock Crypto In Production
+        run: |
+          if cargo tree -p hyperscale-production -e normal | grep -q hyperscale-crypto-mock; then
+            echo "hyperscale-crypto-mock reached a non-dev dependency path of hyperscale-production"
+            exit 1
+          fi
 
   build-tests:
     name: Build Test Archive
