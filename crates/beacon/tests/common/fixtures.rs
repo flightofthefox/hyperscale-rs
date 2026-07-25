@@ -1,6 +1,8 @@
 //! Deterministic fixtures — committees keyed off a seed, plus PC
 //! signing-context builders.
 
+use std::sync::Arc;
+
 use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_types::{
     ConsensusPublicKey, Epoch, PcContext, Signer, SpcView, ValidatorId, pc_context, spc_context,
@@ -10,8 +12,9 @@ use hyperscale_types::{
 /// from a `(test_seed, validator_id)` pair so each test gets a stable
 /// set of keypairs without persistent fixture files.
 pub struct Committee {
-    /// Per-validator BLS signers, indexed positionally.
-    pub keys: Vec<BlsSigner>,
+    /// Per-validator BLS signers, indexed positionally. Shared handles so
+    /// sims can hand a signer to a coordinator without duplicating the key.
+    pub keys: Vec<Arc<BlsSigner>>,
     /// Per-validator `(ValidatorId, public_key)` pairs, indexed
     /// positionally and in the same order as `keys`. Suitable for
     /// passing straight into the PC verifier API.
@@ -33,10 +36,17 @@ impl Committee {
             let sk = BlsSigner::from_seed(&bytes);
             let id = ValidatorId::new(i as u64);
             let pk = sk.public_key();
-            keys.push(sk);
+            keys.push(Arc::new(sk));
             members.push((id, pk));
         }
         Self { keys, members }
+    }
+
+    /// Shared signer handles, indexed positionally alongside
+    /// [`members`](Self::members).
+    #[must_use]
+    pub fn signers(&self) -> Vec<Arc<BlsSigner>> {
+        self.keys.clone()
     }
 
     /// Number of members.

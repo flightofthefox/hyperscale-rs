@@ -17,6 +17,15 @@ use libp2p::PeerId;
 use libp2p::identity::Keypair;
 use libp2p::identity::ed25519::{Keypair as Ed25519Keypair, SecretKey};
 
+/// Mixing constant for this fixture's consensus-key derivation.
+///
+/// Deliberately different from the one `hyperscale_types::TestCommittee`
+/// uses: the two fixtures are independent families, and the same
+/// `(seed, index)` must not name the same key in both. Keeping the
+/// constants distinct makes that separation visible instead of resting
+/// on a one-line difference in how many seed bytes each writes.
+const KEY_DERIVATION_MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+
 /// Generate `num_validators` deterministic BLS (consensus) and Ed25519
 /// (libp2p) keypairs from `seed`, on independent derivation paths.
 fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<Arc<BlsSigner>>, Vec<Keypair>) {
@@ -25,7 +34,7 @@ fn derive_keypairs(seed: u64, num_validators: u32) -> (Vec<Arc<BlsSigner>>, Vec<
             let mut seed_bytes = [0u8; 32];
             let key_seed = seed
                 .wrapping_add(u64::from(i))
-                .wrapping_mul(0x517c_c1b7_2722_0a95);
+                .wrapping_mul(KEY_DERIVATION_MIX);
             seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
             seed_bytes[8..16].copy_from_slice(&u64::from(i).to_le_bytes());
             Arc::new(BlsSigner::from_seed(&seed_bytes))

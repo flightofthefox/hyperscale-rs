@@ -8,30 +8,23 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+use hyperscale_crypto_bls::BlsVerifier;
+pub use hyperscale_crypto_bls::{
+    public_key_from_u64_seed as pubkey, signer_from_u64_seed as keypair,
+};
 use hyperscale_types::{
     AggregateSignature, BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount,
-    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, CertificateRoot, ConsensusPublicKey,
-    ConsensusSignature, Epoch, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR,
-    NetworkDefinition, PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp, ProvisionsRoot,
-    QuorumCertificate, Round, ShardCommittee, ShardEpochContribution, ShardId,
-    ShardVoteEquivocation, ShardWitness, ShardWitnessPayload, ShardWitnessProof, Signer,
-    SignerBitfield, SlotEffects, Stake, StakePool, StakePoolId, StateRoot, TransactionRoot,
-    ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp,
-    compute_merkle_root_with_proof, validator_possession_proof_sign, vrf_sign,
+    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, CertificateRoot, ConsensusSignature,
+    Epoch, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition,
+    PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
+    Round, ShardCommittee, ShardEpochContribution, ShardId, ShardVoteEquivocation, ShardWitness,
+    ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SlotEffects, Stake, StakePool,
+    StakePoolId, StateRoot, TransactionRoot, ValidatorId, ValidatorRecord, ValidatorStatus,
+    VrfProof, WeightedTimestamp, compute_merkle_root_with_proof, validator_possession_proof_sign,
+    vrf_sign,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
-
-pub fn keypair(seed: u64) -> BlsSigner {
-    let mut s = [0u8; 32];
-    s[..8].copy_from_slice(&seed.to_le_bytes());
-    BlsSigner::from_seed(&s)
-}
-
-pub fn pubkey(seed: u64) -> ConsensusPublicKey {
-    keypair(seed).public_key()
-}
 
 pub fn net() -> NetworkDefinition {
     NetworkDefinition::simulator()

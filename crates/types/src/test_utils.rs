@@ -194,6 +194,13 @@ impl std::fmt::Debug for TestCommittee {
     }
 }
 
+/// Mixing constant for this fixture's consensus-key derivation.
+///
+/// Deliberately different from the one `hyperscale-network-libp2p`'s
+/// test fixtures use: the two are independent families, and the same
+/// `(seed, index)` must not name the same key in both.
+const KEY_DERIVATION_MIX: u64 = 0x517c_c1b7_2722_0a95;
+
 impl TestCommittee {
     /// Create a new test committee with the given size and seed.
     ///
@@ -208,9 +215,7 @@ impl TestCommittee {
         for i in 0..size {
             // Generate deterministic seed for this validator
             let mut seed_bytes = [0u8; 32];
-            let key_seed = seed
-                .wrapping_add(i as u64)
-                .wrapping_mul(0x517c_c1b7_2722_0a95);
+            let key_seed = seed.wrapping_add(i as u64).wrapping_mul(KEY_DERIVATION_MIX);
             seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
             seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
             seed_bytes[16..24].copy_from_slice(&seed.to_le_bytes());

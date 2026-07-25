@@ -17,6 +17,8 @@ use hyperscale_types::{
     PcVote3, Signer, SpcView, ValidatorId, Verified, pc_context, spc_context,
 };
 
+use super::fixtures::Committee;
+
 /// One pending message in the network: a vote event addressed to a
 /// specific party.
 struct Envelope {
@@ -41,16 +43,9 @@ impl PcSim {
     #[must_use]
     pub fn new(n: usize, seed: u64, epoch: Epoch, view: SpcView) -> Self {
         let network = NetworkDefinition::simulator();
-        let mut sks = Vec::with_capacity(n);
-        let mut members = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut bytes = [0u8; 32];
-            bytes[..8].copy_from_slice(&seed.to_le_bytes());
-            bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
-            let sk = BlsSigner::from_seed(&bytes);
-            members.push((ValidatorId::new(i as u64), sk.public_key()));
-            sks.push(Arc::new(sk));
-        }
+        let committee = Committee::new(n, seed);
+        let members = committee.members.clone();
+        let sks = committee.signers();
         let instances: Vec<PcInstance> = (0..n)
             .map(|_| PcInstance::new(Arc::new(BlsVerifier), epoch, view, members.clone()))
             .collect();

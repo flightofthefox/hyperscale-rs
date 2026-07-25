@@ -1680,17 +1680,10 @@ impl BeaconState {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto::Signer;
-    use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_crypto_bls::public_key_from_u64_seed;
 
     use super::*;
     use crate::{Hash, JailReason};
-
-    fn pubkey(seed: u64) -> ConsensusPublicKey {
-        let mut s = [0u8; 32];
-        s[..8].copy_from_slice(&seed.to_le_bytes());
-        BlsSigner::from_seed(&s).public_key()
-    }
 
     fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> ValidatorRecord {
         ValidatorRecord {
@@ -1698,7 +1691,7 @@ mod tests {
             pool: StakePoolId::new(pool),
             status,
             registered_at_epoch: Epoch::GENESIS,
-            pubkey: pubkey(id),
+            pubkey: public_key_from_u64_seed(id),
         }
     }
 

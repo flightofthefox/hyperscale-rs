@@ -2645,16 +2645,7 @@ mod tests {
 
     use super::*;
     use crate::genesis::build_genesis_beacon_state;
-
-    fn keypair(seed: u64) -> BlsSigner {
-        let mut s = [0u8; 32];
-        s[..8].copy_from_slice(&seed.to_le_bytes());
-        BlsSigner::from_seed(&s)
-    }
-
-    fn pubkey(seed: u64) -> ConsensusPublicKey {
-        keypair(seed).public_key()
-    }
+    use crate::state::test_fixtures::{keypair, pubkey};
 
     /// 4 validators, all on the beacon committee, all placed on the ROOT
     /// genesis shard.

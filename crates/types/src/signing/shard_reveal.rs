@@ -88,7 +88,7 @@ pub fn shard_reveal_verify(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_crypto_bls::{BlsVerifier, signer_from_u64_seed};
 
     use super::*;
     use crate::signing::beacon_vrf::DOMAIN_PC_VRF;
@@ -97,12 +97,6 @@ mod tests {
 
     fn net() -> NetworkDefinition {
         NetworkDefinition::simulator()
-    }
-
-    fn signer(seed: u64) -> BlsSigner {
-        let mut s = [0u8; 32];
-        s[..8].copy_from_slice(&seed.to_le_bytes());
-        BlsSigner::from_seed(&s)
     }
 
     /// Pins the byte layout of `shard_reveal_message`. Any change to the
@@ -171,7 +165,7 @@ mod tests {
 
     #[test]
     fn shard_reveal_sign_verify_round_trip() {
-        let signer = signer(3);
+        let signer = signer_from_u64_seed(3);
         let proof = shard_reveal_sign(&signer, &net(), ShardId::leaf(1, 1), BlockHeight::new(42))
             .expect("sign");
         assert!(shard_reveal_verify(
@@ -188,7 +182,7 @@ mod tests {
     /// replicas. A re-proposal at the same `(shard, height)` is byte-identical.
     #[test]
     fn shard_reveal_sign_is_deterministic() {
-        let signer = signer(7);
+        let signer = signer_from_u64_seed(7);
         let a = shard_reveal_sign(&signer, &net(), ShardId::leaf(1, 0), BlockHeight::new(100))
             .expect("sign");
         let b = shard_reveal_sign(&signer, &net(), ShardId::leaf(1, 0), BlockHeight::new(100))
@@ -201,8 +195,8 @@ mod tests {
     /// value is bound to the signer's key, so a proposer can't lift another's.
     #[test]
     fn shard_reveal_verify_rejects_cross_party() {
-        let signer_a = signer(3);
-        let signer_b = signer(4);
+        let signer_a = signer_from_u64_seed(3);
+        let signer_b = signer_from_u64_seed(4);
         let proof = shard_reveal_sign(&signer_a, &net(), ShardId::leaf(1, 0), BlockHeight::new(42))
             .expect("sign");
         assert!(!shard_reveal_verify(
@@ -218,7 +212,7 @@ mod tests {
     /// A reveal for height N doesn't verify against height M ≠ N.
     #[test]
     fn shard_reveal_verify_rejects_wrong_height() {
-        let signer = signer(3);
+        let signer = signer_from_u64_seed(3);
         let proof = shard_reveal_sign(&signer, &net(), ShardId::leaf(1, 0), BlockHeight::new(42))
             .expect("sign");
         assert!(!shard_reveal_verify(
@@ -234,7 +228,7 @@ mod tests {
     /// A reveal for shard S doesn't verify against shard T ≠ S.
     #[test]
     fn shard_reveal_verify_rejects_wrong_shard() {
-        let signer = signer(3);
+        let signer = signer_from_u64_seed(3);
         let proof = shard_reveal_sign(&signer, &net(), ShardId::leaf(1, 0), BlockHeight::new(42))
             .expect("sign");
         assert!(!shard_reveal_verify(
@@ -252,7 +246,7 @@ mod tests {
     /// signature check is the whole predicate.
     #[test]
     fn shard_reveal_verify_rejects_tampered_proof() {
-        let signer = signer(3);
+        let signer = signer_from_u64_seed(3);
         let proof = shard_reveal_sign(&signer, &net(), ShardId::leaf(1, 0), BlockHeight::new(42))
             .expect("sign");
         let mut bytes = *proof.as_bytes();

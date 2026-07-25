@@ -425,7 +425,7 @@ impl RatifyTracker {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, signer_from_u64_seed};
     use hyperscale_types::{Hash, NetworkDefinition, Signer, verify_ratify_cert};
 
     use super::*;
@@ -434,17 +434,11 @@ mod tests {
         NetworkDefinition::simulator()
     }
 
-    fn signing_key(seed: u64) -> BlsSigner {
-        let mut s = [0u8; 32];
-        s[..8].copy_from_slice(&seed.to_le_bytes());
-        BlsSigner::from_seed(&s)
-    }
-
     fn pool(n: u64) -> (Vec<(ValidatorId, ConsensusPublicKey)>, Vec<BlsSigner>) {
         let mut active = Vec::new();
         let mut keys = Vec::new();
         for i in 0..n {
-            let sk = signing_key(i);
+            let sk = signer_from_u64_seed(i);
             active.push((ValidatorId::new(i), sk.public_key()));
             keys.push(sk);
         }

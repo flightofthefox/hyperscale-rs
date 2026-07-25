@@ -13,6 +13,8 @@ mod signer;
 mod verifier;
 
 pub use keys::{bls_keypair_from_seed, generate_bls_keypair};
+#[cfg(any(test, feature = "test-utils"))]
+pub use keys::{public_key_from_u64_seed, signer_from_u64_seed};
 pub use radix_common::crypto::{Bls12381G1PrivateKey, Bls12381G1PublicKey};
 pub use signer::BlsSigner;
 pub use verifier::BlsVerifier;

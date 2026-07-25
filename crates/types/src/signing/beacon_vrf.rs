@@ -72,7 +72,7 @@ pub fn vrf_verify(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::BlsVerifier;
+    use hyperscale_crypto_bls::{BlsVerifier, signer_from_u64_seed};
 
     use super::*;
     use crate::signing::{DOMAIN_PC_EMPTY_VIEW, DOMAIN_PC_VOTE1};
@@ -134,17 +134,9 @@ mod tests {
 
     // ─── sign / verify round trip and adversarial cases ──────────────────
 
-    use hyperscale_crypto_bls::BlsSigner;
-
-    fn signer(seed: u64) -> BlsSigner {
-        let mut s = [0u8; 32];
-        s[..8].copy_from_slice(&seed.to_le_bytes());
-        BlsSigner::from_seed(&s)
-    }
-
     #[test]
     fn vrf_sign_verify_round_trip() {
-        let signer = signer(3);
+        let signer = signer_from_u64_seed(3);
         let proof = vrf_sign(&signer, &net(), Epoch::new(42)).expect("sign");
         assert!(vrf_verify(
             &BlsVerifier,
@@ -158,7 +150,7 @@ mod tests {
     /// Deterministic: same inputs → same proof across replicas.
     #[test]
     fn vrf_sign_is_deterministic() {
-        let signer = signer(7);
+        let signer = signer_from_u64_seed(7);
         let a = vrf_sign(&signer, &net(), Epoch::new(100)).expect("sign");
         let b = vrf_sign(&signer, &net(), Epoch::new(100)).expect("sign");
         assert_eq!(a, b);
@@ -167,8 +159,8 @@ mod tests {
     /// A reveal from party A doesn't verify under party B's pubkey.
     #[test]
     fn vrf_verify_rejects_cross_party() {
-        let signer_a = signer(3);
-        let signer_b = signer(4);
+        let signer_a = signer_from_u64_seed(3);
+        let signer_b = signer_from_u64_seed(4);
         let proof = vrf_sign(&signer_a, &net(), Epoch::new(42)).expect("sign");
         assert!(!vrf_verify(
             &BlsVerifier,
@@ -183,7 +175,7 @@ mod tests {
     /// is bound into the signing message.
     #[test]
     fn vrf_verify_rejects_wrong_slot() {
-        let signer = signer(3);
+        let signer = signer_from_u64_seed(3);
         let proof = vrf_sign(&signer, &net(), Epoch::new(42)).expect("sign");
         assert!(!vrf_verify(
             &BlsVerifier,
@@ -199,7 +191,7 @@ mod tests {
     /// the epoch matches.
     #[test]
     fn vrf_verify_rejects_cross_network() {
-        let signer = signer(3);
+        let signer = signer_from_u64_seed(3);
         let proof = vrf_sign(&signer, &NetworkDefinition::mainnet(), Epoch::new(42)).expect("sign");
         assert!(!vrf_verify(
             &BlsVerifier,
@@ -215,7 +207,7 @@ mod tests {
     /// proof's signature check is the whole predicate.
     #[test]
     fn vrf_verify_rejects_tampered_proof() {
-        let signer = signer(3);
+        let signer = signer_from_u64_seed(3);
         let proof = vrf_sign(&signer, &net(), Epoch::new(42)).expect("sign");
         let mut bytes = *proof.as_bytes();
         bytes[0] ^= 1;

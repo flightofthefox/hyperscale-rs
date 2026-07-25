@@ -19,21 +19,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_beacon::state::{ApplyEpochInput, apply_epoch};
-use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+use hyperscale_crypto_bls::{BlsVerifier, public_key_from_u64_seed};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, ConsensusPublicKey, Epoch, MIN_STAKE_FLOOR, NetworkDefinition,
-    Randomness, ShardCommittee, ShardId, Signer, Stake, StakePool, StakePoolId, ValidatorId,
-    ValidatorRecord, ValidatorStatus,
+    BeaconChainConfig, BeaconState, Epoch, MIN_STAKE_FLOOR, NetworkDefinition, Randomness,
+    ShardCommittee, ShardId, Stake, StakePool, StakePoolId, ValidatorId, ValidatorRecord,
+    ValidatorStatus,
 };
 
 const V: usize = 3;
 const EPOCHS: u64 = 50;
-
-fn pubkey(seed: u64) -> ConsensusPublicKey {
-    let mut s = [0u8; 32];
-    s[..8].copy_from_slice(&seed.to_le_bytes());
-    BlsSigner::from_seed(&s).public_key()
-}
 
 /// Initial state: 10 validators in one pool — 8 placed `OnShard` ready
 /// across two shards of capacity 4, 2 sitting `Pooled` so the shuffle
@@ -74,7 +68,7 @@ fn initial_state() -> BeaconState {
                 pool: pool_id,
                 status,
                 registered_at_epoch: Epoch::GENESIS,
-                pubkey: pubkey(i),
+                pubkey: public_key_from_u64_seed(i),
             },
         );
         pool_validators.insert(id);

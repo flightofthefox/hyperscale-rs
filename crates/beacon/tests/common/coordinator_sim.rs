@@ -37,6 +37,8 @@ use hyperscale_types::{
     sign_vote1, sign_vote2, sign_vote3, spc_context, vrf_sign,
 };
 
+use super::fixtures::Committee;
+
 /// Adversarial transform a flagged replica applies to its next matching
 /// outbound action. Each variant fires once, then clears.
 #[derive(Clone, Debug)]
@@ -123,7 +125,7 @@ enum SimEvent {
 pub struct CoordinatorSim {
     pub coordinators: Vec<BeaconCoordinator>,
     pub members: Vec<(ValidatorId, ConsensusPublicKey)>,
-    sks: Vec<BlsSigner>,
+    sks: Vec<Arc<BlsSigner>>,
     network: NetworkDefinition,
     /// Per-replica committed (block, state) tuples, ordered by capture
     /// time. One push per `Action::CommitBeaconBlock` the replica
@@ -201,17 +203,9 @@ impl CoordinatorSim {
         assert!(committee_n <= pool_n);
         let network = NetworkDefinition::simulator();
 
-        let mut sks = Vec::with_capacity(pool_n);
-        let mut members = Vec::with_capacity(pool_n);
-        for i in 0..pool_n {
-            let mut bytes = [0u8; 32];
-            bytes[..8].copy_from_slice(&seed.to_le_bytes());
-            bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
-            let sk = BlsSigner::from_seed(&bytes);
-            let id = ValidatorId::new(i as u64);
-            members.push((id, sk.public_key()));
-            sks.push(sk);
-        }
+        let committee = Committee::new(pool_n, seed);
+        let members = committee.members.clone();
+        let sks = committee.signers();
 
         let pool_id = StakePoolId::new(0);
         let chain_config = BeaconChainConfig {
@@ -540,7 +534,7 @@ impl CoordinatorSim {
             .iter()
             .enumerate()
             .map(|(idx, validator)| {
-                let sk = &self.sks[self.idx_of(*validator)];
+                let sk = self.sks[self.idx_of(*validator)].as_ref();
                 let vote = BlockVote::new(
                     &self.network,
                     b_hash,
@@ -907,7 +901,7 @@ impl CoordinatorSim {
                 if let Some(extra) = self.pending_vote_equivocations.remove(&epoch) {
                     vote_equivocations.extend(extra);
                 }
-                let sk = &self.sks[emitter_idx];
+                let sk = self.sks[emitter_idx].as_ref();
                 let vrf_proof = vrf_sign(sk, &self.network, epoch).expect("sign");
                 let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
                     boundary_qcs,
@@ -988,7 +982,7 @@ impl CoordinatorSim {
             } => {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
                 let vote = sign_vote1(
-                    &self.sks[emitter_idx],
+                    self.sks[emitter_idx].as_ref(),
                     me,
                     &self.network,
                     &pc_ctx,
@@ -1009,7 +1003,7 @@ impl CoordinatorSim {
                     self.byzantine_fires[emitter_idx] += 1;
                     let conflicting_v_in = perturb_pc_vector(&v_in);
                     let conflicting_vote = sign_vote1(
-                        &self.sks[emitter_idx],
+                        self.sks[emitter_idx].as_ref(),
                         me,
                         &self.network,
                         &pc_ctx,
@@ -1026,8 +1020,14 @@ impl CoordinatorSim {
                 recipients,
             } => {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
-                let vote = sign_vote2(&self.sks[emitter_idx], me, &self.network, &pc_ctx, *qc1)
-                    .expect("sign");
+                let vote = sign_vote2(
+                    self.sks[emitter_idx].as_ref(),
+                    me,
+                    &self.network,
+                    &pc_ctx,
+                    *qc1,
+                )
+                .expect("sign");
                 self.queue_pc_vote2(emitter_idx, me, &recipients, view, Box::new(vote));
             }
             Action::SignAndBroadcastPcVote3 {
@@ -1037,8 +1037,14 @@ impl CoordinatorSim {
                 recipients,
             } => {
                 let pc_ctx = pc_context(&spc_context(epoch), view);
-                let vote = sign_vote3(&self.sks[emitter_idx], me, &self.network, &pc_ctx, *qc2)
-                    .expect("sign");
+                let vote = sign_vote3(
+                    self.sks[emitter_idx].as_ref(),
+                    me,
+                    &self.network,
+                    &pc_ctx,
+                    *qc2,
+                )
+                .expect("sign");
                 self.queue_pc_vote3(emitter_idx, me, &recipients, view, Box::new(vote));
             }
             Action::SignAndBroadcastEmptyView {
@@ -1049,7 +1055,7 @@ impl CoordinatorSim {
             } => {
                 let spc_ctx = spc_context(epoch);
                 let verified = Verified::<SpcEmptyViewMsg>::sign_local(
-                    &self.sks[emitter_idx],
+                    self.sks[emitter_idx].as_ref(),
                     me,
                     &self.network,
                     &spc_ctx,
@@ -1147,7 +1153,7 @@ impl CoordinatorSim {
                 phase,
                 block_hash,
             } => {
-                let sk = &self.sks[emitter_idx];
+                let sk = self.sks[emitter_idx].as_ref();
                 let signer = self.members[emitter_idx].0;
                 let verified = Verified::<RatifyVote>::sign_local(
                     sk,

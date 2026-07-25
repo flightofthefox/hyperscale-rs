@@ -839,7 +839,7 @@ impl Verified<CandidateBeaconBlock> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, signer_from_u64_seed};
 
     use super::*;
     use crate::Hash;
@@ -856,17 +856,11 @@ mod tests {
         BeaconBlockHash::from_raw(Hash::from_bytes(b"block"))
     }
 
-    fn signing_key(seed: u64) -> BlsSigner {
-        let mut s = [0u8; 32];
-        s[..8].copy_from_slice(&seed.to_le_bytes());
-        BlsSigner::from_seed(&s)
-    }
-
     fn pool(n: u64) -> (Vec<(ValidatorId, ConsensusPublicKey)>, Vec<BlsSigner>) {
         let mut active = Vec::new();
         let mut keys = Vec::new();
         for i in 0..n {
-            let sk = signing_key(i);
+            let sk = signer_from_u64_seed(i);
             active.push((ValidatorId::new(i), sk.public_key()));
             keys.push(sk);
         }
@@ -957,7 +951,7 @@ mod tests {
     #[test]
     fn verify_ratify_vote_rejects_unknown_signer() {
         let (active, _keys) = pool(4);
-        let outsider = signing_key(99);
+        let outsider = signer_from_u64_seed(99);
         let vote = sign_ratify_vote(
             &outsider,
             ValidatorId::new(99),

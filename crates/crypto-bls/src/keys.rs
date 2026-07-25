@@ -33,6 +33,33 @@ pub fn bls_keypair_from_seed(seed: &[u8; 32]) -> Bls12381G1PrivateKey {
     Bls12381G1PrivateKey::from_bytes(&sk_bytes).expect("valid BLS scalar bytes")
 }
 
+/// Deterministic seeded-key fixtures shared across the workspace's test
+/// suites, so the same integer names the same key in every crate.
+#[cfg(any(test, feature = "test-utils"))]
+mod fixtures {
+    use hyperscale_crypto::{ConsensusPublicKey, Signer};
+
+    use crate::BlsSigner;
+
+    /// Derive a signer from a small integer, widened into the seed space
+    /// as little-endian bytes in the low 8 positions with the rest zero.
+    #[must_use]
+    pub fn signer_from_u64_seed(seed: u64) -> BlsSigner {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        BlsSigner::from_seed(&bytes)
+    }
+
+    /// Public key of [`signer_from_u64_seed`] for the same integer.
+    #[must_use]
+    pub fn public_key_from_u64_seed(seed: u64) -> ConsensusPublicKey {
+        signer_from_u64_seed(seed).public_key()
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use fixtures::{public_key_from_u64_seed, signer_from_u64_seed};
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -389,20 +389,15 @@ fn validate_beacon_committee(config: &BeaconGenesisConfig, validator_ids: &BTree
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
-        BeaconChainConfig, ConsensusPublicKey, GenesisPool, GenesisValidator, MAX_VOTE_VECTOR_LEN,
-        NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness, Signer,
+        BeaconChainConfig, GenesisPool, GenesisValidator, MAX_VOTE_VECTOR_LEN, NetworkDefinition,
+        PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness,
     };
 
     use super::*;
+    use crate::state::test_fixtures::pubkey;
     use crate::state::{ApplyEpochInput, apply_epoch};
-
-    fn pubkey(seed: u64) -> ConsensusPublicKey {
-        let mut s = [0u8; 32];
-        s[..8].copy_from_slice(&seed.to_le_bytes());
-        BlsSigner::from_seed(&s).public_key()
-    }
 
     /// Build a single-pool, single-shard config with `n_validators`,
     /// the first `n_shard_members` placed on the ROOT genesis shard and

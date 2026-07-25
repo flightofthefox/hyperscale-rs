@@ -256,16 +256,9 @@ pub fn genesis_config_hash(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_crypto::Signer;
-    use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_crypto_bls::public_key_from_u64_seed;
 
     use super::*;
-
-    fn pubkey(seed: u64) -> ConsensusPublicKey {
-        let mut s = [0u8; 32];
-        s[..8].copy_from_slice(&seed.to_le_bytes());
-        BlsSigner::from_seed(&s).public_key()
-    }
 
     fn sample_config() -> BeaconGenesisConfig {
         let pool_id = StakePoolId::new(0);
@@ -273,7 +266,7 @@ mod tests {
             .map(|i| GenesisValidator {
                 id: ValidatorId::new(i),
                 pool: pool_id,
-                pubkey: pubkey(i),
+                pubkey: public_key_from_u64_seed(i),
             })
             .collect();
         let members: Vec<ValidatorId> = (0u64..4).map(ValidatorId::new).collect();
@@ -387,7 +380,7 @@ mod tests {
         assert_ne!(genesis_config_hash(&diff_pool_stake, &net()), base_hash);
 
         let mut diff_pubkey = base;
-        diff_pubkey.initial_validators[0].pubkey = pubkey(99);
+        diff_pubkey.initial_validators[0].pubkey = public_key_from_u64_seed(99);
         assert_ne!(genesis_config_hash(&diff_pubkey, &net()), base_hash);
     }
 

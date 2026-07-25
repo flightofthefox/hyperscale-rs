@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 description = "BLS12-381 implementation of the consensus crypto interface"
 
+[features]
+# Exposes the deterministic seeded-key fixtures for other crates' test suites.
+test-utils = []
+
 [dependencies]
 blst.workspace = true
 hyperscale-crypto.workspace = true

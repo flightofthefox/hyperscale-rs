@@ -41,4 +41,4 @@ pub use epoch::{ApplyEpochInput, apply_epoch, apply_input_for};
 pub use pool::pool_draw;
 
 #[cfg(test)]
-mod test_fixtures;
+pub(crate) mod test_fixtures;

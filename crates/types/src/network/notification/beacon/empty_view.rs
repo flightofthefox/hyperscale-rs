@@ -95,7 +95,7 @@ impl NetworkMessage for SpcEmptyViewMsgNotification {
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto::Signer;
-    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_crypto_bls::{BlsVerifier, signer_from_u64_seed};
     use sbor::prelude::*;
 
     use super::*;
@@ -138,12 +138,6 @@ mod tests {
         }
     }
 
-    fn signing_key(seed: u64) -> BlsSigner {
-        let mut s = [0u8; 32];
-        s[..8].copy_from_slice(&seed.to_le_bytes());
-        BlsSigner::from_seed(&s)
-    }
-
     /// Build a notification whose inner empty-view is signed by
     /// `signer_key_seed`'s key but claims `claimed_signer` as the signer
     /// id. Honest when the two match; a forged-signer relay when they
@@ -159,7 +153,7 @@ mod tests {
             proof: sample_pc_qc3().into(),
         };
         let msg = sign_empty_view_msg(
-            &signing_key(signer_key_seed),
+            &signer_from_u64_seed(signer_key_seed),
             ValidatorId::new(claimed_signer),
             &NetworkDefinition::simulator(),
             &spc_context(epoch),
@@ -194,7 +188,7 @@ mod tests {
     #[test]
     fn signed_signature_verifies_under_signer_key() {
         let n = signed_notification(Epoch::new(7), 2, 2);
-        let pk = signing_key(2).public_key();
+        let pk = signer_from_u64_seed(2).public_key();
         assert!(
             n.verify_signature(&SignedContext {
                 verifier: &BlsVerifier,
@@ -212,7 +206,7 @@ mod tests {
     #[test]
     fn signed_signature_rejects_forged_signer() {
         let n = signed_notification(Epoch::new(7), 99, 2);
-        let honest_pk = signing_key(2).public_key();
+        let honest_pk = signer_from_u64_seed(2).public_key();
         assert_eq!(
             n.verify_signature(&SignedContext {
                 verifier: &BlsVerifier,
@@ -230,7 +224,7 @@ mod tests {
     fn signed_signature_is_epoch_bound() {
         let mut n = signed_notification(Epoch::new(7), 2, 2);
         n.epoch = Epoch::new(8);
-        let pk = signing_key(2).public_key();
+        let pk = signer_from_u64_seed(2).public_key();
         assert_eq!(
             n.verify_signature(&SignedContext {
                 verifier: &BlsVerifier,

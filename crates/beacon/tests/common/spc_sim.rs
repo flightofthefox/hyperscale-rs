@@ -18,6 +18,8 @@ use hyperscale_types::{
     SpcCert, SpcEmptyViewMsg, SpcView, ValidatorId, Verified, pc_context, spc_context,
 };
 
+use super::fixtures::Committee;
+
 /// One pending event in the network: an `SpcEvent` addressed to a
 /// specific party.
 struct Envelope {
@@ -80,16 +82,9 @@ impl SpcSim {
     #[must_use]
     pub fn new(n: usize, seed: u64, epoch: Epoch, view_timeout: Duration) -> Self {
         let network = NetworkDefinition::simulator();
-        let mut sks = Vec::with_capacity(n);
-        let mut members = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut bytes = [0u8; 32];
-            bytes[..8].copy_from_slice(&seed.to_le_bytes());
-            bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
-            let sk = BlsSigner::from_seed(&bytes);
-            members.push((ValidatorId::new(i as u64), sk.public_key()));
-            sks.push(Arc::new(sk));
-        }
+        let committee = Committee::new(n, seed);
+        let members = committee.members.clone();
+        let sks = committee.signers();
         let instances: Vec<SpcInstance> = (0..n)
             .map(|i| {
                 SpcInstance::new(
