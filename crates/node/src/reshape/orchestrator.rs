@@ -26,7 +26,7 @@ use hyperscale_types::network::request::{GetBlockRequest, GetStateRangeRequest};
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, NetworkDefinition, QuorumCertificate,
-    ShardAnchor, ShardId, StateRoot, StoredReceipt, ValidatorId, Verifier,
+    ShardAnchor, ShardId, StateRoot, StoredReceipt, ValidatorId, Verifier, WeightedTimestamp,
 };
 
 use crate::bootstrap::{BootstrapRequest, ShardBootstrap, StateRangeOutcome};
@@ -340,16 +340,66 @@ impl KeeperHalf {
             terminal_requested: false,
         }
     }
+
+    /// A half whose terminal the keeper already recognised on the child's
+    /// own chain, so its span assembles against that terminal rather than
+    /// against whichever crossing the beacon last anchored.
+    fn recognized(child: ShardId, sighting: &TerminalSighting) -> Self {
+        let header = &sighting.header;
+        Self {
+            child,
+            bootstrap: Box::new(ShardBootstrap::state_only(child, terminal_anchor(header))),
+            terminal: Some((header.clone(), sighting.canonical_qc.clone())),
+            terminal_requested: true,
+        }
+    }
+}
+
+/// One child's terminal walk in a keeper's merge duty: the follow that
+/// finds which of the child's blocks ends its chain, applying nothing.
+struct KeeperRecognition {
+    child: ShardId,
+    tail: Box<ObserverTail>,
+    /// The terminal once found and commit-proven. Retained so the proof
+    /// is verified once rather than on every advance the sibling half
+    /// still has to catch up over.
+    proven: Option<TerminalSighting>,
+}
+
+/// The anchor a recognised terminal stands in for — the record the beacon
+/// writes for that same block when its contribution folds an epoch later.
+/// Mirrors `record_boundaries`' field-for-field construction, so a half
+/// assembled against it verifies exactly as one assembled against the
+/// beacon's.
+fn terminal_anchor(header: &BlockHeader) -> ShardAnchor {
+    ShardAnchor {
+        state_root: header.state_root(),
+        block_hash: header.hash(),
+        height: header.height(),
+        weighted_timestamp: header.parent_qc().weighted_timestamp(),
+        witness_base: header.beacon_witness_base(),
+        settled_waves_root: header.settled_waves_root(),
+    }
 }
 
 /// One keeper's progress through its merge duty, keyed by the parent it reforms.
 enum KeeperPhase {
-    /// Re-asserting ready until the parent composes.
+    /// Re-asserting ready until the cut is in reach.
     ReassertingReady,
-    /// The parent composed; collecting both halves and terminals, deriving the
+    /// Walking both children's chains to find the terminals that end them,
+    /// so the parent reforms at the cut rather than an epoch later when the
+    /// beacon composes its anchor. Applies nothing — the merged store is
+    /// built from the halves' spans in `Building`.
+    Recognizing {
+        left: Box<KeeperRecognition>,
+        right: Box<KeeperRecognition>,
+    },
+    /// Both terminals in hand; collecting both halves' spans, deriving the
     /// merged genesis, and finalizing the staged union.
     Building {
-        parent_anchor: ShardAnchor,
+        /// The instant the children terminate at, and the merged chain's
+        /// clock anchor.
+        cut_wt: WeightedTimestamp,
         left: Box<KeeperHalf>,
         right: Box<KeeperHalf>,
         derived: Option<(ChainOrigin, Box<Block>)>,
@@ -441,6 +491,22 @@ struct ParentHalfDuty {
 }
 
 /// The keeper half `from` addresses, when it is one of the duty's children.
+/// The recognition walk covering `from`, when a keeper is still finding
+/// its children's terminals.
+fn recognition_for<'a>(
+    left: &'a mut KeeperRecognition,
+    right: &'a mut KeeperRecognition,
+    from: ShardId,
+) -> Option<&'a mut KeeperRecognition> {
+    if left.child == from {
+        Some(left)
+    } else if right.child == from {
+        Some(right)
+    } else {
+        None
+    }
+}
+
 fn half_for<'a>(
     left: &'a mut KeeperHalf,
     right: &'a mut KeeperHalf,
@@ -514,7 +580,7 @@ impl ReshapeOrchestrator {
         }
         let parents: Vec<ShardId> = self.keepers.keys().copied().collect();
         for parent in parents {
-            self.advance_keeper(parent, view, &mut requests);
+            self.advance_keeper(parent, view, verifier, &mut requests);
         }
         let halves: Vec<ShardId> = self.parent_halves.keys().copied().collect();
         for child in halves {
@@ -634,15 +700,24 @@ impl ReshapeOrchestrator {
                 (ObserverPhase::FetchingTerminal { requested, .. }, _) => *requested = false,
                 _ => {}
             }
-        } else if let Some(keeper) = self.keepers.get_mut(&duty)
-            && let KeeperPhase::Building { left, right, .. } = &mut keeper.phase
-            && let Some(half) = half_for(left, right, from)
-        {
-            match kind {
-                FetchKind::StateRange { sub_range, .. } => {
-                    half.bootstrap.on_state_range_failure(sub_range);
+        } else if let Some(keeper) = self.keepers.get_mut(&duty) {
+            match &mut keeper.phase {
+                KeeperPhase::Recognizing { left, right } => {
+                    if let Some(half) = recognition_for(left, right, from) {
+                        half.tail.on_failure();
+                    }
                 }
-                FetchKind::Block { .. } => half.terminal_requested = false,
+                KeeperPhase::Building { left, right, .. } => {
+                    if let Some(half) = half_for(left, right, from) {
+                        match kind {
+                            FetchKind::StateRange { sub_range, .. } => {
+                                half.bootstrap.on_state_range_failure(sub_range);
+                            }
+                            FetchKind::Block { .. } => half.terminal_requested = false,
+                        }
+                    }
+                }
+                _ => {}
             }
         } else if let Some(half) = self.parent_halves.get_mut(&duty) {
             match &mut half.phase {
@@ -676,6 +751,14 @@ impl ReshapeOrchestrator {
         let Some(keeper) = self.keepers.get_mut(&parent) else {
             return;
         };
+        if let KeeperPhase::Recognizing { left, right } = &mut keeper.phase {
+            if let FetchedKind::Block { response } = &kind
+                && let Some(half) = recognition_for(left, right, from)
+            {
+                half.tail.on_response(response);
+            }
+            return;
+        }
         let KeeperPhase::Building { left, right, .. } = &mut keeper.phase else {
             return;
         };
@@ -924,7 +1007,7 @@ impl ReshapeOrchestrator {
                 {
                     tracing::info!(
                         ?child,
-                        terminal_height = sighting.height.inner(),
+                        terminal_height = sighting.header.height().inner(),
                         "flipping the split child from its own follow of the parent"
                     );
                     duty.adopted_genesis = Some(derived.block.hash());
@@ -1061,6 +1144,7 @@ impl ReshapeOrchestrator {
         &mut self,
         parent: ShardId,
         view: &ReshapeView,
+        verifier: &dyn Verifier,
         out: &mut Vec<ReshapeRequest>,
     ) {
         let Some(duty) = self.keepers.get_mut(&parent) else {
@@ -1069,19 +1153,46 @@ impl ReshapeOrchestrator {
         match &mut duty.phase {
             KeeperPhase::ReassertingReady => {
                 let (left, right) = parent.children();
-                // Build only once the merge has executed — the beacon seated a
-                // live committee on the reformed parent and composed its anchor.
-                // A bare `boundary(parent)` would also match the parent's own
-                // pre-merge terminal record (a grow-then-merge reforms a shard
-                // that split earlier), firing the build against the wrong
-                // anchor and quitting the ready re-assert before the gate fires.
+                // With both cuts scheduled a window ahead, the children's own
+                // chains say which of their blocks end them — no need to wait
+                // for the beacon to compose the parent's anchor. Only when
+                // genuinely early: once that anchor projects the children have
+                // terminated and may already have dissolved, so a walk of
+                // their chains would never resolve.
+                if !view.merge_composed(parent)
+                    && view.terminal_cut(left).is_some()
+                    && view.terminal_cut(right).is_some()
+                    && let Some(left_anchor) = view.boundary(left)
+                    && let Some(right_anchor) = view.boundary(right)
+                {
+                    duty.phase = KeeperPhase::Recognizing {
+                        left: Box::new(KeeperRecognition {
+                            child: left,
+                            tail: Box::new(ObserverTail::recognizing(left_anchor, left)),
+                            proven: None,
+                        }),
+                        right: Box::new(KeeperRecognition {
+                            child: right,
+                            tail: Box::new(ObserverTail::recognizing(right_anchor, right)),
+                            proven: None,
+                        }),
+                    };
+                    return;
+                }
+                // Fallback: build once the merge has executed — the beacon
+                // seated a live committee on the reformed parent and composed
+                // its anchor. A bare `boundary(parent)` would also match the
+                // parent's own pre-merge terminal record (a grow-then-merge
+                // reforms a shard that split earlier), firing the build against
+                // the wrong anchor and quitting the ready re-assert before the
+                // gate fires.
                 if view.merge_composed(parent)
                     && let Some(parent_anchor) = view.boundary(parent)
                     && let Some(left_anchor) = view.boundary(left)
                     && let Some(right_anchor) = view.boundary(right)
                 {
                     duty.phase = KeeperPhase::Building {
-                        parent_anchor,
+                        cut_wt: parent_anchor.weighted_timestamp,
                         left: Box::new(KeeperHalf::new(left, left_anchor)),
                         right: Box::new(KeeperHalf::new(right, right_anchor)),
                         derived: None,
@@ -1100,8 +1211,50 @@ impl ReshapeOrchestrator {
                     }
                 }
             }
+            KeeperPhase::Recognizing { left, right } => {
+                for half in [&mut *left, &mut *right] {
+                    if half.proven.is_some() {
+                        continue;
+                    }
+                    half.tail.set_terminal_cut(view.terminal_cut(half.child));
+                    half.tail
+                        .capture_committee(view.resolved_committee(half.child));
+                    if let Some(sighting) = half.tail.settled_terminal()
+                        && commit_proven(half.child, sighting, verifier, view.network())
+                    {
+                        half.proven = Some(sighting.clone());
+                    } else if let Some(request) = half.tail.next_request() {
+                        out.push(ReshapeRequest::Fetch {
+                            duty: parent,
+                            from: half.child,
+                            kind: FetchKind::Block { request },
+                        });
+                    }
+                }
+                // Both children's terminals are commit-proven, so the merged
+                // root composes from a pair neither chain can have forged.
+                // Both terminate on one cut — a merge stamps its two children
+                // in a single step — so either child's resolves it.
+                if let (Some(left_sighting), Some(right_sighting)) = (&left.proven, &right.proven)
+                    && let Some(cut_wt) = view.terminal_cut(left.child)
+                {
+                    tracing::info!(
+                        ?parent,
+                        left_terminal = left_sighting.header.height().inner(),
+                        right_terminal = right_sighting.header.height().inner(),
+                        "reforming the merged parent from both children's own chains"
+                    );
+                    duty.phase = KeeperPhase::Building {
+                        cut_wt,
+                        left: Box::new(KeeperHalf::recognized(left.child, left_sighting)),
+                        right: Box::new(KeeperHalf::recognized(right.child, right_sighting)),
+                        derived: None,
+                        finalize_requested: false,
+                    };
+                }
+            }
             KeeperPhase::Building {
-                parent_anchor,
+                cut_wt,
                 left,
                 right,
                 derived,
@@ -1132,7 +1285,7 @@ impl ReshapeOrchestrator {
                         parent,
                         (left_h, left_qc),
                         (right_h, right_qc),
-                        parent_anchor,
+                        *cut_wt,
                     )
                 {
                     *derived = Some((origin, Box::new(genesis)));
@@ -1266,7 +1419,7 @@ impl ReshapeOrchestrator {
                 {
                     tracing::info!(
                         ?child,
-                        terminal_height = sighting.height.inner(),
+                        terminal_height = sighting.header.height().inner(),
                         "seating the split child's parent half from the local parent chain"
                     );
                     next = Some(ParentHalfPhase::SeedingAt {
@@ -1357,7 +1510,7 @@ fn commit_proven(
     verifier: &dyn Verifier,
     network: &NetworkDefinition,
 ) -> bool {
-    let height = sighting.height.inner();
+    let height = sighting.header.height().inner();
     let Some((proof, committee)) = &sighting.commit_proof else {
         tracing::debug!(
             ?child,

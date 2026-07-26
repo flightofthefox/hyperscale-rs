@@ -579,15 +579,9 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Reshape adopt for an unopened store; dropped");
             return;
         };
-        let anchor_root = self
-            .process
-            .topology_snapshot()
-            .load()
-            .boundary(shard)
-            .map(|a| a.state_root);
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
-            match adopt_prepared_store(storage.as_ref(), kind, origin, &genesis, anchor_root) {
+            match adopt_prepared_store(storage.as_ref(), kind, origin, &genesis) {
                 Ok(recovered) => {
                     let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Adopted {
                         shard,

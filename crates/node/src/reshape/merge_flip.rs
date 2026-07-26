@@ -1,45 +1,43 @@
 //! The merged-parent genesis flip's deterministic core.
 //!
 //! A keeper reforms the parent from its two children's terminated
-//! chains: each child's terminal block `B` (the crossing the beacon
-//! anchors) and its certifying quorum certificate. The merged store the
-//! keeper built holds both subtrees, so its root is `r_p`; the beacon
-//! composed the same root and seeded the parent anchor with
-//! [`BlockHeader::merge_parent_genesis`]'s hash over the terminal pair.
-//! The derived genesis must reconstruct that anchor byte-for-byte, or
-//! the local chains and the beacon disagree and the flip fails closed.
+//! chains: each child's terminal block `B` — the crossing that ends its
+//! chain — and its certifying quorum certificate. Every input to the
+//! genesis is in those two blocks and the schedule both halves already
+//! read, so a keeper derives it at the cut rather than an epoch later
+//! when the beacon composes the same value.
 
-use hyperscale_types::{Block, BlockHeader, ChainOrigin, QuorumCertificate, ShardAnchor, ShardId};
+use hyperscale_types::{
+    Block, BlockHeader, ChainOrigin, QuorumCertificate, ShardId, SplitChildRoots, WeightedTimestamp,
+};
 
 /// Derive a merged parent's genesis block and chain origin from its two
-/// children's certified terminal blocks, verified against the beacon's
-/// composed parent anchor.
+/// children's certified terminal blocks.
 ///
 /// `left`/`right` are the terminal blocks of `parent`'s `path‖0` and
 /// `path‖1` children in canonical order — the order
 /// [`BlockHeader::merge_parent_genesis`] composes — each with a QC
-/// certifying it. The merged chain's clock anchors at the cut, read
-/// canonically from [`anchor.weighted_timestamp`](ShardAnchor::weighted_timestamp)
-/// — the value the fold composed in `compose_merge_parent`, floored off
-/// the children's canonical terminal `parent_qc` timestamps. The served
-/// terminal QCs confirm the terminals are certified but their own
-/// weighted timestamps are never used: a terminal re-certified at a
-/// higher round past the crossing carries a divergent timestamp that
-/// could floor to a different epoch and break the reconstruction. Its
-/// first block continues both height lines at `max(h_p0, h_p1) + 1`.
-/// `anchor.state_root` is the beacon-composed `r_p` the keeper's merged
-/// store must already hold.
+/// certifying it. The merged root is the internal node over the two
+/// terminal subtree roots, the inverse of the composition a split
+/// verifies; each side is attested by its own chain, so the pair cannot
+/// name a subtree neither terminal committed. The first block continues
+/// both height lines at `max(h_p0, h_p1) + 1`.
+///
+/// `cut_wt` is the instant the children terminate at — the end of their
+/// scheduled terminal window, which the beacon fold composes from the
+/// same schedule. The terminal QCs confirm the terminals are certified
+/// but their own weighted timestamps are never the clock: the fold binds
+/// whichever QC `canonical_boundary_qcs` ranked highest across the
+/// committed proposal set, so no keeper could reproduce that choice.
 ///
 /// # Errors
 ///
-/// Fails when a quorum certificate does not certify its terminal block,
-/// or when the derived genesis does not reconstruct the beacon-composed
-/// anchor.
+/// Fails when a quorum certificate does not certify its terminal block.
 pub fn merge_genesis_from_terminals(
     parent: ShardId,
     left: (&BlockHeader, &QuorumCertificate),
     right: (&BlockHeader, &QuorumCertificate),
-    anchor: &ShardAnchor,
+    cut_wt: WeightedTimestamp,
 ) -> Result<(Block, ChainOrigin), String> {
     let (left_terminal, left_qc) = left;
     let (right_terminal, right_qc) = right;
@@ -49,21 +47,18 @@ pub fn merge_genesis_from_terminals(
     if right_qc.block_hash() != right_terminal.hash() {
         return Err("the right quorum certificate does not certify the right terminal".to_string());
     }
-    let cut_wt = anchor.weighted_timestamp;
+    let composed = SplitChildRoots {
+        left: left_terminal.state_root(),
+        right: right_terminal.state_root(),
+    }
+    .composed_root();
     let genesis = Block::merge_parent_genesis(
         parent,
-        anchor.state_root,
+        composed,
         (left_terminal.hash(), left_terminal.height()),
         (right_terminal.hash(), right_terminal.height()),
         cut_wt,
     );
-    if genesis.hash() != anchor.block_hash {
-        return Err(format!(
-            "derived merge genesis {:?} does not reconstruct the beacon anchor {:?}",
-            genesis.hash(),
-            anchor.block_hash,
-        ));
-    }
     let origin = ChainOrigin {
         genesis_height: genesis.height(),
         anchor_wt: cut_wt,
@@ -124,10 +119,11 @@ mod tests {
     }
 
     /// The derivation reproduces exactly the genesis the beacon fold
-    /// composed: same inputs, same hash, height `max + 1`, clock at the
-    /// cut. A wrong anchor fails closed.
+    /// composes: same inputs, same hash, height `max + 1`, clock at the
+    /// cut. The served QCs carry higher-round re-certification timestamps
+    /// the derivation must ignore.
     #[test]
-    fn derivation_reconstructs_the_beacon_anchor() {
+    fn derivation_reproduces_the_fold_composition() {
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
         let left_root = StateRoot::from_raw(Hash::from_bytes(b"left subtree"));
@@ -138,9 +134,7 @@ mod tests {
         }
         .composed_root();
 
-        // Children terminate at heights 8 and 9; the beacon composed the
-        // cut at 2000ms. The served QCs carry higher-round re-certification
-        // timestamps the derivation must ignore in favour of the anchor's.
+        // Children terminate at heights 8 and 9, at a cut of 2000ms.
         let left_terminal = terminal_header(left, 8, left_root);
         let right_terminal = terminal_header(right, 9, right_root);
         let left_qc = certifying_qc(&left_terminal, 2_400);
@@ -155,39 +149,47 @@ mod tests {
             (right_terminal.hash(), right_terminal.height()),
             cut_wt,
         );
-        let anchor = ShardAnchor {
-            state_root: composed,
-            block_hash: expected.hash(),
-            height: BlockHeight::new(10),
-            weighted_timestamp: cut_wt,
-            witness_base: BeaconWitnessLeafCount::ZERO,
-            settled_waves_root: None,
-        };
 
         let (genesis, origin) = merge_genesis_from_terminals(
             parent,
             (&left_terminal, &left_qc),
             (&right_terminal, &right_qc),
-            &anchor,
+            cut_wt,
         )
         .expect("derives");
-        assert_eq!(genesis.hash(), anchor.block_hash);
+        assert_eq!(genesis.hash(), expected.hash());
+        assert_eq!(genesis.header().state_root(), composed);
         assert_eq!(origin.genesis_height, BlockHeight::new(10));
         assert_eq!(origin.anchor_wt, cut_wt);
+    }
 
-        let wrong = ShardAnchor {
-            block_hash: BlockHash::from_raw(Hash::from_bytes(b"forged")),
-            ..anchor
-        };
-        assert!(
+    /// The merged root is composed from the terminals themselves, so a
+    /// terminal naming a different subtree yields a different genesis
+    /// rather than silently adopting the beacon's.
+    #[test]
+    fn a_different_terminal_root_changes_the_genesis() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let cut_wt = WeightedTimestamp::from_millis(2_000);
+        let right_terminal = terminal_header(right, 9, StateRoot::from_raw(Hash::from_bytes(b"r")));
+        let right_qc = certifying_qc(&right_terminal, 2_600);
+
+        let derive = |root: &[u8]| {
+            let left_terminal =
+                terminal_header(left, 8, StateRoot::from_raw(Hash::from_bytes(root)));
+            let left_qc = certifying_qc(&left_terminal, 2_400);
             merge_genesis_from_terminals(
                 parent,
                 (&left_terminal, &left_qc),
                 (&right_terminal, &right_qc),
-                &wrong,
+                cut_wt,
             )
-            .is_err()
-        );
+            .expect("derives")
+            .0
+            .hash()
+        };
+
+        assert_ne!(derive(b"honest"), derive(b"forged"));
     }
 
     /// A quorum certificate that doesn't certify its terminal block is
@@ -201,20 +203,12 @@ mod tests {
         let good = certifying_qc(&left_terminal, 2_400);
         // A QC certifying the wrong block.
         let bad = certifying_qc(&right_terminal, 2_600);
-        let anchor = ShardAnchor {
-            state_root: StateRoot::ZERO,
-            block_hash: BlockHash::ZERO,
-            height: BlockHeight::new(10),
-            weighted_timestamp: WeightedTimestamp::ZERO,
-            witness_base: BeaconWitnessLeafCount::ZERO,
-            settled_waves_root: None,
-        };
         assert!(
             merge_genesis_from_terminals(
                 parent,
                 (&left_terminal, &bad),
                 (&right_terminal, &good),
-                &anchor,
+                WeightedTimestamp::ZERO,
             )
             .is_err()
         );

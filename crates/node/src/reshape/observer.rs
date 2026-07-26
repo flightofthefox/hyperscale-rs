@@ -26,9 +26,9 @@ use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin, CommitProof,
-    NetworkDefinition, ReadySignal, ResolvedCommittee, ShardAnchor, ShardId, SignError, Signer,
-    StateRoot, StoredReceipt, ValidatorId, WeightedTimestamp, ready_signal_message,
-    ready_signal_window, shard_prefix_path,
+    NetworkDefinition, QuorumCertificate, ReadySignal, ResolvedCommittee, ShardAnchor, ShardId,
+    SignError, Signer, StateRoot, StoredReceipt, ValidatorId, WeightedTimestamp,
+    ready_signal_message, ready_signal_window, shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
@@ -261,13 +261,14 @@ pub enum TailOutcome {
 /// seeds the child's anchor.
 #[derive(Debug, Clone)]
 pub struct TerminalSighting {
-    /// Height of the terminal block.
-    pub height: BlockHeight,
-    /// Hash of the terminal block.
-    pub hash: BlockHash,
-    /// The canonical weighted timestamp certifying it — the child clock's
-    /// start anchor.
-    pub canonical_wt: WeightedTimestamp,
+    /// The terminal block's header. A split child reads its
+    /// `split_child_roots`; a merged parent composes its `state_root`
+    /// with the sibling terminal's.
+    pub header: BlockHeader,
+    /// The canonical certificate over the terminal — the `parent_qc` of
+    /// its committed successor. Its weighted timestamp is the child
+    /// clock's start anchor.
+    pub canonical_qc: QuorumCertificate,
     /// The derived child genesis, absent when the terminal carried no
     /// `split_child_roots` pair or one that fails to compose to its own
     /// state root.
@@ -466,7 +467,7 @@ impl ObserverTail {
     #[must_use]
     pub fn settled_terminal(&self) -> Option<&TerminalSighting> {
         let terminal = self.terminal.as_ref()?;
-        (self.applied? >= terminal.height.next()).then_some(terminal)
+        (self.applied? >= terminal.header.height().next()).then_some(terminal)
     }
 
     /// The next block fetch, when none is outstanding and nothing is
@@ -543,9 +544,8 @@ impl ObserverTail {
                     )
                 });
             self.terminal = Some(TerminalSighting {
-                height: terminal.height(),
-                hash: terminal.hash(),
-                canonical_wt: parent_qc_wt,
+                header: terminal.clone(),
+                canonical_qc: header.parent_qc().clone(),
                 genesis: derive_child_genesis(self.child, terminal, parent_qc_wt),
                 commit_proof,
             });

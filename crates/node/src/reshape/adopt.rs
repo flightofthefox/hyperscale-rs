@@ -15,63 +15,58 @@ use hyperscale_types::{Block, ChainOrigin, StateRoot};
 use super::orchestrator::AdoptKind;
 
 /// Install a reshape duty's derived `genesis` into its prepared store and
-/// gate the adopted root against the beacon anchor.
+/// gate the adopted root against the one the genesis names.
 ///
 /// Returns the [`RecoveredState`] the seat boots from.
 /// The store-level adopt differs per duty — [`AdoptKind::Split`] adopts the
 /// observer's followed store, [`AdoptKind::ParentHalf`] the
 /// checkpoint-cloned child subtree, [`AdoptKind::Merge`] the composed parent
-/// union — as does the expected root. Both split kinds verify against the
-/// genesis block's own root: the genesis is derived from the parent's
-/// terminal block, whose `split_child_roots` pair is checked to compose to
-/// that block's committed state root, so the pair cannot name a subtree the
-/// terminal does not contain. A merge has no such self-verifying pair and
-/// verifies against the beacon-attested `anchor_root`.
+/// union — but every kind verifies against the genesis block's own root.
+/// Each genesis composes from terminal blocks its duty commit-proved: a
+/// split reads the terminal's `split_child_roots`, checked to compose to
+/// that block's own committed state root; a merge composes the two
+/// children's terminal roots, each attested by its own chain. Neither pair
+/// can name a subtree no terminal committed, so the store either holds what
+/// the genesis names or the duty must not seat.
 ///
 /// # Errors
 ///
-/// Returns a description when the store-level adopt fails, when
-/// `anchor_root` is `None` for a merge (the anchor no longer projects), or
-/// when the adopted root does not match the expected one — the store does
-/// not hold the subtree the genesis names, so the duty must not seat.
+/// Returns a description when the store-level adopt fails, or when the
+/// adopted root does not match the genesis's — the store does not hold the
+/// subtree the genesis names.
 pub fn adopt_prepared_store<S: BoundaryStore>(
     storage: &S,
     kind: AdoptKind,
     origin: ChainOrigin,
     genesis: &Block,
-    anchor_root: Option<StateRoot>,
 ) -> Result<RecoveredState, String> {
-    let (adopted, expected) = match kind {
-        AdoptKind::Split => (
-            storage
-                .adopt_followed_child(origin, genesis)
-                .map_err(|e| format!("followed adoption: {e}"))?,
-            genesis.header().state_root(),
-        ),
-        AdoptKind::ParentHalf => (
-            storage
-                .adopt_split_child(origin, genesis)
-                .map_err(|e| format!("split child adoption: {e}"))?,
-            genesis.header().state_root(),
-        ),
-        AdoptKind::Merge => (
-            storage
-                .adopt_merge_parent(origin, genesis)
-                .map_err(|e| format!("merge adoption: {e}"))?,
-            anchor_root.ok_or("merge parent anchor no longer projects")?,
-        ),
+    let adopted = match kind {
+        AdoptKind::Split => storage
+            .adopt_followed_child(origin, genesis)
+            .map_err(|e| format!("followed adoption: {e}"))?,
+        AdoptKind::ParentHalf => storage
+            .adopt_split_child(origin, genesis)
+            .map_err(|e| format!("split child adoption: {e}"))?,
+        AdoptKind::Merge => storage
+            .adopt_merge_parent(origin, genesis)
+            .map_err(|e| format!("merge adoption: {e}"))?,
     };
     let substate_bytes = storage
         .substate_bytes_at_version(origin.genesis_height.inner())
         .unwrap_or(0);
-    verified_recovered_state(adopted, expected, origin, substate_bytes)
+    verified_recovered_state(
+        adopted,
+        genesis.header().state_root(),
+        origin,
+        substate_bytes,
+    )
 }
 
-/// Accept a reshape adoption, gating it against the beacon anchor.
+/// Accept a reshape adoption, gating it against the root its genesis names.
 ///
-/// Checks the store's `adopted` root against the beacon-attested `expected`
-/// anchor root and builds the [`RecoveredState`] the seat boots from over
-/// `origin` and the adopted `substate_bytes`.
+/// Checks the store's `adopted` root against `expected` and builds the
+/// [`RecoveredState`] the seat boots from over `origin` and the adopted
+/// `substate_bytes`.
 fn verified_recovered_state(
     adopted: StateRoot,
     expected: StateRoot,
@@ -80,7 +75,7 @@ fn verified_recovered_state(
 ) -> Result<RecoveredState, String> {
     if adopted != expected {
         return Err(format!(
-            "adopted reshape root {adopted:?} does not match the anchor {expected:?}"
+            "adopted reshape root {adopted:?} does not match the genesis's {expected:?}"
         ));
     }
     Ok(RecoveredState {

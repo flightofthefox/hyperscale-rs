@@ -192,7 +192,7 @@ impl SimulationRunner {
                 kind,
                 origin,
                 genesis,
-            } => self.reshape_adopt(host, view, shard, kind, origin, *genesis),
+            } => self.reshape_adopt(host, shard, kind, origin, *genesis),
             ReshapeRequest::Seat { shard } => {
                 self.reshape_seat(host, view, shard);
                 None
@@ -366,16 +366,14 @@ impl SimulationRunner {
     fn reshape_adopt(
         &mut self,
         host: NodeIndex,
-        view: &ReshapeView,
         shard: ShardId,
         kind: AdoptKind,
         origin: ChainOrigin,
         genesis: Block,
     ) -> Option<ReshapeEvent> {
         let storage = self.reshape_stores.get(&(host, shard))?.storage.clone();
-        let anchor_root = view.boundary(shard).map(|anchor| anchor.state_root);
-        let recovered = adopt_prepared_store(&storage, kind, origin, &genesis, anchor_root)
-            .expect("adopted reshape root must match the beacon anchor");
+        let recovered = adopt_prepared_store(&storage, kind, origin, &genesis)
+            .expect("adopted reshape root must match the genesis it derived");
         let entry = self.reshape_stores.get_mut(&(host, shard))?;
         entry.genesis = Some(genesis);
         entry.recovered = recovered;

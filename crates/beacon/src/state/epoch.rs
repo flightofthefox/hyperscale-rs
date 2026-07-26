@@ -1221,17 +1221,20 @@ fn compose_merge_parent(
     let (left, right) = parent.children();
     let left_b = state.boundaries[&left];
     let right_b = state.boundaries[&right];
-    // The merged chain's clock anchors at the start of the epoch the left
-    // child's terminal block fell in — floored from its certifying QC's
-    // weighted timestamp, the same value the keeper derives off the same
-    // QC in `merge_genesis_from_terminals`. Flooring `terminal_epoch`'s
-    // window end instead would diverge whenever a child coasted more than
-    // one epoch past its cut, so the keeper's reconstruction would not
-    // reproduce this genesis hash.
-    let left_terminal_wt = left_b
-        .terminal_qc_wt
+    // The merged chain's clock anchors at the cut its children terminate
+    // at — the end of their scheduled terminal window, which both halves
+    // of the handoff read from the same schedule. A keeper reforming the
+    // parent derives the same instant from its own frozen projection, so
+    // its reconstruction of this genesis needs nothing this fold chose.
+    //
+    // The children's certifying QCs cannot serve: the fold sees whichever
+    // QC `canonical_boundary_qcs` picked as highest across the committed
+    // proposal set, which depends on the beacon's own consensus and not on
+    // the child chains, so no keeper can predict it.
+    let terminal = left_b
+        .terminal_epoch
         .expect("a child in compose has folded its terminal");
-    let cut_wt = windows.window_of(windows.epoch_for(left_terminal_wt)).start;
+    let cut_wt = windows.window_of(terminal).end;
     let composed = SplitChildRoots {
         left: left_b.state_root,
         right: right_b.state_root,
