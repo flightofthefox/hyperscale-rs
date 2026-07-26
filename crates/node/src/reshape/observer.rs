@@ -448,6 +448,15 @@ impl ObserverTail {
         }
     }
 
+    /// The latched cut, for a driver that needs the instant itself rather
+    /// than the crossing it identifies — a merged parent's clock anchors
+    /// there. Reading it back here rather than from the projection is what
+    /// keeps one latch instead of two.
+    #[must_use]
+    pub const fn terminal_cut(&self) -> Option<WeightedTimestamp> {
+        self.terminal_cut
+    }
+
     /// Capture the parent's consensus committee while it is still live, so
     /// the terminal's QCs can be verified after the head has moved on.
     ///

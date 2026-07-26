@@ -1246,9 +1246,12 @@ impl ReshapeOrchestrator {
                 // Both children's terminals are commit-proven, so the merged
                 // root composes from a pair neither chain can have forged.
                 // Both terminate on one cut — a merge stamps its two children
-                // in a single step — so either child's resolves it.
+                // in a single step — so either child's resolves it. Read from
+                // the tail's latch, not the projection: the applying fold has
+                // consumed the record by the time both walks finish, so the
+                // view no longer names the cut this parent's clock anchors at.
                 if let (Some(left_sighting), Some(right_sighting)) = (&left.proven, &right.proven)
-                    && let Some(cut_wt) = view.terminal_cut(left.child)
+                    && let Some(cut_wt) = left.tail.terminal_cut()
                 {
                     tracing::info!(
                         ?parent,
@@ -1263,6 +1266,18 @@ impl ReshapeOrchestrator {
                         derived: None,
                         finalize_requested: false,
                     };
+                } else if view.merge_composed(parent) {
+                    // The walk ran out of time: the beacon has composed the
+                    // parent's anchor, so the children have terminated and may
+                    // already have dissolved — nothing further will arrive to
+                    // prove. Hand back to the re-assert, whose compose branch
+                    // builds against that anchor.
+                    tracing::debug!(
+                        ?parent,
+                        "merge terminal walk did not resolve before the parent composed; \
+                         falling back to the attested anchor"
+                    );
+                    duty.phase = KeeperPhase::ReassertingReady;
                 }
             }
             KeeperPhase::Building {
@@ -1439,6 +1454,18 @@ impl ReshapeOrchestrator {
                         genesis: Box::new(derived.block.clone()),
                         requested: false,
                     });
+                } else if view.boundary(child).is_some() {
+                    // The walk ran out of time: the beacon published the
+                    // child's anchor, so the parent has terminated and may
+                    // already have dissolved — nothing further will arrive to
+                    // prove. Hand back to the seed, whose anchor branch clones
+                    // the local parent against that height.
+                    tracing::debug!(
+                        ?child,
+                        "parent terminal walk did not resolve before the child anchored; \
+                         falling back to the attested anchor"
+                    );
+                    next = Some(ParentHalfPhase::Seeding { requested: false });
                 } else if let Some(request) = tail.next_request() {
                     out.push(ReshapeRequest::Fetch {
                         duty: child,
@@ -1607,8 +1634,9 @@ mod tests {
     };
 
     use super::{
-        FetchKind, KeeperDuty, KeeperMember, KeeperPhase, ObserverDuty, ObserverPhase,
-        ParentHalfDuty, ParentHalfPhase, ReshapeEvent, ReshapeOrchestrator, ReshapeRequest,
+        FetchKind, KeeperDuty, KeeperMember, KeeperPhase, KeeperRecognition, ObserverDuty,
+        ObserverPhase, ParentHalfDuty, ParentHalfPhase, ReshapeEvent, ReshapeOrchestrator,
+        ReshapeRequest,
     };
     use crate::reshape::observer::{ObserverBootstrap, ObserverTail};
     use crate::reshape::view::ReshapeView;
@@ -2274,6 +2302,103 @@ mod tests {
         assert!(
             !orch.observers.contains_key(&child),
             "a disagreeing duty stops rather than re-seeding",
+        );
+    }
+
+    // ─── recognition walks fall back ────────────────────────────────────
+
+    /// A parent half whose walk never resolves a commit-provable terminal
+    /// hands back to the anchor path once the child's anchor lands, rather
+    /// than fetching heights past a tip that will never advance.
+    #[test]
+    fn a_parent_half_walk_falls_back_once_the_child_anchors() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        // The child's anchor projects, so the parent has terminated: the
+        // walk cannot resolve and the seed is the way through.
+        let snap = snapshot_parent_halves(&[(child, &[1, 5])], &[(child, 5, parent)], &[child]);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+        orch.parent_halves.insert(
+            child,
+            ParentHalfDuty {
+                parent,
+                validators: vec![vid(5)],
+                phase: ParentHalfPhase::Recognizing(Box::new(ObserverTail::recognizing(
+                    anchor(),
+                    child,
+                ))),
+                store_seeded: false,
+            },
+        );
+
+        let view = ReshapeView::new(&snap, 1_000);
+        // The first step leaves `Recognizing`; the second emits the seed the
+        // anchor path opens with.
+        let _ = orch.step(&view, &BlsVerifier, Vec::new());
+        assert!(
+            matches!(
+                orch.parent_halves[&child].phase,
+                ParentHalfPhase::Seeding { .. }
+            ),
+            "the walk must hand back to the seed",
+        );
+        let requests = orch.step(&view, &BlsVerifier, Vec::new());
+        assert!(
+            requests.iter().any(
+                |r| matches!(r, ReshapeRequest::SeedFromParent { child: c, .. } if *c == child)
+            ),
+            "the fallback must emit the anchor path's seed; got {requests:?}",
+        );
+    }
+
+    /// A keeper whose walks never resolve hands back to the re-assert once
+    /// the beacon composes the parent, so the compose branch can build
+    /// against the attested anchor.
+    #[test]
+    fn a_keeper_walk_falls_back_once_the_parent_composes() {
+        let parent = ShardId::ROOT;
+        let (left, right) = parent.children();
+        // A live committee on a seeded parent is a composed merge.
+        let snap = snapshot_keepers(
+            &[(parent, &[1, 5]), (left, &[1]), (right, &[1])],
+            &[(left, 5, parent)],
+            &[parent, left, right],
+        );
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+        orch.keepers.insert(
+            parent,
+            KeeperDuty {
+                members: vec![KeeperMember {
+                    validator: vid(5),
+                    own_child: left,
+                }],
+                phase: KeeperPhase::Recognizing {
+                    left: Box::new(KeeperRecognition {
+                        child: left,
+                        tail: Box::new(ObserverTail::recognizing(anchor(), left)),
+                        proven: None,
+                    }),
+                    right: Box::new(KeeperRecognition {
+                        child: right,
+                        tail: Box::new(ObserverTail::recognizing(anchor(), right)),
+                        proven: None,
+                    }),
+                },
+                open_requested: false,
+                store_opened: false,
+                pending_stage: Vec::new(),
+                stages_unacked: 0,
+            },
+        );
+
+        let view = ReshapeView::new(&snap, 1_000);
+        let _ = orch.step(&view, &BlsVerifier, Vec::new());
+        assert!(
+            matches!(
+                orch.keepers[&parent].phase,
+                KeeperPhase::ReassertingReady | KeeperPhase::Building { .. }
+            ),
+            "the walk must hand back to the re-assert, which builds on the anchor",
         );
     }
 }
