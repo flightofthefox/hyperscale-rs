@@ -786,10 +786,20 @@ fn build_shard_io<S: ShardStorage>(
     // snap-sync import — fetches from `committed + 1` instead of
     // re-pulling the whole chain from genesis for the coordinator to
     // filter as already committed.
-    if initial_persisted_height > BlockHeight::GENESIS {
+    //
+    // Floored at the chain's origin, which a reshape seat needs and the
+    // recovered tip cannot supply: a split child or merge parent boots
+    // with its coordinator still at genesis and folds its own genesis
+    // block a moment later, through a path that admits no height. No
+    // block below that origin exists on this chain anywhere, so a sync
+    // starting from the network genesis asks every peer for heights none
+    // of them can ever serve, and never completes.
+    let sync_floor =
+        initial_persisted_height.max(rep.state.shard_coordinator().chain_origin().genesis_height);
+    if sync_floor > BlockHeight::GENESIS {
         let outputs = io.consensus.block_sync.handle(BlockSyncInput::Admitted {
             scope: (),
-            height: initial_persisted_height,
+            height: sync_floor,
         });
         debug_assert!(
             outputs.is_empty(),

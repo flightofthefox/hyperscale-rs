@@ -5451,6 +5451,15 @@ impl ShardCoordinator {
         self.committed_height
     }
 
+    /// The chain's origin — the height its first block sits at, and the
+    /// clock that block anchors to. `ChainOrigin::ROOT` for a chain born
+    /// at network genesis; a reshape child continues its parent's height
+    /// line, so no block below `genesis_height` exists on this chain.
+    #[must_use]
+    pub const fn chain_origin(&self) -> ChainOrigin {
+        self.chain_origin
+    }
+
     /// Number of distinct validators for which this coordinator holds
     /// detected double-vote equivocation evidence not yet carried into a
     /// committed block. Drained into each proposal and pruned once the
