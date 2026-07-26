@@ -68,6 +68,20 @@ impl<'a> ReshapeView<'a> {
         self.topology_snapshot.network()
     }
 
+    /// Whether the beacon has folded a boundary crossing of `shard`'s own —
+    /// it is producing on its own chain, not merely seeded.
+    ///
+    /// Separates the two records a reshape successor's boundary can hold. A
+    /// seed written by the parent's terminal fold is the deterministic
+    /// genesis, comparable to what a successor derived for itself; a
+    /// crossing the successor produced is not, and replaces the seed if it
+    /// folds first. A derivation cross-check is only meaningful while this
+    /// is `false`.
+    #[must_use]
+    pub fn advanced_past_genesis(&self, shard: ShardId) -> bool {
+        self.topology_snapshot.advanced_past_genesis(shard)
+    }
+
     /// The shard's beacon-attested boundary anchor, or `None` until it seeds.
     #[must_use]
     pub fn boundary(&self, shard: ShardId) -> Option<ShardAnchor> {

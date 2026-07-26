@@ -904,35 +904,47 @@ impl ReshapeOrchestrator {
             return;
         };
         // A duty that flipped from its own follow adopted a genesis before
-        // the beacon published one. When the anchor lands it must agree:
-        // both are derived from the same terminal block, one by this host
-        // from the chain it tailed and one by the fold from the terminal
-        // contribution it committed. Disagreement means the parent chain
-        // this host followed is not the one the network committed, so the
-        // adopted store is unusable — wipe the duty back to the start and
-        // re-seed from the anchor, the path a late joiner takes anyway.
-        if let Some(adopted) = duty.adopted_genesis
-            && let Some(anchor) = view.boundary(child)
-        {
-            if anchor.block_hash == adopted {
+        // the beacon published one. The seeded anchor is the same block
+        // derived twice — once by this host from the chain it tailed, once
+        // by the fold from the terminal contribution it committed — so the
+        // two must agree.
+        //
+        // Only against the *seeded* anchor. `seed_split_children` fills a
+        // child's record only while it is still the zero placeholder, so a
+        // child whose own first crossing folds first keeps that crossing as
+        // its anchor and is never seeded. Comparing a genesis hash against
+        // a crossing hash can only mismatch, and the child is correct.
+        // `advanced_past_genesis` is exactly that distinction: the fold
+        // sets it on a real crossing and never on a seed.
+        if duty.adopted_genesis.is_some() {
+            if view.advanced_past_genesis(child) {
+                // The comparison window closed with no disagreement to see.
                 duty.adopted_genesis = None;
-            } else {
-                tracing::error!(
-                    ?child,
-                    ?adopted,
-                    anchored = ?anchor.block_hash,
-                    "adopted split-child genesis disagrees with the beacon anchor; \
-                     re-seeding the duty from the attested anchor"
-                );
-                duty.adopted_genesis = None;
-                duty.open_requested = false;
-                duty.store_opened = false;
-                duty.pending_stage.clear();
-                duty.stages_unacked = 0;
-                duty.phase = ObserverPhase::Opening;
-                return;
+            } else if let Some(anchor) = view.boundary(child) {
+                let adopted = duty.adopted_genesis.take();
+                if anchor.block_hash != adopted.expect("checked above") {
+                    // The local parent chain and the network disagree about a
+                    // committed block. Nothing here can repair that: the store
+                    // may already be seated under a running vnode, so wiping it
+                    // would take the shard down to fix a fault it cannot fix.
+                    // Surface it and stop — the duty is done either way, and
+                    // the split's cohort projection has already released, so no
+                    // rediscovery re-opens it.
+                    tracing::error!(
+                        ?child,
+                        adopted = ?adopted,
+                        anchored = ?anchor.block_hash,
+                        "adopted split-child genesis disagrees with the beacon anchor; \
+                         the followed parent chain is not the one the network committed"
+                    );
+                    self.observers.remove(&child);
+                    return;
+                }
             }
         }
+        let Some(duty) = self.observers.get_mut(&child) else {
+            return;
+        };
         match &mut duty.phase {
             ObserverPhase::Opening => {
                 if !duty.open_requested {
@@ -2167,6 +2179,101 @@ mod tests {
         assert!(
             !orch.parent_halves.contains_key(&child),
             "a released seated parent half is dropped",
+        );
+    }
+
+    // ─── the derived-versus-attested cross-check ────────────────────────
+
+    /// A seated observer duty holding `adopted` as the genesis it flipped on.
+    fn adopted_duty(parent: ShardId, child: ShardId, adopted: BlockHash) -> ObserverDuty {
+        ObserverDuty {
+            adopted_genesis: Some(adopted),
+            ..observer_duty(parent, child, 5, ObserverPhase::Seated)
+        }
+    }
+
+    /// The seeded anchor agrees with what the host derived: the check
+    /// clears and the duty carries on untouched.
+    #[test]
+    fn a_matching_seeded_anchor_clears_the_cross_check() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        // The parent-half projection still lists the child, so a seated
+        // duty is not yet released — the state the seed lands in.
+        let snap = snapshot_parent_halves(&[(child, &[5])], &[(child, 5, parent)], &[child]);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+        orch.observers
+            .insert(child, adopted_duty(parent, child, anchor().block_hash));
+
+        let requests = orch.step(&ReshapeView::new(&snap, 1_000), &BlsVerifier, Vec::new());
+
+        assert!(
+            requests.is_empty(),
+            "a matching anchor emits nothing; got {requests:?}"
+        );
+        assert!(
+            orch.observers.contains_key(&child),
+            "a matching anchor leaves the duty in place",
+        );
+        assert!(
+            orch.observers[&child].adopted_genesis.is_none(),
+            "the check is consumed once it has agreed",
+        );
+    }
+
+    /// The child folded a crossing of its own before its parent's terminal
+    /// folded, so the beacon never wrote the seed and the anchor is that
+    /// crossing. A genesis hash cannot match a crossing hash, and the child
+    /// is correct — the comparison window has closed, not been failed.
+    #[test]
+    fn a_crossing_anchor_closes_the_cross_check_without_wiping() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let snap = snapshot_parent_halves(&[(child, &[5])], &[(child, 5, parent)], &[child])
+            .with_advanced(BTreeSet::from([child]));
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+        let derived = BlockHash::from_raw(Hash::from_bytes(b"locally-derived-genesis"));
+        orch.observers
+            .insert(child, adopted_duty(parent, child, derived));
+
+        let requests = orch.step(&ReshapeView::new(&snap, 1_000), &BlsVerifier, Vec::new());
+
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, ReshapeRequest::OpenStore { .. })),
+            "a producing child must never have its store re-opened; got {requests:?}",
+        );
+        assert!(
+            orch.observers.contains_key(&child),
+            "a producing child's duty survives the closed window",
+        );
+    }
+
+    /// A genuine disagreement against the seeded anchor: the followed parent
+    /// chain is not the one the network committed. The duty stops without
+    /// touching the store, which a seated vnode is running on.
+    #[test]
+    fn a_disagreeing_seeded_anchor_stops_without_re_opening_the_store() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let snap = snapshot_parent_halves(&[(child, &[5])], &[(child, 5, parent)], &[child]);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+        let forged = BlockHash::from_raw(Hash::from_bytes(b"forged"));
+        orch.observers
+            .insert(child, adopted_duty(parent, child, forged));
+
+        let requests = orch.step(&ReshapeView::new(&snap, 1_000), &BlsVerifier, Vec::new());
+
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, ReshapeRequest::OpenStore { .. })),
+            "a disagreement must not wipe the store; got {requests:?}",
+        );
+        assert!(
+            !orch.observers.contains_key(&child),
+            "a disagreeing duty stops rather than re-seeding",
         );
     }
 }
