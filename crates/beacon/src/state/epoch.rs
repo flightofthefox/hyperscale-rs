@@ -277,6 +277,18 @@ pub fn apply_epoch(
     // their parent once the keeper committee is ready.
     apply_scheduled_merges(state);
     schedule_ready_merges(state);
+    // INV-RESHAPE-9, asserted where it is established: a cut named for the
+    // window this fold opens would land after the promotion freeze above,
+    // so the window's two schedule entries would disagree about whether a
+    // boundary lands at its end — and its proposers would stamp verdicts
+    // from whichever they held.
+    debug_assert!(
+        state
+            .live_scheduled_terminals()
+            .values()
+            .all(|terminal| *terminal > epoch),
+        "a fold scheduled a terminal for the window it opens",
+    );
     // Halt detection reads the settled reshape state: a shard whose reshape
     // executed this epoch is already terminal-marked or placeholder-fresh,
     // so it reads as legitimately quiet. Recovery runs before the top-up
@@ -1288,8 +1300,9 @@ mod tests {
 
     use super::*;
     use crate::state::test_fixtures::{
-        apply_next_epoch, apply_witness_chunk, net, single_pool_state,
+        apply_next_epoch, apply_witness_chunk, net, single_pool_state, validator_record,
     };
+    use crate::state::witness::apply_shard_payload;
 
     // ─── boundary fold ──────────────────────────────────────────────────────
 
@@ -2199,7 +2212,12 @@ mod tests {
         let lookahead = state.live_witness_bases();
         assert_eq!(lookahead.get(&shard), Some(&BeaconWitnessLeafCount::new(7)));
 
-        // Window 2's promotion freezes exactly what the lookahead read.
+        // Window 2's promotion freezes exactly what the lookahead read —
+        // and the whole window-frozen projection agrees, not just this
+        // field. A boundary fold is the one that advances a watermark, so
+        // this is where a field whose value only moves on a contribution
+        // would show a missing freeze.
+        let projected = window_frozen_view(&state.derive_next_topology_snapshot(net()));
         apply_epoch(
             &BlsVerifier,
             &mut state,
@@ -2211,6 +2229,12 @@ mod tests {
             },
         );
         assert_eq!(state.witness_window_bases, lookahead);
+        assert_eq!(
+            projected,
+            window_frozen_view(&state.derive_topology_snapshot(net())),
+            "the lookahead written across a boundary fold must equal the \
+             active entry re-derived at that window's promotion",
+        );
     }
 
     /// The topology snapshot projects a recorded boundary as a
@@ -4114,5 +4138,125 @@ mod tests {
             Some(parent),
         );
         assert!(snapshot.reshape_parent_half_cohorts().contains_key(&child));
+    }
+
+    // ─── window projection agreement ─────────────────────────────────────
+
+    /// Every window's schedule entry is written twice — once as the
+    /// preceding fold's lookahead, once re-derived as that window's active
+    /// entry at promotion — and the two must be byte-identical. A window's
+    /// boundary verdicts are stamped into signed headers from whichever
+    /// copy a node holds, so a divergence between them is a fork.
+    ///
+    /// The property the per-field promotion freezes exist to establish,
+    /// asserted over the whole projection rather than one field at a time:
+    /// a field that gains a live value but no freeze fails here.
+    /// The window-frozen half of a snapshot: everything a window's own
+    /// entry fixes at promotion, which both writes must agree on.
+    ///
+    /// The rest of a snapshot is deliberately live in both writes, and
+    /// excluded here. Boundary anchors, `advanced` and the recovery records
+    /// are the current view of the chain rather than a property of the
+    /// window. So are the retained parent-half cohorts: the applying fold
+    /// derives them from the committee change it is making, so a lookahead
+    /// taken before that fold carries none while the active entry re-derived
+    /// after it does. Nothing stamps a verdict from either — they drive duty
+    /// discovery off the head — so the divergence forks nothing.
+    fn window_frozen_view(snapshot: &TopologySnapshot) -> String {
+        let mut shards: Vec<ShardId> = snapshot.shard_trie().leaves().collect();
+        shards.sort_unstable();
+        let per_shard: Vec<String> = shards
+            .iter()
+            .map(|s| {
+                format!(
+                    "{s:?} committee={:?} consensus={:?} witness_base={:?} \
+                     split_pending={} scheduled_terminal={:?} settled_floor={:?}",
+                    snapshot.committee_for_shard(*s),
+                    snapshot.consensus_committee_for_shard(*s),
+                    snapshot.witness_base(*s),
+                    snapshot.split_pending(*s),
+                    snapshot.scheduled_terminal(*s),
+                    snapshot.settled_window_floor(*s),
+                )
+            })
+            .collect();
+        format!(
+            "shards={per_shard:?} observers={:?} keepers={:?} params={:?}",
+            snapshot.reshape_observer_cohorts(),
+            snapshot.reshape_keeper_cohorts(),
+            snapshot.params(),
+        )
+    }
+
+    fn assert_lookahead_becomes_the_active_entry(state: &mut BeaconState, what: &str) {
+        let lookahead = window_frozen_view(&state.derive_next_topology_snapshot(net()));
+        apply_next_epoch(state, &[]);
+        let active = window_frozen_view(&state.derive_topology_snapshot(net()));
+        assert_eq!(
+            lookahead, active,
+            "the lookahead written before {what} must equal the active entry \
+             re-derived at that window's promotion",
+        );
+    }
+
+    /// The two writes agree across every fold a reshape passes through:
+    /// admission, the readiness gate that schedules the cut, and the fold
+    /// at the cut that applies it. The scheduling fold is the one that
+    /// motivates INV-RESHAPE-9 — a cut stamped for the window the fold
+    /// opens would land after that window's active entry was frozen.
+    #[test]
+    fn a_window_entry_is_identical_from_either_write_across_a_reshape() {
+        let p = ShardId::leaf(1, 0);
+        let mut state = single_pool_state(4);
+        state.chain_config.shard_size = 4;
+        state.chain_config.epoch_duration_ms = 1_000;
+        state.shard_committees = state.next_shard_committees.clone();
+        for i in 0..4u64 {
+            state.validators.insert(
+                ValidatorId::new(1000 + i),
+                validator_record(1000 + i, 0, ValidatorStatus::Pooled),
+            );
+        }
+        apply_next_epoch(&mut state, &[]);
+
+        assert_lookahead_becomes_the_active_entry(&mut state, "a quiet fold");
+
+        // Admission draws the observer cohort.
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit { shard: p },
+        );
+        assert_lookahead_becomes_the_active_entry(&mut state, "a split admission");
+
+        // Every observer readies, so the next fold's gate schedules the cut.
+        let seats: Vec<(ValidatorId, ShardId)> = match &state.pending_reshapes[&p] {
+            PendingReshape::Split { cohort, .. } => {
+                cohort.iter().map(|(id, seat)| (*id, seat.child)).collect()
+            }
+            PendingReshape::Merge { .. } => panic!("a split was admitted"),
+        };
+        for (validator, child) in seats {
+            apply_shard_payload(
+                &BlsVerifier,
+                &mut state,
+                &net(),
+                p,
+                &ShardWitnessPayload::ReshapeReady { validator, child },
+            );
+        }
+        assert_lookahead_becomes_the_active_entry(&mut state, "the fold that schedules the cut");
+        assert!(
+            state.pending_reshapes[&p].scheduled_terminal().is_some(),
+            "the gate must have fired for this to cover the scheduling fold",
+        );
+
+        assert_lookahead_becomes_the_active_entry(&mut state, "the fold at the cut");
+        assert!(
+            state.pending_reshapes.is_empty(),
+            "the cut must have applied for this to cover the applying fold",
+        );
     }
 }
