@@ -672,7 +672,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use hyperscale_crypto_bls::BlsVerifier;
-    use hyperscale_types::{Epoch, NodeId, ShardWitnessPayload};
+    use hyperscale_types::{Epoch, Hash, NodeId, ShardWitnessPayload};
 
     use super::*;
     use crate::state::test_fixtures::{
@@ -1605,6 +1605,126 @@ mod tests {
                 .members
                 .contains(&strayed),
             "a keeper that rotated away must not be seated on the merged parent",
+        );
+    }
+
+    // ─── admission against a terminating shard ──────────────────────────
+
+    /// A boundary record for a shard that has produced — the shape every
+    /// live leaf carries.
+    fn live_boundary() -> ShardBoundary {
+        ShardBoundary {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
+            height: BlockHeight::new(4),
+            weighted_timestamp: WeightedTimestamp::ZERO,
+            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            last_live_epoch: Epoch::GENESIS,
+            consecutive_misses: 0,
+            terminal_epoch: None,
+            terminal_qc_wt: None,
+            settled_waves_root: None,
+            reshape_admitted_epoch: None,
+            reveals_fenced_below: None,
+        }
+    }
+
+    /// A shard re-asserting its trigger inside its own final window admits
+    /// nothing.
+    ///
+    /// The applying fold consumes the reshape record at the top of that
+    /// window, but the shard keeps its committee and keeps producing to its
+    /// terminal — and the witness window that suppresses a duplicate trigger
+    /// leaf is deliberately shorter than a reshape's life, so it re-asserts.
+    /// Admitting there would draw a fresh cohort out of the pool onto a
+    /// shard about to leave the trie.
+    #[test]
+    fn a_terminating_split_target_admits_no_further_reshape() {
+        let p = ShardId::leaf(1, 0);
+        let mut state = grow_state(8);
+        // A live shard always carries a boundary record; the terminal mark
+        // the schedule stamps lands on it.
+        state.boundaries.insert(p, live_boundary());
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit { shard: p },
+        );
+        let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
+        for observer in observers {
+            mark_ready(&mut state, p, observer);
+        }
+        schedule_ready_splits(&mut state);
+        let cut = state.pending_reshapes[&p]
+            .scheduled_terminal()
+            .expect("the gate fires");
+        state.current_epoch = cut;
+        apply_scheduled_splits(&mut state);
+        assert!(state.pending_reshapes.is_empty(), "the record is consumed");
+        assert!(
+            state.shard_committees.contains_key(&p),
+            "the parent is live through its final window",
+        );
+
+        // The parent re-asserts inside that window.
+        let pooled_before = state.pooled_validators().len();
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit { shard: p },
+        );
+
+        assert!(
+            state.pending_reshapes.is_empty(),
+            "a terminating shard must admit no further reshape",
+        );
+        assert_eq!(
+            state.pooled_validators().len(),
+            pooled_before,
+            "no cohort may be drawn onto a shard about to leave the trie",
+        );
+    }
+
+    /// The same for a merge child, whose final-window assertion would
+    /// otherwise record a fresh half against its parent.
+    #[test]
+    fn a_terminating_merge_child_admits_no_further_reshape() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(0);
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
+        for (id, seat) in keepers_of(&state, parent) {
+            apply_shard_payload(
+                &BlsVerifier,
+                &mut state,
+                &net(),
+                seat.child,
+                &ShardWitnessPayload::ReshapeReady {
+                    validator: id,
+                    child: seat.child,
+                },
+            );
+        }
+        schedule_ready_merges(&mut state);
+        let cut = state.pending_reshapes[&parent]
+            .scheduled_terminal()
+            .expect("the gate fires");
+        state.current_epoch = cut;
+        apply_scheduled_merges(&mut state);
+        assert!(state.pending_reshapes.is_empty(), "the record is consumed");
+
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+
+        assert!(
+            state.pending_reshapes.is_empty(),
+            "a terminating child must record no further merge half",
         );
     }
 

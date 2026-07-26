@@ -483,8 +483,11 @@ pub(super) fn apply_shard_payload(
                 return None;
             }
             // The target must be an active trie leaf, free of any
-            // overlapping reshape.
-            if !state.shard_committees.contains_key(shard) || state.reshape_involves(*shard) {
+            // overlapping reshape, and not already on its way out.
+            if !state.shard_committees.contains_key(shard)
+                || state.reshape_involves(*shard)
+                || terminating(state, *shard)
+            {
                 return None;
             }
             // The shard ceiling counts splits already admitted but not
@@ -528,10 +531,13 @@ pub(super) fn apply_shard_payload(
             if source_shard.parent() != Some(*parent) {
                 return None;
             }
-            // Both children must be active trie leaves.
+            // Both children must be active trie leaves, and neither already
+            // on its way out.
             let (left, right) = parent.children();
             if !state.shard_committees.contains_key(&left)
                 || !state.shard_committees.contains_key(&right)
+                || terminating(state, left)
+                || terminating(state, right)
             {
                 return None;
             }
@@ -627,6 +633,27 @@ pub(super) fn apply_shard_payload(
             None
         }
     }
+}
+
+/// Whether `shard` is already scheduled to leave the trie.
+///
+/// A reshape's record is consumed by the fold that applies it, at the top
+/// of the shard's final window — but the shard stays in the committee set
+/// and keeps producing for that whole window, so it keeps asserting its
+/// trigger. Without this, admission sees a live leaf with no pending
+/// reshape and admits a fresh one against a shard about to vanish, drawing
+/// a cohort out of the pool onto a dead target and counting it against the
+/// shard ceiling until the TTLs sweep it.
+///
+/// The terminal mark is stamped when the cut is scheduled, a window before
+/// the record is consumed, so it covers the whole exposure. It cannot
+/// misfire on a legitimate successor: a reformed merge parent and a fresh
+/// split child both get boundaries with no mark.
+fn terminating(state: &BeaconState, shard: ShardId) -> bool {
+    state
+        .boundaries
+        .get(&shard)
+        .is_some_and(|b| b.terminal_epoch.is_some())
 }
 
 /// Lapse or cancel pending reshapes whose triggers went quiet or whose
