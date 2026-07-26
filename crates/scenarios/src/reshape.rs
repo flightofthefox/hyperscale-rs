@@ -10,7 +10,7 @@ use crate::support::query::{committee_size, live_shards};
 use crate::support::tx::{account_from_seed, build_faucet_tx, signer_from_seed, validity_around};
 use crate::support::wait::{
     assert_height_frozen, await_beacon_epoch, await_height, await_merge_keeper_count,
-    await_root_matches_anchor, await_serves, await_split_admitted,
+    await_root_matches_anchor, await_serves, await_serves_ahead_of_anchor, await_split_admitted,
 };
 use crate::support::{Cluster, epochs, grow_to, vote_reshape_threshold};
 
@@ -114,10 +114,20 @@ pub fn split_lifecycle(c: &mut impl Cluster) {
     );
     c.submit(Arc::new(transfer));
 
-    assert!(
-        await_serves(c, left, epochs(28)) && await_serves(c, right, epochs(28)),
-        "both split children were not served within budget"
-    );
+    // Each child seats from the terminal crossing its members followed,
+    // ahead of the fold that publishes its anchor. Serving alone would
+    // also pass on the anchor fallback an epoch later, so the assertion
+    // is on *when*: a child that seats only once its anchor exists has
+    // taken the fallback, and the cut-over is not being exercised.
+    for child in [left, right] {
+        match await_serves_ahead_of_anchor(c, child, epochs(28)) {
+            Some(true) => {}
+            Some(false) => {
+                panic!("split child {child} seated off its beacon anchor, not its parent's cut")
+            }
+            None => panic!("split child {child} was not served within budget"),
+        }
+    }
     assert!(
         await_height(c, left, 1, epochs(8)) && await_height(c, right, 1, epochs(8)),
         "split children did not commit past genesis within budget"

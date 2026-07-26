@@ -4,6 +4,8 @@
 //! over the cluster's synchronous observations. The bool-returning waits report
 //! whether the condition held within budget; a scenario asserts on that.
 
+use std::cell::Cell;
+
 use hyperscale_types::{ShardId, TransactionStatus, TxHash};
 
 use super::query::{
@@ -53,6 +55,33 @@ pub fn await_merge_keeper_count<C: Cluster>(
 /// placeholder its cut installed.
 pub fn await_anchor_seeded<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) -> bool {
     c.run_until(budget, |c| anchored_genesis_height(c, shard).is_some())
+}
+
+/// Wait until `shard` is served, reporting whether the beacon had yet to
+/// compose its reshape anchor at that instant.
+///
+/// `Some(true)` is the cut-over: the successor seated from its
+/// predecessor's terminal crossing, ahead of the fold that publishes its
+/// anchor. `Some(false)` means it seated only once the anchor was already
+/// available — the fallback path, correct but an epoch late. `None` means
+/// it never served within budget.
+///
+/// The reading is taken inside the wait, at the first step the shard
+/// serves, so it cannot drift as the beacon catches up afterwards.
+pub fn await_serves_ahead_of_anchor<C: Cluster>(
+    c: &mut C,
+    shard: ShardId,
+    budget: Budget,
+) -> Option<bool> {
+    let ahead = Cell::new(false);
+    let served = c.run_until(budget, |c| {
+        if !c.serves_shard(shard) {
+            return false;
+        }
+        ahead.set(anchored_genesis_height(c, shard).is_none());
+        true
+    });
+    served.then(|| ahead.get())
 }
 
 /// Wait until `shard`'s committed root matches the beacon-composed anchor — the

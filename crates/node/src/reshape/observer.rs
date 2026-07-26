@@ -431,10 +431,21 @@ impl ObserverTail {
     }
 
     /// Publish the parent's scheduled cut, so the follow can recognise the
-    /// terminal crossing as it walks past it. Idempotent — the driver
-    /// re-supplies it every step, and a scheduled cut never moves.
+    /// terminal crossing as it walks past it.
+    ///
+    /// The driver re-supplies it every step and the last published value
+    /// is retained, for the same reason [`Self::capture_committee`]
+    /// latches: a cut never moves, but it is *projected* for one window
+    /// only. The fold that applies the reshape consumes the record at the
+    /// top of the parent's final window, so the next promotion freezes an
+    /// empty projection — while the crossing this identifies is only
+    /// recognisable once the terminal's successor arrives, at the close of
+    /// that same window. Clearing on `None` would drop the cut exactly as
+    /// the block that needs it lands.
     pub const fn set_terminal_cut(&mut self, cut: Option<WeightedTimestamp>) {
-        self.terminal_cut = cut;
+        if cut.is_some() {
+            self.terminal_cut = cut;
+        }
     }
 
     /// Capture the parent's consensus committee while it is still live, so
@@ -637,7 +648,11 @@ mod tests {
     use hyperscale_storage::test_helpers::pin_snap_sync_replica;
     use hyperscale_storage::{BoundaryStore, SubstateStore, WitnessSeed};
     use hyperscale_storage_memory::SimShardStorage;
-    use hyperscale_types::Hash;
+    use hyperscale_types::{
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BoundedVec, CertificateRoot,
+        ElidedCertifiedBlock, Hash, InFlightCount, Inventory, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionsRoot, Round, SignerBitfield, SplitChildRoots, TransactionRoot, WitnessSources,
+    };
 
     use super::*;
     use crate::bootstrap::state_range_serve::serve_state_range_request;
@@ -791,5 +806,277 @@ mod tests {
     fn rejects_a_target_outside_the_split() {
         let (_, anchor) = parent_replica();
         let _ = ObserverBootstrap::new(ShardId::ROOT, anchor, ShardId::leaf(2, 0b11));
+    }
+
+    // ─── terminal recognition ───────────────────────────────────────────
+
+    const CUT_MS: u64 = 6_000;
+
+    /// A QC over `block` stamping `wt` — the value a follower reads when
+    /// this QC arrives as the *next* block's `parent_qc`.
+    fn qc_over(header: &BlockHeader, wt: u64) -> QuorumCertificate {
+        QuorumCertificate::new(
+            header.hash(),
+            header.shard_id(),
+            header.height(),
+            header.parent_block_hash(),
+            Round::new(header.round().inner()),
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(wt),
+        )
+    }
+
+    /// One parent-chain block. `pred_wt` is the stamp on its own
+    /// `parent_qc` — the value the crossing test compares against the cut
+    /// — and `pair` its `split_child_roots`, carried by every final-window
+    /// header.
+    fn parent_block(
+        height: u64,
+        round: u64,
+        parent: BlockHash,
+        pred_wt: u64,
+        state_root: StateRoot,
+        pair: Option<SplitChildRoots>,
+    ) -> Block {
+        let parent_qc = QuorumCertificate::new(
+            parent,
+            ShardId::ROOT,
+            BlockHeight::new(height.saturating_sub(1)),
+            BlockHash::ZERO,
+            Round::new(round.saturating_sub(1)),
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(pred_wt),
+        );
+        let header = BlockHeader::new(
+            ShardId::ROOT,
+            BlockHeight::new(height),
+            parent,
+            parent_qc,
+            ValidatorId::new(0),
+            ProposerTimestamp::ZERO,
+            Round::new(round),
+            false,
+            state_root,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+            pair,
+            None,
+        );
+        Block::Live {
+            header,
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    /// The response a follower gets for `block`, certified by a QC
+    /// stamping `served_wt` — deliberately *not* the stamp the derivation
+    /// may use, so a test that reads the served QC's clock fails.
+    fn response(block: &Block, served_wt: u64) -> GetBlockResponse {
+        GetBlockResponse::found(ElidedCertifiedBlock::elide(
+            block,
+            qc_over(block.header(), served_wt),
+            &Inventory::empty(),
+        ))
+    }
+
+    /// A parent chain straddling the cut: the terminal at height 2 (its
+    /// own `parent_qc` at or before the cut) and the coast block at
+    /// height 3 whose `parent_qc` lands past it. The terminal carries the
+    /// child-root pair composing to its own state root.
+    ///
+    /// Returns the anchor the follow starts from and the two blocks.
+    fn straddling_chain() -> (ShardAnchor, Block, Block, SplitChildRoots) {
+        let left = StateRoot::from_raw(Hash::from_bytes(b"left subtree"));
+        let right = StateRoot::from_raw(Hash::from_bytes(b"right subtree"));
+        let pair = SplitChildRoots { left, right };
+        let terminal_root = pair.composed_root();
+
+        let anchor_block = parent_block(1, 1, BlockHash::ZERO, 4_000, StateRoot::ZERO, None);
+        let anchor = ShardAnchor {
+            state_root: StateRoot::ZERO,
+            block_hash: anchor_block.hash(),
+            height: BlockHeight::new(1),
+            weighted_timestamp: WeightedTimestamp::from_millis(4_000),
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            settled_waves_root: None,
+        };
+        // The terminal's own parent QC sits at the cut exactly — the
+        // boundary instant counts as not yet crossed.
+        let terminal = parent_block(2, 2, anchor.block_hash, CUT_MS, terminal_root, Some(pair));
+        // The coast block's parent QC is the canonical certificate over
+        // the terminal, stamped past the cut.
+        let coast = parent_block(
+            3,
+            3,
+            terminal.hash(),
+            CUT_MS + 500,
+            terminal_root,
+            Some(pair),
+        );
+        (anchor, terminal, coast, pair)
+    }
+
+    /// A recognizing follow walks the parent chain, spots the crossing
+    /// when the coast block's `parent_qc` lands past the cut, and derives
+    /// the child genesis the beacon fold composes from the same terminal.
+    ///
+    /// The canonical clock is the coast block's `parent_qc`, never the QC
+    /// served alongside either block — a terminal re-certified at a higher
+    /// round during the coast carries a divergent stamp.
+    #[test]
+    fn recognizing_follow_derives_the_child_genesis_from_the_terminal() {
+        let (anchor, terminal, coast, pair) = straddling_chain();
+        let (child, _) = ShardId::ROOT.children();
+
+        let mut tail = ObserverTail::recognizing(anchor, child);
+        tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
+
+        assert!(
+            tail.next_request().is_some(),
+            "the walk starts above the anchor"
+        );
+        assert_eq!(
+            tail.on_response(&response(&terminal, 9_999)),
+            TailOutcome::Accepted
+        );
+        assert!(
+            tail.settled_terminal().is_none(),
+            "the terminal is not recognised until its successor arrives",
+        );
+
+        assert!(tail.next_request().is_some());
+        assert_eq!(
+            tail.on_response(&response(&coast, 9_999)),
+            TailOutcome::Accepted
+        );
+
+        let sighting = tail.settled_terminal().expect("the crossing is recognised");
+        assert_eq!(sighting.header.hash(), terminal.hash());
+        assert_eq!(
+            sighting.canonical_qc.weighted_timestamp(),
+            WeightedTimestamp::from_millis(CUT_MS + 500),
+            "the clock is the coast block's parent QC, not either served QC",
+        );
+
+        let derived = sighting.genesis.as_ref().expect("the pair composes");
+        let expected = Block::split_child_genesis(
+            child,
+            pair.left,
+            terminal.header(),
+            WeightedTimestamp::from_millis(CUT_MS + 500),
+        );
+        assert_eq!(derived.block.hash(), expected.hash());
+        assert_eq!(derived.origin.genesis_height, BlockHeight::new(3));
+    }
+
+    /// The cut is projected for one window, and the block that resolves
+    /// the crossing arrives at its close. A `None` published after the
+    /// projection drops it must not clear what the follow already holds,
+    /// or the recognition is lost exactly when it becomes possible.
+    #[test]
+    fn a_withdrawn_projection_does_not_clear_the_published_cut() {
+        let (anchor, terminal, coast, _) = straddling_chain();
+        let (child, _) = ShardId::ROOT.children();
+
+        let mut tail = ObserverTail::recognizing(anchor, child);
+        tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
+        let _ = tail.next_request();
+        assert_eq!(
+            tail.on_response(&response(&terminal, 9_999)),
+            TailOutcome::Accepted
+        );
+
+        // The applying fold consumed the reshape record, so the head
+        // projection no longer names a cut for the parent.
+        tail.set_terminal_cut(None);
+
+        let _ = tail.next_request();
+        assert_eq!(
+            tail.on_response(&response(&coast, 9_999)),
+            TailOutcome::Accepted
+        );
+        assert!(
+            tail.settled_terminal().is_some(),
+            "the latched cut must still recognise the crossing",
+        );
+    }
+
+    /// Without a cut the follow is a plain tail: it walks the same blocks
+    /// and recognises nothing, which is what a duty discovered too late
+    /// falls back from.
+    #[test]
+    fn a_follow_with_no_cut_recognises_nothing() {
+        let (anchor, terminal, coast, _) = straddling_chain();
+        let (child, _) = ShardId::ROOT.children();
+
+        let mut tail = ObserverTail::recognizing(anchor, child);
+        for block in [&terminal, &coast] {
+            let _ = tail.next_request();
+            assert_eq!(
+                tail.on_response(&response(block, 9_999)),
+                TailOutcome::Accepted
+            );
+        }
+        assert!(tail.settled_terminal().is_none());
+    }
+
+    /// A following tail recognises the same crossing, but withholds the
+    /// sighting until the store has applied through the terminal — the
+    /// genesis adopts the child subtree as of *its* root.
+    #[test]
+    fn a_following_tail_withholds_the_sighting_until_it_has_applied() {
+        let (anchor, terminal, coast, _) = straddling_chain();
+        let (child, _) = ShardId::ROOT.children();
+
+        let mut tail = ObserverTail::new(anchor, child, StateRoot::ZERO);
+        tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
+
+        let _ = tail.next_request();
+        assert_eq!(
+            tail.on_response(&response(&terminal, 9_999)),
+            TailOutcome::Accepted
+        );
+        let (height, _) = tail
+            .take_apply()
+            .expect("the terminal is pending application");
+        assert_eq!(height, BlockHeight::new(2));
+        // The terminal carries the pair, so the applied root must reproduce
+        // this child's half.
+        tail.on_applied(StateRoot::from_raw(Hash::from_bytes(b"left subtree")))
+            .expect("the applied root matches the carried half");
+
+        let _ = tail.next_request();
+        assert_eq!(
+            tail.on_response(&response(&coast, 9_999)),
+            TailOutcome::Accepted
+        );
+        assert!(
+            tail.settled_terminal().is_none(),
+            "the successor is accepted but not yet applied",
+        );
+
+        let (height, _) = tail
+            .take_apply()
+            .expect("the coast block is pending application");
+        assert_eq!(height, BlockHeight::new(3));
+        tail.on_applied(StateRoot::from_raw(Hash::from_bytes(b"left subtree")))
+            .expect("a coast block moves no state under the prefix");
+        assert!(
+            tail.settled_terminal().is_some(),
+            "applying through the successor releases the sighting",
+        );
     }
 }
