@@ -21,17 +21,19 @@ use super::orchestrator::AdoptKind;
 /// The store-level adopt differs per duty — [`AdoptKind::Split`] adopts the
 /// observer's followed store, [`AdoptKind::ParentHalf`] the
 /// checkpoint-cloned child subtree, [`AdoptKind::Merge`] the composed parent
-/// union — as does the expected root: a followed store verifies against the
-/// genesis block's own root (itself reproduced from the parent terminal and
-/// the child anchor), while a parent half and a merge verify against the
-/// beacon-attested `anchor_root`.
+/// union — as does the expected root. Both split kinds verify against the
+/// genesis block's own root: the genesis is derived from the parent's
+/// terminal block, whose `split_child_roots` pair is checked to compose to
+/// that block's committed state root, so the pair cannot name a subtree the
+/// terminal does not contain. A merge has no such self-verifying pair and
+/// verifies against the beacon-attested `anchor_root`.
 ///
 /// # Errors
 ///
 /// Returns a description when the store-level adopt fails, when
-/// `anchor_root` is `None` for a kind that requires it (the anchor no longer
-/// projects), or when the adopted root does not match the expected one — the
-/// local derivation and the beacon disagree, so the duty must not seat.
+/// `anchor_root` is `None` for a merge (the anchor no longer projects), or
+/// when the adopted root does not match the expected one — the store does
+/// not hold the subtree the genesis names, so the duty must not seat.
 pub fn adopt_prepared_store<S: BoundaryStore>(
     storage: &S,
     kind: AdoptKind,
@@ -50,7 +52,7 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
             storage
                 .adopt_split_child(origin, genesis)
                 .map_err(|e| format!("split child adoption: {e}"))?,
-            anchor_root.ok_or("split child anchor no longer projects")?,
+            genesis.header().state_root(),
         ),
         AdoptKind::Merge => (
             storage

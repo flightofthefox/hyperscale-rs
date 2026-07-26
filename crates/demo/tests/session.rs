@@ -194,20 +194,16 @@ fn the_root_shard_splits_while_the_session_is_being_watched() {
 }
 
 #[test]
-#[ignore = "submissions in the split cut-over gap are dropped at ingress; see .plans/live-split-cutover.md"]
 fn transfers_reach_a_terminal_outcome_on_either_side_of_a_split() {
     // Status is per host and a host only tracks the shards it serves, so a
     // session that polls one host reports nothing for transactions routed to
     // the other child — they look stuck in flight forever when they in fact
     // settled. Every submission here must reach a terminal outcome.
     //
-    // Two submissions land in the window where the trie has already handed
-    // their prefix to a child that has no live chain yet: routing resolves
-    // the child, no host serves it, and the fanout gossips into a topic
-    // with no committee. They are dropped, not delayed — twenty further
-    // epochs of settle time leave them unreported. Closing the cut-over
-    // gap removes the window; rejecting an unroutable submission at
-    // ingress removes the silence.
+    // Submissions run on past the split, so a transfer whose prefix the trie
+    // has handed to a child has to settle on that child. Each child takes
+    // over at its parent's terminal crossing, so the shard the fanout
+    // resolves is one with a live committee to gossip to.
     let mut session = Session::new(
         SessionConfig {
             max_shards: 2,

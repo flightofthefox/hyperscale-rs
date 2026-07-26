@@ -360,6 +360,16 @@ pub struct ObserverTail {
     parent_committee: Option<ResolvedCommittee>,
     /// The terminal block, once the follow has walked past it.
     terminal: Option<TerminalSighting>,
+    /// Height of the last block the driver applied into the child store.
+    /// The genesis adopts the child subtree as of the *terminal* root, so
+    /// a flip before the store has applied through it would adopt the
+    /// wrong subtree.
+    applied: Option<BlockHeight>,
+    /// Walk headers without applying anything. A parent half already holds
+    /// the parent's state and seeds its child by cloning it, so it needs
+    /// the walk only to find which of the parent's blocks is the terminal
+    /// and to derive the genesis from it.
+    recognition_only: bool,
     /// The store's root after the last application (the imported root
     /// until the first one).
     root: StateRoot,
@@ -399,6 +409,23 @@ impl ObserverTail {
             prev: None,
             parent_committee: None,
             terminal: None,
+            applied: None,
+            recognition_only: false,
+        }
+    }
+
+    /// A follow that only recognises the terminal, applying nothing.
+    ///
+    /// For a parent half: it was on the parent, so its child store is a
+    /// clone of state it already holds rather than something the follow
+    /// builds. It walks the same headers for the same reason an observer
+    /// does — to find the terminal crossing and derive the child genesis
+    /// from it — and skips every write.
+    #[must_use]
+    pub fn recognizing(anchor: ShardAnchor, child: ShardId) -> Self {
+        Self {
+            recognition_only: true,
+            ..Self::new(anchor, child, StateRoot::ZERO)
         }
     }
 
@@ -424,11 +451,22 @@ impl ObserverTail {
         }
     }
 
-    /// The parent's terminal block, once the follow has walked one block
-    /// past it. `None` until then.
+    /// The terminal sighting, but only once the follow has reached the
+    /// block *after* the terminal — applied for a following tail, walked
+    /// past for a recognizing one.
+    ///
+    /// Two reasons it is the successor and not the terminal itself. A
+    /// followed store's root must be the child subtree as of the terminal
+    /// root, which applying the terminal establishes — and the successor is
+    /// a coast block past the cut, empty by rule, so it moves no state. But
+    /// the adopt reads the child's substate byte total at the genesis
+    /// height, which is `terminal + 1`, so that version has to exist. A
+    /// recognizing tail writes nothing, and needs the successor anyway: its
+    /// `parent_qc` is the only canonical source of the genesis clock.
     #[must_use]
-    pub const fn terminal(&self) -> Option<&TerminalSighting> {
-        self.terminal.as_ref()
+    pub fn settled_terminal(&self) -> Option<&TerminalSighting> {
+        let terminal = self.terminal.as_ref()?;
+        (self.applied? >= terminal.height.next()).then_some(terminal)
     }
 
     /// The next block fetch, when none is outstanding and nothing is
@@ -514,11 +552,15 @@ impl ObserverTail {
         }
         self.prev = Some(header.clone());
 
-        self.pending = Some(PendingFollow {
-            height: header.height(),
-            receipts,
-            expected_root,
-        });
+        if self.recognition_only {
+            self.applied = Some(header.height());
+        } else {
+            self.pending = Some(PendingFollow {
+                height: header.height(),
+                receipts,
+                expected_root,
+            });
+        }
         self.last_hash = certified.block().hash();
         self.next = self.next.next();
         TailOutcome::Accepted
@@ -569,6 +611,7 @@ impl ObserverTail {
                 pending.height,
             ));
         }
+        self.applied = Some(pending.height);
         self.root = root;
         Ok(())
     }

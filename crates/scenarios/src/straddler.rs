@@ -17,15 +17,17 @@ use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 
 use crate::reshape::split_lifecycle;
-use crate::support::query::{beacon_epoch, committee_size, split_admitted};
+use crate::support::query::{
+    anchored_genesis_height, beacon_epoch, committee_size, split_admitted,
+};
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER,
     STRADDLER_SURVIVOR, build_reshape_threshold_vote_tx, build_transfer_tx, merge_straddler_setup,
     split_straddler_setup, validity_around,
 };
 use crate::support::wait::{
-    await_beacon_epoch, await_merge_keeper_count, await_root_matches_anchor, await_serves,
-    await_split_admitted, await_tx_terminal,
+    await_anchor_seeded, await_beacon_epoch, await_merge_keeper_count, await_root_matches_anchor,
+    await_serves, await_split_admitted, await_tx_terminal,
 };
 use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs};
 
@@ -224,10 +226,14 @@ pub fn split_straddler_run<C: Cluster>(
         "both splitter children must be served within budget",
     );
 
-    // The splitter's terminal block sits one below the children's genesis.
-    let terminal_b = c
-        .beacon_state()
-        .and_then(|s| s.boundaries.get(&child_left).map(|b| b.height))
+    // The splitter's terminal block sits one below the children's genesis. The
+    // children serve from the cut, ahead of the fold that publishes their
+    // anchor, so the height only reads off the boundary once that fold lands.
+    assert!(
+        await_anchor_seeded(c, child_left, epochs(6)),
+        "the beacon must compose the split children's anchor",
+    );
+    let terminal_b = anchored_genesis_height(c, child_left)
         .and_then(BlockHeight::prev)
         .expect("the children's seeded genesis pins the splitter's terminal block");
 

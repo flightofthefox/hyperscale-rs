@@ -110,9 +110,11 @@ impl SimulationRunner {
                 self.reshape_open_store(host, shard);
                 Some(ReshapeEvent::Opened { shard })
             }
-            ReshapeRequest::SeedFromParent { parent, child } => {
-                self.reshape_seed_from_parent(host, parent, child, retries)
-            }
+            ReshapeRequest::SeedFromParent {
+                parent,
+                child,
+                through,
+            } => self.reshape_seed_from_parent(host, parent, child, through, retries),
             ReshapeRequest::Fetch { duty, from, kind } => {
                 self.reshape_fetch(duty, from, kind, retries)
             }
@@ -227,13 +229,12 @@ impl SimulationRunner {
         host: NodeIndex,
         parent: ShardId,
         child: ShardId,
+        through: BlockHeight,
         retries: &mut Vec<ReshapeEvent>,
     ) -> Option<ReshapeEvent> {
         let ready = self
-            .host_topology(host)
-            .and_then(|topology_snapshot| topology_snapshot.boundary(child))
-            .zip(self.hosts_shard(host, parent))
-            .is_some_and(|(anchor, storage)| storage.committed_height() >= anchor.height);
+            .hosts_shard(host, parent)
+            .is_some_and(|storage| storage.committed_height() >= through);
         if !ready {
             retries.push(ReshapeEvent::SeedDeferred { child });
             return None;

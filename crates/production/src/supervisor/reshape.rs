@@ -198,8 +198,12 @@ impl ShardSupervisor {
         }
         match request {
             ReshapeRequest::OpenStore { shard } => self.reshape_open_store(shard),
-            ReshapeRequest::SeedFromParent { parent, child } => {
-                self.reshape_seed_from_parent(parent, child);
+            ReshapeRequest::SeedFromParent {
+                parent,
+                child,
+                through,
+            } => {
+                self.reshape_seed_from_parent(parent, child, through);
             }
             ReshapeRequest::Fetch { duty, from, kind } => self.reshape_fetch(duty, from, kind),
             ReshapeRequest::StageChunk {
@@ -270,12 +274,8 @@ impl ShardSupervisor {
     /// while the local parent is still behind (or its store is gone). The
     /// checkpoint hard-links, so the clone shares the engine bootstrap and the
     /// parent's substates without copying.
-    fn reshape_seed_from_parent(&self, parent: ShardId, child: ShardId) {
+    fn reshape_seed_from_parent(&self, parent: ShardId, child: ShardId, through: BlockHeight) {
         let events = self.events_tx.clone();
-        let Some(anchor) = self.process.topology_snapshot().load().boundary(child) else {
-            let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::SeedDeferred { child }));
-            return;
-        };
         let parent_storage = self
             .storages
             .lock()
@@ -290,10 +290,10 @@ impl ShardSupervisor {
         let factory = Arc::clone(&self.storage_factory);
         let dir = (self.storage_dir)(child);
         self.tokio_handle.spawn_blocking(move || {
-            // The anchor's height is the child genesis height; the parent commits
-            // one block past its terminal (the coast certifying it), so the local
-            // chain is ready for the clone once its tip reaches the anchor.
-            if parent_storage.committed_height() < anchor.height {
+            // `through` is the child's genesis height; the parent commits one
+            // block past its terminal (the coast certifying it), so the local
+            // chain is ready for the clone once its tip reaches it.
+            if parent_storage.committed_height() < through {
                 let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::SeedDeferred { child }));
                 return;
             }

@@ -25,7 +25,7 @@ use hyperscale_storage::{ImportLeaf, ImportProgress};
 use hyperscale_types::network::request::{GetBlockRequest, GetStateRangeRequest};
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, ChainOrigin, NetworkDefinition, QuorumCertificate,
+    Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, NetworkDefinition, QuorumCertificate,
     ShardAnchor, ShardId, StateRoot, StoredReceipt, ValidatorId, Verifier,
 };
 
@@ -85,6 +85,12 @@ pub enum ReshapeRequest {
         parent: ShardId,
         /// The split child the clone seeds.
         child: ShardId,
+        /// Height the local parent must have committed through before the
+        /// clone is taken — the child's genesis height, one past the
+        /// parent's terminal. Passed rather than read from the child's
+        /// beacon anchor, which does not exist until an epoch after the
+        /// cut and is precisely what the early flip does without.
+        through: BlockHeight,
     },
     /// Fetch from `from`'s committee, on behalf of `duty`. Answered by
     /// [`ReshapeEvent::Fetched`] (or [`ReshapeEvent::FetchFailed`]). The
@@ -302,6 +308,11 @@ struct ObserverDuty {
     /// Stage writes emitted but not yet acknowledged; the finalize waits
     /// for zero so every staged chunk is durable first.
     stages_unacked: usize,
+    /// Hash of the genesis this duty adopted from its own follow, before
+    /// the beacon's anchor existed. Checked against that anchor when it
+    /// lands; a mismatch means the parent chain this host followed is not
+    /// the one the network committed.
+    adopted_genesis: Option<BlockHash>,
 }
 
 /// One keeper seat this host runs in a pending merge.
@@ -375,7 +386,23 @@ struct KeeperDuty {
 enum ParentHalfPhase {
     /// Awaiting the child anchor, then seeding the child store by cloning the
     /// host's local parent once it has committed through the terminal crossing.
+    /// The fallback entry, for a duty with no scheduled cut to recognise.
     Seeding {
+        /// Whether the seed request is already in flight.
+        requested: bool,
+    },
+    /// Walking the parent's own committed chain to find its terminal
+    /// crossing, so the child can be seeded and adopted at the cut rather
+    /// than an epoch later when the beacon publishes the child's anchor.
+    /// Applies nothing — the store comes from cloning the local parent.
+    Recognizing(Box<ObserverTail>),
+    /// Terminal recognised and genesis derived; cloning the local parent
+    /// through the child's genesis height.
+    SeedingAt {
+        /// The derived chain origin.
+        origin: ChainOrigin,
+        /// The derived genesis block.
+        genesis: Box<Block>,
         /// Whether the seed request is already in flight.
         requested: bool,
     },
@@ -491,7 +518,7 @@ impl ReshapeOrchestrator {
         }
         let halves: Vec<ShardId> = self.parent_halves.keys().copied().collect();
         for child in halves {
-            self.advance_parent_half(child, view, &mut requests);
+            self.advance_parent_half(child, view, verifier, &mut requests);
         }
         // A seated parent half lingers only to keep its child from being
         // re-discovered; once the projection releases it (the child committed
@@ -585,16 +612,18 @@ impl ReshapeOrchestrator {
                 }
             }
             ReshapeEvent::SeedDeferred { child } => {
-                if let Some(duty) = self.parent_halves.get_mut(&child)
-                    && let ParentHalfPhase::Seeding { requested } = &mut duty.phase
-                {
-                    *requested = false;
+                if let Some(duty) = self.parent_halves.get_mut(&child) {
+                    match &mut duty.phase {
+                        ParentHalfPhase::Seeding { requested }
+                        | ParentHalfPhase::SeedingAt { requested, .. } => *requested = false,
+                        _ => {}
+                    }
                 }
             }
         }
     }
 
-    /// Re-arm a failed fetch on the observer or keeper half awaiting it.
+    /// Re-arm a failed fetch on the duty awaiting it.
     fn apply_fetch_failed(&mut self, duty: ShardId, from: ShardId, kind: FetchKind) {
         if let Some(observer) = self.observers.get_mut(&duty) {
             match (&mut observer.phase, kind) {
@@ -615,10 +644,12 @@ impl ReshapeOrchestrator {
                 }
                 FetchKind::Block { .. } => half.terminal_requested = false,
             }
-        } else if let Some(half) = self.parent_halves.get_mut(&duty)
-            && let ParentHalfPhase::FetchingTerminal { requested, .. } = &mut half.phase
-        {
-            *requested = false;
+        } else if let Some(half) = self.parent_halves.get_mut(&duty) {
+            match &mut half.phase {
+                ParentHalfPhase::Recognizing(tail) => tail.on_failure(),
+                ParentHalfPhase::FetchingTerminal { requested, .. } => *requested = false,
+                _ => {}
+            }
         }
     }
 
@@ -725,6 +756,12 @@ impl ReshapeOrchestrator {
             return;
         };
         let mut next: Option<ParentHalfPhase> = None;
+        if let ParentHalfPhase::Recognizing(tail) = &mut duty.phase
+            && let FetchedKind::Block { response } = &kind
+        {
+            tail.on_response(response);
+            return;
+        }
         if let ParentHalfPhase::FetchingTerminal { anchor, requested } = &mut duty.phase
             && let FetchedKind::Block { response } = kind
         {
@@ -762,6 +799,7 @@ impl ReshapeOrchestrator {
                     store_opened: false,
                     pending_stage: Vec::new(),
                     stages_unacked: 0,
+                    adopted_genesis: None,
                 });
                 if !duty.validators.contains(&validator) {
                     duty.validators.push(validator);
@@ -782,6 +820,36 @@ impl ReshapeOrchestrator {
         let Some(duty) = self.observers.get_mut(&child) else {
             return;
         };
+        // A duty that flipped from its own follow adopted a genesis before
+        // the beacon published one. When the anchor lands it must agree:
+        // both are derived from the same terminal block, one by this host
+        // from the chain it tailed and one by the fold from the terminal
+        // contribution it committed. Disagreement means the parent chain
+        // this host followed is not the one the network committed, so the
+        // adopted store is unusable — wipe the duty back to the start and
+        // re-seed from the anchor, the path a late joiner takes anyway.
+        if let Some(adopted) = duty.adopted_genesis
+            && let Some(anchor) = view.boundary(child)
+        {
+            if anchor.block_hash == adopted {
+                duty.adopted_genesis = None;
+            } else {
+                tracing::error!(
+                    ?child,
+                    ?adopted,
+                    anchored = ?anchor.block_hash,
+                    "adopted split-child genesis disagrees with the beacon anchor; \
+                     re-seeding the duty from the attested anchor"
+                );
+                duty.adopted_genesis = None;
+                duty.open_requested = false;
+                duty.store_opened = false;
+                duty.pending_stage.clear();
+                duty.stages_unacked = 0;
+                duty.phase = ObserverPhase::Opening;
+                return;
+            }
+        }
         match &mut duty.phase {
             ObserverPhase::Opening => {
                 if !duty.open_requested {
@@ -844,6 +912,28 @@ impl ReshapeOrchestrator {
                 // around when the follow reaches the terminal whose QCs it
                 // verifies.
                 tail.capture_committee(view.resolved_committee(duty.parent));
+                // Flip at the cut, from the chain this host followed,
+                // rather than an epoch later when the beacon publishes the
+                // anchor. The store must have applied through the terminal
+                // — the genesis adopts the child subtree as of *its* root —
+                // and the terminal must be commit-proven, since a bare
+                // certificate can be superseded.
+                if let Some(sighting) = tail.settled_terminal()
+                    && let Some(derived) = &sighting.genesis
+                    && commit_proven(child, sighting, verifier, view.network())
+                {
+                    tracing::info!(
+                        ?child,
+                        terminal_height = sighting.height.inner(),
+                        "flipping the split child from its own follow of the parent"
+                    );
+                    duty.adopted_genesis = Some(derived.block.hash());
+                    duty.phase = ObserverPhase::Adopting {
+                        origin: derived.origin,
+                        genesis: Box::new(derived.block.clone()),
+                    };
+                    return;
+                }
                 // Once this child's boundary seeds, the parent terminated.
                 // Keep following its committed blocks until the tail catches
                 // up through the terminal crossing, then derive genesis from
@@ -853,13 +943,6 @@ impl ReshapeOrchestrator {
                 if let Some(anchor) = child_anchor
                     && tail.next_height() >= anchor.height
                 {
-                    report_terminal_evidence(
-                        child,
-                        tail.terminal(),
-                        anchor,
-                        verifier,
-                        view.network(),
-                    );
                     duty.phase = ObserverPhase::FetchingTerminal {
                         anchor,
                         requested: false,
@@ -1123,10 +1206,12 @@ impl ReshapeOrchestrator {
     }
 
     /// Advance one parent-half duty, emitting its current io.
+    #[allow(clippy::too_many_lines)] // single dispatch over ParentHalfPhase
     fn advance_parent_half(
         &mut self,
         child: ShardId,
         view: &ReshapeView,
+        verifier: &dyn Verifier,
         out: &mut Vec<ReshapeRequest>,
     ) {
         let Some(duty) = self.parent_halves.get_mut(&child) else {
@@ -1137,19 +1222,83 @@ impl ReshapeOrchestrator {
         let mut next: Option<ParentHalfPhase> = None;
         match &mut duty.phase {
             ParentHalfPhase::Seeding { requested } => {
-                // The child anchor seeds once the parent's terminal folds; it is
-                // the version the clone must reach and the derivation verifies
-                // against, so wait for it before seeding.
-                if let Some(anchor) = view.boundary(child) {
+                // With the cut scheduled a window ahead, the parent's own
+                // chain says which of its blocks is the terminal — no need
+                // to wait for the beacon to publish the child's anchor.
+                // Only when genuinely early: once the child's anchor
+                // projects, the parent has terminated and may already have
+                // dissolved, so a walk of its chain would never resolve.
+                // Late-discovered duties take the anchor path below.
+                if !*requested
+                    && view.boundary(child).is_none()
+                    && view.terminal_cut(parent).is_some()
+                    && let Some(parent_anchor) = view.boundary(parent)
+                {
+                    next = Some(ParentHalfPhase::Recognizing(Box::new(
+                        ObserverTail::recognizing(parent_anchor, child),
+                    )));
+                }
+                // Fallback: the child anchor seeds once the parent's terminal
+                // folds; it is the version the clone must reach and the
+                // derivation verifies against.
+                else if let Some(anchor) = view.boundary(child) {
                     if store_seeded {
                         next = Some(ParentHalfPhase::FetchingTerminal {
                             anchor,
                             requested: false,
                         });
                     } else if !*requested {
-                        out.push(ReshapeRequest::SeedFromParent { parent, child });
+                        out.push(ReshapeRequest::SeedFromParent {
+                            parent,
+                            child,
+                            through: anchor.height,
+                        });
                         *requested = true;
                     }
+                }
+            }
+            ParentHalfPhase::Recognizing(tail) => {
+                tail.set_terminal_cut(view.terminal_cut(parent));
+                tail.capture_committee(view.resolved_committee(parent));
+                if let Some(sighting) = tail.settled_terminal()
+                    && let Some(derived) = &sighting.genesis
+                    && commit_proven(child, sighting, verifier, view.network())
+                {
+                    tracing::info!(
+                        ?child,
+                        terminal_height = sighting.height.inner(),
+                        "seating the split child's parent half from the local parent chain"
+                    );
+                    next = Some(ParentHalfPhase::SeedingAt {
+                        origin: derived.origin,
+                        genesis: Box::new(derived.block.clone()),
+                        requested: false,
+                    });
+                } else if let Some(request) = tail.next_request() {
+                    out.push(ReshapeRequest::Fetch {
+                        duty: child,
+                        from: parent,
+                        kind: FetchKind::Block { request },
+                    });
+                }
+            }
+            ParentHalfPhase::SeedingAt {
+                origin,
+                genesis,
+                requested,
+            } => {
+                if store_seeded {
+                    next = Some(ParentHalfPhase::Adopting {
+                        origin: *origin,
+                        genesis: genesis.clone(),
+                    });
+                } else if !*requested {
+                    out.push(ReshapeRequest::SeedFromParent {
+                        parent,
+                        child,
+                        through: origin.genesis_height,
+                    });
+                    *requested = true;
                 }
             }
             ParentHalfPhase::FetchingTerminal { anchor, requested } => {
@@ -1197,57 +1346,26 @@ impl ReshapeOrchestrator {
     }
 }
 
-/// A ready signal's recipients — `shard`'s committee minus the signer.
-/// Check a locally derived child genesis against the beacon's anchor for
-/// the same child, once that anchor lands.
-///
-/// The two are computed from the same terminal block by different parties
-/// — the follower from the chain it tailed, the beacon fold from the
-/// terminal contribution it committed — so they must agree byte for byte.
-/// A disagreement means the local parent chain and the network disagree
-/// about a committed block. Reported only; the flip still adopts against
-/// the anchor, so the derivation is proven across real runs before
-/// anything depends on it.
-/// Report what the follow established about the parent's terminal, once
-/// the beacon's anchor for the child lands: that the terminal *committed*
-/// rather than merely certified, and that the genesis derived from it
-/// reconstructs the anchor.
-///
-/// Both are reported only. The flip still adopts against the anchor, so
-/// the evidence is proven across real runs before anything depends on it.
-fn report_terminal_evidence(
-    child: ShardId,
-    sighting: Option<&TerminalSighting>,
-    anchor: ShardAnchor,
-    verifier: &dyn Verifier,
-    network: &NetworkDefinition,
-) {
-    if let Some(sighting) = sighting {
-        report_commit_proof(child, sighting, verifier, network);
-    }
-    compare_derived_genesis(child, sighting, anchor);
-}
-
-/// Verify the two-chain that commits the parent's terminal.
+/// Whether the parent's terminal is commit-proven — the gate the flip
+/// keys on.
 ///
 /// Two QCs can exist at one height; two commits cannot. Certification
-/// alone would let a superseded block seed the children, so the flip will
-/// key on this rather than on the served certificate.
-fn report_commit_proof(
+/// alone would let a superseded block seed the children.
+fn commit_proven(
     child: ShardId,
     sighting: &TerminalSighting,
     verifier: &dyn Verifier,
     network: &NetworkDefinition,
-) {
+) -> bool {
     let height = sighting.height.inner();
     let Some((proof, committee)) = &sighting.commit_proof else {
-        tracing::warn!(
+        tracing::debug!(
             ?child,
             height,
-            "no commit proof for the parent's terminal: no captured committee, \
-             or a view change broke the two-chain"
+            "no commit proof for the parent's terminal yet: no captured committee, \
+             or a view change broke the two-chain — the anchor path still covers it"
         );
-        return;
+        return false;
     };
     // Both QCs are the parent's, in the same window, so the two-chain
     // verifies against one committee twice.
@@ -1259,45 +1377,12 @@ fn report_commit_proof(
             %error,
             "the parent's terminal failed commit-proof verification"
         );
-        return;
+        return false;
     }
-    tracing::debug!(?child, height, "the parent's terminal is commit-proven");
+    true
 }
 
-fn compare_derived_genesis(
-    child: ShardId,
-    sighting: Option<&TerminalSighting>,
-    anchor: ShardAnchor,
-) {
-    let Some(sighting) = sighting else {
-        tracing::debug!(
-            ?child,
-            "child anchor seeded before the follow recognised the parent's terminal"
-        );
-        return;
-    };
-    let Some(derived) = &sighting.genesis else {
-        tracing::warn!(
-            ?child,
-            terminal_height = sighting.height.inner(),
-            "the parent's terminal carried no composable split child roots"
-        );
-        return;
-    };
-    let derived_hash = derived.block.hash();
-    if derived_hash == anchor.block_hash {
-        tracing::debug!(?child, "derived child genesis matches the beacon anchor");
-    } else {
-        tracing::error!(
-            ?child,
-            ?derived_hash,
-            anchored = ?anchor.block_hash,
-            terminal_height = sighting.height.inner(),
-            "derived child genesis disagrees with the beacon anchor"
-        );
-    }
-}
-
+/// A ready signal's recipients — `shard`'s committee minus the signer.
 fn recipients_for(view: &ReshapeView, shard: ShardId, validator: ValidatorId) -> Vec<ValidatorId> {
     view.committee(shard)
         .iter()
@@ -1485,6 +1570,7 @@ mod tests {
             store_opened: true,
             pending_stage: Vec::new(),
             stages_unacked: 0,
+            adopted_genesis: None,
         }
     }
 
@@ -1825,7 +1911,7 @@ mod tests {
         assert!(
             matches!(
                 requests.as_slice(),
-                [ReshapeRequest::SeedFromParent { parent: p, child: c }]
+                [ReshapeRequest::SeedFromParent { parent: p, child: c, .. }]
                     if *p == parent && *c == child
             ),
             "a held parent-half seat must seed from the parent; got {requests:?}",

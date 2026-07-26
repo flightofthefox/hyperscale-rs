@@ -6,7 +6,9 @@
 
 use hyperscale_types::{ShardId, TransactionStatus, TxHash};
 
-use super::query::{anchor_root, beacon_epoch, merge_keeper_count, split_admitted};
+use super::query::{
+    anchor_root, anchored_genesis_height, beacon_epoch, merge_keeper_count, split_admitted,
+};
 use super::{Budget, Cluster};
 
 /// Wait until the committed beacon epoch reaches `target`.
@@ -45,6 +47,12 @@ pub fn await_merge_keeper_count<C: Cluster>(
     c.run_until(budget, |c| {
         merge_keeper_count(c, parent).is_some_and(|count| count >= min)
     })
+}
+
+/// Wait until the beacon composes `shard`'s reshape anchor, replacing the
+/// placeholder its cut installed.
+pub fn await_anchor_seeded<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) -> bool {
+    c.run_until(budget, |c| anchored_genesis_height(c, shard).is_some())
 }
 
 /// Wait until `shard`'s committed root matches the beacon-composed anchor — the

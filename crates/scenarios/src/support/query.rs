@@ -10,8 +10,9 @@ use std::collections::BTreeSet;
 
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    BlockHeight, ConsensusPublicKey, Epoch, PendingReshape, ShardId, Stake, StakePool, StakePoolId,
-    StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
+    BlockHash, BlockHeight, ConsensusPublicKey, Epoch, PendingReshape, ShardId, Stake, StakePool,
+    StakePoolId, StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    ValidatorStatus,
 };
 
 use super::Cluster;
@@ -87,6 +88,24 @@ pub fn split_admitted<C: Cluster>(c: &C, parent: ShardId) -> bool {
 pub fn anchor_root<C: Cluster>(c: &C, shard: ShardId) -> Option<StateRoot> {
     c.beacon_state()
         .and_then(|state| state.boundaries.get(&shard).map(|b| b.state_root))
+}
+
+/// The genesis height the beacon composed onto `shard`'s boundary, once the
+/// fold that publishes the anchor has run.
+///
+/// `None` while the record is still the placeholder a reshape cut installs,
+/// which carries a zero block hash. A split child outruns that fold — it
+/// flips from its own follow of the parent and serves from the cut — so
+/// "served" no longer implies "anchored".
+#[must_use]
+pub fn anchored_genesis_height<C: Cluster>(c: &C, shard: ShardId) -> Option<BlockHeight> {
+    c.beacon_state().and_then(|state| {
+        state
+            .boundaries
+            .get(&shard)
+            .filter(|boundary| boundary.block_hash != BlockHash::ZERO)
+            .map(|boundary| boundary.height)
+    })
 }
 
 /// The number of keepers drawn for a merge into `parent`, once paired (both
