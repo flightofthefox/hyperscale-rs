@@ -1555,10 +1555,24 @@ fn commit_proven(
             ?child,
             height,
             "no commit proof for the parent's terminal yet: no captured committee, \
-             or a view change broke the two-chain — the anchor path still covers it"
+             or the coast has not yet produced a round-contiguous pair — the \
+             anchor path still covers it"
         );
         return false;
     };
+    // What the proof commits must be the block the genesis derives from.
+    // A prefix proof's two-chain sits above the terminal, so the link's
+    // foot is the only thing tying it back down; checked before the
+    // signature work, which is the expensive half.
+    if proof.proven_block_hash() != sighting.header.hash() {
+        tracing::error!(
+            ?child,
+            height,
+            proven = ?proof.proven_block_hash(),
+            "the commit proof commits a block other than the parent's terminal"
+        );
+        return false;
+    }
     // Both QCs are the parent's, in the same window, so the two-chain
     // verifies against one committee twice.
     let committees = [committee.clone(), committee.clone()];

@@ -26,9 +26,9 @@ use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin, CommitProof,
-    NetworkDefinition, QuorumCertificate, ReadySignal, ResolvedCommittee, ShardAnchor, ShardId,
-    SignError, Signer, StateRoot, StoredReceipt, ValidatorId, WeightedTimestamp,
-    ready_signal_message, ready_signal_window, shard_prefix_path,
+    MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, QuorumCertificate, ReadySignal,
+    ResolvedCommittee, ShardAnchor, ShardId, SignError, Signer, StateRoot, StoredReceipt,
+    ValidatorId, WeightedTimestamp, ready_signal_message, ready_signal_window, shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
@@ -273,11 +273,13 @@ pub struct TerminalSighting {
     /// `split_child_roots` pair or one that fails to compose to its own
     /// state root.
     pub genesis: Option<DerivedGenesis>,
-    /// The two-chain proving the terminal *committed* rather than merely
-    /// certified, with the committee its QCs verify against. Absent when
-    /// the follow never captured the parent's committee, or when the
-    /// block after the terminal is not round-contiguous with it — a view
-    /// change between them means no direct commit to prove here.
+    /// The proof that the terminal *committed* rather than merely
+    /// certified, with the committee its QCs verify against. Built from
+    /// the first round-contiguous pair at or above the terminal — its own
+    /// successor when no view change intervened, a later coast pair with
+    /// an ancestry link down to it otherwise. Absent until such a pair
+    /// arrives, and permanently when the follow never captured the
+    /// parent's committee or the gap outgrew [`MAX_COMMIT_PROOF_ANCESTRY`].
     pub commit_proof: Option<(CommitProof, ResolvedCommittee)>,
 }
 
@@ -361,6 +363,11 @@ pub struct ObserverTail {
     parent_committee: Option<ResolvedCommittee>,
     /// The terminal block, once the follow has walked past it.
     terminal: Option<TerminalSighting>,
+    /// The terminal and the coast blocks above it, ascending — the run a
+    /// prefix commitment proof walks back down. Seeded when the crossing is
+    /// sighted and dropped once the proof is built or the gap outgrows what
+    /// one can carry.
+    since_terminal: Vec<BlockHeader>,
     /// Height of the last block the driver applied into the child store.
     /// The genesis adopts the child subtree as of the *terminal* root, so
     /// a flip before the store has applied through it would adopt the
@@ -410,6 +417,7 @@ impl ObserverTail {
             prev: None,
             parent_committee: None,
             terminal: None,
+            since_terminal: Vec::new(),
             applied: None,
             recognition_only: false,
         }
@@ -546,30 +554,18 @@ impl ObserverTail {
             && terminal.parent_qc().weighted_timestamp().as_millis() <= cut.as_millis()
             && parent_qc_wt.as_millis() > cut.as_millis()
         {
-            // The two-chain that commits the terminal: its own certificate
-            // is this block's parent QC, and this block carries the QC over
-            // itself. Only a round-contiguous pair is a direct commit; a
-            // view change between them leaves nothing to prove here.
-            let commit_proof = self
-                .parent_committee
-                .clone()
-                .filter(|_| header.round() == terminal.round().next())
-                .map(|committee| {
-                    (
-                        CommitProof::direct(
-                            CertifiedBlockHeader::new(terminal.clone(), header.parent_qc().clone()),
-                            CertifiedBlockHeader::new(header.clone(), certified.qc().clone()),
-                        ),
-                        committee,
-                    )
-                });
+            // The run the commitment proof walks back down starts at the
+            // terminal itself; the coast blocks above it are appended as
+            // they arrive.
+            self.since_terminal = vec![terminal.clone()];
             self.terminal = Some(TerminalSighting {
                 header: terminal.clone(),
                 canonical_qc: header.parent_qc().clone(),
                 genesis: derive_child_genesis(self.child, terminal, parent_qc_wt),
-                commit_proof,
+                commit_proof: None,
             });
         }
+        self.advance_commit_proof(header, certified.qc());
         self.prev = Some(header.clone());
 
         if self.recognition_only {
@@ -584,6 +580,69 @@ impl ObserverTail {
         self.last_hash = certified.block().hash();
         self.next = self.next.next();
         TailOutcome::Accepted
+    }
+
+    /// Extend the terminal's commitment proof with `header`, the newest
+    /// block of the parent's coast.
+    ///
+    /// A block commits when a round-contiguous pair forms at or above it,
+    /// so the terminal's own successor proves it only when no view change
+    /// intervened. The coast supplies as many further blocks as needed —
+    /// and the terminal committed at all only if some such pair exists — so
+    /// the walk keeps going and proves the terminal as the *prefix* of
+    /// whichever pair arrives, the shape [`CommitProof`]'s ancestry link
+    /// carries.
+    ///
+    /// The gap is bounded: past [`MAX_COMMIT_PROOF_ANCESTRY`] no proof can
+    /// carry it, so the run is abandoned and the duty falls back to the
+    /// anchor path.
+    fn advance_commit_proof(&mut self, header: &BlockHeader, qc: &QuorumCertificate) {
+        if self
+            .terminal
+            .as_ref()
+            .is_none_or(|s| s.commit_proof.is_some())
+        {
+            return;
+        }
+        // An abandoned run stays abandoned. Restarting it would build a
+        // direct proof over two coast blocks, which commits one of them and
+        // not the terminal below.
+        if self.since_terminal.is_empty() {
+            return;
+        }
+        if self.since_terminal.len() > MAX_COMMIT_PROOF_ANCESTRY + 1 {
+            // The gap outgrew what an ancestry link can carry; stop
+            // retaining it and leave the duty to the anchor path.
+            self.since_terminal = Vec::new();
+            return;
+        }
+        self.since_terminal.push(header.clone());
+        let run = &self.since_terminal;
+        let n = run.len();
+        // `n >= 2` holds: the run is seeded with the terminal before the
+        // first push. The pair is the two newest blocks.
+        let Some(prev) = run.get(n.wrapping_sub(2)) else {
+            return;
+        };
+        if header.round() != prev.round().next() {
+            return;
+        }
+        let Some(committee) = self.parent_committee.clone() else {
+            return;
+        };
+        // Descending from `prev`'s parent to the terminal, which the proof
+        // requires as the link's last element. Empty when `prev` is the
+        // terminal — the direct commit.
+        let ancestry: Vec<BlockHeader> = run[..n - 2].iter().rev().cloned().collect();
+        let proof = CommitProof::new(
+            CertifiedBlockHeader::new(prev.clone(), header.parent_qc().clone()),
+            CertifiedBlockHeader::new(header.clone(), qc.clone()),
+            ancestry,
+        );
+        if let Some(sighting) = &mut self.terminal {
+            sighting.commit_proof = Some((proof, committee));
+        }
+        self.since_terminal = Vec::new();
     }
 
     /// Re-arm after a transport-level failure.
@@ -653,14 +712,16 @@ impl ObserverTail {
 mod tests {
     use std::sync::Arc;
 
+    use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_jmt::{Blake3Hasher, Hasher};
     use hyperscale_storage::test_helpers::pin_snap_sync_replica;
     use hyperscale_storage::{BoundaryStore, SubstateStore, WitnessSeed};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BoundedVec, CertificateRoot,
-        ElidedCertifiedBlock, Hash, InFlightCount, Inventory, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, Round, SignerBitfield, SplitChildRoots, TransactionRoot, WitnessSources,
+        CommitProofVerifyError, ElidedCertifiedBlock, Hash, InFlightCount, Inventory,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, SignerBitfield,
+        SplitChildRoots, TransactionRoot, VoteCount, WitnessSources,
     };
 
     use super::*;
@@ -1040,6 +1101,203 @@ mod tests {
             );
         }
         assert!(tail.settled_terminal().is_none());
+    }
+
+    /// A committee the tail only stores — it verifies nothing itself, so
+    /// the contents are irrelevant to what these tests assert.
+    fn stub_committee() -> ResolvedCommittee {
+        ResolvedCommittee {
+            public_keys: Vec::new(),
+            quorum_threshold: VoteCount::new(0),
+        }
+    }
+
+    /// The terminal's own successor is round-contiguous with it, so the
+    /// proof is direct and carries no ancestry link.
+    #[test]
+    fn a_contiguous_successor_proves_the_terminal_directly() {
+        let (anchor, terminal, coast, _) = straddling_chain();
+        let (child, _) = ShardId::ROOT.children();
+
+        let mut tail = ObserverTail::recognizing(anchor, child);
+        tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
+        tail.capture_committee(Some(stub_committee()));
+        for block in [&terminal, &coast] {
+            let _ = tail.next_request();
+            assert_eq!(
+                tail.on_response(&response(block, 9_999)),
+                TailOutcome::Accepted
+            );
+        }
+
+        let (proof, _) = tail
+            .settled_terminal()
+            .expect("recognised")
+            .commit_proof
+            .as_ref()
+            .expect("a contiguous pair proves the terminal");
+        assert_eq!(proof.proven_block_hash(), terminal.hash());
+        assert_eq!(proof.proven_height(), BlockHeight::new(2));
+    }
+
+    /// A view change at the coast breaks round contiguity with the
+    /// terminal's own successor. The terminal still committed — some pair
+    /// above it formed — so the walk keeps going and proves it as the
+    /// prefix of the pair that does arrive.
+    #[test]
+    fn a_view_change_at_the_coast_still_proves_the_terminal() {
+        let (anchor, terminal, _, pair) = straddling_chain();
+        let (child, _) = ShardId::ROOT.children();
+        let terminal_root = pair.composed_root();
+
+        // Round 3 is skipped: the coast block at height 3 lands at round 4,
+        // so it is not contiguous with the terminal at round 2.
+        let gap = parent_block(
+            3,
+            4,
+            terminal.hash(),
+            CUT_MS + 500,
+            terminal_root,
+            Some(pair),
+        );
+        // The next block is contiguous with *that* one, committing it — and
+        // the terminal below it as the branch's prefix.
+        let pairing = parent_block(4, 5, gap.hash(), CUT_MS + 900, terminal_root, Some(pair));
+
+        let mut tail = ObserverTail::recognizing(anchor, child);
+        tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
+        tail.capture_committee(Some(stub_committee()));
+
+        let _ = tail.next_request();
+        assert_eq!(
+            tail.on_response(&response(&terminal, 9_999)),
+            TailOutcome::Accepted
+        );
+        let _ = tail.next_request();
+        assert_eq!(
+            tail.on_response(&response(&gap, 9_999)),
+            TailOutcome::Accepted
+        );
+        assert!(
+            tail.settled_terminal()
+                .expect("recognised")
+                .commit_proof
+                .is_none(),
+            "a view change leaves the terminal's own successor unable to prove it",
+        );
+
+        let _ = tail.next_request();
+        assert_eq!(
+            tail.on_response(&response(&pairing, 9_999)),
+            TailOutcome::Accepted
+        );
+        let (proof, _) = tail
+            .settled_terminal()
+            .expect("recognised")
+            .commit_proof
+            .as_ref()
+            .expect("the later coast pair proves the terminal");
+        assert_eq!(
+            proof.proven_block_hash(),
+            terminal.hash(),
+            "the ancestry link must bottom out at the terminal",
+        );
+        // Every structural check passes — linkage, the round-contiguous
+        // two-chain, and the ancestry link chaining down to the terminal.
+        // Only the signature work fails, against a committee holding no keys.
+        let err = proof
+            .verify_resolved(
+                &BlsVerifier,
+                &NetworkDefinition::simulator(),
+                &[stub_committee(), stub_committee()],
+            )
+            .expect_err("a keyless committee cannot satisfy the QCs");
+        assert!(
+            matches!(err, CommitProofVerifyError::Qc(_)),
+            "the prefix proof must be structurally well formed; got {err:?}",
+        );
+    }
+
+    /// A coast that never pairs for longer than an ancestry link can carry
+    /// abandons the proof permanently. Resuming later would prove one of
+    /// the coast blocks rather than the terminal beneath them.
+    #[test]
+    fn a_coast_gap_past_the_ancestry_cap_abandons_the_proof() {
+        let (anchor, terminal, _, pair) = straddling_chain();
+        let (child, _) = ShardId::ROOT.children();
+        let root = pair.composed_root();
+
+        let mut tail = ObserverTail::recognizing(anchor, child);
+        tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
+        tail.capture_committee(Some(stub_committee()));
+        let _ = tail.next_request();
+        assert_eq!(
+            tail.on_response(&response(&terminal, 9_999)),
+            TailOutcome::Accepted
+        );
+
+        // Every coast block skips a round, so no pair is ever contiguous.
+        //
+        // The run holds the terminal plus its successor after the sighting,
+        // and grows by one per block; the cap clears it on the call that
+        // finds it already at `MAX + 2`. Exactly this many blocks therefore
+        // leaves it cleared, which is the state the resumption guard covers.
+        let mut parent = terminal.hash();
+        let mut round = 4;
+        for i in 0..=MAX_COMMIT_PROOF_ANCESTRY as u64 {
+            let block = parent_block(3 + i, round, parent, CUT_MS + 1 + i, root, Some(pair));
+            let _ = tail.next_request();
+            assert_eq!(
+                tail.on_response(&response(&block, 9_999)),
+                TailOutcome::Accepted
+            );
+            parent = block.hash();
+            round += 2;
+        }
+        assert!(
+            tail.settled_terminal()
+                .expect("recognised")
+                .commit_proof
+                .is_none(),
+            "no pair ever formed, so nothing proves the terminal",
+        );
+
+        // Three more blocks. The first is the call that finds the run over
+        // the cap and clears it; the next two are round contiguous, which is
+        // what a resumed run would build a direct proof from — committing
+        // the second of them, not the terminal far below.
+        let next = 4 + MAX_COMMIT_PROOF_ANCESTRY as u64;
+        let a = parent_block(next, round, parent, CUT_MS + next, root, Some(pair));
+        let b = parent_block(
+            next + 1,
+            round + 2,
+            a.hash(),
+            CUT_MS + next + 1,
+            root,
+            Some(pair),
+        );
+        let c = parent_block(
+            next + 2,
+            round + 3,
+            b.hash(),
+            CUT_MS + next + 2,
+            root,
+            Some(pair),
+        );
+        for block in [&a, &b, &c] {
+            let _ = tail.next_request();
+            assert_eq!(
+                tail.on_response(&response(block, 9_999)),
+                TailOutcome::Accepted
+            );
+        }
+        assert!(
+            tail.settled_terminal()
+                .expect("recognised")
+                .commit_proof
+                .is_none(),
+            "an abandoned run must not resume and commit a coast block",
+        );
     }
 
     /// A following tail recognises the same crossing, but withholds the
