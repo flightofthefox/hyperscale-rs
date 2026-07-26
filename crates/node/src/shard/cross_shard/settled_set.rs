@@ -1,9 +1,11 @@
 //! Per-shard settled-waves acquisition.
 //!
-//! When a remote shard `P` terminates at a split, a surviving counterpart
-//! must learn `S_P` — the wave-ids `P` settled at or before its terminal
-//! block — so the split-boundary fence can resolve cross-shard
-//! `FinalizedWave`s naming `P`. It owns one acquisition per
+//! When a remote shard `P` terminates — a split's parent, or either child
+//! of a merge — a surviving counterpart must learn `S_P`, the wave-ids `P`
+//! settled at or before its terminal block, so the boundary fence can
+//! resolve cross-shard `FinalizedWave`s naming `P`. The acquisition scan
+//! keys on a shard having left the trie, so it covers both reshapes
+//! identically. It owns one acquisition per
 //! past-terminal shard: a single verified fetch of `P`'s complete settled
 //! window list, checked against the beacon-attested `settled_waves_root`
 //! the node read from its own fold.

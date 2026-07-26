@@ -305,15 +305,16 @@ pub struct ShardBoundary {
     /// parent) and drain the witness backlog, and drops once both have
     /// happened. `None` for a live shard.
     pub terminal_epoch: Option<Epoch>,
-    /// Weighted timestamp of the QC certifying the terminal block. A merge
-    /// parent floors it to its epoch start to anchor the composed genesis,
-    /// the same value the keeper reads off the child's terminal QC, so both
-    /// reconstruct identical genesis bytes regardless of how far the child
-    /// coasted past its cut. `Some` once the terminal contribution has
-    /// folded — which lets the parent compose across separate folds when its
-    /// two children's terminals land in different epochs. `None` for a live
-    /// shard or a scheduled terminal whose contribution hasn't folded yet.
-    pub terminal_qc_wt: Option<WeightedTimestamp>,
+    /// Whether this shard's terminal contribution has folded — set on a
+    /// merge child, whose parent composes from both children's terminal
+    /// roots and so must wait for the pair.
+    ///
+    /// Persisted rather than derived per fold: the two children's
+    /// terminals can land in different epochs, and the earlier one's record
+    /// is not refreshed while the later one is still outstanding. A split
+    /// parent never sets it — its children seed in the same fold that
+    /// records its terminal, so there is nothing to wait for.
+    pub terminal_delivered: bool,
     /// The terminal header's `settled_waves_root` — the beacon-attested
     /// commitment over the wave-ids this shard settled in its retention
     /// window up to its terminal block. `Some` only on a terminated
@@ -1920,7 +1921,7 @@ mod tests {
             last_live_epoch: creation,
             consecutive_misses: 0,
             terminal_epoch: None,
-            terminal_qc_wt: None,
+            terminal_delivered: false,
             settled_waves_root: None,
             reshape_admitted_epoch: None,
             reveals_fenced_below: None,
@@ -1987,7 +1988,7 @@ mod tests {
             last_live_epoch: Epoch::new(1),
             consecutive_misses: misses,
             terminal_epoch: None,
-            terminal_qc_wt: None,
+            terminal_delivered: false,
             settled_waves_root: None,
             reshape_admitted_epoch: None,
             reveals_fenced_below: None,
@@ -2286,7 +2287,7 @@ mod tests {
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
-                terminal_qc_wt: None,
+                terminal_delivered: false,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
                 reveals_fenced_below: None,

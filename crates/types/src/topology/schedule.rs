@@ -56,10 +56,15 @@ pub enum SplitAtBoundary {
     /// No split lands at the end of this window — definitive.
     No,
     /// The schedule doesn't hold the window the timestamp resolves —
-    /// evicted below the retention floor, or ahead of the newest entry.
+    /// ahead of the newest entry, or evicted below the retention floor.
     /// An admitted reshape never lands here: its cut is scheduled a
-    /// window ahead, so the window's own entry decides. Transient only
-    /// insofar as the schedule can still gain the entry.
+    /// window ahead, so the window's own entry decides.
+    ///
+    /// Callers defer, which is right for the first case and inert for the
+    /// second: a proposer keys on its own tip's QC and a voter on the
+    /// block it is judging, so neither reaches back below a floor derived
+    /// from that same chain. A caller that could ask about an arbitrarily
+    /// old window would need its own answer rather than this one.
     Unresolved,
     /// The shard's final epoch: the trie replaces it with these children
     /// at the next boundary.
@@ -297,6 +302,10 @@ impl TopologySchedule {
     /// [`Evicted`](ScheduleLookup::Evicted) alike. The one adapter behind
     /// every `at_*` wrapper, so a new `ScheduleLookup` variant is handled
     /// in one place.
+    ///
+    /// Callers that must tell the two apart — a transient lag deserves a
+    /// defer, an evicted window a reject — cannot use this and should read
+    /// the `lookup_*` form directly.
     const fn resolved(
         (lookup, past_terminal): (ScheduleLookup<'_>, bool),
     ) -> Option<(&Arc<TopologySnapshot>, bool)> {
@@ -1612,7 +1621,7 @@ mod tests {
         assert_eq!(merge.terminates_at_next_boundary(right, wt), Some(true));
 
         // An admitted reshape carrying no cut does not terminate here —
-        // definitive, where it used to be unresolvable.
+        // definitive: the window's own entry carries the answer.
         let merge_pending = TopologySchedule::new(
             1000,
             Epoch::new(5),

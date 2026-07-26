@@ -774,8 +774,7 @@ impl ShardCoordinator {
     ///
     /// Quiescence is *not* the end of the chain's life: the committee keeps
     /// coasting, voting, and serving past this point until its reshape
-    /// successors are live (see [`Self::dissolved`]). The two coincide today;
-    /// they part once the successor-live gate lands.
+    /// successors are live, which [`Self::dissolved`] is the test for.
     #[must_use]
     pub fn quiescent(&self, topology_schedule: &TopologySchedule) -> bool {
         self.past_terminal_window(topology_schedule, self.committed_anchor_ts)

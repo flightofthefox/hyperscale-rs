@@ -1015,10 +1015,10 @@ impl ReshapeOrchestrator {
                         height,
                     });
                 }
-                if let Some(root) = bootstrap.imported_root() {
+                if bootstrap.imported_root().is_some() {
                     let anchor = bootstrap.anchor();
                     duty.phase =
-                        ObserverPhase::Following(Box::new(ObserverTail::new(anchor, child, root)));
+                        ObserverPhase::Following(Box::new(ObserverTail::new(anchor, child)));
                 }
             }
             ObserverPhase::Following(tail) => {
@@ -1986,11 +1986,7 @@ mod tests {
                 parent,
                 child,
                 5,
-                ObserverPhase::Following(Box::new(ObserverTail::new(
-                    anchor(),
-                    child,
-                    StateRoot::ZERO,
-                ))),
+                ObserverPhase::Following(Box::new(ObserverTail::new(anchor(), child))),
             ),
         );
 
@@ -2021,11 +2017,7 @@ mod tests {
                 parent,
                 child,
                 5,
-                ObserverPhase::Following(Box::new(ObserverTail::new(
-                    anchor(),
-                    child,
-                    StateRoot::ZERO,
-                ))),
+                ObserverPhase::Following(Box::new(ObserverTail::new(anchor(), child))),
             ),
         );
 

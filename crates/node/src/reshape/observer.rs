@@ -8,13 +8,20 @@
 //! child-rooted store as it arrives, and the finalize builds the child
 //! subtree from the staged leaves.
 //!
-//! There is no anchor to compare the imported root against — the beacon
-//! holds only the parent's root, a one-way hash over the child
-//! subtrees. The trust source is the chunks themselves: each one proves
-//! its leaves into the attested parent root with completeness, so the
-//! imported set is exactly the tree's leaves under the child prefix,
-//! and prefix-rooted hashing makes the resulting store root the parent
-//! tree's subtree node at that prefix by construction.
+//! No anchor exists to compare the imported root against while the
+//! bootstrap runs — the beacon holds only the parent's root, a one-way
+//! hash over the child subtrees. Within the import, then, the trust
+//! source is the chunks: each proves its leaves into the attested parent
+//! root with completeness, so the imported set is exactly the tree's
+//! leaves under the child prefix, and prefix-rooted hashing makes the
+//! resulting store root the parent tree's subtree node at that prefix by
+//! construction.
+//!
+//! The root is checked later all the same. Adoption requires the store's
+//! root to equal the one the child's genesis names, which is the
+//! terminal's `split_child_roots` half — itself checked to compose to
+//! that block's own committed state root. Completeness is what makes the
+//! import correct, not what makes it safe to seat on.
 //!
 //! Sans-io like [`ShardBootstrap`](crate::bootstrap::ShardBootstrap): drivers own
 //! transport, peer selection, and the staging and finalize writes, and
@@ -363,9 +370,6 @@ pub struct ObserverTail {
     /// the walk only to find which of the parent's blocks is the terminal
     /// and to derive the genesis from it.
     recognition_only: bool,
-    /// The store's root after the last application (the imported root
-    /// until the first one).
-    root: StateRoot,
     in_flight: bool,
     /// Accepted block waiting for the driver to apply and answer.
     pending: Option<PendingFollow>,
@@ -387,14 +391,13 @@ struct PendingFollow {
 
 impl ObserverTail {
     /// Start following the parent chain above the `anchor` a completed
-    /// [`ObserverBootstrap`] imported at, from its `imported_root`.
+    /// [`ObserverBootstrap`] imported at.
     #[must_use]
-    pub const fn new(anchor: ShardAnchor, child: ShardId, imported_root: StateRoot) -> Self {
+    pub const fn new(anchor: ShardAnchor, child: ShardId) -> Self {
         Self {
             child,
             last_hash: anchor.block_hash,
             next: anchor.height.next(),
-            root: imported_root,
             in_flight: false,
             pending: None,
             apply_in_flight: false,
@@ -419,7 +422,7 @@ impl ObserverTail {
     pub fn recognizing(anchor: ShardAnchor, child: ShardId) -> Self {
         Self {
             recognition_only: true,
-            ..Self::new(anchor, child, StateRoot::ZERO)
+            ..Self::new(anchor, child)
         }
     }
 
@@ -735,14 +738,7 @@ impl ObserverTail {
             ));
         }
         self.applied = Some(pending.height);
-        self.root = root;
         Ok(())
-    }
-
-    /// The store's root after the last applied block.
-    #[must_use]
-    pub const fn root(&self) -> StateRoot {
-        self.root
     }
 
     /// The next parent height the follower wants.
@@ -1352,7 +1348,7 @@ mod tests {
         let (anchor, terminal, coast, _) = straddling_chain();
         let (child, _) = ShardId::ROOT.children();
 
-        let mut tail = ObserverTail::new(anchor, child, StateRoot::ZERO);
+        let mut tail = ObserverTail::new(anchor, child);
         tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
 
         let _ = tail.next_request();

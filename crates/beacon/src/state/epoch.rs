@@ -11,7 +11,7 @@ use hyperscale_types::{
     ObserverSeat, PendingReshape, QcContext, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS,
     RETENTION_HORIZON, RecoveryCause, ShardBoundary, ShardEpochContribution, ShardId, ShardWitness,
     ShardWitnessPayload, SlotEffects, TerminalRef, TopologySnapshot, TransitionCause, ValidatorId,
-    ValidatorStatus, Verifier, Verify, VrfOutput, WeightedTimestamp,
+    ValidatorStatus, Verifier, Verify, VrfOutput,
 };
 
 use crate::rules::{
@@ -533,7 +533,7 @@ fn diff_keeper_seats(
 struct TerminalMarks {
     terminal_epoch: Option<Epoch>,
     reshape_admitted_epoch: Option<Epoch>,
-    terminal_qc_wt: Option<WeightedTimestamp>,
+    terminal_delivered: bool,
 }
 
 /// The marks for a shard's rebuilt boundary record, plus whether this
@@ -570,13 +570,12 @@ fn carried_terminal_marks(
             )
             .is_some_and(|crossed| crossed > t)
     });
-    let terminal_qc_wt =
-        (is_terminal && header.split_child_roots().is_none()).then(|| qc.weighted_timestamp());
+    let terminal_delivered = is_terminal && header.split_child_roots().is_none();
     (
         TerminalMarks {
             terminal_epoch,
             reshape_admitted_epoch,
-            terminal_qc_wt,
+            terminal_delivered,
         },
         is_terminal,
     )
@@ -819,7 +818,7 @@ fn record_boundaries(
     // Merge children whose terminal contribution — the coast block past
     // their cut, carrying their frozen terminal root — landed this fold.
     // Drives the compose attempt below: the children's terminal records (and
-    // their persisted `terminal_qc_wt`) linger across folds, so a parent
+    // their persisted `terminal_delivered`) linger across folds, so a parent
     // composes once both children have folded, whichever fold completes the
     // pair.
     let mut terminal_recorded: BTreeSet<ShardId> = BTreeSet::new();
@@ -919,7 +918,7 @@ fn record_boundaries(
                 last_live_epoch: epoch,
                 consecutive_misses: 0,
                 terminal_epoch: marks.terminal_epoch,
-                terminal_qc_wt: marks.terminal_qc_wt,
+                terminal_delivered: marks.terminal_delivered,
                 settled_waves_root: header.settled_waves_root(),
                 reshape_admitted_epoch: marks.reshape_admitted_epoch,
                 reveals_fenced_below: fence.filter(|f| chunk_end < f.inner()),
@@ -1142,7 +1141,7 @@ fn seed_split_children(
                 last_live_epoch: epoch,
                 consecutive_misses: 0,
                 terminal_epoch: None,
-                terminal_qc_wt: None,
+                terminal_delivered: false,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
                 reveals_fenced_below: None,
@@ -1174,7 +1173,7 @@ fn compose_merge_parents(
             continue;
         };
         // Both children have folded their terminal contribution — each
-        // carries a `terminal_qc_wt` — and the parent is still a pending
+        // carries a `terminal_delivered` — and the parent is still a pending
         // placeholder (zero hash, post-genesis; a split-child placeholder has
         // no children, so this never matches one). The two children's
         // terminals may have landed in separate folds: each terminal record
@@ -1185,7 +1184,7 @@ fn compose_merge_parents(
             state
                 .boundaries
                 .get(c)
-                .is_some_and(|b| b.terminal_qc_wt.is_some())
+                .is_some_and(|b| b.terminal_delivered)
         });
         if both_terminal
             && state.boundaries.get(&parent).is_some_and(|b| {
@@ -1251,7 +1250,7 @@ fn compose_merge_parent(
             last_live_epoch: epoch,
             consecutive_misses: 0,
             terminal_epoch: None,
-            terminal_qc_wt: None,
+            terminal_delivered: false,
             settled_waves_root: None,
             reshape_admitted_epoch: None,
             reveals_fenced_below: None,
@@ -1689,7 +1688,7 @@ mod tests {
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: None,
-                terminal_qc_wt: None,
+                terminal_delivered: false,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
                 reveals_fenced_below: None,
@@ -1745,7 +1744,7 @@ mod tests {
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: None,
-                terminal_qc_wt: None,
+                terminal_delivered: false,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
                 reveals_fenced_below: None,
@@ -2145,7 +2144,7 @@ mod tests {
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
-                terminal_qc_wt: None,
+                terminal_delivered: false,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
                 reveals_fenced_below: None,
@@ -2239,7 +2238,7 @@ mod tests {
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
-                terminal_qc_wt: None,
+                terminal_delivered: false,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
                 reveals_fenced_below: None,
@@ -2312,7 +2311,7 @@ mod tests {
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
-                terminal_qc_wt: None,
+                terminal_delivered: false,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
                 reveals_fenced_below: None,
@@ -3043,7 +3042,7 @@ mod tests {
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: Some(Epoch::new(1)),
-                terminal_qc_wt: None,
+                terminal_delivered: false,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
                 reveals_fenced_below: None,
@@ -3062,7 +3061,7 @@ mod tests {
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
                     terminal_epoch: None,
-                    terminal_qc_wt: None,
+                    terminal_delivered: false,
                     settled_waves_root: None,
                     reshape_admitted_epoch: None,
                     reveals_fenced_below: None,
@@ -3483,14 +3482,14 @@ mod tests {
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: None,
-                terminal_qc_wt: None,
+                terminal_delivered: false,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
                 reveals_fenced_below: None,
             },
         );
         // Both children have folded their terminal contribution (a real
-        // anchor, `terminal_qc_wt` set), waiting for the parent to compose.
+        // anchor, `terminal_delivered` set), waiting for the parent to compose.
         for child in [left, right] {
             state.boundaries.insert(
                 child,
@@ -3504,7 +3503,7 @@ mod tests {
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
                     terminal_epoch: Some(Epoch::new(1)),
-                    terminal_qc_wt: Some(WeightedTimestamp::from_millis(1_900)),
+                    terminal_delivered: true,
                     settled_waves_root: None,
                     reshape_admitted_epoch: None,
                     reveals_fenced_below: None,
@@ -3650,7 +3649,7 @@ mod tests {
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
                     terminal_epoch: Some(Epoch::new(1)),
-                    terminal_qc_wt: None,
+                    terminal_delivered: false,
                     settled_waves_root: None,
                     reshape_admitted_epoch: None,
                     reveals_fenced_below: None,
@@ -3669,7 +3668,7 @@ mod tests {
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: None,
-                terminal_qc_wt: None,
+                terminal_delivered: false,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
                 reveals_fenced_below: None,
@@ -3828,11 +3827,11 @@ mod tests {
         );
 
         // The spanning refresh recorded — but as a live refresh, not a
-        // terminal: no terminal_qc_wt, and the parent stays pending
+        // terminal: no terminal_delivered, and the parent stays pending
         // rather than composing with the pre-freeze root.
         let left_record = state.boundaries.get(&left).expect("left refreshed");
         assert_eq!(left_record.state_root, pre_freeze);
-        assert_eq!(left_record.terminal_qc_wt, None);
+        assert!(!left_record.terminal_delivered);
         let parent_record = state.boundaries.get(&parent).expect("parent tracked");
         assert_eq!(
             parent_record.block_hash,
@@ -4054,7 +4053,7 @@ mod tests {
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
-                terminal_qc_wt: None,
+                terminal_delivered: false,
                 settled_waves_root: None,
                 reshape_admitted_epoch: None,
                 reveals_fenced_below: None,
@@ -4276,7 +4275,7 @@ mod tests {
                     last_live_epoch: Epoch::GENESIS,
                     consecutive_misses: 0,
                     terminal_epoch: None,
-                    terminal_qc_wt: None,
+                    terminal_delivered: false,
                     settled_waves_root: None,
                     reshape_admitted_epoch: None,
                     reveals_fenced_below: None,
