@@ -457,16 +457,25 @@ pub(super) fn apply_shard_payload(
             // clock. If a lapse emptied the cohort, the re-assertion also
             // re-staffs it from the frozen seed over the now-refilled
             // pool, re-deriving the identical selection and assignment.
+            //
+            // Never once the cut is scheduled. The gate approved one
+            // specific cohort and froze the carve beside it, and there is
+            // no second gate to approve another — a re-staff there would
+            // seat the children from a cohort no gate ever passed, every
+            // seat unready. A scheduled record's cohort cannot empty today
+            // (the TTL lapse skips it), so this is the same property stated
+            // where it would be violated rather than two files away.
             let existing = match state.pending_reshapes.get(shard) {
                 Some(PendingReshape::Split {
                     cohort,
                     cohort_seed,
+                    scheduled,
                     ..
-                }) => Some((cohort.is_empty(), *cohort_seed)),
+                }) => Some((cohort.is_empty() && scheduled.is_none(), *cohort_seed)),
                 _ => None,
             };
-            if let Some((lapsed, seed)) = existing {
-                let restaffed = (lapsed
+            if let Some((restaffable, seed)) = existing {
+                let restaffed = (restaffable
                     && state.pooled_validators().len() >= state.chain_config.shard_size as usize)
                     .then(|| draw_split_cohort(state, *shard, &seed));
                 if let Some(PendingReshape::Split {

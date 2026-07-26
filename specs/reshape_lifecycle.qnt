@@ -466,6 +466,11 @@ module reshape_lifecycle {
     all {
       not(executed),
       pendingPresent,
+      // The third retraction arm. A scheduled record's cohort cannot empty
+      // while `lapse` is guarded, so this is unreachable rather than
+      // independently checked — but the guard belongs where the carve would
+      // move, not only where the cohort would drain.
+      RETRACTABLE or not(scheduled),
       cohortL.union(cohortR) == Set(),
       pool.size() == SHARD_SIZE,
       epoch' = epoch,

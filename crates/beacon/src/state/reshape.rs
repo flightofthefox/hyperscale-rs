@@ -1728,6 +1728,55 @@ mod tests {
         );
     }
 
+    /// A re-assertion arriving after the cut is scheduled refreshes the
+    /// trigger clock but never re-staffs the cohort.
+    ///
+    /// The gate approved one specific cohort and froze the carve beside
+    /// it; there is no second gate to approve another. A re-staff there
+    /// would seat the children from a cohort no gate ever passed, every
+    /// seat unready.
+    #[test]
+    fn a_scheduled_split_never_restaffs_its_cohort() {
+        let p = ShardId::leaf(1, 0);
+        let mut state = grow_state(8);
+        state.boundaries.insert(p, live_boundary());
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit { shard: p },
+        );
+        let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
+        for observer in &observers {
+            mark_ready(&mut state, p, *observer);
+        }
+        schedule_ready_splits(&mut state);
+        assert!(state.pending_reshapes[&p].scheduled_terminal().is_some());
+        let approved = cohort_of(&state, p).clone();
+
+        // Empty the cohort the way only a lapse could, then re-assert with a
+        // pool deep enough to draw a fresh one. The carve must not move.
+        let PendingReshape::Split { cohort, .. } =
+            state.pending_reshapes.get_mut(&p).expect("scheduled split")
+        else {
+            panic!("a split was admitted");
+        };
+        cohort.clear();
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit { shard: p },
+        );
+
+        assert!(
+            cohort_of(&state, p).is_empty(),
+            "a scheduled record must not re-staff: the approved cohort was {approved:?}",
+        );
+    }
+
     // ─── merge execution gate ────────────────────────────────────────────
 
     /// The gate holds until the merged committee's ready keepers reach
