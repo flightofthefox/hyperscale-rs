@@ -22,7 +22,9 @@
 //! witness-history variant never appears — the pending child's
 //! accumulator starts empty).
 
-use hyperscale_types::network::request::GetBlockRequest;
+use hyperscale_types::network::request::{
+    GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,
+};
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin, CommitProof,
@@ -499,7 +501,8 @@ impl ObserverTail {
     }
 
     /// The next block fetch, when none is outstanding and nothing is
-    /// waiting to be applied.
+    /// waiting to be applied. For a following tail, which needs each
+    /// block's body to apply its child-half writes.
     pub fn next_request(&mut self) -> Option<GetBlockRequest> {
         if self.in_flight || self.pending.is_some() {
             return None;
@@ -508,41 +511,42 @@ impl ObserverTail {
         Some(GetBlockRequest::new(self.next, self.next))
     }
 
-    /// Feed the response for the outstanding fetch.
-    pub fn on_response(&mut self, response: &GetBlockResponse) -> TailOutcome {
-        if !self.in_flight {
-            return TailOutcome::Rejected("unsolicited block response");
+    /// The next certified-header fetch from `source`, for a recognizing
+    /// tail — which discards bodies, so it walks headers instead.
+    ///
+    /// Batched to [`MAX_REMOTE_HEADERS_PER_REQUEST`]. The walk starts cold
+    /// at a boundary anchor an epoch or more behind a chain that is still
+    /// producing, so one block per round trip closes the gap only while a
+    /// round trip is shorter than a block time. A batch closes it
+    /// regardless.
+    pub const fn next_header_request(
+        &mut self,
+        source: ShardId,
+    ) -> Option<GetRemoteHeadersRequest> {
+        if self.in_flight || self.pending.is_some() {
+            return None;
         }
-        self.in_flight = false;
-        let Some(elided) = &response.certified else {
-            return TailOutcome::NotYetAvailable;
-        };
-        // The follower advertises no inventory, so every body is inline
-        // and rehydration resolves nothing; this also pins the QC to the
-        // header. The QC's signature is the driver's to verify.
-        let Ok(certified) = elided.try_rehydrate(|_| None, |_| None, |_| None) else {
-            return TailOutcome::Rejected("elided or mispaired block body");
-        };
-        let header = certified.block().header();
+        self.in_flight = true;
+        Some(GetRemoteHeadersRequest {
+            source_shard: source,
+            from_height: self.next,
+            count: MAX_REMOTE_HEADERS_PER_REQUEST,
+        })
+    }
+
+    /// Absorb one certified header: the chain link, the terminal crossing
+    /// test, and the commitment proof.
+    ///
+    /// The shared core of both feeds, so a recognizing walk over headers
+    /// and a following walk over blocks cannot drift on which block is the
+    /// terminal or what proves it.
+    fn absorb_header(&mut self, header: &BlockHeader, qc: &QuorumCertificate) -> TailOutcome {
         if header.height() != self.next {
             return TailOutcome::Rejected("block height does not match the requested height");
         }
         if header.parent_block_hash() != self.last_hash {
             return TailOutcome::Rejected("block does not extend the attested anchor chain");
         }
-        let receipts: Vec<StoredReceipt> = certified
-            .block()
-            .certificates()
-            .iter()
-            .flat_map(|fw| fw.receipts().iter().cloned())
-            .collect();
-        let expected_root = header.split_child_roots().map(|pair| {
-            if self.child.path() & 1 == 0 {
-                pair.left
-            } else {
-                pair.right
-            }
-        });
         // This block's parent QC is the canonical certificate over its
         // predecessor, so accepting it is what decides whether that
         // predecessor was the terminal crossing: the predecessor's own
@@ -565,20 +569,77 @@ impl ObserverTail {
                 commit_proof: None,
             });
         }
-        self.advance_commit_proof(header, certified.qc());
+        self.advance_commit_proof(header, qc);
         self.prev = Some(header.clone());
-
         if self.recognition_only {
             self.applied = Some(header.height());
-        } else {
+        }
+        self.last_hash = header.hash();
+        self.next = self.next.next();
+        TailOutcome::Accepted
+    }
+
+    /// Feed a batch of consecutive certified headers to a recognizing
+    /// walk. Stops at the first header the walk rejects, keeping whatever
+    /// the prefix established.
+    pub fn on_certified_headers(&mut self, headers: &[CertifiedBlockHeader]) -> TailOutcome {
+        if !self.in_flight {
+            return TailOutcome::Rejected("unsolicited header response");
+        }
+        self.in_flight = false;
+        if headers.is_empty() {
+            return TailOutcome::NotYetAvailable;
+        }
+        for certified in headers {
+            let outcome = self.absorb_header(certified.header(), certified.qc());
+            if outcome != TailOutcome::Accepted {
+                return outcome;
+            }
+        }
+        TailOutcome::Accepted
+    }
+
+    /// Feed the response for the outstanding fetch.
+    pub fn on_response(&mut self, response: &GetBlockResponse) -> TailOutcome {
+        if !self.in_flight {
+            return TailOutcome::Rejected("unsolicited block response");
+        }
+        self.in_flight = false;
+        let Some(elided) = &response.certified else {
+            return TailOutcome::NotYetAvailable;
+        };
+        // The follower advertises no inventory, so every body is inline
+        // and rehydration resolves nothing; this also pins the QC to the
+        // header. The QC's signature is the driver's to verify.
+        let Ok(certified) = elided.try_rehydrate(|_| None, |_| None, |_| None) else {
+            return TailOutcome::Rejected("elided or mispaired block body");
+        };
+        let header = certified.block().header();
+        let receipts: Vec<StoredReceipt> = certified
+            .block()
+            .certificates()
+            .iter()
+            .flat_map(|fw| fw.receipts().iter().cloned())
+            .collect();
+        let expected_root = header.split_child_roots().map(|pair| {
+            if self.child.path() & 1 == 0 {
+                pair.left
+            } else {
+                pair.right
+            }
+        });
+        let height = header.height();
+        let outcome = self.absorb_header(header, certified.qc());
+        if outcome != TailOutcome::Accepted {
+            return outcome;
+        }
+        if !self.recognition_only {
             self.pending = Some(PendingFollow {
-                height: header.height(),
+                height,
                 receipts,
                 expected_root,
             });
         }
-        self.last_hash = certified.block().hash();
-        self.next = self.next.next();
         TailOutcome::Accepted
     }
 

@@ -7,7 +7,7 @@
 //! short-caps on the first missing height rather than failing.
 
 use hyperscale_metrics::record_fetch_response_sent;
-use hyperscale_storage::{PendingChain, ShardStorage};
+use hyperscale_storage::{PendingChain, ShardChainReader, ShardStorage};
 use hyperscale_types::network::request::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};
 use hyperscale_types::network::response::GetRemoteHeadersResponse;
 use hyperscale_types::{BlockHeight, ShardId};
@@ -63,5 +63,34 @@ pub fn serve_remote_headers_request<S: ShardStorage>(
         record_fetch_response_sent("remote_header", headers.len());
     }
 
+    GetRemoteHeadersResponse { headers }
+}
+
+/// Serve a certified-header batch out of a committed chain reader alone.
+///
+/// The reshape counterpart of [`serve_remote_headers_request`], for a host
+/// answering from a store it holds directly rather than through a live
+/// vnode's pending chain. A recognition walk reads the chain of a shard
+/// that is terminating: its committee dissolves at the cut, so by the time
+/// the walk reaches the terminal there may be no committee left to ask —
+/// but every member still holds the chain.
+///
+/// The caller selects the store by the requested source shard, so the
+/// cross-shard gate [`serve_remote_headers_request`] applies is already
+/// satisfied by construction here. Stops on the first missing height, so
+/// the response is a contiguous prefix of the requested range.
+pub fn serve_local_certified_headers<S: ShardChainReader>(
+    storage: &S,
+    req: &GetRemoteHeadersRequest,
+) -> GetRemoteHeadersResponse {
+    let bounded_count = req.count.min(MAX_REMOTE_HEADERS_PER_REQUEST);
+    let mut headers = Vec::with_capacity(usize::try_from(bounded_count.inner()).unwrap_or(0));
+    for offset in 0..bounded_count.inner() {
+        let height = BlockHeight::new(req.from_height.inner().saturating_add(offset));
+        let Some(certified) = storage.get_certified_header(height) else {
+            break;
+        };
+        headers.push(certified.as_ref().clone());
+    }
     GetRemoteHeadersResponse { headers }
 }

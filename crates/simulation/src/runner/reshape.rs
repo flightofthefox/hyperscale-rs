@@ -31,12 +31,14 @@ use hyperscale_node::reshape::orchestrator::{
 };
 use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::shard::HostEvent;
-use hyperscale_node::{serve_block_request, serve_state_range_request};
+use hyperscale_node::{
+    serve_block_request, serve_local_certified_headers, serve_state_range_request,
+};
 use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader, WitnessSeed};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
-use hyperscale_types::network::request::GetBlockRequest;
-use hyperscale_types::network::response::GetBlockResponse;
+use hyperscale_types::network::request::{GetBlockRequest, GetRemoteHeadersRequest};
+use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ChainOrigin, ShardId, ValidatorId, Verified,
     shard_prefix_path,
@@ -298,6 +300,26 @@ impl SimulationRunner {
                     },
                 })
             }
+            FetchKind::Headers { request } => {
+                // A recognition walk reads a chain the host co-hosts, or a
+                // sibling child's; serve from whichever host holds it.
+                let response = self.serve_reshape_headers(from, &request);
+                if response.headers.is_empty() {
+                    retries.push(ReshapeEvent::FetchFailed {
+                        duty,
+                        from,
+                        kind: FetchKind::Headers { request },
+                    });
+                    return None;
+                }
+                Some(ReshapeEvent::Fetched {
+                    duty,
+                    from,
+                    kind: FetchedKind::Headers {
+                        response: Box::new(response),
+                    },
+                })
+            }
             FetchKind::Block { request } => {
                 let response = self.serve_reshape_block(from, &request);
                 if response.certified.is_none() {
@@ -333,6 +355,24 @@ impl SimulationRunner {
                 .get(usize::try_from(recipient.inner()).expect("id fits usize"))
                 .copied()
         })
+    }
+
+    /// Serve a certified-header batch for a recognition walk, from any host
+    /// that holds `from`'s chain. Mirrors production's local-first read: the
+    /// walked shard is terminating, so its committee may already be gone
+    /// while its members still hold the chain.
+    fn serve_reshape_headers(
+        &self,
+        from: ShardId,
+        request: &GetRemoteHeadersRequest,
+    ) -> GetRemoteHeadersResponse {
+        (0..self.num_hosts())
+            .filter_map(|host| self.hosts_shard(host, from))
+            .map(|storage| serve_local_certified_headers(storage, request))
+            .find(|r| !r.headers.is_empty())
+            .unwrap_or(GetRemoteHeadersResponse {
+                headers: Vec::new(),
+            })
     }
 
     /// Serve a block for a reshape duty. A keeper's terminal sits in the

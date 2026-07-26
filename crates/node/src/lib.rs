@@ -50,7 +50,7 @@ pub use config::NodeConfig;
 pub use host::{NodeHost, ShardGenesis};
 pub use process::TxStatusCache;
 pub use shard::consensus::{BlockSyncStateKind, serve_block_request};
-pub use shard::cross_shard::serve_settled_waves_request;
+pub use shard::cross_shard::{serve_local_certified_headers, serve_settled_waves_request};
 pub use shard::{SharedTopologySnapshot, TimerOp, timer_event};
 pub use state::NodeStateMachine;
 pub use vnode::{SeatFollower, SeatVnodeGroup, Vnode, VnodeInit, seat_follower, seat_vnode_group};

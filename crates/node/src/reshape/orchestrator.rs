@@ -22,8 +22,12 @@
 use std::collections::BTreeMap;
 
 use hyperscale_storage::{ImportLeaf, ImportProgress};
-use hyperscale_types::network::request::{GetBlockRequest, GetStateRangeRequest};
-use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
+use hyperscale_types::network::request::{
+    GetBlockRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
+};
+use hyperscale_types::network::response::{
+    GetBlockResponse, GetRemoteHeadersResponse, GetStateRangeResponse,
+};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, NetworkDefinition, QuorumCertificate,
     ShardAnchor, ShardId, StateRoot, StoredReceipt, ValidatorId, Verifier, WeightedTimestamp,
@@ -51,6 +55,14 @@ pub enum FetchKind {
     Block {
         /// The block request itself.
         request: GetBlockRequest,
+    },
+    /// A batch of consecutive certified headers, from a recognizing
+    /// [`ObserverTail`]. A recognition walk discards bodies, so it reads
+    /// headers — which a host co-hosting the source serves from its own
+    /// store, and which batch far better over the wire when it does not.
+    Headers {
+        /// The header request itself.
+        request: GetRemoteHeadersRequest,
     },
 }
 
@@ -183,6 +195,11 @@ pub enum FetchedKind {
     Block {
         /// The response.
         response: Box<GetBlockResponse>,
+    },
+    /// A certified-header batch response.
+    Headers {
+        /// The response.
+        response: Box<GetRemoteHeadersResponse>,
     },
 }
 
@@ -714,6 +731,8 @@ impl ReshapeOrchestrator {
                                 half.bootstrap.on_state_range_failure(sub_range);
                             }
                             FetchKind::Block { .. } => half.terminal_requested = false,
+                            // A building half walks no headers.
+                            FetchKind::Headers { .. } => {}
                         }
                     }
                 }
@@ -752,10 +771,10 @@ impl ReshapeOrchestrator {
             return;
         };
         if let KeeperPhase::Recognizing { left, right } = &mut keeper.phase {
-            if let FetchedKind::Block { response } = &kind
+            if let FetchedKind::Headers { response } = &kind
                 && let Some(half) = recognition_for(left, right, from)
             {
-                half.tail.on_response(response);
+                half.tail.on_certified_headers(&response.headers);
             }
             return;
         }
@@ -776,6 +795,8 @@ impl ReshapeOrchestrator {
                     keeper.pending_stage.push((progress, leaves));
                 }
             }
+            // A building half walks no headers.
+            FetchedKind::Headers { .. } => {}
             FetchedKind::Block { response } => {
                 if let Some(elided) = &response.certified {
                     half.terminal = Some((elided.header().clone(), elided.qc().clone()));
@@ -840,9 +861,9 @@ impl ReshapeOrchestrator {
         };
         let mut next: Option<ParentHalfPhase> = None;
         if let ParentHalfPhase::Recognizing(tail) = &mut duty.phase
-            && let FetchedKind::Block { response } = &kind
+            && let FetchedKind::Headers { response } = &kind
         {
-            tail.on_response(response);
+            tail.on_certified_headers(&response.headers);
             return;
         }
         if let ParentHalfPhase::FetchingTerminal { anchor, requested } = &mut duty.phase
@@ -1235,11 +1256,11 @@ impl ReshapeOrchestrator {
                         && commit_proven(half.child, sighting, verifier, view.network())
                     {
                         half.proven = Some(sighting.clone());
-                    } else if let Some(request) = half.tail.next_request() {
+                    } else if let Some(request) = half.tail.next_header_request(half.child) {
                         out.push(ReshapeRequest::Fetch {
                             duty: parent,
                             from: half.child,
-                            kind: FetchKind::Block { request },
+                            kind: FetchKind::Headers { request },
                         });
                     }
                 }
@@ -1466,11 +1487,11 @@ impl ReshapeOrchestrator {
                          falling back to the attested anchor"
                     );
                     next = Some(ParentHalfPhase::Seeding { requested: false });
-                } else if let Some(request) = tail.next_request() {
+                } else if let Some(request) = tail.next_header_request(parent) {
                     out.push(ReshapeRequest::Fetch {
                         duty: child,
                         from: parent,
-                        kind: FetchKind::Block { request },
+                        kind: FetchKind::Headers { request },
                     });
                 }
             }

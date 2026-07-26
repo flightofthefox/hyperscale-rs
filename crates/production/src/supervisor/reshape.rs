@@ -21,13 +21,13 @@ use hyperscale_node::reshape::orchestrator::{
     AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest,
 };
 use hyperscale_node::reshape::view::ReshapeView;
-use hyperscale_node::serve_state_range_request;
+use hyperscale_node::{serve_local_certified_headers, serve_state_range_request};
 use hyperscale_storage::{
     BoundaryStore, ImportLeaf, ImportProgress, RecoveredState, ShardChainReader, WitnessSeed,
 };
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
-use hyperscale_types::network::request::GetStateRangeRequest;
+use hyperscale_types::network::request::{GetRemoteHeadersRequest, GetStateRangeRequest};
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, ShardAnchor, ShardId, StateRoot, StoredReceipt, ValidatorId,
 };
@@ -367,6 +367,34 @@ impl ShardSupervisor {
                     }
                 });
             }
+            FetchKind::Headers { request } => {
+                // A recognition walk reads its own chain: a parent half is a
+                // member of the parent it walks, and a merge keeper co-hosts
+                // the child it runs. Serve those from the local store rather
+                // than asking the network for blocks this host already holds
+                // — and, for a shard whose committee dissolves at the cut,
+                // rather than asking a committee that may already be gone.
+                let local = self
+                    .storages
+                    .lock()
+                    .expect("storages lock")
+                    .get(&from)
+                    .cloned();
+                let Some(storage) = local else {
+                    Self::network_headers(self.process.network(), &events, duty, from, request);
+                    return;
+                };
+                self.tokio_handle.spawn_blocking(move || {
+                    let response = serve_local_certified_headers(storage.as_ref(), &request);
+                    let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Fetched {
+                        duty,
+                        from,
+                        kind: FetchedKind::Headers {
+                            response: Box::new(response),
+                        },
+                    }));
+                });
+            }
             FetchKind::Block { request } => {
                 let on_fail = request.clone();
                 self.process.network().request(
@@ -395,6 +423,46 @@ impl ShardSupervisor {
                 );
             }
         }
+    }
+
+    /// Request a certified-header batch from `from`'s committee. The
+    /// fallback when the walked shard isn't co-hosted locally — a merge
+    /// keeper's sibling child.
+    fn network_headers(
+        network: &Arc<Libp2pNetwork>,
+        events: &mpsc::UnboundedSender<SupervisorEvent>,
+        duty: ShardId,
+        from: ShardId,
+        request: GetRemoteHeadersRequest,
+    ) {
+        let on_fail = request.clone();
+        let events = events.clone();
+        network.request(
+            from,
+            None,
+            request,
+            None,
+            Box::new(move |result| {
+                let io = result.map_or_else(
+                    |_| ReshapeIo::FetchFailed {
+                        duty,
+                        from,
+                        kind: FetchKind::Headers {
+                            request: on_fail.clone(),
+                        },
+                    },
+                    |response| ReshapeIo::Fetched {
+                        duty,
+                        from,
+                        kind: FetchedKind::Headers {
+                            response: Box::new(response),
+                        },
+                    },
+                );
+                let _ = events.send(SupervisorEvent::Reshape(io));
+                ResponseVerdict::Accept
+            }),
+        );
     }
 
     /// Request one reshape state range from `from`'s committee, answering with a

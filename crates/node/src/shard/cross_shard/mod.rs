@@ -31,7 +31,7 @@ use hyperscale_types::{BlockHeight, LocalTimestamp, ShardId};
 pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::serve_provision_request;
 use remote_header::{RemoteHeaderSync, RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
-pub use remote_header_serve::serve_remote_headers_request;
+pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
 pub use settled_set::SettledWavesAcquisition;
 pub use settled_waves_serve::serve_settled_waves_request;
 
