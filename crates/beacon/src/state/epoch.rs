@@ -1032,12 +1032,12 @@ fn gc_terminal_boundaries(state: &mut BeaconState, epoch: Epoch, windows: EpochW
     // inside the bound. Surface it loudly. The predecessor keeps coasting — it
     // is the successors' only anchor, so tearing it down here would strand them
     // — until they go live or an operator intervenes.
-    for (shard, executed_at) in stalled_handoffs(&pending_fold, epoch) {
+    for (shard, cut) in stalled_handoffs(&pending_fold, epoch) {
         tracing::error!(
             ?shard,
-            executed_at = executed_at.inner(),
+            cut = cut.inner(),
             current = epoch.inner(),
-            "reshape handoff stalled: successors not live within the TTL after execution"
+            "reshape handoff stalled: successors not live within the TTL after the cut"
         );
     }
     state.boundaries.retain(|shard, b| {
@@ -1080,18 +1080,16 @@ fn successors_live_for_terminal(state: &BeaconState, shard: ShardId) -> bool {
 }
 
 /// The terminal shards whose handoff has stalled — their reshape successors
-/// are still not live [`RESHAPE_HANDOFF_TTL_EPOCHS`] epochs after the reshape
-/// executed. `pending` maps each terminal shard whose successors aren't yet
-/// live to the epoch its reshape executed (the boundary's `terminal_epoch`),
+/// are still not live [`RESHAPE_HANDOFF_TTL_EPOCHS`] epochs after the shard's
+/// scheduled cut. `pending` maps each terminal shard whose successors aren't
+/// yet live to the window it terminates at (the boundary's `terminal_epoch`),
 /// and `epoch` is the fold's current epoch. Each result pairs the stalled
-/// shard with that execution epoch for the diagnostic.
+/// shard with that cut for the diagnostic.
 fn stalled_handoffs(pending: &BTreeMap<ShardId, Epoch>, epoch: Epoch) -> Vec<(ShardId, Epoch)> {
     pending
         .iter()
-        .filter(|(_, executed_at)| {
-            epoch.inner().saturating_sub(executed_at.inner()) >= RESHAPE_HANDOFF_TTL_EPOCHS
-        })
-        .map(|(shard, executed_at)| (*shard, *executed_at))
+        .filter(|(_, cut)| epoch.inner().saturating_sub(cut.inner()) >= RESHAPE_HANDOFF_TTL_EPOCHS)
+        .map(|(shard, cut)| (*shard, *cut))
         .collect()
 }
 
@@ -3345,24 +3343,24 @@ mod tests {
 
     /// The handoff stall diagnostic fires exactly at the bound: a terminal
     /// shard whose successors are still not live `RESHAPE_HANDOFF_TTL_EPOCHS`
-    /// epochs after its reshape executed is flagged; one epoch shy it stays
+    /// epochs after its scheduled cut is flagged; one epoch shy it stays
     /// quiet.
     #[test]
     fn stalled_handoffs_fire_at_the_ttl_not_before() {
         let parent = ShardId::ROOT;
-        let executed_at = Epoch::new(5);
-        let pending = BTreeMap::from([(parent, executed_at)]);
+        let cut = Epoch::new(5);
+        let pending = BTreeMap::from([(parent, cut)]);
 
-        let just_under = Epoch::new(executed_at.inner() + RESHAPE_HANDOFF_TTL_EPOCHS - 1);
+        let just_under = Epoch::new(cut.inner() + RESHAPE_HANDOFF_TTL_EPOCHS - 1);
         assert!(
             stalled_handoffs(&pending, just_under).is_empty(),
             "quiet one epoch shy of the bound",
         );
 
-        let at_bound = Epoch::new(executed_at.inner() + RESHAPE_HANDOFF_TTL_EPOCHS);
+        let at_bound = Epoch::new(cut.inner() + RESHAPE_HANDOFF_TTL_EPOCHS);
         assert_eq!(
             stalled_handoffs(&pending, at_bound),
-            vec![(parent, executed_at)],
+            vec![(parent, cut)],
             "flagged once the bound is reached",
         );
     }

@@ -404,23 +404,33 @@ fn apply_scheduled_split(state: &mut BeaconState, target: ShardId) {
 
         let mut members: Vec<ValidatorId> = Vec::with_capacity(assigned.len());
         for id in assigned {
+            // A cohort seat carries the readiness its `ReshapeReady` folded;
+            // a parent-half member is ready by construction and holds none.
+            // The two sets are disjoint — halves are filtered to the parent's
+            // `OnShard` members and the cohort is drawn from the free pool —
+            // so a half member reaching the observing arm has no seat to read,
+            // and is dropped like any other drift rather than indexed for.
+            let seat_ready = cohort.get(&id).map(|seat| seat.ready);
             let rec = state
                 .validators
                 .get_mut(&id)
                 .expect("members come from committee/cohort state, must be in validators");
-            rec.status = match rec.status {
-                ValidatorStatus::OnShard {
-                    shard,
-                    ready,
-                    placed_at_epoch,
-                } if shard == target => ValidatorStatus::OnShard {
+            rec.status = match (rec.status, seat_ready) {
+                (
+                    ValidatorStatus::OnShard {
+                        shard,
+                        ready,
+                        placed_at_epoch,
+                    },
+                    _,
+                ) if shard == target => ValidatorStatus::OnShard {
                     shard: child,
                     ready,
                     placed_at_epoch,
                 },
-                ValidatorStatus::Observing { .. } => ValidatorStatus::OnShard {
+                (ValidatorStatus::Observing { .. }, Some(ready)) => ValidatorStatus::OnShard {
                     shard: child,
-                    ready: cohort[&id].ready,
+                    ready,
                     placed_at_epoch: state.current_epoch,
                 },
                 // Jailed, withdrawn, or rotated away since the carve was
@@ -575,10 +585,10 @@ fn apply_scheduled_merge(state: &mut BeaconState, parent: ShardId) {
 
     // The merged committee, keepers in id order, each now `OnShard` on
     // the parent carrying the readiness its `ReshapeReady` folded. A
-    // keeper jailed or withdrawn since the cut was scheduled is dropped
-    // rather than moved — the schedule cannot be retracted to re-gate
-    // around it, so the parent seats short and `top_up_committees`
-    // backfills it this same fold.
+    // keeper jailed, withdrawn, or rotated off its child since the cut was
+    // scheduled is dropped rather than moved — the schedule cannot be
+    // retracted to re-gate around it, so the parent seats short and
+    // `top_up_committees` backfills it this same fold.
     let mut members: Vec<ValidatorId> = Vec::with_capacity(keepers.len());
     for (id, seat) in &keepers {
         let rec = state
@@ -592,11 +602,19 @@ fn apply_scheduled_merge(state: &mut BeaconState, parent: ShardId) {
         // would otherwise strand the beacon with no eligible signers the
         // moment every member left the children.
         let ValidatorStatus::OnShard {
-            placed_at_epoch, ..
+            shard,
+            placed_at_epoch,
+            ..
         } = rec.status
         else {
             continue;
         };
+        // The keeper must still be on one of the merging children. Moving a
+        // validator that has rotated elsewhere would seat it on the parent
+        // while its own shard still counts it.
+        if !children.contains(&shard) {
+            continue;
+        }
         rec.status = ValidatorStatus::OnShard {
             shard: parent,
             ready: seat.ready,
@@ -1480,6 +1498,114 @@ mod tests {
         assert!(state.pending_reshapes.is_empty());
         // Keepers returned to ordinary rotation: still OnShard, no longer pinned.
         assert!(!state.is_merge_keeper(left, ValidatorId::new(0)));
+    }
+
+    // ─── placement drift across the scheduled window ────────────────────
+
+    /// A carve member whose placement moves between the gate and the cut is
+    /// dropped rather than seated.
+    ///
+    /// The carve is frozen when the gate fires and there is no second gate
+    /// to re-approve a different one, so the applying fold a window later
+    /// meets whatever the intervening window did. A parent half found in
+    /// any state but `OnShard` on the splitting parent holds no cohort seat
+    /// to read a readiness from — the two sets are disjoint by
+    /// construction — so it is dropped, the child seats short, and the
+    /// top-up backfills it in the same fold.
+    #[test]
+    fn a_split_carve_member_that_moved_is_dropped_not_seated() {
+        let p = ShardId::leaf(1, 0);
+        let children: [ShardId; 2] = p.children().into();
+        let mut state = grow_state(4);
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit { shard: p },
+        );
+        // Collected first: marking readiness borrows the state mutably.
+        let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
+        for observer in observers {
+            mark_ready(&mut state, p, observer);
+        }
+        schedule_ready_splits(&mut state);
+        let scheduled = state.pending_reshapes[&p]
+            .scheduled_terminal()
+            .expect("the gate fires");
+
+        // A parent half is drawn into another split's cohort in the window
+        // between the gate and the cut — the one shape that would index a
+        // cohort seat it does not hold.
+        let half = *state.next_shard_committees[&p]
+            .members
+            .iter()
+            .find(|id| !cohort_of(&state, p).contains_key(id))
+            .expect("the carve holds parent-half members");
+        state.validators.get_mut(&half).expect("seated").status = ValidatorStatus::Observing {
+            shard: ShardId::leaf(1, 1),
+            placed_at_epoch: state.current_epoch,
+        };
+
+        state.current_epoch = scheduled;
+        apply_scheduled_splits(&mut state);
+
+        assert!(state.pending_reshapes.is_empty(), "the cut applied");
+        assert!(
+            !children
+                .iter()
+                .any(|c| state.next_shard_committees[c].members.contains(&half)),
+            "a member that moved must not be seated on a child",
+        );
+    }
+
+    /// A keeper that rotated off its child between the gate and the cut is
+    /// dropped rather than moved onto the merged parent, which would seat it
+    /// there while its own shard still counted it.
+    #[test]
+    fn a_merge_keeper_that_rotated_away_is_dropped_not_moved() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(0);
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
+        let keepers = keepers_of(&state, parent);
+        for (id, seat) in &keepers {
+            apply_shard_payload(
+                &BlsVerifier,
+                &mut state,
+                &net(),
+                seat.child,
+                &ShardWitnessPayload::ReshapeReady {
+                    validator: *id,
+                    child: seat.child,
+                },
+            );
+        }
+        schedule_ready_merges(&mut state);
+        let scheduled = state.pending_reshapes[&parent]
+            .scheduled_terminal()
+            .expect("the gate fires");
+
+        // One keeper rotates onto an unrelated shard before the cut.
+        let strayed = *keepers.keys().next().expect("keepers drawn");
+        state.validators.get_mut(&strayed).expect("seated").status = ValidatorStatus::OnShard {
+            shard: ShardId::leaf(1, 1),
+            ready: true,
+            placed_at_epoch: state.current_epoch,
+        };
+
+        state.current_epoch = scheduled;
+        apply_scheduled_merges(&mut state);
+
+        assert!(state.pending_reshapes.is_empty(), "the cut applied");
+        assert!(
+            !state.next_shard_committees[&parent]
+                .members
+                .contains(&strayed),
+            "a keeper that rotated away must not be seated on the merged parent",
+        );
     }
 
     // ─── merge execution gate ────────────────────────────────────────────
