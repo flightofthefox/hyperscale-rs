@@ -503,18 +503,29 @@ impl WaveState {
 
     // ── Vote emission ───────────────────────────────────────────────────
 
-    /// Vote anchor timestamp — the shard consensus-authenticated weighted timestamp (ms)
-    /// at which this wave's outcome is fixed.
-    /// - Fully provisioned: `all_provisioned_at` (max provisioning ts
-    ///   across txs in the wave).
-    /// - Timed out: `wave_start_ts + WAVE_TIMEOUT` (deterministic abort
-    ///   anchor).
+    /// Vote anchor timestamp: the wave-starting block's BFT-authenticated
+    /// weighted timestamp.
     ///
-    /// Included in the vote payload and the EC canonical hash, so all
-    /// validators aggregate under the same identifier.
-    fn target_vote_anchor_ts(&self) -> WeightedTimestamp {
-        self.all_provisioned_at
-            .unwrap_or_else(|| self.wave_start_ts.plus(WAVE_TIMEOUT))
+    /// This rides the vote payload and the EC canonical hash, and
+    /// [`VoteTracker`] groups votes by it, so every validator must derive the
+    /// same value from the same wave or agreeing votes never aggregate. Only
+    /// committed chain content carries that guarantee: the wave block's
+    /// timestamp is identical everywhere, whereas when a wave became
+    /// provisioned and which of its transactions a conflict detector aborted
+    /// are local observations that differ across a committee.
+    ///
+    /// Unconditional for the same reason. A per-branch anchor would diverge
+    /// even if each branch's value were sound on its own, because the branch
+    /// itself is locally determined — one validator's `all_provisioned_at` is
+    /// set by an abort its peers have not recorded yet.
+    ///
+    /// Already in the past when the vote is built, so the committee it
+    /// resolves is available at once; an anchor ahead of the committed clock
+    /// would defer every certificate until the schedule reached it.
+    ///
+    /// [`VoteTracker`]: crate::vote_tracker::VoteTracker
+    const fn target_vote_anchor_ts(&self) -> WeightedTimestamp {
+        self.wave_start_ts
     }
 
     /// Whether the local vote can be emitted at the given committed timestamp.
@@ -1099,12 +1110,46 @@ mod tests {
         assert!(w.can_emit_vote(at_timeout));
 
         let (anchor, _root, outcomes) = w.build_vote_data(at_timeout).unwrap();
-        assert_eq!(anchor, at_timeout);
+        assert_eq!(anchor, wave_start_ts, "the anchor is the wave block");
         assert_eq!(outcomes.len(), 2);
         assert!(
             outcomes
                 .iter()
                 .all(|o| matches!(o.outcome(), ExecutionOutcome::Aborted))
+        );
+    }
+
+    /// Two validators recording the same conflict abort at different local
+    /// commit timestamps must still vote under one anchor.
+    ///
+    /// The anchor keys vote aggregation, so a value derived from when a
+    /// validator happened to observe the abort splits agreeing votes into
+    /// groups that each fall short of quorum — the votes are unanimous on the
+    /// outcome and no certificate ever forms.
+    #[test]
+    fn conflict_abort_timing_does_not_move_the_vote_anchor() {
+        let early = ts_for(BlockHeight::new(WAVE_START.inner() + 12));
+        let late = ts_for(BlockHeight::new(WAVE_START.inner() + 36));
+
+        let mut seen_early = make_cross_shard_wave(1);
+        let h = seen_early.tx_hashes()[0];
+        seen_early.record_abort(h, early);
+        let (anchor_early, root_early, _) = seen_early
+            .build_vote_data(early)
+            .expect("an explicit abort is an outcome, so the wave votes");
+
+        let mut seen_late = make_cross_shard_wave(1);
+        let h = seen_late.tx_hashes()[0];
+        seen_late.record_abort(h, late);
+        let (anchor_late, root_late, _) = seen_late
+            .build_vote_data(late)
+            .expect("an explicit abort is an outcome, so the wave votes");
+
+        assert_eq!(anchor_early, ts_for(WAVE_START));
+        assert_eq!(anchor_late, ts_for(WAVE_START));
+        assert_eq!(
+            root_early, root_late,
+            "same outcome, so the votes must also agree on the receipt root"
         );
     }
 
