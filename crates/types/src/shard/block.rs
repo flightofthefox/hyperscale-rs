@@ -16,8 +16,8 @@ use crate::{
     ChainOrigin, FinalizedWave, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, QuorumCertificate, RoutableTransaction, ShardId, SharedWitnessSources,
-    StateRoot, TransactionRoot, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    WitnessSources,
+    SplitChildRoots, StateRoot, TransactionRoot, TxHash, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, WitnessSources,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -137,6 +137,22 @@ pub enum Block {
 
 // Variant discriminator constants — referenced by the `#[sbor(discriminator)]`
 // attributes above. Naming them explicitly means future variants can't
+/// One side of a merge: the terminal block a child's chain ends at, as
+/// much of it as the merged genesis derives from.
+///
+/// Both the beacon fold (reading its recorded boundary) and a keeper
+/// (reading the header it commit-proved) can supply this, so the
+/// derivation does not care which of the two is calling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalRef {
+    /// The terminal's committed state root — the child's subtree.
+    pub state_root: StateRoot,
+    /// The terminal's block hash.
+    pub block_hash: BlockHash,
+    /// The terminal's height.
+    pub height: BlockHeight,
+}
+
 // silently renumber existing ones.
 const BLOCK_VARIANT_LIVE: u8 = 0;
 const BLOCK_VARIANT_SEALED: u8 = 1;
@@ -244,6 +260,92 @@ impl Block {
             provisions: Arc::new(BoundedVec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
+    }
+
+    /// Derive a split child's genesis and chain origin from its parent's
+    /// terminal header alone.
+    ///
+    /// The one derivation every party performs: the beacon fold seeding the
+    /// child's anchor, a follower flipping at the cut, and a late joiner
+    /// deriving against that anchor all call this, so none of them can
+    /// disagree about the block a child starts from.
+    ///
+    /// Both inputs are frozen chain content. The subtree root is the
+    /// terminal's [`split_child_roots`](BlockHeader::split_child_roots)
+    /// entry for `child`, self-verifying by the composition check below —
+    /// collision resistance means a parent cannot name a pair that composes
+    /// to its own committed state root without holding those subtrees.
+    /// `canonical_wt` is the weighted timestamp of the canonical
+    /// certificate over the terminal, which is the `parent_qc` of the
+    /// terminal's committed successor and never a QC served alongside it.
+    ///
+    /// `None` when the terminal carries no pair, or one that does not
+    /// compose to its own state root.
+    #[must_use]
+    pub fn split_child_genesis_from_terminal(
+        child: ShardId,
+        terminal: &BlockHeader,
+        canonical_wt: WeightedTimestamp,
+    ) -> Option<(Self, ChainOrigin)> {
+        let pair = terminal.split_child_roots()?;
+        if !pair.composes_to(terminal.state_root()) {
+            return None;
+        }
+        let child_root = if child.path() & 1 == 0 {
+            pair.left
+        } else {
+            pair.right
+        };
+        Some((
+            Self::split_child_genesis(child, child_root, terminal, canonical_wt),
+            ChainOrigin {
+                genesis_height: terminal.height().next(),
+                anchor_wt: canonical_wt,
+            },
+        ))
+    }
+
+    /// Derive a merged parent's genesis and chain origin from its two
+    /// children's terminals and the cut they terminate at.
+    ///
+    /// The merge counterpart of
+    /// [`split_child_genesis_from_terminal`](Self::split_child_genesis_from_terminal),
+    /// and likewise the one derivation both the beacon fold and every
+    /// keeper perform. The merged root is the internal node over the two
+    /// terminal subtree roots — the inverse of the composition a split
+    /// verifies, each side attested by its own chain — and the first block
+    /// continues both height lines at `max(h_left, h_right) + 1`.
+    ///
+    /// `cut_wt` is the instant the children terminate at: the end of their
+    /// scheduled terminal window, which both sides read from the same
+    /// schedule. A child's terminal certificate cannot serve, unlike a
+    /// split's: the fold binds whichever QC ranked highest across the
+    /// committed proposal set, an outcome of the beacon's own consensus
+    /// that no keeper can reproduce.
+    #[must_use]
+    pub fn merge_parent_genesis_from_terminals(
+        parent: ShardId,
+        left: TerminalRef,
+        right: TerminalRef,
+        cut_wt: WeightedTimestamp,
+    ) -> (Self, ChainOrigin) {
+        let composed = SplitChildRoots {
+            left: left.state_root,
+            right: right.state_root,
+        }
+        .composed_root();
+        let genesis = Self::merge_parent_genesis(
+            parent,
+            composed,
+            (left.block_hash, left.height),
+            (right.block_hash, right.height),
+            cut_wt,
+        );
+        let origin = ChainOrigin {
+            genesis_height: genesis.height(),
+            anchor_wt: cut_wt,
+        };
+        (genesis, origin)
     }
 
     /// Block header — present in both variants.

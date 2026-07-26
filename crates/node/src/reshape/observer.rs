@@ -296,32 +296,15 @@ pub struct DerivedGenesis {
 
 /// Derive `child`'s genesis from the parent's terminal header.
 ///
-/// `None` when the terminal carries no `split_child_roots` pair, or one
-/// that does not compose to the terminal's own committed `state_root` —
-/// collision resistance makes the composition check enough on its own,
-/// so a parent cannot name a child subtree its terminal root doesn't
-/// contain.
+/// Thin over [`Block::split_child_genesis_from_terminal`], which is the
+/// one derivation the beacon fold and every successor share.
 fn derive_child_genesis(
     child: ShardId,
     terminal: &BlockHeader,
     canonical_wt: WeightedTimestamp,
 ) -> Option<DerivedGenesis> {
-    let pair = terminal.split_child_roots()?;
-    if !pair.composes_to(terminal.state_root()) {
-        return None;
-    }
-    let child_root = if child.path() & 1 == 0 {
-        pair.left
-    } else {
-        pair.right
-    };
-    Some(DerivedGenesis {
-        block: Block::split_child_genesis(child, child_root, terminal, canonical_wt),
-        origin: ChainOrigin {
-            genesis_height: terminal.height().next(),
-            anchor_wt: canonical_wt,
-        },
-    })
+    let (block, origin) = Block::split_child_genesis_from_terminal(child, terminal, canonical_wt)?;
+    Some(DerivedGenesis { block, origin })
 }
 
 /// Sans-io tail-follower keeping an observer's synced child store

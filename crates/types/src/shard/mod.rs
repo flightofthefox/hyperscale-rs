@@ -44,8 +44,8 @@ pub mod vote_registers;
 pub mod witness_sources;
 
 pub use block::{
-    Block, SharedCertificates, SharedProvisions, SharedTransactions, VerifiedBlockAssembleError,
-    shared_transactions_from_raw,
+    Block, SharedCertificates, SharedProvisions, SharedTransactions, TerminalRef,
+    VerifiedBlockAssembleError, shared_transactions_from_raw,
 };
 pub use witness_sources::{SharedWitnessSources, WitnessSources};
 

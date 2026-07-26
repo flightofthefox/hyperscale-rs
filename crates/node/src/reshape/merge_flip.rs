@@ -8,7 +8,7 @@
 //! when the beacon composes the same value.
 
 use hyperscale_types::{
-    Block, BlockHeader, ChainOrigin, QuorumCertificate, ShardId, SplitChildRoots, WeightedTimestamp,
+    Block, BlockHeader, ChainOrigin, QuorumCertificate, ShardId, TerminalRef, WeightedTimestamp,
 };
 
 /// Derive a merged parent's genesis block and chain origin from its two
@@ -47,22 +47,22 @@ pub fn merge_genesis_from_terminals(
     if right_qc.block_hash() != right_terminal.hash() {
         return Err("the right quorum certificate does not certify the right terminal".to_string());
     }
-    let composed = SplitChildRoots {
-        left: left_terminal.state_root(),
-        right: right_terminal.state_root(),
-    }
-    .composed_root();
-    let genesis = Block::merge_parent_genesis(
+    // The one shared derivation, so a keeper reforming the parent installs
+    // exactly the block the beacon fold composes from the same terminals.
+    let (genesis, origin) = Block::merge_parent_genesis_from_terminals(
         parent,
-        composed,
-        (left_terminal.hash(), left_terminal.height()),
-        (right_terminal.hash(), right_terminal.height()),
+        TerminalRef {
+            state_root: left_terminal.state_root(),
+            block_hash: left_terminal.hash(),
+            height: left_terminal.height(),
+        },
+        TerminalRef {
+            state_root: right_terminal.state_root(),
+            block_hash: right_terminal.hash(),
+            height: right_terminal.height(),
+        },
         cut_wt,
     );
-    let origin = ChainOrigin {
-        genesis_height: genesis.height(),
-        anchor_wt: cut_wt,
-    };
     Ok((genesis, origin))
 }
 

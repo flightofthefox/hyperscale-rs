@@ -1,68 +1,58 @@
-//! The split-child genesis flip's deterministic core.
+//! The split-child genesis flip's anchor fallback.
 //!
-//! A pre-staffed member of a split child derives the child's genesis
-//! from the terminated parent chain: the terminal block `B` (the
-//! crossing the beacon anchors) and the canonical weighted timestamp the
-//! beacon recorded for it. The derived genesis must reconstruct the
-//! beacon's child anchor byte-for-byte — the fold seeded the anchor with
-//! [`BlockHeader::split_child_genesis`]'s hash over the same inputs — so
-//! a mismatch means the local parent chain and the beacon disagree, and
-//! the flip fails closed.
+//! A member of a split child that did not recognise its parent's terminal
+//! crossing on its own follow derives the child's genesis from the
+//! terminated parent chain instead: the terminal block `B` and the
+//! canonical weighted timestamp the beacon recorded for it.
 //!
-//! The clock anchor is read from the beacon's [`ShardAnchor::weighted_timestamp`],
-//! which the fold derived from `B`'s committed child's `parent_qc` — the
-//! canonical certifying QC carried in the chain. The QC the local store
-//! serves *alongside* `B` is not that one: a terminal block can be
-//! re-certified at a higher round during the parent's coast, so the served
-//! certified block carries the freshest QC over `B`, whose weighted
-//! timestamp differs from the canonical `parent_qc`'s. A weighted timestamp
-//! must therefore only ever be taken from a `parent_qc`; the served QC is
-//! used only to confirm `B` is certified at all.
+//! The clock is read from the child's beacon anchor, which the fold took
+//! from `B`'s committed successor's `parent_qc` — the canonical certifying
+//! QC carried in the chain. The QC the local store serves *alongside* `B`
+//! is not that one: a terminal can be re-certified at a higher round during
+//! the parent's coast, so the served certified block carries the freshest
+//! QC over `B`, whose weighted timestamp differs from the canonical
+//! `parent_qc`'s. A weighted timestamp may therefore only ever be taken
+//! from a `parent_qc`; the served QC confirms only that `B` is certified.
 
-use hyperscale_types::{Block, BlockHeader, ChainOrigin, QuorumCertificate, ShardAnchor, ShardId};
+use hyperscale_types::{
+    Block, BlockHeader, ChainOrigin, QuorumCertificate, ShardId, WeightedTimestamp,
+};
 
-/// Derive a split child's genesis block and chain origin from the
-/// parent chain's certified terminal block, verified against the
-/// beacon's child anchor.
+/// Derive a split child's genesis block and chain origin from the parent
+/// chain's certified terminal block.
 ///
-/// `terminal_header` is `B` (the block at `anchor.height - 1` on the
-/// parent chain) and `terminal_qc` a QC certifying it. The child clock's
-/// start anchor is *not* read from `terminal_qc` — it is
-/// [`anchor.weighted_timestamp`](ShardAnchor::weighted_timestamp), the
-/// canonical value the beacon fold took from `B`'s committed child's
-/// `parent_qc`. `terminal_qc` only confirms `B` is certified; its own
-/// weighted timestamp may be a higher-round re-certification past the
-/// crossing and is never used.
+/// The fallback path a duty takes when it could not recognise the crossing
+/// on its own follow — a late-discovered duty, or one whose walk lost the
+/// race. `terminal_header` is `B`, the block below the child's genesis
+/// height, and `terminal_qc` a QC certifying it.
+///
+/// The derivation itself is [`Block::split_child_genesis_from_terminal`],
+/// shared with the beacon fold and the cut-over flip, so all three install
+/// the same block. `canonical_wt` is the clock the caller read from the
+/// beacon's child anchor — the value the fold took from `B`'s committed
+/// successor's `parent_qc`. `terminal_qc` only confirms `B` is certified;
+/// its own weighted timestamp may be a higher-round re-certification past
+/// the crossing and is never used.
+///
+/// Verifying the result against the anchor is the caller's: it holds one
+/// on this path, and the derivation is shared with paths that do not.
 ///
 /// # Errors
 ///
-/// Fails when the quorum certificate does not certify the terminal
-/// header, or when the derived genesis does not reconstruct the
-/// beacon-anchored genesis hash and adopted state root.
+/// Fails when the quorum certificate does not certify the terminal header,
+/// or when the terminal carries no `split_child_roots` pair composing to
+/// its own committed state root.
 pub fn split_genesis_from_terminal(
     child: ShardId,
     terminal_header: &BlockHeader,
     terminal_qc: &QuorumCertificate,
-    anchor: &ShardAnchor,
+    canonical_wt: WeightedTimestamp,
 ) -> Result<(Block, ChainOrigin), String> {
     if terminal_qc.block_hash() != terminal_header.hash() {
         return Err("the quorum certificate does not certify the terminal block".to_string());
     }
-    let canonical_wt = anchor.weighted_timestamp;
-    let origin = ChainOrigin {
-        genesis_height: terminal_header.height().next(),
-        anchor_wt: canonical_wt,
-    };
-    let genesis =
-        Block::split_child_genesis(child, anchor.state_root, terminal_header, canonical_wt);
-    if genesis.hash() != anchor.block_hash {
-        return Err(format!(
-            "derived split genesis {:?} does not reconstruct the beacon anchor {:?}",
-            genesis.hash(),
-            anchor.block_hash,
-        ));
-    }
-    Ok((genesis, origin))
+    Block::split_child_genesis_from_terminal(child, terminal_header, canonical_wt)
+        .ok_or_else(|| "the terminal carries no composing split child roots".to_string())
 }
 
 #[cfg(test)]
@@ -72,13 +62,19 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
         CertificateRoot, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, ValidatorId,
-        WeightedTimestamp,
+        QuorumCertificate, Round, ShardId, SignerBitfield, SplitChildRoots, StateRoot,
+        TransactionRoot, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
 
-    fn header_at(shard: ShardId, height: BlockHeight, parent_qc: QuorumCertificate) -> BlockHeader {
+    fn header_at(
+        shard: ShardId,
+        height: BlockHeight,
+        parent_qc: QuorumCertificate,
+        state_root: StateRoot,
+        pair: Option<SplitChildRoots>,
+    ) -> BlockHeader {
         BlockHeader::new(
             shard,
             height,
@@ -88,7 +84,7 @@ mod tests {
             ProposerTimestamp::ZERO,
             Round::new(7),
             false,
-            StateRoot::from_raw(Hash::from_bytes(b"terminal state")),
+            state_root,
             TransactionRoot::ZERO,
             CertificateRoot::ZERO,
             LocalReceiptRoot::ZERO,
@@ -99,7 +95,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
-            None,
+            pair,
             None,
         )
     }
@@ -117,47 +113,65 @@ mod tests {
         )
     }
 
-    /// The derivation reproduces exactly the genesis the beacon fold
-    /// seeded: same inputs, same hash; a wrong anchor fails closed. The
-    /// clock anchor is the beacon's `anchor.weighted_timestamp`, not the
-    /// served QC's — a QC re-certified at a higher round past the crossing
-    /// carries a divergent timestamp the derivation must ignore.
+    /// A terminal carrying a composing child-root pair derives the child's
+    /// genesis, clocked by the canonical timestamp the caller supplies —
+    /// never by the served QC, which carries a higher-round
+    /// re-certification stamp from past the crossing.
     #[test]
-    fn derivation_reconstructs_the_beacon_anchor() {
+    fn derivation_uses_the_canonical_clock_not_the_served_qc() {
         let parent = ShardId::leaf(1, 0);
         let (left, _) = parent.children();
+        let pair = SplitChildRoots {
+            left: StateRoot::from_raw(Hash::from_bytes(b"left subtree")),
+            right: StateRoot::from_raw(Hash::from_bytes(b"right subtree")),
+        };
         let terminal = header_at(
             parent,
             BlockHeight::new(9),
             QuorumCertificate::genesis(parent, ChainOrigin::ROOT),
+            pair.composed_root(),
+            Some(pair),
         );
         let canonical_wt = WeightedTimestamp::from_millis(2_500);
-        let child_root = StateRoot::from_raw(Hash::from_bytes(b"left subtree"));
 
-        // The fold seeds the anchor with the canonical (parent-QC) timestamp.
-        let expected = Block::split_child_genesis(left, child_root, &terminal, canonical_wt);
-        let anchor = ShardAnchor {
-            state_root: child_root,
-            block_hash: expected.hash(),
-            height: BlockHeight::new(10),
-            weighted_timestamp: canonical_wt,
-            witness_base: BeaconWitnessLeafCount::ZERO,
-            settled_waves_root: None,
-        };
-
-        // The served QC carries a *higher-round* re-certification timestamp;
-        // the derivation must use the anchor's, not this one.
         let stale_qc = certifying_qc(&terminal, 9_999);
         let (genesis, origin) =
-            split_genesis_from_terminal(left, &terminal, &stale_qc, &anchor).expect("derives");
-        assert_eq!(genesis.hash(), anchor.block_hash);
+            split_genesis_from_terminal(left, &terminal, &stale_qc, canonical_wt).expect("derives");
+        assert_eq!(
+            genesis.hash(),
+            Block::split_child_genesis(left, pair.left, &terminal, canonical_wt).hash(),
+        );
         assert_eq!(origin.genesis_height, BlockHeight::new(10));
         assert_eq!(origin.anchor_wt, canonical_wt);
+    }
 
-        let wrong = ShardAnchor {
-            block_hash: BlockHash::from_raw(Hash::from_bytes(b"forged")),
-            ..anchor
+    /// A terminal whose child-root pair does not compose to its own
+    /// committed state root derives nothing — a parent cannot name a
+    /// subtree its terminal does not hold.
+    #[test]
+    fn a_non_composing_pair_derives_nothing() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, _) = parent.children();
+        let pair = SplitChildRoots {
+            left: StateRoot::from_raw(Hash::from_bytes(b"left subtree")),
+            right: StateRoot::from_raw(Hash::from_bytes(b"right subtree")),
         };
-        assert!(split_genesis_from_terminal(left, &terminal, &stale_qc, &wrong).is_err());
+        let terminal = header_at(
+            parent,
+            BlockHeight::new(9),
+            QuorumCertificate::genesis(parent, ChainOrigin::ROOT),
+            StateRoot::from_raw(Hash::from_bytes(b"a different root")),
+            Some(pair),
+        );
+        let qc = certifying_qc(&terminal, 2_500);
+        assert!(
+            split_genesis_from_terminal(
+                left,
+                &terminal,
+                &qc,
+                WeightedTimestamp::from_millis(2_500)
+            )
+            .is_err()
+        );
     }
 }

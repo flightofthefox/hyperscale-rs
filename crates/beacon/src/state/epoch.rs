@@ -6,12 +6,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeader,
+    BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader,
     CertifiedBeaconBlock, CompletedRecovery, Epoch, EpochWindows, KeptSeat, NetworkDefinition,
     ObserverSeat, PendingReshape, QcContext, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS,
     RETENTION_HORIZON, RecoveryCause, ShardBoundary, ShardEpochContribution, ShardId, ShardWitness,
-    ShardWitnessPayload, SlotEffects, SplitChildRoots, TopologySnapshot, TransitionCause,
-    ValidatorId, ValidatorStatus, Verifier, Verify, VrfOutput, WeightedTimestamp,
+    ShardWitnessPayload, SlotEffects, TerminalRef, TopologySnapshot, TransitionCause, ValidatorId,
+    ValidatorStatus, Verifier, Verify, VrfOutput, WeightedTimestamp,
 };
 
 use crate::rules::{
@@ -1104,22 +1104,8 @@ fn seed_split_children(
     terminal_qc: &QuorumCertificate,
     epoch: Epoch,
 ) {
-    let Some(pair) = terminal_header.split_child_roots() else {
-        tracing::warn!(
-            shard = ?parent,
-            "terminal contribution carries no split child roots; children seed from their own contributions"
-        );
-        return;
-    };
-    if !pair.composes_to(terminal_header.state_root()) {
-        tracing::warn!(
-            shard = ?parent,
-            "terminal contribution's split child roots do not compose to its state root"
-        );
-        return;
-    }
-    let (left, right) = parent.children();
-    for (child, child_root) in [(left, pair.left), (right, pair.right)] {
+    let children: [ShardId; 2] = parent.children().into();
+    for child in children {
         let pending = state
             .boundaries
             .get(&child)
@@ -1127,19 +1113,30 @@ fn seed_split_children(
         if !pending {
             continue;
         }
-        let genesis = BlockHeader::split_child_genesis(
+        // The one shared derivation, so the record this seeds is the block
+        // a successor deriving from the same terminal already installed.
+        // A terminal carrying no pair, or one that does not compose to its
+        // own committed root, seeds nothing: the children then seed from
+        // their own first boundary contributions instead.
+        let Some((genesis, _)) = Block::split_child_genesis_from_terminal(
             child,
-            child_root,
             terminal_header,
             terminal_qc.weighted_timestamp(),
-        );
+        ) else {
+            tracing::warn!(
+                shard = ?parent,
+                "terminal contribution carries no composing split child roots; \
+                 children seed from their own contributions"
+            );
+            return;
+        };
         state.boundaries.insert(
             child,
             ShardBoundary {
-                state_root: child_root,
+                state_root: genesis.header().state_root(),
                 block_hash: genesis.hash(),
                 height: genesis.height(),
-                weighted_timestamp: genesis.parent_qc().weighted_timestamp(),
+                weighted_timestamp: genesis.header().parent_qc().weighted_timestamp(),
                 witness_leaf_count: BeaconWitnessLeafCount::ZERO,
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 last_live_epoch: epoch,
@@ -1226,25 +1223,29 @@ fn compose_merge_parent(
         .terminal_epoch
         .expect("a child in compose has folded its terminal");
     let cut_wt = windows.window_of(terminal).end;
-    let composed = SplitChildRoots {
-        left: left_b.state_root,
-        right: right_b.state_root,
-    }
-    .composed_root();
-    let genesis = BlockHeader::merge_parent_genesis(
+    // The one shared derivation, so this record is the block every keeper
+    // reforming the parent from the same two terminals already installed.
+    let (genesis, _) = Block::merge_parent_genesis_from_terminals(
         parent,
-        composed,
-        (left_b.block_hash, left_b.height),
-        (right_b.block_hash, right_b.height),
+        TerminalRef {
+            state_root: left_b.state_root,
+            block_hash: left_b.block_hash,
+            height: left_b.height,
+        },
+        TerminalRef {
+            state_root: right_b.state_root,
+            block_hash: right_b.block_hash,
+            height: right_b.height,
+        },
         cut_wt,
     );
     state.boundaries.insert(
         parent,
         ShardBoundary {
-            state_root: composed,
+            state_root: genesis.header().state_root(),
             block_hash: genesis.hash(),
             height: genesis.height(),
-            weighted_timestamp: genesis.parent_qc().weighted_timestamp(),
+            weighted_timestamp: genesis.header().parent_qc().weighted_timestamp(),
             witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
             last_live_epoch: epoch,
@@ -1270,13 +1271,13 @@ mod tests {
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
         AggregateSignature, BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
-        BlockHeader, BlockHeight, BoundedVec, CertificateRoot, Epoch, Hash, InFlightCount,
-        LeafIndex, LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, Round, SettledWavesRoot, ShardBoundary, ShardCommittee,
-        ShardForkProof, ShardId, ShardRecovery, ShardWitness, ShardWitnessPayload,
-        ShardWitnessProof, SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId,
-        StateRoot, TransactionRoot, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
-        compute_merkle_root_with_proof,
+        BlockHeader, BlockHeight, BoundedVec, CertificateRoot, ChainOrigin, Epoch, Hash,
+        InFlightCount, LeafIndex, LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, SettledWavesRoot,
+        ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardRecovery, ShardWitness,
+        ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SplitChildRoots, Stake, StakePool,
+        StakePoolId, StateRoot, TransactionRoot, TransitionCause, ValidatorId, VrfProof,
+        WeightedTimestamp, compute_merkle_root_with_proof,
     };
 
     use super::*;
@@ -4239,5 +4240,93 @@ mod tests {
             state.pending_reshapes.is_empty(),
             "the cut must have applied for this to cover the applying fold",
         );
+    }
+
+    /// The beacon's seed and a successor's own derivation are the same
+    /// block, because they are the same function.
+    ///
+    /// The fold seeds a child's anchor from the parent's terminal
+    /// contribution; a follower derives its genesis from the same terminal
+    /// as it walks past. Those two once had independent implementations
+    /// that had to be kept in step by inspection — and on the merge side
+    /// they had already diverged.
+    #[test]
+    fn the_fold_and_a_successor_derive_one_genesis_from_one_terminal() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let pair = SplitChildRoots {
+            left: StateRoot::from_raw(Hash::from_bytes(b"left subtree")),
+            right: StateRoot::from_raw(Hash::from_bytes(b"right subtree")),
+        };
+        let canonical_wt = WeightedTimestamp::from_millis(7_000);
+        let terminal = terminal_header_with_pair(parent, pair);
+
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        for child in [left, right] {
+            state.boundaries.insert(
+                child,
+                ShardBoundary {
+                    state_root: StateRoot::ZERO,
+                    block_hash: BlockHash::ZERO,
+                    height: BlockHeight::GENESIS,
+                    weighted_timestamp: WeightedTimestamp::ZERO,
+                    witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+                    witness_base: BeaconWitnessLeafCount::ZERO,
+                    last_live_epoch: Epoch::GENESIS,
+                    consecutive_misses: 0,
+                    terminal_epoch: None,
+                    terminal_qc_wt: None,
+                    settled_waves_root: None,
+                    reshape_admitted_epoch: None,
+                    reveals_fenced_below: None,
+                },
+            );
+        }
+        seed_split_children(
+            &mut state,
+            parent,
+            &terminal,
+            &qc_over(&terminal, canonical_wt.as_millis()),
+            Epoch::new(1),
+        );
+
+        for child in [left, right] {
+            let (derived, origin) =
+                Block::split_child_genesis_from_terminal(child, &terminal, canonical_wt)
+                    .expect("the pair composes");
+            let seeded = state.boundaries[&child];
+            assert_eq!(seeded.block_hash, derived.hash());
+            assert_eq!(seeded.height, origin.genesis_height);
+            assert_eq!(seeded.state_root, derived.header().state_root());
+        }
+    }
+
+    /// A terminal header carrying `pair`, with the composed root as its own
+    /// committed state root so the pair self-verifies.
+    fn terminal_header_with_pair(shard: ShardId, pair: SplitChildRoots) -> BlockHeader {
+        BlockHeader::new(
+            shard,
+            BlockHeight::new(9),
+            BlockHash::ZERO,
+            QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
+            ValidatorId::new(0),
+            ProposerTimestamp::ZERO,
+            Round::new(3),
+            false,
+            pair.composed_root(),
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+            Some(pair),
+            None,
+        )
     }
 }

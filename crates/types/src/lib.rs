@@ -153,7 +153,7 @@ pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::SafeVoteRegisters;
 pub use shard::{
     Block, SharedCertificates, SharedProvisions, SharedTransactions, SharedWitnessSources,
-    VerifiedBlockAssembleError, WitnessSources, shared_transactions_from_raw,
+    TerminalRef, VerifiedBlockAssembleError, WitnessSources, shared_transactions_from_raw,
 };
 pub use signing::{
     DOMAIN_PC_VOTE1, DOMAIN_SPC_NEW_COMMIT, DOMAIN_SPC_NEW_VIEW, PcContext,

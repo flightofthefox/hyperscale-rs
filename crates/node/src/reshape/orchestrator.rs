@@ -417,6 +417,10 @@ enum KeeperPhase {
         /// The instant the children terminate at, and the merged chain's
         /// clock anchor.
         cut_wt: WeightedTimestamp,
+        /// The beacon's composed parent anchor, when this duty reached
+        /// `Building` by the fallback rather than the cut-over. Present
+        /// means the derivation is checked against it.
+        anchor: Option<ShardAnchor>,
         left: Box<KeeperHalf>,
         right: Box<KeeperHalf>,
         derived: Option<(ChainOrigin, Box<Block>)>,
@@ -838,8 +842,8 @@ impl ReshapeOrchestrator {
                 *requested = false;
                 let anchor = *anchor;
                 if let Some(elided) = &response.certified
-                    && let Ok((genesis, origin)) =
-                        split_genesis_from_terminal(child, elided.header(), elided.qc(), &anchor)
+                    && let Some((genesis, origin)) =
+                        anchored_split_genesis(child, elided.header(), elided.qc(), &anchor)
                 {
                     next = Some(ObserverPhase::Adopting {
                         origin,
@@ -872,8 +876,8 @@ impl ReshapeOrchestrator {
             *requested = false;
             let anchor = *anchor;
             if let Some(elided) = &response.certified
-                && let Ok((genesis, origin)) =
-                    split_genesis_from_terminal(child, elided.header(), elided.qc(), &anchor)
+                && let Some((genesis, origin)) =
+                    anchored_split_genesis(child, elided.header(), elided.qc(), &anchor)
             {
                 next = Some(ParentHalfPhase::Adopting {
                     origin,
@@ -1226,6 +1230,11 @@ impl ReshapeOrchestrator {
                 {
                     duty.phase = KeeperPhase::Building {
                         cut_wt: parent_anchor.weighted_timestamp,
+                        // The fallback holds the composed anchor, so the
+                        // derivation is checked against it. The cut-over path
+                        // below has none yet — its guard is the pair of
+                        // commitment proofs it built the terminals from.
+                        anchor: Some(parent_anchor),
                         left: Box::new(KeeperHalf::new(left, left_anchor)),
                         right: Box::new(KeeperHalf::new(right, right_anchor)),
                         derived: None,
@@ -1282,6 +1291,7 @@ impl ReshapeOrchestrator {
                     );
                     duty.phase = KeeperPhase::Building {
                         cut_wt,
+                        anchor: None,
                         left: Box::new(KeeperHalf::recognized(left.child, left_sighting)),
                         right: Box::new(KeeperHalf::recognized(right.child, right_sighting)),
                         derived: None,
@@ -1303,6 +1313,7 @@ impl ReshapeOrchestrator {
             }
             KeeperPhase::Building {
                 cut_wt,
+                anchor,
                 left,
                 right,
                 derived,
@@ -1335,6 +1346,24 @@ impl ReshapeOrchestrator {
                         (right_h, right_qc),
                         *cut_wt,
                     )
+                    // On the fallback the beacon has already composed this
+                    // parent, so the derivation is checked against it —
+                    // agreement is free, and disagreement means the local
+                    // child chains and the network disagree about a committed
+                    // block.
+                    && anchor.is_none_or(|a| {
+                        let matches = genesis.hash() == a.block_hash;
+                        if !matches {
+                            tracing::error!(
+                                ?parent,
+                                derived = ?genesis.hash(),
+                                anchored = ?a.block_hash,
+                                "derived merged-parent genesis does not reconstruct \
+                                 the beacon anchor"
+                            );
+                        }
+                        matches
+                    })
                 {
                     *derived = Some((origin, Box::new(genesis)));
                 }
@@ -1557,6 +1586,38 @@ impl ReshapeOrchestrator {
             duty.phase = phase;
         }
     }
+}
+
+/// Derive a successor's genesis on the anchor fallback path, checking it
+/// against the anchor the beacon attested.
+///
+/// The derivation is shared with the cut-over flip and the beacon fold, so
+/// it takes no anchor. This path holds one, so it compares: agreement is
+/// free, and disagreement means the local parent chain and the network
+/// disagree about a committed block. The cut-over flip has no anchor to
+/// compare against yet — its guard is the commitment proof at the front.
+fn anchored_split_genesis(
+    child: ShardId,
+    terminal: &BlockHeader,
+    qc: &QuorumCertificate,
+    anchor: &ShardAnchor,
+) -> Option<(Block, ChainOrigin)> {
+    let (genesis, origin) =
+        split_genesis_from_terminal(child, terminal, qc, anchor.weighted_timestamp)
+            .inspect_err(|error| {
+                tracing::warn!(?child, %error, "split child genesis derivation failed");
+            })
+            .ok()?;
+    if genesis.hash() != anchor.block_hash {
+        tracing::error!(
+            ?child,
+            derived = ?genesis.hash(),
+            anchored = ?anchor.block_hash,
+            "derived split-child genesis does not reconstruct the beacon anchor"
+        );
+        return None;
+    }
+    Some((genesis, origin))
 }
 
 /// Whether the parent's terminal is commit-proven — the gate the flip
