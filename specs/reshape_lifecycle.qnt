@@ -1,6 +1,7 @@
 // Model F (register: specs/README.md) — the reshape lifecycle and its
 // staffing. INV-RESHAPE-1 (seating gate), INV-RESHAPE-7 (staffing
-// stability), INV-RESHAPE-8 (bounded lifecycle, staffing half), and the
+// stability), INV-RESHAPE-8 (bounded lifecycle, staffing half),
+// INV-RESHAPE-9/10 (the terminal lead and its irrevocability), and the
 // reshape clauses of INV-SEC-2.
 //
 // Two modules, mirroring the implementation's own split between the
@@ -20,7 +21,16 @@
 //   `reshape_lifecycle` — the pure beacon fold for a split: trigger
 //   admission under the pool gate, the frozen-seed cohort draw and its
 //   child assignment, the sticky ready fold, TTL lapse/re-staff and
-//   abandonment, and the 2f+1-per-child seating gate. A `synced` ground
+//   abandonment, and the 2f+1-per-child seating gate. The gate and the
+//   trie mutation are two folds, a window apart: the gate fires once and
+//   stamps a cut for a *later* window (INV-RESHAPE-9, so a proposer can
+//   read its own window's frozen projection and stamp the boundary
+//   verdicts its header owes), freezing the approved carve with it; the
+//   fold at the cut consumes the record and seats from that carve
+//   without re-gating. The lead is what makes irrevocability an
+//   obligation (INV-RESHAPE-10): the cut reaches signed headers before
+//   the fold that applies it, so the TTL arms must skip a scheduled
+//   record — the `RETRACTABLE` twins are both of those arms. A `synced` ground
 //   truth records which observers actually synced each child, so the
 //   seating gate can be checked at its semantic floor rather than by seat
 //   count alone. A ready signal is bound only to its emitter — it carries
@@ -118,6 +128,14 @@
 //   quint verify --main=reshape_unbound_ready --invariant=invNoHonestFalseReady --max-steps=10 specs/reshape_lifecycle.qnt
 //     (the finding: an unbound signal from the observer's prior seat folds
 //      for its churned-to seat; expect a counterexample)
+//   quint verify --main=reshape_retractable_schedule --invariant=invSeatingGate --max-steps=13 specs/reshape_lifecycle.qnt
+//     (the lapse arm on a scheduled record: the cohort the frozen carve
+//      names drains, and the applying fold seats the child below the
+//      quorum its own gate approved; expect a counterexample)
+//   quint verify --main=reshape_retractable_abandon --invariant=invScheduleIrrevocable --max-steps=12 specs/reshape_lifecycle.qnt
+//     (the abandon arm, on a short readiness TTL so it lands inside a
+//      practical depth: the record is dropped while its cut is already
+//      published; expect a counterexample)
 
 module ready_signal_admission {
   // Ticks a signal must rest in the pool before it is drain-eligible.
@@ -304,6 +322,10 @@ module reshape_lifecycle {
   // the validator ready for whatever seat it currently holds. False is the
   // child-bound signal the fix would carry.
   const UNBOUND_READY: bool
+  // Broken twin: the TTL arms still fire on a record that already
+  // carries a scheduled cut. False is the shipped guard, where
+  // `prune_stale_reshapes` skips a scheduled record on both arms.
+  const RETRACTABLE: bool
 
   pure val QUORUM = 2 * F + 1
   // The observer identities: a full cohort's worth plus one benched spare.
@@ -359,6 +381,18 @@ module reshape_lifecycle {
   var admittedAt: int
   // The split has executed; the model is terminal (only the clock advances).
   var executed: bool
+  // The cut has been stamped. From here the readiness gate is not
+  // re-evaluated and the record cannot be withdrawn (INV-RESHAPE-10).
+  var scheduled: bool
+  // Epoch the cut was stamped in. The applying fold runs at a later
+  // window — never the one the scheduling fold opens (INV-RESHAPE-9).
+  var scheduledAt: int
+  // The carve frozen with the cut: the cohort seats each child was
+  // approved with. There is no second gate to approve a different one,
+  // so the applying fold seats from this, skipping any member whose
+  // placement has since moved.
+  var carveL: Set[int]
+  var carveR: Set[int]
 
   action init = all {
     epoch' = 0,
@@ -378,6 +412,10 @@ module reshape_lifecycle {
     lastAsserted' = 0,
     admittedAt' = 0,
     executed' = false,
+    scheduled' = false,
+    scheduledAt' = 0,
+    carveL' = Set(),
+    carveR' = Set(),
   }
 
   // The seed a draw uses: frozen (healthy) or re-rolled from the epoch (twin).
@@ -411,6 +449,10 @@ module reshape_lifecycle {
       lastAsserted' = epoch,
       admittedAt' = epoch,
       executed' = false,
+      scheduled' = scheduled,
+      scheduledAt' = scheduledAt,
+      carveL' = carveL,
+      carveR' = carveR,
     }
   }
 
@@ -443,6 +485,10 @@ module reshape_lifecycle {
       lastAsserted' = epoch,
       admittedAt' = admittedAt,
       executed' = false,
+      scheduled' = scheduled,
+      scheduledAt' = scheduledAt,
+      carveL' = carveL,
+      carveR' = carveR,
     }
   }
 
@@ -470,6 +516,10 @@ module reshape_lifecycle {
       lastAsserted' = lastAsserted,
       admittedAt' = admittedAt,
       executed' = false,
+      scheduled' = scheduled,
+      scheduledAt' = scheduledAt,
+      carveL' = carveL,
+      carveR' = carveR,
     }
   }
 
@@ -499,6 +549,10 @@ module reshape_lifecycle {
       lastAsserted' = lastAsserted,
       admittedAt' = admittedAt,
       executed' = false,
+      scheduled' = scheduled,
+      scheduledAt' = scheduledAt,
+      carveL' = carveL,
+      carveR' = carveR,
     }
   }
 
@@ -529,6 +583,10 @@ module reshape_lifecycle {
       lastAsserted' = lastAsserted,
       admittedAt' = admittedAt,
       executed' = false,
+      scheduled' = scheduled,
+      scheduledAt' = scheduledAt,
+      carveL' = carveL,
+      carveR' = carveR,
     }
   }
 
@@ -561,6 +619,10 @@ module reshape_lifecycle {
       lastAsserted' = lastAsserted,
       admittedAt' = admittedAt,
       executed' = false,
+      scheduled' = scheduled,
+      scheduledAt' = scheduledAt,
+      carveL' = carveL,
+      carveR' = carveR,
     }
   }
 
@@ -569,6 +631,7 @@ module reshape_lifecycle {
   action lapse = all {
     not(executed),
     pendingPresent,
+    RETRACTABLE or not(scheduled),
     cohortL.union(cohortR) != Set(),
     epoch - lastAsserted >= TRIGGER_TTL,
     epoch - admittedAt < READY_TTL,
@@ -589,6 +652,10 @@ module reshape_lifecycle {
     lastAsserted' = lastAsserted,
     admittedAt' = admittedAt,
     executed' = false,
+    scheduled' = scheduled,
+    scheduledAt' = scheduledAt,
+    carveL' = carveL,
+    carveR' = carveR,
   }
 
   // Ungated for READY_TTL after admission: abandon, returning the cohort to
@@ -596,6 +663,7 @@ module reshape_lifecycle {
   action abandon = all {
     not(executed),
     pendingPresent,
+    RETRACTABLE or not(scheduled),
     epoch - admittedAt >= READY_TTL,
     epoch' = epoch,
     pool' = pool.union(cohortL).union(cohortR),
@@ -614,17 +682,59 @@ module reshape_lifecycle {
     lastAsserted' = lastAsserted,
     admittedAt' = admittedAt,
     executed' = false,
+    scheduled' = scheduled,
+    scheduledAt' = scheduledAt,
+    carveL' = carveL,
+    carveR' = carveR,
   }
 
-  // The seating gate: parent halves plus ready cohort seats reach 2f+1 for
-  // both children. The code counts ready seats, synced or not. Once fired
-  // the model is terminal — the seated sets freeze for the invariant.
-  action execute = all {
+  // The seating gate: parent halves plus ready cohort seats reach 2f+1
+  // for both children. The code counts ready seats, synced or not. The
+  // gate fires once and stamps the cut — it does not reshape anything —
+  // freezing the carve with it, since no second gate will approve a
+  // different one (`try_schedule_split`).
+  action schedule = all {
     not(executed),
+    not(scheduled),
     pendingPresent,
     PARENT_HALF_L + readyL.size() >= QUORUM,
     PARENT_HALF_R + readyR.size() >= QUORUM,
+    scheduled' = true,
+    scheduledAt' = epoch,
+    carveL' = cohortL,
+    carveR' = cohortR,
+    executed' = false,
+    epoch' = epoch,
+    pool' = pool,
+    benched' = benched,
+    pendingPresent' = true,
+    seed' = seed,
+    cohortL' = cohortL,
+    cohortR' = cohortR,
+    readyL' = readyL,
+    readyR' = readyR,
+    syncedL' = syncedL,
+    syncedR' = syncedR,
+    liveSig' = liveSig,
+    everAssignedL' = everAssignedL,
+    everAssignedR' = everAssignedR,
+    lastAsserted' = lastAsserted,
+    admittedAt' = admittedAt,
+  }
+
+  // The fold at the cut consumes the record and seats the children from
+  // the frozen carve. The cut is never the window the scheduling fold
+  // opened (INV-RESHAPE-9), so this is a strictly later epoch. No gate
+  // is re-evaluated here (`apply_scheduled_splits`).
+  action apply = all {
+    not(executed),
+    scheduled,
+    epoch > scheduledAt,
     executed' = true,
+    scheduled' = scheduled,
+    scheduledAt' = scheduledAt,
+    carveL' = carveL,
+    carveR' = carveR,
     epoch' = epoch,
     pool' = pool,
     benched' = benched,
@@ -661,10 +771,15 @@ module reshape_lifecycle {
     lastAsserted' = lastAsserted,
     admittedAt' = admittedAt,
     executed' = executed,
+    scheduled' = scheduled,
+    scheduledAt' = scheduledAt,
+    carveL' = carveL,
+    carveR' = carveR,
   }
 
   action step = any {
-    admit, reassert, syncStep, expireSig, foldReady, churn, lapse, abandon, execute, tick,
+    admit, reassert, syncStep, expireSig, foldReady, churn, lapse, abandon, schedule, apply,
+    tick,
   }
 
   // Honest-synced members a child actually has: its parent half (trusted
@@ -700,16 +815,34 @@ module reshape_lifecycle {
     readyR.exclude(BYZ).subseteq(syncedR),
   }
 
+  // The seats the applying fold can actually install: the frozen carve
+  // minus anyone whose placement moved since, which is what
+  // `apply_scheduled_split` skips rather than moves.
+  def seatableL = carveL.intersect(cohortL)
+  def seatableR = carveR.intersect(cohortR)
+
   // INV-RESHAPE-1 (semantic floor): if the split executed, each child seats
-  // at least a quorum of genuinely honest-synced members.
+  // at least a quorum of genuinely honest-synced members. Judged over the
+  // carve as it stands at the applying fold, a window after the gate — so
+  // this also pins that the cohort holds its seats across that window.
   val invSeatingGate =
-    executed implies (functionalL >= QUORUM and functionalR >= QUORUM)
+    executed implies and {
+      PARENT_HALF_L + seatableL.intersect(syncedL).exclude(BYZ).size() >= QUORUM,
+      PARENT_HALF_R + seatableR.intersect(syncedR).exclude(BYZ).size() >= QUORUM,
+    }
+
+  // INV-RESHAPE-10: a stamped cut is never withdrawn. The record lives
+  // from the scheduling fold to the applying one, so a proposer that
+  // already stamped this cut into a header is never contradicted.
+  val invScheduleIrrevocable =
+    scheduled implies (pendingPresent or executed)
 
   val invAll = and {
     invConservation,
     invSeatStability,
     invNoHonestFalseReady,
     invSeatingGate,
+    invScheduleIrrevocable,
   }
 }
 
@@ -720,7 +853,8 @@ module reshape_split_ok {
     SHARD_SIZE = 4, F = 1, PARENT_HALF_L = 2, PARENT_HALF_R = 2,
     TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
     SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = false,
-    UNBOUND_READY = false
+    UNBOUND_READY = false,
+    RETRACTABLE = false
   ).*
 }
 
@@ -733,7 +867,8 @@ module reshape_split_churn {
     SHARD_SIZE = 4, F = 1, PARENT_HALF_L = 2, PARENT_HALF_R = 2,
     TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
     SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = true,
-    UNBOUND_READY = false
+    UNBOUND_READY = false,
+    RETRACTABLE = false
   ).*
 }
 
@@ -746,7 +881,8 @@ module reshape_unbound_ready {
     SHARD_SIZE = 4, F = 1, PARENT_HALF_L = 2, PARENT_HALF_R = 2,
     TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
     SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = true,
-    UNBOUND_READY = true
+    UNBOUND_READY = true,
+    RETRACTABLE = false
   ).*
 }
 
@@ -760,7 +896,38 @@ module reshape_epoch_seeded {
     SHARD_SIZE = 4, F = 1, PARENT_HALF_L = 2, PARENT_HALF_R = 2,
     TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
     SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = true, POOL_CHURN = false,
-    UNBOUND_READY = false
+    UNBOUND_READY = false,
+    RETRACTABLE = false
+  ).*
+}
+
+// The TTL arms still fire on a scheduled record — the pre-2026-07 shape,
+// where `prune_stale_reshapes` ran ahead of the reshape folds and knew
+// nothing about a stamped cut. Both arms break something: `abandon` drops
+// a record whose cut the parent's proposers have already stamped into
+// signed headers (`invScheduleIrrevocable`), and `lapse` drains the cohort
+// the frozen carve names, so the applying fold seats a child below the
+// quorum its gate approved (`invSeatingGate`).
+module reshape_retractable_schedule {
+  import reshape_lifecycle(
+    SHARD_SIZE = 4, F = 1, PARENT_HALF_L = 2, PARENT_HALF_R = 2,
+    TRIGGER_TTL = 2, READY_TTL = 5, BYZ = Set(),
+    SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = false,
+    UNBOUND_READY = false,
+    RETRACTABLE = true
+  ).*
+}
+
+// The same twin with a short readiness TTL, so the `abandon` arm is
+// reachable inside a practical depth: the record is dropped outright
+// while its cut is already published.
+module reshape_retractable_abandon {
+  import reshape_lifecycle(
+    SHARD_SIZE = 4, F = 1, PARENT_HALF_L = 2, PARENT_HALF_R = 2,
+    TRIGGER_TTL = 2, READY_TTL = 2, BYZ = Set(),
+    SEEDS = Set(1, 2), EPOCH_SEEDED_DRAW = false, POOL_CHURN = false,
+    UNBOUND_READY = false,
+    RETRACTABLE = true
   ).*
 }
 

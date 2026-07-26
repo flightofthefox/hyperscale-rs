@@ -1,13 +1,14 @@
 // Model I (register: specs/README.md) — the reshape cut and successor
 // genesis: the handoff seam between a terminating chain and the
 // committees that continue its state. Three modules. `split_handoff` —
-// the terminal fold's seeding of split children and the member-side
-// genesis flip: genesis determinism (INV-RESHAPE-2), the seed guard's
-// root continuity (INV-RESHAPE-3), canonical-clock adoption
-// (INV-RESHAPE-4), and terminal-record retention (INV-BEACON-8).
-// `merge_handoff` — the merge compose: terminal-mark soundness at the
-// boundary instant, the both-terminals gate, the cut floor, and the
-// keepers' anchor read-back (INV-RESHAPE-2/3/4 on the merge side).
+// the member-side genesis flip at the cut: genesis determinism
+// (INV-RESHAPE-2), the composition guard's root continuity
+// (INV-RESHAPE-3), canonical-clock adoption (INV-RESHAPE-4), the
+// cut-over trigger (INV-RESHAPE-11), and terminal-record retention
+// (INV-BEACON-8). `merge_handoff` — the merge cut: terminal-mark
+// soundness at the boundary instant, the both-terminals compose gate,
+// and the scheduled cut both the fold and the keepers derive
+// (INV-RESHAPE-2/3/4/11 on the merge side).
 // `canonical_pick` — the per-shard canonical boundary QC choice's
 // totality (INV-BEACON-5).
 //
@@ -42,19 +43,25 @@
 //     lingering records carry `terminal_qc_wt` and the parent is still
 //     a placeholder (once-only by the zero-hash guard); the composed
 //     root is `hash_internal(r_p0, r_p1)` over the two recorded
-//     terminal roots, and the cut is the *start of the epoch containing
-//     the left child's terminal QC weighted timestamp* — floored off
-//     the certified value, not the scheduled epoch, so extra coast
-//     epochs cannot drift it.
+//     terminal roots, and the cut is the end of the children's
+//     scheduled terminal window. It cannot be floored off a certificate
+//     the fold picked: the boundary QC it binds is the highest-ranked
+//     entry across the committed proposal set (`canonical_boundary_qcs`),
+//     an outcome of the beacon's own consensus, so no keeper could
+//     reproduce it. The `qc_floor` twin is that rule.
 //   - Member flips: crates/node/src/reshape/split_flip.rs
 //     `split_genesis_from_terminal` and merge_flip.rs
-//     `merge_genesis_from_terminals` — the clock is read from
-//     `ShardAnchor::weighted_timestamp`, the value the fold composed;
-//     the served QC only proves the terminal is certified. A terminal
-//     can be re-certified at a higher round during the coast, so the
-//     served stamp is a gossip artifact whose value (or floor) can
-//     differ. The derived genesis must reconstruct `anchor.block_hash`
-//     exactly or the flip fails closed.
+//     `merge_genesis_from_terminals` — every input is frozen chain
+//     content plus the schedule, so a member flips at the cut rather
+//     than waiting for the fold that publishes the successor's anchor.
+//     A split child's clock is the canonical certificate over the
+//     terminal — the `parent_qc` of its committed successor, unique by
+//     chain — and a merged parent's is the scheduled cut. The QC served
+//     alongside a terminal only proves it certified: the coast can
+//     re-certify at a higher round, so that stamp is a gossip artifact
+//     whose value (or floor) can differ. Adoption fails closed unless
+//     the store holds exactly the subtree the genesis names
+//     (crates/node/src/reshape/adopt.rs).
 //   - Retention: crates/beacon/src/state/epoch.rs
 //     `gc_terminal_boundaries` / `successors_live_for_terminal` — a
 //     terminal record is released only when its successors are *live*
@@ -72,26 +79,29 @@
 //
 // Properties:
 //   invGenesisAgree   — (split/merge) every member that completes the
-//                       flip adopts the identical genesis — the one the
-//                       beacon anchored (INV-RESHAPE-2). The
-//                       `split_handoff_served_clock` twin derives the
-//                       clock from the served certified QC instead of
-//                       the anchor (with nothing composed there is
-//                       nothing to fail closed against): two members
-//                       served different coast re-certifications adopt
+//                       flip adopts the identical genesis
+//                       (INV-RESHAPE-2). Members flip at the cut from
+//                       frozen chain content, so agreement rests on the
+//                       derivation alone — there is no anchor yet to
+//                       fail closed against. The
+//                       `split_handoff_served_clock` twin clocks from
+//                       the served certified QC: two members served
+//                       different coast re-certifications adopt
 //                       different genesis bytes — a successor-chain
 //                       fork with zero Byzantine action.
 //   invCanonicalClock — (split) every adopted clock is the canonical
-//                       terminal QC weighted timestamp the fold bound —
-//                       never a served re-certification's
+//                       certificate's weighted timestamp — the
+//                       `parent_qc` of the terminal's committed
+//                       successor, never a served re-certification's
 //                       (INV-RESHAPE-4). Violated by the same twin.
-//   invRootContinuity — (split) a seeded child anchor carries the true
-//                       subtree root: the claimed pair composed to the
-//                       committed terminal root (INV-RESHAPE-3). The
+//   invRootContinuity — (split) no member adopts a root the parent's
+//                       terminal did not contain: the claimed pair
+//                       composed to the committed terminal root
+//                       (INV-RESHAPE-3). The
 //                       `split_handoff_unchecked_seed` twin skips
-//                       `composes_to` and seeds a child whose adopted
-//                       root is not the parent's subtree — state
-//                       re-keyed by fiat.
+//                       `composes_to` and adopts a child root that is
+//                       not the parent's subtree — state re-keyed by
+//                       fiat.
 //   invRetention      — (split) the parent's terminal record survives
 //                       until both children are live (produced past
 //                       genesis) and the horizon has passed
@@ -109,19 +119,30 @@
 //                       is marked terminal.
 //   invComposedAnchor — (merge) the composed parent anchor is
 //                       `hash_internal` over the two *frozen terminal*
-//                       roots, its cut the epoch start of the genuine
-//                       left terminal stamp (INV-RESHAPE-3/4). The
+//                       roots, its cut the scheduled one
+//                       (INV-RESHAPE-3/4). The
 //                       `merge_handoff_eager_compose` twin drops the
 //                       both-terminals gate and composes over the
 //                       still-running sibling's pre-terminal root.
 //                       Violated by the boundary-instant twin too.
-//   invKeeperReadback — (merge) every keeper's adopted cut is the
-//                       anchor's — composed once by the fold, read
-//                       back, never re-derived (INV-RESHAPE-4). The
+//   invKeeperCut      — (merge) every keeper's adopted cut is the
+//                       scheduled one, derived from its own frozen
+//                       projection rather than read back from anything
+//                       the fold composed (INV-RESHAPE-4/11). The
 //                       `merge_handoff_refloor` twin re-floors the
 //                       served left QC: a re-certification that drifted
 //                       into a later epoch floors to a different cut
 //                       and the keepers fork.
+//   invFoldKeeperAgree — (merge) the fold's composed cut and every
+//                       keeper's derived cut are the same instant
+//                       (INV-RESHAPE-11). The `merge_handoff_qc_floor`
+//                       twin floors the fold's cut off the recorded
+//                       terminal QC — the pre-2026-07 rule — while
+//                       keepers derive from the schedule: a terminal
+//                       certified more than one window past the cut
+//                       drifts the fold's value away from every
+//                       keeper's, and the anchor the beacon publishes
+//                       no longer matches the genesis they seated on.
 //   invPickTotal      — (canonical_pick) two consumers folding the same
 //                       candidate set in different orders bind the same
 //                       canonical QC (INV-BEACON-5). The
@@ -181,8 +202,12 @@
 //     (the twin composes on the first terminal; expect a counterexample)
 //   quint verify --main=merge_handoff_boundary_instant --invariant=invTerminalMarkSound --max-steps=4 specs/reshape_handoff.qnt
 //     (the twin judges the cut inclusively; expect a counterexample)
-//   quint verify --main=merge_handoff_refloor --invariant=invKeeperReadback --max-steps=8 specs/reshape_handoff.qnt
+//   quint verify --main=merge_handoff_refloor --invariant=invKeeperCut --max-steps=8 specs/reshape_handoff.qnt
 //     (the twin re-floors the served left QC; expect a counterexample)
+//   quint verify --main=merge_handoff_qc_floor --invariant=invFoldKeeperAgree --max-steps=8 specs/reshape_handoff.qnt
+//     (the twin floors the fold's cut off the recorded terminal QC while
+//      keepers derive theirs from the schedule; expect a counterexample —
+//      invComposedAnchor falls at the same depth)
 //   quint verify --main=canonical_pick_ok --invariant=invPickTotal --max-steps=8 specs/reshape_handoff.qnt
 //     (holds)
 //   quint verify --main=canonical_pick_wt_only --invariant=invPickTotal --max-steps=8 specs/reshape_handoff.qnt
@@ -197,11 +222,12 @@ module split_handoff {
   // Weighted-timestamp band for terminal stamps and re-certifications.
   const MAX_WT: int
   // Broken twin: members clock genesis from the served certified QC
-  // instead of the anchor, with no beacon-composed value to fail closed
-  // against. False is the shipped `split_genesis_from_terminal`.
+  // instead of the canonical certificate over the terminal. False is
+  // the shipped `split_genesis_from_terminal`.
   const SERVED_CLOCK: bool
-  // Broken twin: `seed_split_children` skips the `composes_to` guard.
-  // False is the shipped seed.
+  // Broken twin: the flip skips the `composes_to` guard on the
+  // terminal's claimed child-root pair. False is the shipped
+  // derivation, which admits a pair only when it composes.
   const UNCHECKED_SEED: bool
   // Broken twin: `gc_terminal_boundaries` releases on the horizon
   // alone, ignoring `successors_live_for_terminal`. False is the
@@ -220,8 +246,9 @@ module split_handoff {
   var folded: bool
   // Epoch of the terminal fold (the record's terminal window).
   var termEpoch: int
-  // The canonical terminal QC weighted timestamp the fold bound — the
-  // chain-carried `parent_qc` form, which the anchor records.
+  // The canonical certificate's weighted timestamp over the terminal —
+  // the `parent_qc` of its committed successor, which the fold binds
+  // and every follower reads off the same block.
   var termWt: int
   // Stamps of QCs the store may serve alongside the terminal: the
   // canonical one plus coast re-certifications.
@@ -273,8 +300,9 @@ module split_handoff {
 
   // The parent's terminal crossing folds: the canonical QC binds the
   // stamp, and `seed_split_children` fills both placeholders iff the
-  // committed claimed pair composes to the terminal root (the twin
-  // seeds regardless). A failed pair leaves the children pending.
+  // committed claimed pair composes to the terminal root. The anchor no
+  // longer gates the flip — members are already past it — but it still
+  // seeds third parties, so the fold keeps it.
   action foldTerminal = {
     nondet w = 1.to(MAX_WT).oneOf()
     nondet good = Set(true, false).oneOf()
@@ -310,23 +338,26 @@ module split_handoff {
     }
   }
 
-  // The anchor root a member reads back (the seeded child anchor).
-  val anchorRoot: int = if (seedGood) TRUE_ROOT else FAKE_ROOT
+  // The root a member derives from the terminal's own claimed pair.
+  val derivedRoot: int = if (seedGood) TRUE_ROOT else FAKE_ROOT
 
-  // Member 1 completes the flip: fetch the retained terminal with some
-  // served QC, derive genesis. Shipped: root and clock read back from
-  // the anchor, reconstruction hash-checked (it passes by
-  // construction). Twin: clock from the served QC, root from the local
-  // chain.
+  // Member 1 completes the flip on the terminal it commit-proved,
+  // without waiting for the child's anchor (INV-RESHAPE-11). Shipped:
+  // the root comes from the terminal's `split_child_roots`, admitted
+  // only when the pair composes to the terminal's own state root, and
+  // the clock from the canonical certificate over it. The
+  // `unchecked_seed` twin drops the composition guard; the
+  // `served_clock` twin clocks from a coast re-certification.
   action adopt1 = {
     nondet sw = 1.to(MAX_WT).oneOf()
     all {
       record,
-      seeded,
+      folded,
+      seedGood or UNCHECKED_SEED,
       not(ad1),
       served.contains(sw),
       ad1' = true,
-      adRoot1' = if (SERVED_CLOCK) TRUE_ROOT else anchorRoot,
+      adRoot1' = if (SERVED_CLOCK) TRUE_ROOT else derivedRoot,
       adWt1' = if (SERVED_CLOCK) sw else termWt,
       now' = now, folded' = folded, termEpoch' = termEpoch,
       termWt' = termWt, served' = served,
@@ -340,11 +371,12 @@ module split_handoff {
     nondet sw = 1.to(MAX_WT).oneOf()
     all {
       record,
-      seeded,
+      folded,
+      seedGood or UNCHECKED_SEED,
       not(ad2),
       served.contains(sw),
       ad2' = true,
-      adRoot2' = if (SERVED_CLOCK) TRUE_ROOT else anchorRoot,
+      adRoot2' = if (SERVED_CLOCK) TRUE_ROOT else derivedRoot,
       adWt2' = if (SERVED_CLOCK) sw else termWt,
       now' = now, folded' = folded, termEpoch' = termEpoch,
       termWt' = termWt, served' = served,
@@ -358,7 +390,6 @@ module split_handoff {
   // `advanced`. Its committee only exists through seated members, so a
   // completed flip is the precondition.
   action advanceL = all {
-    seeded,
     ad1 or ad2,
     not(advL),
     advL' = true,
@@ -371,9 +402,9 @@ module split_handoff {
   }
 
   // The right child's cohort is abstracted away; it goes live any time
-  // after seeding.
+  // after the terminal folds.
   action advanceR = all {
-    seeded,
+    folded,
     not(advR),
     advR' = true,
     now' = now, folded' = folded, termEpoch' = termEpoch,
@@ -424,8 +455,13 @@ module split_handoff {
     ad2 implies adWt2 == termWt,
   }
 
-  // A seeded anchor carries the true subtree root (INV-RESHAPE-3).
-  val invRootContinuity = seeded implies seedGood
+  // No member ever adopts a root the parent's terminal did not contain
+  // (INV-RESHAPE-3). The composition check is the member's own, so this
+  // judges the adopted genesis rather than what the fold seeded.
+  val invRootContinuity = and {
+    ad1 implies adRoot1 == TRUE_ROOT,
+    ad2 implies adRoot2 == TRUE_ROOT,
+  }
 
   // The terminal record outlives its dependents (INV-BEACON-8).
   val invRetention =
@@ -456,9 +492,14 @@ module merge_handoff {
   // `carried_terminal_marks` rule.
   const BOUNDARY_INSTANT: bool
   // Broken twin: keepers re-floor the served left QC instead of
-  // reading the anchor's cut. False is the shipped
+  // deriving the scheduled cut. False is the shipped
   // `merge_genesis_from_terminals`.
   const REFLOOR: bool
+  // Broken twin: the fold floors the composed cut off the left child's
+  // recorded terminal QC stamp — the pre-2026-07 `compose_merge_parent`
+  // rule — while keepers derive theirs from the schedule. False is the
+  // shipped rule, where both sides read the same scheduled cut.
+  const QC_FLOOR: bool
 
   // A child record's state root before its chain passes the cut (still
   // evolving) vs the root frozen at the cut.
@@ -471,6 +512,10 @@ module merge_handoff {
   pure def crossEpoch(w: int): int = (w - 1) / E_LEN
   // Anchor floors use plain window containment (`epoch_for`).
   pure def floorStart(w: int): int = (w / E_LEN) * E_LEN
+  // The cut both children terminate at: the end of the scheduled
+  // terminal window, which `compose_merge_parent` and every keeper read
+  // from the same schedule entry.
+  pure val cutInstant: int = (T_CUT + 1) * E_LEN
 
   // Per child: the last folded crossing's stamp (0 = chain start).
   var lastWtL: int
@@ -581,10 +626,10 @@ module merge_handoff {
   }
 
   // The fold composes the parent anchor from the two lingering child
-  // records: root pair as recorded, cut floored from the left record's
-  // `terminal_qc_wt`. Shipped gate: both records carry the mark and
-  // the parent is still a placeholder (once-only). The twin composes
-  // on the left mark alone.
+  // records: root pair as recorded, cut taken from the schedule. Shipped
+  // gate: both records carry the mark and the parent is still a
+  // placeholder (once-only). One twin composes on the left mark alone;
+  // the other floors the cut off the recorded terminal QC stamp.
   action compose = all {
     not(composed),
     termWtL != 0,
@@ -592,7 +637,7 @@ module merge_handoff {
     composed' = true,
     compRootL' = rootL,
     compRootR' = rootR,
-    compCut' = floorStart(termWtL),
+    compCut' = if (QC_FLOOR) floorStart(termWtL) else cutInstant,
     lastWtL' = lastWtL, lastWtR' = lastWtR,
     rootL' = rootL, rootR' = rootR,
     termWtL' = termWtL, termWtR' = termWtR,
@@ -611,7 +656,7 @@ module merge_handoff {
       not(k1),
       servedL.contains(sw),
       k1' = true,
-      kCut1' = if (REFLOOR) floorStart(sw) else compCut,
+      kCut1' = if (REFLOOR) floorStart(sw) else cutInstant,
       lastWtL' = lastWtL, lastWtR' = lastWtR,
       rootL' = rootL, rootR' = rootR,
       termWtL' = termWtL, termWtR' = termWtR,
@@ -630,7 +675,7 @@ module merge_handoff {
       not(k2),
       servedL.contains(sw),
       k2' = true,
-      kCut2' = if (REFLOOR) floorStart(sw) else compCut,
+      kCut2' = if (REFLOOR) floorStart(sw) else cutInstant,
       lastWtL' = lastWtL, lastWtR' = lastWtR,
       rootL' = rootL, rootR' = rootR,
       termWtL' = termWtL, termWtR' = termWtR,
@@ -661,26 +706,39 @@ module merge_handoff {
     termWtR != 0 implies (rootR == TERM_ROOT and termWtR == trueTermWtR),
   }
 
-  // The composed anchor is the frozen terminal pair, its cut the epoch
-  // start of the genuine left terminal stamp (INV-RESHAPE-3/4).
+  // The composed anchor is the frozen terminal pair, its cut the
+  // scheduled one (INV-RESHAPE-3/4).
   val invComposedAnchor =
     composed implies and {
       compRootL == TERM_ROOT,
       compRootR == TERM_ROOT,
       trueTermWtL != 0,
-      compCut == floorStart(trueTermWtL),
+      compCut == cutInstant,
     }
 
-  // Every keeper's adopted cut is the anchor's (INV-RESHAPE-2/4).
-  val invKeeperReadback = and {
-    k1 implies kCut1 == compCut,
-    k2 implies kCut2 == compCut,
+  // Every keeper's adopted cut is the scheduled one (INV-RESHAPE-2/4).
+  // Nothing here is read back from the fold: keeper and fold agree
+  // because they read one schedule, which is what lets a keeper derive
+  // the genesis before the fold composes anything (INV-RESHAPE-11).
+  val invKeeperCut = and {
+    k1 implies kCut1 == cutInstant,
+    k2 implies kCut2 == cutInstant,
+  }
+
+  // Fold and keepers land on the same cut. Implied by the two above on
+  // the healthy instance, and the property the `qc_floor` twin breaks:
+  // there the fold's cut is an artifact of which certificate the beacon
+  // committed, which no keeper can reproduce.
+  val invFoldKeeperAgree = and {
+    (composed and k1) implies kCut1 == compCut,
+    (composed and k2) implies kCut2 == compCut,
   }
 
   val invAll = and {
     invTerminalMarkSound,
     invComposedAnchor,
-    invKeeperReadback,
+    invKeeperCut,
+    invFoldKeeperAgree,
   }
 }
 
@@ -779,28 +837,40 @@ module split_handoff_horizon_gc {
 module merge_handoff_ok {
   import merge_handoff(
     E_LEN = 3, T_CUT = 1, MAX_WT = 10,
-    EAGER_COMPOSE = false, BOUNDARY_INSTANT = false, REFLOOR = false
+    EAGER_COMPOSE = false, BOUNDARY_INSTANT = false, REFLOOR = false,
+    QC_FLOOR = false
   ).*
 }
 
 module merge_handoff_eager_compose {
   import merge_handoff(
     E_LEN = 3, T_CUT = 1, MAX_WT = 10,
-    EAGER_COMPOSE = true, BOUNDARY_INSTANT = false, REFLOOR = false
+    EAGER_COMPOSE = true, BOUNDARY_INSTANT = false, REFLOOR = false,
+    QC_FLOOR = false
   ).*
 }
 
 module merge_handoff_boundary_instant {
   import merge_handoff(
     E_LEN = 3, T_CUT = 1, MAX_WT = 10,
-    EAGER_COMPOSE = false, BOUNDARY_INSTANT = true, REFLOOR = false
+    EAGER_COMPOSE = false, BOUNDARY_INSTANT = true, REFLOOR = false,
+    QC_FLOOR = false
   ).*
 }
 
 module merge_handoff_refloor {
   import merge_handoff(
     E_LEN = 3, T_CUT = 1, MAX_WT = 10,
-    EAGER_COMPOSE = false, BOUNDARY_INSTANT = false, REFLOOR = true
+    EAGER_COMPOSE = false, BOUNDARY_INSTANT = false, REFLOOR = true,
+    QC_FLOOR = false
+  ).*
+}
+
+module merge_handoff_qc_floor {
+  import merge_handoff(
+    E_LEN = 3, T_CUT = 1, MAX_WT = 10,
+    EAGER_COMPOSE = false, BOUNDARY_INSTANT = false, REFLOOR = false,
+    QC_FLOOR = true
   ).*
 }
 
