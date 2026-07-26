@@ -27,6 +27,7 @@ mod block;
 pub mod certified;
 pub mod certified_header;
 pub mod chain_origin;
+pub mod commit_proof;
 pub mod evidence;
 pub mod fork_fence;
 pub mod header;
