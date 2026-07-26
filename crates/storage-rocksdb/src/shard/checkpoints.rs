@@ -18,7 +18,7 @@ use std::sync::Arc;
 use hyperscale_jmt::{Key, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    BoundaryStore, ImportLeaf, ImportProgress, JmtSnapshot, ResolveLeaf, WitnessSeed,
+    AdoptSource, BoundaryStore, ImportLeaf, ImportProgress, JmtSnapshot, ResolveLeaf, WitnessSeed,
     filter_updates_to_prefix, merge_owned_nodes, merge_updates_from_receipts,
 };
 use hyperscale_types::{Block, BlockHeight, ChainOrigin, Hash, StateRoot, StoredReceipt};
@@ -620,24 +620,13 @@ impl BoundaryStore for RocksDbShardStorage {
         Ok(new_root)
     }
 
-    fn adopt_split_child(&self, origin: ChainOrigin, genesis: &Block) -> Result<StateRoot, String> {
-        Self::adopt_split_child(self, origin, genesis).map_err(|e| e.to_string())
-    }
-
-    fn adopt_followed_child(
+    fn adopt_genesis(
         &self,
         origin: ChainOrigin,
         genesis: &Block,
+        source: AdoptSource,
     ) -> Result<StateRoot, String> {
-        Self::adopt_followed_child(self, origin, genesis).map_err(|e| e.to_string())
-    }
-
-    fn adopt_merge_parent(
-        &self,
-        origin: ChainOrigin,
-        genesis: &Block,
-    ) -> Result<StateRoot, String> {
-        Self::adopt_merge_parent(self, origin, genesis).map_err(|e| e.to_string())
+        Self::adopt_genesis(self, origin, genesis, source).map_err(|e| e.to_string())
     }
 
     fn substate_bytes_at_version(&self, version: u64) -> Option<u64> {

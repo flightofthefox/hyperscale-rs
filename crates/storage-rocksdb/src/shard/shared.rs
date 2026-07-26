@@ -14,10 +14,10 @@ use std::sync::Arc;
 
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::{
-    BaseReadCache, BlockForSync, BoundaryStore, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, GenesisCommit, ImportLeaf, ImportProgress, JmtSnapshot, PartitionEntry,
-    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore,
-    VersionedStore, WitnessSeed,
+    AdoptSource, BaseReadCache, BlockForSync, BoundaryStore, DatabaseUpdates, DbPartitionKey,
+    DbSortKey, DbSubstateValue, GenesisCommit, ImportLeaf, ImportProgress, JmtSnapshot,
+    PartitionEntry, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateDatabase,
+    SubstateStore, VersionedStore, WitnessSeed,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
@@ -204,24 +204,13 @@ impl BoundaryStore for SharedStorage {
         self.0.follow_block_writes(height, receipts)
     }
 
-    fn adopt_split_child(&self, origin: ChainOrigin, genesis: &Block) -> Result<StateRoot, String> {
-        BoundaryStore::adopt_split_child(&*self.0, origin, genesis)
-    }
-
-    fn adopt_followed_child(
+    fn adopt_genesis(
         &self,
         origin: ChainOrigin,
         genesis: &Block,
+        source: AdoptSource,
     ) -> Result<StateRoot, String> {
-        BoundaryStore::adopt_followed_child(&*self.0, origin, genesis)
-    }
-
-    fn adopt_merge_parent(
-        &self,
-        origin: ChainOrigin,
-        genesis: &Block,
-    ) -> Result<StateRoot, String> {
-        BoundaryStore::adopt_merge_parent(&*self.0, origin, genesis)
+        BoundaryStore::adopt_genesis(&*self.0, origin, genesis, source)
     }
 
     fn substate_bytes_at_version(&self, version: u64) -> Option<u64> {

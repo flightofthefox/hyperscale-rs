@@ -109,6 +109,26 @@ pub struct ImportLeaf {
     pub value: Vec<u8>,
 }
 
+/// How a reshape successor's store reaches the version its genesis sits at
+/// — the only thing that differs between the three adoptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptSource {
+    /// A split child seeded by checkpoint-cloning its parent: the child
+    /// subtree is extracted from the parent's root node and re-pointed at
+    /// the genesis version.
+    ParentSubtree,
+    /// A split child assembled by an observer: the store's own tip *is* the
+    /// adopted subtree — snap-synced at the parent's anchor, then carried
+    /// forward by following the parent's child-half writes. The version
+    /// line is sparse on the parent's heights, so the tip's root node is
+    /// re-pointed at the genesis version.
+    FollowedTip,
+    /// A merged parent's union, already assembled at the genesis version by
+    /// the boundary import. Nothing to re-point; unlike a split child the
+    /// prefix may be the trie root.
+    InPlace,
+}
+
 /// Pin and serve committed state at epoch boundary heights.
 pub trait BoundaryStore {
     /// A pinned boundary opened for serving: the JMT at the pinned
@@ -215,44 +235,30 @@ pub trait BoundaryStore {
         receipts: &[StoredReceipt],
     ) -> Result<StateRoot, String>;
 
-    /// Adopt a split child's derived `genesis` into this parent-cloned
-    /// store: re-root the state at the child subtree and install the block
-    /// as the chain origin. Returns the adopted state root for the caller
-    /// to verify against the beacon-attested anchor before trusting the
-    /// store.
+    /// Install a reshape successor's derived `genesis` as this store's
+    /// chain origin and committed tip, returning the adopted state root.
+    ///
+    /// `source` names only how the tree reaches the genesis version; the
+    /// adopted root is then checked against the root the `genesis` names,
+    /// which is what gates the seat. A successor's genesis derives from
+    /// frozen chain content its duty commit-proved, so it cannot name a
+    /// subtree no terminal committed — and a store that does not hold what
+    /// the genesis names must not seat.
+    ///
+    /// Idempotent: a re-run over an already-adopted store returns the
+    /// recorded adoption.
     ///
     /// # Errors
     ///
     /// Returns a description of the failure — a genesis block off the
-    /// origin's height, an unresolvable child subtree, or a backend error.
-    fn adopt_split_child(&self, origin: ChainOrigin, genesis: &Block) -> Result<StateRoot, String>;
-
-    /// Adopt a split observer's followed-store `genesis`: the store already
-    /// sits at the child state (snap-synced span plus followed parent
-    /// writes), so this installs the block as the chain origin. Returns the
-    /// adopted state root for the caller's anchor check.
-    ///
-    /// # Errors
-    ///
-    /// Returns a description of the failure — a genesis block off the
-    /// origin's height or carrying a root other than the followed one, or a
-    /// backend error.
-    fn adopt_followed_child(
+    /// origin's height, a store vintage `source` does not admit, an
+    /// unresolvable subtree, or an adopted root the genesis does not name.
+    fn adopt_genesis(
         &self,
         origin: ChainOrigin,
         genesis: &Block,
+        source: AdoptSource,
     ) -> Result<StateRoot, String>;
-
-    /// Adopt a merge keeper's composed-parent `genesis` into this
-    /// union-imported store, installing the block as the chain origin.
-    /// Returns the adopted state root for the caller's anchor check.
-    ///
-    /// # Errors
-    ///
-    /// Returns a description of the failure — a genesis block off the
-    /// origin's height, a store tip elsewhere, or a root mismatch.
-    fn adopt_merge_parent(&self, origin: ChainOrigin, genesis: &Block)
-    -> Result<StateRoot, String>;
 
     /// The committed substate byte total at `version`, or `None` when the
     /// store's version line doesn't carry it.

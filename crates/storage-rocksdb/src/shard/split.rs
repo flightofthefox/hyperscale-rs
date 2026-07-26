@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
+use hyperscale_storage::AdoptSource;
 use hyperscale_storage::tree::Jmt;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified,
@@ -77,40 +78,38 @@ impl RocksDbShardStorage {
         Ok(())
     }
 
-    /// Re-point this store — opened over a hard-linked checkpoint of the
-    /// terminated parent, with this store's `root_path` already the
-    /// child's prefix — at the child's adopted subtree.
+    /// Install a reshape successor's derived `genesis` as this store's
+    /// chain origin and committed tip.
     ///
-    /// Reads the parent's root node at the checkpoint's committed
-    /// version, takes the child-side slot as the adopted `state_root`,
-    /// copies the child's root node to the genesis version (the same
-    /// carry-forward an empty block performs), seeds the substate byte total
-    /// by walking the subtree, and records the chain origin plus the
-    /// `genesis` block as the committed tip — all in one atomic batch,
-    /// so a crash at any later point recovers the store as a committed
-    /// child chain at its genesis. Idempotent: a re-run over an
-    /// already-adopted store returns the recorded adoption untouched.
-    /// An observer's followed store adopts through
-    /// [`Self::adopt_followed_child`] instead — the shapes are
-    /// caller-distinguished, since a checkpoint can be structurally
-    /// ambiguous with a followed store.
+    /// One operation for all three successors; `source` names only how the
+    /// tree reaches the genesis version. Everything after that is shared:
+    /// the adopted root must equal the root the genesis names, and the
+    /// origin plus the genesis tip are recorded in one atomic batch, so a
+    /// crash at any later point recovers the store as a committed chain at
+    /// its genesis.
     ///
-    /// Returns the adopted child `state_root` — `ZERO` for an empty
-    /// side. The caller asserts it against the beacon-verified
-    /// `split_child_roots` pair.
+    /// The root check is the guarantee. A successor's genesis derives from
+    /// frozen chain content its duty commit-proved — a split child's from
+    /// the parent terminal's `split_child_roots`, checked to compose to
+    /// that block's own committed root; a merged parent's from the two
+    /// children's terminal roots, each attested by its own chain — so
+    /// neither can name a subtree no terminal committed, and a store that
+    /// does not hold what the genesis names must not seat.
+    ///
+    /// Idempotent: a re-run over an already-adopted store returns the
+    /// recorded adoption.
     ///
     /// # Errors
     ///
-    /// Fails closed when the checkpoint sits below the crossing (a stale or
-    /// foreign store), when the extracted child root does not match the
-    /// `genesis` block's attested state root, when the genesis block does not
-    /// sit at the origin's height, when the parent's root collapsed to a leaf
-    /// (a ≤1-key parent cannot split), or when the store's root path is the
-    /// trie root (no parent side to adopt from).
-    pub fn adopt_split_child(
+    /// Fails closed when the genesis block does not sit at the origin's
+    /// height, when the store's vintage does not match what `source`
+    /// requires, when the tree cannot yield the named subtree, or when the
+    /// adopted root does not match the genesis's.
+    pub fn adopt_genesis(
         &self,
         origin: ChainOrigin,
         genesis: &Block,
+        source: AdoptSource,
     ) -> Result<StateRoot, StorageError> {
         let _commit_guard = self
             .commit_lock
@@ -123,44 +122,103 @@ impl RocksDbShardStorage {
                 origin.genesis_height,
             )));
         }
-
-        let (checkpoint_version, current_root) = read_jmt_metadata(&*self.db);
+        let (version, current_root) = read_jmt_metadata(&*self.db);
         let genesis_version = origin.genesis_height.inner();
-        // A re-run over an already-adopted store returns the recorded
-        // adoption.
-        if checkpoint_version == genesis_version && read_chain_origin(&*self.db) == origin {
+        if version == genesis_version && read_chain_origin(&*self.db) == origin {
             return Ok(current_root);
         }
-        // The parent chain coasts past its crossing before it stops — empty
-        // blocks whose no-op commits advance the JMT version with a frozen
-        // root. Under make-before-break the parent coasts an unbounded number
-        // of such blocks past the terminal (until its successors go live), so
-        // the checkpoint sits at the crossing version (`genesis_version - 1`)
-        // or any height above it; the frozen root makes the extracted child
-        // subtree identical at every one. Reject only a checkpoint from below
-        // the crossing — a stale or foreign store that never held the
-        // terminal's child-half writes. The root-equality check below is the
-        // real guarantee that the extracted subtree is the beacon-attested one,
-        // and it rejects a non-frozen coast (a byzantine parent that changed
-        // the child's state after the crossing) however far past it lands.
-        if checkpoint_version + 1 < genesis_version {
+
+        let cf = CfHandles::resolve(&self.db);
+        let mut batch = WriteBatch::default();
+        let adopted = match source {
+            AdoptSource::InPlace => {
+                if version != genesis_version {
+                    return Err(StorageError::DatabaseError(format!(
+                        "in-place adoption vintage mismatch: store at version {version}, \
+                         genesis height {genesis_version}"
+                    )));
+                }
+                current_root
+            }
+            AdoptSource::ParentSubtree => self.repoint(
+                &cf,
+                &mut batch,
+                self.parent_subtree(version)?,
+                genesis_version,
+            )?,
+            AdoptSource::FollowedTip => {
+                // A followed store only ever advances on child-half writes,
+                // which the parent's coast cannot produce, so its tip sits
+                // below the genesis height; the version line is sparse on the
+                // parent's heights, so no checkpoint vintage applies.
+                if version >= genesis_version {
+                    return Err(StorageError::DatabaseError(format!(
+                        "followed adoption vintage mismatch: store at version {version}, \
+                         genesis height {genesis_version}"
+                    )));
+                }
+                let tip = (current_root != StateRoot::ZERO)
+                    .then(|| {
+                        let key = JmtNodeKey::new(version, self.child_prefix()?);
+                        Ok::<_, StorageError>((key, current_root))
+                    })
+                    .transpose()?;
+                self.repoint(&cf, &mut batch, tip, genesis_version)?
+            }
+        };
+        if adopted != genesis.header().state_root() {
             return Err(StorageError::DatabaseError(format!(
-                "split adoption vintage mismatch: checkpoint at version {checkpoint_version}, \
-                 genesis height {genesis_version}"
+                "adopted root {adopted:?} does not match the genesis state root {:?}",
+                genesis.header().state_root(),
             )));
         }
+        if !matches!(source, AdoptSource::InPlace) {
+            write_jmt_metadata(&mut batch, genesis_version, adopted);
+        }
+        write_chain_origin(&mut batch, origin);
+        self.append_genesis_tip_to_batch(&mut batch, genesis);
+        self.db
+            .write(batch)
+            .map_err(|e| StorageError::DatabaseError(format!("reshape adoption write: {e}")))?;
+        Ok(adopted)
+    }
 
-        let child_path = self.root_path.clone();
-        if child_path.is_empty() {
+    /// This store's own prefix, which a split child's adoption re-roots at.
+    /// A merged parent may sit at the trie root; a child never can.
+    fn child_prefix(&self) -> Result<NibblePath, StorageError> {
+        let path = self.root_path.clone();
+        if path.is_empty() {
             return Err(StorageError::DatabaseError(
                 "split adoption requires a non-root child prefix".into(),
             ));
         }
+        Ok(path)
+    }
+
+    /// The child subtree to adopt out of a parent checkpoint this store was
+    /// cloned from: the child-side slot of the parent's root node, as
+    /// `(node key, root)`, or `None` for an empty side.
+    ///
+    /// The parent chain coasts past its crossing before it stops — empty
+    /// blocks whose no-op commits advance the JMT version with a frozen
+    /// root. Under make-before-break it coasts an unbounded number of them
+    /// (until its successors go live), so the checkpoint sits at the
+    /// crossing version or any height above it, and the frozen root makes
+    /// the extracted subtree identical at every one. Only a checkpoint from
+    /// *below* the crossing is rejected here — a stale or foreign store
+    /// that never held the terminal's child-half writes. The caller's
+    /// root-equality check is the real guarantee, and it rejects a
+    /// non-frozen coast (a parent that changed the child's state after the
+    /// crossing) however far past it lands.
+    fn parent_subtree(
+        &self,
+        checkpoint_version: u64,
+    ) -> Result<Option<(JmtNodeKey, StateRoot)>, StorageError> {
+        let child_path = self.child_prefix()?;
         let mut parent_path = child_path.clone();
         parent_path.truncate(child_path.len() - 1);
         let side = usize::from(child_path.bits_at(child_path.len() - 1, 1));
 
-        let cf = CfHandles::resolve(&self.db);
         let parent_root_key = JmtNodeKey::new(checkpoint_version, parent_path);
         let parent_root = self
             .cf_get::<JmtNodesCf>(&StoredNodeKey::from_jmt(&parent_root_key))
@@ -173,241 +231,44 @@ impl RocksDbShardStorage {
                 "parent root collapsed to a leaf; a ≤1-key parent cannot split".into(),
             ));
         };
+        Ok(parent_root.children[side].as_ref().map(|slot| {
+            (
+                JmtNodeKey::new(slot.version, child_path),
+                StateRoot::from_raw(Hash::from_hash_bytes(&slot.hash)),
+            )
+        }))
+    }
 
-        let mut batch = WriteBatch::default();
-        let child_root = match &parent_root.children[side] {
-            None => {
-                // Empty side: the child starts with an empty tree — no
-                // root node exists at any version, and the zero root
-                // marks it so.
-                batch_put::<SubstateBytesCf>(
-                    &mut batch,
-                    SubstateBytesCf::handle(&cf),
-                    &genesis_version,
-                    &0,
-                );
-                StateRoot::ZERO
-            }
-            Some(slot) => {
-                let child_node_key = JmtNodeKey::new(slot.version, child_path.clone());
-                let child_node = self
-                    .cf_get::<JmtNodesCf>(&StoredNodeKey::from_jmt(&child_node_key))
-                    .ok_or_else(|| {
-                        StorageError::DatabaseError(
-                            "checkpoint carries no child subtree root node".into(),
-                        )
-                    })?;
-                let genesis_root_key = JmtNodeKey::new(genesis_version, child_path);
-                batch_put::<JmtNodesCf>(
-                    &mut batch,
-                    JmtNodesCf::handle(&cf),
-                    &StoredNodeKey::from_jmt(&genesis_root_key),
-                    &child_node,
-                );
-                let bytes = self.sum_subtree_value_lens(&genesis_root_key, &child_node)?;
-                batch_put::<SubstateBytesCf>(
-                    &mut batch,
-                    SubstateBytesCf::handle(&cf),
-                    &genesis_version,
-                    &bytes,
-                );
-                StateRoot::from_raw(Hash::from_hash_bytes(&slot.hash))
-            }
+    /// Copy `source`'s root node to the genesis version — the same
+    /// carry-forward an empty block performs — and seed the substate byte
+    /// total by walking it. `None` is an empty subtree: the zero root, and
+    /// no bytes.
+    fn repoint(
+        &self,
+        cf: &CfHandles,
+        batch: &mut WriteBatch,
+        source: Option<(JmtNodeKey, StateRoot)>,
+        genesis_version: u64,
+    ) -> Result<StateRoot, StorageError> {
+        let Some((source_key, root)) = source else {
+            batch_put::<SubstateBytesCf>(batch, SubstateBytesCf::handle(cf), &genesis_version, &0);
+            return Ok(StateRoot::ZERO);
         };
-        // The extracted subtree must be the one the beacon attested as the
-        // child's genesis — the same trust the followed-store path keys on. With
-        // the vintage check relaxed for an arbitrarily long coast, this is what
-        // rejects a checkpoint whose child state was changed past the crossing.
-        if child_root != genesis.header().state_root() {
-            return Err(StorageError::DatabaseError(format!(
-                "split adoption root {child_root:?} does not match the genesis state root {:?}",
-                genesis.header().state_root(),
-            )));
-        }
-        write_jmt_metadata(&mut batch, genesis_version, child_root);
-        write_chain_origin(&mut batch, origin);
-        self.append_genesis_tip_to_batch(&mut batch, genesis);
-        self.db
-            .write(batch)
-            .map_err(|e| StorageError::DatabaseError(format!("split adoption write: {e}")))?;
-        Ok(child_root)
-    }
-
-    /// Re-point an observer's followed store at its adopted subtree —
-    /// the child root the store itself holds at its tip version.
-    ///
-    /// The store imported the child span at the splitting parent's
-    /// anchor and followed the parent's child-half writes to its
-    /// crossing, so its tree *is* the adopted subtree: the tip's root
-    /// node is copied to the genesis version, the substate byte total seeded
-    /// by walking it, and the chain origin plus the `genesis` block
-    /// recorded as the committed tip — all in one atomic batch, so a
-    /// crash at any later point recovers the store as a committed child
-    /// chain at its genesis. The tip version is sparse on the parent's
-    /// heights (foreign-half blocks never advanced it), so no checkpoint
-    /// vintage applies — the trust is the equality check against the
-    /// beacon-seeded child anchor. Idempotent like
-    /// [`Self::adopt_split_child`].
-    ///
-    /// Returns the adopted child `state_root` — `ZERO` for a store
-    /// whose span held nothing (an empty half).
-    ///
-    /// # Errors
-    ///
-    /// Fails closed when the store's tip sits at or past the genesis
-    /// height (a followed store only ever advances on child-half writes,
-    /// which the parent's coast cannot produce), when the genesis block
-    /// does not sit at the origin's height or carries a state root other
-    /// than the followed one, when the store's metadata names a root its
-    /// tree doesn't hold, or when the store's root path is the trie
-    /// root.
-    pub fn adopt_followed_child(
-        &self,
-        origin: ChainOrigin,
-        genesis: &Block,
-    ) -> Result<StateRoot, StorageError> {
-        let _commit_guard = self
-            .commit_lock
-            .lock()
-            .map_err(|_| StorageError::DatabaseError("commit lock poisoned".into()))?;
-        if genesis.height() != origin.genesis_height {
-            return Err(StorageError::DatabaseError(format!(
-                "genesis block at height {} does not sit at the origin's {}",
-                genesis.height(),
-                origin.genesis_height,
-            )));
-        }
-
-        let (tip_version, current_root) = read_jmt_metadata(&*self.db);
-        let genesis_version = origin.genesis_height.inner();
-        // A re-run over an already-adopted store returns the recorded
-        // adoption.
-        if tip_version == genesis_version && read_chain_origin(&*self.db) == origin {
-            return Ok(current_root);
-        }
-        if tip_version >= genesis_version {
-            return Err(StorageError::DatabaseError(format!(
-                "followed adoption vintage mismatch: store at version {tip_version}, \
-                 genesis height {genesis_version}"
-            )));
-        }
-        if genesis.header().state_root() != current_root {
-            return Err(StorageError::DatabaseError(format!(
-                "followed root {current_root:?} does not match the genesis state root {:?}",
-                genesis.header().state_root(),
-            )));
-        }
-        let child_path = self.root_path.clone();
-        if child_path.is_empty() {
-            return Err(StorageError::DatabaseError(
-                "split adoption requires a non-root child prefix".into(),
-            ));
-        }
-
-        let cf = CfHandles::resolve(&self.db);
-        let mut batch = WriteBatch::default();
-        if current_root == StateRoot::ZERO {
-            // An empty half: the sync imported nothing and no follow
-            // ever advanced the tip — the child starts from an empty
-            // tree at its genesis height.
-            batch_put::<SubstateBytesCf>(
-                &mut batch,
-                SubstateBytesCf::handle(&cf),
-                &genesis_version,
-                &0,
-            );
-        } else {
-            let own_root_key = JmtNodeKey::new(tip_version, child_path.clone());
-            let own_root = self
-                .cf_get::<JmtNodesCf>(&StoredNodeKey::from_jmt(&own_root_key))
-                .ok_or_else(|| {
-                    StorageError::DatabaseError(
-                        "followed store holds no root node at its tip version".into(),
-                    )
-                })?;
-            let genesis_root_key = JmtNodeKey::new(genesis_version, child_path);
-            batch_put::<JmtNodesCf>(
-                &mut batch,
-                JmtNodesCf::handle(&cf),
-                &StoredNodeKey::from_jmt(&genesis_root_key),
-                &own_root,
-            );
-            let bytes = self.sum_subtree_value_lens(&genesis_root_key, &own_root)?;
-            batch_put::<SubstateBytesCf>(
-                &mut batch,
-                SubstateBytesCf::handle(&cf),
-                &genesis_version,
-                &bytes,
-            );
-        }
-        write_jmt_metadata(&mut batch, genesis_version, current_root);
-        write_chain_origin(&mut batch, origin);
-        self.append_genesis_tip_to_batch(&mut batch, genesis);
-        self.db
-            .write(batch)
-            .map_err(|e| StorageError::DatabaseError(format!("followed adoption write: {e}")))?;
-        Ok(current_root)
-    }
-
-    /// Adopt a merged parent's store — a `parent`-rooted store already
-    /// holding both children's subtrees and the stitched root `r_p` at
-    /// its tip (the keeper hard-linked its own half, synced the sibling,
-    /// and stitched the root with one internal-node write). The tip
-    /// already sits at the genesis version, so adoption only records the
-    /// deterministic merged genesis as the committed tip; unlike a split
-    /// child the prefix may be the trie root, and there is no subtree
-    /// re-pointing — the merged tree is already in place.
-    ///
-    /// Returns the adopted `r_p`. The caller asserts it against the
-    /// beacon-composed parent anchor.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the genesis block does not sit at the origin's height,
-    /// when the store's tip does not sit at that height, or when the
-    /// store's root does not match the genesis state root.
-    pub fn adopt_merge_parent(
-        &self,
-        origin: ChainOrigin,
-        genesis: &Block,
-    ) -> Result<StateRoot, StorageError> {
-        let _commit_guard = self
-            .commit_lock
-            .lock()
-            .map_err(|_| StorageError::DatabaseError("commit lock poisoned".into()))?;
-        if genesis.height() != origin.genesis_height {
-            return Err(StorageError::DatabaseError(format!(
-                "genesis block at height {} does not sit at the origin's {}",
-                genesis.height(),
-                origin.genesis_height,
-            )));
-        }
-        let (tip_version, current_root) = read_jmt_metadata(&*self.db);
-        let genesis_version = origin.genesis_height.inner();
-        // A re-run over an already-adopted store returns the recorded
-        // adoption.
-        if read_chain_origin(&*self.db) == origin {
-            return Ok(current_root);
-        }
-        if tip_version != genesis_version {
-            return Err(StorageError::DatabaseError(format!(
-                "merge adoption vintage mismatch: store at version {tip_version}, \
-                 genesis height {genesis_version}"
-            )));
-        }
-        if genesis.header().state_root() != current_root {
-            return Err(StorageError::DatabaseError(format!(
-                "merged root {current_root:?} does not match the genesis state root {:?}",
-                genesis.header().state_root(),
-            )));
-        }
-        let mut batch = WriteBatch::default();
-        write_chain_origin(&mut batch, origin);
-        self.append_genesis_tip_to_batch(&mut batch, genesis);
-        self.db
-            .write(batch)
-            .map_err(|e| StorageError::DatabaseError(format!("merge adoption write: {e}")))?;
-        Ok(current_root)
+        let node = self
+            .cf_get::<JmtNodesCf>(&StoredNodeKey::from_jmt(&source_key))
+            .ok_or_else(|| {
+                StorageError::DatabaseError("store holds no root node at the source version".into())
+            })?;
+        let genesis_root_key = JmtNodeKey::new(genesis_version, source_key.path);
+        batch_put::<JmtNodesCf>(
+            batch,
+            JmtNodesCf::handle(cf),
+            &StoredNodeKey::from_jmt(&genesis_root_key),
+            &node,
+        );
+        let bytes = self.sum_subtree_value_lens(&genesis_root_key, &node)?;
+        batch_put::<SubstateBytesCf>(batch, SubstateBytesCf::handle(cf), &genesis_version, &bytes);
+        Ok(root)
     }
 
     /// Fold the child's deterministic genesis into an adoption batch as
@@ -480,7 +341,7 @@ impl TreeReader for PreRootStore<'_> {
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, Hasher, Key, NibblePath};
     use hyperscale_storage::test_helpers::import_boundary_state;
-    use hyperscale_storage::{BoundaryStore, ImportLeaf, WitnessSeed};
+    use hyperscale_storage::{AdoptSource, BoundaryStore, ImportLeaf, WitnessSeed};
     use hyperscale_types::{BlockHash, BlockHeight, ShardId, ValidatorId, WeightedTimestamp};
     use tempfile::TempDir;
 
@@ -593,7 +454,9 @@ mod tests {
             let child = RocksDbShardStorage::open(&target, child_path(side)).unwrap();
             let child_root = child_root_from_parent(&parent, parent_version, side);
             let genesis = genesis_at_10(child_of(side), child_root);
-            let root = child.adopt_split_child(origin_at_10(), &genesis).unwrap();
+            let root = child
+                .adopt_genesis(origin_at_10(), &genesis, AdoptSource::ParentSubtree)
+                .unwrap();
             assert_eq!(root, child_root, "adoption returns the attested child root");
             assert_ne!(root, StateRoot::ZERO);
             roots.push(root);
@@ -614,7 +477,9 @@ mod tests {
 
             // Idempotent: a re-run lands on the same values.
             assert_eq!(
-                child.adopt_split_child(origin_at_10(), &genesis).unwrap(),
+                child
+                    .adopt_genesis(origin_at_10(), &genesis, AdoptSource::ParentSubtree)
+                    .unwrap(),
                 root,
             );
         }
@@ -656,7 +521,11 @@ mod tests {
             terminal.header(),
             WeightedTimestamp::from_millis(42_000),
         );
-        assert!(child.adopt_split_child(stale, &genesis).is_err());
+        assert!(
+            child
+                .adopt_genesis(stale, &genesis, AdoptSource::ParentSubtree)
+                .is_err()
+        );
     }
 
     /// Make-before-break coasts the parent an unbounded number of empty blocks
@@ -688,7 +557,9 @@ mod tests {
         let genesis = genesis_at_10(child_of(0), child_root);
         // checkpoint_version 12 is three past the genesis height 10 — rejected
         // by the old at-or-one-below vintage check, accepted now.
-        let root = child.adopt_split_child(origin_at_10(), &genesis).unwrap();
+        let root = child
+            .adopt_genesis(origin_at_10(), &genesis, AdoptSource::ParentSubtree)
+            .unwrap();
         assert_eq!(root, child_root);
         assert_eq!(child.read_jmt_metadata(), (10, root));
     }
@@ -708,7 +579,11 @@ mod tests {
             child_of(0),
             StateRoot::from_raw(Hash::from_bytes(b"forged")),
         );
-        assert!(child.adopt_split_child(origin_at_10(), &forged).is_err());
+        assert!(
+            child
+                .adopt_genesis(origin_at_10(), &forged, AdoptSource::ParentSubtree)
+                .is_err()
+        );
     }
 
     /// A keeper's merged parent store, built whole-keyspace from both
@@ -753,12 +628,19 @@ mod tests {
             anchor_wt: cut,
         };
 
-        let adopted = storage.adopt_merge_parent(origin, &genesis).unwrap();
+        let adopted = storage
+            .adopt_genesis(origin, &genesis, AdoptSource::InPlace)
+            .unwrap();
         assert_eq!(adopted, root);
         assert_eq!(storage.read_jmt_metadata(), (10, root));
         assert_eq!(read_chain_origin(&*storage.db), origin);
         // Idempotent re-run returns the recorded adoption.
-        assert_eq!(storage.adopt_merge_parent(origin, &genesis).unwrap(), root);
+        assert_eq!(
+            storage
+                .adopt_genesis(origin, &genesis, AdoptSource::InPlace)
+                .unwrap(),
+            root
+        );
 
         // A genesis claiming a different root fails closed.
         let dir2 = TempDir::new().unwrap();
@@ -771,7 +653,11 @@ mod tests {
         )
         .unwrap();
         let wrong = merge_genesis(StateRoot::from_raw(Hash::from_bytes(b"forged")));
-        assert!(other.adopt_merge_parent(origin, &wrong).is_err());
+        assert!(
+            other
+                .adopt_genesis(origin, &wrong, AdoptSource::InPlace)
+                .is_err()
+        );
     }
 
     /// An empty side adopts a zero root with a zero count — the child
@@ -794,7 +680,9 @@ mod tests {
         storage.checkpoint_into(&target).unwrap();
         let child = RocksDbShardStorage::open(&target, child_path(1)).unwrap();
         let genesis = genesis_at_10(child_of(1), StateRoot::ZERO);
-        let root = child.adopt_split_child(origin_at_10(), &genesis).unwrap();
+        let root = child
+            .adopt_genesis(origin_at_10(), &genesis, AdoptSource::ParentSubtree)
+            .unwrap();
         assert_eq!(root, StateRoot::ZERO);
         assert_eq!(child.read_jmt_metadata(), (10, StateRoot::ZERO));
         assert_eq!(child.substate_bytes_at_version(10), Some(0));
@@ -888,7 +776,9 @@ mod tests {
                 terminal.header(),
                 WeightedTimestamp::from_millis(42_000),
             );
-            let adopted = store.adopt_followed_child(origin, &genesis).unwrap();
+            let adopted = store
+                .adopt_genesis(origin, &genesis, AdoptSource::FollowedTip)
+                .unwrap();
             assert_eq!(adopted, followed_root);
             assert_eq!(store.read_jmt_metadata(), (9, followed_root));
             assert!(store.substate_bytes_at_version(9).is_some());
@@ -899,7 +789,9 @@ mod tests {
             assert!(recovered.latest_qc.is_none());
             // Idempotent: a re-run lands on the same values.
             assert_eq!(
-                store.adopt_followed_child(origin, &genesis).unwrap(),
+                store
+                    .adopt_genesis(origin, &genesis, AdoptSource::FollowedTip)
+                    .unwrap(),
                 adopted
             );
         }

@@ -9,7 +9,7 @@
 //! selection, and the acceptance check — so both harnesses call one gate
 //! rather than re-deriving any part of it.
 
-use hyperscale_storage::{BoundaryStore, RecoveredState};
+use hyperscale_storage::{AdoptSource, BoundaryStore, RecoveredState};
 use hyperscale_types::{Block, ChainOrigin, StateRoot};
 
 use super::orchestrator::AdoptKind;
@@ -40,17 +40,14 @@ pub fn adopt_prepared_store<S: BoundaryStore>(
     origin: ChainOrigin,
     genesis: &Block,
 ) -> Result<RecoveredState, String> {
-    let adopted = match kind {
-        AdoptKind::Split => storage
-            .adopt_followed_child(origin, genesis)
-            .map_err(|e| format!("followed adoption: {e}"))?,
-        AdoptKind::ParentHalf => storage
-            .adopt_split_child(origin, genesis)
-            .map_err(|e| format!("split child adoption: {e}"))?,
-        AdoptKind::Merge => storage
-            .adopt_merge_parent(origin, genesis)
-            .map_err(|e| format!("merge adoption: {e}"))?,
+    let source = match kind {
+        AdoptKind::Split => AdoptSource::FollowedTip,
+        AdoptKind::ParentHalf => AdoptSource::ParentSubtree,
+        AdoptKind::Merge => AdoptSource::InPlace,
     };
+    let adopted = storage
+        .adopt_genesis(origin, genesis, source)
+        .map_err(|e| format!("reshape adoption: {e}"))?;
     let substate_bytes = storage
         .substate_bytes_at_version(origin.genesis_height.inner())
         .unwrap_or(0);

@@ -16,6 +16,7 @@
 use std::sync::{Arc, RwLock};
 
 use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
+use hyperscale_storage::AdoptSource;
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::Jmt;
 use hyperscale_types::{Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified};
@@ -42,30 +43,25 @@ impl SimShardStorage {
         }
     }
 
-    /// Re-point this child-prefix-rooted clone of the parent's store at
-    /// its adopted subtree: the child root hangs off the parent root's
-    /// child-side slot at the clone's tip version. The node is copied to
-    /// the genesis version, the substate byte total seeded by walking the
-    /// subtree, and the chain origin recorded for recovery.
+    /// Install a reshape successor's derived `genesis` as this store's
+    /// chain origin and committed tip. The simulation mirror of the
+    /// production backend's `adopt_genesis`, sharing its structure so the
+    /// two harnesses cannot diverge on what an adoption admits.
     ///
-    /// Returns the adopted child `state_root` — `ZERO` for an empty
-    /// side. The caller asserts it against the beacon-verified child
-    /// anchor; unlike the production backend there is no checkpoint
-    /// vintage check, since the simulation harness supplies the stores.
-    /// The `genesis` block records as the committed tip, mirroring the
-    /// production batch. An observer's followed store adopts through
-    /// [`Self::adopt_followed_child`] instead — the shapes are
-    /// caller-distinguished.
+    /// `source` names only how the tree reaches the genesis version; the
+    /// adopted root is then checked against the root the `genesis` names.
     ///
     /// # Errors
     ///
-    /// Fails when the store's root path is the trie root, when the
-    /// genesis block does not sit at the origin's height, or when the
-    /// clone resolves no parent root or child subtree node.
-    pub fn adopt_split_child(
+    /// Fails when the genesis block does not sit at the origin's height,
+    /// when the store's vintage does not match what `source` requires,
+    /// when the tree cannot yield the named subtree, or when the adopted
+    /// root does not match the genesis's.
+    pub fn adopt_genesis(
         &self,
         origin: ChainOrigin,
         genesis: &Block,
+        source: AdoptSource,
     ) -> Result<StateRoot, String> {
         if genesis.height() != origin.genesis_height {
             return Err(format!(
@@ -76,159 +72,99 @@ impl SimShardStorage {
         }
         let recorded_origin = read_or_recover(&self.consensus).chain_origin;
         let mut shared = write_or_recover(&self.state);
-        let child_path = shared.tree_store.root_path();
-        if child_path.is_empty() {
-            return Err("split adoption requires a non-root child prefix".to_string());
-        }
-
         // A re-run over an already-adopted store returns the recorded
-        // adoption: the tip already sits at the genesis height under this
-        // origin, and the parent slot the first run consumed is gone.
-        let tip = shared.current_block_height;
-        if tip == origin.genesis_height && recorded_origin == origin {
+        // adoption: the tip sits at the genesis height under this origin,
+        // and the parent slot the first run consumed is gone.
+        let at_genesis_version = shared.current_block_height == origin.genesis_height;
+        if at_genesis_version && recorded_origin == origin {
             return Ok(shared.current_root_hash);
         }
 
-        // The metadata is the parent's; the child root hangs off the
-        // parent root's child-side slot.
-        let current_version = shared.current_block_height.inner();
-        let mut parent_path = child_path.clone();
-        parent_path.truncate(child_path.len() - 1);
-        let side = usize::from(child_path.bits_at(child_path.len() - 1, 1));
-        let parent_root = shared
-            .tree_store
-            .get_node(&NodeKey::new(current_version, parent_path))
-            .ok_or("clone carries no parent root node")?;
-        let Node::Internal(parent_root) = parent_root.as_ref() else {
-            return Err(
-                "parent root collapsed to a leaf; a ≤1-key parent cannot split".to_string(),
-            );
-        };
-        let (child_node, child_root) = match &parent_root.children[side] {
-            None => (None, StateRoot::ZERO),
-            Some(slot) => {
-                let node = shared
-                    .tree_store
-                    .get_node(&NodeKey::new(slot.version, child_path))
-                    .ok_or("clone carries no child subtree root node")?;
-                (
-                    Some(node),
-                    StateRoot::from_raw(Hash::from_hash_bytes(&slot.hash)),
-                )
+        let adopted = match source {
+            AdoptSource::InPlace => {
+                if shared.current_block_height != origin.genesis_height {
+                    return Err(format!(
+                        "merged store at version {} does not sit at the genesis height {}",
+                        shared.current_block_height, origin.genesis_height,
+                    ));
+                }
+                shared.current_root_hash
+            }
+            AdoptSource::ParentSubtree | AdoptSource::FollowedTip => {
+                let child_path = shared.tree_store.root_path();
+                if child_path.is_empty() {
+                    return Err("split adoption requires a non-root child prefix".to_string());
+                }
+                let (node, root) = if matches!(source, AdoptSource::ParentSubtree) {
+                    // The metadata is the parent's; the child root hangs off
+                    // the parent root's child-side slot.
+                    let version = shared.current_block_height.inner();
+                    let mut parent_path = child_path.clone();
+                    parent_path.truncate(child_path.len() - 1);
+                    let side = usize::from(child_path.bits_at(child_path.len() - 1, 1));
+                    let parent_root = shared
+                        .tree_store
+                        .get_node(&NodeKey::new(version, parent_path))
+                        .ok_or("clone carries no parent root node")?;
+                    let Node::Internal(parent_root) = parent_root.as_ref() else {
+                        return Err(
+                            "parent root collapsed to a leaf; a ≤1-key parent cannot split"
+                                .to_string(),
+                        );
+                    };
+                    match &parent_root.children[side] {
+                        None => (None, StateRoot::ZERO),
+                        Some(slot) => {
+                            let node = shared
+                                .tree_store
+                                .get_node(&NodeKey::new(slot.version, child_path))
+                                .ok_or("clone carries no child subtree root node")?;
+                            (
+                                Some(node),
+                                StateRoot::from_raw(Hash::from_hash_bytes(&slot.hash)),
+                            )
+                        }
+                    }
+                } else {
+                    // The store's own tip is the adopted subtree; an empty
+                    // half never advanced it past the zero root.
+                    let root = shared.current_root_hash;
+                    if root == StateRoot::ZERO {
+                        (None, root)
+                    } else {
+                        let version = shared.current_block_height.inner();
+                        (
+                            Some(
+                                shared
+                                    .tree_store
+                                    .get_node(&NodeKey::new(version, child_path))
+                                    .ok_or(
+                                        "followed store holds no root node at its tip version",
+                                    )?,
+                            ),
+                            root,
+                        )
+                    }
+                };
+                if root != genesis.header().state_root() {
+                    return Err(format!(
+                        "adopted root {root:?} does not match the genesis state root {:?}",
+                        genesis.header().state_root(),
+                    ));
+                }
+                install_adoption(&mut shared, origin, node, root)?;
+                root
             }
         };
-        install_adoption(&mut shared, origin, child_node, child_root)?;
-        drop(shared);
-        self.install_genesis_tip(origin, genesis);
-        Ok(child_root)
-    }
-
-    /// Re-point an observer's followed store at its adopted subtree —
-    /// the child root the store's own metadata names at its (sparse)
-    /// tip version. The simulation mirror of the production backend's
-    /// `adopt_followed_child`.
-    ///
-    /// Returns the adopted child `state_root` — `ZERO` for a store
-    /// whose span held nothing (an empty half). The caller asserts it
-    /// against the beacon-verified child anchor. The `genesis` block
-    /// records as the committed tip, mirroring the production batch.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the store's root path is the trie root, when the
-    /// genesis block does not sit at the origin's height or carries a
-    /// state root other than the followed one, or when the store's
-    /// metadata names a root its tree doesn't hold.
-    pub fn adopt_followed_child(
-        &self,
-        origin: ChainOrigin,
-        genesis: &Block,
-    ) -> Result<StateRoot, String> {
-        if genesis.height() != origin.genesis_height {
+        if adopted != genesis.header().state_root() {
             return Err(format!(
-                "genesis block at height {} does not sit at the origin's {}",
-                genesis.height(),
-                origin.genesis_height,
-            ));
-        }
-        let mut shared = write_or_recover(&self.state);
-        let child_path = shared.tree_store.root_path();
-        if child_path.is_empty() {
-            return Err("split adoption requires a non-root child prefix".to_string());
-        }
-
-        let child_root = shared.current_root_hash;
-        let child_node = if child_root == StateRoot::ZERO {
-            // An empty half: the sync imported nothing and no follow
-            // ever advanced the tip.
-            None
-        } else {
-            let tip_version = shared.current_block_height.inner();
-            Some(
-                shared
-                    .tree_store
-                    .get_node(&NodeKey::new(tip_version, child_path))
-                    .ok_or("followed store holds no root node at its tip version")?,
-            )
-        };
-        if genesis.header().state_root() != child_root {
-            return Err(format!(
-                "followed root {child_root:?} does not match the genesis state root {:?}",
+                "adopted root {adopted:?} does not match the genesis state root {:?}",
                 genesis.header().state_root(),
             ));
         }
-        install_adoption(&mut shared, origin, child_node, child_root)?;
         drop(shared);
         self.install_genesis_tip(origin, genesis);
-        Ok(child_root)
-    }
-
-    /// Adopt a merged parent's store — a `parent`-rooted store already
-    /// holding both children's subtrees and the stitched root `r_p` at
-    /// its tip (the keeper imported them there). Unlike a split child
-    /// this adopts a whole shard, whose prefix may be the trie root, so
-    /// there is no child-slot re-pointing; the import already built the
-    /// tree. Records the deterministic merged genesis as the committed
-    /// tip.
-    ///
-    /// Returns the adopted `r_p`. The caller asserts it against the
-    /// beacon-composed parent anchor.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the genesis block does not sit at the origin's height,
-    /// when the store's tip does not sit at that height, or when the
-    /// store's root does not match the genesis state root.
-    pub fn adopt_merge_parent(
-        &self,
-        origin: ChainOrigin,
-        genesis: &Block,
-    ) -> Result<StateRoot, String> {
-        if genesis.height() != origin.genesis_height {
-            return Err(format!(
-                "genesis block at height {} does not sit at the origin's {}",
-                genesis.height(),
-                origin.genesis_height,
-            ));
-        }
-        let merged_root = {
-            let shared = read_or_recover(&self.state);
-            if shared.current_block_height != origin.genesis_height {
-                return Err(format!(
-                    "merged store at version {} does not sit at the genesis height {}",
-                    shared.current_block_height, origin.genesis_height,
-                ));
-            }
-            shared.current_root_hash
-        };
-        if genesis.header().state_root() != merged_root {
-            return Err(format!(
-                "merged root {merged_root:?} does not match the genesis state root {:?}",
-                genesis.header().state_root(),
-            ));
-        }
-        self.install_genesis_tip(origin, genesis);
-        Ok(merged_root)
+        Ok(adopted)
     }
 
     /// Record the child's deterministic genesis as the committed tip —
@@ -278,7 +214,7 @@ fn install_adoption(
 mod tests {
     use hyperscale_jmt::{Blake3Hasher, Hasher};
     use hyperscale_storage::test_helpers::import_boundary_state;
-    use hyperscale_storage::{ImportLeaf, WitnessSeed};
+    use hyperscale_storage::{AdoptSource, ImportLeaf, WitnessSeed};
     use hyperscale_types::{
         Block, BlockHash, BlockHeight, ChainOrigin, Hash, ShardId, StateRoot, ValidatorId,
         WeightedTimestamp,
@@ -344,7 +280,9 @@ mod tests {
         let (genesis, origin) = merge_genesis(root);
         assert_eq!(genesis.height(), BlockHeight::new(10));
 
-        let adopted = store.adopt_merge_parent(origin, &genesis).unwrap();
+        let adopted = store
+            .adopt_genesis(origin, &genesis, AdoptSource::InPlace)
+            .unwrap();
         assert_eq!(adopted, root);
 
         let recovered = store.load_recovered_state();
@@ -362,7 +300,11 @@ mod tests {
         let (store, root) = merged_store();
         let (_, origin) = merge_genesis(root);
         let (wrong, _) = merge_genesis(StateRoot::from_raw(Hash::from_bytes(b"forged root")));
-        assert!(store.adopt_merge_parent(origin, &wrong).is_err());
+        assert!(
+            store
+                .adopt_genesis(origin, &wrong, AdoptSource::InPlace)
+                .is_err()
+        );
     }
 
     /// A parent store at the trie root holding two left-side leaves and
@@ -417,6 +359,30 @@ mod tests {
         )
     }
 
+    /// The child-side slot of `parent`'s root node — the subtree a clone of
+    /// it adopts, and so the root that clone's genesis must name.
+    fn child_subtree_root(parent: &SimShardStorage, side: u8) -> StateRoot {
+        let path = child_path(side);
+        let mut parent_path = path.clone();
+        parent_path.truncate(path.len() - 1);
+        let slot_index = usize::from(path.bits_at(path.len() - 1, 1));
+        let node = {
+            let shared = read_or_recover(&parent.state);
+            let version = shared.current_block_height.inner();
+            shared
+                .tree_store
+                .get_node(&NodeKey::new(version, parent_path))
+                .expect("the parent holds a root node")
+        };
+        let Node::Internal(root) = node.as_ref() else {
+            panic!("a ≤1-key parent cannot split");
+        };
+        let slot = root.children[slot_index]
+            .as_ref()
+            .expect("both halves are populated");
+        StateRoot::from_raw(Hash::from_hash_bytes(&slot.hash))
+    }
+
     /// Both halves adopt; their roots compose to the parent's terminal
     /// root and their counts partition the leaves. Adoption is idempotent:
     /// a re-run returns the recorded root rather than failing on the
@@ -427,8 +393,14 @@ mod tests {
         let mut roots = Vec::new();
         for side in [0u8, 1u8] {
             let child = parent.clone_for_split_child(child_path(side));
-            let genesis = split_genesis(child_of(side), StateRoot::ZERO);
-            let root = child.adopt_split_child(origin_at_10(), &genesis).unwrap();
+            // The genesis must name the subtree the clone actually holds —
+            // that equality is what gates the seat.
+            let expected = child_subtree_root(&parent, side);
+            let genesis = split_genesis(child_of(side), expected);
+            let root = child
+                .adopt_genesis(origin_at_10(), &genesis, AdoptSource::ParentSubtree)
+                .unwrap();
+            assert_eq!(root, expected);
             assert_ne!(root, StateRoot::ZERO);
             roots.push(root);
 
@@ -439,7 +411,9 @@ mod tests {
             assert_eq!(recovered.substate_bytes, if side == 0 { 2 } else { 1 });
 
             assert_eq!(
-                child.adopt_split_child(origin_at_10(), &genesis).unwrap(),
+                child
+                    .adopt_genesis(origin_at_10(), &genesis, AdoptSource::ParentSubtree)
+                    .unwrap(),
                 root,
                 "re-run returns the recorded adoption",
             );

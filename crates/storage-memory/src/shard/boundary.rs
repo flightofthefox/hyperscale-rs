@@ -12,8 +12,8 @@ use hyperscale_jmt::{Key, NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
-    BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ImportProgress, ResolveLeaf, WitnessSeed,
-    filter_updates_to_prefix, merge_owned_nodes, merge_updates_from_receipts,
+    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportLeaf, ImportProgress, ResolveLeaf,
+    WitnessSeed, filter_updates_to_prefix, merge_owned_nodes, merge_updates_from_receipts,
 };
 use hyperscale_types::{Block, BlockHeight, ChainOrigin, StateRoot, StoredReceipt};
 
@@ -219,24 +219,13 @@ impl BoundaryStore for SimShardStorage {
         Ok(root)
     }
 
-    fn adopt_split_child(&self, origin: ChainOrigin, genesis: &Block) -> Result<StateRoot, String> {
-        Self::adopt_split_child(self, origin, genesis)
-    }
-
-    fn adopt_followed_child(
+    fn adopt_genesis(
         &self,
         origin: ChainOrigin,
         genesis: &Block,
+        source: AdoptSource,
     ) -> Result<StateRoot, String> {
-        Self::adopt_followed_child(self, origin, genesis)
-    }
-
-    fn adopt_merge_parent(
-        &self,
-        origin: ChainOrigin,
-        genesis: &Block,
-    ) -> Result<StateRoot, String> {
-        Self::adopt_merge_parent(self, origin, genesis)
+        Self::adopt_genesis(self, origin, genesis, source)
     }
 
     fn substate_bytes_at_version(&self, version: u64) -> Option<u64> {
