@@ -549,6 +549,47 @@ pub struct CompletedRecovery {
     pub attested_frontier: BlockHeight,
 }
 
+/// The window-frozen half of a beacon projection — see
+/// [`BeaconState::window`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, BasicSbor)]
+pub struct FrozenWindow {
+    /// Each shard's beacon-witness accumulator base for this window: the
+    /// applied watermark (`boundaries[shard].witness_leaf_count`) as it
+    /// stood at promotion, before this epoch's fold advances it.
+    pub witness_bases: BTreeMap<ShardId, BeaconWitnessLeafCount>,
+    /// Shards with an admitted, not-yet-applied split. The schedule's
+    /// boundary predicates read it to tell which reshape a scheduled cut
+    /// belongs to, and it marks the shards whose settled-waves window is
+    /// fenced open.
+    pub split_pending: BTreeSet<ShardId>,
+    /// Each terminating leaf's scheduled final window — the affirmative
+    /// counterpart of `split_pending`, letting a boundary predicate answer
+    /// "this window *is* the shard's last" from this entry alone.
+    ///
+    /// Soundness rests on no fold scheduling a terminal for the window it
+    /// opens (INV-RESHAPE-9). The freeze runs before the reshape folds, so
+    /// a self-naming schedule would land after this snapshot and diverge a
+    /// window's two writes.
+    pub scheduled_terminals: BTreeMap<ShardId, Epoch>,
+    /// Each terminating leaf's settled-waves window floor: pending split
+    /// targets and paired merge children from the live records, plus
+    /// shards already coasting to their terminal.
+    pub settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
+    /// Each pending split's observer cohort, keyed by parent, mapping
+    /// observer to child sub-shard. A window's `ReshapeReady` leaf
+    /// classification reads it, and the applying fold flips the cohort to
+    /// `OnShard` mid-fold — so a live projection would differ between the
+    /// two writes and fork the beacon-witness root across replicas at
+    /// different fold heights.
+    pub reshape_observers: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    /// Each pending merge's keepers, keyed by the child each keeper runs,
+    /// mapping keeper to merging parent. Drives a child's `ReshapeReady`
+    /// classification and the merge-terminal settled-waves carry; the
+    /// applying fold consumes the keepers mid-fold, under the same
+    /// argument as the observer cohort.
+    pub reshape_keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+}
+
 /// Global beacon state. Updated atomically per epoch by `apply_epoch`.
 ///
 /// Cross-validator agreement on every field at every epoch follows from
@@ -650,65 +691,24 @@ pub struct BeaconState {
     /// active one — a Ready or Jail witness folding this epoch takes
     /// consensus effect one window out, exactly like membership changes.
     pub shard_consensus_members: BTreeMap<ShardId, Vec<ValidatorId>>,
-    /// Per-shard beacon-witness window base for the window this state
-    /// governs, frozen at promotion: each shard's applied witness
-    /// watermark (`boundaries[shard].witness_leaf_count`) as it stood
-    /// when the lookahead committee was promoted — before this epoch's
-    /// fold advances it.
+    /// Everything else a window's schedule entry fixes at its promotion,
+    /// frozen in one step before this epoch's folds mutate any of it.
     ///
-    /// Freezing here keeps the base byte-identical to what the prior
-    /// state's lookahead derivation read live from the same boundaries
-    /// (nothing mutates `boundaries` between the end of one
-    /// `apply_epoch` and the start of the next), so a window's base is
-    /// the same whether a node resolves it from the lookahead schedule
-    /// entry or the re-derived active one — the
-    /// [`Self::shard_consensus_members`] discipline.
-    pub witness_window_bases: BTreeMap<ShardId, BeaconWitnessLeafCount>,
-    /// Shards with an admitted, not-yet-executed split as of this
-    /// epoch's promotion, frozen under the
-    /// [`Self::witness_window_bases`] discipline so a window's value is
-    /// byte-identical whether resolved from the lookahead schedule entry
-    /// or the re-derived active one. The schedule's split-at-boundary
-    /// predicate reads it to answer "no split lands at this window's
-    /// end" without the next window's entry.
-    pub split_pending_window: BTreeSet<ShardId>,
-    /// Each terminating leaf's scheduled final window as of this epoch's
-    /// promotion, frozen under the [`Self::split_pending_window`]
-    /// discipline. The affirmative counterpart of `split_pending_window`:
-    /// the schedule's boundary predicates read it to answer "this window
-    /// *is* the shard's last" without the next window's entry.
+    /// A window's entry is written twice — once as the preceding fold's
+    /// lookahead, once re-derived as the active entry when the window
+    /// opens — and consensus stamps boundary verdicts into signed headers
+    /// from whichever copy a node holds. The two must therefore agree, so
+    /// every field here is frozen rather than read live, and they are
+    /// frozen together: [`Self::live_window`] is the one source and the
+    /// promotion assigns its result whole, so a field that gains a live
+    /// value but no freeze cannot arise.
     ///
-    /// Soundness rests on no fold scheduling a terminal for the window it
-    /// opens. The freeze runs before the reshape folds, so a self-naming
-    /// schedule would land after this snapshot and diverge a window's
-    /// lookahead entry from its re-derived active one.
-    pub terminal_epoch_window: BTreeMap<ShardId, Epoch>,
-    /// Each terminating leaf's settled-waves window floor as of this
-    /// epoch's promotion, frozen under the [`Self::split_pending_window`]
-    /// discipline: pending split targets and paired merge children from
-    /// the live records, plus shards already coasting to their terminal
-    /// (their boundary carries the stamp once the record is gone). The
-    /// schedule's settled-window floor reads it.
-    pub settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
-    /// Each pending split's observer cohort (keyed by parent, mapping
-    /// observer → child sub-shard) as of this epoch's promotion, frozen
-    /// under the [`Self::split_pending_window`] discipline. A window's
-    /// `ReshapeReady` leaf classification reads it, so freezing keeps it
-    /// byte-identical whether a node resolves the window from the
-    /// lookahead schedule entry or the re-derived active one — the split
-    /// execution fold flips the cohort to `OnShard` mid-fold, so a live
-    /// projection would differ between the two writes and fork the
-    /// beacon-witness root across replicas at different fold heights.
-    pub reshape_observers_window: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
-    /// Each pending merge's keepers (keyed by the child each keeper runs,
-    /// mapping keeper → merging parent) as of this epoch's promotion,
-    /// frozen under the same discipline. Drives both a child's
-    /// `ReshapeReady` leaf classification and the merge-terminal
-    /// settled-waves carry (`TopologySnapshot::merge_pending`); the merge
-    /// execution fold consumes the keepers mid-fold, so a live projection
-    /// would diverge between the lookahead and active writes of the
-    /// execution window.
-    pub reshape_keepers_window: BTreeMap<ShardId, BTreeMap<ValidatorId, ShardId>>,
+    /// Not everything a snapshot carries belongs here. Boundary anchors,
+    /// [`Self::advanced`], the recovery records and
+    /// [`Self::reshape_parent_halves`] are the current view of the chain
+    /// rather than a property of the window: both writes take them live,
+    /// and no verdict is stamped from them.
+    pub window: FrozenWindow,
     /// Parent-half cohorts of executed splits, keyed by the freshly split
     /// child each member seats on, mapping member → the parent it re-roots
     /// its local store from. Written when a split executes (the members that
@@ -1062,12 +1062,7 @@ impl BeaconState {
             shard_committees: BTreeMap::new(),
             next_shard_committees: BTreeMap::new(),
             shard_consensus_members: BTreeMap::new(),
-            witness_window_bases: BTreeMap::new(),
-            split_pending_window: BTreeSet::new(),
-            terminal_epoch_window: BTreeMap::new(),
-            settled_window_floors: BTreeMap::new(),
-            reshape_observers_window: BTreeMap::new(),
-            reshape_keepers_window: BTreeMap::new(),
+            window: FrozenWindow::default(),
             reshape_parent_halves: BTreeMap::new(),
             boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
@@ -1343,13 +1338,13 @@ impl BeaconState {
             &self.shard_committees,
             WindowProjection {
                 consensus_members: self.shard_consensus_members.clone(),
-                witness_bases: self.witness_window_bases.clone(),
-                reshape_observers: self.reshape_observers_window.clone(),
-                reshape_keepers: self.reshape_keepers_window.clone(),
+                witness_bases: self.window.witness_bases.clone(),
+                reshape_observers: self.window.reshape_observers.clone(),
+                reshape_keepers: self.window.reshape_keepers.clone(),
                 reshape_parent_halves: self.reshape_parent_halves.clone(),
-                split_pending: self.split_pending_window.clone(),
-                scheduled_terminals: self.terminal_epoch_window.clone(),
-                settled_window_floors: self.settled_window_floors.clone(),
+                split_pending: self.window.split_pending.clone(),
+                scheduled_terminals: self.window.scheduled_terminals.clone(),
+                settled_window_floors: self.window.settled_window_floors.clone(),
                 params: self.params,
             },
             network,
@@ -1365,17 +1360,18 @@ impl BeaconState {
     /// the window opens.
     #[must_use]
     pub fn derive_next_topology_snapshot(&self, network: NetworkDefinition) -> TopologySnapshot {
+        let live = self.live_window();
         self.derive_topology_from(
             &self.next_shard_committees,
             WindowProjection {
                 consensus_members: self.ready_consensus_members(&self.next_shard_committees),
-                witness_bases: self.live_witness_bases(),
-                reshape_observers: self.live_reshape_observers(),
-                reshape_keepers: self.live_reshape_keepers(),
+                witness_bases: live.witness_bases,
+                reshape_observers: live.reshape_observers,
+                reshape_keepers: live.reshape_keepers,
                 reshape_parent_halves: self.reshape_parent_halves.clone(),
-                split_pending: self.live_split_pending(),
-                scheduled_terminals: self.live_scheduled_terminals(),
-                settled_window_floors: self.live_settled_window_floors(),
+                split_pending: live.split_pending,
+                scheduled_terminals: live.scheduled_terminals,
+                settled_window_floors: live.settled_window_floors,
                 params: self.next_params,
             },
             network,
@@ -1410,6 +1406,25 @@ impl BeaconState {
                 (*shard, ready)
             })
             .collect()
+    }
+
+    /// The window projection as state stands right now — what the next
+    /// promotion freezes into [`Self::window`], and what the lookahead
+    /// snapshot projects for the window it describes.
+    ///
+    /// One source for both, so the two writes of a window's entry cannot
+    /// disagree, and a field added here is frozen and projected by
+    /// construction rather than by remembering to touch both.
+    #[must_use]
+    pub fn live_window(&self) -> FrozenWindow {
+        FrozenWindow {
+            witness_bases: self.live_witness_bases(),
+            split_pending: self.live_split_pending(),
+            scheduled_terminals: self.live_scheduled_terminals(),
+            settled_window_floors: self.live_settled_window_floors(),
+            reshape_observers: self.live_reshape_observers(),
+            reshape_keepers: self.live_reshape_keepers(),
+        }
     }
 
     /// Each shard's applied witness watermark as `boundaries` stand right
@@ -2254,8 +2269,8 @@ mod tests {
     fn head_projects_frozen_bases_lookahead_projects_live() {
         let mut state = single_pool_state(4);
         let shard = ShardId::ROOT;
-        state.witness_window_bases = state.live_witness_bases();
-        let frozen = state.witness_window_bases.get(&shard).copied();
+        state.window.witness_bases = state.live_witness_bases();
+        let frozen = state.window.witness_bases.get(&shard).copied();
 
         // The fold advances the live watermark mid-window.
         state
@@ -2356,7 +2371,7 @@ mod tests {
         );
 
         // Promotion freezes the projection into the active window.
-        state.reshape_observers_window = state.live_reshape_observers();
+        state.window.reshape_observers = state.live_reshape_observers();
         assert_eq!(
             state
                 .derive_topology_snapshot(NetworkDefinition::simulator())
@@ -2373,7 +2388,7 @@ mod tests {
                 .reshape_observer_child(p, observer),
             None,
         );
-        state.reshape_observers_window = state.live_reshape_observers();
+        state.window.reshape_observers = state.live_reshape_observers();
         assert_eq!(
             state
                 .derive_topology_snapshot(NetworkDefinition::simulator())

@@ -162,7 +162,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
     // consensus subset starts as full membership; the witness window
     // bases start at the zeroed genesis watermarks.
     state.shard_consensus_members = state.ready_consensus_members(&state.shard_committees);
-    state.witness_window_bases = state.live_witness_bases();
+    state.window.witness_bases = state.live_witness_bases();
     state
 }
 

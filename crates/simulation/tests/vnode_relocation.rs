@@ -254,7 +254,8 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
         .expect("beacon chain is committed");
     assert!(
         beacon_state
-            .witness_window_bases
+            .window
+            .witness_bases
             .get(&to)
             .is_some_and(|base| base.inner() > 0),
         "the destination shard's witness window base must have advanced \

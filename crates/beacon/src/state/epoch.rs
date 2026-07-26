@@ -147,33 +147,14 @@ pub fn apply_epoch(
     // `activate_at - 1`, so this epoch's blocks resolve the value every
     // member already froze into this window's topology snapshot.
     state.params = state.next_params;
-    // Freeze each shard's beacon-witness window base under the same
-    // discipline: the applied watermark as it stands before this epoch's
-    // fold advances it, matching what the prior state's lookahead
-    // derivation read live from the same boundaries.
-    state.witness_window_bases = state.live_witness_bases();
-    // Freeze the pending-split set the same way — before this fold's
-    // admissions, cancellations, and executions mutate it — so a
-    // window's split-at-boundary projection is byte-identical whether
-    // resolved from the lookahead schedule entry or the re-derived
-    // active one.
-    state.split_pending_window = state.live_split_pending();
-    // The affirmative half of the same freeze, and the reason no fold may
-    // schedule a terminal for the window it opens: a schedule stamped
-    // after this point would miss the snapshot a window's active entry
-    // re-derives from, while the lookahead written at the end of this fold
-    // would carry it — the two writes of one window's entry would disagree.
-    state.terminal_epoch_window = state.live_scheduled_terminals();
-    state.settled_window_floors = state.live_settled_window_floors();
-    // Freeze the reshape-seat projections under the same discipline.
-    // The execution fold flips a split's observer cohort to `OnShard`
-    // and consumes a merge's keepers mid-fold, so a live projection
-    // would differ between a window's lookahead write and its active
-    // overwrite — diverging the `ReshapeReady` leaf classification (and
-    // the merge-terminal settled-waves carry) across replicas at
-    // different fold heights, which forks the beacon-witness root.
-    state.reshape_observers_window = state.live_reshape_observers();
-    state.reshape_keepers_window = state.live_reshape_keepers();
+    // Freeze everything the window's schedule entry fixes, in one step
+    // and before this fold mutates any of it. A window's entry is
+    // written twice — the lookahead at the end of the preceding fold, the
+    // active entry re-derived here — and proposers stamp boundary verdicts
+    // into signed headers from whichever they hold, so the two must agree.
+    // Assigning the whole projection is what makes that structural: a
+    // field cannot gain a live value and miss its freeze.
+    state.window = state.live_window();
 
     // Snapshot each shard's member list before the pipeline runs so the
     // end-of-epoch set-diff against this snapshot can surface
@@ -2169,7 +2150,7 @@ mod tests {
                 reveals_fenced_below: None,
             },
         );
-        state.witness_window_bases = state.live_witness_bases();
+        state.window.witness_bases = state.live_witness_bases();
 
         // Epoch 1 folds a boundary whose chunk applies 7 witness leaves.
         let root = StateRoot::from_raw(Hash::from_bytes(b"epoch1"));
@@ -2205,7 +2186,7 @@ mod tests {
         // The stamp ran before the fold: window 1's base is the genesis
         // watermark, not the count the fold just applied.
         assert_eq!(
-            state.witness_window_bases.get(&shard),
+            state.window.witness_bases.get(&shard),
             Some(&BeaconWitnessLeafCount::ZERO)
         );
         // What the lookahead derivation for window 2 reads live now.
@@ -2228,7 +2209,7 @@ mod tests {
                 shard_contributions: &BTreeMap::new(),
             },
         );
-        assert_eq!(state.witness_window_bases, lookahead);
+        assert_eq!(state.window.witness_bases, lookahead);
         assert_eq!(
             projected,
             window_frozen_view(&state.derive_topology_snapshot(net())),
