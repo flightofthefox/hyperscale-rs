@@ -626,38 +626,33 @@ function renderMeter() {
   }
   const carried = [...totals.values()].reduce((a, b) => a + b, 0);
 
-  const bar = document.createElement("div");
-  bar.className = "meterbar";
   const key = document.createElement("div");
   key.className = "meterkey";
   if (!carried) {
     const quiet = document.createElement("span");
     quiet.className = "k none";
-    quiet.textContent = "no traffic in the last 2s of simulated time";
+    quiet.textContent = "nothing carried";
     key.appendChild(quiet);
   }
   for (const cls of CLASSES) {
     const count = totals.get(cls) ?? 0;
     if (!count) continue;
-    const seg = document.createElement("i");
-    seg.className = `m ${cls}`;
-    seg.style.width = `${(count / carried) * 100}%`;
-    seg.title = `${cls.replace(/_/g, " ")} — ${count} deliveries`;
-    bar.appendChild(seg);
     const k = document.createElement("span");
     k.className = "k";
     k.innerHTML =
       `<span class="sw m ${cls}"></span>${cls.replace(/_/g, " ")} <b>${count}</b>`;
     key.appendChild(k);
   }
-  $("meter").replaceChildren(bar, key);
+  $("meter").replaceChildren(key);
 
   const thinned = dropped > 0
-    ? ` <span class="thinned">drawing ${sampled} of ${sampled + dropped}</span> —` +
-      ` the totals above cover all of them.`
+    ? ` <span class="thinned">Drawing ${sampled} of ${sampled + dropped}</span> —` +
+      ` the counts cover all of them.`
     : "";
   $("netcap").innerHTML =
-    `Latency is configured, not geographic &mdash; positions carry no distance.${thinned}`;
+    `Deliveries over the last ${TRAFFIC_WINDOW_MS / 1000}s of simulated time, ` +
+    `urgent class first. Latency is configured, not geographic &mdash; ` +
+    `positions carry no distance.${thinned}`;
   $("netclock").textContent = state.speed > DOT_SPEED_LIMIT
     ? `${state.speed}× — edge weight, too fast for single messages`
     : `t = ${fmtWt(state.simNow)} on the harness clock`;

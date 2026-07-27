@@ -194,13 +194,6 @@ h1 em { font-style: normal; color: var(--ink2); }
 .dot.bulk { fill: var(--cls-bulk); }
 
 .meter { padding: 4px 14px 0; }
-.meterbar {
-  display: flex; gap: 2px; height: 8px; margin-bottom: 8px;
-  background: var(--panel2); border-radius: 4px; overflow: hidden;
-}
-.meterbar i { display: block; min-width: 0; }
-.meterbar i:first-child { border-radius: 4px 0 0 4px; }
-.meterbar i:last-child { border-radius: 0 4px 4px 0; }
 .meterkey {
   display: flex; flex-wrap: wrap; gap: 4px 16px;
   font-family: var(--mono); font-size: 10px; color: var(--ink2);
