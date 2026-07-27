@@ -170,8 +170,21 @@ h1 em { font-style: normal; color: var(--ink2); }
    A panel of its own, on its own coordinates. The timeline says what
    consensus attested; this says what the transport carried, and the two
    never share an axis so a delivery is never mistaken for a settlement. */
-.network { margin-bottom: 14px; }
+.network { margin-bottom: 14px; position: relative; }
 #net { display: block; width: 100%; }
+/* Inspecting a message only makes sense while the timeline is stopped: at any
+   playback rate the dot under the pointer is a different message by the next
+   frame, so the hit targets are drawn on pause and not before. */
+#nettip {
+  position: absolute; z-index: 2; pointer-events: none;
+  transform: translate(-50%, -100%);
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.55;
+  color: var(--ink); background: var(--panel2);
+  border: 1px solid var(--line2); border-radius: 6px;
+  padding: 5px 9px; white-space: pre; box-shadow: 0 4px 14px rgb(0 0 0 / .28);
+}
+#nettip b { color: var(--ink2); font-weight: 600; }
+.hit { fill: transparent; cursor: crosshair; }
 .cluster { fill: none; stroke: var(--line2); stroke-width: 1.2; stroke-dasharray: 3 4; }
 .cluster-label {
   font-family: var(--mono); font-size: 9.5px; font-weight: 700;

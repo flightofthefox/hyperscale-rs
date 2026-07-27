@@ -204,7 +204,8 @@ function apply(event) {
       // flight time — is counted by the meter and drawn by nothing.
       if (k.deliveredAt > state.simNow) {
         state.flights.push({
-          from: k.from, to: k.to, sentAt: k.sentAt, deliveredAt: k.deliveredAt, cls: k.class,
+          from: k.from, to: k.to, sentAt: k.sentAt, deliveredAt: k.deliveredAt,
+          cls: k.class, messageType: k.messageType,
         });
       }
       const key = k.from < k.to ? `${k.from}-${k.to}` : `${k.to}-${k.from}`;
@@ -587,28 +588,58 @@ function renderNetwork() {
     const spot = at(host.host);
     if (!spot) continue;
     const pooled = groupOf(host) === null;
-    const g = el("g", { class: `host${pooled ? " pooled" : ""}` }, svg);
-    el("title", {}, g).textContent = pooled
-      ? `host ${host.host} — free pool, ${host.pooled} following the beacon`
-      : `host ${host.host} — serving ${host.shards.map(labelOf).join(", ")}`;
+    const g = el("g", {
+      class: `host${pooled ? " pooled" : ""}`,
+      "data-tip": pooled
+        ? `host ${host.host}\nfree pool — ${host.pooled} following the beacon`
+        : `host ${host.host}\nserving ${host.shards.map(labelOf).join(", ")}`,
+    }, svg);
     el("circle", { cx: spot.x, cy: spot.y, r: 11 }, g);
     el("text", { x: spot.x, y: spot.y }, g).textContent = host.host;
   }
 
   if (!dots) return;
+  // Hit targets are far bigger than the marks they stand for, and exist only
+  // while the timeline is stopped — there is nothing to aim at otherwise.
+  const hits = state.playing ? null : el("g", {}, svg);
   for (const flight of state.flights) {
     const from = at(flight.from);
     const to = at(flight.to);
     if (!from || !to || flight.deliveredAt <= flight.sentAt) continue;
-    const t = (state.simNow - flight.sentAt) / (flight.deliveredAt - flight.sentAt);
+    const span = flight.deliveredAt - flight.sentAt;
+    const t = (state.simNow - flight.sentAt) / span;
     if (t < 0 || t > 1) continue;
-    el("circle", {
-      class: `dot ${flight.cls}`,
-      cx: from.x + (to.x - from.x) * t,
-      cy: from.y + (to.y - from.y) * t,
-      r: 2.8,
-    }, svg);
+    const cx = from.x + (to.x - from.x) * t;
+    const cy = from.y + (to.y - from.y) * t;
+    el("circle", { class: `dot ${flight.cls}`, cx, cy, r: 2.8 }, svg);
+    if (hits) {
+      el("circle", {
+        class: "hit", cx, cy, r: 9,
+        "data-tip":
+          `${flight.messageType}\n${flight.cls.replace(/_/g, " ")}\n` +
+          `host ${flight.from} → host ${flight.to}\n` +
+          `${span}ms in flight, ${Math.round(t * 100)}% of the way`,
+      }, hits);
+    }
   }
+}
+
+// One tooltip for the panel, driven by whatever `data-tip` the pointer is
+// over — hosts and messages both, rather than a mechanism each.
+function bindNetworkTip() {
+  const svg = $("net");
+  const tip = $("nettip");
+  const panel = svg.closest(".panel");
+  svg.addEventListener("pointermove", (ev) => {
+    const target = ev.target.closest("[data-tip]");
+    if (!target) { tip.hidden = true; return; }
+    const box = panel.getBoundingClientRect();
+    tip.textContent = target.dataset.tip;
+    tip.style.left = `${ev.clientX - box.left}px`;
+    tip.style.top = `${ev.clientY - box.top - 10}px`;
+    tip.hidden = false;
+  });
+  svg.addEventListener("pointerleave", () => { tip.hidden = true; });
 }
 
 // Per-class totals over the window, exact — they cover every delivery, not
@@ -653,9 +684,15 @@ function renderMeter() {
     `Deliveries over the last ${TRAFFIC_WINDOW_MS / 1000}s of simulated time, ` +
     `urgent class first. Latency is configured, not geographic &mdash; ` +
     `positions carry no distance.${thinned}`;
-  $("netclock").textContent = state.speed > DOT_SPEED_LIMIT
-    ? `${state.speed}× — edge weight, too fast for single messages`
-    : `t = ${fmtWt(state.simNow)} on the harness clock`;
+  if (!state.playing) {
+    $("netclock").textContent = state.speed > DOT_SPEED_LIMIT
+      ? "paused — messages resolve below 8×"
+      : "paused — hover a message in flight";
+  } else if (state.speed > DOT_SPEED_LIMIT) {
+    $("netclock").textContent = `${state.speed}× — edge weight, too fast for single messages`;
+  } else {
+    $("netclock").textContent = `t = ${fmtWt(state.simNow)} on the harness clock`;
+  }
 }
 
 // Row elements are built once per transaction and updated in place. Rebuilding
@@ -844,6 +881,7 @@ async function main() {
   $("meta").textContent = `seed ${SEED} · ${SHARD_SIZE} validators per shard`;
   note(0, "genesis — one shard, committee seated", "hl");
   buildSpeeds();
+  bindNetworkTip();
 
   // ?warmup=<seconds> runs the session forward before the first paint, for
   // deep-linking past the wait to a state worth looking at — the split lands
@@ -870,6 +908,11 @@ $("play").addEventListener("click", () => {
   // Drop the gap the pause opened up rather than replaying it on resume.
   state.lastClock = null;
   $("play").innerHTML = state.playing ? "&#10074;&#10074; PAUSE" : "&#9654; PLAY";
+  // The loop renders only while playing, so a pause has to draw its own
+  // frame — that frame is the one carrying the hit targets.
+  if (!state.playing) $("nettip").hidden = true;
+  renderNetwork();
+  renderMeter();
 });
 // Grouped so the slow gears read as a deliberate range rather than a mistake:
 // nobody thinks to look below real time until the control says it is there.
