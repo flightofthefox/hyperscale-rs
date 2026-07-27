@@ -23,6 +23,18 @@ const WINDOW_MS = Number(new URLSearchParams(location.search).get("window")) * 1
 // a tab left open overnight take the browser down with it.
 const MAX_SIM_MS = 20 * 60_000;
 
+// Playback above which a delivery no longer resolves as a moving dot: one
+// frame then spans more simulated time than a message spends in flight, so
+// every dot would be born already landed. Past it the network view switches
+// to edge weight, which says the same thing at a rate a frame can carry.
+const DOT_SPEED_LIMIT = 4;
+// How much simulated time the traffic meter totals over. Long enough to read
+// as a rate rather than a flicker, short enough that a spike is still a spike.
+const TRAFFIC_WINDOW_MS = 2_000;
+// Message classes, urgent first — the order the protocol prioritises them in,
+// which is the order the meter stacks and the legend lists.
+const CLASSES = ["consensus", "block_completion", "cross_shard_progress", "recovery", "bulk"];
+
 // Colour by trie path so a shard keeps its identity across a split; the two
 // children of a shard never collide because their paths differ in the last bit.
 const PALETTE = ["#3E8DCB", "#CC6390", "#8A66DB", "#2EA871", "#C77B4C"];
@@ -73,6 +85,17 @@ const state = {
   // being drawn.
   arcs: [],             // { wt, from, fromHeight, to, toHeight, txs }
   waves: [],            // { wt, shard, height, wave, participants, txs }
+  // The harness clock, advanced by exactly what is handed to `step`. The
+  // network view runs on this: a message in flight exists on the clock the
+  // session is stepping, where `wt` is what consensus has since attested and
+  // necessarily trails it. The two are never compared.
+  simNow: 0,
+  hosts: [],            // { host, shards, pooled } — every host, in host order
+  flights: [],          // { from, to, sentAt, deliveredAt, class } in flight
+  edges: new Map(),     // "a-b" -> deliveries seen, decayed — degrade-mode weight
+  traffic: [],          // { at, byClass: Map, sampled, dropped } per step
+  layout: new Map(),    // host -> { x, y, tx, ty } — positions ease to targets
+  dirtyLayout: true,
   txs: new Map(),       // label -> { status, height, submittedWt }
   // Which blocks carry each transaction, as `path height` keys. Built
   // from the certificates that name it, so it covers every shard that ran
@@ -166,6 +189,31 @@ function apply(event) {
       );
       break;
     }
+    case "messageDelivered": {
+      // Kept only while it is still in the air. A delivery reported after it
+      // already landed — which is every delivery once a frame outruns the
+      // flight time — is counted by the meter and drawn by nothing.
+      if (k.deliveredAt > state.simNow) {
+        state.flights.push({
+          from: k.from, to: k.to, sentAt: k.sentAt, deliveredAt: k.deliveredAt, cls: k.class,
+        });
+      }
+      const key = k.from < k.to ? `${k.from}-${k.to}` : `${k.to}-${k.from}`;
+      state.edges.set(key, (state.edges.get(key) ?? 0) + 1);
+      break;
+    }
+    case "trafficSampled":
+      state.traffic.push({
+        at: state.simNow,
+        byClass: new Map(k.byClass.map(([cls, deliveries]) => [cls, deliveries])),
+        sampled: k.sampled,
+        dropped: k.dropped,
+      });
+      break;
+    case "hostsChanged":
+      state.hosts = k.hosts;
+      state.dirtyLayout = true;
+      break;
     case "beaconBlockCommitted":
       state.beacon.push({ wt: event.wt, epoch: k.epoch });
       if (state.beacon.length > 200) state.beacon.shift();
@@ -173,6 +221,9 @@ function apply(event) {
       break;
     case "topologyChanged":
       state.shards = k.shards.map((s) => s);
+      // The clusters are the live committees, so a new partition is a new
+      // arrangement of the network view as well as of the trie.
+      state.dirtyLayout = true;
       state.splits.push({ wt: event.wt, appeared: k.appeared, retired: k.retired });
       for (const path of k.retired) laneFor(path).retiredAt = event.wt;
       note(
@@ -214,6 +265,20 @@ const dimmedBlock = (path, height) =>
 // Arcs and convergence points live as long as the blocks they attach to,
 // which the lanes already bound by the visible window.
 function prune() {
+  // Traffic prunes on the harness clock, not attested time: it is what the
+  // transport did, and it is measured on the clock the transport runs on.
+  state.flights = state.flights.filter((f) => f.deliveredAt > state.simNow);
+  const trafficFloor = state.simNow - TRAFFIC_WINDOW_MS;
+  if (state.traffic.length && state.traffic[0].at < trafficFloor) {
+    state.traffic = state.traffic.filter((t) => t.at >= trafficFloor);
+  }
+  // Edge weight decays rather than accumulating, so a busy edge that goes
+  // quiet fades instead of staying lit for the rest of the session.
+  for (const [key, weight] of state.edges) {
+    if (weight < 0.5) state.edges.delete(key);
+    else state.edges.set(key, weight * 0.94);
+  }
+
   const floor = state.wt - WINDOW_MS * 2;
   if (state.arcs.length > 512) state.arcs = state.arcs.filter((a) => a.wt >= floor);
   if (state.waves.length > 256) state.waves = state.waves.filter((w) => w.wt >= floor);
@@ -278,7 +343,7 @@ function renderTrie() {
 let laneWidth = 0;
 let laneViewBox = "";
 const measureLanes = () => { laneWidth = $("lanes").clientWidth || 900; };
-window.addEventListener("resize", () => { laneWidth = 0; });
+window.addEventListener("resize", () => { laneWidth = 0; netWidth = 0; });
 
 function renderLanes() {
   const svg = $("lanes");
@@ -410,6 +475,185 @@ function renderLanes() {
   }
 }
 
+// ── the network view ─────────────────────────────────────────────────────
+// Hosts grouped by the committee they serve, with the free pool as a group of
+// its own. Positions are abstract: this simulation has no geography, and
+// latency is a configured value with jitter rather than a function of
+// distance, so a map would assert a story the run does not have.
+
+// Which group a host belongs to: the live shard it serves, or the pool. A
+// grown host keeps its retired parent alongside its live child, so the
+// membership is the intersection with the live partition rather than
+// whatever the host still carries.
+function groupOf(host) {
+  const live = host.shards.filter((s) => state.shards.includes(s));
+  return live.length ? live[0] : null;
+}
+
+const NET_ROW = 108;
+const NET_PAD = 30;
+
+// Recompute where each host belongs. Targets only — the drawn positions ease
+// toward them, so a split slides its new committees into place instead of
+// teleporting every node the instant the partition changes.
+function retarget(width) {
+  // Every live shard gets a group whether or not it is staffed yet; the pool
+  // gets one only while somebody is sitting in it.
+  const present = [...state.shards];
+  if (state.hosts.some((h) => groupOf(h) === null)) present.push(null);
+  const span = (width - NET_PAD * 2) / Math.max(present.length, 1);
+  const radius = Math.max(14, Math.min(34, span / 2 - 22));
+  const mid = NET_ROW / 2;
+
+  return present.map((group, column) => {
+    const cx = NET_PAD + span * (column + 0.5);
+    const members = state.hosts.filter((h) => groupOf(h) === group);
+    members.forEach((host, i) => {
+      // Spread around the group's circle by index, so a host keeps its place
+      // within a committee for as long as it stays in one.
+      const angle = (i / Math.max(members.length, 1)) * Math.PI * 2 - Math.PI / 2;
+      const spot = state.layout.get(host.host) ?? { x: cx, y: mid };
+      spot.tx = cx + Math.cos(angle) * radius;
+      spot.ty = mid + Math.sin(angle) * radius;
+      state.layout.set(host.host, spot);
+    });
+    return { group, cx, r: radius + 16 };
+  });
+}
+
+let netWidth = 0;
+let netGroups = [];
+let netViewBox = "";
+
+function renderNetwork() {
+  const svg = $("net");
+  if (!netWidth) {
+    netWidth = svg.clientWidth || 900;
+    state.dirtyLayout = true;
+  }
+  if (state.dirtyLayout) { netGroups = retarget(netWidth); state.dirtyLayout = false; }
+  const viewBox = `0 0 ${netWidth} ${NET_ROW}`;
+  if (viewBox !== netViewBox) {
+    netViewBox = viewBox;
+    svg.setAttribute("height", NET_ROW);
+    svg.setAttribute("viewBox", viewBox);
+  }
+  svg.replaceChildren();
+  if (!state.hosts.length) return;
+
+  // Ease toward the targets. Membership animates; the layout is never
+  // recomputed out from under a node mid-move.
+  for (const spot of state.layout.values()) {
+    spot.x += (spot.tx - spot.x) * 0.12;
+    spot.y += (spot.ty - spot.y) * 0.12;
+  }
+
+  for (const { group, cx, r } of netGroups) {
+    el("ellipse", { class: "cluster", cx, cy: NET_ROW / 2, rx: r, ry: r * 0.86 }, svg);
+    el("text", {
+      class: "cluster-label", x: cx, y: 12,
+      fill: group === null ? "var(--muted)" : colorOf(group),
+    }, svg).textContent = group === null ? "FREE POOL" : labelOf(group);
+  }
+
+  const at = (host) => state.layout.get(host);
+  const dots = state.speed <= DOT_SPEED_LIMIT;
+  if (!dots) {
+    // Past the dot limit, weight each edge by what the sample saw cross it.
+    const heaviest = Math.max(...state.edges.values(), 1);
+    for (const [key, weight] of state.edges) {
+      const [a, b] = key.split("-").map(Number);
+      const from = at(a);
+      const to = at(b);
+      if (!from || !to) continue;
+      el("line", {
+        class: "wire hot", x1: from.x, y1: from.y, x2: to.x, y2: to.y,
+        "stroke-width": 0.4 + (weight / heaviest) * 2.4,
+        opacity: 0.15 + (weight / heaviest) * 0.5,
+      }, svg);
+    }
+  }
+
+  for (const host of state.hosts) {
+    const spot = at(host.host);
+    if (!spot) continue;
+    const pooled = groupOf(host) === null;
+    const g = el("g", { class: `host${pooled ? " pooled" : ""}` }, svg);
+    el("title", {}, g).textContent = pooled
+      ? `host ${host.host} — free pool, ${host.pooled} following the beacon`
+      : `host ${host.host} — serving ${host.shards.map(labelOf).join(", ")}`;
+    el("circle", { cx: spot.x, cy: spot.y, r: 11 }, g);
+    el("text", { x: spot.x, y: spot.y }, g).textContent = host.host;
+  }
+
+  if (!dots) return;
+  for (const flight of state.flights) {
+    const from = at(flight.from);
+    const to = at(flight.to);
+    if (!from || !to || flight.deliveredAt <= flight.sentAt) continue;
+    const t = (state.simNow - flight.sentAt) / (flight.deliveredAt - flight.sentAt);
+    if (t < 0 || t > 1) continue;
+    el("circle", {
+      class: `dot ${flight.cls}`,
+      cx: from.x + (to.x - from.x) * t,
+      cy: from.y + (to.y - from.y) * t,
+      r: 2.8,
+    }, svg);
+  }
+}
+
+// Per-class totals over the window, exact — they cover every delivery, not
+// just the ones the sample kept.
+function renderMeter() {
+  const totals = new Map(CLASSES.map((cls) => [cls, 0]));
+  let sampled = 0;
+  let dropped = 0;
+  for (const step of state.traffic) {
+    for (const [cls, deliveries] of step.byClass) {
+      totals.set(cls, (totals.get(cls) ?? 0) + deliveries);
+    }
+    sampled += step.sampled;
+    dropped += step.dropped;
+  }
+  const carried = [...totals.values()].reduce((a, b) => a + b, 0);
+
+  const bar = document.createElement("div");
+  bar.className = "meterbar";
+  const key = document.createElement("div");
+  key.className = "meterkey";
+  if (!carried) {
+    const quiet = document.createElement("span");
+    quiet.className = "k none";
+    quiet.textContent = "no traffic in the last 2s of simulated time";
+    key.appendChild(quiet);
+  }
+  for (const cls of CLASSES) {
+    const count = totals.get(cls) ?? 0;
+    if (!count) continue;
+    const seg = document.createElement("i");
+    seg.className = `m ${cls}`;
+    seg.style.width = `${(count / carried) * 100}%`;
+    seg.title = `${cls.replace(/_/g, " ")} — ${count} deliveries`;
+    bar.appendChild(seg);
+    const k = document.createElement("span");
+    k.className = "k";
+    k.innerHTML =
+      `<span class="sw m ${cls}"></span>${cls.replace(/_/g, " ")} <b>${count}</b>`;
+    key.appendChild(k);
+  }
+  $("meter").replaceChildren(bar, key);
+
+  const thinned = dropped > 0
+    ? ` <span class="thinned">drawing ${sampled} of ${sampled + dropped}</span> —` +
+      ` the totals above cover all of them.`
+    : "";
+  $("netcap").innerHTML =
+    `Latency is configured, not geographic &mdash; positions carry no distance.${thinned}`;
+  $("netclock").textContent = state.speed > DOT_SPEED_LIMIT
+    ? `${state.speed}× — edge weight, too fast for single messages`
+    : `t = ${fmtWt(state.simNow)} on the harness clock`;
+}
+
 // Row elements are built once per transaction and updated in place. Rebuilding
 // them would replace the node under the pointer between mousedown and mouseup,
 // and a click only fires when both land on the same element — at this panel's
@@ -515,12 +759,16 @@ let lastPanels = 0;
 function render(clock = 0) {
   if (dirtyTopology) { renderTrie(); renderLegend(); dirtyTopology = false; }
   renderLanes();
+  // The node graph animates messages in flight, so it repaints with the
+  // timeline rather than with the text panels.
+  renderNetwork();
   // Text panels change far slower than the timeline pans, and rebuilding them
   // costs layout on every row. 8Hz is past the point anyone reads a difference.
   if (clock - lastPanels > 125) {
     lastPanels = clock;
     renderTxs();
     renderLog();
+    renderMeter();
     renderChrome();
   }
 }
@@ -541,7 +789,14 @@ function frame(clock) {
 
     let events = [];
     try {
-      if (simMs > 0) events = state.session.step(Math.round(simMs));
+      if (simMs > 0) {
+        // Advance the local copy of the harness clock by exactly what the
+        // session is given, so a delivery's two instants land on the same
+        // timeline the network view interpolates along.
+        const stepped = Math.round(simMs);
+        state.simNow += stepped;
+        events = state.session.step(stepped);
+      }
     } catch (err) {
       state.playing = false;
       const msg = last_panic() || String(err);
@@ -575,6 +830,7 @@ async function main() {
   const t0 = performance.now();
   state.session = new DemoSession(SEED, SHARD_SIZE, MAX_SHARDS);
   state.shards = state.session.shards();
+  state.hosts = state.session.hosts();
   for (const p of state.shards) laneFor(p);
   const boot = Math.round(performance.now() - t0);
   $("badge").textContent = `LIVE — booted in ${boot}ms`;
@@ -592,6 +848,7 @@ async function main() {
     $("badge").textContent = `skipping to ${warmup}s…`;
     $("badge").className = "badge boot";
     for (let t = 0; t < warmup * 1000; t += 4000) {
+      state.simNow += 4000;
       for (const e of state.session.step(4000)) apply(e);
     }
     dirtyTopology = true;

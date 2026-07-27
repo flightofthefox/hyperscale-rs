@@ -5,6 +5,16 @@
   --ok: #46B86B; --bad: #D95757; --warn: #D99C3A; --run: #3E8DCB;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  /* Message classes are an ordered priority spectrum, not a set of names, so
+     they take one hue in monotone steps and the order is visible in the
+     colour. The urgent end is the prominent one, which means the light end on
+     a dark surface and the dark end on a light one — the two ramps are chosen
+     against their own surface rather than flipped. */
+  --cls-consensus: #9ec5f4;
+  --cls-block-completion: #6da7ec;
+  --cls-cross-shard-progress: #3987e5;
+  --cls-recovery: #256abf;
+  --cls-bulk: #184f95;
 }
 @media (prefers-color-scheme: light) {
   :root {
@@ -12,6 +22,11 @@
     --line: #D8E0EA; --line2: #C4CFDC;
     --ink: #17202B; --ink2: #4E6076; --muted: #7E8FA3;
     --ok: #1E7E3E; --bad: #B3382E; --warn: #9A6D10; --run: #2374B5;
+    --cls-consensus: #104281;
+    --cls-block-completion: #1c5cab;
+    --cls-cross-shard-progress: #2a78d6;
+    --cls-recovery: #5598e7;
+    --cls-bulk: #86b6ef;
   }
 }
 * { box-sizing: border-box; }
@@ -138,6 +153,55 @@ h1 em { font-style: normal; color: var(--ink2); }
 .arckey svg { overflow: visible; }
 .arckey .arc, .arckey .converge { stroke: var(--ink2); opacity: 1; }
 .sw { width: 10px; height: 10px; border-radius: 2.5px; display: inline-block; }
+
+/* ── the network view ──────────────────────────────────────────────────
+   A panel of its own, on its own coordinates. The timeline says what
+   consensus attested; this says what the transport carried, and the two
+   never share an axis so a delivery is never mistaken for a settlement. */
+.network { margin-bottom: 14px; }
+#net { display: block; width: 100%; }
+.cluster { fill: none; stroke: var(--line2); stroke-width: 1.2; stroke-dasharray: 3 4; }
+.cluster-label {
+  font-family: var(--mono); font-size: 9.5px; font-weight: 700;
+  letter-spacing: .1em; text-anchor: middle;
+}
+.host circle { fill: var(--panel2); stroke: var(--line2); stroke-width: 1.4; }
+.host.pooled circle { stroke-dasharray: 2 2.5; }
+.host text {
+  font-family: var(--mono); font-size: 8.5px; fill: var(--ink2);
+  text-anchor: middle; dominant-baseline: middle;
+}
+.wire { stroke: var(--line); stroke-width: 1; fill: none; }
+/* Degrade mode: an edge's weight is how much the sample saw cross it. */
+.wire.hot { stroke: var(--ink2); }
+.dot { stroke: none; }
+.dot.consensus { fill: var(--cls-consensus); }
+.dot.block_completion { fill: var(--cls-block-completion); }
+.dot.cross_shard_progress { fill: var(--cls-cross-shard-progress); }
+.dot.recovery { fill: var(--cls-recovery); }
+.dot.bulk { fill: var(--cls-bulk); }
+
+.meter { padding: 4px 14px 0; }
+.meterbar {
+  display: flex; gap: 2px; height: 8px; margin-bottom: 8px;
+  background: var(--panel2); border-radius: 4px; overflow: hidden;
+}
+.meterbar i { display: block; min-width: 0; }
+.meterbar i:first-child { border-radius: 4px 0 0 4px; }
+.meterbar i:last-child { border-radius: 0 4px 4px 0; }
+.meterkey {
+  display: flex; flex-wrap: wrap; gap: 4px 16px;
+  font-family: var(--mono); font-size: 10px; color: var(--ink2);
+}
+.meterkey .k { display: inline-flex; align-items: center; gap: 6px; }
+.meterkey b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.meterkey .none { color: var(--muted); }
+.m.consensus { background: var(--cls-consensus); }
+.m.block_completion { background: var(--cls-block-completion); }
+.m.cross_shard_progress { background: var(--cls-cross-shard-progress); }
+.m.recovery { background: var(--cls-recovery); }
+.m.bulk { background: var(--cls-bulk); }
+.cap .thinned { color: var(--warn); }
 
 .txs { padding: 10px 14px 14px; display: flex; flex-direction: column; gap: 7px;
   max-height: 210px; overflow-y: auto; }
