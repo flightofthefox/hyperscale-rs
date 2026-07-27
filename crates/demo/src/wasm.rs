@@ -81,6 +81,17 @@ impl DemoSession {
         crate::event::TxLabel::from(self.inner.submit_transfer()).0
     }
 
+    /// What each host serves, in host order — the roster the network view
+    /// opens on. Every later move arrives as a `hostsChanged` event.
+    ///
+    /// # Errors
+    ///
+    /// Returns the serialization error if the roster cannot be represented
+    /// as a JavaScript value.
+    pub fn hosts(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&self.inner.hosts()).map_err(Into::into)
+    }
+
     /// The shards currently served by at least one host, in trie order.
     ///
     /// # Errors

@@ -4,10 +4,20 @@
 //! JavaScript values and never hashed, signed, or gossiped, so the ordered
 //! collection discipline the wire types carry does not apply here.
 
+use std::time::Duration;
+
+use hyperscale_simulation::{DeliveryDrain, DeliveryRecord};
 use hyperscale_types::{
-    BlockHeight, ExecutionOutcome, FinalizedWave, Round, ShardId, TxHash, TxOutcome, WaveId,
+    BlockHeight, ExecutionOutcome, FinalizedWave, MessageClass, Round, ShardId, TxHash, TxOutcome,
+    WaveId,
 };
 use serde::Serialize;
+
+/// Milliseconds on the harness clock, the unit every instant in the stream
+/// is reported in.
+fn as_millis(at: Duration) -> u64 {
+    u64::try_from(at.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// One observation, stamped with the BFT-attested time it happened at.
 ///
@@ -15,6 +25,13 @@ use serde::Serialize;
 /// committing child's parent QC (INV-SHARD-6), never a served QC's stamp —
 /// so it is monotone along a chain and identical on every replica. It is the
 /// timeline's x-axis.
+///
+/// An observation with no attested time of its own — a transaction's status,
+/// a partition change, anything the transport did — is stamped at the
+/// attested frontier it was observed from, so one sort orders the whole
+/// stream. [`TraceKind::MessageDelivered`] additionally carries the two
+/// instants the delivery spanned; those are the harness clock the session
+/// steps, not attested time, and the two never mix in one field.
 #[derive(Debug, Clone, Serialize)]
 #[allow(missing_docs)] // `wt` is described above; `kind` is the payload
 pub struct TraceEvent {
@@ -30,7 +47,7 @@ pub struct TraceEvent {
 /// parent exactly when it is a prefix of it, which is the same relation the
 /// keyspace partition uses. `ShardId`'s own `Display` is a debug rendering
 /// and carries no such structure.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShardPath(pub String);
 
 impl From<ShardId> for ShardPath {
@@ -150,6 +167,55 @@ pub enum TraceKind {
         height: u64,
         handoff_from: Option<u64>,
     },
+    /// One message the transport carried between two hosts.
+    ///
+    /// This is what the network *attempted*, not what consensus attested: a
+    /// delivery is a message that arrived, and nothing more. The arcs on the
+    /// timeline stand for verified artifacts and these do not, which is why
+    /// they are drawn in a panel of their own rather than between the lanes.
+    ///
+    /// `sentAt` and `deliveredAt` are milliseconds on the harness clock the
+    /// session steps — their difference is the latency the transport drew.
+    /// Attested time necessarily trails that clock, so they are never
+    /// comparable with the `wt` this event is stamped at.
+    #[serde(rename_all = "camelCase")]
+    MessageDelivered {
+        from: u32,
+        to: u32,
+        /// Priority class of the sending type: `consensus`,
+        /// `block_completion`, `cross_shard_progress`, `recovery`, or `bulk`.
+        /// Only the last two are sheddable under backpressure.
+        class: &'static str,
+        message_type: &'static str,
+        sent_at: u64,
+        delivered_at: u64,
+        /// Shard the delivery was scoped to; absent for global traffic and
+        /// for request round trips, whose shard is the committee's rather
+        /// than the message's.
+        shard: Option<ShardPath>,
+    },
+    /// What the transport carried over one step, in full.
+    ///
+    /// `byClass` is exact and covers every delivery, including those the
+    /// sample dropped: a viewer animating a thinned sample still reports
+    /// true volume, and `dropped` is how much it is not showing.
+    #[serde(rename_all = "camelCase")]
+    TrafficSampled {
+        /// `(class, deliveries, bytes)` for each class that carried
+        /// anything this step.
+        by_class: Vec<(&'static str, u64, u64)>,
+        /// Deliveries reported individually as [`Self::MessageDelivered`].
+        sampled: u32,
+        /// Deliveries the sample budget left out.
+        dropped: u64,
+    },
+    /// The hosts and what each one serves.
+    ///
+    /// Emitted whenever the roster moves, which is what makes a split legible
+    /// as staffing: hosts leave the free pool and appear in a child's
+    /// committee, and a reshape stops being a line on a timeline.
+    #[serde(rename_all = "camelCase")]
+    HostsChanged { hosts: Vec<HostRole> },
     #[serde(rename_all = "camelCase")]
     TxSubmitted { tx: TxLabel },
     #[serde(rename_all = "camelCase")]
@@ -162,6 +228,28 @@ pub enum TraceKind {
         /// Set once the transaction is ordered: the height that committed it.
         height: Option<u64>,
     },
+}
+
+/// What one host is doing: the shards it serves and how many shard-less
+/// vnodes it keeps following the beacon.
+///
+/// A host with no shards and a non-zero `pooled` is free pool — stock a
+/// reshape draws on to staff a new committee. Hosts are identified by index
+/// alone: the demo runs one vnode per host, so the host *is* the validator
+/// and a second identifier would name the same thing twice.
+///
+/// `shards` is what the host carries, which outlives the live partition: a
+/// split parent's store is retained past its terminal block (INV-BEACON-8),
+/// so a grown host lists the retired parent alongside its live child. The
+/// viewer already knows the live leaves from
+/// [`TraceKind::TopologyChanged`] and intersects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(missing_docs)] // three flat readouts; their names are the documentation
+pub struct HostRole {
+    pub host: u32,
+    pub shards: Vec<ShardPath>,
+    pub pooled: u32,
 }
 
 /// A transaction hash, shortened to the prefix a reader can match by eye.
@@ -351,6 +439,44 @@ impl TraceEvent {
                 height: height.inner(),
                 handoff_from: handoff_from.map(BlockHeight::inner),
             },
+        }
+    }
+
+    pub(crate) fn message_delivered(wt: u64, record: &DeliveryRecord) -> Self {
+        Self {
+            wt,
+            kind: TraceKind::MessageDelivered {
+                from: record.from,
+                to: record.to,
+                class: record.class.as_str(),
+                message_type: record.message_type,
+                sent_at: as_millis(record.sent_at),
+                delivered_at: as_millis(record.delivered_at),
+                shard: record.shard.map(ShardPath::from),
+            },
+        }
+    }
+
+    pub(crate) fn traffic_sampled(wt: u64, sampled: u32, drain: &DeliveryDrain) -> Self {
+        Self {
+            wt,
+            kind: TraceKind::TrafficSampled {
+                by_class: MessageClass::ALL
+                    .iter()
+                    .map(|class| (*class, drain.by_class[*class as usize]))
+                    .filter(|(_, tally)| tally.deliveries > 0)
+                    .map(|(class, tally)| (class.as_str(), tally.deliveries, tally.bytes))
+                    .collect(),
+                sampled,
+                dropped: drain.dropped,
+            },
+        }
+    }
+
+    pub(crate) const fn hosts_changed(wt: u64, hosts: Vec<HostRole>) -> Self {
+        Self {
+            wt,
+            kind: TraceKind::HostsChanged { hosts },
         }
     }
 

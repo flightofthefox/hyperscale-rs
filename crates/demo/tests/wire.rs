@@ -13,7 +13,7 @@ use serde_json::{Value, to_value};
 
 /// Every event kind, and the exact keys its payload carries.
 fn expected() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
-    let kinds: [(&str, &[&str]); 9] = [
+    let kinds: [(&str, &[&str]); 12] = [
         (
             "blockCommitted",
             &[
@@ -40,6 +40,20 @@ fn expected() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
             &["shard", "height", "openedAt", "wave", "participants", "txs"],
         ),
         ("shardTerminal", &["shard", "height", "handoffFrom"]),
+        (
+            "messageDelivered",
+            &[
+                "from",
+                "to",
+                "class",
+                "messageType",
+                "sentAt",
+                "deliveredAt",
+                "shard",
+            ],
+        ),
+        ("trafficSampled", &["byClass", "sampled", "dropped"]),
+        ("hostsChanged", &["hosts"]),
         ("txSubmitted", &["tx"]),
         ("txStatusChanged", &["tx", "status", "height"]),
     ];
@@ -147,6 +161,55 @@ fn an_arcs_payload_reads_as_the_page_expects() {
     assert!(
         kind["txs"][0].is_string(),
         "a transaction label is a string"
+    );
+}
+
+#[test]
+fn the_network_view_s_payloads_read_as_the_page_expects() {
+    // The panel indexes per-class totals as `[class, deliveries, bytes]` and
+    // reads each host's duties off named fields. Both are collections of
+    // tuples or structs that a derive could reshape without a type error.
+    let events = every_kind();
+
+    let traffic = events
+        .iter()
+        .find(|e| e["kind"]["type"] == "trafficSampled")
+        .expect("a running network carries traffic");
+    let by_class = &traffic["kind"]["byClass"][0];
+    assert!(
+        by_class[0].is_string(),
+        "a class is named by its metric label, saw {by_class:?}",
+    );
+    assert!(
+        by_class[1].is_u64() && by_class[2].is_u64(),
+        "a class carries a delivery count and a byte count, saw {by_class:?}",
+    );
+
+    let roster = events
+        .iter()
+        .find(|e| e["kind"]["type"] == "hostsChanged")
+        .expect("a split moves the roster");
+    let host = &roster["kind"]["hosts"][0];
+    assert!(host["host"].is_u64(), "a host is named by index");
+    assert!(host["shards"].is_array(), "a host lists what it serves");
+    assert!(
+        host["pooled"].is_u64(),
+        "a host counts its shard-less followers",
+    );
+
+    let delivered = events
+        .iter()
+        .find(|e| e["kind"]["type"] == "messageDelivered")
+        .expect("a running network delivers messages");
+    let kind = &delivered["kind"];
+    assert!(
+        kind["from"].is_u64() && kind["to"].is_u64(),
+        "a delivery names hosts by index, matching the roster",
+    );
+    assert!(
+        kind["shard"].is_string() || kind["shard"].is_null(),
+        "a delivery's shard is a bare path or absent, saw {:?}",
+        kind["shard"],
     );
 }
 

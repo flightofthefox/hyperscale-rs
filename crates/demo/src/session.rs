@@ -17,7 +17,7 @@ use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
 
-use crate::event::TraceEvent;
+use crate::event::{HostRole, ShardPath, TraceEvent};
 
 /// The signer for demo account `seed`, and the preallocated account it
 /// controls. Deterministic so a seeded session funds and spends the same
@@ -38,6 +38,14 @@ fn validity_around(now: Duration) -> TimestampRange {
         WeightedTimestamp::ZERO.plus(now + Duration::from_secs(150)),
     )
 }
+
+/// Deliveries reported individually per step.
+///
+/// More than a viewer can animate in one frame, and far fewer than a busy
+/// step carries — the point of a budget is that the two need not match. What
+/// the budget leaves out is still counted, so a thinned sample costs detail
+/// and never accuracy.
+const DELIVERY_SAMPLE: usize = 64;
 
 /// Genesis-funded accounts the load generator draws from. Small enough that
 /// every transfer pair is visually distinguishable, large enough that
@@ -163,6 +171,25 @@ fn settlement_events(
     }
 }
 
+/// What each host serves, in host order.
+///
+/// Read from what hosts actually carry rather than from the trie, because
+/// that is the question the roster answers: which committee a host is in, and
+/// whether it is sitting in the free pool waiting to staff one.
+fn roster(runner: &SimulationRunner) -> Vec<HostRole> {
+    (0..runner.num_hosts())
+        .map(|host| HostRole {
+            host,
+            shards: runner
+                .hosted_shards_of(host)
+                .into_iter()
+                .map(ShardPath::from)
+                .collect(),
+            pooled: u32::try_from(runner.pooled_len(host)).unwrap_or(u32::MAX),
+        })
+        .collect()
+}
+
 /// How the cluster a session opens is shaped.
 #[derive(Debug, Clone, Copy)]
 pub struct SessionConfig {
@@ -215,6 +242,8 @@ pub struct Session {
     /// Submitted transactions and the last status reported for each, so a
     /// step emits only transitions.
     tracked: BTreeMap<TxHash, Option<Reported>>,
+    /// The host roster as last reported, so a step emits only moves.
+    reported_hosts: Vec<HostRole>,
     /// Events raised between steps — submissions happen on the caller's
     /// clock, not the simulation's, so they wait here for the next drain.
     pending: Vec<TraceEvent>,
@@ -258,6 +287,7 @@ impl Session {
             ..SimConfig::default()
         };
         let mut runner = SimulationRunner::new(&sim_config, seed);
+        runner.enable_delivery_log(DELIVERY_SAMPLE);
         let balances: Vec<_> = (1..=ACCOUNTS)
             .map(|s| (account_from_seed(s), Decimal::from(100_000)))
             .collect();
@@ -269,6 +299,7 @@ impl Session {
             .find_map(|host| runner.host_topology(host))
             .map(|topology| topology.shard_trie().leaves().collect())
             .unwrap_or_default();
+        let opening_hosts = roster(&runner);
         Self {
             runner,
             now: Duration::ZERO,
@@ -278,9 +309,22 @@ impl Session {
             attested_wt: 0,
             reported_through: BTreeMap::new(),
             tracked: BTreeMap::new(),
+            // Seeded with the roster the session opens on, read back through
+            // `hosts()`, so the first change reported is a real move rather
+            // than the session announcing the cluster it booted.
+            reported_hosts: opening_hosts,
             pending: Vec::new(),
             nonce: 0,
         }
+    }
+
+    /// What each host serves right now, in host order.
+    ///
+    /// The roster a viewer opens on; every later move arrives as a
+    /// [`TraceKind::HostsChanged`](crate::event::TraceKind::HostsChanged).
+    #[must_use]
+    pub fn hosts(&self) -> Vec<HostRole> {
+        roster(&self.runner)
     }
 
     /// Build an XRD transfer between two funded accounts.
@@ -362,6 +406,8 @@ impl Session {
         events.extend(std::mem::take(&mut self.pending));
         events.extend(self.drain_beacon());
         events.extend(self.drain_topology());
+        events.extend(self.drain_hosts());
+        events.extend(self.drain_traffic());
         events.extend(self.drain_tx_status());
         // One batch, one timeline: the viewer renders in weighted-time order
         // regardless of which derivation produced an event.
@@ -432,6 +478,38 @@ impl Session {
             retired,
         ));
         self.reported_shards = current;
+        events
+    }
+
+    /// Report the host roster, if any host's duties moved this step.
+    fn drain_hosts(&mut self) -> Vec<TraceEvent> {
+        let current = roster(&self.runner);
+        if current == self.reported_hosts {
+            return Vec::new();
+        }
+        self.reported_hosts.clone_from(&current);
+        vec![TraceEvent::hosts_changed(self.attested_wt, current)]
+    }
+
+    /// Report what the transport carried this step: a bounded sample of
+    /// individual deliveries, and the exact totals behind them.
+    ///
+    /// Both are stamped at the attested frontier, because a delivery has no
+    /// attested time of its own — the instants it spanned ride the event's
+    /// payload on the harness clock instead.
+    fn drain_traffic(&mut self) -> Vec<TraceEvent> {
+        let wt = self.attested_wt;
+        let drain = self.runner.drain_deliveries();
+        if drain.records.is_empty() && drain.dropped == 0 {
+            return Vec::new();
+        }
+        let mut events: Vec<TraceEvent> = drain
+            .records
+            .iter()
+            .map(|record| TraceEvent::message_delivered(wt, record))
+            .collect();
+        let sampled = u32::try_from(drain.records.len()).unwrap_or(u32::MAX);
+        events.push(TraceEvent::traffic_sampled(wt, sampled, &drain));
         events
     }
 

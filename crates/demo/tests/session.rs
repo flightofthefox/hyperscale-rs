@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_demo::{Session, SessionConfig, ShardPath, TraceEvent, TraceKind};
+use hyperscale_demo::{HostRole, Session, SessionConfig, ShardPath, TraceEvent, TraceKind};
 use hyperscale_types::ShardId;
 
 fn config() -> SessionConfig {
@@ -595,6 +595,206 @@ fn a_terminal_status_never_turns_into_a_different_one() {
     assert!(
         flipped.is_empty(),
         "a settled transaction must keep its outcome; flipped: {flipped:?}",
+    );
+}
+
+#[test]
+fn traffic_totals_cover_every_delivery_the_sample_left_out() {
+    // The viewer animates a bounded sample and reports unbounded totals, so
+    // the two have to reconcile: whatever a step carried is either reported
+    // individually or counted as dropped. A totals figure that only covered
+    // the sample would make a busy network look quiet exactly when it is not.
+    // Stepped wide on purpose. The sample budget is sized for the fastest
+    // playback a viewer can ask for, so a step has to span a comparable
+    // stretch of simulated time before it overruns — and a budget that never
+    // overruns leaves the half of the reconciliation that matters untested.
+    let mut session = Session::new(config(), 42);
+    let mut steps = 0;
+    let mut busy = 0;
+
+    for _ in 0..40 {
+        let events = session.step(4_000);
+        let reported = u32::try_from(
+            events
+                .iter()
+                .filter(|e| matches!(e.kind, TraceKind::MessageDelivered { .. }))
+                .count(),
+        )
+        .expect("a step reports far fewer deliveries than u32 holds");
+        let mut summaries = events.iter().filter_map(|e| match &e.kind {
+            TraceKind::TrafficSampled {
+                by_class,
+                sampled,
+                dropped,
+            } => Some((by_class, *sampled, *dropped)),
+            _ => None,
+        });
+        let Some((by_class, sampled, dropped)) = summaries.next() else {
+            assert_eq!(
+                reported, 0,
+                "deliveries reported without a summary to account for them",
+            );
+            continue;
+        };
+        assert!(
+            summaries.next().is_none(),
+            "a step summarises its traffic once",
+        );
+        steps += 1;
+
+        assert_eq!(
+            reported, sampled,
+            "the summary counts the deliveries the step actually reported",
+        );
+        let counted: u64 = by_class.iter().map(|(_, deliveries, _)| deliveries).sum();
+        assert_eq!(
+            counted,
+            u64::from(sampled) + dropped,
+            "every delivery is either sampled or counted as dropped",
+        );
+        assert!(
+            by_class
+                .iter()
+                .all(|(_, deliveries, bytes)| *deliveries > 0 && *bytes > 0),
+            "a class appears only when it carried something, saw {by_class:?}",
+        );
+        if dropped > 0 {
+            busy += 1;
+        }
+    }
+
+    assert!(steps > 0, "a running network carries traffic");
+    assert!(
+        busy > 0,
+        "some step must exceed the sample budget, or the reconciliation is untested",
+    );
+}
+
+#[test]
+fn a_delivery_names_two_hosts_and_the_span_it_flew() {
+    let mut session = Session::new(config(), 42);
+    let hosts = u32::try_from(session.hosts().len()).expect("a demo cluster is small");
+    let mut events = Vec::new();
+    for _ in 0..20 {
+        events.extend(session.step(500));
+    }
+
+    let deliveries: Vec<(u32, u32, &str, u64, u64)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            TraceKind::MessageDelivered {
+                from,
+                to,
+                class,
+                sent_at,
+                delivered_at,
+                ..
+            } => Some((*from, *to, *class, *sent_at, *delivered_at)),
+            _ => None,
+        })
+        .collect();
+    assert!(!deliveries.is_empty(), "the network delivered nothing");
+
+    for (from, to, class, sent_at, delivered_at) in &deliveries {
+        assert!(
+            *from < hosts && *to < hosts,
+            "a delivery names hosts in the roster, saw {from} -> {to} of {hosts}",
+        );
+        assert_ne!(from, to, "a host does not deliver to itself");
+        assert!(
+            delivered_at > sent_at,
+            "a delivery lands after it was sent, saw {sent_at} -> {delivered_at}",
+        );
+        assert!(
+            matches!(
+                *class,
+                "consensus" | "block_completion" | "cross_shard_progress" | "recovery" | "bulk"
+            ),
+            "a delivery carries a named class, saw {class:?}",
+        );
+    }
+
+    // Consensus is what a running committee spends its traffic on, and it is
+    // not the class a type gets by declaring nothing — so seeing it proves
+    // the class survived the trip from the send site rather than defaulting.
+    assert!(
+        deliveries
+            .iter()
+            .any(|(_, _, class, ..)| *class == "consensus"),
+        "a committee committing blocks exchanges consensus traffic",
+    );
+}
+
+#[test]
+fn a_split_moves_hosts_out_of_the_pool_and_into_the_children() {
+    // The roster is what makes a reshape legible as staffing rather than as
+    // a line on a timeline: the children's committees are drawn from hosts
+    // that were sitting in the free pool, and this is where that shows.
+    let mut session = Session::new(
+        SessionConfig {
+            max_shards: 2,
+            ..SessionConfig::default()
+        },
+        42,
+    );
+
+    let opening = session.hosts();
+    let pooled_at_open: Vec<u32> = opening
+        .iter()
+        .filter(|h| h.shards.is_empty() && h.pooled > 0)
+        .map(|h| h.host)
+        .collect();
+    assert!(
+        !pooled_at_open.is_empty(),
+        "a session that can split opens with a free pool, saw {opening:?}",
+    );
+
+    let mut events = Vec::new();
+    for _ in 0..600 {
+        events.extend(session.step(500));
+    }
+
+    let rosters: Vec<&Vec<HostRole>> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            TraceKind::HostsChanged { hosts } => Some(hosts),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !rosters.is_empty(),
+        "growing the topology must move the roster",
+    );
+
+    // Every reported roster covers the whole cluster, so a viewer that joins
+    // late still renders it without stitching deltas together.
+    let hosts = opening.len();
+    assert!(
+        rosters.iter().all(|r| r.len() == hosts),
+        "each roster names every host",
+    );
+
+    let seated = session
+        .hosts()
+        .iter()
+        .any(|h| pooled_at_open.contains(&h.host) && !h.shards.is_empty());
+    assert!(
+        seated,
+        "the split staffs its children from the pool; pool at open {pooled_at_open:?}, \
+         final roster {:?}",
+        session.hosts(),
+    );
+
+    // And the children are served by the end of it — the roster tracks the
+    // partition rather than lagging it.
+    let children: BTreeSet<String> = session
+        .hosts()
+        .iter()
+        .flat_map(|h| h.shards.iter().map(|s| s.0.clone()))
+        .collect();
+    assert!(
+        children.contains("0") && children.contains("1"),
+        "both children are served, saw {children:?}",
     );
 }
 
