@@ -61,7 +61,11 @@ const fmtWt = (ms) => {
 
 let dirtyTopology = true;
 const params = new URLSearchParams(location.search);
-const SPEEDS = [1, 2, 4, 8, 16, 32, 64];
+// Playback rates, slowest first. The gears below 1× are what make the network
+// panel readable: a message spends about 150ms in flight, which at real time
+// is nine frames and far too quick to follow, and slowing the playback is the
+// honest way to see it — the latency is what it is, only the watching changes.
+const SPEEDS = [0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64];
 
 const state = {
   session: null,
@@ -73,6 +77,11 @@ const state = {
   // block arrivals; panning on this makes it glide.
   viewWt: 0,
   speed: SPEEDS.includes(Number(params.get("speed"))) ? Number(params.get("speed")) : 1,
+  // Simulated milliseconds owed but not yet stepped. The session takes whole
+  // milliseconds, so a slow gear asking for 1.6ms a frame would round to 2 and
+  // quietly run a quarter faster than the label claims. Carrying the remainder
+  // keeps the playback rate exactly what the control says it is.
+  stepCarry: 0,
   wt: 0,
   shards: [],           // live trie leaves, in order
   beacon: [],           // { wt, epoch } — one per committed epoch
@@ -789,11 +798,13 @@ function frame(clock) {
 
     let events = [];
     try {
-      if (simMs > 0) {
+      state.stepCarry += simMs;
+      const stepped = Math.floor(state.stepCarry);
+      state.stepCarry -= stepped;
+      if (stepped > 0) {
         // Advance the local copy of the harness clock by exactly what the
         // session is given, so a delivery's two instants land on the same
         // timeline the network view interpolates along.
-        const stepped = Math.round(simMs);
         state.simNow += stepped;
         events = state.session.step(stepped);
       }
@@ -837,7 +848,7 @@ async function main() {
   $("badge").className = "badge";
   $("meta").textContent = `seed ${SEED} · ${SHARD_SIZE} validators per shard`;
   note(0, "genesis — one shard, committee seated", "hl");
-  $("speed").textContent = `${state.speed}×`;
+  buildSpeeds();
 
   // ?warmup=<seconds> runs the session forward before the first paint, for
   // deep-linking past the wait to a state worth looking at — the split lands
@@ -865,9 +876,32 @@ $("play").addEventListener("click", () => {
   state.lastClock = null;
   $("play").innerHTML = state.playing ? "&#10074;&#10074; PAUSE" : "&#9654; PLAY";
 });
-$("speed").addEventListener("click", () => {
-  state.speed = SPEEDS[(SPEEDS.indexOf(state.speed) + 1) % SPEEDS.length];
-  $("speed").textContent = `${state.speed}×`;
+// Grouped so the slow gears read as a deliberate range rather than a mistake:
+// nobody thinks to look below real time until the control says it is there.
+function buildSpeeds() {
+  const select = $("speed");
+  const groups = [
+    ["slower than real time", SPEEDS.filter((s) => s < 1)],
+    ["real time and faster", SPEEDS.filter((s) => s >= 1)],
+  ];
+  for (const [label, speeds] of groups) {
+    const group = document.createElement("optgroup");
+    group.label = label;
+    for (const speed of speeds) {
+      const option = document.createElement("option");
+      option.value = String(speed);
+      option.textContent = `${speed}×`;
+      group.appendChild(option);
+    }
+    select.appendChild(group);
+  }
+  select.value = String(state.speed);
+}
+
+$("speed").addEventListener("change", (ev) => {
+  state.speed = Number(ev.target.value);
+  // Whatever the old gear owed is not what the new one owes.
+  state.stepCarry = 0;
 });
 $("submit").addEventListener("click", () => {
   if (state.session) state.session.submit_transfer();

@@ -37,13 +37,25 @@ body {
 }
 .wrap { max-width: 1280px; margin: 0 auto; padding: 18px 20px 40px; }
 
-button {
+button, select {
   font-family: var(--mono); font-size: 13px; color: var(--ink);
   background: var(--panel); border: 1px solid var(--line2);
   border-radius: 6px; padding: 6px 12px; cursor: pointer;
 }
-button:hover { border-color: var(--ink2); }
-button:focus-visible { outline: 2px solid var(--run); outline-offset: 2px; }
+button:hover, select:hover { border-color: var(--ink2); }
+button:focus-visible, select:focus-visible { outline: 2px solid var(--run); outline-offset: 2px; }
+/* The native control paints its own background in dark mode on some
+   platforms, which would sit as a light slab in the transport row. */
+select { appearance: none; padding-right: 26px; color-scheme: light dark; }
+.transport { position: relative; }
+.transport select {
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--ink2) 50%),
+    linear-gradient(135deg, var(--ink2) 50%, transparent 50%);
+  background-position: right 13px top 15px, right 8px top 15px;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
 
 header {
   display: flex; align-items: flex-end; justify-content: space-between;
