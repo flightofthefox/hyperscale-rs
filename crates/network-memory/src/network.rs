@@ -32,13 +32,13 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_network::fault::{Decision, Engine, FaultBuilder, HostId, MessageContext, Tier};
 use hyperscale_network::{HandlerRegistry, RequestError, ResponseVerdict, compression};
-use hyperscale_types::{ShardId, ValidatorId};
+use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use tracing::{debug, trace};
@@ -334,6 +334,16 @@ impl PeerHealth {
     }
 }
 
+/// Who exchanged what, for a request the peer served.
+#[derive(Clone, Copy)]
+struct RoundTrip {
+    requester: NodeIndex,
+    peer: NodeIndex,
+    type_id: &'static str,
+    class: MessageClass,
+    response_class: MessageClass,
+}
+
 /// The stable identity of a request, threaded through each retry attempt.
 struct RequestAttempt<'a> {
     requester: NodeIndex,
@@ -345,7 +355,14 @@ struct RequestAttempt<'a> {
 /// Outcome of one modeled attempt inside the retry loop.
 enum AttemptOutcome {
     /// The peer answered; carries the response bytes and the round-trip cost.
-    Success { bytes: Vec<u8>, rtt: Duration },
+    ///
+    /// `out_leg` is the request direction's share of `rtt`, kept apart so the
+    /// two legs can be reported as the separate deliveries they are.
+    Success {
+        bytes: Vec<u8>,
+        rtt: Duration,
+        out_leg: Duration,
+    },
     /// The peer never answered (partition, packet loss, dropping fault rule).
     /// The transport waits out a stream timeout, then backs off and retries.
     Timeout,
@@ -357,6 +374,104 @@ enum AttemptOutcome {
 impl Scheduled for ScheduledResponse {
     fn delivery_time(&self) -> Duration {
         self.delivery_time
+    }
+}
+
+/// One delivery the transport carried, recorded where it was scheduled.
+///
+/// A record exists only for a message that survived partition, packet loss,
+/// and the fault engine, so it describes a delivery that happened rather than
+/// one that was attempted. `sent_at` and `delivered_at` are simulated-clock
+/// instants — their difference is the latency this delivery drew, and neither
+/// is BFT-attested time.
+///
+/// Gossip suppressed by a receiver's dedup produces no record: the transport
+/// never schedules it, so there is no delivery to describe. Those are counted
+/// in [`FulfillmentStats::messages_deduplicated`] instead.
+#[derive(Debug, Clone)]
+pub struct DeliveryRecord {
+    /// Sending host.
+    pub from: NodeIndex,
+    /// Receiving host.
+    pub to: NodeIndex,
+    /// Message type identifier, shared by both legs of a request round trip —
+    /// which leg this is shows in the direction.
+    pub message_type: &'static str,
+    /// Class of the sending type, carried from the send site.
+    pub class: MessageClass,
+    /// When the sender put it on the wire.
+    pub sent_at: Duration,
+    /// When the receiving handler runs.
+    pub delivered_at: Duration,
+    /// Shard the delivery was scoped to; `None` for globally scoped traffic
+    /// and for request round trips, whose target shard is the committee's,
+    /// not the message's.
+    pub shard: Option<ShardId>,
+    /// Encoded size on the wire.
+    pub wire_bytes: usize,
+}
+
+/// Per-class totals over a drain interval, indexed by `MessageClass as usize`.
+///
+/// Exact, unlike the sampled records beside them: a consumer that thins the
+/// records for display still reports true volume.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ClassTally {
+    /// Deliveries carried.
+    pub deliveries: u64,
+    /// Bytes carried.
+    pub bytes: u64,
+}
+
+/// Everything the delivery log accumulated since the last drain.
+#[derive(Debug, Default, Clone)]
+pub struct DeliveryDrain {
+    /// Records retained, oldest first, bounded by the log's capacity.
+    pub records: Vec<DeliveryRecord>,
+    /// Records the capacity forced out. A consumer that displays the sample
+    /// reports this rather than letting a thinned view read as a quiet
+    /// network.
+    pub dropped: u64,
+    /// Exact totals, one entry per [`MessageClass`], covering dropped
+    /// records as well as retained ones.
+    pub by_class: [ClassTally; MessageClass::COUNT],
+}
+
+/// A bounded, opt-in record of what the transport delivered.
+///
+/// Off unless a harness asks for it, because the default simulation suite
+/// pays for it on every delivery and reads none of it. Recording appends and
+/// tallies; it draws no randomness and reads no simulation state, so a seeded
+/// run is byte-identical whether or not the log is on.
+#[derive(Debug, Default)]
+struct DeliveryLog {
+    capacity: usize,
+    records: VecDeque<DeliveryRecord>,
+    dropped: u64,
+    by_class: [ClassTally; MessageClass::COUNT],
+}
+
+impl DeliveryLog {
+    fn record(&mut self, record: DeliveryRecord) {
+        if self.capacity == 0 {
+            return;
+        }
+        let tally = &mut self.by_class[record.class as usize];
+        tally.deliveries += 1;
+        tally.bytes += record.wire_bytes as u64;
+        if self.records.len() == self.capacity {
+            self.records.pop_front();
+            self.dropped += 1;
+        }
+        self.records.push_back(record);
+    }
+
+    fn drain(&mut self) -> DeliveryDrain {
+        DeliveryDrain {
+            records: self.records.drain(..).collect(),
+            dropped: std::mem::take(&mut self.dropped),
+            by_class: std::mem::take(&mut self.by_class),
+        }
     }
 }
 
@@ -404,6 +519,10 @@ pub struct SimulatedNetwork {
     /// inside the retry loop. Each requester tracks its own view of every peer
     /// it has asked, mirroring the libp2p per-node `PeerHealthTracker`.
     peer_health: HashMap<(NodeIndex, NodeIndex), PeerHealth>,
+    /// Opt-in record of what was delivered, for harnesses that observe
+    /// traffic rather than chain content. Inert until
+    /// [`Self::enable_delivery_log`].
+    deliveries: DeliveryLog,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -447,7 +566,24 @@ impl SimulatedNetwork {
             gossip_seen: (0..num_hosts).map(|_| HashSet::new()).collect(),
             faults: Engine::new(seed),
             peer_health: HashMap::new(),
+            deliveries: DeliveryLog::default(),
         }
+    }
+
+    /// Start recording deliveries, retaining at most `capacity` records
+    /// between drains.
+    ///
+    /// Everything beyond the capacity is counted, not kept: a caller that
+    /// wants exact volume reads [`DeliveryDrain::by_class`], and a caller
+    /// that wants individual deliveries gets the most recent `capacity` of
+    /// them. Passing zero turns recording back off.
+    pub const fn enable_delivery_log(&mut self, capacity: usize) {
+        self.deliveries.capacity = capacity;
+    }
+
+    /// Take everything recorded since the last drain, resetting the log.
+    pub fn drain_deliveries(&mut self) -> DeliveryDrain {
+        self.deliveries.drain()
     }
 
     /// Translate a `ValidatorId` to its hosting `NodeIndex`, from the
@@ -722,25 +858,15 @@ impl SimulatedNetwork {
             shard,
             preferred_peer,
             type_id,
+            class,
+            response_class,
             request_bytes,
             on_response,
         } = request;
 
-        // Target committee, dropping ourselves so we never round-trip through
-        // our own node.
-        let candidates: Vec<NodeIndex> = self
-            .peers_in_shard(shard)
-            .into_iter()
-            .filter(|&n| n != requester)
-            .collect();
-
-        // Initial peer: the preferred peer if it resolves into the committee,
-        // otherwise a health-weighted pick. An empty committee surfaces
-        // `NoPeers` after only the short discovery delay.
-        let initial = preferred_peer
-            .map(|vid| self.validator_to_node(vid))
-            .filter(|p| candidates.contains(p))
-            .or_else(|| self.select_peer_weighted(requester, &candidates, rng));
+        let (candidates, initial) = self.request_candidates(requester, shard, preferred_peer, rng);
+        // An empty committee surfaces `NoPeers` after only the short
+        // discovery delay.
         let Some(mut current_peer) = initial else {
             self.schedule_response(
                 now,
@@ -763,13 +889,31 @@ impl SimulatedNetwork {
         let mut elapsed = Duration::ZERO;
         let mut backoff = INITIAL_BACKOFF;
 
-        loop {
+        // One exit: the loop yields what the requester gets, and the single
+        // `schedule_response` below delivers it after `elapsed` — whichever
+        // attempt produced it.
+        let outcome = loop {
             match self.attempt_request(&attempt, current_peer, now + elapsed, rng, stats) {
-                AttemptOutcome::Success { bytes, rtt } => {
+                AttemptOutcome::Success {
+                    bytes,
+                    rtt,
+                    out_leg,
+                } => {
                     self.record_peer_success(requester, current_peer);
+                    self.record_round_trip(
+                        RoundTrip {
+                            requester,
+                            peer: current_peer,
+                            type_id,
+                            class,
+                            response_class,
+                        },
+                        now + elapsed,
+                        (out_leg, rtt),
+                        (request_bytes.len(), bytes.len()),
+                    );
                     elapsed += rtt;
-                    self.schedule_response(now, elapsed, requester, Ok(bytes), on_response);
-                    return;
+                    break Ok(bytes);
                 }
                 AttemptOutcome::Timeout => {
                     self.record_peer_failure(requester, current_peer, true);
@@ -777,14 +921,7 @@ impl SimulatedNetwork {
                     current_peer_attempts += 1;
                     elapsed += STREAM_TIMEOUT;
                     if attempts >= MAX_TOTAL_ATTEMPTS {
-                        self.schedule_response(
-                            now,
-                            elapsed,
-                            requester,
-                            Err(RequestError::Exhausted { attempts }),
-                            on_response,
-                        );
-                        return;
+                        break Err(RequestError::Exhausted { attempts });
                     }
                     // A timed-out peer might just have dropped a packet: retry
                     // it before rotating, then back off.
@@ -804,14 +941,7 @@ impl SimulatedNetwork {
                     attempts += 1;
                     elapsed += rtt;
                     if attempts >= MAX_TOTAL_ATTEMPTS {
-                        self.schedule_response(
-                            now,
-                            elapsed,
-                            requester,
-                            Err(RequestError::Exhausted { attempts }),
-                            on_response,
-                        );
-                        return;
+                        break Err(RequestError::Exhausted { attempts });
                     }
                     // An application-level error won't fix itself on retry:
                     // rotate immediately, no backoff.
@@ -823,7 +953,64 @@ impl SimulatedNetwork {
                     current_peer_attempts = 0;
                 }
             }
-        }
+        };
+        self.schedule_response(now, elapsed, requester, outcome, on_response);
+    }
+
+    /// The committee a request may ask, and the peer to open with: the
+    /// preferred peer where it resolves into that committee, otherwise a
+    /// health-weighted pick. The requester is never its own peer, so a
+    /// request never round-trips through the node that made it.
+    fn request_candidates(
+        &self,
+        requester: NodeIndex,
+        shard: ShardId,
+        preferred_peer: Option<ValidatorId>,
+        rng: &mut ChaCha8Rng,
+    ) -> (Vec<NodeIndex>, Option<NodeIndex>) {
+        let candidates: Vec<NodeIndex> = self
+            .peers_in_shard(shard)
+            .into_iter()
+            .filter(|&n| n != requester)
+            .collect();
+        let initial = preferred_peer
+            .map(|vid| self.validator_to_node(vid))
+            .filter(|p| candidates.contains(p))
+            .or_else(|| self.select_peer_weighted(requester, &candidates, rng));
+        (candidates, initial)
+    }
+
+    /// Log a served request as the two deliveries it is: the request reaching
+    /// the peer, and the response coming back. `legs` is `(out, round trip)`
+    /// measured from `sent_at`, `sizes` the wire bytes of each direction.
+    fn record_round_trip(
+        &mut self,
+        trip: RoundTrip,
+        sent_at: Duration,
+        legs: (Duration, Duration),
+        sizes: (usize, usize),
+    ) {
+        let (out_leg, rtt) = legs;
+        self.deliveries.record(DeliveryRecord {
+            from: trip.requester,
+            to: trip.peer,
+            message_type: trip.type_id,
+            class: trip.class,
+            sent_at,
+            delivered_at: sent_at + out_leg,
+            shard: None,
+            wire_bytes: sizes.0,
+        });
+        self.deliveries.record(DeliveryRecord {
+            from: trip.peer,
+            to: trip.requester,
+            message_type: trip.type_id,
+            class: trip.response_class,
+            sent_at: sent_at + out_leg,
+            delivered_at: sent_at + rtt,
+            shard: None,
+            wire_bytes: sizes.1,
+        });
     }
 
     /// Model one attempt against `peer`, updating drop stats. Returns the
@@ -882,8 +1069,10 @@ impl SimulatedNetwork {
             return AttemptOutcome::Timeout;
         }
 
-        let rtt =
-            self.sample_latency(requester, peer, rng) + self.sample_latency(peer, requester, rng);
+        // Sampled per leg, in request-then-response order, because that is
+        // the order the RNG is drawn in and each leg is a delivery of its own.
+        let out_leg = self.sample_latency(requester, peer, rng);
+        let rtt = out_leg + self.sample_latency(peer, requester, rng);
 
         // A missing handler or empty payload is an application-level error:
         // the peer answered, but with nothing usable.
@@ -914,6 +1103,7 @@ impl SimulatedNetwork {
         AttemptOutcome::Success {
             bytes: response_bytes,
             rtt,
+            out_leg,
         }
     }
 
@@ -1030,6 +1220,7 @@ impl SimulatedNetwork {
             let PendingNotification {
                 recipients,
                 type_id,
+                class,
                 data,
             } = notification;
 
@@ -1076,6 +1267,16 @@ impl SimulatedNetwork {
                             analyzer.record_message(type_id, payload.len(), data.len(), sender, to);
                         }
                         self.notification_sequence += 1;
+                        self.deliveries.record(DeliveryRecord {
+                            from: sender,
+                            to,
+                            message_type: type_id,
+                            class,
+                            sent_at: now,
+                            delivered_at: now + latency,
+                            shard: None,
+                            wire_bytes: data.len(),
+                        });
                         self.pending_notifications
                             .push(Reverse(ScheduledNotification {
                                 delivery_time: now + latency,
@@ -1194,6 +1395,16 @@ impl SimulatedNetwork {
                         BroadcastTarget::Shard(s) => Some(s),
                         BroadcastTarget::Global => None,
                     };
+                    self.deliveries.record(DeliveryRecord {
+                        from,
+                        to,
+                        message_type,
+                        class: entry.class,
+                        sent_at: now,
+                        delivered_at: now + latency,
+                        shard,
+                        wire_bytes: entry.data.len(),
+                    });
                     self.pending_gossip.push(Reverse(ScheduledGossip {
                         delivery_time: now + latency,
                         sequence: self.gossip_sequence,
@@ -1664,6 +1875,8 @@ mod tests {
             shard,
             preferred_peer,
             type_id: "test.request",
+            class: MessageClass::Recovery,
+            response_class: MessageClass::Recovery,
             request_bytes: vec![1, 2, 3],
             on_response: Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);
@@ -1956,6 +2169,7 @@ mod tests {
         OutboxEntry {
             target,
             message_type: "test.gossip",
+            class: MessageClass::Bulk,
             data,
         }
     }
@@ -2209,6 +2423,7 @@ mod tests {
         let entry = OutboxEntry {
             target: BroadcastTarget::Global,
             message_type: "test.gossip",
+            class: MessageClass::Bulk,
             data: vec![0xFF, 0xFE, 0xFD],
         };
 

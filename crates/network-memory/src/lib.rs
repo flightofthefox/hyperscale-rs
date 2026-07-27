@@ -14,7 +14,10 @@ mod traffic;
 // wraps into `HostId`; the engine itself lives in `hyperscale-network` under
 // `test-utils` (shared with the libp2p transport) and sim code reaches it there.
 pub use hyperscale_network::fault::HostId;
-pub use network::{FulfillmentStats, HostLayout, NetworkConfig, SimulatedNetwork};
+pub use network::{
+    ClassTally, DeliveryDrain, DeliveryRecord, FulfillmentStats, HostLayout, NetworkConfig,
+    SimulatedNetwork,
+};
 pub use sim_network::{OutboxEntry, PendingNotification, SimNetworkAdapter};
 pub use traffic::{BandwidthReport, NetworkTrafficAnalyzer};
 

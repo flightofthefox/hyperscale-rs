@@ -17,7 +17,7 @@ use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::{GenesisConfig, RadixExecutor, TransactionValidation};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
-    BandwidthReport, HostLayout, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex,
+    BandwidthReport, DeliveryDrain, HostLayout, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex,
     SimNetworkAdapter, SimulatedNetwork,
 };
 use hyperscale_node::pool_loop::POOL_FETCH_TICK_INTERVAL;
@@ -656,6 +656,21 @@ impl SimulationRunner {
     #[must_use]
     pub const fn stats(&self) -> &SimulationStats {
         &self.stats
+    }
+
+    /// Start recording what the transport delivers, keeping at most
+    /// `capacity` records between drains.
+    ///
+    /// Off by default. Recording is pure observation — it draws no randomness
+    /// and reads no simulation state — so a seeded run behaves identically
+    /// whether or not it is on.
+    pub const fn enable_delivery_log(&mut self, capacity: usize) {
+        self.network.enable_delivery_log(capacity);
+    }
+
+    /// Take every delivery recorded since the last drain.
+    pub fn drain_deliveries(&mut self) -> DeliveryDrain {
+        self.network.drain_deliveries()
     }
 
     /// Get current simulation time.

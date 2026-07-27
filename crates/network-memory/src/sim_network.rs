@@ -37,6 +37,11 @@ pub struct OutboxEntry {
     pub target: BroadcastTarget,
     /// The message type identifier (e.g., "block.header").
     pub message_type: &'static str,
+    /// The sending type's [`NetworkMessage::class`]. Carried on the entry
+    /// because the class is a property of the Rust type and never reaches
+    /// the wire: the harness sees only `message_type` once the message is
+    /// encoded, so anything downstream that needs the class needs it here.
+    pub class: MessageClass,
     /// Wire-encoded message bytes (SBOR + LZ4).
     pub data: Vec<u8>,
 }
@@ -47,6 +52,9 @@ pub struct PendingNotification {
     pub recipients: Vec<ValidatorId>,
     /// Message type ID for handler lookup.
     pub type_id: &'static str,
+    /// The sending type's [`NetworkMessage::class`]. See
+    /// [`OutboxEntry::class`].
+    pub class: MessageClass,
     /// Wire-encoded message bytes (SBOR + LZ4).
     pub data: Vec<u8>,
 }
@@ -65,6 +73,12 @@ pub struct PendingRequest {
     pub preferred_peer: Option<ValidatorId>,
     /// Message type ID for handler lookup (e.g., "block.request").
     pub type_id: &'static str,
+    /// Class of the request leg — the caller's override where it gave one,
+    /// otherwise the request type's own. See [`OutboxEntry::class`].
+    pub class: MessageClass,
+    /// Class of the response leg, from the response type. The two legs of a
+    /// round trip are separate messages and need not share a class.
+    pub response_class: MessageClass,
     /// SBOR-encoded request bytes.
     pub request_bytes: Vec<u8>,
     /// Callback that receives SBOR-encoded response bytes (or error). Returns
@@ -189,6 +203,7 @@ impl Network for SimNetworkAdapter {
         self.outbox.lock().unwrap().push(OutboxEntry {
             target: BroadcastTarget::Shard(shard),
             message_type: M::message_type_id(),
+            class: M::class(),
             data,
         });
     }
@@ -201,6 +216,7 @@ impl Network for SimNetworkAdapter {
         self.outbox.lock().unwrap().push(OutboxEntry {
             target: BroadcastTarget::Global,
             message_type: M::message_type_id(),
+            class: M::class(),
             data,
         });
     }
@@ -233,6 +249,7 @@ impl Network for SimNetworkAdapter {
             .push(PendingNotification {
                 recipients: recipients.to_vec(),
                 type_id: M::message_type_id(),
+                class: M::class(),
                 data,
             });
     }
@@ -271,7 +288,7 @@ impl Network for SimNetworkAdapter {
         shard: ShardId,
         preferred_peer: Option<ValidatorId>,
         request: R,
-        _class_override: Option<MessageClass>,
+        class_override: Option<MessageClass>,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
     ) {
         let request_bytes =
@@ -292,6 +309,8 @@ impl Network for SimNetworkAdapter {
             shard,
             preferred_peer,
             type_id: R::message_type_id(),
+            class: class_override.unwrap_or_else(R::class),
+            response_class: <R::Response as NetworkMessage>::class(),
             request_bytes,
             on_response: typed_callback,
         });

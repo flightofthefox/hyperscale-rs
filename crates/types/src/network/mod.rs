@@ -115,6 +115,19 @@ pub enum MessageClass {
 }
 
 impl MessageClass {
+    /// How many classes there are, for consumers that tally per class by
+    /// discriminant.
+    pub const COUNT: usize = 5;
+
+    /// Every class, in priority order.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::Consensus,
+        Self::BlockCompletion,
+        Self::CrossShardProgress,
+        Self::Recovery,
+        Self::Bulk,
+    ];
+
     /// Whether this class can be dropped under backpressure.
     ///
     /// Only `Recovery` and `Bulk` are droppable. Higher classes must be
