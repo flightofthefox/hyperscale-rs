@@ -61,7 +61,8 @@ pub fn pool_draw(state: &mut BeaconState, shard: ShardId) -> Option<ValidatorId>
 /// were `OnShard`, remove them from that shard's committee and draw a
 /// pool refill onto it via [`pool_draw`] — unless the shard has a
 /// pending split, whose gate would miscount an unready refill as a
-/// ready parent-half member.
+/// ready parent-half member, or the departing validator is a party to
+/// the shard's rotation, whose entrant is already the refill.
 ///
 /// The caller writes the validator's new status first and passes the
 /// status it held immediately before as `prior`. An `OnShard`
@@ -94,6 +95,24 @@ pub(super) fn exit_placement(
                     state.pending_reshapes.get_mut(&parent)
             {
                 keepers.remove(&validator);
+            }
+            // A rotation the departing validator is party to dies with
+            // the departure, and takes the refill with it: the committee
+            // is carrying a spare precisely because a rotation is open, so
+            // a draw on top would seat one more member than the shard has
+            // seats and nothing would ever retire it. A victim leaving is
+            // replaced by the entrant already seated; an entrant leaving
+            // aborts the rotation and the victim keeps the seat it never
+            // gave up. Attrition anywhere else on the shard still refills:
+            // that member is neither the seat the entrant syncs into nor
+            // the one the victim holds.
+            let rotating = state
+                .pending_rotations
+                .get(&shard)
+                .is_some_and(|r| r.victim == validator || r.entrant == validator);
+            if rotating {
+                state.pending_rotations.remove(&shard);
+                return;
             }
             // A pending split's parent members all carry to its children
             // as parent halves, ready by construction — the readiness the

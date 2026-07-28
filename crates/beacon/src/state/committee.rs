@@ -61,6 +61,29 @@ pub(super) fn resolve_pending_rotations(state: &mut BeaconState) {
     }
 }
 
+/// Cancel `shard`'s rotation, if it has one: the entrant returns to the
+/// pool and the victim keeps the seat it never gave up, leaving the
+/// committee at `shard_size` with every member ready.
+///
+/// A rotation is a promise to swap a seat over a sync window. A caller
+/// that needs the committee settled inside that window breaks the
+/// promise instead of waiting it out, at the cost of the entrant's
+/// partial sync.
+pub(super) fn abort_rotation(state: &mut BeaconState, shard: ShardId) {
+    let Some(rotation) = state.pending_rotations.remove(&shard) else {
+        return;
+    };
+    if let Some(committee) = state.next_shard_committees.get_mut(&shard) {
+        committee.members.retain(|v| *v != rotation.entrant);
+    }
+    if let Some(rec) = state.validators.get_mut(&rotation.entrant)
+        && matches!(rec.status, ValidatorStatus::OnShard { shard: s, .. } if s == shard)
+    {
+        rec.status = ValidatorStatus::Pooled;
+    }
+    state.miss_counters.remove(&rotation.entrant);
+}
+
 /// Trickled committee rotation, make before break. When
 /// `state.current_epoch` lands on a shuffle-interval boundary (and
 /// `epoch > 0`), each shard seats an entrant from the pool via
@@ -311,6 +334,10 @@ fn recover_committee(
         }
         state.miss_counters.remove(id);
     }
+    // The whole committee is replaced, victim and entrant with it, so a
+    // rotation the shuffle had open on this shard names two validators
+    // that no longer sit here.
+    state.pending_rotations.remove(&shard);
 
     // The recovery resets the shard's miss count: the fresh committee
     // gets a full threshold of observed folds to sync and produce before
@@ -529,15 +556,19 @@ mod tests {
     use hyperscale_types::{
         BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch,
         HALT_THRESHOLD_EPOCHS, Hash, JailReason, MIN_STAKE_FLOOR, PendingReshape, Randomness,
-        ShardBoundary, ShardCommittee, ShardId, ShardWitnessPayload, Stake, StakePool, StakePoolId,
-        StateRoot, TransitionCause, ValidatorId, ValidatorStatus, WeightedTimestamp,
+        RecoveryCause, ShardBoundary, ShardCommittee, ShardId, ShardWitnessPayload, Stake,
+        StakePool, StakePoolId, StateRoot, TransitionCause, ValidatorId, ValidatorStatus,
+        WeightedTimestamp,
     };
 
-    use super::{recover_committees, resample_beacon_committee, run_shuffle_step};
+    use super::{
+        recover_committee, recover_committees, resample_beacon_committee, run_shuffle_step,
+    };
     use crate::state::test_fixtures::{
         apply_next_epoch, apply_witness_chunk, empty_state, possession_proof, single_pool_state,
         validator_record,
     };
+    use crate::state::vrf::jail_validator;
     // ─── run_shuffle_step + shard_committee_transitions diff ─────────────
 
     /// The shuffle interval the fixture states derive — all of them run
@@ -1088,6 +1119,112 @@ mod tests {
             "a second entrant must not seat on a rotating shard",
         );
         assert_eq!(state.pooled_validators(), pool);
+    }
+
+    /// Jailing the victim mid-rotation drops the pair and takes the
+    /// refill with it: the entrant already seated is the replacement, and
+    /// a second draw would leave the committee one over strength with
+    /// nothing left to retire it — `top_up_committees` only grows.
+    #[test]
+    fn jailing_the_victim_mid_rotation_leaves_the_committee_at_strength() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 4, 3);
+        add_eligible_slack(&mut state);
+        state.current_epoch = Epoch::new(shuffle_interval());
+        run_shuffle_step(&mut state);
+        let rotation = state.pending_rotations[&shard];
+        assert_eq!(state.next_shard_committees[&shard].members.len(), 5);
+
+        let epoch = state.current_epoch;
+        jail_validator(&mut state, rotation.victim, JailReason::Performance, epoch);
+
+        assert!(state.pending_rotations.is_empty(), "the pair dies with it");
+        let members = &state.next_shard_committees[&shard].members;
+        assert_eq!(members.len(), 4, "the entrant is the replacement");
+        assert!(members.contains(&rotation.entrant));
+        assert!(!members.contains(&rotation.victim));
+    }
+
+    /// Jailing the entrant mid-rotation aborts the rotation: the victim
+    /// keeps the seat it never gave up, so the committee is already at
+    /// strength and needs no refill either.
+    #[test]
+    fn jailing_the_entrant_mid_rotation_leaves_the_victim_seated() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 4, 3);
+        add_eligible_slack(&mut state);
+        state.current_epoch = Epoch::new(shuffle_interval());
+        run_shuffle_step(&mut state);
+        let rotation = state.pending_rotations[&shard];
+
+        let epoch = state.current_epoch;
+        jail_validator(&mut state, rotation.entrant, JailReason::Performance, epoch);
+
+        assert!(state.pending_rotations.is_empty());
+        let members = &state.next_shard_committees[&shard].members;
+        assert_eq!(members.len(), 4);
+        assert!(
+            members.contains(&rotation.victim),
+            "the victim holds its seat"
+        );
+        assert!(!members.contains(&rotation.entrant));
+        assert_eq!(
+            state.ready_consensus_members(&state.next_shard_committees)[&shard].len(),
+            4,
+        );
+    }
+
+    /// Attrition elsewhere on a rotating shard still refills: the lost
+    /// member is neither the seat the entrant syncs into nor the one the
+    /// victim holds, so without a draw the shard would settle one short
+    /// when the rotation resolves.
+    #[test]
+    fn jailing_a_bystander_mid_rotation_still_refills() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 4, 3);
+        add_eligible_slack(&mut state);
+        state.current_epoch = Epoch::new(shuffle_interval());
+        run_shuffle_step(&mut state);
+        let rotation = state.pending_rotations[&shard];
+        let bystander = *state.next_shard_committees[&shard]
+            .members
+            .iter()
+            .find(|id| **id != rotation.victim && **id != rotation.entrant)
+            .expect("a rotating committee has bystanders");
+
+        let epoch = state.current_epoch;
+        jail_validator(&mut state, bystander, JailReason::Performance, epoch);
+
+        assert_eq!(
+            state.pending_rotations[&shard], rotation,
+            "a bystander's departure leaves the rotation standing",
+        );
+        assert_eq!(
+            state.next_shard_committees[&shard].members.len(),
+            5,
+            "the refill keeps the shard whole for the resolution",
+        );
+    }
+
+    /// A recovery re-draws the whole committee, victim and entrant with
+    /// it, so the rotation naming them is dropped rather than left to
+    /// retire a validator the fresh committee never seated.
+    #[test]
+    fn recovery_drops_the_shards_rotation() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 4, 8);
+        add_eligible_slack(&mut state);
+        state.current_epoch = Epoch::new(shuffle_interval());
+        run_shuffle_step(&mut state);
+        let rotation = state.pending_rotations[&shard];
+
+        assert!(recover_committee(&mut state, shard, RecoveryCause::Halt));
+
+        assert!(state.pending_rotations.is_empty());
+        let members = &state.next_shard_committees[&shard].members;
+        assert_eq!(members.len(), 4, "a fresh committee, at strength");
+        assert!(!members.contains(&rotation.victim));
+        assert!(!members.contains(&rotation.entrant));
     }
 
     /// The consensus subset holds at `shard_size` for every fold of a

@@ -25,6 +25,7 @@ use rand::RngExt;
 use rand_chacha::ChaCha20Rng;
 
 use crate::sampling::prng_from;
+use crate::state::committee::abort_rotation;
 
 /// Domain tag for the cohort draw + child assignment seed. Distinct
 /// from the parent-half and keeper tags so the reshape PRNG streams
@@ -233,6 +234,17 @@ pub(super) fn schedule_ready_splits(state: &mut BeaconState) {
         .map(|(target, _)| *target)
         .collect();
     for target in targets {
+        // A rotation in flight puts an unready entrant in the parent half
+        // the gate below trusts as ready by construction, where it can
+        // carry a child over `2f+1` and wedge it — the failure the
+        // shuffle's own split skip prevents from the other side. Cancel
+        // the rotation rather than wait it out: a split's readiness TTL
+        // is far shorter than the sync window a rotation may run for, so
+        // holding the gate would abandon the split and re-draw its cohort
+        // on a loop until the seat swap finished. The entrant gives up a
+        // partial sync of a committee that is about to be re-carved
+        // anyway.
+        abort_rotation(state, target);
         try_schedule_split(state, target);
     }
 }
@@ -384,6 +396,9 @@ fn apply_scheduled_split(state: &mut BeaconState, target: ShardId) {
     };
     tracing::info!(shard = ?target, "Shard split cut reached; reshaping the trie");
     state.next_shard_committees.remove(&target);
+    // The parent's seats are re-carved between its children, so a pair
+    // naming one of them has nothing left to retire.
+    state.pending_rotations.remove(&target);
 
     for (child, half) in halves {
         // Child committee: the parent half in assignment order, then
@@ -570,6 +585,10 @@ fn apply_scheduled_merge(state: &mut BeaconState, parent: ShardId) {
     // until their terminal block.
     let children: [ShardId; 2] = parent.children().into();
     for child in children {
+        // Keepers move to the parent and everyone else pools, so both
+        // parties of any rotation on this child land in a placement of
+        // their own and the pair has nothing left to say.
+        state.pending_rotations.remove(&child);
         if let Some(committee) = state.next_shard_committees.remove(&child) {
             for id in committee.members {
                 if keepers.contains_key(&id) {
@@ -1466,6 +1485,55 @@ mod tests {
         }
     }
 
+    /// A merge re-carves both children wholesale — keepers onto the
+    /// parent, everyone else into the pool — so a rotation either child
+    /// had open is dropped rather than left holding a seat that no longer
+    /// exists. Both of its parties land in a placement of their own.
+    #[test]
+    fn a_merge_drops_its_children_rotations() {
+        use crate::state::committee::run_shuffle_step;
+
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(4);
+        state.current_epoch = Epoch::new(state.chain_config.shuffle_interval_epochs());
+        run_shuffle_step(&mut state);
+        let parties: Vec<ValidatorId> = state
+            .pending_rotations
+            .values()
+            .flat_map(|r| [r.victim, r.entrant])
+            .collect();
+        assert_eq!(parties.len(), 4, "both children rotate");
+
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
+        for (id, seat) in keepers_of(&state, parent) {
+            apply_shard_payload(
+                &BlsVerifier,
+                &mut state,
+                &net(),
+                seat.child,
+                &ShardWitnessPayload::ReshapeReady {
+                    validator: id,
+                    child: seat.child,
+                },
+            );
+        }
+        fold_merge(&mut state);
+
+        assert!(state.pending_rotations.is_empty());
+        assert_eq!(state.next_shard_committees[&parent].members.len(), 4);
+        for id in parties {
+            let status = state.validators[&id].status;
+            assert!(
+                matches!(status, ValidatorStatus::OnShard { shard, .. } if shard == parent)
+                    || matches!(status, ValidatorStatus::Pooled),
+                "{id:?} was left at {status:?} by the merge",
+            );
+        }
+    }
+
     /// Once paired, a required half going quiet cancels the merge and
     /// un-pins the keepers — unlike a lone half, which simply waits.
     #[test]
@@ -1773,6 +1841,73 @@ mod tests {
             cohort_of(&state, p).is_empty(),
             "a scheduled record must not re-staff: the approved cohort was {approved:?}",
         );
+    }
+
+    /// A split admitted onto a rotating shard cancels the rotation
+    /// instead of scheduling around it. The parent half is assigned over
+    /// every `OnShard` member with no ready filter, so carving
+    /// mid-rotation would put the unready entrant in a child's half and
+    /// let it count toward the 2f+1 the gate trusts as ready by
+    /// construction.
+    #[test]
+    fn a_split_cancels_a_rotation_on_its_target() {
+        use crate::state::committee::run_shuffle_step;
+
+        let p = ShardId::leaf(1, 0);
+        let (left, right) = p.children();
+        let mut state = grow_state(8);
+        // Ready members on an uncommitteed shard, so `beacon_eligible`
+        // clears the shuffle's floor without adding a shard to rotate.
+        for i in 500u64..504 {
+            state.validators.insert(
+                ValidatorId::new(i),
+                validator_record(
+                    i,
+                    0,
+                    ValidatorStatus::OnShard {
+                        shard: ShardId::leaf(1, 1),
+                        ready: true,
+                        placed_at_epoch: Epoch::GENESIS,
+                    },
+                ),
+            );
+        }
+        state.current_epoch = Epoch::new(state.chain_config.shuffle_interval_epochs());
+        run_shuffle_step(&mut state);
+        let rotation = state.pending_rotations[&p];
+
+        // Admit the split and ready its whole cohort: the only thing left
+        // between it and its cut is the rotation.
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit { shard: p },
+        );
+        for child in [left, right] {
+            let observer = observer_for(&state, p, child);
+            mark_ready(&mut state, p, observer);
+        }
+
+        fold_split(&mut state);
+
+        // The rotation is gone, its entrant back in the pool, and the
+        // split carved a committee of ready members only.
+        assert!(state.pending_rotations.is_empty());
+        assert!(matches!(
+            state.validators[&rotation.entrant].status,
+            ValidatorStatus::Pooled,
+        ));
+        assert!(!state.next_shard_committees.contains_key(&p));
+        for child in [left, right] {
+            let members = &state.next_shard_committees[&child].members;
+            assert_eq!(members.len(), 4);
+            assert!(
+                !members.contains(&rotation.entrant),
+                "a cancelled entrant must not ride the carve into a child",
+            );
+        }
     }
 
     // ─── merge execution gate ────────────────────────────────────────────
