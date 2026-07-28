@@ -4,12 +4,13 @@
 use hyperscale_crypto::Verifier;
 use thiserror::Error;
 
+use crate::shard::roots::reveal_chain::next_reveal_chain;
 use crate::signing::shard_reveal_verify;
 use crate::{
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, Hash, ReadySignal,
-    ReshapeThresholds, ReshapeTrigger, Round, ShardId, ShardWitnessPayload, StoredReceipt,
-    TopologySnapshot, ValidatorId, Verified, Verify, WitnessSources, compute_merkle_root,
-    vrf_output_from_proof,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, Epoch, Hash,
+    ReadySignal, ReshapeThresholds, ReshapeTrigger, RevealChain, Round, ShardId,
+    ShardWitnessPayload, StoredReceipt, TopologySnapshot, ValidatorId, Verified, Verify,
+    WitnessSources, compute_merkle_root, vrf_output_from_proof,
 };
 
 /// Inputs the [`BeaconWitnessRoot`] verifier reads against.
@@ -29,6 +30,19 @@ pub struct BeaconWitnessRootContext<'a> {
     /// (`topology.witness_base(shard)`) — a proposer cannot shift the
     /// window it commits over.
     pub claimed_base: BeaconWitnessLeafCount,
+    /// Header's claimed reveal chain. Verification recomputes it from
+    /// `parent_reveal_chain`, the two anchor epochs, and the block's own
+    /// reveal output, and rejects a mismatch — so a proposer can neither
+    /// break the chain nor reseed it off an epoch boundary.
+    pub claimed_reveal_chain: RevealChain,
+    /// Reveal chain on the parent header — what this block's chain extends
+    /// when both anchor in the same epoch.
+    pub parent_reveal_chain: RevealChain,
+    /// Anchor epoch of the parent header.
+    pub parent_anchor_epoch: Epoch,
+    /// Anchor epoch of the block being verified. Differing from
+    /// `parent_anchor_epoch` is what reseeds the chain.
+    pub anchor_epoch: Epoch,
     /// Absolute leaf index of `parent_witness_leaves[0]` — the
     /// committed accumulator's retained-window start. The recomputed
     /// leaf count is `parent_leaves_start + |window + new leaves|`.
@@ -102,6 +116,16 @@ pub enum BeaconWitnessRootVerifyError {
         claimed: u64,
         /// Base resolved from the block's schedule entry.
         expected: u64,
+    },
+    /// The header's reveal chain is not the one its parent's chain and
+    /// this block's reveal output derive — a broken link, or a reseed
+    /// claimed without an anchor-epoch change.
+    #[error("reveal chain mismatch: claimed {claimed:?}, computed {computed:?}")]
+    RevealChainMismatch {
+        /// Header's claimed chain.
+        claimed: RevealChain,
+        /// Chain the shared derivation produces.
+        computed: RevealChain,
     },
     /// The manifest's reshape assertion diverges from the locally
     /// recomputed load predicate — a claimed trigger the load doesn't
@@ -303,6 +327,35 @@ pub fn ready_leaf_payload(
     }
 }
 
+/// Check the header's claimed reveal chain against the shared derivation.
+///
+/// Runs after the reveal proof itself verifies, so the output folded here is
+/// the one the block's proposer was bound to produce: the claim can only
+/// differ by breaking the link or reseeding without an anchor-epoch change.
+fn verify_reveal_chain(
+    ctx: &BeaconWitnessRootContext<'_>,
+) -> Result<(), BeaconWitnessRootVerifyError> {
+    let computed = next_reveal_chain(
+        ctx.parent_reveal_chain,
+        ctx.parent_anchor_epoch,
+        ctx.anchor_epoch,
+        vrf_output_from_proof(ctx.witness_sources.randomness_reveal()),
+    );
+    if ctx.claimed_reveal_chain != computed {
+        tracing::warn!(
+            claimed = ?ctx.claimed_reveal_chain,
+            ?computed,
+            height = ctx.height.inner(),
+            "Reveal chain verification FAILED"
+        );
+        return Err(BeaconWitnessRootVerifyError::RevealChainMismatch {
+            claimed: ctx.claimed_reveal_chain,
+            computed,
+        });
+    }
+    Ok(())
+}
+
 impl Verified<BeaconWitnessRoot> {
     /// Pipeline-attestation gate for slot prefill. The trust source is
     /// the verification pipeline's per-root tracking: an earlier
@@ -367,6 +420,8 @@ impl Verify<&BeaconWitnessRootContext<'_>> for BeaconWitnessRoot {
                 expected: resolved_base.inner(),
             });
         }
+
+        verify_reveal_chain(ctx)?;
         let missed = missed_proposals_since_prev_commit(
             ctx.shard,
             ctx.height,
@@ -451,7 +506,7 @@ mod tests {
     use super::*;
     use crate::{
         ConsensusSignature, NetworkDefinition, ReshapeSeat, ValidatorId, ValidatorInfo,
-        ValidatorSet, VrfProof, shard_reveal_sign,
+        ValidatorSet, VrfOutput, VrfProof, extend_reveal_chain, shard_reveal_sign,
     };
 
     /// The single committee member's key. Deterministic so a test can both
@@ -569,6 +624,17 @@ mod tests {
             verifier: &BlsVerifier,
             expected_leaf_count: BeaconWitnessLeafCount::new(expected_leaf_count),
             claimed_base: BeaconWitnessLeafCount::new(claimed_base),
+            // Same anchor epoch on both sides, so the fixture's claimed
+            // chain is the parent's extended by this block's reveal.
+            claimed_reveal_chain: next_reveal_chain(
+                RevealChain::ZERO,
+                Epoch::GENESIS,
+                Epoch::GENESIS,
+                vrf_output_from_proof(witness_sources.randomness_reveal()),
+            ),
+            parent_reveal_chain: RevealChain::ZERO,
+            parent_anchor_epoch: Epoch::GENESIS,
+            anchor_epoch: Epoch::GENESIS,
             parent_leaves_start: BeaconWitnessLeafCount::ZERO,
             parent_witness_leaves,
             parent_round: Round::INITIAL,
@@ -816,6 +882,45 @@ mod tests {
     /// before any root work — the digest is leaf 0, so an unverified
     /// proof would let the proposer choose the output and grind the seed.
     /// Both a zero sentinel and a reveal signed by the wrong key reject.
+    /// The chain must be the one the parent's chain and this block's reveal
+    /// derive: a broken link is rejected, and so is a reseed claimed while
+    /// both sides anchor in the same epoch.
+    #[test]
+    fn a_reveal_chain_that_is_not_derived_is_rejected() {
+        let shard = ShardId::ROOT;
+        let snapshot = snapshot_with_base(shard, 0);
+        let sources = empty_sources(shard);
+        let mut ctx = context_with(&snapshot, &sources, shard, 0, Vec::new(), 1);
+
+        // Baseline: the fixture's claimed chain is the derived one.
+        let root = commit_witness_window(
+            &[],
+            &derive_leaves(shard, &snapshot, &[], &[], &sources),
+            BeaconWitnessLeafCount::ZERO,
+        )
+        .0;
+        assert!(root.verify(&ctx).is_ok());
+
+        // A link off a different predecessor.
+        ctx.claimed_reveal_chain = extend_reveal_chain(
+            RevealChain::from_raw(Hash::from_bytes(b"other")),
+            VrfOutput::ZERO,
+        );
+        assert!(matches!(
+            root.verify(&ctx),
+            Err(BeaconWitnessRootVerifyError::RevealChainMismatch { .. })
+        ));
+
+        // A reseed claimed without an anchor-epoch change: the parent chain
+        // is non-zero, so seeding fresh is not what the derivation produces.
+        let mut reseeding = context_with(&snapshot, &sources, shard, 0, Vec::new(), 1);
+        reseeding.parent_reveal_chain = RevealChain::from_raw(Hash::from_bytes(b"parent"));
+        assert!(matches!(
+            root.verify(&reseeding),
+            Err(BeaconWitnessRootVerifyError::RevealChainMismatch { .. })
+        ));
+    }
+
     #[test]
     fn invalid_reveal_is_rejected() {
         let shard = ShardId::ROOT;

@@ -2728,6 +2728,8 @@ impl ShardCoordinator {
                 &self.pending_blocks,
                 &self.beacon_witness_accumulator,
                 self.committed_hash,
+                self.committed_reveal_chain,
+                self.committed_anchor_ts,
                 block_hash,
                 block,
                 SubstateCountSource {
@@ -3580,6 +3582,8 @@ impl ShardCoordinator {
             &self.pending_blocks,
             &self.beacon_witness_accumulator,
             self.committed_hash,
+            self.committed_reveal_chain,
+            self.committed_anchor_ts,
             self.local_shard,
             committee,
             topology_schedule,

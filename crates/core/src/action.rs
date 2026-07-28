@@ -675,6 +675,15 @@ pub enum Action {
         /// The block header's claimed witness window base, checked
         /// against the schedule-resolved value for the block's window.
         claimed_base: BeaconWitnessLeafCount,
+        /// Header's claimed reveal chain, recomputed from the parent's and
+        /// this block's reveal output.
+        claimed_reveal_chain: RevealChain,
+        /// Reveal chain on the parent header.
+        parent_reveal_chain: RevealChain,
+        /// Anchor epoch of the parent header.
+        parent_anchor_epoch: Epoch,
+        /// Anchor epoch of the block being verified.
+        anchor_epoch: Epoch,
         /// Absolute leaf index of `parent_witness_leaves[0]` — the
         /// committed accumulator's retained-window start.
         parent_leaves_start: BeaconWitnessLeafCount,

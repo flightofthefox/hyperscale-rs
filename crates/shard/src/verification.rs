@@ -15,9 +15,9 @@ use hyperscale_core::Action;
 use hyperscale_types::{
     BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
     CertifiedBlock, ChainOrigin, FinalizedWave, InFlightCount, LinkageError, LocalReceiptRoot,
-    ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds, SettledWavesRoot,
-    ShardId, SplitChildRoots, StateRoot, TopologySchedule, TopologySnapshot, TransactionRoot,
-    Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp,
+    ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds, RevealChain,
+    SettledWavesRoot, ShardId, SplitChildRoots, StateRoot, TopologySchedule, TopologySnapshot,
+    TransactionRoot, Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -928,6 +928,7 @@ impl VerificationPipeline {
         let beacon_witness_root_status = match beacon_witness_defer {
             Some((_, BeaconWitnessDefer::WitnessAncestor)) => "deferred(witness_ancestor)",
             Some((_, BeaconWitnessDefer::SubstateCount)) => "deferred(substate_count)",
+            Some((_, BeaconWitnessDefer::ParentRevealChain)) => "deferred(parent_reveal_chain)",
             None => root_status(VerificationKind::BeaconWitnessRoot, "skipped", true),
         };
 
@@ -1277,6 +1278,8 @@ impl VerificationPipeline {
         pending_blocks: &PendingBlocks,
         accumulator: &BeaconWitnessAccumulator,
         committed_hash: BlockHash,
+        committed_reveal_chain: Option<RevealChain>,
+        committed_anchor_ts: WeightedTimestamp,
         local_shard: ShardId,
         topology_snapshot: &TopologySnapshot,
         schedule: &TopologySchedule,
@@ -1365,12 +1368,35 @@ impl VerificationPipeline {
             parent_leaf_count = parent_witness_leaves.len(),
             "Initiating beacon-witness root verification"
         );
+        // The parent's chain and anchor, for the reveal-chain recompute. An
+        // unresolvable parent parks like a blocked leaf walk rather than
+        // verifying against a guessed chain.
+        let parent_hash = header.parent_block_hash();
+        let Some((parent_reveal_chain, parent_anchor_ts)) = self.parent_reveal_anchor(
+            parent_hash,
+            committed_hash,
+            committed_reveal_chain,
+            committed_anchor_ts,
+            pending_blocks,
+        ) else {
+            self.park_beacon_witness(
+                parent_hash,
+                block_hash,
+                BeaconWitnessDefer::ParentRevealChain,
+            );
+            return Vec::new();
+        };
+
         self.mark_root_in_flight(block_hash, VerificationKind::BeaconWitnessRoot);
         vec![Action::VerifyBeaconWitnessRoot {
             block_hash,
             expected_root: header.beacon_witness_root(),
             expected_leaf_count: header.beacon_witness_leaf_count(),
             claimed_base: header.beacon_witness_base(),
+            claimed_reveal_chain: header.reveal_chain(),
+            parent_reveal_chain,
+            parent_anchor_epoch: schedule.epoch_for(parent_anchor_ts),
+            anchor_epoch: schedule.epoch_for(header.parent_qc().weighted_timestamp()),
             parent_leaves_start,
             parent_witness_leaves,
             parent_round: header.parent_qc().round(),
@@ -1382,6 +1408,40 @@ impl VerificationPipeline {
             finalized_waves,
             topology_snapshot: topology_snapshot.clone(),
         }]
+    }
+
+    /// The parent header's reveal chain and committee anchor, for the
+    /// reveal-chain recompute.
+    ///
+    /// Resolves through the same two caches the leaf walk uses; when the
+    /// parent is the committed tip (pruned from both) the coordinator's
+    /// scalars answer. `None` when no route resolves it.
+    fn parent_reveal_anchor(
+        &self,
+        parent_hash: BlockHash,
+        committed_hash: BlockHash,
+        committed_reveal_chain: Option<RevealChain>,
+        committed_anchor_ts: WeightedTimestamp,
+        pending_blocks: &PendingBlocks,
+    ) -> Option<(RevealChain, WeightedTimestamp)> {
+        let held = pending_blocks
+            .get(parent_hash)
+            .map(PendingBlock::header)
+            .or_else(|| {
+                self.verified_certified_blocks
+                    .get(&parent_hash)
+                    .map(|certified| certified.block().header())
+            });
+        if let Some(parent) = held {
+            return Some((
+                parent.reveal_chain(),
+                parent.parent_qc().weighted_timestamp(),
+            ));
+        }
+        (parent_hash == committed_hash)
+            .then_some(committed_reveal_chain)
+            .flatten()
+            .map(|chain| (chain, committed_anchor_ts))
     }
 
     /// Park `block_hash`'s beacon-witness verification on `blocking_hash`,
@@ -1506,6 +1566,10 @@ enum BeaconWitnessDefer {
     /// The reshape predicate's substate byte walk crossed a block with no
     /// known delta (see [`SubstateCountBlocked`]).
     SubstateCount,
+    /// The parent header carrying the reveal chain this block extends is
+    /// held by neither cache, and is not the committed tip whose scalar
+    /// would answer.
+    ParentRevealChain,
 }
 
 /// Inputs for resolving the substate byte total behind a block's parent —
@@ -1620,6 +1684,8 @@ impl VerificationPipeline {
         pending_blocks: &PendingBlocks,
         accumulator: &BeaconWitnessAccumulator,
         committed_hash: BlockHash,
+        committed_reveal_chain: Option<RevealChain>,
+        committed_anchor_ts: WeightedTimestamp,
         block_hash: BlockHash,
         block: &Block,
         count_source: SubstateCountSource<'_>,
@@ -1701,6 +1767,8 @@ impl VerificationPipeline {
                 pending_blocks,
                 accumulator,
                 committed_hash,
+                committed_reveal_chain,
+                committed_anchor_ts,
                 local_shard,
                 topology_snapshot,
                 schedule,
@@ -2481,6 +2549,8 @@ mod tests {
             &pending,
             &accumulator,
             BlockHash::ZERO,
+            None,
+            WeightedTimestamp::ZERO,
             ShardId::ROOT,
             &topology_snapshot,
             &dummy_schedule(&topology_snapshot),
@@ -2523,6 +2593,8 @@ mod tests {
                 &pending,
                 &accumulator,
                 BlockHash::ZERO,
+                None,
+                WeightedTimestamp::ZERO,
                 ShardId::ROOT,
                 &topology_snapshot,
                 &dummy_schedule(&topology_snapshot),
@@ -2565,6 +2637,8 @@ mod tests {
             &pending,
             &accumulator,
             BlockHash::ZERO,
+            None,
+            WeightedTimestamp::ZERO,
             ShardId::ROOT,
             &topology_snapshot,
             &dummy_schedule(&topology_snapshot),
