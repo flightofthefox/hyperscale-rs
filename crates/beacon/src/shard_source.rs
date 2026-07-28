@@ -360,6 +360,19 @@ impl ShardSourceTracker {
     ///   chunk cap per epoch rather than one crossing per epoch — which
     ///   could not outrun a shard emitting them faster than that.
     ///
+    /// Skipping the crossings in between costs their epochs' randomness:
+    /// each carries a per-epoch `reveal_chain`, and nothing carries an
+    /// unfolded epoch's reveals forward, so the loss is one epoch of shard
+    /// entropy per epoch of lag. That is the trade this rule takes — a
+    /// bounded, self-healing entropy reduction against a fold that freezes.
+    /// Sourcing the *oldest* unfolded crossing instead would close every
+    /// epoch, but it drains one crossing per epoch, so lag never clears;
+    /// once the lag exceeds the schedule's retention the crossing's own
+    /// committee falls below the consumer floor and the fold stops for
+    /// good. The seed still mixes prior randomness and every shard that did
+    /// cross, so a skipped epoch reduces the entropy folded, never the
+    /// seed's determinism or the fence's reach.
+    ///
     /// When every retained crossing is folded (`count <= watermark`) it falls
     /// back to the latest, so a terminated shard's folded terminal keeps being
     /// sourced for merge composition — the caller's `crossing_fully_folded`
