@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blake3::Hasher;
 use hyperscale_types::{
-    BeaconProposal, BeaconState, Epoch, JailReason, NetworkDefinition, Randomness, ShardId,
-    ValidatorId, ValidatorStatus, Verifier, VrfOutput, vrf_verify,
+    BeaconProposal, BeaconState, Epoch, JailReason, NetworkDefinition, Randomness, RevealChain,
+    ShardId, ValidatorId, ValidatorStatus, Verifier, VrfOutput, vrf_verify,
 };
 
 use crate::state::pool::exit_placement;
@@ -48,16 +48,15 @@ pub(super) struct VrfStageOutcome<'a> {
 /// were rejected — or whose proposals never reached the committed set
 /// at all.
 ///
-/// The seed's steady-state source is `reveals` — the shard blocks'
-/// mandatory reveal leaves the boundary fold applied this epoch. Each
-/// output is a hash-VRF over `(shard, height)`, committed before any
-/// later leaf existed, so the set is duplicate-free by construction
-/// and interior entries are blind to their own producers. The fold
-/// consumes them shard-sorted (the map's order) with each shard's
-/// outputs in leaf order. The boundary fold already held back any
-/// halt-recovery-fenced band (`ShardBoundary::reveals_fenced_below` —
-/// the beyond-f retained committee's possible post-halt production),
-/// so every output handed here seeds.
+/// The seed's steady-state source is `reveals` — one chain value per
+/// shard whose crossing folded this epoch, each closing that shard's
+/// anchor epoch. Every link is a hash-VRF over `(shard, height)`,
+/// committed before any later block existed, so a chain is fixed by its
+/// producers' keys and slots and interior links are blind to their own
+/// producers. The fold consumes the chains shard-sorted (the map's
+/// order). The boundary fold already dropped any crossing a halt
+/// recovery fenced — the beyond-f retained committee's possible
+/// post-halt production — so every chain handed here seeds.
 ///
 /// Epochs where no reveal folded (bootstrap before the first
 /// crossings, a `Skip`, or total crossing suppression — a
@@ -86,7 +85,7 @@ pub(super) fn filter_and_roll_randomness<'a>(
     network: &NetworkDefinition,
     epoch: Epoch,
     committed: &'a [(ValidatorId, BeaconProposal)],
-    reveals: &BTreeMap<ShardId, Vec<VrfOutput>>,
+    reveals: &BTreeMap<ShardId, RevealChain>,
 ) -> VrfStageOutcome<'a> {
     let committee_set: BTreeSet<ValidatorId> = state.committee.iter().copied().collect();
 
@@ -114,23 +113,25 @@ pub(super) fn filter_and_roll_randomness<'a>(
         }
     }
 
-    // Roll randomness: reveal leaves when any folded this epoch, else the
-    // ceremony mix over the accepted outputs. Always runs — see the
-    // function-level doc for the source switch and the "all-rejected"
-    // semantics. Both paths fold the same preimage shape — domain ‖ prior
-    // randomness ‖ each 32-byte output — differing only in the domain tag
-    // and the output source, so the fold lives in one place.
-    let folded: Vec<&VrfOutput> = reveals.values().flatten().collect();
-    let (domain, outputs): (&[u8], Vec<&VrfOutput>) = if folded.is_empty() {
-        (DOMAIN_BEACON_RANDOMNESS, accepted_outputs.iter().collect())
-    } else {
-        (DOMAIN_BEACON_RANDOMNESS_REVEALS, folded)
-    };
+    // Roll randomness: the folded reveal chains when any crossing folded
+    // this epoch, else the ceremony mix over the accepted outputs. Always
+    // runs — see the function-level doc for the source switch and the
+    // "all-rejected" semantics. Both paths fold the same preimage shape —
+    // domain ‖ prior randomness ‖ each 32-byte value — differing only in
+    // the domain tag and the source, so the fold lives in one place.
     let mut h = Hasher::new();
-    h.update(domain);
-    h.update(state.randomness.as_bytes());
-    for o in outputs {
-        h.update(o.as_bytes());
+    if reveals.is_empty() {
+        h.update(DOMAIN_BEACON_RANDOMNESS);
+        h.update(state.randomness.as_bytes());
+        for o in &accepted_outputs {
+            h.update(o.as_bytes());
+        }
+    } else {
+        h.update(DOMAIN_BEACON_RANDOMNESS_REVEALS);
+        h.update(state.randomness.as_bytes());
+        for chain in reveals.values() {
+            h.update(chain.as_raw().as_bytes());
+        }
     }
     state.randomness = Randomness::new(*h.finalize().as_bytes());
 
@@ -232,8 +233,8 @@ mod tests {
     use blake3::Hasher;
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
-        BeaconProposal, BeaconState, Epoch, JailReason, MIN_STAKE_FLOOR, Randomness, ShardId,
-        Stake, StakePoolId, ValidatorId, ValidatorStatus, VrfOutput,
+        BeaconProposal, BeaconState, Epoch, Hash, JailReason, MIN_STAKE_FLOOR, Randomness,
+        RevealChain, ShardId, Stake, StakePoolId, ValidatorId, ValidatorStatus,
     };
 
     use super::{DOMAIN_BEACON_RANDOMNESS, DOMAIN_BEACON_RANDOMNESS_REVEALS};
@@ -551,15 +552,15 @@ mod tests {
 
     /// Roll `state` directly through the fold under test with a fully
     /// present committee, supplying `reveals`.
-    fn roll(state: &mut BeaconState, reveals: &BTreeMap<ShardId, Vec<VrfOutput>>) {
+    fn roll(state: &mut BeaconState, reveals: &BTreeMap<ShardId, RevealChain>) {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let committed = full_committee_proposals(state);
         let target = state.current_epoch.next();
         super::filter_and_roll_randomness(&BlsVerifier, state, &net(), target, &committed, reveals);
     }
 
-    fn reveal_outputs(seeds: &[u8]) -> Vec<VrfOutput> {
-        seeds.iter().map(|s| VrfOutput::new([*s; 32])).collect()
+    fn reveal_chain(seed: u8) -> RevealChain {
+        RevealChain::from_raw(Hash::from_bytes(&[seed; 32]))
     }
 
     /// Reveal leaves seed the roll byte-exactly: BLAKE3 over the reveal
@@ -574,15 +575,15 @@ mod tests {
         let mut state = single_pool_state(4);
         let prev = state.randomness;
         let mut reveals = BTreeMap::new();
-        reveals.insert(ShardId::leaf(1, 1), reveal_outputs(&[3, 4]));
-        reveals.insert(ShardId::leaf(1, 0), reveal_outputs(&[1, 2]));
+        reveals.insert(ShardId::leaf(1, 1), reveal_chain(2));
+        reveals.insert(ShardId::leaf(1, 0), reveal_chain(1));
         roll(&mut state, &reveals);
 
         let mut h = Hasher::new();
         h.update(DOMAIN_BEACON_RANDOMNESS_REVEALS);
         h.update(prev.as_bytes());
-        for seed in [1u8, 2, 3, 4] {
-            h.update(VrfOutput::new([seed; 32]).as_bytes());
+        for seed in [1u8, 2] {
+            h.update(reveal_chain(seed).as_raw().as_bytes());
         }
         assert_eq!(state.randomness, Randomness::new(*h.finalize().as_bytes()));
     }
@@ -601,7 +602,7 @@ mod tests {
         let full = full_committee_proposals(&a);
         let partial: Vec<_> = full.iter().take(2).cloned().collect();
         let mut reveals = BTreeMap::new();
-        reveals.insert(ShardId::leaf(1, 0), reveal_outputs(&[1, 2]));
+        reveals.insert(ShardId::leaf(1, 0), reveal_chain(1));
         super::filter_and_roll_randomness(&BlsVerifier, &mut a, &net(), target, &full, &reveals);
         super::filter_and_roll_randomness(&BlsVerifier, &mut b, &net(), target, &partial, &reveals);
         assert_eq!(a.randomness, b.randomness);

@@ -3021,7 +3021,6 @@ mod tests {
             terminal_delivered: false,
             settled_waves_root: None,
             reshape_admitted_epoch: None,
-            reveals_fenced_below: None,
         };
 
         // Unfolded: the crossing is fresh news, so it sources.
@@ -5541,7 +5540,6 @@ mod tests {
             terminal_delivered: false,
             settled_waves_root: None,
             reshape_admitted_epoch: None,
-            reveals_fenced_below: None,
         }
     }
 
