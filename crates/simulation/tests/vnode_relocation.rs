@@ -32,7 +32,7 @@ use tracing_test::traced_test;
 
 mod support;
 
-use support::{SimCluster, committee_member_host, rotation_config};
+use support::{PER_SHARD, SimCluster, committee_member_host, rotation_config};
 
 /// Seed for the grown placement the rotation runs against. `RELOC_SEED`
 /// overrides it to re-run the lifecycle under a different one.
@@ -75,13 +75,30 @@ fn run_until_or(
     false
 }
 
+/// The shard's consensus committee must be at full strength on every
+/// slice of every wait below — that is what make-before-break buys.
+/// A rotation may carry a fifth member, but the set that votes holds at
+/// `shard_size`, so `quorum_threshold` never tightens and neither end of
+/// the sync window costs a view change.
+fn assert_at_strength(runner: &SimulationRunner, shard: ShardId) {
+    let topology = runner.host_topology(0).expect("host 0 holds a topology");
+    let consensus = topology.consensus_committee_for_shard(shard);
+    assert_eq!(
+        consensus.len(),
+        PER_SHARD as usize,
+        "consensus committee for {shard:?} dipped to {consensus:?}",
+    );
+}
+
 /// Run in one-second slices until `found` picks a delta out of the
-/// deltas collected so far, or `deadline` passes.
+/// deltas collected so far, or `deadline` passes, running `on_slice`
+/// over the runner each time round.
 fn run_until_delta(
     runner: &mut SimulationRunner,
     deadline: Duration,
     moves: &mut Vec<(NodeIndex, ParticipationChange)>,
     found: impl Fn(&ParticipationChange) -> bool,
+    on_slice: impl Fn(&SimulationRunner),
 ) -> Option<(NodeIndex, ValidatorId, ShardId)> {
     let picked = |moves: &[(NodeIndex, ParticipationChange)]| {
         moves.iter().find(|(_, c)| found(c)).map(|(node, c)| {
@@ -96,6 +113,7 @@ fn run_until_delta(
         let next = runner.now() + Duration::from_secs(1);
         runner.run_until(next);
         moves.extend(runner.take_participation_changes());
+        on_slice(runner);
     }
     picked(moves)
 }
@@ -136,9 +154,14 @@ fn vnode_moves_through_a_committee_rotation() {
     let shuffle_interval = chain_state.chain_config.shuffle_interval_epochs();
     let shuffle = Duration::from_millis(EPOCH_MS * (shuffle_interval + SHUFFLE_SLACK_EPOCHS));
     let mut moves: Vec<(NodeIndex, ParticipationChange)> = Vec::new();
-    let (node, validator, to) =
-        run_until_delta(&mut *runner, shuffle, &mut moves, |c| c.join.is_some())
-            .unwrap_or_else(|| panic!("seed {seed} must seat an entrant; got {moves:?}"));
+    let (node, validator, to) = run_until_delta(
+        &mut *runner,
+        shuffle,
+        &mut moves,
+        |c| c.join.is_some(),
+        |_| {},
+    )
+    .unwrap_or_else(|| panic!("seed {seed} must seat an entrant; got {moves:?}"));
 
     // ── Join: snap-sync bootstrap against the attested anchor ───────
     // The harness runs the same `ShardBootstrap` sequencing production
@@ -164,6 +187,7 @@ fn vnode_moves_through_a_committee_rotation() {
     // within a few epochs.
     let ready_deadline = runner.now() + Duration::from_millis(EPOCH_MS * READY_BUDGET_EPOCHS);
     let became_ready = run_until_or(&mut *runner, ready_deadline, &mut moves, |r| {
+        assert_at_strength(r, to);
         matches!(
             mover_status(r, node, validator),
             Some(ValidatorStatus::OnShard { shard, ready: true, .. }) if shard == to
@@ -208,6 +232,7 @@ fn vnode_moves_through_a_committee_rotation() {
     let (peer, _) = committee_member_host(&*runner, to, Some(node));
     let proposed_deadline = runner.now() + Duration::from_millis(EPOCH_MS * PROPOSAL_BUDGET_EPOCHS);
     let proposed = run_until_or(&mut *runner, proposed_deadline, &mut moves, |r| {
+        assert_at_strength(r, to);
         let tip = r
             .vnode_state_in(peer, to)
             .expect("member host carries the shard")
@@ -284,9 +309,13 @@ fn vnode_moves_through_a_committee_rotation() {
     // The seat the entrant synced into is the one the rotation has been
     // holding open, so the victim leaves the very shard it joined.
     let retire_deadline = runner.now() + Duration::from_millis(EPOCH_MS * DRAIN_BUDGET_EPOCHS);
-    let (victim_node, victim, from) = run_until_delta(&mut *runner, retire_deadline, &mut moves, {
-        move |c| c.leave == Some(to)
-    })
+    let (victim_node, victim, from) = run_until_delta(
+        &mut *runner,
+        retire_deadline,
+        &mut moves,
+        move |c| c.leave == Some(to),
+        move |r| assert_at_strength(r, to),
+    )
     .unwrap_or_else(|| panic!("a ready entrant must retire its rotation's victim; got {moves:?}"));
     assert_ne!(
         victim, validator,
@@ -310,6 +339,7 @@ fn vnode_moves_through_a_committee_rotation() {
         .committed_height();
     let drain_deadline = runner.now() + Duration::from_millis(EPOCH_MS * DRAIN_BUDGET_EPOCHS);
     let origin_alive = run_until_or(&mut *runner, drain_deadline, &mut moves, |r| {
+        assert_at_strength(r, from);
         r.vnode_state_in(origin_peer, from)
             .expect("origin member host")
             .shard_coordinator()

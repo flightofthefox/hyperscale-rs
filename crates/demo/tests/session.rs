@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_demo::{HostRole, Session, SessionConfig, ShardPath, TraceEvent, TraceKind};
-use hyperscale_types::ShardId;
+use hyperscale_types::{ShardId, VIEW_CHANGE_TIMEOUT};
 
 fn config() -> SessionConfig {
     SessionConfig::default()
@@ -826,6 +826,61 @@ fn a_different_seed_produces_a_different_run() {
     let b = run(7, 20);
     assert!(!a.is_empty() && !b.is_empty());
     assert_ne!(format!("{a:?}"), format!("{b:?}"));
+}
+
+/// A committee rotation must not stall a lane. Holding the victim's seat
+/// until its replacement is ready keeps the consensus subset at
+/// `shard_size` through the whole sync window, so `quorum_threshold`
+/// never tightens toward all-of-N: retiring first ran a four-member shard
+/// at three for the window and cost a view-change timeout entering it and
+/// another leaving.
+#[test]
+fn a_rotation_never_stalls_a_lane_for_a_view_change() {
+    let mut session = Session::new(
+        SessionConfig {
+            max_shards: 2,
+            pool_spares: 2,
+            ..SessionConfig::default()
+        },
+        42,
+    );
+
+    let mut roster = session.hosts();
+    let mut split_at = None;
+    let mut rotation_at = None;
+    let mut last: BTreeMap<String, u64> = BTreeMap::new();
+    let mut worst: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for step in 0..1200 {
+        for event in session.step(500) {
+            match &event.kind {
+                TraceKind::TopologyChanged { .. } => split_at = Some(step),
+                TraceKind::BlockCommitted { shard, .. } => {
+                    if let Some(previous) = last.insert(shard.0.clone(), event.wt) {
+                        let gap = event.wt - previous;
+                        let entry = worst.entry(shard.0.clone()).or_default();
+                        if gap > entry.0 {
+                            *entry = (gap, event.wt);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let next = session.hosts();
+        if next != roster && split_at.is_some_and(|at| at != step) {
+            rotation_at.get_or_insert(step);
+        }
+        roster = next;
+    }
+    assert!(rotation_at.is_some(), "the run must cover a rotation");
+    assert_eq!(worst.len(), 3, "root then both children, saw {worst:?}");
+    let ceiling = u64::try_from(VIEW_CHANGE_TIMEOUT.as_millis()).expect("timeout fits a u64");
+    for (lane, (gap, at)) in &worst {
+        assert!(
+            *gap < ceiling,
+            "lane {lane} stalled {gap}ms at wt {at}, a view change or worse",
+        );
+    }
 }
 
 #[test]
