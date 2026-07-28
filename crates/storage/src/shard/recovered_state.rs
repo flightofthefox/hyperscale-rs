@@ -50,12 +50,13 @@ pub struct RecoveredState {
 
     /// Reveal chain carried by the committed tip's header — the value the
     /// next block extends (or reseeds past, when it anchors in a later
-    /// epoch). `None` on an ordinary restart, exactly as
-    /// [`committed_in_flight`](Self::committed_in_flight): the scalar
-    /// relives on the first commit, and until then the vote path skips
-    /// rather than accept a chain it cannot check. A snap-synced bootstrap
-    /// seeds it from the boundary header so the fresh committee's first
-    /// block past the anchor is votable.
+    /// epoch). Read back from the tip's stored header, so an ordinary
+    /// restart resolves it rather than waiting on a commit; a snap-synced
+    /// bootstrap seeds it from the boundary header, keeping the fresh
+    /// committee's first block past the anchor votable. `None` only when no
+    /// block is stored at the committed height, where the coordinator seeds
+    /// `ZERO` for the genesis tip; a `None` against a real tip skips the
+    /// vote rather than accept a chain it cannot check.
     pub committed_reveal_chain: Option<RevealChain>,
 
     /// Weighted timestamp of the committed tip's *parent* QC — the anchor

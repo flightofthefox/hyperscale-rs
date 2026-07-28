@@ -1,9 +1,13 @@
 //! Executable model of the beacon randomness grind and its defences.
 //!
-//! The next-epoch beacon seed is `BLAKE3(prev ‖ VRF outputs of the
-//! committed beacon-committee proposals)`, rolled and then consumed —
-//! by the trickle shuffle and the committee resample — in the same
-//! [`apply_epoch`]. A Byzantine beacon member's VRF output is key-fixed
+//! The harness drives the seed's fallback path — `BLAKE3(prev ‖ VRF
+//! outputs of the committed beacon-committee proposals)`, taken in an
+//! epoch where no shard crossing folds its reveal chain — rolled and then
+//! consumed, by the trickle shuffle and the committee resample, in the
+//! same [`apply_epoch`]. That path is where the classical last-revealer
+//! grind survives, so it is the one worth pricing.
+//!
+//! A Byzantine beacon member's VRF output is key-fixed
 //! (deterministic in `(key, epoch)`), so its only lever is *inclusion*:
 //! reveal early ⇒ folded, withhold ⇒ absent, unfolded. With `t` such
 //! members the adversary enumerates the `2^t` include/omit seeds and

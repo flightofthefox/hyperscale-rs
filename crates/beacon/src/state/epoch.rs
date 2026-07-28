@@ -855,18 +855,15 @@ fn record_boundaries(
         ) {
             continue;
         }
-        // The halt-recovery randomness fence, judged here while the
-        // shard's recovery record (if any) is still live. A crossing above
-        // the recovery's attested frontier commits history the beyond-f
-        // retained committee could have forged post-halt, so the fence
-        // covers every leaf up to that crossing's count — persisted on the
-        // boundary record so the whole band stays out of the seed across
-        // drain epochs and later record refreshes, until the applied
-        // watermark passes it.
         // The crossing block is the last anchored in the epoch it ends, so
         // the chain it carries closes that epoch. A drain re-fold names the
         // crossing already folded, so it contributes nothing: exactly-once
-        // falls out of the fresh-crossing test rather than a watermark.
+        // falls out of the fresh-crossing test rather than a watermark. It
+        // covers the whole seed because successive crossings anchor in
+        // strictly increasing epochs — a crossing the test admits carries an
+        // anchor epoch no earlier crossing could have closed. The fence is
+        // judged here while the shard's recovery record (if any) is still
+        // live: the completing fold clears it.
         if !drain_refold && !reveal_chain_fenced(state, shard, header) {
             reveals.insert(*shard, header.reveal_chain());
         }
