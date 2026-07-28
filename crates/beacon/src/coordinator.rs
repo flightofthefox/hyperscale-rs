@@ -1785,9 +1785,10 @@ impl BeaconCoordinator {
     /// verifiable at proposal admission (and reportable by local
     /// proposers): `boundary_qc_admissible` resolves headers from this
     /// view, and a validator is never on the remote path for its own
-    /// shard. Off-committee vnodes retain the header
-    /// (their inbound `BeaconBlock` verifier needs it to check witness
-    /// merkle paths) and emit nothing. On-committee vnodes additionally
+    /// shard. Off-committee vnodes retain the header (a vnode drawn onto
+    /// the committee admits boundary QCs against the history it already
+    /// holds, rather than abstaining until fresh headers arrive) and emit
+    /// nothing. On-committee vnodes additionally
     /// fetch the witness chunk of the shard's latest observed crossing via
     /// [`fetch_witness_chunk`](Self::fetch_witness_chunk) — the leaves
     /// `[prior, chunk_end)` the boundary fold will apply next, anchored to

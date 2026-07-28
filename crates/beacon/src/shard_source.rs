@@ -385,8 +385,9 @@ impl ShardSourceTracker {
     /// Called by the coordinator when a commit rotates the local
     /// validator off the beacon committee. Drops witness chunks and
     /// pending fetches — off-committee vnodes neither propose nor fetch —
-    /// but keeps `shard_headers` since the vnode still needs them to
-    /// verify incoming `BeaconBlock`s.
+    /// but keeps `shard_headers` so a vnode drawn back onto the committee
+    /// admits boundary QCs immediately instead of abstaining until fresh
+    /// headers arrive.
     ///
     /// Returns the in-flight fetch ids that were dropped, so the caller
     /// can cancel them via `FetchAbandon::ShardWitnesses` — same contract
