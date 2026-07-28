@@ -97,7 +97,8 @@ pub use primitives::identifiers::{
     ValidatorId, VoteCount,
 };
 pub use primitives::merkle::{
-    compute_merkle_root, compute_merkle_root_with_proof, verify_merkle_inclusion,
+    compute_merkle_root, compute_merkle_root_with_proof, compute_range_proof,
+    verify_merkle_inclusion, verify_range_inclusion,
 };
 pub use primitives::positional_bundle::PositionalBundle;
 pub use primitives::randomness::{RANDOMNESS_BYTES, Randomness};
