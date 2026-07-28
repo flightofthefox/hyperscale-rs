@@ -1,114 +1,84 @@
-// Model H (register: specs/README.md) — the beacon-witness fold's window
-// arithmetic, which the epoch randomness now rides. The `witness_fold`
-// module checks the exactly-once consumption and recovery-fence clauses
-// the reveal fold added to INV-BEACON-2's surface; the `witness_window`
-// module checks the window-base freeze that keeps a window's two schedule
-// writes byte-identical (INV-BEACON-3's bookend discipline applied to
-// `witness_window_bases`).
+// Model H (register: specs/README.md) — the two folds a shard's boundary
+// crossing drives, split because they no longer share a coordinate. The
+// `witness_fold` module checks the governance-leaf accumulator's window
+// arithmetic (INV-BEACON-6). The `reveal_fold` module checks the epoch
+// randomness the crossing header's reveal chain carries (INV-BEACON-10,
+// INV-BEACON-11). The `witness_window` module checks the window-base
+// freeze that keeps a window's two schedule writes byte-identical
+// (INV-BEACON-3's bookend discipline applied to `witness_window_bases`).
 //
-// One subject shard's accumulator, folded by the committed beacon epoch
-// sequence, plus one reshape generation (the successor's fresh
-// accumulator, with the predecessor's terminal record draining
-// concurrently). The environment plays the committed sequence: the chain
-// grows, a proposer reports a fresh crossing or re-rides the recorded one
-// (a drain re-fold), a halt recovery stamps its frontier, the shard
-// terminates into a successor. The chunk arithmetic, the fence, and the
-// reseat are transcribed from the fold; everything else exists only as
-// that input trace.
+// One subject shard, folded by the committed beacon epoch sequence. The
+// environment plays that sequence: the chain grows, a proposer reports a
+// fresh crossing or re-rides the recorded one, a halt recovery stamps its
+// frontier, the shard terminates into a successor.
 //
 // Code anchors:
 //   - Chunk bounds: crates/beacon/src/rules.rs `chunk_bounds` — the fold
 //     consumes `[watermark, min(watermark + CAP, boundary_count))`; the
 //     range derives from the local watermark, never from the reporter.
-//     A boundary whose count regressed below the watermark is rejected
-//     (`record_boundaries` monotonicity gate).
-//   - Application: crates/beacon/src/state/witness.rs
-//     `apply_contribution_witnesses` — exact-range, all-or-nothing; the
-//     reveal outputs the randomness fold consumes are collected from
-//     exactly the applied chunk (epoch.rs `reveal_outputs`).
-//   - Drain re-folds: crates/beacon/src/state/epoch.rs `record_boundaries`
-//     — a re-fold of the recorded crossing with witness progress advances
-//     the watermark only (no record refresh); its reveals fold like any
-//     applied chunk's. Model G carries the detection side (the
-//     no-progress re-fold is a miss); here only the applied-leaf
-//     bookkeeping matters.
-//   - Fence: crates/beacon/src/state/epoch.rs `record_boundaries` — a
-//     crossing beyond a pending recovery's `attested_frontier` records
-//     `ShardBoundary::reveals_fenced_below = boundary_count` and folds its
-//     chunk into state contributing nothing to the seed. The fence
-//     persists on the boundary across drain epochs and record refreshes
-//     until the applied watermark passes it, so the whole backlog is held
-//     out — not just the epoch the recovery record clears. The frontier
-//     is the recorded crossing's position at stamp time
-//     (crates/beacon/src/state/committee.rs `recover_committee`),
-//     so the halted chain's legitimate backlog — at or below it — seeds
-//     on recovery.
+//   - Leaf application: crates/beacon/src/state/witness.rs
+//     `apply_contribution_witnesses` — exact-range, all-or-nothing.
+//   - Reveal collection: crates/beacon/src/state/epoch.rs
+//     `record_boundaries` — a fresh crossing contributes
+//     `header.reveal_chain()`, the closed chain of the anchor epoch that
+//     crossing ends; a drain re-fold of the recorded crossing contributes
+//     nothing, so exactly-once needs no watermark.
+//   - Chain derivation: crates/types/src/shard/roots/reveal_chain.rs
+//     `next_reveal_chain` — reseeds when the block's anchor epoch differs
+//     from its parent's, so an epoch's chain descends from no earlier
+//     epoch's reveals.
+//   - Fence: crates/beacon/src/state/epoch.rs `reveal_chain_fenced` — a
+//     crossing above a pending recovery's `attested_frontier` contributes
+//     nothing. No band persists: per-epoch chains are independent, so
+//     dropping one epoch's value excises it permanently.
 //   - Reseat: crates/beacon/src/state/epoch.rs `seed_split_children` /
 //     `compose_merge_parent` — successors start fresh accumulators; the
-//     predecessor's terminal record keeps draining until consumed (split
-//     children and a merge's composed parent are identical at this
-//     abstraction).
+//     predecessor's terminal record keeps draining until consumed.
 //   - Base freeze: crates/beacon/src/state/epoch.rs `apply_epoch` —
 //     `witness_window_bases = live_witness_bases()` at the epoch's open,
 //     before the fold advances any watermark; the lookahead projection
 //     (crates/types/src/beacon/state.rs `derive_next_topology_snapshot`)
-//     reads the same live value at the prior epoch's close, so a window's
-//     two schedule writes agree.
+//     reads the same live value at the prior epoch's close.
 //
 // Properties:
-//   invNoDoubleFold — no leaf is applied (and hence no reveal folded into
-//                     the seed) twice, across fresh crossings, backlog
-//                     drains, and the terminal drain of a reshaped-away
-//                     predecessor. The `witness_fold_reporter_range` twin
-//                     lets the reporter choose the chunk's start instead
-//                     of the local watermark and violates it: a re-sent
-//                     chunk re-folds leaves the fold already consumed.
-//   invFence        — no leaf a beyond-frontier crossing introduced ever
-//                     enters the seed: the beyond-f retained committee's
-//                     post-halt production cannot steer the draw, across
-//                     the completing epoch and every drain epoch after it.
-//                     The `witness_fold_no_fence` twin folds the completing
-//                     crossing's chunk straight into the seed; the
-//                     `witness_fold_transient_fence` twin fences only the
-//                     completing epoch (dropping the fence when the
-//                     recovery record clears) and leaks the backlog's drain
-//                     — both violate it.
-//   invCoverage     — every leaf below a generation's watermark is
-//                     accounted exactly once (seeded, or deterministically
-//                     fenced), and nothing at or above it is: the seed is
-//                     a pure function of the committed sequence with no
-//                     skipped or phantom leaves.
-//   invWatermarkSound — watermarks are bounded by their recorded
-//                     crossings and chains; the fold never runs ahead of
-//                     certified content.
-//   invWindowAgree  — (witness_window) a window's active base equals its
-//                     lookahead base: both writes read the watermark
-//                     between the prior fold and this window's fold. The
-//                     `witness_window_live_base` twin defers the active
-//                     write past the fold and violates it — the two
-//                     schedule writes of one window diverge, which forks
-//                     the beacon-witness root across replicas resolving
-//                     through different writes.
+//   invNoDoubleFold  — no leaf is applied twice, across fresh crossings,
+//                      backlog drains, and the terminal drain of a
+//                      reshaped-away predecessor. The
+//                      `witness_fold_reporter_range` twin lets the
+//                      reporter choose the chunk's start instead of the
+//                      local watermark and violates it.
+//   invCoverage      — every leaf below a generation's watermark is
+//                      applied exactly once, and nothing at or above it
+//                      is: the accumulator is a pure function of the
+//                      committed sequence with no skipped or phantom
+//                      leaves.
+//   invRevealFence   — no reveal a beyond-frontier crossing produced ever
+//                      enters the seed, in its own epoch or carried
+//                      forward by a later one. The `reveal_fold_no_fence`
+//                      twin folds the fenced crossing directly; the
+//                      `reveal_fold_cumulative_chain` twin never reseeds
+//                      the chain, so a later epoch's fold drags the
+//                      fenced epoch's reveals in by descent — the design
+//                      alternative this split exists to reject.
+//   invRevealOnce    — each epoch's chain folds at most once. The
+//                      `reveal_fold_drain_refolds` twin re-folds the
+//                      recorded crossing and violates it.
 //
-// Modeling assumptions:
-//   - Chunks are QC-attested content: a chunk either matches the boundary
+// Assumptions:
+//   - Content validation is out of scope. A contribution matches its
 //     header exactly or is rejected whole (`contribution_chunk_valid`),
 //     so the model applies ranges, never forged leaves. The adversary's
 //     levers are scheduling ones: which certified crossing is reported
 //     when, how much backlog accumulates, when the chain grows (minted
 //     post-halt growth included — the fence, not content validation, is
 //     what keeps it out of the seed).
-//   - Every leaf is a reveal. Leaf-0 mandatory-ness (`derive_leaves`,
-//     enforced by `VerifyBeaconWitnessRoot`) is shard-side validation;
-//     at the fold's abstraction the reveal/content distinction changes
-//     which applied leaves carry entropy, not the window arithmetic, and
-//     exactly-once over all leaves subsumes exactly-once over reveals.
-//   - Heights collapse onto leaf counts: with a mandatory reveal per
-//     block the two advance in lockstep, and the fence compares positions
-//     along one chain, so the collapse preserves every checked ordering.
-//   - One reshape generation (the reseat guard), draining concurrently
-//     with the successor — enough to exercise the fresh accumulator and
-//     the terminal drain; further generations repeat the same shape.
+//   - Heights collapse onto leaf counts in `witness_fold` and onto epochs
+//     in `reveal_fold`. Each fence compares positions along one chain, so
+//     the collapse preserves every checked ordering.
+//   - One reshape generation in `witness_fold` (the reseat guard),
+//     draining concurrently with the successor. `reveal_fold` carries no
+//     reseat: a per-epoch chain already restarts at every epoch, so a
+//     reshape adds no case the epoch boundary does not.
 //   - Terminal drains bypass the fence: halt detection exempts terminal
 //     records, so no recovery ever pends on the draining predecessor.
 //   - Seed determinism itself is not a separate invariant: the fold is a
@@ -118,21 +88,14 @@
 // Run:
 //   quint typecheck specs/witness_fold.qnt
 //   quint verify --main=witness_fold_ok --invariant=invAll --max-steps=10 specs/witness_fold.qnt
-//     (holds; depth 10 covers grow → fresh fold → stamp → clear → drain →
-//      reseat → concurrent terminal drain)
-//   quint verify --main=witness_fold_reporter_range --invariant=invNoDoubleFold --max-steps=6 specs/witness_fold.qnt
-//     (the twin folds a reporter-chosen range; expect a counterexample)
-//   quint verify --main=witness_fold_no_fence --invariant=invFence --max-steps=6 specs/witness_fold.qnt
-//     (the twin seeds a post-frontier chunk under a pending recovery;
-//      expect a counterexample)
-//   quint verify --main=witness_fold_transient_fence --invariant=invFence --max-steps=8 specs/witness_fold.qnt
-//     (the twin fences only the completing epoch and leaks the drain of a
-//      beyond-frontier backlog; expect a counterexample)
+//   quint verify --main=reveal_fold_ok --invariant=invRevealAll --max-steps=10 specs/witness_fold.qnt
 //   quint verify --main=witness_window_ok --invariant=invWindowAgree --max-steps=8 specs/witness_fold.qnt
-//     (holds)
-//   quint verify --main=witness_window_live_base --invariant=invWindowAgree --max-steps=4 specs/witness_fold.qnt
-//     (the twin writes the active base after the fold; expect a
-//      counterexample)
+//
+//   Twins (each must produce a counterexample):
+//   quint verify --main=witness_fold_reporter_range --invariant=invNoDoubleFold --max-steps=10 specs/witness_fold.qnt
+//   quint verify --main=reveal_fold_no_fence --invariant=invRevealFence --max-steps=10 specs/witness_fold.qnt
+//   quint verify --main=reveal_fold_cumulative_chain --invariant=invRevealFence --max-steps=8 specs/witness_fold.qnt
+//   quint verify --main=reveal_fold_drain_refolds --invariant=invRevealOnce --max-steps=10 specs/witness_fold.qnt
 
 module witness_fold {
   // Chunk cap per fold (`MAX_WITNESSES_PER_SHARD`; model scale).
@@ -145,21 +108,11 @@ module witness_fold {
   // Broken twin: the chunk's start comes from the reporter rather than
   // the local watermark. False is the shipped `chunk_bounds`.
   const REPORTER_RANGE: bool
-  // Broken twin: the recovery fence is off entirely. False is the
-  // shipped fence.
-  const FENCE_OFF: bool
-  // Broken twin: the fence is transient — it holds only the epoch the
-  // recovery record is live (the crossing's completing fold), never
-  // persisted onto the boundary. True is the shipped persisted fence;
-  // false reproduces the drain-leak (a beyond-frontier crossing's
-  // backlog seeds from the second epoch on, after its record cleared).
-  const FENCE_PERSIST: bool
 
   // ── Current-generation accumulator ──
   // Reshape generation: 0 = the original shard, 1 = its successor.
   var gen: int
-  // The chain's committed leaf count (ground truth, minted growth
-  // included).
+  // The chain's committed leaf count (ground truth).
   var chainCount: int
   // `ShardBoundary::witness_leaf_count` — the applied watermark.
   var watermark: int
@@ -170,36 +123,12 @@ module witness_fold {
   var oldActive: bool
   var oldWatermark: int
   var oldRecorded: int
-  // The predecessor's persisted fence, carried onto its terminal record:
-  // a beyond-frontier band still draining when the shard terminated stays
-  // out of the seed through the terminal drain (the fold reads
-  // `reveals_fenced_below` off the terminal record like any other).
-  var oldFenceBelow: int
-
-  // ── Halt recovery fence ──
-  var recoveryPending: bool
-  // `ShardRecovery::attested_frontier`, in the collapsed height≈count
-  // coordinates.
-  var frontier: int
-  // `ShardBoundary::reveals_fenced_below`: the leaf count below which
-  // applied chunks stay out of the seed, persisted on the boundary
-  // record so a beyond-frontier crossing's backlog is held out across
-  // every drain epoch and record refresh — not just the epoch its
-  // recovery record clears. 0 = no fenced band draining.
-  var fenceBelow: int
 
   // ── Ghosts ──
-  // Leaves whose reveal entered the seed, as (generation, leaf index).
-  var seeded: Set[(int, int)]
-  // Leaves applied under an active fence — state-mutating, seed-inert.
-  var fenced: Set[(int, int)]
+  // Leaves the fold applied, as (generation, leaf index).
+  var applied: Set[(int, int)]
   // A leaf was applied twice.
   var dupSeen: bool
-  // Ground truth, independent of the fence bookkeeping: leaves a
-  // beyond-frontier crossing introduced — the beyond-f retained
-  // committee's post-halt production, which must never seed no matter
-  // how many epochs its backlog takes to drain.
-  var tainted: Set[(int, int)]
 
   pure def minInt(a: int, b: int): int = if (a < b) a else b
 
@@ -215,18 +144,11 @@ module witness_fold {
     oldActive' = false,
     oldWatermark' = 0,
     oldRecorded' = 0,
-    oldFenceBelow' = 0,
-    recoveryPending' = false,
-    frontier' = 0,
-    fenceBelow' = 0,
-    seeded' = Set(),
-    fenced' = Set(),
+    applied' = Set(),
     dupSeen' = false,
-    tainted' = Set(),
   }
 
-  // The chain commits more blocks; every block appends its mandatory
-  // reveal leaf. Includes a beyond-f committee minting post-halt.
+  // The chain commits more blocks, some carrying governance leaves.
   action grow = {
     nondet n = 1.to(MAX_GROW).oneOf()
     all {
@@ -234,95 +156,48 @@ module witness_fold {
       chainCount' = chainCount + n,
       gen' = gen, watermark' = watermark, recorded' = recorded,
       oldActive' = oldActive, oldWatermark' = oldWatermark,
-      oldRecorded' = oldRecorded, oldFenceBelow' = oldFenceBelow,
-      recoveryPending' = recoveryPending, frontier' = frontier,
-      fenceBelow' = fenceBelow,
-      seeded' = seeded, fenced' = fenced,
-      dupSeen' = dupSeen, tainted' = tainted,
+      oldRecorded' = oldRecorded,
+      applied' = applied, dupSeen' = dupSeen,
     }
   }
 
-  // A fresh crossing at count c records the shard's new boundary, applies
-  // the chunk `[watermark, min(watermark + CAP, c))`, and clears a
-  // pending recovery. A beyond-frontier crossing raises the persisted
-  // fence to its own count, dominating any carried band (the accumulator
-  // is monotone along the chain); the fence holds every leaf below it out
-  // of the seed and is carried onto the record while unfolded leaves
-  // below it remain.
+  // A fresh crossing at count c records the shard's new boundary and
+  // applies the chunk `[watermark, min(watermark + CAP, c))`.
   action foldFresh = {
     nondet c = 0.to(MAX_LEAVES).oneOf()
     nondet s = 0.to(MAX_LEAVES).oneOf()
     val start = if (REPORTER_RANGE) s else watermark
     val end = minInt(watermark + CAP, c)
     val newLeaves = leafBand(gen, start, end)
-    val beyond = recoveryPending and c > frontier
-    // This fold's fence line: the beyond-frontier crossing's own count
-    // (fence on) raised over the carried band, else the carried band.
-    val own = if (beyond and not(FENCE_OFF)) c else 0
-    val fence = if (own > fenceBelow) own else fenceBelow
-    val fenced_now = fence > 0 and start < fence
     all {
       c > recorded,
       c <= chainCount,
       c >= watermark,
       s <= watermark,
-      seeded' = if (fenced_now) seeded else seeded.union(newLeaves),
-      fenced' = if (fenced_now) fenced.union(newLeaves) else fenced,
-      dupSeen' = if (newLeaves.intersect(seeded.union(fenced)) != Set()) true else dupSeen,
-      // A beyond-frontier crossing taints its whole applied band up to
-      // its count — ground truth the leak check reads regardless of how
-      // the fence variable evolves.
-      tainted' = if (beyond) tainted.union(leafBand(gen, start, c)) else tainted,
-      // Persist the fence while leaves below it are still unfolded; the
-      // transient twin drops it the moment the record clears.
-      fenceBelow' =
-        if (FENCE_PERSIST and fence > 0 and end < fence) fence else 0,
+      applied' = applied.union(newLeaves),
+      dupSeen' = if (newLeaves.intersect(applied) != Set()) true else dupSeen,
       watermark' = end,
       recorded' = c,
-      recoveryPending' = false,
       gen' = gen, chainCount' = chainCount,
       oldActive' = oldActive, oldWatermark' = oldWatermark,
-      oldRecorded' = oldRecorded, oldFenceBelow' = oldFenceBelow,
-      frontier' = frontier,
+      oldRecorded' = oldRecorded,
     }
   }
 
   // A drain re-fold of the recorded crossing: watermark-only progress, no
-  // record refresh, recovery untouched. The persisted fence still holds
-  // the beyond-frontier band out; it clears once the watermark passes it.
+  // record refresh.
   action foldDrain = {
     val end = minInt(watermark + CAP, recorded)
     val newLeaves = leafBand(gen, watermark, end)
-    val fenced_now = fenceBelow > 0 and watermark < fenceBelow
     all {
       watermark < recorded,
-      seeded' = if (fenced_now) seeded else seeded.union(newLeaves),
-      fenced' = if (fenced_now) fenced.union(newLeaves) else fenced,
-      dupSeen' = if (newLeaves.intersect(seeded.union(fenced)) != Set()) true else dupSeen,
-      tainted' = tainted,
-      fenceBelow' = if (fenceBelow > 0 and end < fenceBelow) fenceBelow else 0,
+      applied' = applied.union(newLeaves),
+      dupSeen' = if (newLeaves.intersect(applied) != Set()) true else dupSeen,
       watermark' = end,
       gen' = gen, chainCount' = chainCount, recorded' = recorded,
       oldActive' = oldActive, oldWatermark' = oldWatermark,
-      oldRecorded' = oldRecorded, oldFenceBelow' = oldFenceBelow,
-      recoveryPending' = recoveryPending, frontier' = frontier,
+      oldRecorded' = oldRecorded,
     }
-  }
-
-  // The detector flags the shard and the re-draw stamps a recovery whose
-  // frontier is the recorded crossing's position. Detection calibration
-  // is Model G's subject; here any moment is a valid stamp.
-  action stampRecovery = all {
-    not(recoveryPending),
-    recoveryPending' = true,
-    frontier' = recorded,
-    gen' = gen, chainCount' = chainCount, watermark' = watermark,
-    recorded' = recorded,
-    oldActive' = oldActive, oldWatermark' = oldWatermark,
-    oldRecorded' = oldRecorded, oldFenceBelow' = oldFenceBelow,
-    fenceBelow' = fenceBelow,
-    seeded' = seeded, fenced' = fenced,
-    dupSeen' = dupSeen, tainted' = tainted,
   }
 
   // The shard terminates at its recorded crossing and a successor seats
@@ -332,43 +207,30 @@ module witness_fold {
   action reseat = all {
     gen == 0,
     recorded > 0,
-    not(recoveryPending),
     oldActive' = watermark < recorded,
     oldWatermark' = watermark,
     oldRecorded' = recorded,
-    // The predecessor's persisted fence rides onto its terminal record.
-    oldFenceBelow' = fenceBelow,
     gen' = gen + 1,
     chainCount' = 0,
     watermark' = 0,
     recorded' = 0,
-    recoveryPending' = false, frontier' = frontier,
-    fenceBelow' = 0,
-    seeded' = seeded, fenced' = fenced,
-    dupSeen' = dupSeen, tainted' = tainted,
+    applied' = applied, dupSeen' = dupSeen,
   }
 
   // The predecessor's terminal record drains: re-sourced every fold until
-  // consumed, then dropped. The fold reads `reveals_fenced_below` off the
-  // terminal record like any other, so a beyond-frontier band that was
-  // still draining when the shard terminated stays out of the seed.
+  // consumed, then dropped.
   action foldOldDrain = {
     val end = minInt(oldWatermark + CAP, oldRecorded)
     val newLeaves = leafBand(gen - 1, oldWatermark, end)
-    val fenced_now = oldFenceBelow > 0 and oldWatermark < oldFenceBelow
     all {
       oldActive,
       oldWatermark < oldRecorded,
-      seeded' = if (fenced_now) seeded else seeded.union(newLeaves),
-      fenced' = if (fenced_now) fenced.union(newLeaves) else fenced,
-      dupSeen' = if (newLeaves.intersect(seeded.union(fenced)) != Set()) true else dupSeen,
+      applied' = applied.union(newLeaves),
+      dupSeen' = if (newLeaves.intersect(applied) != Set()) true else dupSeen,
       oldWatermark' = end,
       oldActive' = end < oldRecorded,
-      oldFenceBelow' = if (oldFenceBelow > 0 and end < oldFenceBelow) oldFenceBelow else 0,
       gen' = gen, chainCount' = chainCount, watermark' = watermark,
       recorded' = recorded, oldRecorded' = oldRecorded,
-      recoveryPending' = recoveryPending, frontier' = frontier,
-      fenceBelow' = fenceBelow, tainted' = tainted,
     }
   }
 
@@ -377,7 +239,6 @@ module witness_fold {
     foldFresh,
     foldDrain,
     foldOldDrain,
-    stampRecovery,
     reseat,
   }
 
@@ -385,25 +246,16 @@ module witness_fold {
 
   val invNoDoubleFold = not(dupSeen)
 
-  // No leaf a beyond-frontier crossing introduced ever enters the seed —
-  // checked against the ground-truth taint set, so it holds across the
-  // completing epoch, every drain epoch, and any record refresh, not
-  // only while the recovery record is live.
-  val invFence = seeded.intersect(tainted) == Set()
-
   // Exactly-once accounting: below a generation's watermark every leaf is
-  // seeded xor fenced; at or above it, nothing is.
+  // applied; at or above it, nothing is.
   val invCoverage = and {
     0.to(MAX_LEAVES).forall(i =>
-      (i < watermark) implies
-        (seeded.contains((gen, i)) or fenced.contains((gen, i)))),
+      (i < watermark) implies applied.contains((gen, i))),
     0.to(MAX_LEAVES).forall(i =>
-      (oldActive and i < oldWatermark) implies
-        (seeded.contains((gen - 1, i)) or fenced.contains((gen - 1, i)))),
-    seeded.union(fenced).forall(l =>
+      (oldActive and i < oldWatermark) implies applied.contains((gen - 1, i))),
+    applied.forall(l =>
       if (l._1 == gen) l._2 < watermark
       else l._1 == gen - 1 and l._2 < oldWatermark),
-    seeded.intersect(fenced) == Set(),
   }
 
   // The fold never runs ahead of certified content.
@@ -416,9 +268,144 @@ module witness_fold {
 
   val invAll = and {
     invNoDoubleFold,
-    invFence,
     invCoverage,
     invWatermarkSound,
+  }
+}
+
+module reveal_fold {
+  // Epoch band the chain can reach (model scale).
+  const MAX_EPOCH: int
+  // Broken twin: the recovery fence is off entirely. False is the shipped
+  // `reveal_chain_fenced`.
+  const FENCE_OFF: bool
+  // Broken twin: the chain never reseeds at an epoch boundary, so folding
+  // one epoch's value carries every earlier epoch's reveals with it —
+  // the cumulative-chain design this model exists to reject. False is the
+  // shipped per-epoch reseed.
+  const CHAIN_CUMULATIVE: bool
+  // Broken twin: a drain re-fold of the recorded crossing folds its chain
+  // again instead of contributing nothing. False is the shipped
+  // `drain_refold` gate.
+  const DRAIN_REFOLDS: bool
+
+  // The shard's current anchor epoch. Its blocks fold into one chain,
+  // which reseeds when the anchor epoch changes.
+  var epoch: int
+  // The last epoch whose crossing the beacon recorded. -1 before any.
+  var recordedEpoch: int
+  var recoveryPending: bool
+  // `ShardRecovery::attested_frontier`, in the collapsed height≈epoch
+  // coordinates.
+  var frontier: int
+  // Epochs whose chain reached `state.randomness`.
+  var seededEpochs: Set[int]
+  // Ground truth: epochs a beyond-frontier committee produced into, whose
+  // reveals must never seed however the fold's bookkeeping evolves.
+  var taintedEpochs: Set[int]
+  // An epoch's chain folded twice.
+  var dupFold: bool
+
+  action init = all {
+    epoch' = 0,
+    recordedEpoch' = -1,
+    recoveryPending' = false,
+    frontier' = 0,
+    seededEpochs' = Set(),
+    taintedEpochs' = Set(),
+    dupFold' = false,
+  }
+
+  // The chain crosses into its next anchor epoch.
+  action advanceEpoch = all {
+    epoch + 1 <= MAX_EPOCH,
+    epoch' = epoch + 1,
+    recordedEpoch' = recordedEpoch,
+    recoveryPending' = recoveryPending, frontier' = frontier,
+    seededEpochs' = seededEpochs, taintedEpochs' = taintedEpochs,
+    dupFold' = dupFold,
+  }
+
+  // The beacon folds the crossing that closes epoch e — one chain value,
+  // read off the crossing block's header. A crossing above a pending
+  // recovery's frontier is fenced: its epoch contributes nothing.
+  action foldCrossing = {
+    nondet e = 0.to(MAX_EPOCH).oneOf()
+    val beyond = recoveryPending and e > frontier
+    val fenced = beyond and not(FENCE_OFF)
+    // What the folded value carries. A per-epoch chain carries only its
+    // own epoch; a cumulative one drags every earlier epoch in with it.
+    val carried =
+      if (CHAIN_CUMULATIVE) 0.to(MAX_EPOCH).filter(i => i <= e)
+      else Set(e)
+    all {
+      e > recordedEpoch,
+      e <= epoch,
+      seededEpochs' =
+        if (fenced) seededEpochs else seededEpochs.union(carried),
+      dupFold' =
+        if (not(fenced) and carried.intersect(seededEpochs) != Set()) true
+        else dupFold,
+      taintedEpochs' =
+        if (beyond) taintedEpochs.union(Set(e)) else taintedEpochs,
+      recordedEpoch' = e,
+      recoveryPending' = false,
+      epoch' = epoch, frontier' = frontier,
+    }
+  }
+
+  // A committed re-fold of the crossing already recorded. The shipped fold
+  // recognises it and contributes nothing; the twin folds its chain again.
+  action drainRefold = all {
+    recordedEpoch >= 0,
+    seededEpochs' =
+      if (DRAIN_REFOLDS) seededEpochs.union(Set(recordedEpoch))
+      else seededEpochs,
+    dupFold' =
+      if (DRAIN_REFOLDS and seededEpochs.contains(recordedEpoch)) true
+      else dupFold,
+    epoch' = epoch, recordedEpoch' = recordedEpoch,
+    recoveryPending' = recoveryPending, frontier' = frontier,
+    taintedEpochs' = taintedEpochs,
+  }
+
+  // The detector flags the shard and the re-draw stamps a recovery whose
+  // frontier is the recorded crossing's position. Detection calibration is
+  // Model G's subject; here any moment is a valid stamp.
+  action stampRecovery = all {
+    not(recoveryPending),
+    recoveryPending' = true,
+    frontier' = if (recordedEpoch > 0) recordedEpoch else 0,
+    epoch' = epoch, recordedEpoch' = recordedEpoch,
+    seededEpochs' = seededEpochs, taintedEpochs' = taintedEpochs,
+    dupFold' = dupFold,
+  }
+
+  action step = any {
+    advanceEpoch,
+    foldCrossing,
+    drainRefold,
+    stampRecovery,
+  }
+
+  // ── Invariants ──
+
+  // No reveal a beyond-frontier crossing produced ever enters the seed —
+  // not in the epoch it lands in, and not carried forward by any later
+  // epoch's fold. The `CHAIN_CUMULATIVE` twin violates it by descent.
+  val invRevealFence = seededEpochs.intersect(taintedEpochs) == Set()
+
+  // Each epoch's chain folds at most once. The `DRAIN_REFOLDS` twin
+  // violates it by re-folding the recorded crossing.
+  val invRevealOnce = not(dupFold)
+
+  // The fold never seeds an epoch the chain has not reached.
+  val invRevealSound = seededEpochs.forall(e => e <= epoch)
+
+  val invRevealAll = and {
+    invRevealFence,
+    invRevealOnce,
+    invRevealSound,
   }
 }
 
@@ -487,30 +474,38 @@ module witness_window {
 }
 
 module witness_fold_ok {
-  import witness_fold(
-    CAP = 2, MAX_GROW = 2, MAX_LEAVES = 6,
-    REPORTER_RANGE = false, FENCE_OFF = false, FENCE_PERSIST = true
-  ).*
+  import witness_fold(CAP = 2, MAX_GROW = 2, MAX_LEAVES = 6, REPORTER_RANGE = false).*
 }
 
 module witness_fold_reporter_range {
-  import witness_fold(
-    CAP = 2, MAX_GROW = 2, MAX_LEAVES = 6,
-    REPORTER_RANGE = true, FENCE_OFF = false, FENCE_PERSIST = true
+  import witness_fold(CAP = 2, MAX_GROW = 2, MAX_LEAVES = 6, REPORTER_RANGE = true).*
+}
+
+module reveal_fold_ok {
+  import reveal_fold(
+    MAX_EPOCH = 4, FENCE_OFF = false, CHAIN_CUMULATIVE = false,
+    DRAIN_REFOLDS = false
   ).*
 }
 
-module witness_fold_no_fence {
-  import witness_fold(
-    CAP = 2, MAX_GROW = 2, MAX_LEAVES = 6,
-    REPORTER_RANGE = false, FENCE_OFF = true, FENCE_PERSIST = true
+module reveal_fold_no_fence {
+  import reveal_fold(
+    MAX_EPOCH = 4, FENCE_OFF = true, CHAIN_CUMULATIVE = false,
+    DRAIN_REFOLDS = false
   ).*
 }
 
-module witness_fold_transient_fence {
-  import witness_fold(
-    CAP = 2, MAX_GROW = 2, MAX_LEAVES = 6,
-    REPORTER_RANGE = false, FENCE_OFF = false, FENCE_PERSIST = false
+module reveal_fold_cumulative_chain {
+  import reveal_fold(
+    MAX_EPOCH = 4, FENCE_OFF = false, CHAIN_CUMULATIVE = true,
+    DRAIN_REFOLDS = false
+  ).*
+}
+
+module reveal_fold_drain_refolds {
+  import reveal_fold(
+    MAX_EPOCH = 4, FENCE_OFF = false, CHAIN_CUMULATIVE = false,
+    DRAIN_REFOLDS = true
   ).*
 }
 
