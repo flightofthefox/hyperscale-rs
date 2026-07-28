@@ -760,7 +760,7 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BoundedVec, CertificateRoot,
         CommitProofVerifyError, ElidedCertifiedBlock, Hash, InFlightCount, Inventory,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Round, SignerBitfield,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, RevealChain, Round, SignerBitfield,
         SplitChildRoots, TransactionRoot, VoteCount, WitnessSources,
     };
 
@@ -979,6 +979,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             pair,
             None,
         );

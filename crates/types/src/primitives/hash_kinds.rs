@@ -188,6 +188,18 @@ hash_newtype!(
     "BeaconWitnessRoot"
 );
 
+hash_newtype!(
+    /// Running hash chain over a shard's randomness reveals within one
+    /// anchor epoch.
+    ///
+    /// Carried in `BlockHeader::reveal_chain` and therefore QC-attested.
+    /// Resets to `ZERO`-seeded at every anchor-epoch change, so the chain a
+    /// boundary block carries is exactly the closed chain of the epoch that
+    /// block ends — the value the beacon folds into `state.randomness`.
+    pub RevealChain,
+    "RevealChain"
+);
+
 #[cfg(test)]
 mod tests {
     use sbor::prelude::*;

@@ -13,9 +13,9 @@ use hyperscale_types::{
     AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
     BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
     Hash, InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash,
-    ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TopologySchedule,
-    TopologySnapshot, TransactionRoot, ValidatorId, Verified, WaveId, WeightedTimestamp,
-    WitnessSources,
+    ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId, SignerBitfield, StateRoot,
+    TopologySchedule, TopologySnapshot, TransactionRoot, ValidatorId, Verified, WaveId,
+    WeightedTimestamp, WitnessSources,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -54,6 +54,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
         BeaconWitnessRoot::ZERO,
         BeaconWitnessLeafCount::ZERO,
         BeaconWitnessLeafCount::ZERO,
+        RevealChain::ZERO,
         None,
         None,
     );
@@ -113,6 +114,7 @@ fn make_remote_header_targeting(
         BeaconWitnessRoot::ZERO,
         BeaconWitnessLeafCount::ZERO,
         BeaconWitnessLeafCount::ZERO,
+        RevealChain::ZERO,
         None,
         None,
     );

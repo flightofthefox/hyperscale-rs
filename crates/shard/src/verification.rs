@@ -2145,8 +2145,9 @@ mod tests {
     }
     use hyperscale_types::{
         BeaconWitnessLeafCount, BoundedVec, CertificateRoot, Epoch, Hash, LocalReceiptRoot,
-        LocalTimestamp, ProposerTimestamp, QuorumCertificate, Round, RoutableTransaction, ShardId,
-        SignerBitfield, TransactionRoot, ValidatorId, WeightedTimestamp,
+        LocalTimestamp, ProposerTimestamp, QuorumCertificate, RevealChain, Round,
+        RoutableTransaction, ShardId, SignerBitfield, TransactionRoot, ValidatorId,
+        WeightedTimestamp,
     };
 
     use super::*;
@@ -2180,6 +2181,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         )
@@ -2708,6 +2710,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );

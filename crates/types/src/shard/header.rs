@@ -13,8 +13,8 @@ use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, BoundedBTreeMap, BoundedVec,
     CertificateRoot, ChainOrigin, Hash, InFlightCount, LocalReceiptRoot,
     MAX_REMOTE_SHARDS_PER_WAVE, MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionTxRoot,
-    ProvisionsRoot, QuorumCertificate, Round, SettledWavesRoot, ShardId, SplitChildRoots,
-    StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified, Verify, WaveId,
+    ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledWavesRoot, ShardId,
+    SplitChildRoots, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified, Verify, WaveId,
     WeightedTimestamp,
 };
 
@@ -55,6 +55,14 @@ pub struct BlockHeader {
     /// joiners) reads the base off the header instead of reconstructing
     /// historical beacon state.
     beacon_witness_base: BeaconWitnessLeafCount,
+    /// Running hash chain over this shard's randomness reveals within the
+    /// block's anchor epoch (`epoch_for(parent_qc.wt)`), reseeded whenever
+    /// that epoch differs from the parent's. A block whose child anchors
+    /// past the epoch cut is the last of its epoch, so the chain a boundary
+    /// block carries is the closed value the beacon folds into
+    /// `state.randomness` — one 32-byte commitment per epoch rather than a
+    /// leaf per block.
+    reveal_chain: RevealChain,
     /// The two child hashes of the JMT root node behind `state_root`,
     /// carried on every header of a split-pending shard's final epoch
     /// (`None` everywhere else). Produced by the same replay that fills
@@ -79,7 +87,7 @@ impl BlockHeader {
     ///
     /// Panics if `waves.len() > MAX_TXS_PER_BLOCK` or
     /// `provision_tx_roots.len() > MAX_REMOTE_SHARDS_PER_WAVE`.
-    #[allow(clippy::too_many_arguments)] // mirrors the 21 stored fields
+    #[allow(clippy::too_many_arguments)] // mirrors the 22 stored fields
     #[must_use]
     pub fn new(
         shard_id: ShardId,
@@ -101,6 +109,7 @@ impl BlockHeader {
         beacon_witness_root: BeaconWitnessRoot,
         beacon_witness_leaf_count: BeaconWitnessLeafCount,
         beacon_witness_base: BeaconWitnessLeafCount,
+        reveal_chain: RevealChain,
         split_child_roots: Option<SplitChildRoots>,
         settled_waves_root: Option<SettledWavesRoot>,
     ) -> Self {
@@ -124,6 +133,7 @@ impl BlockHeader {
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
+            reveal_chain,
             split_child_roots,
             settled_waves_root,
         }
@@ -166,6 +176,7 @@ impl BlockHeader {
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
+            reveal_chain: RevealChain::ZERO,
             split_child_roots: None,
             settled_waves_root: None,
         }
@@ -216,6 +227,7 @@ impl BlockHeader {
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
+            reveal_chain: RevealChain::ZERO,
             split_child_roots: None,
             settled_waves_root: None,
         }
@@ -280,6 +292,7 @@ impl BlockHeader {
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
+            reveal_chain: RevealChain::ZERO,
             split_child_roots: None,
             settled_waves_root: None,
         }
@@ -488,6 +501,16 @@ impl BlockHeader {
         self.beacon_witness_base
     }
 
+    /// The reveal chain this block commits.
+    ///
+    /// On a boundary block this is the closed chain of the epoch the block
+    /// ends, which is what the beacon folds; on any other block it is a
+    /// partial run that no consumer reads.
+    #[must_use]
+    pub const fn reveal_chain(&self) -> RevealChain {
+        self.reveal_chain
+    }
+
     /// The two child hashes of the JMT root node behind `state_root` —
     /// present on every header of a split-pending shard's final epoch,
     /// `None` everywhere else. Verified beside the state root.
@@ -505,7 +528,7 @@ impl BlockHeader {
     }
 
     /// Decompose into the raw fields, in struct-declaration order.
-    #[allow(clippy::type_complexity)] // mirrors the 21 stored fields
+    #[allow(clippy::type_complexity)] // mirrors the 22 stored fields
     #[must_use]
     pub fn into_parts(
         self,
@@ -529,6 +552,7 @@ impl BlockHeader {
         BeaconWitnessRoot,
         BeaconWitnessLeafCount,
         BeaconWitnessLeafCount,
+        RevealChain,
         Option<SplitChildRoots>,
         Option<SettledWavesRoot>,
     ) {
@@ -552,6 +576,7 @@ impl BlockHeader {
             self.beacon_witness_root,
             self.beacon_witness_leaf_count,
             self.beacon_witness_base,
+            self.reveal_chain,
             self.split_child_roots,
             self.settled_waves_root,
         )
@@ -820,6 +845,7 @@ mod tests {
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
+            reveal_chain,
             _,
             _,
         ) = bare.clone().into_parts();
@@ -843,6 +869,7 @@ mod tests {
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
+            reveal_chain,
             Some(pair),
             None,
         );
@@ -879,6 +906,7 @@ mod tests {
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
+            reveal_chain,
             split_child_roots,
             _,
         ) = bare.clone().into_parts();
@@ -902,6 +930,7 @@ mod tests {
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
+            reveal_chain,
             split_child_roots,
             Some(root),
         );
@@ -922,8 +951,8 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            // BlockHeader has 21 fields.
-            enc.write_size(21).unwrap();
+            // BlockHeader has 22 fields.
+            enc.write_size(22).unwrap();
             enc.encode(&h.shard_id).unwrap();
             enc.encode(&h.height).unwrap();
             enc.encode(&h.parent_block_hash).unwrap();
@@ -962,7 +991,7 @@ mod tests {
             enc.write_payload_prefix(BASIC_SBOR_V1_PAYLOAD_PREFIX)
                 .unwrap();
             enc.write_value_kind(ValueKind::Tuple).unwrap();
-            enc.write_size(21).unwrap();
+            enc.write_size(22).unwrap();
             enc.encode(&h.shard_id).unwrap();
             enc.encode(&h.height).unwrap();
             enc.encode(&h.parent_block_hash).unwrap();

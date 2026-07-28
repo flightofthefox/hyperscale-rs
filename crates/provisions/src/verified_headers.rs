@@ -96,8 +96,8 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         CertificateRoot, ChainOrigin, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, Round, SignerBitfield, StateRoot, TransactionRoot,
-        ValidatorId, WeightedTimestamp,
+        ProvisionsRoot, QuorumCertificate, RevealChain, Round, SignerBitfield, StateRoot,
+        TransactionRoot, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -123,6 +123,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );

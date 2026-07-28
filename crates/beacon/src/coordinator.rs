@@ -2629,7 +2629,7 @@ mod tests {
         Epoch, GenesisConfigHash, GenesisPool, GenesisValidator, Hash, InFlightCount, JailReason,
         KeptSeat, LeafIndex, LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR,
         NetworkDefinition, ObserverSeat, PcVector, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Randomness, Round, ShardBoundary, ShardCommittee,
+        QuorumCertificate, Randomness, RevealChain, Round, ShardBoundary, ShardCommittee,
         ShardEpochContribution, ShardId, ShardWitnessPayload, Signer, SignerBitfield, SpcCert,
         SpcView, Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, VrfProof,
         WeightedTimestamp, build_qc1, build_qc2, build_qc3, build_ratify_cert, compute_merkle_root,
@@ -2760,6 +2760,7 @@ mod tests {
             root,
             BeaconWitnessLeafCount::new(leaf_count),
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );
@@ -2880,6 +2881,7 @@ mod tests {
             BeaconWitnessRoot::from_raw(Hash::from_bytes(format!("bw-{height}").as_bytes())),
             BeaconWitnessLeafCount::new(leaf_count),
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );
@@ -5269,6 +5271,7 @@ mod tests {
             beacon_root,
             BeaconWitnessLeafCount::new(total_leaves),
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );

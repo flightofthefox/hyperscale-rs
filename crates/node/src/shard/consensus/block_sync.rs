@@ -428,8 +428,8 @@ mod tests {
         BlockHeader, BoundedVec, CertificateRoot, ChainOrigin, ConsensusReceipt,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot, TransactionRoot, TxHash,
-        TxOutcome, ValidatorId, Verifiable, WaveCertificate, WaveId, WeightedTimestamp,
+        QuorumCertificate, RevealChain, Round, ShardId, SignerBitfield, StateRoot, TransactionRoot,
+        TxHash, TxOutcome, ValidatorId, Verifiable, WaveCertificate, WaveId, WeightedTimestamp,
         WitnessSources,
     };
 
@@ -458,6 +458,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         )
@@ -490,6 +491,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         )

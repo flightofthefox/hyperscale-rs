@@ -955,8 +955,8 @@ mod tests {
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
         BlockHeader, BoundedVec, CertificateRoot, ChainOrigin, Hash, InFlightCount,
         LocalReceiptRoot, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp,
-        ProvisionEntry, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, Round, ShardId,
-        SignerBitfield, StateRoot, TopologySnapshot, TransactionRoot, TxHash, ValidatorId,
+        ProvisionEntry, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
+        ShardId, SignerBitfield, StateRoot, TopologySnapshot, TransactionRoot, TxHash, ValidatorId,
         ValidatorSet, Verifiable, WaveId, WeightedTimestamp, WitnessSources, compute_merkle_root,
     };
     use proptest::bool::ANY as ANY_BOOL;
@@ -1034,6 +1034,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );
@@ -1933,6 +1934,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );
@@ -1997,6 +1999,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );
@@ -2306,6 +2309,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );

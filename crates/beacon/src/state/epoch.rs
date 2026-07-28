@@ -1282,7 +1282,7 @@ mod tests {
         AggregateSignature, BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
         BlockHeader, BlockHeight, BoundedVec, CertificateRoot, ChainOrigin, Epoch, Hash,
         InFlightCount, LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, SettledWavesRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledWavesRoot,
         ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardRecovery, ShardWitnessPayload,
         SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TransactionRoot,
         TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root,
@@ -1354,6 +1354,7 @@ mod tests {
             root,
             BeaconWitnessLeafCount::new(leaf_count),
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             split_child_roots,
             settled_waves_root,
         )
@@ -4373,6 +4374,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             Some(pair),
             None,
         )

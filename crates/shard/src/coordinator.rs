@@ -5731,9 +5731,9 @@ mod tests {
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BoundedVec, CertificateRoot,
         ConsensusSignature, Epoch, Hash, InFlightCount, LocalReceiptRoot, MAX_TIMESTAMP_DELAY,
         MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, ProvisionsRoot, RETENTION_HORIZON,
-        RoutableTransaction, ShardId, Signer, SignerBitfield, TopologySchedule, TopologySnapshot,
-        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
-        WitnessSources, test_utils,
+        RevealChain, RoutableTransaction, ShardId, Signer, SignerBitfield, TopologySchedule,
+        TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
+        WeightedTimestamp, WitnessSources, test_utils,
     };
 
     use super::*;
@@ -5905,6 +5905,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );
@@ -6020,6 +6021,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             );
@@ -6079,6 +6081,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         )
@@ -6151,6 +6154,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             )
@@ -6218,6 +6222,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );
@@ -6267,6 +6272,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );
@@ -6426,6 +6432,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             );
@@ -6480,6 +6487,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             )
@@ -6559,6 +6567,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             )
@@ -6649,6 +6658,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             )
@@ -6723,6 +6733,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             )
@@ -6812,6 +6823,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             )
@@ -6919,6 +6931,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             )
@@ -6973,6 +6986,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             )
@@ -7570,6 +7584,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             )
@@ -7920,6 +7935,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             )
@@ -7968,6 +7984,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             )
@@ -8068,6 +8085,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             )
@@ -8890,6 +8908,7 @@ mod tests {
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
+                    RevealChain::ZERO,
                     None,
                     None,
                 )
@@ -8963,6 +8982,7 @@ mod tests {
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
+                    RevealChain::ZERO,
                     None,
                     None,
                 )
@@ -9015,6 +9035,7 @@ mod tests {
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
+                    RevealChain::ZERO,
                     None,
                     None,
                 )
@@ -9216,6 +9237,7 @@ mod tests {
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
+                    RevealChain::ZERO,
                     None,
                     None,
                 )
@@ -9254,6 +9276,7 @@ mod tests {
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
+                    RevealChain::ZERO,
                     None,
                     None,
                 )
@@ -9304,6 +9327,7 @@ mod tests {
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
+                    RevealChain::ZERO,
                     None,
                     None,
                 )
@@ -9340,6 +9364,7 @@ mod tests {
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
+                    RevealChain::ZERO,
                     None,
                     None,
                 )
@@ -9802,6 +9827,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );

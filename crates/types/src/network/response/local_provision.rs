@@ -116,8 +116,8 @@ mod tests {
             BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
             CertificateRoot, CertifiedBlockHeader, ChainOrigin, Hash, InFlightCount,
             LocalReceiptRoot, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry,
-            ProvisionsRoot, QuorumCertificate, Round, ShardId, SignerBitfield, StateRoot,
-            TransactionRoot, TxHash, ValidatorId, WeightedTimestamp,
+            ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId, SignerBitfield,
+            StateRoot, TransactionRoot, TxHash, ValidatorId, WeightedTimestamp,
         };
 
         let source_shard = ShardId::leaf(1, 1);
@@ -155,6 +155,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );

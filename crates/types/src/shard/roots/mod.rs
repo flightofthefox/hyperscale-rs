@@ -24,6 +24,7 @@ pub mod certificate;
 pub mod local_receipt;
 pub mod provision_tx;
 pub mod provisions;
+pub mod reveal_chain;
 pub mod settled_waves;
 pub mod state;
 pub mod transaction;
@@ -38,6 +39,7 @@ pub use certificate::{
 pub use local_receipt::{LocalReceiptRootContext, LocalReceiptRootVerifyError};
 pub use provision_tx::{ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError};
 pub use provisions::{ProvisionRootVerifyError, ProvisionsRootContext};
+pub use reveal_chain::{REVEAL_CHAIN_DOMAIN_TAG, extend_reveal_chain, next_reveal_chain};
 pub use settled_waves::{local_settled_wave_ids, settled_waves_root_from_ids};
 pub use state::{SplitChildRoots, StateRootContext, StateRootVerifyError};
 pub use transaction::{TransactionRootContext, TxRootVerifyError};

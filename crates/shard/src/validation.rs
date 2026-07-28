@@ -478,10 +478,10 @@ mod tests {
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         BoundedVec, CertificateRoot, ChainOrigin, FinalizedWave, Hash, InFlightCount,
         LocalReceiptRoot, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp,
-        ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate, Round, RoutableTransaction,
-        ShardId, Signer, SignerBitfield, StateRoot, TransactionDecision, TransactionRoot,
-        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, WeightedTimestamp, WitnessSources,
-        compute_waves, test_utils,
+        ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
+        RoutableTransaction, ShardId, Signer, SignerBitfield, StateRoot, TransactionDecision,
+        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, WeightedTimestamp,
+        WitnessSources, compute_waves, test_utils,
     };
 
     use super::*;
@@ -526,6 +526,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         )
@@ -558,6 +559,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         )
@@ -584,6 +586,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );
@@ -792,6 +795,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         )
@@ -937,6 +941,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         )

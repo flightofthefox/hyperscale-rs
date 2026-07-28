@@ -238,9 +238,9 @@ mod tests {
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
         BlockHash, BlockHeader, BoundedVec, CertificateRoot, ExecutionCertificate,
         ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId,
-        SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
-        Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
+        ShardId, SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
+        Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources,
         settled_waves_root_from_ids,
     };
 
@@ -309,6 +309,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             );

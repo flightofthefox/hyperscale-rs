@@ -29,11 +29,12 @@ use hyperscale_types::{
     LocalReceiptRoot, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, PcValueElement, PcVector,
     PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteVerifyContext, ProposerTimestamp,
     ProvisionsRoot, QuorumCertificate, Randomness, RatifyPhase, RatifyRound, RatifyVerifyContext,
-    RatifyVote, Round, SKIP_TIMEOUT, ShardId, ShardVoteEquivocation, ShardWitnessPayload, Signer,
-    SignerBitfield, SpcEmptyViewMsg, SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView,
-    Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, compute_merkle_root, compute_range_proof, genesis_config_hash, pc_context,
-    sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3, spc_context, vrf_sign,
+    RatifyVote, RevealChain, Round, SKIP_TIMEOUT, ShardId, ShardVoteEquivocation,
+    ShardWitnessPayload, Signer, SignerBitfield, SpcEmptyViewMsg, SpcNewCommitMsg,
+    SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, compute_merkle_root, compute_range_proof,
+    genesis_config_hash, pc_context, sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3,
+    spc_context, vrf_sign,
 };
 
 use super::fixtures::Committee;
@@ -1569,6 +1570,7 @@ fn make_source_header_with_parent_qc(
         witness_root,
         BeaconWitnessLeafCount::new(leaf_count),
         BeaconWitnessLeafCount::ZERO,
+        RevealChain::ZERO,
         None,
         None,
     );

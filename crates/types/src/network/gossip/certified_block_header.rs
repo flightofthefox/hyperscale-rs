@@ -98,8 +98,8 @@ mod tests {
     fn test_sbor_roundtrip() {
         use crate::{
             BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, CertificateRoot,
-            ChainOrigin, Hash, LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, Round, ShardId,
-            StateRoot, TransactionRoot, ValidatorId,
+            ChainOrigin, Hash, LocalReceiptRoot, ProvisionsRoot, QuorumCertificate, RevealChain,
+            Round, ShardId, StateRoot, TransactionRoot, ValidatorId,
         };
 
         let header = BlockHeader::new(
@@ -122,6 +122,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );

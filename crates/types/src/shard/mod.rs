@@ -60,9 +60,9 @@ mod tests {
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         BlockHeight, BoundedVec, CertificateRoot, ChainOrigin, ExecutionCertificate,
         ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId,
-        SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
-        Verified, WaveCertificate, WaveId, WeightedTimestamp, generate_ed25519_keypair,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
+        ShardId, SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
+        Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, generate_ed25519_keypair,
         routable_from_notarized_v1, sign_and_notarize,
     };
 
@@ -88,6 +88,7 @@ mod tests {
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
             None,
             None,
         );
@@ -269,6 +270,7 @@ mod tests {
                 header.beacon_witness_root(),
                 header.beacon_witness_leaf_count(),
                 header.beacon_witness_base(),
+                RevealChain::ZERO,
                 None,
                 None,
             );

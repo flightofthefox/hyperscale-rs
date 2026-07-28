@@ -151,8 +151,8 @@ mod tests {
     use hyperscale_types::test_utils::make_live_block;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-        CertifiedBlockHeader, ChainOrigin, LocalTimestamp, QuorumCertificate, ShardId, ValidatorId,
-        Verified, WaveId,
+        CertifiedBlockHeader, ChainOrigin, LocalTimestamp, QuorumCertificate, RevealChain, ShardId,
+        ValidatorId, Verified, WaveId,
     };
 
     use crate::assert_emits;
@@ -203,6 +203,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             );

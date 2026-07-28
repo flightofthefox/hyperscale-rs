@@ -22,8 +22,8 @@ use crate::{
     BlockHeight, BoundedVec, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
     CommitProof, ConsensusPublicKey, ConsensusSignature, ExecutionCertificate, ExecutionOutcome,
     FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot,
-    NetworkDefinition, NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-    RoutableTransaction, ShardForkProof, ShardId, SignerBitfield, StateRoot, TimestampRange,
+    NetworkDefinition, NodeId, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain,
+    Round, RoutableTransaction, ShardForkProof, ShardId, SignerBitfield, StateRoot, TimestampRange,
     TopologySnapshot, TransactionDecision, TransactionRoot, TxHash, TxOutcome, ValidatorId,
     ValidatorInfo, ValidatorSet, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
     WitnessSources, block_vote_message,
@@ -378,6 +378,7 @@ pub fn make_live_block(
         BeaconWitnessRoot::ZERO,
         BeaconWitnessLeafCount::ZERO,
         BeaconWitnessLeafCount::ZERO,
+        RevealChain::ZERO,
         None,
         None,
     );
@@ -558,6 +559,7 @@ pub(crate) fn fork_header(
         BeaconWitnessRoot::ZERO,
         BeaconWitnessLeafCount::ZERO,
         BeaconWitnessLeafCount::ZERO,
+        RevealChain::ZERO,
         None,
         None,
     )
@@ -722,6 +724,7 @@ fn live_fork_header(
         BeaconWitnessRoot::ZERO,
         BeaconWitnessLeafCount::ZERO,
         BeaconWitnessLeafCount::ZERO,
+        RevealChain::ZERO,
         None,
         None,
     )
@@ -811,6 +814,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
+            reveal_chain,
             split_child_roots,
             settled_waves_root,
         ) = header.into_parts();
@@ -845,6 +849,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
+            reveal_chain,
             split_child_roots,
             settled_waves_root,
         )

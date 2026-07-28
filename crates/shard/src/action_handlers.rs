@@ -21,13 +21,13 @@ use hyperscale_types::{
     InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
-    ReshapeTrigger, Round, RoutableTransaction, SettledWavesRoot, ShardId, SplitChildRoots,
-    StateRoot, StateRootContext, Stopwatch, StoredReceipt, Timeout, TimeoutContext,
-    TopologySnapshot, TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified,
-    Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, block_header_message,
-    block_vote_message, certified_block_header_message, commit_witness_window, compute_waves,
-    derive_leaves, local_settled_wave_ids, missed_proposals_since_prev_commit,
-    ready_signal_message, shard_reveal_sign,
+    ReshapeTrigger, RevealChain, Round, RoutableTransaction, SettledWavesRoot, ShardId,
+    SplitChildRoots, StateRoot, StateRootContext, Stopwatch, StoredReceipt, Timeout,
+    TimeoutContext, TopologySnapshot, TransactionRoot, TransactionRootContext, ValidatorId,
+    Verifiable, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
+    block_header_message, block_vote_message, certified_block_header_message,
+    commit_witness_window, compute_waves, derive_leaves, local_settled_wave_ids,
+    missed_proposals_since_prev_commit, ready_signal_message, shard_reveal_sign,
 };
 
 /// Result of QC verification and assembly.
@@ -311,6 +311,7 @@ pub fn build_proposal<S: ShardChainWriter>(
         beacon_witness_root,
         beacon_witness_leaf_count,
         beacon_witness_base,
+        RevealChain::ZERO,
         split_child_roots,
         settled_waves_root,
     );

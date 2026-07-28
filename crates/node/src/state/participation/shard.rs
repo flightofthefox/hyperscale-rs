@@ -493,8 +493,8 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader, BlockHeight, BlockManifest,
         CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp,
         MerkleInclusionProof, ProvisionEntry, Provisions, QuorumCertificate, RETENTION_HORIZON,
-        Round, ShardForkProof, ShardId, TransactionStatus, TxHash, ValidatorId, Verified, WaveId,
-        WitnessSources,
+        RevealChain, Round, ShardForkProof, ShardId, TransactionStatus, TxHash, ValidatorId,
+        Verified, WaveId, WitnessSources,
     };
 
     use crate::state::test_support::TestNode;
@@ -544,6 +544,7 @@ mod tests {
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
                 None,
                 None,
             );

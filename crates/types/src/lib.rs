@@ -87,8 +87,8 @@ pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
     BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot, EventRoot, GenesisConfigHash,
     GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, OwnershipRoot, ProvisionHash,
-    ProvisionTxRoot, ProvisionsRoot, SettledWavesRoot, StateRoot, TransactionRoot, TxHash,
-    WaveReceiptHash, WritesRoot,
+    ProvisionTxRoot, ProvisionsRoot, RevealChain, SettledWavesRoot, StateRoot, TransactionRoot,
+    TxHash, WaveReceiptHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, InFlightCount,
@@ -142,11 +142,12 @@ pub use shard::roots::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CertRootVerifyError,
     CertificateRootContext, LocalReceiptRootContext, LocalReceiptRootVerifyError,
     ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, ProvisionsRootContext, SplitChildRoots, StateRootContext,
-    StateRootVerifyError, TransactionRootContext, TxRootVerifyError,
+    ProvisionTxRootsVerifyError, ProvisionsRootContext, REVEAL_CHAIN_DOMAIN_TAG, SplitChildRoots,
+    StateRootContext, StateRootVerifyError, TransactionRootContext, TxRootVerifyError,
     certificate_root_from_receipt_hashes, commit_witness_window, derive_leaves,
-    derive_reshape_trigger, local_settled_wave_ids, missed_proposals_since_prev_commit,
-    ready_leaf_payload, settled_waves_root_from_ids,
+    derive_reshape_trigger, extend_reveal_chain, local_settled_wave_ids,
+    missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
+    settled_waves_root_from_ids,
 };
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
