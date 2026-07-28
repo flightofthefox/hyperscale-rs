@@ -246,10 +246,11 @@ pub struct ValidatorRecord {
 /// validator from `members` synchronously. Order is incidental — the
 /// active signer set is filtered from `members` by status, not by
 /// position. `members.len() ≤ SHARD_CAPACITY` plus any observer
-/// cohort and at most one rotation entrant
-/// ([`BeaconState::pending_rotations`]) at every epoch boundary; the
-/// list shrinks transiently when an epoch opens, then refills via
-/// `pool_draw` within the same step.
+/// cohort and one entrant per open rotation
+/// ([`BeaconState::pending_rotations`], bounded by
+/// [`BeaconChainConfig::max_rotations_in_flight`]) at every epoch
+/// boundary; the list shrinks transiently when an epoch opens, then
+/// refills via `pool_draw` within the same step.
 #[derive(Debug, Default, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ShardCommittee {
     /// Ordered list of validators on this shard.

@@ -166,10 +166,9 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
         }
         // Rotations run concurrently — one opens per interval and each
         // stays open for its entrant's sync — so a shard carries
-        // `⌈sync / interval⌉` of them, which the interval derivation
-        // sizes at `shard_size / SHUFFLE_SYNC_HEADROOM`. The cap bounds
-        // committee size at that; it never throttles the opening rate,
-        // which is what tenure is derived from.
+        // `⌈sync / interval⌉` of them. The cap bounds committee size at
+        // that; it never throttles the opening rate, which is what
+        // tenure is derived from.
         let in_flight = state
             .pending_rotations
             .get(&shard)
@@ -1255,43 +1254,55 @@ mod tests {
         assert!(!members.contains(&entrant));
     }
 
-    /// Rotations run concurrently, up to the mid-sync fraction the
-    /// interval derivation is built around. A shard limited to one open
-    /// rotation would rotate once per sync window instead of once per
-    /// interval, stretching per-seat tenure by that same ratio and
-    /// weakening the adaptive-corruption defense the cadence exists for.
+    /// Rotations run concurrently, up to what the cadence opens against
+    /// the sync window. A shard limited to one open rotation would rotate
+    /// once per sync window instead of once per interval, stretching
+    /// per-seat tenure by that same ratio and weakening the
+    /// adaptive-corruption defense the cadence exists for.
+    ///
+    /// Run at 16 and at 12. Twelve is the case a cap read off the
+    /// mid-sync fraction `⌊n / SHUFFLE_SYNC_HEADROOM⌋` gets wrong,
+    /// holding the shard at one rotation where its own cadence opens two.
     #[test]
     fn a_shard_holds_concurrent_rotations_up_to_the_cap() {
-        let shard = ShardId::leaf(1, 0);
-        let mut state = multi_shard_state(1, 16, 8);
-        state.chain_config.shard_size = 16;
-        let interval = state.chain_config.shuffle_interval_epochs();
-        assert_eq!(state.chain_config.max_rotations_in_flight(), 2);
+        for shard_size in [16usize, 12] {
+            let seats = u64::try_from(shard_size).expect("test sizes fit a u64");
+            let shard = ShardId::leaf(1, 0);
+            let mut state = multi_shard_state(1, seats, 8);
+            state.chain_config.shard_size =
+                u32::try_from(shard_size).expect("test sizes fit a u32");
+            let interval = state.chain_config.shuffle_interval_epochs();
+            assert_eq!(state.chain_config.max_rotations_in_flight(), 2);
 
-        // Three intervals with no entrant readying: two rotations open,
-        // the third is held at the cap.
-        for i in 1..=3 {
-            state.current_epoch = Epoch::new(interval * i);
-            run_shuffle_step(&mut state);
+            // Three intervals with no entrant readying: two rotations
+            // open, the third is held at the cap.
+            for i in 1..=3 {
+                state.current_epoch = Epoch::new(interval * i);
+                run_shuffle_step(&mut state);
+            }
+
+            let rotations = &state.pending_rotations[&shard];
+            assert_eq!(
+                rotations.len(),
+                2,
+                "shard_size {shard_size}: the cap bounds what is open at once",
+            );
+            assert_eq!(
+                rotations.keys().collect::<BTreeSet<_>>().len(),
+                2,
+                "shard_size {shard_size}: a member already named is not named again",
+            );
+            assert_eq!(
+                state.next_shard_committees[&shard].members.len(),
+                shard_size + 2,
+                "shard_size {shard_size}: each open rotation carries one entrant above strength",
+            );
+            assert_eq!(
+                state.ready_consensus_members(&state.next_shard_committees)[&shard].len(),
+                shard_size,
+                "shard_size {shard_size}: concurrent entrants cost the quorum denominator nothing",
+            );
         }
-
-        let rotations = &state.pending_rotations[&shard];
-        assert_eq!(rotations.len(), 2, "the cap bounds what is open at once");
-        assert_eq!(
-            rotations.keys().collect::<BTreeSet<_>>().len(),
-            2,
-            "a member already named is not named again",
-        );
-        assert_eq!(
-            state.next_shard_committees[&shard].members.len(),
-            18,
-            "each open rotation carries one entrant above strength",
-        );
-        assert_eq!(
-            state.ready_consensus_members(&state.next_shard_committees)[&shard].len(),
-            16,
-            "concurrent entrants cost the quorum denominator nothing",
-        );
     }
 
     /// The consensus subset holds at `shard_size` for every fold of a

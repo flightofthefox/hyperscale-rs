@@ -368,14 +368,18 @@ the *transition kernel* — measurable at every occupied corrupt count — and
   points either side of the swap — but each seat's tenure carries the sync
   lag on top of n·I, at most `ready_timeout_epochs` and in practice the
   real sync time. What the latency does *not* do is slow the rotation
-  rate: rotations run concurrently up to
-  `max(1, n / SHUFFLE_SYNC_HEADROOM)`, which is `⌈ready_timeout / I(n)⌉`
-  at the derived interval, so a shard still opens one per interval. Were
-  that cap one instead, a shard would rotate once per sync window rather
-  than once per interval and mean tenure would stretch by `n / 8` — at the
-  §6 operating point a 16× stretch of T, moving τ½ from ~15h to ~10 days.
-  The cap is derived from the same headroom the interval is, so the two
-  cannot drift apart.
+  rate: rotations run concurrently up to `max(1, ⌈ready_timeout / I(n)⌉)`,
+  so a shard still opens one per interval. Were that cap one instead, a
+  shard would rotate once per sync window rather than once per interval
+  and mean tenure would stretch by the same ratio — at the §6 operating
+  point a 16× stretch of T, moving τ½ from ~15h to ~10 days. The cap is
+  read off `I(n)` rather than recomputed from the headroom, so the two
+  cannot drift apart. The concurrent mid-sync fraction `n /
+  SHUFFLE_SYNC_HEADROOM` is the same quantity in the continuous limit and
+  is what §4 prices against, but the two round apart in both directions
+  once `I(n)`'s own ceiling bites — at n = 12 the fraction reads 1 where
+  the cadence opens 2, at n = 20 it reads 3 where the cadence opens 2 —
+  so the cap follows the cadence, which is what actually seats entrants.
 - **Reshape pauses** — a pending split suspends its shard's rotation
   entirely; merge keepers are victim-exempt. Measured: the skip lasts
   exactly the pending window (neighbors rotate throughout) and is

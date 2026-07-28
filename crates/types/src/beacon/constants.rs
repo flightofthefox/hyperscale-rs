@@ -139,11 +139,12 @@ pub const POOL_BUFFER_TARGET: usize = 4;
 /// ready_timeout_epochs / shard_size`, so with one draw per shard per
 /// interval at most `shard_size / SHUFFLE_SYNC_HEADROOM` seats sit
 /// inside their sync budget concurrently, and each seat spends at most
-/// `1 / SHUFFLE_SYNC_HEADROOM` of its tenure mid-sync. The same ratio is
-/// the rotation concurrency cap
-/// ([`BeaconChainConfig::max_rotations_in_flight`](crate::BeaconChainConfig::max_rotations_in_flight)),
-/// so the bound on in-flight rotations and the cadence that produces
-/// them are derived from one number and cannot drift apart.
+/// `1 / SHUFFLE_SYNC_HEADROOM` of its tenure mid-sync. That fraction is
+/// what the rotation concurrency cap
+/// ([`BeaconChainConfig::max_rotations_in_flight`](crate::BeaconChainConfig::max_rotations_in_flight))
+/// tracks; the cap is read off the interval itself rather than
+/// recomputed from this constant, so the bound on in-flight rotations
+/// and the cadence that produces them cannot drift apart.
 ///
 /// What the margin buys is dead weight, not a quorum dip: rotation seats
 /// an entrant beside the member it replaces and retires that member only

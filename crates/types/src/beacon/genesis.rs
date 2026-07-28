@@ -127,23 +127,36 @@ impl BeaconChainConfig {
     }
 
     /// Rotations a shard may hold open at once, derived rather than
-    /// stored: `max(1, shard_size / SHUFFLE_SYNC_HEADROOM)`.
+    /// stored: `max(1, ⌈ready_timeout_epochs / shuffle_interval_epochs⌉)`.
     ///
-    /// A rotation stays open for as long as its entrant takes to sync, so
-    /// one opening per [`Self::shuffle_interval_epochs`] leaves
-    /// `⌈sync / interval⌉` of them in flight — at the sync budget's
-    /// ceiling, exactly `shard_size / SHUFFLE_SYNC_HEADROOM`, which is
-    /// the concurrent mid-sync fraction the interval derivation is built
-    /// around. Capping below that would throttle the shuffle rate itself:
-    /// a shard that may hold only one rotation open rotates once per sync
-    /// window instead of once per interval, stretching tenure by the same
-    /// ratio and weakening the adaptive-corruption defense the cadence
-    /// exists to provide. Concurrent entrants cost nothing to quorum —
-    /// they ride committee membership without entering the consensus
-    /// subset — so the bound is a bound on committee size, not on safety.
+    /// A rotation stays open for as long as its entrant takes to sync, and
+    /// the shuffle opens one per [`Self::shuffle_interval_epochs`], so a
+    /// shard whose entrants all run to the sync budget's ceiling carries
+    /// exactly this many at once. Capping below it would throttle the
+    /// shuffle rate itself: a shard that may hold only one rotation open
+    /// rotates once per sync window instead of once per interval,
+    /// stretching tenure by the same ratio and weakening the
+    /// adaptive-corruption defense the cadence exists to provide.
+    /// Concurrent entrants cost nothing to quorum — they ride committee
+    /// membership without entering the consensus subset — so the bound is
+    /// a bound on committee size, not on safety.
+    ///
+    /// Reading the cap off the interval rather than recomputing it from
+    /// [`SHUFFLE_SYNC_HEADROOM`] is what keeps the two from drifting: the
+    /// headroom already sets the interval, and the cap is a property of
+    /// the cadence that interval produces. Deriving it independently
+    /// approximates the same quantity as `⌈shard_size /
+    /// SHUFFLE_SYNC_HEADROOM⌉` — the concurrent mid-sync fraction — but
+    /// the two agree only where the interval divides the sync window
+    /// evenly, and disagree in *both* directions elsewhere: at
+    /// `shard_size = 12` the fraction rounds down to one where the cadence
+    /// opens two, and at `shard_size = 20` it rounds up to three where the
+    /// cadence opens two.
     #[must_use]
     pub const fn max_rotations_in_flight(&self) -> u64 {
-        let concurrent = self.shard_size as u64 / SHUFFLE_SYNC_HEADROOM;
+        let concurrent = self
+            .ready_timeout_epochs
+            .div_ceil(self.shuffle_interval_epochs());
         if concurrent == 0 { 1 } else { concurrent }
     }
 
@@ -360,6 +373,82 @@ mod tests {
         // Degenerate sizes clamp rather than divide by zero or stall.
         assert_eq!(at(0, 8), 64);
         assert_eq!(at(4, 0), 1);
+    }
+
+    /// The rotation cap covers the sync window the cadence opens against,
+    /// and covers it exactly. Too small and a shard at the cap must skip
+    /// intervals, rotating once per sync window instead of once per
+    /// interval — the tenure stretch the shuffle exists to avoid. Too
+    /// large and it admits entrants the cadence never opens, inflating
+    /// committees for nothing.
+    ///
+    /// Stated as a product against the interval rather than as the
+    /// quotient the implementation computes, so the two are independent:
+    /// `cap` openings spaced `interval` apart must span `ready_timeout`.
+    #[test]
+    fn rotation_cap_spans_the_sync_window_it_opens_against() {
+        for shard_size in 1u32..=256 {
+            for ready_timeout_epochs in [1u64, 4, 8, 10, 12, 32, 100] {
+                let config = BeaconChainConfig {
+                    shard_size,
+                    ready_timeout_epochs,
+                    ..BeaconChainConfig::default()
+                };
+                let (cap, interval) = (
+                    config.max_rotations_in_flight(),
+                    config.shuffle_interval_epochs(),
+                );
+                let at = format!("shard_size {shard_size}, ready_timeout {ready_timeout_epochs}");
+                assert!(cap >= 1, "cap must admit at least one rotation at {at}");
+                assert!(
+                    cap * interval >= ready_timeout_epochs,
+                    "cap {cap} × interval {interval} leaves the sync window short at {at}",
+                );
+                assert!(
+                    cap == 1 || (cap - 1) * interval < ready_timeout_epochs,
+                    "cap {cap} × interval {interval} over-provisions at {at}",
+                );
+            }
+        }
+    }
+
+    /// The cap at the operating points the security analysis names, so a
+    /// regression reads as a changed committee size rather than as an
+    /// off-by-one inside the sweep above. The concurrent mid-sync
+    /// fraction `⌈n / SHUFFLE_SYNC_HEADROOM⌉` tracks these but is not
+    /// equal to them — it reads 1 at n = 12 and 3 at n = 20.
+    #[test]
+    fn rotation_cap_at_the_named_operating_points() {
+        let cap = |shard_size: u32| {
+            BeaconChainConfig {
+                shard_size,
+                ..BeaconChainConfig::default()
+            }
+            .max_rotations_in_flight()
+        };
+        assert_eq!((cap(4), cap(8), cap(16)), (1, 1, 2));
+        assert_eq!((cap(12), cap(20), cap(28)), (2, 2, 3));
+        // The production target (n = 128, S = 32) holds a sixteenth of
+        // its committee mid-sync — the headroom's reciprocal, exactly.
+        assert_eq!(
+            BeaconChainConfig {
+                shard_size: 128,
+                ready_timeout_epochs: 32,
+                ..BeaconChainConfig::default()
+            }
+            .max_rotations_in_flight(),
+            16,
+        );
+        // Degenerate sizes clamp rather than capping at zero.
+        assert_eq!(cap(0), 1);
+        assert_eq!(
+            BeaconChainConfig {
+                ready_timeout_epochs: 0,
+                ..BeaconChainConfig::default()
+            }
+            .max_rotations_in_flight(),
+            1,
+        );
     }
 
     /// Serving retention outlives the ready budget: one epoch for the
