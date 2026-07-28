@@ -15,10 +15,10 @@ use hyperscale_scenarios::tx::{
     merge_straddler_setup, split_straddler_setup, witness_genesis_balances,
 };
 use hyperscale_scenarios::{
-    Cluster, FaultableCluster, ScenarioConfig, beacon_pool_partition_stalls_epoch_production,
-    cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_fetch_fallback,
-    cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
-    cross_shard_provisions_fetch_with_request_loss,
+    Cluster, FaultableCluster, ScenarioConfig, beacon_lag_drops_skipped_epochs_reveal_chains,
+    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
+    cross_shard_exec_cert_drop_fetch_fallback, cross_shard_header_fetch_fallback,
+    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_tx, epochs,
     gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
@@ -193,6 +193,27 @@ fn beacon_pool_partition_stalls_epoch_production_sim() {
         &intershard_partition_genesis_balances(),
     );
     cluster.run_faultable(beacon_pool_partition_stalls_epoch_production);
+}
+
+/// Single-shard genesis wide enough that the members off the beacon committee
+/// still form the pool quorum a skip block needs — the beacon must keep
+/// committing (as skips) while its commit channels are down, so the shard
+/// stays live and keeps crossing epoch cuts through the outage.
+const fn beacon_lag_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 8,
+        vnodes_per_host: 1,
+        pool_surplus: 0,
+        num_shards: 1,
+        split_bytes: u64::MAX,
+        latency: Duration::from_millis(150),
+    }
+}
+
+#[test]
+fn beacon_lag_drops_skipped_epochs_reveal_chains_sim() {
+    let mut cluster = SimCluster::new(&beacon_lag_config(), 42);
+    cluster.run_faultable(beacon_lag_drops_skipped_epochs_reveal_chains);
 }
 
 /// Single-shard genesis armed so the funded root splits exactly once and the

@@ -12,7 +12,6 @@ use radix_common::network::NetworkDefinition;
 
 use crate::reshape::split_lifecycle;
 use crate::straddler::{chain_settled, submit_straddler};
-use crate::support::epochs;
 use crate::support::faultable::FaultableCluster;
 use crate::support::query::beacon_epoch;
 use crate::support::tx::{
@@ -20,6 +19,7 @@ use crate::support::tx::{
     halt_straddler_setup, signer_from_seed, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_height, await_tx_terminal};
+use crate::support::{Cluster, epochs};
 
 /// Dropping `transaction.gossip` still delivers a submitted transfer — via the
 /// fetch fallback — with the drop rule firing and the fetch engaging.
@@ -1338,5 +1338,137 @@ pub fn cross_shard_provisions_recovers_after_transient_outage(c: &mut impl Fault
         c.metric("transactions_aborted", None),
         0,
         "the transfer must not abort",
+    );
+}
+
+/// Every channel a beacon commit needs. With all seven dropped the committee
+/// never reaches its vote threshold, so each epoch commits as a skip block:
+/// the topology schedule keeps advancing — shards stay live and keep crossing
+/// epoch cuts — while no shard contribution seats.
+const BEACON_COMMIT_CHANNELS: [&str; 7] = [
+    "beacon.proposal",
+    "beacon.spc.new_view",
+    "beacon.spc.new_commit",
+    "beacon.spc.empty_view",
+    "beacon.pc.vote1",
+    "beacon.pc.vote2",
+    "beacon.pc.vote3",
+];
+
+/// Epochs the beacon spends committing skips.
+const SUPPRESSED_EPOCHS: u32 = 3;
+
+/// The anchor epoch of the reveal chain the fold last seeded from `shard`.
+///
+/// `record_boundaries` stamps `ShardBoundary::weighted_timestamp` from the
+/// crossing header's parent QC on exactly the folds that seed, so the anchor
+/// epoch a fold closed reads straight off the boundary record. The identity
+/// holds while no crossing is fenced — a fenced crossing records without
+/// seeding — which is the case whenever no halt recovery is pending.
+fn folded_anchor_epoch<C: Cluster>(c: &C, shard: ShardId) -> Option<Epoch> {
+    let state = c.beacon_state()?;
+    let boundary = state.boundaries.get(&shard)?;
+    Some(
+        state
+            .chain_config
+            .epoch_windows()
+            .epoch_for(boundary.weighted_timestamp),
+    )
+}
+
+/// A beacon that lags across several epochs folds one crossing on resumption
+/// and drops the reveal chains of every epoch it skipped.
+///
+/// The fold seeds `state.randomness` from one chain value per crossing, and a
+/// chain is per-epoch: nothing carries an unfolded epoch's reveals forward, so
+/// entropy the shard produced while the beacon was blind is gone rather than
+/// deferred. This prices that loss. Suppressing the commit channels leaves
+/// epoch production running on skip blocks, so the shard keeps producing and
+/// crossing cuts throughout; on resumption the sourcing rule anchors the
+/// newest crossing and the epochs between the last fold and that crossing
+/// never contribute.
+///
+/// The loss tracks the outage one epoch for one: the fold cannot skip an
+/// epoch it was awake for, and it always folds the crossing that ends the
+/// outage. A healthy-beacon control runs first, pinning the awake fold at one
+/// anchor epoch closed per step, so the gap the outage opens cannot be
+/// mistaken for one the fold leaves anyway.
+///
+/// # Panics
+///
+/// Panics if no crossing folds before the outage, the awake fold leaves a gap
+/// of its own, the beacon stops committing (freezing the shard rather than
+/// lagging it), the suppression fails to stall the fold, the fold never
+/// resumes, or the skipped span differs from the outage that produced it.
+pub fn beacon_lag_drops_skipped_epochs_reveal_chains(c: &mut impl FaultableCluster) {
+    let shard = ShardId::ROOT;
+
+    // A seeded genesis record reads as anchor epoch 0, and so does the first
+    // crossing (the one into epoch 1, anchored below the cut it crosses), so
+    // only an anchor epoch past 0 proves a real crossing folded.
+    assert!(
+        c.run_until(epochs(8), |c| folded_anchor_epoch(c, shard)
+            .is_some_and(|e| e.inner() >= 1)),
+        "the fold must seed from a crossing before the outage",
+    );
+    let warmed = folded_anchor_epoch(c, shard)
+        .expect("a folded crossing")
+        .inner();
+
+    // Control: an awake beacon closes every anchor epoch, so the next fold
+    // steps by exactly one. Without this the outage measurement below could
+    // be reading a gap the fold leaves anyway.
+    assert!(
+        c.run_until(epochs(3), |c| folded_anchor_epoch(c, shard)
+            .is_some_and(|e| e.inner() > warmed)),
+        "the fold must close an anchor epoch while the beacon is awake",
+    );
+    let before = folded_anchor_epoch(c, shard)
+        .expect("a folded crossing")
+        .inner();
+    assert_eq!(
+        before - warmed,
+        1,
+        "an awake beacon must leave no gap: folded {warmed} then {before}",
+    );
+    let epoch_before = beacon_epoch(c).expect("a committed beacon epoch").inner();
+
+    for channel in BEACON_COMMIT_CHANNELS {
+        c.drop_type(channel);
+    }
+    c.run_until(epochs(SUPPRESSED_EPOCHS), |_| false);
+    let during = folded_anchor_epoch(c, shard)
+        .expect("the boundary record survives the outage")
+        .inner();
+    assert!(
+        beacon_epoch(c).expect("a committed beacon epoch").inner() > epoch_before,
+        "the beacon must keep committing skip blocks through the outage, \
+         or the shard freezes at the schedule head instead of lagging",
+    );
+    assert_eq!(
+        during, before,
+        "a beacon committing only skips must seat no contribution",
+    );
+    c.clear_drops();
+
+    assert!(
+        c.run_until(epochs(10), |c| folded_anchor_epoch(c, shard)
+            .is_some_and(|e| e.inner() > before)),
+        "the fold must resume once the commit channels reopen",
+    );
+    let after = folded_anchor_epoch(c, shard)
+        .expect("a folded crossing")
+        .inner();
+
+    // Epochs strictly between the two folds contributed nothing. The loss
+    // tracks the outage one for one: the fold cannot skip an epoch it was
+    // awake for, and it always folds the crossing that ends the outage.
+    let skipped = after - before - 1;
+    assert_eq!(
+        skipped,
+        u64::from(SUPPRESSED_EPOCHS),
+        "a {SUPPRESSED_EPOCHS}-epoch outage must cost exactly that many \
+         epochs' reveal chains, but skipped {skipped} (folded {before} then \
+         {after})",
     );
 }
