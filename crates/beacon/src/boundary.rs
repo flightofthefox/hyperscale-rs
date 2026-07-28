@@ -167,12 +167,14 @@ pub fn build_shard_contributions(
         let (prior, chunk_end) = rules::witness_chunk_bounds(state, shard, &boundary_header);
         // Defer the whole block if the chunk isn't in hand — a
         // fully-synced peer will assemble and gossip it.
-        let witnesses = shard_source.witness_chunk(shard, qc.block_hash(), prior, chunk_end)?;
+        let (payloads, range_proof) =
+            shard_source.witness_chunk(shard, qc.block_hash(), prior, chunk_end)?;
         contributions.insert(
             shard,
             ShardEpochContribution {
                 boundary_header,
-                witnesses: witnesses.into(),
+                payloads: payloads.into(),
+                range_proof: range_proof.into(),
             },
         );
     }

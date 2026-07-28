@@ -29,12 +29,11 @@ use hyperscale_types::{
     LocalReceiptRoot, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, PcValueElement, PcVector,
     PcVote1, PcVote2, PcVote3, PcVoteEquivocation, PcVoteVerifyContext, ProposerTimestamp,
     ProvisionsRoot, QuorumCertificate, Randomness, RatifyPhase, RatifyRound, RatifyVerifyContext,
-    RatifyVote, Round, SKIP_TIMEOUT, ShardId, ShardVoteEquivocation, ShardWitness,
-    ShardWitnessPayload, ShardWitnessProof, Signer, SignerBitfield, SpcEmptyViewMsg,
-    SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot,
-    TransactionRoot, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    compute_merkle_root_with_proof, genesis_config_hash, pc_context, sign_empty_view_msg,
-    sign_vote1, sign_vote2, sign_vote3, spc_context, vrf_sign,
+    RatifyVote, Round, SKIP_TIMEOUT, ShardId, ShardVoteEquivocation, ShardWitnessPayload, Signer,
+    SignerBitfield, SpcEmptyViewMsg, SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView,
+    Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, compute_merkle_root, compute_range_proof, genesis_config_hash, pc_context,
+    sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3, spc_context, vrf_sign,
 };
 
 use super::fixtures::Committee;
@@ -370,27 +369,31 @@ impl CoordinatorSim {
         state_root: StateRoot,
         leaf_count: u64,
     ) -> BlockHash {
-        let (b, witnesses) =
+        let (b, payloads, range_proof) =
             Self::build_boundary_block(shard, b_height, pred_wt, state_root, leaf_count);
         // `C`'s parent QC is the canonical QC over `B` — a genuine `2f+1`
         // of the governing shard committee, the form the beacon's
         // boundary-QC verification authenticates.
         let canonical_qc = self.genuine_boundary_qc(shard, &b, b_wt);
-        self.deliver_crossing_pair(shard, &b, b_height, canonical_qc, &witnesses)
+        self.deliver_crossing_pair(shard, &b, b_height, canonical_qc, &payloads, &range_proof)
     }
 
     /// Build boundary block `B` for `shard` whose beacon-witness
-    /// accumulator holds `leaf_count` deposit leaves, plus the matching
-    /// per-leaf `ShardWitness`es (merkle-proven against `B`'s root, anchored
-    /// to `B`). The leaves are distinct `StakeDeposit`s so the fold has
-    /// real payloads to apply.
+    /// accumulator holds `leaf_count` deposit leaves, plus the chunk
+    /// covering the whole window: its payloads and the range proof lifting
+    /// them to `B`'s root. The leaves are distinct `StakeDeposit`s so the
+    /// fold has real payloads to apply.
     fn build_boundary_block(
         shard: ShardId,
         b_height: u64,
         pred_wt: u64,
         state_root: StateRoot,
         leaf_count: u64,
-    ) -> (Arc<Verified<CertifiedBlockHeader>>, Vec<Arc<ShardWitness>>) {
+    ) -> (
+        Arc<Verified<CertifiedBlockHeader>>,
+        Vec<ShardWitnessPayload>,
+        Vec<Hash>,
+    ) {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
                 pool_id: StakePoolId::new(100 + u32::try_from(i).unwrap_or(u32::MAX)),
@@ -404,7 +407,7 @@ impl CoordinatorSim {
         let witness_root = if leaf_hashes.is_empty() {
             BeaconWitnessRoot::ZERO
         } else {
-            BeaconWitnessRoot::from_raw(compute_merkle_root_with_proof(&leaf_hashes, 0).0)
+            BeaconWitnessRoot::from_raw(compute_merkle_root(&leaf_hashes))
         };
         let b = make_linked_source_header(
             shard,
@@ -415,24 +418,8 @@ impl CoordinatorSim {
             witness_root,
             leaf_count,
         );
-        let b_hash = b.block_hash();
-        let witnesses: Vec<Arc<ShardWitness>> = payloads
-            .into_iter()
-            .enumerate()
-            .map(|(i, payload)| {
-                let (_, siblings, _) = compute_merkle_root_with_proof(&leaf_hashes, i);
-                Arc::new(ShardWitness {
-                    payload,
-                    proof: ShardWitnessProof {
-                        shard_id: shard,
-                        committed_block_hash: b_hash,
-                        leaf_index: LeafIndex::new(i as u64),
-                        siblings: siblings.into(),
-                    },
-                })
-            })
-            .collect();
-        (b, witnesses)
+        let range_proof = compute_range_proof(&leaf_hashes, 0, leaf_hashes.len());
+        (b, payloads, range_proof)
     }
 
     /// Like [`Self::deliver_boundary_crossing`], but `C`'s parent QC over
@@ -451,7 +438,7 @@ impl CoordinatorSim {
         state_root: StateRoot,
         leaf_count: u64,
     ) -> BlockHash {
-        let (b, witnesses) =
+        let (b, payloads, range_proof) =
             Self::build_boundary_block(shard, b_height, pred_wt, state_root, leaf_count);
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
@@ -467,7 +454,7 @@ impl CoordinatorSim {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(b_wt),
         );
-        self.deliver_crossing_pair(shard, &b, b_height, forged_qc, &witnesses)
+        self.deliver_crossing_pair(shard, &b, b_height, forged_qc, &payloads, &range_proof)
     }
 
     /// Seat boundary block `B`, its child `C` (carrying `canonical_qc` as
@@ -481,7 +468,8 @@ impl CoordinatorSim {
         b: &Arc<Verified<CertifiedBlockHeader>>,
         b_height: u64,
         canonical_qc: QuorumCertificate,
-        witnesses: &[Arc<ShardWitness>],
+        payloads: &[ShardWitnessPayload],
+        range_proof: &[Hash],
     ) -> BlockHash {
         let b_hash = b.block_hash();
         // `C`'s own beacon-witness fields are never read for `B`'s
@@ -493,14 +481,20 @@ impl CoordinatorSim {
             canonical_qc,
             StateRoot::ZERO,
             BeaconWitnessRoot::ZERO,
-            witnesses.len() as u64,
+            payloads.len() as u64,
         );
         for idx in 0..self.coordinators.len() {
             let a_b = self.coordinators[idx].on_verified_source_header(b);
             self.absorb(idx, a_b);
             let a_c = self.coordinators[idx].on_verified_source_header(&c);
             self.absorb(idx, a_c);
-            let a_w = self.coordinators[idx].on_shard_witnesses_received(shard, witnesses.to_vec());
+            let a_w = self.coordinators[idx].on_shard_witnesses_received(
+                shard,
+                b_hash,
+                LeafIndex::new(0),
+                payloads.to_vec(),
+                range_proof.to_vec(),
+            );
             self.absorb(idx, a_w);
         }
         b_hash

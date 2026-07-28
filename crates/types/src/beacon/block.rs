@@ -14,11 +14,12 @@ use sbor::prelude::*;
 
 use crate::{
     BeaconBlockHash, BeaconProposal, BlockHeader, BoundedBTreeMap, BoundedVec, Epoch, Hash,
-    MAX_BEACON_COMMITTEE, MAX_SHARDS, MAX_WITNESSES_PER_SHARD, ShardId, ShardWitness, ValidatorId,
+    MAX_BEACON_COMMITTEE, MAX_RANGE_PROOF_NODES, MAX_SHARDS, MAX_WITNESSES_PER_SHARD, ShardId,
+    ShardWitnessPayload, ValidatorId,
 };
 
 /// One shard's contribution to an epoch's beacon block: its canonical
-/// boundary block header and the witnesses the boundary block added.
+/// boundary block header and the witness leaves the boundary block added.
 ///
 /// The header is a verifiable projection — bound to a committed
 /// proposal's canonical boundary QC by `hash(boundary_header) ==
@@ -26,18 +27,27 @@ use crate::{
 /// `state_root` and witness `leaf_count`, which the cert-bound QC
 /// authenticates but does not itself contain.
 ///
-/// `witnesses` are the governance leaves the boundary block appended to
-/// its beacon-witness accumulator — the contiguous range
+/// `payloads` are the governance leaves the boundary block appended to its
+/// beacon-witness accumulator — the contiguous range
 /// `[boundaries[shard].witness_leaf_count, boundary_header.beacon_witness_leaf_count)`
-/// in leaf-index order, proven against `boundary_header.beacon_witness_root`.
-/// Like the header, they carry no standalone verification marker: the fold
-/// re-checks merkle inclusion + count every time.
+/// in leaf-index order. Leaf positions are implied by that range rather
+/// than carried per payload, so a payload cannot claim a position the fold
+/// didn't ask for.
+///
+/// `range_proof` carries the flanking nodes that lift those leaves to
+/// `boundary_header.beacon_witness_root`. Like the header, neither field
+/// carries a standalone verification marker: the fold recomputes the root
+/// every time.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ShardEpochContribution {
     /// The shard's canonical boundary block header for this epoch.
     pub boundary_header: BlockHeader,
-    /// The witnesses the boundary block appended, in leaf-index order.
-    pub witnesses: BoundedVec<ShardWitness, MAX_WITNESSES_PER_SHARD>,
+    /// The witness payloads the boundary block appended, in leaf-index
+    /// order.
+    pub payloads: BoundedVec<ShardWitnessPayload, MAX_WITNESSES_PER_SHARD>,
+    /// Flanking merkle nodes lifting `payloads` to the boundary header's
+    /// beacon-witness root.
+    pub range_proof: BoundedVec<Hash, MAX_RANGE_PROOF_NODES>,
 }
 
 /// One epoch's committed-proposal record.

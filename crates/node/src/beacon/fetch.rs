@@ -11,8 +11,6 @@
 //! The generic engine, the [`FetchBinding`] trait, and the shared
 //! `partition_solicited` helper live in [`crate::fetch`].
 
-use std::sync::Arc;
-
 use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_network::{Network, ResponseVerdict};
@@ -21,7 +19,7 @@ use hyperscale_types::network::request::beacon::{
     GetBeaconProposalRequest, GetShardWitnessesRequest,
 };
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, LeafIndex, MessageClass, ShardId, ShardWitness, ValidatorId,
+    BlockHash, BlockHeight, Epoch, LeafIndex, MessageClass, ShardId, ValidatorId,
 };
 
 use crate::config::NodeConfig;
@@ -29,10 +27,10 @@ use crate::fetch::{Fetch, FetchBinding};
 use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
 
 /// Cross-shard beacon-witness fetch keyed by
-/// `(source_shard, block_height, committed_block_hash, leaf_index)`.
-/// Each id is a single leaf in the source shard's accumulator at the
-/// named committed block.
-pub type ShardWitnessFetch = Fetch<(ShardId, BlockHeight, BlockHash, LeafIndex)>;
+/// `(source_shard, block_height, committed_block_hash, lo, hi)`.
+/// Each id is one contiguous leaf run in the source shard's accumulator
+/// at the named committed block — the unit a range proof covers.
+pub type ShardWitnessFetch = Fetch<(ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex)>;
 /// Missing-proposal fetch keyed by `(epoch, validator)` — one entry
 /// per beacon-committee member whose proposal SPC's `OutputHigh`
 /// committed but the local pool never observed.
@@ -78,14 +76,13 @@ impl BeaconFetchState {
 pub struct ShardWitnessBinding;
 
 impl FetchBinding for ShardWitnessBinding {
-    type Id = (ShardId, BlockHeight, BlockHash, LeafIndex);
+    type Id = (ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex);
 
     const NAME: &'static str = "shard_witness";
 
-    /// One request per leaf — keeps the dispatcher simple. The
-    /// underlying wire type can carry many leaves per request; a
-    /// future grouping optimisation can chunk-batch leaves that
-    /// share `(shard, block_height, committed_block_hash)`.
+    /// One request per chunk. The id already names a whole leaf run and a
+    /// range proof only verifies for the run it covers, so batching two
+    /// ids into one request would produce a response neither could use.
     const PER_ID: bool = true;
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
@@ -102,17 +99,13 @@ impl FetchBinding for ShardWitnessBinding {
         sender: &Sender<HostEvent>,
     ) {
         debug_assert_eq!(ids.len(), 1, "PER_ID binding hands one id per chunk");
-        let (source_shard, block_height, committed_block_hash, leaf_index) = ids[0];
+        let (source_shard, block_height, committed_block_hash, lo, hi) = ids[0];
         debug_assert_eq!(
             shard, source_shard,
             "ShardWitnessBinding routes to the source shard; the runner sets it from the variant",
         );
-        let request = GetShardWitnessesRequest::new(
-            source_shard,
-            block_height,
-            committed_block_hash,
-            vec![leaf_index],
-        );
+        let request =
+            GetShardWitnessesRequest::new(source_shard, block_height, committed_block_hash, lo, hi);
         let es = sender.clone();
         network.request(
             shard,
@@ -125,12 +118,7 @@ impl FetchBinding for ShardWitnessBinding {
                         &es,
                         local_shard,
                         ShardScopedInput::ShardWitnessesFetchFailed {
-                            ids: vec![(
-                                source_shard,
-                                block_height,
-                                committed_block_hash,
-                                leaf_index,
-                            )],
+                            ids: vec![(source_shard, block_height, committed_block_hash, lo, hi)],
                         },
                     );
                 };
@@ -138,20 +126,21 @@ impl FetchBinding for ShardWitnessBinding {
                     push_failed();
                     return ResponseVerdict::Accept;
                 };
-                if response.witnesses.is_empty() {
+                if response.payloads.is_empty() {
                     push_failed();
                     return ResponseVerdict::Reject;
                 }
-                let witnesses: Vec<Arc<ShardWitness>> = response.witnesses.into_inner();
+                let payloads = response.payloads.into_inner();
+                let range_proof = response.range_proof.into_inner();
                 // Release the fetch slot before delivering the payload:
                 // the coordinator's chunk re-drive runs while handling
-                // the delivery, and the next leaf it requests needs the
+                // the delivery, and the next range it requests needs the
                 // slot this response just freed.
                 push_shard_input(
                     &es,
                     local_shard,
                     ShardScopedInput::ShardWitnessesFetchFulfilled {
-                        ids: vec![(source_shard, block_height, committed_block_hash, leaf_index)],
+                        ids: vec![(source_shard, block_height, committed_block_hash, lo, hi)],
                     },
                 );
                 push_protocol_event(
@@ -159,7 +148,10 @@ impl FetchBinding for ShardWitnessBinding {
                     local_shard,
                     ProtocolEvent::ShardWitnessesReceived {
                         shard_id: source_shard,
-                        witnesses,
+                        committed_block_hash,
+                        lo,
+                        payloads,
+                        range_proof,
                     },
                 );
                 ResponseVerdict::Accept

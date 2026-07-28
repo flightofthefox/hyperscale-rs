@@ -9,7 +9,7 @@ use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader,
     CertifiedBeaconBlock, CompletedRecovery, Epoch, EpochWindows, KeptSeat, NetworkDefinition,
     ObserverSeat, PendingReshape, QcContext, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS,
-    RETENTION_HORIZON, RecoveryCause, ShardBoundary, ShardEpochContribution, ShardId, ShardWitness,
+    RETENTION_HORIZON, RecoveryCause, ShardBoundary, ShardEpochContribution, ShardId,
     ShardWitnessPayload, SlotEffects, TerminalRef, TopologySnapshot, TransitionCause, ValidatorId,
     ValidatorStatus, Verifier, Verify, VrfOutput,
 };
@@ -592,10 +592,10 @@ fn carried_terminal_marks(
 
 /// The `RandomnessReveal` outputs of an applied witness chunk, in leaf
 /// order — one reveal per block, so ascending block height.
-fn reveal_outputs(witnesses: &[ShardWitness]) -> Vec<VrfOutput> {
-    witnesses
+fn reveal_outputs(payloads: &[ShardWitnessPayload]) -> Vec<VrfOutput> {
+    payloads
         .iter()
-        .filter_map(|w| match &w.payload {
+        .filter_map(|payload| match payload {
             ShardWitnessPayload::RandomnessReveal { output } => Some(*output),
             _ => None,
         })
@@ -882,7 +882,8 @@ fn record_boundaries(
             state,
             network,
             header,
-            &contribution.witnesses,
+            &contribution.payloads,
+            &contribution.range_proof,
             prior,
             chunk_end,
             &mut outcome,
@@ -904,7 +905,7 @@ fn record_boundaries(
         // Drain re-folds contribute like any other chunk's, unless the
         // fence holds the band out of the seed.
         if !fenced {
-            let outputs = reveal_outputs(&contribution.witnesses);
+            let outputs = reveal_outputs(&contribution.payloads);
             if !outputs.is_empty() {
                 reveals.insert(*shard, outputs);
             }
@@ -1280,12 +1281,12 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
         BlockHeader, BlockHeight, BoundedVec, CertificateRoot, ChainOrigin, Epoch, Hash,
-        InFlightCount, LeafIndex, LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR,
+        InFlightCount, LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, SettledWavesRoot,
-        ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardRecovery, ShardWitness,
-        ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SplitChildRoots, Stake, StakePool,
-        StakePoolId, StateRoot, TransactionRoot, TransitionCause, ValidatorId, VrfProof,
-        WeightedTimestamp, compute_merkle_root_with_proof,
+        ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardRecovery, ShardWitnessPayload,
+        SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TransactionRoot,
+        TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root,
+        compute_range_proof,
     };
 
     use super::*;
@@ -1385,7 +1386,7 @@ mod tests {
         pred_wt: u64,
         state_root: StateRoot,
         payloads: Vec<ShardWitnessPayload>,
-    ) -> (BlockHeader, Vec<ShardWitness>) {
+    ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
         boundary_block_with_payloads_full(shard, height, pred_wt, state_root, payloads, None, None)
     }
 
@@ -1400,7 +1401,7 @@ mod tests {
         payloads: Vec<ShardWitnessPayload>,
         split_child_roots: Option<SplitChildRoots>,
         settled_waves_root: Option<SettledWavesRoot>,
-    ) -> (BlockHeader, Vec<ShardWitness>) {
+    ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
         let leaf_count = payloads.len() as u64;
         let leaf_hashes: Vec<Hash> = payloads
             .iter()
@@ -1409,7 +1410,7 @@ mod tests {
         let root = if leaf_hashes.is_empty() {
             BeaconWitnessRoot::ZERO
         } else {
-            BeaconWitnessRoot::from_raw(compute_merkle_root_with_proof(&leaf_hashes, 0).0)
+            BeaconWitnessRoot::from_raw(compute_merkle_root(&leaf_hashes))
         };
         let header = boundary_block_full(
             shard,
@@ -1421,24 +1422,8 @@ mod tests {
             split_child_roots,
             settled_waves_root,
         );
-        let block_hash = header.hash();
-        let witnesses = payloads
-            .into_iter()
-            .enumerate()
-            .map(|(i, payload)| {
-                let (_, siblings, _) = compute_merkle_root_with_proof(&leaf_hashes, i);
-                ShardWitness {
-                    payload,
-                    proof: ShardWitnessProof {
-                        shard_id: shard,
-                        committed_block_hash: block_hash,
-                        leaf_index: LeafIndex::new(i as u64),
-                        siblings: siblings.into(),
-                    },
-                }
-            })
-            .collect();
-        (header, witnesses)
+        let range_proof = compute_range_proof(&leaf_hashes, 0, leaf_hashes.len());
+        (header, payloads, range_proof)
     }
 
     /// [`boundary_block_with_payloads`] over `leaf_count` `StakeDeposit`
@@ -1450,7 +1435,7 @@ mod tests {
         pred_wt: u64,
         state_root: StateRoot,
         leaf_count: u64,
-    ) -> (BlockHeader, Vec<ShardWitness>) {
+    ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
                 pool_id: StakePoolId::new(200 + u32::try_from(i).unwrap_or(u32::MAX)),
@@ -1458,6 +1443,24 @@ mod tests {
             })
             .collect();
         boundary_block_with_payloads(shard, height, pred_wt, state_root, payloads)
+    }
+
+    /// The sub-chunk `[lo, hi)` of a boundary block's window: its payloads
+    /// plus the range proof lifting them to the block's root. These
+    /// fixtures put the window base at zero, so positions are leaf indices.
+    fn sub_chunk(
+        payloads: &[ShardWitnessPayload],
+        lo: usize,
+        hi: usize,
+    ) -> (Vec<ShardWitnessPayload>, Vec<Hash>) {
+        let leaf_hashes: Vec<Hash> = payloads
+            .iter()
+            .map(ShardWitnessPayload::leaf_hash)
+            .collect();
+        (
+            payloads[lo..hi].to_vec(),
+            compute_range_proof(&leaf_hashes, lo, hi),
+        )
     }
 
     /// A QC naming `header` with weighted timestamp `wt`.
@@ -1484,7 +1487,7 @@ mod tests {
         let shard = ShardId::leaf(1, 0);
 
         let anchor = StateRoot::from_raw(Hash::from_bytes(b"anchor"));
-        let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 900, anchor, 7);
+        let (b, payloads, range_proof) = boundary_block_with_witnesses(shard, 5, 900, anchor, 7);
         let qc = qc_over(&b, 1_500);
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
@@ -1498,7 +1501,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                witnesses: witnesses.into(),
+                payloads: payloads.into(),
+                range_proof: range_proof.into(),
             },
         ))
         .collect();
@@ -1764,7 +1768,7 @@ mod tests {
             .insert(shard, pending_recovery(RecoveryCause::Fork));
 
         let anchor = StateRoot::from_raw(Hash::from_bytes(b"anchor"));
-        let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 900, anchor, 7);
+        let (b, payloads, range_proof) = boundary_block_with_witnesses(shard, 5, 900, anchor, 7);
         let qc = qc_over(&b, 1_500);
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
@@ -1778,7 +1782,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                witnesses: witnesses.into(),
+                payloads: payloads.into(),
+                range_proof: range_proof.into(),
             },
         ))
         .collect();
@@ -2008,7 +2013,8 @@ mod tests {
                 output: VrfOutput::new([9; 32]),
             },
         ];
-        let (b, witnesses) = boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, payloads);
+        let (b, payloads, range_proof) =
+            boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, payloads);
         let qc = qc_over(&b, 1_500);
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
@@ -2022,7 +2028,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                witnesses: witnesses.into(),
+                payloads: payloads.into(),
+                range_proof: range_proof.into(),
             },
         ))
         .collect();
@@ -2059,7 +2066,7 @@ mod tests {
         let shard = ShardId::leaf(1, 0);
 
         let anchor = StateRoot::from_raw(Hash::from_bytes(b"anchor"));
-        let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 900, anchor, 7);
+        let (b, payloads, range_proof) = boundary_block_with_witnesses(shard, 5, 900, anchor, 7);
         let qc = qc_over(&b, 1_500);
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
@@ -2073,7 +2080,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b.clone(),
-                witnesses: witnesses.into(),
+                payloads: payloads.into(),
+                range_proof: range_proof.into(),
             },
         ))
         .collect();
@@ -2104,7 +2112,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                witnesses: BoundedVec::new(),
+                payloads: BoundedVec::new(),
+                range_proof: BoundedVec::new(),
             },
         ))
         .collect();
@@ -2163,7 +2172,7 @@ mod tests {
 
         // Epoch 1 folds a boundary whose chunk applies 7 witness leaves.
         let root = StateRoot::from_raw(Hash::from_bytes(b"epoch1"));
-        let (header, witnesses) = boundary_block_with_witnesses(shard, 5, 900, root, 7);
+        let (header, payloads, range_proof) = boundary_block_with_witnesses(shard, 5, 900, root, 7);
         let qc = qc_over(&header, 1_500);
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
@@ -2177,7 +2186,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: header,
-                witnesses: witnesses.into(),
+                payloads: payloads.into(),
+                range_proof: range_proof.into(),
             },
         ))
         .collect();
@@ -2275,7 +2285,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                witnesses: BoundedVec::new(),
+                payloads: BoundedVec::new(),
+                range_proof: BoundedVec::new(),
             },
         ))
         .collect();
@@ -2341,7 +2352,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                witnesses: BoundedVec::new(),
+                payloads: BoundedVec::new(),
+                range_proof: BoundedVec::new(),
             },
         ))
         .collect();
@@ -2384,7 +2396,8 @@ mod tests {
         let total = 2 * cap + 3;
 
         let anchor = StateRoot::from_raw(Hash::from_bytes(b"backlog-anchor"));
-        let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 900, anchor, total as u64);
+        let (b, payloads, _range_proof) =
+            boundary_block_with_witnesses(shard, 5, 900, anchor, total as u64);
         let qc = qc_over(&b, 1_500);
         let proposal = BeaconProposal::new(
             std::iter::once((shard, Some(qc))).collect(),
@@ -2396,12 +2409,14 @@ mod tests {
         let committed = vec![(ValidatorId::new(0), proposal)];
 
         let contribution_with =
-            |chunk: &[ShardWitness]| -> BTreeMap<ShardId, ShardEpochContribution> {
+            |lo: usize, hi: usize| -> BTreeMap<ShardId, ShardEpochContribution> {
+                let (chunk, range_proof) = sub_chunk(&payloads, lo, hi);
                 std::iter::once((
                     shard,
                     ShardEpochContribution {
                         boundary_header: b.clone(),
-                        witnesses: chunk.to_vec().into(),
+                        payloads: chunk.into(),
+                        range_proof: range_proof.into(),
                     },
                 ))
                 .collect()
@@ -2416,7 +2431,7 @@ mod tests {
             &net(),
             Epoch::new(1),
             &committed,
-            &contribution_with(&witnesses[..cap]),
+            &contribution_with(0, cap),
             &BTreeSet::new(),
         );
         let after_1 = state.boundaries.get(&shard).expect("boundary recorded");
@@ -2450,7 +2465,7 @@ mod tests {
             &net(),
             Epoch::new(2),
             &committed,
-            &contribution_with(&witnesses[cap..2 * cap]),
+            &contribution_with(cap, 2 * cap),
             &BTreeSet::new(),
         );
         let after_2 = state
@@ -2474,7 +2489,7 @@ mod tests {
             &net(),
             Epoch::new(3),
             &committed,
-            &contribution_with(&witnesses[2 * cap..]),
+            &contribution_with(2 * cap, payloads.len()),
             &BTreeSet::new(),
         );
         let after_3 = state
@@ -2535,14 +2550,14 @@ mod tests {
         let total = cap + 3;
 
         stamp_recovery(&mut state, shard, 3);
-        let (b, witnesses) =
+        let (b, payloads, _range_proof) =
             boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, reveal_payloads(total));
 
         // Completing epoch: the crossing (height 5 > frontier 3) folds,
         // clears the recovery, and contributes nothing to the seed; the
         // fence over its full count persists on the record.
         let (committed, contributions) =
-            contribution_for(shard, b.clone(), witnesses[..cap].to_vec(), 1_500);
+            contribution_for(shard, b.clone(), sub_chunk(&payloads, 0, cap), 1_500);
         let (_, reveals) = record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -2563,7 +2578,7 @@ mod tests {
         // Drain epoch: the backlog remainder applies but stays out of the
         // seed; the fence clears once the watermark reaches it.
         let (committed, contributions) =
-            contribution_for(shard, b, witnesses[cap..].to_vec(), 1_500);
+            contribution_for(shard, b, sub_chunk(&payloads, cap, payloads.len()), 1_500);
         let (_, reveals) = record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -2582,15 +2597,19 @@ mod tests {
         assert_eq!(record.reveals_fenced_below, None);
 
         // The next crossing is post-recovery production: its chunk seeds.
-        let (b2, witnesses2) = boundary_block_with_payloads(
+        let (b2, payloads2, _proof2) = boundary_block_with_payloads(
             shard,
             9,
             1_900,
             StateRoot::ZERO,
             reveal_payloads(total + 2),
         );
-        let (committed, contributions) =
-            contribution_for(shard, b2, witnesses2[total..].to_vec(), 2_500);
+        let (committed, contributions) = contribution_for(
+            shard,
+            b2,
+            sub_chunk(&payloads2, total, payloads2.len()),
+            2_500,
+        );
         let (_, reveals) = record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -2616,9 +2635,9 @@ mod tests {
         let shard = ShardId::leaf(1, 0);
 
         stamp_recovery(&mut state, shard, 5);
-        let (b, witnesses) =
+        let (b, payloads, range_proof) =
             boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, reveal_payloads(2));
-        let (committed, contributions) = contribution_for(shard, b, witnesses, 1_500);
+        let (committed, contributions) = contribution_for(shard, b, (payloads, range_proof), 1_500);
         let (_, reveals) = record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -2650,12 +2669,12 @@ mod tests {
         let band = 2 * cap;
 
         stamp_recovery(&mut state, shard, 3);
-        let (b, witnesses) =
+        let (b, payloads, _range_proof) =
             boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, reveal_payloads(band));
 
         // Completing epoch: first chunk of the beyond-frontier backlog.
         let (committed, contributions) =
-            contribution_for(shard, b, witnesses[..cap].to_vec(), 1_500);
+            contribution_for(shard, b, sub_chunk(&payloads, 0, cap), 1_500);
         let (_, reveals) = record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -2675,7 +2694,7 @@ mod tests {
         // crossing eviction produces). Its chunk still sits inside the
         // fenced band: no seeding, and the refreshed record keeps the
         // fence only while leaves below it remain.
-        let (b2, witnesses2) = boundary_block_with_payloads(
+        let (b2, payloads2, _proof2) = boundary_block_with_payloads(
             shard,
             9,
             1_900,
@@ -2683,7 +2702,7 @@ mod tests {
             reveal_payloads(band + 3),
         );
         let (committed, contributions) =
-            contribution_for(shard, b2.clone(), witnesses2[cap..band].to_vec(), 2_500);
+            contribution_for(shard, b2.clone(), sub_chunk(&payloads2, cap, band), 2_500);
         let (_, reveals) = record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -2699,8 +2718,12 @@ mod tests {
         assert_eq!(record.reveals_fenced_below, None, "band fully drained");
 
         // The newer crossing's own remainder is past the band: it seeds.
-        let (committed, contributions) =
-            contribution_for(shard, b2, witnesses2[band..].to_vec(), 2_500);
+        let (committed, contributions) = contribution_for(
+            shard,
+            b2,
+            sub_chunk(&payloads2, band, payloads2.len()),
+            2_500,
+        );
         let (_, reveals) = record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -2794,7 +2817,7 @@ mod tests {
 
         // Epoch 1 folds a Ready witness for the joiner, carried in the
         // boundary contribution's chunk.
-        let (b, witnesses) = boundary_block_with_payloads(
+        let (b, payloads, range_proof) = boundary_block_with_payloads(
             shard,
             5,
             900,
@@ -2814,7 +2837,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b,
-                witnesses: witnesses.into(),
+                payloads: payloads.into(),
+                range_proof: range_proof.into(),
             },
         ))
         .collect();
@@ -3015,7 +3039,7 @@ mod tests {
         state_root: StateRoot,
         leaf_count: u64,
         settled_waves_root: Option<SettledWavesRoot>,
-    ) -> (BlockHeader, Vec<ShardWitness>) {
+    ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
                 pool_id: StakePoolId::new(200 + u32::try_from(i).unwrap_or(u32::MAX)),
@@ -3088,7 +3112,7 @@ mod tests {
     fn contribution_for(
         shard: ShardId,
         header: BlockHeader,
-        witnesses: Vec<ShardWitness>,
+        chunk: (Vec<ShardWitnessPayload>, Vec<Hash>),
         qc_wt: u64,
     ) -> (
         Vec<(ValidatorId, BeaconProposal)>,
@@ -3103,11 +3127,13 @@ mod tests {
             VrfProof::ZERO,
         );
         let committed = vec![(ValidatorId::new(0), proposal)];
+        let (payloads, range_proof) = chunk;
         let contributions = std::iter::once((
             shard,
             ShardEpochContribution {
                 boundary_header: header,
-                witnesses: witnesses.into(),
+                payloads: payloads.into(),
+                range_proof: range_proof.into(),
             },
         ))
         .collect();
@@ -3124,9 +3150,10 @@ mod tests {
         let (mut state, parent, pair, composed) = terminating_state();
         let (left, right) = parent.children();
 
-        let (header, witnesses) =
+        let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
-        let (committed, contributions) = contribution_for(parent, header.clone(), witnesses, 2_500);
+        let (committed, contributions) =
+            contribution_for(parent, header.clone(), (payloads, range_proof), 2_500);
 
         record_boundaries(
             &BlsVerifier,
@@ -3170,9 +3197,10 @@ mod tests {
             left: StateRoot::from_raw(Hash::from_bytes(b"forged")),
             right: pair.right,
         };
-        let (header, witnesses) =
+        let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, forged, composed, 3, None);
-        let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
+        let (committed, contributions) =
+            contribution_for(parent, header, (payloads, range_proof), 2_500);
 
         record_boundaries(
             &BlsVerifier,
@@ -3201,9 +3229,10 @@ mod tests {
         let (mut state, parent, pair, composed) = terminating_state();
         let (left, _) = parent.children();
 
-        let (header, witnesses) =
+        let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 900, pair, composed, 3, None);
-        let (committed, contributions) = contribution_for(parent, header, witnesses, 1_500);
+        let (committed, contributions) =
+            contribution_for(parent, header, (payloads, range_proof), 1_500);
 
         record_boundaries(
             &BlsVerifier,
@@ -3257,10 +3286,10 @@ mod tests {
         let (mut state, parent, pair, composed) = terminating_state();
         let total = MAX_WITNESSES_PER_SHARD as u64 + 6;
 
-        let (header, witnesses) =
+        let (header, payloads, _range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, total, None);
 
-        let first_chunk = witnesses[..MAX_WITNESSES_PER_SHARD].to_vec();
+        let first_chunk = sub_chunk(&payloads, 0, MAX_WITNESSES_PER_SHARD);
         let (committed, contributions) =
             contribution_for(parent, header.clone(), first_chunk, 2_500);
         record_boundaries(
@@ -3285,7 +3314,7 @@ mod tests {
             "children seed at the first terminal fold"
         );
 
-        let rest = witnesses[MAX_WITNESSES_PER_SHARD..].to_vec();
+        let rest = sub_chunk(&payloads, MAX_WITNESSES_PER_SHARD, payloads.len());
         let (committed, contributions) = contribution_for(parent, header, rest, 2_500);
         record_boundaries(
             &BlsVerifier,
@@ -3314,9 +3343,10 @@ mod tests {
     #[test]
     fn terminal_record_drops_past_the_retention_horizon() {
         let (mut state, parent, pair, composed) = terminating_state();
-        let (header, witnesses) =
+        let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
-        let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
+        let (committed, contributions) =
+            contribution_for(parent, header, (payloads, range_proof), 2_500);
         record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -3414,9 +3444,10 @@ mod tests {
         }
 
         // The terminal contribution finally lands: it seeds both children.
-        let (header, witnesses) =
+        let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
-        let (committed, contributions) = contribution_for(parent, header, witnesses, 2_500);
+        let (committed, contributions) =
+            contribution_for(parent, header, (payloads, range_proof), 2_500);
         let later = Epoch::new(RETENTION_HORIZON.as_secs() + 6);
         record_boundaries(
             &BlsVerifier,
@@ -3606,9 +3637,9 @@ mod tests {
         let total = MAX_WITNESSES_PER_SHARD as u64 + 6;
         let root = SettledWavesRoot::from_raw(Hash::from_bytes(b"settled waves"));
 
-        let (header, witnesses) =
+        let (header, payloads, _range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, total, Some(root));
-        let first_chunk = witnesses[..MAX_WITNESSES_PER_SHARD].to_vec();
+        let first_chunk = sub_chunk(&payloads, 0, MAX_WITNESSES_PER_SHARD);
         let (committed, contributions) = contribution_for(parent, header, first_chunk, 2_500);
         record_boundaries(
             &BlsVerifier,
@@ -3716,9 +3747,9 @@ mod tests {
         let (mut state, parent, left_root, right_root) = merge_terminating_state();
         let (left, right) = parent.children();
 
-        let (lh, lw) =
+        let (lh, lw, lw_proof) =
             boundary_block_with_payloads_full(left, 9, 1_900, left_root, vec![], None, None);
-        let (rh, rw) =
+        let (rh, rw, rw_proof) =
             boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None, None);
         let proposal = BeaconProposal::new(
             [
@@ -3738,14 +3769,16 @@ mod tests {
                 left,
                 ShardEpochContribution {
                     boundary_header: lh.clone(),
-                    witnesses: lw.into(),
+                    payloads: lw.into(),
+                    range_proof: lw_proof.into(),
                 },
             ),
             (
                 right,
                 ShardEpochContribution {
                     boundary_header: rh.clone(),
-                    witnesses: rw.into(),
+                    payloads: rw.into(),
+                    range_proof: rw_proof.into(),
                 },
             ),
         ]
@@ -3785,14 +3818,14 @@ mod tests {
         let (left, right) = parent.children();
 
         // Right child: genuine terminal coast (crosses the 2_000 cut).
-        let (rh, rw) =
+        let (rh, rw, rw_proof) =
             boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None, None);
         // Left child: spans its whole final window — anchored before the
         // window opens, certified exactly on the terminal cut. A genuine
         // crossing (of the cut INTO the final window), carrying the
         // still-running chain's pre-freeze root.
         let pre_freeze = StateRoot::from_raw(Hash::from_bytes(b"left pre-freeze root"));
-        let (span_header, span_witnesses) =
+        let (span_header, span_witnesses, span_witnesses_proof) =
             boundary_block_with_payloads_full(left, 9, 900, pre_freeze, vec![], None, None);
         let proposal = BeaconProposal::new(
             [
@@ -3812,14 +3845,16 @@ mod tests {
                 left,
                 ShardEpochContribution {
                     boundary_header: span_header,
-                    witnesses: span_witnesses.into(),
+                    payloads: span_witnesses.into(),
+                    range_proof: span_witnesses_proof.into(),
                 },
             ),
             (
                 right,
                 ShardEpochContribution {
                     boundary_header: rh.clone(),
-                    witnesses: rw.into(),
+                    payloads: rw.into(),
+                    range_proof: rw_proof.into(),
                 },
             ),
         ]
@@ -3850,7 +3885,7 @@ mod tests {
 
         // The real coast block crosses the cut with the frozen root; the
         // parent composes from it and the lingering right terminal.
-        let (coast_header, coast_witnesses) =
+        let (coast_header, coast_witnesses, coast_witnesses_proof) =
             boundary_block_with_payloads_full(left, 10, 2_000, left_root, vec![], None, None);
         let proposal = BeaconProposal::new(
             std::iter::once((left, Some(qc_over(&coast_header, 2_100)))).collect(),
@@ -3864,7 +3899,8 @@ mod tests {
             left,
             ShardEpochContribution {
                 boundary_header: coast_header.clone(),
-                witnesses: coast_witnesses.into(),
+                payloads: coast_witnesses.into(),
+                range_proof: coast_witnesses_proof.into(),
             },
         ))
         .collect();
@@ -3891,9 +3927,9 @@ mod tests {
     fn a_lone_terminal_child_holds_until_its_sibling_composes_the_parent() {
         let (mut state, parent, left_root, right_root) = merge_terminating_state();
         let (left, right) = parent.children();
-        let (lh, lw) =
+        let (lh, lw, lw_proof) =
             boundary_block_with_payloads_full(left, 9, 1_900, left_root, vec![], None, None);
-        let (rh, rw) =
+        let (rh, rw, rw_proof) =
             boundary_block_with_payloads_full(right, 10, 1_900, right_root, vec![], None, None);
 
         // Both children's terminal records, sourced together — the
@@ -3917,14 +3953,16 @@ mod tests {
                     left,
                     ShardEpochContribution {
                         boundary_header: lh.clone(),
-                        witnesses: lw.clone().into(),
+                        payloads: lw.clone().into(),
+                        range_proof: lw_proof.clone().into(),
                     },
                 ),
                 (
                     right,
                     ShardEpochContribution {
                         boundary_header: rh.clone(),
-                        witnesses: rw.clone().into(),
+                        payloads: rw.clone().into(),
+                        range_proof: rw_proof.clone().into(),
                     },
                 ),
             ]
@@ -3935,7 +3973,8 @@ mod tests {
 
         // Fold E: only the left child terminates. It is held (the parent
         // can't compose without the sibling) and the parent stays pending.
-        let (committed, contributions) = contribution_for(left, lh.clone(), lw.clone(), 2_500);
+        let (committed, contributions) =
+            contribution_for(left, lh.clone(), (lw.clone(), lw_proof.clone()), 2_500);
         record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -3956,7 +3995,8 @@ mod tests {
         // this fold. The parent composes anyway, off the left's persisted
         // terminal record, so the compose no longer hinges on both terminals
         // landing in a single fold (the case staggered witness fetches miss).
-        let (committed, contributions) = contribution_for(right, rh.clone(), rw.clone(), 2_500);
+        let (committed, contributions) =
+            contribution_for(right, rh.clone(), (rw.clone(), rw_proof.clone()), 2_500);
         record_boundaries(
             &BlsVerifier,
             &mut state,

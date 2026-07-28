@@ -8,16 +8,11 @@
 //! the retained CF payloads, and return one inclusion proof per
 //! requested leaf index.
 
-use std::sync::Arc;
-
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
 use hyperscale_types::network::response::beacon::GetShardWitnessesResponse;
-use hyperscale_types::{
-    BoundedVec, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
-    compute_merkle_root_with_proof,
-};
+use hyperscale_types::{Hash, ShardWitnessPayload, compute_range_proof};
 use tracing::{debug, warn};
 
 /// Serve an inbound shard-witness fetch request.
@@ -37,37 +32,37 @@ use tracing::{debug, warn};
 /// 3. Read retained leaf payloads via
 ///    [`ShardChainReader::get_beacon_witness_payloads`](hyperscale_storage::ShardChainReader)
 ///    up to `header.beacon_witness_leaf_count()`. A retention-pruned
-///    anchor returns short — those leaves yield no proof and are
-///    silently skipped.
-/// 4. Generate one [`ShardWitness`] per requested leaf index by hashing
-///    each payload and reconstructing the path against the leaf-hash
-///    list. The proof's `committed_block_hash` matches the anchor the
-///    requester named, so the requester verifies against the root they
-///    already hold.
+///    anchor returns short — without the whole window no root can be
+///    rebuilt, so the response is empty.
+/// 4. Clamp the requested run to the window and answer with its payloads
+///    plus one range proof against the anchor's witness root.
 ///
-/// Requested indices that fall past `leaf_count_at_block_end` are
-/// silently dropped from the response (the responder has no leaf at
-/// that position to prove). Requesters detect missing indices by
-/// pairing the response order against their request's order.
+/// The proof is scoped to the run it names, so the response carries no
+/// per-leaf positions: the requester knows `lo` from its own request and
+/// the window from the anchor header it already holds. One pass over the
+/// window serves any run, however wide.
 pub fn serve_shard_witnesses_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     req: &GetShardWitnessesRequest,
 ) -> GetShardWitnessesResponse {
-    let witnesses = build_witnesses(pending_chain, req);
-    record_fetch_response_sent("shard_witness", witnesses.len());
-    GetShardWitnessesResponse::new(witnesses)
+    let Some((payloads, range_proof)) = build_chunk(pending_chain, req) else {
+        record_fetch_response_sent("shard_witness", 0);
+        return GetShardWitnessesResponse::empty();
+    };
+    record_fetch_response_sent("shard_witness", payloads.len());
+    GetShardWitnessesResponse::new(payloads, range_proof)
 }
 
-fn build_witnesses<S: ShardStorage>(
+fn build_chunk<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     req: &GetShardWitnessesRequest,
-) -> Vec<Arc<ShardWitness>> {
+) -> Option<(Vec<ShardWitnessPayload>, Vec<Hash>)> {
     let Some(certified_header) = pending_chain.certified_header(req.block_height) else {
         debug!(
             block_height = req.block_height.inner(),
             "Shard-witness request: block not found"
         );
-        return Vec::new();
+        return None;
     };
     let header = certified_header.header();
     if header.hash() != req.committed_block_hash {
@@ -77,58 +72,47 @@ fn build_witnesses<S: ShardStorage>(
             local = ?header.hash(),
             "Shard-witness request: anchor hash mismatch (fork divergence)"
         );
-        return Vec::new();
+        return None;
     }
 
-    // The anchor header's root commits its witness window only; paths
-    // build over the window's hashes at window-relative positions.
-    let base = header.beacon_witness_base();
-    let leaf_count_at_block_end = header.beacon_witness_leaf_count();
-    let window_len = leaf_count_at_block_end.inner().saturating_sub(base.inner());
+    // The anchor header's root commits its witness window only; the proof
+    // builds over the window's hashes at window-relative positions.
+    let base = header.beacon_witness_base().inner();
+    let leaf_count_at_block_end = header.beacon_witness_leaf_count().inner();
+    let window_len = leaf_count_at_block_end.saturating_sub(base);
     if window_len == 0 {
-        return Vec::new();
+        return None;
     }
 
-    let payloads = pending_chain
-        .get_beacon_witness_payload_range(base.inner(), leaf_count_at_block_end.inner());
-    if (payloads.len() as u64) < window_len {
+    // Clamp the requested run to the window. The run is served whole —
+    // the requester admits a chunk only when it covers exactly the range
+    // the fold will apply, so truncating to a per-response page would
+    // produce a response nobody can use. `chunk_bounds` already caps the
+    // requested width at the fold's per-epoch budget.
+    let lo = req.lo.inner().max(base);
+    let hi = req.hi.inner().min(leaf_count_at_block_end);
+    if hi <= lo {
+        return None;
+    }
+
+    let window = pending_chain.get_beacon_witness_payload_range(base, leaf_count_at_block_end);
+    if (window.len() as u64) < window_len {
         debug!(
             block_height = req.block_height.inner(),
-            base = base.inner(),
-            expected = leaf_count_at_block_end.inner(),
-            retained = payloads.len(),
+            base,
+            expected = leaf_count_at_block_end,
+            retained = window.len(),
             "Shard-witness request: window leaves pruned past retention horizon"
         );
-        return Vec::new();
+        return None;
     }
-    let leaf_hashes: Vec<_> = payloads
-        .iter()
-        .map(ShardWitnessPayload::leaf_hash)
-        .collect();
+    let leaf_hashes: Vec<Hash> = window.iter().map(ShardWitnessPayload::leaf_hash).collect();
 
-    let mut witnesses: Vec<Arc<ShardWitness>> = Vec::with_capacity(req.leaf_indices.len());
-    for leaf_index in req.leaf_indices.iter() {
-        let raw_index = leaf_index.inner();
-        if raw_index < base.inner() || raw_index >= leaf_count_at_block_end.inner() {
-            continue;
-        }
-        let Ok(position) = usize::try_from(raw_index - base.inner()) else {
-            continue;
-        };
-        let Some(payload) = payloads.get(position).cloned() else {
-            continue;
-        };
-        let (_root, siblings, _idx) = compute_merkle_root_with_proof(&leaf_hashes, position);
-        let proof = ShardWitnessProof {
-            shard_id: req.shard_id,
-            committed_block_hash: req.committed_block_hash,
-            leaf_index: *leaf_index,
-            siblings: BoundedVec::from(siblings),
-        };
-        witnesses.push(Arc::new(ShardWitness { payload, proof }));
-    }
-
-    witnesses
+    let (Ok(from), Ok(to)) = (usize::try_from(lo - base), usize::try_from(hi - base)) else {
+        return None;
+    };
+    let range_proof = compute_range_proof(&leaf_hashes, from, to);
+    Some((window[from..to].to_vec(), range_proof))
 }
 
 #[cfg(test)]
@@ -145,7 +129,7 @@ mod tests {
         ChainOrigin, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, ProposerTimestamp,
         ProvisionsRoot, QuorumCertificate, Round, ShardId, ShardWitnessPayload, SignerBitfield,
         Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verified, WeightedTimestamp,
-        WitnessSources, compute_merkle_root, verify_merkle_inclusion,
+        WitnessSources, compute_merkle_root, verify_range_inclusion,
     };
 
     use super::*;
@@ -242,8 +226,24 @@ mod tests {
         (block_hash, root, leaf_count_at_block_end)
     }
 
+    /// The served run recomputes to the anchor's root through the same
+    /// predicate the fold uses, so responder and verifier cannot drift.
+    fn verify_against(
+        resp: &GetShardWitnessesResponse,
+        root: BeaconWitnessRoot,
+        lo: usize,
+        window_len: usize,
+    ) -> bool {
+        let leaves: Vec<Hash> = resp
+            .payloads
+            .iter()
+            .map(ShardWitnessPayload::leaf_hash)
+            .collect();
+        verify_range_inclusion(root.into_raw(), &leaves, lo, window_len, &resp.range_proof)
+    }
+
     #[test]
-    fn fetch_returns_proofs_that_verify_against_the_anchor_root() {
+    fn fetch_returns_a_run_that_verifies_against_the_anchor_root() {
         let storage = Arc::new(SimShardStorage::default());
         let leaves: Vec<_> = (1u64..=5).map(deposit).collect();
         let (block_hash, root, _count) = commit_block_with_witnesses(
@@ -254,30 +254,31 @@ mod tests {
         );
         let pending_chain = PendingChain::new(storage);
 
+        // A strict sub-range: flanks are needed on the left, derived on
+        // the right.
         let req = GetShardWitnessesRequest::new(
             SHARD,
             BlockHeight::new(1),
             block_hash,
-            vec![LeafIndex::new(0), LeafIndex::new(2), LeafIndex::new(4)],
+            LeafIndex::new(1),
+            LeafIndex::new(4),
         );
         let resp = serve_shard_witnesses_request(&pending_chain, &req);
-        assert_eq!(resp.witnesses.len(), 3);
+        assert_eq!(resp.payloads.len(), 3);
+        assert!(verify_against(&resp, root, 1, 5));
 
-        for witness in resp.witnesses.iter() {
-            assert_eq!(witness.proof.shard_id, SHARD);
-            assert_eq!(witness.proof.committed_block_hash, block_hash);
-            let leaf_hash = witness.payload.leaf_hash();
-            let raw_index = u32::try_from(witness.proof.leaf_index.inner()).unwrap();
-            assert!(
-                verify_merkle_inclusion(
-                    root.into_raw(),
-                    leaf_hash,
-                    &witness.proof.siblings,
-                    raw_index,
-                ),
-                "proof must verify against anchor root"
-            );
-        }
+        // The full window needs no proof at all.
+        let full = GetShardWitnessesRequest::new(
+            SHARD,
+            BlockHeight::new(1),
+            block_hash,
+            LeafIndex::new(0),
+            LeafIndex::new(5),
+        );
+        let resp = serve_shard_witnesses_request(&pending_chain, &full);
+        assert_eq!(resp.payloads.len(), 5);
+        assert!(resp.range_proof.is_empty());
+        assert!(verify_against(&resp, root, 0, 5));
     }
 
     #[test]
@@ -288,17 +289,18 @@ mod tests {
             SHARD,
             BlockHeight::new(99),
             BlockHash::ZERO,
-            vec![LeafIndex::new(0)],
+            LeafIndex::new(0),
+            LeafIndex::new(1),
         );
         let resp = serve_shard_witnesses_request(&pending_chain, &req);
-        assert!(resp.witnesses.is_empty());
+        assert!(resp.payloads.is_empty());
     }
 
-    /// An anchor whose root commits a window starting past leaf zero:
-    /// served proofs verify at window-relative positions through the
-    /// header-rebasing predicate, and below-window indices are dropped.
+    /// An anchor whose root commits a window starting past leaf zero: the
+    /// served run verifies at window-relative positions, and a request
+    /// reaching below the window is clamped up to its base.
     #[test]
-    fn fetch_serves_windowed_proofs_and_drops_below_window_indices() {
+    fn fetch_serves_windowed_runs_and_clamps_below_window_requests() {
         use hyperscale_storage::test_helpers::commit_block_with_witness_window;
 
         let storage = Arc::new(SimShardStorage::default());
@@ -317,20 +319,20 @@ mod tests {
             .expect("committed anchor resolves")
             .header()
             .clone();
+        let root = header.beacon_witness_root();
 
-        // Global leaves 4..7 are in the window; 2 sits below it.
+        // Global leaves 4..7 are in the window; a request from 2 clamps up
+        // to the base at 4.
         let req = GetShardWitnessesRequest::new(
             SHARD,
             BlockHeight::new(1),
             block_hash,
-            vec![LeafIndex::new(2), LeafIndex::new(4), LeafIndex::new(6)],
+            LeafIndex::new(2),
+            LeafIndex::new(7),
         );
         let resp = serve_shard_witnesses_request(&pending_chain, &req);
-        assert_eq!(resp.witnesses.len(), 2);
-        for witness in resp.witnesses.iter() {
-            assert!(witness.proof.leaf_index.inner() >= 4);
-            assert!(witness.merkle_includes_in(&header));
-        }
+        assert_eq!(resp.payloads.len(), 3);
+        assert!(verify_against(&resp, root, 0, 3));
     }
 
     #[test]
@@ -349,20 +351,23 @@ mod tests {
             SHARD,
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"not_the_committed_hash")),
-            vec![LeafIndex::new(0)],
+            LeafIndex::new(0),
+            LeafIndex::new(1),
         );
         let resp = serve_shard_witnesses_request(&pending_chain, &req);
         assert!(
-            resp.witnesses.is_empty(),
-            "fork-divergent anchor must yield no proofs"
+            resp.payloads.is_empty(),
+            "fork-divergent anchor must yield no run"
         );
     }
 
+    /// A run reaching past the anchor's leaf count is answered with the
+    /// prefix that exists, proven for that shorter range.
     #[test]
-    fn fetch_silently_drops_out_of_range_indices() {
+    fn fetch_truncates_a_run_reaching_past_the_anchor() {
         let storage = Arc::new(SimShardStorage::default());
         let leaves: Vec<_> = (1u64..=3).map(deposit).collect();
-        let (block_hash, _root, _count) = commit_block_with_witnesses(
+        let (block_hash, root, _count) = commit_block_with_witnesses(
             &storage,
             BlockHeight::new(1),
             &leaves,
@@ -374,12 +379,12 @@ mod tests {
             SHARD,
             BlockHeight::new(1),
             block_hash,
-            vec![LeafIndex::new(1), LeafIndex::new(99)],
+            LeafIndex::new(1),
+            LeafIndex::new(99),
         );
         let resp = serve_shard_witnesses_request(&pending_chain, &req);
-        // Index 99 is past leaf_count_at_block_end (3) — only index 1 is served.
-        assert_eq!(resp.witnesses.len(), 1);
-        assert_eq!(resp.witnesses[0].proof.leaf_index, LeafIndex::new(1));
+        assert_eq!(resp.payloads.len(), 2);
+        assert!(verify_against(&resp, root, 1, 3));
     }
 
     #[test]
@@ -397,9 +402,10 @@ mod tests {
             SHARD,
             BlockHeight::new(1),
             block_hash,
-            vec![LeafIndex::new(0)],
+            LeafIndex::new(0),
+            LeafIndex::new(1),
         );
         let resp = serve_shard_witnesses_request(&pending_chain, &req);
-        assert!(resp.witnesses.is_empty());
+        assert!(resp.payloads.is_empty());
     }
 }

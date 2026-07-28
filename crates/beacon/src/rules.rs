@@ -12,8 +12,9 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    BeaconBlock, BeaconProposal, BeaconState, BlockHash, BlockHeader, EpochWindows,
-    MAX_WITNESSES_PER_SHARD, QuorumCertificate, ShardId, ShardWitness, Verifiable,
+    BeaconBlock, BeaconProposal, BeaconState, BlockHash, BlockHeader, EpochWindows, Hash,
+    MAX_WITNESSES_PER_SHARD, QuorumCertificate, ShardId, ShardWitnessPayload, Verifiable,
+    verify_range_inclusion,
 };
 
 /// Witness chunk bounds for one shard's boundary: `prior` is the applied
@@ -84,33 +85,64 @@ pub(crate) fn crossing_fully_folded(
     crossing_already_recorded(state, shard, boundary_header.hash()) && prior == chunk_end
 }
 
-/// Whether `witnesses` are exactly the contiguous, ascending 0-based leaf
-/// range `[prior, chunk_end)`, each merkle-proving into
+/// Whether `payloads` are exactly the leaf range `[prior, chunk_end)` of
+/// `boundary_header`'s witness window, with `range_proof` lifting them to
 /// `boundary_header.beacon_witness_root()`. The shared shape check behind
 /// both the fold's `apply_contribution_witnesses` and the received-block
 /// [`contributions_well_formed`], so producer and verifier can't drift.
+///
+/// Contiguity and leaf ordering are structural: positions come from the
+/// range, so a gapped or reordered run reaches a different root rather
+/// than failing a per-element index check. An empty range carries an
+/// empty proof — a contribution can't spend block bytes on a chunk that
+/// claims nothing.
 #[must_use]
 pub(crate) fn contribution_chunk_valid(
     boundary_header: &BlockHeader,
-    witnesses: &[ShardWitness],
+    payloads: &[ShardWitnessPayload],
+    range_proof: &[Hash],
     prior: u64,
     chunk_end: u64,
 ) -> bool {
     let Ok(expected_len) = usize::try_from(chunk_end.saturating_sub(prior)) else {
         return false;
     };
-    if witnesses.len() != expected_len {
+    if payloads.len() != expected_len {
         return false;
     }
-    for (offset, witness) in witnesses.iter().enumerate() {
-        if witness.proof.leaf_index.inner() != prior + offset as u64 {
-            return false;
-        }
-        if !witness.merkle_includes_in(boundary_header) {
-            return false;
-        }
+    if expected_len == 0 {
+        return range_proof.is_empty();
     }
-    true
+    let Some((lo, window_len)) = window_position(boundary_header, prior) else {
+        return false;
+    };
+    let leaves: Vec<Hash> = payloads
+        .iter()
+        .map(ShardWitnessPayload::leaf_hash)
+        .collect();
+    verify_range_inclusion(
+        *boundary_header.beacon_witness_root().as_raw(),
+        &leaves,
+        lo,
+        window_len,
+        range_proof,
+    )
+}
+
+/// Resolve `leaf_index` against `boundary_header`'s witness window as
+/// `(window-relative position, window length)`. `None` when the leaf sits
+/// below the window's base or either value overflows the merkle helpers'
+/// width.
+#[must_use]
+pub(crate) fn window_position(
+    boundary_header: &BlockHeader,
+    leaf_index: u64,
+) -> Option<(usize, usize)> {
+    let base = boundary_header.beacon_witness_base().inner();
+    let count = boundary_header.beacon_witness_leaf_count().inner();
+    let lo = usize::try_from(leaf_index.checked_sub(base)?).ok()?;
+    let window_len = usize::try_from(count.saturating_sub(base)).ok()?;
+    Some((lo, window_len))
 }
 
 /// Per-shard canonical boundary QC across a committed proposal set: the
@@ -191,7 +223,13 @@ pub(crate) fn contributions_well_formed(state: &BeaconState, block: &BeaconBlock
                 return false;
             }
             let (prior, chunk_end) = witness_chunk_bounds(state, shard, header);
-            contribution_chunk_valid(header, &contribution.witnesses, prior, chunk_end)
+            contribution_chunk_valid(
+                header,
+                &contribution.payloads,
+                &contribution.range_proof,
+                prior,
+                chunk_end,
+            )
         })
     })
 }

@@ -79,14 +79,21 @@ pub const MAX_PREFIX_SIGS: usize = MAX_VOTE_VECTOR_LEN + 1;
 /// pathological inputs.
 pub const MAX_WITNESS_PROOF_DEPTH: usize = 64;
 
-/// Per-request cap on the number of shard witnesses a beacon validator
-/// pulls in one round-trip.
+/// Cap on the node count of a witness-chunk range multiproof.
 ///
-/// Bounds the `leaf_indices` request array and the matching `witnesses`
-/// response array at decode time. Sized at a moderate batch — beacon
-/// validators typically fetch a handful of witnesses per slot
-/// (committee turnover, jails); larger batches degrade to multiple
-/// round-trips rather than ballooning a single request.
+/// A range proof carries at most one left and one right flank per tree
+/// level, so twice [`MAX_WITNESS_PROOF_DEPTH`] covers any window the
+/// depth cap admits. Realistic proofs are far smaller: a chunk ending at
+/// the window's leaf count needs no right flank at any level, so it costs
+/// at most one node per level and usually fewer.
+pub const MAX_RANGE_PROOF_NODES: usize = 2 * MAX_WITNESS_PROOF_DEPTH;
+
+/// Per-request cap on the number of shard-witness leaves a beacon
+/// validator pulls in one round-trip.
+///
+/// Bounds the requested range's width and the matching payload array at
+/// decode time. A chunk wider than this degrades to successive requests,
+/// each proving its own sub-range, rather than one unbounded response.
 pub const MAX_WITNESSES_PER_FETCH: usize = 128;
 
 /// Per-transaction cap on

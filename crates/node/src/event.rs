@@ -383,24 +383,24 @@ pub enum ShardScopedInput {
         hashes: Vec<WaveId>,
     },
 
-    /// A shard-witness fetch failed (network error, empty response, or
-    /// peer reported the witness as pruned). Per-id so multiple
-    /// in-flight leaves can fail independently.
+    /// A shard-witness chunk fetch failed (network error, empty response,
+    /// or the peer's window was pruned). Per-id so multiple in-flight
+    /// runs can fail independently.
     ShardWitnessesFetchFailed {
-        /// Per-leaf identities that failed to fetch.
-        ids: Vec<(ShardId, BlockHeight, BlockHash, LeafIndex)>,
+        /// Anchor + range identities that failed to fetch.
+        ids: Vec<(ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex)>,
     },
 
-    /// A shard-witness fetch response delivered its payload: release the
-    /// fetch slot so the next queued leaf can dispatch. Keyed by the
+    /// A shard-witness chunk response delivered its payload: release the
+    /// fetch slot so the next queued run can dispatch. Keyed by the
     /// *request* ids, not the response contents, so a peer's payload can't
-    /// leave the slot pinned; if the delivered witness fails admission,
-    /// the beacon coordinator's chunk re-drive re-requests the leaf. The
+    /// leave the slot pinned; if the delivered chunk fails admission, the
+    /// beacon coordinator's chunk re-drive re-requests the run. The
     /// payload itself rides the accompanying
     /// `ProtocolEvent::ShardWitnessesReceived`.
     ShardWitnessesFetchFulfilled {
-        /// Per-leaf identities the response fulfilled.
-        ids: Vec<(ShardId, BlockHeight, BlockHash, LeafIndex)>,
+        /// Anchor + range identities the response fulfilled.
+        ids: Vec<(ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex)>,
     },
 
     /// A beacon-proposal fetch failed (network error, or the peer

@@ -636,16 +636,13 @@ where
                 source_shard,
                 block_height,
                 committed_block_hash,
-                leaf_indices,
+                lo,
+                hi,
                 preferred,
                 class,
             } => {
-                let ids: Vec<_> = leaf_indices
-                    .into_iter()
-                    .map(|leaf| (source_shard, block_height, committed_block_hash, leaf))
-                    .collect();
                 self.drive_fetch::<ShardWitnessBinding>(FetchInput::Request {
-                    ids,
+                    ids: vec![(source_shard, block_height, committed_block_hash, lo, hi)],
                     shard: source_shard,
                     preferred,
                     class,

@@ -26,19 +26,19 @@ use hyperscale_core::{
 };
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
-    BeaconState, BlockHash, BlockHeight, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
+    BeaconState, BlockHash, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
     CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, CertifiedBlockHeader,
-    ConsensusPublicKey, Epoch, GenesisConfigHash, LeafIndex, LocalTimestamp,
-    MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_WITNESSES_PER_FETCH, NetworkDefinition, PcValueElement,
-    PcVector, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
-    PcVote3VerifyError, PcVoteEquivocation, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT,
-    RETENTION_HORIZON, RatifyCert, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteRecord,
-    RatifyVoteVerifyError, RecoveryCause, SKIP_TIMEOUT, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT,
-    ShardCommittee, ShardForkProof, ShardId, ShardVoteEquivocation, ShardVoteEquivocationContext,
-    ShardWitness, SlotEffects, SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError,
-    SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError,
-    SpcView, TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable,
-    Verified, Verifier, Verify, WeightedTimestamp,
+    ConsensusPublicKey, Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp,
+    MAX_EQUIVOCATIONS_PER_PROPOSER, NetworkDefinition, PcValueElement, PcVector, PcVote1,
+    PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
+    PcVoteEquivocation, PcVoteEquivocationContext, RATIFY_ROUND_TIMEOUT, RETENTION_HORIZON,
+    RatifyCert, RatifyPhase, RatifyRound, RatifyVote, RatifyVoteRecord, RatifyVoteVerifyError,
+    RecoveryCause, SKIP_TIMEOUT, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, ShardCommittee, ShardForkProof,
+    ShardId, ShardVoteEquivocation, ShardVoteEquivocationContext, ShardWitnessPayload, SlotEffects,
+    SpcCert, SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg,
+    SpcNewCommitMsgVerifyError, SpcProposalObject, SpcProposalObjectVerifyError, SpcView,
+    TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable, Verified,
+    Verifier, WeightedTimestamp,
 };
 use tracing::{trace, warn};
 
@@ -47,7 +47,7 @@ use crate::equivocations::EquivocationObservations;
 use crate::fork_observations::ForkProofObservations;
 use crate::proposal_pool::BeaconProposalPool;
 use crate::ratify::{RatifyEffect, RatifyTracker};
-use crate::shard_source::ShardSourceTracker;
+use crate::shard_source::{ChunkFetchId, ShardSourceTracker};
 use crate::spc::SpcEffect;
 use crate::spc_driver::SpcDriver;
 use crate::state::{apply_epoch, apply_input_for};
@@ -1721,60 +1721,63 @@ impl BeaconCoordinator {
         self.lift_ratify_effects(effects)
     }
 
-    /// A shard-witness fetch response arrived. For each witness:
-    /// look up the source-shard committed block's
-    /// `beacon_witness_root` via the local
-    /// [`ShardSourceTracker`](crate::ShardSourceTracker)
-    /// header records, verify Merkle inclusion under that root, and
-    /// admit to the validated pool. Witnesses that fail any check are
-    /// dropped silently; the fetch protocol retries on its own cadence.
+    /// A shard-witness chunk arrived. Resolve the anchor block's header
+    /// from the local [`ShardSourceTracker`](crate::ShardSourceTracker),
+    /// recompute the window root from the payloads plus the range proof,
+    /// and admit the run whole. A chunk that fails any check is dropped
+    /// silently; the fetch protocol retries on its own cadence.
+    ///
+    /// Admission is all-or-nothing because a range proof only verifies
+    /// for the run it names — half a chunk proves nothing, so there is no
+    /// partial progress to bank.
     ///
     /// Off-committee vnodes don't initiate fetches, so this handler
     /// no-ops there — the pool is empty by design for those nodes.
     pub fn on_shard_witnesses_received(
         &mut self,
         shard_id: ShardId,
-        witnesses: Vec<Arc<ShardWitness>>,
+        anchor: BlockHash,
+        lo: LeafIndex,
+        payloads: Vec<ShardWitnessPayload>,
+        range_proof: Vec<Hash>,
     ) -> Vec<Action> {
         if !self.is_on_committee() {
             return Vec::new();
         }
-        for witness in witnesses {
-            if witness.proof.shard_id != shard_id {
-                warn!(
-                    expected = ?shard_id,
-                    got = ?witness.proof.shard_id,
-                    "ShardWitness shard_id mismatches enclosing fetch response — dropping",
-                );
-                continue;
-            }
-            let Some(header) = self
-                .shard_source
-                .verified_header_by_block_hash(shard_id, witness.proof.committed_block_hash)
-            else {
-                warn!(
-                    shard = ?shard_id,
-                    "ShardWitness committed_block_hash has no verified header yet — dropping",
-                );
-                continue;
-            };
-            match witness.verify(header.as_ref()) {
-                Ok(verified) => {
-                    self.shard_source.admit_witness(Arc::new(verified));
-                }
-                Err(err) => {
-                    warn!(
-                        shard = ?shard_id,
-                        leaf = witness.proof.leaf_index.inner(),
-                        %err,
-                        "ShardWitness verification failed — dropping",
-                    );
-                }
-            }
+        if payloads.is_empty() {
+            return self.fetch_witness_chunk(shard_id);
         }
-        // Pull the next gap now that this batch landed — a chunk wider than
-        // one fetch completes across responses without waiting for the
-        // shard's next source header (a terminated shard sends none).
+        let Some(header) = self
+            .shard_source
+            .verified_header_by_block_hash(shard_id, anchor)
+        else {
+            warn!(
+                shard = ?shard_id,
+                "Witness chunk anchor has no verified header yet — dropping",
+            );
+            return self.fetch_witness_chunk(shard_id);
+        };
+        let chunk_end = lo.inner() + payloads.len() as u64;
+        if rules::contribution_chunk_valid(
+            header.header(),
+            &payloads,
+            &range_proof,
+            lo.inner(),
+            chunk_end,
+        ) {
+            self.shard_source
+                .admit_chunk(shard_id, anchor, lo.inner(), payloads, range_proof);
+        } else {
+            warn!(
+                shard = ?shard_id,
+                lo = lo.inner(),
+                chunk_end,
+                "Witness chunk failed root recomputation — dropping",
+            );
+        }
+        // Re-drive now that this response landed: on success the next
+        // crossing's chunk, on failure the same range against another peer.
+        // A terminated shard sends no further source header to trigger it.
         self.fetch_witness_chunk(shard_id)
     }
 
@@ -1788,13 +1791,13 @@ impl BeaconCoordinator {
     /// shard. Off-committee vnodes retain the header (a vnode drawn onto
     /// the committee admits boundary QCs against the history it already
     /// holds, rather than abstaining until fresh headers arrive) and emit
-    /// nothing. On-committee vnodes additionally
-    /// fetch the witness chunk of the shard's latest observed crossing via
+    /// nothing. On-committee vnodes additionally fetch the witness chunk of
+    /// the shard's latest observed crossing via
     /// [`fetch_witness_chunk`](Self::fetch_witness_chunk) — the leaves
     /// `[prior, chunk_end)` the boundary fold will apply next, anchored to
-    /// the boundary block, bounded to [`MAX_WITNESSES_PER_FETCH`] leaves
-    /// per call so a large producer/consumer gap can't make one header do
-    /// unbounded work.
+    /// the boundary block. `chunk_bounds` caps that range at the fold's
+    /// per-epoch budget, so a large producer/consumer gap can't make one
+    /// header do unbounded work.
     pub fn on_verified_source_header(
         &mut self,
         certified_header: &Arc<Verified<CertifiedBlockHeader>>,
@@ -1812,19 +1815,18 @@ impl BeaconCoordinator {
         self.fetch_witness_chunk(certified_header.header().shard_id())
     }
 
-    /// Fetch the lowest still-missing leaves of `shard`'s current witness
-    /// chunk, anchored to its latest observed crossing's boundary block.
+    /// Fetch `shard`'s current witness chunk, anchored to its latest
+    /// observed crossing's boundary block.
     ///
     /// The anchor is the boundary block `B` (not whichever header just
-    /// arrived): a witness proves against `B`'s `beacon_witness_root`, and
-    /// the chunk is the leaves `[prior, chunk_end)` the boundary fold will
-    /// apply next (`prior` = the applied watermark). At most
-    /// [`MAX_WITNESSES_PER_FETCH`] leaves per call, taken from where the
-    /// held leaves end rather than a fixed offset from `prior`: the chunk
-    /// folds (advancing `prior`) only once every leaf is in hand, so a
-    /// chunk wider than one fetch is pulled across successive calls, each
-    /// re-issue — next observation, fetch response, or commit — picking up
-    /// the next gap.
+    /// arrived): the chunk's range proof lifts to `B`'s
+    /// `beacon_witness_root`, and the chunk is the leaves
+    /// `[prior, chunk_end)` the boundary fold will apply next (`prior` =
+    /// the applied watermark). The whole run is one request: the proof is
+    /// range-scoped, so a partial answer proves nothing and there is no
+    /// gap-filling to do across responses. `chunk_bounds` already caps the
+    /// run at the fold's per-epoch budget, which bounds the work one
+    /// header can trigger.
     fn fetch_witness_chunk(&mut self, shard: ShardId) -> Vec<Action> {
         let watermark = self.state.fold_watermark(shard);
         let (anchor, block_height, prior, chunk_end) = {
@@ -1841,29 +1843,21 @@ impl BeaconCoordinator {
                 chunk_end,
             )
         };
-        let leaves_to_fetch: Vec<LeafIndex> = self
-            .shard_source
-            .missing_chunk_leaves(shard, anchor, prior, chunk_end)
-            .into_iter()
-            .take(MAX_WITNESSES_PER_FETCH)
-            .collect();
-        if leaves_to_fetch.is_empty() {
+        if chunk_end <= prior {
             return Vec::new();
         }
-        // The request names every missing leaf regardless of in-flight
-        // status: the runner's fetch dedups ids it already tracks, so a
-        // re-issue only revives leaves whose earlier fetch was fulfilled
-        // without admission or abandoned. The batch advances as held
-        // leaves drop out of `missing_chunk_leaves` on each re-issue.
-        for &leaf in &leaves_to_fetch {
-            self.shard_source
-                .register_pending_fetch(shard, block_height, anchor, leaf);
-        }
+        // The request goes out regardless of in-flight status: the runner's
+        // fetch dedups ids it already tracks, so a re-issue only revives a
+        // run whose earlier fetch was fulfilled without admission or
+        // abandoned. The tracker's record is for cancellation, not dedup.
+        self.shard_source
+            .register_pending_fetch(shard, block_height, anchor, prior, chunk_end);
         vec![Action::Fetch(FetchRequest::ShardWitnesses {
             source_shard: shard,
             block_height,
             committed_block_hash: anchor,
-            leaf_indices: leaves_to_fetch,
+            lo: LeafIndex::new(prior),
+            hi: LeafIndex::new(chunk_end),
             preferred: None,
             class: None,
         })]
@@ -1992,8 +1986,8 @@ impl BeaconCoordinator {
             self.now,
         ));
 
-        // Evict witnesses the boundary fold has now consumed — those below
-        // each shard's advanced applied watermark
+        // Evict chunks the boundary fold has now consumed — those starting
+        // below each shard's advanced applied watermark
         // (`boundaries[shard].witness_leaf_count`) — and bound the
         // verified-header maps to their sliding window.
         let consumed: Vec<(ShardId, u64)> = self
@@ -2002,8 +1996,7 @@ impl BeaconCoordinator {
             .iter()
             .map(|(shard, boundary)| (*shard, boundary.witness_leaf_count.inner()))
             .collect();
-        let mut abandoned_witness_ids: Vec<(ShardId, BlockHeight, BlockHash, LeafIndex)> =
-            Vec::new();
+        let mut abandoned_witness_ids: Vec<ChunkFetchId> = Vec::new();
         for (shard, watermark) in consumed {
             abandoned_witness_ids.extend(self.shard_source.evict_consumed(shard, watermark));
         }
@@ -2637,11 +2630,11 @@ mod tests {
         KeptSeat, LeafIndex, LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR,
         NetworkDefinition, ObserverSeat, PcVector, ProposerTimestamp, ProvisionsRoot,
         QuorumCertificate, Randomness, Round, ShardBoundary, ShardCommittee,
-        ShardEpochContribution, ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof,
-        Signer, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
-        ValidatorId, VrfProof, WeightedTimestamp, build_qc1, build_qc2, build_qc3,
-        build_ratify_cert, compute_merkle_root_with_proof, genesis_config_hash, pc_context,
-        sign_ratify_vote, sign_vote1, sign_vote2, sign_vote3, spc_context,
+        ShardEpochContribution, ShardId, ShardWitnessPayload, Signer, SignerBitfield, SpcCert,
+        SpcView, Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, VrfProof,
+        WeightedTimestamp, build_qc1, build_qc2, build_qc3, build_ratify_cert, compute_merkle_root,
+        compute_range_proof, genesis_config_hash, pc_context, sign_ratify_vote, sign_vote1,
+        sign_vote2, sign_vote3, spc_context,
     };
 
     use super::*;
@@ -2807,18 +2800,25 @@ mod tests {
     }
 
     /// A boundary header committing a real beacon-witness accumulator of
-    /// `leaf_count` `StakeDeposit` leaves, plus the matching per-leaf
-    /// witnesses (merkle-proven against the block's root, anchored to its
-    /// hash). Seat the witnesses into a coordinator via
-    /// [`BeaconCoordinator::on_shard_witnesses_received`] or embed them in a
+    /// `leaf_count` `StakeDeposit` leaves, plus the chunk covering the
+    /// whole window: its payloads and the range proof lifting them to the
+    /// block's root. Seat the chunk into a coordinator via
+    /// [`BeaconCoordinator::on_shard_witnesses_received`] or embed it in a
     /// [`ShardEpochContribution`] to drive the witness-chunk fetch and fold.
+    ///
+    /// The window base is zero and the run spans it, so the proof is empty
+    /// — the full-width case the assembler hits in steady state.
     fn boundary_block_with_witnesses(
         shard: ShardId,
         height: u64,
         pred_wt: u64,
         state_root: StateRoot,
         leaf_count: u64,
-    ) -> (Arc<Verified<CertifiedBlockHeader>>, Vec<ShardWitness>) {
+    ) -> (
+        Arc<Verified<CertifiedBlockHeader>>,
+        Vec<ShardWitnessPayload>,
+        Vec<Hash>,
+    ) {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
                 pool_id: StakePoolId::new(200 + u32::try_from(i).unwrap_or(u32::MAX)),
@@ -2832,28 +2832,12 @@ mod tests {
         let root = if leaf_hashes.is_empty() {
             BeaconWitnessRoot::ZERO
         } else {
-            BeaconWitnessRoot::from_raw(compute_merkle_root_with_proof(&leaf_hashes, 0).0)
+            BeaconWitnessRoot::from_raw(compute_merkle_root(&leaf_hashes))
         };
         let certified =
             boundary_block_header_with_root(shard, height, pred_wt, state_root, root, leaf_count);
-        let block_hash = certified.block_hash();
-        let witnesses = payloads
-            .into_iter()
-            .enumerate()
-            .map(|(i, payload)| {
-                let (_, siblings, _) = compute_merkle_root_with_proof(&leaf_hashes, i);
-                ShardWitness {
-                    payload,
-                    proof: ShardWitnessProof {
-                        shard_id: shard,
-                        committed_block_hash: block_hash,
-                        leaf_index: LeafIndex::new(i as u64),
-                        siblings: siblings.into(),
-                    },
-                }
-            })
-            .collect();
-        (certified, witnesses)
+        let range_proof = compute_range_proof(&leaf_hashes, 0, leaf_hashes.len());
+        (certified, payloads, range_proof)
     }
 
     /// A verified header whose `parent_qc` names `parent_hash` at
@@ -2952,7 +2936,8 @@ mod tests {
         let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
         let anchor = StateRoot::from_raw(Hash::from_bytes(b"unit-anchor"));
-        let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
+        let (b, payloads, range_proof) =
+            boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
         let qc = qc_naming(b.block_hash(), shard, 5, 301_000);
         let committed = vec![(
             ValidatorId::new(0),
@@ -2974,13 +2959,19 @@ mod tests {
         );
 
         // Once the witness chunk arrives, the contribution seats with it.
-        coord.on_shard_witnesses_received(shard, witnesses.iter().cloned().map(Arc::new).collect());
+        coord.on_shard_witnesses_received(
+            shard,
+            b.block_hash(),
+            LeafIndex::new(0),
+            payloads,
+            range_proof,
+        );
         let built =
             boundary::build_shard_contributions(&coord.state, &coord.shard_source, &committed)
                 .expect("contribution seats once the boundary block and chunk sync");
         assert_eq!(built.len(), 1);
         assert_eq!(built[&shard].boundary_header.hash(), b.block_hash());
-        assert_eq!(built[&shard].witnesses.len(), 3);
+        assert_eq!(built[&shard].payloads.len(), 3);
     }
 
     /// The proposer stops sourcing a live shard's crossing once the fold
@@ -2995,7 +2986,8 @@ mod tests {
         let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
         let anchor = StateRoot::from_raw(Hash::from_bytes(b"folded-anchor"));
-        let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
+        let (b, payloads, range_proof) =
+            boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
         coord.state.shard_committees.insert(
             shard,
             ShardCommittee {
@@ -3007,7 +2999,13 @@ mod tests {
         let c = linked_block_header(shard, 6, b.block_hash(), 301_000, 3);
         coord.on_verified_source_header(&b);
         coord.on_verified_source_header(&c);
-        coord.on_shard_witnesses_received(shard, witnesses.iter().cloned().map(Arc::new).collect());
+        coord.on_shard_witnesses_received(
+            shard,
+            b.block_hash(),
+            LeafIndex::new(0),
+            payloads.clone(),
+            range_proof,
+        );
         let boundary = |applied: u64| ShardBoundary {
             state_root: anchor,
             block_hash: b.block_hash(),
@@ -3028,12 +3026,25 @@ mod tests {
         let sourced = boundary::source_boundary_qcs(&coord.state, &coord.shard_source);
         assert!(sourced.contains_key(&shard), "a fresh crossing sources");
 
-        // Folded with a partially drained chunk: keep sourcing the rest.
+        // Folded with backlog left: the shard keeps sourcing once the
+        // remaining run is in hand. The watermark only ever lands on a
+        // chunk boundary, so the tail is a chunk in its own right.
         coord.state.boundaries.insert(shard, boundary(1));
+        let leaves: Vec<Hash> = payloads
+            .iter()
+            .map(ShardWitnessPayload::leaf_hash)
+            .collect();
+        coord.on_shard_witnesses_received(
+            shard,
+            b.block_hash(),
+            LeafIndex::new(1),
+            payloads[1..].to_vec(),
+            compute_range_proof(&leaves, 1, 3),
+        );
         let sourced = boundary::source_boundary_qcs(&coord.state, &coord.shard_source);
         assert!(
             sourced.contains_key(&shard),
-            "a partially drained chunk keeps sourcing",
+            "an undrained backlog keeps sourcing",
         );
 
         // Fully folded: nothing new to report, so the shard is absent.
@@ -3054,12 +3065,14 @@ mod tests {
         let shard = ShardId::leaf(1, 0);
         let other = ShardId::leaf(1, 1);
         let anchor = StateRoot::from_raw(Hash::from_bytes(b"wf-anchor"));
-        let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
+        let (b, payloads, range_proof) =
+            boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
         let qc = qc_naming(b.block_hash(), shard, 5, 301_000);
         let committed = vec![(ValidatorId::new(0), proposal_with_boundary(shard, qc))];
         let contribution = ShardEpochContribution {
             boundary_header: b.header().clone(),
-            witnesses: witnesses.into(),
+            payloads: payloads.into(),
+            range_proof: range_proof.into(),
         };
         let block_with = |contribs: BTreeMap<ShardId, ShardEpochContribution>| {
             BeaconBlock::new_with_contributions(
@@ -3095,7 +3108,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: wrong.header().clone(),
-                witnesses: BoundedVec::new(),
+                payloads: BoundedVec::new(),
+                range_proof: BoundedVec::new(),
             },
         ))
         .collect();
@@ -3111,7 +3125,8 @@ mod tests {
             shard,
             ShardEpochContribution {
                 boundary_header: b.header().clone(),
-                witnesses: BoundedVec::new(),
+                payloads: BoundedVec::new(),
+                range_proof: BoundedVec::new(),
             },
         ))
         .collect();
@@ -3131,12 +3146,14 @@ mod tests {
         let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
         let anchor = StateRoot::from_raw(Hash::from_bytes(b"cand-anchor"));
-        let (b, witnesses) = boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
+        let (b, payloads, range_proof) =
+            boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
         let qc = qc_naming(b.block_hash(), shard, 5, 301_000);
         let committed = vec![(ValidatorId::new(0), proposal_with_boundary(shard, qc))];
         let contribution = ShardEpochContribution {
             boundary_header: b.header().clone(),
-            witnesses: witnesses.into(),
+            payloads: payloads.into(),
+            range_proof: range_proof.into(),
         };
         let epoch = coord.state.current_epoch.next();
         let prev = coord.latest_block.block_hash();
@@ -4582,12 +4599,9 @@ mod tests {
         let shard = ShardId::leaf(1, 0);
         let anchor = BlockHash::from_raw(Hash::from_bytes(b"witness-anchor"));
         let height = BlockHeight::new(5);
-        let leaf = LeafIndex::new(0);
-        assert!(
-            coord
-                .shard_source
-                .register_pending_fetch(shard, height, anchor, leaf)
-        );
+        coord
+            .shard_source
+            .register_pending_fetch(shard, height, anchor, 0, 2);
 
         // Jail the local validator so the post-apply resample drops it
         // from the beacon committee.
@@ -4602,12 +4616,12 @@ mod tests {
         let actions = complete_verifications(&mut coord, dispatched);
 
         assert!(!coord.is_on_committee());
-        assert!(!coord.shard_source.is_pending_fetch(shard, anchor, leaf));
+        assert!(!coord.shard_source.is_pending_fetch(shard, anchor, 0, 2));
         let abandoned = actions.iter().any(|a| {
             matches!(
                 a,
                 Action::AbandonFetch(FetchAbandon::ShardWitnesses { ids })
-                    if ids.contains(&(shard, height, anchor, leaf))
+                    if ids.contains(&(shard, height, anchor, LeafIndex::new(0), LeafIndex::new(2)))
             )
         });
         assert!(
@@ -5202,35 +5216,36 @@ mod tests {
         assert!(coord.spc.is_bootstrapped());
     }
 
-    /// Build a (witness, source-shard verified header) pair where the
-    /// witness's Merkle proof verifies under the header's
-    /// `beacon_witness_root`. `total_leaves` controls the accumulator
-    /// size; `leaf_index` picks which slot belongs to our witness.
-    fn make_verifiable_witness_and_header(
+    /// Build a (chunk, source-shard verified header) pair where the
+    /// chunk's range proof verifies under the header's
+    /// `beacon_witness_root`. `total_leaves` sizes the accumulator; the
+    /// chunk covers `[lo, hi)` of it.
+    fn make_verifiable_chunk_and_header(
         shard: ShardId,
         height: u64,
-        leaf_index: u64,
+        lo: u64,
+        hi: u64,
         total_leaves: u64,
-    ) -> (Arc<ShardWitness>, Arc<Verified<CertifiedBlockHeader>>) {
-        use hyperscale_types::{
-            BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
-            CertificateRoot, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, ProposerTimestamp,
-            ProvisionsRoot, QuorumCertificate, Round, ShardWitnessPayload, ShardWitnessProof,
-            SignerBitfield, StateRoot, TransactionRoot, WeightedTimestamp,
-            compute_merkle_root_with_proof,
-        };
-        let payload = ShardWitnessPayload::StakeDeposit {
-            pool_id: StakePoolId::new(0),
-            amount: Stake::from_whole_tokens(1),
-        };
-        let our_leaf = payload.leaf_hash();
+    ) -> (
+        Vec<ShardWitnessPayload>,
+        Vec<Hash>,
+        Arc<Verified<CertifiedBlockHeader>>,
+    ) {
+        let payloads: Vec<ShardWitnessPayload> = (lo..hi)
+            .map(|i| ShardWitnessPayload::StakeDeposit {
+                pool_id: StakePoolId::new(u32::try_from(i).unwrap_or(u32::MAX)),
+                amount: Stake::from_whole_tokens(1),
+            })
+            .collect();
         let mut leaves: Vec<Hash> = (0..total_leaves)
             .map(|i| Hash::from_bytes(format!("leaf-{i}").as_bytes()))
             .collect();
-        let leaf_idx_usize = usize::try_from(leaf_index).unwrap();
-        leaves[leaf_idx_usize] = our_leaf;
-        let (root, siblings, _) = compute_merkle_root_with_proof(&leaves, leaf_idx_usize);
-        let beacon_root = BeaconWitnessRoot::from_raw(root);
+        let (lo_i, hi_i) = (usize::try_from(lo).unwrap(), usize::try_from(hi).unwrap());
+        for (offset, payload) in payloads.iter().enumerate() {
+            leaves[lo_i + offset] = payload.leaf_hash();
+        }
+        let beacon_root = BeaconWitnessRoot::from_raw(compute_merkle_root(&leaves));
+        let range_proof = compute_range_proof(&leaves, lo_i, hi_i);
 
         let parent_qc = QuorumCertificate::genesis(shard, ChainOrigin::ROOT);
         let parent_block_hash = BlockHash::ZERO;
@@ -5271,121 +5286,129 @@ mod tests {
         let certified_header = Arc::new(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(header, qc),
         ));
-
-        let proof = ShardWitnessProof {
-            shard_id: shard,
-            committed_block_hash: block_hash,
-            leaf_index: LeafIndex::new(leaf_index),
-            siblings: siblings.into(),
-        };
-        let witness = Arc::new(ShardWitness { payload, proof });
-        (witness, certified_header)
+        (payloads, range_proof, certified_header)
     }
 
-    /// An observed crossing whose boundary block holds far more
-    /// accumulator leaves than the beacon has applied enqueues at most
-    /// `MAX_WITNESSES_PER_FETCH` leaves per call — the chunk fetch is a
-    /// bounded window `[prior, prior + MAX)` anchored to the boundary
-    /// block, not the full applied/boundary gap. The remainder is picked
-    /// up on later observations as the watermark advances.
+    /// An observed crossing enqueues the whole chunk `[prior, chunk_end)`
+    /// as one fetch, capped by `chunk_bounds` at the fold's per-epoch
+    /// budget. The run is the unit the range proof covers, so it is never
+    /// split across requests.
     #[test]
-    fn on_verified_source_header_caps_leaf_fetch_window() {
-        use hyperscale_types::{MAX_WITNESSES_PER_FETCH, ShardId};
+    fn on_verified_source_header_requests_the_whole_chunk() {
+        use hyperscale_types::{MAX_WITNESSES_PER_SHARD, ShardId};
         let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
 
         // A `(B, C)` crossing of the epoch-1 cut: `B`'s predecessor sits
         // at wt 1 (≤ the 300_000 ms cut) and `B`'s own wt is 300_001 (past
-        // it), with a large accumulator at `B`.
-        let total_leaves = u64::try_from(MAX_WITNESSES_PER_FETCH + 50).unwrap();
+        // it), with an accumulator wider than the per-epoch fold budget.
+        let total_leaves = u64::try_from(MAX_WITNESSES_PER_SHARD + 50).unwrap();
         let b = linked_block_header(shard, 5, BlockHash::ZERO, 1, total_leaves);
         let c = linked_block_header(shard, 6, b.block_hash(), 300_001, total_leaves);
         coord.on_verified_source_header(&b);
         let actions = coord.on_verified_source_header(&c);
 
-        let leaf_indices = actions
+        let (lo, hi) = actions
             .iter()
             .find_map(|a| match a {
-                Action::Fetch(FetchRequest::ShardWitnesses { leaf_indices, .. }) => {
-                    Some(leaf_indices)
-                }
+                Action::Fetch(FetchRequest::ShardWitnesses { lo, hi, .. }) => Some((*lo, *hi)),
                 _ => None,
             })
             .expect("expected a ShardWitnesses fetch");
-        assert_eq!(leaf_indices.len(), MAX_WITNESSES_PER_FETCH);
-        // Contiguous 0-based window `[0, MAX)` from the applied watermark.
-        assert_eq!(leaf_indices.first().copied(), Some(LeafIndex::new(0)));
-        assert_eq!(
-            leaf_indices.last().copied(),
-            Some(LeafIndex::new(MAX_WITNESSES_PER_FETCH as u64 - 1)),
+        // `[0, MAX_WITNESSES_PER_SHARD)` from the applied watermark — the
+        // cap binds, the remainder follows once the watermark advances.
+        assert_eq!(lo, LeafIndex::new(0));
+        assert_eq!(hi, LeafIndex::new(MAX_WITNESSES_PER_SHARD as u64));
+    }
+
+    #[test]
+    fn on_shard_witnesses_received_admits_valid_chunk() {
+        use hyperscale_types::ShardId;
+        let mut coord = fresh_coord();
+        let shard = ShardId::leaf(1, 0);
+        let (payloads, range_proof, header) = make_verifiable_chunk_and_header(shard, 1, 1, 3, 4);
+        coord
+            .shard_source
+            .on_verified_source_header(Arc::clone(&header));
+
+        let actions = coord.on_shard_witnesses_received(
+            shard,
+            header.block_hash(),
+            LeafIndex::new(1),
+            payloads,
+            range_proof,
         );
-    }
-
-    #[test]
-    fn on_shard_witnesses_received_admits_valid_witness() {
-        use hyperscale_types::ShardId;
-        let mut coord = fresh_coord();
-        let shard = ShardId::leaf(1, 0);
-        let (witness, header) = make_verifiable_witness_and_header(shard, 1, 2, 4);
-        coord
-            .shard_source
-            .on_verified_source_header(Arc::clone(&header));
-
-        let actions = coord.on_shard_witnesses_received(shard, vec![Arc::clone(&witness)]);
         assert!(actions.is_empty());
-        assert_eq!(coord.shard_source.total_chunk_len(), 1);
+        assert_eq!(coord.shard_source.total_chunk_len(), 2);
     }
 
     #[test]
-    fn on_shard_witnesses_received_drops_mismatched_shard_id() {
+    fn on_shard_witnesses_received_drops_unknown_anchor() {
         use hyperscale_types::ShardId;
         let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
-        let other = ShardId::leaf(1, 1);
-        let (witness, header) = make_verifiable_witness_and_header(shard, 1, 2, 4);
-        coord
-            .shard_source
-            .on_verified_source_header(Arc::clone(&header));
+        // The anchor's header was never seated locally.
+        let (payloads, range_proof, header) = make_verifiable_chunk_and_header(shard, 1, 0, 1, 1);
 
-        // Witness is for `shard` but envelope claims `other`.
-        let actions = coord.on_shard_witnesses_received(other, vec![witness]);
+        let actions = coord.on_shard_witnesses_received(
+            shard,
+            header.block_hash(),
+            LeafIndex::new(0),
+            payloads,
+            range_proof,
+        );
         assert!(actions.is_empty());
         assert_eq!(coord.shard_source.total_chunk_len(), 0);
     }
 
+    /// A chunk delivered at the wrong offset recomputes to a different
+    /// root and is dropped — the range's position is what the proof
+    /// commits to, so a misplaced run can't slip in.
     #[test]
-    fn on_shard_witnesses_received_drops_unknown_committed_block() {
+    fn on_shard_witnesses_received_drops_chunk_at_wrong_offset() {
         use hyperscale_types::ShardId;
         let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
-        // Build a witness pointing at a block hash that no header
-        // record exists for (we never call on_verified_source_header).
-        let (witness, _header) = make_verifiable_witness_and_header(shard, 1, 0, 1);
-
-        let actions = coord.on_shard_witnesses_received(shard, vec![witness]);
-        assert!(actions.is_empty());
-        assert_eq!(coord.shard_source.total_chunk_len(), 0);
-    }
-
-    #[test]
-    fn on_shard_witnesses_received_drops_bad_merkle_proof() {
-        use hyperscale_types::{LeafIndex, ShardId};
-        let mut coord = fresh_coord();
-        let shard = ShardId::leaf(1, 0);
-        let (witness, header) = make_verifiable_witness_and_header(shard, 1, 2, 4);
+        let (payloads, range_proof, header) = make_verifiable_chunk_and_header(shard, 1, 1, 3, 4);
         coord
             .shard_source
             .on_verified_source_header(Arc::clone(&header));
 
-        // Tamper with the witness's leaf_index so the path no longer
-        // reconstructs the committed root.
-        let mut tampered_proof = witness.proof.clone();
-        tampered_proof.leaf_index = LeafIndex::new(0);
-        let bad = Arc::new(ShardWitness {
-            payload: witness.payload.clone(),
-            proof: tampered_proof,
-        });
-        let actions = coord.on_shard_witnesses_received(shard, vec![bad]);
+        let actions = coord.on_shard_witnesses_received(
+            shard,
+            header.block_hash(),
+            LeafIndex::new(2),
+            payloads,
+            range_proof,
+        );
+        assert!(actions.is_empty());
+        assert_eq!(coord.shard_source.total_chunk_len(), 0);
+    }
+
+    /// A mutated payload breaks the recomputed root, so the whole chunk is
+    /// dropped rather than partially admitted.
+    #[test]
+    fn on_shard_witnesses_received_drops_mutated_payload() {
+        use hyperscale_types::ShardId;
+        let mut coord = fresh_coord();
+        let shard = ShardId::leaf(1, 0);
+        let (mut payloads, range_proof, header) =
+            make_verifiable_chunk_and_header(shard, 1, 1, 3, 4);
+        coord
+            .shard_source
+            .on_verified_source_header(Arc::clone(&header));
+
+        payloads[0] = ShardWitnessPayload::StakeDeposit {
+            pool_id: StakePoolId::new(999),
+            amount: Stake::from_whole_tokens(7),
+        };
+        let actions = coord.on_shard_witnesses_received(
+            shard,
+            header.block_hash(),
+            LeafIndex::new(1),
+            payloads,
+            range_proof,
+        );
         assert!(actions.is_empty());
         assert_eq!(coord.shard_source.total_chunk_len(), 0);
     }
@@ -5396,14 +5419,20 @@ mod tests {
         // Validator 99 isn't on the committee.
         let mut observer = new_coord(ValidatorId::new(99));
         let shard = ShardId::leaf(1, 0);
-        let (witness, header) = make_verifiable_witness_and_header(shard, 1, 0, 1);
+        let (payloads, range_proof, header) = make_verifiable_chunk_and_header(shard, 1, 0, 1, 1);
         observer
             .shard_source
             .on_verified_source_header(Arc::clone(&header));
 
-        let actions = observer.on_shard_witnesses_received(shard, vec![witness]);
+        let actions = observer.on_shard_witnesses_received(
+            shard,
+            header.block_hash(),
+            LeafIndex::new(0),
+            payloads,
+            range_proof,
+        );
         assert!(actions.is_empty());
-        // Pool stays empty — off-committee never admits witnesses.
+        // Pool stays empty — off-committee never admits chunks.
         assert_eq!(observer.shard_source.total_chunk_len(), 0);
     }
 

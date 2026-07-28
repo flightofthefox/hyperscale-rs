@@ -15,13 +15,12 @@ pub use hyperscale_crypto_bls::{
 use hyperscale_types::{
     AggregateSignature, BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount,
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, CertificateRoot, ConsensusSignature,
-    Epoch, Hash, InFlightCount, LeafIndex, LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition,
+    Epoch, Hash, InFlightCount, LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition,
     PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
-    Round, ShardCommittee, ShardEpochContribution, ShardId, ShardVoteEquivocation, ShardWitness,
-    ShardWitnessPayload, ShardWitnessProof, SignerBitfield, SlotEffects, Stake, StakePool,
-    StakePoolId, StateRoot, TransactionRoot, ValidatorId, ValidatorRecord, ValidatorStatus,
-    VrfProof, WeightedTimestamp, compute_merkle_root_with_proof, validator_possession_proof_sign,
-    vrf_sign,
+    Round, ShardCommittee, ShardEpochContribution, ShardId, ShardVoteEquivocation,
+    ShardWitnessPayload, SignerBitfield, SlotEffects, Stake, StakePool, StakePoolId, StateRoot,
+    TransactionRoot, ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp,
+    compute_merkle_root, compute_range_proof, validator_possession_proof_sign, vrf_sign,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
@@ -194,15 +193,16 @@ pub fn vrf_proposal_with_vote_equivocations(
 /// Build shard `shard_n`'s boundary block `B` and the witness chunk
 /// `[prior, prior + payloads.len())` that proves against it. `B`'s
 /// accumulator is the full `[0, prior + n)` — filler hashes below the
-/// applied watermark `prior`, the `payloads` at and above it — so every
-/// returned witness merkle-proves into `B.beacon_witness_root`. Returns
-/// the boundary header and its chunk; the caller seats them into a
-/// contribution (or tampers with the chunk to exercise rejection).
+/// applied watermark `prior`, the `payloads` at and above it — so the
+/// returned range proof lifts the chunk into `B.beacon_witness_root`.
+/// Returns the boundary header, the chunk's payloads, and its proof; the
+/// caller seats them into a contribution (or tampers with one to exercise
+/// rejection).
 pub fn boundary_chunk(
     shard_n: u64,
     prior: u64,
     payloads: Vec<ShardWitnessPayload>,
-) -> (BlockHeader, Vec<ShardWitness>) {
+) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
     let shard = ShardId::leaf(1, shard_n);
     let n = payloads.len() as u64;
 
@@ -212,31 +212,13 @@ pub fn boundary_chunk(
     leaf_hashes.extend(payloads.iter().map(ShardWitnessPayload::leaf_hash));
     let boundary_count = prior + n;
 
-    let (root, _, _) = compute_merkle_root_with_proof(&leaf_hashes, 0);
+    let root = compute_merkle_root(&leaf_hashes);
     let header = boundary_header(shard, BeaconWitnessRoot::from_raw(root), boundary_count);
-    let block_hash = header.hash();
 
-    let witnesses: Vec<ShardWitness> = payloads
-        .into_iter()
-        .enumerate()
-        .map(|(offset, payload)| {
-            let leaf = prior + offset as u64;
-            let (_, siblings, _) = compute_merkle_root_with_proof(
-                &leaf_hashes,
-                usize::try_from(leaf).expect("leaf index fits usize"),
-            );
-            ShardWitness {
-                payload,
-                proof: ShardWitnessProof {
-                    shard_id: shard,
-                    committed_block_hash: block_hash,
-                    leaf_index: LeafIndex::new(leaf),
-                    siblings: siblings.into(),
-                },
-            }
-        })
-        .collect();
-    (header, witnesses)
+    let lo = usize::try_from(prior).expect("leaf index fits usize");
+    let hi = usize::try_from(boundary_count).expect("leaf count fits usize");
+    let range_proof = compute_range_proof(&leaf_hashes, lo, hi);
+    (header, payloads, range_proof)
 }
 
 /// Apply `payloads` as shard `shard_n`'s witness chunk through one
@@ -261,7 +243,7 @@ pub fn apply_witness_chunk(
         .get(&shard)
         .map_or(0, |b| b.witness_leaf_count.inner());
 
-    let (header, witnesses) = boundary_chunk(shard_n, prior, payloads);
+    let (header, payloads, range_proof) = boundary_chunk(shard_n, prior, payloads);
     let block_hash = header.hash();
 
     // A placeholder boundary QC over `B` at a weighted timestamp past the
@@ -308,7 +290,8 @@ pub fn apply_witness_chunk(
         shard,
         ShardEpochContribution {
             boundary_header: header,
-            witnesses: witnesses.into(),
+            payloads: payloads.into(),
+            range_proof: range_proof.into(),
         },
     ))
     .collect();

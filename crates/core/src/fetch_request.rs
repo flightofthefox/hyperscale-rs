@@ -97,9 +97,10 @@ pub enum FetchRequest {
         class: Option<MessageClass>,
     },
     /// Cross-shard beacon-witness fetch keyed by the source shard's
-    /// `(block_height, committed_block_hash, leaf_index)`. Routing
+    /// `(block_height, committed_block_hash, leaf range)`. Routing
     /// shard is `source_shard` (the shard whose committee anchors the
-    /// witness accumulator).
+    /// witness accumulator). The whole run is one request: its range
+    /// proof is scoped to the run, so a partial answer proves nothing.
     ShardWitnesses {
         /// Source shard whose witnesses we want.
         source_shard: ShardId,
@@ -108,8 +109,10 @@ pub enum FetchRequest {
         /// Hash of the anchor block; binds responses to the right
         /// `beacon_witness_root`.
         committed_block_hash: BlockHash,
-        /// Leaf indices to fetch in the anchor block's accumulator.
-        leaf_indices: Vec<LeafIndex>,
+        /// First leaf of the run in the anchor block's accumulator.
+        lo: LeafIndex,
+        /// End of the run, exclusive.
+        hi: LeafIndex,
         /// Canonical-source hint, when one exists.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.

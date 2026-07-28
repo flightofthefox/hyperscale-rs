@@ -14,12 +14,12 @@ use hyperscale_types::{
     CandidateBeaconBlockVerifyError, CertRootVerifyError, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError,
-    ExecutionVote, FinalizedWave, FinalizedWaveVerifyError, LocalReceiptRoot,
+    ExecutionVote, FinalizedWave, FinalizedWaveVerifyError, Hash, LeafIndex, LocalReceiptRoot,
     LocalReceiptRootVerifyError, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
     PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
     Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
     RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Round,
-    RoutableTransaction, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitness,
+    RoutableTransaction, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
     SpcEmptyViewMsg, SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError,
     SpcProposalObject, SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError,
     StoredReceipt, Timeout, TransactionRoot, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable,
@@ -968,14 +968,20 @@ pub enum ProtocolEvent {
         result: Result<Arc<Verified<CandidateBeaconBlock>>, CandidateBeaconBlockVerifyError>,
     },
 
-    /// A shard-witness fetch response landed. `BeaconCoordinator`
-    /// validates the per-leaf Merkle proofs against the relevant
-    /// `shard_header_records` entry and admits to the witness pool.
+    /// A shard-witness chunk landed. `BeaconCoordinator` recomputes the
+    /// anchor block's witness-window root from the payloads plus the range
+    /// proof and admits the run whole.
     ShardWitnessesReceived {
         /// Source shard that served the response.
         shard_id: ShardId,
-        /// Witnesses returned by the peer.
-        witnesses: Vec<Arc<ShardWitness>>,
+        /// Anchor block the run proves against.
+        committed_block_hash: BlockHash,
+        /// First leaf of the returned run.
+        lo: LeafIndex,
+        /// Payloads in leaf-index order, starting at `lo`.
+        payloads: Vec<ShardWitnessPayload>,
+        /// Flanking nodes lifting `payloads` to the anchor's witness root.
+        range_proof: Vec<Hash>,
     },
 
     /// Result of an [`Action::FetchBeaconProposal`] dispatch — carries a

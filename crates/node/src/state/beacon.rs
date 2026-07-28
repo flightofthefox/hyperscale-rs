@@ -88,10 +88,17 @@ impl NodeStateMachine {
             }
             ProtocolEvent::ShardWitnessesReceived {
                 shard_id,
-                witnesses,
-            } => self
-                .beacon_coordinator
-                .on_shard_witnesses_received(shard_id, witnesses),
+                committed_block_hash,
+                lo,
+                payloads,
+                range_proof,
+            } => self.beacon_coordinator.on_shard_witnesses_received(
+                shard_id,
+                committed_block_hash,
+                lo,
+                payloads,
+                range_proof,
+            ),
             ProtocolEvent::BeaconProposalFetched {
                 epoch,
                 validator,

@@ -4,10 +4,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    BeaconProposal, BeaconState, BlockHeader, JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS,
+    BeaconProposal, BeaconState, BlockHeader, Hash, JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS,
     MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingReshape, PendingWithdrawal,
-    RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS, ShardId, ShardWitness,
-    ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier,
+    RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS, ShardId, ShardWitnessPayload, Stake,
+    StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier,
     validator_possession_proof_verify, verify_shard_vote_equivocation, verify_vote_equivocation,
 };
 
@@ -138,37 +138,37 @@ pub(super) fn ingest_equivocations(
 
 /// Validate and apply one shard's boundary-contribution witness chunk.
 ///
-/// `witnesses` must be exactly the contiguous, ascending 0-based leaf
-/// range `[prior, chunk_end)`, each merkle-proving into
+/// `payloads` must be exactly the leaf range `[prior, chunk_end)` of
+/// `boundary_header`'s witness window, with `range_proof` lifting them to
 /// `boundary_header.beacon_witness_root()`. Returns `false` **without
-/// mutating `state`** if the chunk is the wrong length, has a gap, or any
-/// proof fails — the caller treats the shard as not refreshed. On success
+/// mutating `state`** if the chunk is the wrong length or the recomputed
+/// root misses — the caller treats the shard as not refreshed. On success
 /// every payload applies in leaf-index order via [`apply_shard_payload`],
 /// its validator-level event recorded into `outcome`. Validation runs to
 /// completion before any application, so a malformed chunk never
 /// half-applies.
+///
+/// The source shard comes from the header rather than the payloads: a
+/// contribution's leaves are the ones that shard's own accumulator
+/// committed, so there is no per-payload origin to disagree with it.
 #[allow(clippy::too_many_arguments)] // fold-internal helper mirroring the contribution's fields
 pub(super) fn apply_contribution_witnesses(
     verifier: &dyn Verifier,
     state: &mut BeaconState,
     network: &NetworkDefinition,
     boundary_header: &BlockHeader,
-    witnesses: &[ShardWitness],
+    payloads: &[ShardWitnessPayload],
+    range_proof: &[Hash],
     prior: u64,
     chunk_end: u64,
     outcome: &mut WitnessOutcome,
 ) -> bool {
-    if !rules::contribution_chunk_valid(boundary_header, witnesses, prior, chunk_end) {
+    if !rules::contribution_chunk_valid(boundary_header, payloads, range_proof, prior, chunk_end) {
         return false;
     }
-    for witness in witnesses {
-        if let Some(event) = apply_shard_payload(
-            verifier,
-            state,
-            network,
-            witness.proof.shard_id,
-            &witness.payload,
-        ) {
+    let source_shard = boundary_header.shard_id();
+    for payload in payloads {
+        if let Some(event) = apply_shard_payload(verifier, state, network, source_shard, payload) {
             outcome.record(&event);
         }
     }
@@ -832,40 +832,55 @@ mod tests {
         }
     }
 
-    /// `contribution_chunk_valid` accepts exactly the contiguous,
-    /// ascending chunk that merkle-proves into the boundary root, and
-    /// rejects every malformed shape — short, over-count, gapped,
-    /// reordered, or proven against the wrong root. This is the fold-side
+    /// `contribution_chunk_valid` accepts exactly the run whose recomputed
+    /// root matches the boundary header's, and rejects every malformed
+    /// shape — short, over-count, gapped, reordered, or proven against the
+    /// wrong root. This is the fold-side
     /// (`apply_contribution_witnesses`) defence that mirrors the
     /// `contributions_well_formed` gate; both share this predicate, so a
     /// gap/short/over/wrong-root chunk can never half-apply.
+    ///
+    /// Gaps and reordering fail here through the recomputed root rather
+    /// than a per-element index check: the range fixes each payload's
+    /// position, so any permutation hashes to a different root.
     #[test]
     fn contribution_chunk_valid_rejects_malformed_chunks() {
-        let (header, witnesses) =
+        let (header, payloads, proof) =
             boundary_chunk(0, 0, vec![deposit(7, 1), deposit(7, 2), deposit(7, 3)]);
 
         // The exact chunk `[0, 3)` — accepted.
-        assert!(contribution_chunk_valid(&header, &witnesses, 0, 3));
+        assert!(contribution_chunk_valid(&header, &payloads, &proof, 0, 3));
 
-        // Short: two witnesses for a three-leaf range.
-        assert!(!contribution_chunk_valid(&header, &witnesses[..2], 0, 3));
+        // Short: two payloads for a three-leaf range.
+        assert!(!contribution_chunk_valid(
+            &header,
+            &payloads[..2],
+            &proof,
+            0,
+            3
+        ));
 
-        // Over-count: three witnesses for a two-leaf range.
-        assert!(!contribution_chunk_valid(&header, &witnesses, 0, 2));
+        // Over-count: three payloads for a two-leaf range.
+        assert!(!contribution_chunk_valid(&header, &payloads, &proof, 0, 2));
 
         // Gapped: leaves 0 and 2 where the range expects 0 and 1.
-        let gapped = vec![witnesses[0].clone(), witnesses[2].clone()];
-        assert!(!contribution_chunk_valid(&header, &gapped, 0, 2));
+        let gapped = vec![payloads[0].clone(), payloads[2].clone()];
+        assert!(!contribution_chunk_valid(&header, &gapped, &proof, 0, 2));
 
-        // Reordered: descending leaf indices.
-        let mut reordered = witnesses.clone();
+        // Reordered: the same payloads in the wrong positions.
+        let mut reordered = payloads.clone();
         reordered.reverse();
-        assert!(!contribution_chunk_valid(&header, &reordered, 0, 3));
+        assert!(!contribution_chunk_valid(&header, &reordered, &proof, 0, 3));
 
         // Wrong root: the same chunk proven against a different boundary
         // block (distinct payloads → distinct accumulator root).
-        let (other, _) = boundary_chunk(0, 0, vec![deposit(9, 1), deposit(9, 2), deposit(9, 3)]);
-        assert!(!contribution_chunk_valid(&other, &witnesses, 0, 3));
+        let (other, _, _) = boundary_chunk(0, 0, vec![deposit(9, 1), deposit(9, 2), deposit(9, 3)]);
+        assert!(!contribution_chunk_valid(&other, &payloads, &proof, 0, 3));
+
+        // A non-empty proof on an empty range spends block bytes for
+        // nothing — rejected.
+        assert!(contribution_chunk_valid(&header, &[], &[], 0, 0));
+        assert!(!contribution_chunk_valid(&header, &[], &[Hash::ZERO], 0, 0));
     }
 
     /// `StakeDeposit` for an unknown pool implicitly creates the pool and

@@ -1,49 +1,63 @@
 //! Shard-witness fetch response.
 
-use std::sync::Arc;
-
 use sbor::prelude::BasicSbor;
 
-use crate::{BoundedVec, MAX_WITNESSES_PER_FETCH, MessageClass, NetworkMessage, ShardWitness};
+use crate::{
+    BoundedVec, Hash, MAX_RANGE_PROOF_NODES, MAX_WITNESSES_PER_SHARD, MessageClass, NetworkMessage,
+    ShardWitnessPayload,
+};
 
 /// Response to a
 /// [`GetShardWitnessesRequest`](crate::network::request::beacon::GetShardWitnessesRequest).
 ///
-/// Carries each requested witness paired with its inclusion proof
-/// against the requested committed block's
-/// [`BeaconWitnessRoot`](crate::BeaconWitnessRoot). Each witness's
-/// [`ShardWitnessProof`](crate::ShardWitnessProof) names that same
-/// `committed_block_hash` so the requester verifies against the root
-/// they already hold.
+/// Carries a contiguous run of witness payloads starting at the request's
+/// `lo`, with one range proof lifting them to the requested block's
+/// [`BeaconWitnessRoot`](crate::BeaconWitnessRoot). Leaf positions are
+/// implied by `lo` and the payload order, so the requester verifies
+/// against the window it already resolved from the anchor header.
 ///
-/// Order matches the request's `leaf_indices` for trivial caller-side
-/// pairing. Empty when the responder has none of the requested
-/// witnesses at the named committed block — the requester falls
-/// through to another peer in the shard's committee.
+/// The run is served whole: the requester admits a chunk only when it
+/// covers exactly the range the fold will apply, so a prefix would be
+/// dropped on arrival. A responder that can't cover the request clamps to
+/// what its window holds, and the requester re-requests against a later
+/// anchor. Empty when the responder can serve nothing at the named
+/// committed block, in which case the requester falls through to another
+/// peer in the shard's committee.
+///
+/// The run's width is bounded by the fold's per-epoch budget
+/// ([`MAX_WITNESSES_PER_SHARD`]) — the same bound the beacon block itself
+/// carries, so a servable chunk always fits in the block that commits it.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetShardWitnessesResponse {
-    /// Witnesses with their inclusion proofs.
-    pub witnesses: BoundedVec<Arc<ShardWitness>, MAX_WITNESSES_PER_FETCH>,
+    /// Witness payloads in leaf-index order, starting at the request's
+    /// `lo`.
+    pub payloads: BoundedVec<ShardWitnessPayload, MAX_WITNESSES_PER_SHARD>,
+    /// Flanking merkle nodes lifting `payloads` to the anchor block's
+    /// beacon-witness root.
+    pub range_proof: BoundedVec<Hash, MAX_RANGE_PROOF_NODES>,
 }
 
 impl GetShardWitnessesResponse {
-    /// Build a response from a vector of witnesses.
+    /// Build a response from a payload run and its range proof.
     ///
     /// # Panics
     ///
-    /// Panics if `witnesses.len() > MAX_WITNESSES_PER_FETCH`.
+    /// Panics if `payloads.len() > MAX_WITNESSES_PER_SHARD` or
+    /// `range_proof.len() > MAX_RANGE_PROOF_NODES`.
     #[must_use]
-    pub fn new(witnesses: Vec<Arc<ShardWitness>>) -> Self {
+    pub fn new(payloads: Vec<ShardWitnessPayload>, range_proof: Vec<Hash>) -> Self {
         Self {
-            witnesses: witnesses.into(),
+            payloads: payloads.into(),
+            range_proof: range_proof.into(),
         }
     }
 
-    /// Empty response — responder has none of the requested witnesses.
+    /// Empty response — responder can serve nothing at the named block.
     #[must_use]
     pub fn empty() -> Self {
         Self {
-            witnesses: Vec::new().into(),
+            payloads: Vec::new().into(),
+            range_proof: Vec::new().into(),
         }
     }
 }
@@ -63,38 +77,21 @@ mod tests {
     use sbor::{basic_decode, basic_encode};
 
     use super::*;
-    use crate::{
-        BlockHash, Hash, LeafIndex, ShardId, ShardWitnessPayload, ShardWitnessProof, Stake,
-        StakePoolId,
-    };
+    use crate::{Stake, StakePoolId};
 
-    fn sample_witness(leaf_index: u64) -> Arc<ShardWitness> {
-        Arc::new(ShardWitness {
-            payload: ShardWitnessPayload::StakeDeposit {
-                pool_id: StakePoolId::new(1),
-                amount: Stake::from_whole_tokens(1_000),
-            },
-            proof: ShardWitnessProof {
-                shard_id: ShardId::ROOT,
-                committed_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed")),
-                leaf_index: LeafIndex::new(leaf_index),
-                siblings: vec![
-                    Hash::from_bytes(b"sib0"),
-                    Hash::from_bytes(b"sib1"),
-                    Hash::from_bytes(b"sib2"),
-                ]
-                .into(),
-            },
-        })
+    fn sample_payload(pool: u32) -> ShardWitnessPayload {
+        ShardWitnessPayload::StakeDeposit {
+            pool_id: StakePoolId::new(pool),
+            amount: Stake::from_whole_tokens(1_000),
+        }
     }
 
     #[test]
     fn sbor_round_trip_populated() {
-        let resp = GetShardWitnessesResponse::new(vec![
-            sample_witness(1),
-            sample_witness(2),
-            sample_witness(42),
-        ]);
+        let resp = GetShardWitnessesResponse::new(
+            vec![sample_payload(1), sample_payload(2), sample_payload(42)],
+            vec![Hash::from_bytes(b"flank0"), Hash::from_bytes(b"flank1")],
+        );
         let bytes = basic_encode(&resp).unwrap();
         let decoded: GetShardWitnessesResponse = basic_decode(&bytes).unwrap();
         assert_eq!(resp, decoded);

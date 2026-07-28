@@ -15,12 +15,12 @@
 //!   root-specific — a witness only counts toward the boundary block it
 //!   was fetched against).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, Epoch, EpochWindows, LeafIndex,
-    QuorumCertificate, ShardId, ShardWitness, Verified,
+    BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, Epoch, EpochWindows, Hash,
+    LeafIndex, QuorumCertificate, ShardId, ShardWitnessPayload, Verified,
 };
 
 /// How many recent epoch-boundary crossings to retain per shard. The
@@ -65,10 +65,37 @@ impl ObservedCrossing {
     }
 }
 
-/// A boundary block's verified witness chunk, keyed by leaf index. A
-/// witness proves against one block's `beacon_witness_root`, so each chunk
-/// is scoped to a single `(shard, anchor block hash)`.
-type AnchorChunk = BTreeMap<LeafIndex, Arc<Verified<ShardWitness>>>;
+/// A boundary block's verified witness chunk: the contiguous leaf run
+/// starting at `lo`, with the flanking nodes that lift it to that block's
+/// `beacon_witness_root`.
+///
+/// Chunks admit and evict whole. A range proof only verifies for the run
+/// it names, so half a chunk proves nothing and there is no partial state
+/// worth holding — a short or unverifiable response is dropped and the
+/// range re-requested against another peer.
+#[derive(Debug)]
+struct AnchorChunk {
+    lo: u64,
+    payloads: Vec<ShardWitnessPayload>,
+    range_proof: Vec<Hash>,
+}
+
+impl AnchorChunk {
+    /// End of the run, exclusive.
+    const fn hi(&self) -> u64 {
+        self.lo + self.payloads.len() as u64
+    }
+
+    /// Whether this chunk is exactly the run `[prior, chunk_end)`.
+    const fn covers(&self, prior: u64, chunk_end: u64) -> bool {
+        self.lo == prior && self.hi() == chunk_end
+    }
+}
+
+/// A witness-chunk fetch id: the anchor plus the run it covers. The whole
+/// run is one fetch, so cancellation and dedup key on the range rather
+/// than on individual leaves.
+pub type ChunkFetchId = (ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex);
 
 /// Per-shard source tracking.
 ///
@@ -82,11 +109,11 @@ type AnchorChunk = BTreeMap<LeafIndex, Arc<Verified<ShardWitness>>>;
 ///   keyed by the crossed epoch (bounded by
 ///   [`MAX_RETAINED_CROSSINGS_PER_SHARD`]), retained past header pruning so
 ///   the proposer can report a crossing long after its headers age out.
-/// - `witness_chunks` — verified witnesses keyed by their anchor boundary
-///   block `(shard, block_hash)` then leaf index. A witness proves against
-///   one block's `beacon_witness_root`, so it counts only toward that
-///   boundary. Empty when the local validator is off-committee.
-/// - `pending_fetches` — outstanding witness-fetch dedup per anchor.
+/// - `witness_chunks` — one verified leaf run per anchor boundary block
+///   `(shard, block_hash)`. A range proof verifies against one block's
+///   `beacon_witness_root`, so a chunk counts only toward that boundary.
+///   Empty when the local validator is off-committee.
+/// - `pending_fetches` — outstanding chunk-fetch dedup per anchor.
 #[derive(Debug, Default)]
 pub struct ShardSourceTracker {
     shard_headers: BTreeMap<ShardId, BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>>,
@@ -95,14 +122,15 @@ pub struct ShardSourceTracker {
     pending_fetches: BTreeMap<(ShardId, BlockHash), PendingFetch>,
 }
 
-/// An anchor's outstanding witness fetch. Carries the boundary block
-/// `height` alongside the in-flight `leaves` so an eviction can name each
-/// cancelled leaf as the `(shard, height, block_hash, leaf)` id the
-/// runner's `FetchAbandon::ShardWitnesses` handler matches against.
+/// An anchor's outstanding chunk fetch. Carries the boundary block
+/// `height` alongside the in-flight run so an eviction can name the
+/// cancelled fetch as the [`ChunkFetchId`] the runner's
+/// `FetchAbandon::ShardWitnesses` handler matches against.
 #[derive(Debug)]
 struct PendingFetch {
     height: BlockHeight,
-    leaves: BTreeSet<LeafIndex>,
+    lo: u64,
+    hi: u64,
 }
 
 impl ShardSourceTracker {
@@ -129,55 +157,64 @@ impl ShardSourceTracker {
             .insert(height, certified_header);
     }
 
-    /// Admit a verified witness into the chunk for its anchor boundary
-    /// block (`witness.proof.committed_block_hash`). Clears the matching
-    /// pending-fetch entry.
-    pub fn admit_witness(&mut self, witness: Arc<Verified<ShardWitness>>) {
-        let shard = witness.proof.shard_id;
-        let anchor = witness.proof.committed_block_hash;
-        let leaf = witness.proof.leaf_index;
-        self.witness_chunks
-            .entry((shard, anchor))
-            .or_default()
-            .insert(leaf, witness);
-        if let Some(pending) = self.pending_fetches.get_mut(&(shard, anchor)) {
-            pending.leaves.remove(&leaf);
-        }
+    /// Admit a verified chunk — the run `[lo, lo + payloads.len())` against
+    /// `anchor` — and clear the matching pending-fetch entry. Replaces any
+    /// chunk already held for the anchor: a later fetch is issued only for
+    /// a range the fold now wants, so the fresher run is the useful one.
+    pub fn admit_chunk(
+        &mut self,
+        shard: ShardId,
+        anchor: BlockHash,
+        lo: u64,
+        payloads: Vec<ShardWitnessPayload>,
+        range_proof: Vec<Hash>,
+    ) {
+        self.witness_chunks.insert(
+            (shard, anchor),
+            AnchorChunk {
+                lo,
+                payloads,
+                range_proof,
+            },
+        );
+        self.pending_fetches.remove(&(shard, anchor));
     }
 
-    /// Mark a `(shard, anchor, leaf)` witness fetch in flight against the
-    /// boundary block at `block_height`. Returns `true` if newly inserted,
-    /// `false` if already pooled or already tracked — the caller treats
-    /// `false` as "don't redispatch." The height is retained so a later
-    /// eviction can hand the runner the exact in-flight fetch id to cancel.
+    /// Record the chunk fetch `[lo, hi)` against `anchor` as in flight, for
+    /// the boundary block at `block_height`. A pending entry for a
+    /// different run is replaced: the fold has moved on, so the older
+    /// request's response is no longer wanted. The height is retained so a
+    /// later eviction can hand the runner the exact id to cancel.
+    ///
+    /// Bookkeeping only — dispatch dedup belongs to the runner's fetch,
+    /// which drops ids it already tracks. Gating re-issue on this record
+    /// would strand a run whose response arrived but failed verification:
+    /// the runner has already released its slot by then.
     pub fn register_pending_fetch(
         &mut self,
         shard: ShardId,
         block_height: BlockHeight,
         anchor: BlockHash,
-        leaf: LeafIndex,
-    ) -> bool {
-        let already_pooled = self
-            .witness_chunks
-            .get(&(shard, anchor))
-            .is_some_and(|m| m.contains_key(&leaf));
-        if already_pooled {
-            return false;
+        lo: u64,
+        hi: u64,
+    ) {
+        if self.has_witness_chunk(shard, anchor, lo, hi) {
+            return;
         }
-        self.pending_fetches
-            .entry((shard, anchor))
-            .or_insert_with(|| PendingFetch {
+        self.pending_fetches.insert(
+            (shard, anchor),
+            PendingFetch {
                 height: block_height,
-                leaves: BTreeSet::new(),
-            })
-            .leaves
-            .insert(leaf)
+                lo,
+                hi,
+            },
+        );
     }
 
-    /// Whether every leaf of the chunk `[prior, chunk_end)` anchored to
-    /// `anchor` is held — the presence check behind the proposer's
-    /// witness-availability coupling, without cloning the payloads. An
-    /// empty range is trivially held.
+    /// Whether the chunk `[prior, chunk_end)` anchored to `anchor` is held
+    /// — the presence check behind the proposer's witness-availability
+    /// coupling, without cloning the payloads. An empty range is trivially
+    /// held.
     #[must_use]
     pub fn has_witness_chunk(
         &self,
@@ -189,36 +226,15 @@ impl ShardSourceTracker {
         if chunk_end <= prior {
             return true;
         }
-        let Some(map) = self.witness_chunks.get(&(shard, anchor)) else {
-            return false;
-        };
-        (prior..chunk_end).all(|leaf| map.contains_key(&LeafIndex::new(leaf)))
+        self.witness_chunks
+            .get(&(shard, anchor))
+            .is_some_and(|chunk| chunk.covers(prior, chunk_end))
     }
 
-    /// The leaves of `[prior, chunk_end)` anchored to `anchor` not yet
-    /// held. Unlike [`register_pending_fetch`](Self::register_pending_fetch),
-    /// this ignores in-flight status, so a re-drive can re-request a leaf
-    /// whose earlier fetch response never landed — otherwise it stays
-    /// pinned in `pending_fetches` and the chunk never completes.
-    #[must_use]
-    pub fn missing_chunk_leaves(
-        &self,
-        shard: ShardId,
-        anchor: BlockHash,
-        prior: u64,
-        chunk_end: u64,
-    ) -> Vec<LeafIndex> {
-        let held = self.witness_chunks.get(&(shard, anchor));
-        (prior..chunk_end)
-            .map(LeafIndex::new)
-            .filter(|li| held.is_none_or(|m| !m.contains_key(li)))
-            .collect()
-    }
-
-    /// The contiguous witness chunk `[prior, chunk_end)` anchored to
-    /// `anchor`, in leaf-index order, or `None` if any leaf in the range
-    /// isn't held yet (the assembler defers). An empty range
-    /// (`chunk_end <= prior`) returns an empty vec.
+    /// The witness chunk `[prior, chunk_end)` anchored to `anchor` as
+    /// `(payloads, range proof)`, or `None` if the run isn't held (the
+    /// assembler defers). An empty range (`chunk_end <= prior`) returns an
+    /// empty run with an empty proof.
     #[must_use]
     pub fn witness_chunk(
         &self,
@@ -226,17 +242,15 @@ impl ShardSourceTracker {
         anchor: BlockHash,
         prior: u64,
         chunk_end: u64,
-    ) -> Option<Vec<ShardWitness>> {
+    ) -> Option<(Vec<ShardWitnessPayload>, Vec<Hash>)> {
         if chunk_end <= prior {
-            return Some(Vec::new());
+            return Some((Vec::new(), Vec::new()));
         }
-        let map = self.witness_chunks.get(&(shard, anchor))?;
-        let mut out = Vec::with_capacity(usize::try_from(chunk_end - prior).unwrap_or(0));
-        for leaf in prior..chunk_end {
-            let witness = map.get(&LeafIndex::new(leaf))?;
-            out.push(witness.as_ref().as_ref().clone());
+        let chunk = self.witness_chunks.get(&(shard, anchor))?;
+        if !chunk.covers(prior, chunk_end) {
+            return None;
         }
-        Some(out)
+        Some((chunk.payloads.clone(), chunk.range_proof.clone()))
     }
 
     /// Drop witnesses and pending fetches for `shard` below the applied
@@ -250,33 +264,16 @@ impl ShardSourceTracker {
     /// consumed on-chain and a future contribution can't include it, so the
     /// runner's in-flight slot should release rather than pin on a payload
     /// the tracker would only evict on arrival.
-    pub fn evict_consumed(
-        &mut self,
-        shard: ShardId,
-        consumed: u64,
-    ) -> Vec<(ShardId, BlockHeight, BlockHash, LeafIndex)> {
-        self.witness_chunks.retain(|(s, _), leaves| {
-            if *s == shard {
-                leaves.retain(|leaf, _| leaf.inner() >= consumed);
-                !leaves.is_empty()
-            } else {
-                true
-            }
-        });
+    pub fn evict_consumed(&mut self, shard: ShardId, consumed: u64) -> Vec<ChunkFetchId> {
+        self.witness_chunks
+            .retain(|(s, _), chunk| *s != shard || chunk.lo >= consumed);
         let mut abandoned = Vec::new();
         self.pending_fetches.retain(|(s, anchor), pending| {
-            if *s != shard {
+            if *s != shard || pending.lo >= consumed {
                 return true;
             }
-            pending.leaves.retain(|leaf| {
-                if leaf.inner() < consumed {
-                    abandoned.push((*s, pending.height, *anchor, *leaf));
-                    false
-                } else {
-                    true
-                }
-            });
-            !pending.leaves.is_empty()
+            abandoned.push(pending_id(*s, *anchor, pending));
+            false
         });
         abandoned
     }
@@ -393,15 +390,12 @@ impl ShardSourceTracker {
     /// can cancel them via `FetchAbandon::ShardWitnesses` — same contract
     /// as [`Self::evict_consumed`], keeping the runner's fetch slots from
     /// pinning on payloads no longer wanted.
-    pub fn evicted_from_committee(&mut self) -> Vec<(ShardId, BlockHeight, BlockHash, LeafIndex)> {
+    pub fn evicted_from_committee(&mut self) -> Vec<ChunkFetchId> {
         self.witness_chunks.clear();
-        let mut abandoned = Vec::new();
-        for ((shard, anchor), pending) in std::mem::take(&mut self.pending_fetches) {
-            for leaf in pending.leaves {
-                abandoned.push((shard, pending.height, anchor, leaf));
-            }
-        }
-        abandoned
+        std::mem::take(&mut self.pending_fetches)
+            .into_iter()
+            .map(|((shard, anchor), pending)| pending_id(shard, anchor, &pending))
+            .collect()
     }
 
     /// Look up the verified source-shard header by `committed_block_hash`.
@@ -482,20 +476,34 @@ impl ShardSourceTracker {
     pub fn chunk_len(&self, shard: ShardId, anchor: BlockHash) -> usize {
         self.witness_chunks
             .get(&(shard, anchor))
-            .map_or(0, BTreeMap::len)
+            .map_or(0, |chunk| chunk.payloads.len())
     }
 
     #[must_use]
     pub fn total_chunk_len(&self) -> usize {
-        self.witness_chunks.values().map(BTreeMap::len).sum()
+        self.witness_chunks
+            .values()
+            .map(|chunk| chunk.payloads.len())
+            .sum()
     }
 
     #[must_use]
-    pub fn is_pending_fetch(&self, shard: ShardId, anchor: BlockHash, leaf: LeafIndex) -> bool {
+    pub fn is_pending_fetch(&self, shard: ShardId, anchor: BlockHash, lo: u64, hi: u64) -> bool {
         self.pending_fetches
             .get(&(shard, anchor))
-            .is_some_and(|pending| pending.leaves.contains(&leaf))
+            .is_some_and(|pending| pending.lo == lo && pending.hi == hi)
     }
+}
+
+/// The cancellable fetch id for an in-flight chunk request.
+const fn pending_id(shard: ShardId, anchor: BlockHash, pending: &PendingFetch) -> ChunkFetchId {
+    (
+        shard,
+        pending.height,
+        anchor,
+        LeafIndex::new(pending.lo),
+        LeafIndex::new(pending.hi),
+    )
 }
 
 #[cfg(test)]
@@ -504,10 +512,10 @@ mod tests {
 
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-        BlockHeight, BoundedVec, CertificateRoot, CertifiedBlockHeader, Hash, InFlightCount,
-        LeafIndex, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round,
-        ShardId, ShardWitness, ShardWitnessPayload, ShardWitnessProof, SignerBitfield, Stake,
-        StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verified, WeightedTimestamp,
+        BlockHeight, CertificateRoot, CertifiedBlockHeader, Hash, InFlightCount, LeafIndex,
+        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Round, ShardId,
+        ShardWitnessPayload, SignerBitfield, Stake, StakePoolId, StateRoot, TransactionRoot,
+        ValidatorId, Verified, WeightedTimestamp,
     };
 
     use super::*;
@@ -582,19 +590,16 @@ mod tests {
         t.observe_crossing(h.header().shard_id(), h.header().height(), dur);
     }
 
-    fn witness(s: ShardId, anchor: BlockHash, leaf: u64) -> Arc<Verified<ShardWitness>> {
-        Arc::new(Verified::new_unchecked_for_test(ShardWitness {
-            payload: ShardWitnessPayload::StakeDeposit {
-                pool_id: StakePoolId::new(0),
+    /// `n` distinct deposit payloads — content the chunk helpers can hash
+    /// into leaves. The tracker never verifies them, so any distinct run
+    /// exercises the coverage bookkeeping.
+    fn payloads(n: u64) -> Vec<ShardWitnessPayload> {
+        (0..n)
+            .map(|i| ShardWitnessPayload::StakeDeposit {
+                pool_id: StakePoolId::new(u32::try_from(i).unwrap_or(u32::MAX)),
                 amount: Stake::from_whole_tokens(1),
-            },
-            proof: ShardWitnessProof {
-                shard_id: s,
-                committed_block_hash: anchor,
-                leaf_index: LeafIndex::new(leaf),
-                siblings: BoundedVec::new(),
-            },
-        }))
+            })
+            .collect()
     }
 
     fn anchor(n: u64) -> BlockHash {
@@ -609,109 +614,100 @@ mod tests {
     }
 
     #[test]
-    fn admit_witness_lands_in_chunk_and_clears_pending() {
+    fn admit_chunk_lands_whole_and_clears_pending() {
         let mut t = ShardSourceTracker::new();
-        assert!(t.register_pending_fetch(
-            shard(0),
-            BlockHeight::new(5),
-            anchor(1),
-            LeafIndex::new(3)
-        ));
-        assert!(t.is_pending_fetch(shard(0), anchor(1), LeafIndex::new(3)));
-        t.admit_witness(witness(shard(0), anchor(1), 3));
-        assert_eq!(t.chunk_len(shard(0), anchor(1)), 1);
-        assert!(!t.is_pending_fetch(shard(0), anchor(1), LeafIndex::new(3)));
+        t.register_pending_fetch(shard(0), BlockHeight::new(5), anchor(1), 3, 6);
+        assert!(t.is_pending_fetch(shard(0), anchor(1), 3, 6));
+        t.admit_chunk(shard(0), anchor(1), 3, payloads(3), Vec::new());
+        assert_eq!(t.chunk_len(shard(0), anchor(1)), 3);
+        assert!(!t.is_pending_fetch(shard(0), anchor(1), 3, 6));
     }
 
+    /// A run the fold has moved on to replaces the stale pending entry, and
+    /// a run already pooled records nothing — there is no id to cancel.
     #[test]
-    fn register_pending_fetch_is_idempotent_and_rejects_when_pooled() {
+    fn register_pending_fetch_supersedes_and_skips_held_runs() {
         let mut t = ShardSourceTracker::new();
-        assert!(t.register_pending_fetch(
-            shard(0),
-            BlockHeight::new(5),
-            anchor(1),
-            LeafIndex::new(3)
-        ));
-        assert!(!t.register_pending_fetch(
-            shard(0),
-            BlockHeight::new(5),
-            anchor(1),
-            LeafIndex::new(3)
-        ));
-        t.admit_witness(witness(shard(0), anchor(1), 5));
-        assert!(!t.register_pending_fetch(
-            shard(0),
-            BlockHeight::new(5),
-            anchor(1),
-            LeafIndex::new(5)
-        ));
+        let h = BlockHeight::new(5);
+        t.register_pending_fetch(shard(0), h, anchor(1), 3, 6);
+        assert!(t.is_pending_fetch(shard(0), anchor(1), 3, 6));
+
+        // A different run supersedes: the fold advanced, so the older
+        // request's response is no longer wanted.
+        t.register_pending_fetch(shard(0), h, anchor(1), 6, 9);
+        assert!(t.is_pending_fetch(shard(0), anchor(1), 6, 9));
+        assert!(!t.is_pending_fetch(shard(0), anchor(1), 3, 6));
+
+        // A run already pooled records nothing.
+        t.admit_chunk(shard(0), anchor(2), 6, payloads(3), Vec::new());
+        t.register_pending_fetch(shard(0), h, anchor(2), 6, 9);
+        assert!(!t.is_pending_fetch(shard(0), anchor(2), 6, 9));
     }
 
+    /// The chunk reads back only for the exact run it covers: a wider or
+    /// narrower range, or a different anchor, defers. An empty range is
+    /// trivially available.
     #[test]
-    fn witness_chunk_returns_contiguous_range_or_none_on_gap() {
+    fn witness_chunk_returns_only_the_covered_run() {
         let mut t = ShardSourceTracker::new();
-        // Empty range is trivially available.
         assert_eq!(
-            t.witness_chunk(shard(0), anchor(1), 4, 4).map(|c| c.len()),
-            Some(0),
+            t.witness_chunk(shard(0), anchor(1), 4, 4)
+                .map(|(p, proof)| (p.len(), proof.len())),
+            Some((0, 0)),
         );
-        // Seat leaves 4 and 5 (the chunk [4, 6)).
-        t.admit_witness(witness(shard(0), anchor(1), 4));
-        t.admit_witness(witness(shard(0), anchor(1), 5));
-        let chunk = t
+
+        t.admit_chunk(shard(0), anchor(1), 4, payloads(2), Vec::new());
+        let (chunk, proof) = t
             .witness_chunk(shard(0), anchor(1), 4, 6)
             .expect("chunk present");
-        let indices: Vec<u64> = chunk.iter().map(|w| w.proof.leaf_index.inner()).collect();
-        assert_eq!(indices, vec![4, 5]);
-        // A gap (leaf 6 missing) defers.
+        assert_eq!(chunk.len(), 2);
+        assert!(proof.is_empty());
+
+        // A wider range than the chunk covers — the run can't be proven.
         assert!(t.witness_chunk(shard(0), anchor(1), 4, 7).is_none());
+        // A narrower one likewise: the proof is scoped to the whole run.
+        assert!(t.witness_chunk(shard(0), anchor(1), 4, 5).is_none());
         // The wrong anchor has nothing.
         assert!(t.witness_chunk(shard(0), anchor(2), 4, 6).is_none());
     }
 
     #[test]
-    fn evict_consumed_drops_below_watermark() {
+    fn evict_consumed_drops_chunks_below_watermark() {
         let mut t = ShardSourceTracker::new();
-        for leaf in 0..5u64 {
-            t.admit_witness(witness(shard(0), anchor(1), leaf));
-        }
+        t.admit_chunk(shard(0), anchor(1), 0, payloads(5), Vec::new());
         t.evict_consumed(shard(0), 3);
-        // Leaves 0..3 dropped; 3, 4 remain.
-        assert_eq!(t.chunk_len(shard(0), anchor(1)), 2);
-        assert!(t.witness_chunk(shard(0), anchor(1), 3, 5).is_some());
-        assert!(t.witness_chunk(shard(0), anchor(1), 0, 5).is_none());
-    }
-
-    #[test]
-    fn evict_consumed_removes_emptied_anchor() {
-        let mut t = ShardSourceTracker::new();
-        t.admit_witness(witness(shard(0), anchor(1), 0));
-        t.evict_consumed(shard(0), 1);
         assert_eq!(t.total_chunk_len(), 0);
+
+        // A chunk starting at or above the watermark survives.
+        t.admit_chunk(shard(0), anchor(2), 3, payloads(2), Vec::new());
+        t.evict_consumed(shard(0), 3);
+        assert!(t.witness_chunk(shard(0), anchor(2), 3, 5).is_some());
     }
 
     /// Eviction hands back the in-flight fetches it dropped — full
-    /// `(shard, height, anchor, leaf)` ids — so the coordinator can cancel
-    /// them via `FetchAbandon::ShardWitnesses`. Leaves at or above the
-    /// watermark stay in flight.
+    /// `(shard, height, anchor, lo, hi)` ids — so the coordinator can
+    /// cancel them via `FetchAbandon::ShardWitnesses`. A run starting at or
+    /// above the watermark stays in flight.
     #[test]
     fn evict_consumed_returns_abandoned_in_flight_fetches() {
         let mut t = ShardSourceTracker::new();
         let height = BlockHeight::new(5);
-        let a = anchor(1);
-        for leaf in 0..3u64 {
-            t.register_pending_fetch(shard(0), height, a, LeafIndex::new(leaf));
-        }
-        let abandoned = t.evict_consumed(shard(0), 2);
+        t.register_pending_fetch(shard(0), height, anchor(1), 0, 2);
+        t.register_pending_fetch(shard(0), height, anchor(2), 3, 5);
+
+        let abandoned = t.evict_consumed(shard(0), 3);
         assert_eq!(
             abandoned,
-            vec![
-                (shard(0), height, a, LeafIndex::new(0)),
-                (shard(0), height, a, LeafIndex::new(1)),
-            ],
+            vec![(
+                shard(0),
+                height,
+                anchor(1),
+                LeafIndex::new(0),
+                LeafIndex::new(2),
+            )],
         );
-        assert!(t.is_pending_fetch(shard(0), a, LeafIndex::new(2)));
-        assert!(!t.is_pending_fetch(shard(0), a, LeafIndex::new(0)));
+        assert!(t.is_pending_fetch(shard(0), anchor(2), 3, 5));
+        assert!(!t.is_pending_fetch(shard(0), anchor(1), 0, 2));
     }
 
     /// A `(B, C)` parent/child pair straddling an epoch boundary records a
@@ -800,16 +796,22 @@ mod tests {
     fn evicted_from_committee_clears_chunks_keeps_headers() {
         let mut t = ShardSourceTracker::new();
         t.on_verified_source_header(linked_header(shard(0), 1, BlockHash::ZERO, 0, 0));
-        t.admit_witness(witness(shard(0), anchor(1), 0));
-        t.register_pending_fetch(shard(0), BlockHeight::new(5), anchor(1), LeafIndex::new(1));
+        t.admit_chunk(shard(0), anchor(1), 0, payloads(1), Vec::new());
+        t.register_pending_fetch(shard(0), BlockHeight::new(5), anchor(2), 1, 3);
         let abandoned = t.evicted_from_committee();
         assert_eq!(t.total_chunk_len(), 0);
-        assert!(!t.is_pending_fetch(shard(0), anchor(1), LeafIndex::new(1)));
+        assert!(!t.is_pending_fetch(shard(0), anchor(2), 1, 3));
         assert!(t.header(shard(0), BlockHeight::new(1)).is_some());
         // The in-flight fetch comes back as a cancellable id.
         assert_eq!(
             abandoned,
-            vec![(shard(0), BlockHeight::new(5), anchor(1), LeafIndex::new(1))],
+            vec![(
+                shard(0),
+                BlockHeight::new(5),
+                anchor(2),
+                LeafIndex::new(1),
+                LeafIndex::new(3),
+            )],
         );
     }
 }
