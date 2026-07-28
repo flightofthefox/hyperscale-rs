@@ -12,6 +12,7 @@ use hyperscale_types::{
 };
 
 use crate::rules;
+use crate::state::committee::abort_rotations;
 use crate::state::conviction::convict_pool;
 use crate::state::reshape::{draw_merge_keepers, draw_split_cohort, lapse_split, release_cohort};
 use crate::state::vrf::jail_validator;
@@ -567,6 +568,21 @@ pub(super) fn apply_shard_payload(
             };
             if let Some(pairs_now) = refreshed {
                 if pairs_now {
+                    // The keeper draw prefers ready members, and a
+                    // rotation's victim is ready by construction — it is
+                    // the longest-tenured ready member on its shard. Drawn
+                    // as a keeper it would hold a seat the rotation then
+                    // retires, and a keeper off its child can neither
+                    // signal ready nor reach the keeper move: the gate
+                    // loses it and the merged committee seats short. The
+                    // victim-exempt filter the shuffle applies covers only
+                    // the seats that are keepers when it names a victim, so
+                    // cancel here instead, where the keepers are chosen.
+                    // Both children read at `shard_size`, every member
+                    // ready — the same precondition the split gate gets.
+                    for child in [left, right] {
+                        abort_rotations(state, child);
+                    }
                     let keepers = draw_merge_keepers(state, *parent);
                     if let Some(PendingReshape::Merge {
                         keepers: seats,

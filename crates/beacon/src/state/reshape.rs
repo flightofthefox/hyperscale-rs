@@ -1488,17 +1488,78 @@ mod tests {
         }
     }
 
-    /// A merge re-carves both children wholesale — keepers onto the
-    /// parent, everyone else into the pool — so a rotation either child
-    /// had open is dropped rather than left holding a seat that no longer
-    /// exists. Both of its parties land in a placement of their own.
+    /// Pairing draws the keepers, and the draw prefers ready members —
+    /// which is exactly what a rotation's victim is. Cancel first, so no
+    /// keeper seat is handed to a member on its way out and both children
+    /// read at full strength, every member ready.
     #[test]
-    fn a_merge_drops_its_children_rotations() {
+    fn merge_pairing_cancels_its_children_rotations() {
         use crate::state::committee::run_shuffle_step;
 
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
         let mut state = merge_grow_state(4);
+        state.current_epoch = Epoch::new(state.chain_config.shuffle_interval_epochs());
+        run_shuffle_step(&mut state);
+        let parties: Vec<(ValidatorId, ValidatorId)> = state
+            .pending_rotations
+            .values()
+            .flat_map(|rotations| rotations.iter().map(|(v, rot)| (*v, rot.entrant)))
+            .collect();
+        assert_eq!(parties.len(), 2, "both children rotate");
+
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
+
+        assert!(state.pending_rotations.is_empty(), "pairing cancels both");
+        let keepers = keepers_of(&state, parent);
+        for (victim, entrant) in parties {
+            assert!(
+                !keepers.contains_key(&entrant),
+                "a cancelled entrant was drawn as a keeper",
+            );
+            assert_eq!(
+                state.validators[&entrant].status,
+                ValidatorStatus::Pooled,
+                "a cancelled entrant returns to the pool",
+            );
+            // The victim keeps the seat it never gave up, so it is a
+            // legitimate keeper candidate like any other member.
+            assert!(matches!(
+                state.validators[&victim].status,
+                ValidatorStatus::OnShard { ready: true, .. },
+            ));
+        }
+        for child in [left, right] {
+            let members = &state.next_shard_committees[&child].members;
+            assert_eq!(members.len(), 4, "the child reads at full strength");
+            assert_eq!(
+                state.ready_consensus_members(&state.next_shard_committees)[&child].len(),
+                4,
+                "every member the keeper draw sees is ready",
+            );
+        }
+    }
+
+    /// The shuffle exempts keepers but not the rest of a merging child, so
+    /// a rotation can still open after pairing. The cut re-carves both
+    /// children wholesale — keepers onto the parent, everyone else into
+    /// the pool — so that rotation is dropped rather than left holding a
+    /// seat that no longer exists, and both parties land in a placement of
+    /// their own.
+    #[test]
+    fn a_merge_drops_a_rotation_opened_after_pairing() {
+        use crate::state::committee::run_shuffle_step;
+
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(4);
+
+        let merge = ShardWitnessPayload::ScheduleMerge { parent };
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
+
         state.current_epoch = Epoch::new(state.chain_config.shuffle_interval_epochs());
         run_shuffle_step(&mut state);
         let parties: Vec<ValidatorId> = state
@@ -1510,11 +1571,8 @@ mod tests {
                     .flat_map(|(victim, rotation)| [*victim, rotation.entrant])
             })
             .collect();
-        assert_eq!(parties.len(), 4, "both children rotate");
+        assert_eq!(parties.len(), 4, "both children rotate past the pairing");
 
-        let merge = ShardWitnessPayload::ScheduleMerge { parent };
-        apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
-        apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
         for (id, seat) in keepers_of(&state, parent) {
             apply_shard_payload(
                 &BlsVerifier,
@@ -1537,6 +1595,78 @@ mod tests {
                 matches!(status, ValidatorStatus::OnShard { shard, .. } if shard == parent)
                     || matches!(status, ValidatorStatus::Pooled),
                 "{id:?} was left at {status:?} by the merge",
+            );
+        }
+    }
+
+    /// A merge that pairs mid-rotation seats its parent at full strength,
+    /// whichever members the draw happens to pick. Left to resolve, a
+    /// rotation retires a member the keeper draw had already seated: that
+    /// keeper can neither signal ready from a child it has left nor reach
+    /// the keeper move, so the gate loses it and the parent seats short —
+    /// or, once two are lost, never executes at all.
+    #[test]
+    fn a_merge_mid_rotation_seats_the_parent_at_full_strength() {
+        use hyperscale_types::Randomness;
+
+        use crate::state::committee::{resolve_pending_rotations, run_shuffle_step};
+
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        for seed in 0u8..40 {
+            let mut state = merge_grow_state(4);
+            state.randomness = Randomness::new([seed; 32]);
+            state.current_epoch = Epoch::new(state.chain_config.shuffle_interval_epochs());
+            run_shuffle_step(&mut state);
+
+            let merge = ShardWitnessPayload::ScheduleMerge { parent };
+            apply_shard_payload(&BlsVerifier, &mut state, &net(), left, &merge);
+            apply_shard_payload(&BlsVerifier, &mut state, &net(), right, &merge);
+
+            // Any entrant that outlived the pairing would ready here and
+            // retire its victim out from under the keeper draw.
+            for rec in state.validators.values_mut() {
+                if let ValidatorStatus::OnShard { ready, .. } = &mut rec.status {
+                    *ready = true;
+                }
+            }
+            resolve_pending_rotations(&mut state);
+
+            // Only a keeper still seated on its child can emit a
+            // ReshapeReady leaf through that child's chain.
+            for (id, seat) in keepers_of(&state, parent) {
+                if !matches!(
+                    state.validators[&id].status,
+                    ValidatorStatus::OnShard { shard, .. } if shard == seat.child
+                ) {
+                    continue;
+                }
+                apply_shard_payload(
+                    &BlsVerifier,
+                    &mut state,
+                    &net(),
+                    seat.child,
+                    &ShardWitnessPayload::ReshapeReady {
+                        validator: id,
+                        child: seat.child,
+                    },
+                );
+            }
+            fold_merge(&mut state);
+
+            assert!(
+                !state.pending_reshapes.contains_key(&parent),
+                "seed {seed}: the merge gate never met its keeper quorum",
+            );
+            assert_eq!(
+                state.next_shard_committees[&parent].members.len(),
+                4,
+                "seed {seed}: the merged parent seated short",
+            );
+            assert_eq!(
+                state.ready_consensus_members(&state.next_shard_committees)[&parent].len(),
+                4,
+                "seed {seed}: the merged parent opened below full consensus strength",
             );
         }
     }
