@@ -891,9 +891,8 @@ fn a_spare_stocked_session_rotates_a_validator_between_committees() {
     );
 
     // The rotation is a relocation, not a host quietly picking up a second
-    // shard: both committees end the run at full strength. Retained parent
-    // stores are filtered out — a grown host lists the retired root it still
-    // serves alongside the child it belongs to.
+    // shard. Retained parent stores are filtered out — a grown host lists the
+    // retired root it still serves alongside the child it belongs to.
     let live: BTreeSet<String> = session
         .live_shards()
         .into_iter()
@@ -901,15 +900,26 @@ fn a_spare_stocked_session_rotates_a_validator_between_committees() {
         .collect();
     let mut staffed: BTreeMap<String, u32> = BTreeMap::new();
     for host in &roster {
-        for shard in host.shards.iter().filter(|s| live.contains(&s.0)) {
+        let served: Vec<&ShardPath> = host.shards.iter().filter(|s| live.contains(&s.0)).collect();
+        assert!(
+            served.len() <= 1,
+            "host {} serves {served:?}, more than one live shard",
+            host.host,
+        );
+        for shard in served {
             *staffed.entry(shard.0.clone()).or_default() += 1;
         }
     }
     assert_eq!(
-        staffed,
-        [("0".to_string(), 4), ("1".to_string(), 4)]
-            .into_iter()
-            .collect(),
-        "both committees end at full strength, saw {roster:?}",
+        staffed.len(),
+        2,
+        "both children are staffed, saw {staffed:?}"
+    );
+    // Both committees end at full strength, plus a rotation entrant on any
+    // child whose victim has yet to retire — the seat the entrant syncs into
+    // is one the shard still holds at consensus strength.
+    assert!(
+        staffed.values().all(|n| (4..=5).contains(n)),
+        "a committee is off strength, saw {staffed:?} in {roster:?}",
     );
 }

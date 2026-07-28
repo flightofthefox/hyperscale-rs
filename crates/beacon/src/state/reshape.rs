@@ -1440,8 +1440,8 @@ mod tests {
 
         run_shuffle_step(&mut state);
 
-        // Every keeper still runs its child; a non-keeper rotated in its
-        // place on each child (the pool refilled the freed slot).
+        // Every keeper still runs its child, and no keeper is the member
+        // either child's rotation is waiting to retire.
         for (id, seat) in &keepers {
             assert_eq!(
                 state.validators[id].status,
@@ -1457,15 +1457,13 @@ mod tests {
                     .contains(id)
             );
         }
-        assert_eq!(state.next_shard_committees[&left].members.len(), 4);
-        assert_eq!(state.next_shard_committees[&right].members.len(), 4);
-        // A non-keeper got rotated out — the shuffle wasn't a no-op.
-        assert!(
-            state
-                .pooled_validators()
-                .iter()
-                .any(|id| !keepers.contains_key(id) && id.inner() < 8),
-        );
+        // The shuffle wasn't a no-op: both children opened a rotation, and
+        // each named a non-keeper as its victim.
+        for child in [left, right] {
+            let victim = state.pending_rotations[&child].victim;
+            assert!(!keepers.contains_key(&victim), "a keeper was named victim");
+            assert_eq!(state.next_shard_committees[&child].members.len(), 5);
+        }
     }
 
     /// Once paired, a required half going quiet cancels the merge and

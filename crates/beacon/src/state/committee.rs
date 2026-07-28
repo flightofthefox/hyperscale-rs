@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use blake3::Hasher;
 use hyperscale_types::{
     BeaconState, BlockHash, BlockHeight, CommitteeTransition, Epoch, MIN_BEACON_COMMITTEE_SIZE,
-    PendingReshape, RecoveryCause, ShardCommittee, ShardId, ShardRecovery, TransitionCause,
-    ValidatorId, ValidatorStatus,
+    PendingReshape, PendingRotation, RecoveryCause, ShardCommittee, ShardId, ShardRecovery,
+    TransitionCause, ValidatorId, ValidatorStatus,
 };
 
 use crate::sampling::{sample_committee, sample_committee_weighted};
@@ -19,14 +19,59 @@ use crate::state::pool::pool_draw;
 /// `(randomness, epoch, shard)` input.
 const DOMAIN_SHARD_RECOVERY: &[u8] = b"hyperscale-shard-recovery-v1";
 
-/// Trickled committee rotation. When `state.current_epoch` lands on a
-/// shuffle-interval boundary (and `epoch > 0`), each shard rotates one
-/// of its ready `OnShard` validators back to `Pooled` and immediately
-/// refills the freed slot via [`pool_draw`]. The system-wide rotation
-/// rate is one validator per shard per interval, keeping per-shard
-/// composition churn uniform and bounded; the interval itself derives
-/// from the chain config
-/// ([`BeaconChainConfig::shuffle_interval_epochs`](hyperscale_types::BeaconChainConfig::shuffle_interval_epochs)).
+/// Retire the victim of every rotation whose entrant has readied.
+///
+/// The break half of the make-before-break rotation [`run_shuffle_step`]
+/// opens. The entrant is now `OnShard { ready: true }`, so it counts
+/// toward the shard's consensus subset and the victim's seat can go.
+/// Deferring the removal to here rather than taking it at the opening
+/// fold is the whole point: the consensus subset holds at `shard_size`
+/// across the entrant's sync window, so the quorum denominator — and
+/// with it the fault tolerance the shard actually runs at — never moves.
+///
+/// Runs behind the shuffle, so a victim is `OnShard` — and therefore
+/// outside the derived pool — for every draw of the step that retires
+/// it. A rotation opened by that same step seats an unready entrant, so
+/// no fold both opens and resolves a rotation either.
+pub(super) fn resolve_pending_rotations(state: &mut BeaconState) {
+    let resolved: Vec<(ShardId, ValidatorId)> = state
+        .pending_rotations
+        .iter()
+        .filter(|(shard, rotation)| {
+            matches!(
+                state.validators.get(&rotation.entrant).map(|r| r.status),
+                Some(ValidatorStatus::OnShard { shard: s, ready: true, .. }) if s == **shard
+            )
+        })
+        .map(|(shard, rotation)| (*shard, rotation.victim))
+        .collect();
+    for (shard, victim) in resolved {
+        state.pending_rotations.remove(&shard);
+        if let Some(committee) = state.next_shard_committees.get_mut(&shard) {
+            committee.members.retain(|v| *v != victim);
+        }
+        // Guarded like the recovery's replaced set: only pool a victim
+        // still seated where the rotation left it, so a validator some
+        // other transition has moved on is never dragged back.
+        if let Some(rec) = state.validators.get_mut(&victim)
+            && matches!(rec.status, ValidatorStatus::OnShard { shard: s, .. } if s == shard)
+        {
+            rec.status = ValidatorStatus::Pooled;
+        }
+    }
+}
+
+/// Trickled committee rotation, make before break. When
+/// `state.current_epoch` lands on a shuffle-interval boundary (and
+/// `epoch > 0`), each shard seats an entrant from the pool via
+/// [`pool_draw`] and records it against its longest-tenured ready member
+/// in [`BeaconState::pending_rotations`]. The victim keeps its seat and
+/// its `OnShard` status; [`resolve_pending_rotations`] retires it once
+/// the entrant is ready. The system-wide rotation rate is one validator
+/// per shard per interval, keeping per-shard composition churn uniform
+/// and bounded; the interval itself derives from the chain config
+/// ([`BeaconChainConfig::shuffle_interval_epochs`](hyperscale_types::BeaconChainConfig::shuffle_interval_epochs)),
+/// which is sized so the open window is a bounded fraction of it.
 ///
 /// Shards iterate in sorted [`ShardId`] order; the victim within each
 /// shard is its longest-tenured ready member — the smallest
@@ -41,27 +86,30 @@ const DOMAIN_SHARD_RECOVERY: &[u8] = b"hyperscale-shard-recovery-v1";
 /// predictable far ahead, handing an adaptive adversary a cheap target.
 /// Shards with no eligible victim are skipped.
 ///
-/// Ordering invariant — pinned by `shuffle_avoids_self_replacement`:
-///
-/// 1. Remove the victim from the shard committee.
-/// 2. [`pool_draw`] to refill — the derived pool excludes the victim
-///    because their status is still `OnShard` here.
-/// 3. Flip the victim's status to `Pooled`.
-///
-/// Flipping status *after* the draw is what prevents self-replacement:
-/// derivation makes "in the pool" mean "status == Pooled", so flipping
-/// early would put the victim in the pool just in time for the same
-/// draw to pick them. A later shard's draw in the same step may pick
-/// the victim and place them on a different shard — a legitimate
-/// cross-shard reassignment.
+/// Self-replacement is impossible by construction — pinned by
+/// `shuffle_avoids_self_replacement`. Derivation makes "in the pool"
+/// mean "status == Pooled", and the victim holds `OnShard` from the
+/// opening fold through the resolving one, so no draw in that span can
+/// pick it. That span also fixes when a rotated-out validator becomes
+/// drawable elsewhere: not in the step that rotates it out, but from the
+/// fold that resolves its rotation onward.
 pub(super) fn run_shuffle_step(state: &mut BeaconState) {
     let epoch = state.current_epoch;
     let interval = state.chain_config.shuffle_interval_epochs();
     if epoch.inner() == 0 || !epoch.inner().is_multiple_of(interval) {
         return;
     }
+    // An entrant seats unready, so it is no use to the beacon until its
+    // Ready folds, and while a rotation is open the shard carries no
+    // ready spare to absorb attrition. At the BFT minimum the eligible
+    // set has none of that slack to give, and a skip epoch folds no
+    // Ready witness to recover it, so hold rotation network-wide until
+    // it does. Opening a rotation moves nobody in or out of the eligible
+    // set, so one reading covers the whole step.
+    if state.beacon_eligible_count() <= MIN_BEACON_COMMITTEE_SIZE {
+        return;
+    }
     let shard_ids: Vec<ShardId> = state.next_shard_committees.keys().copied().collect();
-    let mut eligible_count = state.beacon_eligible_count();
     for shard in shard_ids {
         // A pending split's parent members all carry over to its children
         // as parent halves, ready by construction — the readiness the
@@ -83,6 +131,12 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
         // the shard the recovery just re-seated. Rotation resumes once
         // the first crossing clears the recovery.
         if state.pending_recoveries.contains_key(&shard) {
+            continue;
+        }
+        // A shard already rotating holds until its pair resolves. A
+        // second entrant would grow the committee by one every interval,
+        // and the seat it syncs into is one the shard hasn't freed yet.
+        if state.pending_rotations.contains_key(&shard) {
             continue;
         }
         // Bind the candidate set to validators whose status records
@@ -114,42 +168,21 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
         let Some((_, victim)) = victim else {
             continue;
         };
-        // Rotation must never shrink a committee: with nobody `Pooled` to
-        // refill the freed slot, removing the victim would permanently drop
-        // the committee below `shard_size` — and below the BFT minimum at
-        // small validator counts, parking the beacon on the skip path and
-        // tightening the shard quorum toward all-of-N. Skip this shard's
-        // rotation until the pool recovers. An earlier shard's victim in
-        // the same step is already `Pooled` here, so it still backfills a
-        // later shard (the legitimate cross-shard reassignment).
-        if state.pooled_validators().is_empty() {
+        // An empty pool leaves the rotation unopened rather than half
+        // done: the victim keeps its seat until an interval whose pool
+        // has stock, and the committee is never carrying a promise to
+        // retire a member it has no replacement for.
+        let Some(entrant) = pool_draw(state, shard) else {
             continue;
-        }
-        // Rotation also thins `beacon_eligible` by one until the drawn
-        // joiner's Ready folds — the victim pools, the draw seats unready.
-        // At the BFT minimum that dip parks the beacon on the skip path,
-        // and a skip epoch folds no Ready witness, so the dip sustains
-        // itself until the ready timeout clears it. Hold rotation until
-        // the eligible set has slack to give. The count is cached across
-        // shards — only a completed rotation mutates eligibility — and
-        // recomputed after each one.
-        if eligible_count <= MIN_BEACON_COMMITTEE_SIZE {
-            break;
-        }
-
-        state
-            .next_shard_committees
-            .get_mut(&shard)
-            .expect("present")
-            .members
-            .retain(|v| *v != victim);
-        pool_draw(state, shard);
-        state
-            .validators
-            .get_mut(&victim)
-            .expect("victim is in state.validators")
-            .status = ValidatorStatus::Pooled;
-        eligible_count = state.beacon_eligible_count();
+        };
+        state.pending_rotations.insert(
+            shard,
+            PendingRotation {
+                victim,
+                entrant,
+                opened_at: epoch,
+            },
+        );
     }
 }
 
@@ -500,7 +533,7 @@ mod tests {
         StateRoot, TransitionCause, ValidatorId, ValidatorStatus, WeightedTimestamp,
     };
 
-    use super::{recover_committees, resample_beacon_committee};
+    use super::{recover_committees, resample_beacon_committee, run_shuffle_step};
     use crate::state::test_fixtures::{
         apply_next_epoch, apply_witness_chunk, empty_state, possession_proof, single_pool_state,
         validator_record,
@@ -532,6 +565,30 @@ mod tests {
                 ),
             );
         }
+    }
+
+    /// Flip a seated validator's `OnShard` status to ready, standing in
+    /// for the `Ready` witness that resolves a rotation.
+    fn mark_ready(state: &mut BeaconState, id: ValidatorId) {
+        let status = &mut state.validators.get_mut(&id).expect("seated").status;
+        let ValidatorStatus::OnShard { ready, .. } = status else {
+            panic!("{id:?} is not seated on a shard");
+        };
+        *ready = true;
+    }
+
+    /// Ready every open rotation's entrant, then fold — the break half of
+    /// every make-before-break rotation currently in flight.
+    fn resolve_open_rotations(state: &mut BeaconState) {
+        let entrants: Vec<ValidatorId> = state
+            .pending_rotations
+            .values()
+            .map(|rotation| rotation.entrant)
+            .collect();
+        for entrant in entrants {
+            mark_ready(state, entrant);
+        }
+        apply_next_epoch(state, &[]);
     }
 
     /// Two shards, `per_shard` ready members each, `pool_extras`
@@ -702,9 +759,10 @@ mod tests {
         );
     }
 
-    /// On a shuffle-interval boundary, each shard rotates one
-    /// of its ready `OnShard` validators back to `Pooled` and refills
-    /// the freed slot via `pool_draw`.
+    /// On a shuffle-interval boundary, each shard seats one entrant from
+    /// the pool beside its longest-tenured ready member. The member keeps
+    /// its seat until the entrant readies, and only then retires to the
+    /// pool.
     #[test]
     fn shuffle_rotates_one_validator_per_shard_at_interval() {
         // 2 shards × 4 ready actives + 2 pool extras = 10 validators.
@@ -712,48 +770,65 @@ mod tests {
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         state.current_epoch = Epoch::new(shuffle_interval() - 1);
 
-        let initial_shard_0 = state.next_shard_committees[&ShardId::leaf(1, 0)]
-            .members
-            .clone();
-        let initial_shard_1 = state.next_shard_committees[&ShardId::leaf(1, 1)]
-            .members
-            .clone();
+        let shards = [ShardId::leaf(1, 0), ShardId::leaf(1, 1)];
+        let initial: Vec<Vec<ValidatorId>> = shards
+            .iter()
+            .map(|shard| state.next_shard_committees[shard].members.clone())
+            .collect();
 
         apply_next_epoch(&mut state, &[]);
 
-        let final_shard_0 = state.next_shard_committees[&ShardId::leaf(1, 0)]
-            .members
-            .clone();
-        let final_shard_1 = state.next_shard_committees[&ShardId::leaf(1, 1)]
-            .members
-            .clone();
-
-        // Capacity preserved.
-        assert_eq!(final_shard_0.len(), 4);
-        assert_eq!(final_shard_1.len(), 4);
-        // Each shard saw at most one membership change (zero is
-        // possible if a cross-shard rotation lands the same set
-        // back).
-        let shard_0_diff = final_shard_0
-            .iter()
-            .filter(|id| !initial_shard_0.contains(id))
-            .count();
-        let shard_1_diff = final_shard_1
-            .iter()
-            .filter(|id| !initial_shard_1.contains(id))
-            .count();
-        assert!(shard_0_diff <= 1, "shard 0 churned by {shard_0_diff}");
-        assert!(shard_1_diff <= 1, "shard 1 churned by {shard_1_diff}");
         // The genesis cohorts share a placement epoch, so tenure ties
-        // break by id: each shard rotates out its smallest member id.
-        assert!(
-            !final_shard_0.contains(&ValidatorId::new(0)),
-            "shard 0 evicts its longest-tenured member",
-        );
-        assert!(
-            !final_shard_1.contains(&ValidatorId::new(4)),
-            "shard 1 evicts its longest-tenured member",
-        );
+        // break by id: each shard names its smallest member id as victim.
+        for (i, (shard, expected_victim)) in shards.iter().zip([0u64, 4]).enumerate() {
+            let members = &state.next_shard_committees[shard].members;
+            let rotation = state.pending_rotations[shard];
+            assert_eq!(
+                rotation.victim,
+                ValidatorId::new(expected_victim),
+                "tenure names the longest-tenured member as victim",
+            );
+            assert_eq!(rotation.opened_at, state.current_epoch);
+            assert_eq!(
+                members.len(),
+                5,
+                "the entrant seats beside a committee still at full strength",
+            );
+            assert!(
+                members.contains(&rotation.victim),
+                "the victim holds its seat until the entrant readies",
+            );
+            assert!(
+                !initial[i].contains(&rotation.entrant),
+                "the entrant comes from the pool",
+            );
+            assert_eq!(
+                state.ready_consensus_members(&state.next_shard_committees)[shard].len(),
+                4,
+                "the consensus subset never dips through the window",
+            );
+        }
+
+        resolve_open_rotations(&mut state);
+
+        for (shard, victim) in shards.iter().zip([0u64, 4]) {
+            let members = &state.next_shard_committees[shard].members;
+            let victim = ValidatorId::new(victim);
+            assert_eq!(members.len(), 4, "the committee is back to capacity");
+            assert!(
+                !members.contains(&victim),
+                "the victim retires on resolution"
+            );
+            assert!(matches!(
+                state.validators[&victim].status,
+                ValidatorStatus::Pooled,
+            ));
+            assert_eq!(
+                state.ready_consensus_members(&state.next_shard_committees)[shard].len(),
+                4,
+            );
+        }
+        assert!(state.pending_rotations.is_empty());
     }
 
     /// Not-ready members are ineligible to be rotated out — only
@@ -790,6 +865,16 @@ mod tests {
         let initial_members = state.next_shard_committees[&shard].members.clone();
         apply_next_epoch(&mut state, &[]);
 
+        // The victim is the longer-tenured of the two ready members —
+        // 0 over 1, equal epochs falling to the smaller id.
+        assert_eq!(
+            state.pending_rotations[&shard].victim,
+            ValidatorId::new(0),
+            "only a ready member can be named victim",
+        );
+
+        resolve_open_rotations(&mut state);
+
         // Not-ready validators must still be on the shard.
         for not_ready_id in [2u64, 3] {
             assert!(
@@ -799,8 +884,6 @@ mod tests {
                 "not-ready validator {not_ready_id} got shuffled out"
             );
         }
-        // Exactly one of the ready members (0 or 1) was rotated out —
-        // the longer-tenured 0 (equal epochs, id breaks the tie).
         let rotated = initial_members
             .iter()
             .filter(|id| !state.next_shard_committees[&shard].members.contains(id))
@@ -814,10 +897,10 @@ mod tests {
         );
     }
 
-    /// The per-shard `pool_draw` must not pick the just-rotated victim
-    /// and restore them. Victim flips to `Pooled` *after* the draw, so a
-    /// pool holding exactly one spare must always refill with the spare —
-    /// never the victim.
+    /// The per-shard `pool_draw` must not pick the shard's own victim.
+    /// The victim holds `OnShard` from the opening fold to the resolving
+    /// one, so a pool holding exactly one spare must always seat the
+    /// spare — never the validator on its way out.
     #[test]
     fn shuffle_avoids_self_replacement() {
         let shard = ShardId::leaf(1, 0);
@@ -836,23 +919,33 @@ mod tests {
         let initial_members = state.next_shard_committees[&shard].members.clone();
         apply_next_epoch(&mut state, &[]);
 
-        // Capacity preserved: the spare filled the freed slot.
-        let members = state.next_shard_committees[&shard].members.clone();
-        assert_eq!(members.len(), 4);
-        assert!(members.contains(&spare), "the lone spare must refill");
-        // Exactly one original member rotated out, into the pool.
-        let pool_now = state.pooled_validators();
-        assert_eq!(pool_now.len(), 1);
-        let victim = pool_now[0];
+        let rotation = state.pending_rotations[&shard];
         assert_eq!(
-            victim,
+            rotation.entrant, spare,
+            "the lone spare must be the entrant"
+        );
+        assert_eq!(
+            rotation.victim,
             ValidatorId::new(0),
             "tenure picks the victim: equal epochs fall to the smallest id",
         );
-        assert!(initial_members.contains(&victim));
-        assert!(!members.contains(&victim), "victim must not be re-drawn");
+        assert!(initial_members.contains(&rotation.victim));
+        // The victim is out of the pool for the whole open window, so no
+        // later draw anywhere can pick it back up.
+        assert!(state.pooled_validators().is_empty());
+
+        resolve_open_rotations(&mut state);
+
+        let members = state.next_shard_committees[&shard].members.clone();
+        assert_eq!(members.len(), 4);
+        assert!(members.contains(&spare));
+        assert!(
+            !members.contains(&rotation.victim),
+            "victim must not be re-drawn",
+        );
+        assert_eq!(state.pooled_validators(), vec![rotation.victim]);
         assert!(matches!(
-            state.validators[&victim].status,
+            state.validators[&rotation.victim].status,
             ValidatorStatus::Pooled,
         ));
     }
@@ -891,6 +984,14 @@ mod tests {
 
         apply_next_epoch(&mut state, &[]);
 
+        assert_eq!(
+            state.pending_rotations[&shard].victim,
+            ValidatorId::new(1),
+            "the oldest tenure with the smallest id is named victim",
+        );
+
+        resolve_open_rotations(&mut state);
+
         let members = &state.next_shard_committees[&shard].members;
         assert!(
             !members.contains(&ValidatorId::new(1)),
@@ -908,10 +1009,9 @@ mod tests {
         ));
     }
 
-    /// With nobody `Pooled` to refill the freed slot, the shuffle skips
-    /// the shard's rotation entirely: removing a member without a
-    /// replacement would permanently shrink the committee — below the
-    /// BFT minimum at small validator counts.
+    /// With nobody `Pooled` to seat as entrant, the shuffle leaves the
+    /// rotation unopened: the committee never carries a promise to retire
+    /// a member it has no replacement for.
     #[test]
     fn shuffle_skips_rotation_when_pool_cannot_refill() {
         let shard = ShardId::leaf(1, 0);
@@ -928,13 +1028,14 @@ mod tests {
             "an unrefillable rotation must not run",
         );
         assert!(state.pooled_validators().is_empty());
+        assert!(state.pending_rotations.is_empty());
         assert!(effects.shard_committee_transitions.is_empty());
     }
 
-    /// With `beacon_eligible` at the BFT minimum, rotation is held: the
-    /// victim pools and the draw seats unready, so the swap would thin
-    /// the eligible set below what SPC bootstrap requires — and a skip
-    /// epoch folds no Ready witness to recover it.
+    /// With `beacon_eligible` at the BFT minimum, rotation is held: an
+    /// entrant seats unready, so it is no use to the beacon until its
+    /// Ready folds, and a skip epoch folds no Ready witness to recover
+    /// the eligible set if attrition takes it below the floor.
     #[test]
     fn shuffle_holds_rotation_at_the_beacon_eligible_floor() {
         let shard = ShardId::leaf(1, 0);
@@ -957,6 +1058,65 @@ mod tests {
             state.next_shard_committees[&shard].members, initial_members,
             "rotation at the eligible floor must hold",
         );
+        assert!(state.pending_rotations.is_empty());
+    }
+
+    /// A shard with a rotation in flight is skipped by the next
+    /// interval's shuffle. Without the skip, membership would grow by one
+    /// entrant per interval and no fold could say which victim a
+    /// resolution retires.
+    #[test]
+    fn shuffle_skips_a_shard_already_rotating() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 4, 3);
+        add_eligible_slack(&mut state);
+        state.current_epoch = Epoch::new(shuffle_interval());
+
+        run_shuffle_step(&mut state);
+        let opened = state.pending_rotations[&shard];
+        let members = state.next_shard_committees[&shard].members.clone();
+        let pool = state.pooled_validators();
+
+        run_shuffle_step(&mut state);
+
+        assert_eq!(
+            state.pending_rotations[&shard], opened,
+            "the open rotation is the one that resolves",
+        );
+        assert_eq!(
+            state.next_shard_committees[&shard].members, members,
+            "a second entrant must not seat on a rotating shard",
+        );
+        assert_eq!(state.pooled_validators(), pool);
+    }
+
+    /// The consensus subset holds at `shard_size` for every fold of a
+    /// rotation's window — the whole point of deferring the victim's
+    /// retirement. A dip tightens `quorum_threshold` toward all-of-N and
+    /// costs a view-change timeout at each end of the window.
+    #[test]
+    fn rotation_holds_the_consensus_subset_at_full_strength() {
+        let mut state = multi_shard_state(2, 4, 2);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.current_epoch = Epoch::new(shuffle_interval() - 1);
+
+        // Two full intervals: rotations open, coast unready until the
+        // ready timeout backstops them, resolve, and open again.
+        for _ in 0..(2 * shuffle_interval()) {
+            apply_next_epoch(&mut state, &[]);
+            for (shard, members) in &state.next_shard_committees {
+                assert_eq!(
+                    state.ready_consensus_members(&state.next_shard_committees)[shard].len(),
+                    4,
+                    "consensus subset dipped at epoch {:?}",
+                    state.current_epoch,
+                );
+                assert!(
+                    members.members.len() <= 5,
+                    "a rotation adds at most one member",
+                );
+            }
+        }
     }
 
     /// A shard mid-split is exempt from rotation. Its members all carry

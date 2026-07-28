@@ -287,9 +287,13 @@ fn count_corrupt(members: &[ValidatorId], corrupt: &BTreeSet<ValidatorId>) -> u6
 }
 
 /// Drive the fold for `cell.epochs` and tally the shuffle kernel.
-/// Asserts the structural facts the tally depends on: membership only
-/// changes at shuffle epochs, and every shuffle swaps exactly one
-/// member per shard.
+///
+/// A rotation spans two folds — the entrant seats at the shuffle epoch,
+/// the victim retires once its `Ready` folds — so the committee is only
+/// comparable against the chain at the settled points either side of
+/// that span. The tally samples there and asserts the structural facts
+/// it depends on: a settled change follows a shuffle within the
+/// resolution bound, and swaps exactly one member per shard.
 fn run_cell(cell: &Cell, corrupt: &BTreeSet<ValidatorId>) -> KernelTally {
     let network = NetworkDefinition::simulator();
     let mut state = mc_state(cell);
@@ -304,8 +308,9 @@ fn run_cell(cell: &Cell, corrupt: &BTreeSet<ValidatorId>) -> KernelTally {
         .map(|id| (id, 0))
         .collect();
 
+    let mut settled = state.next_shard_committees.clone();
+    let mut shuffle_epoch = 0;
     for e in 1..=cell.epochs {
-        let before = state.next_shard_committees.clone();
         apply_epoch(
             &BlsVerifier,
             &mut state,
@@ -325,17 +330,20 @@ fn run_cell(cell: &Cell, corrupt: &BTreeSet<ValidatorId>) -> KernelTally {
             *tally.beacon.entry((m, k)).or_default() += 1;
         }
 
-        if !e.is_multiple_of(interval) {
-            assert_eq!(
-                before, state.next_shard_committees,
-                "membership changed outside a shuffle epoch (epoch {e})"
-            );
+        if e.is_multiple_of(interval) {
+            shuffle_epoch = e;
+        }
+        if !state.pending_rotations.is_empty() || state.next_shard_committees == settled {
             continue;
         }
+        assert!(
+            e - shuffle_epoch <= cell.ready_timeout_epochs + 1,
+            "membership settled at epoch {e}, adrift of the shuffle at {shuffle_epoch}"
+        );
 
         tally.events += 1;
         let burned_in = tally.events > BURN_IN_EVENTS;
-        for (shard, committee_before) in &before {
+        for (shard, committee_before) in &settled {
             let after = &state.next_shard_committees[shard];
             let prior: BTreeSet<_> = committee_before.members.iter().copied().collect();
             let current: BTreeSet<_> = after.members.iter().copied().collect();
@@ -344,7 +352,7 @@ fn run_cell(cell: &Cell, corrupt: &BTreeSet<ValidatorId>) -> KernelTally {
             assert_eq!(
                 (removed.len(), added.len()),
                 (1, 1),
-                "shuffle at epoch {e} must swap exactly one member of {shard:?}"
+                "the shuffle at epoch {shuffle_epoch} must swap exactly one member of {shard:?}"
             );
             let out = removed[0];
             let seated = seated_at.remove(&out).expect("rotated member was seated");
@@ -369,6 +377,7 @@ fn run_cell(cell: &Cell, corrupt: &BTreeSet<ValidatorId>) -> KernelTally {
                 Ordering::Equal => {}
             }
         }
+        settled = state.next_shard_committees.clone();
     }
     tally
 }
@@ -777,6 +786,8 @@ fn shuffle_skips_split_pending_shard() {
 
     let mut skipped_events = 0;
     let mut rotated_events = 0;
+    let mut settled = state.next_shard_committees.clone();
+    let mut shuffle_epoch = 0;
     for e in 1..=200_u64 {
         if window.contains(&e) {
             // A live pending split: both TTL anchors are refreshed each
@@ -799,7 +810,6 @@ fn shuffle_skips_split_pending_shard() {
         } else {
             state.pending_reshapes.remove(&target);
         }
-        let before = state.next_shard_committees.clone();
         apply_epoch(
             &BlsVerifier,
             &mut state,
@@ -811,18 +821,26 @@ fn shuffle_skips_split_pending_shard() {
             },
         );
         flip_ready(&mut state, 0);
-        if !e.is_multiple_of(interval) {
+        if e.is_multiple_of(interval) {
+            shuffle_epoch = e;
+        }
+        // Sample where the live shards' rotations have settled, and
+        // attribute what changed to the shuffle epoch that opened them.
+        if !state.pending_rotations.is_empty() || state.next_shard_committees == settled {
             continue;
         }
-        for (shard, committee_before) in &before {
+        for (shard, committee_before) in &settled {
             let prior: BTreeSet<_> = committee_before.members.iter().copied().collect();
             let current: BTreeSet<_> = state.next_shard_committees[shard]
                 .members
                 .iter()
                 .copied()
                 .collect();
-            if *shard == target && window.contains(&e) {
-                assert_eq!(prior, current, "pending-split shard rotated at epoch {e}");
+            if *shard == target && window.contains(&shuffle_epoch) {
+                assert_eq!(
+                    prior, current,
+                    "pending-split shard rotated at epoch {shuffle_epoch}"
+                );
                 skipped_events += 1;
             } else {
                 assert_eq!(
@@ -831,13 +849,14 @@ fn shuffle_skips_split_pending_shard() {
                         current.difference(&prior).count()
                     ),
                     (1, 1),
-                    "live shard {shard:?} failed to rotate at epoch {e}"
+                    "live shard {shard:?} failed to rotate at epoch {shuffle_epoch}"
                 );
                 if *shard == target {
                     rotated_events += 1;
                 }
             }
         }
+        settled = state.next_shard_committees.clone();
     }
     // Every shuffle epoch inside the pending window skips the target;
     // the target still rotates before the window opens and after it

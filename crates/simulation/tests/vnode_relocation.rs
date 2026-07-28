@@ -1,16 +1,21 @@
-//! End-to-end vnode relocation across a shard committee rotation.
+//! End-to-end vnode movement across a shard committee rotation.
 //!
 //! Boots a 2-shard network, runs past the shuffle-interval boundary,
 //! and — unlike [`topology_rotation`], which only checks that
 //! cross-shard *verification* survives the rotation — actually moves
-//! the shuffled vnode: the lookahead placement delta surfaces through
-//! `StepOutput`, the harness snap-syncs the destination shard against
-//! its beacon-attested anchor (the same sans-io `ShardBootstrap`
-//! sequencer production pumps), seats the vnode, and the protocol does
-//! the rest — tail sync, the self-signed `ReadySignal`, the fold
-//! flipping `ready: true`, and consensus participation in the new
-//! shard. The origin shard then drains, and a rejoin with the retained
-//! storage takes the fast path with no snap-sync.
+//! the vnodes the rotation names. A rotation is make before break, so it
+//! moves two: the entrant seats first and the victim retires once the
+//! entrant is ready, and this test follows both halves.
+//!
+//! The entrant's lookahead placement delta surfaces through
+//! `StepOutput`, the harness snap-syncs its shard against the
+//! beacon-attested anchor (the same sans-io `ShardBootstrap` sequencer
+//! production pumps), seats the vnode, and the protocol does the rest —
+//! tail sync, the self-signed `ReadySignal`, the fold flipping `ready:
+//! true`, and consensus participation. That readiness is what retires
+//! the victim: its seat drains, the shard keeps committing without it,
+//! and a rejoin with the retained storage takes the fast path with no
+//! snap-sync.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -21,7 +26,7 @@ use hyperscale_simulation::{EPOCH_MS, JoinKind, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, ValidatorId, ValidatorStatus, shard_prefix_path,
+    BeaconChainConfig, BlockHeight, ShardId, ValidatorId, ValidatorStatus, shard_prefix_path,
 };
 use tracing_test::traced_test;
 
@@ -29,12 +34,8 @@ mod support;
 
 use support::{SimCluster, committee_member_host, rotation_config};
 
-/// Seed chosen so the first shuffle (epoch 16 at this config's derived
-/// interval) produces a *direct* cross-shard move: one shard's rotation
-/// victim is drawn straight into the other shard's freed slot, yielding
-/// a single `ParticipationChange` with both `join` and `leave` set on a
-/// hosted vnode. `RELOC_SEED` overrides it to search for a direct move
-/// under a different grown placement.
+/// Seed for the grown placement the rotation runs against. `RELOC_SEED`
+/// overrides it to re-run the lifecycle under a different one.
 const SEED: u64 = 7;
 
 /// Epochs past the shuffle boundary the placement delta gets to
@@ -74,6 +75,31 @@ fn run_until_or(
     false
 }
 
+/// Run in one-second slices until `found` picks a delta out of the
+/// deltas collected so far, or `deadline` passes.
+fn run_until_delta(
+    runner: &mut SimulationRunner,
+    deadline: Duration,
+    moves: &mut Vec<(NodeIndex, ParticipationChange)>,
+    found: impl Fn(&ParticipationChange) -> bool,
+) -> Option<(NodeIndex, ValidatorId, ShardId)> {
+    let picked = |moves: &[(NodeIndex, ParticipationChange)]| {
+        moves.iter().find(|(_, c)| found(c)).map(|(node, c)| {
+            let shard = c.join.or(c.leave).expect("a picked delta names a shard");
+            (*node, c.validator, shard)
+        })
+    };
+    while runner.now() < deadline {
+        if let Some(delta) = picked(moves) {
+            return Some(delta);
+        }
+        let next = runner.now() + Duration::from_secs(1);
+        runner.run_until(next);
+        moves.extend(runner.take_participation_changes());
+    }
+    picked(moves)
+}
+
 /// The mover's status in the latest committed beacon state, read from
 /// its own host's fold.
 fn mover_status(
@@ -88,7 +114,7 @@ fn mover_status(
 #[traced_test]
 #[test]
 #[allow(clippy::too_many_lines)] // one relocation lifecycle asserted end to end
-fn vnode_relocates_across_shards_at_the_shuffle() {
+fn vnode_moves_through_a_committee_rotation() {
     let seed = std::env::var("RELOC_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -101,7 +127,7 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
     runner.grow_to(2);
     let _ = runner.take_participation_changes();
 
-    // ── Detection: the first shuffle surfaces a direct move ─────────
+    // ── Make: the first shuffle seats an entrant ────────────────────
     let (_, chain_state) = runner
         .beacon_storage(0)
         .expect("host 0 exists")
@@ -110,17 +136,9 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
     let shuffle_interval = chain_state.chain_config.shuffle_interval_epochs();
     let shuffle = Duration::from_millis(EPOCH_MS * (shuffle_interval + SHUFFLE_SLACK_EPOCHS));
     let mut moves: Vec<(NodeIndex, ParticipationChange)> = Vec::new();
-    run_until_or(&mut *runner, shuffle, &mut moves, |_| false);
-    let (node, change) = moves
-        .iter()
-        .find(|(_, c)| c.join.is_some() && c.leave.is_some())
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!("seed {seed} must yield a direct cross-shard move; got {moves:?}")
-        });
-    let validator = change.validator;
-    let from = change.leave.expect("direct move carries a leave");
-    let to = change.join.expect("direct move carries a join");
+    let (node, validator, to) =
+        run_until_delta(&mut *runner, shuffle, &mut moves, |c| c.join.is_some())
+            .unwrap_or_else(|| panic!("seed {seed} must seat an entrant; got {moves:?}"));
 
     // ── Join: snap-sync bootstrap against the attested anchor ───────
     // The harness runs the same `ShardBootstrap` sequencing production
@@ -262,16 +280,29 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
          past zero once the mover's Ready leaf folded"
     );
 
-    // ── Drain: the origin shard tears down and stays live without us ─
+    // ── Break: the entrant's readiness retires the victim ───────────
+    // The seat the entrant synced into is the one the rotation has been
+    // holding open, so the victim leaves the very shard it joined.
+    let retire_deadline = runner.now() + Duration::from_millis(EPOCH_MS * DRAIN_BUDGET_EPOCHS);
+    let (victim_node, victim, from) = run_until_delta(&mut *runner, retire_deadline, &mut moves, {
+        move |c| c.leave == Some(to)
+    })
+    .unwrap_or_else(|| panic!("a ready entrant must retire its rotation's victim; got {moves:?}"));
+    assert_ne!(
+        victim, validator,
+        "a rotation retires the member it replaces"
+    );
+
+    // ── Drain: the retired seat tears down and the shard stays live ──
     assert!(
         !matches!(
-            mover_status(&*runner, node, validator),
+            mover_status(&*runner, victim_node, victim),
             Some(ValidatorStatus::OnShard { shard, .. }) if shard == from
         ),
-        "the mover's window on the origin shard has closed"
+        "the victim's window on the shard has closed"
     );
-    let retained = runner.leave_shard(node, from);
-    let (origin_peer, _) = committee_member_host(&*runner, from, Some(node));
+    let retained = runner.leave_shard(victim_node, from);
+    let (origin_peer, _) = committee_member_host(&*runner, from, Some(victim_node));
     let origin_before = runner
         .vnode_state_in(origin_peer, from)
         .expect("origin member host")
@@ -287,22 +318,22 @@ fn vnode_relocates_across_shards_at_the_shuffle() {
     });
     assert!(
         origin_alive,
-        "the origin shard must keep committing after the drain"
+        "the shard must keep committing after the victim drains"
     );
 
     // ── Fast path: rejoining with retained storage skips snap-sync ──
-    let kind = runner.join_shard(node, validator, from, retained);
+    let kind = runner.join_shard(victim_node, victim, from, retained);
     let JoinKind::Retained { committed_height } = kind else {
         panic!("retained store must take the fast path, got {kind:?}");
     };
     assert!(committed_height > BlockHeight::GENESIS);
     // The rejoined vnode resumes exactly at the retained tip — the
     // chain survived the leave/rejoin cycle without replay. (It is no
-    // longer an origin-committee member, so it observes rather than
+    // longer a committee member, so it observes rather than
     // participates; member-grade catch-up is the beacon-driven join
     // path asserted above.)
     let resumed = runner
-        .vnode_state_in(node, from)
+        .vnode_state_in(victim_node, from)
         .expect("rejoined shard is hosted")
         .shard_coordinator()
         .committed_height();

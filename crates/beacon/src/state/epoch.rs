@@ -18,8 +18,8 @@ use crate::rules::{
     canonical_boundary_qcs, chunk_bounds, crossing_already_recorded, is_boundary_crossing,
 };
 use crate::state::committee::{
-    diff_shard_committees, recover_committees, resample_beacon_committee, run_shuffle_step,
-    top_up_committees,
+    diff_shard_committees, recover_committees, resample_beacon_committee,
+    resolve_pending_rotations, run_shuffle_step, top_up_committees,
 };
 use crate::state::conviction::convict_pool;
 use crate::state::governance::tally_param_votes;
@@ -242,6 +242,15 @@ pub fn apply_epoch(
     let rewards_credited = distribute_epoch_rewards(state);
     let timeout_readied = auto_ready_timeout(state);
     run_shuffle_step(state);
+    // Close resolvable rotations after the shuffle, never before it. The
+    // ready timeout backstops an entrant a whole sync window after it
+    // seats, which lands on a shuffle boundary as often as not; resolving
+    // first would free the shard to rotate again in the same fold and put
+    // the victim in the pool in time for that rotation's own draw to seat
+    // it right back. Ordering the retirement last keeps every victim
+    // outside the derived pool for every draw of the step that retires
+    // it, the same discipline the shuffle's own draw relies on.
+    resolve_pending_rotations(state);
     // After the shuffle so the parent-half assignment reads
     // post-rotation membership and the children first shuffle one
     // epoch after they form; before the resample so freshly placed
