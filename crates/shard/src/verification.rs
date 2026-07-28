@@ -2221,6 +2221,7 @@ mod tests {
             committed_hash,
             StateRoot::ZERO,
             None,
+            None,
             latest_qc,
             pending,
             empty_certified(),

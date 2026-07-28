@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{RecoveredState, SubstateStore};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, Hash,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, Hash, RevealChain,
     SafeVoteRegisters, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
 };
 
@@ -72,6 +72,7 @@ impl RocksDbShardStorage {
             latest_qc,
             anchor_qc: None,
             committed_in_flight: None,
+            committed_reveal_chain: self.committed_reveal_chain(committed_height),
             committed_anchor_ts: self.committed_anchor_ts(committed_height),
             jmt_root: jmt_root_opt,
             beacon_witness_start,
@@ -111,6 +112,18 @@ impl RocksDbShardStorage {
         let metadata: BlockMetadata =
             get::<BlocksCf>(&*self.db, blocks_cf, &committed_height.inner())?;
         Some(metadata.header().parent_qc().weighted_timestamp())
+    }
+
+    /// Reveal chain carried by the committed tip's header, read from its
+    /// stored metadata — the value the next block extends. `None` when no
+    /// block is stored at `committed_height` (fresh start / genesis tip),
+    /// where the coordinator seeds `ZERO` for the genesis tip.
+    fn committed_reveal_chain(&self, committed_height: BlockHeight) -> Option<RevealChain> {
+        let cf = self.cf();
+        let blocks_cf = BlocksCf::handle(&cf);
+        let metadata: BlockMetadata =
+            get::<BlocksCf>(&*self.db, blocks_cf, &committed_height.inner())?;
+        Some(metadata.header().reveal_chain())
     }
 
     /// The committed tip's witness window base, read from its stored

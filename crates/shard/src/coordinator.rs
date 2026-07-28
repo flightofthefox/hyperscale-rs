@@ -86,10 +86,11 @@ use hyperscale_types::{
     CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, FinalizedWave,
     LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, ProvisionRootVerifyError,
     ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
-    QcVerifyError, QuorumCertificate, RecoveryCause, Round, RoutableTransaction, SafeVoteRegisters,
-    StateRoot, StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, TransactionRoot,
-    TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
-    derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
+    QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round, RoutableTransaction,
+    SafeVoteRegisters, StateRoot, StateRootVerifyError, Timeout, TopologySchedule,
+    TopologySnapshot, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable,
+    Verified, Verifier, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
+    ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -242,6 +243,13 @@ pub struct ShardCoordinator {
     /// a snap-synced joiner seeds it from the boundary header so its
     /// fresh committee's first block is votable.
     committed_in_flight: Option<InFlightCount>,
+
+    /// Reveal chain on the committed tip's header — what the next block
+    /// extends. `None` under the same conditions as
+    /// [`Self::committed_in_flight`], and with the same consequence: a
+    /// block extending the pruned tip can't have its chain checked, so the
+    /// vote is skipped until the first commit reseats the scalar.
+    committed_reveal_chain: Option<RevealChain>,
 
     /// Latest QC (certifies the latest certified block). Verified at
     /// every adoption gate; the typestate makes that invariant local.
@@ -428,6 +436,16 @@ impl ShardCoordinator {
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
             pending_bytes_deltas: HashMap::new(),
             committed_in_flight: recovered.committed_in_flight,
+            // A fresh start's tip is the chain's genesis, whose header
+            // carries `ZERO` — known, not guessed. A restart with a real
+            // tip and no recovered scalar stays `None` and defers the
+            // build until the first commit reseats it.
+            committed_reveal_chain: recovered.committed_reveal_chain.or_else(|| {
+                recovered
+                    .committed_hash
+                    .is_none()
+                    .then_some(RevealChain::ZERO)
+            }),
             latest_qc: recovered.latest_qc,
             anchor_qc: recovered.anchor_qc,
             deferred_qc: DeferredQc::new(),
@@ -484,6 +502,7 @@ impl ShardCoordinator {
             self.committed_hash,
             self.committed_state_root,
             self.committed_in_flight,
+            self.committed_reveal_chain,
             self.latest_qc.as_ref(),
             &self.pending_blocks,
             self.verification.verified_certified_blocks(),
@@ -1151,6 +1170,7 @@ impl ShardCoordinator {
         self.committed_hash = hash;
         self.committed_state_root = genesis.header().state_root();
         self.committed_in_flight = Some(genesis.header().in_flight());
+        self.committed_reveal_chain = Some(genesis.header().reveal_chain());
         // A chain's genesis height and clock are per-chain properties: a
         // split child's genesis continues the parent's height line and
         // anchors at its final canonical weighted timestamp (ZERO and
@@ -1731,6 +1751,23 @@ impl ShardCoordinator {
             );
             return vec![];
         };
+        // The block's reveal chain extends the parent's, so an unresolvable
+        // parent — pruned from pending with no recovered committed-tip scalar
+        // — has no chain to extend. Defer rather than guess: a wrong chain
+        // produces a header every other replica rejects. The first commit
+        // past the gap reseats the scalar.
+        let (Some(parent_reveal_chain), Some(parent_anchor_wt)) = (
+            self.chain_view().parent_reveal_chain(parent_block_hash),
+            self.committee_anchor(parent_block_hash),
+        ) else {
+            trace!(
+                validator = ?self.me,
+                height = height.inner(),
+                "Parent reveal chain unresolvable; deferring the build"
+            );
+            return vec![];
+        };
+        let parent_anchor_epoch = topology_schedule.epoch_for(parent_anchor_wt);
         // The reshape predicate reads the substate byte total behind the parent
         // state. Resolve it before the witness preview drains the
         // ready-signal pool: a missing ancestor delta defers the whole
@@ -1780,6 +1817,9 @@ impl ShardCoordinator {
             preview.reshape_trigger,
             preview.parent_window,
             preview.base,
+            parent_reveal_chain,
+            parent_anchor_epoch,
+            topology_schedule.epoch_for(parent_qc.weighted_timestamp()),
             carry_split_child_roots,
             carry_settled_waves_root,
             topology_schedule
@@ -4050,6 +4090,7 @@ impl ShardCoordinator {
         self.committed_anchor_ts = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
         self.committed_in_flight = Some(block.header().in_flight());
+        self.committed_reveal_chain = Some(block.header().reveal_chain());
         self.gc_settled_sets();
 
         // Retire the committed block's substate delta into the count
@@ -8161,6 +8202,9 @@ mod tests {
                 __qc.weighted_timestamp(),
             ))
         });
+        // The QC's block is the committed tip in this fixture; naming it
+        // keeps the parent resolvable, as it always is on a live chain.
+        state.committed_hash = state.latest_qc.as_ref().unwrap().block_hash();
 
         // Rounds increase per block: height 4 proposes at round 4
         // (proposer_for(4, 4) = validator 0).
@@ -8218,6 +8262,9 @@ mod tests {
                 WeightedTimestamp::from_millis(old_timestamp),
             ))
         });
+        // The QC's block is the committed tip in this fixture; naming it
+        // keeps the parent resolvable, as it always is on a live chain.
+        state.committed_hash = state.latest_qc.as_ref().unwrap().block_hash();
         // Height 4 proposes at round 4 (rounds increase per block).
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
@@ -8247,6 +8294,9 @@ mod tests {
             BlockHash::from_raw(Hash::from_bytes(b"block_3")),
             BlockHeight::new(3),
         ));
+        // The QC's block is the committed tip in this fixture; naming it
+        // keeps the parent resolvable, as it always is on a live chain.
+        state.committed_hash = state.latest_qc.as_ref().unwrap().block_hash();
         // Height 4 proposes at round 4 (rounds increase per block).
         state.view_change.view = Round::new(4);
 
@@ -9090,6 +9140,9 @@ mod tests {
                 __qc.weighted_timestamp(),
             ))
         });
+        // The QC's block is the committed tip in this fixture; naming it
+        // keeps the parent resolvable, as it always is on a live chain.
+        state.committed_hash = state.latest_qc.as_ref().unwrap().block_hash();
         // Height 4 proposes at round 4 (rounds increase per block).
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
@@ -9128,6 +9181,9 @@ mod tests {
                 WeightedTimestamp::from_millis(parent_timestamp),
             ))
         });
+        // The QC's block is the committed tip in this fixture; naming it
+        // keeps the parent resolvable, as it always is on a live chain.
+        state.committed_hash = state.latest_qc.as_ref().unwrap().block_hash();
 
         state.set_block_syncing(true);
         let sync_actions = state.build_and_dispatch_proposal(
@@ -9194,6 +9250,9 @@ mod tests {
                 __qc.weighted_timestamp(),
             ))
         });
+        // The QC's block is the committed tip in this fixture; naming it
+        // keeps the parent resolvable, as it always is on a live chain.
+        state.committed_hash = state.latest_qc.as_ref().unwrap().block_hash();
         // Height 4 proposes at round 4 (rounds increase per block).
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);

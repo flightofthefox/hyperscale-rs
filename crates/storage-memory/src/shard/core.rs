@@ -156,6 +156,10 @@ impl SimShardStorage {
             .blocks
             .get(&committed_height)
             .map(|block| block.block().header().parent_qc().weighted_timestamp());
+        let committed_reveal_chain = c
+            .blocks
+            .get(&committed_height)
+            .map(|block| block.block().header().reveal_chain());
         // The accumulator window starts at the tip's witness base;
         // retained entries below it are the persistence layer's
         // hysteresis stock — serving data, not accumulator state.
@@ -187,6 +191,7 @@ impl SimShardStorage {
             latest_qc,
             anchor_qc: None,
             committed_in_flight: None,
+            committed_reveal_chain,
             committed_anchor_ts,
             jmt_root: Some(self.state_root()),
             beacon_witness_start,

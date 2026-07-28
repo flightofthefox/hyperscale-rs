@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash, InFlightCount,
-    QuorumCertificate, SafeVoteRegisters, ShardAnchor, StateRoot, ValidatorId, Verified,
-    WeightedTimestamp,
+    QuorumCertificate, RevealChain, SafeVoteRegisters, ShardAnchor, StateRoot, ValidatorId,
+    Verified, WeightedTimestamp,
 };
 
 /// State recovered from storage on startup.
@@ -47,6 +47,16 @@ pub struct RecoveredState {
     /// anchor is votable — the vote path checks the claimed in-flight
     /// count against the parent's.
     pub committed_in_flight: Option<InFlightCount>,
+
+    /// Reveal chain carried by the committed tip's header — the value the
+    /// next block extends (or reseeds past, when it anchors in a later
+    /// epoch). `None` on an ordinary restart, exactly as
+    /// [`committed_in_flight`](Self::committed_in_flight): the scalar
+    /// relives on the first commit, and until then the vote path skips
+    /// rather than accept a chain it cannot check. A snap-synced bootstrap
+    /// seeds it from the boundary header so the fresh committee's first
+    /// block past the anchor is votable.
+    pub committed_reveal_chain: Option<RevealChain>,
 
     /// Weighted timestamp of the committed tip's *parent* QC — the anchor
     /// its committee was keyed on (`committee = at(committed_anchor_ts)`).
@@ -132,6 +142,7 @@ impl RecoveredState {
             latest_qc: None,
             anchor_qc: Some(anchor_qc),
             committed_in_flight: Some(boundary_header.in_flight()),
+            committed_reveal_chain: Some(boundary_header.reveal_chain()),
             committed_anchor_ts: Some(boundary_header.parent_qc().weighted_timestamp()),
             jmt_root: Some(anchor.state_root),
             beacon_witness_start: boundary_header.beacon_witness_base(),

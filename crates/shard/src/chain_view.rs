@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, InFlightCount, ProvisionHash,
-    QuorumCertificate, ShardId, StateRoot, TxHash, Verified, WaveId,
+    QuorumCertificate, RevealChain, ShardId, StateRoot, TxHash, Verified, WaveId,
 };
 use tracing::warn;
 
@@ -28,6 +28,7 @@ pub struct ChainView<'a> {
     committed_hash: BlockHash,
     committed_state_root: StateRoot,
     committed_in_flight: Option<InFlightCount>,
+    committed_reveal_chain: Option<RevealChain>,
     latest_qc: Option<&'a Verified<QuorumCertificate>>,
     pending: &'a PendingBlocks,
     certified: &'a HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
@@ -42,6 +43,7 @@ impl<'a> ChainView<'a> {
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
         committed_in_flight: Option<InFlightCount>,
+        committed_reveal_chain: Option<RevealChain>,
         latest_qc: Option<&'a Verified<QuorumCertificate>>,
         pending: &'a PendingBlocks,
         certified: &'a HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
@@ -53,6 +55,7 @@ impl<'a> ChainView<'a> {
             committed_hash,
             committed_state_root,
             committed_in_flight,
+            committed_reveal_chain,
             latest_qc,
             pending,
             certified,
@@ -115,6 +118,23 @@ impl<'a> ChainView<'a> {
         }
         (parent_block_hash == self.committed_hash)
             .then_some(self.committed_in_flight)
+            .flatten()
+    }
+
+    /// Reveal chain on the parent header — the value the next block extends,
+    /// or reseeds past when it anchors in a later epoch. `None` when the
+    /// parent is unresolvable, under the same conditions as
+    /// [`Self::parent_in_flight_checked`]: pruned from `pending` and, when
+    /// the parent is the committed tip itself, the committed-tip scalar
+    /// wasn't recovered. There is no safe default — a guessed chain produces
+    /// a header every other replica rejects — so a `None` skips the vote and
+    /// defers the build until the first commit reseats the scalar.
+    pub fn parent_reveal_chain(&self, parent_block_hash: BlockHash) -> Option<RevealChain> {
+        if let Some(header) = self.get_header(parent_block_hash) {
+            return Some(header.reveal_chain());
+        }
+        (parent_block_hash == self.committed_hash)
+            .then_some(self.committed_reveal_chain)
             .flatten()
     }
 
@@ -254,6 +274,7 @@ mod tests {
             committed_hash,
             committed_state_root,
             committed_in_flight: None,
+            committed_reveal_chain: None,
             latest_qc,
             pending,
             certified: &certified,

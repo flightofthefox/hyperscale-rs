@@ -14,12 +14,12 @@ use hyperscale_types::{
     PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp,
     ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase,
     RatifyRound, RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee,
-    Round, RoutableTransaction, RoutingCommittees, SafeVoteRegisters, SettledWavesRoot,
-    ShardForkProof, ShardId, ShardVoteEquivocation, SharedCertificates, SharedTransactions,
-    SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject,
-    SpcView, SplitChildRoots, StateRoot, SubstateEntry, Timeout, TopologySnapshot, TransactionRoot,
-    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId,
-    WeightedTimestamp,
+    RevealChain, Round, RoutableTransaction, RoutingCommittees, SafeVoteRegisters,
+    SettledWavesRoot, ShardForkProof, ShardId, ShardVoteEquivocation, SharedCertificates,
+    SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
+    SpcProposalObject, SpcView, SplitChildRoots, StateRoot, SubstateEntry, Timeout,
+    TopologySnapshot, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId,
+    Verifiable, Verified, VoteCount, WaveId, WeightedTimestamp,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -846,6 +846,15 @@ pub enum Action {
         /// coordinator from the same schedule entry as the block's
         /// committee. Stamped verbatim into the header.
         beacon_witness_base: BeaconWitnessLeafCount,
+        /// Reveal chain on the parent header — what this block's chain
+        /// extends when both anchor in the same epoch.
+        parent_reveal_chain: RevealChain,
+        /// Anchor epoch of the parent header. Differing from `anchor_epoch`
+        /// is what reseeds the chain.
+        parent_anchor_epoch: Epoch,
+        /// Anchor epoch of the block being built —
+        /// `epoch_for(parent_qc.weighted_timestamp)`.
+        anchor_epoch: Epoch,
         /// Whether the block's window is the shard's final epoch before
         /// a split, resolved by the coordinator from the schedule. When
         /// set, the handler extracts the root node's two child hashes

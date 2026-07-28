@@ -17,7 +17,7 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRootContext, Block, BlockHash, BlockHeader, BlockHeight,
     BlockVote, CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, ConsensusPublicKey, ConsensusReceipt, FinalizedWave, Hash,
+    CertifiedHeaderVerifyError, ConsensusPublicKey, ConsensusReceipt, Epoch, FinalizedWave, Hash,
     InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
     ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
     ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
@@ -27,7 +27,8 @@ use hyperscale_types::{
     Verifiable, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
     block_header_message, block_vote_message, certified_block_header_message,
     commit_witness_window, compute_waves, derive_leaves, local_settled_wave_ids,
-    missed_proposals_since_prev_commit, ready_signal_message, shard_reveal_sign,
+    missed_proposals_since_prev_commit, next_reveal_chain, ready_signal_message, shard_reveal_sign,
+    vrf_output_from_proof,
 };
 
 /// Result of QC verification and assembly.
@@ -211,6 +212,9 @@ pub fn build_proposal<S: ShardChainWriter>(
     randomness_reveal: VrfProof,
     parent_witness_leaves: &[Hash],
     beacon_witness_base: BeaconWitnessLeafCount,
+    parent_reveal_chain: RevealChain,
+    parent_anchor_epoch: Epoch,
+    anchor_epoch: Epoch,
     carry_split_child_roots: bool,
     settled_waves_root: Option<SettledWavesRoot>,
     pending_snapshots: &[Arc<JmtSnapshot>],
@@ -271,6 +275,17 @@ pub fn build_proposal<S: ShardChainWriter>(
         beacon_witness_base,
     );
 
+    // The reveal chain closes the block's anchor epoch: it extends the
+    // parent's when both anchor in the same epoch and reseeds otherwise, so
+    // a boundary block — the last anchored in the epoch it ends — carries
+    // that epoch's whole run.
+    let reveal_chain = next_reveal_chain(
+        parent_reveal_chain,
+        parent_anchor_epoch,
+        anchor_epoch,
+        vrf_output_from_proof(witness_sources.randomness_reveal()),
+    );
+
     let mut provision_hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
     provision_hashes.sort();
 
@@ -311,7 +326,7 @@ pub fn build_proposal<S: ShardChainWriter>(
         beacon_witness_root,
         beacon_witness_leaf_count,
         beacon_witness_base,
-        RevealChain::ZERO,
+        reveal_chain,
         split_child_roots,
         settled_waves_root,
     );
@@ -760,6 +775,9 @@ where
             reshape_trigger,
             parent_witness_leaves,
             beacon_witness_base,
+            parent_reveal_chain,
+            parent_anchor_epoch,
+            anchor_epoch,
             carry_split_child_roots,
             carry_settled_waves_root,
             settled_waves_window_floor,
@@ -823,6 +841,9 @@ where
                 randomness_reveal,
                 &parent_witness_leaves,
                 beacon_witness_base,
+                parent_reveal_chain,
+                parent_anchor_epoch,
+                anchor_epoch,
                 carry_split_child_roots,
                 settled_waves_root,
                 &pending_snapshots,

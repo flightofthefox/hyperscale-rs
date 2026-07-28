@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, FinalizedWave, Hash, LocalTimestamp,
-    ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, Round,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, FinalizedWave, Hash, LocalTimestamp,
+    ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
     RoutableTransaction, ShardId, TopologySnapshot, TxHash, ValidatorId, Verifiable, Verified,
     WaveId, WeightedTimestamp,
 };
@@ -315,6 +315,9 @@ pub fn assemble_build_action(
     reshape_trigger: Option<ReshapeTrigger>,
     parent_witness_leaves: Vec<Hash>,
     beacon_witness_base: BeaconWitnessLeafCount,
+    parent_reveal_chain: RevealChain,
+    parent_anchor_epoch: Epoch,
+    anchor_epoch: Epoch,
     carry_split_child_roots: bool,
     carry_settled_waves_root: bool,
     settled_waves_window_floor: Option<WeightedTimestamp>,
@@ -396,6 +399,9 @@ pub fn assemble_build_action(
         reshape_trigger,
         parent_witness_leaves,
         beacon_witness_base,
+        parent_reveal_chain,
+        parent_anchor_epoch,
+        anchor_epoch,
         carry_split_child_roots,
         carry_settled_waves_root,
         settled_waves_window_floor,
