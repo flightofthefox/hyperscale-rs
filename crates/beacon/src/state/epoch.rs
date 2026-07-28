@@ -858,12 +858,13 @@ fn record_boundaries(
         // The crossing block is the last anchored in the epoch it ends, so
         // the chain it carries closes that epoch. A drain re-fold names the
         // crossing already folded, so it contributes nothing: exactly-once
-        // falls out of the fresh-crossing test rather than a watermark. It
-        // covers the whole seed because successive crossings anchor in
-        // strictly increasing epochs — a crossing the test admits carries an
-        // anchor epoch no earlier crossing could have closed. The fence is
-        // judged here while the shard's recovery record (if any) is still
-        // live: the completing fold clears it.
+        // falls out of the fresh-crossing test rather than a watermark. The
+        // test covers a chain whole only because successive crossings anchor
+        // in increasing epochs — inherited from the weighted-timestamp clamp
+        // each QC applies at aggregation, not established here, and that
+        // field rides outside the aggregate signature. The fence is judged
+        // while the shard's recovery record (if any) is still live: the
+        // completing fold clears it.
         if !drain_refold && !reveal_chain_fenced(state, shard, header) {
             reveals.insert(*shard, header.reveal_chain());
         }

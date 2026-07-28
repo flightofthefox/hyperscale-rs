@@ -31,6 +31,17 @@ pub const REVEAL_CHAIN_DOMAIN_TAG: &[u8] = b"hyperscale-reveal-chain-v1";
 /// Seeds a fresh chain when the epochs differ, extends the parent's when
 /// they match. The one shared derivation: the proposer stamps what this
 /// returns and the verifier recomputes it, so the two cannot drift.
+///
+/// Anchor epochs advance along a chain because a QC's weighted timestamp
+/// is clamped to its parent's at aggregation
+/// ([`QuorumCertificate::from_verified_votes`](crate::QuorumCertificate)),
+/// but that field is not covered by the aggregate signature, so a
+/// backwards step is representable. The reset therefore keys on the
+/// epochs *differing*, not on the block anchoring later: seeding fresh in
+/// either direction keeps a chain's contents inside the epoch its block
+/// claims, where extending across a backwards step would carry a later
+/// epoch's reveals under an earlier epoch's label and give a fenced
+/// epoch a route into the seed.
 #[must_use]
 pub fn next_reveal_chain(
     parent_chain: RevealChain,
