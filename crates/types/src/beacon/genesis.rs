@@ -141,6 +141,11 @@ impl BeaconChainConfig {
     /// membership without entering the consensus subset — so the bound is
     /// a bound on committee size, not on safety.
     ///
+    /// What it bounds is *syncing* entrants. The shuffle counts a
+    /// rotation against the cap only while its entrant is unready; one
+    /// whose readiness has folded is a retirement the same epoch
+    /// completes, freeing the seat rather than occupying it.
+    ///
     /// Reading the cap off the interval rather than recomputing it from
     /// [`SHUFFLE_SYNC_HEADROOM`] is what keeps the two from drifting: the
     /// headroom already sets the interval, and the cap is a property of

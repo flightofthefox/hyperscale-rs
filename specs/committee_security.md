@@ -154,9 +154,14 @@ The survival term has a measured floor the formula rounds away: a fresh
 seat cannot be rotated out before its second shuffle event (readiness is
 sampled at shuffle boundaries, and an unready seat is victim-ineligible —
 §7), so survival(τ) = 1 for τ up to two intervals. A named seat also holds
-until its replacement is ready, which adds the entrant's sync to each
-tenure without changing the rate rotations are named at (§7). Little's law
-pins the *mean* tenure at n·I plus that sync lag; only the shape moves.
+until its replacement is ready, which adds the entrant's sync to the span
+a validator is attached to the shard — but not to its span as a voting
+member, which is what `r_max` denominates, and not to the rate rotations
+are named at (§7). Little's law pins that mean at n·I: the committee
+holds n voting seats and retires one per interval whatever the sync
+costs. Measured 16.00 intervals at n = 16, unmoved from instant
+readiness through a sync running to the auto-ready backstop; only the
+shape moves.
 
 `r_max` is a rate heuristic; the actual quantity is a compromise
 *probability* over a campaign, which the corrupt-count chain computes
@@ -364,15 +369,22 @@ the *transition kernel* — measurable at every occupied corrupt count — and
   the fold seats the entrant first and retires the victim only once that
   entrant is ready, so a seat's exit trails the shuffle event that names it
   by the entrant's sync. The kernel is untouched — the pair is frozen when
-  the event fires, and the harness samples the committee at the settled
-  points either side of the swap — but each seat's tenure carries the sync
-  lag on top of n·I, at most `ready_timeout_epochs` and in practice the
-  real sync time. What the latency does *not* do is slow the rotation
-  rate: rotations run concurrently up to `max(1, ⌈ready_timeout / I(n)⌉)`,
-  so a shard still opens one per interval. Were that cap one instead, a
-  shard would rotate once per sync window rather than once per interval
-  and mean tenure would stretch by the same ratio — at the §6 operating
-  point a 16× stretch of T, moving τ½ from ~15h to ~10 days. The cap is
+  the event fires, and the harness attributes each swap to the rotation
+  record that carried it, so the tally reads the same events whether or
+  not the spans overlap. Voting tenure is untouched too: measured 16.00
+  intervals at n = 16 across lags of zero, one, and two intervals, the
+  last being the cell's whole `ready_timeout_epochs`. What the sync adds
+  is time attached to the shard before the seat is voted, not time
+  holding it. What the latency does *not* do is slow the rotation rate:
+  rotations run concurrently up to `max(1, ⌈ready_timeout / I(n)⌉)`, and
+  the cap counts only entrants still syncing — one whose readiness has
+  folded is a retirement the same epoch completes, so a resolution
+  landing on a shuffle boundary does not cost the shard that boundary.
+  Were either wrong, a shard would rotate on the sync window rather than
+  the interval and mean tenure would stretch by the ratio between them —
+  at the §6 operating point a 16× stretch of T, moving τ½ from ~15h to
+  ~10 days; counting resolving rotations against the cap alone measured
+  24.00 intervals against 16 at n = 16, S = 32. The cap is
   read off `I(n)` rather than recomputed from the headroom, so the two
   cannot drift apart. The concurrent mid-sync fraction `n /
   SHUFFLE_SYNC_HEADROOM` is the same quantity in the continuous limit and

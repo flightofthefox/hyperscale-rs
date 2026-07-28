@@ -169,10 +169,27 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
         // `⌈sync / interval⌉` of them. The cap bounds committee size at
         // that; it never throttles the opening rate, which is what
         // tenure is derived from.
-        let in_flight = state
-            .pending_rotations
-            .get(&shard)
-            .map_or(0, |rotations| rotations.len() as u64);
+        //
+        // Count only the entrants still syncing, which is what the cap
+        // measures. An entrant whose readiness folded earlier this epoch
+        // is not competing for sync headroom: [`resolve_pending_rotations`]
+        // retires its victim later in this same fold, and the seat it
+        // leaves is the one a rotation opened here would fill. Counting
+        // it would cost the shard the whole boundary whenever a
+        // resolution lands on one — every interval at which the derived
+        // cadence divides the sync time, which is the common case, not
+        // the corner.
+        let in_flight = state.pending_rotations.get(&shard).map_or(0, |rotations| {
+            rotations
+                .values()
+                .filter(|rotation| {
+                    !matches!(
+                        state.validators.get(&rotation.entrant).map(|r| r.status),
+                        Some(ValidatorStatus::OnShard { ready: true, .. })
+                    )
+                })
+                .count() as u64
+        });
         if in_flight >= state.chain_config.max_rotations_in_flight() {
             continue;
         }
@@ -585,7 +602,8 @@ mod tests {
     };
 
     use super::{
-        recover_committee, recover_committees, resample_beacon_committee, run_shuffle_step,
+        recover_committee, recover_committees, resample_beacon_committee,
+        resolve_pending_rotations, run_shuffle_step,
     };
     use crate::state::test_fixtures::{
         apply_next_epoch, apply_witness_chunk, empty_state, possession_proof, single_pool_state,
@@ -1303,6 +1321,61 @@ mod tests {
                 "shard_size {shard_size}: concurrent entrants cost the quorum denominator nothing",
             );
         }
+    }
+
+    /// A resolution landing on a shuffle boundary must not cost the shard
+    /// that boundary. The entrant's readiness folds before the shuffle
+    /// runs and its victim retires after, so a shard at the cap on such
+    /// an epoch is at the cap only for the width of one fold — counting
+    /// the resolving rotation would skip the opening and drop the shard
+    /// to a fraction of its cadence, stretching tenure by the reciprocal.
+    #[test]
+    fn a_resolution_on_a_shuffle_boundary_still_opens_a_rotation() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 16, 8);
+        state.chain_config.shard_size = 16;
+        let interval = state.chain_config.shuffle_interval_epochs();
+        assert_eq!(state.chain_config.max_rotations_in_flight(), 2);
+
+        // Fill the shard to its cap, then ready the older entrant — the
+        // shape `auto_ready_timeout` leaves when a sync budget expires on
+        // a shuffle epoch.
+        for i in 1..=2 {
+            state.current_epoch = Epoch::new(interval * i);
+            run_shuffle_step(&mut state);
+        }
+        let at_cap = state.pending_rotations[&shard].clone();
+        assert_eq!(at_cap.len(), 2);
+        let (resolving_victim, resolving) = at_cap
+            .iter()
+            .min_by_key(|(_, rotation)| rotation.opened_at)
+            .expect("two rotations open");
+        mark_ready(&mut state, resolving.entrant);
+
+        state.current_epoch = Epoch::new(interval * 3);
+        run_shuffle_step(&mut state);
+
+        assert_eq!(
+            state.pending_rotations[&shard].len(),
+            3,
+            "the boundary opened against a rotation that is on its way out",
+        );
+        // And the fold's own ordering completes the swap, so the shard
+        // ends the epoch back at the cap rather than above it.
+        resolve_pending_rotations(&mut state);
+        let open = &state.pending_rotations[&shard];
+        assert_eq!(open.len(), 2, "the resolving rotation retired this fold");
+        assert!(!open.contains_key(resolving_victim));
+        assert_eq!(
+            state.next_shard_committees[&shard].members.len(),
+            18,
+            "one entrant per open rotation, above a committee at strength",
+        );
+        assert_eq!(
+            state.ready_consensus_members(&state.next_shard_committees)[&shard].len(),
+            16,
+            "the consensus subset never moved",
+        );
     }
 
     /// The consensus subset holds at `shard_size` for every fold of a
