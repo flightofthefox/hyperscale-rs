@@ -153,8 +153,10 @@ r_max = (f − βn) / (survival(τ) · n · I)    corruptions per epoch, per sha
 The survival term has a measured floor the formula rounds away: a fresh
 seat cannot be rotated out before its second shuffle event (readiness is
 sampled at shuffle boundaries, and an unready seat is victim-ineligible —
-§7), so survival(τ) = 1 for τ up to two intervals. Little's law pins the
-*mean* tenure at n·I regardless; only the shape moves.
+§7), so survival(τ) = 1 for τ up to two intervals. A named seat also holds
+until its replacement is ready, which adds the entrant's sync to each
+tenure without changing the rate rotations are named at (§7). Little's law
+pins the *mean* tenure at n·I plus that sync lag; only the shape moves.
 
 `r_max` is a rate heuristic; the actual quantity is a compromise
 *probability* over a campaign, which the corrupt-count chain computes
@@ -358,6 +360,22 @@ the *transition kernel* — measurable at every occupied corrupt count — and
   before its second shuffle event (P[tenure ≥ 2 intervals] measured 0.94 at
   instant readiness, 1.00 at any real lag), while Little's law pins mean
   tenure at n·I. §4 carries the resulting survival floor.
+- **Make-before-break latency** — the ideal swaps a seat instantaneously;
+  the fold seats the entrant first and retires the victim only once that
+  entrant is ready, so a seat's exit trails the shuffle event that names it
+  by the entrant's sync. The kernel is untouched — the pair is frozen when
+  the event fires, and the harness samples the committee at the settled
+  points either side of the swap — but each seat's tenure carries the sync
+  lag on top of n·I, at most `ready_timeout_epochs` and in practice the
+  real sync time. What the latency does *not* do is slow the rotation
+  rate: rotations run concurrently up to
+  `max(1, n / SHUFFLE_SYNC_HEADROOM)`, which is `⌈ready_timeout / I(n)⌉`
+  at the derived interval, so a shard still opens one per interval. Were
+  that cap one instead, a shard would rotate once per sync window rather
+  than once per interval and mean tenure would stretch by `n / 8` — at the
+  §6 operating point a 16× stretch of T, moving τ½ from ~15h to ~10 days.
+  The cap is derived from the same headroom the interval is, so the two
+  cannot drift apart.
 - **Reshape pauses** — a pending split suspends its shard's rotation
   entirely; merge keepers are victim-exempt. Measured: the skip lasts
   exactly the pending window (neighbors rotate throughout) and is

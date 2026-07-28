@@ -96,7 +96,7 @@ Each duty keeps an anchor-driven fallback for the case its walk cannot resolve â
 
 All gate predicates are pure functions over committed state (for example, "children seeded" means both child boundaries have non-zero block hashes), so production and simulation provably make the same decisions from the same facts. The orchestrator exists precisely because three hand-written copies of this logic had drifted apart.
 
-Supporting safety and liveness machinery, briefly (details in [05-byzantine-safety.md](05-byzantine-safety.md) and [03-state-and-sync.md](03-state-and-sync.md)): the shuffle skips mid-reshape shards entirely; `top_up_committees` refills any committee left under strength by a reshape-depleted pool; store-lock arbitration keeps the host supervisor from wiping a store a reshape duty is building in; and remote-header routing is terminal-clamped so drained shards' terminal artifacts stay fetchable through the retention window.
+Supporting safety and liveness machinery, briefly (details in [05-byzantine-safety.md](05-byzantine-safety.md) and [03-state-and-sync.md](03-state-and-sync.md)): the shuffle skips mid-reshape shards entirely, and a split cancels any rotation already in flight on its target rather than carve a not-yet-ready entrant into a child's parent half; `top_up_committees` refills any committee left under strength by a reshape-depleted pool; store-lock arbitration keeps the host supervisor from wiping a store a reshape duty is building in; and remote-header routing is terminal-clamped so drained shards' terminal artifacts stay fetchable through the retention window.
 
 ## 6. Properties
 
