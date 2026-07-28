@@ -98,21 +98,28 @@ pub(super) fn exit_placement(
             }
             // A rotation the departing validator is party to dies with
             // the departure, and takes the refill with it: the committee
-            // is carrying a spare precisely because a rotation is open, so
-            // a draw on top would seat one more member than the shard has
-            // seats and nothing would ever retire it. A victim leaving is
-            // replaced by the entrant already seated; an entrant leaving
-            // aborts the rotation and the victim keeps the seat it never
-            // gave up. Attrition anywhere else on the shard still refills:
-            // that member is neither the seat the entrant syncs into nor
-            // the one the victim holds.
-            let rotating = state
-                .pending_rotations
-                .get(&shard)
-                .is_some_and(|r| r.victim == validator || r.entrant == validator);
-            if rotating {
-                state.pending_rotations.remove(&shard);
-                return;
+            // carries a spare per open rotation, so a draw on top would
+            // seat one more member than the shard has seats and nothing
+            // would ever retire it. A victim leaving is replaced by the
+            // entrant already seated; an entrant leaving aborts its
+            // rotation and the victim keeps the seat it never gave up.
+            // Attrition anywhere else on the shard still refills: that
+            // member is neither a seat an entrant syncs into nor one a
+            // victim holds.
+            if let Some(rotations) = state.pending_rotations.get_mut(&shard) {
+                let party = rotations
+                    .iter()
+                    .find(|(victim, rotation)| {
+                        **victim == validator || rotation.entrant == validator
+                    })
+                    .map(|(victim, _)| *victim);
+                if let Some(victim) = party {
+                    rotations.remove(&victim);
+                    if rotations.is_empty() {
+                        state.pending_rotations.remove(&shard);
+                    }
+                    return;
+                }
             }
             // A pending split's parent members all carry to its children
             // as parent halves, ready by construction — the readiness the

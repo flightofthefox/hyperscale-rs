@@ -126,6 +126,27 @@ impl BeaconChainConfig {
         if interval == 0 { 1 } else { interval }
     }
 
+    /// Rotations a shard may hold open at once, derived rather than
+    /// stored: `max(1, shard_size / SHUFFLE_SYNC_HEADROOM)`.
+    ///
+    /// A rotation stays open for as long as its entrant takes to sync, so
+    /// one opening per [`Self::shuffle_interval_epochs`] leaves
+    /// `⌈sync / interval⌉` of them in flight — at the sync budget's
+    /// ceiling, exactly `shard_size / SHUFFLE_SYNC_HEADROOM`, which is
+    /// the concurrent mid-sync fraction the interval derivation is built
+    /// around. Capping below that would throttle the shuffle rate itself:
+    /// a shard that may hold only one rotation open rotates once per sync
+    /// window instead of once per interval, stretching tenure by the same
+    /// ratio and weakening the adaptive-corruption defense the cadence
+    /// exists to provide. Concurrent entrants cost nothing to quorum —
+    /// they ride committee membership without entering the consensus
+    /// subset — so the bound is a bound on committee size, not on safety.
+    #[must_use]
+    pub const fn max_rotations_in_flight(&self) -> u64 {
+        let concurrent = self.shard_size as u64 / SHUFFLE_SYNC_HEADROOM;
+        if concurrent == 0 { 1 } else { concurrent }
+    }
+
     /// Boundary checkpoints a serving store retains, derived rather than
     /// stored: `ready_timeout_epochs + 2`.
     ///

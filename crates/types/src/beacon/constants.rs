@@ -139,13 +139,23 @@ pub const POOL_BUFFER_TARGET: usize = 4;
 /// ready_timeout_epochs / shard_size`, so with one draw per shard per
 /// interval at most `shard_size / SHUFFLE_SYNC_HEADROOM` seats sit
 /// inside their sync budget concurrently, and each seat spends at most
-/// `1 / SHUFFLE_SYNC_HEADROOM` of its tenure mid-sync. The margin is
-/// what the unready dip costs: quorum is denominated in the
-/// ready-filtered consensus subset, so every mid-sync seat shrinks the
-/// committee while corrupt seats always signal ready — and once the
-/// ready timeout auto-flips a still-unsynced seat, it sits in the
-/// denominator as dead weight until the miss jail catches it. Eight
-/// caps both erosions at an eighth of the committee.
+/// `1 / SHUFFLE_SYNC_HEADROOM` of its tenure mid-sync. The same ratio is
+/// the rotation concurrency cap
+/// ([`BeaconChainConfig::max_rotations_in_flight`](crate::BeaconChainConfig::max_rotations_in_flight)),
+/// so the bound on in-flight rotations and the cadence that produces
+/// them are derived from one number and cannot drift apart.
+///
+/// What the margin buys is dead weight, not a quorum dip: rotation seats
+/// an entrant beside the member it replaces and retires that member only
+/// once the entrant is ready, so a mid-sync seat never enters the
+/// ready-filtered consensus subset the quorum is denominated in. The
+/// erosion that remains is the ready timeout auto-flipping a seat that
+/// has *not* finished syncing — it joins the denominator, and its victim
+/// leaves, so the committee carries it as dead weight until the miss
+/// jail catches it, while corrupt seats always signal ready on time.
+/// Eight caps that at an eighth of the committee, and caps the
+/// concurrent snap-sync load a shard's serving members answer at the
+/// same fraction.
 pub const SHUFFLE_SYNC_HEADROOM: u64 = 8;
 
 /// How many consecutive boundary folds may observe a live shard missing

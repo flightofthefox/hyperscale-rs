@@ -481,21 +481,19 @@ impl PendingReshape {
 }
 
 /// A committee rotation with its entrant seated and its victim not yet
-/// retired, keyed in [`BeaconState::pending_rotations`] by the rotating
-/// shard.
+/// retired, held in [`BeaconState::pending_rotations`] under the
+/// rotating shard and keyed by the victim it will retire.
 ///
 /// The shuffle rotates make-before-break: the entrant joins `members`
 /// unready, syncing and gossiping, while the victim holds the consensus
 /// seat that keeps the shard's quorum denominator at `shard_size`. The
-/// pair is frozen here at the opening fold rather than recomputed at
+/// pair is frozen at the opening fold rather than recomputed at
 /// resolution, so the seat the victim holds is the seat the entrant
 /// takes. The rotation resolves in the fold after the entrant's
 /// readiness lands, and every entrant becomes ready — by witness or by
 /// the auto-ready timeout — so no rotation stays open indefinitely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, BasicSbor)]
 pub struct PendingRotation {
-    /// The seated member retiring to the pool once the entrant is ready.
-    pub victim: ValidatorId,
     /// The drawn member syncing into the seat, `OnShard { ready: false }`
     /// until its readiness folds.
     pub entrant: ValidatorId,
@@ -786,13 +784,15 @@ pub struct BeaconState {
     /// drops on the shard's next observed crossing (the fresh committee
     /// produced) and is GC'd with the shard's boundary record.
     pub pending_recoveries: BTreeMap<ShardId, ShardRecovery>,
-    /// In-flight committee rotations, keyed by the rotating shard — at
-    /// most one per shard. Opened by the shuffle when it seats an
-    /// entrant, consumed by the fold that observes the entrant ready and
-    /// retires the victim. Dropped without retiring when either party
-    /// leaves the shard some other way, or when the shard is re-carved
-    /// by a reshape or recovery.
-    pub pending_rotations: BTreeMap<ShardId, PendingRotation>,
+    /// In-flight committee rotations per shard, each keyed by the victim
+    /// it retires, bounded by
+    /// [`BeaconChainConfig::max_rotations_in_flight`]. The shuffle opens
+    /// one per shard per interval; the fold that observes an entrant
+    /// ready retires its victim and consumes that entry. An entry is
+    /// dropped without retiring when either party leaves the shard some
+    /// other way, and a shard's whole map is dropped when a reshape or
+    /// recovery re-carves it.
+    pub pending_rotations: BTreeMap<ShardId, BTreeMap<ValidatorId, PendingRotation>>,
     /// Each shard's most recent completed recovery, stamped when the
     /// pending record clears on the shard's first crossing. Permanent —
     /// one entry per recovered shard, overwritten by a later recovery —

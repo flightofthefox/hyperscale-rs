@@ -25,7 +25,7 @@ use rand::RngExt;
 use rand_chacha::ChaCha20Rng;
 
 use crate::sampling::prng_from;
-use crate::state::committee::abort_rotation;
+use crate::state::committee::abort_rotations;
 
 /// Domain tag for the cohort draw + child assignment seed. Distinct
 /// from the parent-half and keeper tags so the reshape PRNG streams
@@ -244,7 +244,7 @@ pub(super) fn schedule_ready_splits(state: &mut BeaconState) {
         // on a loop until the seat swap finished. The entrant gives up a
         // partial sync of a committee that is about to be re-carved
         // anyway.
-        abort_rotation(state, target);
+        abort_rotations(state, target);
         try_schedule_split(state, target);
     }
 }
@@ -1479,7 +1479,10 @@ mod tests {
         // The shuffle wasn't a no-op: both children opened a rotation, and
         // each named a non-keeper as its victim.
         for child in [left, right] {
-            let victim = state.pending_rotations[&child].victim;
+            let victim = *state.pending_rotations[&child]
+                .keys()
+                .next()
+                .expect("the child opened a rotation");
             assert!(!keepers.contains_key(&victim), "a keeper was named victim");
             assert_eq!(state.next_shard_committees[&child].members.len(), 5);
         }
@@ -1501,7 +1504,11 @@ mod tests {
         let parties: Vec<ValidatorId> = state
             .pending_rotations
             .values()
-            .flat_map(|r| [r.victim, r.entrant])
+            .flat_map(|rotations| {
+                rotations
+                    .iter()
+                    .flat_map(|(victim, rotation)| [*victim, rotation.entrant])
+            })
             .collect();
         assert_eq!(parties.len(), 4, "both children rotate");
 
@@ -1874,7 +1881,11 @@ mod tests {
         }
         state.current_epoch = Epoch::new(state.chain_config.shuffle_interval_epochs());
         run_shuffle_step(&mut state);
-        let rotation = state.pending_rotations[&p];
+        let entrant = state.pending_rotations[&p]
+            .values()
+            .next()
+            .expect("the shuffle opened a rotation")
+            .entrant;
 
         // Admit the split and ready its whole cohort: the only thing left
         // between it and its cut is the rotation.
@@ -1896,7 +1907,7 @@ mod tests {
         // split carved a committee of ready members only.
         assert!(state.pending_rotations.is_empty());
         assert!(matches!(
-            state.validators[&rotation.entrant].status,
+            state.validators[&entrant].status,
             ValidatorStatus::Pooled,
         ));
         assert!(!state.next_shard_committees.contains_key(&p));
@@ -1904,7 +1915,7 @@ mod tests {
             let members = &state.next_shard_committees[&child].members;
             assert_eq!(members.len(), 4);
             assert!(
-                !members.contains(&rotation.entrant),
+                !members.contains(&entrant),
                 "a cancelled entrant must not ride the carve into a child",
             );
         }
