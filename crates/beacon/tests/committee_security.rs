@@ -289,11 +289,16 @@ fn count_corrupt(members: &[ValidatorId], corrupt: &BTreeSet<ValidatorId>) -> u6
 /// Drive the fold for `cell.epochs` and tally the shuffle kernel.
 ///
 /// A rotation spans two folds — the entrant seats at the shuffle epoch,
-/// the victim retires once its `Ready` folds — so the committee is only
-/// comparable against the chain at the settled points either side of
-/// that span. The tally samples there and asserts the structural facts
-/// it depends on: a settled change follows a shuffle within the
-/// resolution bound, and swaps exactly one member per shard.
+/// the victim retires once its `Ready` folds — and while it is open the
+/// entrant rides `members` above the settled committee. Several may be
+/// open at once, so at any fast cadence there is no moment when the raw
+/// membership is a settled committee to diff against.
+///
+/// So the tally reads the rotation records rather than the committee:
+/// each `PendingRotation` names the pair it will swap, and the fold that
+/// consumes it is the swap. `settled` tracks the committee those swaps
+/// have produced, never contaminated by an entrant still syncing, and is
+/// checked against real membership whenever a shard is quiescent.
 fn run_cell(cell: &Cell, corrupt: &BTreeSet<ValidatorId>) -> KernelTally {
     let network = NetworkDefinition::simulator();
     let mut state = mc_state(cell);
@@ -308,9 +313,14 @@ fn run_cell(cell: &Cell, corrupt: &BTreeSet<ValidatorId>) -> KernelTally {
         .map(|id| (id, 0))
         .collect();
 
-    let mut settled = state.next_shard_committees.clone();
-    let mut shuffle_epoch = 0;
+    let mut settled: BTreeMap<ShardId, Vec<ValidatorId>> = state
+        .next_shard_committees
+        .iter()
+        .map(|(shard, committee)| (*shard, committee.members.clone()))
+        .collect();
     for e in 1..=cell.epochs {
+        let open = open_rotations(&state);
+
         apply_epoch(
             &BlsVerifier,
             &mut state,
@@ -330,56 +340,112 @@ fn run_cell(cell: &Cell, corrupt: &BTreeSet<ValidatorId>) -> KernelTally {
             *tally.beacon.entry((m, k)).or_default() += 1;
         }
 
-        if e.is_multiple_of(interval) {
-            shuffle_epoch = e;
+        // A rotation the fold consumed, whose victim actually left, is one
+        // swap. A cancelled rotation also leaves the map, but its victim
+        // keeps the seat — these cells trigger no reshape, so that branch
+        // is defensive.
+        let resolved: Vec<_> = open
+            .into_iter()
+            .filter(|(shard, victim, _, _)| {
+                !state
+                    .pending_rotations
+                    .get(shard)
+                    .is_some_and(|rotations| rotations.contains_key(victim))
+                    && !state.next_shard_committees[shard].members.contains(victim)
+            })
+            .collect();
+        if !resolved.is_empty() {
+            tally.events += 1;
         }
-        if !state.pending_rotations.is_empty() || state.next_shard_committees == settled {
-            continue;
-        }
-        assert!(
-            e - shuffle_epoch <= cell.ready_timeout_epochs + 1,
-            "membership settled at epoch {e}, adrift of the shuffle at {shuffle_epoch}"
-        );
-
-        tally.events += 1;
         let burned_in = tally.events > BURN_IN_EVENTS;
-        for (shard, committee_before) in &settled {
-            let after = &state.next_shard_committees[shard];
-            let prior: BTreeSet<_> = committee_before.members.iter().copied().collect();
-            let current: BTreeSet<_> = after.members.iter().copied().collect();
-            let removed: Vec<_> = prior.difference(&current).copied().collect();
-            let added: Vec<_> = current.difference(&prior).copied().collect();
-            assert_eq!(
-                (removed.len(), added.len()),
-                (1, 1),
-                "the shuffle at epoch {shuffle_epoch} must swap exactly one member of {shard:?}"
+        for (shard, victim, entrant, opened_at) in resolved {
+            assert!(
+                e - opened_at <= cell.ready_timeout_epochs + 1,
+                "rotation opened at {opened_at} resolved at {e}, past the ready backstop",
             );
-            let out = removed[0];
-            let seated = seated_at.remove(&out).expect("rotated member was seated");
-            seated_at.insert(added[0], e);
+            let seats = settled.get_mut(&shard).expect("shard seated at genesis");
+            let k_before = count_corrupt(seats, corrupt);
+            seats.retain(|id| *id != victim);
+            seats.push(entrant);
+            let k_after = count_corrupt(seats, corrupt);
+            assert_eq!(
+                seats.len(),
+                cell.shard_size as usize,
+                "the settled committee of {shard:?} left strength at epoch {e}",
+            );
+
+            let seated = seated_at
+                .remove(&victim)
+                .expect("rotated member was seated");
+            seated_at.insert(entrant, e);
             if !burned_in {
                 continue;
             }
             let intervals = (e - seated) / interval;
-            let tenure = if corrupt.contains(&out) {
+            let tenure = if corrupt.contains(&victim) {
                 &mut tally.tenure_corrupt
             } else {
                 &mut tally.tenure_honest
             };
             *tenure.entry(intervals).or_default() += 1;
-            let k_before = count_corrupt(&committee_before.members, corrupt);
-            let k_after = count_corrupt(&after.members, corrupt);
             *tally.visits.entry(k_before).or_default() += 1;
-            // One swap bounds the move to ±1, asserted above.
+            // One swap per resolution bounds the move to ±1.
             match k_after.cmp(&k_before) {
                 Ordering::Greater => *tally.ups.entry(k_before).or_default() += 1,
                 Ordering::Less => *tally.downs.entry(k_before).or_default() += 1,
                 Ordering::Equal => {}
             }
         }
-        settled = state.next_shard_committees.clone();
+
+        assert_settled_view(&state, &settled, e);
     }
     tally
+}
+
+/// Every rotation currently open, as `(shard, victim, entrant,
+/// opened_at)`.
+///
+/// Collected rather than borrowed: the fold consumes the entries it
+/// resolves, so the pairs must outlive it to be attributed afterwards.
+fn open_rotations(state: &BeaconState) -> Vec<(ShardId, ValidatorId, ValidatorId, u64)> {
+    state
+        .pending_rotations
+        .iter()
+        .flat_map(|(shard, rotations)| {
+            rotations.iter().map(|(victim, rotation)| {
+                (
+                    *shard,
+                    *victim,
+                    rotation.entrant,
+                    rotation.opened_at.inner(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// With nothing in flight a shard's settled view is its committee. Pins
+/// the swap bookkeeping against the fold's own membership, which is what
+/// the tally would otherwise be trusted on unchecked.
+fn assert_settled_view(
+    state: &BeaconState,
+    settled: &BTreeMap<ShardId, Vec<ValidatorId>>,
+    epoch: u64,
+) {
+    for (shard, seats) in settled {
+        if state.pending_rotations.contains_key(shard) {
+            continue;
+        }
+        assert_eq!(
+            seats.iter().copied().collect::<BTreeSet<_>>(),
+            state.next_shard_committees[shard]
+                .members
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "settled view of {shard:?} drifted from its committee at epoch {epoch}",
+        );
+    }
 }
 
 // ─── Comparison against the chain ────────────────────────────────────────────
@@ -760,6 +826,50 @@ fn beacon_resample_matches_hypergeometric() {
     assert!(asserted >= 3, "only {asserted} m-bins were populated");
 }
 
+/// The tally observes rotations that overlap. At a lag long enough that
+/// a shard always has one open, there is no fold on which its membership
+/// is a settled committee — a harness that waits for one measures
+/// nothing and reports it as a clean run, so every claim about the
+/// lagged regime silently rests on zero samples.
+///
+/// Swept from instant readiness up to the auto-ready backstop, at a
+/// geometry whose cadence keeps two rotations in flight. Deterministic,
+/// and sized for CI rather than for the tables in the analysis note.
+#[test]
+fn the_tally_observes_rotations_that_overlap() {
+    let interval = cell_interval(16, 32);
+    let intervals = 60;
+    for ready_lag_epochs in [0u64, 8, 16, 32] {
+        let cell = Cell {
+            shards: 1,
+            shard_size: 16,
+            population: 320,
+            corrupt: 80,
+            epochs: intervals * interval,
+            ready_lag_epochs,
+            ready_timeout_epochs: 32,
+            beacon_size: None,
+            seed: 0x17,
+        };
+        assert!(
+            mc_state(&cell).chain_config.max_rotations_in_flight() > 1,
+            "the cell must admit concurrent rotations to be probative",
+        );
+        let tally = run_cell(&cell, &spread_corrupt(cell.population, cell.corrupt));
+        // Every rotation the cell opens resolves inside the run, so the
+        // count tracks the intervals. Asserted loosely: what this test
+        // guards is that the tally sees the lagged regime at all, and the
+        // opening rate it sees is a property of the fold's cap, pinned by
+        // `a_shard_holds_concurrent_rotations_up_to_the_cap`.
+        assert!(
+            tally.events * 2 >= intervals,
+            "lag {ready_lag_epochs}: {} events over {intervals} intervals — \
+             the tally is not seeing resolutions",
+            tally.events,
+        );
+    }
+}
+
 /// A shard with a pending split is skipped by the shuffle for as long
 /// as the record stands, and resumes rotating once it clears — the
 /// residence-time extension the analysis note prices is exactly the
@@ -780,14 +890,13 @@ fn shuffle_skips_split_pending_shard() {
     let network = NetworkDefinition::simulator();
     let mut state = mc_state(&cell);
     let interval = state.chain_config.shuffle_interval_epochs();
-    let target = shard_ids(cell.shards)[0];
+    let shards = shard_ids(cell.shards);
+    let target = shards[0];
     let window = 32..=128;
     let no_contributions = BTreeMap::new();
 
     let mut skipped_events = 0;
     let mut rotated_events = 0;
-    let mut settled = state.next_shard_committees.clone();
-    let mut shuffle_epoch = 0;
     for e in 1..=200_u64 {
         if window.contains(&e) {
             // A live pending split: both TTL anchors are refreshed each
@@ -821,42 +930,33 @@ fn shuffle_skips_split_pending_shard() {
             },
         );
         flip_ready(&mut state, 0);
-        if e.is_multiple_of(interval) {
-            shuffle_epoch = e;
-        }
-        // Sample where the live shards' rotations have settled, and
-        // attribute what changed to the shuffle epoch that opened them.
-        if !state.pending_rotations.is_empty() || state.next_shard_committees == settled {
+        if !e.is_multiple_of(interval) {
             continue;
         }
-        for (shard, committee_before) in &settled {
-            let prior: BTreeSet<_> = committee_before.members.iter().copied().collect();
-            let current: BTreeSet<_> = state.next_shard_committees[shard]
-                .members
-                .iter()
-                .copied()
-                .collect();
-            if *shard == target && window.contains(&shuffle_epoch) {
-                assert_eq!(
-                    prior, current,
-                    "pending-split shard rotated at epoch {shuffle_epoch}"
-                );
+        // Read the skip off the rotation the shuffle just opened rather
+        // than off a committee diff: what the guard suppresses is the
+        // opening, and a diff only shows it a resolution later.
+        let opened = |shard: &ShardId| {
+            state.pending_rotations.get(shard).is_some_and(|rotations| {
+                rotations
+                    .values()
+                    .any(|rotation| rotation.opened_at.inner() == e)
+            })
+        };
+        for shard in &shards {
+            if *shard == target && window.contains(&e) {
+                assert!(!opened(shard), "pending-split shard rotated at epoch {e}");
                 skipped_events += 1;
             } else {
-                assert_eq!(
-                    (
-                        prior.difference(&current).count(),
-                        current.difference(&prior).count()
-                    ),
-                    (1, 1),
-                    "live shard {shard:?} failed to rotate at epoch {shuffle_epoch}"
+                assert!(
+                    opened(shard),
+                    "live shard {shard:?} failed to rotate at {e}"
                 );
                 if *shard == target {
                     rotated_events += 1;
                 }
             }
         }
-        settled = state.next_shard_committees.clone();
     }
     // Every shuffle epoch inside the pending window skips the target;
     // the target still rotates before the window opens and after it
