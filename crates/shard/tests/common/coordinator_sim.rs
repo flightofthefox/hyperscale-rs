@@ -43,9 +43,9 @@ use hyperscale_types::{
     LocalTimestamp, NetworkDefinition, ProposerTimestamp, ProvisionRootVerifyError,
     ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
     ProvisionsRoot, ProvisionsRootContext, QcContext, QcVerifyError, QuorumCertificate,
-    ReadySignal, RevealChain, Round, RoutableTransaction, ShardId, ShardVoteEquivocation,
-    ShardWitnessPayload, Signer, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt,
-    Timeout, TimeoutContext, TopologySchedule, TransactionRoot, TransactionRootContext, TxHash,
+    ReadySignal, Round, RoutableTransaction, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
+    Signer, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, Timeout,
+    TimeoutContext, TopologySchedule, TransactionRoot, TransactionRootContext, TxHash,
     TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof,
     WeightedTimestamp, local_settled_wave_ids, ready_signal_message, shard_reveal_sign,
 };
@@ -1890,8 +1890,8 @@ pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
         h.beacon_witness_root(),
         h.beacon_witness_leaf_count(),
         h.beacon_witness_base(),
-        RevealChain::ZERO,
+        h.reveal_chain(),
         h.split_child_roots(),
-        None,
+        h.settled_waves_root(),
     )
 }
