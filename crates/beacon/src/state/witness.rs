@@ -183,8 +183,8 @@ pub(super) fn apply_contribution_witnesses(
 /// [`HostEvent`] for [`apply_contribution_witnesses`] to route into
 /// [`WitnessOutcome`].
 ///
-/// `source_shard` is the shard that emitted the witness (carried in
-/// the wrapping [`ShardWitnessProof`](hyperscale_types::ShardWitnessProof)).
+/// `source_shard` is the shard that emitted the witness, read from the
+/// contribution's boundary header.
 /// Most variants ignore it; `MissedProposal` uses it to scope the
 /// miss-counter increment to the witness's source committee — a
 /// `MissedProposal` from shard S only counts against validators

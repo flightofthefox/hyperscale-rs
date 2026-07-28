@@ -456,9 +456,8 @@ impl BlockHeader {
     /// this block.
     ///
     /// QC-attested (part of the signed header). Beacon validators
-    /// verify a fetched [`ShardWitness`](crate::ShardWitness) against
-    /// this root via the Merkle path in its
-    /// [`ShardWitnessProof`](crate::ShardWitnessProof).
+    /// recompute it from a fetched chunk's payloads plus its range
+    /// proof.
     ///
     /// `BeaconWitnessRoot::ZERO` for blocks that produced no witnesses.
     #[must_use]

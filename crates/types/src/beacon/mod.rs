@@ -29,9 +29,8 @@
 //!   pool aggregates, committee tables, the epoch-effect bundle). Pure
 //!   data shapes — the application logic that mutates these lives in
 //!   `hyperscale_beacon::state`.
-//! - [`witness`]: [`Witness`] / [`ShardWitness`] / [`ShardWitnessPayload`] /
-//!   [`ShardWitnessProof`] / [`BeaconWitnessEvent`] (observations the
-//!   beacon applies per slot).
+//! - [`witness`]: [`ShardWitnessPayload`] / [`BeaconWitnessEvent`] — the
+//!   accumulator leaves the beacon folds per epoch.
 
 pub mod block;
 pub mod cert;
@@ -106,7 +105,4 @@ pub use state::{
     RecoveryCause, ScheduledSplit, ShardBoundary, ShardCommittee, ShardRecovery, SlotEffects,
     StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
 };
-pub use witness::{
-    BeaconWitnessEvent, SHARD_WITNESS_LEAF_DOMAIN_TAG, ShardWitness, ShardWitnessPayload,
-    ShardWitnessProof, ShardWitnessVerifyError,
-};
+pub use witness::{BeaconWitnessEvent, SHARD_WITNESS_LEAF_DOMAIN_TAG, ShardWitnessPayload};

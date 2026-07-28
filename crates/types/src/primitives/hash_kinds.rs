@@ -181,10 +181,9 @@ hash_newtype!(
     /// given committed block.
     ///
     /// Carried in `BlockHeader::beacon_witness_root` and therefore
-    /// QC-attested. Beacon validators verify a fetched
-    /// [`ShardWitness`](crate::ShardWitness) against this root using
-    /// the Merkle path in its
-    /// [`ShardWitnessProof`](crate::ShardWitnessProof).
+    /// QC-attested. Beacon validators recompute this root from a fetched
+    /// chunk's payloads plus its range proof, so a run only counts toward
+    /// the committed block it was fetched against.
     pub BeaconWitnessRoot,
     "BeaconWitnessRoot"
 );

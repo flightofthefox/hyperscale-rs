@@ -98,9 +98,9 @@ pub const MAX_PROGRESS_WAIT: Duration = Duration::from_secs(9);
 /// rolling the epoch counter, decoupling committee-replacement from
 /// natural epoch rotation.
 ///
-/// Also bounds the witness-inclusion window: a [`ShardWitness`](crate::ShardWitness)
-/// is includable in a beacon proposal during epoch `E` if its source
-/// block's `weighted_timestamp ≤ t_end_E`.
+/// Also bounds the witness-inclusion window: a witness leaf is includable
+/// in a beacon proposal during epoch `E` if its source block's
+/// `weighted_timestamp ≤ t_end_E`.
 pub const EPOCH_DURATION: Duration = Duration::from_mins(5);
 
 /// Wall-clock interval an active validator waits past an epoch's

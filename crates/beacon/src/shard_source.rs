@@ -4,9 +4,8 @@
 //! proposer draws on to build a `BeaconProposal` and an epoch's
 //! `shard_contributions`:
 //!
-//! - recent verified headers — the verify context for inbound
-//!   `BeaconBlock`s and `ShardWitness`es and the input to crossing
-//!   detection;
+//! - recent verified headers — the verify context for inbound witness
+//!   chunks and the input to crossing detection;
 //! - observed epoch-boundary crossings — the per-shard anchors the
 //!   proposer reports in `boundary_qcs`;
 //! - per-anchor witness chunks — verified witnesses for a boundary

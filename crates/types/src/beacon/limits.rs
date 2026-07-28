@@ -70,13 +70,11 @@ pub const MAX_VOTE_VECTOR_LEN: usize = 1024;
 /// slot). Cap follows directly from [`MAX_VOTE_VECTOR_LEN`].
 pub const MAX_PREFIX_SIGS: usize = MAX_VOTE_VECTOR_LEN + 1;
 
-/// Cap on the depth of a [`ShardWitnessProof`](crate::ShardWitnessProof)'s
-/// Merkle path.
+/// Cap on the depth of a shard's beacon-witness accumulator tree.
 ///
-/// Each level contributes one sibling hash. Sized to handle accumulators
-/// up to `2^64` leaves with headroom — overkill for any realistic
-/// shard-witness volume but cheap on the wire and safe against
-/// pathological inputs.
+/// Sized to handle accumulators up to `2^64` leaves with headroom —
+/// overkill for any realistic shard-witness volume, but it is what bounds
+/// [`MAX_RANGE_PROOF_NODES`] and so belongs on the generous side.
 pub const MAX_WITNESS_PROOF_DEPTH: usize = 64;
 
 /// Cap on the node count of a witness-chunk range multiproof.
@@ -88,12 +86,12 @@ pub const MAX_WITNESS_PROOF_DEPTH: usize = 64;
 /// at most one node per level and usually fewer.
 pub const MAX_RANGE_PROOF_NODES: usize = 2 * MAX_WITNESS_PROOF_DEPTH;
 
-/// Per-request cap on the number of shard-witness leaves a beacon
-/// validator pulls in one round-trip.
+/// Page size for the bootstrap witness-history sync.
 ///
-/// Bounds the requested range's width and the matching payload array at
-/// decode time. A chunk wider than this degrades to successive requests,
-/// each proving its own sub-range, rather than one unbounded response.
+/// Bounds one `GetWitnessHistoryResponse`'s payload array at decode time.
+/// The beacon's own chunk fetch does not page: a range proof only
+/// verifies for the whole run it covers, so that path is bounded by
+/// [`MAX_WITNESSES_PER_SHARD`] instead.
 pub const MAX_WITNESSES_PER_FETCH: usize = 128;
 
 /// Per-transaction cap on
