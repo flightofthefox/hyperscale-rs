@@ -1432,7 +1432,7 @@ impl ShardCoordinatorSim {
                     ready_signals,
                     reshape_trigger,
                     // Sign a genuine reveal with the proposer's key so the
-                    // block's leaf 0 passes the signature gate `verify` now runs;
+                    // block's reveal passes the signature gate `verify` now runs;
                     // `VrfProof::ZERO` would fail it. The proposer leads
                     // this round, so it matches `proposer_for` at verify.
                     shard_reveal_sign(

@@ -32,16 +32,16 @@ pub const MAX_SHARDS: usize = 4096;
 ///
 /// In steady state the fold drains a crossing's whole backlog each
 /// epoch and never touches this cap; it binds only on catch-up, when
-/// the beacon lagged a live, producing shard. With a mandatory
-/// randomness-reveal leaf on every block, a shard's leaf production is
-/// its block rate — freewheel proposing runs a committee near ~1,000
-/// blocks per five-minute epoch — so the cap must exceed worst-case
-/// per-epoch production by a healthy multiple: a fold capped below
-/// production can never catch up, and the reshape lifecycle (whose
-/// ready signals ride the same stream) livelocks on its readiness TTL.
-/// Four epochs of freewheel production also covers the deepest live
-/// backlog the crossing retention window can accumulate before the
-/// topology-schedule floor would park the fold.
+/// the beacon lagged a live, producing shard. Leaf production tracks
+/// staking-contract activity, committee turnover, and reshape signals —
+/// not block rate — so steady-state windows sit far below the cap. It is
+/// sized against the burst case instead: a block's receipts can each emit
+/// up to [`MAX_BEACON_WITNESS_EVENTS_PER_TX`] leaves, so a fold capped
+/// below a burst can never catch up, and the reshape lifecycle (whose
+/// ready signals ride the same stream) would livelock on its readiness
+/// TTL. The cap also bounds the deepest live backlog the crossing
+/// retention window can accumulate before the topology-schedule floor
+/// would park the fold.
 pub const MAX_WITNESSES_PER_SHARD: usize = 4096;
 
 /// Per-proposer cap on equivocation evidence in a single

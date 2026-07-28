@@ -702,7 +702,7 @@ pub enum Action {
         /// re-verified inside the shared verifier before its leaf folds
         /// — equivocation evidence against each equivocator's registered
         /// key, the reshape assertion against the locally recomputed
-        /// load predicate, the randomness reveal (leaf 0) against the
+        /// load predicate, the randomness reveal against the
         /// proposer's key — so an invalid entry fails the block.
         witness_sources: SharedWitnessSources,
         /// Committed substate byte total behind the parent block's
@@ -847,7 +847,7 @@ pub enum Action {
         /// The trimmed parent-window accumulator leaves this block's new
         /// witnesses append onto, resolved by the coordinator (which owns the
         /// accumulator and does the ancestor walk). The handler signs the
-        /// block's randomness reveal (leaf 0) on the dispatch pool, derives the
+        /// block's randomness reveal on the dispatch pool, derives the
         /// block's new leaves over these, and finalizes `beacon_witness_root`
         /// and the leaf count.
         parent_witness_leaves: Vec<Hash>,

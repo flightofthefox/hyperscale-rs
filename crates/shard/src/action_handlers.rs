@@ -245,8 +245,8 @@ pub fn build_proposal<S: ShardChainWriter>(
         .flat_map(|fw| fw.receipts().iter().cloned())
         .collect();
 
-    // Finalize the beacon-witness commitment: the reveal (leaf 0) plus the
-    // content leaves append onto the coordinator-resolved parent window. The
+    // Finalize the beacon-witness commitment: the content leaves append
+    // onto the coordinator-resolved parent window. The
     // missed-round walk derives here from the same `(parent_round, round,
     // topology)` the verifier reads, so proposer and verifier share the one
     // helper and their leaf order can't drift.
@@ -635,7 +635,7 @@ where
                 thresholds,
                 topology_snapshot: &topology_snapshot,
             };
-            // `verify` gates the reveal's signature validity (leaf 0's proof by
+            // `verify` gates the reveal's signature validity (its proof by
             // the block's proposer) before folding its digest, so an
             // unverified reveal can never reach the root — the grind check
             // lives inside the shared verifier, off the main loop on the
@@ -793,7 +793,7 @@ where
         } => {
             // Sign the block's randomness reveal here — off the main loop, on
             // the dispatch pool — so the sans-io coordinator holds no key. Its
-            // digest is leaf 0 of the block's beacon-witness leaves; the proof
+            // digest is the link the block adds to its reveal chain; the proof
             // rides the block body and manifest for the verifier's re-check.
             let Ok(randomness_reveal) = shard_reveal_sign(
                 ctx.signer.as_ref(),

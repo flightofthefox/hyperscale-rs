@@ -1242,7 +1242,7 @@ mod tests {
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledWavesRoot,
         ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardRecovery, ShardWitnessPayload,
         SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TransactionRoot,
-        TransitionCause, ValidatorId, VrfOutput, VrfProof, WeightedTimestamp, compute_merkle_root,
+        TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root,
         compute_range_proof,
     };
 
@@ -1956,18 +1956,10 @@ mod tests {
         state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
 
-        let payloads = vec![
-            ShardWitnessPayload::RandomnessReveal {
-                output: VrfOutput::new([7; 32]),
-            },
-            ShardWitnessPayload::StakeDeposit {
-                pool_id: StakePoolId::new(200),
-                amount: Stake::from_whole_tokens(1),
-            },
-            ShardWitnessPayload::RandomnessReveal {
-                output: VrfOutput::new([9; 32]),
-            },
-        ];
+        let payloads = vec![ShardWitnessPayload::StakeDeposit {
+            pool_id: StakePoolId::new(200),
+            amount: Stake::from_whole_tokens(1),
+        }];
         let (b, payloads, range_proof) =
             boundary_block_with_payloads(shard, 5, 900, StateRoot::ZERO, payloads);
         let expected_chain = b.reveal_chain();

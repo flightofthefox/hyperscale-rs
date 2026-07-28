@@ -174,7 +174,7 @@ const MAX_HEADER_HEIGHT_LOOKAHEAD: u64 = 256;
 /// proposal: the drained ready signals, the reshape assertion, the trimmed
 /// parent-window leaves the block's new leaves append onto, and the window
 /// base. The beacon-witness root is finalized in the `BuildProposal` handler,
-/// which signs the block's randomness reveal (leaf 0) on the dispatch pool and
+/// which signs the block's randomness reveal on the dispatch pool and
 /// derives the block's leaves over `parent_window`.
 struct WitnessCommitmentPreview {
     ready_signals: Vec<ReadySignal>,
@@ -1676,8 +1676,7 @@ impl ShardCoordinator {
 
         let reshape_trigger =
             self.derive_proposal_reshape_trigger(topology_snapshot, substate_bytes, &parent_leaves);
-        // The block's new leaves — the randomness reveal (leaf 0) plus the
-        // content leaves — are derived and merkle-committed in the
+        // The block's new leaves are derived and merkle-committed in the
         // `BuildProposal` handler, where the reveal is signed off the main
         // loop. The preview resolves only the inputs to that: the trimmed
         // parent window the new leaves append onto, the deduped ready signals,

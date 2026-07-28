@@ -661,7 +661,7 @@ pub struct BeaconState {
     /// Per-id stake pools.
     pub pools: BTreeMap<StakePoolId, StakePool>,
     /// Running beacon randomness — BLAKE3 mix of the prior value with
-    /// the shard reveal leaves folded this epoch; an epoch where no
+    /// the shard reveal chains folded this epoch; an epoch where no
     /// reveal folds mixes the accepted ceremony VRF outputs instead.
     pub randomness: Randomness,
     /// Beacon committee for the current epoch — the validators running

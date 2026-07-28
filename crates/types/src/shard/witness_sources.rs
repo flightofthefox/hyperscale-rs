@@ -39,7 +39,7 @@ pub struct WitnessSources {
     /// locally recomputed load predicate.
     reshape_trigger: Option<ReshapeTrigger>,
     /// The proposer's per-block randomness reveal — the VRF proof over
-    /// `(network, shard, height)` whose digest is leaf 0 of the block's
+    /// `(network, shard, height)` whose digest is the link this block adds to
     /// witness contribution. Re-verified against the proposer's key;
     /// genesis blocks carry [`VrfProof::ZERO`].
     randomness_reveal: VrfProof,

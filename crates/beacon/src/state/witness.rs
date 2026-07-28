@@ -652,11 +652,6 @@ pub(super) fn apply_shard_payload(
             }
             None
         }
-        ShardWitnessPayload::RandomnessReveal { .. } => {
-            // Harvested for the randomness fold (`filter_and_roll_randomness`),
-            // not applied as validator state. No host event.
-            None
-        }
     }
 }
 

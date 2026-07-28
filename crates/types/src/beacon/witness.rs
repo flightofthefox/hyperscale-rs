@@ -15,7 +15,7 @@ use sbor::prelude::*;
 
 use crate::{
     BlockHeight, ConsensusPublicKey, ConsensusSignature, Hash, ParamVote, Round, ShardId, Stake,
-    StakePoolId, ValidatorId, VrfOutput,
+    StakePoolId, ValidatorId,
 };
 
 /// Domain tag for accumulator leaf hashing.
@@ -164,19 +164,6 @@ pub enum ShardWitnessPayload {
         /// Successor shard the emitter attests it synced (a split child,
         /// or the child a merge keeper runs).
         child: ShardId,
-    },
-    /// The block proposer's per-block randomness reveal — the digest of a
-    /// VRF over `(network, shard, height)`, unforgeable and unchooseable
-    /// (fixed by the proposer's key and slot). Leaf 0 of every block, so the
-    /// beacon folds the whole accumulator range of reveals into the epoch
-    /// seed while the proposer that wrote any interior reveal committed it
-    /// before the later reveals existed. The proof rides the block body and
-    /// is verified against the proposer's key at block validation; only the
-    /// output lands here. Beacon-side this mutates no validator state — it is
-    /// harvested for the randomness fold, so `apply_shard_payload` ignores it.
-    RandomnessReveal {
-        /// Digest of the proposer's VRF proof for this block's slot.
-        output: VrfOutput,
     },
 }
 

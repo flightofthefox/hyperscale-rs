@@ -487,32 +487,27 @@ mod tests {
             &missed,
             &sources,
         );
-        // Leaf 0 is the randomness reveal, then 1 MissedProposal + 3 readiness
-        // witnesses (sorted ascending by validator id, kind per sender) + the
-        // reshape trigger last.
-        assert_eq!(leaves.len(), 6);
+        // 1 MissedProposal + 3 readiness witnesses (sorted ascending by
+        // validator id, kind per sender) + the reshape trigger last.
+        assert_eq!(leaves.len(), 5);
         assert!(matches!(
             &leaves[0],
-            ShardWitnessPayload::RandomnessReveal { .. }
-        ));
-        assert!(matches!(
-            &leaves[1],
             ShardWitnessPayload::MissedProposal { .. }
         ));
-        match &leaves[2] {
+        match &leaves[1] {
             ShardWitnessPayload::Ready { id } => assert_eq!(id.inner(), 1),
             other => panic!("expected Ready, got {other:?}"),
         }
-        match &leaves[3] {
+        match &leaves[2] {
             ShardWitnessPayload::ReshapeReady { validator, .. } => assert_eq!(validator.inner(), 2),
             other => panic!("expected ReshapeReady, got {other:?}"),
         }
-        match &leaves[4] {
+        match &leaves[3] {
             ShardWitnessPayload::Ready { id } => assert_eq!(id.inner(), 3),
             other => panic!("expected Ready, got {other:?}"),
         }
         assert!(matches!(
-            &leaves[5],
+            &leaves[4],
             ShardWitnessPayload::ScheduleSplit { .. }
         ));
     }

@@ -12,7 +12,7 @@ use hyperscale_types::{
 use crate::state::pool::exit_placement;
 
 /// Domain tag for the ceremony-randomness mixer — the fallback seed
-/// path for epochs where no reveal leaf folded. Binds the BLAKE3 input
+/// path for epochs where no reveal chain folded. Binds the BLAKE3 input
 /// to "beacon randomness v1" so the digest can't collide with any
 /// other 32-byte BLAKE3 hash in the codebase (committee draw seed,
 /// pool draw seed, etc.).

@@ -356,9 +356,9 @@ impl ShardSourceTracker {
     ///   committee ages below that floor and every verifier abstains,
     ///   freezing the fold exactly when it most needs to advance.
     /// - One chunk can span several lagging crossings' leaves, so a fold
-    ///   that fell behind a dense witness stream (a reveal leaf on every
-    ///   block) catches up at the chunk cap per epoch rather than one
-    ///   crossing per epoch — which can never outrun live production.
+    ///   that fell behind a burst of governance leaves catches up at the
+    ///   chunk cap per epoch rather than one crossing per epoch — which
+    ///   could not outrun a shard emitting them faster than that.
     ///
     /// When every retained crossing is folded (`count <= watermark`) it falls
     /// back to the latest, so a terminated shard's folded terminal keeps being
