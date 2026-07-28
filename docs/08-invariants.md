@@ -4,7 +4,7 @@ The consolidated register of the system's safety and liveness properties, with s
 
 **Classification.** *Safety* — never violated in any reachable state, regardless of timing. *Liveness* — eventually holds under eventual synchrony. *Assumption* — a premise the deployment must establish; other properties are conditional on it. *Determinism* — a functional property (same inputs ⇒ same outputs across replicas) that safety properties reduce to.
 
-**Suggested verification order** (dependency-first): INV-SEC-1 (the premise) → INV-SHARD-1..9 (single-chain safety) → INV-BEACON-1..8 (topology determinism) → INV-EXEC-1..10 (atomic commitment) → INV-RESHAPE-1..11 (atomicity under topology change) → INV-SEC-2..14 / INV-STATE / INV-ECON / INV-DET (the supporting mechanisms and reductions).
+**Suggested verification order** (dependency-first): INV-SEC-1 (the premise) → INV-SHARD-1..9 (single-chain safety) → INV-BEACON-1..11 (topology determinism) → INV-EXEC-1..10 (atomic commitment) → INV-RESHAPE-1..11 (atomicity under topology change) → INV-SEC-2..14 / INV-STATE / INV-ECON / INV-DET (the supporting mechanisms and reductions).
 
 ---
 
@@ -56,7 +56,7 @@ The consolidated register of the system's safety and liveness properties, with s
 | **INV-BEACON-8** | Safety | **Terminal retention.** A terminated shard's boundary record (including its settled-waves root) is retained until every dependent has consumed it: split children seeded, merge parent composed, plus the retention horizon. |
 | **INV-BEACON-9** | Determinism | **Reveal chain derivation.** Each block's `reveal_chain` is a pure function of its parent header, its own reveal output, and the genesis-fixed epoch duration — reseeded exactly when its anchor epoch differs from its parent's. Proposer and verifier derive it byte-identically, and the verdict on a header never changes with later state. |
 | **INV-BEACON-10** | Safety | **Fenced reveals never seed.** No reveal from a block above a pending recovery's attested frontier reaches `state.randomness`: its anchor epoch's chain is dropped whole, and no later epoch's chain descends from it. |
-| **INV-BEACON-11** | Safety | **Reveal fold exactly once.** Each shard anchor epoch's reveal chain folds into the seed at most once — a drain re-fold of an already-recorded crossing contributes nothing. |
+| **INV-BEACON-11** | Safety | **Reveal fold exactly once.** Each shard anchor epoch's reveal chain folds into the seed at most once: only a crossing the fold has not already recorded seeds — a drain re-fold of the recorded crossing contributes nothing — and successive crossings on one chain anchor in strictly increasing epochs, so no later crossing re-closes an epoch an earlier one closed. Exactly-once is therefore per chain: two certified siblings crossing into one epoch would carry one anchor epoch under two block hashes, which takes quorum-scale equivocation outside INV-SEC-1's band, and a fork-flagged shard's crossings stop folding altogether. |
 
 ## Execution and atomic commitment — [04](04-atomic-commitment.md), [01 §2](01-consensus-layers.md)
 
