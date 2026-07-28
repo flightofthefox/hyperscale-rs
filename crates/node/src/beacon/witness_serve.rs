@@ -3,16 +3,16 @@
 //! Beacon validators outside a shard's committee pull witnesses lifted
 //! by that shard so they can verify proofs against the shard's
 //! QC-attested [`BeaconWitnessRoot`](hyperscale_types::BeaconWitnessRoot).
-//! This module is the responder side: read the anchor block's leaf
-//! count from its header, reconstruct the per-anchor accumulator from
-//! the retained CF payloads, and return one inclusion proof per
-//! requested leaf index.
+//! This module is the responder side: read the anchor block's witness
+//! window `[base, leaf_count)` from its header, rebuild that window from
+//! the retained CF payloads, and answer with one contiguous run plus the
+//! range proof lifting it to the window's root.
 
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
 use hyperscale_types::network::response::beacon::GetShardWitnessesResponse;
-use hyperscale_types::{Hash, ShardWitnessPayload, compute_range_proof};
+use hyperscale_types::{Hash, MAX_WITNESSES_PER_SHARD, ShardWitnessPayload, compute_range_proof};
 use tracing::{debug, warn};
 
 /// Serve an inbound shard-witness fetch request.
@@ -29,13 +29,15 @@ use tracing::{debug, warn};
 ///    is fork divergence — return empty so the requester falls through
 ///    to another peer rather than receiving proofs against the wrong
 ///    root.
-/// 3. Read retained leaf payloads via
-///    [`ShardChainReader::get_beacon_witness_payloads`](hyperscale_storage::ShardChainReader)
-///    up to `header.beacon_witness_leaf_count()`. A retention-pruned
-///    anchor returns short — without the whole window no root can be
-///    rebuilt, so the response is empty.
-/// 4. Clamp the requested run to the window and answer with its payloads
-///    plus one range proof against the anchor's witness root.
+/// 3. Resolve the run against the anchor's window: refuse a `lo` below
+///    the window base (those leaves are unprovable under this root), and
+///    cap `hi` at both the window's end and the fold's per-epoch budget.
+/// 4. Read the window's retained payloads via
+///    [`ShardChainReader::get_beacon_witness_payloads`](hyperscale_storage::ShardChainReader).
+///    A retention-pruned anchor reads short — without the whole window no
+///    root can be rebuilt, so the response is empty. Otherwise answer with
+///    the run's payloads plus one range proof against the anchor's
+///    witness root.
 ///
 /// The proof is scoped to the run it names, so the response carries no
 /// per-leaf positions: the requester knows `lo` from its own request and
@@ -84,19 +86,41 @@ fn build_chunk<S: ShardStorage>(
         return None;
     }
 
+    // A run reaching below the window base names leaves this root cannot
+    // prove. Refuse rather than clamp up to the base: the requester
+    // verifies at the `lo` it asked for, so a relocated run could only be
+    // rejected on arrival, and re-requesting it would spin.
+    let lo = req.lo.inner();
+    if lo < base {
+        debug!(
+            block_height = req.block_height.inner(),
+            base,
+            requested = lo,
+            "Shard-witness request: run starts below the anchor's window base"
+        );
+        return None;
+    }
+
     // Clamp the requested run to the window. The run is served whole —
     // the requester admits a chunk only when it covers exactly the range
     // the fold will apply, so truncating to a per-response page would
-    // produce a response nobody can use. `chunk_bounds` already caps the
-    // requested width at the fold's per-epoch budget.
-    let lo = req.lo.inner().max(base);
-    let hi = req.hi.inner().min(leaf_count_at_block_end);
+    // produce a response nobody can use.
+    //
+    // `hi` is unbounded on the wire, so the fold's per-epoch budget is
+    // enforced here rather than taken on trust: the response's payload
+    // array is bounded at that same width, and a wider run would overrun
+    // it. An honest requester's `chunk_bounds` never asks for more.
+    let hi = req
+        .hi
+        .inner()
+        .min(leaf_count_at_block_end)
+        .min(lo.saturating_add(MAX_WITNESSES_PER_SHARD as u64));
     if hi <= lo {
         return None;
     }
 
     let window = pending_chain.get_beacon_witness_payload_range(base, leaf_count_at_block_end);
-    if (window.len() as u64) < window_len {
+    if window.len() as u64 != window_len {
         debug!(
             block_height = req.block_height.inner(),
             base,
@@ -226,6 +250,31 @@ mod tests {
         (block_hash, root, leaf_count_at_block_end)
     }
 
+    /// A committed anchor whose witness window opens at leaf 4 and holds
+    /// three leaves — the shape a boundary block takes once the beacon
+    /// fold has advanced the shard's base past zero.
+    fn windowed_anchor() -> (PendingChain<SimShardStorage>, BlockHash, BeaconWitnessRoot) {
+        use hyperscale_storage::test_helpers::commit_block_with_witness_window;
+
+        let storage = Arc::new(SimShardStorage::default());
+        let window: Vec<_> = (1u64..=3).map(deposit).collect();
+        let block_hash = commit_block_with_witness_window(
+            storage.as_ref(),
+            BlockHeight::new(1),
+            4,
+            &window,
+            &window,
+            None,
+        );
+        let pending_chain = PendingChain::new(storage);
+        let root = pending_chain
+            .certified_header(BlockHeight::new(1))
+            .expect("committed anchor resolves")
+            .header()
+            .beacon_witness_root();
+        (pending_chain, block_hash, root)
+    }
+
     /// The served run recomputes to the anchor's root through the same
     /// predicate the fold uses, so responder and verifier cannot drift.
     fn verify_against(
@@ -296,33 +345,34 @@ mod tests {
         assert!(resp.payloads.is_empty());
     }
 
-    /// An anchor whose root commits a window starting past leaf zero: the
-    /// served run verifies at window-relative positions, and a request
-    /// reaching below the window is clamped up to its base.
+    /// A windowed anchor whose root commits leaves 4..7: the served run
+    /// verifies at the position the requester holds, which it derives as
+    /// `req.lo - base` exactly as the fold's `window_position` does.
     #[test]
-    fn fetch_serves_windowed_runs_and_clamps_below_window_requests() {
-        use hyperscale_storage::test_helpers::commit_block_with_witness_window;
+    fn fetch_serves_a_windowed_run() {
+        let (pending_chain, block_hash, root) = windowed_anchor();
 
-        let storage = Arc::new(SimShardStorage::default());
-        let window: Vec<_> = (1u64..=3).map(deposit).collect();
-        let block_hash = commit_block_with_witness_window(
-            storage.as_ref(),
+        let req = GetShardWitnessesRequest::new(
+            SHARD,
             BlockHeight::new(1),
-            4,
-            &window,
-            &window,
-            None,
+            block_hash,
+            LeafIndex::new(5),
+            LeafIndex::new(7),
         );
-        let pending_chain = PendingChain::new(storage);
-        let header = pending_chain
-            .certified_header(BlockHeight::new(1))
-            .expect("committed anchor resolves")
-            .header()
-            .clone();
-        let root = header.beacon_witness_root();
+        let resp = serve_shard_witnesses_request(&pending_chain, &req);
+        assert_eq!(resp.payloads.len(), 2);
+        // Window base is 4, so global leaf 5 sits at window position 1.
+        assert!(verify_against(&resp, root, 1, 3));
+    }
 
-        // Global leaves 4..7 are in the window; a request from 2 clamps up
-        // to the base at 4.
+    /// A run reaching below the window base is refused outright. Clamping
+    /// it up to the base would relocate the run away from the `lo` the
+    /// requester verifies against, so the answer could only be rejected on
+    /// arrival and re-requested forever.
+    #[test]
+    fn fetch_below_the_window_base_returns_empty() {
+        let (pending_chain, block_hash, _root) = windowed_anchor();
+
         let req = GetShardWitnessesRequest::new(
             SHARD,
             BlockHeight::new(1),
@@ -331,8 +381,8 @@ mod tests {
             LeafIndex::new(7),
         );
         let resp = serve_shard_witnesses_request(&pending_chain, &req);
-        assert_eq!(resp.payloads.len(), 3);
-        assert!(verify_against(&resp, root, 0, 3));
+        assert!(resp.payloads.is_empty());
+        assert!(resp.range_proof.is_empty());
     }
 
     #[test]
@@ -385,6 +435,38 @@ mod tests {
         let resp = serve_shard_witnesses_request(&pending_chain, &req);
         assert_eq!(resp.payloads.len(), 2);
         assert!(verify_against(&resp, root, 1, 3));
+    }
+
+    /// `hi` is unbounded on the wire, but the response's payload array is
+    /// bounded at the fold's per-epoch budget. A request naming the whole
+    /// u64 range against a window wider than that budget is answered with
+    /// the budget's worth of leaves — not refused, and not a panic on the
+    /// bounded-array conversion.
+    #[test]
+    fn fetch_caps_an_unbounded_run_at_the_fold_budget() {
+        let storage = Arc::new(SimShardStorage::default());
+        let leaves: Vec<_> = (1u64..=(MAX_WITNESSES_PER_SHARD as u64 + 1))
+            .map(deposit)
+            .collect();
+        let window_len = leaves.len();
+        let (block_hash, root, _count) = commit_block_with_witnesses(
+            &storage,
+            BlockHeight::new(1),
+            &leaves,
+            BeaconWitnessLeafCount::ZERO,
+        );
+        let pending_chain = PendingChain::new(storage);
+
+        let req = GetShardWitnessesRequest::new(
+            SHARD,
+            BlockHeight::new(1),
+            block_hash,
+            LeafIndex::new(0),
+            LeafIndex::new(u64::MAX),
+        );
+        let resp = serve_shard_witnesses_request(&pending_chain, &req);
+        assert_eq!(resp.payloads.len(), MAX_WITNESSES_PER_SHARD);
+        assert!(verify_against(&resp, root, 0, window_len));
     }
 
     #[test]

@@ -15,8 +15,9 @@ use crate::{
 /// answers the beacon fold's witness fetches for the window it seeded —
 /// an all-cold recovery committee would otherwise hold no payloads below
 /// its anchor and starve both. Pages are capped by the payload-sized
-/// [`MAX_WITNESSES_PER_FETCH`], the bound the beacon's own witness fetch
-/// decodes under.
+/// [`MAX_WITNESSES_PER_FETCH`]; the beacon's own witness fetch pages under
+/// no such bound, since a range proof only verifies for the whole run it
+/// covers — that path decodes under `MAX_WITNESSES_PER_SHARD` instead.
 ///
 /// The verifier trusts none of it bare: `header` must hash to the
 /// beacon-attested anchor `block_hash`, and the hashes of the fully
