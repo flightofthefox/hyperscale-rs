@@ -264,14 +264,13 @@ impl VoteKeeper {
             return vec![];
         }
 
-        let total_power = topology_snapshot.committee_votes(local_shard);
         vote_set.buffer_unverified_vote(prep.voter_index, vote, prep.public_key);
         trace!(
             validator = ?me,
             block_hash = ?block_hash,
             verified_power = vote_set.verified_power().inner(),
             unverified_power = vote_set.unverified_power().inner(),
-            total_power = total_power.inner(),
+            total_power = vote_set.committee_votes().inner(),
             "Vote buffered"
         );
 

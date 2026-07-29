@@ -63,6 +63,15 @@ pub struct VoteSet {
     /// Number of unverified votes buffered.
     unverified_power: VoteCount,
 
+    /// Committee votes this set tallies against — one per seat, latched from
+    /// the committee that governs the voted block when the set is created.
+    ///
+    /// The quorum denominator is a property of the set, not something to
+    /// re-resolve later: by the time a verification batch returns, the block's
+    /// committee may no longer resolve (its parent pruned, or not yet
+    /// arrived), and re-deriving it there would strand the tally.
+    committee_votes: VoteCount,
+
     /// Voters counted into the verified set. Permanent for the life of the
     /// vote set: a verified voter is never tallied twice, across its own vote
     /// and any number of batch results.
@@ -107,6 +116,7 @@ impl VoteSet {
             verified_timestamp_weight_sum: 0,
             unverified_votes: Vec::new(),
             unverified_power: VoteCount::ZERO,
+            committee_votes: VoteCount::of(num_validators),
             verified_voters: vec![false; num_validators],
             buffered_voters: vec![false; num_validators],
             pending_verification: false,
@@ -114,15 +124,9 @@ impl VoteSet {
         }
     }
 
-    /// Committee votes this set tallies against — one per seat, latched at
-    /// construction from the committee that governs the voted block.
-    ///
-    /// The quorum denominator is a property of the set, not something to
-    /// re-resolve later: by the time a verification batch returns, the block's
-    /// committee may no longer resolve (its parent pruned, or not yet
-    /// arrived), and re-deriving it there would strand the tally.
+    /// Committee votes this set tallies against — see the field.
     pub const fn committee_votes(&self) -> VoteCount {
-        VoteCount::of(self.verified_voters.len())
+        self.committee_votes
     }
 
     /// Get the block height.

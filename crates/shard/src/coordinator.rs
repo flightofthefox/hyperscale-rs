@@ -610,9 +610,10 @@ impl ShardCoordinator {
     }
 
     /// Weighted timestamp selecting the committee for the height in progress /
-    /// our next proposal. We extend `high_qc`, so the block we are about to
-    /// propose is a child of the block `high_qc` certifies, and a child's
-    /// committee anchors on its parent: `committee_anchor(high_qc.block_hash())`.
+    /// our next proposal: the [`Self::block_anchor`] of the block we are about
+    /// to extend, since a child's committee anchors on its parent. The build
+    /// path resolves its committee from the same parent through
+    /// [`Self::committee_for_child_of`], so election and build cannot disagree.
     ///
     /// Keying on the tip block rather than on our own aggregate over it is
     /// what makes the proposer agreed. A QC's weighted timestamp is the mean
@@ -622,16 +623,13 @@ impl ShardCoordinator {
     /// committees and elects two leaders, and the round's votes split between
     /// proposals that both verify.
     ///
-    /// `None` when the tip block is unknown by every route, so its anchor
-    /// can't be resolved and the caller stalls. With no QC yet the chain sits
-    /// at its genesis, whose origin anchor is `ZERO` for root chains and the
-    /// parent's terminal canonical timestamp for a split child (a `ZERO`
-    /// fallback would resolve a child's first proposal against epoch 0).
+    /// `None` when that block is unknown by every route, so its anchor can't
+    /// be resolved and the caller stalls. With no QC yet the parent is the
+    /// committed tip, whose anchor a split child's genesis carries from the
+    /// parent chain's terminal canonical timestamp — resolving its first
+    /// proposal in the window it inherited rather than epoch 0.
     fn tip_anchor_ts(&self) -> Option<WeightedTimestamp> {
-        self.latest_qc.as_ref().map_or_else(
-            || Some(self.chain_origin.anchor_wt),
-            |qc| self.block_anchor(qc.block_hash()),
-        )
+        self.block_anchor(self.chain_view().proposal_parent().0)
     }
 
     /// Committee that signed/produced `block_hash`. `None` to stall: the block
