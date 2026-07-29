@@ -303,15 +303,19 @@ pub struct ExecutionCoordinator {
 }
 
 impl ExecutionCoordinator {
-    /// Create a new execution state machine with its own fresh stores.
-    /// For hosts running multiple same-shard validators, prefer
-    /// [`Self::with_shared_stores`] to share one set of stores across
-    /// every coordinator in the shard.
+    /// Create a new execution state machine with its own fresh stores and a
+    /// genesis commit frontier. For hosts running multiple same-shard
+    /// validators, prefer [`Self::with_shared_stores`] to share one set of
+    /// stores across every coordinator in the shard; for a recovered chain,
+    /// it also seeds the frontier from storage.
     #[must_use]
     pub fn new(me: ValidatorId, local_shard: ShardId) -> Self {
         Self::with_shared_stores(
             me,
             local_shard,
+            BlockHeight::GENESIS,
+            WeightedTimestamp::ZERO,
+            WeightedTimestamp::ZERO,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizedWaveStore::new()),
         )
@@ -322,18 +326,33 @@ impl ExecutionCoordinator {
     /// one set of stores so the `IoLoop`'s inbound fetch handler and
     /// sync-inventory bloom read from a single canonical view per shard
     /// rather than vnode-0's incidentally-convergent copy.
+    ///
+    /// The three commit-frontier scalars seed from the recovered tip
+    /// (`RecoveredState`'s height, `block_anchor_wt()`, and
+    /// `committee_anchor_wt()`; genesis/`ZERO` for a fresh chain). Seeding
+    /// them keeps the first post-restart commit on the exact carry path —
+    /// height-contiguous with the recovered tip, its committee anchor is the
+    /// tip's own anchor — where a zero frontier would take the gap fallback
+    /// and classify that block's waves under the window it opens: a replica
+    /// restarted just below an epoch cut that a reshape moves would group
+    /// waves differently from its peers and split execution votes. A seeded
+    /// frontier also gives pre-first-commit bookkeeping (expected-cert ages,
+    /// conflict detection) a real clock instead of a zero one.
     #[must_use]
     pub fn with_shared_stores(
         me: ValidatorId,
         local_shard: ShardId,
+        committed_height: BlockHeight,
+        committed_block_anchor_wt: WeightedTimestamp,
+        committed_committee_anchor_wt: WeightedTimestamp,
         exec_certs: Arc<ExecCertStore>,
         finalized: Arc<FinalizedWaveStore>,
     ) -> Self {
         Self {
             finalized,
-            committed_height: BlockHeight::GENESIS,
-            committed_ts: WeightedTimestamp::ZERO,
-            committed_committee_anchor_wt: WeightedTimestamp::ZERO,
+            committed_height,
+            committed_ts: committed_block_anchor_wt,
+            committed_committee_anchor_wt,
             waves: WaveRegistry::new(),
             early: EarlyArrivalBuffer::new(),
             provisioning: ProvisioningTracker::new(),
@@ -1732,16 +1751,24 @@ impl ExecutionCoordinator {
         // Update committed height + timestamp before anything else — needed
         // for timeout calculations and pruning even when there are no new
         // transactions.
-        let first_commit = self.committed_ts == WeightedTimestamp::ZERO;
+        //
+        // "First commit" means the chain has never committed, not that the
+        // clock reads zero: a root chain's first blocks genuinely anchor at
+        // zero, and their zero is a carriable parent anchor, not a gap.
+        let first_commit = self.committed_height == BlockHeight::GENESIS
+            && self.committed_ts == WeightedTimestamp::ZERO;
         if height > self.committed_height {
             let own_anchor = certified.block().header().parent_qc().weighted_timestamp();
             // This block's committee anchors on its parent, whose anchor is
-            // the one the previous commit carried. Contiguity is what makes
-            // the carry exact — across a gap (the first commit, a snap-synced
-            // or halt-recovered suffix) there is no parent anchor to inherit,
-            // so the block's own stands in: the same window except when the
-            // gap ends on an epoch's first block, and exact again at the next
-            // commit.
+            // the one the previous commit carried — or the recovered frontier
+            // seeded at construction, which is the same value across a
+            // restart. Contiguity is what makes the carry exact — across a
+            // gap (a fresh chain's first commit, or a commit landing above a
+            // hole) there is no parent anchor to inherit, so the block's own
+            // stands in: the same window except when the gap ends on an
+            // epoch's first block, and exact again at the next commit. A
+            // fresh chain is exact too: its genesis QC carries the chain
+            // origin's anchor, which *is* the parent anchor of block one.
             self.committed_committee_anchor_wt =
                 if !first_commit && height == self.committed_height.next() {
                     self.committed_ts
@@ -4703,6 +4730,77 @@ mod tests {
             WeightedTimestamp::from_millis(1_500),
             "its own anchor still drives the deterministic clock",
         );
+    }
+
+    /// A root chain's first blocks genuinely anchor at zero, and that zero
+    /// is a carriable parent anchor, not an uninitialized clock: the second
+    /// commit classifies in the window its parent anchored (epoch 0) even
+    /// when the chain stalled long enough at genesis for the block to date
+    /// itself past a cut.
+    #[test]
+    fn a_zero_anchor_at_genesis_is_carried_not_treated_as_a_gap() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
+        let topo = make_test_topology();
+
+        let commit = |state: &mut ExecutionCoordinator, height: u64, anchor_ms: u64| {
+            let block = make_live_block_on_shard(
+                ShardId::ROOT,
+                BlockHeight::new(height),
+                anchor_ms,
+                ValidatorId::new(0),
+                vec![],
+            );
+            let _ = state.on_block_committed(&topo, &test_certify(block, anchor_ms));
+        };
+
+        // Block 1 anchors at genesis zero; block 2 dates itself far past it.
+        commit(&mut state, 1, 0);
+        commit(&mut state, 2, 1_500);
+
+        assert_eq!(
+            state.committed_committee_anchor_wt,
+            WeightedTimestamp::ZERO,
+            "block 2's committee anchors on block 1, at genesis zero",
+        );
+    }
+
+    /// A restarted replica's first commit classifies exactly like a
+    /// non-restarted peer's: the frontier seeded from the recovered tip is
+    /// the parent anchor the carry needs, so the commit extending the tip
+    /// resolves the window the tip anchored — not the one the new block
+    /// opens, which a zero frontier's gap fallback would pick and which a
+    /// reshape cut between the two turns into a vote-splitting divergence.
+    #[test]
+    fn a_seeded_frontier_carries_the_recovered_anchor_across_a_restart() {
+        let topo = make_test_topology();
+        // The recovered tip: height 5, its own anchor at 900 ms.
+        let mut state = ExecutionCoordinator::with_shared_stores(
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            BlockHeight::new(5),
+            WeightedTimestamp::from_millis(900),
+            WeightedTimestamp::from_millis(800),
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizedWaveStore::new()),
+        );
+
+        // The first post-restart commit extends the tip and dates itself
+        // past it.
+        let block = make_live_block_on_shard(
+            ShardId::ROOT,
+            BlockHeight::new(6),
+            1_100,
+            ValidatorId::new(0),
+            vec![],
+        );
+        let _ = state.on_block_committed(&topo, &test_certify(block, 1_100));
+
+        assert_eq!(
+            state.committed_committee_anchor_wt,
+            WeightedTimestamp::from_millis(900),
+            "the commit extending the recovered tip is classified in the tip's window",
+        );
+        assert_eq!(state.committed_ts, WeightedTimestamp::from_millis(1_100));
     }
 
     /// Commit-time wave/provision classification anchors on the block's

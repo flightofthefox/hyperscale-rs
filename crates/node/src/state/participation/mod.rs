@@ -109,6 +109,13 @@ impl ShardParticipation {
         exec_cert_store: Arc<ExecCertStore>,
         finalized_wave_store: Arc<FinalizedWaveStore>,
     ) -> Self {
+        // Execution's commit frontier seeds from the same recovered tip the
+        // shard coordinator restores, so the first post-restart commit
+        // classifies its waves under the carried committee anchor exactly as
+        // a non-restarted peer does.
+        let committed_height = recovered.committed_height;
+        let committed_block_anchor_wt = recovered.block_anchor_wt();
+        let committed_committee_anchor_wt = recovered.committee_anchor_wt();
         Self {
             local_shard,
             shard_coordinator: ShardCoordinator::new(
@@ -121,6 +128,9 @@ impl ShardParticipation {
             execution_coordinator: ExecutionCoordinator::with_shared_stores(
                 me,
                 local_shard,
+                committed_height,
+                committed_block_anchor_wt,
+                committed_committee_anchor_wt,
                 exec_cert_store,
                 finalized_wave_store,
             ),
