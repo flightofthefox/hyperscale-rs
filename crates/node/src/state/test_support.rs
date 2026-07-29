@@ -131,6 +131,7 @@ fn test_beacon_coordinator(committee: &TestCommittee, me: ValidatorId) -> Beacon
         me,
         ShardId::ROOT,
         WeightedTimestamp::ZERO,
+        WeightedTimestamp::ZERO,
         network,
         config_hash,
     )

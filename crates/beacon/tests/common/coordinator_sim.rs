@@ -248,6 +248,7 @@ impl CoordinatorSim {
                     members[i].0,
                     ShardId::ROOT,
                     WeightedTimestamp::ZERO,
+                    WeightedTimestamp::ZERO,
                     network.clone(),
                     config_hash,
                 )

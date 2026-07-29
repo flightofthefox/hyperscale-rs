@@ -142,6 +142,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
                 validator,
                 args.shard,
                 args.recovered.committee_anchor_ts(),
+                args.recovered.block_anchor_ts(),
                 args.beacon_network.clone(),
                 args.beacon_config_hash,
             );
@@ -224,6 +225,7 @@ pub fn seat_follower(args: SeatFollower<'_>) -> VnodeInit {
         beacon_history,
         args.validator,
         ShardId::ROOT,
+        WeightedTimestamp::ZERO,
         WeightedTimestamp::ZERO,
         args.beacon_network,
         args.beacon_config_hash,

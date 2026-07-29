@@ -125,6 +125,7 @@ impl Fixture {
             me,
             shard,
             WeightedTimestamp::ZERO,
+            WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             self.config_hash,
         );
@@ -156,6 +157,7 @@ impl Fixture {
             vec![self.genesis_state.clone()],
             me,
             ShardId::ROOT,
+            WeightedTimestamp::ZERO,
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             self.config_hash,

@@ -76,8 +76,9 @@ const MAX_INPUT_DWELL_REARMS: u32 = 6;
 /// Oldest epoch the topology schedule must retain — the minimum of the
 /// consumer frontiers that still verify QC-bearing artifacts:
 ///
-/// - the local shard chain's committee anchor (`local_frontier`, the
-///   committed tip's parent-QC weighted timestamp): live votes/headers and
+/// - the local shard chain's committee anchor (`local_frontier`): the
+///   committed tip is signed by the committee its *parent* anchors, so this
+///   trails the tip's own anchor by one commit. Live votes/headers and
 ///   synced blocks all key their schedule lookups at or after it;
 /// - each shard's last live boundary epoch, minus one window of slack (a
 ///   boundary block is signed by the committee at its *parent* QC's weighted
@@ -260,6 +261,18 @@ pub struct BeaconCoordinator {
     /// [`on_local_block_committed`](Self::on_local_block_committed).
     local_frontier: WeightedTimestamp,
 
+    /// The committed tip's *own* anchor, one hop newer than
+    /// [`Self::local_frontier`] — held so the next commit can shift it into
+    /// place. A block's committee anchors on its parent, so the anchor a
+    /// commit reports becomes the frontier only once the block after it
+    /// commits.
+    ///
+    /// Kept rather than derived: consecutive blocks' anchors sit an
+    /// unbounded number of windows apart when the chain stalls between them
+    /// (a QC aggregated after a view-change gap dates far past its parent's),
+    /// so no fixed slack subtracted from the frontier bounds it.
+    local_block_anchor: WeightedTimestamp,
+
     me: ValidatorId,
 
     /// Shard the host vnode belongs to. Beacon is process-wide
@@ -320,6 +333,7 @@ impl BeaconCoordinator {
         me: ValidatorId,
         local_shard: ShardId,
         local_frontier: WeightedTimestamp,
+        local_block_anchor: WeightedTimestamp,
         network: NetworkDefinition,
         expected_config_hash: GenesisConfigHash,
     ) -> Self {
@@ -399,6 +413,7 @@ impl BeaconCoordinator {
             local_shard,
             topology_schedule,
             local_frontier,
+            local_block_anchor,
             me,
             network,
             now: LocalTimestamp::ZERO,
@@ -440,7 +455,11 @@ impl BeaconCoordinator {
     /// the new tip's parent-QC weighted timestamp, the node-local frontier
     /// [`retention_floor`] keeps the schedule open for.
     pub const fn on_local_block_committed(&mut self, anchor_ts: WeightedTimestamp) {
-        self.local_frontier = anchor_ts;
+        // `anchor_ts` is the committed block's own anchor, which selects the
+        // committee of the block *after* it. The committee that signed the
+        // block just committed anchors one hop back — the value the previous
+        // commit reported — so the frontier trails by one.
+        self.local_frontier = std::mem::replace(&mut self.local_block_anchor, anchor_ts);
     }
 
     /// Schedule the first `BeaconCommitteeStart` timer so the upcoming
@@ -2690,6 +2709,7 @@ mod tests {
             me,
             ShardId::ROOT,
             WeightedTimestamp::ZERO,
+            WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
         )
@@ -3300,6 +3320,7 @@ mod tests {
             ValidatorId::new(0),
             ShardId::ROOT,
             WeightedTimestamp::ZERO,
+            WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
         );
@@ -3319,6 +3340,7 @@ mod tests {
             vec![state],
             ValidatorId::new(0),
             ShardId::ROOT,
+            WeightedTimestamp::ZERO,
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
@@ -3355,6 +3377,7 @@ mod tests {
             vec![state],
             ValidatorId::new(0),
             ShardId::ROOT,
+            WeightedTimestamp::ZERO,
             WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             GenesisConfigHash::ZERO,
@@ -3799,6 +3822,7 @@ mod tests {
             ValidatorId::new(0),
             ShardId::ROOT,
             WeightedTimestamp::ZERO,
+            WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
         );
@@ -3831,6 +3855,7 @@ mod tests {
                 vec![state],
                 ValidatorId::new(0),
                 ShardId::ROOT,
+                WeightedTimestamp::ZERO,
                 WeightedTimestamp::ZERO,
                 NetworkDefinition::simulator(),
                 config_hash,
@@ -5473,6 +5498,7 @@ mod tests {
             ValidatorId::new(0),
             ShardId::ROOT,
             WeightedTimestamp::ZERO,
+            WeightedTimestamp::ZERO,
             NetworkDefinition::simulator(),
             config_hash,
         )
@@ -5551,6 +5577,30 @@ mod tests {
     }
 
     /// Each consumer frontier can become the floor: the lagging one wins.
+    #[test]
+    fn the_local_frontier_trails_the_committed_tips_own_anchor() {
+        // The shard resolves its committed tip's committee from the tip's
+        // *parent* anchor, so the floor has to sit there and not at the tip's
+        // own — otherwise the window that verifies the parent QC over the tip
+        // is evictable. A fixed slack cannot stand in for the real value:
+        // consecutive anchors sit an unbounded number of windows apart when
+        // the chain stalls between the two blocks, as it does here.
+        let mut coord = new_coord(ValidatorId::new(0));
+        let anchor = |ms: u64| WeightedTimestamp::from_millis(ms);
+
+        coord.on_local_block_committed(anchor(1_000));
+        coord.on_local_block_committed(anchor(9_000));
+        assert_eq!(
+            coord.local_frontier,
+            anchor(1_000),
+            "committing a block past a long stall leaves the frontier at the anchor its parent \
+             carried, not the one it dates itself by",
+        );
+
+        coord.on_local_block_committed(anchor(9_500));
+        assert_eq!(coord.local_frontier, anchor(9_000));
+    }
+
     #[test]
     fn retention_floor_is_the_minimum_consumer_frontier() {
         let shard = ShardId::ROOT;
