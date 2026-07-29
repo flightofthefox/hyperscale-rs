@@ -415,15 +415,18 @@ impl ShardCoordinator {
             .as_deref()
             .map_or(Round::INITIAL, QuorumCertificate::round);
         let initial_view = high_qc_round.next();
-        // The committed tip's committee was keyed on its parent QC's weighted
-        // timestamp, and the live commit path anchors `committed_ts` on that
-        // same value; storage recovers it from the tip's stored header. When it
-        // didn't (fresh start, or genesis tip), fall back to the tip's own WT —
-        // identical except when the recovered tip is an epoch's first block, and
-        // exact again after the next commit. Restoring both `committed_ts` and
-        // `committed_anchor_ts` from it keeps a restarted node's BFT clock equal
-        // to a non-restarted peer's rather than one to two blocks ahead.
-        let committed_anchor_ts = recovered.committee_anchor_ts();
+        // Both of the tip's anchors come back from stored headers: its own from
+        // the tip's, and its committee's from the header one height below,
+        // since a block's committee keys on its parent. Each falls back a hop
+        // when its header is absent (fresh start, genesis tip, snap-synced
+        // boundary, parent pruned past retention) — the fallback names the same
+        // committee except when the tip sits at an epoch's first block, and the
+        // next commit reseats both exactly. `committed_ts` shares the tip's own
+        // anchor, which is what the live commit path sets it to, so a restarted
+        // node's BFT clock equals a non-restarted peer's rather than running one
+        // to two blocks ahead.
+        let committed_anchor_ts = recovered.block_anchor_ts();
+        let committed_committee_anchor_ts = recovered.committee_anchor_ts();
         let recovered_registers = recovered
             .safe_vote_registers
             .get(&me)
@@ -436,7 +439,7 @@ impl ShardCoordinator {
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
             committed_ts: committed_anchor_ts,
             committed_anchor_ts,
-            committed_committee_anchor_ts: committed_anchor_ts,
+            committed_committee_anchor_ts,
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
             pending_bytes_deltas: HashMap::new(),
@@ -6262,6 +6265,58 @@ mod tests {
             grandchild_committee.committee_for_shard(shard),
             epoch1.committee_for_shard(shard),
             "the epoch advances one block after the anchor crosses N·ED",
+        );
+    }
+
+    #[test]
+    fn a_restarted_replica_resolves_its_tips_own_committee() {
+        // Storage recovers two anchors because the tip's committee keys on the
+        // header below it, and that header survives nowhere else: it is pruned
+        // from `pending_blocks` and it is not `committed_hash`. Seeding both
+        // from the tip's own anchor would resolve the tip against the window it
+        // opens rather than the one that signed it — one epoch late whenever
+        // the tip is an epoch's first block, which is exactly when the parent
+        // QC over the tip fails to verify and the restart costs a vote.
+        const ED: u64 = 1_000;
+        let shard = ShardId::ROOT;
+
+        let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
+        let epoch1 = Arc::new(committee_snapshot_with_ids(&[10, 11, 12, 13]));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
+
+        // A tip that is an epoch's first block: its own anchor sits at the cut,
+        // the one its parent carried just below.
+        let tip = BlockHash::from_raw(Hash::from_bytes(b"restarted_tip"));
+        let state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            shard,
+            ShardConsensusConfig::default(),
+            RecoveredState {
+                committed_height: BlockHeight::new(9),
+                committed_hash: Some(tip),
+                committed_anchor_ts: Some(WeightedTimestamp::from_millis(ED)),
+                committed_committee_anchor_ts: Some(WeightedTimestamp::from_millis(ED - 1)),
+                ..RecoveredState::default()
+            },
+        );
+
+        assert_eq!(
+            state
+                .committee_of_block(&schedule, tip)
+                .expect("the tip's committee is in the schedule")
+                .committee_for_shard(shard),
+            epoch0.committee_for_shard(shard),
+            "the tip was signed by the committee its parent anchors",
+        );
+        assert_eq!(
+            state
+                .committee_for_child_of(&schedule, tip)
+                .expect("the extending block's committee is in the schedule")
+                .committee_for_shard(shard),
+            epoch1.committee_for_shard(shard),
+            "the block extending the tip is governed by the window the tip opens",
         );
     }
 

@@ -73,7 +73,10 @@ impl RocksDbShardStorage {
             anchor_qc: None,
             committed_in_flight: None,
             committed_reveal_chain: self.committed_reveal_chain(committed_height),
-            committed_anchor_ts: self.committed_anchor_ts(committed_height),
+            committed_anchor_ts: self.anchor_ts_at(committed_height),
+            committed_committee_anchor_ts: committed_height
+                .prev()
+                .and_then(|parent_height| self.anchor_ts_at(parent_height)),
             jmt_root: jmt_root_opt,
             beacon_witness_start,
             beacon_witness_leaf_hashes,
@@ -101,16 +104,16 @@ impl RocksDbShardStorage {
             .collect()
     }
 
-    /// Weighted timestamp of the committed tip's parent QC — the anchor its
-    /// committee was keyed on (`committee = at(committed_anchor_ts)`). Read
-    /// from the committed block's stored header. `None` when no block is
-    /// stored at `committed_height` (fresh start / genesis tip), where the
-    /// coordinator falls back to the tip's own weighted timestamp.
-    fn committed_anchor_ts(&self, committed_height: BlockHeight) -> Option<WeightedTimestamp> {
+    /// Weighted timestamp of the parent QC on the stored header at `height` —
+    /// that block's own position on the weighted-time grid. Read at the
+    /// committed height it anchors the tip, and one below it the committee
+    /// that signed the tip. `None` when no block is stored there (fresh start
+    /// / genesis tip, or a parent pruned past retention), where the
+    /// coordinator falls back a hop.
+    fn anchor_ts_at(&self, height: BlockHeight) -> Option<WeightedTimestamp> {
         let cf = self.cf();
         let blocks_cf = BlocksCf::handle(&cf);
-        let metadata: BlockMetadata =
-            get::<BlocksCf>(&*self.db, blocks_cf, &committed_height.inner())?;
+        let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.inner())?;
         Some(metadata.header().parent_qc().weighted_timestamp())
     }
 

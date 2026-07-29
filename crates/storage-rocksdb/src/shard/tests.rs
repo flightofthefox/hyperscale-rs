@@ -4,8 +4,9 @@ use std::sync::Arc;
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::test_helpers::{
     db_node_key, make_database_update, make_mapped_database_update, make_test_block,
-    make_test_certified, make_test_execution_certificate, make_test_qc, make_test_receipt,
-    make_test_wave_certificate, test_ec_storage_batch as helpers_test_ec_storage_batch,
+    make_test_block_with_anchor_wt, make_test_certified, make_test_execution_certificate,
+    make_test_qc, make_test_receipt, make_test_wave_certificate,
+    test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
     test_witness_payload_range_reads as helpers_test_witness_payload_range_reads,
 };
@@ -438,6 +439,43 @@ fn test_recovery_seeds_committed_anchor_from_parent_qc() {
         recovered.latest_qc.map(|qc| qc.weighted_timestamp()),
         Some(WeightedTimestamp::from_millis(1000)),
         "sanity: the tip's own QC carries the distinct, non-zero timestamp",
+    );
+}
+
+#[test]
+fn test_recovery_seeds_committee_anchor_from_the_header_below_the_tip() {
+    let temp_dir = TempDir::new().unwrap();
+    // Two committed heights whose anchors sit in different windows: the tip's
+    // own at 200, the one its parent carried at 100.
+    let parent = make_test_block_with_anchor_wt(BlockHeight::new(1), 100);
+    let tip = make_test_block_with_anchor_wt(BlockHeight::new(2), 200);
+    let tip_qc = make_test_qc(&tip);
+
+    {
+        let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+        commit_empty(&storage, &parent, &make_test_qc(&parent));
+        commit_empty(&storage, &tip, &tip_qc);
+        storage.set_chain_metadata(
+            BlockHeight::new(2),
+            Some(*tip.hash().as_raw()),
+            Some(&*tip_qc),
+        );
+    }
+
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    let recovered = storage.load_recovered_state();
+
+    // A block's committee keys on its parent, so the committee that signed the
+    // tip anchors one height below it. Recovering only the tip's own anchor
+    // would resolve the tip against the window it opens.
+    assert_eq!(
+        recovered.committed_anchor_ts,
+        Some(WeightedTimestamp::from_millis(200)),
+    );
+    assert_eq!(
+        recovered.committed_committee_anchor_ts,
+        Some(WeightedTimestamp::from_millis(100)),
+        "the tip's committee anchor comes from the header below it",
     );
 }
 
