@@ -452,10 +452,10 @@ the *transition kernel* — measurable at every occupied corrupt count — and
   hold in seats.
 - **Crossing = compromise** stays conservative by choice. **Unbiased
   randomness** holds up to two priced residuals. On the primary path the
-  epoch seed folds mandatory reveal leaves and the steering residual is a
-  β-gated window-edge best-of-≈2 (§10.3) — on the §3 cliff that moves the
-  crossing lines by well under half a point of β. An epoch where no chunk
-  folds falls back to a grindable reveal ceremony (§10.4) — rare, and
+  epoch seed folds each crossing shard's per-epoch reveal chain and the
+  steering residual is a β-gated window-edge best-of-≈2 (§10.3) — on the §3
+  cliff that moves the crossing lines by well under half a point of β. An
+  epoch where no crossing folds falls back to a grindable reveal ceremony (§10.4) — rare, and
   self-announcing when adversarially induced. The tables of §1–§8 price the
   unsteered draw; §10 prices both deviations.
 
@@ -626,36 +626,40 @@ only route to 2f+1 at plausible β, so prevention's whole job is keeping the
 the cliff's slope (roughly 4× per point of β) even a residual best-of-2 per
 event moves these lines by well under half a point.
 
-### 10.2 The seed: reveal leaves in the beacon-witness accumulator
+### 10.2 The seed: a per-epoch reveal chain on the crossing header
 
-Every shard block carries a **mandatory reveal leaf**: the proposer's
+Every shard block carries a **mandatory reveal**: the proposer's
 deterministic hash-based VRF over `(shard, height)` — unforgeable and
 unchooseable (fixed by key and slot before the epoch), verified by the shard
-committee at block validation — appended to the per-shard beacon-witness
-accumulator the chain already maintains. The epoch seed folds each crossing
-shard's watermark-to-boundary leaf range `[prior, chunk_end)`, the exact
-range the beacon already applies to mutate its own state, verified
-leaf-by-leaf against the 2f+1-certified `beacon_witness_root`.
+committee at block validation. Each block folds its reveal into the running
+`reveal_chain` its header commits, reseeding whenever the block's anchor
+epoch (`epoch_for(parent_qc.weighted_timestamp)`) differs from its parent's.
+A boundary block is the last block anchored in the epoch its crossing ends,
+so the chain it carries is that epoch's closed run, QC-attested on the
+header the beacon already binds. The epoch seed folds one such chain value
+per crossing shard: one 32-byte commitment covering that shard's whole epoch.
 
 Two properties fall out with no new assumption. **There is no include/omit
-lever:** the folded set is a consensus-derived range, not a per-member
-choice, and a block without its valid reveal leaf is invalid — "propose or
-forfeit the slot" replaces "append or quietly omit." **Interior leaves are
-blind unconditionally:** a leaf at accumulator position p is chain-attested
-to precede everything after it, so when a proposer commits an interior reveal
-the later leaves that will join the fold *do not yet exist*. This is a fact
-about certified accumulator position, not a network-timing assumption — the
-property header- and aggregate-blinder designs lack (rejected: both need a
-partial-synchrony race and a shard-count threshold to make dilution
-load-bearing, where the accumulator needs neither).
+lever:** the chain is consensus-derived, not a per-member selection — a block
+whose chain does not extend its parent's is invalid, so "propose or forfeit
+the slot" replaces "append or quietly omit," and a proposer cannot drop a
+predecessor's reveal without breaking a link every verifier recomputes.
+**Interior reveals are blind unconditionally:** a link binds its predecessor
+by hash, so when a proposer commits an interior reveal the later links that
+will absorb it *do not yet exist*. This is a fact about chain descent, not a
+network-timing assumption — the property header- and aggregate-blinder
+designs lack (rejected: both need a partial-synchrony race and a shard-count
+threshold to make dilution load-bearing, where the chain needs neither).
 
-Costs and edges. The randomness fold reads the *same* verified chunk stream
-that already mutates `BeaconState`, so it introduces no new divergence
-source — but it upgrades the blast radius of the witness window arithmetic
-(base freeze, chunk bounds, terminal re-fold exemptions) from witness-state
-corruption to a committee-selection fork. That arithmetic is model-checked
+Costs and edges. The seed reads one value off the boundary header, but
+*whether* a crossing contributes at all runs through the witness path: the
+fold takes the header's chain only once the contribution's chunk applies. The
+window arithmetic (base freeze, chunk bounds, terminal re-fold exemptions)
+therefore carries a committee-selection blast radius, not merely a
+witness-state one — all-or-nothing on the crossing. Both sides are model-checked
 through window, reshape, and recovery churn (Model H,
-[witness_fold.qnt](witness_fold.qnt)). Leaf-value uniqueness under
+[witness_fold.qnt](witness_fold.qnt), whose `witness_fold` and `reveal_fold`
+modules carry the leaf and chain folds separately). Reveal uniqueness under
 adversarial key generation reduces to chain-hash collision resistance
 (already load-bearing across the PQ stack; seed-derived signature masks at
 registration harden it further). Binding the reported boundary QC to the
@@ -663,13 +667,31 @@ committed child (`parent_qc` pinning) closes the sibling-certificate wiggle
 the edge pricing below conservatively absorbs, and benefits witness
 integrity generally.
 
+Two costs are structural to the per-epoch chain, and neither is a steering
+lever. The halt-recovery fence is epoch-whole rather than leaf-exact: a
+crossing above a pending recovery's attested frontier drops its epoch entire,
+where a leaf-exact fence would admit the pre-frontier prefix — deterministic,
+and strict in the safe direction (INV-BEACON-10). And the fold takes one chain
+per shard per epoch with nothing carrying an unfolded epoch forward, so a
+beacon lagging k epochs folds a single crossing on resumption and loses k
+epochs of that shard's entropy
+(measured in `beacon_lag_drops_skipped_epochs_reveal_chains`). That is an
+entropy-*quantity* loss: no party chooses which epochs go missing, the seed
+still mixes prior randomness and every shard that did cross, and the loss is
+bounded by the outage and self-heals. Per this section's opening — steering
+resistance, not entropy quantity, is the load-bearing property — it does not
+enter the pricing below.
+
 ### 10.3 The residual: the window edge
 
 The steering that survives is confined to the **window edge**. The proposers
 who close the last epoch windows still open when the rest of the fold has
 settled can rush or sandbag the boundary within the ~32 s timestamp-validity
-window — choosing among a handful of *known* candidate folds — or forfeit the
-slot for a blind redraw by an unknown successor. Tables W1–W3 price that edge
+window — deciding whether their own block or a successor's is the last
+anchored in the epoch, and so which closed chain the beacon folds — or
+forfeit the slot for a blind redraw by an unknown successor. The candidate
+count is therefore close-at-me, plus one sandbag step per consecutive corrupt
+successor, plus the blind forfeit. Tables W1–W3 price that edge
 (`witness_edge_p_event`) on the same march and FIFO-equilibrium machinery as
 §10.4–§10.5, granting the adversary a zero-latency full-sight network (no
 dilution credited — the structural worst case): the per-event grind is a
@@ -688,26 +710,28 @@ cross-shard closing race only dilutes the edge further.
 
 A variant tightens the edge (table W4). Anchoring the fold's upper cut to a
 *fixed schedule line* `T_cut = boundary − Δ` (`Δ ≥ MAX_TIMESTAMP_DELAY`),
-folding each reveal by its aggregated weighted timestamp rather than by the
-boundary block's own leaf count, lets the timestamp-validity constants
+closing each epoch's chain at the last block whose aggregated weighted
+timestamp precedes that line rather than at whichever block happens to be
+last anchored in the epoch, lets the timestamp-validity constants
 (`MAX_TIMESTAMP_RUSH = 2 s`, `MAX_TIMESTAMP_DELAY = 30 s`) *prove* the bulk
 of the fold un-contestable: ~99 % of the reveals fall outside the ≈ β·32 s
 drag band and are sealed regardless of the adversary's sight. The residual
 becomes a sight-independent β-gated best-of-2 ceiling (the boundary-anchored
-edge grows with sight; this does not) and the single-proposer slide of
-`chunk_end` disappears — contesting the line needs corrupt *weight* to drag
-an aggregated WT, not one slot. The width gain at the design point is
-marginal (best-of-2 either way); the value is robustness. The cost is a
-WT→position cutoff in place of a count range — more fork-critical window
-arithmetic — and a one-epoch lag on the last ≈ β·32 s of reveals (they fold
+edge grows with sight; this does not) and the closing proposer's unilateral
+choice of where the epoch ends disappears — contesting the line needs corrupt
+*weight* to drag an aggregated WT, not one slot. The width gain at the design
+point is marginal (best-of-2 either way); the value is robustness. The cost is
+a WT→position cutoff in place of the anchor-epoch reset — a second
+fork-critical derivation on the header — and a one-epoch lag on the last
+≈ β·32 s of reveals (they fold
 in the next epoch; no entropy is lost). The boundary-anchored cut is the
 design here — already sub-baseline — with the WT anchor held as the
 tightening if the edge ever needs it.
 
 ### 10.4 The fallback: a reveal ceremony, and what a grinder does to one
 
-In an epoch where no witness chunk folds — genesis before the first crossing,
-or every shard's crossing suppressed at once, which spikes every miss counter
+In an epoch where no crossing folds — genesis before the first crossing, or
+every shard's crossing suppressed at once, which spikes every miss counter
 and trips the halt detector (§10.6): loud, network-scale, never a quiet
 per-epoch option — the seed falls back to the beacon ceremony's reveal mix:
 `BLAKE3(prev_randomness ‖ VRF outputs of the committed beacon-committee
@@ -716,6 +740,13 @@ entrant, the beacon resample, and pool draws read it
 (`filter_and_roll_randomness`, crates/beacon/src/state/vrf.rs). A bare
 `BLAKE3(prev)` would be a predictable seed, so the fallback keeps the mix —
 and the mix is what a grinder can steer. This subsection prices that.
+
+The trigger is genuinely "no crossing seated", not "no witness content": a
+crossing whose chunk is empty still folds its header's chain. That
+distinction is what keeps the fallback rare, given that leaves carry only
+governance events — a seed reading the leaf stream would fall back in every
+quiet epoch, handing the grinder the per-epoch option this path is designed
+to deny it.
 
 A Byzantine beacon member cannot *choose* its VRF output — it is a fixed
 function of `(key, epoch)` — but it can choose whether that output joins the
@@ -943,7 +974,7 @@ Design constraints:
 
 ### 10.7 Disposition
 
-The seed's primary path is structural. The range fold removes the
+The seed's primary path is structural. The per-epoch chain fold removes the
 include/omit lever and blinds interior reveals with no network assumption
 (§10.2); the residual is the window edge — a β-gated best-of-≈2, below the
 ceremony baseline at every shard count, whose network FIFO equilibrium stays
@@ -979,6 +1010,9 @@ Residuals, priced above: the window-edge lever (§10.3); fallback-epoch bias
 exposure (one best-of-2^t draw per zero-crossing epoch); the
 beacon-committee compromise rate (liveness/bias only — pool ratification
 carries commits, and the seed's grind resistance no longer rides beacon
-honesty); the f+1 detection-latency exposure window (§10.1, §10.6); and the
-witness window arithmetic's upgraded blast radius (a fold divergence is a
-committee-selection fork — Model H stands guard).
+honesty); the f+1 detection-latency exposure window (§10.1, §10.6); the
+witness window arithmetic's committee-selection blast radius, all-or-nothing
+on whether a crossing seeds (a fold divergence is a committee-selection
+fork — Model H stands guard); and the entropy a lagging beacon drops, one
+epoch per epoch of lag, which reduces folded entropy without giving anyone a
+choice over what is dropped (§10.2).

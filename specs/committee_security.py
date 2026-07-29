@@ -105,8 +105,8 @@ def crossing_rate(N: int, M: int, n: int, boundary: int | None = None) -> float:
 
 
 # ── The fallback ceremony grind (tables M, N — §10.4) ───────────────────────
-# The epoch seed's primary source is the reveal-leaf fold (tables W); in an
-# epoch where no witness chunk folds, the seed falls back to the beacon
+# The epoch seed's primary source is the reveal-chain fold (tables W); in an
+# epoch where no crossing folds, the seed falls back to the beacon
 # ceremony mix BLAKE3(prev || VRF outputs of the COMMITTED beacon-committee
 # proposals). Each VRF output is key-fixed (deterministic in (key, epoch)),
 # so a Byzantine beacon member cannot choose its value — only whether it
@@ -800,18 +800,22 @@ def sim_recency(n, beta, b, epochs, seed, shards=100, jail=True, jail_cd=None,
 
 # ── The epoch seed: the witness-reveal fold (tables W — §10.2–§10.3) ─────
 #
-# Every shard block carries a mandatory reveal leaf — a deterministic
+# Every shard block carries a mandatory reveal — a deterministic
 # per-proposer VRF over (shard, height), unchooseable and unforgeable —
-# appended to the beacon-witness accumulator, and the epoch seed folds each
-# shard's watermark-to-boundary leaf range. The include/omit lever is
-# structurally gone (the folded set is a consensus-derived range, not a
-# per-member choice) and interior leaves are committed before later leaves
-# exist, so interior choices are blind without any network assumption. What
-# remains is the WINDOW EDGE: the proposers who close the last epoch windows
-# to settle can (a) rush or sandbag the boundary within the ~32s timestamp
-# validity window, choosing among a handful of KNOWN candidate folds, or (b)
-# forfeit the slot for a blind redraw by an unknown successor. The model
-# prices exactly that edge.
+# folded into the running reveal_chain its header commits, reseeded at each
+# anchor-epoch change, and the epoch seed folds one closed chain per crossing
+# shard. The include/omit lever is structurally gone (a block whose chain
+# does not extend its parent's is invalid, so the folded value is
+# consensus-derived rather than a per-member choice) and a link binds its
+# predecessor by hash, so interior choices are blind without any network
+# assumption. What remains is the WINDOW EDGE: the proposers who close the
+# last epoch windows to settle can (a) rush or sandbag the boundary within
+# the ~32s timestamp validity window, deciding whether their own block or a
+# successor's closes the epoch and so choosing among a handful of KNOWN
+# candidate folds, or (b) forfeit the slot for a blind redraw by an unknown
+# successor. The model prices exactly that edge: the candidate count is
+# close-at-me, plus one sandbag step per consecutive corrupt successor, plus
+# the blind forfeit.
 
 
 def witness_edge_p_event(beta, p, sight=1.0, edge_windows=2, run_cap=16):
@@ -908,15 +912,15 @@ def witness_network_equilibrium(n, beta, shards, pool_factor, sight=1.0,
 #
 # Anchor the fold's upper edge to a FIXED schedule line T_cut = epoch_boundary
 # - Δ (Δ >= MAX_TIMESTAMP_DELAY) instead of the boundary block's own leaf count.
-# A leaf enters iff its 2f+1-aggregated block weighted timestamp is <= T_cut.
-# No proposer can shift a block's WT more than MAX_TIMESTAMP_RUSH early /
-# MAX_TIMESTAMP_DELAY late, and the aggregate damps even that to a corrupt-
-# weight fraction, so every leaf whose honest WT sits outside the drag band
-# around T_cut is PROVABLY in or out — the fold's bulk is pinned by the
+# A reveal enters iff its 2f+1-aggregated block weighted timestamp is <=
+# T_cut. No proposer can shift a block's WT more than MAX_TIMESTAMP_RUSH early
+# / MAX_TIMESTAMP_DELAY late, and the aggregate damps even that to a corrupt-
+# weight fraction, so every reveal whose honest WT sits outside the drag band
+# around T_cut is PROVABLY in or out — the chain's bulk is pinned by the
 # timestamp-validity constants, not chosen. Two gains over the boundary edge:
-# (1) the line is fixed, so the single-proposer slide of chunk_end (its own
-# leaf count) is gone; (2) the residual is a CEILING independent of sight — the
-# adversary can see the whole chain and still not reach the pinned bulk.
+# (1) the line is fixed, so the closing proposer's unilateral choice of where
+# the epoch ends is gone; (2) the residual is a CEILING independent of sight —
+# the adversary can see the whole chain and still not reach the pinned bulk.
 MAX_TIMESTAMP_DELAY_S = 30   # crates/types/src/time/limits.rs
 MAX_TIMESTAMP_RUSH_S = 2     # crates/types/src/time/limits.rs
 
@@ -1443,7 +1447,7 @@ def main() -> None:
     # territory (a risk bound on the unsteered draw, not a comparison an
     # unsharded chain loses; steering voids it). Steering is the only route
     # to 2f+1 at plausible beta (table M's march at ~2.5x the f+1 time), which
-    # is what the input-side stack (T) and the reveal-leaf fold (W) defend.
+    # is what the input-side stack (T) and the reveal-chain fold (W) defend.
     # Between the two lines the network degrades but stays sound: the f+1
     # column shows halts becoming routine long before the terminal tail opens.
     n = 128
@@ -1698,7 +1702,7 @@ def main() -> None:
           "the ceremony forks;")
     print("    2f+1 — the TERMINAL line — is never approached. Sight=1 is the "
           "worst case; the")
-    print("    accumulator ordering blinds interior leaves unconditionally, so "
+    print("    chain descent blinds interior reveals unconditionally, so "
           "real sight < 1.)")
 
     print(f"\nW4. WT-cutoff variant — anchor the fold edge to a fixed schedule "
@@ -1730,15 +1734,16 @@ def main() -> None:
     print("    epoch later, no entropy lost. The residual caps at beta-gated "
           "best-of-2 regardless of")
     print("    sight, where the boundary edge grows with m, and it removes the "
-          "single-proposer own-count")
-    print("    slide of chunk_end. Cost: the fold computes a WT->position cutoff, "
-          "not a leaf-count range —")
-    print("    more fork-critical arithmetic on the witness-window path.)")
+          "closing proposer's")
+    print("    unilateral choice of where the epoch ends. Cost: a WT->position "
+          "cutoff in place of the")
+    print("    anchor-epoch reset — a second fork-critical derivation on the "
+          "header.)")
 
     print("   The seed in one line: the include/omit lever is removed "
-          "structurally (range fold),")
-    print("   interior leaves are blind without a network assumption "
-          "(accumulator ordering), and the")
+          "structurally (chain fold),")
+    print("   interior reveals are blind without a network assumption "
+          "(chain descent), and the")
     print("   residual edge is below the ceremony at every shard count — so NO "
           "shard-count threshold")
     print("   and NO separate blinder are needed. The ceremony survives only as "
@@ -1750,7 +1755,7 @@ def main() -> None:
     print("   f+1 (liveness) is recoverable -> detect-and-rotate (§10.6, table S).")
     print("   2f+1 is TERMINAL — unilateral control mints stake and cascades; no "
           "recovery, so the")
-    print("   defense is PREVENTION: the reveal-leaf seed removes the include/omit "
+    print("   defense is PREVENTION: the reveal-chain seed removes the include/omit "
           "lever (tables W),")
     print("   the fallback ceremony is confined to zero-crossing epochs and bounded "
           "by the input-side")
