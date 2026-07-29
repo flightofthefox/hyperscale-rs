@@ -681,9 +681,16 @@ impl ObserverTail {
         // requires as the link's last element. Empty when `prev` is the
         // terminal — the direct commit.
         let ancestry: Vec<BlockHeader> = run[..n - 2].iter().rev().cloned().collect();
+        // The certified block's parent, when the run reaches it. A direct
+        // commit over the terminal does not: the run starts there, and the
+        // block below is the snap-sync anchor, whose header never arrives.
+        // This proof's consumer resolves its own committee, so `None` costs
+        // it nothing.
+        let certified_parent = run.get(n.wrapping_sub(3)).cloned();
         let proof = CommitProof::new(
             CertifiedBlockHeader::new(prev.clone(), header.parent_qc().clone()),
             CertifiedBlockHeader::new(header.clone(), qc.clone()),
+            certified_parent,
             ancestry,
         );
         if let Some(sighting) = &mut self.terminal {

@@ -21,7 +21,7 @@ use thiserror::Error;
 
 use crate::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ConsensusPublicKey,
-    NetworkDefinition, QcContext, QcVerifyError, ShardId, Verify, VoteCount,
+    NetworkDefinition, QcContext, QcVerifyError, ShardId, Verify, VoteCount, WeightedTimestamp,
 };
 
 /// Cap on a [`CommitProof`]'s ancestry-link length.
@@ -70,6 +70,23 @@ pub struct CommitProof {
     certified: CertifiedBlockHeader,
     /// Round-contiguous child that commits [`Self::certified`].
     child: CertifiedBlockHeader,
+    /// [`Self::certified`]'s parent — carried because a block's committee
+    /// anchors on its parent, so this header is what resolves the committee
+    /// that signed `certified`'s QC. A fork-evidence verifier holds no part
+    /// of the accused shard's chain, so only the proof can supply it.
+    ///
+    /// Pinned by `certified.header().parent_block_hash()`, which is also
+    /// what the [`Self::ancestry`] walk pins its first link to — so a
+    /// non-empty ancestry names this same header, and neither can be
+    /// substituted to steer committee resolution.
+    ///
+    /// `None` where the producer cannot reach it: the reshape handoff proves
+    /// a terminal sitting directly above a snap-sync anchor, whose header it
+    /// never receives. That consumer resolves its own committee (one window
+    /// covers the whole two-chain) and never asks. Fork evidence does ask,
+    /// and a proof that cannot answer is dropped rather than verified against
+    /// a guess.
+    certified_parent: Option<BlockHeader>,
     /// Parent-hash header chain from [`Self::certified`]'s parent down to
     /// the proven block; empty when `certified` is itself the proven
     /// block. `ancestry[0]` is `certified`'s parent; `ancestry[i].hash()
@@ -94,6 +111,10 @@ pub enum CommitProofVerifyError {
     /// `child.round != certified.round + 1` — not a direct commit.
     #[error("commit proof child is not round-contiguous")]
     NotRoundContiguous,
+    /// The carried `certified_parent` is not the header `certified` names as
+    /// its parent, so it cannot resolve `certified`'s committee.
+    #[error("commit proof certified-parent header does not match")]
+    ParentMismatch,
     /// An ancestry link's hash or height does not chain down from
     /// `certified`.
     #[error("commit proof ancestry link is broken")]
@@ -112,11 +133,13 @@ impl CommitProof {
     pub const fn new(
         certified: CertifiedBlockHeader,
         child: CertifiedBlockHeader,
+        certified_parent: Option<BlockHeader>,
         ancestry: Vec<BlockHeader>,
     ) -> Self {
         Self {
             certified,
             child,
+            certified_parent,
             ancestry,
         }
     }
@@ -124,8 +147,34 @@ impl CommitProof {
     /// A direct-commit proof: `certified` is itself the proven block,
     /// committed by its round-contiguous `child`.
     #[must_use]
-    pub const fn direct(certified: CertifiedBlockHeader, child: CertifiedBlockHeader) -> Self {
-        Self::new(certified, child, Vec::new())
+    pub const fn direct(
+        certified: CertifiedBlockHeader,
+        child: CertifiedBlockHeader,
+        certified_parent: Option<BlockHeader>,
+    ) -> Self {
+        Self::new(certified, child, certified_parent, Vec::new())
+    }
+
+    /// Anchor selecting the committee that signed [`Self::certified`]'s QC —
+    /// its parent's own anchor, since a block's committee keys on its parent.
+    /// `None` when the proof carries no parent (see
+    /// [`Self::certified_parent`]).
+    #[must_use]
+    pub fn certified_committee_anchor(&self) -> Option<WeightedTimestamp> {
+        Some(
+            self.certified_parent
+                .as_ref()?
+                .parent_qc()
+                .weighted_timestamp(),
+        )
+    }
+
+    /// Anchor selecting the committee that signed [`Self::child`]'s QC — the
+    /// certified block's own anchor, one hop up from
+    /// [`Self::certified_committee_anchor`].
+    #[must_use]
+    pub fn child_committee_anchor(&self) -> WeightedTimestamp {
+        self.certified.header().parent_qc().weighted_timestamp()
     }
 
     /// The shard this proof is on.
@@ -189,6 +238,21 @@ impl CommitProof {
         }
         if self.child.header().round() != self.certified.header().round().next() {
             return Err(CommitProofVerifyError::NotRoundContiguous);
+        }
+
+        // A carried parent is what resolves `certified`'s committee, so it
+        // has to be the real one: pin it to the hash `certified` names. The
+        // ancestry walk below pins its first link to the same value, so a
+        // non-empty ancestry cannot disagree with it.
+        if let Some(parent) = &self.certified_parent {
+            if parent.shard_id() != self.certified.shard_id() {
+                return Err(CommitProofVerifyError::ShardMismatch);
+            }
+            if parent.hash() != self.certified.header().parent_block_hash()
+                || self.certified.height().prev() != Some(parent.height())
+            {
+                return Err(CommitProofVerifyError::ParentMismatch);
+            }
         }
 
         if self.ancestry.len() > MAX_COMMIT_PROOF_ANCESTRY {

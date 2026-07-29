@@ -510,9 +510,18 @@ fn direct_commit_proof_signed(
     salt: u64,
     signers: &[usize],
 ) -> CommitProof {
+    // The proof carries the certified block's parent, so build it first and
+    // hang the two-chain off it; `parent` becomes the grandparent hash.
+    let parent_header = fork_header(
+        shard,
+        height.prev().expect("fork fixtures start above genesis"),
+        round,
+        parent,
+        salt + 900,
+    );
     let block = certify_header(
         committee,
-        fork_header(shard, height, round, parent, salt),
+        fork_header(shard, height, round, parent_header.hash(), salt),
         signers,
     );
     let child = certify_header(
@@ -526,7 +535,7 @@ fn direct_commit_proof_signed(
         ),
         &committee.quorum_indices(),
     );
-    CommitProof::direct(block, child)
+    CommitProof::direct(block, child, Some(parent_header))
 }
 
 /// A minimal `BlockHeader` on `shard` distinguished by `salt` (varies the
@@ -671,10 +680,21 @@ fn live_commit_proof(
     wt: WeightedTimestamp,
     salt: u64,
 ) -> CommitProof {
+    // The proof carries the certified block's parent, so build it first and
+    // hang the two-chain off it; `parent` becomes the grandparent hash. It
+    // anchors at `wt` like the rest, so the whole proof resolves one window.
+    let parent_header = live_fork_header(
+        shard,
+        height.prev().expect("fork fixtures start above genesis"),
+        round,
+        parent,
+        wt,
+        salt + 900,
+    );
     let block = live_certify(
         verifier,
         committee_keys,
-        live_fork_header(shard, height, round, parent, wt, salt),
+        live_fork_header(shard, height, round, parent_header.hash(), wt, salt),
         wt,
     );
     let child = live_certify(
@@ -690,13 +710,13 @@ fn live_commit_proof(
         ),
         wt,
     );
-    CommitProof::direct(block, child)
+    CommitProof::direct(block, child, Some(parent_header))
 }
 
 /// A minimal `BlockHeader` on `shard` whose `parent_qc` carries weighted
 /// timestamp `wt` — the anchor the fork verifier resolves the committee by.
 /// `salt` varies the proposer timestamp (and so the hash).
-fn live_fork_header(
+pub(crate) fn live_fork_header(
     shard: ShardId,
     height: BlockHeight,
     round: Round,
@@ -734,7 +754,7 @@ fn live_fork_header(
 /// verifier reads `parent_qc().weighted_timestamp()` as the committee anchor
 /// and never authenticates the parent QC itself, so its other fields are
 /// inert.
-fn anchor_qc(shard: ShardId, wt: WeightedTimestamp) -> QuorumCertificate {
+pub(crate) fn anchor_qc(shard: ShardId, wt: WeightedTimestamp) -> QuorumCertificate {
     let zero = BlockHash::from_raw(Hash::from_bytes(b"shard-fork-live-anchor"));
     QuorumCertificate::new(
         zero,

@@ -17,11 +17,11 @@ use std::time::Duration;
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use hyperscale_types::{
-    AwaitingTopologyBuffer, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, CommitProof, CompletedRecovery, ConsensusPublicKey, Epoch,
-    ForkFence, HeaderFetchCount, InFlightCount, REMOTE_HEADER_RETENTION, RETENTION_HORIZON,
-    ScheduleLookup, ShardForkProof, ShardId, TopologySchedule, TopologySnapshot, ValidatorId,
-    Verified, WeightedTimestamp,
+    AwaitingTopologyBuffer, BlockHash, BlockHeader, BlockHeight, CertifiedBlock,
+    CertifiedBlockHeader, CertifiedHeaderVerifyError, CommitProof, CompletedRecovery,
+    ConsensusPublicKey, Epoch, ForkFence, HeaderFetchCount, InFlightCount, REMOTE_HEADER_RETENTION,
+    RETENTION_HORIZON, ScheduleLookup, ShardForkProof, ShardId, TopologySchedule, TopologySnapshot,
+    ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -1374,6 +1374,11 @@ impl RemoteHeaderCoordinator {
         let mut proofs = Vec::new();
         for block in blocks {
             let block_header: &CertifiedBlockHeader = block;
+            // The proof carries the certified block's parent when it is held
+            // — that is what lets a remote verifier resolve the committee
+            // that signed it. Absent, the proof still assembles and still
+            // engages the local fence; only a remote verifier drops it.
+            let parent = self.held_header(shard, block_header.header().parent_block_hash());
             if let Some(child) = children.iter().find(|c| {
                 let ch: &CertifiedBlockHeader = c;
                 ch.header().parent_block_hash() == block_header.block_hash()
@@ -1384,10 +1389,29 @@ impl RemoteHeaderCoordinator {
                 proofs.push(CommitProof::direct(
                     block_header.clone(),
                     child_header.clone(),
+                    parent.cloned(),
                 ));
             }
         }
         proofs
+    }
+
+    /// A held header for `shard` matching `hash`, across the canonical
+    /// winner and the fork siblings at its height. The height is not known
+    /// to the caller — a parent hash names a block, not a slot — so this
+    /// scans the shard's held heights.
+    fn held_header(&self, shard: ShardId, hash: BlockHash) -> Option<&BlockHeader> {
+        self.verified
+            .iter()
+            .filter(|((s, _), _)| *s == shard)
+            .map(|(_, held)| held.header())
+            .chain(
+                self.fork_siblings
+                    .iter()
+                    .filter(|((s, _), _)| *s == shard)
+                    .flat_map(|(_, siblings)| siblings.iter().map(|h| h.header())),
+            )
+            .find(|header| header.hash() == hash)
     }
 
     /// Mark every height the insertion at `(shard, height)` newly commit-proves,

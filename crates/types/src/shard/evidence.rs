@@ -232,21 +232,30 @@ impl ShardForkProof {
         v
     }
 
-    /// Resolve each QC's committee from the schedule, keyed by the QC's
-    /// window (`committee(h) = at(WT_{h-1})`, recovery-bridged like any
-    /// certified artifact). `None` if any QC's governing epoch is not
-    /// folded — the caller defers, exactly as cross-shard consumption
-    /// does. The result lines up positionally with [`Self::qc_headers`].
+    /// Resolve each QC's committee from the schedule, keyed by the block's
+    /// committee anchor — its *parent's* weighted timestamp, since that is
+    /// what selects the committee that signed it — and recovery-bridged like
+    /// any certified artifact. `None` if any QC's governing epoch is not
+    /// folded, or if a proof carries no parent for its certified block; the
+    /// caller defers, exactly as cross-shard consumption does. The result
+    /// lines up positionally with [`Self::qc_headers`].
     #[must_use]
     pub fn resolve_committees(
         &self,
         schedule: &TopologySchedule,
     ) -> Option<Vec<ResolvedCommittee>> {
+        let Self::ConflictingCommits { a, b } = self;
+        let anchors = [
+            a.certified_committee_anchor()?,
+            a.child_committee_anchor(),
+            b.certified_committee_anchor()?,
+            b.child_committee_anchor(),
+        ];
         self.qc_headers()
             .into_iter()
-            .map(|ch| {
+            .zip(anchors)
+            .map(|(ch, anchor_wt)| {
                 let shard = ch.shard_id();
-                let anchor_wt = ch.header().parent_qc().weighted_timestamp();
                 let qc_wt = ch.qc().weighted_timestamp();
                 let (snapshot, _bridged) =
                     schedule.at_for_shard_certified(shard, anchor_wt, qc_wt)?;
@@ -538,8 +547,11 @@ mod tests {
         use hyperscale_crypto_bls::BlsVerifier;
 
         use super::super::*;
-        use crate::test_utils::{TestCommittee, certify_header, direct_commit_proof, fork_header};
-        use crate::{BlockHeader, Epoch, Hash, TopologySchedule};
+        use crate::test_utils::{
+            TestCommittee, anchor_qc, certify_header, direct_commit_proof, fork_header,
+            live_fork_header,
+        };
+        use crate::{BlockHeader, Epoch, Hash, TopologySchedule, WeightedTimestamp};
 
         const SHARD: ShardId = ShardId::ROOT;
 
@@ -586,6 +598,73 @@ mod tests {
             }
         }
 
+        /// A block's committee anchors on its parent, so the committee that
+        /// signed a QC over block `h` is the one at `h-1`'s anchor — not
+        /// `h`'s own. A committee that forks chooses when to do it, so a
+        /// boundary is exactly where it would aim: resolving on the block's
+        /// own anchor hands it a window where its evidence never verifies and
+        /// the fence never fires.
+        #[test]
+        fn each_qcs_committee_resolves_at_the_signing_window() {
+            const ED: u64 = 1_000;
+            let committee = TestCommittee::new(4, 21);
+
+            // Two windows, distinguishable by committee size: epoch 0 seats
+            // four, epoch 1 seats three.
+            let epoch0 = Arc::new(committee.topology_snapshot(1));
+            let epoch1 = Arc::new(TestCommittee::new(3, 22).topology_snapshot(1));
+            let mut sched = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&epoch1));
+            sched.insert(Epoch::new(0), Arc::clone(&epoch0));
+
+            // The certified block's parent anchors below the cut; the block
+            // itself above it. So `certified`'s QC was signed by epoch 0 and
+            // `child`'s by epoch 1 — one proof spanning both.
+            let below = WeightedTimestamp::from_millis(ED - 1);
+            let above = WeightedTimestamp::from_millis(ED + 1);
+            let certified_parent = live_fork_header(
+                SHARD,
+                BlockHeight::new(7),
+                Round::new(7),
+                BlockHash::ZERO,
+                below,
+                1,
+            );
+            let certified_header = live_fork_header(
+                SHARD,
+                BlockHeight::new(8),
+                Round::new(8),
+                certified_parent.hash(),
+                above,
+                2,
+            );
+            let child_header = live_fork_header(
+                SHARD,
+                BlockHeight::new(9),
+                Round::new(9),
+                certified_header.hash(),
+                above,
+                3,
+            );
+            let proof = CommitProof::direct(
+                CertifiedBlockHeader::new(certified_header, anchor_qc(SHARD, above)),
+                CertifiedBlockHeader::new(child_header, anchor_qc(SHARD, above)),
+                Some(certified_parent),
+            );
+            let fork = ShardForkProof::ConflictingCommits {
+                a: proof.clone(),
+                b: proof,
+            };
+
+            let resolved = fork
+                .resolve_committees(&sched)
+                .expect("both windows are in the schedule");
+            assert_eq!(
+                (resolved[0].public_keys.len(), resolved[1].public_keys.len()),
+                (4, 3),
+                "the certified block's QC resolves in its parent's window, its child's in its own",
+            );
+        }
+
         #[test]
         fn direct_fork_assembles_and_verifies() {
             let committee = TestCommittee::new(4, 1);
@@ -630,9 +709,10 @@ mod tests {
         fn non_round_contiguous_child_rejected() {
             let committee = TestCommittee::new(4, 4);
             let parent = BlockHash::from_raw(Hash::from_bytes(b"p"));
+            let block_parent = header(BlockHeight::new(4), Round::new(4), parent, 9);
             let block = certify(
                 &committee,
-                header(BlockHeight::new(5), Round::new(5), parent, 1),
+                header(BlockHeight::new(5), Round::new(5), block_parent.hash(), 1),
             );
             // Child at round+2, not round+1 — a valid QC but no direct commit.
             let child = certify(
@@ -641,7 +721,7 @@ mod tests {
             );
             let good = direct_proof(&committee, BlockHeight::new(5), Round::new(5), parent, 3);
             let proof = ShardForkProof::ConflictingCommits {
-                a: CommitProof::direct(block, child),
+                a: CommitProof::direct(block, child, Some(block_parent)),
                 b: good,
             };
             assert_eq!(
@@ -656,9 +736,10 @@ mod tests {
         fn child_not_extending_parent_rejected() {
             let committee = TestCommittee::new(4, 5);
             let parent = BlockHash::from_raw(Hash::from_bytes(b"p"));
+            let block_parent = header(BlockHeight::new(4), Round::new(4), parent, 9);
             let block = certify(
                 &committee,
-                header(BlockHeight::new(5), Round::new(5), parent, 1),
+                header(BlockHeight::new(5), Round::new(5), block_parent.hash(), 1),
             );
             // Child whose parent hash points elsewhere.
             let child = certify(
@@ -671,7 +752,7 @@ mod tests {
                 ),
             );
             let proof = ShardForkProof::ConflictingCommits {
-                a: CommitProof::direct(block, child),
+                a: CommitProof::direct(block, child, Some(block_parent)),
                 b: direct_proof(&committee, BlockHeight::new(5), Round::new(5), parent, 3),
             };
             assert_eq!(
@@ -701,7 +782,7 @@ mod tests {
                 &committee,
                 header(BlockHeight::new(10), Round::new(21), d.block_hash(), 3),
             );
-            let a = CommitProof::new(d, child, vec![b.clone()]);
+            let a = CommitProof::new(d, child, Some(b.clone()), vec![b.clone()]);
             assert_eq!(a.proven_height(), BlockHeight::new(8));
             assert_eq!(a.proven_block_hash(), b.hash());
 
