@@ -403,21 +403,9 @@ impl RemoteHeaderCoordinator {
         // suffix band — the orphan a beyond-f cohort forged extending the
         // halted tip; drop it rather than admit a forged header into the
         // routing view.
-        // A block's committee anchors on its parent, so the window that signed
-        // this QC is the one the parent dates itself in. Sync walks a window
-        // in ascending height, so the parent is held for every header but the
-        // first; that one falls back to its own anchor — the same window
-        // except across an epoch cut, and self-healing, since a re-offered
-        // header resolves exactly once the parent lands.
-        let committee_anchor = self
-            .held_header(shard, certified_header.header().parent_block_hash())
-            .map_or_else(
-                || certified_header.header().parent_qc().weighted_timestamp(),
-                |parent| parent.parent_qc().weighted_timestamp(),
-            );
         let committee = match topology_schedule.lookup_for_shard_certified_fenced(
             shard,
-            committee_anchor,
+            self.committee_anchor_wt(shard, certified_header.header()),
             certified_header.qc().weighted_timestamp(),
         ) {
             None => {
@@ -521,7 +509,7 @@ impl RemoteHeaderCoordinator {
                         self.pending.remove(&key);
                         return vec![];
                     };
-                    let anchor = next_header.header().parent_qc().weighted_timestamp();
+                    let anchor = self.committee_anchor_wt(shard, next_header.header());
                     let qc_wt = next_header.qc().weighted_timestamp();
                     // A recovery folded (or advanced) after this header
                     // buffered can turn it into a suffix-band orphan the
@@ -1408,6 +1396,24 @@ impl RemoteHeaderCoordinator {
         proofs
     }
 
+    /// Anchor selecting the committee that signed the QC over `header`'s
+    /// block. A block's committee anchors on its parent, so the window that
+    /// signed this QC is the one the parent dates itself in. Sync walks a
+    /// window in ascending height, so the parent is held for every header but
+    /// the first; that one falls back to the header's own anchor — the same
+    /// window except across an epoch cut, and self-healing, since a
+    /// re-offered header resolves exactly once the parent lands. Both the
+    /// first dispatch and the failed-candidate retry drain resolve through
+    /// here, so a buffered sibling verifies under the same committee its
+    /// predecessor did.
+    fn committee_anchor_wt(&self, shard: ShardId, header: &BlockHeader) -> WeightedTimestamp {
+        self.held_header(shard, header.parent_block_hash())
+            .map_or_else(
+                || header.parent_qc().weighted_timestamp(),
+                |parent| parent.parent_qc().weighted_timestamp(),
+            )
+    }
+
     /// A held header for `shard` matching `hash`, across the canonical
     /// winner, the fork siblings, and the headers still awaiting QC
     /// verification. The height is not known to the caller — a parent hash
@@ -1857,6 +1863,56 @@ mod tests {
             *keys, expected0,
             "the child's QC must verify under the window its parent anchors, not the one it \
              dates itself into",
+        );
+    }
+
+    /// The failed-candidate retry drain resolves a buffered sibling's
+    /// committee by the same rule as the first dispatch — via the held
+    /// parent. Keying the retry on the sibling's own anchor re-verifies an
+    /// epoch-first header under the window it opens, so across a cut that
+    /// moves keys every honest sibling fails in turn and the slot drains
+    /// empty.
+    #[test]
+    fn a_retried_sibling_verifies_under_the_committee_its_parent_anchors() {
+        const ED: u64 = 1_000;
+        let remote = ShardId::leaf(1, 1);
+        let ids = [0u64, 1, 2, 3];
+        let epoch0 = Arc::new(shard_snapshot(2, &ids, 0));
+        let epoch1 = Arc::new(shard_snapshot(2, &ids, 1));
+        let expected0: Vec<ConsensusPublicKey> = epoch0
+            .committee_for_shard(remote)
+            .iter()
+            .map(|v| epoch0.public_key(*v).unwrap())
+            .collect();
+
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
+
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+
+        // The parent anchors below the cut, the child above it. Two senders
+        // offer the child: the first dispatches, the second waits pending.
+        let parent = chained_remote_header(remote, BlockHeight::new(5), BlockHash::ZERO, ED - 1);
+        let child =
+            chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
+
+        let _ = coord.on_remote_header_received(&schedule, parent, ValidatorId::new(1));
+        let _ = coord.on_remote_header_received(&schedule, Arc::clone(&child), ValidatorId::new(1));
+        let _ = coord.on_remote_header_received(&schedule, child, ValidatorId::new(3));
+
+        let retried = coord.on_remote_header_qc_verified(
+            &schedule,
+            remote,
+            BlockHeight::new(6),
+            ValidatorId::new(1),
+            Err(CertifiedHeaderVerifyError::LinkageMismatch),
+        );
+
+        let keys = verify_qc_keys(&retried).expect("the buffered sibling re-dispatches");
+        assert_eq!(
+            *keys, expected0,
+            "the retried sibling's QC must verify under the window its parent anchors, not the \
+             one it dates itself into",
         );
     }
 
