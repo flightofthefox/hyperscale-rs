@@ -2396,28 +2396,32 @@ impl ShardCoordinator {
         }
     }
 
-    /// The header for `block_hash` just arrived, so its exact committee now
-    /// resolves: admit any votes that were held raw because they arrived first
-    /// (see [`Self::on_unverified_block_vote`]). Each is run through the normal
-    /// committee-membership filter against the exact committee, so fabricated
-    /// pre-header votes are dropped here. Returns the admissions' trigger
-    /// actions.
+    /// `block_hash`'s exact committee just became resolvable — its header
+    /// arrived, or so did the parent that committee anchors on — so admit any
+    /// votes held raw for want of it (see [`Self::on_unverified_block_vote`]).
+    /// Each is run through the normal committee-membership filter against the
+    /// exact committee, so fabricated pre-header votes are dropped here.
+    /// Returns the admissions' trigger actions.
+    ///
+    /// The committee resolves *before* the buffer is drained. A block's
+    /// committee anchors on its parent, so a header can land ahead of it and
+    /// leave the committee unresolvable even though `reject_invalid_header`
+    /// admitted the header (its own proposer check defers on the same
+    /// condition). Draining first would discard the very votes the parent's
+    /// arrival is about to admit.
     fn link_buffered_votes_to_header(
         &mut self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
         header: &BlockHeader,
     ) -> Vec<Action> {
+        let Some(committee) = self.committee_of_block(topology_schedule, block_hash) else {
+            return vec![];
+        };
         let buffered = self.votes.take_unanchored_votes(block_hash);
         if buffered.is_empty() {
             return vec![];
         }
-        // The header is now in `pending_blocks`, so this resolves the exact
-        // committee; `None` (beacon behind) can't occur after the header
-        // passed `reject_invalid_header`, but drop rather than guess if it did.
-        let Some(committee) = self.committee_of_block(topology_schedule, block_hash) else {
-            return vec![];
-        };
         info!(
             block_hash = ?block_hash,
             count = buffered.len(),
@@ -2438,36 +2442,36 @@ impl ShardCoordinator {
     }
 
     /// A block `parent_hash` just became locally available (its header arrived,
-    /// or it committed), so `committee(parent_hash)` now resolves. Re-trigger
-    /// any complete pending child that extends it — these are the blocks whose
-    /// parent-QC verification [`trigger_qc_verification_or_vote`] deferred for
-    /// lack of the parent. This is the stateless retry that pairs with that
-    /// deferral; `trigger_qc_verification_or_vote` is idempotent (cache hits /
-    /// the safe-vote rule short-circuit a child already handled), so
-    /// re-triggering unconditionally is safe.
+    /// or it committed), so `committee(parent_hash)` now resolves — and so does
+    /// the committee of every pending child that anchors on it. Two jobs, each
+    /// with its own reach:
+    ///
+    /// - Admit the votes held raw for a child whose committee was unresolvable.
+    ///   A QC builds off the header alone, so this covers every child with a
+    ///   header, assembled or not.
+    /// - Re-trigger the children whose parent-QC verification
+    ///   [`trigger_qc_verification_or_vote`] deferred for lack of the parent.
+    ///   Only an assembled child has anything to verify. That call is
+    ///   idempotent (cache hits / the safe-vote rule short-circuit a child
+    ///   already handled), so re-triggering unconditionally is safe.
     fn retry_pending_children(
         &mut self,
         topology_schedule: &TopologySchedule,
         parent_hash: BlockHash,
     ) -> Vec<Action> {
-        let children: Vec<BlockHash> = self
+        let children: Vec<(BlockHeader, bool)> = self
             .pending_blocks
             .values()
-            .filter(|p| p.header().parent_block_hash() == parent_hash && p.block().is_some())
-            .map(|p| p.header().hash())
+            .filter(|p| p.header().parent_block_hash() == parent_hash)
+            .map(|p| (p.header().clone(), p.block().is_some()))
             .collect();
         let mut actions = Vec::new();
-        for child in children {
-            // This parent anchors each child's committee, so votes held for
-            // want of it are admissible now.
-            if let Some(header) = self.pending_blocks.get_header(child).cloned() {
-                actions.extend(self.link_buffered_votes_to_header(
-                    topology_schedule,
-                    child,
-                    &header,
-                ));
+        for (header, assembled) in children {
+            let child = header.hash();
+            actions.extend(self.link_buffered_votes_to_header(topology_schedule, child, &header));
+            if assembled {
+                actions.extend(self.trigger_qc_verification_or_vote(topology_schedule, child));
             }
-            actions.extend(self.trigger_qc_verification_or_vote(topology_schedule, child));
         }
         actions
     }
@@ -6258,6 +6262,116 @@ mod tests {
             grandchild_committee.committee_for_shard(shard),
             epoch1.committee_for_shard(shard),
             "the epoch advances one block after the anchor crosses N·ED",
+        );
+    }
+
+    /// A wire vote for `block`, signed by committee member `voter`.
+    fn wire_vote_for(keys: &[BlsSigner], voter: usize, block: &Block) -> BlockVote {
+        BlockVote::new(
+            &NetworkDefinition::simulator(),
+            block.hash(),
+            block.header().parent_block_hash(),
+            ShardId::ROOT,
+            block.height(),
+            block.header().round(),
+            ValidatorId::new(voter as u64),
+            &keys[voter],
+            ProposerTimestamp::ZERO,
+        )
+        .expect("vote signs")
+    }
+
+    #[test]
+    fn a_header_ahead_of_its_parent_keeps_its_buffered_votes() {
+        // A block's committee anchors on its parent, so a header can land
+        // while the committee its votes tally against is still unresolvable —
+        // `reject_invalid_header` admits such a header, deferring its own
+        // proposer check on the same condition. The link attempt that header
+        // triggers must leave the buffer intact: the parent's arrival is what
+        // admits these votes, and nothing re-fetches a vote already gossiped.
+        let (mut state, schedule, keys) = make_multi_validator_state_with_keys(0);
+        let parent = block_with_parent_qc_ts(BlockHeight::new(5), 100);
+        let child = block_chained_on(BlockHeight::new(6), parent.hash(), 200);
+        let child_hash = child.hash();
+
+        assert!(
+            state
+                .votes
+                .buffer_unanchored_vote(wire_vote_for(&keys, 1, &child))
+        );
+
+        // The header lands while its parent is still missing.
+        install_complete_block(&mut state, &child);
+        assert!(
+            state.committee_of_block(&schedule, child_hash).is_none(),
+            "the parent is unheld, so the child's committee anchor is unresolvable",
+        );
+
+        assert!(
+            state
+                .link_buffered_votes_to_header(&schedule, child_hash, child.header())
+                .is_empty(),
+            "no committee, no admission",
+        );
+        assert_eq!(
+            state.votes.take_unanchored_votes(child_hash).len(),
+            1,
+            "the vote must outlive a link attempt that couldn't resolve the committee",
+        );
+    }
+
+    #[test]
+    fn the_parent_landing_admits_votes_held_for_an_unassembled_child() {
+        // A QC builds off the header alone — height, round and parent anchor
+        // all come from it — so a child whose body hasn't arrived still tallies
+        // votes. The parent's arrival is the only event that resolves such a
+        // child's committee, and it is also the last one: no later step
+        // revisits the buffer.
+        let (mut state, schedule, keys) = make_multi_validator_state_with_keys(0);
+        let grandparent = block_with_parent_qc_ts(BlockHeight::new(4), 100);
+        let parent = block_chained_on(BlockHeight::new(5), grandparent.hash(), 200);
+        let child = block_chained_on(BlockHeight::new(6), parent.hash(), 300);
+        let child_hash = child.hash();
+
+        // The grandparent has committed, so the parent's own anchor resolves
+        // once it lands.
+        state.committed_hash = grandparent.hash();
+        state.committed_anchor_ts = WeightedTimestamp::from_millis(100);
+
+        // The child holds a header naming a transaction we don't have, so its
+        // block never assembles.
+        state.pending_blocks.assemble(
+            child.header().clone(),
+            BlockManifest::new(
+                vec![TxHash::from_raw(Hash::from_bytes(b"absent-tx"))],
+                vec![],
+                vec![],
+                WitnessSources::empty(),
+            ),
+            LocalTimestamp::ZERO,
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        assert!(state.pending_blocks.get_block(child_hash).is_none());
+
+        assert!(
+            state
+                .votes
+                .buffer_unanchored_vote(wire_vote_for(&keys, 1, &child))
+        );
+
+        install_complete_block(&mut state, &parent);
+        state.retry_pending_children(&schedule, parent.hash());
+
+        assert!(
+            state.votes.take_unanchored_votes(child_hash).is_empty(),
+            "the parent resolved the child's committee, so the vote is admitted",
+        );
+        assert_eq!(
+            state.votes.vote_sets_len(),
+            1,
+            "the admitted vote tallies against the child's exact committee",
         );
     }
 
