@@ -153,6 +153,13 @@ pub struct ExecutionCoordinator {
     /// validators and independent of block production rate.
     committed_ts: WeightedTimestamp,
 
+    /// Anchor selecting the committee that governs the last locally committed
+    /// block — the anchor its *parent* carried, since a block's committee
+    /// keys on its parent. What wave and provision classification resolves
+    /// against, so every replica groups a block's transactions exactly as the
+    /// proposer built them and the verifier validated them.
+    committed_committee_anchor_ts: WeightedTimestamp,
+
     // ═══════════════════════════════════════════════════════════════════════
     // Provisioning
     // ═══════════════════════════════════════════════════════════════════════
@@ -326,6 +333,7 @@ impl ExecutionCoordinator {
             finalized,
             committed_height: BlockHeight::GENESIS,
             committed_ts: WeightedTimestamp::ZERO,
+            committed_committee_anchor_ts: WeightedTimestamp::ZERO,
             waves: WaveRegistry::new(),
             early: EarlyArrivalBuffer::new(),
             provisioning: ProvisioningTracker::new(),
@@ -372,12 +380,18 @@ impl ExecutionCoordinator {
 
     /// The committed block's **anchored** committee — `at_for_shard(local_shard,
     /// anchor_wt)`, the same snapshot the proposer classified `waves` against
-    /// and the verifier validated against. Wave and provision classification at
-    /// commit keys on it, not the `ArcSwap` head, so every replica groups a
-    /// block's transactions identically across a reshape boundary (a head-flipped
-    /// replica would otherwise split execution votes). Falls back to the head
-    /// only if the window was evicted — unreachable for a just-committed block,
-    /// whose committee resolved at verification.
+    /// and the verifier validated against. Both of those resolve a block's
+    /// committee from its parent, so `anchor_wt` is
+    /// [`Self::committed_committee_anchor_ts`], not the block's own: the two
+    /// straddle an epoch cut once per window, and a reshape cut there changes
+    /// the shard set `compute_waves` routes over.
+    ///
+    /// Wave and provision classification at commit keys on it, not the
+    /// `ArcSwap` head, so every replica groups a block's transactions
+    /// identically across a reshape boundary (a head-flipped replica would
+    /// otherwise split execution votes). Falls back to the head only if the
+    /// window was evicted — unreachable for a just-committed block, whose
+    /// committee resolved at verification.
     fn classification_committee<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
@@ -1720,8 +1734,22 @@ impl ExecutionCoordinator {
         // transactions.
         let first_commit = self.committed_ts == WeightedTimestamp::ZERO;
         if height > self.committed_height {
+            let own_anchor = certified.block().header().parent_qc().weighted_timestamp();
+            // This block's committee anchors on its parent, whose anchor is
+            // the one the previous commit carried. Contiguity is what makes
+            // the carry exact — across a gap (the first commit, a snap-synced
+            // or halt-recovered suffix) there is no parent anchor to inherit,
+            // so the block's own stands in: the same window except when the
+            // gap ends on an epoch's first block, and exact again at the next
+            // commit.
+            self.committed_committee_anchor_ts =
+                if !first_commit && height == self.committed_height.next() {
+                    self.committed_ts
+                } else {
+                    own_anchor
+                };
             self.committed_height = height;
-            self.committed_ts = certified.block().header().parent_qc().weighted_timestamp();
+            self.committed_ts = own_anchor;
         }
         self.provisioning.advance_clock(self.committed_ts);
         self.gc_settled_sets();
@@ -1847,8 +1875,8 @@ impl ExecutionCoordinator {
         // Classification anchors on the block's committee, not the head, so
         // every replica groups its waves and provisions identically across a
         // reshape boundary.
-        let anchored = self
-            .classification_committee(topology_schedule, header.parent_qc().weighted_timestamp());
+        let anchored =
+            self.classification_committee(topology_schedule, self.committed_committee_anchor_ts);
 
         // ── Provision broadcasting (proposer only) ─────────────────────
         if self.me == header.proposer() {
@@ -1913,8 +1941,8 @@ impl ExecutionCoordinator {
         if transactions.is_empty() {
             return Vec::new();
         }
-        let anchored = self
-            .classification_committee(topology_schedule, header.parent_qc().weighted_timestamp());
+        let anchored =
+            self.classification_committee(topology_schedule, self.committed_committee_anchor_ts);
         self.register_sealed_wave_assignments(anchored, header.height(), transactions);
         self.replay_early_wave_attestations(topology_schedule, transactions)
     }
@@ -4636,11 +4664,51 @@ mod tests {
         sched
     }
 
+    /// An empty block at `height` whose parent QC carries `anchor_ms` — the
+    /// block's own position on the weighted-time grid.
+    /// Commit-time classification resolves against the window the block's
+    /// *parent* anchored in, because that is where a block's committee comes
+    /// from — so it matches the snapshot the proposer built under and the
+    /// verifier validated against. Reading the block's own anchor instead
+    /// straddles an epoch cut once per window, and a reshape cut there
+    /// changes the shard set `compute_waves` routes over.
+    #[test]
+    fn classification_anchors_on_the_parents_window_across_commits() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
+        let topo = make_test_topology();
+
+        // `certify` stamps the block's parent-QC weighted timestamp, which is
+        // the block's own anchor.
+        let commit = |state: &mut ExecutionCoordinator, height: u64, anchor_ms: u64| {
+            let block = make_live_block_on_shard(
+                ShardId::ROOT,
+                BlockHeight::new(height),
+                anchor_ms,
+                ValidatorId::new(0),
+                vec![],
+            );
+            let _ = state.on_block_committed(&topo, &test_certify(block, anchor_ms));
+        };
+
+        commit(&mut state, 1, 500);
+        commit(&mut state, 2, 1_500);
+
+        assert_eq!(
+            state.committed_committee_anchor_ts,
+            WeightedTimestamp::from_millis(500),
+            "the second block is classified in the window its parent anchored in",
+        );
+        assert_eq!(
+            state.committed_ts,
+            WeightedTimestamp::from_millis(1_500),
+            "its own anchor still drives the deterministic clock",
+        );
+    }
+
     /// Commit-time wave/provision classification anchors on the block's
-    /// committee — `at_for_shard(local_shard, parent_qc.wt)` — not the
-    /// `ArcSwap` head, so every replica groups a block's transactions
-    /// identically across a reshape boundary (matching the proposer and the
-    /// verifier).
+    /// committee — not the `ArcSwap` head, so every replica groups a block's
+    /// transactions identically across a reshape boundary (matching the
+    /// proposer and the verifier).
     #[test]
     fn classification_committee_anchors_at_the_block_window_not_the_head() {
         let state = make_test_state_for_shard(ValidatorId::new(0), ShardId::ROOT);
