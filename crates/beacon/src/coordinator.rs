@@ -76,7 +76,7 @@ const MAX_INPUT_DWELL_REARMS: u32 = 6;
 /// Oldest epoch the topology schedule must retain — the minimum of the
 /// consumer frontiers that still verify QC-bearing artifacts:
 ///
-/// - the local shard chain's committee anchor (`local_frontier`): the
+/// - the local shard chain's committee anchor (`local_committee_anchor`): the
 ///   committed tip is signed by the committee its *parent* anchors, so this
 ///   trails the tip's own anchor by one commit. Live votes/headers and
 ///   synced blocks all key their schedule lookups at or after it;
@@ -106,11 +106,11 @@ const fn cert_kind(cert: &BeaconCert) -> &'static str {
 #[must_use]
 pub fn retention_floor(
     state: &BeaconState,
-    local_frontier: WeightedTimestamp,
+    local_committee_anchor: WeightedTimestamp,
     now: LocalTimestamp,
 ) -> Epoch {
     let windows = state.chain_config.epoch_windows();
-    let local_chain = windows.epoch_for(local_frontier);
+    let local_chain = windows.epoch_for(local_committee_anchor);
     let shard_boundaries = state
         .shard_committees
         .keys()
@@ -252,20 +252,20 @@ pub struct BeaconCoordinator {
     /// before its window opens. A node-local cache, not consensus-critical.
     topology_schedule: TopologySchedule,
 
-    /// Committee anchor of the local shard's committed tip — its parent QC's
-    /// weighted timestamp. The oldest anchor the local chain can still key a
+    /// Committee anchor of the local shard's committed tip — the anchor its
+    /// *parent* carried. The oldest anchor the local chain can still key a
     /// schedule lookup on; holds [`retention_floor`] open while the shard
     /// chain verifies blocks older than the beacon head (catch-up after
     /// downtime, resume after a stall). Seeded at construction from the
     /// recovered tip; advances on every local commit via
     /// [`on_local_block_committed`](Self::on_local_block_committed).
-    local_frontier: WeightedTimestamp,
+    local_committee_anchor: WeightedTimestamp,
 
     /// The committed tip's *own* anchor, one hop newer than
-    /// [`Self::local_frontier`] — held so the next commit can shift it into
-    /// place. A block's committee anchors on its parent, so the anchor a
-    /// commit reports becomes the frontier only once the block after it
-    /// commits.
+    /// [`Self::local_committee_anchor`] — held so the next commit can shift
+    /// it into place. A block's committee anchors on its parent, so the
+    /// anchor a commit reports governs the block after it, and only becomes
+    /// the retained floor once that block commits.
     ///
     /// Kept rather than derived: consecutive blocks' anchors sit an
     /// unbounded number of windows apart when the chain stalls between them
@@ -310,8 +310,8 @@ impl BeaconCoordinator {
     /// the live state). Each state seeds the topology schedule with its
     /// active and lookahead snapshots, so the coordinator boots able to
     /// verify cross-shard artifacts back across the loaded window.
-    /// `local_frontier` is the local shard chain's recovered committee
-    /// anchor (`RecoveredState::committee_anchor_ts`); it seeds the
+    /// `local_committee_anchor` is the local shard chain's recovered committee
+    /// anchor (`RecoveredState::committee_anchor_wt`); it seeds the
     /// schedule's eviction floor and advances via
     /// [`on_local_block_committed`](Self::on_local_block_committed) as the
     /// chain commits. When `latest_block` is genesis, debug-asserts its cert's
@@ -332,7 +332,7 @@ impl BeaconCoordinator {
         history: Vec<BeaconState>,
         me: ValidatorId,
         local_shard: ShardId,
-        local_frontier: WeightedTimestamp,
+        local_committee_anchor: WeightedTimestamp,
         local_block_anchor: WeightedTimestamp,
         network: NetworkDefinition,
         expected_config_hash: GenesisConfigHash,
@@ -412,7 +412,7 @@ impl BeaconCoordinator {
             commit_assembly: CommitAssembler::new(),
             local_shard,
             topology_schedule,
-            local_frontier,
+            local_committee_anchor,
             local_block_anchor,
             me,
             network,
@@ -451,15 +451,16 @@ impl BeaconCoordinator {
         self.pending_candidate.as_ref().map(|c| c.block_hash())
     }
 
-    /// Local shard block committed — advance the chain's committee anchor to
-    /// the new tip's parent-QC weighted timestamp, the node-local frontier
-    /// [`retention_floor`] keeps the schedule open for.
-    pub const fn on_local_block_committed(&mut self, anchor_ts: WeightedTimestamp) {
-        // `anchor_ts` is the committed block's own anchor, which selects the
-        // committee of the block *after* it. The committee that signed the
+    /// Local shard block committed — shift both anchors up a hop, so
+    /// [`Self::local_committee_anchor`] names the committee that signed the
+    /// new tip and [`retention_floor`] keeps the schedule open for it.
+    pub const fn on_local_block_committed(&mut self, block_anchor_wt: WeightedTimestamp) {
+        // `block_anchor_wt` is the committed block's own anchor, which selects
+        // the committee of the block *after* it. The committee that signed the
         // block just committed anchors one hop back — the value the previous
-        // commit reported — so the frontier trails by one.
-        self.local_frontier = std::mem::replace(&mut self.local_block_anchor, anchor_ts);
+        // commit reported — so the retained anchor trails by one.
+        self.local_committee_anchor =
+            std::mem::replace(&mut self.local_block_anchor, block_anchor_wt);
     }
 
     /// Schedule the first `BeaconCommitteeStart` timer so the upcoming
@@ -2001,7 +2002,7 @@ impl BeaconCoordinator {
         );
         self.topology_schedule.evict_below(retention_floor(
             &self.state,
-            self.local_frontier,
+            self.local_committee_anchor,
             self.now,
         ));
 
@@ -5576,9 +5577,8 @@ mod tests {
         }
     }
 
-    /// Each consumer frontier can become the floor: the lagging one wins.
     #[test]
-    fn the_local_frontier_trails_the_committed_tips_own_anchor() {
+    fn the_retained_anchor_trails_the_committed_tips_own_anchor() {
         // The shard resolves its committed tip's committee from the tip's
         // *parent* anchor, so the floor has to sit there and not at the tip's
         // own — otherwise the window that verifies the parent QC over the tip
@@ -5591,16 +5591,17 @@ mod tests {
         coord.on_local_block_committed(anchor(1_000));
         coord.on_local_block_committed(anchor(9_000));
         assert_eq!(
-            coord.local_frontier,
+            coord.local_committee_anchor,
             anchor(1_000),
-            "committing a block past a long stall leaves the frontier at the anchor its parent \
-             carried, not the one it dates itself by",
+            "committing a block past a long stall retains the anchor its parent carried, not the \
+             one it dates itself by",
         );
 
         coord.on_local_block_committed(anchor(9_500));
-        assert_eq!(coord.local_frontier, anchor(9_000));
+        assert_eq!(coord.local_committee_anchor, anchor(9_000));
     }
 
+    /// Each consumer frontier can become the floor: the lagging one wins.
     #[test]
     fn retention_floor_is_the_minimum_consumer_frontier() {
         let shard = ShardId::ROOT;

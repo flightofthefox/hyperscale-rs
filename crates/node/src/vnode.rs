@@ -117,7 +117,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
         .expect("beacon chain is non-empty after the genesis commit");
     let boot_floor = retention_floor(
         &latest_state,
-        args.recovered.committee_anchor_ts(),
+        args.recovered.committee_anchor_wt(),
         args.now,
     );
     let beacon_history: Vec<BeaconState> = args
@@ -141,8 +141,8 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
                 beacon_history.clone(),
                 validator,
                 args.shard,
-                args.recovered.committee_anchor_ts(),
-                args.recovered.block_anchor_ts(),
+                args.recovered.committee_anchor_wt(),
+                args.recovered.block_anchor_wt(),
                 args.beacon_network.clone(),
                 args.beacon_config_hash,
             );

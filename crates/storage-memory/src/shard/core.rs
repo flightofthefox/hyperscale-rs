@@ -157,9 +157,9 @@ impl SimShardStorage {
                 .get(&height)
                 .map(|block| block.block().header().parent_qc().weighted_timestamp())
         };
-        let committed_anchor_ts = anchor_ts_at(committed_height);
+        let committed_block_anchor_wt = anchor_ts_at(committed_height);
         // The committee that signed the tip anchors on the header below it.
-        let committed_committee_anchor_ts = committed_height.prev().and_then(anchor_ts_at);
+        let committed_committee_anchor_wt = committed_height.prev().and_then(anchor_ts_at);
         let committed_reveal_chain = c
             .blocks
             .get(&committed_height)
@@ -196,8 +196,8 @@ impl SimShardStorage {
             anchor_qc: None,
             committed_in_flight: None,
             committed_reveal_chain,
-            committed_anchor_ts,
-            committed_committee_anchor_ts,
+            committed_block_anchor_wt,
+            committed_committee_anchor_wt,
             jmt_root: Some(self.state_root()),
             beacon_witness_start,
             beacon_witness_leaf_hashes,

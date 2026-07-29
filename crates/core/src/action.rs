@@ -681,9 +681,9 @@ pub enum Action {
         /// Reveal chain on the parent header.
         parent_reveal_chain: RevealChain,
         /// Anchor epoch of the parent header.
-        parent_anchor_epoch: Epoch,
+        parent_committee_anchor_epoch: Epoch,
         /// Anchor epoch of the block being verified.
-        anchor_epoch: Epoch,
+        committee_anchor_epoch: Epoch,
         /// Absolute leaf index of `parent_witness_leaves[0]` — the
         /// committed accumulator's retained-window start.
         parent_leaves_start: BeaconWitnessLeafCount,
@@ -858,12 +858,12 @@ pub enum Action {
         /// Reveal chain on the parent header — what this block's chain
         /// extends when both anchor in the same epoch.
         parent_reveal_chain: RevealChain,
-        /// Anchor epoch of the parent header. Differing from `anchor_epoch`
+        /// Anchor epoch of the parent header. Differing from `committee_anchor_epoch`
         /// is what reseeds the chain.
-        parent_anchor_epoch: Epoch,
+        parent_committee_anchor_epoch: Epoch,
         /// Anchor epoch of the block being built —
         /// `epoch_for(parent_qc.weighted_timestamp)`.
-        anchor_epoch: Epoch,
+        committee_anchor_epoch: Epoch,
         /// Whether the block's window is the shard's final epoch before
         /// a split, resolved by the coordinator from the schedule. When
         /// set, the handler extracts the root node's two child hashes

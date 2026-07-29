@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, QuorumCertificate,
-    ValidatorId, Verified, VoteCount,
+    Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ConsensusPublicKey,
+    QuorumCertificate, ValidatorId, Verified, VoteCount,
 };
 use tracing::{debug, info, warn};
 
@@ -229,6 +229,29 @@ impl BlockSyncManager {
         self.buffered_synced_blocks
             .get(&height)
             .is_none_or(|entries| entries.len() < MAX_BUFFERED_PER_HEIGHT)
+    }
+
+    /// Header of a synced block still inside the sync pipeline — pending QC
+    /// verification, or buffered awaiting its turn. The drain hands
+    /// consecutive heights to verification in parallel, so a block's parent
+    /// is routinely still in flight here when the block itself needs its
+    /// parent's anchor to resolve a committee.
+    ///
+    /// An unverified entry counts: `hash` names one block and only that
+    /// block hashes to it, so reading its anchor is sound whether or not its
+    /// own QC has been checked. A forger who supplies both a block and its
+    /// parent still cannot make the pair verify — the QC must hold under
+    /// whatever committee the anchor selects.
+    pub fn held_header(&self, block_hash: BlockHash) -> Option<&BlockHeader> {
+        self.pending_synced_block_verifications
+            .get(&block_hash)
+            .map(|pending| pending.block().header())
+            .or_else(|| {
+                self.buffered_synced_blocks
+                    .values()
+                    .find_map(|entries| entries.get(&block_hash))
+                    .map(|certified| certified.block().header())
+            })
     }
 
     /// Check if any pending verification has a block at the given height.

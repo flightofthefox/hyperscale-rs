@@ -15,11 +15,14 @@ pub struct TransactionRootContext<'a> {
     /// The block's transactions — each contributes one leaf (its
     /// content hash) to the recomputed root.
     pub transactions: &'a [Arc<Verifiable<RoutableTransaction>>],
-    /// Parent QC's `weighted_timestamp` — the shard-consensus-authenticated
-    /// clock for this block, used as the anchor every tx's `validity_range`
-    /// must enclose. An honest cluster never sees a window mismatch here
-    /// because the proposer applied the same check during transaction
-    /// selection.
+    /// Parent QC's `weighted_timestamp` — the block's own anchor, the
+    /// shard-consensus-authenticated clock every tx's `validity_range` must
+    /// enclose. Named for the role rather than the value: it is the same
+    /// quantity the coordinator calls a block anchor, not a further kind of
+    /// anchor, and in particular not the one that selects the committee
+    /// (which keys on the parent, a hop lower). An honest cluster never sees
+    /// a window mismatch here because the proposer applied the same check
+    /// during transaction selection.
     pub validity_anchor: WeightedTimestamp,
 }
 

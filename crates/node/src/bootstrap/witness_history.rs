@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
         assert_eq!(
-            recovered.committed_anchor_ts,
+            recovered.committed_block_anchor_wt,
             Some(header.parent_qc().weighted_timestamp()),
         );
         assert!(recovered.latest_qc.is_none());

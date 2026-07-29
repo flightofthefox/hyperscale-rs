@@ -45,11 +45,11 @@ pub const REVEAL_CHAIN_DOMAIN_TAG: &[u8] = b"hyperscale-reveal-chain-v1";
 #[must_use]
 pub fn next_reveal_chain(
     parent_chain: RevealChain,
-    parent_anchor_epoch: Epoch,
-    own_anchor_epoch: Epoch,
+    parent_committee_anchor_epoch: Epoch,
+    committee_anchor_epoch: Epoch,
     own_output: VrfOutput,
 ) -> RevealChain {
-    let prior = if own_anchor_epoch == parent_anchor_epoch {
+    let prior = if committee_anchor_epoch == parent_committee_anchor_epoch {
         parent_chain
     } else {
         RevealChain::ZERO

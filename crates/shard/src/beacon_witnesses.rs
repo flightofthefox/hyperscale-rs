@@ -138,7 +138,7 @@ impl BeaconWitnessAccumulator {
 /// then prepends the committed accumulator's retained window. Each
 /// ancestor's leaves resolve against *its own* committee — the certified
 /// binding of its committee anchor (its parent's
-/// `parent_qc.weighted_timestamp()`, or `committed_anchor_ts` for the
+/// `parent_qc.weighted_timestamp()`, or `committed_block_anchor_wt` for the
 /// ancestor extending the committed tip) and its certifying QC
 /// (`parent_qc_wt` for the first ancestor, then each successor's
 /// `parent_qc` down the chain), matching the commit-time
@@ -175,7 +175,7 @@ impl BeaconWitnessAccumulator {
 pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
     accumulator: &BeaconWitnessAccumulator,
     committed_hash: BlockHash,
-    committed_anchor_ts: WeightedTimestamp,
+    committed_block_anchor_wt: WeightedTimestamp,
     parent_block_hash: BlockHash,
     parent_qc_wt: WeightedTimestamp,
     pending_blocks: &PendingBlocks,
@@ -227,7 +227,7 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
         // they walk it.
         let committee_anchor = chain
             .get(index + 1)
-            .map_or(committed_anchor_ts, |(parent, _)| {
+            .map_or(committed_block_anchor_wt, |(parent, _)| {
                 parent.header().parent_qc().weighted_timestamp()
             });
         let Some((committee, _)) =

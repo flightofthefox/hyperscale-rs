@@ -38,11 +38,12 @@ pub struct BeaconWitnessRootContext<'a> {
     /// Reveal chain on the parent header — what this block's chain extends
     /// when both anchor in the same epoch.
     pub parent_reveal_chain: RevealChain,
-    /// Anchor epoch of the parent header.
-    pub parent_anchor_epoch: Epoch,
-    /// Anchor epoch of the block being verified. Differing from
-    /// `parent_anchor_epoch` is what reseeds the chain.
-    pub anchor_epoch: Epoch,
+    /// Epoch the parent header's committee is drawn from.
+    pub parent_committee_anchor_epoch: Epoch,
+    /// Epoch the committee of the block being verified is drawn from —
+    /// the parent's committee anchor, a hop below this block's own. Differing
+    /// from `parent_committee_anchor_epoch` is what reseeds the chain.
+    pub committee_anchor_epoch: Epoch,
     /// Absolute leaf index of `parent_witness_leaves[0]` — the
     /// committed accumulator's retained-window start. The recomputed
     /// leaf count is `parent_leaves_start + |window + new leaves|`.
@@ -329,8 +330,8 @@ fn verify_reveal_chain(
 ) -> Result<(), BeaconWitnessRootVerifyError> {
     let computed = next_reveal_chain(
         ctx.parent_reveal_chain,
-        ctx.parent_anchor_epoch,
-        ctx.anchor_epoch,
+        ctx.parent_committee_anchor_epoch,
+        ctx.committee_anchor_epoch,
         vrf_output_from_proof(ctx.witness_sources.randomness_reveal()),
     );
     if ctx.claimed_reveal_chain != computed {
@@ -625,8 +626,8 @@ mod tests {
                 vrf_output_from_proof(witness_sources.randomness_reveal()),
             ),
             parent_reveal_chain: RevealChain::ZERO,
-            parent_anchor_epoch: Epoch::GENESIS,
-            anchor_epoch: Epoch::GENESIS,
+            parent_committee_anchor_epoch: Epoch::GENESIS,
+            committee_anchor_epoch: Epoch::GENESIS,
             parent_leaves_start: BeaconWitnessLeafCount::ZERO,
             parent_witness_leaves,
             parent_round: Round::INITIAL,

@@ -83,7 +83,9 @@ pub enum SplitAtBoundary {
 /// late transactions simply land in the counterpart abort backstop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuiesceCut {
-    /// The proposer's current chain anchor.
+    /// Where the proposer's chain sits on the weighted-time grid: the
+    /// committee anchor of the block it would build next, so the window this
+    /// cut closes is the one that committee is drawn from.
     pub now_wt: WeightedTimestamp,
     /// The weighted timestamp at which the shard splits.
     pub cut_wt: WeightedTimestamp,

@@ -65,17 +65,17 @@ pub struct RecoveredState {
     /// timestamp (the tip's own WT) when the tip is an epoch's first block.
     /// `None` for a fresh start or genesis tip; the coordinator then falls
     /// back to the tip's own WT, exact except across that one boundary case.
-    pub committed_anchor_ts: Option<WeightedTimestamp>,
+    pub committed_block_anchor_wt: Option<WeightedTimestamp>,
 
     /// Weighted timestamp of the parent QC on the header *below* the committed
     /// tip — the anchor of the committee that signed the tip itself, since a
     /// block's committee keys on its parent. Read back one height below
-    /// `committed_anchor_ts` from the same stored headers. `None` when that
+    /// `committed_block_anchor_wt` from the same stored headers. `None` when that
     /// header isn't stored (fresh start, genesis tip, a snap-synced boundary
     /// whose parent was never imported, or a parent pruned past retention);
     /// the coordinator then falls back to the tip's own anchor, which resolves
     /// the same committee except when the tip is an epoch's first block.
-    pub committed_committee_anchor_ts: Option<WeightedTimestamp>,
+    pub committed_committee_anchor_wt: Option<WeightedTimestamp>,
 
     /// Last committed JMT root hash.
     ///
@@ -154,10 +154,10 @@ impl RecoveredState {
             anchor_qc: Some(anchor_qc),
             committed_in_flight: Some(boundary_header.in_flight()),
             committed_reveal_chain: Some(boundary_header.reveal_chain()),
-            committed_anchor_ts: Some(boundary_header.parent_qc().weighted_timestamp()),
+            committed_block_anchor_wt: Some(boundary_header.parent_qc().weighted_timestamp()),
             // The boundary's parent is not imported, so the committee that
             // signed the boundary block resolves only through the fallback.
-            committed_committee_anchor_ts: None,
+            committed_committee_anchor_wt: None,
             jmt_root: Some(anchor.state_root),
             beacon_witness_start: boundary_header.beacon_witness_base(),
             beacon_witness_leaf_hashes: witness_leaf_hashes,
@@ -181,13 +181,13 @@ impl RecoveredState {
     }
 
     /// The recovered tip's own position on the weighted-time grid —
-    /// [`committed_anchor_ts`](Self::committed_anchor_ts) when storage
+    /// [`committed_block_anchor_wt`](Self::committed_block_anchor_wt) when storage
     /// recovered it, else the tip QC's own weighted timestamp (identical
     /// except when the tip is an epoch's first block), else `ZERO` on a fresh
     /// start.
     #[must_use]
-    pub fn block_anchor_ts(&self) -> WeightedTimestamp {
-        self.committed_anchor_ts.unwrap_or_else(|| {
+    pub fn block_anchor_wt(&self) -> WeightedTimestamp {
+        self.committed_block_anchor_wt.unwrap_or_else(|| {
             self.latest_qc.as_deref().map_or(
                 WeightedTimestamp::ZERO,
                 QuorumCertificate::weighted_timestamp,
@@ -196,14 +196,14 @@ impl RecoveredState {
     }
 
     /// Anchor of the committee that signed the recovered tip —
-    /// [`committed_committee_anchor_ts`](Self::committed_committee_anchor_ts)
+    /// [`committed_committee_anchor_wt`](Self::committed_committee_anchor_wt)
     /// when storage recovered it, else the tip's own anchor, which names the
     /// same committee except when the tip is an epoch's first block. The
     /// oldest weighted timestamp the recovered chain can still key a topology
     /// lookup on, so it is what schedule retention floors on.
     #[must_use]
-    pub fn committee_anchor_ts(&self) -> WeightedTimestamp {
-        self.committed_committee_anchor_ts
-            .unwrap_or_else(|| self.block_anchor_ts())
+    pub fn committee_anchor_wt(&self) -> WeightedTimestamp {
+        self.committed_committee_anchor_wt
+            .unwrap_or_else(|| self.block_anchor_wt())
     }
 }

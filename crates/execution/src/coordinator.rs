@@ -158,7 +158,7 @@ pub struct ExecutionCoordinator {
     /// keys on its parent. What wave and provision classification resolves
     /// against, so every replica groups a block's transactions exactly as the
     /// proposer built them and the verifier validated them.
-    committed_committee_anchor_ts: WeightedTimestamp,
+    committed_committee_anchor_wt: WeightedTimestamp,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Provisioning
@@ -333,7 +333,7 @@ impl ExecutionCoordinator {
             finalized,
             committed_height: BlockHeight::GENESIS,
             committed_ts: WeightedTimestamp::ZERO,
-            committed_committee_anchor_ts: WeightedTimestamp::ZERO,
+            committed_committee_anchor_wt: WeightedTimestamp::ZERO,
             waves: WaveRegistry::new(),
             early: EarlyArrivalBuffer::new(),
             provisioning: ProvisioningTracker::new(),
@@ -382,7 +382,7 @@ impl ExecutionCoordinator {
     /// anchor_wt)`, the same snapshot the proposer classified `waves` against
     /// and the verifier validated against. Both of those resolve a block's
     /// committee from its parent, so `anchor_wt` is
-    /// [`Self::committed_committee_anchor_ts`], not the block's own: the two
+    /// [`Self::committed_committee_anchor_wt`], not the block's own: the two
     /// straddle an epoch cut once per window, and a reshape cut there changes
     /// the shard set `compute_waves` routes over.
     ///
@@ -1742,7 +1742,7 @@ impl ExecutionCoordinator {
             // so the block's own stands in: the same window except when the
             // gap ends on an epoch's first block, and exact again at the next
             // commit.
-            self.committed_committee_anchor_ts =
+            self.committed_committee_anchor_wt =
                 if !first_commit && height == self.committed_height.next() {
                     self.committed_ts
                 } else {
@@ -1876,7 +1876,7 @@ impl ExecutionCoordinator {
         // every replica groups its waves and provisions identically across a
         // reshape boundary.
         let anchored =
-            self.classification_committee(topology_schedule, self.committed_committee_anchor_ts);
+            self.classification_committee(topology_schedule, self.committed_committee_anchor_wt);
 
         // ── Provision broadcasting (proposer only) ─────────────────────
         if self.me == header.proposer() {
@@ -1942,7 +1942,7 @@ impl ExecutionCoordinator {
             return Vec::new();
         }
         let anchored =
-            self.classification_committee(topology_schedule, self.committed_committee_anchor_ts);
+            self.classification_committee(topology_schedule, self.committed_committee_anchor_wt);
         self.register_sealed_wave_assignments(anchored, header.height(), transactions);
         self.replay_early_wave_attestations(topology_schedule, transactions)
     }
@@ -4694,7 +4694,7 @@ mod tests {
         commit(&mut state, 2, 1_500);
 
         assert_eq!(
-            state.committed_committee_anchor_ts,
+            state.committed_committee_anchor_wt,
             WeightedTimestamp::from_millis(500),
             "the second block is classified in the window its parent anchored in",
         );

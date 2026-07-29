@@ -73,8 +73,8 @@ impl RocksDbShardStorage {
             anchor_qc: None,
             committed_in_flight: None,
             committed_reveal_chain: self.committed_reveal_chain(committed_height),
-            committed_anchor_ts: self.anchor_ts_at(committed_height),
-            committed_committee_anchor_ts: committed_height
+            committed_block_anchor_wt: self.anchor_ts_at(committed_height),
+            committed_committee_anchor_wt: committed_height
                 .prev()
                 .and_then(|parent_height| self.anchor_ts_at(parent_height)),
             jmt_root: jmt_root_opt,

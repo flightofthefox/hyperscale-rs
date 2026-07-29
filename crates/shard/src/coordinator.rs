@@ -220,13 +220,13 @@ pub struct ShardCoordinator {
     /// weighted timestamp. Held as a scalar because the committed tip is
     /// pruned from `pending_blocks`, so its anchor stays resolvable — and it
     /// is the committee anchor of the block extending it.
-    committed_anchor_ts: WeightedTimestamp,
+    committed_block_anchor_wt: WeightedTimestamp,
 
     /// [`Self::committee_anchor`] of the latest committed block — the anchor
-    /// its *parent* carried. Kept alongside `committed_anchor_ts` because the
+    /// its *parent* carried. Kept alongside `committed_block_anchor_wt` because the
     /// committed tip's own parent is pruned too, so the committee that signed
     /// the tip could not otherwise be resolved when verifying the QC over it.
-    committed_committee_anchor_ts: WeightedTimestamp,
+    committed_committee_anchor_wt: WeightedTimestamp,
 
     /// State root from the latest committed block header.
     /// Updated synchronously at commit time (not dependent on async JMT).
@@ -425,8 +425,8 @@ impl ShardCoordinator {
         // anchor, which is what the live commit path sets it to, so a restarted
         // node's BFT clock equals a non-restarted peer's rather than running one
         // to two blocks ahead.
-        let committed_anchor_ts = recovered.block_anchor_ts();
-        let committed_committee_anchor_ts = recovered.committee_anchor_ts();
+        let committed_block_anchor_wt = recovered.block_anchor_wt();
+        let committed_committee_anchor_wt = recovered.committee_anchor_wt();
         let recovered_registers = recovered
             .safe_vote_registers
             .get(&me)
@@ -437,9 +437,9 @@ impl ShardCoordinator {
             view_change: ViewChangeController::new(initial_view),
             committed_height: recovered.committed_height,
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
-            committed_ts: committed_anchor_ts,
-            committed_anchor_ts,
-            committed_committee_anchor_ts,
+            committed_ts: committed_block_anchor_wt,
+            committed_block_anchor_wt,
+            committed_committee_anchor_wt,
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
             pending_bytes_deltas: HashMap::new(),
@@ -546,7 +546,7 @@ impl ShardCoordinator {
 
     /// `block_hash`'s own position on the weighted-time grid — its parent QC's
     /// weighted timestamp. The committed tip (pruned from pending and the
-    /// certified cache alike) uses the `committed_anchor_ts` scalar; every
+    /// certified cache alike) uses the `committed_block_anchor_wt` scalar; every
     /// other block resolves through [`ChainView::get_header`], whose
     /// certified-cache fallback covers an applied-but-uncommitted synced
     /// block — such a tip exists only via block-sync (its header was never
@@ -556,7 +556,7 @@ impl ShardCoordinator {
     /// every route (caller stalls).
     fn block_anchor(&self, block_hash: BlockHash) -> Option<WeightedTimestamp> {
         if block_hash == self.committed_hash {
-            return Some(self.committed_anchor_ts);
+            return Some(self.committed_block_anchor_wt);
         }
         self.chain_view()
             .get_header(block_hash)
@@ -568,13 +568,36 @@ impl ShardCoordinator {
     /// so the committee can't be resolved (caller stalls or defers).
     fn committee_anchor(&self, block_hash: BlockHash) -> Option<WeightedTimestamp> {
         if block_hash == self.committed_hash {
-            return Some(self.committed_committee_anchor_ts);
+            return Some(self.committed_committee_anchor_wt);
         }
         self.block_anchor(
             self.chain_view()
                 .get_header(block_hash)?
                 .parent_block_hash(),
         )
+    }
+
+    /// [`Self::committee_anchor`] for a synced block that is not yet held by
+    /// any of the chain routes — it is arriving now, so the walk starts from
+    /// the parent hash its header names rather than from the block itself.
+    ///
+    /// Reaches into the sync pipeline for that parent: the drain hands
+    /// consecutive heights to QC verification in parallel, so the parent is
+    /// usually still in flight rather than applied. Falls back to the block's
+    /// own anchor when no route holds the parent at all — the first block of
+    /// a sync window, or one whose parent sits below retention. That names
+    /// the same committee except when the block is an epoch's first, and it
+    /// is self-healing: the next arrival resolves exactly once its parent
+    /// lands.
+    fn synced_committee_anchor_wt(&self, header: &BlockHeader) -> WeightedTimestamp {
+        let parent = header.parent_block_hash();
+        self.block_anchor(parent)
+            .or_else(|| {
+                self.block_sync
+                    .held_header(parent)
+                    .map(|parent| parent.parent_qc().weighted_timestamp())
+            })
+            .unwrap_or_else(|| header.parent_qc().weighted_timestamp())
     }
 
     /// Committee governing a block that extends `parent` — the one rule
@@ -599,6 +622,12 @@ impl ShardCoordinator {
     /// The committee lookup itself, for the callers that hold an anchor
     /// rather than a parent hash. Terminal-clamped and recovery-bridged;
     /// `None` is a beacon-behind stall or an evicted window.
+    ///
+    /// `anchor` must be a *committee* anchor — [`Self::committee_anchor`] of
+    /// the block in question, or equivalently [`Self::block_anchor`] of its
+    /// parent. Passing a block's own anchor resolves the window it opens
+    /// rather than the one it belongs to, which is a different committee for
+    /// exactly the blocks that sit on an epoch cut.
     fn committee_at<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
@@ -609,10 +638,10 @@ impl ShardCoordinator {
             .map(|(snapshot, _)| snapshot)
     }
 
-    /// Weighted timestamp selecting the committee for the height in progress /
-    /// our next proposal: the [`Self::block_anchor`] of the block we are about
-    /// to extend, since a child's committee anchors on its parent. The build
-    /// path resolves its committee from the same parent through
+    /// Committee anchor of the height in progress / our next proposal: the
+    /// [`Self::block_anchor`] of the block we are about to extend, since a
+    /// child's committee anchors on its parent. The build path resolves its
+    /// committee from the same parent through
     /// [`Self::committee_for_child_of`], so election and build cannot disagree.
     ///
     /// Keying on the tip block rather than on our own aggregate over it is
@@ -628,7 +657,7 @@ impl ShardCoordinator {
     /// committed tip, whose anchor a split child's genesis carries from the
     /// parent chain's terminal canonical timestamp — resolving its first
     /// proposal in the window it inherited rather than epoch 0.
-    fn tip_anchor_ts(&self) -> Option<WeightedTimestamp> {
+    fn next_proposal_committee_anchor_wt(&self) -> Option<WeightedTimestamp> {
         self.block_anchor(self.chain_view().proposal_parent().0)
     }
 
@@ -680,7 +709,7 @@ impl ShardCoordinator {
         &self,
         topology_schedule: &'t TopologySchedule,
     ) -> Option<&'t TopologySnapshot> {
-        let anchor = self.tip_anchor_ts()?;
+        let anchor = self.next_proposal_committee_anchor_wt()?;
         if self.recovery_quiesced(topology_schedule, anchor) {
             return None;
         }
@@ -739,7 +768,7 @@ impl ShardCoordinator {
     /// the fence rejects any wave naming the shard regardless of the set,
     /// so retaining it only leaks memory.
     fn gc_settled_sets(&mut self) {
-        let now = self.committed_anchor_ts;
+        let now = self.committed_block_anchor_wt;
         self.settled_sets
             .retain(|_, settled| now <= settled.terminal_wt.plus(RETENTION_HORIZON));
     }
@@ -873,7 +902,7 @@ impl ShardCoordinator {
     /// successors are live, which [`Self::dissolved`] is the test for.
     #[must_use]
     pub fn quiescent(&self, topology_schedule: &TopologySchedule) -> bool {
-        self.past_terminal_window(topology_schedule, self.committed_anchor_ts)
+        self.past_terminal_window(topology_schedule, self.committed_block_anchor_wt)
     }
 
     /// Whether this chain may **dissolve** — stop proposing, ingesting headers,
@@ -938,7 +967,7 @@ impl ShardCoordinator {
     /// through, so quiescing on a guess buys nothing.
     #[must_use]
     pub fn quiesce_cut(&self, topology_schedule: &TopologySchedule) -> Option<QuiesceCut> {
-        let now_wt = self.tip_anchor_ts()?;
+        let now_wt = self.next_proposal_committee_anchor_wt()?;
         (topology_schedule.terminates_at_next_boundary(self.local_shard, now_wt) == Some(true))
             .then(|| {
                 let windows = topology_schedule.windows();
@@ -1260,8 +1289,8 @@ impl ShardCoordinator {
         // height 0 for chains born at network genesis).
         self.committed_height = genesis.height();
         self.committed_ts = genesis.header().parent_qc().weighted_timestamp();
-        self.committed_anchor_ts = self.committed_ts;
-        self.committed_committee_anchor_ts = self.committed_ts;
+        self.committed_block_anchor_wt = self.committed_ts;
+        self.committed_committee_anchor_wt = self.committed_ts;
         self.substate_bytes_frontier.0 = genesis.height();
 
         // Record genesis time as initial leader activity so that the view
@@ -1712,7 +1741,7 @@ impl ShardCoordinator {
         let (parent_start, mut parent_leaves) = prospective_parent_witness_leaves(
             &self.beacon_witness_accumulator,
             self.committed_hash,
-            self.committed_anchor_ts,
+            self.committed_block_anchor_wt,
             parent_block_hash,
             proposal_wt,
             &self.pending_blocks,
@@ -1846,11 +1875,16 @@ impl ShardCoordinator {
         // epochs, and a block belongs to the epoch its committee is drawn
         // from — so both epochs are committee anchors: this block's is the
         // parent's own anchor, the parent's is the grandparent's.
-        let (Some(parent_reveal_chain), Some(own_anchor_wt), Some(parent_anchor_wt)) = (
+        let (
+            Some(parent_reveal_chain),
+            Some(committee_anchor_wt),
+            Some(parent_committee_anchor_wt),
+        ) = (
             self.chain_view().parent_reveal_chain(parent_block_hash),
             self.block_anchor(parent_block_hash),
             self.committee_anchor(parent_block_hash),
-        ) else {
+        )
+        else {
             trace!(
                 validator = ?self.me,
                 height = height.inner(),
@@ -1858,8 +1892,8 @@ impl ShardCoordinator {
             );
             return vec![];
         };
-        let parent_anchor_epoch = topology_schedule.epoch_for(parent_anchor_wt);
-        let own_anchor_epoch = topology_schedule.epoch_for(own_anchor_wt);
+        let parent_committee_anchor_epoch = topology_schedule.epoch_for(parent_committee_anchor_wt);
+        let committee_anchor_epoch = topology_schedule.epoch_for(committee_anchor_wt);
         // The reshape predicate reads the substate byte total behind the parent
         // state. Resolve it before the witness preview drains the
         // ready-signal pool: a missing ancestor delta defers the whole
@@ -1910,8 +1944,8 @@ impl ShardCoordinator {
             preview.parent_window,
             preview.base,
             parent_reveal_chain,
-            parent_anchor_epoch,
-            own_anchor_epoch,
+            parent_committee_anchor_epoch,
+            committee_anchor_epoch,
             carry_split_child_roots,
             carry_settled_waves_root,
             topology_schedule
@@ -2557,18 +2591,22 @@ impl ShardCoordinator {
         // This is CRITICAL for shard consensus safety - prevents Byzantine proposers from
         // including fake QCs with invalid signatures.
         if !header.parent_qc().is_genesis() {
-            // The parent QC's weighted timestamp keys this block's committee
-            // but rides outside the QC's signed message, so a Byzantine
-            // proposer can rewrite it on a genuine QC and steer verification
-            // to any retained epoch's committee. Honest aggregation clamps
-            // every vote to the voted block's own anchor (`VoteSet`), so a
-            // genuine QC never regresses below its parent's anchor — enforce
-            // that floor here, the chokepoint every vote path crosses (fresh
-            // headers, deferred children, and the verified-QC cache hit
-            // below). Unresolvable only while the parent itself is unknown —
-            // defer like the committee resolution below does;
-            // `retry_pending_children` re-enters when the parent lands.
-            let Some(parent_anchor) = self.block_anchor(header.parent_qc().block_hash()) else {
+            // This header's committee anchor — the parent's own anchor, one
+            // value that both checks below key on.
+            //
+            // The floor first: the parent QC's weighted timestamp is this
+            // block's own anchor, and it rides outside the QC's signed
+            // message, so a Byzantine proposer can rewrite it on a genuine QC
+            // and steer verification to any retained epoch's committee.
+            // Honest aggregation clamps every vote to the voted block's own
+            // anchor (`VoteSet`), so a genuine QC never regresses below the
+            // committee anchor — enforce that here, the chokepoint every vote
+            // path crosses (fresh headers, deferred children, and the
+            // verified-QC cache hit below). Unresolvable only while the parent
+            // itself is unknown — defer like the committee resolution below
+            // does; `retry_pending_children` re-enters when the parent lands.
+            let Some(committee_anchor_wt) = self.block_anchor(header.parent_qc().block_hash())
+            else {
                 trace!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
@@ -2577,23 +2615,23 @@ impl ShardCoordinator {
                 );
                 return vec![];
             };
-            if header.parent_qc().weighted_timestamp() < parent_anchor {
+            if header.parent_qc().weighted_timestamp() < committee_anchor_wt {
                 warn!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
                     height = height.inner(),
                     qc_weighted_ms = header.parent_qc().weighted_timestamp().as_millis(),
-                    parent_anchor_ms = parent_anchor.as_millis(),
-                    "Parent QC weighted timestamp regresses below the parent's anchor — not voting"
+                    committee_anchor_ms = committee_anchor_wt.as_millis(),
+                    "Parent QC weighted timestamp regresses below the committee anchor — not voting"
                 );
                 return vec![];
             }
 
-            // `committee(h)` anchors on `h-1`, which is now held, so the
-            // proposer check `reject_invalid_header` defers for a header
-            // arriving ahead of its parent runs here — before any vote.
+            // The parent is now held, so `committee(h)` resolves — the
+            // proposer check `reject_invalid_header` skips for a header
+            // arriving ahead of its parent runs here, before any vote.
             if let ScheduleLookup::Committee(committee) = topology_schedule
-                .lookup_for_shard_live(self.local_shard, parent_anchor)
+                .lookup_for_shard_live(self.local_shard, committee_anchor_wt)
                 .0
                 && let Err(e) = validate_proposer(committee.as_ref(), self.local_shard, &header)
             {
@@ -2862,8 +2900,8 @@ impl ShardCoordinator {
                 &self.beacon_witness_accumulator,
                 self.committed_hash,
                 self.committed_reveal_chain,
-                self.committed_anchor_ts,
-                self.committed_committee_anchor_ts,
+                self.committed_block_anchor_wt,
+                self.committed_committee_anchor_wt,
                 block_hash,
                 block,
                 SubstateCountSource {
@@ -3692,8 +3730,8 @@ impl ShardCoordinator {
             &self.beacon_witness_accumulator,
             self.committed_hash,
             self.committed_reveal_chain,
-            self.committed_anchor_ts,
-            self.committed_committee_anchor_ts,
+            self.committed_block_anchor_wt,
+            self.committed_committee_anchor_wt,
             self.local_shard,
             committee,
             topology_schedule,
@@ -4201,8 +4239,8 @@ impl ShardCoordinator {
         // Retain both anchors across the prune: the tip's own, which anchors
         // the committee of the block extending it, and the one its parent
         // carried, which anchors the committee that signed the tip itself.
-        self.committed_committee_anchor_ts = self.committed_anchor_ts;
-        self.committed_anchor_ts = block.header().parent_qc().weighted_timestamp();
+        self.committed_committee_anchor_wt = self.committed_block_anchor_wt;
+        self.committed_block_anchor_wt = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
         self.committed_in_flight = Some(block.header().in_flight());
         self.committed_reveal_chain = Some(block.header().reveal_chain());
@@ -4539,22 +4577,29 @@ impl ShardCoordinator {
             return vec![];
         }
 
-        // The synced block's QC was signed by its own committee,
-        // `at(parent_qc weighted ts)`. A not-yet-committed epoch defers:
-        // the block goes back to the buffer and `on_beacon_block_persisted`
-        // re-drains it once the beacon catches up — discarding it here
-        // would leave a hole the drain can never refill without a network
-        // re-fetch. An evicted epoch rejects: the schedule's floor retains
-        // every epoch the local chain can still verify against, so a synced
-        // block keyed below it carries a forged weighted timestamp (it
-        // rides outside the signed message) or sits on a stale fork — no
-        // amount of retrying resolves it. Certified resolution: a halt
-        // recovery's bridge block — anchored below the bridge, certified
-        // at or past it — verifies against the fresh committee.
+        // The QC over this block was signed by the block's committee, which
+        // anchors on its parent — the same rule the live vote path and every
+        // remote consumer resolve by. Reading the block's own anchor instead
+        // picks the window the block *opens*, and across an epoch cut that
+        // moves keys the signature check fails and sync wedges at that height
+        // rather than crossing the boundary.
+        //
+        // A not-yet-committed epoch defers: the block goes back to the buffer
+        // and `on_beacon_block_persisted` re-drains it once the beacon catches
+        // up — discarding it here would leave a hole the drain can never
+        // refill without a network re-fetch. An evicted epoch rejects: the
+        // schedule's floor retains every epoch the local chain can still
+        // verify against, so a synced block keyed below it carries a forged
+        // weighted timestamp (it rides outside the signed message) or sits on
+        // a stale fork — no amount of retrying resolves it. Certified
+        // resolution: a halt recovery's bridge block — anchored below the
+        // bridge, certified at or past it — verifies against the fresh
+        // committee.
+        let committee_anchor_wt = self.synced_committee_anchor_wt(certified.block().header());
         let committee = match topology_schedule
             .lookup_for_shard_certified(
                 self.local_shard,
-                certified.block().header().parent_qc().weighted_timestamp(),
+                committee_anchor_wt,
                 certified.qc().weighted_timestamp(),
             )
             .0
@@ -6194,8 +6239,8 @@ mod tests {
         install_complete_block(&mut state, &parent);
         install_complete_block(&mut state, &child);
         state.committed_hash = parent.hash();
-        state.committed_anchor_ts = WeightedTimestamp::from_millis(200);
-        state.committed_committee_anchor_ts = WeightedTimestamp::from_millis(100);
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(200);
+        state.committed_committee_anchor_wt = WeightedTimestamp::from_millis(100);
 
         assert!(
             state.committee_of_block(&schedule, child.hash()).is_some(),
@@ -6276,6 +6321,85 @@ mod tests {
     }
 
     #[test]
+    fn a_synced_blocks_qc_verifies_under_the_committee_its_parent_anchors() {
+        // Sync dispatches QC verification against `committee(h)`, which
+        // anchors on `h-1` — the same rule the live vote path and every
+        // remote consumer apply. Resolving on the block's own anchor picks
+        // the window the block *opens*, so across a cut that rotates keys the
+        // aggregate check fails and sync wedges at that height instead of
+        // crossing the boundary.
+        //
+        // The parent here is still awaiting its own QC verification, which is
+        // the normal case: the drain hands consecutive heights to
+        // verification in parallel, so a block reaches this path long before
+        // its parent has been applied.
+        const ED: u64 = 1_000;
+        let shard = ShardId::ROOT;
+
+        let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
+        let epoch1 = Arc::new(committee_snapshot_with_ids(&[10, 11, 12, 13]));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
+
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            shard,
+            ShardConsensusConfig::default(),
+            RecoveredState::default(),
+        );
+
+        let certify = |block: &Block, weighted_ms: u64| {
+            let mut signers = SignerBitfield::new(4);
+            for i in 0..3 {
+                signers.set(i);
+            }
+            CertifiedBlock::new_unchecked(
+                block.clone(),
+                QuorumCertificate::new(
+                    block.hash(),
+                    shard,
+                    block.height(),
+                    block.header().parent_block_hash(),
+                    block.header().round(),
+                    signers,
+                    AggregateSignature::ZERO,
+                    WeightedTimestamp::from_millis(weighted_ms),
+                ),
+            )
+        };
+
+        // Parent anchors below the cut, child above it.
+        let parent = block_with_parent_qc_ts(BlockHeight::new(5), ED - 1);
+        let child = block_chained_on(BlockHeight::new(6), parent.hash(), ED + 1);
+
+        let parent_actions =
+            state.submit_synced_block_for_verification(&schedule, certify(&parent, ED - 1));
+        assert!(
+            parent_actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            "the parent dispatches first and stays in flight",
+        );
+
+        let actions =
+            state.submit_synced_block_for_verification(&schedule, certify(&child, ED + 1));
+        let keys = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::VerifyQcSignature { public_keys, .. } => Some(public_keys),
+                _ => None,
+            })
+            .expect("the child dispatches QC verification");
+        assert_eq!(
+            *keys,
+            committee_public_keys(&epoch0, shard),
+            "the child's QC must verify under the window its parent anchors, not the one it \
+             dates itself into",
+        );
+    }
+
+    #[test]
     fn a_restarted_replica_resolves_its_tips_own_committee() {
         // Storage recovers two anchors because the tip's committee keys on the
         // header below it, and that header survives nowhere else: it is pruned
@@ -6303,8 +6427,8 @@ mod tests {
             RecoveredState {
                 committed_height: BlockHeight::new(9),
                 committed_hash: Some(tip),
-                committed_anchor_ts: Some(WeightedTimestamp::from_millis(ED)),
-                committed_committee_anchor_ts: Some(WeightedTimestamp::from_millis(ED - 1)),
+                committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(ED)),
+                committed_committee_anchor_wt: Some(WeightedTimestamp::from_millis(ED - 1)),
                 ..RecoveredState::default()
             },
         );
@@ -6362,13 +6486,13 @@ mod tests {
         install_complete_block(&mut state, &parent);
         install_complete_block(&mut state, &child);
         state.committed_hash = parent.header().parent_block_hash();
-        state.committed_anchor_ts = WeightedTimestamp::from_millis(ED - 2);
-        state.committed_committee_anchor_ts = WeightedTimestamp::from_millis(ED - 2);
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(ED - 2);
+        state.committed_committee_anchor_wt = WeightedTimestamp::from_millis(ED - 2);
 
         let actions = state.dispatch_or_park_beacon_witness(&schedule, child.hash());
         let Some(Action::VerifyBeaconWitnessRoot {
-            anchor_epoch,
-            parent_anchor_epoch,
+            committee_anchor_epoch,
+            parent_committee_anchor_epoch,
             ..
         }) = actions
             .iter()
@@ -6378,7 +6502,7 @@ mod tests {
         };
 
         assert_eq!(
-            (*anchor_epoch, *parent_anchor_epoch),
+            (*committee_anchor_epoch, *parent_committee_anchor_epoch),
             (Epoch::new(0), Epoch::new(0)),
             "the child dates itself in epoch 1 but is governed by epoch 0, so it extends the \
              parent's reveal chain instead of reseeding",
@@ -6456,7 +6580,7 @@ mod tests {
         // The grandparent has committed, so the parent's own anchor resolves
         // once it lands.
         state.committed_hash = grandparent.hash();
-        state.committed_anchor_ts = WeightedTimestamp::from_millis(100);
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(100);
 
         // The child holds a header naming a transaction we don't have, so its
         // block never assembles.
@@ -6514,7 +6638,7 @@ mod tests {
         // committed tip — otherwise the parent QC's committee is unresolvable
         // and the vote path defers before reaching the floor check.
         state.committed_hash = parent.header().parent_block_hash();
-        state.committed_anchor_ts = WeightedTimestamp::from_millis(5_000);
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(5_000);
 
         let child_with_anchor = |weighted_ms: u64, tag: &[u8]| {
             let mut signers = SignerBitfield::new(4);
@@ -8830,7 +8954,7 @@ mod tests {
         let parent = BlockHash::from_raw(Hash::from_bytes(b"block_3"));
         state.committed_height = BlockHeight::new(3);
         state.committed_hash = parent;
-        state.committed_anchor_ts = WeightedTimestamp::from_millis(500);
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(500);
         state.verification.on_block_persisted(BlockHeight::new(3));
         state.latest_qc = Some({
             let __qc = make_test_qc(parent, BlockHeight::new(3));
@@ -9142,7 +9266,7 @@ mod tests {
         // The block's committee anchors on its parent, so it is the parent's
         // anchor that has to sit above the schedule head for the committee to
         // be unresolvable.
-        state.committed_anchor_ts = WeightedTimestamp::from_millis(5 * ED);
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(5 * ED);
 
         // Parent QC weighted timestamp in epoch 5 — above the schedule head,
         // so the block's committee is unresolvable until the beacon catches up.
@@ -10035,7 +10159,7 @@ mod tests {
 
     fn coordinator_with_committed_anchor(anchor_ms: u64) -> ShardCoordinator {
         let recovered = RecoveredState {
-            committed_anchor_ts: Some(WeightedTimestamp::from_millis(anchor_ms)),
+            committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(anchor_ms)),
             ..RecoveredState::default()
         };
         ShardCoordinator::new(
@@ -10413,8 +10537,8 @@ mod tests {
         // The block's committee anchors on its parent, so seat that parent as
         // the committed tip and date it in the block's own window.
         coord.committed_hash = block.header().parent_block_hash();
-        coord.committed_anchor_ts = block.header().parent_qc().weighted_timestamp();
-        coord.committed_committee_anchor_ts = coord.committed_anchor_ts;
+        coord.committed_block_anchor_wt = block.header().parent_qc().weighted_timestamp();
+        coord.committed_committee_anchor_wt = coord.committed_block_anchor_wt;
         let block_hash = block.hash();
         let height = block.height();
         let round = block.header().round();

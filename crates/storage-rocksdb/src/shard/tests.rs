@@ -431,7 +431,7 @@ fn test_recovery_seeds_committed_anchor_from_parent_qc() {
     // tip's own WT would resolve the wrong committee for the first post-restart
     // child of a tip that is an epoch's first block.
     assert_eq!(
-        recovered.committed_anchor_ts,
+        recovered.committed_block_anchor_wt,
         Some(WeightedTimestamp::ZERO),
         "anchor must come from the tip's parent QC, not its own QC",
     );
@@ -469,11 +469,11 @@ fn test_recovery_seeds_committee_anchor_from_the_header_below_the_tip() {
     // tip anchors one height below it. Recovering only the tip's own anchor
     // would resolve the tip against the window it opens.
     assert_eq!(
-        recovered.committed_anchor_ts,
+        recovered.committed_block_anchor_wt,
         Some(WeightedTimestamp::from_millis(200)),
     );
     assert_eq!(
-        recovered.committed_committee_anchor_ts,
+        recovered.committed_committee_anchor_wt,
         Some(WeightedTimestamp::from_millis(100)),
         "the tip's committee anchor comes from the header below it",
     );

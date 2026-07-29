@@ -1279,8 +1279,8 @@ impl VerificationPipeline {
         accumulator: &BeaconWitnessAccumulator,
         committed_hash: BlockHash,
         committed_reveal_chain: Option<RevealChain>,
-        committed_anchor_ts: WeightedTimestamp,
-        committed_committee_anchor_ts: WeightedTimestamp,
+        committed_block_anchor_wt: WeightedTimestamp,
+        committed_committee_anchor_wt: WeightedTimestamp,
         local_shard: ShardId,
         topology_snapshot: &TopologySnapshot,
         schedule: &TopologySchedule,
@@ -1290,7 +1290,7 @@ impl VerificationPipeline {
         let (parent_leaves_start, parent_witness_leaves) = match prospective_parent_witness_leaves(
             accumulator,
             committed_hash,
-            committed_anchor_ts,
+            committed_block_anchor_wt,
             header.parent_block_hash(),
             header.parent_qc().weighted_timestamp(),
             pending_blocks,
@@ -1339,13 +1339,13 @@ impl VerificationPipeline {
         // unresolvable parent parks like a blocked leaf walk rather than
         // verifying against a guessed chain.
         let parent_hash = header.parent_block_hash();
-        let Some((parent_reveal_chain, own_anchor_ts, parent_anchor_ts)) = self
+        let Some((parent_reveal_chain, committee_anchor_wt, parent_committee_anchor_wt)) = self
             .parent_reveal_anchors(
                 parent_hash,
                 committed_hash,
                 committed_reveal_chain,
-                committed_anchor_ts,
-                committed_committee_anchor_ts,
+                committed_block_anchor_wt,
+                committed_committee_anchor_wt,
                 pending_blocks,
             )
         else {
@@ -1365,8 +1365,8 @@ impl VerificationPipeline {
             claimed_base: header.beacon_witness_base(),
             claimed_reveal_chain: header.reveal_chain(),
             parent_reveal_chain,
-            parent_anchor_epoch: schedule.epoch_for(parent_anchor_ts),
-            anchor_epoch: schedule.epoch_for(own_anchor_ts),
+            parent_committee_anchor_epoch: schedule.epoch_for(parent_committee_anchor_wt),
+            committee_anchor_epoch: schedule.epoch_for(committee_anchor_wt),
             parent_leaves_start,
             parent_witness_leaves,
             parent_round: header.parent_qc().round(),
@@ -1449,15 +1449,15 @@ impl VerificationPipeline {
         parent_hash: BlockHash,
         committed_hash: BlockHash,
         committed_reveal_chain: Option<RevealChain>,
-        committed_anchor_ts: WeightedTimestamp,
-        committed_committee_anchor_ts: WeightedTimestamp,
+        committed_block_anchor_wt: WeightedTimestamp,
+        committed_committee_anchor_wt: WeightedTimestamp,
         pending_blocks: &PendingBlocks,
     ) -> Option<(RevealChain, WeightedTimestamp, WeightedTimestamp)> {
         if let Some(parent) = self.held_header(parent_hash, pending_blocks) {
             let grandparent_anchor = self.block_anchor(
                 parent.parent_block_hash(),
                 committed_hash,
-                committed_anchor_ts,
+                committed_block_anchor_wt,
                 pending_blocks,
             )?;
             return Some((
@@ -1469,7 +1469,13 @@ impl VerificationPipeline {
         (parent_hash == committed_hash)
             .then_some(committed_reveal_chain)
             .flatten()
-            .map(|chain| (chain, committed_anchor_ts, committed_committee_anchor_ts))
+            .map(|chain| {
+                (
+                    chain,
+                    committed_block_anchor_wt,
+                    committed_committee_anchor_wt,
+                )
+            })
     }
 
     /// A block's own position on the weighted-time grid — its parent QC's
@@ -1479,11 +1485,11 @@ impl VerificationPipeline {
         &self,
         block_hash: BlockHash,
         committed_hash: BlockHash,
-        committed_anchor_ts: WeightedTimestamp,
+        committed_block_anchor_wt: WeightedTimestamp,
         pending_blocks: &PendingBlocks,
     ) -> Option<WeightedTimestamp> {
         if block_hash == committed_hash {
-            return Some(committed_anchor_ts);
+            return Some(committed_block_anchor_wt);
         }
         self.held_header(block_hash, pending_blocks)
             .map(|header| header.parent_qc().weighted_timestamp())
@@ -1747,8 +1753,8 @@ impl VerificationPipeline {
         accumulator: &BeaconWitnessAccumulator,
         committed_hash: BlockHash,
         committed_reveal_chain: Option<RevealChain>,
-        committed_anchor_ts: WeightedTimestamp,
-        committed_committee_anchor_ts: WeightedTimestamp,
+        committed_block_anchor_wt: WeightedTimestamp,
+        committed_committee_anchor_wt: WeightedTimestamp,
         block_hash: BlockHash,
         block: &Block,
         count_source: SubstateCountSource<'_>,
@@ -1831,8 +1837,8 @@ impl VerificationPipeline {
                 accumulator,
                 committed_hash,
                 committed_reveal_chain,
-                committed_anchor_ts,
-                committed_committee_anchor_ts,
+                committed_block_anchor_wt,
+                committed_committee_anchor_wt,
                 local_shard,
                 topology_snapshot,
                 schedule,
