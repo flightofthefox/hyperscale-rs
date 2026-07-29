@@ -114,6 +114,17 @@ impl VoteSet {
         }
     }
 
+    /// Committee votes this set tallies against — one per seat, latched at
+    /// construction from the committee that governs the voted block.
+    ///
+    /// The quorum denominator is a property of the set, not something to
+    /// re-resolve later: by the time a verification batch returns, the block's
+    /// committee may no longer resolve (its parent pruned, or not yet
+    /// arrived), and re-deriving it there would strand the tally.
+    pub const fn committee_votes(&self) -> VoteCount {
+        VoteCount::of(self.verified_voters.len())
+    }
+
     /// Get the block height.
     pub const fn height(&self) -> Option<BlockHeight> {
         self.height

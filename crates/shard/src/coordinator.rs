@@ -114,7 +114,7 @@ use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
 use crate::validation::{
     qc_has_local_quorum_power, qc_weighted_timestamp_too_far_ahead, validate_block_for_vote,
-    validate_header,
+    validate_header, validate_proposer,
 };
 use crate::verification::{
     InFlightCheck, ReadyStateRootVerification, SubstateCountBlocked, SubstateCountSource,
@@ -216,13 +216,17 @@ pub struct ShardCoordinator {
     /// "Now" reference for time-based retention in proposal dedup.
     committed_ts: WeightedTimestamp,
 
-    /// Committee anchor of the latest committed block: its parent QC's
-    /// weighted timestamp, the value that selects the committee the block
-    /// belongs to (`committee(tip) == at(committed_anchor_ts)`). Held as a
-    /// scalar because the committed tip is pruned from `pending_blocks`, so
-    /// [`Self::committee_anchor`] can still resolve its committee when
-    /// verifying the QC of the first block extending it.
+    /// [`Self::block_anchor`] of the latest committed block: its parent QC's
+    /// weighted timestamp. Held as a scalar because the committed tip is
+    /// pruned from `pending_blocks`, so its anchor stays resolvable — and it
+    /// is the committee anchor of the block extending it.
     committed_anchor_ts: WeightedTimestamp,
+
+    /// [`Self::committee_anchor`] of the latest committed block — the anchor
+    /// its *parent* carried. Kept alongside `committed_anchor_ts` because the
+    /// committed tip's own parent is pruned too, so the committee that signed
+    /// the tip could not otherwise be resolved when verifying the QC over it.
+    committed_committee_anchor_ts: WeightedTimestamp,
 
     /// State root from the latest committed block header.
     /// Updated synchronously at commit time (not dependent on async JMT).
@@ -432,6 +436,7 @@ impl ShardCoordinator {
             committed_hash: recovered.committed_hash.unwrap_or(BlockHash::ZERO),
             committed_ts: committed_anchor_ts,
             committed_anchor_ts,
+            committed_committee_anchor_ts: committed_anchor_ts,
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
             pending_bytes_deltas: HashMap::new(),
@@ -513,16 +518,30 @@ impl ShardCoordinator {
     // Committee resolution
     // ═══════════════════════════════════════════════════════════════════════════
     //
-    // A block's committee is keyed on its parent's weighted timestamp: every
-    // honest node resolves `committee(block) == at(committee_anchor(block))`,
-    // where `committee_anchor(block) == block.header.parent_qc.weighted_timestamp()`.
-    // Keying on the parent (already attested) rather than the block's own
-    // not-yet-aggregated weighted timestamp lets proposer, voters, and
-    // verifiers agree before the block's votes exist. The committee for the
-    // height currently in progress / our next proposal keys on `high_qc`'s
-    // weighted timestamp, since that is the tip we extend.
+    // Two anchors, one hop apart, and conflating them is the bug this
+    // separation exists to prevent.
+    //
+    // `block_anchor(b)` is `b`'s own position on the weighted-time grid —
+    // `b.header.parent_qc.weighted_timestamp()`. It dates the block, and the
+    // reveal chain and the parent-QC regression floor key on it.
+    //
+    // `committee_anchor(b)` is what selects `b`'s committee, and it is
+    // `block_anchor(parent(b))`. A committee must be resolvable *before* the
+    // block it governs exists, or the proposer for a height cannot be known
+    // until someone has already proposed at it. `block_anchor(b)` fails that:
+    // it reads a QC over `parent(b)`, and a QC's weighted timestamp is the
+    // mean of whichever votes its aggregator held, so replicas hold values
+    // for one block that differ by the spread of the voters' clocks. Either
+    // side of an epoch cut that spread resolves two committees and elects two
+    // leaders, and the round's votes split between proposals that both
+    // verify. Anchoring a block's committee on its parent puts the selection
+    // on a header every replica already holds and reads identically.
+    //
+    // So `committee(b) == at(committee_anchor(b))`, and the committee for the
+    // height in progress is `at(block_anchor(tip))` — the same value, since
+    // the block we are about to build is the tip's child.
 
-    /// Weighted timestamp selecting `block_hash`'s committee — its parent QC's
+    /// `block_hash`'s own position on the weighted-time grid — its parent QC's
     /// weighted timestamp. The committed tip (pruned from pending and the
     /// certified cache alike) uses the `committed_anchor_ts` scalar; every
     /// other block resolves through [`ChainView::get_header`], whose
@@ -531,8 +550,8 @@ impl ShardCoordinator {
     /// gossiped here), so without it a live proposal extending it would
     /// defer on "parent not held" while every re-fetch of the parent is
     /// deduplicated as already applied. `None` when the block is unknown by
-    /// every route, so its committee can't be resolved (caller stalls).
-    fn committee_anchor(&self, block_hash: BlockHash) -> Option<WeightedTimestamp> {
+    /// every route (caller stalls).
+    fn block_anchor(&self, block_hash: BlockHash) -> Option<WeightedTimestamp> {
         if block_hash == self.committed_hash {
             return Some(self.committed_anchor_ts);
         }
@@ -541,17 +560,75 @@ impl ShardCoordinator {
             .map(|header| header.parent_qc().weighted_timestamp())
     }
 
+    /// Weighted timestamp selecting `block_hash`'s committee — its parent's
+    /// [`Self::block_anchor`]. `None` when the block or its parent is unknown,
+    /// so the committee can't be resolved (caller stalls or defers).
+    fn committee_anchor(&self, block_hash: BlockHash) -> Option<WeightedTimestamp> {
+        if block_hash == self.committed_hash {
+            return Some(self.committed_committee_anchor_ts);
+        }
+        self.block_anchor(
+            self.chain_view()
+                .get_header(block_hash)?
+                .parent_block_hash(),
+        )
+    }
+
+    /// Committee governing a block that extends `parent` — the one rule
+    /// every committee question routes through.
+    ///
+    /// Three sites ask it, and they must agree or a block cannot survive its
+    /// own lifecycle: `can_propose` asks about the tip it will extend, the
+    /// build path asks about the parent it is extending, and
+    /// [`Self::committee_of_block`] asks about a held block's parent. They
+    /// were once three expressions of the same question and drifted apart —
+    /// the beacon-witness base is frozen per window, so a block stamped from
+    /// one window's entry and checked against another's is rejected by every
+    /// verifier, at every epoch cut.
+    fn committee_for_child_of<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        parent: BlockHash,
+    ) -> Option<&'t Arc<TopologySnapshot>> {
+        self.committee_at(topology_schedule, self.block_anchor(parent)?)
+    }
+
+    /// The committee lookup itself, for the callers that hold an anchor
+    /// rather than a parent hash. Terminal-clamped and recovery-bridged;
+    /// `None` is a beacon-behind stall or an evicted window.
+    fn committee_at<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        anchor: WeightedTimestamp,
+    ) -> Option<&'t Arc<TopologySnapshot>> {
+        topology_schedule
+            .at_for_shard_live(self.local_shard, anchor)
+            .map(|(snapshot, _)| snapshot)
+    }
+
     /// Weighted timestamp selecting the committee for the height in progress /
-    /// our next proposal: we extend `high_qc`, so the committee is
-    /// `at(high_qc.weighted_timestamp())`. With no QC yet the chain sits at
-    /// its genesis, whose QC carries the chain origin's anchor — `ZERO` for
-    /// root chains, the parent's terminal canonical timestamp for a split
-    /// child (a `ZERO` fallback would resolve a child's first proposal
-    /// against epoch 0).
-    fn tip_anchor_ts(&self) -> WeightedTimestamp {
-        self.latest_qc
-            .as_ref()
-            .map_or(self.chain_origin.anchor_wt, |qc| qc.weighted_timestamp())
+    /// our next proposal. We extend `high_qc`, so the block we are about to
+    /// propose is a child of the block `high_qc` certifies, and a child's
+    /// committee anchors on its parent: `committee_anchor(high_qc.block_hash())`.
+    ///
+    /// Keying on the tip block rather than on our own aggregate over it is
+    /// what makes the proposer agreed. A QC's weighted timestamp is the mean
+    /// of whichever votes the aggregator held when quorum landed, so replicas
+    /// hold different values for one block — by the spread of the voters'
+    /// clocks. Within that spread of an epoch cut, the aggregate resolves two
+    /// committees and elects two leaders, and the round's votes split between
+    /// proposals that both verify.
+    ///
+    /// `None` when the tip block is unknown by every route, so its anchor
+    /// can't be resolved and the caller stalls. With no QC yet the chain sits
+    /// at its genesis, whose origin anchor is `ZERO` for root chains and the
+    /// parent's terminal canonical timestamp for a split child (a `ZERO`
+    /// fallback would resolve a child's first proposal against epoch 0).
+    fn tip_anchor_ts(&self) -> Option<WeightedTimestamp> {
+        self.latest_qc.as_ref().map_or_else(
+            || Some(self.chain_origin.anchor_wt),
+            |qc| self.block_anchor(qc.block_hash()),
+        )
     }
 
     /// Committee that signed/produced `block_hash`. `None` to stall: the block
@@ -567,9 +644,8 @@ impl ShardCoordinator {
         topology_schedule: &'t TopologySchedule,
         block_hash: BlockHash,
     ) -> Option<&'t TopologySnapshot> {
-        topology_schedule
-            .at_for_shard_live(self.local_shard, self.committee_anchor(block_hash)?)
-            .map(|(snapshot, _)| snapshot.as_ref())
+        self.committee_at(topology_schedule, self.committee_anchor(block_hash)?)
+            .map(Arc::as_ref)
     }
 
     /// Committee that signed `qc` — the certified binding. Unlike
@@ -603,12 +679,12 @@ impl ShardCoordinator {
         &self,
         topology_schedule: &'t TopologySchedule,
     ) -> Option<&'t TopologySnapshot> {
-        if self.recovery_quiesced(topology_schedule, self.tip_anchor_ts()) {
+        let anchor = self.tip_anchor_ts()?;
+        if self.recovery_quiesced(topology_schedule, anchor) {
             return None;
         }
-        topology_schedule
-            .at_for_shard_live(self.local_shard, self.tip_anchor_ts())
-            .map(|(snapshot, _)| snapshot.as_ref())
+        self.committee_at(topology_schedule, anchor)
+            .map(Arc::as_ref)
     }
 
     /// Whether work anchored at `wt` rides an in-flight halt recovery's
@@ -861,7 +937,7 @@ impl ShardCoordinator {
     /// through, so quiescing on a guess buys nothing.
     #[must_use]
     pub fn quiesce_cut(&self, topology_schedule: &TopologySchedule) -> Option<QuiesceCut> {
-        let now_wt = self.tip_anchor_ts();
+        let now_wt = self.tip_anchor_ts()?;
         (topology_schedule.terminates_at_next_boundary(self.local_shard, now_wt) == Some(true))
             .then(|| {
                 let windows = topology_schedule.windows();
@@ -1184,6 +1260,7 @@ impl ShardCoordinator {
         self.committed_height = genesis.height();
         self.committed_ts = genesis.header().parent_qc().weighted_timestamp();
         self.committed_anchor_ts = self.committed_ts;
+        self.committed_committee_anchor_ts = self.committed_ts;
         self.substate_bytes_frontier.0 = genesis.height();
 
         // Record genesis time as initial leader activity so that the view
@@ -1717,14 +1794,16 @@ impl ShardCoordinator {
             ProposalKind::Fallback | ProposalKind::Sync => true,
         };
         let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
-        // The block we build belongs to `at(parent_qc weighted ts)`; its
-        // proposer schedule (missed-proposal leaves) and beacon-witness preview
-        // resolve against that committee. Stall if the beacon lacks it.
-        // Terminal-clamped: coast blocks past a split's cut resolve the
+        // The block we build belongs to its parent's window — the same
+        // committee `can_propose` drew our slot from and the same one every
+        // verifier resolves for it. Its proposer schedule (missed-proposal
+        // leaves) and beacon-witness preview key on that entry, and the
+        // witness base is frozen per window, so reading it from any other
+        // entry stamps a base no verifier accepts. Stall if the beacon lacks
+        // it. Terminal-clamped: coast blocks past a split's cut resolve the
         // shard's final-epoch committee. Recovery-bridged: a block extending
         // a halted tip resolves the fresh committee.
-        let Some((committee, _)) =
-            topology_schedule.at_for_shard_live(self.local_shard, parent_qc.weighted_timestamp())
+        let Some(committee) = self.committee_for_child_of(topology_schedule, parent_block_hash)
         else {
             return vec![];
         };
@@ -1763,7 +1842,7 @@ impl ShardCoordinator {
         // past the gap reseats the scalar.
         let (Some(parent_reveal_chain), Some(parent_anchor_wt)) = (
             self.chain_view().parent_reveal_chain(parent_block_hash),
-            self.committee_anchor(parent_block_hash),
+            self.block_anchor(parent_block_hash),
         ) else {
             trace!(
                 validator = ?self.me,
@@ -1998,13 +2077,10 @@ impl ShardCoordinator {
         // `None` here would mean the beacon evicted the epoch out from under a
         // long-stalled block — tally nothing rather than guess.
         let mut actions = self.link_buffered_votes_to_header(topology_schedule, block_hash, header);
-        if let Some(committee) = self.committee_of_block(topology_schedule, block_hash) {
-            actions.extend(self.votes.maybe_trigger_verification(
-                committee,
-                self.local_shard,
-                block_hash,
-            ));
-        }
+        actions.extend(
+            self.votes
+                .maybe_trigger_verification(self.local_shard, block_hash),
+        );
         actions.extend(sync_actions);
         // Cancel fetches orphaned by any eviction the cap performed.
         actions.extend(cap_actions);
@@ -2233,29 +2309,43 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         header: &BlockHeader,
     ) -> bool {
-        // Proposer of `h` is drawn from `committee(h) == at(parent_qc weighted
-        // ts)`, terminal-clamped so a coast header past a split's cut
-        // resolves the shard's final-epoch committee, and recovery-bridged
-        // so a header extending a halted tip resolves the fresh committee.
-        let proposer_committee = match topology_schedule
-            .lookup_for_shard_live(self.local_shard, header.parent_qc().weighted_timestamp())
-            .0
-        {
-            ScheduleLookup::Committee(committee) => committee.as_ref(),
-            ScheduleLookup::NotYetCommitted => {
-                warn!(
-                    validator = ?self.me,
-                    "No committee for header's epoch yet — beacon behind, dropping header"
-                );
-                return true;
-            }
-            ScheduleLookup::Evicted => {
-                warn!(
-                    validator = ?self.me,
-                    "Header's committee epoch is below the schedule floor — dropping header"
-                );
-                return true;
-            }
+        // Proposer of `h` is drawn from `committee(h)`, anchored on `h-1` —
+        // the same value the proposer's own gate resolved before building,
+        // so election and validation cannot disagree. Reading the anchor off
+        // the header's embedded QC instead would let a proposer pick the
+        // committee that legitimizes it. Terminal-clamped so a coast header
+        // past a split's cut resolves the shard's final-epoch committee, and
+        // recovery-bridged so a header extending a halted tip resolves the
+        // fresh committee.
+        //
+        // Skipped (`None`) when `h-1`'s header hasn't arrived, so its anchor
+        // can't be resolved — a node catching up receives live headers far
+        // above its committed tip and holds none of their parents. This
+        // pre-check is a cheap DoS filter; the proposer is checked against
+        // the exact committee in `trigger_qc_verification_or_vote`, which
+        // already defers on the same condition and which no vote bypasses.
+        let proposer_committee = match self.block_anchor(header.parent_block_hash()) {
+            None => None,
+            Some(anchor) => match topology_schedule
+                .lookup_for_shard_live(self.local_shard, anchor)
+                .0
+            {
+                ScheduleLookup::Committee(committee) => Some(committee.as_ref()),
+                ScheduleLookup::NotYetCommitted => {
+                    warn!(
+                        validator = ?self.me,
+                        "No committee for header's epoch yet — beacon behind, dropping header"
+                    );
+                    return true;
+                }
+                ScheduleLookup::Evicted => {
+                    warn!(
+                        validator = ?self.me,
+                        "Header's committee epoch is below the schedule floor — dropping header"
+                    );
+                    return true;
+                }
+            },
         };
         // The parent QC over `h-1` was signed by `committee(h-1)`. Skip the
         // quorum pre-check (`None`) when the parent QC is genesis (no quorum to
@@ -2368,6 +2458,15 @@ impl ShardCoordinator {
             .collect();
         let mut actions = Vec::new();
         for child in children {
+            // This parent anchors each child's committee, so votes held for
+            // want of it are admissible now.
+            if let Some(header) = self.pending_blocks.get_header(child).cloned() {
+                actions.extend(self.link_buffered_votes_to_header(
+                    topology_schedule,
+                    child,
+                    &header,
+                ));
+            }
             actions.extend(self.trigger_qc_verification_or_vote(topology_schedule, child));
         }
         actions
@@ -2457,7 +2556,7 @@ impl ShardCoordinator {
             // below). Unresolvable only while the parent itself is unknown —
             // defer like the committee resolution below does;
             // `retry_pending_children` re-enters when the parent lands.
-            let Some(parent_anchor) = self.committee_anchor(header.parent_qc().block_hash()) else {
+            let Some(parent_anchor) = self.block_anchor(header.parent_qc().block_hash()) else {
                 trace!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
@@ -2474,6 +2573,23 @@ impl ShardCoordinator {
                     qc_weighted_ms = header.parent_qc().weighted_timestamp().as_millis(),
                     parent_anchor_ms = parent_anchor.as_millis(),
                     "Parent QC weighted timestamp regresses below the parent's anchor — not voting"
+                );
+                return vec![];
+            }
+
+            // `committee(h)` anchors on `h-1`, which is now held, so the
+            // proposer check `reject_invalid_header` defers for a header
+            // arriving ahead of its parent runs here — before any vote.
+            if let ScheduleLookup::Committee(committee) = topology_schedule
+                .lookup_for_shard_live(self.local_shard, parent_anchor)
+                .0
+                && let Err(e) = validate_proposer(committee.as_ref(), self.local_shard, &header)
+            {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    error = %e,
+                    "Header names the wrong proposer for its committee — not voting"
                 );
                 return vec![];
             }
@@ -2845,46 +2961,25 @@ impl ShardCoordinator {
 
         // Vote recipients are a routing hint (next-round proposers for
         // pipelining), self-healing via gossip — but a hint that names none
-        // of the round's real proposers costs a view change, so it spans
-        // every committee that round could resolve to. `can_propose` draws
-        // the proposer from the window its own tip anchors in, one
-        // certificate above the anchor a voter holds, so across an epoch
-        // cut the two sit either side of it. A committee whose membership
-        // moves at that cut — a rotation seats its entrant there — puts the
-        // entrant in the later window only, and a hint drawn from the
-        // earlier one alone leaves its first scheduled round without the QC
-        // it needs to propose. Falls back to the head where the schedule
-        // cannot answer: genesis has no anchor, and an evicted window is
-        // far enough back that the head is the better guess.
-        let mut governing: Vec<&TopologySnapshot> = anchored_wt
-            .map(|wt| {
-                topology_schedule
-                    .spanning_for_shard_live(self.local_shard, wt)
-                    .map(AsRef::as_ref)
-                    .collect()
-            })
-            .unwrap_or_default();
-        if governing.is_empty() {
-            // Past a terminal cut the live windows carry the shard no
-            // longer, so the coast blocks certifying the crossing route to
-            // the terminal-clamped committee that signs them.
-            governing.extend(
+        // of the round's real proposers costs a view change, so it resolves
+        // the same committee the next proposer will — by asking the same
+        // question of the same block. The block being voted on is the tip
+        // that proposer extends, so `committee_for_child_of` answers for both.
+        // Falls back to the head where the schedule cannot answer at all:
+        // genesis has no anchor, and an evicted window is far enough back that
+        // the head is the better guess.
+        let governing = self
+            .committee_for_child_of(topology_schedule, block_hash)
+            .or_else(|| {
+                // Past a terminal cut the live windows carry the shard no
+                // longer, so the coast blocks certifying the crossing route
+                // to the terminal-clamped committee that signs them.
                 anchored_wt
                     .and_then(|wt| topology_schedule.at_for_shard(self.local_shard, wt))
-                    .map(|(snapshot, _)| snapshot.as_ref()),
-            );
-        }
-        if governing.is_empty() {
-            governing.push(topology_schedule.head().as_ref());
-        }
-        let mut next_proposers: Vec<ValidatorId> = Vec::new();
-        for snapshot in governing {
-            for validator in vote_recipients(snapshot, self.local_shard, self.me, round) {
-                if !next_proposers.contains(&validator) {
-                    next_proposers.push(validator);
-                }
-            }
-        }
+                    .map(|(snapshot, _)| snapshot)
+            })
+            .map_or_else(|| topology_schedule.head().as_ref(), Arc::as_ref);
+        let next_proposers = vote_recipients(governing, self.local_shard, self.me, round);
 
         // Emit SignAndBroadcastBlockVote — the io_loop persists the
         // ratcheted registers, signs on the consensus crypto pool,
@@ -2966,12 +3061,13 @@ impl ShardCoordinator {
             "Received block vote"
         );
 
-        // A vote tallies against its block's committee, resolved from the
-        // block's header. If the header hasn't arrived, the exact committee is
-        // unknowable — hold the vote raw and admit it against the exact
-        // committee in `link_buffered_votes_to_header` once the header lands.
-        // (Header present but `None` ⇒ beacon-behind stall.)
-        if self.pending_blocks.get_header(vote.block_hash()).is_none() {
+        // A vote tallies against its block's committee, which anchors on the
+        // block's *parent* — so a vote can outrun either header. While the
+        // anchor is unresolvable the exact committee is unknowable: hold the
+        // vote raw, and admit it in `link_buffered_votes_to_header`, which
+        // runs both when the block's header lands and when its parent does.
+        // (Anchor resolvable but committee `None` ⇒ beacon-behind stall.)
+        if self.committee_anchor(vote.block_hash()).is_none() {
             self.votes.buffer_unanchored_vote(vote);
             return vec![];
         }
@@ -3032,14 +3128,13 @@ impl ShardCoordinator {
     /// If QC was built successfully, enqueues `QuorumCertificateFormed` event.
     /// If quorum wasn't reached (some sigs invalid), adds verified votes back
     /// to `VoteSet` and checks if more buffered votes can now reach quorum.
-    #[instrument(skip(self, topology_schedule, qc, verified_votes), fields(
+    #[instrument(skip(self, qc, verified_votes), fields(
         block_hash = ?block_hash,
         has_qc = qc.is_some(),
         verified_count = verified_votes.len()
     ))]
     pub fn on_qc_result(
         &mut self,
-        topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
         qc: Option<Verified<QuorumCertificate>>,
         verified_votes: Vec<(usize, Verified<BlockVote>)>,
@@ -3112,19 +3207,15 @@ impl ShardCoordinator {
 
         self.votes
             .finalize_pending_batch(block_hash, verified_votes);
-        // The QC build we're resulting from was dispatched off this block's
-        // header, so its committee resolves; `None` is a beacon-behind stall.
-        match self.committee_of_block(topology_schedule, block_hash) {
-            Some(committee) => {
-                actions.extend(self.votes.maybe_trigger_verification(
-                    committee,
-                    self.local_shard,
-                    block_hash,
-                ));
-                actions
-            }
-            None => actions,
-        }
+        // The tally's denominator rides on the vote set, latched from the
+        // committee that governed the block when its first vote landed — so a
+        // batch returning after the block's committee stops resolving still
+        // retriggers rather than stranding the votes behind it.
+        actions.extend(
+            self.votes
+                .maybe_trigger_verification(self.local_shard, block_hash),
+        );
+        actions
     }
 
     /// Handle QC signature verification result.
@@ -4093,9 +4184,10 @@ impl ShardCoordinator {
         self.committed_hash = block_hash;
         self.committed_ts = commit_ts;
 
-        // The committee that signed this block is `at(parent_qc weighted ts)`;
-        // retain it so [`Self::committee_anchor`] can resolve the tip's
-        // committee after it is pruned from `pending_blocks`.
+        // Retain both anchors across the prune: the tip's own, which anchors
+        // the committee of the block extending it, and the one its parent
+        // carried, which anchors the committee that signed the tip itself.
+        self.committed_committee_anchor_ts = self.committed_anchor_ts;
         self.committed_anchor_ts = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
         self.committed_in_flight = Some(block.header().in_flight());
@@ -5919,12 +6011,27 @@ mod tests {
     /// A complete empty block at `height` whose parent QC carries
     /// `parent_weighted_ms` — the committee anchor `committee_of_block` keys on.
     fn block_with_parent_qc_ts(height: BlockHeight, parent_weighted_ms: u64) -> Block {
+        block_chained_on(
+            height,
+            BlockHash::from_raw(Hash::from_bytes(b"anchor_parent")),
+            parent_weighted_ms,
+        )
+    }
+
+    /// As [`block_with_parent_qc_ts`], but extending `parent_hash` — so a
+    /// caller can install a real two-block chain and exercise the committee
+    /// anchor's hop to the parent.
+    fn block_chained_on(
+        height: BlockHeight,
+        parent_hash: BlockHash,
+        parent_weighted_ms: u64,
+    ) -> Block {
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
         signers.set(2);
         let parent_qc = QuorumCertificate::new(
-            BlockHash::from_raw(Hash::from_bytes(b"anchor_parent")),
+            parent_hash,
             ShardId::ROOT,
             BlockHeight::new(height.inner() - 1),
             BlockHash::ZERO,
@@ -5969,12 +6076,134 @@ mod tests {
     }
 
     #[test]
-    fn committee_of_block_keys_on_parent_qc_weighted_timestamp() {
-        // committee(block) == at(parent_qc.weighted_timestamp()). A block whose
-        // parent QC weighted timestamp sits just below an epoch boundary resolves
-        // to the prior epoch's committee — the keying that lets every honest node
-        // verify a boundary-straddling block under committee_(N-1), and its
-        // successor (parent QC at the boundary) under committee_N.
+    fn the_proposer_does_not_move_with_the_aggregate_across_a_cut() {
+        // A QC's weighted timestamp is the mean of whichever votes the
+        // aggregator held when quorum landed, so replicas hold different
+        // values for one block — by the spread of the voters' clocks, a few
+        // milliseconds on a healthy shard. Either side of an epoch cut that
+        // spread once resolved two committees and elected two leaders, and
+        // the round's votes split between proposals that both verified, each
+        // carrying the QC that justified its own proposer.
+        //
+        // The committee for the height in progress anchors on the tip block,
+        // which every replica reads identically, so the aggregate's timestamp
+        // does not reach committee resolution at all. Two replicas holding
+        // QCs a millisecond either side of the cut elect one proposer.
+        const ED: u64 = 1_000;
+        let shard = ShardId::ROOT;
+
+        let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
+        // A rotation that moves the seat: where both epochs elect the same
+        // validator the split is invisible, which is the second condition the
+        // stall needs and why most runs cross a cut without one.
+        let epoch1 = Arc::new(committee_snapshot_with_ids(&[10, 11, 12, 13]));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
+
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            shard,
+            ShardConsensusConfig::default(),
+            RecoveredState::default(),
+        );
+
+        // The tip: one block, anchored below the cut, that both replicas hold.
+        let tip = block_with_parent_qc_ts(BlockHeight::new(5), ED - 1);
+        let tip_hash = tip.hash();
+        install_complete_block(&mut state, &tip);
+
+        // Two aggregates over that one block, straddling the cut by 1 ms.
+        let proposer_for = |state: &mut ShardCoordinator, weighted_ms: u64| {
+            state.latest_qc = Some(Verified::<QuorumCertificate>::new_unchecked_for_test(
+                QuorumCertificate::new(
+                    tip_hash,
+                    shard,
+                    BlockHeight::new(5),
+                    BlockHash::ZERO,
+                    Round::new(5),
+                    SignerBitfield::empty(),
+                    AggregateSignature::ZERO,
+                    WeightedTimestamp::from_millis(weighted_ms),
+                ),
+            ));
+            state
+                .tip_committee(&schedule)
+                .expect("the tip's committee is in the schedule")
+                .proposer_for(shard, Round::new(6))
+        };
+
+        let below = proposer_for(&mut state, ED - 1);
+        let above = proposer_for(&mut state, ED + 1);
+
+        assert_eq!(
+            below,
+            above,
+            "aggregates {} ms and {} ms across the cut at {ED} ms elected {below:?} and \
+             {above:?} — the round draws two proposals and its votes split between them",
+            ED - 1,
+            ED + 1,
+        );
+    }
+
+    #[test]
+    fn a_committee_still_resolves_once_the_parent_has_committed() {
+        // A block's committee anchors on its parent, and a parent does not
+        // stay in `pending_blocks` — it is pruned as the chain commits past
+        // it. Only the committed tip keeps a scalar, so the block *below* the
+        // tip has neither: its header is gone and it is not `committed_hash`.
+        //
+        // Every steady-state vote crosses this. Verifying the parent QC on a
+        // block `h` resolves `committee(h-1)`, which anchors on `h-2` — and by
+        // the time `h` arrives, `h-2` is exactly one commit below the tip.
+        const ED: u64 = 1_000;
+        let shard = ShardId::ROOT;
+
+        let epoch0 = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
+        let schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            shard,
+            ShardConsensusConfig::default(),
+            RecoveredState::default(),
+        );
+
+        // A three-block run: `grandparent` has committed and been pruned,
+        // `parent` is the committed tip, `child` is arriving now.
+        let grandparent = block_with_parent_qc_ts(BlockHeight::new(5), 100);
+        let parent = block_chained_on(BlockHeight::new(6), grandparent.hash(), 200);
+        let child = block_chained_on(BlockHeight::new(7), parent.hash(), 300);
+
+        // Only the live blocks are held; the grandparent is pruned.
+        install_complete_block(&mut state, &parent);
+        install_complete_block(&mut state, &child);
+        state.committed_hash = parent.hash();
+        state.committed_anchor_ts = WeightedTimestamp::from_millis(200);
+        state.committed_committee_anchor_ts = WeightedTimestamp::from_millis(100);
+
+        assert!(
+            state.committee_of_block(&schedule, child.hash()).is_some(),
+            "the arriving block's committee anchors on the committed tip, which keeps a scalar",
+        );
+        assert!(
+            state.committee_of_block(&schedule, parent.hash()).is_some(),
+            "the committed tip's own committee anchors on a block already pruned — without a \
+             second scalar it is unresolvable, and the parent-QC verification every vote runs \
+             defers forever",
+        );
+    }
+
+    #[test]
+    fn committee_of_block_keys_on_the_parents_anchor() {
+        // committee(block) == at(block_anchor(parent)). A block's committee
+        // has to be resolvable before the block exists — otherwise no replica
+        // can know who leads a height until someone has already proposed at
+        // it — so it keys on the parent's anchor, which every replica reads
+        // off a header it already holds. The block's own anchor comes from a
+        // QC whose weighted timestamp varies by aggregator, and keying on
+        // that is what once split a round across an epoch cut.
         const ED: u64 = 1_000;
         let shard = ShardId::ROOT;
 
@@ -5991,32 +6220,44 @@ mod tests {
             RecoveredState::default(),
         );
 
-        // Straddling block: parent QC weighted timestamp 999ms — epoch 0.
-        let straddle = block_with_parent_qc_ts(BlockHeight::new(5), ED - 1);
-        let straddle_hash = straddle.hash();
-        install_complete_block(&mut state, &straddle);
+        // Parent sits below the cut, so its anchor is epoch 0.
+        let parent = block_with_parent_qc_ts(BlockHeight::new(5), ED - 1);
+        let parent_hash = parent.hash();
+        install_complete_block(&mut state, &parent);
 
-        // Its successor: parent QC weighted timestamp 1000ms — epoch 1.
-        let successor = block_with_parent_qc_ts(BlockHeight::new(6), ED);
-        let successor_hash = successor.hash();
-        install_complete_block(&mut state, &successor);
+        // The child's own anchor is past the cut — epoch 1 — but its
+        // committee follows the parent's.
+        let child = block_chained_on(BlockHeight::new(6), parent_hash, ED + 1);
+        let child_hash = child.hash();
+        install_complete_block(&mut state, &child);
 
-        let straddle_committee = state
-            .committee_of_block(&schedule, straddle_hash)
-            .expect("epoch 0 committee is in the schedule");
         assert_eq!(
-            straddle_committee.committee_for_shard(shard),
-            epoch0.committee_for_shard(shard),
-            "a parent QC weighted timestamp below N·ED must resolve to committee_(N-1)",
+            state.block_anchor(child_hash),
+            Some(WeightedTimestamp::from_millis(ED + 1)),
+            "the child dates itself past the cut",
         );
 
-        let successor_committee = state
-            .committee_of_block(&schedule, successor_hash)
+        let child_committee = state
+            .committee_of_block(&schedule, child_hash)
+            .expect("epoch 0 committee is in the schedule");
+        assert_eq!(
+            child_committee.committee_for_shard(shard),
+            epoch0.committee_for_shard(shard),
+            "a block whose parent anchors below N·ED is governed by committee_(N-1), \
+             however its own anchor falls",
+        );
+
+        // A grandchild of the epoch-1 block inherits that epoch in turn.
+        let grandchild = block_chained_on(BlockHeight::new(7), child_hash, ED + 2);
+        let grandchild_hash = grandchild.hash();
+        install_complete_block(&mut state, &grandchild);
+        let grandchild_committee = state
+            .committee_of_block(&schedule, grandchild_hash)
             .expect("epoch 1 committee is in the schedule");
         assert_eq!(
-            successor_committee.committee_for_shard(shard),
+            grandchild_committee.committee_for_shard(shard),
             epoch1.committee_for_shard(shard),
-            "a parent QC weighted timestamp at N·ED must resolve to committee_N",
+            "the epoch advances one block after the anchor crosses N·ED",
         );
     }
 
@@ -6035,6 +6276,11 @@ mod tests {
         let parent = block_with_parent_qc_ts(BlockHeight::new(5), 5_000);
         let parent_hash = parent.hash();
         install_complete_block(&mut state, &parent);
+        // The parent's committee anchors on *its* parent, so seat that as the
+        // committed tip — otherwise the parent QC's committee is unresolvable
+        // and the vote path defers before reaching the floor check.
+        state.committed_hash = parent.header().parent_block_hash();
+        state.committed_anchor_ts = WeightedTimestamp::from_millis(5_000);
 
         let child_with_anchor = |weighted_ms: u64, tag: &[u8]| {
             let mut signers = SignerBitfield::new(4);
@@ -7554,7 +7800,7 @@ mod tests {
         // Forged votes are buffered pre-verification and never reach
         // received_votes_by_height, so a legitimate vote for a different block
         // from the same voter is not flagged as equivocation on verification.
-        let (mut state, topology_schedule) = make_multi_validator_state();
+        let (mut state, _topology_schedule) = make_multi_validator_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
 
         let height = BlockHeight::new(5);
@@ -7571,7 +7817,6 @@ mod tests {
         );
 
         let _ = state.on_qc_result(
-            &topology_schedule,
             block_b,
             None,
             vec![(0, Verified::<BlockVote>::new_unchecked_for_test(vote))],
@@ -7597,7 +7842,7 @@ mod tests {
 
         assert!(
             validate_header(
-                topology_schedule.head(),
+                Some(topology_schedule.head()),
                 Some(topology_schedule.head().as_ref()),
                 state.local_shard,
                 &header,
@@ -7641,7 +7886,7 @@ mod tests {
         };
 
         let result = validate_header(
-            topology_schedule.head(),
+            Some(topology_schedule.head()),
             Some(topology_schedule.head().as_ref()),
             state.local_shard,
             &header,
@@ -8660,6 +8905,10 @@ mod tests {
         // terminates immediately and verification can dispatch the moment the
         // committee resolves.
         state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+        // The block's committee anchors on its parent, so it is the parent's
+        // anchor that has to sit above the schedule head for the committee to
+        // be unresolvable.
+        state.committed_anchor_ts = WeightedTimestamp::from_millis(5 * ED);
 
         // Parent QC weighted timestamp in epoch 5 — above the schedule head,
         // so the block's committee is unresolvable until the beacon catches up.
@@ -9927,6 +10176,11 @@ mod tests {
         );
         let sched = make_terminating_schedule(4);
         let block = straddling_block();
+        // The block's committee anchors on its parent, so seat that parent as
+        // the committed tip and date it in the block's own window.
+        coord.committed_hash = block.header().parent_block_hash();
+        coord.committed_anchor_ts = block.header().parent_qc().weighted_timestamp();
+        coord.committed_committee_anchor_ts = coord.committed_anchor_ts;
         let block_hash = block.hash();
         let height = block.height();
         let round = block.header().round();

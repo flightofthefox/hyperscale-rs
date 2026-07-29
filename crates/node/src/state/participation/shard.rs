@@ -133,12 +133,9 @@ impl ShardParticipation {
                 block_hash,
                 qc,
                 verified_votes,
-            } => self.shard_coordinator.on_qc_result(
-                topology_schedule,
-                block_hash,
-                qc,
-                verified_votes,
-            ),
+            } => self
+                .shard_coordinator
+                .on_qc_result(block_hash, qc, verified_votes),
             ProtocolEvent::QcSignatureVerified { block_hash, result } => self
                 .shard_coordinator
                 .on_qc_signature_verified(topology_schedule, block_hash, result),

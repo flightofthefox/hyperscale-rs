@@ -1,6 +1,8 @@
 //! Honest-path liveness invariants pinned by the multi-coordinator
 //! shard sim.
 
+use std::time::Duration;
+
 mod common;
 
 use common::ShardCoordinatorSim;
@@ -118,5 +120,67 @@ fn verification_pipelines_stay_bounded_across_many_commits() {
     assert!(
         pending <= bound,
         "verification pipelines drift unboundedly: pending={pending} > bound={bound}",
+    );
+}
+
+/// A committee lookup that crosses epoch windows must not cost the shard
+/// throughput.
+///
+/// The default sim runs on [`TopologySchedule::single`], whose zero-length
+/// windows fold every weighted timestamp to genesis — so a committee lookup
+/// there always answers, and always with the one snapshot. That makes it blind
+/// to every way epoch resolution can behave: landing in a different window,
+/// and failing to resolve at all. A regression that only appears once windows
+/// are real is invisible to the rest of this suite, and has to be chased
+/// through a ten-minute seeded run instead.
+///
+/// The committee is the same in every window here, so the epochs change
+/// nothing a correct implementation can observe: the gridded run must reach
+/// the same commits in comparable time as the flat one.
+#[test]
+fn crossing_epoch_windows_costs_no_throughput() {
+    const EPOCH_MS: u64 = 20;
+    const EPOCHS: u64 = 512;
+    /// Sim time each delivery costs, so the run's weighted timestamps sweep
+    /// across windows rather than sitting at genesis.
+    const CLOCK_STEP: Duration = Duration::from_millis(2);
+    const SEED: u64 = 0xE9_0C;
+    const TARGET: usize = 6;
+    const MAX_TICKS: usize = 400;
+
+    let all: Vec<usize> = (0..4).collect();
+
+    let mut flat = ShardCoordinatorSim::new(4, SEED);
+    flat.kick_off();
+    let flat_ticks = flat.run_until_committed_paced(&all, TARGET, MAX_TICKS);
+
+    let mut grid = ShardCoordinatorSim::with_epoch_grid(4, SEED, EPOCH_MS, EPOCHS, CLOCK_STEP);
+    grid.kick_off();
+    let grid_ticks = grid.run_until_committed_paced(&all, TARGET, MAX_TICKS);
+
+    // A grid the run never crosses proves nothing, so pin that it did.
+    let epochs: std::collections::BTreeSet<u64> = grid.commits[0]
+        .iter()
+        .map(|c| {
+            c.certified
+                .block()
+                .header()
+                .parent_qc()
+                .weighted_timestamp()
+                .as_millis()
+                / EPOCH_MS
+        })
+        .collect();
+    assert!(
+        epochs.len() > 1,
+        "the run stayed inside one {EPOCH_MS} ms window ({epochs:?}), so the grid was never \
+         exercised — shorten the window or lengthen the run",
+    );
+
+    assert!(
+        grid_ticks <= flat_ticks.saturating_mul(2).max(4),
+        "an epoch grid cost the shard its throughput: {TARGET} commits took {grid_ticks} ticks \
+         across {EPOCH_MS} ms windows against {flat_ticks} on a single-window schedule, with the \
+         same committee governing every window",
     );
 }

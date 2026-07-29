@@ -77,11 +77,13 @@ pub fn qc_weighted_timestamp_too_far_ahead(qc: &QuorumCertificate, now: LocalTim
 /// The header's two committee-keyed checks resolve against different
 /// committees at an epoch boundary: the proposer of block `h` belongs to
 /// `committee(h)` (`proposer_committee`), while the parent QC over `h-1` was
-/// signed by `committee(h-1)` (`parent_committee`). The caller resolves each
-/// by weighted timestamp and passes both; `parent_committee` is `None` only
-/// when the parent QC is genesis (no quorum to check).
+/// signed by `committee(h-1)` (`parent_committee`). Both are anchored on
+/// `h-1`'s header, so both are `None` when it hasn't arrived and the caller
+/// can't resolve them; `parent_committee` is additionally `None` when the
+/// parent QC is genesis (no quorum to check). A skipped proposer check is
+/// re-run against the exact committee before this node votes.
 pub fn validate_header(
-    proposer_committee: &TopologySnapshot,
+    proposer_committee: Option<&TopologySnapshot>,
     parent_committee: Option<&TopologySnapshot>,
     local_shard: ShardId,
     header: &BlockHeader,
@@ -99,13 +101,8 @@ pub fn validate_header(
         ));
     }
 
-    let expected_proposer = proposer_committee.proposer_for(local_shard, round);
-    if header.proposer() != expected_proposer {
-        return Err(format!(
-            "wrong proposer: expected {:?}, got {:?}",
-            expected_proposer,
-            header.proposer()
-        ));
+    if let Some(committee) = proposer_committee {
+        validate_proposer(committee, local_shard, header)?;
     }
 
     // The round span between the parent QC and this block is the number of
@@ -179,6 +176,24 @@ pub fn validate_header(
 
     validate_timestamp(header, now)?;
 
+    Ok(())
+}
+
+/// Validate that `header` names the proposer its committee elects for the
+/// header's round.
+pub fn validate_proposer(
+    proposer_committee: &TopologySnapshot,
+    local_shard: ShardId,
+    header: &BlockHeader,
+) -> Result<(), String> {
+    let expected_proposer = proposer_committee.proposer_for(local_shard, header.round());
+    if header.proposer() != expected_proposer {
+        return Err(format!(
+            "wrong proposer: expected {:?}, got {:?}",
+            expected_proposer,
+            header.proposer()
+        ));
+    }
     Ok(())
 }
 
@@ -715,7 +730,7 @@ mod tests {
         let header = header_at_round(height, Round::new(MAX_ROUND_GAP + 1), &topo);
 
         let err = validate_header(
-            &topo,
+            Some(&topo),
             Some(&topo),
             local_shard(),
             &header,
@@ -735,7 +750,7 @@ mod tests {
 
         assert!(
             validate_header(
-                &topo,
+                Some(&topo),
                 Some(&topo),
                 local_shard(),
                 &header,
@@ -812,7 +827,7 @@ mod tests {
         let header = header_extending(quorum_parent_qc(now.as_millis() + 3_600_000), now);
 
         let err = validate_header(
-            &topo,
+            Some(&topo),
             Some(&topo),
             local_shard(),
             &header,
@@ -837,7 +852,7 @@ mod tests {
 
         assert!(
             validate_header(
-                &topo,
+                Some(&topo),
                 Some(&topo),
                 local_shard(),
                 &header,
@@ -964,7 +979,7 @@ mod tests {
 
         assert!(
             validate_header(
-                &proposer_committee,
+                Some(&proposer_committee),
                 Some(&parent_committee),
                 local_shard(),
                 &header,
@@ -976,7 +991,7 @@ mod tests {
         );
 
         let err = validate_header(
-            &parent_committee,
+            Some(&parent_committee),
             Some(&proposer_committee),
             local_shard(),
             &header,
@@ -1007,7 +1022,7 @@ mod tests {
         );
 
         let err = validate_header(
-            &topo,
+            Some(&topo),
             Some(&topo),
             local_shard(),
             &header,
@@ -1022,7 +1037,7 @@ mod tests {
 
         assert!(
             validate_header(
-                &topo,
+                Some(&topo),
                 None,
                 local_shard(),
                 &header,

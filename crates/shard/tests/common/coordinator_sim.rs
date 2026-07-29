@@ -38,16 +38,17 @@ use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot,
-    CertificateRootContext, CertifiedBlock, ConsensusPublicKey, ConsensusReceipt, FinalizedWave,
-    Hash, InFlightCount, LocalReceiptRoot, LocalReceiptRootContext, LocalReceiptRootVerifyError,
-    LocalTimestamp, NetworkDefinition, ProposerTimestamp, ProvisionRootVerifyError,
-    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
-    ProvisionsRoot, ProvisionsRootContext, QcContext, QcVerifyError, QuorumCertificate,
-    ReadySignal, Round, RoutableTransaction, ShardId, ShardVoteEquivocation, ShardWitnessPayload,
-    Signer, StateRoot, StateRootContext, StateRootVerifyError, StoredReceipt, Timeout,
-    TimeoutContext, TopologySchedule, TransactionRoot, TransactionRootContext, TxHash,
-    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, local_settled_wave_ids, ready_signal_message, shard_reveal_sign,
+    CertificateRootContext, CertifiedBlock, ConsensusPublicKey, ConsensusReceipt, Epoch,
+    FinalizedWave, Hash, InFlightCount, LocalReceiptRoot, LocalReceiptRootContext,
+    LocalReceiptRootVerifyError, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
+    ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
+    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
+    QcVerifyError, QuorumCertificate, ReadySignal, Round, RoutableTransaction, ShardId,
+    ShardVoteEquivocation, ShardWitnessPayload, Signer, StateRoot, StateRootContext,
+    StateRootVerifyError, StoredReceipt, Timeout, TimeoutContext, TopologySchedule,
+    TopologySnapshot, TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError,
+    ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof, WeightedTimestamp,
+    local_settled_wave_ids, ready_signal_message, shard_reveal_sign,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -378,6 +379,12 @@ pub struct ShardCoordinatorSim {
     /// Shared sim clock. Threaded into every coordinator via
     /// `set_time` so per-replica timestamps don't drift.
     pub now: LocalTimestamp,
+    /// Sim time each delivery costs. Zero — the default — freezes the clock
+    /// between pacing ticks, which leaves every weighted timestamp at the
+    /// genesis value and so exercises nothing that reads the chain clock:
+    /// epoch resolution, validity windows, expiry. Set it to give the run a
+    /// clock that actually moves. See [`Self::with_epoch_grid`].
+    pub clock_step: Duration,
 }
 
 impl ShardCoordinatorSim {
@@ -386,9 +393,56 @@ impl ShardCoordinatorSim {
     /// shared empty-JMT-root genesis block.
     #[must_use]
     pub fn new(n: usize, seed: u64) -> Self {
+        Self::with_schedule(n, seed, TopologySchedule::single)
+    }
+
+    /// As [`Self::new`], but on a real epoch grid: windows of
+    /// `epoch_duration_ms`, seeded with the same committee for every epoch
+    /// from genesis through `epochs` inclusive.
+    ///
+    /// [`TopologySchedule::single`] pins `epoch_duration_ms` to zero, which
+    /// folds every weighted timestamp to genesis — so a committee lookup
+    /// there always answers, and always with the one snapshot. That makes the
+    /// default sim blind to everything epoch resolution can do: landing in a
+    /// different window, and failing to resolve at all
+    /// (`NotYetCommitted` above the head, `Evicted` below the floor). A
+    /// boundary-sensitive test needs this constructor, not [`Self::new`].
+    ///
+    /// The committee is identical in every window, so a difference this
+    /// exposes is one of *resolution*, not of membership — keeping the two
+    /// causes separable.
+    #[must_use]
+    pub fn with_epoch_grid(
+        n: usize,
+        seed: u64,
+        epoch_duration_ms: u64,
+        epochs: u64,
+        clock_step: Duration,
+    ) -> Self {
+        let mut sim = Self::with_schedule(n, seed, move |snapshot| {
+            let head_epoch = Epoch::new(epochs);
+            let mut schedule =
+                TopologySchedule::new(epoch_duration_ms, head_epoch, Arc::clone(&snapshot));
+            for epoch in 0..epochs {
+                schedule.insert(Epoch::new(epoch), Arc::clone(&snapshot));
+            }
+            schedule
+        });
+        // A grid the clock never moves across is the flat schedule again, so
+        // the constructor supplies the motion rather than leaving each caller
+        // to remember it.
+        sim.clock_step = clock_step;
+        sim
+    }
+
+    fn with_schedule(
+        n: usize,
+        seed: u64,
+        build: impl FnOnce(Arc<TopologySnapshot>) -> TopologySchedule,
+    ) -> Self {
         assert!(n >= 1, "ShardCoordinatorSim n must be >= 1");
         let committee = TestCommittee::new(n, seed);
-        let topology_schedule = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
+        let topology_schedule = build(Arc::new(committee.topology_snapshot(1)));
         let network = NetworkDefinition::simulator();
         let shard = ShardId::ROOT;
 
@@ -432,6 +486,7 @@ impl ShardCoordinatorSim {
         }
 
         Self {
+            clock_step: Duration::ZERO,
             coordinators,
             members,
             sks,
@@ -626,7 +681,6 @@ impl ShardCoordinatorSim {
             .committee_index_for_shard(self.shard, verified_vote.voter())
             .expect("voter is a committee member");
         let actions = self.coordinators[idx].on_qc_result(
-            &self.topology_schedule,
             block_hash,
             None,
             vec![(voter_index, verified_vote)],
@@ -815,6 +869,9 @@ impl ShardCoordinatorSim {
         let Some(env) = env else {
             return false;
         };
+        if !self.clock_step.is_zero() {
+            self.advance_clock(self.clock_step);
+        }
         if self.drop_counters[env.to_idx] > 0 {
             self.drop_counters[env.to_idx] -= 1;
             return true;
@@ -1098,7 +1155,7 @@ impl ShardCoordinatorSim {
                 block_hash,
                 qc,
                 verified_votes,
-            } => coord.on_qc_result(topology_schedule, block_hash, qc, verified_votes),
+            } => coord.on_qc_result(block_hash, qc, verified_votes),
             SimEvent::QcSignatureVerified { block_hash, result } => {
                 coord.on_qc_signature_verified(topology_schedule, block_hash, result)
             }

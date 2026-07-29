@@ -297,44 +297,6 @@ impl TopologySchedule {
         Self::resolved(self.lookup_for_shard(shard, wt))
     }
 
-    /// Committees that may govern work anchored at `wt` but certified
-    /// above it: `wt`'s own window, and the one after it.
-    ///
-    /// A vote is routed to the validators that will build on it, and the
-    /// round they build at is certified by a QC the vote has not yet
-    /// joined — so the window governing that round is not knowable when
-    /// the vote is cast. The newest anchor a voter holds trails it by one
-    /// certificate, which straddles an epoch cut once per window. Naming
-    /// both committees keeps the routing correct across the cut; away from
-    /// one the two resolve the same committee and the pair collapses to
-    /// it, so spanning costs nothing in the windows where nothing moves.
-    ///
-    /// Ordered anchor-window first. Resolves each window as
-    /// [`at_for_shard_live`](Self::at_for_shard_live) does — this answers
-    /// for work being proposed and voted now, so it must cross a halt
-    /// recovery's bridge to the fresh committee exactly where the round's
-    /// proposer does. Empty when neither window resolves, which is the
-    /// caller's signal to fall back rather than route nowhere.
-    pub fn spanning_for_shard_live(
-        &self,
-        shard: ShardId,
-        wt: WeightedTimestamp,
-    ) -> impl Iterator<Item = &Arc<TopologySnapshot>> {
-        let here = self
-            .at_for_shard_live(shard, wt)
-            .map(|(snapshot, _)| snapshot);
-        // A zero duration folds every timestamp to genesis, so the "next"
-        // window is the same one and dedups away below.
-        let next = self
-            .at_for_shard_live(
-                shard,
-                self.windows().window_of(self.epoch_for(wt).next()).start,
-            )
-            .map(|(snapshot, _)| snapshot);
-        here.into_iter()
-            .chain(next.filter(|next| !here.is_some_and(|here| Arc::ptr_eq(here, next))))
-    }
-
     /// Collapse a lookup tuple to its resolved committee — `None` for
     /// [`NotYetCommitted`](ScheduleLookup::NotYetCommitted) and
     /// [`Evicted`](ScheduleLookup::Evicted) alike. The one adapter behind
@@ -1258,65 +1220,6 @@ mod tests {
         // The live children resolve their head committees.
         assert!(routing.contains_key(&ShardId::leaf(1, 0)));
         assert!(routing.contains_key(&ShardId::leaf(1, 1)));
-    }
-
-    /// Work anchored one certificate below an epoch cut is certified above
-    /// it, so the committee that acts on it is either the anchor's or the
-    /// next window's. Spanning names both where a rotation moves membership
-    /// across the cut, and collapses to one where nothing moves.
-    #[test]
-    fn spanning_for_shard_live_names_both_committees_across_a_seat_change() {
-        use crate::ValidatorInfo;
-
-        let validators: Vec<ValidatorInfo> = (0..5)
-            .map(|i| ValidatorInfo {
-                validator_id: ValidatorId::new(i),
-                public_key: BlsSigner::generate().public_key(),
-            })
-            .collect();
-        let set = ValidatorSet::new(validators);
-        let shard = ShardId::ROOT;
-        let seated: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
-        // What a shuffle does to committee order: the victim leaves the
-        // middle, the entrant lands at the end, every seat behind it shifts.
-        let rotated: Vec<ValidatorId> = [0, 2, 3, 4].into_iter().map(ValidatorId::new).collect();
-
-        let committees = |members: &[ValidatorId]| {
-            Arc::new(TopologySnapshot::with_shard_committees(
-                NetworkDefinition::simulator(),
-                1,
-                &set,
-                std::iter::once((shard, members.to_vec())).collect(),
-            ))
-        };
-        let before = committees(&seated);
-        let after = committees(&rotated);
-
-        let mut sched = TopologySchedule::new(1000, Epoch::new(3), Arc::clone(&before));
-        sched.insert(Epoch::new(3), Arc::clone(&before));
-        sched.insert(Epoch::new(4), Arc::clone(&after));
-
-        // Inside epoch 3, below the cut at 4000.
-        let anchor = WeightedTimestamp::from_millis(3_900);
-        let spanned: Vec<Vec<ValidatorId>> = sched
-            .spanning_for_shard_live(shard, anchor)
-            .map(|snapshot| snapshot.consensus_committee_for_shard(shard).to_vec())
-            .collect();
-        assert_eq!(
-            spanned,
-            vec![seated.clone(), rotated],
-            "the anchor's committee first, then the one the cut seats",
-        );
-
-        // One committee across both windows: the pair collapses to it.
-        let mut flat = TopologySchedule::new(1000, Epoch::new(3), Arc::clone(&before));
-        flat.insert(Epoch::new(3), Arc::clone(&before));
-        flat.insert(Epoch::new(4), Arc::clone(&before));
-        let collapsed: Vec<Vec<ValidatorId>> = flat
-            .spanning_for_shard_live(shard, anchor)
-            .map(|snapshot| snapshot.consensus_committee_for_shard(shard).to_vec())
-            .collect();
-        assert_eq!(collapsed, vec![seated]);
     }
 
     /// A recovering shard's routing entry unions the committee its halt

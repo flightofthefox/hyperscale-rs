@@ -218,7 +218,7 @@ impl VoteKeeper {
         );
         vote_set.add_verified_vote(prep.voter_index, vote);
 
-        self.maybe_trigger_verification(topology_snapshot, local_shard, block_hash)
+        self.maybe_trigger_verification(local_shard, block_hash)
     }
 
     /// Accept a wire-arrived block vote: buffer its signature into the
@@ -275,7 +275,7 @@ impl VoteKeeper {
             "Vote buffered"
         );
 
-        self.maybe_trigger_verification(topology_snapshot, local_shard, block_hash)
+        self.maybe_trigger_verification(local_shard, block_hash)
     }
 
     /// Shared committee/power lookup for both vote-ingestion paths.
@@ -351,15 +351,13 @@ impl VoteKeeper {
     /// threshold can't be met yet or no buffered signatures are waiting.
     pub fn maybe_trigger_verification(
         &mut self,
-        topology_snapshot: &TopologySnapshot,
         local_shard: ShardId,
         block_hash: BlockHash,
     ) -> Vec<Action> {
-        let total_power = topology_snapshot.committee_votes(local_shard);
-
         let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
             return vec![];
         };
+        let total_power = vote_set.committee_votes();
 
         if !vote_set.should_trigger_verification(total_power) {
             return vec![];
