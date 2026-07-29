@@ -137,9 +137,11 @@ impl BeaconWitnessAccumulator {
 /// from its receipts + carried witness sources + missed-round scan,
 /// then prepends the committed accumulator's retained window. Each
 /// ancestor's leaves resolve against *its own* committee — the certified
-/// binding of its anchor (`parent_qc.weighted_timestamp()`) and its
-/// certifying QC (`parent_qc_wt` for the first ancestor, then each
-/// successor's `parent_qc` down the chain), matching the commit-time
+/// binding of its committee anchor (its parent's
+/// `parent_qc.weighted_timestamp()`, or `committed_anchor_ts` for the
+/// ancestor extending the committed tip) and its certifying QC
+/// (`parent_qc_wt` for the first ancestor, then each successor's
+/// `parent_qc` down the chain), matching the commit-time
 /// derivation. A pending chain that straddles an epoch boundary
 /// therefore reproduces exactly what each block committed, rather than
 /// re-deriving an older epoch's missed-proposal leaves under the tip's
@@ -173,6 +175,7 @@ impl BeaconWitnessAccumulator {
 pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
     accumulator: &BeaconWitnessAccumulator,
     committed_hash: BlockHash,
+    committed_anchor_ts: WeightedTimestamp,
     parent_block_hash: BlockHash,
     parent_qc_wt: WeightedTimestamp,
     pending_blocks: &PendingBlocks,
@@ -185,7 +188,10 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
     if parent_block_hash == committed_hash {
         return Ok((start_index, committed_leaves.to_vec()));
     }
-    let mut chain_deltas: Vec<Vec<Hash>> = Vec::new();
+    // Descend to the committed tip before deriving anything: a block's
+    // committee anchors on its parent, so an ancestor's anchor is only in
+    // hand once the walk has reached the block below it.
+    let mut chain: Vec<(&Block, WeightedTimestamp)> = Vec::new();
     let mut current = parent_block_hash;
     // The QC certifying `current` — the caller's `parent_qc` for the first
     // ancestor, then each block's own `parent_qc` as the walk descends.
@@ -201,21 +207,33 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
                 None => return Err(current),
             },
         };
+        chain.push((block, certifying_wt));
+        certifying_wt = block.header().parent_qc().weighted_timestamp();
+        current = block.header().parent_block_hash();
+    }
+    let mut leaves = committed_leaves.to_vec();
+    for (index, (block, certifying_wt)) in chain.iter().enumerate().rev() {
         let header = block.header();
         // This ancestor's leaves committed under its own committee — the
-        // certified binding of its anchor and certifying QC. Resolving it
-        // per ancestor (rather than under the walk's tip committee) keeps
-        // a boundary-straddling pending chain byte-identical to what each
-        // block committed; the certified binding keeps a halt recovery's
-        // sync-admitted suffix on the old committee its headers committed
-        // while a bridge block resolves the fresh committee that proposed
-        // it — stable across replicas however late they walk it.
-        let Some((committee, _)) = schedule.at_for_shard_certified(
-            local_shard,
-            header.parent_qc().weighted_timestamp(),
-            certifying_wt,
-        ) else {
-            return Err(current);
+        // certified binding of its committee anchor and its certifying QC.
+        // The committee anchor is the parent's own anchor: `chain[index + 1]`
+        // is this block's parent, and the walk's last entry extends the
+        // committed tip. Resolving it per ancestor (rather than under the
+        // walk's tip committee) keeps a boundary-straddling pending chain
+        // byte-identical to what each block committed; the certified binding
+        // keeps a halt recovery's sync-admitted suffix on the old committee
+        // its headers committed while a bridge block resolves the fresh
+        // committee that proposed it — stable across replicas however late
+        // they walk it.
+        let committee_anchor = chain
+            .get(index + 1)
+            .map_or(committed_anchor_ts, |(parent, _)| {
+                parent.header().parent_qc().weighted_timestamp()
+            });
+        let Some((committee, _)) =
+            schedule.at_for_shard_certified(local_shard, committee_anchor, *certifying_wt)
+        else {
+            return Err(block.hash());
         };
         let committee = committee.as_ref();
         let receipts: Vec<StoredReceipt> = block
@@ -237,18 +255,7 @@ pub fn prospective_parent_witness_leaves<S: std::hash::BuildHasher>(
             &missed,
             block.witness_sources(),
         );
-        chain_deltas.push(
-            new_leaves
-                .iter()
-                .map(ShardWitnessPayload::leaf_hash)
-                .collect(),
-        );
-        certifying_wt = header.parent_qc().weighted_timestamp();
-        current = header.parent_block_hash();
-    }
-    let mut leaves = committed_leaves.to_vec();
-    for delta in chain_deltas.iter().rev() {
-        leaves.extend_from_slice(delta);
+        leaves.extend(new_leaves.iter().map(ShardWitnessPayload::leaf_hash));
     }
     Ok((start_index, leaves))
 }
@@ -259,10 +266,12 @@ mod tests {
 
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
-        BeaconWitnessRoot, BlockHeight, ConsensusSignature, NetworkDefinition, ReadySignal,
-        ReshapeSeat, ReshapeTrigger, Round, Stake, StakePoolId, TopologySnapshot, ValidatorId,
-        ValidatorInfo, ValidatorSet, VrfProof, WeightedTimestamp, WitnessSources,
-        compute_merkle_root,
+        AggregateSignature, BeaconWitnessRoot, BlockHeader, BlockHeight, BoundedVec,
+        CertificateRoot, ConsensusSignature, Epoch, InFlightCount, LocalReceiptRoot,
+        LocalTimestamp, NetworkDefinition, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
+        ReadySignal, ReshapeSeat, ReshapeTrigger, RevealChain, Round, SignerBitfield, Stake,
+        StakePoolId, StateRoot, TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo,
+        ValidatorSet, VrfProof, WeightedTimestamp, WitnessSources, compute_merkle_root,
     };
 
     use super::*;
@@ -329,6 +338,147 @@ mod tests {
 
     fn ready_signals(ids: &[u64]) -> Vec<ReadySignal> {
         ids.iter().copied().map(ready_signal_for).collect()
+    }
+
+    /// A committee of `ids`, seated on ROOT in that order.
+    fn committee_of(ids: &[u64]) -> TopologySnapshot {
+        let infos: Vec<ValidatorInfo> = ids
+            .iter()
+            .map(|&id| ValidatorInfo {
+                validator_id: ValidatorId::new(id),
+                public_key: *TestCommittee::new(4, id).public_key(0),
+            })
+            .collect();
+        let members: Vec<ValidatorId> = infos.iter().map(|v| v.validator_id).collect();
+        TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &ValidatorSet::new(infos),
+            HashMap::from([(ShardId::ROOT, members.clone())]),
+            HashMap::from([(ShardId::ROOT, members)]),
+            HashMap::new(),
+            HashMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::from([ShardId::ROOT]),
+        )
+    }
+
+    /// An empty block at `height` extending `parent_hash`, whose parent QC
+    /// carries `anchor_ms` and sits `skipped` rounds below the block's own.
+    fn chained(height: BlockHeight, parent_hash: BlockHash, anchor_ms: u64, skipped: u64) -> Block {
+        let parent_round = Round::new(height.inner());
+        let parent_qc = QuorumCertificate::new(
+            parent_hash,
+            ShardId::ROOT,
+            BlockHeight::new(height.inner() - 1),
+            BlockHash::ZERO,
+            parent_round,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(anchor_ms),
+        );
+        Block::Live {
+            header: BlockHeader::new(
+                ShardId::ROOT,
+                height,
+                parent_hash,
+                parent_qc,
+                ValidatorId::new(0),
+                ProposerTimestamp::ZERO,
+                Round::new(parent_round.inner() + 1 + skipped),
+                false,
+                StateRoot::ZERO,
+                TransactionRoot::ZERO,
+                CertificateRoot::ZERO,
+                LocalReceiptRoot::ZERO,
+                ProvisionsRoot::ZERO,
+                Vec::new(),
+                BTreeMap::new(),
+                InFlightCount::ZERO,
+                BeaconWitnessRoot::ZERO,
+                BeaconWitnessLeafCount::ZERO,
+                BeaconWitnessLeafCount::ZERO,
+                RevealChain::ZERO,
+                None,
+                None,
+            ),
+            transactions: Arc::new(BoundedVec::new()),
+            certificates: Arc::new(BoundedVec::new()),
+            provisions: Arc::new(BoundedVec::new()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    fn hold(pending: &mut PendingBlocks, block: &Block) {
+        let mut p = PendingBlock::from_complete_block(block, vec![], vec![], LocalTimestamp::ZERO);
+        p.construct_block().expect("complete block constructs");
+        pending.insert(p);
+    }
+
+    /// The committee a block's leaves derive under must not depend on which
+    /// path derives them.
+    ///
+    /// The prospective walk every proposer and verifier runs resolves each
+    /// ancestor from that ancestor's own anchor. The commit that appends the
+    /// same block's leaves to the accumulator resolves it from the parent's,
+    /// which is where a block's committee lives. Straddle a cut that moves the
+    /// round's proposer and one block's `MissedProposal` leaves name two
+    /// different validators — so the root a proposer stamps is not the root its
+    /// own accumulator ends up holding, and the next block's root is rejected
+    /// by every verifier.
+    #[test]
+    fn a_blocks_leaves_derive_under_one_committee_on_every_path() {
+        const ED: u64 = 1_000;
+        let shard = ShardId::ROOT;
+
+        let epoch0 = Arc::new(committee_of(&[0, 1, 2, 3]));
+        let epoch1 = Arc::new(committee_of(&[10, 11, 12, 13]));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), epoch1);
+        schedule.insert(Epoch::new(0), Arc::clone(&epoch0));
+
+        // Committed tip C, then A anchored below the cut, then P anchored
+        // above it. P skips two rounds, so it carries `MissedProposal` leaves.
+        let committed = BlockHash::from_raw(Hash::from_bytes(b"committed-tip"));
+        let a = chained(BlockHeight::new(5), committed, ED - 1, 0);
+        let p = chained(BlockHeight::new(6), a.hash(), ED + 1, 2);
+
+        let mut pending = PendingBlocks::new();
+        hold(&mut pending, &a);
+        hold(&mut pending, &p);
+
+        let (_, walked) = prospective_parent_witness_leaves(
+            &BeaconWitnessAccumulator::new(),
+            committed,
+            WeightedTimestamp::from_millis(ED - 2),
+            p.hash(),
+            WeightedTimestamp::from_millis(ED + 1),
+            &pending,
+            &HashMap::new(),
+            shard,
+            &schedule,
+        )
+        .expect("both ancestors are held");
+
+        // What the commit path derives for P: its committee anchors on A, so
+        // it is epoch 0's, however far past the cut P dates itself.
+        let missed = missed_proposals_since_prev_commit(
+            shard,
+            p.height(),
+            p.header().parent_qc().round(),
+            p.header().round(),
+            &epoch0,
+        );
+        let committed_leaves: Vec<Hash> =
+            derive_leaves(shard, &epoch0, &[], &missed, p.witness_sources())
+                .iter()
+                .map(ShardWitnessPayload::leaf_hash)
+                .collect();
+
+        assert_eq!(
+            walked, committed_leaves,
+            "the walk derived P's leaves under a different committee than its commit will",
+        );
     }
 
     #[test]

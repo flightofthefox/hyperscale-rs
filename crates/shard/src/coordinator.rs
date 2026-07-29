@@ -1712,6 +1712,7 @@ impl ShardCoordinator {
         let (parent_start, mut parent_leaves) = prospective_parent_witness_leaves(
             &self.beacon_witness_accumulator,
             self.committed_hash,
+            self.committed_anchor_ts,
             parent_block_hash,
             proposal_wt,
             &self.pending_blocks,
@@ -1841,9 +1842,14 @@ impl ShardCoordinator {
         // — has no chain to extend. Defer rather than guess: a wrong chain
         // produces a header every other replica rejects. The first commit
         // past the gap reseats the scalar.
-        let (Some(parent_reveal_chain), Some(parent_anchor_wt)) = (
+        // The chain reseeds when the block and its parent belong to different
+        // epochs, and a block belongs to the epoch its committee is drawn
+        // from — so both epochs are committee anchors: this block's is the
+        // parent's own anchor, the parent's is the grandparent's.
+        let (Some(parent_reveal_chain), Some(own_anchor_wt), Some(parent_anchor_wt)) = (
             self.chain_view().parent_reveal_chain(parent_block_hash),
             self.block_anchor(parent_block_hash),
+            self.committee_anchor(parent_block_hash),
         ) else {
             trace!(
                 validator = ?self.me,
@@ -1853,6 +1859,7 @@ impl ShardCoordinator {
             return vec![];
         };
         let parent_anchor_epoch = topology_schedule.epoch_for(parent_anchor_wt);
+        let own_anchor_epoch = topology_schedule.epoch_for(own_anchor_wt);
         // The reshape predicate reads the substate byte total behind the parent
         // state. Resolve it before the witness preview drains the
         // ready-signal pool: a missing ancestor delta defers the whole
@@ -1904,7 +1911,7 @@ impl ShardCoordinator {
             preview.base,
             parent_reveal_chain,
             parent_anchor_epoch,
-            topology_schedule.epoch_for(parent_qc.weighted_timestamp()),
+            own_anchor_epoch,
             carry_split_child_roots,
             carry_settled_waves_root,
             topology_schedule
@@ -2856,6 +2863,7 @@ impl ShardCoordinator {
                 self.committed_hash,
                 self.committed_reveal_chain,
                 self.committed_anchor_ts,
+                self.committed_committee_anchor_ts,
                 block_hash,
                 block,
                 SubstateCountSource {
@@ -3685,6 +3693,7 @@ impl ShardCoordinator {
             self.committed_hash,
             self.committed_reveal_chain,
             self.committed_anchor_ts,
+            self.committed_committee_anchor_ts,
             self.local_shard,
             committee,
             topology_schedule,
@@ -6315,6 +6324,64 @@ mod tests {
                 .committee_for_shard(shard),
             epoch1.committee_for_shard(shard),
             "the block extending the tip is governed by the window the tip opens",
+        );
+    }
+
+    #[test]
+    fn the_reveal_chain_reseeds_when_the_committee_epoch_changes() {
+        // The chain reseeds when a block and its parent sit in different
+        // epochs — and a block sits in the epoch its committee is drawn from,
+        // which anchors on its parent. A block whose *own* anchor crosses a
+        // cut is still governed by the window its parent anchors in, so it
+        // extends the parent's chain rather than reseeding: reseeding on the
+        // block's own anchor would label a chain with an epoch no committee
+        // that signed it belongs to, and split one committee's reveals across
+        // two chains.
+        //
+        // The same committee sits in both windows, so what this pins is the
+        // epoch label, not committee identity.
+        const ED: u64 = 1_000;
+        let shard = ShardId::ROOT;
+        let committee = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&committee));
+        schedule.insert(Epoch::new(0), Arc::clone(&committee));
+
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            shard,
+            ShardConsensusConfig::default(),
+            RecoveredState::default(),
+        );
+
+        // The committed tip anchors in epoch 0; so does `parent`. `child`
+        // dates itself past the cut, but its committee still anchors on
+        // `parent`, below it.
+        let parent = block_with_parent_qc_ts(BlockHeight::new(5), ED - 1);
+        let child = block_chained_on(BlockHeight::new(6), parent.hash(), ED + 1);
+        install_complete_block(&mut state, &parent);
+        install_complete_block(&mut state, &child);
+        state.committed_hash = parent.header().parent_block_hash();
+        state.committed_anchor_ts = WeightedTimestamp::from_millis(ED - 2);
+        state.committed_committee_anchor_ts = WeightedTimestamp::from_millis(ED - 2);
+
+        let actions = state.dispatch_or_park_beacon_witness(&schedule, child.hash());
+        let Some(Action::VerifyBeaconWitnessRoot {
+            anchor_epoch,
+            parent_anchor_epoch,
+            ..
+        }) = actions
+            .iter()
+            .find(|a| matches!(a, Action::VerifyBeaconWitnessRoot { .. }))
+        else {
+            panic!("the block's witness root dispatches: {actions:?}");
+        };
+
+        assert_eq!(
+            (*anchor_epoch, *parent_anchor_epoch),
+            (Epoch::new(0), Epoch::new(0)),
+            "the child dates itself in epoch 1 but is governed by epoch 0, so it extends the \
+             parent's reveal chain instead of reseeding",
         );
     }
 

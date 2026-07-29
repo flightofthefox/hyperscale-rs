@@ -1280,6 +1280,7 @@ impl VerificationPipeline {
         committed_hash: BlockHash,
         committed_reveal_chain: Option<RevealChain>,
         committed_anchor_ts: WeightedTimestamp,
+        committed_committee_anchor_ts: WeightedTimestamp,
         local_shard: ShardId,
         topology_snapshot: &TopologySnapshot,
         schedule: &TopologySchedule,
@@ -1289,6 +1290,7 @@ impl VerificationPipeline {
         let (parent_leaves_start, parent_witness_leaves) = match prospective_parent_witness_leaves(
             accumulator,
             committed_hash,
+            committed_anchor_ts,
             header.parent_block_hash(),
             header.parent_qc().weighted_timestamp(),
             pending_blocks,
@@ -1306,58 +1308,23 @@ impl VerificationPipeline {
                 return Vec::new();
             }
         };
-        // The reshape predicate reads the substate byte total behind the
-        // block's parent state. With reshaping disabled the predicate
-        // can never fire, so the count is irrelevant and verification
-        // proceeds without it — bit-identical to a network without the
-        // feature. Enabled, a missing ancestor delta parks the
-        // verification exactly like a missing witness ancestor — except
-        // when the walk crosses a halt recovery's sync-admitted suffix:
-        // those blocks are QC-attested but never locally executed, so no
-        // delta can ever land, and the halted tip's commit needs the
-        // successor QC this very verification gates. There the predicate
-        // is out of play (`None`) and the required assertion is absent;
-        // every replica that synced the suffix agrees byte-for-byte on
-        // its absence. The band holds through the completed recovery
-        // record — a member whose walk still crosses the suffix after the
-        // pending record clears on the first crossing must not start
-        // parking, or the circular drain above wedges it permanently. A
-        // sync-admitted block outside the band — an ordinary lagging
-        // replica's local state, whatever the shard's recovery history —
-        // parks as usual and commits from the live quorum drain it.
         let thresholds = count_source.thresholds;
-        let substate_bytes = if thresholds == ReshapeThresholds::DISABLED {
-            None
-        } else {
-            match count_source.count_behind(
-                committed_hash,
-                header.parent_block_hash(),
-                pending_blocks,
-                &self.verified_certified_blocks,
-            ) {
-                Ok(count) => Some(count),
-                Err(SubstateCountBlocked::SyncAdmitted(blocking_hash))
-                    if self
-                        .verified_certified_blocks
-                        .get(&blocking_hash)
-                        .is_some_and(|certified| {
-                            schedule.recovery_suffix_band(
-                                local_shard,
-                                certified.block().header().parent_qc().weighted_timestamp(),
-                                certified.qc().weighted_timestamp(),
-                            )
-                        }) =>
-                {
-                    None
-                }
-                Err(blocked) => {
-                    self.park_beacon_witness(
-                        blocked.blocking_hash(),
-                        block_hash,
-                        BeaconWitnessDefer::SubstateCount,
-                    );
-                    return Vec::new();
-                }
+        let substate_bytes = match self.witness_substate_bytes(
+            committed_hash,
+            header.parent_block_hash(),
+            pending_blocks,
+            local_shard,
+            schedule,
+            &count_source,
+        ) {
+            Ok(bytes) => bytes,
+            Err(blocking_hash) => {
+                self.park_beacon_witness(
+                    blocking_hash,
+                    block_hash,
+                    BeaconWitnessDefer::SubstateCount,
+                );
+                return Vec::new();
             }
         };
         let finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>> =
@@ -1372,13 +1339,16 @@ impl VerificationPipeline {
         // unresolvable parent parks like a blocked leaf walk rather than
         // verifying against a guessed chain.
         let parent_hash = header.parent_block_hash();
-        let Some((parent_reveal_chain, parent_anchor_ts)) = self.parent_reveal_anchor(
-            parent_hash,
-            committed_hash,
-            committed_reveal_chain,
-            committed_anchor_ts,
-            pending_blocks,
-        ) else {
+        let Some((parent_reveal_chain, own_anchor_ts, parent_anchor_ts)) = self
+            .parent_reveal_anchors(
+                parent_hash,
+                committed_hash,
+                committed_reveal_chain,
+                committed_anchor_ts,
+                committed_committee_anchor_ts,
+                pending_blocks,
+            )
+        else {
             self.park_beacon_witness(
                 parent_hash,
                 block_hash,
@@ -1396,7 +1366,7 @@ impl VerificationPipeline {
             claimed_reveal_chain: header.reveal_chain(),
             parent_reveal_chain,
             parent_anchor_epoch: schedule.epoch_for(parent_anchor_ts),
-            anchor_epoch: schedule.epoch_for(header.parent_qc().weighted_timestamp()),
+            anchor_epoch: schedule.epoch_for(own_anchor_ts),
             parent_leaves_start,
             parent_witness_leaves,
             parent_round: header.parent_qc().round(),
@@ -1410,38 +1380,130 @@ impl VerificationPipeline {
         }]
     }
 
-    /// The parent header's reveal chain and committee anchor, for the
-    /// reveal-chain recompute.
+    /// Substate byte total behind the block's parent state, for the reshape
+    /// predicate. `Err(blocking_hash)` when the caller must park.
     ///
-    /// Resolves through the same two caches the leaf walk uses; when the
-    /// parent is the committed tip (pruned from both) the coordinator's
-    /// scalars answer. `None` when no route resolves it.
-    fn parent_reveal_anchor(
+    /// With reshaping disabled the predicate can never fire, so the count is
+    /// irrelevant and verification proceeds without it — bit-identical to a
+    /// network without the feature. Enabled, a missing ancestor delta parks
+    /// the verification exactly like a missing witness ancestor — except when
+    /// the walk crosses a halt recovery's sync-admitted suffix: those blocks
+    /// are QC-attested but never locally executed, so no delta can ever land,
+    /// and the halted tip's commit needs the successor QC this very
+    /// verification gates. There the predicate is out of play (`None`) and the
+    /// required assertion is absent; every replica that synced the suffix
+    /// agrees byte-for-byte on its absence. The band holds through the
+    /// completed recovery record — a member whose walk still crosses the
+    /// suffix after the pending record clears on the first crossing must not
+    /// start parking, or the circular drain wedges it permanently. A
+    /// sync-admitted block outside the band — an ordinary lagging replica's
+    /// local state, whatever the shard's recovery history — parks as usual and
+    /// commits from the live quorum drain it.
+    fn witness_substate_bytes(
+        &self,
+        committed_hash: BlockHash,
+        parent_block_hash: BlockHash,
+        pending_blocks: &PendingBlocks,
+        local_shard: ShardId,
+        schedule: &TopologySchedule,
+        count_source: &SubstateCountSource<'_>,
+    ) -> Result<Option<u64>, BlockHash> {
+        if count_source.thresholds == ReshapeThresholds::DISABLED {
+            return Ok(None);
+        }
+        match count_source.count_behind(
+            committed_hash,
+            parent_block_hash,
+            pending_blocks,
+            &self.verified_certified_blocks,
+        ) {
+            Ok(count) => Ok(Some(count)),
+            Err(SubstateCountBlocked::SyncAdmitted(blocking_hash))
+                if self
+                    .verified_certified_blocks
+                    .get(&blocking_hash)
+                    .is_some_and(|certified| {
+                        schedule.recovery_suffix_band(
+                            local_shard,
+                            certified.block().header().parent_qc().weighted_timestamp(),
+                            certified.qc().weighted_timestamp(),
+                        )
+                    }) =>
+            {
+                Ok(None)
+            }
+            Err(blocked) => Err(blocked.blocking_hash()),
+        }
+    }
+
+    /// The parent header's reveal chain and the two committee anchors the
+    /// reveal-chain recompute keys on: the block's own (the parent's
+    /// [`block_anchor`](Self::block_anchor)) and its parent's (the
+    /// grandparent's).
+    ///
+    /// Resolves through the same two caches the leaf walk uses; when a block
+    /// is the committed tip (pruned from both) the coordinator's scalars
+    /// answer. `None` when no route resolves either.
+    fn parent_reveal_anchors(
         &self,
         parent_hash: BlockHash,
         committed_hash: BlockHash,
         committed_reveal_chain: Option<RevealChain>,
         committed_anchor_ts: WeightedTimestamp,
+        committed_committee_anchor_ts: WeightedTimestamp,
         pending_blocks: &PendingBlocks,
-    ) -> Option<(RevealChain, WeightedTimestamp)> {
-        let held = pending_blocks
-            .get(parent_hash)
-            .map(PendingBlock::header)
-            .or_else(|| {
-                self.verified_certified_blocks
-                    .get(&parent_hash)
-                    .map(|certified| certified.block().header())
-            });
-        if let Some(parent) = held {
+    ) -> Option<(RevealChain, WeightedTimestamp, WeightedTimestamp)> {
+        if let Some(parent) = self.held_header(parent_hash, pending_blocks) {
+            let grandparent_anchor = self.block_anchor(
+                parent.parent_block_hash(),
+                committed_hash,
+                committed_anchor_ts,
+                pending_blocks,
+            )?;
             return Some((
                 parent.reveal_chain(),
                 parent.parent_qc().weighted_timestamp(),
+                grandparent_anchor,
             ));
         }
         (parent_hash == committed_hash)
             .then_some(committed_reveal_chain)
             .flatten()
-            .map(|chain| (chain, committed_anchor_ts))
+            .map(|chain| (chain, committed_anchor_ts, committed_committee_anchor_ts))
+    }
+
+    /// A block's own position on the weighted-time grid — its parent QC's
+    /// weighted timestamp, read off a held header or the committed-tip
+    /// scalar. Mirrors the coordinator's helper of the same name.
+    fn block_anchor(
+        &self,
+        block_hash: BlockHash,
+        committed_hash: BlockHash,
+        committed_anchor_ts: WeightedTimestamp,
+        pending_blocks: &PendingBlocks,
+    ) -> Option<WeightedTimestamp> {
+        if block_hash == committed_hash {
+            return Some(committed_anchor_ts);
+        }
+        self.held_header(block_hash, pending_blocks)
+            .map(|header| header.parent_qc().weighted_timestamp())
+    }
+
+    /// A header from the pending map, falling back to the verified-certified
+    /// cache where a sync-admitted block sits.
+    fn held_header<'a>(
+        &'a self,
+        block_hash: BlockHash,
+        pending_blocks: &'a PendingBlocks,
+    ) -> Option<&'a BlockHeader> {
+        pending_blocks
+            .get(block_hash)
+            .map(PendingBlock::header)
+            .or_else(|| {
+                self.verified_certified_blocks
+                    .get(&block_hash)
+                    .map(|certified| certified.block().header())
+            })
     }
 
     /// Park `block_hash`'s beacon-witness verification on `blocking_hash`,
@@ -1686,6 +1748,7 @@ impl VerificationPipeline {
         committed_hash: BlockHash,
         committed_reveal_chain: Option<RevealChain>,
         committed_anchor_ts: WeightedTimestamp,
+        committed_committee_anchor_ts: WeightedTimestamp,
         block_hash: BlockHash,
         block: &Block,
         count_source: SubstateCountSource<'_>,
@@ -1769,6 +1832,7 @@ impl VerificationPipeline {
                 committed_hash,
                 committed_reveal_chain,
                 committed_anchor_ts,
+                committed_committee_anchor_ts,
                 local_shard,
                 topology_snapshot,
                 schedule,
@@ -2551,6 +2615,7 @@ mod tests {
             BlockHash::ZERO,
             None,
             WeightedTimestamp::ZERO,
+            WeightedTimestamp::ZERO,
             ShardId::ROOT,
             &topology_snapshot,
             &dummy_schedule(&topology_snapshot),
@@ -2595,6 +2660,7 @@ mod tests {
                 BlockHash::ZERO,
                 None,
                 WeightedTimestamp::ZERO,
+                WeightedTimestamp::ZERO,
                 ShardId::ROOT,
                 &topology_snapshot,
                 &dummy_schedule(&topology_snapshot),
@@ -2638,6 +2704,7 @@ mod tests {
             &accumulator,
             BlockHash::ZERO,
             None,
+            WeightedTimestamp::ZERO,
             WeightedTimestamp::ZERO,
             ShardId::ROOT,
             &topology_snapshot,
