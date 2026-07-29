@@ -403,9 +403,21 @@ impl RemoteHeaderCoordinator {
         // suffix band — the orphan a beyond-f cohort forged extending the
         // halted tip; drop it rather than admit a forged header into the
         // routing view.
+        // A block's committee anchors on its parent, so the window that signed
+        // this QC is the one the parent dates itself in. Sync walks a window
+        // in ascending height, so the parent is held for every header but the
+        // first; that one falls back to its own anchor — the same window
+        // except across an epoch cut, and self-healing, since a re-offered
+        // header resolves exactly once the parent lands.
+        let committee_anchor = self
+            .held_header(shard, certified_header.header().parent_block_hash())
+            .map_or_else(
+                || certified_header.header().parent_qc().weighted_timestamp(),
+                |parent| parent.parent_qc().weighted_timestamp(),
+            );
         let committee = match topology_schedule.lookup_for_shard_certified_fenced(
             shard,
-            certified_header.header().parent_qc().weighted_timestamp(),
+            committee_anchor,
             certified_header.qc().weighted_timestamp(),
         ) {
             None => {
@@ -1397,9 +1409,15 @@ impl RemoteHeaderCoordinator {
     }
 
     /// A held header for `shard` matching `hash`, across the canonical
-    /// winner and the fork siblings at its height. The height is not known
-    /// to the caller — a parent hash names a block, not a slot — so this
-    /// scans the shard's held heights.
+    /// winner, the fork siblings, and the headers still awaiting QC
+    /// verification. The height is not known to the caller — a parent hash
+    /// names a block, not a slot — so this scans the shard's held heights.
+    ///
+    /// A pending header counts: `hash` names one block and only that block
+    /// hashes to it, so reading its anchor is sound whether or not its own QC
+    /// has been checked. A forger who supplies both a header and its parent
+    /// still cannot make the pair verify — the QC must hold under whatever
+    /// committee the anchor selects.
     fn held_header(&self, shard: ShardId, hash: BlockHash) -> Option<&BlockHeader> {
         self.verified
             .iter()
@@ -1410,6 +1428,12 @@ impl RemoteHeaderCoordinator {
                     .iter()
                     .filter(|((s, _), _)| *s == shard)
                     .flat_map(|(_, siblings)| siblings.iter().map(|h| h.header())),
+            )
+            .chain(
+                self.pending
+                    .iter()
+                    .filter(|((s, _), _)| *s == shard)
+                    .flat_map(|(_, by_sender)| by_sender.values().map(|h| h.header())),
             )
             .find(|header| header.hash() == hash)
     }
@@ -1738,6 +1762,104 @@ mod tests {
         Arc::new(CertifiedBlockHeader::new(header, qc))
     }
 
+    /// As [`remote_header`], but extending `parent_hash` — so a caller can
+    /// feed a real two-block chain and separate a header's own anchor from
+    /// the one its parent carries.
+    fn chained_remote_header(
+        shard: ShardId,
+        height: BlockHeight,
+        parent_hash: BlockHash,
+        parent_qc_wt: u64,
+    ) -> Arc<CertifiedBlockHeader> {
+        let parent_qc = QuorumCertificate::new(
+            parent_hash,
+            shard,
+            BlockHeight::new(height.inner().saturating_sub(1)),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(parent_qc_wt),
+        );
+        let header = BlockHeader::new(
+            shard,
+            height,
+            parent_hash,
+            parent_qc,
+            ValidatorId::new(0),
+            ProposerTimestamp::from_millis(0),
+            Round::INITIAL,
+            false,
+            StateRoot::ZERO,
+            TransactionRoot::ZERO,
+            CertificateRoot::ZERO,
+            LocalReceiptRoot::ZERO,
+            ProvisionsRoot::ZERO,
+            Vec::new(),
+            BTreeMap::new(),
+            InFlightCount::ZERO,
+            BeaconWitnessRoot::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+            BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
+            None,
+            None,
+        );
+        let qc = QuorumCertificate::new(
+            header.hash(),
+            shard,
+            height,
+            BlockHash::ZERO,
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(parent_qc_wt),
+        );
+        Arc::new(CertifiedBlockHeader::new(header, qc))
+    }
+
+    /// A QC over block `h` is signed by `committee(h)`, which anchors on
+    /// `h-1` — so a header whose parent sits below an epoch cut verifies
+    /// under the earlier window however far past the cut it dates itself.
+    /// Resolving on the header's own anchor picks the window the block
+    /// *opens*, and across a cut that moves keys the signature check fails
+    /// and the header is dropped — cross-shard propagation stalling once per
+    /// window.
+    #[test]
+    fn a_headers_qc_verifies_under_the_committee_its_parent_anchors() {
+        const ED: u64 = 1_000;
+        let remote = ShardId::leaf(1, 1);
+        let ids = [0u64, 1, 2, 3];
+        let epoch0 = Arc::new(shard_snapshot(2, &ids, 0));
+        let epoch1 = Arc::new(shard_snapshot(2, &ids, 1));
+        let expected0: Vec<ConsensusPublicKey> = epoch0
+            .committee_for_shard(remote)
+            .iter()
+            .map(|v| epoch0.public_key(*v).unwrap())
+            .collect();
+
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::clone(&epoch0));
+        schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
+
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
+
+        // The parent anchors below the cut, the child above it. The child's
+        // QC was signed by the committee its parent anchors — epoch 0's.
+        let parent = chained_remote_header(remote, BlockHeight::new(5), BlockHash::ZERO, ED - 1);
+        let child =
+            chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
+
+        let _ = coord.on_remote_header_received(&schedule, parent, ValidatorId::new(1));
+        let actions = coord.on_remote_header_received(&schedule, child, ValidatorId::new(1));
+
+        let keys = verify_qc_keys(&actions).expect("verification dispatched");
+        assert_eq!(
+            *keys, expected0,
+            "the child's QC must verify under the window its parent anchors, not the one it \
+             dates itself into",
+        );
+    }
+
     fn verify_qc_keys(actions: &[Action]) -> Option<&Vec<ConsensusPublicKey>> {
         actions.iter().find_map(|a| match a {
             Action::VerifyRemoteHeaderQc {
@@ -1749,10 +1871,13 @@ mod tests {
     }
 
     #[test]
-    fn remote_header_verifies_under_committee_at_parent_qc_weighted_timestamp() {
-        // Remote shard 1's committee rotates keys between epoch 0 (the head) and
-        // epoch 1. A header whose parent QC weighted timestamp is in epoch 1
-        // must dispatch verification against the epoch-1 keys, not the head's.
+    fn a_header_without_its_parent_falls_back_to_its_own_anchor() {
+        // Remote shard 1's committee rotates keys between epoch 0 (the head)
+        // and epoch 1. A block's committee anchors on its parent, but the
+        // first header of a sync window arrives with no parent held — so it
+        // resolves at its own anchor, in epoch 1 here, rather than stalling.
+        // Never the head's: that would verify against whatever window the
+        // local beacon happens to sit in.
         const ED: u64 = 1_000;
         let remote = ShardId::leaf(1, 1);
         let ids = [0u64, 1, 2, 3]; // shard 1's committee is the odd ids {1, 3}
