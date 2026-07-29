@@ -1378,7 +1378,13 @@ impl RemoteHeaderCoordinator {
             // — that is what lets a remote verifier resolve the committee
             // that signed it. Absent, the proof still assembles and still
             // engages the local fence; only a remote verifier drops it.
-            let parent = self.held_header(shard, block_header.header().parent_block_hash());
+            let parent = block_header.height().prev().and_then(|parent_height| {
+                self.held_header(
+                    shard,
+                    parent_height,
+                    block_header.header().parent_block_hash(),
+                )
+            });
             if let Some(child) = children.iter().find(|c| {
                 let ch: &CertifiedBlockHeader = c;
                 ch.header().parent_block_hash() == block_header.block_hash()
@@ -1407,39 +1413,54 @@ impl RemoteHeaderCoordinator {
     /// here, so a buffered sibling verifies under the same committee its
     /// predecessor did.
     fn committee_anchor_wt(&self, shard: ShardId, header: &BlockHeader) -> WeightedTimestamp {
-        self.held_header(shard, header.parent_block_hash())
+        header
+            .height()
+            .prev()
+            .and_then(|parent_height| {
+                self.held_header(shard, parent_height, header.parent_block_hash())
+            })
             .map_or_else(
                 || header.parent_qc().weighted_timestamp(),
                 |parent| parent.parent_qc().weighted_timestamp(),
             )
     }
 
-    /// A held header for `shard` matching `hash`, across the canonical
-    /// winner, the fork siblings, and the headers still awaiting QC
-    /// verification. The height is not known to the caller — a parent hash
-    /// names a block, not a slot — so this scans the shard's held heights.
+    /// The held header for `shard` at `height` matching `hash`, across the
+    /// canonical winner, the fork siblings, and the headers still awaiting
+    /// QC verification. Callers look up a block's parent, whose slot is
+    /// structurally the height below the block's own — every committee
+    /// enforces `parent_qc.height().next() == height` before voting — so a
+    /// genuine parent is only ever at that key. The hash still pins which
+    /// block: a sibling at the slot doesn't match, and a header lying about
+    /// its height just misses here and takes the caller's fallback.
     ///
     /// A pending header counts: `hash` names one block and only that block
     /// hashes to it, so reading its anchor is sound whether or not its own QC
     /// has been checked. A forger who supplies both a header and its parent
     /// still cannot make the pair verify — the QC must hold under whatever
     /// committee the anchor selects.
-    fn held_header(&self, shard: ShardId, hash: BlockHash) -> Option<&BlockHeader> {
+    fn held_header(
+        &self,
+        shard: ShardId,
+        height: BlockHeight,
+        hash: BlockHash,
+    ) -> Option<&BlockHeader> {
+        let key = (shard, height);
         self.verified
-            .iter()
-            .filter(|((s, _), _)| *s == shard)
-            .map(|(_, held)| held.header())
+            .get(&key)
+            .map(|held| held.header())
+            .into_iter()
             .chain(
                 self.fork_siblings
-                    .iter()
-                    .filter(|((s, _), _)| *s == shard)
-                    .flat_map(|(_, siblings)| siblings.iter().map(|h| h.header())),
+                    .get(&key)
+                    .into_iter()
+                    .flat_map(|siblings| siblings.iter().map(|h| h.header())),
             )
             .chain(
                 self.pending
-                    .iter()
-                    .filter(|((s, _), _)| *s == shard)
-                    .flat_map(|(_, by_sender)| by_sender.values().map(|h| h.header())),
+                    .get(&key)
+                    .into_iter()
+                    .flat_map(|by_sender| by_sender.values().map(|h| h.header())),
             )
             .find(|header| header.hash() == hash)
     }

@@ -594,7 +594,7 @@ impl ShardCoordinator {
         self.block_anchor(parent)
             .or_else(|| {
                 self.block_sync
-                    .held_header(parent)
+                    .held_header(header.height().prev()?, parent)
                     .map(|parent| parent.parent_qc().weighted_timestamp())
             })
             .unwrap_or_else(|| header.parent_qc().weighted_timestamp())

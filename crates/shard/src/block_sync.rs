@@ -235,21 +235,24 @@ impl BlockSyncManager {
     /// verification, or buffered awaiting its turn. The drain hands
     /// consecutive heights to verification in parallel, so a block's parent
     /// is routinely still in flight here when the block itself needs its
-    /// parent's anchor to resolve a committee.
+    /// parent's anchor to resolve a committee. Callers look up a block's
+    /// parent, whose slot is structurally `height` (the height below the
+    /// block's own), so the buffered lookup keys straight to that bucket;
+    /// the hash still pins which candidate within it.
     ///
     /// An unverified entry counts: `hash` names one block and only that
     /// block hashes to it, so reading its anchor is sound whether or not its
     /// own QC has been checked. A forger who supplies both a block and its
     /// parent still cannot make the pair verify — the QC must hold under
     /// whatever committee the anchor selects.
-    pub fn held_header(&self, block_hash: BlockHash) -> Option<&BlockHeader> {
+    pub fn held_header(&self, height: BlockHeight, block_hash: BlockHash) -> Option<&BlockHeader> {
         self.pending_synced_block_verifications
             .get(&block_hash)
             .map(|pending| pending.block().header())
             .or_else(|| {
                 self.buffered_synced_blocks
-                    .values()
-                    .find_map(|entries| entries.get(&block_hash))
+                    .get(&height)?
+                    .get(&block_hash)
                     .map(|certified| certified.block().header())
             })
     }
