@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use crossbeam::channel::unbounded;
+use crossbeam::channel::{Receiver, unbounded};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_core::{ProtocolEvent, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
@@ -32,12 +32,14 @@ use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
+use hyperscale_types::network::gossip::beacon::RatifyVoteGossip;
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
-    BeaconChainConfig, BeaconGenesisConfig, CertifiedBeaconBlock, GenesisConfigHash, GenesisPool,
-    GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, Randomness, ShardId,
-    Signer, Stake, StakePoolId, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
-    Verified, genesis_config_hash, shard_prefix_path,
+    BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig, CertifiedBeaconBlock, Epoch,
+    GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
+    NetworkDefinition, Randomness, RatifyPhase, RatifyRound, RatifyVote, ShardId, Signer, Stake,
+    StakePoolId, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
+    genesis_config_hash, shard_prefix_path,
 };
 
 const SHARD_A: ShardId = ShardId::leaf(1, 0);
@@ -142,15 +144,21 @@ impl Fixture {
         })
     }
 
-    /// A follower-only host: no hosted shards, one pooled vnode.
+    /// A follower-only host: no hosted shards, one pooled vnode. Returns
+    /// the network registry and the host's event receiver alongside so
+    /// tests can drive inbound gossip and observe routing.
     fn follower_host(
         &self,
         idx: usize,
-    ) -> NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch> {
+    ) -> (
+        NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>,
+        Arc<HandlerRegistry>,
+        Receiver<HostEvent>,
+    ) {
         let registry = Arc::new(HandlerRegistry::new(std::collections::BTreeSet::new()));
-        let network = SimNetworkAdapter::new(registry);
-        let (event_tx, _event_rx) = unbounded::<HostEvent>();
-        NodeHost::new(
+        let network = SimNetworkAdapter::new(Arc::clone(&registry));
+        let (event_tx, event_rx) = unbounded::<HostEvent>();
+        let host = NodeHost::new(
             vec![self.follower_init(idx)],
             HashMap::<ShardId, SimShardStorage>::new(),
             Arc::clone(&self.beacon_storage),
@@ -163,7 +171,8 @@ impl Fixture {
             Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
             NodeConfig::default(),
             Arc::new(TransactionValidation::new(NetworkDefinition::simulator())),
-        )
+        );
+        (host, registry, event_rx)
     }
 }
 
@@ -181,7 +190,7 @@ fn has_set(ops: &[TimerOp], want: &TimerId) -> bool {
 #[test]
 fn follower_ratify_rearm_survives_to_the_timer_seam() {
     let fix = fixture();
-    let mut host = fix.follower_host(0);
+    let (mut host, _registry, _event_rx) = fix.follower_host(0);
     host.set_time(LocalTimestamp::from_millis(1_000));
 
     let out = host.step(HostEvent::beacon(ProtocolEvent::BeaconRatifyTimer));
@@ -203,7 +212,7 @@ fn follower_ratify_rearm_survives_to_the_timer_seam() {
 #[test]
 fn follower_seat_arms_the_startup_timers() {
     let fix = fixture();
-    let mut host = fix.follower_host(0);
+    let (mut host, _registry, _event_rx) = fix.follower_host(0);
 
     let out = host.drain_pending_output();
 
@@ -229,7 +238,7 @@ fn midlife_seat_arms_the_startup_timers() {
     let fix = fixture();
     // The host begins life with only a follower (validator 1); validator 0
     // is then seated onto shard A at runtime, the grow-cohort shape.
-    let mut host = fix.follower_host(1);
+    let (mut host, _registry, _host_rx) = fix.follower_host(1);
     let (event_tx, _event_rx) = unbounded::<HostEvent>();
     host.add_shard(
         fix.seated_inits(0, SHARD_A),
@@ -249,4 +258,71 @@ fn midlife_seat_arms_the_startup_timers() {
         "a mid-life seat must arm BeaconCommitteeStart at its resume: got {:?}",
         out.timer_ops
     );
+}
+
+/// A pooled ratify-pool member's skip prevote must actually be signed —
+/// persisted to the durable ratify register, then broadcast — not dropped
+/// as an unexpected action. The ratify fire lands past the epoch's skip
+/// deadline, so the tracker asks for a skip prevote; the pool runs the
+/// same sign handler a seated vnode's dispatch runs, and the
+/// persist-before-sign register write is the observable proof it did.
+#[test]
+fn pooled_ratify_voter_signs_its_skip_prevote() {
+    let fix = fixture();
+    let (mut host, _registry, _event_rx) = fix.follower_host(0);
+    let me = fix.committee.validator_id(0);
+    assert!(
+        fix.beacon_storage.ratify_record(me).is_none(),
+        "no ratify position is spent before the fire"
+    );
+
+    // Well past epoch 0's boundary plus the skip timeout, so the fire is
+    // due and the tracker prevotes the canonical skip hash.
+    let epoch_ms = BeaconChainConfig::default().epoch_duration_ms;
+    host.set_time(LocalTimestamp::from_millis(3 * epoch_ms));
+    let _ = host.step(HostEvent::beacon(ProtocolEvent::BeaconRatifyTimer));
+
+    assert!(
+        fix.beacon_storage.ratify_record(me).is_some(),
+        "the pooled voter's skip prevote must reach the durable ratify \
+         register (persist-before-sign), not be dropped"
+    );
+}
+
+/// Ratify votes gossip globally, but the per-shard fan never reaches a
+/// host with no hosted shards — the additive host-level route must carry
+/// them to the pool's beacon channel, since a ratify voter precommits
+/// only when it observes a prevote quorum.
+#[test]
+fn ratify_vote_gossip_routes_to_the_pool() {
+    let fix = fixture();
+    let (mut host, registry, event_rx) = fix.follower_host(0);
+    host.register_inbound_handlers();
+    while event_rx.try_recv().is_ok() {}
+
+    // A peer's signed prevote arrives via global gossip.
+    let signer = fix.committee.signer(1);
+    let vote = Verified::<RatifyVote>::sign_local(
+        signer.as_ref(),
+        fix.committee.validator_id(1),
+        &NetworkDefinition::simulator(),
+        BeaconBlockHash::ZERO,
+        Epoch::new(1),
+        RatifyRound::new(0),
+        RatifyPhase::Prevote,
+        BeaconBlockHash::ZERO,
+    )
+    .expect("test committee key signs");
+    let gossip = RatifyVoteGossip::new(Arc::new(Verifiable::from(vote)));
+    let _ = registry.local_dispatch_gossip(&gossip, None);
+
+    let event = event_rx
+        .try_recv()
+        .expect("the host-level route must carry the ratify vote to the pool channel");
+    assert!(
+        matches!(event, HostEvent::Beacon(_)),
+        "the ratify vote arrives as a beacon-scoped envelope"
+    );
+    // The pool folds it without treating it as unexpected.
+    let _ = host.step(event);
 }

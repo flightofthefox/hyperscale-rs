@@ -100,6 +100,25 @@ pub fn register_beacon_gossip_handlers<N: Network>(
         },
     );
 
+    // ── beacon.candidate → pool follower (additive) ────────────────
+    //
+    // A pooled validator can sit in the epoch's ratify pool (its seat
+    // pending — a placement onto a halted shard, a draw not yet
+    // bootstrapped); without the candidate it can only ever prevote the
+    // skip hash and a follower-heavy pool degrades every epoch to skip.
+    let bs = beacon_sender.clone();
+    let ra = Arc::clone(route_active);
+    network.register_host_gossip_handler::<BeaconCandidateGossip>(
+        move |gossip: BeaconCandidateGossip| {
+            if !ra.load(Ordering::Acquire) {
+                return;
+            }
+            let _ = bs.send(HostEvent::beacon(ProtocolEvent::BeaconCandidateReceived {
+                candidate: gossip.candidate,
+            }));
+        },
+    );
+
     // ── beacon.ratify_vote → ProtocolEvent::UnverifiedRatifyVoteReceived ──
     let s = senders.clone();
     network.register_gossip_handler::<RatifyVoteGossip>(
@@ -116,4 +135,20 @@ pub fn register_beacon_gossip_handlers<N: Network>(
             GossipVerdict::Accept
         },
     );
+
+    // ── beacon.ratify_vote → pool follower (additive) ──────────────
+    //
+    // A ratify voter precommits only when it observes a prevote quorum,
+    // so a pooled pool member must see its peers' votes or its weight
+    // can never reach a commit certificate.
+    let bs = beacon_sender.clone();
+    let ra = Arc::clone(route_active);
+    network.register_host_gossip_handler::<RatifyVoteGossip>(move |gossip: RatifyVoteGossip| {
+        if !ra.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = bs.send(HostEvent::beacon(
+            ProtocolEvent::UnverifiedRatifyVoteReceived { vote: gossip.vote },
+        ));
+    });
 }

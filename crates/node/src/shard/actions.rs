@@ -823,7 +823,7 @@ where
                 ActionOwner::Shard => handle_shard_action(action, &ctx),
                 ActionOwner::Execution => handle_execution_action(action, &ctx),
                 ActionOwner::Provisions => handle_provisions_action(action, &ctx),
-                ActionOwner::Beacon => handle_beacon_action(action, &ctx),
+                ActionOwner::Beacon => handle_beacon_action(action, &ctx.beacon()),
                 ActionOwner::Local => unreachable!(
                     "dispatch_delegated_action called with Local-owned action — \
                      process_action's outer match should have routed inline"

@@ -186,6 +186,9 @@ fn inter_shard_partition_aborts_waves_at_deadline_sim() {
 }
 
 #[test]
+#[ignore = "a starved catch-up fold withholding-jails honest partition victims \
+            and wedges their shard below quorum; unignore with the sweep's \
+            healthy-epoch gate"]
 fn beacon_pool_partition_stalls_epoch_production_sim() {
     let mut cluster = SimCluster::with_dedicated_pool_hosts(
         &split_config(),

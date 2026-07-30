@@ -7,31 +7,36 @@
 //! `Vec<Vnode>` plus a cloned `Arc<ProcessIo>` and per-step scratch — no
 //! `ShardIo`, no batch accumulators, no per-payload fetches.
 //!
-//! A follower's entire action set is handled **inline**. The delegated-dispatch
-//! path a `ShardLoop` uses is unbuildable here anyway (its `ActionContext` needs
-//! a `PendingChain` a shard-less host has no storage for), and a follower's
-//! actions are cheap: a beacon block's cert verifies with one signature aggregate
-//! check, and adoption only touches process-shared state (the beacon commit
-//! dedup, the topology `ArcSwap`). Because a pooled vnode no-ops
+//! A follower's entire action set is handled **inline** — loop effects
+//! directly, beacon-owned delegated actions through the same
+//! [`hyperscale_beacon::action_handlers`] a seated vnode's dispatch runs,
+//! built over the storage-free `BeaconActionContext` (the full
+//! `ActionContext` needs a `PendingChain` a shard-less host has no storage
+//! for). The work is cheap: signature checks, signing, broadcasts, and
+//! adoption touching process-shared state (the beacon commit dedup, the
+//! topology `ArcSwap`). Because a pooled vnode no-ops
 //! `BeaconBlockPersisted` (it has no shard coordinators to replay into), the
-//! whole `received → verify → adopt → commit` cascade runs to quiescence within
-//! one `PoolLoop::dispatch_event`, with no event-channel round trip.
+//! whole `received → verify → adopt → commit` cascade runs to quiescence
+//! within one `PoolLoop::dispatch_event`, with no event-channel round trip.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine};
+use hyperscale_beacon::action_handlers::handle_action as handle_beacon_action;
+use hyperscale_core::{
+    Action, ActionOwner, BeaconActionContext, ParticipationChange, ProtocolEvent, StateMachine,
+};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::beacon::GetBeaconBlockRequest;
 use hyperscale_types::network::response::beacon::GetBeaconBlockResponse;
 use hyperscale_types::{
-    CertifiedBeaconBlock, CertifiedBeaconBlockVerifyContext, Epoch, LocalTimestamp, ShardId,
-    Verifiable,
+    BeaconProposal, CertifiedBeaconBlock, Epoch, LocalTimestamp, ShardId, ValidatorId, Verifiable,
+    Verified,
 };
-use tracing::warn;
+use tracing::{trace, warn};
 
 use crate::beacon::{self, BeaconBlockSync, BeaconSyncSink, beacon_block_sync_config};
 use crate::event::{HostEvent, PoolScopedInput, classify_fetch_error};
@@ -249,10 +254,14 @@ where
         }
     }
 
-    /// Handle one action from a beacon follower. The set is small: verify a
-    /// gossiped block, commit an adopted one, adopt a fresh topology, surface
-    /// a seat trigger, buffer a timer op. Anything else belongs to shard
-    /// consensus, which a follower never runs.
+    /// Handle one action from a beacon follower: the loop-internal effects
+    /// (commit, topology, seat trigger, timer op, catch-up sync) inline,
+    /// and every beacon-owned delegated action through the same
+    /// [`hyperscale_beacon::action_handlers`] a seated vnode's dispatch
+    /// runs — a pooled validator can sit in the ratify pool or on an SPC
+    /// committee while its seat is still pending, and its votes and
+    /// proposals must flow. Anything else belongs to shard consensus,
+    /// which a follower never runs.
     fn process_action(
         &mut self,
         vnode_idx: usize,
@@ -260,30 +269,6 @@ where
         queue: &mut VecDeque<ProtocolEvent>,
     ) {
         match action {
-            Action::VerifyBeaconBlock {
-                block,
-                committee,
-                active_pool,
-                equivocation_signers,
-            } => {
-                // Inline signature verify of the block's certs — no off-thread
-                // dispatch. The result re-enters the same vnode as a
-                // continuation so adoption runs within this cascade.
-                let coordinator = self.vnodes[vnode_idx].state.beacon_coordinator();
-                let network = coordinator.network_definition();
-                let verifier = Arc::clone(coordinator.verifier());
-                let result = Arc::unwrap_or_clone(block)
-                    .upgrade(&CertifiedBeaconBlockVerifyContext {
-                        verifier: verifier.as_ref(),
-                        network,
-                        committee: &committee,
-                        active_pool: &active_pool,
-                        equivocation_signers: &equivocation_signers,
-                    })
-                    .map(Arc::new)
-                    .map_err(|(_, e)| e);
-                queue.push_back(ProtocolEvent::BeaconBlockVerified { result });
-            }
             Action::CommitBeaconBlock { block, state } => {
                 let epoch = block.epoch();
                 // Process-scoped dedup: the first vnode to reach this
@@ -324,13 +309,13 @@ where
                 self.pending_timer_ops
                     .push(TimerOp::Cancel { shard: None, id });
             }
-            // A follower never amplifies blocks — committee members broadcast
-            // the commits it folds.
-            Action::BroadcastBeaconBlock { .. } => {}
             // Catch-up sync: a follower fell behind a gossiped block, so drive
             // the FSM to fetch the missing epochs from a live committee.
             Action::StartBeaconBlockSync { target } => {
                 beacon::start(self, target);
+            }
+            other if other.owner() == ActionOwner::Beacon => {
+                self.run_beacon_action(vnode_idx, other, queue);
             }
             other => {
                 warn!(
@@ -339,6 +324,78 @@ where
                 );
             }
         }
+    }
+
+    /// Run one beacon-owned delegated action inline, with the same signing
+    /// gates the shard dispatch applies. Handler outcomes re-enter the same
+    /// vnode as continuations so the whole cascade stays synchronous.
+    fn run_beacon_action(
+        &self,
+        vnode_idx: usize,
+        action: Action,
+        queue: &mut VecDeque<ProtocolEvent>,
+    ) {
+        let me = self.vnodes[vnode_idx].validator_id;
+        // The process-level signing fences, shared with every seated vnode of
+        // the same validator: one ratify signature per position, one SPC view
+        // claim per epoch — a seat racing this follower's retirement cannot
+        // double-sign. The pool claims views as `ShardId::ROOT`, the pooled
+        // coordinator's placeholder home.
+        if let Some(position) = action.ratify_signing_position() {
+            if !self.process.allow_ratify_signing(me, position) {
+                trace!(
+                    validator = ?me,
+                    epoch = position.0.inner(),
+                    round = position.1.inner(),
+                    "PoolLoop: dropping already-covered ratify vote position"
+                );
+                return;
+            }
+        } else if let Some((epoch, view)) = action.beacon_signing_position()
+            && !self
+                .process
+                .allow_beacon_signing(me, ShardId::ROOT, epoch, view)
+        {
+            trace!(
+                validator = ?me,
+                epoch = epoch.inner(),
+                view = view.inner(),
+                action = action.type_name(),
+                "PoolLoop: dropping beacon signing action for an unclaimed view"
+            );
+            return;
+        }
+
+        // Handler outcomes buffer here and drain into the cascade queue
+        // after the call. The beacon handlers notify synchronously — none
+        // clone `notify` into a callback that outlives the action — so the
+        // drain sees every outcome.
+        let outcomes: Arc<Mutex<Vec<ProtocolEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&outcomes);
+        let notify: Arc<dyn Fn(ProtocolEvent) + Send + Sync> = Arc::new(move |event| {
+            sink.lock().expect("pool outcome sink lock").push(event);
+        });
+        let proposal_cache = &self.process.dispatch_handles.beacon_proposal_cache;
+        let cache_beacon_proposal =
+            |from: ValidatorId, epoch: Epoch, proposal: Arc<Verified<BeaconProposal>>| {
+                proposal_cache.admit(from, epoch, proposal);
+            };
+        let vnode = &self.vnodes[vnode_idx];
+        let ctx = BeaconActionContext {
+            topology_snapshot: vnode.state.topology_arc(),
+            me,
+            ratify_registers: self.process.beacon_storage.as_ref(),
+            network: &self.process.network,
+            signer: &vnode.signer,
+            verifier: vnode.state.beacon_coordinator().verifier().as_ref(),
+            notify,
+            cache_beacon_proposal: &cache_beacon_proposal,
+        };
+        handle_beacon_action(action, &ctx);
+        drop(ctx);
+        queue.extend(std::mem::take(
+            &mut *outcomes.lock().expect("pool outcome sink lock"),
+        ));
     }
 
     /// Whether a catch-up sync is in flight — actively fetching or holding

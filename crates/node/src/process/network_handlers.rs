@@ -1,7 +1,9 @@
 //! Network handler registration (gossip, notifications, requests).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::record_fetch_response_sent;
@@ -31,9 +33,9 @@ use hyperscale_types::{ExecutionCertificate, ShardId, Verifiable, ready_signal_m
 use tracing::warn;
 
 use crate::beacon::gossip::register_beacon_gossip_handlers;
-use crate::event::ShardScopedInput;
+use crate::event::{HostEvent, ShardScopedInput};
 use crate::host::NodeHost;
-use crate::process::ProcessIo;
+use crate::process::{ProcessIo, SharedShardSenders};
 use crate::shard::verify::{
     resolve_sender_key, verify_sig_with_metrics, verify_signed_by_committee,
     verify_signed_by_proposer,
@@ -558,6 +560,8 @@ where
         let proposal_cache = Arc::clone(&self.process.dispatch_handles.beacon_proposal_cache);
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
+        let beacon_tx = self.process.beacon_event_sender.clone();
+        let route_active = self.process.beacon_route_active();
         self.process
             .network
             .register_notification_handler::<BeaconProposalNotification>(
@@ -585,9 +589,7 @@ where
                             proposal: Arc::new(unverified.into()),
                         },
                     };
-                    for (hosted_shard, tx) in senders.load().iter() {
-                        push_protocol_event(tx, *hosted_shard, event.clone());
-                    }
+                    fan_beacon_event(&senders, &beacon_tx, &route_active, event);
                 },
             );
 
@@ -598,6 +600,8 @@ where
         macro_rules! register_pc_vote_handler {
             ($note_ty:ty, $unv:ident, $ver:ident, $vote_ty:ty $(, $box:tt)?) => {{
                 let senders = self.process.shard_event_senders.clone();
+                let beacon_tx = self.process.beacon_event_sender.clone();
+                let route_active = self.process.beacon_route_active();
                 self.process.network.register_notification_handler::<$note_ty>(
                     move |gossip: $note_ty| {
                         let view = gossip.view;
@@ -611,9 +615,7 @@ where
                                 vote: register_pc_vote_handler!(@wrap $($box)? unverified.into()),
                             },
                         };
-                        for (hosted_shard, tx) in senders.load().iter() {
-                            push_protocol_event(tx, *hosted_shard, event.clone());
-                        }
+                        fan_beacon_event(&senders, &beacon_tx, &route_active, event);
                     },
                 );
             }};
@@ -653,6 +655,8 @@ where
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
+        let beacon_tx = self.process.beacon_event_sender.clone();
+        let route_active = self.process.beacon_route_active();
         self.process
             .network
             .register_notification_handler::<SpcNewViewNotification>(
@@ -672,9 +676,7 @@ where
                         from,
                         proposal: gossip.proposal,
                     };
-                    for (hosted_shard, tx) in senders.load().iter() {
-                        push_protocol_event(tx, *hosted_shard, event.clone());
-                    }
+                    fan_beacon_event(&senders, &beacon_tx, &route_active, event);
                 },
             );
 
@@ -682,6 +684,8 @@ where
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
+        let beacon_tx = self.process.beacon_event_sender.clone();
+        let route_active = self.process.beacon_route_active();
         self.process
             .network
             .register_notification_handler::<SpcNewCommitNotification>(
@@ -701,9 +705,7 @@ where
                         from,
                         msg: gossip.msg,
                     };
-                    for (hosted_shard, tx) in senders.load().iter() {
-                        push_protocol_event(tx, *hosted_shard, event.clone());
-                    }
+                    fan_beacon_event(&senders, &beacon_tx, &route_active, event);
                 },
             );
 
@@ -719,6 +721,8 @@ where
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
+        let beacon_tx = self.process.beacon_event_sender.clone();
+        let route_active = self.process.beacon_route_active();
         self.process
             .network
             .register_notification_handler::<SpcEmptyViewMsgNotification>(
@@ -743,11 +747,29 @@ where
                             msg: Arc::new(unverified.into()),
                         },
                     };
-                    for (hosted_shard, tx) in senders.load().iter() {
-                        push_protocol_event(tx, *hosted_shard, event.clone());
-                    }
+                    fan_beacon_event(&senders, &beacon_tx, &route_active, event);
                 },
             );
+    }
+}
+
+/// Fan a beacon consensus event across every hosted shard's channel and —
+/// while a follower pool is draining the beacon channel — to the pool as
+/// well, so a pooled validator on beacon duty (a ratify-pool member or an
+/// SPC committee draw whose seat is still pending) hears its peers. A host
+/// running both a seated vnode and followers delivers to each coordinator
+/// once; the per-signer vote and verification slots keep that idempotent.
+fn fan_beacon_event(
+    senders: &SharedShardSenders,
+    beacon_tx: &Sender<HostEvent>,
+    route_active: &AtomicBool,
+    event: ProtocolEvent,
+) {
+    for (hosted_shard, tx) in senders.load().iter() {
+        push_protocol_event(tx, *hosted_shard, event.clone());
+    }
+    if route_active.load(Ordering::Acquire) {
+        let _ = beacon_tx.send(HostEvent::beacon(event));
     }
 }
 

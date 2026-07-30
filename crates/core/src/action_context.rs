@@ -91,6 +91,61 @@ impl<S: ShardStorage, N: Network> ActionContext<'_, S, N> {
     pub fn notify_protocol(&self, event: ProtocolEvent) {
         (self.notify)(event);
     }
+
+    /// Narrow this context to the beacon-sufficient subset. The shard
+    /// dispatch site hands this to beacon-owned handlers; the follower
+    /// pool builds a [`BeaconActionContext`] directly, since it has no
+    /// shard storage to fill the full context with.
+    #[must_use]
+    pub fn beacon(&self) -> BeaconActionContext<'_, N> {
+        BeaconActionContext {
+            topology_snapshot: self.topology_snapshot,
+            me: self.me,
+            ratify_registers: self.ratify_registers,
+            network: self.network,
+            signer: self.signer,
+            verifier: self.verifier,
+            notify: Arc::clone(&self.notify),
+            cache_beacon_proposal: self.cache_beacon_proposal,
+        }
+    }
+}
+
+/// Context for executing beacon-owned delegated actions.
+///
+/// The subset of [`ActionContext`] the beacon coordinator's handlers
+/// need: signing, verification, broadcast, the durable ratify
+/// registers, and the outcome sink. Deliberately storage-free — beacon
+/// consensus reads no shard chain state — so a shard-less host (a
+/// beacon-follower pool) can run the same handlers a seated vnode's
+/// dispatch runs.
+#[allow(missing_docs)] // bag of references; field names match ActionContext's
+pub struct BeaconActionContext<'a, N: Network> {
+    pub topology_snapshot: &'a TopologySnapshot,
+    /// Dispatching vnode's validator identity, used for signing, vote
+    /// attribution, and self-filtering recipient lists.
+    pub me: ValidatorId,
+    /// Durable ratification registers on the process's beacon store —
+    /// the ratify-vote sign handler persists through them before
+    /// creating the signature.
+    pub ratify_registers: &'a dyn RatifyRegisterStore,
+    pub network: &'a Arc<N>,
+    pub signer: &'a Arc<dyn Signer>,
+    pub verifier: &'a dyn Verifier,
+    /// Send a [`ProtocolEvent`] back to the state machine — the single
+    /// sink for handler outcomes.
+    pub notify: Arc<dyn Fn(ProtocolEvent) + Send + Sync>,
+    /// Hand the locally signed `BeaconProposal` to the process-level
+    /// cache that serves inbound `GetBeaconProposalRequest`s.
+    pub cache_beacon_proposal:
+        &'a (dyn Fn(ValidatorId, Epoch, Arc<Verified<BeaconProposal>>) + Send + Sync),
+}
+
+impl<N: Network> BeaconActionContext<'_, N> {
+    /// Invoke `notify`; common spelling at action-handler call sites.
+    pub fn notify_protocol(&self, event: ProtocolEvent) {
+        (self.notify)(event);
+    }
 }
 
 /// A successful prepare result, ready to insert into `PendingChain` and

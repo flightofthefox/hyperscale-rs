@@ -1,17 +1,19 @@
 //! Delegated-action handlers for beacon-owned [`Action`] variants.
 //!
 //! [`handle_action`] runs off the `io_loop` thread on the Consensus
-//! dispatch pool; results return to the state machine via
-//! `ctx.notify(ProtocolEvent::*)`. The node's dispatcher routes any
+//! dispatch pool for seated vnodes, and inline on the follower pool's
+//! driver for shard-less ones; results return to the state machine via
+//! `ctx.notify(ProtocolEvent::*)`. The node's dispatchers route any
 //! [`ActionOwner::Beacon`](hyperscale_core::ActionOwner) action here
-//! and unreachable-panics on non-beacon variants — mirrors
-//! `hyperscale_shard::action_handlers::handle_action`.
+//! and unreachable-panic on non-beacon variants — mirrors
+//! `hyperscale_shard::action_handlers::handle_action`. The context is
+//! the storage-free [`BeaconActionContext`], so both dispatch sites can
+//! build it.
 
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ActionContext, ProtocolEvent};
+use hyperscale_core::{Action, BeaconActionContext, ProtocolEvent};
 use hyperscale_network::Network;
-use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::beacon::{
     BeaconBlockGossip, BeaconCandidateGossip, RatifyVoteGossip,
 };
@@ -26,12 +28,11 @@ use hyperscale_types::{
     pc_context, spc_context, spc_relay_signing_message,
 };
 
-/// Dispatch a beacon-owned [`Action`] on the consensus pool. Panics on
-/// non-beacon variants — the node's owner-keyed dispatch is the gate.
+/// Dispatch a beacon-owned [`Action`]. Panics on non-beacon variants —
+/// the node's owner-keyed dispatch is the gate.
 #[allow(clippy::too_many_lines)] // single dispatch over beacon-owned Action variants
-pub fn handle_action<S, N>(action: Action, ctx: &ActionContext<'_, S, N>)
+pub fn handle_action<N>(action: Action, ctx: &BeaconActionContext<'_, N>)
 where
-    S: ShardStorage,
     N: Network,
 {
     let me = ctx.me;
