@@ -130,7 +130,7 @@ Each epoch's fold opens by promoting last epoch's frozen lookahead to active and
 
 ### 3.4 Wall-clock pacing and the genesis anchor
 
-Epochs are paced to wall-clock: the beacon's synthetic time advances as `epoch × epoch_duration_ms`, and a committee refuses to start an epoch before its wall-clock boundary — SPC could otherwise race far ahead of the shards whose schedule windows it defines. Production folding is genesis-relative (`BeaconChainConfig.genesis_timestamp_ms`), so the clock starts at zero at network birth rather than at Unix time.
+Epochs are paced to wall-clock: the beacon's synthetic time advances as `epoch × epoch_duration_ms`, and a committee refuses to start an epoch before its wall-clock boundary — SPC could otherwise race far ahead of the shards whose schedule windows it defines. Production folding is genesis-relative (`BeaconChainConfig.genesis_timestamp_ms`), so the clock starts at zero at network birth rather than at Unix time. The pacing is carried by per-validator timer chains that every ratify-eligible validator keeps live — seated on a shard or following from the pool — so the cadence never rests on validators a draw happens to have placed conveniently (INV-BEACON-12).
 
 ---
 

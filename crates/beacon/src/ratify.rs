@@ -421,6 +421,23 @@ impl RatifyTracker {
     pub fn vote_count(&self, round: RatifyRound, phase: RatifyPhase) -> usize {
         self.votes.get(&(round, phase)).map_or(0, BTreeMap::len)
     }
+
+    /// Per-value vote tallies at `(round, phase)` — the park watchdog's
+    /// view of how far the pool is from a polka or a commit certificate.
+    #[must_use]
+    pub fn tallies(
+        &self,
+        round: RatifyRound,
+        phase: RatifyPhase,
+    ) -> BTreeMap<BeaconBlockHash, usize> {
+        let mut tallies = BTreeMap::new();
+        if let Some(votes) = self.votes.get(&(round, phase)) {
+            for vote in votes.values() {
+                *tallies.entry(vote.block_hash()).or_insert(0) += 1;
+            }
+        }
+        tallies
+    }
 }
 
 #[cfg(test)]

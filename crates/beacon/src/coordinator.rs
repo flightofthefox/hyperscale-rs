@@ -40,7 +40,7 @@ use hyperscale_types::{
     TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable, Verified,
     Verifier, WeightedTimestamp,
 };
-use tracing::{trace, warn};
+use tracing::{error, trace, warn};
 
 use crate::commit_assembly::{AssemblyDecision, CommitAssembler};
 use crate::equivocations::EquivocationObservations;
@@ -302,6 +302,11 @@ pub struct BeaconCoordinator {
     /// no node holds, so all feed the same partial vector) still lets the
     /// epoch make progress.
     input_dwell_rearms: u32,
+
+    /// The last `(pending epoch, overdue epoch count)` the park watchdog
+    /// logged for, so a parked beacon reports once per epoch of parked
+    /// time instead of once per ratify-timer fire.
+    park_logged: Option<(Epoch, u64)>,
 }
 
 impl BeaconCoordinator {
@@ -418,6 +423,7 @@ impl BeaconCoordinator {
             network,
             now: LocalTimestamp::ZERO,
             input_dwell_rearms: 0,
+            park_logged: None,
         }
     }
 
@@ -611,6 +617,7 @@ impl BeaconCoordinator {
     /// would target an epoch whose window may not even have opened.
     /// Re-checking makes any stale or early fire harmless.
     pub fn on_beacon_ratify_timer(&mut self) -> Vec<Action> {
+        self.park_watchdog();
         if !self.skip_trigger_due(self.next_epoch_boundary()) {
             // An early fire must re-arm or this validator's skip
             // machinery dies with the timer chain: the initial arm can
@@ -640,6 +647,45 @@ impl BeaconCoordinator {
             duration: self.duration_until_next_ratify_fire(),
         });
         actions
+    }
+
+    /// The beacon park watchdog: when wall-clock has run a full epoch
+    /// duration past the pending epoch's boundary with no commit, log the
+    /// machine state a diagnosis needs — once per epoch of parked time,
+    /// keyed off the ratify timer's own re-arm loop so no extra timer
+    /// exists to die with the thing it watches. A parked beacon is
+    /// otherwise silent: every wait state defers politely, and the first
+    /// loud symptom is a distant downstream assert or a stalled schedule.
+    fn park_watchdog(&mut self) {
+        let epoch_duration_ms = self.state.chain_config.epoch_duration_ms;
+        let overdue_ms = self
+            .now
+            .as_millis()
+            .saturating_sub(self.next_epoch_boundary().as_millis());
+        if epoch_duration_ms == 0 || overdue_ms <= epoch_duration_ms {
+            self.park_logged = None;
+            return;
+        }
+        let pending = self.state.current_epoch.next();
+        let overdue_epochs = overdue_ms / epoch_duration_ms;
+        if self.park_logged == Some((pending, overdue_epochs)) {
+            return;
+        }
+        self.park_logged = Some((pending, overdue_epochs));
+        let round = self.ratify.round();
+        error!(
+            pending_epoch = pending.inner(),
+            overdue_epochs,
+            spc_bootstrapped = self.spc.is_bootstrapped(),
+            spc_view = ?self.spc.current_view().map(SpcView::inner),
+            spc_input_fed = self.spc.view_one_input_fed(),
+            candidate = ?self.pending_candidate_hash(),
+            ratify_round = round.inner(),
+            ratify_completed = self.ratify.is_completed(),
+            prevotes = ?self.ratify.tallies(round, RatifyPhase::Prevote),
+            precommits = ?self.ratify.tallies(round, RatifyPhase::Precommit),
+            "beacon parked: no epoch commit a full epoch past its boundary"
+        );
     }
 
     /// Lift the tracker's typed effects into actions: sign intents

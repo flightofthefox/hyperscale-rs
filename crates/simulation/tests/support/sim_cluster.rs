@@ -33,6 +33,14 @@ use radix_common::types::ComponentAddress;
 /// internal predicate loop.
 const SLICE: Duration = Duration::from_secs(1);
 
+/// How many epochs the beacon tip may lag wall-clock before the harness
+/// fails the scenario at the park itself, instead of at whatever distant
+/// downstream assert first depends on a committed fold. Sized above the
+/// longest deliberate beacon stall any scenario stages (the pool
+/// partition holds roughly seven epochs, heal included); a genuine park
+/// runs unbounded and crosses this within a few extra slices.
+const MAX_BEACON_LAG_EPOCHS: u64 = 10;
+
 /// The simulation adaptor: a [`Cluster`] over a [`SimulationRunner`].
 pub struct SimCluster {
     runner: SimulationRunner,
@@ -139,6 +147,22 @@ impl SimCluster {
         cluster
     }
 
+    /// Fail the scenario at a beacon park itself: if the committed tip
+    /// lags wall-clock epochs beyond [`MAX_BEACON_LAG_EPOCHS`], panic now
+    /// rather than letting a distant downstream assert report the symptom
+    /// twenty virtual epochs later.
+    fn assert_beacon_cadence(&self) {
+        let expected = u64::try_from(self.runner.now().as_millis()).unwrap_or(u64::MAX) / EPOCH_MS;
+        let actual = self
+            .beacon_state()
+            .map_or(0, |state| state.current_epoch.inner());
+        assert!(
+            expected.saturating_sub(actual) <= MAX_BEACON_LAG_EPOCHS,
+            "beacon parked: committed epoch {actual} lags wall-clock epoch {expected} \
+             beyond the {MAX_BEACON_LAG_EPOCHS}-epoch cadence bound",
+        );
+    }
+
     /// The underlying runner, for bespoke sim tests that compose a portable
     /// scenario and then assert white-box internals the [`Cluster`] surface
     /// doesn't expose (raw stores, committed blocks, validator placement).
@@ -237,6 +261,7 @@ impl Cluster for SimCluster {
             self.runner.topology_step();
             let next = (self.runner.now() + SLICE).min(deadline);
             self.runner.run_until(next);
+            self.assert_beacon_cadence();
             if cond(self) {
                 return true;
             }
