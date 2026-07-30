@@ -1708,6 +1708,11 @@ fn run_pool_loop(mut pool: ProdPoolLoop, config: PoolLoopConfig) {
             recv(beacon_rx) -> e => e.ok(),
             default(timeout) => None,
         };
+        // The select blocks up to `timeout`; re-read the clock so the step
+        // and the deadlines its re-arms produce measure from the wake, not
+        // the pre-sleep instant.
+        let now = consensus_clock(genesis_offset_ms);
+        pool.set_time(now);
         let output = match event {
             Some(HostEvent::Beacon(input)) => pool.run_step(input),
             // A timeout with a sync in flight retries deferred fetches; an
