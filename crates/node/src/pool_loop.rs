@@ -339,8 +339,9 @@ where
         // The process-level signing fences, shared with every seated vnode of
         // the same validator: one ratify signature per position, one SPC view
         // claim per epoch — a seat racing this follower's retirement cannot
-        // double-sign. The pool claims views as `ShardId::ROOT`, the pooled
-        // coordinator's placeholder home.
+        // double-sign. The pool claims views as `None`, a claimant no hosted
+        // shard can alias (a single-shard network's only leaf is
+        // `ShardId::ROOT`).
         if let Some(position) = action.ratify_signing_position() {
             if !self.process.allow_ratify_signing(me, position) {
                 trace!(
@@ -352,9 +353,7 @@ where
                 return;
             }
         } else if let Some((epoch, view)) = action.beacon_signing_position()
-            && !self
-                .process
-                .allow_beacon_signing(me, ShardId::ROOT, epoch, view)
+            && !self.process.allow_beacon_signing(me, None, epoch, view)
         {
             trace!(
                 validator = ?me,

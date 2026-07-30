@@ -46,13 +46,16 @@ pub(crate) type SharedShardSenders = Arc<ArcSwap<BTreeMap<ShardId, Sender<HostEv
 /// last ratify-vote position any vnode signed.
 struct BeaconSignerSeat {
     /// The `(epoch, view)` most recently signed under this validator's
-    /// identity and the vnode that claimed it. A view belongs wholly
-    /// to its claimant — every phase of one view comes from one
-    /// coordinator's state — while any later view is claimable by
-    /// whichever vnode dispatches into it first. Recorded at the
-    /// dispatch funnel before the signature exists, so the fence is
-    /// conservative even when the dispatched action never sends.
-    claim: Option<(Epoch, SpcView, ShardId)>,
+    /// identity and the vnode that claimed it — the claimant's hosted
+    /// shard, or `None` for the follower pool, which is a distinct
+    /// claimant even when a hosted shard is `ShardId::ROOT` (a
+    /// single-shard network's only leaf). A view belongs wholly to its
+    /// claimant — every phase of one view comes from one coordinator's
+    /// state — while any later view is claimable by whichever vnode
+    /// dispatches into it first. Recorded at the dispatch funnel before
+    /// the signature exists, so the fence is conservative even when the
+    /// dispatched action never sends.
+    claim: Option<(Epoch, SpcView, Option<ShardId>)>,
     /// Last ratify-vote position any of this validator's vnodes was
     /// allowed to sign, strictly monotone process-wide. Independent of
     /// the view claim: a torn-down vnode's successor continues from
@@ -79,7 +82,7 @@ impl BeaconSignerSeat {
     /// `(epoch, view)` — no conflicting SPC signatures at one position
     /// — while a claimant that dies or degrades costs exactly its one
     /// view: the sibling's view-change dispatch claims the next.
-    fn allow(&mut self, my_shard: ShardId, epoch: Epoch, view: SpcView) -> bool {
+    fn allow(&mut self, my_shard: Option<ShardId>, epoch: Epoch, view: SpcView) -> bool {
         match self.claim {
             Some((e, v, claimant)) if (e, v) == (epoch, view) => claimant == my_shard,
             Some((e, v, _)) if (epoch, view) > (e, v) => {
@@ -294,18 +297,19 @@ where
         Arc::clone(&self.beacon_route_active)
     }
 
-    /// Whether `my_shard`'s vnode may emit a beacon signing action at
-    /// `(epoch, view)` under `validator`'s identity — one lock for
-    /// check-and-record, per [`BeaconSignerSeat::allow`]. A validator
-    /// with no fence on record claims the view, so single-vnode hosts
-    /// behave identically with or without driver wiring.
+    /// Whether `my_shard`'s vnode (`None` for the follower pool) may emit
+    /// a beacon signing action at `(epoch, view)` under `validator`'s
+    /// identity — one lock for check-and-record, per
+    /// [`BeaconSignerSeat::allow`]. A validator with no fence on record
+    /// claims the view, so single-vnode hosts behave identically with or
+    /// without driver wiring.
     ///
     /// # Panics
     /// Panics if the seat registry mutex is poisoned.
     pub fn allow_beacon_signing(
         &self,
         validator: ValidatorId,
-        my_shard: ShardId,
+        my_shard: Option<ShardId>,
         epoch: Epoch,
         view: SpcView,
     ) -> bool {
@@ -623,8 +627,8 @@ mod tests {
     #[test]
     fn view_claimant_re_passes_and_others_are_denied() {
         let mut seat = BeaconSignerSeat::vacant();
-        let root = ShardId::ROOT;
-        let (left, right) = root.children();
+        let root = Some(ShardId::ROOT);
+        let (left, right) = ShardId::ROOT.children();
         let (e, v) = pos(3, 1);
 
         assert!(
@@ -635,11 +639,31 @@ mod tests {
             seat.allow(root, e, v),
             "claimant re-emission within its view"
         );
-        assert!(!seat.allow(left, e, v), "same view, other vnode");
-        assert!(!seat.allow(right, e, v), "same view, third vnode");
+        assert!(!seat.allow(Some(left), e, v), "same view, other vnode");
+        assert!(!seat.allow(Some(right), e, v), "same view, third vnode");
         assert!(
             seat.allow(root, e, v),
             "claimant still passes after denials"
+        );
+    }
+
+    /// The follower pool claims as `None`, a claimant distinct from every
+    /// hosted shard — including `ShardId::ROOT`, a single-shard network's
+    /// only leaf. A pooled follower and a `ROOT`-seated vnode of the same
+    /// validator can therefore never both sign within one view.
+    #[test]
+    fn pool_claimant_never_aliases_a_root_seated_vnode() {
+        let mut seat = BeaconSignerSeat::vacant();
+        let (e, v) = pos(3, 1);
+
+        assert!(seat.allow(Some(ShardId::ROOT), e, v), "seat claims");
+        assert!(!seat.allow(None, e, v), "pool denied in the claimed view");
+
+        let (_, v2) = pos(3, 2);
+        assert!(seat.allow(None, e, v2), "pool claims the next view");
+        assert!(
+            !seat.allow(Some(ShardId::ROOT), e, v2),
+            "seat denied in the pool's view"
         );
     }
 
@@ -649,15 +673,18 @@ mod tests {
     #[test]
     fn later_view_transfers_the_claim() {
         let mut seat = BeaconSignerSeat::vacant();
-        let root = ShardId::ROOT;
-        let (left, _) = root.children();
+        let root = Some(ShardId::ROOT);
+        let (left, _) = ShardId::ROOT.children();
 
         let (e, v1) = pos(3, 1);
         assert!(seat.allow(root, e, v1));
 
         // Next view within the epoch: the live sibling claims it.
         let (_, v2) = pos(3, 2);
-        assert!(seat.allow(left, e, v2), "sibling claims the next view");
+        assert!(
+            seat.allow(Some(left), e, v2),
+            "sibling claims the next view"
+        );
         assert!(
             !seat.allow(root, e, v2),
             "old claimant denied in the new view"
@@ -673,18 +700,18 @@ mod tests {
     #[test]
     fn regressive_view_is_denied() {
         let mut seat = BeaconSignerSeat::vacant();
-        let root = ShardId::ROOT;
-        let (left, _) = root.children();
+        let root = Some(ShardId::ROOT);
+        let (left, _) = ShardId::ROOT.children();
 
         let (e, v2) = pos(3, 2);
         assert!(seat.allow(root, e, v2));
 
         let (_, v1) = pos(3, 1);
         assert!(!seat.allow(root, e, v1), "claimant regressing");
-        assert!(!seat.allow(left, e, v1), "sibling regressing");
+        assert!(!seat.allow(Some(left), e, v1), "sibling regressing");
 
         let (e2, v9) = pos(2, 9);
-        assert!(!seat.allow(left, e2, v9), "older epoch, any view");
+        assert!(!seat.allow(Some(left), e2, v9), "older epoch, any view");
     }
 
     /// The proposal slot (view zero) precedes view one, so an epoch's
@@ -693,13 +720,13 @@ mod tests {
     #[test]
     fn proposal_slot_orders_before_the_first_view() {
         let mut seat = BeaconSignerSeat::vacant();
-        let root = ShardId::ROOT;
-        let (left, _) = root.children();
+        let root = Some(ShardId::ROOT);
+        let (left, _) = ShardId::ROOT.children();
 
         let (e, v0) = pos(5, 0);
         let (_, v1) = pos(5, 1);
         assert!(seat.allow(root, e, v0), "proposal claims view zero");
-        assert!(seat.allow(left, e, v1), "vote view claimable after");
+        assert!(seat.allow(Some(left), e, v1), "vote view claimable after");
         assert!(!seat.allow(root, e, v0), "proposal slot now regressive");
     }
 

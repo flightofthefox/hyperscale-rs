@@ -757,7 +757,9 @@ where
                 return;
             }
         } else if let Some((epoch, view)) = action.beacon_signing_position()
-            && !self.process.allow_beacon_signing(me, shard, epoch, view)
+            && !self
+                .process
+                .allow_beacon_signing(me, Some(shard), epoch, view)
         {
             trace!(
                 validator = ?me,
