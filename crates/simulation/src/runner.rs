@@ -228,8 +228,9 @@ pub struct SimulationRunner {
     rng: ChaCha8Rng,
 
     /// Timer registry for cancellation support.
-    /// Maps `(host, timer_id) -> event_key` for removal.
-    timers: HashMap<(NodeIndex, ShardId, TimerId), EventKey>,
+    /// Maps `(host, owner, timer_id) -> event_key` for removal; the owner
+    /// is the hosted shard, or `None` for the host's follower pool.
+    timers: HashMap<(NodeIndex, Option<ShardId>, TimerId), EventKey>,
 
     /// Statistics.
     stats: SimulationStats,
@@ -857,6 +858,14 @@ impl SimulationRunner {
                 self.now,
                 HostEvent::protocol(shard, ProtocolEvent::BlockCommitted { certified }),
             );
+        }
+
+        // Drain every host's construction-time output: a follower pool arms
+        // its beacon startup timers at construction, and a follower-only
+        // host runs no genesis ceremony to sweep them up.
+        for host_index in 0..num_hosts {
+            let output = self.hosts[host_index as usize].drain_pending_output();
+            self.process_step_output(host_index, output);
         }
 
         // Wire each host into the in-memory network now that genesis is settled.

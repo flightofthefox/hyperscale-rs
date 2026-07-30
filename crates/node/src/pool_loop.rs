@@ -36,7 +36,7 @@ use tracing::warn;
 use crate::beacon::{self, BeaconBlockSync, BeaconSyncSink, beacon_block_sync_config};
 use crate::event::{HostEvent, PoolScopedInput, classify_fetch_error};
 use crate::process::ProcessIo;
-use crate::shard::StepOutput;
+use crate::shard::{StepOutput, TimerOp};
 use crate::vnode::Vnode;
 
 /// Cadence at which a syncing pool retries deferred beacon-block fetches.
@@ -67,6 +67,13 @@ where
     /// acts on. Cleared at step entry, drained into the step's `StepOutput`.
     pub(crate) pending_participation_changes: Vec<ParticipationChange>,
 
+    /// Per-step scratch: timer operations the pooled vnodes emitted,
+    /// `shard: None` (a follower has no shard — the runner keys its pool
+    /// timers by `TimerId` alone and routes fires back through the beacon
+    /// channel). A follower is a ratify-pool voter and can be drawn onto
+    /// an SPC committee, so its beacon timer chain must stay live.
+    pub(crate) pending_timer_ops: Vec<TimerOp>,
+
     /// Per-step scratch: count of actions the pooled vnodes produced.
     pub(crate) actions_generated: usize,
 
@@ -87,15 +94,63 @@ where
     /// Build a pool driver over the host's shard-less vnodes. Used by
     /// `NodeHost::new` at construction and by the production supervisor when
     /// it builds a follower pool at runtime.
+    ///
+    /// Every follower's beacon startup timers are armed into the timer
+    /// scratch here; the caller drains them to its timer table (the sim
+    /// through the construction-time `drain_pending_output`, the
+    /// production pool thread by re-arming at spawn).
     pub fn new(process: Arc<ProcessIo<S, N, D>>, vnodes: Vec<Vnode>) -> Self {
-        Self {
+        let mut pool = Self {
             process,
             vnodes,
             now: LocalTimestamp::ZERO,
             pending_participation_changes: Vec::new(),
+            pending_timer_ops: Vec::new(),
             actions_generated: 0,
             beacon_block: BeaconBlockSync::new(beacon_block_sync_config()),
+        };
+        pool.arm_startup_timers();
+        pool
+    }
+
+    /// Add a follower at runtime — a validator that drained off its last
+    /// shard — arming its beacon startup timers into the timer scratch for
+    /// the caller to drain.
+    pub fn add_vnode(&mut self, vnode: Vnode) {
+        self.vnodes.push(vnode);
+        self.arm_beacon_startup(self.vnodes.len() - 1);
+    }
+
+    /// Arm every follower's beacon startup timers into the timer scratch.
+    /// Idempotent: re-arming replaces the pending fire at the runner's
+    /// table, and the durations recompute identically from each
+    /// coordinator's clock.
+    fn arm_startup_timers(&mut self) {
+        for vnode_idx in 0..self.vnodes.len() {
+            self.arm_beacon_startup(vnode_idx);
         }
+    }
+
+    /// Re-arm every follower's beacon startup timers and drain the result —
+    /// the production pool thread's spawn-time bootstrap. Replayable: the
+    /// construction-time arming may already have been drained by a genesis
+    /// ceremony on the host, and re-arming is idempotent.
+    pub fn startup_output(&mut self) -> StepOutput {
+        self.clear_scratch();
+        self.arm_startup_timers();
+        self.take_output()
+    }
+
+    /// Drive one follower's startup arming through the action path, so the
+    /// emitted `SetTimer`s land in the timer scratch like any other step's.
+    fn arm_beacon_startup(&mut self, vnode_idx: usize) {
+        let actions = self.vnodes[vnode_idx].state.beacon_startup_actions();
+        self.actions_generated += actions.len();
+        let mut queue = VecDeque::new();
+        for action in actions {
+            self.process_action(vnode_idx, action, &mut queue);
+        }
+        debug_assert!(queue.is_empty(), "startup arming emits only timer sets");
     }
 
     /// Set the cached wall-clock time observed by `state.handle(now, _)`.
@@ -119,30 +174,32 @@ where
     /// before dispatch so the drained output reflects only this step.
     pub(crate) fn clear_scratch(&mut self) {
         self.pending_participation_changes.clear();
+        self.pending_timer_ops.clear();
         self.actions_generated = 0;
     }
 
-    /// Drive one pool input through every pooled vnode and return the
-    /// placement deltas they surfaced (the seat triggers the supervisor acts
-    /// on). Clears per-step scratch first, mirroring
+    /// Drive one pool input through every pooled vnode and return the step's
+    /// output: the placement deltas the followers surfaced (the seat triggers
+    /// the supervisor acts on) and their timer operations. Clears per-step
+    /// scratch first, mirroring
     /// [`ShardLoop::run_step`](crate::shard::ShardLoop::run_step); used by
     /// the production pool thread, which owns the `PoolLoop` directly rather
     /// than driving it through [`NodeHost::step`](crate::host::NodeHost::step).
-    pub fn run_step(&mut self, input: PoolScopedInput) -> Vec<ParticipationChange> {
+    pub fn run_step(&mut self, input: PoolScopedInput) -> StepOutput {
         self.clear_scratch();
         self.dispatch_event(input);
-        self.take_output().participation_changes
+        self.take_output()
     }
 
     /// Drain this step's scratch into a [`StepOutput`]. A follower emits no
-    /// transaction statuses or shard timers, so those fields stay empty; the
-    /// counterpart to [`Self::clear_scratch`], used by both this loop's
-    /// [`Self::run_step`] and the whole-host
-    /// [`NodeHost::step`](crate::host::NodeHost::step) so the scratch field
-    /// set lives in one place.
+    /// transaction statuses, so that field stays empty; the counterpart to
+    /// [`Self::clear_scratch`], used by both this loop's [`Self::run_step`]
+    /// and the whole-host [`NodeHost::step`](crate::host::NodeHost::step) so
+    /// the scratch field set lives in one place.
     pub(crate) fn take_output(&mut self) -> StepOutput {
         StepOutput {
             actions_generated: std::mem::replace(&mut self.actions_generated, 0),
+            timer_ops: std::mem::take(&mut self.pending_timer_ops),
             participation_changes: std::mem::take(&mut self.pending_participation_changes),
             ..StepOutput::default()
         }
@@ -193,10 +250,9 @@ where
     }
 
     /// Handle one action from a beacon follower. The set is small: verify a
-    /// gossiped block, commit an adopted one, adopt a fresh topology, surface a
-    /// seat trigger. Anything else either belongs to shard consensus (which a
-    /// follower never runs) or to beacon-committee duty (which a pooled,
-    /// never-`beacon_eligible` validator never takes on).
+    /// gossiped block, commit an adopted one, adopt a fresh topology, surface
+    /// a seat trigger, buffer a timer op. Anything else belongs to shard
+    /// consensus, which a follower never runs.
     fn process_action(
         &mut self,
         vnode_idx: usize,
@@ -252,12 +308,25 @@ where
             Action::ReconfigureParticipation(change) => {
                 self.pending_participation_changes.push(change);
             }
-            // A follower is never on the beacon committee, so its consensus
-            // timers fire only into handlers that no-op; drop them rather than
-            // schedule dead timers. A follower likewise never amplifies blocks.
-            Action::SetTimer { .. }
-            | Action::CancelTimer { .. }
-            | Action::BroadcastBeaconBlock { .. } => {}
+            // A follower's beacon timer chain is liveness-critical: it is a
+            // ratify-pool voter (`BeaconRatifyTrigger` starts and paces its
+            // skip rounds) and can be drawn onto an SPC committee
+            // (`BeaconCommitteeStart` and the SPC timers). Buffer the ops for
+            // the runner's timer table, keyed by `TimerId` alone — no shard.
+            Action::SetTimer { id, duration } => {
+                self.pending_timer_ops.push(TimerOp::Set {
+                    shard: None,
+                    id,
+                    duration,
+                });
+            }
+            Action::CancelTimer { id } => {
+                self.pending_timer_ops
+                    .push(TimerOp::Cancel { shard: None, id });
+            }
+            // A follower never amplifies blocks — committee members broadcast
+            // the commits it folds.
+            Action::BroadcastBeaconBlock { .. } => {}
             // Catch-up sync: a follower fell behind a gossiped block, so drive
             // the FSM to fetch the missing epochs from a live committee.
             Action::StartBeaconBlockSync { target } => {

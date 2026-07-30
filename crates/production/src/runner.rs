@@ -42,7 +42,9 @@ use hyperscale_network_libp2p::{
 };
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::pool_loop::{POOL_FETCH_TICK_INTERVAL, PoolLoop};
-use hyperscale_node::shard::{HostEvent, PoolScopedInput, ShardLoop, TimerOp, timer_event};
+use hyperscale_node::shard::{
+    HostEvent, PoolScopedInput, ShardLoop, StepOutput, TimerOp, timer_event,
+};
 use hyperscale_node::{
     NodeConfig, NodeHost, SeatFollower, SeatVnodeGroup, ShardGenesis, SharedTopologySnapshot,
     TxStatusCache, VnodeInit, seat_follower, seat_vnode_group,
@@ -887,14 +889,7 @@ impl ProductionRunner {
             .take()
             .expect("shard_channels already taken");
 
-        // Split genesis-emitted timer ops by shard.
-        let mut timer_ops_by_shard: HashMap<ShardId, Vec<TimerOp>> = HashMap::new();
-        for op in initial_timer_ops {
-            let shard = match &op {
-                TimerOp::Set { shard, .. } | TimerOp::Cancel { shard, .. } => *shard,
-            };
-            timer_ops_by_shard.entry(shard).or_default().push(op);
-        }
+        let mut timer_ops_by_shard = split_timer_ops_by_shard(initial_timer_ops);
 
         // ── 3. Spawn one pinned thread per hosted shard, recorded in the
         // supervisor so runtime membership commands can stop them.
@@ -1244,11 +1239,12 @@ impl ShardChannels {
 /// Manages tokio-based timers for one shard's pinned event loop.
 ///
 /// Spawns async sleep tasks via the tokio handle that fire timer events
-/// into the crossbeam timer channel.
+/// into the crossbeam timer channel. Keys carry the op's owner as-is —
+/// a hosted shard, or `None` for pool-owned timers.
 struct ProdTimerManager {
     tokio_handle: TokioHandle,
     timer_tx: Sender<HostEvent>,
-    active: HashMap<(ShardId, TimerId), JoinHandle<()>>,
+    active: HashMap<(Option<ShardId>, TimerId), JoinHandle<()>>,
 }
 
 impl ProdTimerManager {
@@ -1592,11 +1588,64 @@ pub struct PoolLoopConfig {
     pub(crate) genesis_offset_ms: u64,
 }
 
+/// Split genesis-emitted timer ops by owning shard. Pool-owned ops
+/// (`shard: None`) are dropped: the pool thread re-arms its followers'
+/// startup timers at spawn, so nothing is lost.
+fn split_timer_ops_by_shard(ops: Vec<TimerOp>) -> HashMap<ShardId, Vec<TimerOp>> {
+    let mut by_shard: HashMap<ShardId, Vec<TimerOp>> = HashMap::new();
+    for op in ops {
+        let shard = match &op {
+            TimerOp::Set { shard, .. } | TimerOp::Cancel { shard, .. } => *shard,
+        };
+        if let Some(shard) = shard {
+            by_shard.entry(shard).or_default().push(op);
+        }
+    }
+    by_shard
+}
+
+/// Apply one pool step's output: fold its timer ops into the pool's
+/// deadline table (keyed by [`TimerId`] alone — a follower has no shard)
+/// and forward its placement deltas to the runner's reconfiguration loop.
+fn apply_pool_step_output(
+    deadlines: &mut HashMap<TimerId, LocalTimestamp>,
+    participation_tx: &mpsc::UnboundedSender<ParticipationChange>,
+    now: LocalTimestamp,
+    output: StepOutput,
+) {
+    for op in output.timer_ops {
+        match op {
+            TimerOp::Set {
+                shard: None,
+                id,
+                duration,
+            } => {
+                let fire = now
+                    .as_millis()
+                    .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+                deadlines.insert(id, LocalTimestamp::from_millis(fire));
+            }
+            TimerOp::Cancel { shard: None, id } => {
+                deadlines.remove(&id);
+            }
+            TimerOp::Set { shard: Some(_), .. } | TimerOp::Cancel { shard: Some(_), .. } => {
+                warn!("Pool loop emitted a shard-owned timer op; dropping");
+            }
+        }
+    }
+    for change in output.participation_changes {
+        // Send failure means the runner is shutting down.
+        let _ = participation_tx.send(change);
+    }
+}
+
 /// Drive a host's [`PoolLoop`] on its pinned thread, blocking until the
 /// shutdown signal fires. A follower only consumes beacon events
 /// ([`HostEvent::Beacon`]); shard / process envelopes never reach this
-/// channel, and a follower's beacon timers are dropped by the `PoolLoop`,
-/// so there is no timer manager and no batch flushing.
+/// channel and there is no batch flushing. The followers' beacon timers
+/// live in a thread-local deadline table: a follower is a ratify-pool
+/// voter and can be drawn onto an SPC committee, so its timer chain must
+/// fire here exactly as a seated vnode's fires on a shard thread.
 fn run_pool_loop(mut pool: ProdPoolLoop, config: PoolLoopConfig) {
     let PoolLoopConfig {
         beacon_rx,
@@ -1605,34 +1654,69 @@ fn run_pool_loop(mut pool: ProdPoolLoop, config: PoolLoopConfig) {
         genesis_offset_ms,
     } = config;
     info!("Pool event loop starting");
+
+    let mut deadlines: HashMap<TimerId, LocalTimestamp> = HashMap::new();
+
+    // The followers armed their beacon startup timers at construction, but
+    // a genesis ceremony on this host may already have drained that scratch
+    // into ops this thread never sees. Re-arming is idempotent (replace at
+    // the table, identical durations), so arm-and-drain unconditionally.
+    let now = consensus_clock(genesis_offset_ms);
+    pool.set_time(now);
+    let startup = pool.startup_output();
+    apply_pool_step_output(&mut deadlines, &participation_tx, now, startup);
+
     loop {
         if shutdown_rx.try_recv().is_ok() {
             info!("Pool event loop received shutdown signal");
             break;
         }
-        pool.set_time(consensus_clock(genesis_offset_ms));
-        // Wake on a beacon block, or — while a catch-up sync is in flight —
-        // on the retry tick so a deferred fetch eventually rotates to another
-        // peer. An idle follower just blocks on the next gossiped block.
+        let now = consensus_clock(genesis_offset_ms);
+        pool.set_time(now);
+
+        // Fire due pool timers: each fire re-enters the followers as the
+        // timer's protocol event, and its re-arms fold back into the table.
+        let due: Vec<TimerId> = deadlines
+            .iter()
+            .filter(|(_, fire)| fire.as_millis() <= now.as_millis())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            deadlines.remove(&id);
+            let HostEvent::Beacon(input) = timer_event(&id, None) else {
+                continue;
+            };
+            let output = pool.run_step(input);
+            apply_pool_step_output(&mut deadlines, &participation_tx, now, output);
+        }
+
+        // Wake on a beacon block, the nearest timer deadline, or — while a
+        // catch-up sync is in flight — the retry tick so a deferred fetch
+        // eventually rotates to another peer.
+        let timeout = deadlines
+            .values()
+            .map(|fire| Duration::from_millis(fire.as_millis().saturating_sub(now.as_millis())))
+            .min()
+            .map_or(POOL_FETCH_TICK_INTERVAL, |until| {
+                until.min(POOL_FETCH_TICK_INTERVAL)
+            });
         let event = crossbeam::channel::select! {
             recv(shutdown_rx) -> _ => {
                 info!("Pool event loop received shutdown signal (select)");
                 return;
             }
             recv(beacon_rx) -> e => e.ok(),
-            default(POOL_FETCH_TICK_INTERVAL) => None,
+            default(timeout) => None,
         };
-        let changes = match event {
+        let output = match event {
             Some(HostEvent::Beacon(input)) => pool.run_step(input),
             // A timeout with a sync in flight retries deferred fetches; an
-            // idle timeout, or a stray non-beacon envelope, is a no-op.
+            // idle timeout (a timer wake included — the loop top fires it),
+            // or a stray non-beacon envelope, is a no-op.
             None if pool.is_beacon_syncing() => pool.run_step(PoolScopedInput::FetchTick),
             _ => continue,
         };
-        for change in changes {
-            // Send failure means the runner is shutting down.
-            let _ = participation_tx.send(change);
-        }
+        apply_pool_step_output(&mut deadlines, &participation_tx, now, output);
     }
     info!("Pool event loop exiting");
 }

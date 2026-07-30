@@ -146,6 +146,11 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
                 args.beacon_network.clone(),
                 args.beacon_config_hash,
             );
+            // Seed the coordinator's clock from the seat instant so the
+            // startup-timer durations measure from now, not from a frozen
+            // zero that would arm the next epoch boundary a chain
+            // lifetime late.
+            beacon_coordinator.set_now(args.now);
             // Resume the pending epoch's ratification registers from
             // the durable record, so a restarted pool member abstains
             // at spent rounds and keeps its lock.
@@ -230,6 +235,9 @@ pub fn seat_follower(args: SeatFollower<'_>) -> VnodeInit {
         args.beacon_network,
         args.beacon_config_hash,
     );
+    // Seed the coordinator's clock from the seat instant so the pool's
+    // startup-timer durations measure from now, not from a frozen zero.
+    beacon_coordinator.set_now(args.now);
     // Resume the pending epoch's ratification registers from the
     // durable record, so a restarted pool member abstains at spent
     // rounds and keeps its lock.

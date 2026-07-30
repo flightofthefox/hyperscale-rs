@@ -153,13 +153,13 @@ where
             || self.io.cross_shard.has_pending();
         let op = if any_pending {
             TimerOp::Set {
-                shard: self.shard,
+                shard: Some(self.shard),
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,
             }
         } else {
             TimerOp::Cancel {
-                shard: self.shard,
+                shard: Some(self.shard),
                 id: TimerId::FetchTick,
             }
         };

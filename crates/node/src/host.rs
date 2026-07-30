@@ -393,11 +393,13 @@ where
     /// Add a shard-less beacon follower to the host's pool, creating the
     /// pool if the host had none. Used when a validator drains off its last
     /// shard and keeps following the beacon (see
-    /// [`seat_follower`](crate::seat_follower)).
+    /// [`seat_follower`](crate::seat_follower)). The follower's beacon
+    /// startup timers land in the pool's timer scratch; the caller drains
+    /// them via [`Self::drain_pending_output`].
     pub fn add_pooled_vnode(&mut self, init: VnodeInit) {
         let vnode = init.into_vnode();
         match &mut self.pool {
-            Some(pool) => pool.vnodes.push(vnode),
+            Some(pool) => pool.add_vnode(vnode),
             None => self.pool = Some(PoolLoop::new(Arc::clone(&self.process), vec![vnode])),
         }
         // The host now drives a pool; route committed beacon blocks to it.

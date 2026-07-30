@@ -442,7 +442,7 @@ mod tests {
 
         let mut shard_source = ShardSourceTracker::new();
         shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
-            CertifiedBlockHeader::new(parent.clone(), boundary.parent_qc().clone()),
+            CertifiedBlockHeader::new(parent, boundary.parent_qc().clone()),
         )));
 
         assert!(

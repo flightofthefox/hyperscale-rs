@@ -153,18 +153,20 @@ impl<S: ShardStorage> Clone for ShardDispatchHandles<S> {
 // TimerOp — buffered timer operations for the runner
 // ═══════════════════════════════════════════════════════════════════════
 
-/// A timer operation buffered by `ShardLoop` for the runner to process.
+/// A timer operation buffered by a loop driver for the runner to process.
 ///
-/// `shard` is the hosted shard that owns the timer. Every timer is
-/// shard-scoped — the runner's timer driver keys handles by
-/// `(TimerId, ShardId)`, and the firing path produces a
-/// [`ShardScopedInput`] envelope targeting that shard.
+/// `shard` names the hosted shard that owns the timer, or `None` for a
+/// timer owned by the host's shard-less follower pool — the runner's
+/// timer driver keys handles by `(Option<ShardId>, TimerId)`, and the
+/// firing path produces a [`ShardScopedInput`] envelope targeting the
+/// shard or a [`PoolScopedInput`](crate::event::PoolScopedInput)
+/// envelope for the pool.
 #[derive(Debug, Clone)]
 pub enum TimerOp {
     /// Set a timer to fire after `duration`.
     Set {
-        /// Hosted shard that owns this timer.
-        shard: ShardId,
+        /// Hosted shard that owns this timer, or `None` for the pool.
+        shard: Option<ShardId>,
         /// Logical timer identifier (state-machine-side).
         id: TimerId,
         /// How long until the timer should fire.
@@ -172,32 +174,37 @@ pub enum TimerOp {
     },
     /// Cancel a previously set timer.
     Cancel {
-        /// Hosted shard that owns this timer.
-        shard: ShardId,
+        /// Hosted shard that owns this timer, or `None` for the pool.
+        shard: Option<ShardId>,
         /// Logical timer identifier to cancel.
         id: TimerId,
     },
 }
 
 /// Translate a fired [`TimerId`] back into the [`HostEvent`] the runner
-/// pushes onto its event channel. Every variant produces a
-/// [`HostEvent::Shard`] envelope tagged with the owning shard.
+/// pushes onto its event channel.
+///
+/// A shard-owned timer produces a [`HostEvent::Shard`] envelope tagged
+/// with the owning shard; a pool-owned timer (`shard: None`) produces a
+/// [`HostEvent::Beacon`] envelope for the host's follower pool.
 #[must_use]
-pub fn timer_event(id: &TimerId, shard: ShardId) -> HostEvent {
-    match id {
-        TimerId::ViewChange => HostEvent::protocol(shard, ProtocolEvent::ViewChangeTimer),
-        TimerId::Cleanup => HostEvent::protocol(shard, ProtocolEvent::CleanupTimer),
-        TimerId::FetchTick => HostEvent::shard(shard, ShardScopedInput::FetchTick),
-        TimerId::BeaconCommitteeStart => {
-            HostEvent::protocol(shard, ProtocolEvent::BeaconCommitteeStartTimer)
+pub fn timer_event(id: &TimerId, shard: Option<ShardId>) -> HostEvent {
+    let event = match id {
+        TimerId::ViewChange => ProtocolEvent::ViewChangeTimer,
+        TimerId::Cleanup => ProtocolEvent::CleanupTimer,
+        TimerId::FetchTick => {
+            return shard.map_or_else(HostEvent::beacon_fetch_tick, |shard| {
+                HostEvent::shard(shard, ShardScopedInput::FetchTick)
+            });
         }
-        TimerId::BeaconRatifyTrigger => {
-            HostEvent::protocol(shard, ProtocolEvent::BeaconRatifyTimer)
-        }
-        TimerId::BeaconSpcView => HostEvent::protocol(shard, ProtocolEvent::BeaconSpcViewTimer),
-        TimerId::BeaconSpcInputDwell => {
-            HostEvent::protocol(shard, ProtocolEvent::BeaconSpcInputDwellTimer)
-        }
+        TimerId::BeaconCommitteeStart => ProtocolEvent::BeaconCommitteeStartTimer,
+        TimerId::BeaconRatifyTrigger => ProtocolEvent::BeaconRatifyTimer,
+        TimerId::BeaconSpcView => ProtocolEvent::BeaconSpcViewTimer,
+        TimerId::BeaconSpcInputDwell => ProtocolEvent::BeaconSpcInputDwellTimer,
+    };
+    match shard {
+        Some(shard) => HostEvent::protocol(shard, event),
+        None => HostEvent::beacon(event),
     }
 }
 

@@ -322,6 +322,10 @@ impl SimulationRunner {
                 signer,
             });
             self.hosts[host as usize].add_pooled_vnode(init);
+            // The follower armed its beacon startup timers into the pool's
+            // scratch; sweep them into the runner's timer table.
+            let output = self.hosts[host as usize].drain_pending_output();
+            self.process_step_output(host, output);
         }
         storage
     }

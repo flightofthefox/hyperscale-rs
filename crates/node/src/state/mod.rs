@@ -254,8 +254,21 @@ impl NodeStateMachine {
             s.set_time(now);
             actions.extend(s.shard_coordinator.initialize_genesis(genesis));
         }
-        actions.extend(self.beacon_coordinator.on_startup());
+        actions.extend(self.beacon_startup_actions());
         actions
+    }
+
+    /// Arm the beacon coordinator's startup timers: the initial
+    /// `BeaconCommitteeStart` and `BeaconRatifyTrigger` whose re-arm loops
+    /// every ratify-eligible validator must run. Every constructed
+    /// coordinator arms through here exactly once — genesis initialization,
+    /// the committed-state resume of a runtime-seated vnode, or a
+    /// follower's entry into the pool. Durations are measured from the
+    /// coordinator's clock, so the caller (or the seat constructor) must
+    /// have set `now` first.
+    #[must_use]
+    pub fn beacon_startup_actions(&self) -> Vec<Action> {
+        self.beacon_coordinator.on_startup()
     }
 
     /// Seed the reshape trigger's substate-byte frontier from the genesis
@@ -441,9 +454,18 @@ impl StateMachine for NodeStateMachine {
             evt @ (ProtocolEvent::BlockSyncReadyToApply { .. }
             | ProtocolEvent::BlockSyncComplete { .. }
             | ProtocolEvent::RemoteHeaderSyncComplete { .. }
-            | ProtocolEvent::SettledWavesReconstructed { .. }
-            | ProtocolEvent::CommittedStateRestored { .. }) => {
+            | ProtocolEvent::SettledWavesReconstructed { .. }) => {
                 self.with_shard(move |s, sched| s.handle_sync(sched, evt))
+            }
+
+            // The committed-state resume is a runtime seat's only
+            // initialization event (it never runs `initialize_genesis`),
+            // so the beacon timer chain bootstraps here alongside the
+            // shard pacemaker.
+            evt @ ProtocolEvent::CommittedStateRestored { .. } => {
+                let mut actions = self.with_shard(move |s, sched| s.handle_sync(sched, evt));
+                actions.extend(self.beacon_startup_actions());
+                actions
             }
 
             // ── Beacon ───────────────────────────────────────────────────

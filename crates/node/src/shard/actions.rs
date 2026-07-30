@@ -147,7 +147,7 @@ where
 
             // ─── ShardLoop-internal effects ────────────────────────────────
             Action::SetTimer { id, duration } => {
-                let shard = self.shard;
+                let shard = Some(self.shard);
                 self.pending_timer_ops.push(TimerOp::Set {
                     shard,
                     id,
@@ -155,7 +155,7 @@ where
                 });
             }
             Action::CancelTimer { id } => {
-                let shard = self.shard;
+                let shard = Some(self.shard);
                 self.pending_timer_ops.push(TimerOp::Cancel { shard, id });
             }
 
