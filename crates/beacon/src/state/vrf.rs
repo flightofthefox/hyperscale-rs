@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use blake3::Hasher;
 use hyperscale_types::{
     BeaconProposal, BeaconState, Epoch, JailReason, NetworkDefinition, Randomness, RevealChain,
-    ShardId, ValidatorId, ValidatorStatus, Verifier, VrfOutput, vrf_verify,
+    ShardId, ValidatorId, ValidatorStatus, Verifier, VrfOutput, byzantine_threshold, vrf_verify,
 };
 
 use crate::state::pool::exit_placement;
@@ -147,7 +147,7 @@ pub(super) fn filter_and_roll_randomness<'a>(
         jailed.push(*party);
     }
 
-    // Jail committee members with no committed proposal at all — the
+    // Jail committee members with no committed proposal — the
     // withholding lever of the randomness grind (include-or-omit is the
     // only control a member has over the roll above). The committed
     // value is the f+1-shared prefix (`qc1_certify`), so under synchrony
@@ -155,12 +155,31 @@ pub(super) fn filter_and_roll_randomness<'a>(
     // absent; a member with no entry chose silence. One absence jails —
     // no counter — under `JailReason::Withholding`, held out for a full
     // recency period so a grinder cannot cycle its foothold back inside
-    // one committee turnover. Rests on that synchrony assumption: a
-    // member cut off for a whole epoch reads as absent and jails, a
-    // recoverable fault. An epoch with no committed proposals at all
-    // carries no absence signal and is skipped.
-    if !committed.is_empty() {
-        let present: BTreeSet<ValidatorId> = committed.iter().map(|(party, _)| *party).collect();
+    // one committee turnover.
+    //
+    // The sweep runs only when the committed set itself attests a
+    // healthy epoch: at least `n − f` of the committee present. Within
+    // the fault budget an absence is attributable — every other member's
+    // proposal made the shared prefix, so silence was a choice. Beyond
+    // it, the epoch failed the synchrony assumption the jail rests on
+    // (more than f honest members cannot all be withholding): a pool
+    // stall's catch-up folds ratify candidates assembled while peers
+    // were unreachable, and jailing the unreachable guts their shards'
+    // committees with no pool to refill from. Buying amnesty this way
+    // requires forcing more than f proposals out of the f+1-shared
+    // prefix — at least f+1 colluding inputs, beyond the fault budget —
+    // so the grinding price holds in every epoch where the lever works.
+    // The proposal-less epoch (a Skip fold) sits below any threshold and
+    // carries no absence signal.
+    let present: BTreeSet<ValidatorId> = committed.iter().map(|(party, _)| *party).collect();
+    let present_members = state
+        .committee
+        .iter()
+        .filter(|party| present.contains(party))
+        .count();
+    let attributable =
+        present_members >= state.committee.len() - byzantine_threshold(state.committee.len());
+    if attributable {
         let absent: Vec<ValidatorId> = state
             .committee
             .iter()
@@ -477,6 +496,32 @@ mod tests {
             state.validators.get(&ValidatorId::new(0)).unwrap().status,
             ValidatorStatus::Pooled,
         );
+    }
+
+    /// A committed set carrying fewer than `n − f` committee members'
+    /// proposals attests a degraded epoch, not individual withholding —
+    /// nobody jails. A ratification stall's catch-up folds take this
+    /// shape: the candidate was assembled while part of the committee
+    /// was unreachable, and jailing the unreachable would gut their
+    /// shards' committees with no pool to refill from.
+    #[test]
+    fn sub_quorum_committed_set_jails_nobody() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        // Only two of four members' proposals made the shared prefix —
+        // one short of the n − f = 3 attribution threshold.
+        let target = state.current_epoch.next();
+        let committed: Vec<_> = (0u64..2)
+            .map(|i| (ValidatorId::new(i), vrf_proposal(i, target)))
+            .collect();
+        let effects = apply_next_epoch(&mut state, &committed);
+        assert!(effects.jailed.is_empty());
+        for i in 0u64..4 {
+            assert!(matches!(
+                state.validators.get(&ValidatorId::new(i)).unwrap().status,
+                ValidatorStatus::OnShard { .. },
+            ));
+        }
     }
 
     /// An epoch that committed no proposals at all carries no absence
