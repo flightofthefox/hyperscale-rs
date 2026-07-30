@@ -163,12 +163,35 @@ pub fn build_shard_contributions(
     let canonical = rules::canonical_boundary_qcs(committed.iter().map(|(_, p)| &**p));
     let mut contributions = BTreeMap::new();
     for (shard, qc) in canonical {
-        let boundary_header = boundary_header_for(shard_source, shard, qc.block_hash())?.clone();
+        // Defer the whole block if the header or its witness chunk isn't in
+        // hand — a fully-synced peer will assemble and gossip it. The defer
+        // is liveness-critical (a member that always defers never assembles),
+        // so it names what it waits for.
+        let Some(boundary_header) = boundary_header_for(shard_source, shard, qc.block_hash())
+        else {
+            warn!(
+                shard = shard.inner(),
+                block_hash = ?qc.block_hash(),
+                "deferring candidate assembly — a committed boundary's header \
+                 isn't synced locally; awaiting a fully-synced peer's candidate"
+            );
+            return None;
+        };
+        let boundary_header = boundary_header.clone();
         let (prior, chunk_end) = rules::witness_chunk_bounds(state, shard, &boundary_header);
-        // Defer the whole block if the chunk isn't in hand — a
-        // fully-synced peer will assemble and gossip it.
-        let (payloads, range_proof) =
-            shard_source.witness_chunk(shard, qc.block_hash(), prior, chunk_end)?;
+        let Some((payloads, range_proof)) =
+            shard_source.witness_chunk(shard, qc.block_hash(), prior, chunk_end)
+        else {
+            warn!(
+                shard = shard.inner(),
+                block_hash = ?qc.block_hash(),
+                chunk_base = prior,
+                chunk_end = chunk_end,
+                "deferring candidate assembly — a committed boundary's witness \
+                 chunk isn't in hand; awaiting a fully-synced peer's candidate"
+            );
+            return None;
+        };
         contributions.insert(
             shard,
             ShardEpochContribution {
@@ -195,6 +218,15 @@ fn boundary_qc_admissible(
     network: &NetworkDefinition,
 ) -> bool {
     let Some(header) = boundary_header_for(shard_source, shard, qc.block_hash()) else {
+        // Liveness-critical abstention: a member that never syncs this
+        // header abstains from every proposal carrying the QC. Bounded to
+        // one evaluation per proposer per epoch by the admission dedup.
+        warn!(
+            shard = shard.inner(),
+            block_hash = ?qc.block_hash(),
+            "abstaining from proposal admission — the proposed boundary QC's \
+             block isn't synced locally"
+        );
         return false;
     };
     boundary_qc_authentic(

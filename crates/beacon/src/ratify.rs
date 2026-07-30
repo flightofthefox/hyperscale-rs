@@ -35,6 +35,7 @@ use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, ConsensusPublicKey, Epoch, RatifyCert, RatifyPhase, RatifyRound,
     RatifyVote, RatifyVoteRecord, ValidatorId, Verified, Verifier, ratify_quorum,
 };
+use tracing::warn;
 
 /// Rounds ahead of the current one a vote may reference and still be
 /// pooled. Peers legitimately run ahead by however far their timers
@@ -112,6 +113,10 @@ pub struct RatifyTracker {
     votes: BTreeMap<(RatifyRound, RatifyPhase), BTreeMap<ValidatorId, Verified<RatifyVote>>>,
     /// Set once a cert assembles; the tracker is inert afterwards.
     completed: bool,
+    /// Votes dropped for anchor/epoch/round mismatch while the epoch is
+    /// still undecided — the observe-drop `warn!`'s log2 rate bound (the
+    /// tracker carries no clock to bound by time).
+    mismatched_drops: u64,
 }
 
 impl RatifyTracker {
@@ -137,6 +142,7 @@ impl RatifyTracker {
             precommitted: BTreeMap::new(),
             votes: BTreeMap::new(),
             completed: false,
+            mismatched_drops: 0,
         }
     }
 
@@ -263,11 +269,34 @@ impl RatifyTracker {
     /// feeds the lock rule, and a stale precommit quorum is still a
     /// commit.
     pub fn observe(&mut self, vote: Verified<RatifyVote>) -> Vec<RatifyEffect> {
-        if self.completed
-            || vote.anchor_hash() != self.anchor
+        if self.completed {
+            // Votes landing after the cert assembled are healthy stragglers.
+            return vec![];
+        }
+        if vote.anchor_hash() != self.anchor
             || vote.epoch() != self.epoch
             || vote.round().inner() > self.round.inner() + MAX_ROUND_AHEAD
         {
+            // A pool member's weight silently not counting is
+            // liveness-critical while the epoch is undecided — a tip split
+            // or a runaway round leaves the quorum short with no symptom.
+            // Log2-bounded: the tracker has no clock, so the bound is a
+            // power-of-two drop count.
+            self.mismatched_drops += 1;
+            if self.mismatched_drops.is_power_of_two() {
+                warn!(
+                    signer = vote.signer().inner(),
+                    vote_anchor = ?vote.anchor_hash(),
+                    tracker_anchor = ?self.anchor,
+                    vote_epoch = vote.epoch().inner(),
+                    tracker_epoch = self.epoch.inner(),
+                    vote_round = vote.round().inner(),
+                    tracker_round = self.round.inner(),
+                    drops = self.mismatched_drops,
+                    "dropping a ratify vote the tracker cannot pool — anchor, \
+                     epoch, or round out of range while the epoch is undecided"
+                );
+            }
             return vec![];
         }
         let round = vote.round();

@@ -2321,10 +2321,13 @@ impl BeaconCoordinator {
         let Some(shard_contributions) =
             boundary::build_shard_contributions(&self.state, &self.shard_source, &committed)
         else {
-            trace!(
+            // `build_shard_contributions` names the shard and artifact it
+            // waited for; this line anchors the defer to the epoch. Bounded
+            // to the SPC decide plus one resume per fetched proposal.
+            warn!(
                 epoch = epoch.inner(),
-                "Deferring candidate assembly — a committed boundary's source header isn't \
-                 synced locally; awaiting a fully-synced peer's gossiped candidate",
+                "deferring candidate assembly — awaiting a fully-synced peer's \
+                 gossiped candidate",
             );
             return Vec::new();
         };
