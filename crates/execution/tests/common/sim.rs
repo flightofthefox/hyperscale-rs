@@ -396,6 +396,14 @@ impl ExecutionSim {
         self.base.substate(key)
     }
 
+    /// Whether a block carrying `certificates` in this order would settle
+    /// two cell-sharing waves out of the order they executed in — the
+    /// pre-vote gate's question.
+    #[must_use]
+    pub fn settles_out_of_order(&self, certificates: &[WaveId]) -> Option<WaveId> {
+        self.coord.certificates_settle_out_of_order(certificates)
+    }
+
     /// The receipts `wave_id`'s tick produced.
     #[must_use]
     pub fn receipts_for(&self, wave_id: &WaveId) -> Vec<StoredReceipt> {

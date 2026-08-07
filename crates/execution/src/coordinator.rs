@@ -84,12 +84,18 @@ struct CommittingBlock {
 
 /// A wave with entries on the tick chain and no committed fate yet.
 struct TickedWave {
-    /// The last tick it contributed to — what a resolution waits for.
+    /// The last tick it contributed to — what a resolution waits for,
+    /// and the order its certificate must settle in relative to waves it
+    /// shares a cell with.
     tick: BlockHeight,
-    /// What its members declared they would mutate. Empty for a
-    /// single-shard wave: its writes are determined at commit, so no
-    /// later transaction has to wait for them.
+    /// What its members declared they would mutate.
     claims: Vec<DeclaredKey>,
+    /// Whether those claims are held *provisionally* — true for a
+    /// cross-shard wave, whose writes nothing may read until it resolves.
+    /// A single-shard wave's writes are determined at commit and block no
+    /// later transaction from executing; its claims exist only to order
+    /// its certificate against the waves that read them.
+    provisional: bool,
 }
 
 /// One composed-but-undispatched tick: the committing block's identity
@@ -2090,25 +2096,20 @@ impl ExecutionCoordinator {
         if !tick_groups.is_empty() {
             tick_groups.sort_by(|a, b| a.wave_id.cmp(&b.wave_id));
             for group in &tick_groups {
-                // A cross-shard wave's members write provisionally from
-                // the moment they join a tick, so its claims stand from
-                // here until its fate commits. A single-shard wave's
-                // writes are determined and claim nothing.
-                let claims = if group.wave_id.is_zero() {
-                    Vec::new()
-                } else {
-                    self.waves
-                        .get_wave(&group.wave_id)
-                        .map(WaveState::declared_mutations)
-                        .unwrap_or_default()
-                };
+                let claims = self
+                    .waves
+                    .get_wave(&group.wave_id)
+                    .map(WaveState::declared_mutations)
+                    .unwrap_or_default();
                 // A wave contributing to a second tick records the later
-                // one: that is the tick a resolution has to wait for.
+                // one: that is the tick a resolution has to wait for, and
+                // the position its certificate settles from.
                 self.ticked_waves.insert(
                     group.wave_id.clone(),
                     TickedWave {
                         tick: height,
                         claims,
+                        provisional: !group.wave_id.is_zero(),
                     },
                 );
             }
@@ -2132,7 +2133,7 @@ impl ExecutionCoordinator {
     /// and the in-flight cap bounds how many that can be.
     fn provisional_cells(&self) -> ProvisionalCells {
         let mut cells = ProvisionalCells::default();
-        for ticked in self.ticked_waves.values() {
+        for ticked in self.ticked_waves.values().filter(|t| t.provisional) {
             cells.claim(&ticked.claims);
         }
         cells
@@ -2778,12 +2779,86 @@ impl ExecutionCoordinator {
         self.waves.wave_assignment(tx_hash)
     }
 
-    /// Get all finalized waves (for proposal building). Returns the
-    /// `Block::Live.certificates` transport shape so the proposer can hand
-    /// the result straight to the action without a per-element conversion.
+    /// Finalized waves ready for a block, in an order state can be
+    /// applied in. Returns the `Block::Live.certificates` transport shape
+    /// so the proposer can hand the result straight to the action without
+    /// a per-element conversion.
+    ///
+    /// A receipt carries the absolute its tick's baseline produced, and
+    /// settlement is last writer per cell, so two waves that write one
+    /// cell have to settle in the order they executed — the later tick's
+    /// absolute already contains the earlier one's effect and may
+    /// overwrite it, while the reverse reverts a committed write. Waves
+    /// ready together therefore go out in tick order, and one whose
+    /// earlier-tick predecessor is neither settled nor ahead of it here
+    /// waits for a later block.
+    ///
+    /// The relation is a strict order on ticks, so the hold-back cannot
+    /// cycle, and a predecessor that never settles is the same liveness
+    /// question its own transactions already pose.
     #[must_use]
     pub fn get_finalized_waves(&self) -> Vec<Arc<Verifiable<FinalizedWave>>> {
-        self.finalized.all_waves()
+        let ready = self.finalized.all_waves();
+        let mut ordered: Vec<Arc<Verifiable<FinalizedWave>>> = ready;
+        // Ties keep `WaveId` order, which `all_waves` already imposes, so
+        // the result is a pure function of the ready set.
+        ordered.sort_by_key(|fw| self.settlement_position(fw.wave_id()));
+
+        let mut emitted: Vec<Arc<Verifiable<FinalizedWave>>> = Vec::with_capacity(ordered.len());
+        let mut placed: BTreeSet<WaveId> = BTreeSet::new();
+        for fw in ordered {
+            if self.predecessors_unsettled(fw.wave_id(), &placed) {
+                continue;
+            }
+            placed.insert(fw.wave_id().clone());
+            emitted.push(fw);
+        }
+        emitted
+    }
+
+    /// The tick a wave settles from. A wave the coordinator no longer
+    /// tracks has already resolved, so it sorts ahead of everything still
+    /// in flight.
+    fn settlement_position(&self, wave_id: &WaveId) -> BlockHeight {
+        self.ticked_waves
+            .get(wave_id)
+            .map_or(BlockHeight::GENESIS, |ticked| ticked.tick)
+    }
+
+    /// Whether some wave that executed before `wave_id` writes a cell it
+    /// writes and has neither settled nor been placed ahead of it.
+    ///
+    /// Absence from `ticked_waves` means settled: the entry is removed
+    /// when the fate commits.
+    fn predecessors_unsettled(&self, wave_id: &WaveId, placed: &BTreeSet<WaveId>) -> bool {
+        let Some(ticked) = self.ticked_waves.get(wave_id) else {
+            return false;
+        };
+        let mut own = ProvisionalCells::default();
+        own.claim(&ticked.claims);
+        self.ticked_waves.iter().any(|(other_id, other)| {
+            other.tick < ticked.tick && !placed.contains(other_id) && own.blocks(&other.claims)
+        })
+    }
+
+    /// Whether `certificates` — a block's list, in order — settles two
+    /// cell-sharing waves out of the order they executed in.
+    ///
+    /// The mirror of what [`Self::get_finalized_waves`] emits, read by the
+    /// pre-vote gate. A node that has not composed a wave's tick knows of
+    /// no predecessor for it and passes, which is the direction that
+    /// cannot reject a well-formed block: the rule needs a quorum of
+    /// enforcers, not every node.
+    #[must_use]
+    pub fn certificates_settle_out_of_order(&self, certificates: &[WaveId]) -> Option<WaveId> {
+        let mut placed: BTreeSet<WaveId> = BTreeSet::new();
+        for wave_id in certificates {
+            if self.predecessors_unsettled(wave_id, &placed) {
+                return Some(wave_id.clone());
+            }
+            placed.insert(wave_id.clone());
+        }
+        None
     }
 
     /// Whether provisions from `shard` have been absorbed for `tx_hash` —
