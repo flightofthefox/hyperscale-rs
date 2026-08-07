@@ -39,6 +39,23 @@ use hyperscale_types::{
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
 
+/// A wave whose local execution disagreed with the quorum's.
+///
+/// The receipt root the validator voted against the one its committee
+/// certified: direct proof that this node's execution produced different
+/// writes from the same committed chain.
+#[derive(Debug, Clone)]
+pub struct Divergence {
+    /// The wave whose roots disagreed.
+    pub wave_id: WaveId,
+    /// The block whose commit created it.
+    pub block_hash: BlockHash,
+    /// The root this validator voted.
+    pub local_root: GlobalReceiptRoot,
+    /// The root its committee certified.
+    pub ec_root: GlobalReceiptRoot,
+}
+
 /// Age at which a still-alive wave emits a single diagnostic warning.
 ///
 /// Under the two-stage lifecycle (windows gate admission, the wave/execution
@@ -137,12 +154,15 @@ pub struct WaveState {
     /// EC before this validator finishes executing).
     admitted_local_ec_root: Option<GlobalReceiptRoot>,
     /// Set when the admitted local EC's `global_receipt_root` disagreed
-    /// with `local_vote_global_receipt_root`. Permanently bars the wave
-    /// from finalizing locally so divergent receipts cannot enter the
+    /// with `local_vote_global_receipt_root`. Bars the wave from
+    /// finalizing locally so divergent receipts cannot enter the
     /// `finalized` store, propagate via `cert_bloom`, or be re-served on
-    /// sync. The wave is recovered later via the canonical `FinalizedWave`
-    /// admitted through block-sync.
+    /// sync — which matters for the window before the coordinator
+    /// escalates, not as an outcome. There is no recovery from here: a
+    /// wrong tick output is the baseline every later tick reads.
     locally_divergent: bool,
+    /// The mismatch behind the latch, until the coordinator reports it.
+    divergence: Option<Divergence>,
     /// Whether the local EC has been added to `execution_certificates`.
     /// Gates wave completion: `is_complete` requires the local EC to be
     /// present. Independent of the canonical-root reconciliation —
@@ -245,6 +265,7 @@ impl WaveState {
             local_vote_global_receipt_root: None,
             admitted_local_ec_root: None,
             locally_divergent: false,
+            divergence: None,
             local_ec_emitted: false,
             overdue_warned: false,
             covered_shards,
@@ -863,9 +884,10 @@ impl WaveState {
     /// [`ConsensusReceipt::receipt_hash`](hyperscale_types::ConsensusReceipt::receipt_hash)
     /// (which folds in `writes_root` derived from `database_updates`),
     /// so a root mismatch is direct proof that local execution produced
-    /// different writes than the quorum. Latches `locally_divergent` to
-    /// keep the wave out of the `finalized` store; the canonical
-    /// `FinalizedWave` is recovered later via block-sync.
+    /// different writes than the quorum. Latches `locally_divergent` so
+    /// the coordinator can escalate: under chaining a wrong tick output
+    /// is the baseline every later tick reads, so the mismatch is not one
+    /// wave's problem to sit out.
     fn reconcile_local_ec_root(&mut self) {
         if self.locally_divergent {
             return;
@@ -878,20 +900,25 @@ impl WaveState {
         };
         if local_root != ec_root {
             self.locally_divergent = true;
-            tracing::warn!(
-                wave = %self.wave_id,
-                block_hash = ?self.block_hash,
-                local_root = ?local_root,
-                ec_root = ?ec_root,
-                "Local execution diverged from quorum — wave will not finalize locally"
-            );
+            self.divergence = Some(Divergence {
+                wave_id: self.wave_id.clone(),
+                block_hash: self.block_hash,
+                local_root,
+                ec_root,
+            });
         }
     }
 
-    /// Whether this wave was excluded from local finalization because the
-    /// admitted local EC's `global_receipt_root` disagreed with the
-    /// validator's own vote. Callers (e.g. wave pruning) use this to skip
-    /// recovery paths that assume local receipts are canonical.
+    /// Take the divergence this wave detected, if it has not been
+    /// reported yet. One report per wave: the latch stays set.
+    pub const fn take_divergence(&mut self) -> Option<Divergence> {
+        self.divergence.take()
+    }
+
+    /// Whether the admitted local EC's `global_receipt_root` disagreed
+    /// with the validator's own vote. Callers (e.g. wave pruning) use
+    /// this to skip recovery paths that assume local receipts are
+    /// canonical, in the window before the coordinator escalates.
     #[must_use]
     pub const fn is_locally_divergent(&self) -> bool {
         self.locally_divergent

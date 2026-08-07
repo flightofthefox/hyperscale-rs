@@ -62,7 +62,7 @@ use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
 use crate::vote_tracker::VoteTracker;
-use crate::wave_state::WaveState;
+use crate::wave_state::{Divergence, WaveState};
 use crate::waves::{PendingVoteRetry, RetryEffect, WaveRegistry};
 
 /// One payer-side engagement wait: the transaction, the counterpart
@@ -754,6 +754,10 @@ impl ExecutionCoordinator {
                 tx_outcomes,
             });
         }
+
+        // Building a vote is one of the two places a wave learns its
+        // receipts disagree with its committee's.
+        self.escalate_divergence();
 
         // Sort for deterministic ordering (waves is a HashMap).
         completions.sort_by(|a, b| a.wave_id.cmp(&b.wave_id));
@@ -2126,6 +2130,59 @@ impl ExecutionCoordinator {
         actions
     }
 
+    /// Escalate any divergence a wave has just latched.
+    ///
+    /// A wrong tick output is not one wave's problem to sit out. Under
+    /// chaining it is the baseline every later tick reads, so a wave that
+    /// declined to finalize would leave the node quietly producing
+    /// receipts nobody else agrees with, for as long as its drain lasts.
+    ///
+    /// There is nothing to repair: re-execution is deterministic and
+    /// reproduces the same disagreement. The tick named here is the first
+    /// one whose output diverged, which chained baselines make exact — a
+    /// later tick reading a wrong baseline would have diverged too, so
+    /// the earliest report is the origin.
+    fn escalate_divergence(&mut self) {
+        // Ranked by tick rather than by origin block, because that is
+        // what the report names: a wave joins whichever tick it became
+        // executable at, which is not always the block that created it.
+        let ticked = &self.ticked_waves;
+        let mut earliest: Option<(BlockHeight, WaveId, Divergence)> = None;
+        for (wave_id, wave) in self.waves.waves_iter_mut() {
+            let Some(divergence) = wave.take_divergence() else {
+                continue;
+            };
+            let tick = ticked
+                .get(wave_id)
+                .map_or_else(|| wave_id.block_height(), |entry| entry.tick);
+            if earliest.as_ref().is_none_or(|(seen, ..)| tick < *seen) {
+                earliest = Some((tick, wave_id.clone(), divergence));
+            }
+        }
+        let Some((tick, wave_id, divergence)) = earliest else {
+            return;
+        };
+        tracing::error!(
+            shard = %self.local_shard,
+            tick = tick.inner(),
+            wave = %wave_id,
+            block_hash = ?divergence.block_hash,
+            local_root = ?divergence.local_root,
+            ec_root = ?divergence.ec_root,
+            "Local execution diverged from the quorum. Every tick from this \
+             one on reads a baseline nobody else agrees with. Rebuild \
+             required: restore from a state snapshot or resync."
+        );
+        panic!(
+            "BFT CRITICAL: local execution diverged at tick {} (wave {wave_id}): \
+             voted receipt root {:?}, committee certified {:?}. Deterministic \
+             re-execution reproduces it — operator intervention required.",
+            tick.inner(),
+            divergence.local_root,
+            divergence.ec_root,
+        );
+    }
+
     /// The cells unresolved cross-shard waves hold provisionally.
     ///
     /// Rebuilt per commit from `ticked_waves`, which is small: one entry
@@ -2341,6 +2398,9 @@ impl ExecutionCoordinator {
                 actions.extend(self.finalize_wave(topology_schedule, wave_id));
             }
         }
+        // The other: an admitted local EC that contradicts the vote this
+        // validator already cast.
+        self.escalate_divergence();
         actions
     }
 

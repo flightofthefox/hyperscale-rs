@@ -68,7 +68,19 @@ The fixed emission is what settles that account, and it settles it by measuremen
 
 Work is the measure the compensation argument wants and storage is the measure the duty argument wants. A counterpart burns real fuel and holds real exclusivity executing a leg whose fee burned elsewhere, and it records that in its own receipts, so per-shard work tracks exactly the uncompensated execution; stored bytes track the storage a committee stands behind. Neither is a fee, and no weight redirects one: the emission is a fixed issuance and the weights only divide it.
 
-## 5. Vnodes: amortizing the hardware cost of a seat
+## 5. What a block may take on: the work budget
+
+Fees price a transaction to its sender. They do not bound what a shard commits to *doing*, and the two are different problems: a shard commits work at proposal and discharges it at settlement, several blocks later. Between those points sits the **drain** — transactions committed and not yet settled — and it is the drain, not the block, that has to be bounded. A shard that keeps admitting while nothing settles is one that has promised more than it can finish.
+
+Each transaction carries a **work** figure derived at admission, never from the wire: a fixed admit-and-track charge, the footprint its declaration claims, and the execution ceiling its sender signed. The fixed term is the load-bearing one. A minimal declaration with a zero gas limit costs almost nothing to *price* and still costs a wave entry, a tick-chain entry, a receipt and mempool tracking — so without it a budget over work would bound weight while the number of transactions ran free, and a flood of trivial envelopes would slip through a bound built to stop exactly that.
+
+The header carries the running total, advancing like any other chain-derived quantity: the parent's, plus what this block's transactions reserve, minus what its certificates return. Both terms come from the block itself, so a validator checks the arithmetic without reading history — including one that snap-synced past the transactions being released. Releasing exactly what was reserved is why a settled transaction's outcome carries the figure its admission derived, beside the different figure recording what it actually cost.
+
+A proposer adds transactions only while that total stays under the budget, so a backlogged shard admits less until it drains, and stops when it cannot. Two quantities that used to do this job are gone: a transaction *count* priced a publish and a transfer the same, and a per-block count bounded the wrong thing entirely. What remains of the count is a wire cap on how many transactions a block can encode.
+
+Sender-declared inputs get their own ceiling for the obvious reason: a gas limit enters the budget at face value, so without a bound one envelope could reserve a shard's whole allowance for the price of a signature.
+
+## 6. Vnodes: amortizing the hardware cost of a seat
 
 The stake price governs *who may* operate seats; vnodes govern what a seat *costs to run*. A **vnode** is one validator identity — its own BLS key, its own `NodeStateMachine`, its own votes, proposals, and accountability record — and one host process (`NodeHost`) runs any number of them across any set of shards. What is duplicated per identity is exactly the consensus-relevant part; everything expensive is shared:
 
@@ -88,6 +100,6 @@ Co-hosting is safe by construction, not by trust in the operator:
 - **No store fights.** Lock arbitration between vnode duties (a reshape duty building a child store versus a supervisor join on the same shard) is explicit, so co-hosted duties yield rather than deadlock.
 - **No protocol special-casing.** Committee sampling, shuffling, and quorum math are identity-only — the protocol neither knows nor cares about host placement. The corollary is a deliberate, documented trade: co-hosted identities share a fault domain (one machine failing takes all its vnodes offline), and nothing in committee selection spreads a host's identities apart. The BFT math is unaffected — an operator's weight in any committee is bounded by the identities (and thus the stake) they place there, which is exactly what the stake price meters — but operational host-spread is left to deployment tooling rather than the protocol.
 
-## 6. Properties
+## 7. Properties
 
 The economic invariants this document motivates — INV-ECON-1 through INV-ECON-6 — are stated precisely in [08-invariants.md](08-invariants.md).
