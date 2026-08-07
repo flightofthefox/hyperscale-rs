@@ -41,12 +41,12 @@ mod traits;
 
 pub use action::{
     Action, ActionOwner, CrossShardExecutionRequest, FeeDemand, KeepDelta, ObserveDelta,
-    ParticipationChange, ProvisionsRequest,
+    ParticipationChange, ProvisionsRequest, TickExecutionGroup,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock};
 pub use fetch_abandon::FetchAbandon;
 pub use fetch_request::FetchRequest;
 pub use hyperscale_dispatch::Parallelism;
-pub use protocol_event::{CommitSource, ProtocolEvent};
+pub use protocol_event::{CommitSource, ProtocolEvent, WaveExecutionResult};
 pub use timer::TimerId;
 pub use traits::StateMachine;

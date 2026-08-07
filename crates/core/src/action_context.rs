@@ -11,7 +11,7 @@ use hyperscale_dispatch::Parallelism;
 use hyperscale_engine::Executor;
 use hyperscale_network::Network;
 use hyperscale_storage::{
-    JmtSnapshot, PendingChain, RatifyRegisterStore, SafeVoteRegisterStore, ShardStorage,
+    JmtSnapshot, PendingChain, RatifyRegisterStore, SafeVoteRegisterStore, ShardStorage, TickChain,
 };
 use hyperscale_types::{
     BeaconProposal, BlockHash, BlockHeight, ConsensusReceipt, Epoch, PreparedCommit, ShardId,
@@ -42,6 +42,10 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     /// Chain-state lookup. Handlers that read state call
     /// `pending_chain.view_at(block_hash)` to build an anchored view.
     pub pending_chain: &'a Arc<PendingChain<S>>,
+    /// Execution-baseline lookup. The tick execute handler reads through
+    /// `tick_chain.view_at(prev)` and appends the tick's output before
+    /// notifying completion; nothing else touches it from a handler.
+    pub tick_chain: &'a Arc<TickChain<S>>,
     /// Durable safe-vote registers on the shard's backing store. Vote
     /// and timeout sign handlers persist through it before creating the
     /// signature, so no signature can leave the process ahead of the

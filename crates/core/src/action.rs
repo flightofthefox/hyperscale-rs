@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_dispatch::DispatchPool;
+use hyperscale_storage::TickResolution;
 use hyperscale_types::{
     BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
     BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
@@ -44,6 +45,20 @@ pub struct CrossShardExecutionRequest {
     /// resolved the same way, so every participant draws the
     /// transaction's randomness from one attested value.
     pub randomness: RevealChain,
+}
+
+/// One wave's members inside a tick's batch.
+///
+/// Every member carries its resolved per-transaction environment: a
+/// single-shard member holds empty provisions and the committing block's
+/// anchors, a cross-shard leg its provisions and the payer-resolved
+/// anchors.
+#[derive(Debug, Clone)]
+pub struct TickExecutionGroup {
+    /// The wave these members belong to; execution results fan back to it.
+    pub wave_id: WaveId,
+    /// The wave's members with their provisions and environments.
+    pub requests: Vec<CrossShardExecutionRequest>,
 }
 
 /// A change to the local vnode's reshape-observer duty, carried on
@@ -955,65 +970,43 @@ pub enum Action {
         classification_topology_snapshot: Arc<TopologySnapshot>,
     },
 
-    /// Execute every transaction in a single-shard wave.
+    /// Execute one tick's whole batch: the committing block's
+    /// single-shard wave beside every cross-shard wave whose provisions
+    /// completed at that commit, as one executor batch.
     ///
-    /// Delegated to the engine thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::ExecutionBatchCompleted` carrying `wave_id` so the
-    /// state machine can route results back to the correct wave.
+    /// Delegated to the engine thread pool in production, instant in
+    /// simulation. Ticks dispatch serially — the coordinator holds the
+    /// next tick until this one's `ProtocolEvent::ExecutionBatchCompleted`
+    /// returns, because the tick's output is the next tick's baseline.
+    /// The handler reads through `TickChain::view_at` at the previous
+    /// tick, never through the settlement overlay.
     ExecuteTransactions {
-        /// The wave whose txs are being executed. Single-shard waves have
-        /// `remote_shards = {}`; they dispatch immediately at `on_block_committed`.
-        wave_id: WaveId,
-        /// The committed block whose transactions are being executed.
-        /// Paired with `block_height` to anchor state reads via
-        /// `PendingChain::view_at` at the block's historical version
-        /// regardless of persistence-progress drift.
+        /// Tick identifier: the committing block's height.
+        tick: BlockHeight,
+        /// The committing block, reported as the batch context.
         block_hash: BlockHash,
-        /// Height of `block_hash`. Threaded so reads anchor to the block's
-        /// own version even after the entry has been pruned from
-        /// [`PendingChain`].
-        block_height: BlockHeight,
-        /// Transactions to execute (all members of the wave).
-        transactions: Vec<Arc<Verified<Transaction>>>,
-        /// The committing block's parent-QC weighted timestamp: the
-        /// transaction clock for every transaction the block commits.
-        wave_start_ts: WeightedTimestamp,
-        /// The committing block's reveal chain: the randomness anchor for
-        /// every transaction the block commits.
-        wave_start_reveal: RevealChain,
-        /// State root to anchor reads against.
-        state_root: StateRoot,
+        /// The committing block's parent-QC weighted timestamp.
+        tick_ts: WeightedTimestamp,
+        /// The committing block's reveal chain.
+        tick_reveal: RevealChain,
+        /// Wave-attributed members of the batch. Results fan back to each
+        /// wave by `wave_id`.
+        groups: Vec<TickExecutionGroup>,
     },
 
-    /// Execute every transaction in a cross-shard wave, once all its txs are fully provisioned.
-    ///
-    /// Fired the moment a wave transitions from partially-provisioned to
-    /// fully-provisioned (or at block commit if all provisions arrived
-    /// early). All txs in the wave are dispatched together.
-    /// Returns `ProtocolEvent::ExecutionBatchCompleted` carrying `wave_id`.
-    ExecuteCrossShardTransactions {
-        /// The wave being executed.
-        wave_id: WaveId,
-        /// The committed block whose processing kicked off this execution
-        /// (either the block carrying the txs, or the block whose committed
-        /// provisions unblocked them). Paired with `block_height` to anchor
-        /// state reads via `PendingChain::view_at` at the block's historical
-        /// version regardless of persistence-progress drift.
-        block_hash: BlockHash,
-        /// Height of `block_hash`. Threaded so reads anchor to the block's
-        /// own version even after the entry has been pruned from
-        /// [`PendingChain`].
-        block_height: BlockHeight,
-        /// The cross-shard execution requests to process (one per tx in the wave).
-        requests: Vec<CrossShardExecutionRequest>,
-        /// The wave-starting block's parent-QC weighted timestamp. Each
-        /// request carries its own transaction clock; this is the local
-        /// anchor the batch context reports.
-        wave_start_ts: WeightedTimestamp,
-        /// The wave-starting block's reveal chain, the local counterpart
-        /// to `wave_start_ts` for the randomness anchor.
-        wave_start_reveal: RevealChain,
+    /// Resolve wave fates on the tick chain: promote a settled wave's
+    /// provisional entries into the readable fold, or drop an aborted
+    /// wave's. Applied synchronously on the shard thread so a dispatch
+    /// action emitted later in the same commit reads the resolved chain.
+    ResolveTickWaves {
+        /// Wave fates that became known at this commit, in emission order.
+        resolutions: Vec<(WaveId, TickResolution)>,
     },
+
+    /// Tear down the tick chain at a reshape terminal: the shard's chain
+    /// ends and successors seed from settled state, never from tick
+    /// outputs.
+    ClearTickChain,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Block Commit
@@ -1659,8 +1652,7 @@ impl Action {
             | Self::FetchAndBroadcastProvisions { .. }
             | Self::SignAndSendExecutionVote { .. }
             | Self::BroadcastExecutionCertificate { .. }
-            | Self::ExecuteTransactions { .. }
-            | Self::ExecuteCrossShardTransactions { .. } => Some(DispatchPool::Throughput),
+            | Self::ExecuteTransactions { .. } => Some(DispatchPool::Throughput),
 
             _ => None,
         }
@@ -1727,7 +1719,8 @@ impl Action {
             | Self::VerifyReservations { .. }
             | Self::BuildProposal { .. }
             | Self::ExecuteTransactions { .. }
-            | Self::ExecuteCrossShardTransactions { .. }
+            | Self::ResolveTickWaves { .. }
+            | Self::ClearTickChain
             | Self::CommitBlock { .. }
             | Self::CommitBlockByQcOnly { .. }
             | Self::EmitTransactionStatus { .. }
@@ -1824,7 +1817,6 @@ impl Action {
             | Self::VerifyExecutionCertificateSignature { .. }
             | Self::VerifyFinalizedWave { .. }
             | Self::ExecuteTransactions { .. }
-            | Self::ExecuteCrossShardTransactions { .. }
             | Self::SignAndSendExecutionVote { .. }
             | Self::BroadcastExecutionCertificate { .. } => ActionOwner::Execution,
 

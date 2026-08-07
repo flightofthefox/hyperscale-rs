@@ -26,6 +26,26 @@ use hyperscale_types::{
     Verified, WaveId, WeightedTimestamp,
 };
 
+/// One wave's share of a tick's execution results.
+#[derive(Debug, Clone)]
+pub struct WaveExecutionResult {
+    /// The wave whose execution produced these results.
+    pub wave_id: WaveId,
+    /// Per-tx stored receipts (consensus portion + metadata) ready to be
+    /// persisted alongside the wave's commit.
+    pub results: Vec<StoredReceipt>,
+    /// Per-tx outcomes extracted on the handler thread for vote signing.
+    pub tx_outcomes: Vec<TxOutcome>,
+    /// Fee receipts built beside the execution receipts, for the
+    /// transactions this shard pays for and a wave can still abort.
+    /// Held in reserve: an abort settles one of these in place of the
+    /// discarded execution receipt.
+    pub fee_receipts: Vec<StoredReceipt>,
+    /// What this shard attests it did per transaction, carried to the
+    /// wave so the outcomes it votes report it.
+    pub attested_work: Vec<(TxHash, u64)>,
+}
+
 /// How a node learned about the certifying QC that commits a given block.
 ///
 /// Under the 2-chain rule, block N commits when the node observes QC_{N+1}.
@@ -527,31 +547,19 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Execution
     // ═══════════════════════════════════════════════════════════════════════
-    /// Batch of execution results from an `ExecuteTransactions` / `ExecuteCrossShardTransactions` dispatch.
+    /// One tick's execution results from an `ExecuteTransactions`
+    /// dispatch.
     ///
-    /// Results carry the full execution output (writes, receipts) — stays local.
-    /// Every result in this batch belongs to `wave_id`; the wave gets exactly
-    /// one `ExecutionBatchCompleted` and no further results arrive for it.
-    ///
-    /// The state machine uses results to:
-    /// 1. Store pending execution updates (co-located with TC at finalization)
-    /// 2. Store receipts on the `WaveState` for later finalized wave assembly
+    /// Results carry the full execution output (writes, receipts) — stays
+    /// local. Each wave in the tick gets exactly one entry in `waves` and
+    /// no further results ever arrive for it. The tick's output has been
+    /// appended to the tick chain before this event reaches the state
+    /// machine, so the coordinator may dispatch the next tick on it.
     ExecutionBatchCompleted {
-        /// The wave whose execution produced these results.
-        wave_id: WaveId,
-        /// Per-tx stored receipts (consensus portion + metadata) ready
-        /// to be persisted alongside the wave's commit.
-        results: Vec<StoredReceipt>,
-        /// Per-tx outcomes extracted on the handler thread for vote signing.
-        tx_outcomes: Vec<TxOutcome>,
-        /// Fee receipts built beside the execution receipts, for the
-        /// transactions this shard pays for and a wave can still abort.
-        /// Held in reserve: an abort settles one of these in place of the
-        /// discarded execution receipt.
-        fee_receipts: Vec<StoredReceipt>,
-        /// What this shard attests it did per transaction, carried to the
-        /// wave so the outcomes it votes report it.
-        attested_work: Vec<(TxHash, u64)>,
+        /// The tick whose batch completed: the committing block's height.
+        tick: BlockHeight,
+        /// Per-wave results, fanned back to each `WaveState`.
+        waves: Vec<WaveExecutionResult>,
     },
 
     /// Received an execution vote whose signature has already been

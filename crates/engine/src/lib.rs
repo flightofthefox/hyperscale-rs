@@ -36,7 +36,7 @@ pub mod genesis;
 /// Shard assignment and write filtering for `StateWrites`.
 pub mod sharding;
 
-pub use batch::{CrossShardTxInput, WaveBatchContext};
+pub use batch::{CrossShardTxInput, TickTxInput, WaveBatchContext};
 pub use executor::Executor;
 pub use genesis::{GenesisConfig, World, XRD, genesis_world, genesis_writes};
 // Re-export the fan-out strategy `WaveBatchContext` carries, so callers

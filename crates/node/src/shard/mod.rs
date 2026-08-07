@@ -52,7 +52,7 @@ use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Executor;
 use hyperscale_network::Network;
-use hyperscale_storage::{BeaconStorage, PendingChain, RecoveredState, ShardStorage};
+use hyperscale_storage::{BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain};
 use hyperscale_types::{
     Block, CertifiedBlock, LocalTimestamp, ShardId, TopologySnapshot, TransactionStatus, TxHash,
     Verified,
@@ -135,6 +135,7 @@ impl<S: ShardStorage, N> DispatchHandles<S, N> {
 pub(crate) struct ShardDispatchHandles<S: ShardStorage> {
     pub(crate) storage: Arc<S>,
     pub(crate) pending_chain: Arc<PendingChain<S>>,
+    pub(crate) tick_chain: Arc<TickChain<S>>,
     pub(crate) prepared_commits: Arc<Mutex<PreparedCommitMap>>,
 }
 
@@ -143,6 +144,7 @@ impl<S: ShardStorage> Clone for ShardDispatchHandles<S> {
         Self {
             storage: Arc::clone(&self.storage),
             pending_chain: Arc::clone(&self.pending_chain),
+            tick_chain: Arc::clone(&self.tick_chain),
             prepared_commits: Arc::clone(&self.prepared_commits),
         }
     }

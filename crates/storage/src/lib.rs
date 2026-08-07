@@ -45,6 +45,9 @@ pub use shard::genesis::GenesisCommit;
 pub use shard::pending_chain::{BaseReadCache, ChainEntry, PendingChain, SubstateView};
 pub use shard::recovered_state::RecoveredState;
 pub use shard::store::{SubstateStore, VersionedStore};
+pub use shard::tick_chain::{
+    ProvisionalTx, TickChain, TickOutput, TickResolution, TickView, TickViewSnapshot,
+};
 pub use shard::vote_registers::SafeVoteRegisterStore;
 pub use shard::writes::{filter_writes_to_prefix, merge_state_writes, merge_writes_from_receipts};
 pub use tree::{CollectedWrites, JmtSnapshot};

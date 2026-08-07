@@ -26,7 +26,7 @@ use crossbeam::channel::Sender;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::Executor;
 use hyperscale_network::Network;
-use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage};
+use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage, TickChain};
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, LocalTimestamp, NetworkDefinition, ShardId,
     TransactionStatus, TxHash, ValidatorId, Verified,
@@ -714,6 +714,7 @@ fn build_shard_io<S: ShardStorage>(
     );
     let storage = Arc::new(storage);
     let pending_chain = Arc::new(PendingChain::new(Arc::clone(&storage)));
+    let tick_chain = Arc::new(TickChain::new(Arc::clone(&storage)));
     let mut block_commit = BlockCommitCoordinator::new(shard, tree_height);
     {
         // Seed the boundary memo from the committed tip so the
@@ -757,11 +758,13 @@ fn build_shard_io<S: ShardStorage>(
     let handles = ShardDispatchHandles {
         storage: Arc::clone(&storage),
         pending_chain: Arc::clone(&pending_chain),
+        tick_chain: Arc::clone(&tick_chain),
         prepared_commits: block_commit.prepared_commits_handle(),
     };
     let mut io = ShardIo {
         storage,
         pending_chain,
+        tick_chain,
         block_commit,
         caches,
         consensus: ConsensusState::new(config),

@@ -78,7 +78,6 @@ where
             | Action::VerifyReservations { .. }
             | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }
-            | Action::ExecuteCrossShardTransactions { .. }
             | Action::FetchAndBroadcastProvisions { .. }
             | Action::BroadcastBlockHeader { .. }
             | Action::SignAndBroadcastBlockVote { .. }
@@ -109,6 +108,18 @@ where
             | Action::VerifySpcNewCommit { .. }
             | Action::VerifySpcEmptyView { .. } => {
                 self.dispatch_delegated_action(vnode_idx, action);
+            }
+
+            // ─── Tick chain maintenance ────────────────────────────────────
+            // Applied synchronously on the shard thread so a dispatch
+            // action later in the same batch reads the resolved chain.
+            Action::ResolveTickWaves { resolutions } => {
+                for (wave_id, resolution) in &resolutions {
+                    self.io.tick_chain.resolve(wave_id, resolution);
+                }
+            }
+            Action::ClearTickChain => {
+                self.io.tick_chain.clear();
             }
 
             // ─── Sync / fetch protocol drive ───────────────────────────────
@@ -802,6 +813,7 @@ where
                 me,
                 shard,
                 pending_chain: &shard_handles.pending_chain,
+                tick_chain: &shard_handles.tick_chain,
                 vote_registers: shard_handles.storage.as_ref(),
                 ratify_registers: handles.beacon_storage.as_ref(),
                 network: &handles.network,

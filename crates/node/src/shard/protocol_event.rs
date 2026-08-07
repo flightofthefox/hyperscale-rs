@@ -30,6 +30,8 @@ where
         self.io.block_commit.mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
         self.io.pending_chain.prune(height);
+        // Evict ticks whose folds the persisted base now fully covers.
+        self.io.tick_chain.prune_persisted(height);
         // The byte total is written in the same crash-consistent batch as
         // the block's JMT, and `height` is the tip we just persisted, so it
         // is always present. A zero fallback here would silently corrupt the

@@ -15,7 +15,7 @@
 //! memoized in the per-transaction `ProcessExecutionCache` — the same
 //! transaction in a different block may abort differently.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use blake3::hash as blake3_hash;
@@ -44,7 +44,9 @@ use hyperscale_vm_kernel::{
 use crate::backend::EngineBackend;
 use crate::genesis::{World, genesis_world_with_pools};
 use crate::sharding::writes_root;
-use crate::{CachedOutput, CrossShardTxInput, ExecutedTx, WaveBatchContext, project_to_shard};
+use crate::{
+    CachedOutput, CrossShardTxInput, ExecutedTx, TickTxInput, WaveBatchContext, project_to_shard,
+};
 
 /// Whether a derivation holds a gated node to its target's authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -711,10 +713,11 @@ fn assemble_executed_tx(
 }
 
 impl Executor {
-    /// The batch pipeline both dispatch arms share: derive, pre-read the
+    /// The batch pipeline every dispatch arm shares: derive, pre-read the
     /// local baseline, layer provisioned remote cells, execute under the
-    /// shard's locality, fold local keys, and project. `provisions` is
-    /// empty and locality is total for the single-shard arm.
+    /// shard's locality, fold local keys, and project. `abortable` names
+    /// the members a wave verdict can still discard — the cross-shard
+    /// legs; a batch without any executes under total locality.
     #[allow(clippy::too_many_lines)] // one pipeline, stages in order
     fn run_batch(
         &self,
@@ -723,19 +726,23 @@ impl Executor {
         transactions: &[Arc<Verified<Transaction>>],
         provisions_by_tx: &BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
         env_by_tx: &BTreeMap<TxHash, EnvInputs>,
-        cross_shard: bool,
+        abortable: &BTreeSet<TxHash>,
     ) -> Vec<ExecutedTx> {
         if transactions.is_empty() {
             return Vec::new();
         }
-        let locality = if cross_shard {
+        // A cross-shard leg declares remote cells, so its writes must be
+        // filtered to the local subtree; a batch of genuinely single-shard
+        // members owns every key it declares and total locality is the
+        // same filter without the trie walk.
+        let locality = if abortable.is_empty() {
+            Locality::All
+        } else {
             let trie = ctx.shard_trie.clone();
             let local_shard = ctx.local_shard;
             Locality::Owned(Arc::new(move |owner: Address| {
                 trie.shard_for_prefix(owner) == local_shard
             }))
-        } else {
-            Locality::All
         };
         // Publishes carry no manifest, so they never reach the kernel;
         // they settle in their own pass below.
@@ -873,7 +880,7 @@ impl Executor {
                         vault,
                         max_fee: vm.max_fee,
                         floor: vm.abort_floor(),
-                        wave_abortable: cross_shard,
+                        wave_abortable: abortable.contains(&tx.hash()),
                     },
                 ))
             })
@@ -989,7 +996,7 @@ impl Executor {
             transactions,
             &BTreeMap::new(),
             &env_by_tx,
-            false,
+            &BTreeSet::new(),
         )
     }
 
@@ -1024,13 +1031,62 @@ impl Executor {
                 )
             })
             .collect();
+        let abortable: BTreeSet<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
         self.run_batch(
             ctx,
             snapshot,
             &transactions,
             &provisions_by_tx,
             &env_by_tx,
-            true,
+            &abortable,
+        )
+    }
+
+    /// Execute one tick's whole batch — single-shard members beside
+    /// cross-shard legs — against `snapshot`. One [`ExecutedTx`] per
+    /// input, in input order, projected to the context's local shard.
+    ///
+    /// Batch composition is consensus input: conflict grouping and the
+    /// fold run over the whole tick, so every replica must compose the
+    /// same members in the same tick.
+    #[must_use]
+    pub fn execute_tick_batch(
+        &self,
+        ctx: &WaveBatchContext<'_>,
+        snapshot: &(dyn SubstateDatabase + Sync),
+        inputs: &[TickTxInput<'_>],
+    ) -> Vec<ExecutedTx> {
+        let transactions: Vec<Arc<Verified<Transaction>>> =
+            inputs.iter().map(|i| Arc::clone(i.transaction)).collect();
+        let provisions_by_tx: BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>> = inputs
+            .iter()
+            .filter(|i| !i.provisions.is_empty())
+            .map(|i| (i.transaction.hash(), i.provisions.to_vec()))
+            .collect();
+        let env_by_tx: BTreeMap<TxHash, EnvInputs> = inputs
+            .iter()
+            .map(|i| {
+                (
+                    i.transaction.hash(),
+                    EnvInputs {
+                        clock_ms: i.clock.as_millis(),
+                        randomness: tx_randomness(i.randomness, i.transaction.hash()),
+                    },
+                )
+            })
+            .collect();
+        let abortable: BTreeSet<TxHash> = inputs
+            .iter()
+            .filter(|i| i.wave_abortable)
+            .map(|i| i.transaction.hash())
+            .collect();
+        self.run_batch(
+            ctx,
+            snapshot,
+            &transactions,
+            &provisions_by_tx,
+            &env_by_tx,
+            &abortable,
         )
     }
 }

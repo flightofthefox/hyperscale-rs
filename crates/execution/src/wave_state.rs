@@ -28,12 +28,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, CrossShardExecutionRequest};
+use hyperscale_core::{CrossShardExecutionRequest, TickExecutionGroup};
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
-    GlobalReceiptRoot, RevealChain, ShardId, StateRoot, StoredReceipt, Transaction,
-    TransactionDecision, TxHash, TxOutcome, Verifiable, Verified, WAVE_TIMEOUT, WaveCertificate,
-    WaveId, WeightedTimestamp, compute_global_receipt_root,
+    GlobalReceiptRoot, RevealChain, ShardId, StoredReceipt, Transaction, TransactionDecision,
+    TxHash, TxOutcome, Verifiable, Verified, WAVE_TIMEOUT, WaveCertificate, WaveId,
+    WeightedTimestamp, compute_global_receipt_root,
 };
 
 use crate::provisioning::ProvisioningTracker;
@@ -342,57 +342,29 @@ impl WaveState {
         self.local_ec_emitted
     }
 
-    /// Build the one-shot execution dispatch [`Action`] for a fully-provisioned
-    /// wave and flip `dispatched` if one is produced.
+    /// Build this wave's [`TickExecutionGroup`] for the tick being
+    /// composed and flip `dispatched` if one is produced.
     ///
-    /// Returns `None` (without mutating) when the wave isn't fully provisioned,
-    /// has already dispatched, every tx is pre-aborted, or a cross-shard tx is
-    /// missing its provisions. Pairing the build with the flag flip closes the
-    /// invariant that a dispatch action and the dispatched marker move
-    /// together.
-    ///
-    /// The action carries the wave-starting block's hash, not whatever block
-    /// the dispatcher is processing. Anchoring reads to the wave-start block
-    /// keeps the cross-shard provisioned-dispatch path consistent with the
-    /// single-shard dispatch-at-wave-start path; threading
-    /// `committed_block_hash` would fold intervening blocks' cert writes
-    /// (sourced from each validator's own local receipts) into the view,
-    /// seeding divergence downstream.
-    pub fn dispatch_if_ready(&mut self, provisioning: &ProvisioningTracker) -> Option<Action> {
+    /// Returns `None` (without mutating) when the wave isn't fully
+    /// provisioned, has already joined a tick, every tx is pre-aborted,
+    /// or a cross-shard tx is missing its provisions. Pairing the build
+    /// with the flag flip closes the invariant that a wave joins exactly
+    /// one tick.
+    pub fn tick_group_if_ready(
+        &mut self,
+        provisioning: &ProvisioningTracker,
+    ) -> Option<TickExecutionGroup> {
         if !self.is_fully_provisioned() || self.dispatched {
             return None;
         }
-        let action = self.build_dispatch_action(provisioning)?;
+        let group = self.build_tick_group(provisioning)?;
         self.dispatched = true;
-        Some(action)
+        Some(group)
     }
 
     /// Pre-aborted txs are excluded — they produce no state change, so there's
     /// no reason to execute them.
-    fn build_dispatch_action(&self, provisioning: &ProvisioningTracker) -> Option<Action> {
-        if self.wave_id.is_zero() {
-            // Single-shard wave: no provisions needed.
-            let transactions: Vec<Arc<Verified<Transaction>>> = self
-                .tx_hashes
-                .iter()
-                .filter(|h| !self.is_tx_explicitly_aborted(**h))
-                .filter_map(|h| self.transactions.get(h).cloned())
-                .collect();
-            if transactions.is_empty() {
-                return None;
-            }
-            return Some(Action::ExecuteTransactions {
-                wave_id: self.wave_id.clone(),
-                block_hash: self.block_hash,
-                block_height: self.block_height(),
-                transactions,
-                wave_start_ts: self.wave_start_ts,
-                wave_start_reveal: self.wave_start_reveal,
-                state_root: StateRoot::ZERO,
-            });
-        }
-
-        // Cross-shard wave: every non-aborted tx needs its verified provisions assembled.
+    fn build_tick_group(&self, provisioning: &ProvisioningTracker) -> Option<TickExecutionGroup> {
         let mut requests: Vec<CrossShardExecutionRequest> =
             Vec::with_capacity(self.tx_hashes.len());
         for &tx_hash in &self.tx_hashes {
@@ -400,6 +372,18 @@ impl WaveState {
                 continue;
             }
             let tx = self.transactions.get(&tx_hash)?;
+            if self.wave_id.is_zero() {
+                // Single-shard member: no provisions, the committing
+                // block's own anchors.
+                requests.push(CrossShardExecutionRequest {
+                    tx_hash,
+                    transaction: Arc::clone(tx),
+                    provisions: Vec::new(),
+                    clock: self.wave_start_ts,
+                    randomness: self.wave_start_reveal,
+                });
+                continue;
+            }
             // An absent entry is the dependency-free leg: the tx recorded
             // an empty requirement, so nothing ever arrived to store. A
             // tx with real requirements always has entries here — the
@@ -426,13 +410,9 @@ impl WaveState {
         if requests.is_empty() {
             return None;
         }
-        Some(Action::ExecuteCrossShardTransactions {
+        Some(TickExecutionGroup {
             wave_id: self.wave_id.clone(),
-            block_hash: self.block_hash,
-            block_height: self.block_height(),
             requests,
-            wave_start_ts: self.wave_start_ts,
-            wave_start_reveal: self.wave_start_reveal,
         })
     }
 
@@ -1703,7 +1683,7 @@ mod tests {
         let mut provisioning = ProvisioningTracker::new();
         provisioning.seed_provisions(h0, vec![Arc::new(Vec::new())]);
         provisioning.seed_provisions(h1, vec![Arc::new(Vec::new())]);
-        assert!(w.dispatch_if_ready(&provisioning).is_some());
+        assert!(w.tick_group_if_ready(&provisioning).is_some());
         assert!(w.dispatched());
 
         assert!(!w.record_abort(h0, ts_for(WAVE_START + 2)));
@@ -1788,20 +1768,24 @@ mod tests {
         assert_eq!(decisions[&h0], TransactionDecision::Accept);
     }
 
-    // ─── dispatch_if_ready ──────────────────────────────────────────────
+    // ─── tick_group_if_ready ────────────────────────────────────────────
 
     #[test]
-    fn dispatch_if_ready_single_shard_emits_execute_transactions_and_flips_flag() {
+    fn tick_group_single_shard_carries_all_members_and_flips_flag() {
         let mut w = make_single_shard_wave(2);
         let provisioning = ProvisioningTracker::new();
-        match w.dispatch_if_ready(&provisioning) {
-            Some(Action::ExecuteTransactions { transactions, .. }) => {
-                assert_eq!(transactions.len(), 2);
-            }
-            other => panic!("expected ExecuteTransactions, got {other:?}"),
+        let group = w.tick_group_if_ready(&provisioning).expect("group");
+        assert!(group.wave_id.is_zero());
+        assert_eq!(group.requests.len(), 2);
+        // Single-shard members carry no provisions and the committing
+        // block's own anchors.
+        for request in &group.requests {
+            assert!(request.provisions.is_empty());
+            assert_eq!(request.clock, ts_for(WAVE_START));
+            assert_eq!(request.randomness, RevealChain::ZERO);
         }
         assert!(w.dispatched());
-        assert!(w.dispatch_if_ready(&provisioning).is_none());
+        assert!(w.tick_group_if_ready(&provisioning).is_none());
     }
 
     #[test]
@@ -1814,13 +1798,9 @@ mod tests {
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
 
         let provisioning = ProvisioningTracker::new();
-        match w.dispatch_if_ready(&provisioning) {
-            Some(Action::ExecuteCrossShardTransactions { requests, .. }) => {
-                assert_eq!(requests.len(), 1);
-                assert!(requests[0].provisions.is_empty());
-            }
-            other => panic!("expected ExecuteCrossShardTransactions, got {other:?}"),
-        }
+        let group = w.tick_group_if_ready(&provisioning).expect("group");
+        assert_eq!(group.requests.len(), 1);
+        assert!(group.requests[0].provisions.is_empty());
         assert!(w.dispatched());
     }
 
@@ -1833,13 +1813,9 @@ mod tests {
         let mut provisioning = ProvisioningTracker::new();
         provisioning.seed_provisions(h0, vec![Arc::new(Vec::<SubstateEntry>::new())]);
 
-        match w.dispatch_if_ready(&provisioning) {
-            Some(Action::ExecuteCrossShardTransactions { requests, .. }) => {
-                assert_eq!(requests.len(), 1);
-                assert_eq!(requests[0].tx_hash, h0);
-            }
-            other => panic!("expected ExecuteCrossShardTransactions, got {other:?}"),
-        }
+        let group = w.tick_group_if_ready(&provisioning).expect("group");
+        assert_eq!(group.requests.len(), 1);
+        assert_eq!(group.requests[0].tx_hash, h0);
         assert!(w.dispatched());
     }
 
@@ -1984,65 +1960,51 @@ mod tests {
             vec![ProvisionEntry::new(remote_payer_tx, vec![])],
         )));
 
-        match w.dispatch_if_ready(&provisioning) {
-            Some(Action::ExecuteCrossShardTransactions {
-                requests,
-                wave_start_ts,
-                wave_start_reveal: local_reveal,
-                ..
-            }) => {
-                assert_eq!(wave_start_ts, ts_for(WAVE_START));
-                assert_eq!(local_reveal, wave_start_reveal());
-                let request_for = |hash: TxHash| {
-                    requests
-                        .iter()
-                        .find(|r| r.tx_hash == hash)
-                        .expect("request present")
-                };
-                assert_eq!(request_for(remote_payer_tx).clock, payer_clock);
-                assert_eq!(request_for(remote_payer_tx).randomness, payer_reveal);
-                assert_eq!(request_for(local_anchor_tx).clock, ts_for(WAVE_START));
-                assert_eq!(request_for(local_anchor_tx).randomness, wave_start_reveal());
-            }
-            other => panic!("expected ExecuteCrossShardTransactions, got {other:?}"),
-        }
+        let group = w.tick_group_if_ready(&provisioning).expect("group");
+        let request_for = |hash: TxHash| {
+            group
+                .requests
+                .iter()
+                .find(|r| r.tx_hash == hash)
+                .expect("request present")
+        };
+        assert_eq!(request_for(remote_payer_tx).clock, payer_clock);
+        assert_eq!(request_for(remote_payer_tx).randomness, payer_reveal);
+        assert_eq!(request_for(local_anchor_tx).clock, ts_for(WAVE_START));
+        assert_eq!(request_for(local_anchor_tx).randomness, wave_start_reveal());
     }
 
     #[test]
-    fn dispatch_if_ready_skips_pre_aborted_txs() {
+    fn tick_group_skips_pre_aborted_txs() {
         let mut w = make_single_shard_wave(2);
         let aborted = w.tx_hashes()[0];
         w.record_abort(aborted, ts_for(WAVE_START));
 
         let provisioning = ProvisioningTracker::new();
-        match w.dispatch_if_ready(&provisioning) {
-            Some(Action::ExecuteTransactions { transactions, .. }) => {
-                assert_eq!(transactions.len(), 1);
-                assert_ne!(transactions[0].hash(), aborted);
-            }
-            other => panic!("expected ExecuteTransactions, got {other:?}"),
-        }
+        let group = w.tick_group_if_ready(&provisioning).expect("group");
+        assert_eq!(group.requests.len(), 1);
+        assert_ne!(group.requests[0].tx_hash, aborted);
     }
 
     #[test]
-    fn dispatch_if_ready_returns_none_when_all_txs_aborted() {
+    fn tick_group_is_none_when_all_txs_aborted() {
         let mut w = make_single_shard_wave(1);
         let aborted = w.tx_hashes()[0];
         w.record_abort(aborted, ts_for(WAVE_START));
 
         let provisioning = ProvisioningTracker::new();
-        assert!(w.dispatch_if_ready(&provisioning).is_none());
+        assert!(w.tick_group_if_ready(&provisioning).is_none());
         assert!(!w.dispatched());
     }
 
     #[test]
-    fn dispatch_if_ready_returns_none_when_not_fully_provisioned() {
+    fn tick_group_is_none_when_not_fully_provisioned() {
         let mut w = make_cross_shard_wave(2);
         let h0 = w.tx_hashes()[0];
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
 
         let provisioning = ProvisioningTracker::new();
-        assert!(w.dispatch_if_ready(&provisioning).is_none());
+        assert!(w.tick_group_if_ready(&provisioning).is_none());
         assert!(!w.dispatched());
     }
 }

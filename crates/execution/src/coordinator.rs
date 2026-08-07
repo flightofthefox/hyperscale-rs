@@ -32,18 +32,21 @@
 //! Validators collect shard execution proofs from all participating shards. When all
 //! proofs are received, a `WaveCertificate` is created.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
+use hyperscale_core::{
+    Action, FetchAbandon, FetchRequest, ProtocolEvent, TickExecutionGroup, WaveExecutionResult,
+};
+use hyperscale_storage::TickResolution;
 use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
     FinalizedWave, FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Provisions,
     RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledWaveSet, ShardId,
-    StoredReceipt, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId,
-    Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, settled_set_verdict,
-    wave_leader, wave_leader_at,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
+    ValidatorId, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
+    settled_set_verdict, wave_leader, wave_leader_at,
 };
 use tracing::instrument;
 
@@ -76,6 +79,16 @@ struct CommittingBlock {
     ts: WeightedTimestamp,
     /// The block's reveal chain.
     reveal: RevealChain,
+}
+
+/// One composed-but-undispatched tick: the committing block's identity
+/// anchors plus every wave group that joined at its commit.
+struct PendingTick {
+    tick: BlockHeight,
+    block_hash: BlockHash,
+    tick_ts: WeightedTimestamp,
+    tick_reveal: RevealChain,
+    groups: Vec<TickExecutionGroup>,
 }
 
 /// Data returned when a wave is ready for voting.
@@ -170,6 +183,35 @@ pub struct ExecutionCoordinator {
     /// against, so every replica groups a block's transactions exactly as the
     /// proposer built them and the verifier validated them.
     committed_committee_anchor_wt: WeightedTimestamp,
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Tick dispatch
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Ticks composed at commit but not yet dispatched, in height order.
+    /// Ticks execute serially — each output is the next tick's baseline —
+    /// so the head dispatches only when no tick is in flight.
+    pending_ticks: VecDeque<PendingTick>,
+
+    /// Whether a dispatched tick's `ExecutionBatchCompleted` is still
+    /// outstanding.
+    tick_in_flight: bool,
+
+    /// The highest tick whose output is on the tick chain. A resolution
+    /// is emitted only once its wave's tick has appended, so a commit
+    /// racing ahead of a queued tick cannot resolve a wave the chain has
+    /// never seen.
+    last_completed_tick: BlockHeight,
+
+    /// Which tick each wave joined, for waves whose fate is still open.
+    /// Only waves listed here have entries on the tick chain, so a wave
+    /// absent from the map — never dispatched, or committed by a shard
+    /// past the execution window — resolves nothing.
+    ticked_waves: HashMap<WaveId, BlockHeight>,
+
+    /// Wave fates known but not yet emittable, each with the tick that
+    /// carries its entries. Drained whenever a tick completes or a block
+    /// commits.
+    pending_tick_resolutions: Vec<(WaveId, BlockHeight, TickResolution)>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Provisioning
@@ -364,6 +406,11 @@ impl ExecutionCoordinator {
             committed_height,
             committed_ts: committed_block_anchor_wt,
             committed_committee_anchor_wt,
+            pending_ticks: VecDeque::new(),
+            tick_in_flight: false,
+            last_completed_tick: BlockHeight::GENESIS,
+            ticked_waves: HashMap::new(),
+            pending_tick_resolutions: Vec::new(),
             waves: WaveRegistry::new(),
             early: EarlyArrivalBuffer::new(),
             provisioning: ProvisioningTracker::new(),
@@ -519,7 +566,7 @@ impl ExecutionCoordinator {
         classification: &TopologySnapshot,
         block: CommittingBlock,
         transactions: &[Arc<Verifiable<Transaction>>],
-    ) -> (Vec<Action>, Vec<Verifiable<ExecutionVote>>) {
+    ) -> (Vec<TickExecutionGroup>, Vec<Verifiable<ExecutionVote>>) {
         let CommittingBlock {
             hash: block_hash,
             height: block_height,
@@ -534,7 +581,7 @@ impl ExecutionCoordinator {
         // (beacon hasn't reached this epoch) just skips the optimization.
         let setup_committee = topology_schedule.at(block_ts);
         let local_shard = self.local_shard;
-        let mut dispatch_actions: Vec<Action> = Vec::new();
+        let mut tick_groups: Vec<TickExecutionGroup> = Vec::new();
         let mut votes_to_replay: Vec<Verifiable<ExecutionVote>> = Vec::new();
 
         for (wave_id, txs) in waves {
@@ -577,9 +624,10 @@ impl ExecutionCoordinator {
                 wave_state.absorb_engagement_evidence(&self.provisioning);
             }
 
-            // Dispatch execution if fully provisioned at creation.
-            if let Some(action) = wave_state.dispatch_if_ready(&self.provisioning) {
-                dispatch_actions.push(action);
+            // The wave joins this commit's tick if fully provisioned at
+            // creation.
+            if let Some(group) = wave_state.tick_group_if_ready(&self.provisioning) {
+                tick_groups.push(group);
             }
 
             self.waves.insert_wave(wave_id.clone(), wave_state);
@@ -612,7 +660,7 @@ impl ExecutionCoordinator {
             }
         }
 
-        (dispatch_actions, votes_to_replay)
+        (tick_groups, votes_to_replay)
     }
 
     /// Scan all waves and return completion data for any that can emit a vote.
@@ -709,50 +757,73 @@ impl ExecutionCoordinator {
     pub fn on_execution_batch_completed(
         &mut self,
         topology_schedule: &TopologySchedule,
-        wave_id: &WaveId,
-        results: Vec<StoredReceipt>,
-        tx_outcomes: Vec<TxOutcome>,
-        fee_receipts: Vec<StoredReceipt>,
-        attested_work: Vec<(TxHash, u64)>,
+        tick: BlockHeight,
+        waves: Vec<WaveExecutionResult>,
     ) -> Vec<Action> {
-        if results.is_empty() && tx_outcomes.is_empty() {
-            tracing::warn!(
-                wave = %wave_id,
-                "ExecutionBatchCompleted produced ZERO results"
-            );
-            return Vec::new();
+        self.tick_in_flight = false;
+        self.last_completed_tick = self.last_completed_tick.max(tick);
+        let mut actions = Vec::new();
+
+        for wave_result in waves {
+            let WaveExecutionResult {
+                wave_id,
+                results,
+                tx_outcomes,
+                fee_receipts,
+                attested_work,
+            } = wave_result;
+            if results.is_empty() && tx_outcomes.is_empty() {
+                tracing::warn!(
+                    tick = tick.inner(),
+                    wave = %wave_id,
+                    "ExecutionBatchCompleted produced ZERO results for wave"
+                );
+                continue;
+            }
+
+            let Some(wave) = self.waves.get_wave_mut(&wave_id) else {
+                // The wave was swept between joining the tick and the
+                // batch completing (counterpart abort, terminal). Its
+                // provisional entries are already in the appended tick
+                // output; resolve them away so the tick can evict.
+                tracing::warn!(
+                    tick = tick.inner(),
+                    wave = %wave_id,
+                    "ExecutionBatchCompleted for unknown wave — dropping (wave was pruned or never created)"
+                );
+                let height = self.committed_height;
+                self.record_tick_resolution(&wave_id, TickResolution::Aborted { height });
+                continue;
+            };
+            for result in results {
+                wave.record_receipt(result);
+            }
+            for fee in fee_receipts {
+                wave.record_fee_receipt(fee);
+            }
+            for (tx_hash, work) in attested_work {
+                wave.record_attested_work(tx_hash, work);
+            }
+            for wr in tx_outcomes {
+                let (tx_hash, outcome) = wr.into_parts();
+                wave.record_execution_result(tx_hash, outcome);
+            }
+
+            // With local receipts in hand, the wave may have crossed into
+            // `is_complete` if its local EC arrived ahead of the engine.
+            // Drive finalization from here so the deferred finalize
+            // happens on the same event that unblocked it.
+            if wave.is_complete() {
+                actions.extend(self.finalize_wave(topology_schedule, &wave_id));
+            }
         }
 
-        let Some(wave) = self.waves.get_wave_mut(wave_id) else {
-            tracing::warn!(
-                wave = %wave_id,
-                "ExecutionBatchCompleted for unknown wave — dropping (wave was pruned or never created)"
-            );
-            return Vec::new();
-        };
-        for result in results {
-            wave.record_receipt(result);
-        }
-        for fee in fee_receipts {
-            wave.record_fee_receipt(fee);
-        }
-        for (tx_hash, work) in attested_work {
-            wave.record_attested_work(tx_hash, work);
-        }
-        for wr in tx_outcomes {
-            let (tx_hash, outcome) = wr.into_parts();
-            wave.record_execution_result(tx_hash, outcome);
-        }
-
-        // With local receipts in hand, the wave may have crossed into
-        // `is_complete` if its local EC arrived ahead of the engine. Drive
-        // finalization from here so the deferred finalize happens on the
-        // same event that unblocked it.
-        if wave.is_complete() {
-            self.finalize_wave(topology_schedule, wave_id)
-        } else {
-            Vec::new()
-        }
+        // The completed tick's output is on the chain (the handler
+        // appends before notifying), so fates waiting on it can resolve
+        // and the next queued tick can go.
+        actions.extend(self.drain_ready_tick_resolutions());
+        actions.extend(self.dispatch_next_tick());
+        actions
     }
 
     /// Scan complete waves and emit `SignAndSendExecutionVote` actions.
@@ -842,7 +913,7 @@ impl ExecutionCoordinator {
         &mut self,
         batches: &[Arc<Verifiable<Provisions>>],
         committed_ts: WeightedTimestamp,
-    ) -> Vec<Action> {
+    ) -> Vec<TickExecutionGroup> {
         // Sort for deterministic iteration (logs, action vector order).
         let mut ordered: Vec<&Arc<Verifiable<Provisions>>> = batches.iter().collect();
         ordered.sort_by_key(|b| b.hash());
@@ -868,11 +939,11 @@ impl ExecutionCoordinator {
 
         // Then, for each affected wave, drain engagement coverage and
         // mark newly-ready txs provisioned. If a wave transitions from
-        // partial → fully provisioned, emit the one-shot dispatch action.
-        // Dispatch is left alone once fired, but engagement coverage keeps
-        // draining past it: the payer's leg dispatches on its own
-        // requirement long before the echoes its vote waits for arrive.
-        let mut actions: Vec<Action> = Vec::new();
+        // partial → fully provisioned, it joins this commit's tick.
+        // Membership is one-shot, but engagement coverage keeps draining
+        // past it: the payer's leg executes on its own requirement long
+        // before the echoes its vote waits for arrive.
+        let mut tick_groups: Vec<TickExecutionGroup> = Vec::new();
         for wave_id in affected_waves {
             let Some(wave) = self.waves.get_wave_mut(&wave_id) else {
                 continue;
@@ -886,12 +957,12 @@ impl ExecutionCoordinator {
 
             wave.absorb_ready_provisions(&self.provisioning, committed_ts);
 
-            if let Some(action) = wave.dispatch_if_ready(&self.provisioning) {
-                actions.push(action);
+            if let Some(group) = wave.tick_group_if_ready(&self.provisioning) {
+                tick_groups.push(group);
             }
         }
 
-        actions
+        tick_groups
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1869,6 +1940,21 @@ impl ExecutionCoordinator {
             wave.log_if_overdue(self.committed_ts);
         }
 
+        // Wave fates the block's committed certificates decide. Emitted
+        // ahead of the block-specific work, so a tick dispatched below
+        // reads the resolved chain.
+        for fw in block.certificates().iter() {
+            let fw = fw.as_unverified();
+            let aborted: BTreeSet<TxHash> = fw
+                .tx_decisions()
+                .into_iter()
+                .filter(|(_, decision)| !matches!(decision, TransactionDecision::Accept))
+                .map(|(tx_hash, _)| tx_hash)
+                .collect();
+            self.record_tick_resolution(fw.wave_id(), TickResolution::Settled { height, aborted });
+        }
+        actions.extend(self.drain_ready_tick_resolutions());
+
         match block {
             Block::Live {
                 header,
@@ -1935,6 +2021,8 @@ impl ExecutionCoordinator {
             }
         }
 
+        let mut tick_groups: Vec<TickExecutionGroup> = Vec::new();
+
         if !transactions.is_empty() {
             tracing::debug!(
                 height = height.inner(),
@@ -1942,7 +2030,7 @@ impl ExecutionCoordinator {
                 "Starting execution for new transactions"
             );
 
-            let (dispatch_actions, early_votes) = self.setup_waves_and_dispatch(
+            let (groups, early_votes) = self.setup_waves_and_dispatch(
                 topology_schedule,
                 anchored,
                 CommittingBlock {
@@ -1953,7 +2041,7 @@ impl ExecutionCoordinator {
                 },
                 transactions,
             );
-            actions.extend(dispatch_actions);
+            tick_groups.extend(groups);
             for vote in early_votes {
                 actions.extend(self.dispatch_execution_vote(topology_schedule, vote));
             }
@@ -1964,10 +2052,85 @@ impl ExecutionCoordinator {
         // Apply this block's provisions after wave setup so newly-created
         // waves can transition to provisioned from the same block's batches.
         if !provisions.is_empty() {
-            actions.extend(self.apply_committed_provisions(provisions, self.committed_ts));
+            tick_groups.extend(self.apply_committed_provisions(provisions, self.committed_ts));
         }
 
+        // Compose this commit's tick: the single-shard wave plus every
+        // wave that became fully provisioned at this commit. Sorted so
+        // the batch is identical on every replica regardless of which
+        // path produced each group.
+        if !tick_groups.is_empty() {
+            tick_groups.sort_by(|a, b| a.wave_id.cmp(&b.wave_id));
+            for group in &tick_groups {
+                self.ticked_waves.insert(group.wave_id.clone(), height);
+            }
+            self.pending_ticks.push_back(PendingTick {
+                tick: height,
+                block_hash,
+                tick_ts: self.committed_ts,
+                tick_reveal: header.reveal_chain(),
+                groups: tick_groups,
+            });
+        }
+        actions.extend(self.dispatch_next_tick());
+
         actions
+    }
+
+    /// Record a wave's fate for the tick chain.
+    ///
+    /// A wave with no tick entry — never dispatched, or committed by a
+    /// shard already past its execution window — resolves nothing. The
+    /// rest are held until their tick has appended: a block carrying a
+    /// certificate can commit while the tick that executed the wave is
+    /// still queued, and resolving against a chain that has never seen
+    /// the wave would drop the promotion.
+    fn record_tick_resolution(&mut self, wave_id: &WaveId, resolution: TickResolution) {
+        if let Some(tick) = self.ticked_waves.remove(wave_id) {
+            self.pending_tick_resolutions
+                .push((wave_id.clone(), tick, resolution));
+        }
+    }
+
+    /// Emit every buffered resolution whose tick is now on the chain.
+    fn drain_ready_tick_resolutions(&mut self) -> Vec<Action> {
+        let last = self.last_completed_tick;
+        let mut ready: Vec<(WaveId, TickResolution)> = Vec::new();
+        self.pending_tick_resolutions
+            .retain(|(wave_id, tick, resolution)| {
+                if *tick <= last {
+                    ready.push((wave_id.clone(), resolution.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+        if ready.is_empty() {
+            return Vec::new();
+        }
+        vec![Action::ResolveTickWaves { resolutions: ready }]
+    }
+
+    /// Dispatch the queued tick at the head, unless one is already in
+    /// flight. Ticks execute serially: each output is the next tick's
+    /// baseline, so the next dispatch waits for the previous
+    /// `ExecutionBatchCompleted` — by which point the handler has
+    /// appended the output to the tick chain.
+    fn dispatch_next_tick(&mut self) -> Vec<Action> {
+        if self.tick_in_flight {
+            return Vec::new();
+        }
+        let Some(tick) = self.pending_ticks.pop_front() else {
+            return Vec::new();
+        };
+        self.tick_in_flight = true;
+        vec![Action::ExecuteTransactions {
+            tick: tick.tick,
+            block_hash: tick.block_hash,
+            tick_ts: tick.tick_ts,
+            tick_reveal: tick.tick_reveal,
+            groups: tick.groups,
+        }]
     }
 
     /// Sealed path: past the cross-shard execution window. Waves will
@@ -2273,6 +2436,8 @@ impl ExecutionCoordinator {
                 let Some(wave) = self.waves.remove_wave(&wave_id) else {
                     continue;
                 };
+                let height = self.committed_height;
+                self.record_tick_resolution(&wave_id, TickResolution::Aborted { height });
                 for &tx_hash in wave.tx_hashes() {
                     self.waves.remove_assignment(tx_hash);
                     self.provisioning.remove_tx(tx_hash);
@@ -2612,12 +2777,21 @@ impl ExecutionCoordinator {
             expected_certs = expected.len(),
             "Chain terminated — dropped pending execution state"
         );
-        if expected.is_empty() {
-            return Vec::new();
+        // The terminated chain's tick outputs die with it: successors seed
+        // from settled state, and pending resolutions have nothing left to
+        // resolve against. A tick still in flight lands on a cleared
+        // chain, so its completion must be able to release the queue.
+        self.pending_tick_resolutions.clear();
+        self.pending_ticks.clear();
+        self.ticked_waves.clear();
+        self.tick_in_flight = false;
+        let mut actions = vec![Action::ClearTickChain];
+        if !expected.is_empty() {
+            actions.push(Action::AbandonFetch(FetchAbandon::ExecutionCerts {
+                ids: expected,
+            }));
         }
-        vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-            ids: expected,
-        })]
+        actions
     }
 
     /// Prune stale wave state (waves, vote trackers, early votes).
@@ -2777,7 +2951,8 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Epoch,
         ExecutionOutcome, GlobalReceiptHash, Hash, NetworkDefinition, QuorumCertificate,
-        RecoveryCause, ShardRecovery, Signer, SignerBitfield, ValidatorInfo, ValidatorSet,
+        RecoveryCause, ShardRecovery, Signer, SignerBitfield, StoredReceipt, ValidatorInfo,
+        ValidatorSet,
     };
 
     use super::*;
@@ -2978,11 +3153,14 @@ mod tests {
             .expect("the committed tx is assigned to a wave");
         state.on_execution_batch_completed(
             &unresolvable,
-            &wave_id,
-            vec![],
-            vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
-            vec![],
-            vec![],
+            BlockHeight::new(1),
+            vec![WaveExecutionResult {
+                wave_id,
+                results: vec![],
+                tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
+                fee_receipts: vec![],
+                attested_work: vec![],
+            }],
         );
 
         let blocked = state.emit_vote_actions(&unresolvable);

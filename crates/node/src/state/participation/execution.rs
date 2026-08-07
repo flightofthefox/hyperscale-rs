@@ -21,22 +21,14 @@ impl ShardParticipation {
         event: ProtocolEvent,
     ) -> Vec<Action> {
         match event {
-            ProtocolEvent::ExecutionBatchCompleted {
-                wave_id,
-                results,
-                tx_outcomes,
-                fee_receipts,
-                attested_work,
-            } => {
+            ProtocolEvent::ExecutionBatchCompleted { tick, waves } => {
                 // Results arriving can (a) finalize a wave whose local EC
-                // landed ahead of the engine, (b) unblock new vote emission.
+                // landed ahead of the engine, (b) unblock new vote emission,
+                // (c) release the next queued tick.
                 let mut actions = self.execution_coordinator.on_execution_batch_completed(
                     topology_schedule,
-                    &wave_id,
-                    results,
-                    tx_outcomes,
-                    fee_receipts,
-                    attested_work,
+                    tick,
+                    waves,
                 );
                 actions.extend(
                     self.execution_coordinator

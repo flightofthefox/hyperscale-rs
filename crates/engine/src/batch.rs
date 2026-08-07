@@ -56,3 +56,28 @@ pub struct CrossShardTxInput<'a> {
     /// identical on every participant.
     pub randomness: RevealChain,
 }
+
+/// One member of a tick's batch.
+///
+/// A single-shard transaction or a cross-shard leg, each carrying the
+/// environment its committing block fixed. The whole tick executes as
+/// one batch, so the executor's canonical order and conflict groups
+/// sequence members across waves.
+pub struct TickTxInput<'a> {
+    /// The transaction to execute.
+    pub transaction: &'a Arc<Verified<Transaction>>,
+    /// Verified provision entry lists, one per source shard contribution.
+    /// Empty for a single-shard member.
+    pub provisions: &'a [Arc<Vec<SubstateEntry>>],
+    /// The transaction clock, identical on every participant: the
+    /// wave-start anchor for a single-shard member, the payer-shard
+    /// committing block's parent-QC weighted timestamp for a cross-shard
+    /// leg.
+    pub clock: WeightedTimestamp,
+    /// The randomness anchor, resolved the same way as `clock`.
+    pub randomness: RevealChain,
+    /// Whether a wave verdict can still discard this member's effects
+    /// after execution — true for a cross-shard leg. Decides both the
+    /// reserve fee receipt and the batch's write locality.
+    pub wave_abortable: bool,
+}

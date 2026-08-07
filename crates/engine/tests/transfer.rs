@@ -14,11 +14,12 @@ use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, Parallelism, PreviewGrants, PreviewInputs, PreviewOutcome,
     PreviewReport, ResourceChange, WaveBatchContext, XRD, genesis_writes,
 };
-use hyperscale_storage::SubstateDatabase;
+use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput};
 use hyperscale_types::{
-    BlockHash, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash, NetworkId, RevealChain,
-    ShardId, ShardTrie, StateWrites, SubstateKey, Transaction, TransactionBody,
-    TransactionEnvelope, Verified, WeightedTimestamp, absorb_committed_cells,
+    BlockHash, BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
+    MerkleInclusionProof, NetworkId, RevealChain, ShardId, ShardTrie, StateRoot, StateWrites,
+    SubstateKey, Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
+    absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
     AbiParam, Address, Constraint, EdgeRef, EnvelopeTree, Expr, GraphArg, GraphNode, IntentDecl,
@@ -84,6 +85,35 @@ impl MapDb {
 impl SubstateDatabase for MapDb {
     fn substate(&self, key: SubstateKey) -> Option<Vec<u8>> {
         self.0.get(&key).cloned()
+    }
+}
+
+/// The store surface a [`TickChain`] needs. Only `snapshot` carries
+/// meaning here — the map is the whole world, at one version.
+impl SubstateStore for MapDb {
+    type Snapshot<'a> = Self;
+    fn snapshot(&self) -> Self::Snapshot<'_> {
+        Self(self.0.clone())
+    }
+    fn jmt_height(&self) -> BlockHeight {
+        BlockHeight::GENESIS
+    }
+    fn state_root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+    fn get_substate_at_height(
+        &self,
+        _key: SubstateKey,
+        _block_height: BlockHeight,
+    ) -> Option<Option<Vec<u8>>> {
+        None
+    }
+    fn generate_merkle_proofs(
+        &self,
+        _keys: &[SubstateKey],
+        _block_height: BlockHeight,
+    ) -> Option<MerkleInclusionProof> {
+        None
     }
 }
 
@@ -334,11 +364,14 @@ fn a_stamp_writes_the_draw_its_anchor_fixes() {
 /// batches read the same starting balance, both write the same absolute,
 /// and whichever settles last silently discards the other's credit.
 ///
-/// The second half characterises a live defect rather than blessing it —
-/// a payment included while an earlier one is committed but not yet
-/// settled reads exactly that shared baseline.
+/// Both halves assert threading. The first threads by hand, applying each
+/// receipt before the next batch reads; the second threads the way the
+/// shard does, through the tick chain, where the payments land in
+/// consecutive blocks and the earlier one is committed but not yet
+/// settled when the later one executes — the case that used to read a
+/// shared baseline.
 #[test]
-fn a_batch_baseline_decides_whether_two_payments_both_land() {
+fn consecutive_payments_thread_through_the_tick_chain() {
     let payer_a = fee_payer(31);
     let payer_b = fee_payer(32);
     let hot = bob();
@@ -351,7 +384,7 @@ fn a_batch_baseline_decides_whether_two_payments_both_land() {
         ))
     };
 
-    // Threaded: each batch reads what the previous one committed.
+    // Threaded by hand: each batch reads what the previous one committed.
     let mut store = MapDb::genesis(&accounts);
     let mut threaded = Vec::new();
     for (seed, from) in [(31u8, payer_a), (32, payer_b)] {
@@ -372,30 +405,33 @@ fn a_batch_baseline_decides_whether_two_payments_both_land() {
         "each payment must land on top of the last"
     );
 
-    // Unthreaded: both batches read the genesis baseline, as two blocks
-    // committed inside one unsettled window would.
-    let genesis = MapDb::genesis(&accounts);
-    let shared: Vec<Option<Vec<u8>>> = [(31u8, payer_a), (32, payer_b)]
-        .into_iter()
-        .map(|(seed, from)| {
-            let executed = execute_batch_on(&genesis, &executor, &[pay(seed, from)]);
-            vault_cell(
-                executed[0]
-                    .consensus
-                    .writes()
-                    .expect("a completed payment commits updates"),
-                hot,
-            )
-        })
-        .collect();
+    // Threaded by the tick chain: two blocks inside one unsettled window.
+    // Nothing settles between them, so the base never moves; tick 2's
+    // baseline is tick 1's output over it.
+    let chain = TickChain::new(Arc::new(MapDb::genesis(&accounts)));
+    let mut chained = Vec::new();
+    for (height, (seed, from)) in [(31u8, payer_a), (32, payer_b)].into_iter().enumerate() {
+        let tick = BlockHeight::new(height as u64 + 1);
+        let baseline = chain.view_at(BlockHeight::new(height as u64));
+        let executed = execute_batch_on(&baseline.snapshot(), &executor, &[pay(seed, from)]);
+        let updates = executed[0]
+            .consensus
+            .writes()
+            .expect("a completed payment commits updates");
+        chained.push(vault_cell(updates, hot));
+        chain.append(
+            tick,
+            TickOutput {
+                determined: updates.clone(),
+                determined_wave: None,
+                provisional: BTreeMap::new(),
+            },
+        );
+    }
     assert_eq!(
-        shared,
-        vec![
-            Some(encode_amount(110).to_vec()),
-            Some(encode_amount(110).to_vec())
-        ],
-        "two batches on one baseline each write the same absolute — applying \
-         both leaves one credit, not two"
+        chained, threaded,
+        "a payment committed while an earlier one is unsettled must still \
+         read the earlier one's credit"
     );
 }
 
@@ -410,7 +446,7 @@ fn execute_on(
 /// Execute one batch against an explicit store, so a caller can thread
 /// committed state between batches the way the commit path does.
 fn execute_batch_on(
-    snapshot_store: &MapDb,
+    snapshot_store: &(dyn SubstateDatabase + Sync),
     executor: &Executor,
     transactions: &[Arc<Verified<Transaction>>],
 ) -> Vec<ExecutedTx> {
