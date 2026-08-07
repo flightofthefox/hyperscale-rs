@@ -30,9 +30,15 @@ impl ShardChainWriter for SimShardStorage {
         // hint is irrelevant to its perf and is ignored.
         _base_reads: Option<&BaseReadCache>,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
+        // Everything the waves carried, for storage; only what they
+        // decided reaches state.
         let receipts: Vec<StoredReceipt> = finalized_waves
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
+            .collect();
+        let settling: Vec<StoredReceipt> = finalized_waves
+            .iter()
+            .flat_map(|fw| fw.settling_receipts())
             .collect();
 
         // No receipts → no state changes → state root is unchanged.
@@ -73,7 +79,7 @@ impl ShardChainWriter for SimShardStorage {
 
         // Collect per-receipt writes references — no merge needed. State
         // locking guarantees no key conflicts between receipts.
-        let per_receipt_writes: Vec<&StateWrites> = receipts
+        let per_receipt_writes: Vec<&StateWrites> = settling
             .iter()
             .filter_map(|r| r.consensus.writes())
             .collect();
@@ -106,7 +112,7 @@ impl ShardChainWriter for SimShardStorage {
         drop(s); // Release read lock
 
         // Merge for commit-time substate writes (off the state_root critical path).
-        let merged_writes = merge_writes_from_receipts(&receipts);
+        let merged_writes = merge_writes_from_receipts(&settling);
 
         let prepared = build_prepared_commit(
             Arc::clone(self),
@@ -130,7 +136,13 @@ impl ShardChainWriter for SimShardStorage {
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
-        let merged_writes = merge_writes_from_receipts(&receipts);
+        let merged_writes = merge_writes_from_receipts(
+            &block
+                .certificates()
+                .iter()
+                .flat_map(|fw| fw.settling_receipts())
+                .collect::<Vec<_>>(),
+        );
         self.append_beacon_witnesses(witness);
         self.commit_block_inner(&merged_writes, block, qc, &receipts)
     }

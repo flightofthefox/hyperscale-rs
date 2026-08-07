@@ -599,11 +599,13 @@ impl ObserverTail {
             return TailOutcome::Rejected("elided or mispaired block body");
         };
         let header = certified.block().header();
+        // Only what the waves decided reaches the followed store, the
+        // same projection the chain writers apply.
         let receipts: Vec<StoredReceipt> = certified
             .block()
             .certificates()
             .iter()
-            .flat_map(|fw| fw.receipts().iter().cloned())
+            .flat_map(|fw| fw.settling_receipts())
             .collect();
         let expected_root = header.split_child_roots().map(|pair| {
             if self.child.path() & 1 == 0 {

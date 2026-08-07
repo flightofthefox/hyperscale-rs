@@ -320,6 +320,51 @@ impl FinalizedWave {
         Ok(())
     }
 
+    /// The receipts that reach state.
+    ///
+    /// A transaction settles its effects only if the wave decided to
+    /// accept it — every participant together, not the shard whose EC
+    /// carried the receipt. A leg that completed here while its
+    /// counterpart refused it moved nothing, and a shard applying its own
+    /// half regardless would move value one-sidedly.
+    ///
+    /// A charge is not an effect. The fee receipt an outcome names
+    /// settles whatever the verdict, which is what makes a refused
+    /// attempt cost its payer something.
+    ///
+    /// The attested roots are deliberately not filtered this way:
+    /// `local_receipt_root` covers everything the wave carried, because
+    /// it attests what execution produced. This attests what the wave
+    /// decided, which is a different question.
+    #[must_use]
+    pub fn settling_receipts(&self) -> Vec<StoredReceipt> {
+        // Read off the certificates rather than through `tx_decisions`,
+        // whose canonical order needs the local EC: a receipt names its
+        // own transaction, so nothing here has to enumerate the wave, and
+        // a malformed certificate settles nothing instead of panicking on
+        // the commit path.
+        let mut refused: HashSet<TxHash> = HashSet::new();
+        let mut charges: HashSet<GlobalReceiptHash> = HashSet::new();
+        for ec in self.certificate.execution_certificates() {
+            for outcome in ec.tx_outcomes() {
+                if !matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }) {
+                    refused.insert(outcome.tx_hash());
+                }
+                if let Some(charge) = outcome.fee_receipt() {
+                    charges.insert(charge);
+                }
+            }
+        }
+        self.receipts
+            .iter()
+            .filter(|receipt| {
+                !refused.contains(&receipt.tx_hash)
+                    || charges.contains(&receipt.consensus.receipt_hash())
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Aggregate per-tx decisions across all ECs (Aborted > Reject > Accept).
     ///
     /// Iteration order follows the local EC's canonical (block) order.

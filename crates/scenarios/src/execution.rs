@@ -404,7 +404,9 @@ pub fn cross_shard_transfer(c: &mut impl Cluster) {
 ///
 /// One of them has to be refused. Which one is not the claim: the
 /// baseline the second is judged against is, and a vault that funded both
-/// is the only way both could pass.
+/// is the only way both could pass. Conservation is the second half —
+/// the refused withdrawal must not credit its recipient either, which is
+/// the counterpart's side of the same verdict.
 ///
 /// The recipients are distinct so the two deposits land on different
 /// cells — what this measures is the payer's reservation, not the
@@ -413,11 +415,15 @@ pub fn cross_shard_transfer(c: &mut impl Cluster) {
 /// # Panics
 ///
 /// Panics if the payer's shard never commits the first withdrawal, if
-/// either withdrawal misses its budget, or if the vault covers both.
+/// either withdrawal misses its budget, if the vault covers both, or if
+/// the recipients bank more than the payer gave up.
 pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
     let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
     let (payer, from, first_to, second_to) = overdraw_cast();
     let payer_before = vault_balance(c, payer_shard, from);
+    let banked_before =
+        vault_balance(c, recipient_shard, first_to) + vault_balance(c, recipient_shard, second_to);
     assert!(
         payer_before < 2 * OVERDRAW_AMOUNT,
         "the pair has to be jointly uncoverable to measure anything: \
@@ -467,6 +473,18 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
     assert_eq!(
         accepted, 1,
         "only one withdrawal is covered, so only one may pass; verdicts = {verdicts:?}"
+    );
+
+    // Both settlements have to persist before either vault is read.
+    c.run_until(epochs(4), |_| false);
+    let paid = payer_before.saturating_sub(vault_balance(c, payer_shard, from));
+    let banked = (vault_balance(c, recipient_shard, first_to)
+        + vault_balance(c, recipient_shard, second_to))
+    .saturating_sub(banked_before);
+    assert!(
+        paid >= banked,
+        "the payer gave up {paid} out of {payer_before} and the recipients \
+         banked {banked}: a refused withdrawal still credited its recipient"
     );
 }
 

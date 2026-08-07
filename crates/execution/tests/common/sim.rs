@@ -221,7 +221,8 @@ impl ExecutionSim {
         // in commit order and last-writer-wins per cell — the same
         // projection `merge_writes_from_receipts` performs into the JMT.
         for fw in &certificates {
-            self.base.apply(&merge_writes_from_receipts(fw.receipts()));
+            self.base
+                .apply(&merge_writes_from_receipts(&fw.settling_receipts()));
         }
         let block = make_live_block(
             self.local_shard,
@@ -472,5 +473,46 @@ pub fn settle(wave_id: &WaveId, receipts: &[StoredReceipt]) -> FinalizedWave {
         SignerBitfield::new(4),
     );
     let certificate = WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)]);
+    FinalizedWave::new(Arc::new(certificate), receipts.to_vec())
+}
+
+/// A committed `FinalizedWave` whose counterpart refused every member.
+///
+/// The local shard completed its half and carries the receipts to prove
+/// it; the counterpart's certificate reports failure for the same
+/// transactions, so the wave as a whole decided against them. Two
+/// certificates for one wave is the ordinary cross-shard shape — what the
+/// combine exists to reconcile.
+#[must_use]
+pub fn settle_refused_by_counterpart(
+    wave_id: &WaveId,
+    counterpart: ShardId,
+    receipts: &[StoredReceipt],
+) -> FinalizedWave {
+    let local = settle(wave_id, receipts);
+    let refused: Vec<TxOutcome> = receipts
+        .iter()
+        .map(|receipt| TxOutcome::new(receipt.tx_hash, ExecutionOutcome::Failed))
+        .collect();
+    let remote_id = WaveId::new(
+        counterpart,
+        wave_id.block_height(),
+        std::iter::once(wave_id.shard_id()).collect(),
+    );
+    let remote = ExecutionCertificate::new(
+        remote_id,
+        WeightedTimestamp::from_millis(wave_id.block_height().inner() * BLOCK_INTERVAL_MS),
+        compute_global_receipt_root(&refused),
+        refused,
+        AggregateSignature::new([0u8; 96]),
+        SignerBitfield::new(4),
+    );
+    let certificate = WaveCertificate::new(
+        wave_id.clone(),
+        vec![
+            Arc::new(local.execution_certificates()[0].as_unverified().clone()),
+            Arc::new(remote),
+        ],
+    );
     FinalizedWave::new(Arc::new(certificate), receipts.to_vec())
 }

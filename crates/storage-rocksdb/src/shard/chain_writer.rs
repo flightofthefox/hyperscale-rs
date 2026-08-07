@@ -32,9 +32,15 @@ impl ShardChainWriter for RocksDbShardStorage {
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
+        // Everything the waves carried, for storage; only what they
+        // decided reaches state.
         let receipts: Vec<&StoredReceipt> = finalized_waves
             .iter()
             .flat_map(|fw| fw.receipts().iter())
+            .collect();
+        let settling: Vec<StoredReceipt> = finalized_waves
+            .iter()
+            .flat_map(|fw| fw.settling_receipts())
             .collect();
 
         // No receipts → no state changes → state root is unchanged.
@@ -72,7 +78,7 @@ impl ShardChainWriter for RocksDbShardStorage {
         // Collect per-receipt writes references — no merge needed.
         // State locking guarantees no key conflicts between receipts, so
         // put_at_version can flatten them directly into JMT work items.
-        let per_receipt_writes: Vec<&StateWrites> = receipts
+        let per_receipt_writes: Vec<&StateWrites> = settling
             .iter()
             .filter_map(|r| r.consensus.writes())
             .collect();
@@ -138,7 +144,12 @@ impl ShardChainWriter for RocksDbShardStorage {
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
-        let merged_writes = merge_writes_from_receipts(&receipts);
+        let settling: Vec<StoredReceipt> = block
+            .certificates()
+            .iter()
+            .flat_map(|fw| fw.settling_receipts())
+            .collect();
+        let merged_writes = merge_writes_from_receipts(&settling);
         let _commit_guard = self.commit_lock.lock().unwrap();
         self.commit_block_inner_locked(&merged_writes, block, qc, &receipts, witness)
     }
@@ -241,7 +252,12 @@ fn build_prepared_commit(
                 .iter()
                 .flat_map(|fw| fw.receipts().iter().cloned())
                 .collect();
-            let merged_writes = merge_writes_from_receipts(&receipts);
+            let settling: Vec<StoredReceipt> = block
+                .certificates()
+                .iter()
+                .flat_map(|fw| fw.settling_receipts())
+                .collect();
+            let merged_writes = merge_writes_from_receipts(&settling);
             storage.commit_block_inner_locked(&merged_writes, block, qc, &receipts, witness)
         },
     )
