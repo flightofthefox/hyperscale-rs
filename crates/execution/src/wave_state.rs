@@ -782,6 +782,12 @@ impl WaveState {
                 // whose effects were discarded, or a failure that produced
                 // none.
                 let work = self.attested_work.get(tx_hash).copied().unwrap_or(0);
+                // What the transaction reserved when its block committed
+                // it, carried so the settling block can release exactly
+                // that. Derived from the transaction, which this wave
+                // still holds; a member swept before it voted reserved
+                // nothing this wave can return.
+                let reserved = self.transactions.get(tx_hash).map_or(0, |tx| tx.work());
                 match (&outcome, self.fee_receipts.get(tx_hash)) {
                     (ExecutionOutcome::Aborted | ExecutionOutcome::Failed, Some(fee)) => {
                         TxOutcome::with_fee(
@@ -793,6 +799,7 @@ impl WaveState {
                     }
                     _ => TxOutcome::attesting(*tx_hash, outcome.clone(), work),
                 }
+                .reserving(reserved)
             })
             .collect();
 

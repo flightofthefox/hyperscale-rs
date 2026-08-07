@@ -40,7 +40,24 @@ pub struct TxOutcome {
     /// verdict, where a receipt covers only the outcomes that produced
     /// one, so an attempt that failed or aborted still reports the
     /// declaration work it really did.
-    work: u64,
+    attested_work: u64,
+    /// What carrying this transaction cost a block, in work units — the
+    /// quantity admission reserved against the drain budget.
+    ///
+    /// The mirror image of [`TxOutcome::attested_work`]. That is this
+    /// shard's own share of what the transaction *cost*, which
+    /// participants are meant to differ on; this is what it *reserved*,
+    /// derived from the whole declaration and therefore identical on
+    /// every participant.
+    ///
+    /// Attested rather than re-derived because release has to work
+    /// without the transaction. A block settling a wave releases the
+    /// reservation its committing block took, and a validator holding
+    /// the certificate but not the transactions — a node that snap-synced
+    /// past them — still has to reach the same total. Reserving one
+    /// number and releasing another leaves the running total drifting
+    /// upward and never returning to zero.
+    declared_work: u64,
 }
 
 impl TxOutcome {
@@ -54,11 +71,19 @@ impl TxOutcome {
     #[must_use]
     pub const fn attesting(tx_hash: TxHash, outcome: ExecutionOutcome, work: u64) -> Self {
         Self {
-            work,
+            attested_work: work,
+            declared_work: 0,
             tx_hash,
             outcome,
             fee_receipt: None,
         }
+    }
+
+    /// Bind what this transaction reserved against the drain budget.
+    #[must_use]
+    pub const fn reserving(mut self, declared_work: u64) -> Self {
+        self.declared_work = declared_work;
+        self
     }
 
     /// Create a `TxOutcome` that settles the payer's charge through the
@@ -78,7 +103,8 @@ impl TxOutcome {
         work: u64,
     ) -> Self {
         Self {
-            work,
+            attested_work: work,
+            declared_work: 0,
             tx_hash,
             outcome,
             fee_receipt: Some(fee_receipt),
@@ -87,8 +113,14 @@ impl TxOutcome {
 
     /// What this shard attests it did for the transaction.
     #[must_use]
-    pub const fn work(&self) -> u64 {
-        self.work
+    pub const fn attested_work(&self) -> u64 {
+        self.attested_work
+    }
+
+    /// What carrying this transaction reserved against the drain budget.
+    #[must_use]
+    pub const fn declared_work(&self) -> u64 {
+        self.declared_work
     }
 
     /// The fee receipt this outcome settles, if any.

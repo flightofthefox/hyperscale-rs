@@ -28,7 +28,13 @@ pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
         ExecutionOutcome::Failed => Hash::from_parts(&[outcome.tx_hash().as_bytes(), b"FAILED:"]),
         ExecutionOutcome::Aborted => Hash::from_parts(&[outcome.tx_hash().as_bytes(), b"ABORTED:"]),
     };
-    let with_work = Hash::from_parts(&[base.as_bytes(), b"WORK:", &outcome.work().to_le_bytes()]);
+    let with_work = Hash::from_parts(&[
+        base.as_bytes(),
+        b"WORK:",
+        &outcome.attested_work().to_le_bytes(),
+        b"RESERVED:",
+        &outcome.declared_work().to_le_bytes(),
+    ]);
     outcome.fee_receipt().map_or(with_work, |fee_receipt| {
         Hash::from_parts(&[with_work.as_bytes(), b"FEE:", fee_receipt.as_bytes()])
     })
@@ -61,6 +67,56 @@ pub fn compute_global_receipt_root_with_proof(
     let leaf_hash = leaves[tx_index];
     let (root, siblings, leaf_index) = compute_merkle_root_with_proof(&leaves, tx_index);
     (root, siblings, leaf_index, leaf_hash)
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::{compute_global_receipt_root, tx_outcome_leaf};
+    use crate::{ExecutionOutcome, GlobalReceiptHash, Hash, TxHash, TxOutcome};
+
+    fn outcome(reserved: u64) -> TxOutcome {
+        TxOutcome::attesting(
+            TxHash::from(Hash::from_bytes(b"tx")),
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+            7,
+        )
+        .reserving(reserved)
+    }
+
+    /// What a transaction reserved is signed content like what it cost.
+    /// An aggregator that could restate it could hand a block a release
+    /// larger than the reservation it settles, and the running drain
+    /// total would fall below what is actually in flight.
+    #[test]
+    fn the_reservation_is_covered_by_the_outcome_leaf() {
+        assert_ne!(
+            tx_outcome_leaf(&outcome(100)),
+            tx_outcome_leaf(&outcome(101))
+        );
+        assert_ne!(
+            compute_global_receipt_root(&[outcome(100)]),
+            compute_global_receipt_root(&[outcome(101)])
+        );
+    }
+
+    /// The two work quantities are separate axes: one shard's share of
+    /// what a transaction cost, and what every shard agrees it reserved.
+    /// Folding them into one leaf position would let a difference in
+    /// either hide a difference in the other.
+    #[test]
+    fn cost_and_reservation_move_the_leaf_independently() {
+        let costed = TxOutcome::attesting(
+            TxHash::from(Hash::from_bytes(b"tx")),
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+            8,
+        )
+        .reserving(100);
+        assert_ne!(tx_outcome_leaf(&costed), tx_outcome_leaf(&outcome(100)));
+    }
 }
 
 #[cfg(test)]

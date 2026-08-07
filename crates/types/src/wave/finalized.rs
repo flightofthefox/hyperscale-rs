@@ -165,7 +165,28 @@ impl FinalizedWave {
         self.local_ec()
             .tx_outcomes()
             .iter()
-            .fold(0u64, |sum, outcome| sum.saturating_add(outcome.work()))
+            .fold(0u64, |sum, outcome| {
+                sum.saturating_add(outcome.attested_work())
+            })
+    }
+
+    /// Work this wave releases back to the drain budget.
+    ///
+    /// The reservations its transactions took when their block committed
+    /// them, returned now that they are settled. Read off the same
+    /// outcomes as [`Self::attested_work`] and for the same reason: it
+    /// has to cover every verdict, because an aborted transaction leaves
+    /// the drain exactly as a completed one does.
+    ///
+    /// Saturating, so a forged wave cannot wrap a block's running total.
+    #[must_use]
+    pub fn declared_work(&self) -> u64 {
+        self.local_ec()
+            .tx_outcomes()
+            .iter()
+            .fold(0u64, |sum, outcome| {
+                sum.saturating_add(outcome.declared_work())
+            })
     }
 
     /// Iterator over the wave's tx hashes in canonical block order.
