@@ -193,15 +193,22 @@ where
             .absorb(output);
     }
 
-    /// Resolve a wave's fate. The wave's origin tick is its own
-    /// `block_height`; a settled verdict promotes each member's surviving
-    /// side into the readable fold, an abort drops the wave's entries.
+    /// Resolve a wave's fate: a settled verdict promotes each member's
+    /// surviving side into the readable fold, an abort drops the wave's
+    /// entries.
     ///
-    /// Idempotent and tolerant of unknown waves: the origin tick may
-    /// already be evicted (every wave resolved and persisted) or torn
-    /// down at a reshape boundary.
+    /// Every retained tick is searched rather than the one at the wave's
+    /// own height. A wave joins whichever tick it became executable at —
+    /// later than its origin block when its provisions arrived late — and
+    /// contributes to more than one when a member waits on a cell another
+    /// wave holds provisionally. Resolving the wrong entry would leave the
+    /// promotion unapplied and the tick unevictable.
+    ///
+    /// Idempotent and tolerant of unknown waves: every entry may already
+    /// be evicted (every wave resolved and persisted) or torn down at a
+    /// reshape boundary.
     pub fn resolve(&self, wave_id: &WaveId, resolution: &TickResolution) {
-        if let Some(entry) = write_or_recover(&self.entries).get_mut(&wave_id.block_height()) {
+        for entry in write_or_recover(&self.entries).values_mut() {
             entry.resolve(wave_id, resolution);
         }
     }
@@ -501,6 +508,48 @@ mod tests {
             view.snapshot().substate(key(1)),
             Some(b"provisional".to_vec())
         );
+    }
+
+    /// A wave joins whichever tick it became executable at, which is not
+    /// its origin block when provisions arrived late, and it contributes
+    /// to two when a member waited on a provisional cell. Resolution has
+    /// to reach every entry holding it, or the promotion is dropped and
+    /// the tick never evicts.
+    #[test]
+    fn resolution_reaches_every_tick_the_wave_contributed_to() {
+        let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
+        let w = wave(1, &[2]);
+        for (height, cell, member) in [(4u64, key(1), 7u8), (6, key(2), 8)] {
+            chain.append(
+                BlockHeight::new(height),
+                TickOutput {
+                    determined: StateWrites::default(),
+                    determined_wave: None,
+                    provisional: BTreeMap::from([(
+                        w.clone(),
+                        vec![ProvisionalTx {
+                            tx_hash: tx(member),
+                            writes: Some(writes(&[(cell, Some(b"promoted"))])),
+                            reserve: None,
+                        }],
+                    )]),
+                },
+            );
+        }
+
+        chain.resolve(
+            &w,
+            &TickResolution::Settled {
+                height: BlockHeight::new(7),
+                aborted: BTreeSet::new(),
+            },
+        );
+
+        let view = chain.view_at(BlockHeight::new(6));
+        assert_eq!(view.snapshot().substate(key(1)), Some(b"promoted".to_vec()));
+        assert_eq!(view.snapshot().substate(key(2)), Some(b"promoted".to_vec()));
+        chain.prune_persisted(BlockHeight::new(7));
+        assert!(chain.is_empty(), "both entries must become evictable");
     }
 
     #[test]

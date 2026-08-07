@@ -30,12 +30,13 @@ use std::time::Duration;
 
 use hyperscale_core::{CrossShardExecutionRequest, TickExecutionGroup};
 use hyperscale_types::{
-    BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
+    BlockHash, BlockHeight, DeclaredKey, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
     GlobalReceiptRoot, RevealChain, ShardId, StoredReceipt, Transaction, TransactionDecision,
     TxHash, TxOutcome, Verifiable, Verified, WAVE_TIMEOUT, WaveCertificate, WaveId,
     WeightedTimestamp, compute_global_receipt_root,
 };
 
+use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
 
 /// Age at which a still-alive wave emits a single diagnostic warning.
@@ -107,9 +108,10 @@ pub struct WaveState {
     /// What this shard attests it did per transaction, carried from
     /// execution onto the outcomes it votes.
     attested_work: HashMap<TxHash, u64>,
-    /// Whether execution has been dispatched (single `ExecuteTransactions` /
-    /// `ExecuteCrossShardTransactions` emitted). Set true once execution fires.
-    dispatched: bool,
+    /// Members that have joined a tick. A wave usually joins one whole,
+    /// but a member whose declared cells another wave holds provisionally
+    /// waits for a later tick, so membership is tracked per transaction.
+    dispatched: HashSet<TxHash>,
 
     // ── Local execution outputs ─────────────────────────────────────────
     /// Execution results from the engine (per-tx). Non-abort outcomes only.
@@ -235,7 +237,7 @@ impl WaveState {
             engagement_deadline: None,
             fee_receipts: HashMap::new(),
             attested_work: HashMap::new(),
-            dispatched: false,
+            dispatched: HashSet::new(),
             execution_results: HashMap::new(),
             execution_receipts: HashMap::new(),
             explicit_aborts: HashSet::new(),
@@ -287,10 +289,27 @@ impl WaveState {
         self.all_provisioned_at.is_some()
     }
 
-    /// Whether execution has been dispatched for this wave.
+    /// Whether every member has joined a tick.
     #[must_use]
-    pub const fn dispatched(&self) -> bool {
-        self.dispatched
+    pub fn fully_dispatched(&self) -> bool {
+        self.tx_hashes
+            .iter()
+            .all(|tx_hash| self.dispatched.contains(tx_hash))
+    }
+
+    /// The cells this wave's members declare they will mutate.
+    ///
+    /// What a later tick may not read while the wave is unresolved: its
+    /// legs' writes are provisional, so a reader would see the value as
+    /// it stood before them. Declared rather than actual, so the claim
+    /// stands from the moment the wave joins a tick rather than from when
+    /// its batch comes back.
+    #[must_use]
+    pub fn declared_mutations(&self) -> Vec<DeclaredKey> {
+        self.transactions
+            .values()
+            .flat_map(|tx| tx.admission_write_keys())
+            .collect()
     }
 
     // ── Engagement coverage ─────────────────────────────────────────────
@@ -343,35 +362,51 @@ impl WaveState {
     }
 
     /// Build this wave's [`TickExecutionGroup`] for the tick being
-    /// composed and flip `dispatched` if one is produced.
+    /// composed and record which members joined it.
     ///
     /// Returns `None` (without mutating) when the wave isn't fully
-    /// provisioned, has already joined a tick, every tx is pre-aborted,
-    /// or a cross-shard tx is missing its provisions. Pairing the build
-    /// with the flag flip closes the invariant that a wave joins exactly
-    /// one tick.
+    /// provisioned, when every member has already joined a tick or is
+    /// pre-aborted, when a cross-shard tx is missing its provisions, or
+    /// when every remaining member is waiting on a cell `blocked` holds
+    /// provisionally. Pairing the build with the bookkeeping is what
+    /// keeps a member out of two ticks.
+    ///
+    /// Provisions still gate at wave granularity; only the cell wait is
+    /// per member, because that is the granularity the hazard has — one
+    /// transaction's declared cell, not its wave's.
     pub fn tick_group_if_ready(
         &mut self,
         provisioning: &ProvisioningTracker,
+        blocked: &ProvisionalCells,
     ) -> Option<TickExecutionGroup> {
-        if !self.is_fully_provisioned() || self.dispatched {
+        if !self.is_fully_provisioned() {
             return None;
         }
-        let group = self.build_tick_group(provisioning)?;
-        self.dispatched = true;
+        let group = self.build_tick_group(provisioning, blocked)?;
+        for request in &group.requests {
+            self.dispatched.insert(request.tx_hash);
+        }
         Some(group)
     }
 
     /// Pre-aborted txs are excluded — they produce no state change, so there's
-    /// no reason to execute them.
-    fn build_tick_group(&self, provisioning: &ProvisioningTracker) -> Option<TickExecutionGroup> {
+    /// no reason to execute them. So are members already in a tick, and
+    /// members whose declared cells are provisionally held.
+    fn build_tick_group(
+        &self,
+        provisioning: &ProvisioningTracker,
+        blocked: &ProvisionalCells,
+    ) -> Option<TickExecutionGroup> {
         let mut requests: Vec<CrossShardExecutionRequest> =
             Vec::with_capacity(self.tx_hashes.len());
         for &tx_hash in &self.tx_hashes {
-            if self.is_tx_explicitly_aborted(tx_hash) {
+            if self.is_tx_explicitly_aborted(tx_hash) || self.dispatched.contains(&tx_hash) {
                 continue;
             }
             let tx = self.transactions.get(&tx_hash)?;
+            if !blocked.is_empty() && blocked.blocks(&tx.admission_keys()) {
+                continue;
+            }
             if self.wave_id.is_zero() {
                 // Single-shard member: no provisions, the committing
                 // block's own anchors.
@@ -540,12 +575,57 @@ impl WaveState {
     /// the timeout branch, which then marked every tx Aborted (including the
     /// ones that executed successfully).
     pub fn record_abort(&mut self, tx_hash: TxHash, committed_at: WeightedTimestamp) -> bool {
-        if self.dispatched || !self.tx_hash_set.contains(&tx_hash) {
+        if self.dispatched.contains(&tx_hash) || !self.tx_hash_set.contains(&tx_hash) {
             return false;
         }
         self.explicit_aborts.insert(tx_hash);
         self.mark_tx_provisioned(tx_hash, committed_at);
         self.has_outcome_for_every_tx()
+    }
+
+    /// Abort members that have waited past the wave's deadline for a cell
+    /// another wave holds provisionally.
+    ///
+    /// A member kept out of ticks has no outcome, and a fully provisioned
+    /// wave has no deadline of its own, so a wait can otherwise outlive
+    /// whatever it waits for. It can even outlive itself: two shards can
+    /// each hold the cell the other's counterpart needs, and neither sees
+    /// the whole ring. The bound is the one an unprovisioned wave already
+    /// has — the deadline is a backstop, not a schedule, and a wait that
+    /// reaches it was never going to clear.
+    ///
+    /// Returns whether the wave now has an outcome for every member.
+    pub fn abort_members_blocked_past_deadline(
+        &mut self,
+        blocked: &ProvisionalCells,
+        now: WeightedTimestamp,
+    ) -> bool {
+        if blocked.is_empty() || now < self.wave_start_ts.plus(WAVE_TIMEOUT) {
+            return false;
+        }
+        let stuck: Vec<TxHash> = self
+            .tx_hashes
+            .iter()
+            .copied()
+            .filter(|tx_hash| {
+                !self.dispatched.contains(tx_hash)
+                    && !self.explicit_aborts.contains(tx_hash)
+                    && self
+                        .transactions
+                        .get(tx_hash)
+                        .is_some_and(|tx| blocked.blocks(&tx.admission_keys()))
+            })
+            .collect();
+        let mut complete = false;
+        for tx_hash in stuck {
+            tracing::warn!(
+                wave = %self.wave_id,
+                tx_hash = ?tx_hash,
+                "Aborting a member that waited past the deadline for a provisionally held cell"
+            );
+            complete = self.record_abort(tx_hash, now);
+        }
+        complete
     }
 
     /// True if each tx has either an execution result or an explicit abort.
@@ -927,7 +1007,7 @@ impl WaveState {
             num_txs = total,
             provisioned = format!("{}/{}", provisioned, total),
             all_provisioned_at = ?self.all_provisioned_at.map(WeightedTimestamp::as_millis),
-            dispatched = self.dispatched,
+            dispatched = self.dispatched.len(),
             voted = self.voted,
             local_ec_emitted = self.local_ec_emitted,
             local_receipts_ready,
@@ -1683,8 +1763,11 @@ mod tests {
         let mut provisioning = ProvisioningTracker::new();
         provisioning.seed_provisions(h0, vec![Arc::new(Vec::new())]);
         provisioning.seed_provisions(h1, vec![Arc::new(Vec::new())]);
-        assert!(w.tick_group_if_ready(&provisioning).is_some());
-        assert!(w.dispatched());
+        assert!(
+            w.tick_group_if_ready(&provisioning, &ProvisionalCells::default())
+                .is_some()
+        );
+        assert!(w.fully_dispatched());
 
         assert!(!w.record_abort(h0, ts_for(WAVE_START + 2)));
         w.record_execution_result(h0, executed(true));
@@ -1774,7 +1857,9 @@ mod tests {
     fn tick_group_single_shard_carries_all_members_and_flips_flag() {
         let mut w = make_single_shard_wave(2);
         let provisioning = ProvisioningTracker::new();
-        let group = w.tick_group_if_ready(&provisioning).expect("group");
+        let group = w
+            .tick_group_if_ready(&provisioning, &ProvisionalCells::default())
+            .expect("group");
         assert!(group.wave_id.is_zero());
         assert_eq!(group.requests.len(), 2);
         // Single-shard members carry no provisions and the committing
@@ -1784,8 +1869,91 @@ mod tests {
             assert_eq!(request.clock, ts_for(WAVE_START));
             assert_eq!(request.randomness, RevealChain::ZERO);
         }
-        assert!(w.dispatched());
-        assert!(w.tick_group_if_ready(&provisioning).is_none());
+        assert!(w.fully_dispatched());
+        assert!(
+            w.tick_group_if_ready(&provisioning, &ProvisionalCells::default())
+                .is_none()
+        );
+    }
+
+    /// A member declaring a cell an unresolved wave holds provisionally
+    /// stays out of the tick: the value it would read is one nothing may
+    /// depend on. It joins the first tick composed after the claim
+    /// clears.
+    #[test]
+    fn a_member_waits_while_its_declared_cell_is_held_provisionally() {
+        let mut w = make_single_shard_wave(1);
+        let provisioning = ProvisioningTracker::new();
+
+        let mut blocked = ProvisionalCells::default();
+        blocked.claim(&w.declared_mutations());
+        assert!(
+            w.tick_group_if_ready(&provisioning, &blocked).is_none(),
+            "a member whose cell is held provisionally must not join a tick"
+        );
+        assert!(!w.fully_dispatched());
+
+        let group = w
+            .tick_group_if_ready(&provisioning, &ProvisionalCells::default())
+            .expect("the member joins once the claim clears");
+        assert_eq!(group.requests.len(), 1);
+        assert!(w.fully_dispatched());
+    }
+
+    /// The wait is per member, not per wave: one blocked transaction
+    /// must not hold back the rest of its block's batch.
+    #[test]
+    fn only_the_blocked_member_waits() {
+        let mut w = make_single_shard_wave(2);
+        let provisioning = ProvisioningTracker::new();
+
+        // `make_tx(seed)` declares `test_prefix(seed + 50)` exclusively,
+        // so claiming the first member's prefix names it alone.
+        let mut blocked = ProvisionalCells::default();
+        blocked.claim(&[DeclaredKey::prefix(test_prefix(50))]);
+
+        let group = w
+            .tick_group_if_ready(&provisioning, &blocked)
+            .expect("the unblocked member joins");
+        assert_eq!(group.requests.len(), 1);
+        assert_eq!(group.requests[0].tx_hash, w.tx_hashes()[1]);
+        assert!(!w.fully_dispatched(), "the blocked member is still owed");
+
+        let later = w
+            .tick_group_if_ready(&provisioning, &ProvisionalCells::default())
+            .expect("the blocked member joins a later tick");
+        assert_eq!(later.requests.len(), 1);
+        assert_eq!(later.requests[0].tx_hash, w.tx_hashes()[0]);
+        assert!(w.fully_dispatched());
+    }
+
+    /// A wait has to be able to end. Two shards can each hold the cell
+    /// the other's counterpart needs, so a member excluded from every
+    /// tick would otherwise never get an outcome and its wave would never
+    /// vote — the deadline is what breaks the ring.
+    #[test]
+    fn a_member_blocked_past_the_deadline_aborts() {
+        let mut w = make_single_shard_wave(1);
+        let provisioning = ProvisioningTracker::new();
+        let mut blocked = ProvisionalCells::default();
+        blocked.claim(&w.declared_mutations());
+
+        assert!(w.tick_group_if_ready(&provisioning, &blocked).is_none());
+
+        // Short of the deadline the member keeps waiting.
+        let deadline = ts_for(WAVE_START).plus(WAVE_TIMEOUT);
+        assert!(!w.abort_members_blocked_past_deadline(&blocked, ts_for(WAVE_START)));
+        assert!(!w.has_outcome_for_every_tx());
+
+        assert!(
+            w.abort_members_blocked_past_deadline(&blocked, deadline),
+            "the wave has an outcome for every member once the wait aborts"
+        );
+        assert!(
+            w.tick_group_if_ready(&provisioning, &ProvisionalCells::default())
+                .is_none(),
+            "an aborted member never executes, even once the cell frees"
+        );
     }
 
     #[test]
@@ -1798,10 +1966,12 @@ mod tests {
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
 
         let provisioning = ProvisioningTracker::new();
-        let group = w.tick_group_if_ready(&provisioning).expect("group");
+        let group = w
+            .tick_group_if_ready(&provisioning, &ProvisionalCells::default())
+            .expect("group");
         assert_eq!(group.requests.len(), 1);
         assert!(group.requests[0].provisions.is_empty());
-        assert!(w.dispatched());
+        assert!(w.fully_dispatched());
     }
 
     #[test]
@@ -1813,10 +1983,12 @@ mod tests {
         let mut provisioning = ProvisioningTracker::new();
         provisioning.seed_provisions(h0, vec![Arc::new(Vec::<SubstateEntry>::new())]);
 
-        let group = w.tick_group_if_ready(&provisioning).expect("group");
+        let group = w
+            .tick_group_if_ready(&provisioning, &ProvisionalCells::default())
+            .expect("group");
         assert_eq!(group.requests.len(), 1);
         assert_eq!(group.requests[0].tx_hash, h0);
-        assert!(w.dispatched());
+        assert!(w.fully_dispatched());
     }
 
     // ─── engagement coverage ────────────────────────────────────────────
@@ -1960,7 +2132,9 @@ mod tests {
             vec![ProvisionEntry::new(remote_payer_tx, vec![])],
         )));
 
-        let group = w.tick_group_if_ready(&provisioning).expect("group");
+        let group = w
+            .tick_group_if_ready(&provisioning, &ProvisionalCells::default())
+            .expect("group");
         let request_for = |hash: TxHash| {
             group
                 .requests
@@ -1981,7 +2155,9 @@ mod tests {
         w.record_abort(aborted, ts_for(WAVE_START));
 
         let provisioning = ProvisioningTracker::new();
-        let group = w.tick_group_if_ready(&provisioning).expect("group");
+        let group = w
+            .tick_group_if_ready(&provisioning, &ProvisionalCells::default())
+            .expect("group");
         assert_eq!(group.requests.len(), 1);
         assert_ne!(group.requests[0].tx_hash, aborted);
     }
@@ -1993,8 +2169,11 @@ mod tests {
         w.record_abort(aborted, ts_for(WAVE_START));
 
         let provisioning = ProvisioningTracker::new();
-        assert!(w.tick_group_if_ready(&provisioning).is_none());
-        assert!(!w.dispatched());
+        assert!(
+            w.tick_group_if_ready(&provisioning, &ProvisionalCells::default())
+                .is_none()
+        );
+        assert!(!w.fully_dispatched());
     }
 
     #[test]
@@ -2004,7 +2183,10 @@ mod tests {
         w.mark_tx_provisioned(h0, ts_for(WAVE_START + 1));
 
         let provisioning = ProvisioningTracker::new();
-        assert!(w.tick_group_if_ready(&provisioning).is_none());
-        assert!(!w.dispatched());
+        assert!(
+            w.tick_group_if_ready(&provisioning, &ProvisionalCells::default())
+                .is_none()
+        );
+        assert!(!w.fully_dispatched());
     }
 }

@@ -14,15 +14,16 @@ use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
     cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
     insolvent_genesis_accounts, livelock_genesis_accounts, merge_straddler_setup,
-    nullifier_race_genesis_accounts, participant_sweep_genesis_accounts,
-    reshape_lifecycle_accounts, split_straddler_setup, staking_genesis_accounts,
-    storm_genesis_accounts, withdrawal_burst_genesis_accounts,
+    nullifier_race_genesis_accounts, overdraw_genesis_accounts, participant_sweep_genesis_accounts,
+    reshape_lifecycle_accounts, shared_recipient_genesis_accounts, split_straddler_setup,
+    staking_genesis_accounts, storm_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, ScenarioConfig, a_failed_attempt_still_attests_work,
-    abort_converges, abort_floor_settles_on_deadline, attested_load_reaches_the_beacon,
-    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
-    cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_fetch_fallback,
+    a_payer_cannot_spend_one_balance_twice, abort_converges, abort_floor_settles_on_deadline,
+    attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
+    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
+    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_fetch_fallback,
     cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
@@ -219,6 +220,23 @@ fn cross_shard_transfer_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
     cross_shard_transfer(&mut cluster);
+}
+
+#[test]
+fn cross_shard_credit_survives_a_later_local_credit_sim() {
+    let mut cluster = SimCluster::with_grown_accounts(
+        &cross_shard_config(),
+        42,
+        &shared_recipient_genesis_accounts(),
+    );
+    cross_shard_credit_survives_a_later_local_credit(&mut cluster);
+}
+
+#[test]
+fn a_payer_cannot_spend_one_balance_twice_sim() {
+    let mut cluster =
+        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &overdraw_genesis_accounts());
+    a_payer_cannot_spend_one_balance_twice(&mut cluster);
 }
 
 #[test]

@@ -761,6 +761,64 @@ pub fn cross_shard_genesis_accounts() -> Vec<([u8; 16], u128)> {
     vec![(from, 10_000), (to, 10)]
 }
 
+/// What one payer's vault is funded with when two withdrawals off it are
+/// meant to be individually covered and jointly uncoverable.
+pub const OVERDRAW_FUNDING: u128 = 10_000;
+
+/// One withdrawal of an [`OVERDRAW_CAST`](overdraw_cast) pair: covered
+/// on its own, uncoverable beside its sibling.
+pub const OVERDRAW_AMOUNT: u128 = 6_000;
+
+/// The cast of two withdrawals off one vault into separate remote
+/// vaults: the payer on `leaf(1, 0)`, two distinct recipients on
+/// `leaf(1, 1)`.
+///
+/// Distinct recipients so the two credits land on different cells —
+/// what the pair measures is the payer's reservation, not the
+/// recipients' deposits.
+#[must_use]
+pub fn overdraw_cast() -> (Ed25519PrivateKey, [u8; 16], [u8; 16], [u8; 16]) {
+    let mut taken = Vec::new();
+    let (payer, from) = account_routing_to(ShardId::leaf(1, 0), &mut taken);
+    let (_, first) = account_routing_to(ShardId::leaf(1, 1), &mut taken);
+    let (_, second) = account_routing_to(ShardId::leaf(1, 1), &mut taken);
+    (payer, from, first, second)
+}
+
+/// Genesis funding for [`overdraw_cast`]: the payer holding less than the
+/// two withdrawals together, each recipient holding dust.
+#[must_use]
+pub fn overdraw_genesis_accounts() -> Vec<([u8; 16], u128)> {
+    let (_, from, first, second) = overdraw_cast();
+    vec![(from, OVERDRAW_FUNDING), (first, 10), (second, 10)]
+}
+
+/// The cast of a cross-shard leg followed by a local one over the same
+/// cell: the remote payer on `leaf(1, 0)`, a payer on `leaf(1, 1)`, and
+/// the recipient they both credit, also on `leaf(1, 1)`.
+#[must_use]
+pub fn shared_recipient_cast() -> (
+    Ed25519PrivateKey,
+    [u8; 16],
+    Ed25519PrivateKey,
+    [u8; 16],
+    [u8; 16],
+) {
+    let mut taken = Vec::new();
+    let (remote_payer, remote_from) = account_routing_to(ShardId::leaf(1, 0), &mut taken);
+    let (local_payer, local_from) = account_routing_to(ShardId::leaf(1, 1), &mut taken);
+    let (_, to) = account_routing_to(ShardId::leaf(1, 1), &mut taken);
+    (remote_payer, remote_from, local_payer, local_from, to)
+}
+
+/// Genesis funding for [`shared_recipient_cast`]: both payers covered for
+/// their payment and its fee ceiling, the shared recipient holding dust.
+#[must_use]
+pub fn shared_recipient_genesis_accounts() -> Vec<([u8; 16], u128)> {
+    let (_, remote_from, _, local_from, to) = shared_recipient_cast();
+    vec![(remote_from, 10_000), (local_from, 10_000), (to, 10)]
+}
+
 /// The nullifier race's cast: two composers who each fund a request, and
 /// the account that signed it.
 ///

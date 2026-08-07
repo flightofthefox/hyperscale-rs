@@ -41,8 +41,8 @@ use hyperscale_core::{
 use hyperscale_storage::TickResolution;
 use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
-    CertifiedBlock, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote,
-    FinalizedWave, FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Provisions,
+    CertifiedBlock, DeclaredKey, ExecutionCertificate, ExecutionCertificateVerifyError,
+    ExecutionVote, FinalizedWave, FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Provisions,
     RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledWaveSet, ShardId,
     TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
     ValidatorId, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
@@ -59,6 +59,7 @@ use crate::lookups::{
     ec_has_shard_quorum_power, peers_excluding_self,
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
+use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
 use crate::vote_tracker::VoteTracker;
 use crate::wave_state::WaveState;
@@ -79,6 +80,16 @@ struct CommittingBlock {
     ts: WeightedTimestamp,
     /// The block's reveal chain.
     reveal: RevealChain,
+}
+
+/// A wave with entries on the tick chain and no committed fate yet.
+struct TickedWave {
+    /// The last tick it contributed to — what a resolution waits for.
+    tick: BlockHeight,
+    /// What its members declared they would mutate. Empty for a
+    /// single-shard wave: its writes are determined at commit, so no
+    /// later transaction has to wait for them.
+    claims: Vec<DeclaredKey>,
 }
 
 /// One composed-but-undispatched tick: the committing block's identity
@@ -202,11 +213,10 @@ pub struct ExecutionCoordinator {
     /// never seen.
     last_completed_tick: BlockHeight,
 
-    /// Which tick each wave joined, for waves whose fate is still open.
-    /// Only waves listed here have entries on the tick chain, so a wave
-    /// absent from the map — never dispatched, or committed by a shard
-    /// past the execution window — resolves nothing.
-    ticked_waves: HashMap<WaveId, BlockHeight>,
+    /// Waves with entries on the tick chain whose fate is still open. A
+    /// wave absent from the map — never dispatched, or committed by a
+    /// shard past the execution window — resolves nothing.
+    ticked_waves: BTreeMap<WaveId, TickedWave>,
 
     /// Wave fates known but not yet emittable, each with the tick that
     /// carries its entries. Drained whenever a tick completes or a block
@@ -409,7 +419,7 @@ impl ExecutionCoordinator {
             pending_ticks: VecDeque::new(),
             tick_in_flight: false,
             last_completed_tick: BlockHeight::GENESIS,
-            ticked_waves: HashMap::new(),
+            ticked_waves: BTreeMap::new(),
             pending_tick_resolutions: Vec::new(),
             waves: WaveRegistry::new(),
             early: EarlyArrivalBuffer::new(),
@@ -566,6 +576,7 @@ impl ExecutionCoordinator {
         classification: &TopologySnapshot,
         block: CommittingBlock,
         transactions: &[Arc<Verifiable<Transaction>>],
+        blocked: &ProvisionalCells,
     ) -> (Vec<TickExecutionGroup>, Vec<Verifiable<ExecutionVote>>) {
         let CommittingBlock {
             hash: block_hash,
@@ -626,7 +637,7 @@ impl ExecutionCoordinator {
 
             // The wave joins this commit's tick if fully provisioned at
             // creation.
-            if let Some(group) = wave_state.tick_group_if_ready(&self.provisioning) {
+            if let Some(group) = wave_state.tick_group_if_ready(&self.provisioning, blocked) {
                 tick_groups.push(group);
             }
 
@@ -913,6 +924,7 @@ impl ExecutionCoordinator {
         &mut self,
         batches: &[Arc<Verifiable<Provisions>>],
         committed_ts: WeightedTimestamp,
+        blocked: &ProvisionalCells,
     ) -> Vec<TickExecutionGroup> {
         // Sort for deterministic iteration (logs, action vector order).
         let mut ordered: Vec<&Arc<Verifiable<Provisions>>> = batches.iter().collect();
@@ -951,13 +963,13 @@ impl ExecutionCoordinator {
 
             wave.absorb_engagement_evidence(&self.provisioning);
 
-            if wave.dispatched() {
+            if wave.fully_dispatched() {
                 continue;
             }
 
             wave.absorb_ready_provisions(&self.provisioning, committed_ts);
 
-            if let Some(group) = wave.tick_group_if_ready(&self.provisioning) {
+            if let Some(group) = wave.tick_group_if_ready(&self.provisioning, blocked) {
                 tick_groups.push(group);
             }
         }
@@ -2021,7 +2033,18 @@ impl ExecutionCoordinator {
             }
         }
 
-        let mut tick_groups: Vec<TickExecutionGroup> = Vec::new();
+        // One claim set for the whole commit: every composition below
+        // sees the same cells held, whichever path produced the wave.
+        let blocked = self.provisional_cells();
+
+        let now = self.committed_ts;
+        for (_, wave) in self.waves.waves_iter_mut() {
+            wave.abort_members_blocked_past_deadline(&blocked, now);
+        }
+
+        // Members kept out of an earlier tick go first — they are older
+        // than anything this block carries.
+        let mut tick_groups: Vec<TickExecutionGroup> = self.redrive_deferred_members(&blocked);
 
         if !transactions.is_empty() {
             tracing::debug!(
@@ -2040,6 +2063,7 @@ impl ExecutionCoordinator {
                     reveal: header.reveal_chain(),
                 },
                 transactions,
+                &blocked,
             );
             tick_groups.extend(groups);
             for vote in early_votes {
@@ -2052,7 +2076,11 @@ impl ExecutionCoordinator {
         // Apply this block's provisions after wave setup so newly-created
         // waves can transition to provisioned from the same block's batches.
         if !provisions.is_empty() {
-            tick_groups.extend(self.apply_committed_provisions(provisions, self.committed_ts));
+            tick_groups.extend(self.apply_committed_provisions(
+                provisions,
+                self.committed_ts,
+                &blocked,
+            ));
         }
 
         // Compose this commit's tick: the single-shard wave plus every
@@ -2062,7 +2090,27 @@ impl ExecutionCoordinator {
         if !tick_groups.is_empty() {
             tick_groups.sort_by(|a, b| a.wave_id.cmp(&b.wave_id));
             for group in &tick_groups {
-                self.ticked_waves.insert(group.wave_id.clone(), height);
+                // A cross-shard wave's members write provisionally from
+                // the moment they join a tick, so its claims stand from
+                // here until its fate commits. A single-shard wave's
+                // writes are determined and claim nothing.
+                let claims = if group.wave_id.is_zero() {
+                    Vec::new()
+                } else {
+                    self.waves
+                        .get_wave(&group.wave_id)
+                        .map(WaveState::declared_mutations)
+                        .unwrap_or_default()
+                };
+                // A wave contributing to a second tick records the later
+                // one: that is the tick a resolution has to wait for.
+                self.ticked_waves.insert(
+                    group.wave_id.clone(),
+                    TickedWave {
+                        tick: height,
+                        claims,
+                    },
+                );
             }
             self.pending_ticks.push_back(PendingTick {
                 tick: height,
@@ -2077,6 +2125,44 @@ impl ExecutionCoordinator {
         actions
     }
 
+    /// The cells unresolved cross-shard waves hold provisionally.
+    ///
+    /// Rebuilt per commit from `ticked_waves`, which is small: one entry
+    /// per wave that has joined a tick and whose fate has not committed,
+    /// and the in-flight cap bounds how many that can be.
+    fn provisional_cells(&self) -> ProvisionalCells {
+        let mut cells = ProvisionalCells::default();
+        for ticked in self.ticked_waves.values() {
+            cells.claim(&ticked.claims);
+        }
+        cells
+    }
+
+    /// Compose a tick group for every wave holding members that were kept
+    /// out of an earlier tick and are no longer blocked.
+    ///
+    /// Runs after the commit's resolutions are recorded, so a member
+    /// enters the first tick composed after the wave it waited on
+    /// resolved.
+    fn redrive_deferred_members(&mut self, blocked: &ProvisionalCells) -> Vec<TickExecutionGroup> {
+        let deferred: Vec<WaveId> = self
+            .waves
+            .waves_iter()
+            .filter(|(_, wave)| !wave.fully_dispatched())
+            .map(|(wave_id, _)| wave_id.clone())
+            .collect();
+        let mut groups = Vec::new();
+        for wave_id in deferred {
+            let Some(wave) = self.waves.get_wave_mut(&wave_id) else {
+                continue;
+            };
+            if let Some(group) = wave.tick_group_if_ready(&self.provisioning, blocked) {
+                groups.push(group);
+            }
+        }
+        groups
+    }
+
     /// Record a wave's fate for the tick chain.
     ///
     /// A wave with no tick entry — never dispatched, or committed by a
@@ -2086,9 +2172,13 @@ impl ExecutionCoordinator {
     /// still queued, and resolving against a chain that has never seen
     /// the wave would drop the promotion.
     fn record_tick_resolution(&mut self, wave_id: &WaveId, resolution: TickResolution) {
-        if let Some(tick) = self.ticked_waves.remove(wave_id) {
+        // The claims clear with the fate rather than with the promotion:
+        // both the commit path and the tick-completion pump emit pending
+        // resolutions before dispatching, so the chain is always at least
+        // as resolved as the claim set says by the time a later tick runs.
+        if let Some(ticked) = self.ticked_waves.remove(wave_id) {
             self.pending_tick_resolutions
-                .push((wave_id.clone(), tick, resolution));
+                .push((wave_id.clone(), ticked.tick, resolution));
         }
     }
 

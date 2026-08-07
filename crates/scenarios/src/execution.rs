@@ -24,9 +24,9 @@ use hyperscale_vm_effects::package_hash;
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::faultable::FaultableCluster;
 use crate::support::tx::{
-    build_composed_tx, build_publish_tx, build_stamp_tx, build_transfer_tx, cross_shard_cast,
-    cross_shard_keys, nullifier_race_cast, payment_request, recipient, sender, storm_artifact,
-    storm_publishers, validity_around,
+    OVERDRAW_AMOUNT, build_composed_tx, build_publish_tx, build_stamp_tx, build_transfer_tx,
+    cross_shard_cast, cross_shard_keys, nullifier_race_cast, overdraw_cast, payment_request,
+    recipient, sender, shared_recipient_cast, storm_artifact, storm_publishers, validity_around,
 };
 use crate::support::wait::{await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -390,6 +390,169 @@ pub fn cross_shard_transfer(c: &mut impl Cluster) {
     assert!(
         right.is_some(),
         "recipient shard never committed the transfer"
+    );
+}
+
+/// A payer cannot spend one balance twice across two ticks.
+///
+/// The sibling of [`cross_shard_credit_survives_a_later_local_credit`] on
+/// the paying side. A cross-shard leg's reservation is judged against its
+/// tick's baseline, and the debit it settles is provisional until the
+/// wave resolves — so a second withdrawal one tick later would be judged
+/// against a balance the first has not come out of, and two withdrawals
+/// the vault cannot jointly cover would each be individually feasible.
+///
+/// One of them has to be refused. Which one is not the claim: the
+/// baseline the second is judged against is, and a vault that funded both
+/// is the only way both could pass.
+///
+/// The recipients are distinct so the two deposits land on different
+/// cells — what this measures is the payer's reservation, not the
+/// recipients' deposits.
+///
+/// # Panics
+///
+/// Panics if the payer's shard never commits the first withdrawal, if
+/// either withdrawal misses its budget, or if the vault covers both.
+pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
+    let payer_shard = ShardId::leaf(1, 0);
+    let (payer, from, first_to, second_to) = overdraw_cast();
+    let payer_before = vault_balance(c, payer_shard, from);
+    assert!(
+        payer_before < 2 * OVERDRAW_AMOUNT,
+        "the pair has to be jointly uncoverable to measure anything: \
+         holding {payer_before}",
+    );
+
+    let first = build_transfer_tx(
+        &payer,
+        from,
+        first_to,
+        OVERDRAW_AMOUNT,
+        validity_around(c.now()),
+    );
+    let first_hash = first.hash();
+    c.submit(Arc::new(first));
+    assert!(
+        c.run_until(epochs(16), |c| c
+            .chain_fate(payer_shard, first_hash)
+            .0
+            .is_some()),
+        "the payer's shard never committed the first withdrawal"
+    );
+
+    let second = build_transfer_tx(
+        &payer,
+        from,
+        second_to,
+        OVERDRAW_AMOUNT,
+        validity_around(c.now()),
+    );
+    let second_hash = second.hash();
+    c.submit(Arc::new(second));
+
+    let verdicts: Vec<Option<TransactionStatus>> = [first_hash, second_hash]
+        .iter()
+        .map(|hash| await_tx_terminal(c, *hash, epochs(16)))
+        .collect();
+    let accepted = verdicts
+        .iter()
+        .filter(|status| {
+            matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            )
+        })
+        .count();
+    assert_eq!(
+        accepted, 1,
+        "only one withdrawal is covered, so only one may pass; verdicts = {verdicts:?}"
+    );
+}
+
+/// A cross-shard credit and a later local one over the same vault both
+/// survive.
+///
+/// The cross-shard leg's local writes are provisional until its wave
+/// settles — nothing may read them, or an abort would retroactively
+/// change an answer already given. So a transaction the shard commits
+/// afterwards sees the vault as it was before the leg ran, and both
+/// receipts carry an absolute the other's effect is missing from:
+/// whichever settles second overwrites the first, and one credit is
+/// gone.
+///
+/// The local payment is submitted only once the recipient's shard has
+/// committed the crossing, so the pair is genuinely ordered across two
+/// ticks with the wave still open between them. The balance is the whole
+/// assertion — both credits or neither.
+///
+/// # Panics
+///
+/// Panics if either payment misses its budget or does not accept, if the
+/// recipient's shard never commits the crossing, or if the vault does not
+/// hold both credits.
+pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
+    const CROSSING: u128 = 100;
+    const LOCAL: u128 = 50;
+
+    let recipient_shard = ShardId::leaf(1, 1);
+    let (remote_payer, remote_from, local_payer, local_from, to) = shared_recipient_cast();
+    let before = vault_balance(c, recipient_shard, to);
+
+    let crossing = build_transfer_tx(
+        &remote_payer,
+        remote_from,
+        to,
+        CROSSING,
+        validity_around(c.now()),
+    );
+    let crossing_hash = crossing.hash();
+    c.submit(Arc::new(crossing));
+
+    // The recipient's shard has the leg in a tick from the moment it
+    // commits it; the wave cannot settle for several blocks yet, so the
+    // local payment below lands in a later tick with the leg's writes
+    // still provisional.
+    assert!(
+        c.run_until(epochs(16), |c| c
+            .chain_fate(recipient_shard, crossing_hash)
+            .0
+            .is_some()),
+        "the recipient's shard never committed the crossing"
+    );
+
+    let local = build_transfer_tx(
+        &local_payer,
+        local_from,
+        to,
+        LOCAL,
+        validity_around(c.now()),
+    );
+    let local_hash = local.hash();
+    c.submit(Arc::new(local));
+
+    for (hash, label) in [(crossing_hash, "crossing"), (local_hash, "local payment")] {
+        let status = await_tx_terminal(c, hash, epochs(16));
+        assert!(
+            matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            ),
+            "the {label} did not accept; status = {status:?}"
+        );
+    }
+
+    // Settlement trails the decision by the persistence step, and the two
+    // waves settle at different heights — wait for the total rather than
+    // reading whichever landed first.
+    let expected = before + CROSSING + LOCAL;
+    let held = c.run_until(epochs(8), |c| {
+        vault_balance(c, recipient_shard, to) == expected
+    });
+    assert!(
+        held,
+        "the shared vault must hold both credits: expected {expected}, holding {}",
+        vault_balance(c, recipient_shard, to)
     );
 }
 

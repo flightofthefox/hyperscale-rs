@@ -29,8 +29,9 @@ mod witnesses;
 
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
 pub use execution::{
-    a_failed_attempt_still_attests_work, abort_converges, abort_floor_settles_on_deadline,
-    attested_load_reaches_the_beacon, cross_shard_transfer, deploy_storm_rides_out,
+    a_failed_attempt_still_attests_work, a_payer_cannot_spend_one_balance_twice, abort_converges,
+    abort_floor_settles_on_deadline, attested_load_reaches_the_beacon,
+    cross_shard_credit_survives_a_later_local_credit, cross_shard_transfer, deploy_storm_rides_out,
     events_land_on_their_emitters_home_shard, failure_charges_its_payer, hot_recipient,
     insolvent_payer_engages_nothing, nullifier_race_admits_exactly_one,
     preview_reports_resource_changes, randomness_draw_agrees_across_shards,
