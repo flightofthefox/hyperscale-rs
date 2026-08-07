@@ -28,7 +28,7 @@ use std::sync::Arc;
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
 use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizedWaveStore};
-use hyperscale_mempool::{DeferralStats, MempoolConfig, MempoolCoordinator, TxStore};
+use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, TxStore};
 use hyperscale_provisions::{
     OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator, ProvisionStore,
 };
@@ -174,14 +174,6 @@ impl NodeStateMachine {
     #[must_use]
     pub fn topology_snapshot(&self) -> &TopologySnapshot {
         self.beacon_coordinator.current_topology_snapshot()
-    }
-
-    /// The hosted mempool's deferral statistics, when this vnode is seated.
-    #[must_use]
-    pub fn mempool_deferral_stats(&self) -> Option<DeferralStats> {
-        self.shard
-            .as_ref()
-            .map(|s| s.mempool_coordinator.deferral_stats())
     }
 
     /// Get the current topology snapshot as an `Arc`, for sites that

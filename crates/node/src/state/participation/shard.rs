@@ -65,8 +65,8 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, ShardForkProof,
-    TopologySchedule, Verifiable, Verified,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TX_IN_FLIGHT, MAX_TXS_PER_BLOCK, QuorumCertificate,
+    ShardForkProof, TopologySchedule, Verifiable, Verified,
 };
 
 use super::ShardParticipation;
@@ -369,21 +369,15 @@ impl ShardParticipation {
             return vec![];
         }
 
-        // Validate in-flight limits only for the next block after committed
-        // height. For blocks further ahead, validators at different heights
-        // see different in_flight() counts — checking would split votes and
-        // trigger view changes.
-        let committed_height = self.shard_coordinator.committed_height();
-        let is_next_block = header.height() == committed_height + 1;
-
-        if is_next_block
-            && self
-                .mempool_coordinator
-                .would_exceed_in_flight(total_tx_count, manifest.cert_ids().len())
-        {
+        // The drain cap, read off the header the proposer built: the count
+        // is chain-derived, so every replica reaches the same verdict at
+        // every height instead of one that drifts with local pipeline
+        // position.
+        if header.in_flight().inner() as usize > MAX_TX_IN_FLIGHT {
             tracing::warn!(
                 block_hash = ?header.hash(),
                 height = header.height().inner(),
+                in_flight = header.in_flight().inner(),
                 "Rejecting block that would exceed in-flight limit"
             );
             return vec![];
@@ -414,14 +408,7 @@ impl ShardParticipation {
         block_hash: BlockHash,
         qc: &Verified<QuorumCertificate>,
     ) -> Vec<Action> {
-        // Count transactions and certificates in the block that will be
-        // committed. Critical for in-flight limits: the `BlockCommitted`
-        // event won't be processed until after we select transactions, so
-        // we preemptively account for txs that will INCREASE in-flight (new
-        // commits) and certificates that will DECREASE it (completions).
-        let (pending_tx_count, pending_cert_count) =
-            self.shard_coordinator.pending_commit_counts(qc);
-        let inputs = self.gather_proposal_inputs(sched, pending_tx_count, pending_cert_count);
+        let inputs = self.gather_proposal_inputs(sched);
 
         self.shard_coordinator.on_qc_formed(
             sched,
@@ -471,16 +458,12 @@ impl ShardParticipation {
     /// hands back their transaction hashes; the mempool releases their locks
     /// and drives them to `Completed(Aborted)`. A no-op when no partner is
     /// past-terminal.
-    pub(in crate::state) fn sweep_ready_counterpart_straddlers(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-    ) -> Vec<Action> {
+    pub(in crate::state) fn sweep_ready_counterpart_straddlers(&mut self) -> Vec<Action> {
         let aborts = self.execution_coordinator.take_ready_counterpart_aborts();
         if aborts.is_empty() {
             return Vec::new();
         }
-        self.mempool_coordinator
-            .abort_transactions(topology_schedule.head(), &aborts)
+        self.mempool_coordinator.abort_transactions(&aborts)
     }
 }
 

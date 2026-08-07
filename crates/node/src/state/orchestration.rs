@@ -98,9 +98,7 @@ impl NodeStateMachine {
             s.apply_block_to_execution(self.beacon_coordinator.topology_schedule(), certified),
         );
 
-        actions.extend(
-            s.sweep_ready_counterpart_straddlers(self.beacon_coordinator.topology_schedule()),
-        );
+        actions.extend(s.sweep_ready_counterpart_straddlers());
 
         // The first coast commit quiesces the chain's content: finalization is a
         // wave certificate in a later block, and no later content block will
@@ -116,10 +114,7 @@ impl NodeStateMachine {
                 .quiescent(self.beacon_coordinator.topology_schedule())
         {
             s.terminal_chain_swept = true;
-            actions.extend(
-                s.mempool_coordinator
-                    .abort_in_flight(self.beacon_coordinator.topology_schedule().head()),
-            );
+            actions.extend(s.mempool_coordinator.abort_in_flight());
             actions.extend(s.execution_coordinator.abort_pending_waves());
         }
 

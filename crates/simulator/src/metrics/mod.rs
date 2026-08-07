@@ -5,7 +5,6 @@
 use std::time::Duration;
 
 use hdrhistogram::Histogram;
-use hyperscale_mempool::LockContentionStats;
 
 /// Collects metrics during a simulation run.
 pub struct MetricsCollector {
@@ -39,13 +38,6 @@ pub struct MetricsCollector {
     /// Completions at last sample.
     last_sample_completions: u64,
 
-    // Lock contention tracking
-    /// Peak locked nodes observed.
-    peak_locked_nodes: u64,
-
-    /// Peak contention ratio observed.
-    peak_contention_ratio: f64,
-
     /// In-flight transactions at simulation end.
     in_flight_at_end: u64,
 }
@@ -70,8 +62,6 @@ impl MetricsCollector {
             samples: Vec::new(),
             last_sample_time: start_time,
             last_sample_completions: 0,
-            peak_locked_nodes: 0,
-            peak_contention_ratio: 0.0,
             in_flight_at_end: 0,
         }
     }
@@ -111,14 +101,7 @@ impl MetricsCollector {
     }
 
     /// Take a sample for time-series tracking.
-    ///
-    /// Accepts lock contention stats aggregated from all shards.
-    pub fn sample(
-        &mut self,
-        current_time: Duration,
-        in_flight: u64,
-        lock_stats: LockContentionStats,
-    ) {
+    pub fn sample(&mut self, current_time: Duration, in_flight: u64) {
         let elapsed_since_last = current_time.saturating_sub(self.last_sample_time);
         let completions_since_last = self
             .completions
@@ -137,15 +120,6 @@ impl MetricsCollector {
             self.peak_tps = instant_tps;
         }
 
-        // Track peak lock contention
-        if lock_stats.locked_nodes > self.peak_locked_nodes {
-            self.peak_locked_nodes = lock_stats.locked_nodes;
-        }
-        let contention_ratio = lock_stats.contention_ratio();
-        if contention_ratio > self.peak_contention_ratio {
-            self.peak_contention_ratio = contention_ratio;
-        }
-
         self.samples.push(MetricsSample {
             time: current_time,
             submissions: self.submissions,
@@ -153,8 +127,6 @@ impl MetricsCollector {
             rejections: self.rejections,
             in_flight,
             instant_tps,
-            locked_nodes: lock_stats.locked_nodes,
-            contention_ratio,
         });
 
         self.last_sample_time = current_time;
@@ -194,8 +166,6 @@ impl MetricsCollector {
             total_duration,
             submission_duration,
             samples: self.samples,
-            peak_locked_nodes: self.peak_locked_nodes,
-            peak_contention_ratio: self.peak_contention_ratio,
         }
     }
 }
@@ -215,10 +185,6 @@ pub struct MetricsSample {
     pub in_flight: u64,
     /// Instantaneous TPS at this point.
     pub instant_tps: f64,
-    /// Number of locked nodes at this point.
-    pub locked_nodes: u64,
-    /// Contention ratio at this point (`pending_deferred` / `pending_count`).
-    pub contention_ratio: f64,
 }
 
 /// Final simulation report.
@@ -243,10 +209,6 @@ pub struct SimulationReport {
     pub submission_duration: Duration,
     /// Time-series samples.
     pub samples: Vec<MetricsSample>,
-    /// Peak number of locked nodes observed.
-    pub peak_locked_nodes: u64,
-    /// Peak contention ratio observed.
-    pub peak_contention_ratio: f64,
 }
 
 impl SimulationReport {
@@ -325,12 +287,6 @@ impl SimulationReport {
         println!("  Max:  {:?}", self.max_latency());
         println!("  Avg:  {:?}", self.avg_latency());
         println!();
-        println!("Lock Contention (peak):");
-        println!("  Locked nodes:     {}", self.peak_locked_nodes);
-        println!(
-            "  Contention ratio: {:.2}%",
-            self.peak_contention_ratio * 100.0
-        );
         println!();
         println!("Duration: {:?}", self.total_duration);
         println!("═══════════════════════════════════════════\n");

@@ -67,7 +67,7 @@ The consolidated register of the system's safety and liveness properties, with s
 |---|---|---|
 | **INV-EXEC-1** | Safety | **Atomic commitment.** A cross-shard transaction reaches the same terminal outcome (succeeded / aborted / rejected) on every participating shard. Finalization is per transaction: success requires success outcomes (identical receipt hashes, by deterministic execution) from every participant's EC; any participant's abort outcome is terminal — abort dominant, success unanimous. Abort paths are deterministic functions of committed state. |
 | **INV-EXEC-2** | Safety | **Certificate soundness.** An EC's receipt root is recomputed from its outcome vector at decode and must match; quorum power and aggregate signature verify against the WT-resolved committee. A valid-looking EC with divergent content cannot exist. |
-| **INV-EXEC-3** | Safety | **Partial coupling.** No two transactions simultaneously in flight or ready share any declared node; locks persist from commit to wave finalization. Local deadlock is structurally impossible. Mempool admission note: the conflict domain is the *declared key* — an owner prefix, optionally narrowed to one substate slot — always derived locally from the signed envelope through the effect DSL, never carried on the wire. Under the `share_declared_reads` mempool flag, admission relaxes read-read overlap on a key while writes stay exclusive; the track layer's lock discipline is unchanged either way, and the safety backstop for shared reads is INV-EXEC-9's write filter. |
+| **INV-EXEC-3** | *Retired* | **Partial coupling.** Held while admission arbitrated conflicts: no two transactions simultaneously in flight or ready shared any declared key, and locks persisted from commit to wave finalization. Execution now decides what runs together — a committed block's work is one batch, sequenced by the executor's conflict groups over one overlay, and each batch's output is the next one's baseline. Conflict-freedom between committed transactions is no longer a property anything maintains. See *Retired invariants*. |
 | **INV-EXEC-4** | *Retired* | **Conflict verdicts.** Held while a deterministic detector aborted true cross-shard cycles by hash order. No cycle detector exists: what breaks a cycle is the wave deadline (INV-EXEC-5), which is deterministic for the same reason. See *Retired invariants*. |
 | **INV-EXEC-5** | Liveness | **Termination.** Every wave reaches a terminal outcome by its deadline (source WT + `WAVE_TIMEOUT`); a wave unprovisioned at deadline all-aborts identically everywhere. No lock is held past a computable bound. |
 | **INV-EXEC-6** | *Retired* | **Ownership merge.** Held while ownership was resolved at execution time and had to be claimed across a shard boundary. A substate key carries its owner's prefix, so placement is a property of the key: there is no map to merge and no contested claim to arbitrate. See *Retired invariants*. |
@@ -141,6 +141,16 @@ analysis still resolve to the property they were written about.
   deadline abort (INV-EXEC-5) rather than a hash-order tiebreak. The cost of the change is
   a floor: the tiebreak settled one side of a cycle, the deadline settles
   neither.
+- **INV-EXEC-3 (Partial coupling).** Retired with the mempool's conflict
+  arbitration. It made admission responsible for a property admission was
+  not positioned to hold: a transaction took its claim when its block
+  committed, while a proposer selects over blocks that have not, so two
+  conflicting transactions were both selectable and both executed against
+  a baseline excluding the other. Execution decides instead — one batch
+  per committed block, sequenced by the executor's conflict groups over a
+  single overlay, chained onto the previous batch's output. Contenders
+  now see each other's writes rather than being kept apart, so the
+  property is not narrowed but dissolved.
 - **INV-EXEC-6 (Ownership merge).** Retired with the engine that resolved
   ownership at execution time. Its replacement is structural rather than
   another rule: placement is read off the key.

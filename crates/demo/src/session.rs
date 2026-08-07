@@ -74,10 +74,9 @@ const EPOCH_MS: u64 = 30_000;
 const RESHAPE_TICK_MS: u64 = 100;
 
 /// Genesis-funded accounts the load generator draws from. Small enough that
-/// every transfer pair is visually distinguishable, large enough that
-/// consecutive transfers rarely contend on the same account — contending
-/// transfers are held by the ready set (INV-EXEC-3) rather than run, which
-/// looks like a stall to anyone watching.
+/// every transfer pair is visually distinguishable, large enough that a
+/// session spreads its traffic rather than piling every transfer onto one
+/// account.
 const ACCOUNTS: u8 = 8;
 
 /// What each demo account holds at genesis — far above anything a session

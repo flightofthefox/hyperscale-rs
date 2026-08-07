@@ -16,7 +16,7 @@ use hyperscale_scenarios::tx::{
     insolvent_genesis_accounts, livelock_genesis_accounts, merge_straddler_setup,
     nullifier_race_genesis_accounts, participant_sweep_genesis_accounts,
     reshape_lifecycle_accounts, split_straddler_setup, staking_genesis_accounts,
-    storm_genesis_accounts,
+    storm_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, ScenarioConfig, a_failed_attempt_still_attests_work,
@@ -45,7 +45,8 @@ use hyperscale_scenarios::{
     split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_terminating_payer_releases_its_reservation, stake_withdraw_drops_effective_stake,
     surviving_sibling_split_seats_full_committees,
-    withdrawal_ejects_a_validator_that_a_deposit_reactivates, zipf_payments,
+    withdrawal_ejects_a_validator_that_a_deposit_reactivates, withdrawals_compose_over_one_vault,
+    zipf_payments,
 };
 use hyperscale_simulation::ExecutionMode;
 use hyperscale_storage::ShardChainReader;
@@ -270,6 +271,17 @@ fn hot_recipient_sim() {
     println!("hot_recipient senders=12 height_span={height_span} executed={executed}: {report:?}");
 }
 
+#[test]
+fn withdrawals_compose_over_one_vault_sim() {
+    let mut cluster = SimCluster::with_accounts(
+        &liveness_config(),
+        42,
+        &withdrawal_burst_genesis_accounts(50),
+    );
+    let blocks = cluster.run_faultable(|c| withdrawals_compose_over_one_vault(c, 50));
+    println!("withdrawals_compose_over_one_vault count=50 blocks={blocks}");
+}
+
 /// Deterministic parallel wave execution on committed blocks: one seed,
 /// serial vs parallel batch scheduling, identical committed state
 /// roots. Receipts are
@@ -314,44 +326,6 @@ fn cross_shard_fraction_sim() {
     let report = cluster.run_faultable(|c| cross_shard_fraction(c, CROSS_FRACTION_SENDERS, 500));
     let executed = cluster.metric("transactions_executed", None);
     println!("cross_shard_fraction total=16 cross=50% executed={executed}: {report:?}");
-}
-
-/// The read-share A/B, write-traffic side: the payment mix has no
-/// read-read overlap to admit (every `CallMethod` target declares
-/// read+write), so the discipline flip changes no admission decision —
-/// deferral counts, causes, promotions, and queue depths agree exactly.
-/// Waits may only lengthen: counted locks hold a node the commit pipeline
-/// double-locked until its last holder completes, where the exclusive set
-/// releases at the first.
-#[test]
-fn read_share_leaves_write_traffic_decisions_unchanged_sim() {
-    let run = |share: bool| {
-        let accounts = genesis_accounts(24, 6);
-        let mut cluster = if share {
-            SimCluster::with_accounts_and_read_share(&liveness_config(), 42, &accounts)
-        } else {
-            SimCluster::with_accounts(&liveness_config(), 42, &accounts)
-        };
-        cluster
-            .run_faultable(|c| zipf_payments(c, 24, 6, 1.0))
-            .deferral
-            .expect("sim exposes deferral stats")
-    };
-    let (exclusive, shared) = (run(false), run(true));
-    println!("zipf exclusive: {exclusive:?}");
-    println!("zipf shared:    {shared:?}");
-    assert_eq!(exclusive.deferral_events, shared.deferral_events);
-    assert_eq!(exclusive.read_read_deferrals, shared.read_read_deferrals);
-    assert_eq!(
-        exclusive.write_involved_deferrals,
-        shared.write_involved_deferrals
-    );
-    assert_eq!(exclusive.promotions, shared.promotions);
-    assert_eq!(
-        exclusive.peak_deferred_queue_depth,
-        shared.peak_deferred_queue_depth
-    );
-    assert!(shared.total_deferral_wait >= exclusive.total_deferral_wait);
 }
 
 /// Four stable leaves for the participant sweep: grown like

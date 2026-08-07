@@ -127,10 +127,6 @@ pub struct SimConfig {
     pub packet_loss_rate: f64,
     /// Consensus crypto scheme every simulated validator runs.
     pub crypto_scheme: CryptoScheme,
-    /// Whether every mempool admits under the read-share discipline
-    /// (`MempoolConfig::share_declared_reads`). Off by default; the
-    /// read-share A/B constructs one cluster per setting.
-    pub share_declared_reads: bool,
     /// Genesis-funded accounts (owner prefix, balance). Builds the
     /// process VM statics and the executor world, and seeds the funded
     /// vault cells at genesis. Empty runs no traffic.
@@ -175,7 +171,6 @@ impl Default for SimConfig {
             jitter_fraction: 0.1,
             packet_loss_rate: 0.0,
             crypto_scheme: CryptoScheme::default(),
-            share_declared_reads: false,
             accounts: Vec::new(),
             world_accounts: Vec::new(),
             pools: Vec::new(),
@@ -233,10 +228,6 @@ pub struct SimulationRunner {
     /// derive additional signers (e.g. registration scenarios) under
     /// the same scheme.
     crypto_scheme: CryptoScheme,
-
-    /// [`SimConfig::share_declared_reads`], retained so runtime-seated
-    /// vnodes admit under the same discipline as genesis-seated ones.
-    share_declared_reads: bool,
 
     /// [`SimConfig::accounts`], retained so genesis seeds the same
     /// world the executor and statics were built with.
@@ -519,12 +510,7 @@ impl SimulationRunner {
                     shard: *shard,
                     recovered: &RecoveredState::default(),
                     shard_config: &ShardConsensusConfig::default(),
-                    // Harness default: the routing overlay runs in every
-                    // simulation; prod stays off unless configured.
-                    mempool_config: MempoolConfig {
-                        share_declared_reads: network_config.share_declared_reads,
-                        ..MempoolConfig::default()
-                    },
+                    mempool_config: MempoolConfig::default(),
                     provision_config: ProvisionConfig::default(),
                     vnodes,
                 }));
@@ -626,7 +612,6 @@ impl SimulationRunner {
             signers,
             verifier,
             crypto_scheme,
-            share_declared_reads: network_config.share_declared_reads,
             accounts: network_config.accounts.clone(),
             pools,
             engine,

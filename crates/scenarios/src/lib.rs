@@ -34,7 +34,8 @@ pub use execution::{
     events_land_on_their_emitters_home_shard, failure_charges_its_payer, hot_recipient,
     insolvent_payer_engages_nothing, nullifier_race_admits_exactly_one,
     preview_reports_resource_changes, randomness_draw_agrees_across_shards,
-    reads_the_committed_baseline, single_transfer, zipf_payments,
+    reads_the_committed_baseline, single_transfer, withdrawals_compose_over_one_vault,
+    zipf_payments,
 };
 pub use faults::{
     beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
@@ -48,7 +49,6 @@ pub use faults::{
     minority_fragment_rejoins_after_partition, partition_halts_and_heals,
     partition_heals_at_exact_quorum,
 };
-pub use hyperscale_mempool::DeferralStats;
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;
 pub use reshape::{

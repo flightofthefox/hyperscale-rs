@@ -19,8 +19,7 @@ use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{chain_fate, status_rank};
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_accounts, world_pools};
 use hyperscale_scenarios::{
-    Budget, Cluster, DeferralStats, FaultHandle, FaultableCluster, ScenarioConfig, grow_to,
-    vote_reshape_threshold,
+    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
 };
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
@@ -48,7 +47,6 @@ struct BuildArgs<'a> {
     config: &'a ScenarioConfig,
     seed: u64,
     dedicated_pool_hosts: bool,
-    share_declared_reads: bool,
     accounts: &'a [([u8; 16], u128)],
     execution_mode: ExecutionMode,
 }
@@ -67,18 +65,7 @@ impl SimCluster {
     /// accounts of its own.
     #[must_use]
     pub fn new(config: &ScenarioConfig, seed: u64) -> Self {
-        Self::build(config, seed, &[], false, false)
-    }
-
-    /// [`Self::with_accounts`] with declared reads shared rather than
-    /// exclusive — the share side of the read-share A/B.
-    #[must_use]
-    pub fn with_accounts_and_read_share(
-        config: &ScenarioConfig,
-        seed: u64,
-        accounts: &[([u8; 16], u128)],
-    ) -> Self {
-        Self::build(config, seed, accounts, false, true)
+        Self::build(config, seed, &[], false)
     }
 
     /// Build a genesis cluster with funded accounts, batch-scheduling
@@ -105,7 +92,6 @@ impl SimCluster {
             config,
             seed,
             dedicated_pool_hosts: false,
-            share_declared_reads: false,
             accounts,
             execution_mode,
         })
@@ -120,7 +106,7 @@ impl SimCluster {
         seed: u64,
         accounts: &[([u8; 16], u128)],
     ) -> Self {
-        Self::build(config, seed, accounts, true, false)
+        Self::build(config, seed, accounts, true)
     }
 
     /// Build a genesis cluster giving each pool extra its own shard-less
@@ -132,7 +118,7 @@ impl SimCluster {
     /// `vnodes_per_host` alone.
     #[must_use]
     pub fn with_dedicated_pool_hosts(config: &ScenarioConfig, seed: u64) -> Self {
-        Self::build(config, seed, &[], true, false)
+        Self::build(config, seed, &[], true)
     }
 
     fn build(
@@ -140,13 +126,11 @@ impl SimCluster {
         seed: u64,
         accounts: &[([u8; 16], u128)],
         dedicated_pool_hosts: bool,
-        share_declared_reads: bool,
     ) -> Self {
         Self::build_full(&BuildArgs {
             config,
             seed,
             dedicated_pool_hosts,
-            share_declared_reads,
             accounts,
             execution_mode: ExecutionMode::Serial,
         })
@@ -170,7 +154,6 @@ impl SimCluster {
             beacon_chain_config: Some(beacon_chain_config),
             intra_shard_latency: config.latency,
             cross_shard_latency: config.latency,
-            share_declared_reads: args.share_declared_reads,
             // Every cluster funds the pool operator and seats the pools,
             // because the founding pool's vote is how any cluster retunes
             // a network parameter — the same reason the statics register
@@ -386,16 +369,6 @@ impl Cluster for SimCluster {
             .filter_map(|storage| storage.latest_committed())
             .max_by_key(|(_, state)| state.current_epoch)
             .map(|(_, state)| state)
-    }
-
-    fn deferral_stats(&self) -> Option<DeferralStats> {
-        let mut total = DeferralStats::default();
-        for state in self.runner.all_vnode_states() {
-            if let Some(stats) = state.mempool_deferral_stats() {
-                total.absorb(&stats);
-            }
-        }
-        Some(total)
     }
 
     fn substate(&self, shard: ShardId, owner: [u8; 16], local: [u8; 16]) -> Option<Vec<u8>> {

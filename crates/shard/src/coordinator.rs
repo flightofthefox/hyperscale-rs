@@ -16,12 +16,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, DeclaredKey, Hash, InFlightCount, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp,
-    ProvisionHash, QuiesceCut, RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger,
-    ScheduleLookup, SettledSetVerdict, SettledWaveSet, ShardId, SplitAtBoundary, StoredReceipt,
-    SubstateKey, WaveId, WeightedTimestamp, derive_reshape_trigger, ready_signal_window,
-    settled_set_verdict,
+    BlockHash, Hash, InFlightCount, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionHash, QuiesceCut,
+    RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup,
+    SettledSetVerdict, SettledWaveSet, ShardId, SplitAtBoundary, StoredReceipt, SubstateKey,
+    WaveId, WeightedTimestamp, derive_reshape_trigger, ready_signal_window, settled_set_verdict,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -3021,33 +3020,6 @@ impl ShardCoordinator {
         }
 
         self.create_vote(topology_schedule, block_hash, height, round)
-    }
-
-    /// The admission conflict keys held by transactions in blocks that
-    /// are proposed or certified but not yet committed.
-    ///
-    /// A transaction takes its mempool lock when its block *commits*, and
-    /// a proposer selects while earlier blocks are still uncommitted — so
-    /// the pipeline is deeper than the lock window, and two conflicting
-    /// transactions can both be selected before either locks anything.
-    /// This reads that window back out of chain content, which is what
-    /// lets selection exclude the conflicts the lock set does not yet
-    /// cover.
-    ///
-    /// Every pending block rather than one branch's ancestors, and every
-    /// key rather than the read/write split: both over-approximate, and
-    /// over-approximating only defers a transaction for the couple of
-    /// blocks the window lasts. Under-approximating admits a conflicting
-    /// pair, which is what this exists to stop.
-    #[must_use]
-    pub fn in_flight_admission_keys(&self) -> BTreeSet<DeclaredKey> {
-        self.pending_blocks
-            .iter()
-            .filter(|pending| pending.header().height() > self.committed_height)
-            .filter_map(|pending| pending.block())
-            .flat_map(|block| block.transactions().iter())
-            .flat_map(|tx| tx.admission_keys())
-            .collect()
     }
 
     /// Per-payer fee-reservation demands for the transaction list
@@ -6113,6 +6085,26 @@ impl ShardCoordinator {
         self.latest_qc
             .as_deref()
             .map_or(self.committed_hash, QuorumCertificate::block_hash)
+    }
+
+    /// The drain the committed tip records: committed transactions whose
+    /// wave has not settled. `0` before the first header is observed.
+    #[must_use]
+    pub fn committed_in_flight(&self) -> u32 {
+        self.committed_in_flight.map_or(0, InFlightCount::inner)
+    }
+
+    /// The drain this shard still owes at the proposal parent: committed
+    /// transactions whose wave has not settled, read off the parent's
+    /// header rather than tracked locally.
+    ///
+    /// Chain-derived, so every replica computes the same number from the
+    /// same block — where a locally-tracked count drifts with each node's
+    /// own pipeline position.
+    #[must_use]
+    pub fn proposal_parent_in_flight(&self) -> InFlightCount {
+        self.chain_view()
+            .parent_in_flight(self.proposal_parent_block_hash())
     }
 
     /// Returns the number of transactions in the QC chain above committed height.

@@ -302,17 +302,22 @@ pub fn zipf_payments(
     settle_and_report(c, &submissions, epochs(10))
 }
 
-/// One hot VM recipient driven to the admission serialization ceiling.
+/// One hot VM recipient, composed rather than serialized.
 ///
-/// Every payer deposits to the same vault cell; its substate-granular
-/// write key serializes the batch at admission (the delta mode's
-/// commutativity is a later admission lever, not exercised here), so no
-/// two payments commit at one height.
+/// Every payer deposits to the same vault cell. Admission no longer
+/// arbitrates that overlap, so the payments ride whatever blocks they
+/// land in and the batch's conflict groups sequence them — deposits are
+/// `delta`, which the mode lattice calls commutative, so they run in one
+/// group against one overlay.
+///
+/// The balance is the assertion that matters: it is the only thing that
+/// distinguishes payments threaded through a batch from payments each
+/// computing an absolute against a baseline that excludes its siblings.
 ///
 /// # Panics
 ///
-/// Panics if any payment misses its budget, does not accept, or two hot
-/// payments commit at one height.
+/// Panics if any payment misses its budget, does not accept, or the hot
+/// vault does not hold every accepted payment.
 pub fn hot_recipient(c: &mut impl Cluster, senders: u8) -> (ContentionReport, u64) {
     let hot = recipient(0);
     let before = vault_balance(c, ShardId::ROOT, hot);
@@ -334,21 +339,11 @@ pub fn hot_recipient(c: &mut impl Cluster, senders: u8) -> (ContentionReport, u6
     let span = heights
         .last()
         .map_or(0, |last| last.inner() - heights[0].inner() + 1);
-    let distinct = {
-        let mut deduped = heights.clone();
-        deduped.dedup();
-        deduped.len()
-    };
-    assert_eq!(
-        distinct,
-        heights.len(),
-        "two hot VM payments committed at one height — the serialization bound is broken",
-    );
 
-    // Every payment has to be *in* the hot vault. Counting commit
-    // heights says they were serialized; only the balance says none was
-    // overwritten by another executing against the same baseline —
-    // `settle_and_report` has already asserted all of them accepted.
+    // Every payment has to be *in* the hot vault: only the balance says
+    // none was overwritten by another executing against the same
+    // baseline — `settle_and_report` has already asserted all of them
+    // accepted.
     let settled = u128::try_from(report.submitted).expect("bounded");
     assert_eq!(
         vault_balance(c, ShardId::ROOT, hot) - before,
@@ -824,6 +819,83 @@ pub fn failure_charges_its_payer(c: &mut impl Cluster) {
         ),
         "a covered VM transfer must accept after a charged failure; status = {status:?}"
     );
+}
+
+/// Many withdrawals in one validity window, all drawing on one vault.
+///
+/// Every withdrawal reserves the same cell, so admission once handed
+/// them out one per commit cycle and the set took as many blocks as it
+/// had members. Composed into ticks instead, they land in one conflict
+/// group and run sequentially against one overlay: each sees what its
+/// predecessors took, and all of them land.
+///
+/// The amounts ascend so that no two envelopes are identical; the sum
+/// stays inside the vault, because an uncoverable envelope is refused at
+/// admission rather than aborted at execution — that path is
+/// [`failure_charges_its_payer`]'s.
+///
+/// Returns the number of blocks the accepted set occupied, which is the
+/// figure the serialization ceiling used to pin at one per member.
+///
+/// # Panics
+///
+/// Panics if any withdrawal misses its budget or does not accept, if the
+/// recipient's balance disagrees with the total withdrawn, or if the
+/// payer settled less than it moved.
+pub fn withdrawals_compose_over_one_vault(c: &mut impl Cluster, count: u8) -> u64 {
+    let shard = ShardId::ROOT;
+    let (payer, from) = sender(0);
+    let to = recipient(0);
+    let payer_before = vault_balance(c, shard, from);
+    let recipient_before = vault_balance(c, shard, to);
+
+    let amount_for = |index: u8| -> u128 { 1 + u128::from(index) };
+    let mut submissions = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let tx = build_transfer_tx(
+            &payer,
+            from,
+            to,
+            amount_for(index),
+            validity_around(c.now()),
+        );
+        submissions.push((tx.hash(), c.now()));
+        c.submit(Arc::new(tx));
+    }
+    settle_and_report(c, &submissions, epochs(16));
+
+    let moved: u128 = (0..count).map(amount_for).sum();
+    assert_eq!(
+        vault_balance(c, shard, to) - recipient_before,
+        moved,
+        "the recipient must hold every withdrawal — a shared baseline would \
+         leave only the last one",
+    );
+    let spent = payer_before - vault_balance(c, shard, from);
+    assert!(
+        spent >= moved,
+        "the payer settled every withdrawal it moved: spent = {spent}, moved = {moved}",
+    );
+
+    // How tightly the set packed. One block per withdrawal is the
+    // serialization ceiling; fewer means they composed.
+    let mut heights: Vec<BlockHeight> = submissions
+        .iter()
+        .map(|(hash, _)| {
+            c.chain_fate(shard, *hash)
+                .0
+                .expect("an accepted withdrawal has a commit height")
+        })
+        .collect();
+    heights.sort_unstable();
+    heights.dedup();
+    assert!(
+        heights.len() < count as usize,
+        "{count} withdrawals over one vault occupied {} blocks — they are still \
+         serialized one per block",
+        heights.len(),
+    );
+    heights.len() as u64
 }
 
 /// The committed balance of a account's native vault, read through the

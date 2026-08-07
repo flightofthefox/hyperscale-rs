@@ -23,10 +23,9 @@ use std::collections::BTreeMap;
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::{
-    MemoryMetrics, set_backpressure_active, set_fetch_in_flight, set_fetch_oldest_in_flight_age_ms,
-    set_in_flight, set_lock_contention, set_memory_metrics, set_mempool_size, set_shard_round,
-    set_sync_blocks_behind, set_sync_in_progress, set_sync_round_in_flight, set_view_changes,
-    set_view_syncs,
+    MemoryMetrics, set_fetch_in_flight, set_fetch_oldest_in_flight_age_ms, set_memory_metrics,
+    set_mempool_size, set_shard_round, set_sync_blocks_behind, set_sync_in_progress,
+    set_sync_round_in_flight, set_view_changes, set_view_syncs,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
@@ -64,9 +63,6 @@ pub struct VnodeMetrics {
     pub view_changes: u64,
     pub view_syncs: u64,
     pub mempool_size: usize,
-    pub contention_ratio: f64,
-    pub in_flight: usize,
-    pub backpressure_active: bool,
 }
 
 /// Composite metrics snapshot.
@@ -131,9 +127,6 @@ pub fn record_metrics(
         set_view_changes(s, v, vnode.view_changes);
         set_view_syncs(s, v, vnode.view_syncs);
         set_mempool_size(s, v, vnode.mempool_size);
-        set_lock_contention(s, v, vnode.contention_ratio);
-        set_in_flight(s, v, vnode.in_flight);
-        set_backpressure_active(s, v, vnode.backpressure_active);
     }
 
     let mut memory = snapshot.memory;
@@ -200,14 +193,10 @@ where
             let state = &vnode.state;
             let shard_stats = state.shard_coordinator().stats();
             let mempool = state.mempool_coordinator();
-            let contention = mempool.lock_contention_stats();
             set_shard_round(s, v, shard_stats.current_round);
             set_view_changes(s, v, shard_stats.view_changes);
             set_view_syncs(s, v, shard_stats.view_syncs);
             set_mempool_size(s, v, mempool.len());
-            set_lock_contention(s, v, contention.contention_ratio());
-            set_in_flight(s, v, mempool.in_flight());
-            set_backpressure_active(s, v, mempool.at_in_flight_limit());
         }
     }
 }
@@ -259,7 +248,6 @@ where
                 let state = &vnode.state;
                 let shard_stats = state.shard_coordinator().stats();
                 let mempool = state.mempool_coordinator();
-                let contention = mempool.lock_contention_stats();
                 vnodes.insert(
                     vnode.validator_id,
                     VnodeMetrics {
@@ -268,9 +256,6 @@ where
                         view_changes: shard_stats.view_changes,
                         view_syncs: shard_stats.view_syncs,
                         mempool_size: mempool.len(),
-                        contention_ratio: contention.contention_ratio(),
-                        in_flight: mempool.in_flight(),
-                        backpressure_active: mempool.at_in_flight_limit(),
                     },
                 );
             }
@@ -332,12 +317,8 @@ where
             exec_unproven_ecs: exec_mem.unproven_ecs,
             // Mempool
             mempool_pool: mempool_mem.pool,
-            mempool_ready: mempool_mem.ready,
+            mempool_pending: mempool_mem.pending,
             mempool_tombstones: mempool_mem.tombstones,
-            mempool_locked_nodes: mempool_mem.locked_nodes,
-            mempool_deferred_by_nodes: mempool_mem.deferred_by_nodes,
-            mempool_txs_deferred_by_node: mempool_mem.txs_deferred_by_node,
-            mempool_ready_txs_by_node: mempool_mem.ready_txs_by_node,
             // Remote Headers
             rh_pending_headers: rh_mem.pending_headers,
             rh_verified_headers: rh_mem.verified_headers,

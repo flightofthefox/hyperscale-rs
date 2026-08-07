@@ -4,7 +4,7 @@ This document covers the machinery that gives Hyperscale single-chain semantics 
 
 **If you know two-phase commit, read this first.** The family resemblance is real — ordering a transaction under locks plays the role prepare plays classically — but the three defining features of 2PC are all absent. There is **no coordinator**: the protocol is symmetric across shards, so the coordinator-failure blocking problem that defines textbook 2PC has no analogue. There are **no votes on the outcome**: in 2PC the result is genuinely open until participants' votes are tallied, whereas here it is a deterministic function of committed chain content — which transactions ordered, and which provisions landed by the attested deadline. Execution certificates *attest* an outcome every honest replica already computed rather than *choosing* one. (The closer lineage is deterministic databases, where determinism replaces commit-time agreement, not distributed transactions.) And **participants don't fail in the 2PC sense**: each "participant" is a BFT-replicated committee, and even a participant shard ceasing to exist mid-flight — a case classical 2PC has no answer for — resolves deterministically through the settled-set fence ([02-dynamic-sharding.md](02-dynamic-sharding.md) §4).
 
-Main code homes: `crates/mempool` (admission, ready set), `crates/provisions` (provision coordination and DA), `crates/execution` (waves, vote aggregation), `crates/engine` (the effect-typed engine and its fee rules), with the wire types in `crates/types` (`Provisions`, `ProvisionEntry`, `ExecutionCertificate`, `WaveCertificate`, `FinalizedWave`).
+Main code homes: `crates/mempool` (admission and availability), `crates/provisions` (provision coordination and DA), `crates/execution` (waves, vote aggregation), `crates/engine` (the effect-typed engine and its fee rules), with the wire types in `crates/types` (`Provisions`, `ProvisionEntry`, `ExecutionCertificate`, `WaveCertificate`, `FinalizedWave`).
 
 ---
 
@@ -14,13 +14,9 @@ Every transaction's declared access is derived from its signed envelope through 
 
 The mempool (`MempoolCoordinator`) admits transactions into a hash-ordered pool with process-level dedup caches shared across co-hosted vnodes (`CanonicalTxs` — one signature/HBOR validation per transaction per process; `TxStatusCache` — one status truth for RPC). Terminal-state tombstones prevent re-admission of finished transactions.
 
-**The ready set is what makes local deadlock structurally impossible.** `ReadySet::add` enforces **partial coupling**: no two transactions that are simultaneously in flight (committed and holding locks) or ready (eligible for proposal) may share *any* declared key (INV-EXEC-3). A transaction whose declared keys overlap a lock or another ready transaction is deferred, indexed by the blocking key, and promoted the moment the key frees. Locks are held from commit until the transaction's wave finalizes, and cross-shard transactions extend their locks over all provisioning dependencies. Consequences:
+**Admission does not arbitrate conflicts.** Selection is hash-ordered iteration over the eligible pool up to the block budget; two transactions touching one cell are both selectable. What sequences them is execution: a committed block's work is one batch, partitioned into conflict groups and run against a single overlay, and each batch's output is the next batch's baseline. Contenders therefore see each other's writes instead of being held apart, and a hot cell no longer costs a commit cycle per transaction.
 
-- Two local transactions can never deadlock — they are never in flight together if they could contend.
-- Proposal selection is deterministic (hash-ordered iteration up to the block budget — a transaction count, with a gas budget planned), so all replicas agree on eligibility reasoning.
-- The invariant is deliberately a *superset* of the minimum needed for cross-shard coupling safety, which structurally defuses gaming strategies that exploit partially-coupled scheduling.
-
-An in-flight cap (`MAX_TX_IN_FLIGHT`) bounds the total lock-holding population, providing backpressure.
+An in-flight cap (`MAX_TX_IN_FLIGHT`) bounds the drain a shard still owes — committed transactions whose wave has not settled. The count is chain-derived, carried on the block header, so every replica reads the same number rather than one that drifts with its own pipeline position.
 
 **Authorization is admission's business.** A VM manifest node names its target by address, and an address is public — naming one is evidence of nothing. Each method a package publishes declares whether reaching it requires the target's own authority: `deposit` does not, because being paid is not a decision the recipient makes, while `withdraw` and the entropy stamp do, because spending an account's funds and writing its leaves are. A gated node is well-formed only inside an intent its target signed — the composer's account for a root-intent node, the declared signer's for a subintent node — so moving a second party's funds takes a subintent that party signed, and an ordinary transfer still settles under the sender's single signature (INV-VM-12). The verdict reads only signed content and content-addressed package metadata, never state, so it sits beside the rest of derivation, ahead of ordering and ahead of any fee exposure: an envelope that fails it never enters a block and nobody pays for it. Accessibility is a declaration the package makes about its own methods, carried in the metadata section its content address covers, so no transaction can weaken it and every shard reads the same one.
 
@@ -84,7 +80,7 @@ Fetch-path plumbing (unified `IdFetch` protocols, abandon-on-terminal notificati
 
 A transaction declaring accounts on shards A and B:
 
-1. **Admission.** Both shards admit it (routing by declared nodes); each shard's ready set holds it until no declared node is contended locally.
+1. **Admission.** Both shards admit it (routing by declared keys); a non-payer shard parks it until its payer's engagement evidence commits.
 2. **Ordering.** A and B each commit it in a block, independently — there is no cross-shard coordination in consensus itself. Locks engage on both sides.
 3. **Provisioning.** A's proposer sends B a proven bundle of A's declared substates (and vice versa). Each side verifies against the other's QC-attested header.
 4. **Execution.** Both sides now hold identical merged inputs; both execute; both compute the same receipts and the same `global_receipt_root`.

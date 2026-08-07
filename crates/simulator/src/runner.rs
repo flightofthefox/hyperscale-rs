@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use hyperscale_mempool::LockContentionStats;
 use hyperscale_network_memory::{BandwidthReport, NodeIndex};
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::SimulationRunner;
@@ -367,12 +366,8 @@ impl Simulator {
             0.0
         };
 
-        // Aggregate lock contention stats from all shards
-        let lock_stats = self.aggregate_lock_contention();
-
-        // Take a sample
         self.metrics
-            .sample(self.runner.now(), self.in_flight.len() as u64, lock_stats);
+            .sample(self.runner.now(), self.in_flight.len() as u64);
 
         info!(
             elapsed_secs = elapsed.as_secs(),
@@ -384,26 +379,6 @@ impl Simulator {
             tps = format!("{:.2}", tps),
             "Simulation progress"
         );
-    }
-
-    /// Aggregate lock contention stats across the live leaf shards.
-    ///
-    /// Sums stats from one vnode per leaf (they all see the same mempool).
-    fn aggregate_lock_contention(&self) -> LockContentionStats {
-        let mut total = LockContentionStats::default();
-
-        let depth = self.config.num_shards.trailing_zeros();
-        for shard_idx in 0..self.config.num_shards {
-            let shard = ShardId::leaf(depth, u64::from(shard_idx));
-            if let Some(node) = self.runner.shard_vnodes(shard).first() {
-                let stats = node.mempool_coordinator().lock_contention_stats();
-                total.locked_nodes += stats.locked_nodes;
-                total.pending_count += stats.pending_count;
-                total.pending_deferred += stats.pending_deferred;
-            }
-        }
-
-        total
     }
 
     /// Get the underlying simulation runner (for advanced use).

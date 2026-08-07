@@ -1345,28 +1345,12 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.mempool_pool as f64);
         self.metrics
             .memory_mempool
-            .with_label_values(&["ready"])
-            .set(m.mempool_ready as f64);
+            .with_label_values(&["pending"])
+            .set(m.mempool_pending as f64);
         self.metrics
             .memory_mempool
             .with_label_values(&["tombstones"])
             .set(m.mempool_tombstones as f64);
-        self.metrics
-            .memory_mempool
-            .with_label_values(&["locked_nodes"])
-            .set(m.mempool_locked_nodes as f64);
-        self.metrics
-            .memory_mempool
-            .with_label_values(&["deferred_by_nodes"])
-            .set(m.mempool_deferred_by_nodes as f64);
-        self.metrics
-            .memory_mempool
-            .with_label_values(&["txs_deferred_by_node"])
-            .set(m.mempool_txs_deferred_by_node as f64);
-        self.metrics
-            .memory_mempool
-            .with_label_values(&["ready_txs_by_node"])
-            .set(m.mempool_ready_txs_by_node as f64);
 
         // Remote Headers
         self.metrics

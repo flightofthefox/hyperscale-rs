@@ -46,21 +46,13 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
     let coord = MempoolCoordinator::new(ShardId::ROOT);
     let MempoolMemoryStats {
         pool,
-        ready,
+        pending,
         tombstones,
-        locked_nodes,
-        deferred_by_nodes,
-        txs_deferred_by_node,
-        ready_txs_by_node,
     } = coord.memory_stats();
 
     assert_eq!(pool, 0);
-    assert_eq!(ready, 0);
+    assert_eq!(pending, 0);
     assert_eq!(tombstones, 0);
-    assert_eq!(locked_nodes, 0);
-    assert_eq!(deferred_by_nodes, 0);
-    assert_eq!(txs_deferred_by_node, 0);
-    assert_eq!(ready_txs_by_node, 0);
 }
 
 #[test]
@@ -68,15 +60,8 @@ fn fresh_coordinator_reports_empty_pool_and_ready_set() {
     let coord = MempoolCoordinator::new(ShardId::ROOT);
     assert_eq!(coord.len(), 0);
     assert!(coord.is_empty());
-    assert_eq!(coord.in_flight(), 0);
     assert_eq!(coord.pending_count(), 0);
     assert_eq!(coord.tombstone_count(), 0);
-}
-
-#[test]
-fn at_in_flight_limit_is_false_on_fresh_coordinator() {
-    let coord = MempoolCoordinator::new(ShardId::ROOT);
-    assert!(!coord.at_in_flight_limit());
 }
 
 #[test]
@@ -106,20 +91,9 @@ fn ready_transactions_is_empty_on_fresh_coordinator() {
     let coord = MempoolCoordinator::new(ShardId::ROOT);
     assert!(
         coord
-            .ready_transactions(100, 0, 0, LocalTimestamp::ZERO, None)
+            .ready_transactions(100, 0, LocalTimestamp::ZERO, None)
             .is_empty()
     );
-}
-
-#[test]
-fn lock_contention_stats_zero_on_fresh_coordinator() {
-    let coord = MempoolCoordinator::new(ShardId::ROOT);
-    let stats = coord.lock_contention_stats();
-    assert_eq!(stats.locked_nodes, 0);
-    assert_eq!(stats.pending_count, 0);
-    assert_eq!(stats.pending_deferred, 0);
-    assert_eq!(stats.in_flight_count, 0);
-    assert!(stats.contention_ratio().abs() < f64::EPSILON);
 }
 
 #[test]
@@ -144,13 +118,13 @@ fn submit_then_ready_round_trips_a_transaction() {
     assert!(coord.has_transaction(&tx_hash));
     assert_eq!(coord.status(&tx_hash), Some(TransactionStatus::Pending));
 
-    let ready = coord.ready_transactions(10, 0, 0, LocalTimestamp::ZERO, None);
+    let ready = coord.ready_transactions(10, 0, LocalTimestamp::ZERO, None);
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].hash(), tx_hash);
 }
 
 #[test]
-fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
+fn on_block_committed_transitions_pending_to_committed() {
     let topology_snapshot = test_topology();
     let mut coord = MempoolCoordinator::new(ShardId::ROOT);
 
@@ -161,7 +135,6 @@ fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
         Arc::new(verified(tx.clone())),
         LocalTimestamp::ZERO,
     );
-    assert_eq!(coord.in_flight(), 0);
 
     let block = make_live_block(
         ShardId::ROOT,
@@ -173,7 +146,6 @@ fn on_block_committed_transitions_pending_to_committed_and_bumps_in_flight() {
     );
     coord.on_block_committed(&topology_snapshot, &certify(block, 1_000));
 
-    assert_eq!(coord.in_flight(), 1);
     assert_eq!(
         coord.status(&tx_hash),
         Some(TransactionStatus::Committed(BlockHeight::new(1)))

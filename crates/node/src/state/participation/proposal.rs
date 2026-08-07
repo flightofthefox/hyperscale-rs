@@ -29,8 +29,6 @@ impl ShardParticipation {
     pub(in crate::state) fn gather_proposal_inputs(
         &self,
         sched: &TopologySchedule,
-        pending_txs: usize,
-        pending_certs: usize,
     ) -> ProposalInputs {
         // Request extra transactions from the mempool to compensate for QC-chain
         // duplicates that will be filtered by shard consensus during proposal building.
@@ -40,10 +38,12 @@ impl ShardParticipation {
         // can't settle before the cut. `None` in steady state, so the
         // mempool filter is inert.
         let quiesce = self.shard_coordinator.quiesce_cut(sched);
+        // The cap reads the chain, not a local claim set: the parent
+        // header carries what this shard still owes.
+        let in_flight = self.shard_coordinator.proposal_parent_in_flight();
         let ready_txs = self.mempool_coordinator.ready_transactions(
             max_txs,
-            pending_txs,
-            pending_certs,
+            in_flight.inner() as usize,
             self.now,
             quiesce,
         );
@@ -58,23 +58,8 @@ impl ShardParticipation {
         // payer evidence; a mis-paired inclusion is backstopped by the
         // dispatch gate's required-set check.
         let topology = sched.head();
-        // A transaction takes its mempool lock when its block commits,
-        // and this selects while earlier blocks are still uncommitted —
-        // the pipeline is deeper than the lock window, so the ready set
-        // alone would let two conflicting transactions into two blocks
-        // and both would execute against the same baseline. The window
-        // the lock set does not yet cover is read back out of chain
-        // content and excluded here.
-        let in_flight = self.shard_coordinator.in_flight_admission_keys();
         let ready_txs = ready_txs
             .into_iter()
-            .filter(|tx| {
-                in_flight.is_empty()
-                    || !tx
-                        .admission_keys()
-                        .iter()
-                        .any(|key| in_flight.contains(key))
-            })
             .filter(|tx| self.engagement_held(tx, topology, &queued))
             .collect();
 
@@ -127,8 +112,7 @@ impl ShardParticipation {
         &mut self,
         sched: &TopologySchedule,
     ) -> Vec<Action> {
-        let (pending_txs, pending_certs) = self.shard_coordinator.pending_block_counts();
-        let inputs = self.gather_proposal_inputs(sched, pending_txs, pending_certs);
+        let inputs = self.gather_proposal_inputs(sched);
 
         self.shard_coordinator.try_propose(
             sched,

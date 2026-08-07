@@ -4,17 +4,15 @@
 //!
 //! Every scenario is deterministic (seeded sampling, fixed account sets)
 //! and budgeted in epochs, and returns its chain-derived observables as a
-//! report; the mempool deferral statistics ride along when the harness
-//! exposes them. Assertions cover correctness — every payment accepts —
-//! and the structural bound the hot component must show (at most one
-//! transaction per block); the numbers are the phase record's baseline.
+//! report. Assertions cover correctness — every payment accepts — and how
+//! tightly contended work packs into blocks; the numbers are the phase
+//! record's baseline.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_mempool::DeferralStats;
 use hyperscale_types::{ShardId, TransactionDecision, TransactionStatus, TxHash};
 
 use crate::reshape::split_lifecycle;
@@ -39,9 +37,6 @@ pub struct ContentionReport {
     pub latency_p50: Duration,
     /// 95th-percentile submit-to-terminal latency.
     pub latency_p95: Duration,
-    /// Aggregated mempool deferral statistics, when the harness exposes
-    /// them.
-    pub deferral: Option<DeferralStats>,
 }
 
 /// Deterministic 64-bit LCG (Knuth's MMIX constants) for seeded sampling.
@@ -150,7 +145,6 @@ fn settle_terminal(
         elapsed: last_terminal.saturating_sub(first_submit),
         latency_p50: percentile(50),
         latency_p95: percentile(95),
-        deferral: c.deferral_stats(),
     }
 }
 

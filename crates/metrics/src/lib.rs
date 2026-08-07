@@ -124,18 +124,10 @@ pub struct MemoryMetrics {
     // ── Mempool ──
     /// All transactions in the pool.
     pub mempool_pool: usize,
-    /// Ready transactions (no node conflicts).
-    pub mempool_ready: usize,
+    /// Pool entries still awaiting inclusion.
+    pub mempool_pending: usize,
     /// Terminal state transactions (for dedup).
     pub mempool_tombstones: usize,
-    /// Cached set of locked nodes.
-    pub mempool_locked_nodes: usize,
-    /// Transactions deferred due to node conflicts.
-    pub mempool_deferred_by_nodes: usize,
-    /// Reverse index: node -> deferred transactions.
-    pub mempool_txs_deferred_by_node: usize,
-    /// Reverse index: node -> ready transactions.
-    pub mempool_ready_txs_by_node: usize,
 
     // ── Remote Headers ──
     /// Remote headers pending QC verification.

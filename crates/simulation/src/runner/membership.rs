@@ -443,10 +443,7 @@ impl SimulationRunner {
             shard,
             recovered,
             shard_config: &ShardConsensusConfig::default(),
-            mempool_config: MempoolConfig {
-                share_declared_reads: self.share_declared_reads,
-                ..MempoolConfig::default()
-            },
+            mempool_config: MempoolConfig::default(),
             provision_config: ProvisionConfig::default(),
             vnodes: vec![(validator, signer)],
         })

@@ -2,8 +2,7 @@
 //! transactions.
 //!
 //! Owns the per-validator transaction pool and the bookkeeping that surrounds
-//! it: a [`TxStore`] of pending transactions, a [`ReadySet`] of admission-
-//! eligible candidates, a [`LockTracker`] that tracks transactions holding
+//! it: a [`TxStore`] of pending transactions, a tombstone store that
 //! state locks (the in-flight set), a [`TombstoneStore`] for recently
 //! decided hashes, and an [`ExpectedTxs`] sub-machine that backfills
 //! cross-shard transactions referenced by remote provisions before their
@@ -36,17 +35,14 @@ use std::time::Duration;
 use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, CompletedRecovery, DeclaredKey, ForkFence, LocalTimestamp,
-    MAX_TX_IN_FLIGHT, MessageClass, QuiesceCut, RETENTION_HORIZON, ShardId, TopologySnapshot,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, Verified, WAVE_TIMEOUT,
-    WeightedTimestamp,
+    BlockHeight, CertifiedBlock, CompletedRecovery, ForkFence, LocalTimestamp, MAX_TX_IN_FLIGHT,
+    MessageClass, QuiesceCut, RETENTION_HORIZON, ShardId, TopologySnapshot, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, Verified, WAVE_TIMEOUT, WeightedTimestamp,
 };
 use serde::Deserialize;
 use tracing::instrument;
 
 use crate::expected_txs::{EXPECTED_TX_GRACE, ExpectedTxs};
-use crate::lock_tracker::LockTracker;
-use crate::ready_set::{DeferralStats, ReadySet};
 use crate::tombstones::TombstoneStore;
 use crate::tx_store::TxStore;
 
@@ -114,14 +110,6 @@ pub struct MempoolConfig {
     /// [`DEFAULT_QUIESCE_SINGLE_SHARD_MARGIN`] is the operator recommendation.
     #[serde(default = "default_quiesce_single_shard_margin")]
     pub quiesce_single_shard_margin: Duration,
-
-    /// Whether admission shares declared reads: readers stack on a node
-    /// while writers exclude everyone, instead of every declared node
-    /// being exclusive. Mempool admission policy only — the track layer's
-    /// lock discipline is unchanged. Off by default; off is bit-identical
-    /// to the exclusive discipline.
-    #[serde(default)]
-    pub share_declared_reads: bool,
 }
 
 const fn default_max_pending() -> usize {
@@ -147,33 +135,6 @@ impl Default for MempoolConfig {
             min_dwell_time: DEFAULT_MIN_DWELL_TIME,
             quiesce_cross_shard_margin: Duration::ZERO,
             quiesce_single_shard_margin: Duration::ZERO,
-            share_declared_reads: false,
-        }
-    }
-}
-
-/// Lock contention statistics from the mempool.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LockContentionStats {
-    /// Number of nodes currently locked by in-flight transactions.
-    pub locked_nodes: u64,
-    /// Number of transactions in Pending status.
-    pub pending_count: u64,
-    /// Number of pending transactions that conflict with locked nodes.
-    pub pending_deferred: u64,
-    /// Number of transactions in Committed status (holding state locks).
-    pub in_flight_count: u64,
-}
-
-impl LockContentionStats {
-    /// Contention ratio: what fraction of pending transactions are deferred.
-    #[must_use]
-    #[allow(clippy::cast_precision_loss)] // ratio is a monitoring readout, precision loss is irrelevant
-    pub fn contention_ratio(&self) -> f64 {
-        if self.pending_count > 0 {
-            self.pending_deferred as f64 / self.pending_count as f64
-        } else {
-            0.0
         }
     }
 }
@@ -183,18 +144,10 @@ impl LockContentionStats {
 pub struct MempoolMemoryStats {
     /// Transactions held in the main pool.
     pub pool: usize,
-    /// Transactions currently in the ready set.
-    pub ready: usize,
+    /// Pool entries still awaiting inclusion.
+    pub pending: usize,
     /// Tombstone entries (terminal-state dedup).
     pub tombstones: usize,
-    /// Nodes currently locked by in-flight transactions.
-    pub locked_nodes: usize,
-    /// Distinct nodes with at least one deferred transaction.
-    pub deferred_by_nodes: usize,
-    /// Total transaction-node entries in the deferred index.
-    pub txs_deferred_by_node: usize,
-    /// Total transaction-node entries in the ready index.
-    pub ready_txs_by_node: usize,
 }
 
 /// Entry in the transaction pool. Carries the body alongside admission
@@ -251,17 +204,6 @@ pub struct MempoolCoordinator {
     /// in [`Self::tx_store`].
     tombstones: TombstoneStore,
 
-    /// Node-level state locks + in-flight counters. A node is locked while
-    /// any transaction touching it is in a lock-holding status; the counters
-    /// feed backpressure and contention stats.
-    locks: LockTracker,
-
-    /// Incremental ready/deferred tracking for Pending transactions.
-    /// Every Pending tx is in exactly one of: the ready set (eligible for
-    /// block inclusion), the deferred set (blocked by a locked node or a
-    /// ready-set conflict), or neither (removed).
-    ready: ReadySet,
-
     /// Current committed block height (for retry transaction creation).
     current_height: BlockHeight,
 
@@ -317,9 +259,6 @@ impl std::fmt::Debug for MempoolCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MempoolCoordinator")
             .field("pool_size", &self.pool.len())
-            .field("ready", &self.ready.ready_count())
-            .field("deferred", &self.ready.deferred_count())
-            .field("in_flight", &self.in_flight())
             .finish_non_exhaustive()
     }
 }
@@ -356,8 +295,6 @@ impl MempoolCoordinator {
             pool: BTreeMap::new(),
             tx_store,
             tombstones: TombstoneStore::new(),
-            locks: LockTracker::with_read_share(config.share_declared_reads),
-            ready: ReadySet::with_read_share(config.share_declared_reads),
             current_height: BlockHeight::new(0),
             current_ts: WeightedTimestamp::ZERO,
             expected_txs: ExpectedTxs::new(),
@@ -373,12 +310,6 @@ impl MempoolCoordinator {
     /// Push the dispatch seam's clock reading, before any handler runs.
     pub const fn set_time(&mut self, now: LocalTimestamp) {
         self.now = now;
-    }
-
-    /// Aggregated deferral statistics for this mempool.
-    #[must_use]
-    pub const fn deferral_stats(&self) -> DeferralStats {
-        self.ready.deferral_stats()
     }
 
     /// Reference to the shared body store. Callers that need to read
@@ -439,11 +370,8 @@ impl MempoolCoordinator {
         let cross_shard = topology_snapshot.is_cross_shard_transaction(tx);
         // A cross-shard transaction at a non-payer shard enters
         // contention only once its engagement evidence exists.
-        match self.engagement_park_target(topology_snapshot, tx, cross_shard) {
-            Some(payer_shard) => {
-                self.parked_engagement.insert(hash, payer_shard);
-            }
-            None => self.add_to_ready_tracking(hash, tx, now),
+        if let Some(payer_shard) = self.engagement_park_target(topology_snapshot, tx, cross_shard) {
+            self.parked_engagement.insert(hash, payer_shard);
         }
         self.tx_store.insert(Arc::clone(tx));
         self.pool.insert(
@@ -623,19 +551,10 @@ impl MempoolCoordinator {
     /// expires. Terminal states include:
     /// - Completed (certificate committed)
     /// - Aborted (explicitly aborted)
-    fn evict_terminal(&mut self, topology_snapshot: &TopologySnapshot, tx_hash: TxHash) {
+    fn evict_terminal(&mut self, tx_hash: TxHash) {
         let Some(entry) = self.pool.remove(&tx_hash) else {
             return;
         };
-
-        if entry.status.holds_state_lock() {
-            self.remove_locked_nodes(topology_snapshot, &entry.tx);
-            if matches!(entry.status, TransactionStatus::Committed(_)) {
-                self.locks.dec_in_flight();
-            }
-        }
-
-        self.remove_from_ready_tracking(&tx_hash);
 
         // Tombstone the hash so it can't be re-admitted. Body stays in
         // `tx_store` so peers can still fetch by hash; both expire on the
@@ -659,28 +578,8 @@ impl MempoolCoordinator {
     /// lock/unlock siblings — only locally-routed keys were ever locked.
     /// At a reshape boundary the head trie may have re-routed keys this
     /// chain locked; skipping them is sound because a terminated chain's
-    /// lock set dies with it. A tx that never reached `Committed` holds
-    /// no in-flight lock, so the release is skipped for it.
-    fn abort_one(
-        &mut self,
-        topology_snapshot: &TopologySnapshot,
-        tx_hash: TxHash,
-    ) -> Option<Action> {
+    fn abort_one(&mut self, tx_hash: TxHash) -> Option<Action> {
         let entry = self.pool.remove(&tx_hash)?;
-        if matches!(entry.status, TransactionStatus::Committed(_)) {
-            let local_shard = self.local_shard;
-            let local =
-                |key: &DeclaredKey| topology_snapshot.shard_for_declared_key(key) == local_shard;
-            let promotable = self.locks.unlock_declared(
-                entry.tx.admission_read_keys().into_iter().filter(local),
-                entry.tx.admission_write_keys().into_iter().filter(local),
-            );
-            for key in promotable {
-                self.promote_transactions_for_key(key);
-            }
-            self.locks.dec_in_flight();
-        }
-        self.remove_from_ready_tracking(&tx_hash);
         self.tombstones
             .tombstone(tx_hash, entry.tx.validity_range().end_timestamp_exclusive);
         record_transaction_aborted();
@@ -698,7 +597,7 @@ impl MempoolCoordinator {
     /// wave certificate in a later block, and a terminated chain commits
     /// no later block, so an in-flight tx here is permanently undecidable —
     /// abort is its terminal state.
-    pub fn abort_in_flight(&mut self, topology_snapshot: &TopologySnapshot) -> Vec<Action> {
+    pub fn abort_in_flight(&mut self) -> Vec<Action> {
         let mut in_flight: Vec<TxHash> = self
             .pool
             .iter()
@@ -709,7 +608,7 @@ impl MempoolCoordinator {
 
         let mut actions = Vec::with_capacity(in_flight.len());
         for tx_hash in in_flight {
-            actions.extend(self.abort_one(topology_snapshot, tx_hash));
+            actions.extend(self.abort_one(tx_hash));
         }
         actions
     }
@@ -719,18 +618,14 @@ impl MempoolCoordinator {
     /// shard, once a terminated partner's settled set proves the
     /// transaction's cross-shard half will never finalize. Hashes not in
     /// the pool (already terminal) are skipped.
-    pub fn abort_transactions(
-        &mut self,
-        topology_snapshot: &TopologySnapshot,
-        tx_hashes: &[TxHash],
-    ) -> Vec<Action> {
+    pub fn abort_transactions(&mut self, tx_hashes: &[TxHash]) -> Vec<Action> {
         let mut sorted: Vec<TxHash> = tx_hashes.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
 
         let mut actions = Vec::with_capacity(sorted.len());
         for tx_hash in sorted {
-            actions.extend(self.abort_one(topology_snapshot, tx_hash));
+            actions.extend(self.abort_one(tx_hash));
         }
         actions
     }
@@ -836,11 +731,6 @@ impl MempoolCoordinator {
                     let cross_shard = entry.cross_shard;
                     let submitted_locally = entry.submitted_locally;
                     entry.status = TransactionStatus::Committed(height);
-                    // Remove from ready tracking (no longer Pending)
-                    self.remove_from_ready_tracking(&hash);
-                    // Add locks for committed transactions and update counter
-                    self.add_locked_nodes(topology_snapshot, tx);
-                    self.locks.inc_in_flight();
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: hash,
                         status: TransactionStatus::Committed(height),
@@ -932,11 +822,7 @@ impl MempoolCoordinator {
                 if matches!(decision, TransactionDecision::Aborted) {
                     record_transaction_aborted();
                 }
-                actions.extend(self.process_certificate_committed(
-                    topology_snapshot,
-                    tx_hash,
-                    decision,
-                ));
+                actions.extend(self.process_certificate_committed(tx_hash, decision));
             }
         }
 
@@ -951,7 +837,6 @@ impl MempoolCoordinator {
     /// Emits the terminal status update and evicts/tombstones the entry.
     fn process_certificate_committed(
         &mut self,
-        topology_snapshot: &TopologySnapshot,
         tx_hash: TxHash,
         decision: TransactionDecision,
     ) -> Vec<Action> {
@@ -968,8 +853,7 @@ impl MempoolCoordinator {
                 submitted_locally,
             });
 
-            // Release locks and evict — same for all terminal states
-            self.evict_terminal(topology_snapshot, tx_hash);
+            self.evict_terminal(tx_hash);
         }
 
         actions
@@ -986,38 +870,11 @@ impl MempoolCoordinator {
     /// peer shard's wave finalization, which can stall independently. Locking
     /// them here would permanently defer future local cross-shard txs that
     /// share those remote nodes, cascading the stall.
-    fn add_locked_nodes(&mut self, topology_snapshot: &TopologySnapshot, tx: &Transaction) {
-        let local_shard = self.local_shard;
-        let local =
-            |key: &DeclaredKey| topology_snapshot.shard_for_declared_key(key) == local_shard;
-        let blocking = self.locks.lock_declared(
-            tx.admission_read_keys().into_iter().filter(local),
-            tx.admission_write_keys().into_iter().filter(local),
-        );
-        for (key, scope) in blocking {
-            let write_locked = self.locks.is_write_locked(&key);
-            self.ready.block_key(key, scope, write_locked, self.now);
-        }
-    }
-
     /// Remove a transaction's nodes from the locked set.
     /// Called when a transaction transitions FROM a lock-holding state (evicted).
     ///
     /// Also promotes any blocked transactions that were waiting on these nodes.
     /// Scoped to local-shard nodes; mirrors [`Self::add_locked_nodes`].
-    fn remove_locked_nodes(&mut self, topology_snapshot: &TopologySnapshot, tx: &Transaction) {
-        let local_shard = self.local_shard;
-        let local =
-            |key: &DeclaredKey| topology_snapshot.shard_for_declared_key(key) == local_shard;
-        let promotable = self.locks.unlock_declared(
-            tx.admission_read_keys().into_iter().filter(local),
-            tx.admission_write_keys().into_iter().filter(local),
-        );
-        for key in promotable {
-            self.promote_transactions_for_key(key);
-        }
-    }
-
     /// Add a transaction to ready tracking when it becomes Pending. The
     /// store decides whether it lands in the ready or deferred set based on
     /// currently-locked and already-claimed nodes.
@@ -1065,14 +922,9 @@ impl MempoolCoordinator {
         for hash in tx_hashes {
             match self.parked_engagement.get(&hash) {
                 Some(&payer_shard) if payer_shard == source => {
+                    // Unparked: a Pending entry no longer parked is
+                    // selectable by construction.
                     self.parked_engagement.remove(&hash);
-                    if let Some(entry) = self.pool.get(&hash)
-                        && entry.status == TransactionStatus::Pending
-                    {
-                        let tx = Arc::clone(&entry.tx);
-                        let added_at = entry.admitted_at;
-                        self.ready.add(hash, tx, added_at, self.now, &self.locks);
-                    }
                 }
                 Some(_) => {}
                 None => {
@@ -1105,45 +957,9 @@ impl MempoolCoordinator {
             .retain(|_, (_, deadline)| *deadline > now);
     }
 
-    fn add_to_ready_tracking(
-        &mut self,
-        hash: TxHash,
-        tx: &Arc<Verified<Transaction>>,
-        added_at: LocalTimestamp,
-    ) {
-        self.ready
-            .add(hash, Arc::clone(tx), added_at, added_at, &self.locks);
-    }
-
-    /// Remove a transaction from ready tracking. If the tx was in the ready
-    /// set, cascade-promote any deferred tx whose only blocker was the
-    /// ready-set claim.
-    fn remove_from_ready_tracking(&mut self, hash: &TxHash) {
-        let freed_keys = self.ready.remove(hash);
-        for key in freed_keys {
-            self.promote_transactions_for_key(key);
-        }
-    }
-
     /// Remove `key` from the blocker set of every deferred tx, re-adding
     /// any tx whose last blocker was this key back through the store so it
     /// gets re-checked against remaining locks and ready-set claims.
-    fn promote_transactions_for_key(&mut self, key: DeclaredKey) {
-        let mut promotable = self.ready.promotable_for_key(key);
-        promotable.sort();
-        let mut to_readd: Vec<(TxHash, Arc<Verified<Transaction>>, LocalTimestamp)> = Vec::new();
-        for tx_hash in promotable {
-            if let Some(entry) = self.pool.get(&tx_hash)
-                && entry.status == TransactionStatus::Pending
-            {
-                to_readd.push((tx_hash, Arc::clone(&entry.tx), entry.admitted_at));
-            }
-        }
-        for (hash, tx, added_at) in to_readd {
-            self.ready.add(hash, tx, added_at, self.now, &self.locks);
-        }
-    }
-
     /// Get transactions ready for inclusion in a block with backpressure support.
     ///
     /// Returns transactions sorted by hash (ascending) for determinism.
@@ -1173,25 +989,16 @@ impl MempoolCoordinator {
     pub fn ready_transactions(
         &self,
         max_count: usize,
-        pending_commit_tx_count: usize,
-        pending_commit_cert_count: usize,
+        in_flight: usize,
         now: LocalTimestamp,
         quiesce: Option<QuiesceCut>,
     ) -> Vec<Arc<Verified<Transaction>>> {
-        // Certificates reduce in-flight (transactions complete), txs increase it
-        let effective_in_flight = self
-            .in_flight()
-            .saturating_add(pending_commit_tx_count)
-            .saturating_sub(pending_commit_cert_count);
-        let at_limit = effective_in_flight >= MAX_TX_IN_FLIGHT;
-
-        if at_limit {
+        // The drain the chain says this shard still owes. Selection stops
+        // adding to it at the cap rather than tracking claims of its own.
+        if in_flight >= MAX_TX_IN_FLIGHT {
             return Vec::new();
         }
-
-        // Cap max_count to stay within limit
-        let room = MAX_TX_IN_FLIGHT.saturating_sub(effective_in_flight);
-        let max_count = max_count.min(room);
+        let max_count = max_count.min(MAX_TX_IN_FLIGHT - in_flight);
 
         // Split-boundary quiesce is inert with both margins zero (the
         // default) — drop the per-transaction classification entirely.
@@ -1200,8 +1007,15 @@ impl MempoolCoordinator {
                 || !self.config.quiesce_single_shard_margin.is_zero()
         });
 
-        self.ready
-            .iter_ready(self.config.min_dwell_time, now)
+        let min_dwell = self.config.min_dwell_time;
+        self.pool
+            .iter()
+            .filter(|(hash, entry)| {
+                matches!(entry.status, TransactionStatus::Pending)
+                    && !self.parked_engagement.contains_key(*hash)
+                    && now.saturating_sub(entry.admitted_at) >= min_dwell
+            })
+            .map(|(_, entry)| Arc::clone(&entry.tx))
             .filter(|tx| self.passes_quiesce(tx, quiesce))
             .take(max_count)
             .collect()
@@ -1232,79 +1046,15 @@ impl MempoolCoordinator {
         cut.now_wt.plus(margin) < cut.cut_wt
     }
 
-    /// Get lock contention statistics.
-    ///
-    /// Returns counts of:
-    /// - `locked_nodes`: Number of nodes currently locked by in-flight transactions
-    /// - `pending_count`: Number of transactions in Pending status
-    /// - `pending_deferred`: Number of pending transactions that conflict with locked nodes
-    /// - `in_flight_count`: Number of transactions in Committed status (holding locks)
-    ///
-    /// All stats are `O(1)` via cached counters and ready sets.
-    #[must_use]
-    pub fn lock_contention_stats(&self) -> LockContentionStats {
-        let locked_nodes = self.locks.locked_count() as u64;
-
-        // Pending counts are O(1) from ready set
-        let ready_count = self.ready.ready_count();
-        let deferred_count = self.ready.deferred_count();
-        let pending_deferred = deferred_count as u64;
-        let pending_count = (ready_count + deferred_count) as u64;
-
-        LockContentionStats {
-            locked_nodes,
-            pending_count,
-            pending_deferred,
-            in_flight_count: self.locks.in_flight() as u64,
-        }
-    }
-
-    /// Count transactions currently holding state locks (in-flight).
-    ///
-    /// This counts all transactions in Committed or Executed status,
-    /// which are actively holding state locks and consuming execution/crypto resources.
-    ///
-    /// Used for backpressure to control overall system load.
-    ///
-    /// This is `O(1)` as it returns a cached count maintained incrementally
-    /// when transaction status changes or transactions are evicted.
-    #[must_use]
-    pub const fn in_flight(&self) -> usize {
-        self.locks.in_flight()
-    }
-
-    /// Check if we're at the in-flight limit.
-    ///
-    /// At this limit, no new transactions are proposed.
-    #[must_use]
-    pub const fn at_in_flight_limit(&self) -> bool {
-        self.in_flight() >= MAX_TX_IN_FLIGHT
-    }
-
-    /// Check whether accepting a block would unacceptably increase in-flight load.
-    ///
-    /// Returns `true` if the block should be rejected. Blocks that reduce or
-    /// maintain the current in-flight count are always accepted, even when over
-    /// the limit — this prevents deadlock when certificate-heavy blocks would
-    /// relieve backpressure.
-    #[must_use]
-    pub const fn would_exceed_in_flight(&self, new_tx_count: usize, cert_count: usize) -> bool {
-        let current = self.in_flight();
-        let projected = current
-            .saturating_add(new_tx_count)
-            .saturating_sub(cert_count);
-        let would_exceed = projected > MAX_TX_IN_FLIGHT;
-        let would_increase = projected > current;
-        would_exceed && would_increase
-    }
-
-    /// Get the number of pending transactions.
-    ///
-    /// Every `Pending` pool entry lives in exactly one of the ready or
-    /// deferred sets, so the sum of those counts is equivalent and `O(1)`.
+    /// The number of transactions still awaiting inclusion, parked ones
+    /// included — they occupy the pool whether or not they are currently
+    /// selectable.
     #[must_use]
     pub fn pending_count(&self) -> usize {
-        self.ready.ready_count() + self.ready.deferred_count()
+        self.pool
+            .values()
+            .filter(|entry| matches!(entry.status, TransactionStatus::Pending))
+            .count()
     }
 
     /// Check if we're at the pending transaction limit for RPC backpressure.
@@ -1347,12 +1097,8 @@ impl MempoolCoordinator {
     pub fn memory_stats(&self) -> MempoolMemoryStats {
         MempoolMemoryStats {
             pool: self.pool.len(),
-            ready: self.ready.ready_count(),
+            pending: self.pending_count(),
             tombstones: self.tombstones.len_tombstones(),
-            locked_nodes: self.locks.locked_count(),
-            deferred_by_nodes: self.ready.deferred_count(),
-            txs_deferred_by_node: self.ready.txs_deferred_by_key_len(),
-            ready_txs_by_node: self.ready.ready_txs_by_key_len(),
         }
     }
 
@@ -1424,7 +1170,6 @@ impl MempoolCoordinator {
             .collect();
         for hash in &expired {
             self.pool.remove(hash);
-            self.remove_from_ready_tracking(hash);
         }
         if !expired.is_empty() {
             self.tx_store.evict(expired.iter().copied());
@@ -1457,8 +1202,8 @@ mod tests {
         Verified::new_unchecked_for_test(tx)
     }
     use hyperscale_types::{
-        Block, FinalizedWave, MAX_TXS_PER_BLOCK, MerkleInclusionProof, ProvisionEntry, Provisions,
-        ShardId, ValidatorId,
+        Block, FinalizedWave, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId,
+        ValidatorId,
     };
 
     use super::*;
@@ -2062,10 +1807,8 @@ mod tests {
             vec![],
         );
         mempool.on_block_committed(&topology_snapshot, &certify(block, TEST_BLOCK_INTERVAL_MS));
-        assert_eq!(mempool.in_flight(), 1);
-        assert!(mempool.lock_contention_stats().locked_nodes > 0);
 
-        let actions = mempool.abort_in_flight(&topology_snapshot);
+        let actions = mempool.abort_in_flight();
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -2077,8 +1820,6 @@ mod tests {
             )),
             "sweep must emit the terminal abort status"
         );
-        assert_eq!(mempool.in_flight(), 0);
-        assert_eq!(mempool.lock_contention_stats().locked_nodes, 0);
         assert!(mempool.status(&tx_hash).is_none());
         assert!(mempool.is_tombstoned(&tx_hash));
     }
@@ -2094,8 +1835,8 @@ mod tests {
         let kept = test_transaction_with_prefixes(b"kept", &[test_prefix(9)], &[test_prefix(10)]);
         let kept_hash = kept.hash();
 
-        // Both commit with no deciding wave certificate: in flight, holding
-        // their declared-node locks.
+        // Both commit with no deciding wave certificate, so both are
+        // still in the drain.
         let block = make_live_block(
             ShardId::ROOT,
             BlockHeight::new(1),
@@ -2105,9 +1846,8 @@ mod tests {
             vec![],
         );
         mempool.on_block_committed(&topology_snapshot, &certify(block, TEST_BLOCK_INTERVAL_MS));
-        assert_eq!(mempool.in_flight(), 2);
 
-        let actions = mempool.abort_transactions(&topology_snapshot, &[doomed_hash]);
+        let actions = mempool.abort_transactions(&[doomed_hash]);
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -2119,18 +1859,13 @@ mod tests {
             )),
             "the named tx is driven to terminal abort",
         );
-        assert_eq!(
-            mempool.in_flight(),
-            1,
-            "only the named tx releases its slot"
-        );
         assert!(mempool.is_tombstoned(&doomed_hash));
         assert!(
             matches!(
                 mempool.status(&kept_hash),
                 Some(TransactionStatus::Committed(_))
             ),
-            "the unnamed tx keeps its locks and in-flight slot",
+            "the unnamed tx stays committed",
         );
     }
 
@@ -2268,42 +2003,6 @@ mod tests {
         test_transaction_with_prefixes(&seed, &[], &[prefix])
     }
 
-    /// Fill a mempool to [`MAX_TX_IN_FLIGHT`] by submitting that many
-    /// distinct transactions and committing them across enough blocks to
-    /// stay within `MAX_TXS_PER_BLOCK` per block — every tx transitions
-    /// to `Committed`, holding a state lock.
-    fn put_mempool_at_limit(
-        mempool: &mut MempoolCoordinator,
-        topology_snapshot: &TopologySnapshot,
-    ) {
-        let txs: Vec<Arc<Transaction>> = (0..MAX_TX_IN_FLIGHT)
-            .map(|i| Arc::new(unique_test_tx(i)))
-            .collect();
-        for tx in &txs {
-            mempool.on_submit_transaction(
-                topology_snapshot,
-                Arc::new(verified((**tx).clone())),
-                LocalTimestamp::ZERO,
-            );
-        }
-        for (i, chunk) in txs.chunks(MAX_TXS_PER_BLOCK).enumerate() {
-            let block = make_live_block(
-                ShardId::leaf(1, 0),
-                BlockHeight::new(u64::try_from(i + 1).unwrap()),
-                1_234_567_890,
-                ValidatorId::new(0),
-                chunk.to_vec(),
-                vec![],
-            );
-            mempool.on_block_committed(topology_snapshot, &certify(block, TEST_BLOCK_INTERVAL_MS));
-        }
-
-        assert!(
-            mempool.at_in_flight_limit(),
-            "mempool should be at in-flight limit after committing {MAX_TX_IN_FLIGHT} txs",
-        );
-    }
-
     /// Create a topology with 2 shards for cross-shard testing
     fn make_cross_shard_topology() -> TopologySnapshot {
         TestCommittee::new(8, 42).topology_snapshot(2)
@@ -2366,7 +2065,7 @@ mod tests {
 
         // No pending split → no quiesce, both selectable.
         assert_eq!(
-            mempool.ready_transactions(10, 0, 0, now, None).len(),
+            mempool.ready_transactions(10, 0, now, None).len(),
             2,
             "without a cut the quiesce is inert",
         );
@@ -2379,7 +2078,7 @@ mod tests {
             cut_wt: WeightedTimestamp::from_millis(10_000),
         };
         let selected: Vec<TxHash> = mempool
-            .ready_transactions(10, 0, 0, now, Some(cut))
+            .ready_transactions(10, 0, now, Some(cut))
             .iter()
             .map(|tx| tx.hash())
             .collect();
@@ -2413,7 +2112,7 @@ mod tests {
             cut_wt: WeightedTimestamp::from_millis(10_000),
         };
         assert_eq!(
-            mempool.ready_transactions(10, 0, 0, now, Some(cut)).len(),
+            mempool.ready_transactions(10, 0, now, Some(cut)).len(),
             1,
             "zero margins disable quiesce even at the cut",
         );
@@ -2445,20 +2144,15 @@ mod tests {
         );
 
         // Below limit: all TXs should be returned
-        let ready = mempool.ready_transactions(10, 0, 0, read_at, None);
+        let ready = mempool.ready_transactions(10, 0, read_at, None);
         assert_eq!(ready.len(), 2, "All TXs should be allowed below limit");
     }
 
     #[test]
     fn test_backpressure_rejects_all_at_limit() {
-        let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
         let topology_snapshot = make_cross_shard_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
 
-        // Put mempool at the in-flight limit
-        put_mempool_at_limit(&mut mempool, &topology_snapshot);
-        assert!(mempool.at_in_flight_limit());
-
-        // Add a transaction
         let tx = test_transaction(1);
         mempool.on_submit_transaction(
             &topology_snapshot,
@@ -2466,8 +2160,8 @@ mod tests {
             LocalTimestamp::ZERO,
         );
 
-        // At limit: no TXs should be returned
-        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::ZERO, None);
+        // The drain the chain reports is already at the cap.
+        let ready = mempool.ready_transactions(10, MAX_TX_IN_FLIGHT, LocalTimestamp::ZERO, None);
         assert!(
             ready.is_empty(),
             "No TXs should be returned at in-flight limit"
@@ -2482,9 +2176,6 @@ mod tests {
             ..MempoolConfig::default()
         };
         let mut mempool = MempoolCoordinator::with_config(ShardId::leaf(1, 0), config);
-
-        // Mempool is not at limit (nothing committed)
-        assert!(!mempool.at_in_flight_limit());
 
         // Add a single-shard transaction
         let single_tx = test_transaction(1);
@@ -2503,77 +2194,8 @@ mod tests {
         );
 
         // Not at limit: all TXs should be allowed
-        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::ZERO, None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::ZERO, None);
         assert_eq!(ready.len(), 2);
-    }
-
-    #[test]
-    fn test_in_flight_counts_all_txns() {
-        let topology_snapshot = make_cross_shard_topology();
-        let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
-
-        assert_eq!(mempool.in_flight(), 0);
-
-        let single_tx = test_transaction(200);
-        let single_hash = single_tx.hash();
-        let cross_tx = test_cross_shard_transaction(1);
-        let cross_hash = cross_tx.hash();
-        mempool.on_submit_transaction(
-            &topology_snapshot,
-            Arc::new(verified(single_tx.clone())),
-            LocalTimestamp::ZERO,
-        );
-        mempool.on_submit_transaction(
-            &topology_snapshot,
-            Arc::new(verified(cross_tx.clone())),
-            LocalTimestamp::ZERO,
-        );
-        assert_eq!(mempool.in_flight(), 0, "Pending TXs do not count");
-
-        // Block 1 commits both txs — both transition Pending → Committed.
-        let block1 = make_live_block(
-            ShardId::leaf(1, 0),
-            BlockHeight::new(1),
-            1_000,
-            ValidatorId::new(0),
-            vec![Arc::new(single_tx), Arc::new(cross_tx)],
-            vec![],
-        );
-        mempool.on_block_committed(&topology_snapshot, &certify(block1, 1_000));
-        assert_eq!(mempool.in_flight(), 2, "Committed TXs hold state locks");
-
-        // Block 2 carries the wave cert for the cross-shard tx — completes it.
-        let block2 = make_live_block(
-            ShardId::leaf(1, 0),
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![],
-            vec![Arc::new(
-                make_finalized_wave(BlockHeight::new(2), cross_hash, TransactionDecision::Accept)
-                    .into(),
-            )],
-        );
-        mempool.on_block_committed(&topology_snapshot, &certify(block2, 2_000));
-        assert_eq!(mempool.in_flight(), 1, "Completed TX releases its lock");
-
-        let block3 = make_live_block(
-            ShardId::leaf(1, 0),
-            BlockHeight::new(3),
-            3_000,
-            ValidatorId::new(0),
-            vec![],
-            vec![Arc::new(
-                make_finalized_wave(
-                    BlockHeight::new(3),
-                    single_hash,
-                    TransactionDecision::Accept,
-                )
-                .into(),
-            )],
-        );
-        mempool.on_block_committed(&topology_snapshot, &certify(block3, 3_000));
-        assert_eq!(mempool.in_flight(), 0, "All completed");
     }
 
     // =========================================================================
@@ -2593,7 +2215,7 @@ mod tests {
         let tx = test_transaction(1);
         mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), now);
 
-        let ready = mempool.ready_transactions(10, 0, 0, now, None);
+        let ready = mempool.ready_transactions(10, 0, now, None);
         assert_eq!(ready.len(), 1, "Zero dwell time should select immediately");
     }
 
@@ -2608,7 +2230,7 @@ mod tests {
         mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), submitted_at);
 
         // At t=10.1s — not yet eligible (100ms < 150ms)
-        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(10_100), None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_100), None);
         assert_eq!(
             ready.len(),
             0,
@@ -2616,7 +2238,7 @@ mod tests {
         );
 
         // At t=10.15s — eligible (150ms >= 150ms)
-        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(10_150), None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_150), None);
         assert_eq!(ready.len(), 1, "Should select after 150ms default dwell");
     }
 
@@ -2635,11 +2257,11 @@ mod tests {
         mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), submitted_at);
 
         // Still at t=10s — dwell time not met
-        let ready = mempool.ready_transactions(10, 0, 0, submitted_at, None);
+        let ready = mempool.ready_transactions(10, 0, submitted_at, None);
         assert_eq!(ready.len(), 0, "Should not select before dwell time");
 
         // Advance to t=10.3s — still not enough
-        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(10_300), None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_300), None);
         assert_eq!(
             ready.len(),
             0,
@@ -2647,7 +2269,7 @@ mod tests {
         );
 
         // Advance to t=10.5s — exactly at dwell time
-        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(10_500), None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_500), None);
         assert_eq!(ready.len(), 1, "Should select after dwell time elapses");
     }
 
@@ -2677,11 +2299,11 @@ mod tests {
         );
 
         // At t=1.4s — tx1 has 400ms dwell (eligible), tx2 has 100ms (not eligible).
-        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(1_400), None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(1_400), None);
         assert_eq!(ready.len(), 1, "Only tx1 should be eligible");
 
         // At t=1.5s — both eligible
-        let ready = mempool.ready_transactions(10, 0, 0, LocalTimestamp::from_millis(1_500), None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(1_500), None);
         assert_eq!(ready.len(), 2, "Both should be eligible");
     }
 
@@ -2967,7 +2589,7 @@ mod tests {
         assert_eq!(mempool.parked_count(), 1);
         assert!(
             mempool
-                .ready_transactions(10, 0, 0, LocalTimestamp::from_millis(1_000), None)
+                .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000), None)
                 .is_empty()
         );
 
@@ -2982,7 +2604,7 @@ mod tests {
             LocalTimestamp::ZERO,
         );
         let ready: Vec<TxHash> = mempool
-            .ready_transactions(10, 0, 0, LocalTimestamp::from_millis(1_000), None)
+            .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000), None)
             .iter()
             .map(|tx| tx.hash())
             .collect();
@@ -2992,18 +2614,20 @@ mod tests {
         mempool.on_engagement_evidence(local, [parked_hash]);
         assert_eq!(mempool.parked_count(), 1);
 
-        // The payer's bundle promotes the parked transaction into
-        // contention — where it now correctly defers behind the ready
-        // local leg on their shared key.
+        // The payer's bundle unparks the transaction. Nothing arbitrates
+        // their shared key any more — both legs are selectable, and the
+        // batch they land in is what sequences them.
         mempool.on_engagement_evidence(payer_shard, [parked_hash]);
         assert_eq!(mempool.parked_count(), 0);
-        let ready: Vec<TxHash> = mempool
-            .ready_transactions(10, 0, 0, LocalTimestamp::from_millis(1_000), None)
+        let mut ready: Vec<TxHash> = mempool
+            .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000), None)
             .iter()
             .map(|tx| tx.hash())
             .collect();
-        assert_eq!(ready, vec![local_hash]);
-        assert!(mempool.deferral_stats().deferral_events >= 1);
+        ready.sort_unstable();
+        let mut expected = vec![local_hash, parked_hash];
+        expected.sort_unstable();
+        assert_eq!(ready, expected);
     }
 
     #[test]
@@ -3023,7 +2647,7 @@ mod tests {
 
         assert_eq!(mempool.parked_count(), 0);
         let ready: Vec<TxHash> = mempool
-            .ready_transactions(10, 0, 0, LocalTimestamp::from_millis(1_000), None)
+            .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000), None)
             .iter()
             .map(|tx| tx.hash())
             .collect();

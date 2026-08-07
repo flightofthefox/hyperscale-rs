@@ -69,7 +69,7 @@ impl ShardParticipation {
                 // Settled certificates ingested before the set was
                 // reconstructed leave the counterpart sweep immediately
                 // ready: abort the straddlers the partner never settled.
-                actions.extend(self.sweep_ready_counterpart_straddlers(topology_schedule));
+                actions.extend(self.sweep_ready_counterpart_straddlers());
                 actions
             }
             _ => unreachable!("non-sync event routed to handle_sync"),

@@ -1524,12 +1524,8 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
             for vnode in &shard_loop.vnodes {
                 let state = &vnode.state;
                 let mempool = state.mempool_coordinator();
-                let contention = mempool.lock_contention_stats();
-                #[allow(clippy::cast_possible_truncation)] // pool sizes fit usize
-                let (pending, in_flight) = (
-                    contention.pending_count as usize,
-                    contention.in_flight_count as usize,
-                );
+                let pending = mempool.pending_count();
+                let in_flight = state.shard_coordinator().committed_in_flight() as usize;
                 updated.vnodes.push(VnodeStatusEntry {
                     validator_id: vnode.validator_id.inner(),
                     shard: shard_key,
@@ -1581,12 +1577,8 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
             for vnode in &shard_loop.vnodes {
                 let state = &vnode.state;
                 let mempool = state.mempool_coordinator();
-                let contention = mempool.lock_contention_stats();
-                #[allow(clippy::cast_possible_truncation)]
-                let (pending, in_flight) = (
-                    contention.pending_count as usize,
-                    contention.in_flight_count as usize,
-                );
+                let pending = mempool.pending_count();
+                let in_flight = state.shard_coordinator().committed_in_flight() as usize;
                 updated.vnodes.insert(
                     vnode.validator_id.inner(),
                     VnodeMempoolSnapshot {
@@ -1594,7 +1586,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
                         in_flight_count: in_flight,
                         total_count: mempool.len(),
                         updated_at: Some(Instant::now()),
-                        accepting_rpc_transactions: !mempool.at_in_flight_limit(),
+                        accepting_rpc_transactions: in_flight < MAX_TX_IN_FLIGHT,
                         at_pending_limit: mempool.at_pending_limit(),
                         remote_shard_in_flight: state
                             .remote_headers_coordinator()
