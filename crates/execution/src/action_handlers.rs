@@ -34,7 +34,8 @@ use hyperscale_types::{
 /// Split a batch's executed records into the three parallel streams the
 /// wave consumes: outcomes for the vote, execution receipts, and the fee
 /// receipts held in reserve against an abort.
-fn split_execution_outputs(executed: Vec<ExecutedTx>) -> ExecutionOutputs {
+#[must_use]
+pub fn split_execution_outputs(executed: Vec<ExecutedTx>) -> ExecutionOutputs {
     let mut outcomes = Vec::with_capacity(executed.len());
     let mut results = Vec::with_capacity(executed.len());
     let mut fee_receipts = Vec::new();
@@ -58,11 +59,15 @@ fn split_execution_outputs(executed: Vec<ExecutedTx>) -> ExecutionOutputs {
 /// The four per-batch products execution hands the wave: the outcomes it
 /// votes, the receipts it stores, the charges an attempt that applied
 /// nothing still settles, and what this shard attests it did.
-struct ExecutionOutputs {
-    outcomes: Vec<TxOutcome>,
-    results: Vec<StoredReceipt>,
-    fee_receipts: Vec<StoredReceipt>,
-    attested_work: Vec<(TxHash, u64)>,
+pub struct ExecutionOutputs {
+    /// Per-tx outcomes the wave votes.
+    pub outcomes: Vec<TxOutcome>,
+    /// Per-tx execution receipts.
+    pub results: Vec<StoredReceipt>,
+    /// Charges held in reserve against a wave abort.
+    pub fee_receipts: Vec<StoredReceipt>,
+    /// What this shard attests it did per transaction.
+    pub attested_work: Vec<(TxHash, u64)>,
 }
 
 /// Fold one wave group's executed records into the tick output.
@@ -74,7 +79,7 @@ struct ExecutionOutputs {
 /// as per-tx provisional entries until the wave resolves: the execution
 /// writes on one side, the reserve fee charge on the other, whichever
 /// the wave's verdict picks.
-fn accumulate_tick_output(
+pub fn accumulate_tick_output(
     output: &mut TickOutput,
     group: &TickExecutionGroup,
     executed: &[ExecutedTx],

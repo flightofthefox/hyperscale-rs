@@ -32,7 +32,7 @@ use crate::lock_recover::{read_or_recover, write_or_recover};
 use crate::{SubstateDatabase, VersionedStore};
 
 /// One cross-shard transaction's provisional contribution to a tick.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvisionalTx {
     /// Transaction whose wave verdict decides which side settles.
     pub tx_hash: TxHash,
@@ -49,7 +49,7 @@ pub struct ProvisionalTx {
 }
 
 /// The execution output of one tick.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TickOutput {
     /// Folded absolute cells determined at commit: the single-shard
     /// wave's writes, including its unconditional fee burns. Readable by
