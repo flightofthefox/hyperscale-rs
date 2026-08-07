@@ -30,16 +30,19 @@ impl ShardParticipation {
         &self,
         sched: &TopologySchedule,
     ) -> ProposalInputs {
-        // Request extra transactions from the mempool to compensate for QC-chain
-        // duplicates that will be filtered by shard consensus during proposal building.
+        // The wire cap, not the packing bound — a block cannot encode
+        // more than this however light its transactions are. What decides
+        // how many are actually offered is the work budget inside
+        // `ready_transactions`. The overhead compensates for QC-chain
+        // duplicates shard consensus filters during proposal building.
         let max_txs = MAX_TXS_PER_BLOCK + self.shard_coordinator.dedup_overhead();
         // Reshape-boundary quiesce: in a shard's final epoch before it
         // terminates at a split or merge, stop selecting transactions that
         // can't settle before the cut. `None` in steady state, so the
         // mempool filter is inert.
         let quiesce = self.shard_coordinator.quiesce_cut(sched);
-        // The cap reads the chain, not a local claim set: the parent
-        // header carries what this shard still owes.
+        // The budget reads the chain, not a local claim set: the parent
+        // header carries what this shard still owes in work.
         let in_flight = self.shard_coordinator.proposal_parent_in_flight();
         let ready_txs = self.mempool_coordinator.ready_transactions(
             max_txs,

@@ -11,7 +11,7 @@
 //! # Backpressure
 //!
 //! Two limits gate proposal and ingress:
-//! - [`MAX_BLOCK_WORK`] (a protocol constant in `hyperscale-types`) caps
+//! - [`MAX_DRAIN_WORK`] (a protocol constant in `hyperscale-types`) caps
 //!   simultaneous lock-holding transactions, preventing the execution
 //!   pipeline from being overrun. Not operator-tunable: the right value
 //!   is fully determined by block size × pipeline depth.
@@ -35,9 +35,10 @@ use std::time::Duration;
 use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, CompletedRecovery, ForkFence, LocalTimestamp, MAX_BLOCK_WORK,
-    MessageClass, QUIESCE_MARGIN, QuiesceCut, RETENTION_HORIZON, ShardId, TopologySnapshot,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, Verified, WeightedTimestamp,
+    BlockHeight, CertifiedBlock, CompletedRecovery, ForkFence, LocalTimestamp, MAX_DRAIN_WORK,
+    MAX_GAS_LIMIT, MessageClass, QUIESCE_MARGIN, QuiesceCut, RETENTION_HORIZON, ShardId,
+    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, Verified,
+    WeightedTimestamp,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -299,6 +300,19 @@ impl MempoolCoordinator {
                 end_ms = tx.validity_range().end_timestamp_exclusive.as_millis(),
                 now_ms = self.current_ts.as_millis(),
                 "Rejecting expired transaction"
+            );
+            return None;
+        }
+
+        // The signed ceiling enters the drain budget at face value, so a
+        // limit nobody could legitimately need is refused here rather
+        // than allowed to reserve the shard's whole allowance for one
+        // signature.
+        if tx.body().gas_limit > MAX_GAS_LIMIT {
+            tracing::debug!(
+                tx_hash = ?hash,
+                gas_limit = tx.body().gas_limit,
+                "Rejecting transaction declaring more gas than the protocol admits"
             );
             return None;
         }
@@ -947,10 +961,12 @@ impl MempoolCoordinator {
         now: LocalTimestamp,
         quiesce: Option<QuiesceCut>,
     ) -> Vec<Arc<Verified<Transaction>>> {
-        // The drain the chain says this shard still owes, in work units.
+        // `max_count` is the wire cap on a block's transaction list, not
+        // a packing bound: what decides how far selection goes is the
+        // drain the chain says this shard still owes, in work units.
         // Selection adds to it only while the total stays under budget —
         // a shard that is not settling admits less until it does.
-        let Some(mut budget) = MAX_BLOCK_WORK.checked_sub(in_flight) else {
+        let Some(mut budget) = MAX_DRAIN_WORK.checked_sub(in_flight) else {
             return Vec::new();
         };
 
@@ -1142,7 +1158,7 @@ mod tests {
     }
     use hyperscale_types::{
         Block, FinalizedWave, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId,
-        ValidatorId,
+        TX_ADMISSION_WORK, ValidatorId,
     };
 
     use super::*;
@@ -2516,6 +2532,78 @@ mod tests {
             1_000,
             test_validity_range(),
         )))
+    }
+
+    /// A shard that is not settling admits less until it does.
+    ///
+    /// The drain the chain reports is what selection has left to spend,
+    /// so a backlog does not merely slow proposals down — it shrinks
+    /// them, and stops them entirely at the budget.
+    #[test]
+    fn a_backlogged_shard_admits_less_until_it_drains() {
+        let topology = TestCommittee::new(4, 42).topology_snapshot(1);
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+
+        let owners: Vec<[u8; 16]> = (0..8u8).map(|i| [0x40 + i; 16]).collect();
+        for owner in &owners {
+            let tx = stub_vm(*owner, std::slice::from_ref(owner));
+            mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
+        }
+        let now = LocalTimestamp::from_millis(1_000);
+
+        // An idle chain offers everything the block can hold.
+        let idle = mempool.ready_transactions(10, 0, now, None);
+        assert_eq!(idle.len(), 8, "an undrained budget selects freely");
+
+        // Halfway to the budget, only what fits is offered.
+        let each = idle[0].work();
+        let room_for_three = MAX_DRAIN_WORK - each * 3;
+        let squeezed = mempool.ready_transactions(10, room_for_three, now, None);
+        assert_eq!(
+            squeezed.len(),
+            3,
+            "selection spends exactly the room the drain left"
+        );
+
+        // At the budget it offers nothing, whatever is pooled.
+        assert!(
+            mempool
+                .ready_transactions(10, MAX_DRAIN_WORK, now, None)
+                .is_empty(),
+            "a shard at its budget admits nothing until the drain clears"
+        );
+    }
+
+    /// Minimal transactions are not free. The fixed admit-and-track
+    /// charge inside each one's work is what keeps the budget a bound on
+    /// how *many* the drain holds, not just how heavy they are — without
+    /// it a flood declaring nothing and signing a zero gas limit would
+    /// price at almost zero and slip past.
+    #[test]
+    fn a_flood_of_minimal_transactions_is_bounded_by_the_same_budget() {
+        let topology = TestCommittee::new(4, 42).topology_snapshot(1);
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+
+        let owners: Vec<[u8; 16]> = (0..6u8).map(|i| [0x60 + i; 16]).collect();
+        for owner in &owners {
+            let tx = stub_vm(*owner, std::slice::from_ref(owner));
+            mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
+        }
+        let now = LocalTimestamp::from_millis(1_000);
+
+        let each = mempool.ready_transactions(10, 0, now, None)[0].work();
+        assert!(
+            each >= TX_ADMISSION_WORK,
+            "every transaction costs the fixed charge whatever it declared: {each}"
+        );
+        let room_for_two = MAX_DRAIN_WORK - each * 2;
+        assert_eq!(
+            mempool
+                .ready_transactions(10, room_for_two, now, None)
+                .len(),
+            2,
+            "the fixed charge is what makes the budget count them"
+        );
     }
 
     #[test]

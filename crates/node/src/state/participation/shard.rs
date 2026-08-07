@@ -64,7 +64,7 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_BLOCK_WORK,
+    BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_DRAIN_WORK,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate,
     ShardForkProof, TopologySchedule, Verifiable, Verified,
 };
@@ -373,7 +373,7 @@ impl ShardParticipation {
         // total is chain-derived, so every replica reaches the same
         // verdict at every height instead of one that drifts with local
         // pipeline position.
-        if header.work_in_flight().inner() > MAX_BLOCK_WORK {
+        if header.work_in_flight().inner() > MAX_DRAIN_WORK {
             tracing::warn!(
                 block_hash = ?header.hash(),
                 height = header.height().inner(),

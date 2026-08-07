@@ -54,16 +54,33 @@ pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
 /// sets it against measured baselines.
 pub const TX_ADMISSION_WORK: u64 = 1_000;
 
-/// What one block may add to the unexecuted drain, in work units.
+/// How much unsettled work this shard's chain may owe at once.
 ///
 /// The packing bound: a proposer adds transactions only while the
 /// drain's summed work stays under this, so a shard that is not settling
 /// admits less until it does. Replaces the transaction *count* as the
-/// packing rule — counting priced a publish and a transfer the same.
+/// packing rule — counting priced a publish and a transfer the same, and
+/// bounded the drain by how many transactions it held rather than by
+/// what they would cost to execute and settle.
 ///
-/// Generous placeholder; phase 6 calibrates it beside
-/// [`TX_ADMISSION_WORK`] against measured throughput.
-pub const MAX_BLOCK_WORK: u64 = 4_096 * (TX_ADMISSION_WORK + 1_000_000);
+/// Sized like the count it replaces: a full pipeline of blocks
+/// (commit → execute → certify) at a representative gas limit, so a
+/// shard settling normally never feels it. Every number here is a
+/// placeholder; phase 6 calibrates them together against measured
+/// throughput.
+pub const MAX_DRAIN_WORK: u64 = 3 * MAX_TXS_PER_BLOCK as u64 * (TX_ADMISSION_WORK + MAX_GAS_LIMIT);
+
+/// The largest execution ceiling a transaction may sign for.
+///
+/// A sender's `gas_limit` is theirs to choose, and it enters the drain
+/// budget at face value — so without a bound one envelope could reserve
+/// the whole of it and stall the shard for the price of a single
+/// signature. The engine's per-invocation fuel backstop is a different
+/// thing: it stops a runaway guest, not a runaway declaration.
+///
+/// Placeholder like the rest of the work model; phase 6 sets it against
+/// what the heaviest legitimate transaction actually needs.
+pub const MAX_GAS_LIMIT: u64 = 1_000_000;
 
 /// Hard cap on `header.round() - header.parent_qc().round()` — how many
 /// skipped consensus rounds a single block may span.

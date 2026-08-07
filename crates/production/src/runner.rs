@@ -54,7 +54,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, GenesisValidators, LocalTimestamp, MAX_BLOCK_WORK,
+    BeaconChainConfig, BlockHeight, GenesisValidators, LocalTimestamp, MAX_DRAIN_WORK,
     NetworkDefinition, ShardId, Signer, StakePoolSeat, Transaction, ValidatorId, ValidatorStatus,
     Verifier, WorkInFlight,
 };
@@ -1571,7 +1571,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
     // than picking a per-shard representative.
     if let Some(ref mempool_snapshot) = config.publishers.mempool {
         #[allow(clippy::cast_possible_truncation)] // pool size derived from a fixed const
-        let remote_congestion_threshold = WorkInFlight::new(MAX_BLOCK_WORK * 4 / 5);
+        let remote_congestion_threshold = WorkInFlight::new(MAX_DRAIN_WORK * 4 / 5);
         mempool_snapshot.rcu(|current| {
             let mut updated = (**current).clone();
             for vnode in &shard_loop.vnodes {
@@ -1586,7 +1586,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
                         in_flight_count: in_flight,
                         total_count: mempool.len(),
                         updated_at: Some(Instant::now()),
-                        accepting_rpc_transactions: in_flight < MAX_BLOCK_WORK,
+                        accepting_rpc_transactions: in_flight < MAX_DRAIN_WORK,
                         at_pending_limit: mempool.at_pending_limit(),
                         remote_shard_in_flight: state
                             .remote_headers_coordinator()
