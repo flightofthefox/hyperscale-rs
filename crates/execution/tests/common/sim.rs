@@ -72,28 +72,48 @@ pub enum Schedule {
     Lagged(usize),
 }
 
-/// The base every tick reads through. Versionless: the harness drives the
-/// tick chain, and a tick's fall-through is the same empty base at every
-/// height, so any value a test observes came from a fold.
+/// The settled base every tick reads through, versioned by height.
+///
+/// A tick reads it as of its own anchor, not as of whatever this replica
+/// has persisted, so the harness has to keep the history: a settlement at
+/// height 9 must be invisible to a read anchored at 8, exactly as it is
+/// in the real store.
 #[derive(Default)]
 struct StubBase {
-    cells: Mutex<HashMap<SubstateKey, Vec<u8>>>,
+    /// Settled writes in commit order, each with the height that applied
+    /// them.
+    history: Mutex<Vec<(BlockHeight, StateWrites)>>,
 }
 
 impl StubBase {
-    /// Land a settled write set. Removals delete, matching the JMT.
-    fn apply(&self, writes: &StateWrites) {
-        let mut cells = self.cells.lock().expect("base lock");
-        for (key, change) in &writes.cells {
-            match change {
-                Some(value) => {
-                    cells.insert(*key, value.clone());
-                }
-                None => {
-                    cells.remove(key);
+    /// Land a settled write set at `height`.
+    fn apply(&self, height: BlockHeight, writes: &StateWrites) {
+        self.history
+            .lock()
+            .expect("base lock")
+            .push((height, writes.clone()));
+    }
+
+    /// The cells as of `height`: every settled write at or below it, in
+    /// commit order, last writer per cell.
+    fn cells_at(&self, height: BlockHeight) -> HashMap<SubstateKey, Vec<u8>> {
+        let mut cells = HashMap::new();
+        for (applied, writes) in self.history.lock().expect("base lock").iter() {
+            if *applied > height {
+                break;
+            }
+            for (key, change) in &writes.cells {
+                match change {
+                    Some(value) => {
+                        cells.insert(*key, value.clone());
+                    }
+                    None => {
+                        cells.remove(key);
+                    }
                 }
             }
         }
+        cells
     }
 }
 
@@ -108,7 +128,7 @@ impl SubstateDatabase for StubSnapshot {
 
 impl SubstateDatabase for StubBase {
     fn substate(&self, key: SubstateKey) -> Option<Vec<u8>> {
-        self.cells.lock().expect("base lock").get(&key).cloned()
+        self.cells_at(BlockHeight::new(u64::MAX)).get(&key).cloned()
     }
 }
 
@@ -116,7 +136,7 @@ impl SubstateStore for StubBase {
     type Snapshot<'a> = StubSnapshot;
 
     fn snapshot(&self) -> Self::Snapshot<'_> {
-        StubSnapshot(self.cells.lock().expect("base lock").clone())
+        StubSnapshot(self.cells_at(BlockHeight::new(u64::MAX)))
     }
     fn jmt_height(&self) -> BlockHeight {
         BlockHeight::GENESIS
@@ -141,8 +161,8 @@ impl SubstateStore for StubBase {
 }
 
 impl VersionedStore for StubBase {
-    fn snapshot_at(&self, _height: BlockHeight) -> Self::Snapshot<'_> {
-        self.snapshot()
+    fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+        StubSnapshot(self.cells_at(height))
     }
     fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
         None
@@ -221,8 +241,10 @@ impl ExecutionSim {
         // in commit order and last-writer-wins per cell — the same
         // projection `merge_writes_from_receipts` performs into the JMT.
         for fw in &certificates {
-            self.base
-                .apply(&merge_writes_from_receipts(&fw.settling_receipts()));
+            self.base.apply(
+                self.height,
+                &merge_writes_from_receipts(&fw.settling_receipts()),
+            );
         }
         let block = make_live_block(
             self.local_shard,
@@ -238,6 +260,9 @@ impl ExecutionSim {
         let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
         let actions = self.coord.on_block_committed(&self.topology, &certified);
         self.absorb(actions);
+        // Persistence follows the commit, which is when the chain evicts
+        // the folds it believes the base now covers.
+        self.chain.prune_persisted(self.height);
         self.release_due();
     }
 

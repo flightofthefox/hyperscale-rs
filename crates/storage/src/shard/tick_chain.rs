@@ -164,6 +164,11 @@ impl TickEntry {
 pub struct TickChain<S> {
     base: Arc<S>,
     entries: RwLock<BTreeMap<BlockHeight, TickEntry>>,
+    /// The highest tick whose output has been appended. Ticks execute
+    /// serially in height order, so the next tick to run anchors at or
+    /// above this — which is what makes it the floor eviction may not
+    /// outrun.
+    executed: RwLock<BlockHeight>,
 }
 
 impl<S> TickChain<S>
@@ -175,6 +180,7 @@ where
         Self {
             base,
             entries: RwLock::new(BTreeMap::new()),
+            executed: RwLock::new(BlockHeight::GENESIS),
         }
     }
 
@@ -191,6 +197,8 @@ where
             .entry(height)
             .or_insert_with(|| TickEntry::empty(height))
             .absorb(output);
+        let mut executed = write_or_recover(&self.executed);
+        *executed = (*executed).max(height);
     }
 
     /// Resolve a wave's fate: a settled verdict promotes each member's
@@ -213,12 +221,22 @@ where
         }
     }
 
-    /// Drop every tick fully covered by the persisted base: all waves
-    /// resolved, and every settling height (and the tick itself) at or
-    /// below `persisted`. Called on `BlockPersisted`.
+    /// Drop every tick a future read can no longer need: all waves
+    /// resolved, and both the tick and every settling height at or below
+    /// the eviction floor. Called on `BlockPersisted`.
+    ///
+    /// The floor is the lower of what has persisted and what has
+    /// executed, and the second half is load-bearing. A fold's writes
+    /// enter the base at the height its wave *settled*, which can be
+    /// above the anchor a still-queued tick will read from — so dropping
+    /// on persistence alone lets eviction outrun a lagging tick queue,
+    /// and that tick then finds neither the fold nor a base old enough to
+    /// hold it. Two replicas at different execution positions would
+    /// derive different receipts from one committed chain.
     pub fn prune_persisted(&self, persisted: BlockHeight) {
+        let floor = persisted.min(*read_or_recover(&self.executed));
         write_or_recover(&self.entries).retain(|height, entry| {
-            !(entry.pending.is_empty() && *height <= persisted && entry.max_resolution <= persisted)
+            !(entry.pending.is_empty() && *height <= floor && entry.max_resolution <= floor)
         });
     }
 
@@ -540,7 +558,7 @@ mod tests {
         chain.resolve(
             &w,
             &TickResolution::Settled {
-                height: BlockHeight::new(7),
+                height: BlockHeight::new(6),
                 aborted: BTreeSet::new(),
             },
         );
@@ -548,7 +566,7 @@ mod tests {
         let view = chain.view_at(BlockHeight::new(6));
         assert_eq!(view.snapshot().substate(key(1)), Some(b"promoted".to_vec()));
         assert_eq!(view.snapshot().substate(key(2)), Some(b"promoted".to_vec()));
-        chain.prune_persisted(BlockHeight::new(7));
+        chain.prune_persisted(BlockHeight::new(6));
         assert!(chain.is_empty(), "both entries must become evictable");
     }
 
@@ -615,24 +633,31 @@ mod tests {
         assert_eq!(view.snapshot().substate(key(9)), None);
     }
 
+    /// A fold survives until nothing can still need it: every wave in it
+    /// resolved, the settlement persisted, and execution advanced past the
+    /// settling height. The last is what keeps eviction from outrunning a
+    /// queued tick, whose anchor can sit below the height the base gained
+    /// the write at.
     #[test]
-    fn eviction_waits_for_resolution_and_persistence() {
+    fn eviction_waits_for_resolution_persistence_and_execution() {
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
         let w = wave(1, &[]);
-        chain.append(
-            BlockHeight::new(1),
-            TickOutput {
-                determined: writes(&[(key(1), Some(b"one"))]),
-                determined_wave: Some(w.clone()),
-                provisional: BTreeMap::new(),
-            },
-        );
+        let append_at = |height: u64, wave: Option<WaveId>| {
+            chain.append(
+                BlockHeight::new(height),
+                TickOutput {
+                    determined: writes(&[(key(1), Some(b"one"))]),
+                    determined_wave: wave,
+                    provisional: BTreeMap::new(),
+                },
+            );
+        };
+        append_at(1, Some(w.clone()));
 
         // Unresolved: survives any persistence progress.
         chain.prune_persisted(BlockHeight::new(10));
         assert_eq!(chain.len(), 1);
 
-        // Resolved at height 3: survives persistence to 2, evicts at 3.
         chain.resolve(
             &w,
             &TickResolution::Settled {
@@ -640,17 +665,30 @@ mod tests {
                 aborted: BTreeSet::new(),
             },
         );
-        chain.prune_persisted(BlockHeight::new(2));
-        assert_eq!(chain.len(), 1);
+
+        // Resolved and persisted, but execution has only reached tick 1 —
+        // the next tick anchors there, and the base gained the write at 3.
         chain.prune_persisted(BlockHeight::new(3));
-        assert!(chain.is_empty());
+        assert_eq!(
+            chain.len(),
+            1,
+            "a fold a queued tick still anchors below must not evict"
+        );
+
+        // Execution reaches the settling height: nothing anchors below it
+        // any more.
+        append_at(3, Some(wave(3, &[])));
+        chain.prune_persisted(BlockHeight::new(2));
+        assert_eq!(chain.len(), 2, "persistence has not caught up");
+        chain.prune_persisted(BlockHeight::new(3));
+        assert_eq!(chain.len(), 1, "only the settled tick evicts");
     }
 
     #[test]
     fn resolution_is_idempotent_and_tolerates_unknown_waves() {
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
         let settled = TickResolution::Settled {
-            height: BlockHeight::new(3),
+            height: BlockHeight::new(1),
             aborted: BTreeSet::new(),
         };
         // Unknown wave: no entry at its origin height.
@@ -667,7 +705,7 @@ mod tests {
         );
         chain.resolve(&w, &settled);
         chain.resolve(&w, &settled);
-        chain.prune_persisted(BlockHeight::new(3));
+        chain.prune_persisted(BlockHeight::new(1));
         assert!(chain.is_empty());
     }
 }

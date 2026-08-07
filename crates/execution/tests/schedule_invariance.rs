@@ -128,3 +128,40 @@ fn tick_outputs_do_not_move_with_resolution_timing() {
         );
     }
 }
+
+/// A tick reads its own anchor, and the chain evicts a fold once the base
+/// "covers" it — but the base covers it at the height its wave *settled*,
+/// which can be above the anchor a queued tick will read from.
+///
+/// So a tick that runs before the eviction sees its predecessor's write in
+/// the fold, and one that runs after sees neither the fold nor a base old
+/// enough to hold it. Same committed chain, two answers.
+fn evicted_between(schedule: Schedule) -> u64 {
+    let mut sim = ExecutionSim::new(schedule);
+
+    let first = local_tx(0, LOCAL);
+    let first_hash = first.hash();
+    sim.commit(vec![first], Vec::new());
+
+    // The follower: composed now, run whenever the schedule says.
+    sim.commit(vec![local_tx(1, LOCAL)], Vec::new());
+
+    // The predecessor's certificate. Settling it lets the chain evict its
+    // fold, and the base only gains the write at this height.
+    let wave = sim.wave_of(first_hash).expect("wave assigned");
+    let receipts = sim.receipts_for(&wave);
+    assert!(!receipts.is_empty(), "the predecessor executed");
+    sim.commit(Vec::new(), vec![settle(&wave, &receipts)]);
+
+    sim.drain();
+    counter(sim.read(cell_of(test_prefix(LOCAL))))
+}
+
+#[test]
+fn a_fold_evicted_before_its_reader_runs_does_not_change_the_answer() {
+    assert_eq!(
+        evicted_between(Schedule::Lagged(1)),
+        evicted_between(Schedule::Eager),
+        "eviction raced a queued tick: the follower lost its predecessor's write"
+    );
+}
