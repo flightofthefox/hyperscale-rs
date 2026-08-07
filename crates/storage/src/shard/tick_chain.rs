@@ -29,7 +29,7 @@ use std::sync::{Arc, RwLock};
 use hyperscale_types::{BlockHeight, StateWrites, SubstateKey, TxHash, WaveId};
 
 use crate::lock_recover::{read_or_recover, write_or_recover};
-use crate::{SubstateDatabase, SubstateStore};
+use crate::{SubstateDatabase, VersionedStore};
 
 /// One cross-shard transaction's provisional contribution to a tick.
 #[derive(Clone, Debug)]
@@ -168,7 +168,7 @@ pub struct TickChain<S> {
 
 impl<S> TickChain<S>
 where
-    S: SubstateStore,
+    S: VersionedStore,
 {
     /// Create an empty tick chain over the given base storage.
     pub const fn new(base: Arc<S>) -> Self {
@@ -236,13 +236,21 @@ where
 
     /// Build the baseline view for the tick after `tick`: every retained
     /// tick's readable fold at or below `tick`, in height order, over the
-    /// persisted base.
+    /// base as of `tick`.
     ///
-    /// Base reads are unanchored on purpose: the persisted base and the
-    /// retained folds are value-identical wherever they overlap (the
-    /// settled receipts are the same receipts), so any base version at or
-    /// past the eviction floor reads the same. Determinism across
-    /// replicas comes from the folds, not the base version.
+    /// The base read is anchored at `tick`, not at whatever this replica
+    /// has currently persisted. Execution runs behind consensus, so a
+    /// replica whose tick queue lags still commits and persists blocks —
+    /// including the settlement of a wave belonging to a *later* tick,
+    /// which 2f+1 other replicas certified without waiting for this one.
+    /// Reading the live base would fold that later tick's writes into
+    /// this tick's baseline, and the receipts would disagree with every
+    /// replica that was not lagging. Anchoring makes the baseline a
+    /// function of the tick alone.
+    ///
+    /// Folds cover the window the anchor cannot: settlements between the
+    /// persisted tip and `tick` belong to ticks at or below `tick`, and a
+    /// tick is only evicted once the base has absorbed it.
     pub fn view_at(&self, tick: BlockHeight) -> TickView<S> {
         let mut overlay: HashMap<SubstateKey, Option<Vec<u8>>> = HashMap::new();
         {
@@ -255,37 +263,33 @@ where
         }
         TickView {
             base: Arc::clone(&self.base),
+            anchor: tick,
             overlay: Arc::new(overlay),
         }
     }
 }
 
-/// Read view over the tick chain's folds at one anchor, falling through
-/// to base storage. The engine's eager pre-read consumes this via
-/// [`Self::snapshot`].
+/// Read view over the tick chain's folds at one anchor.
+///
+/// Falls through to the base as of that anchor. The engine's eager
+/// pre-read consumes this via [`Self::snapshot`], which is the view's
+/// only read path — a baseline that could be read unanchored would not
+/// be deterministic.
 pub struct TickView<S> {
     base: Arc<S>,
+    anchor: BlockHeight,
     overlay: Arc<HashMap<SubstateKey, Option<Vec<u8>>>>,
 }
 
-impl<S: SubstateStore> TickView<S> {
-    /// Snapshot for batch execution: the overlay over the base's own
-    /// snapshot.
+impl<S: VersionedStore> TickView<S> {
+    /// Snapshot for batch execution: the folds over the base as of this
+    /// view's anchor height.
     #[must_use]
     pub fn snapshot(&self) -> TickViewSnapshot<S::Snapshot<'_>> {
         TickViewSnapshot {
-            base_snapshot: self.base.snapshot(),
+            base_snapshot: self.base.snapshot_at(self.anchor),
             overlay: Arc::clone(&self.overlay),
         }
-    }
-}
-
-impl<S: SubstateStore> SubstateDatabase for TickView<S> {
-    fn substate(&self, key: SubstateKey) -> Option<Vec<u8>> {
-        if let Some(change) = self.overlay.get(&key) {
-            return change.clone();
-        }
-        self.base.substate(key)
     }
 }
 
@@ -307,18 +311,28 @@ impl<Snap: SubstateDatabase> SubstateDatabase for TickViewSnapshot<Snap> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use hyperscale_types::{Address, Hash, LocalKey, MerkleInclusionProof, ShardId, StateRoot};
 
     use super::*;
+    use crate::SubstateStore;
+    use crate::lock_recover::lock_or_recover;
 
+    /// A base whose every version reads the same — the anchor is
+    /// exercised by [`StubStore::anchors`], not by versioned values.
     struct StubStore {
         cells: HashMap<SubstateKey, Vec<u8>>,
+        /// Anchor heights `snapshot_at` was asked for, so a test can
+        /// pin that a tick reads the base as of its own height.
+        anchors: Mutex<Vec<BlockHeight>>,
     }
 
     impl StubStore {
         fn with_cell(key: SubstateKey, value: &[u8]) -> Self {
             Self {
                 cells: HashMap::from([(key, value.to_vec())]),
+                anchors: Mutex::new(Vec::new()),
             }
         }
     }
@@ -333,6 +347,16 @@ mod tests {
     impl SubstateDatabase for StubSnapshot {
         fn substate(&self, key: SubstateKey) -> Option<Vec<u8>> {
             self.0.get(&key).cloned()
+        }
+    }
+
+    impl VersionedStore for StubStore {
+        fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
+            lock_or_recover(&self.anchors).push(height);
+            StubSnapshot(self.cells.clone())
+        }
+        fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
+            None
         }
     }
 
@@ -413,14 +437,33 @@ mod tests {
 
         // Anchored below tick 2: tick 1's write shadows base.
         let view = chain.view_at(BlockHeight::new(1));
-        assert_eq!(view.substate(key(1)), Some(b"one".to_vec()));
-        assert_eq!(view.substate(key(2)), Some(b"two".to_vec()));
+        assert_eq!(view.snapshot().substate(key(1)), Some(b"one".to_vec()));
+        assert_eq!(view.snapshot().substate(key(2)), Some(b"two".to_vec()));
 
         // Anchored at tick 2: the removal wins; untouched key falls through.
         let view = chain.view_at(BlockHeight::new(2));
-        assert_eq!(view.substate(key(1)), None);
-        assert_eq!(view.substate(key(2)), Some(b"two".to_vec()));
+        assert_eq!(view.snapshot().substate(key(1)), None);
         assert_eq!(view.snapshot().substate(key(2)), Some(b"two".to_vec()));
+    }
+
+    /// A tick reads the base as of its own height, not as of whatever
+    /// this replica has persisted. Execution runs behind consensus, so a
+    /// lagging replica has already persisted settlements belonging to
+    /// ticks it has not run; an unanchored read would fold those into an
+    /// earlier tick's baseline and split its receipts from the
+    /// committee's.
+    #[test]
+    fn a_tick_reads_the_base_as_of_its_own_height() {
+        let store = Arc::new(StubStore::with_cell(key(1), b"base"));
+        let chain = TickChain::new(Arc::clone(&store));
+
+        let _ = chain.view_at(BlockHeight::new(4)).snapshot();
+        let _ = chain.view_at(BlockHeight::new(9)).snapshot();
+
+        assert_eq!(
+            *lock_or_recover(&store.anchors),
+            vec![BlockHeight::new(4), BlockHeight::new(9)]
+        );
     }
 
     #[test]
@@ -444,7 +487,7 @@ mod tests {
         );
 
         let view = chain.view_at(BlockHeight::new(1));
-        assert_eq!(view.substate(key(1)), Some(b"base".to_vec()));
+        assert_eq!(view.snapshot().substate(key(1)), Some(b"base".to_vec()));
 
         chain.resolve(
             &w,
@@ -454,7 +497,10 @@ mod tests {
             },
         );
         let view = chain.view_at(BlockHeight::new(1));
-        assert_eq!(view.substate(key(1)), Some(b"provisional".to_vec()));
+        assert_eq!(
+            view.snapshot().substate(key(1)),
+            Some(b"provisional".to_vec())
+        );
     }
 
     #[test]
@@ -485,8 +531,8 @@ mod tests {
             },
         );
         let view = chain.view_at(BlockHeight::new(1));
-        assert_eq!(view.substate(key(1)), Some(b"base".to_vec()));
-        assert_eq!(view.substate(key(9)), Some(b"floor".to_vec()));
+        assert_eq!(view.snapshot().substate(key(1)), Some(b"base".to_vec()));
+        assert_eq!(view.snapshot().substate(key(9)), Some(b"floor".to_vec()));
     }
 
     #[test]
@@ -516,8 +562,8 @@ mod tests {
             },
         );
         let view = chain.view_at(BlockHeight::new(1));
-        assert_eq!(view.substate(key(1)), Some(b"base".to_vec()));
-        assert_eq!(view.substate(key(9)), None);
+        assert_eq!(view.snapshot().substate(key(1)), Some(b"base".to_vec()));
+        assert_eq!(view.snapshot().substate(key(9)), None);
     }
 
     #[test]

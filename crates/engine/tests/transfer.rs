@@ -14,7 +14,7 @@ use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, Parallelism, PreviewGrants, PreviewInputs, PreviewOutcome,
     PreviewReport, ResourceChange, WaveBatchContext, XRD, genesis_writes,
 };
-use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput};
+use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput, VersionedStore};
 use hyperscale_types::{
     BlockHash, BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
     MerkleInclusionProof, NetworkId, RevealChain, ShardId, ShardTrie, StateRoot, StateWrites,
@@ -88,8 +88,8 @@ impl SubstateDatabase for MapDb {
     }
 }
 
-/// The store surface a [`TickChain`] needs. Only `snapshot` carries
-/// meaning here — the map is the whole world, at one version.
+/// The store surface a [`TickChain`] needs. The map is the whole world
+/// at one version, so every anchor reads the same.
 impl SubstateStore for MapDb {
     type Snapshot<'a> = Self;
     fn snapshot(&self) -> Self::Snapshot<'_> {
@@ -113,6 +113,15 @@ impl SubstateStore for MapDb {
         _keys: &[SubstateKey],
         _block_height: BlockHeight,
     ) -> Option<MerkleInclusionProof> {
+        None
+    }
+}
+
+impl VersionedStore for MapDb {
+    fn snapshot_at(&self, _height: BlockHeight) -> Self::Snapshot<'_> {
+        Self(self.0.clone())
+    }
+    fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
         None
     }
 }
