@@ -439,9 +439,9 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, CertificateRoot, ChainOrigin, Hash,
-        InFlightCount, LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, RevealChain, ShardId, ShardLoad, Signer, StateRoot, TransactionRoot,
-        ValidatorId,
+        LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
+        RevealChain, ShardId, ShardLoad, Signer, StateRoot, TransactionRoot, ValidatorId,
+        WorkInFlight,
     };
 
     use super::*;
@@ -467,7 +467,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,

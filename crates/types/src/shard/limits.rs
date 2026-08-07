@@ -40,15 +40,6 @@ pub const MAX_FINALIZED_TX_PER_BLOCK: usize = 8_192;
 /// revisiting.
 pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
 
-/// Cap on the number of in-flight transactions the mempool tracks
-/// simultaneously (transactions holding state locks).
-///
-/// Sized at `MAX_TXS_PER_BLOCK * 3` to keep a full pipeline of blocks
-/// (commit → execute → certify) without stalling proposal of new
-/// transactions. Not operator-tunable: the right value is fully
-/// determined by block size and pipeline depth.
-pub const MAX_TX_IN_FLIGHT: usize = MAX_TXS_PER_BLOCK * 3;
-
 /// What admitting and tracking any transaction costs a block, before
 /// anything it declares.
 ///

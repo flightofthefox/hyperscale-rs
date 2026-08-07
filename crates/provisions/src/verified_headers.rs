@@ -95,9 +95,9 @@ impl VerifiedHeaderBuffer {
 mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-        CertificateRoot, ChainOrigin, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardLoad, SignerBitfield,
-        StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
+        CertificateRoot, ChainOrigin, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, RevealChain, Round, ShardLoad, SignerBitfield, StateRoot,
+        TransactionRoot, ValidatorId, WeightedTimestamp, WorkInFlight,
     };
 
     use super::*;
@@ -119,7 +119,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             std::collections::BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,

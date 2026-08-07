@@ -94,9 +94,9 @@ pub use primitives::hash_kinds::{
     WaveReceiptHash, WritesRoot,
 };
 pub use primitives::identifiers::{
-    Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, InFlightCount,
-    LeafIndex, RatifyRound, Round, ShardId, SpcView, Stake, StakePoolId, StakePoolSeat,
-    ValidatorId, VoteCount,
+    Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex, RatifyRound,
+    Round, ShardId, SpcView, Stake, StakePoolId, StakePoolSeat, ValidatorId, VoteCount,
+    WorkInFlight,
 };
 pub use primitives::merkle::{
     compute_merkle_root, compute_merkle_root_with_proof, compute_range_proof,
@@ -132,7 +132,7 @@ pub use shard::header::{BlockHeader, BlockHeaderParentQcMismatch, BlockHeaderVer
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
     MAX_BLOCK_WORK, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP,
-    MAX_TX_IN_FLIGHT, MAX_TXS_PER_BLOCK, TX_ADMISSION_WORK,
+    MAX_TXS_PER_BLOCK, TX_ADMISSION_WORK,
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};

@@ -766,9 +766,9 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, CertificateRoot,
-        CommitProofVerifyError, ElidedCertifiedBlock, Hash, InFlightCount, Inventory,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, RevealChain, Round, ShardLoad,
-        SignerBitfield, SplitChildRoots, TransactionRoot, VoteCount, WitnessSources,
+        CommitProofVerifyError, ElidedCertifiedBlock, Hash, Inventory, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, RevealChain, Round, ShardLoad, SignerBitfield,
+        SplitChildRoots, TransactionRoot, VoteCount, WitnessSources, WorkInFlight,
     };
 
     use super::*;
@@ -982,7 +982,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             std::collections::BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,

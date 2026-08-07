@@ -4,9 +4,9 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash, InFlightCount,
+    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash,
     QuorumCertificate, RevealChain, SafeVoteRegisters, ShardAnchor, ShardLoad, StateRoot,
-    ValidatorId, Verified, WeightedTimestamp,
+    ValidatorId, Verified, WeightedTimestamp, WorkInFlight,
 };
 
 /// State recovered from storage on startup.
@@ -46,7 +46,7 @@ pub struct RecoveredState {
     /// boundary header so the fresh committee's first block past the
     /// anchor is votable — the vote path checks the claimed in-flight
     /// count against the parent's.
-    pub committed_in_flight: Option<InFlightCount>,
+    pub committed_in_flight: Option<WorkInFlight>,
 
     /// Reveal chain carried by the committed tip's header — the value the
     /// next block extends (or reseeds past, when it anchors in a later
@@ -157,7 +157,7 @@ impl RecoveredState {
             committed_hash: Some(anchor.block_hash),
             latest_qc: None,
             anchor_qc: Some(anchor_qc),
-            committed_in_flight: Some(boundary_header.in_flight()),
+            committed_in_flight: Some(boundary_header.work_in_flight()),
             committed_reveal_chain: Some(boundary_header.reveal_chain()),
             committed_load: Some(boundary_header.load()),
             committed_block_anchor_wt: Some(boundary_header.parent_qc().weighted_timestamp()),

@@ -816,9 +816,9 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeight, CertificateRoot,
-        ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, StateRoot, TransactionRoot,
-        ValidatorId, Verified, WaveCertificate, WaveId, WitnessSources,
+        ChainOrigin, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
+        RevealChain, Round, ShardId, ShardLoad, StateRoot, TransactionRoot, ValidatorId, Verified,
+        WaveCertificate, WaveId, WitnessSources, WorkInFlight,
     };
 
     use super::*;
@@ -840,7 +840,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -868,7 +868,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,

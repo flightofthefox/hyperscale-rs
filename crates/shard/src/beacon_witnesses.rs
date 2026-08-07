@@ -267,11 +267,11 @@ mod tests {
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessRoot, BlockHeader, BlockHeight, CertificateRoot,
-        ConsensusSignature, Epoch, InFlightCount, LocalReceiptRoot, LocalTimestamp,
-        NetworkDefinition, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ReadySignal,
-        ReshapeSeat, ReshapeTrigger, RevealChain, Round, ShardLoad, SignerBitfield, Stake,
-        StakePoolId, StateRoot, TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo,
-        ValidatorSet, VrfProof, WeightedTimestamp, WitnessSources, compute_merkle_root,
+        ConsensusSignature, Epoch, LocalReceiptRoot, LocalTimestamp, NetworkDefinition,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ReadySignal, ReshapeSeat,
+        ReshapeTrigger, RevealChain, Round, ShardLoad, SignerBitfield, Stake, StakePoolId,
+        StateRoot, TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
+        VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, compute_merkle_root,
     };
 
     use super::*;
@@ -395,7 +395,7 @@ mod tests {
                 ProvisionsRoot::ZERO,
                 Vec::new(),
                 BTreeMap::new(),
-                InFlightCount::ZERO,
+                WorkInFlight::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,

@@ -79,9 +79,9 @@ mod tests {
     use super::*;
     use crate::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
-        CertificateRoot, ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, SignerBitfield,
-        Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
+        CertificateRoot, ChainOrigin, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, Stake,
+        StakePoolId, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp, WorkInFlight,
     };
 
     fn make_header() -> BlockHeader {
@@ -101,7 +101,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::new(2),
             BeaconWitnessLeafCount::ZERO,

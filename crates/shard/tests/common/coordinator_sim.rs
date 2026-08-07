@@ -39,7 +39,7 @@ use hyperscale_types::{
     BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot,
     CertificateRootContext, CertifiedBlock, ConsensusPublicKey, ConsensusReceipt, Epoch,
-    FinalizedWave, Hash, HborSigned, InFlightCount, LocalReceiptRoot, LocalReceiptRootContext,
+    FinalizedWave, Hash, HborSigned, LocalReceiptRoot, LocalReceiptRootContext,
     LocalReceiptRootVerifyError, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
     ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
@@ -48,7 +48,7 @@ use hyperscale_types::{
     StateRootVerifyError, StoredReceipt, Timeout, TimeoutContext, TopologySchedule,
     TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash,
     TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, local_settled_wave_ids, shard_reveal_sign, signed_bytes,
+    WeightedTimestamp, WorkInFlight, local_settled_wave_ids, shard_reveal_sign, signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -97,7 +97,7 @@ struct StaleReparent {
     parent_qc: QuorumCertificate,
     parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
-    parent_in_flight: InFlightCount,
+    parent_in_flight: WorkInFlight,
     parent_load: ShardLoad,
     height: BlockHeight,
 }
@@ -1415,7 +1415,6 @@ impl ShardCoordinatorSim {
                 parent_in_flight,
                 parent_load,
                 substate_bytes,
-                finalized_tx_count,
                 ready_signals,
                 reshape_trigger,
                 parent_witness_leaves,
@@ -1502,7 +1501,6 @@ impl ShardCoordinatorSim {
                     parent_in_flight,
                     parent_load,
                     substate_bytes,
-                    finalized_tx_count,
                     ready_signals,
                     reshape_trigger,
                     // Sign a genuine reveal with the proposer's key so the
@@ -1930,7 +1928,7 @@ impl ShardCoordinatorSim {
             parent_qc: grandparent.parent_qc().clone(),
             parent_state_root: ancestor.state_root(),
             parent_block_height: ancestor.height(),
-            parent_in_flight: ancestor.in_flight(),
+            parent_in_flight: ancestor.work_in_flight(),
             parent_load: ancestor.load(),
             height: ancestor.height().next(),
         })
@@ -1973,7 +1971,7 @@ pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
         h.provision_root(),
         waves,
         provision_tx_roots,
-        h.in_flight(),
+        h.work_in_flight(),
         h.beacon_witness_root(),
         h.beacon_witness_leaf_count(),
         h.beacon_witness_base(),

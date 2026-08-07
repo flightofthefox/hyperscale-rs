@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use hyperscale_node::TxStatusCache;
-use hyperscale_types::{InFlightCount, ShardId, Transaction, TransactionStatus, TxHash};
+use hyperscale_types::{ShardId, Transaction, TransactionStatus, TxHash, WorkInFlight};
 use serde::{Deserialize, Serialize};
 
 use crate::status::SyncStatus;
@@ -98,7 +98,7 @@ pub struct VnodeMempoolSnapshot {
     /// Number of pending transactions (waiting to be included in a block).
     pub pending_count: usize,
     /// Number of transactions holding state locks (Committed status).
-    pub in_flight_count: usize,
+    pub in_flight_count: u64,
     /// Total number of transactions in the mempool.
     pub total_count: usize,
     /// When this snapshot was taken.
@@ -115,10 +115,10 @@ pub struct VnodeMempoolSnapshot {
     pub at_pending_limit: bool,
     /// Per-remote-shard in-flight counts from latest verified block headers.
     /// Used for cross-shard backpressure: reject transactions targeting congested shards.
-    pub remote_shard_in_flight: HashMap<ShardId, InFlightCount>,
+    pub remote_shard_in_flight: HashMap<ShardId, WorkInFlight>,
     /// Threshold for rejecting transactions due to remote shard congestion
     /// (80% of [`hyperscale_types::MAX_TX_IN_FLIGHT`]).
-    pub remote_congestion_threshold: InFlightCount,
+    pub remote_congestion_threshold: WorkInFlight,
 }
 
 impl Default for VnodeMempoolSnapshot {
@@ -131,7 +131,7 @@ impl Default for VnodeMempoolSnapshot {
             accepting_rpc_transactions: true,
             at_pending_limit: false,
             remote_shard_in_flight: HashMap::new(),
-            remote_congestion_threshold: InFlightCount::ZERO,
+            remote_congestion_threshold: WorkInFlight::ZERO,
         }
     }
 }
@@ -172,6 +172,6 @@ pub struct VnodeStatusEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VnodeMempoolStats {
     pub pending_count: usize,
-    pub in_flight_count: usize,
+    pub in_flight_count: u64,
     pub total_count: usize,
 }

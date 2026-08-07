@@ -1549,8 +1549,9 @@ mod tests {
     // ── Boundary trigger ─────────────────────────────────────────────────
 
     use hyperscale_types::{
-        BeaconWitnessRoot, Block, BlockHeader, CertificateRoot, InFlightCount, LocalReceiptRoot,
+        BeaconWitnessRoot, Block, BlockHeader, CertificateRoot, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, RevealChain, Round, ShardLoad, TransactionRoot,
+        WorkInFlight,
     };
 
     /// Tag the pin hook pushes into the sink, distinguishing pins from
@@ -1603,7 +1604,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             std::collections::BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,

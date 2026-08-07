@@ -15,12 +15,12 @@ pub use hyperscale_crypto_bls::{
 use hyperscale_types::{
     AggregateSignature, BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount,
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, CertificateRoot, ConsensusSignature,
-    Epoch, Hash, InFlightCount, LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition,
-    PcVoteEquivocation, PendingWithdrawal, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
-    RevealChain, Round, ShardCommittee, ShardEpochContribution, ShardId, ShardLoad,
-    ShardVoteEquivocation, ShardWitnessPayload, SignerBitfield, SlotEffects, Stake, StakePool,
-    StakePoolId, StateRoot, TransactionRoot, ValidatorId, ValidatorRecord, ValidatorStatus,
-    VrfProof, WeightedTimestamp, beacon_reveal_sign, compute_merkle_root, compute_range_proof,
+    Epoch, Hash, LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation,
+    PendingWithdrawal, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
+    ShardCommittee, ShardEpochContribution, ShardId, ShardLoad, ShardVoteEquivocation,
+    ShardWitnessPayload, SignerBitfield, SlotEffects, Stake, StakePool, StakePoolId, StateRoot,
+    TransactionRoot, ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp,
+    WorkInFlight, beacon_reveal_sign, compute_merkle_root, compute_range_proof,
     validator_possession_proof_sign,
 };
 
@@ -341,7 +341,7 @@ fn boundary_header(shard: ShardId, root: BeaconWitnessRoot, leaf_count: u64) -> 
         ProvisionsRoot::ZERO,
         Vec::new(),
         BTreeMap::new(),
-        InFlightCount::ZERO,
+        WorkInFlight::ZERO,
         root,
         BeaconWitnessLeafCount::new(leaf_count),
         BeaconWitnessLeafCount::ZERO,

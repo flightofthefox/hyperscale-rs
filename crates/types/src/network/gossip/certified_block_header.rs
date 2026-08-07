@@ -86,7 +86,7 @@ mod tests {
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
-    use crate::{BlockHash, InFlightCount, ProposerTimestamp};
+    use crate::{BlockHash, ProposerTimestamp, WorkInFlight};
 
     #[test]
     fn test_message_type_id() {
@@ -120,7 +120,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,

@@ -954,11 +954,11 @@ mod tests {
     use hyperscale_core::FetchRequest;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
-        BlockHeader, CertificateRoot, ChainOrigin, Hash, InFlightCount, LocalReceiptRoot,
-        MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
-        ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId, ShardLoad,
-        SignerBitfield, StateRoot, TopologySnapshot, TransactionRoot, TxHash, ValidatorId,
-        ValidatorSet, Verifiable, WaveId, WeightedTimestamp, WitnessSources, compute_merkle_root,
+        BlockHeader, CertificateRoot, ChainOrigin, Hash, LocalReceiptRoot, MerkleInclusionProof,
+        NetworkDefinition, ProposerTimestamp, ProvisionEntry, ProvisionTxRoot, ProvisionsRoot,
+        QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot,
+        TopologySnapshot, TransactionRoot, TxHash, ValidatorId, ValidatorSet, Verifiable, WaveId,
+        WeightedTimestamp, WitnessSources, WorkInFlight, compute_merkle_root,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -1031,7 +1031,7 @@ mod tests {
             header.provision_root(),
             header.waves().clone(),
             roots,
-            header.in_flight(),
+            header.work_in_flight(),
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -1947,7 +1947,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             waves,
             provision_tx_roots,
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -2013,7 +2013,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -2324,7 +2324,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,

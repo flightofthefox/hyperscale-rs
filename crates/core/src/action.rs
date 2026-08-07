@@ -11,16 +11,16 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
     CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader,
     ConsensusPublicKey, Epoch, ExecutionCertificate, ExecutionVote, FinalizedWave,
-    GlobalReceiptRoot, Hash, HeaderFetchCount, InFlightCount, LocalReceiptRoot, PcQc1, PcQc2,
-    PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
-    RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain,
-    Round, RoutingCommittees, SafeVoteRegisters, SettledWavesRoot, ShardForkProof, ShardId,
-    ShardLoad, ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
+    GlobalReceiptRoot, Hash, HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1,
+    PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
+    Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
+    ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round,
+    RoutingCommittees, SafeVoteRegisters, SettledWavesRoot, ShardForkProof, ShardId, ShardLoad,
+    ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
     SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
     StateRoot, SubstateEntry, SubstateKey, Timeout, TopologySnapshot, Transaction, TransactionRoot,
     TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId,
-    WeightedTimestamp,
+    WeightedTimestamp, WorkInFlight,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -905,7 +905,7 @@ pub enum Action {
         /// voters verify the reservations against.
         fee_read_height: BlockHeight,
         /// Parent block's in-flight count (for deterministic computation).
-        parent_in_flight: InFlightCount,
+        parent_in_flight: WorkInFlight,
         /// Attested load on the parent's header — the running gas total
         /// this block advances by the gas its own certificates report.
         parent_load: Option<ShardLoad>,
@@ -916,7 +916,6 @@ pub enum Action {
         /// play, and the header states that absence rather than guessing.
         substate_bytes: Option<u64>,
         /// Number of transactions finalized by wave certificates in this block.
-        finalized_tx_count: u32,
         /// Dwell-eligible [`ReadySignal`]s drained from the proposer's pool
         /// for inclusion in the block's manifest. Beacon's `Ready` witness
         /// derives one entry per included signal at block-assembly time.

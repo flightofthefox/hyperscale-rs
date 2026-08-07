@@ -64,8 +64,8 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TX_IN_FLIGHT, MAX_TXS_PER_BLOCK, QuorumCertificate,
+    BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_BLOCK_WORK,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate,
     ShardForkProof, TopologySchedule, Verifiable, Verified,
 };
 
@@ -369,16 +369,16 @@ impl ShardParticipation {
             return vec![];
         }
 
-        // The drain cap, read off the header the proposer built: the count
-        // is chain-derived, so every replica reaches the same verdict at
-        // every height instead of one that drifts with local pipeline
-        // position.
-        if header.in_flight().inner() as usize > MAX_TX_IN_FLIGHT {
+        // The drain budget, read off the header the proposer built: the
+        // total is chain-derived, so every replica reaches the same
+        // verdict at every height instead of one that drifts with local
+        // pipeline position.
+        if header.work_in_flight().inner() > MAX_BLOCK_WORK {
             tracing::warn!(
                 block_hash = ?header.hash(),
                 height = header.height().inner(),
-                in_flight = header.in_flight().inner(),
-                "Rejecting block that would exceed in-flight limit"
+                work_in_flight = header.work_in_flight().inner(),
+                "Rejecting block whose drain exceeds the work budget"
             );
             return vec![];
         }
@@ -553,7 +553,7 @@ mod tests {
                     ShardId::ROOT,
                     ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),
                 )]),
-                header.in_flight(),
+                header.work_in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,

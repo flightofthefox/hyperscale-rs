@@ -16,11 +16,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, Epoch, Hash, InFlightCount, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp,
-    ProvisionHash, QuiesceCut, RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger,
-    ScheduleLookup, SettledSetVerdict, SettledWaveSet, ShardId, SplitAtBoundary, StoredReceipt,
-    SubstateKey, WaveId, WeightedTimestamp, derive_reshape_trigger, ready_signal_window,
+    BlockHash, Epoch, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
+    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionHash, QuiesceCut,
+    RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup,
+    SettledSetVerdict, SettledWaveSet, ShardId, SplitAtBoundary, StoredReceipt, SubstateKey,
+    WaveId, WeightedTimestamp, WorkInFlight, derive_reshape_trigger, ready_signal_window,
     settled_set_verdict,
 };
 
@@ -258,7 +258,7 @@ pub struct ShardCoordinator {
     /// when the tip's header was never observed (an ordinary restart);
     /// a snap-synced joiner seeds it from the boundary header so its
     /// fresh committee's first block is votable.
-    committed_in_flight: Option<InFlightCount>,
+    committed_in_flight: Option<WorkInFlight>,
 
     /// Reveal chain on the committed tip's header — what the next block
     /// extends. `None` under the same conditions as
@@ -1334,7 +1334,7 @@ impl ShardCoordinator {
 
         self.committed_hash = hash;
         self.committed_state_root = genesis.header().state_root();
-        self.committed_in_flight = Some(genesis.header().in_flight());
+        self.committed_in_flight = Some(genesis.header().work_in_flight());
         self.committed_reveal_chain = Some(genesis.header().reveal_chain());
         self.committed_load = Some(genesis.header().load());
         // A chain's genesis height and clock are per-chain properties: a
@@ -1533,7 +1533,6 @@ impl ShardCoordinator {
                     transactions: Vec::new(),
                     finalized_waves: Vec::new(),
                     provisions: Vec::new(),
-                    finalized_tx_count: 0,
                 },
             );
         }
@@ -1558,7 +1557,6 @@ impl ShardCoordinator {
                     transactions: Vec::new(),
                     finalized_waves: Vec::new(),
                     provisions: Vec::new(),
-                    finalized_tx_count: 0,
                 },
             );
         }
@@ -1582,7 +1580,7 @@ impl ShardCoordinator {
             &self.dedup_index,
             validity_anchor,
         );
-        let (finalized_waves, finalized_tx_count) = select_finalized_waves(
+        let (finalized_waves, _finalized_tx_count) = select_finalized_waves(
             finalized_waves,
             &qc_chain_cert_hashes,
             &self.dedup_index,
@@ -1613,7 +1611,6 @@ impl ShardCoordinator {
                 transactions,
                 finalized_waves,
                 provisions,
-                finalized_tx_count: u32::try_from(finalized_tx_count).unwrap_or(u32::MAX),
             },
         )
     }
@@ -2912,10 +2909,10 @@ impl ShardCoordinator {
             // Blocks the safe-vote rule declines must still run verification to
             // produce PreparedCommit. Parent-pruned blocks likewise run
             // verification but can't contribute in-flight accounting.
-            let (parent_in_flight, finalized_tx_count) = {
+            let (parent_in_flight, _finalized_tx_count) = {
                 let chain = self.chain_view();
                 let parent_in_flight = if block.header().parent_qc().is_genesis() {
-                    Some(InFlightCount::ZERO)
+                    Some(WorkInFlight::ZERO)
                 } else {
                     chain.parent_in_flight_checked(block.header().parent_block_hash())
                 };
@@ -2929,7 +2926,6 @@ impl ShardCoordinator {
             };
             let skip_vote = match self.verification.classify_vote_in_flight(
                 parent_in_flight,
-                finalized_tx_count,
                 block_hash,
                 block,
                 !safe,
@@ -4473,7 +4469,7 @@ impl ShardCoordinator {
         self.committed_committee_anchor_wt = self.committed_block_anchor_wt;
         self.committed_block_anchor_wt = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
-        self.committed_in_flight = Some(block.header().in_flight());
+        self.committed_in_flight = Some(block.header().work_in_flight());
         self.committed_reveal_chain = Some(block.header().reveal_chain());
         self.committed_load = Some(block.header().load());
         self.gc_settled_sets();
@@ -6098,11 +6094,12 @@ impl ShardCoordinator {
             .map_or(self.committed_hash, QuorumCertificate::block_hash)
     }
 
-    /// The drain the committed tip records: committed transactions whose
-    /// wave has not settled. `0` before the first header is observed.
+    /// The drain the committed tip records, in work units: what committed
+    /// transactions reserved and their waves have not yet returned. `0`
+    /// before the first header is observed.
     #[must_use]
-    pub fn committed_in_flight(&self) -> u32 {
-        self.committed_in_flight.map_or(0, InFlightCount::inner)
+    pub fn committed_in_flight(&self) -> u64 {
+        self.committed_in_flight.map_or(0, WorkInFlight::inner)
     }
 
     /// The drain this shard still owes at the proposal parent: committed
@@ -6113,7 +6110,7 @@ impl ShardCoordinator {
     /// same block — where a locally-tracked count drifts with each node's
     /// own pipeline position.
     #[must_use]
-    pub fn proposal_parent_in_flight(&self) -> InFlightCount {
+    pub fn proposal_parent_in_flight(&self) -> WorkInFlight {
         self.chain_view()
             .parent_in_flight(self.proposal_parent_block_hash())
     }
@@ -6236,11 +6233,11 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, CertificateRoot,
-        ConsensusSignature, Epoch, Hash, InFlightCount, LocalReceiptRoot, MAX_TIMESTAMP_DELAY,
-        MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams, ProvisionsRoot, RETENTION_HORIZON,
-        RevealChain, ShardId, ShardLoad, Signer, SignerBitfield, TopologySchedule,
-        TopologySnapshot, Transaction, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
-        VoteCount, WeightedTimestamp, WitnessSources, test_utils,
+        ConsensusSignature, Epoch, Hash, LocalReceiptRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
+        NetworkDefinition, NetworkParams, ProvisionsRoot, RETENTION_HORIZON, RevealChain, ShardId,
+        ShardLoad, Signer, SignerBitfield, TopologySchedule, TopologySnapshot, Transaction,
+        TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
+        WitnessSources, WorkInFlight, test_utils,
     };
 
     use super::*;
@@ -6423,7 +6420,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -6978,7 +6975,7 @@ mod tests {
                 ProvisionsRoot::ZERO,
                 Vec::new(),
                 BTreeMap::new(),
-                InFlightCount::ZERO,
+                WorkInFlight::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -7039,7 +7036,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -7113,7 +7110,7 @@ mod tests {
                 __h.provision_root(),
                 __h.waves().clone(),
                 __h.provision_tx_roots().clone(),
-                __h.in_flight(),
+                __h.work_in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -7182,7 +7179,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -7233,7 +7230,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -7394,7 +7391,7 @@ mod tests {
                 ProvisionsRoot::ZERO,
                 Vec::new(),
                 BTreeMap::new(),
-                InFlightCount::ZERO,
+                WorkInFlight::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -7450,7 +7447,7 @@ mod tests {
                 ProvisionsRoot::ZERO,
                 Vec::new(),
                 BTreeMap::new(),
-                InFlightCount::ZERO,
+                WorkInFlight::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -7531,7 +7528,7 @@ mod tests {
                 ProvisionsRoot::ZERO,
                 Vec::new(),
                 BTreeMap::new(),
-                InFlightCount::ZERO,
+                WorkInFlight::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -7623,7 +7620,7 @@ mod tests {
                 __h.provision_root(),
                 __h.waves().clone(),
                 __h.provision_tx_roots().clone(),
-                __h.in_flight(),
+                __h.work_in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -7699,7 +7696,7 @@ mod tests {
                 __h.provision_root(),
                 __h.waves().clone(),
                 __h.provision_tx_roots().clone(),
-                __h.in_flight(),
+                __h.work_in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -7790,7 +7787,7 @@ mod tests {
                 __h.provision_root(),
                 __h.waves().clone(),
                 __h.provision_tx_roots().clone(),
-                __h.in_flight(),
+                __h.work_in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -7899,7 +7896,7 @@ mod tests {
                 __h.provision_root(),
                 __h.waves().clone(),
                 __h.provision_tx_roots().clone(),
-                __h.in_flight(),
+                __h.work_in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -7955,7 +7952,7 @@ mod tests {
                 __h.provision_root(),
                 __h.waves().clone(),
                 __h.provision_tx_roots().clone(),
-                __h.in_flight(),
+                __h.work_in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -8553,7 +8550,7 @@ mod tests {
                 __h.provision_root(),
                 __h.waves().clone(),
                 __h.provision_tx_roots().clone(),
-                __h.in_flight(),
+                __h.work_in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -8905,7 +8902,7 @@ mod tests {
                 __h.provision_root(),
                 __h.waves().clone(),
                 __h.provision_tx_roots().clone(),
-                __h.in_flight(),
+                __h.work_in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -8955,7 +8952,7 @@ mod tests {
                 __h.provision_root(),
                 __h.waves().clone(),
                 __h.provision_tx_roots().clone(),
-                __h.in_flight(),
+                __h.work_in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -9057,7 +9054,7 @@ mod tests {
                 __h.provision_root(),
                 __h.waves().clone(),
                 __h.provision_tx_roots().clone(),
-                __h.in_flight(),
+                __h.work_in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,
@@ -9894,7 +9891,7 @@ mod tests {
                     __h.provision_root(),
                     __h.waves().clone(),
                     __h.provision_tx_roots().clone(),
-                    __h.in_flight(),
+                    __h.work_in_flight(),
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
@@ -9969,7 +9966,7 @@ mod tests {
                     __h.provision_root(),
                     __h.waves().clone(),
                     __h.provision_tx_roots().clone(),
-                    __h.in_flight(),
+                    __h.work_in_flight(),
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
@@ -10023,7 +10020,7 @@ mod tests {
                     __h.provision_root(),
                     __h.waves().clone(),
                     __h.provision_tx_roots().clone(),
-                    __h.in_flight(),
+                    __h.work_in_flight(),
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
@@ -10235,7 +10232,7 @@ mod tests {
                     __h.provision_root(),
                     __h.waves().clone(),
                     __h.provision_tx_roots().clone(),
-                    __h.in_flight(),
+                    __h.work_in_flight(),
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
@@ -10275,7 +10272,7 @@ mod tests {
                     __h.provision_root(),
                     __h.waves().clone(),
                     __h.provision_tx_roots().clone(),
-                    __h.in_flight(),
+                    __h.work_in_flight(),
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
@@ -10327,7 +10324,7 @@ mod tests {
                     __h.provision_root(),
                     __h.waves().clone(),
                     __h.provision_tx_roots().clone(),
-                    __h.in_flight(),
+                    __h.work_in_flight(),
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
@@ -10365,7 +10362,7 @@ mod tests {
                     __h.provision_root(),
                     __h.waves().clone(),
                     __h.provision_tx_roots().clone(),
-                    __h.in_flight(),
+                    __h.work_in_flight(),
                     BeaconWitnessRoot::ZERO,
                     BeaconWitnessLeafCount::ZERO,
                     BeaconWitnessLeafCount::ZERO,
@@ -10882,7 +10879,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -10996,7 +10993,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -11033,7 +11030,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,

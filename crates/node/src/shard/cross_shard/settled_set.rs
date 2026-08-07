@@ -237,11 +237,11 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
         BlockHash, BlockHeader, CertificateRoot, ExecutionCertificate, ExecutionOutcome,
-        FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot,
+        FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
         ShardLoad, SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
         Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources,
-        settled_waves_root_from_ids,
+        WorkInFlight, settled_waves_root_from_ids,
     };
 
     use super::*;
@@ -305,7 +305,7 @@ mod tests {
                 ProvisionsRoot::ZERO,
                 Vec::new(),
                 std::collections::BTreeMap::new(),
-                InFlightCount::ZERO,
+                WorkInFlight::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,

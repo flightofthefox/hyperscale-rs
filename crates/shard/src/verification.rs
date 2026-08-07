@@ -14,10 +14,11 @@ use std::sync::Arc;
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_types::{
     BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
-    CertifiedBlock, ChainOrigin, FinalizedWave, InFlightCount, LinkageError, LocalReceiptRoot,
+    CertifiedBlock, ChainOrigin, FinalizedWave, LinkageError, LocalReceiptRoot,
     ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds, RevealChain,
     SettledWavesRoot, ShardId, SplitChildRoots, StateRoot, TopologySchedule, TopologySnapshot,
     TransactionRoot, Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp,
+    WorkInFlight,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -1970,8 +1971,7 @@ impl VerificationPipeline {
     /// voting, running verifications only, or aborting.
     pub(crate) fn classify_vote_in_flight(
         &mut self,
-        parent_in_flight: Option<InFlightCount>,
-        finalized_tx_count: u32,
+        parent_in_flight: Option<WorkInFlight>,
         block_hash: BlockHash,
         block: &Block,
         safe_vote_declined: bool,
@@ -1988,37 +1988,38 @@ impl VerificationPipeline {
             return InFlightCheck::SkipVote;
         };
 
-        if self.verify_in_flight(block_hash, block, parent_in_flight, finalized_tx_count) {
+        if self.verify_in_flight(block_hash, block, parent_in_flight) {
             InFlightCheck::Proceed
         } else {
             InFlightCheck::Abort
         }
     }
 
-    /// Verify the proposed in-flight count is deterministically correct.
+    /// Verify the proposed drain total is deterministically correct.
     ///
-    /// `in_flight` = `parent.in_flight()` + `new_txs` - `finalized_txs`
+    /// `work_in_flight` = parent's + what this block's transactions
+    /// reserve - what its certificates return.
     ///
-    /// All validators can compute this from chain state, so it must be exact.
-    /// Certificates are only counted when actually included (JMT was ready).
+    /// Both terms are read off the block itself, so every validator
+    /// reaches the same figure with no history behind it — including one
+    /// that snap-synced past the transactions being released.
     pub fn verify_in_flight(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
-        parent_in_flight: InFlightCount,
-        finalized_tx_count: u32,
+        parent_in_flight: WorkInFlight,
     ) -> bool {
-        let proposed = block.header().in_flight();
-
-        // Compute expected: only subtract finalized txs when certs are actually included.
-        let certs_finalized = if block.certificates().is_empty() {
-            0
-        } else {
-            finalized_tx_count
-        };
+        let proposed = block.header().work_in_flight();
         let expected = parent_in_flight
-            .saturating_add(u32::try_from(block.transaction_count()).unwrap_or(u32::MAX))
-            .saturating_sub(certs_finalized);
+            .saturating_add(
+                block
+                    .transactions()
+                    .iter()
+                    .fold(0u64, |total, tx| total.saturating_add(tx.work())),
+            )
+            .saturating_sub(block.certificates().iter().fold(0u64, |total, fw| {
+                total.saturating_add(fw.as_unverified().declared_work())
+            }));
 
         if proposed == expected {
             self.verified_in_flight.insert(block_hash);
@@ -2031,7 +2032,6 @@ impl VerificationPipeline {
                 expected = expected.inner(),
                 parent_in_flight = parent_in_flight.inner(),
                 new_txs = block.transaction_count(),
-                finalized_txs = certs_finalized,
                 "In-flight count verification failed — proposed value does not match expected"
             );
             false
@@ -2380,6 +2380,7 @@ impl VerificationPipeline {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{AggregateSignature, WitnessSources};
 
     fn disabled_count_source() -> SubstateCountSource<'static> {
@@ -2431,7 +2432,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             std::collections::BTreeMap::new(),
-            InFlightCount::new(in_flight),
+            WorkInFlight::new(u64::from(in_flight)),
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -2506,8 +2507,7 @@ mod tests {
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
 
-        let out =
-            vp.classify_vote_in_flight(Some(InFlightCount::ZERO), 0, block_hash, &block, true);
+        let out = vp.classify_vote_in_flight(Some(WorkInFlight::ZERO), block_hash, &block, true);
         assert!(matches!(out, InFlightCheck::SkipVote));
     }
 
@@ -2519,7 +2519,7 @@ mod tests {
         let block = block_with(BlockHeight::new(5), bh(b"parent"), 0, vec![]);
         let block_hash = block.hash();
 
-        let out = vp.classify_vote_in_flight(None, 0, block_hash, &block, false);
+        let out = vp.classify_vote_in_flight(None, block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::SkipVote));
     }
 
@@ -2529,8 +2529,7 @@ mod tests {
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
 
-        let out =
-            vp.classify_vote_in_flight(Some(InFlightCount::ZERO), 0, block_hash, &block, false);
+        let out = vp.classify_vote_in_flight(Some(WorkInFlight::ZERO), block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::Proceed));
     }
 
@@ -2542,9 +2541,44 @@ mod tests {
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 5, vec![]);
         let block_hash = block.hash();
 
-        let out =
-            vp.classify_vote_in_flight(Some(InFlightCount::ZERO), 0, block_hash, &block, false);
+        let out = vp.classify_vote_in_flight(Some(WorkInFlight::ZERO), block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::Abort));
+    }
+
+    /// The drain is what its transactions reserved, not how many there
+    /// are. A block carrying one transaction has to claim that
+    /// transaction's work — a count would have claimed one.
+    #[test]
+    fn the_drain_states_what_the_block_reserved() {
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let tx = Arc::new(Verifiable::from(test_transaction(1)));
+        let reserved = tx.work();
+        assert!(
+            reserved > 1,
+            "a transaction reserves more than a count would give it: {reserved}"
+        );
+
+        let honest = block_claiming(
+            BlockHeight::new(1),
+            BlockHash::ZERO,
+            u32::try_from(reserved).expect("fits"),
+            vec![Arc::clone(&tx)],
+            None,
+        );
+        let hash = honest.hash();
+        assert!(matches!(
+            vp.classify_vote_in_flight(Some(WorkInFlight::ZERO), hash, &honest, false),
+            InFlightCheck::Proceed
+        ));
+
+        // Understating it would let a shard carry work the budget never
+        // saw, so the claim has to be exact rather than a ceiling.
+        let understated = block_with(BlockHeight::new(1), BlockHash::ZERO, 1, vec![tx]);
+        let hash = understated.hash();
+        assert!(matches!(
+            vp.classify_vote_in_flight(Some(WorkInFlight::ZERO), hash, &understated, false),
+            InFlightCheck::Abort
+        ));
     }
 
     // ─── drain_ready_state_root_verifications ───────────────────────────
@@ -3017,7 +3051,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             std::collections::BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,

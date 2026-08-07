@@ -18,17 +18,17 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRootContext, Block, BlockHash, BlockHeader, BlockHeight,
     BlockProposalMessage, BlockVote, BlockVoteMessage, CertificateRoot, CertificateRootContext,
     CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError,
-    ConsensusPublicKey, ConsensusReceipt, Epoch, FinalizedWave, Hash, InFlightCount,
-    LocalReceiptRoot, LocalReceiptRootContext, NetworkDefinition, PreparedCommit,
-    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
-    ProvisionsRoot, ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal,
-    ReshapeTrigger, RevealChain, Round, SettledWavesRoot, ShardId, ShardLoad, SplitChildRoots,
-    StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateKey, Timeout, TimeoutContext,
-    TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, ValidatorId,
-    Verifiable, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
-    absorb_committed_cells, commit_witness_window, compute_waves, derive_leaves,
-    local_settled_wave_ids, missed_proposals_since_prev_commit, next_reveal_chain,
-    shard_reveal_sign, signed_bytes, vrf_output_from_proof, work_over_certificates,
+    ConsensusPublicKey, ConsensusReceipt, Epoch, FinalizedWave, Hash, LocalReceiptRoot,
+    LocalReceiptRootContext, NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, RevealChain,
+    Round, SettledWavesRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot, StateRootContext,
+    Stopwatch, StoredReceipt, SubstateKey, Timeout, TimeoutContext, TopologySnapshot, Transaction,
+    TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified, Verifier, Verify,
+    VoteCount, VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, absorb_committed_cells,
+    commit_witness_window, compute_waves, derive_leaves, local_settled_wave_ids,
+    missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
+    vrf_output_from_proof, work_over_certificates,
 };
 
 /// Result of QC verification and assembly.
@@ -207,10 +207,9 @@ pub fn build_proposal<S: ShardChainWriter>(
     local_shard: ShardId,
     topology_snapshot: &TopologySnapshot,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
-    parent_in_flight: InFlightCount,
+    parent_in_flight: WorkInFlight,
     parent_load: Option<ShardLoad>,
     substate_bytes: Option<u64>,
-    finalized_tx_count: u32,
     ready_signals: Vec<ReadySignal>,
     reshape_trigger: Option<ReshapeTrigger>,
     randomness_reveal: VrfProof,
@@ -303,11 +302,19 @@ pub fn build_proposal<S: ShardChainWriter>(
         Verified::<ProvisionTxRootsMap>::compute(local_shard, topology_snapshot, &transactions)
             .into_inner();
 
-    // in_flight is deterministic from chain state:
-    // parent's in_flight + new transactions committed - transactions finalized by certificates.
-    let in_flight = parent_in_flight
-        .saturating_add(u32::try_from(transactions.len()).unwrap_or(u32::MAX))
-        .saturating_sub(finalized_tx_count);
+    // The drain is deterministic from the block's own content: what its
+    // transactions reserve, less what its certificates return. Both terms
+    // read off this block, so a validator reaches the same total without
+    // any history behind it.
+    let work_in_flight = parent_in_flight
+        .saturating_add(
+            transactions
+                .iter()
+                .fold(0u64, |total, tx| total.saturating_add(tx.work())),
+        )
+        .saturating_sub(certificates.iter().fold(0u64, |total, fw| {
+            total.saturating_add(fw.as_unverified().declared_work())
+        }));
 
     // The running gas total: the parent's advanced by what this block's
     // certificates report. An unresolvable parent load falls back to a
@@ -333,7 +340,7 @@ pub fn build_proposal<S: ShardChainWriter>(
         provision_root,
         waves,
         provision_tx_roots,
-        in_flight,
+        work_in_flight,
         beacon_witness_root,
         beacon_witness_leaf_count,
         beacon_witness_base,
@@ -835,7 +842,6 @@ where
             parent_in_flight,
             parent_load,
             substate_bytes,
-            finalized_tx_count,
             ready_signals,
             reshape_trigger,
             parent_witness_leaves,
@@ -952,7 +958,6 @@ where
                 parent_in_flight,
                 parent_load,
                 substate_bytes,
-                finalized_tx_count,
                 ready_signals,
                 reshape_trigger,
                 randomness_reveal,

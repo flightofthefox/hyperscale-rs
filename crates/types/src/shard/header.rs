@@ -11,10 +11,10 @@ use thiserror::Error;
 
 use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
-    ChainOrigin, Hash, InFlightCount, LocalReceiptRoot, MAX_REMOTE_SHARDS_PER_WAVE,
-    MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
-    RevealChain, Round, SettledWavesRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot,
-    TransactionRoot, ValidatorId, Verifiable, Verified, Verify, WaveId, WeightedTimestamp,
+    ChainOrigin, Hash, LocalReceiptRoot, MAX_REMOTE_SHARDS_PER_WAVE, MAX_TXS_PER_BLOCK,
+    ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
+    SettledWavesRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot, TransactionRoot, ValidatorId,
+    Verifiable, Verified, Verify, WaveId, WeightedTimestamp, WorkInFlight,
 };
 
 /// Block header containing consensus metadata.
@@ -44,7 +44,7 @@ pub struct BlockHeader {
     waves: Vec<WaveId>,
     #[hbor(max = MAX_REMOTE_SHARDS_PER_WAVE)]
     provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
-    in_flight: InFlightCount,
+    work_in_flight: WorkInFlight,
     beacon_witness_root: BeaconWitnessRoot,
     beacon_witness_leaf_count: BeaconWitnessLeafCount,
     /// The beacon-witness window base of the window this block belongs
@@ -114,7 +114,7 @@ impl BlockHeader {
         provision_root: ProvisionsRoot,
         waves: Vec<WaveId>,
         provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
-        in_flight: InFlightCount,
+        work_in_flight: WorkInFlight,
         beacon_witness_root: BeaconWitnessRoot,
         beacon_witness_leaf_count: BeaconWitnessLeafCount,
         beacon_witness_base: BeaconWitnessLeafCount,
@@ -139,7 +139,7 @@ impl BlockHeader {
             provision_root,
             waves,
             provision_tx_roots,
-            in_flight,
+            work_in_flight,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
@@ -183,7 +183,7 @@ impl BlockHeader {
             provision_root: ProvisionsRoot::ZERO,
             waves: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
+            work_in_flight: WorkInFlight::ZERO,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
@@ -235,7 +235,7 @@ impl BlockHeader {
             provision_root: ProvisionsRoot::ZERO,
             waves: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
+            work_in_flight: WorkInFlight::ZERO,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
@@ -301,7 +301,7 @@ impl BlockHeader {
             provision_root: ProvisionsRoot::ZERO,
             waves: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
-            in_flight: InFlightCount::ZERO,
+            work_in_flight: WorkInFlight::ZERO,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
@@ -473,8 +473,8 @@ impl BlockHeader {
     /// the parent's in-flight count forward unchanged (no txs admitted, none
     /// finalized).
     #[must_use]
-    pub const fn in_flight(&self) -> InFlightCount {
-        self.in_flight
+    pub const fn work_in_flight(&self) -> WorkInFlight {
+        self.work_in_flight
     }
 
     /// Root of this shard's monotonic beacon-witness accumulator at
@@ -568,7 +568,7 @@ impl BlockHeader {
         ProvisionsRoot,
         Vec<WaveId>,
         BTreeMap<ShardId, ProvisionTxRoot>,
-        InFlightCount,
+        WorkInFlight,
         BeaconWitnessRoot,
         BeaconWitnessLeafCount,
         BeaconWitnessLeafCount,
@@ -593,7 +593,7 @@ impl BlockHeader {
             self.provision_root,
             self.waves,
             self.provision_tx_roots,
-            self.in_flight,
+            self.work_in_flight,
             self.beacon_witness_root,
             self.beacon_witness_leaf_count,
             self.beacon_witness_base,

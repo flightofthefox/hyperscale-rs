@@ -19,9 +19,9 @@ use hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use hyperscale_types::{
     AwaitingTopologyBuffer, BlockHash, BlockHeader, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, CertifiedHeaderVerifyError, CommitProof, CompletedRecovery,
-    ConsensusPublicKey, Epoch, ForkFence, HeaderFetchCount, InFlightCount, REMOTE_HEADER_RETENTION,
+    ConsensusPublicKey, Epoch, ForkFence, HeaderFetchCount, REMOTE_HEADER_RETENTION,
     RETENTION_HORIZON, ScheduleLookup, ShardForkProof, ShardId, TopologySchedule, TopologySnapshot,
-    ValidatorId, Verified, WeightedTimestamp,
+    ValidatorId, Verified, WeightedTimestamp, WorkInFlight,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -911,13 +911,13 @@ impl RemoteHeaderCoordinator {
     /// Used for cross-shard backpressure: RPC nodes can reject transactions
     /// targeting congested remote shards.
     #[must_use]
-    pub fn remote_shard_in_flight(&self) -> HashMap<ShardId, InFlightCount> {
+    pub fn remote_shard_in_flight(&self) -> HashMap<ShardId, WorkInFlight> {
         self.tips
             .iter()
             .filter_map(|(&shard, &(tip_height, _tip_ts))| {
                 self.verified
                     .get(&(shard, tip_height))
-                    .map(|h| (shard, h.header().in_flight()))
+                    .map(|h| (shard, h.header().work_in_flight()))
             })
             .collect()
     }
@@ -1632,10 +1632,10 @@ mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-        CertificateRoot, ChainOrigin, Epoch, Hash, InFlightCount, LocalReceiptRoot,
-        NetworkDefinition, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain,
-        Round, ShardId, ShardLoad, Signer, SignerBitfield, StateRoot, TransactionRoot, ValidatorId,
-        ValidatorInfo, ValidatorSet,
+        CertificateRoot, ChainOrigin, Epoch, Hash, LocalReceiptRoot, NetworkDefinition,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
+        ShardLoad, Signer, SignerBitfield, StateRoot, TransactionRoot, ValidatorId, ValidatorInfo,
+        ValidatorSet, WorkInFlight,
     };
 
     use super::*;
@@ -1671,7 +1671,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -1769,7 +1769,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -1826,7 +1826,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -2274,7 +2274,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,

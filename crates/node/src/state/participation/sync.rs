@@ -204,7 +204,7 @@ mod tests {
                     ShardId::ROOT,
                     ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),
                 )]),
-                header.in_flight(),
+                header.work_in_flight(),
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,

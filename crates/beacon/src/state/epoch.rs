@@ -1267,13 +1267,13 @@ mod tests {
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
         AggregateSignature, BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
-        BlockHeader, BlockHeight, CertificateRoot, ChainOrigin, Epoch, Hash, InFlightCount,
-        LocalReceiptRoot, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, ProposerTimestamp,
-        ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledWavesRoot, ShardBoundary,
-        ShardCommittee, ShardForkProof, ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload,
-        SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TransactionRoot,
-        TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root,
-        compute_range_proof,
+        BlockHeader, BlockHeight, CertificateRoot, ChainOrigin, Epoch, Hash, LocalReceiptRoot,
+        MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, ProposerTimestamp, ProvisionsRoot,
+        QuorumCertificate, RevealChain, Round, SettledWavesRoot, ShardBoundary, ShardCommittee,
+        ShardForkProof, ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield,
+        SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TransactionRoot,
+        TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, WorkInFlight,
+        compute_merkle_root, compute_range_proof,
     };
 
     use super::*;
@@ -1337,7 +1337,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             root,
             BeaconWitnessLeafCount::new(leaf_count),
             BeaconWitnessLeafCount::ZERO,
@@ -4351,7 +4351,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,

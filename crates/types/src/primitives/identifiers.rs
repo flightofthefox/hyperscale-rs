@@ -966,50 +966,57 @@ impl Display for VoteCount {
 
 /// In-flight transaction count on a shard at block-proposal time.
 ///
-/// "In-flight" = txs admitted to the proposer's mempool but not yet finalized
-/// by a wave certificate. Carried in `BlockHeader` and gossiped cross-shard so
-/// remote nodes can shed RPC submissions targeting congested shards. Verified
-/// deterministically as `parent + new - finalized`.
+/// Work committed to this shard's chain and not yet settled.
+///
+/// The drain, in the same units admission prices a transaction in: a
+/// fixed admit-and-track charge, the declared footprint, and the signed
+/// gas limit. Carried in `BlockHeader` and gossiped cross-shard so remote
+/// nodes can shed RPC submissions targeting a congested shard.
+///
+/// Verified deterministically as `parent + added - released`, both terms
+/// read off the block's own content — the transactions it carries and the
+/// reservations its certificates return. A validator needs no history to
+/// check it, which is what lets a node that snap-synced past those
+/// transactions still reach the same total.
+///
+/// Weight rather than count, because counting prices a publish and a
+/// transfer the same. The fixed charge inside each transaction's work is
+/// what keeps this a bound on their number as well.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Hbor)]
 #[hbor(transparent)]
-pub struct InFlightCount(u32);
+pub struct WorkInFlight(u64);
 
-impl InFlightCount {
-    /// Zero in-flight (genesis).
+impl WorkInFlight {
+    /// Nothing in flight (genesis).
     pub const ZERO: Self = Self(0);
 
-    /// Construct an in-flight count from a raw `u32`.
-    ///
-    /// Most call sites should use [`InFlightCount::saturating_add`] /
-    /// [`InFlightCount::saturating_sub`] instead — this constructor is the
-    /// escape hatch for boundaries (mempool-derived thresholds, tests) where
-    /// the count genuinely originates as a raw integer.
+    /// Construct a drain total from raw work units.
     #[must_use]
-    pub const fn new(value: u32) -> Self {
+    pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
-    /// Inner `u32`. Use sparingly — at boundaries (display, structured log
-    /// fields) only.
+    /// Inner work units. Use sparingly — at boundaries (display,
+    /// structured log fields, budget comparisons) only.
     #[must_use]
-    pub const fn inner(self) -> u32 {
+    pub const fn inner(self) -> u64 {
         self.0
     }
 
-    /// Add `new_txs` (admissions in this block), saturating at `u32::MAX`.
+    /// Add what this block's transactions reserved.
     #[must_use]
-    pub const fn saturating_add(self, new_txs: u32) -> Self {
-        Self(self.0.saturating_add(new_txs))
+    pub const fn saturating_add(self, added: u64) -> Self {
+        Self(self.0.saturating_add(added))
     }
 
-    /// Subtract `finalized_txs` (finalizations in this block), saturating at zero.
+    /// Subtract what this block's certificates released.
     #[must_use]
-    pub const fn saturating_sub(self, finalized_txs: u32) -> Self {
-        Self(self.0.saturating_sub(finalized_txs))
+    pub const fn saturating_sub(self, released: u64) -> Self {
+        Self(self.0.saturating_sub(released))
     }
 }
 
-impl Display for InFlightCount {
+impl Display for WorkInFlight {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }

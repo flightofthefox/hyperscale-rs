@@ -14,8 +14,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, InFlightCount, ProvisionHash,
+    BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, ProvisionHash,
     QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, TxHash, Verified, WaveId,
+    WorkInFlight,
 };
 use tracing::warn;
 
@@ -27,7 +28,7 @@ pub struct ChainView<'a> {
     committed_height: BlockHeight,
     committed_hash: BlockHash,
     committed_state_root: StateRoot,
-    committed_in_flight: Option<InFlightCount>,
+    committed_in_flight: Option<WorkInFlight>,
     committed_load: Option<ShardLoad>,
     committed_reveal_chain: Option<RevealChain>,
     latest_qc: Option<&'a Verified<QuorumCertificate>>,
@@ -43,7 +44,7 @@ impl<'a> ChainView<'a> {
         committed_height: BlockHeight,
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
-        committed_in_flight: Option<InFlightCount>,
+        committed_in_flight: Option<WorkInFlight>,
         committed_load: Option<ShardLoad>,
         committed_reveal_chain: Option<RevealChain>,
         latest_qc: Option<&'a Verified<QuorumCertificate>>,
@@ -115,9 +116,9 @@ impl<'a> ChainView<'a> {
     /// A snap-synced joiner extending its boundary anchor resolves through
     /// the scalar (the anchor header never enters `pending`); a `None`
     /// skips the vote, since the claimed in-flight count can't be checked.
-    pub fn parent_in_flight_checked(&self, parent_block_hash: BlockHash) -> Option<InFlightCount> {
+    pub fn parent_in_flight_checked(&self, parent_block_hash: BlockHash) -> Option<WorkInFlight> {
         if let Some(header) = self.get_header(parent_block_hash) {
-            return Some(header.in_flight());
+            return Some(header.work_in_flight());
         }
         (parent_block_hash == self.committed_hash)
             .then_some(self.committed_in_flight)
@@ -156,9 +157,9 @@ impl<'a> ChainView<'a> {
 
     /// In-flight count on the parent header. Returns zero if the parent is
     /// unresolvable (see [`Self::parent_in_flight_checked`]).
-    pub fn parent_in_flight(&self, parent_block_hash: BlockHash) -> InFlightCount {
+    pub fn parent_in_flight(&self, parent_block_hash: BlockHash) -> WorkInFlight {
         self.parent_in_flight_checked(parent_block_hash)
-            .unwrap_or(InFlightCount::ZERO)
+            .unwrap_or(WorkInFlight::ZERO)
     }
 
     /// Parent to use when building the next proposal: the latest QC's block
@@ -251,7 +252,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             std::collections::BTreeMap::new(),
-            InFlightCount::new(u32::from(height)),
+            WorkInFlight::new(u64::from(height)),
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -492,7 +493,7 @@ mod tests {
     fn parent_in_flight_returns_header_value_or_zero() {
         let block = make_block(7, BlockHash::ZERO);
         let hash = block.hash();
-        let expected_in_flight = block.header().in_flight();
+        let expected_in_flight = block.header().work_in_flight();
         let unknown = bh(b"unknown");
 
         let mut pending = PendingBlocks::new();
@@ -506,7 +507,7 @@ mod tests {
             None,
             |view| {
                 assert_eq!(view.parent_in_flight(hash), expected_in_flight);
-                assert_eq!(view.parent_in_flight(unknown), InFlightCount::ZERO);
+                assert_eq!(view.parent_in_flight(unknown), WorkInFlight::ZERO);
             },
         );
     }

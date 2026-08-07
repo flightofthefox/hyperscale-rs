@@ -43,7 +43,7 @@ impl ShardParticipation {
         let in_flight = self.shard_coordinator.proposal_parent_in_flight();
         let ready_txs = self.mempool_coordinator.ready_transactions(
             max_txs,
-            in_flight.inner() as usize,
+            in_flight.inner(),
             self.now,
             quiesce,
         );

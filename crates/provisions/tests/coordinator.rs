@@ -12,10 +12,10 @@ use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
     BlockHeight, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash,
-    InFlightCount, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId, ShardLoad,
-    SignerBitfield, StateRoot, TopologySchedule, TopologySnapshot, TransactionRoot, ValidatorId,
-    Verified, WaveId, WeightedTimestamp, WitnessSources,
+    LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash, ProvisionTxRoot,
+    ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, SignerBitfield,
+    StateRoot, TopologySchedule, TopologySnapshot, TransactionRoot, ValidatorId, Verified, WaveId,
+    WeightedTimestamp, WitnessSources, WorkInFlight,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -50,7 +50,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
         ProvisionsRoot::ZERO,
         Vec::new(),
         std::collections::BTreeMap::new(),
-        InFlightCount::ZERO,
+        WorkInFlight::ZERO,
         BeaconWitnessRoot::ZERO,
         BeaconWitnessLeafCount::ZERO,
         BeaconWitnessLeafCount::ZERO,
@@ -117,7 +117,7 @@ fn make_remote_header_targeting(
         ProvisionsRoot::ZERO,
         waves,
         provision_tx_roots,
-        InFlightCount::ZERO,
+        WorkInFlight::ZERO,
         BeaconWitnessRoot::ZERO,
         BeaconWitnessLeafCount::ZERO,
         BeaconWitnessLeafCount::ZERO,

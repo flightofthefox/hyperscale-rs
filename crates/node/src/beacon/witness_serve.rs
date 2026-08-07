@@ -150,10 +150,10 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
         BlockHash, BlockHeader, BlockHeight, CertificateRoot, CertifiedBlock, ChainOrigin, Hash,
-        InFlightCount, LeafIndex, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, ShardWitnessPayload,
-        SignerBitfield, Stake, StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verified,
-        WeightedTimestamp, WitnessSources, compute_merkle_root, verify_range_inclusion,
+        LeafIndex, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
+        RevealChain, Round, ShardId, ShardLoad, ShardWitnessPayload, SignerBitfield, Stake,
+        StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verified, WeightedTimestamp,
+        WitnessSources, WorkInFlight, compute_merkle_root, verify_range_inclusion,
     };
 
     use super::*;
@@ -188,7 +188,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             beacon_witness_root,
             beacon_witness_leaf_count,
             BeaconWitnessLeafCount::ZERO,

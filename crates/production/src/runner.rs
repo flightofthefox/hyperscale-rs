@@ -54,9 +54,9 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, GenesisValidators, InFlightCount, LocalTimestamp,
-    MAX_TX_IN_FLIGHT, NetworkDefinition, ShardId, Signer, StakePoolSeat, Transaction, ValidatorId,
-    ValidatorStatus, Verifier,
+    BeaconChainConfig, BlockHeight, GenesisValidators, LocalTimestamp, MAX_BLOCK_WORK,
+    NetworkDefinition, ShardId, Signer, StakePoolSeat, Transaction, ValidatorId, ValidatorStatus,
+    Verifier, WorkInFlight,
 };
 use libp2p::identity::Keypair;
 use thiserror::Error;
@@ -1525,7 +1525,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
                 let state = &vnode.state;
                 let mempool = state.mempool_coordinator();
                 let pending = mempool.pending_count();
-                let in_flight = state.shard_coordinator().committed_in_flight() as usize;
+                let in_flight = state.shard_coordinator().committed_in_flight();
                 updated.vnodes.push(VnodeStatusEntry {
                     validator_id: vnode.validator_id.inner(),
                     shard: shard_key,
@@ -1571,14 +1571,14 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
     // than picking a per-shard representative.
     if let Some(ref mempool_snapshot) = config.publishers.mempool {
         #[allow(clippy::cast_possible_truncation)] // pool size derived from a fixed const
-        let remote_congestion_threshold = InFlightCount::new((MAX_TX_IN_FLIGHT * 4 / 5) as u32);
+        let remote_congestion_threshold = WorkInFlight::new(MAX_BLOCK_WORK * 4 / 5);
         mempool_snapshot.rcu(|current| {
             let mut updated = (**current).clone();
             for vnode in &shard_loop.vnodes {
                 let state = &vnode.state;
                 let mempool = state.mempool_coordinator();
                 let pending = mempool.pending_count();
-                let in_flight = state.shard_coordinator().committed_in_flight() as usize;
+                let in_flight = state.shard_coordinator().committed_in_flight();
                 updated.vnodes.insert(
                     vnode.validator_id.inner(),
                     VnodeMempoolSnapshot {
@@ -1586,7 +1586,7 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
                         in_flight_count: in_flight,
                         total_count: mempool.len(),
                         updated_at: Some(Instant::now()),
-                        accepting_rpc_transactions: in_flight < MAX_TX_IN_FLIGHT,
+                        accepting_rpc_transactions: in_flight < MAX_BLOCK_WORK,
                         at_pending_limit: mempool.at_pending_limit(),
                         remote_shard_in_flight: state
                             .remote_headers_coordinator()

@@ -11,7 +11,7 @@
 //! # Backpressure
 //!
 //! Two limits gate proposal and ingress:
-//! - [`MAX_TX_IN_FLIGHT`] (a protocol constant in `hyperscale-types`) caps
+//! - [`MAX_BLOCK_WORK`] (a protocol constant in `hyperscale-types`) caps
 //!   simultaneous lock-holding transactions, preventing the execution
 //!   pipeline from being overrun. Not operator-tunable: the right value
 //!   is fully determined by block size × pipeline depth.
@@ -35,7 +35,7 @@ use std::time::Duration;
 use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, CompletedRecovery, ForkFence, LocalTimestamp, MAX_TX_IN_FLIGHT,
+    BlockHeight, CertifiedBlock, CompletedRecovery, ForkFence, LocalTimestamp, MAX_BLOCK_WORK,
     MessageClass, QUIESCE_MARGIN, QuiesceCut, RETENTION_HORIZON, ShardId, TopologySnapshot,
     Transaction, TransactionDecision, TransactionStatus, TxHash, Verified, WeightedTimestamp,
 };
@@ -943,16 +943,16 @@ impl MempoolCoordinator {
     pub fn ready_transactions(
         &self,
         max_count: usize,
-        in_flight: usize,
+        in_flight: u64,
         now: LocalTimestamp,
         quiesce: Option<QuiesceCut>,
     ) -> Vec<Arc<Verified<Transaction>>> {
-        // The drain the chain says this shard still owes. Selection stops
-        // adding to it at the cap rather than tracking claims of its own.
-        if in_flight >= MAX_TX_IN_FLIGHT {
+        // The drain the chain says this shard still owes, in work units.
+        // Selection adds to it only while the total stays under budget —
+        // a shard that is not settling admits less until it does.
+        let Some(mut budget) = MAX_BLOCK_WORK.checked_sub(in_flight) else {
             return Vec::new();
-        }
-        let max_count = max_count.min(MAX_TX_IN_FLIGHT - in_flight);
+        };
 
         // The reshape quiesce is a property of the boundary, not of any
         // transaction: inside the margin nothing this shard could select
@@ -962,16 +962,27 @@ impl MempoolCoordinator {
         }
 
         let min_dwell = self.config.min_dwell_time;
-        self.pool
-            .iter()
-            .filter(|(hash, entry)| {
-                matches!(entry.status, TransactionStatus::Pending)
-                    && !self.parked_engagement.contains_key(*hash)
-                    && now.saturating_sub(entry.admitted_at) >= min_dwell
-            })
-            .map(|(_, entry)| Arc::clone(&entry.tx))
-            .take(max_count)
-            .collect()
+        let mut selected = Vec::new();
+        for (_, entry) in self.pool.iter().filter(|(hash, entry)| {
+            matches!(entry.status, TransactionStatus::Pending)
+                && !self.parked_engagement.contains_key(*hash)
+                && now.saturating_sub(entry.admitted_at) >= min_dwell
+        }) {
+            if selected.len() >= max_count {
+                break;
+            }
+            // Hash order decides who is offered; the budget decides how
+            // far down the list that goes. A transaction too heavy for
+            // what is left is passed over rather than ending selection —
+            // otherwise one outsized envelope would stall every lighter
+            // one behind it until the drain cleared.
+            let Some(remaining) = budget.checked_sub(entry.tx.work()) else {
+                continue;
+            };
+            budget = remaining;
+            selected.push(Arc::clone(&entry.tx));
+        }
+        selected
     }
 
     /// The number of transactions still awaiting inclusion, parked ones
@@ -1922,7 +1933,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Build a `Transaction` whose write set is a single
-    /// index-derived prefix, so callers can mint up to `MAX_TX_IN_FLIGHT`
+    /// index-derived prefix, so callers can mint up to a block's worth of
     /// distinct, non-conflicting txs by feeding sequential indices.
     fn unique_test_tx(idx: usize) -> Transaction {
         let seed = idx.to_le_bytes();
@@ -2056,7 +2067,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_allows_txns_below_limit() {
-        // A few txs is far below MAX_TX_IN_FLIGHT, so ready_transactions
+        // A few txs is far below the work budget, so ready_transactions
         // returns them all once they've dwelled long enough.
         let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
         let topology_snapshot = make_cross_shard_topology();
@@ -2097,7 +2108,7 @@ mod tests {
         );
 
         // The drain the chain reports is already at the cap.
-        let ready = mempool.ready_transactions(10, MAX_TX_IN_FLIGHT, LocalTimestamp::ZERO, None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::ZERO, None);
         assert!(
             ready.is_empty(),
             "No TXs should be returned at in-flight limit"

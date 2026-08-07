@@ -437,9 +437,9 @@ mod tests {
     use crate::test_utils::test_transaction;
     use crate::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
-        BloomFilter, CertificateRoot, ChainOrigin, Hash, InFlightCount, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, RevealChain, Round, ShardId, ShardLoad, SignerBitfield,
-        StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp,
+        BloomFilter, CertificateRoot, ChainOrigin, Hash, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionsRoot, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot,
+        TransactionRoot, ValidatorId, WeightedTimestamp, WorkInFlight,
     };
 
     fn create_test_block() -> Block {
@@ -462,7 +462,7 @@ mod tests {
                 ProvisionsRoot::ZERO,
                 Vec::new(),
                 BTreeMap::new(),
-                InFlightCount::ZERO,
+                WorkInFlight::ZERO,
                 BeaconWitnessRoot::ZERO,
                 BeaconWitnessLeafCount::ZERO,
                 BeaconWitnessLeafCount::ZERO,

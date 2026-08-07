@@ -426,10 +426,10 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
         BlockHeader, CertificateRoot, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
-        ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, InFlightCount,
-        LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
-        ShardId, ShardLoad, SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome,
-        ValidatorId, Verifiable, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources,
+        ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
+        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
+        ShardLoad, SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
+        Verifiable, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources, WorkInFlight,
     };
 
     use super::*;
@@ -453,7 +453,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             std::collections::BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -487,7 +487,7 @@ mod tests {
             h.provision_root(),
             h.waves().clone(),
             h.provision_tx_roots().clone(),
-            h.in_flight(),
+            h.work_in_flight(),
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,

@@ -67,10 +67,10 @@ mod tests {
     use crate::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         BlockHeight, CertificateRoot, ChainOrigin, ExecutionCertificate, ExecutionOutcome,
-        FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot,
+        FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
         ShardLoad, SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
-        Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
+        Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, WorkInFlight,
     };
 
     #[test]
@@ -91,7 +91,7 @@ mod tests {
             ProvisionsRoot::ZERO,
             Vec::new(),
             std::collections::BTreeMap::new(),
-            InFlightCount::ZERO,
+            WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -268,7 +268,7 @@ mod tests {
                 header.provision_root(),
                 header.waves().clone(),
                 header.provision_tx_roots().clone(),
-                header.in_flight(),
+                header.work_in_flight(),
                 header.beacon_witness_root(),
                 header.beacon_witness_leaf_count(),
                 header.beacon_witness_base(),
