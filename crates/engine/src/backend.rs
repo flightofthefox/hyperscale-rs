@@ -13,6 +13,16 @@
 
 use crate::host::HostState;
 
+/// Per-invocation fuel budget.
+///
+/// Consensus content: exhaustion is a deterministic trap, so the two
+/// engines have to meter against one number. It lives outside both
+/// backend modules because they are target-gated and never compile
+/// together — a per-module constant could drift between targets with
+/// nothing to catch it, and the divergence would only surface as two
+/// nodes disagreeing on whether a runaway guest trapped.
+const FUEL: u64 = 10_000_000;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use std::collections::BTreeMap;
@@ -29,13 +39,8 @@ mod native {
     use wasmtime::component::{Component, InstancePre, Linker};
     use wasmtime::{Engine, Store};
 
-    use super::HostState;
+    use super::{FUEL, HostState};
     use crate::genesis::{account_artifact, staking_artifact};
-
-    /// Per-invocation fuel budget. Exhaustion is a deterministic trap:
-    /// the metering schedule is pinned by the blessed engine's
-    /// configuration, and the reference interpreter meters its own.
-    const FUEL: u64 = 10_000_000;
 
     /// The compiled account guest, pre-linked for cheap instantiation.
     pub struct EngineBackend {
@@ -151,7 +156,7 @@ mod reference {
     use hyperscale_vm_ref::{CVal, RefComponent, RefComponentInstance, ResourceKind};
     use hyperscale_vm_runtime::validate_component;
 
-    use super::HostState;
+    use super::{FUEL, HostState};
     use crate::genesis::{account_artifact, staking_artifact};
 
     /// The decoded stdlib guests under the reference interpreter.
@@ -196,6 +201,10 @@ mod reference {
             };
             let mut instance = RefComponentInstance::instantiate(component, HostState(session))
                 .expect("the validated genesis component instantiates");
+            // The same ceiling the blessed engine meters against. Without
+            // it this engine is unbounded, and a guest past the budget
+            // traps on one target and runs on the other.
+            instance.set_fuel_limit(FUEL);
             let outcome = instance.invoke(call.export, &args);
             let fuel = instance.fuel_consumed();
             let session = instance.into_host().0;
