@@ -12,6 +12,11 @@
 //!   suppression while a proposal is in flight. Validators that disagree on
 //!   these values either time out asymmetrically (degraded liveness) or
 //!   weaken the stall-attack bound that `MAX_PROGRESS_WAIT` enforces.
+//! - **Proposer policy derived from those windows** (`QUIESCE_MARGIN`) —
+//!   not enforced by any validity rule, so a proposer that ignores it is
+//!   not producing an invalid block; it lives here because it is derived
+//!   from an abort window above and would drift if it were defined apart
+//!   from it.
 //!
 //! Sub-state-machine-local timeouts (fallback fetch, IO retry backoff, etc.)
 //! stay in their owning crate.
@@ -33,6 +38,29 @@ use crate::MAX_VALIDITY_RANGE;
 /// `weighted_timestamp_ms` of the committing QC, so every validator derives
 /// the same abort anchor.
 pub const WAVE_TIMEOUT: Duration = Duration::from_secs(24);
+
+/// How long before a reshape cut a terminating shard stops selecting
+/// transactions.
+///
+/// A shard stops producing content blocks at its cut, so work committed
+/// inside this margin has no block left to carry its certificate: the
+/// transaction is reported committed and then aborted, and its sender
+/// resubmits. Not selecting it is the whole of the remedy.
+///
+/// [`WAVE_TIMEOUT`] plus headroom, and one margin for every transaction.
+/// A cross-shard transaction needs the full settlement round, which is
+/// the only bound the protocol actually fixes — nothing caps how long a
+/// *provisioned* wave takes to reach its certificate, single-shard waves
+/// included, so a narrower margin for local work would be a guess, and a
+/// guess that falls short leaves exactly the aborts this exists to
+/// prevent.
+///
+/// Proposer policy, not a validity rule: a proposer that selects inside
+/// the margin produces a perfectly valid block, and the straddlers it
+/// admits fall to the counterpart abort backstop as they always have.
+/// It is not operator-tunable — a shard quiescing later than its peers
+/// would only hand that backstop work this avoids.
+pub const QUIESCE_MARGIN: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() + 6);
 
 /// How long to retain remote block headers below each shard's tip.
 ///

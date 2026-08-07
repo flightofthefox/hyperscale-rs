@@ -720,7 +720,21 @@ impl TopologySchedule {
         if self.epoch_duration_ms == 0 {
             return Some(false);
         }
-        let epoch = self.anchor_epoch_for(wt);
+        self.terminates_at_end_of(shard, self.anchor_epoch_for(wt))
+    }
+
+    /// [`terminates_at_next_boundary`](Self::terminates_at_next_boundary)
+    /// keyed on the window itself rather than on an instant inside it.
+    ///
+    /// Callers that already hold an epoch use this: naming the window by
+    /// its opening instant would resolve the *previous* one, since
+    /// [`anchor_epoch_for`](Self::anchor_epoch_for) treats a boundary
+    /// instant as belonging to the window it closes.
+    #[must_use]
+    pub fn terminates_at_end_of(&self, shard: ShardId, epoch: Epoch) -> Option<bool> {
+        if self.epoch_duration_ms == 0 {
+            return Some(false);
+        }
         let current = self.by_epoch.get(&epoch)?;
         Some(
             current.shard_trie().contains(shard)

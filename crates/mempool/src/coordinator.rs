@@ -36,8 +36,8 @@ use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, CompletedRecovery, ForkFence, LocalTimestamp, MAX_TX_IN_FLIGHT,
-    MessageClass, QuiesceCut, RETENTION_HORIZON, ShardId, TopologySnapshot, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, Verified, WAVE_TIMEOUT, WeightedTimestamp,
+    MessageClass, QUIESCE_MARGIN, QuiesceCut, RETENTION_HORIZON, ShardId, TopologySnapshot,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, Verified, WeightedTimestamp,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -54,25 +54,6 @@ pub const DEFAULT_MIN_DWELL_TIME: Duration = Duration::from_millis(150);
 
 /// Default RPC-pending backpressure limit (≈ 2× block size).
 pub const DEFAULT_MAX_PENDING: usize = 8192;
-
-/// Operator-recommended quiesce margin for cross-shard transactions.
-///
-/// A full cross-shard 2PC round ([`WAVE_TIMEOUT`]) plus headroom, so a
-/// cross-shard transaction selected before a split's cut settles on every
-/// shard by the terminal block. Shipped disabled (zero) in
-/// [`MempoolConfig::default`] so the whole reshape feature is dormant
-/// until configured (matching `ReshapeThresholds::DISABLED`) and
-/// simulations keep producing boundary straddlers for the counterpart
-/// abort backstop to sweep.
-pub const DEFAULT_QUIESCE_CROSS_SHARD_MARGIN: Duration =
-    Duration::from_secs(WAVE_TIMEOUT.as_secs() + 6);
-
-/// Operator-recommended quiesce margin for single-shard transactions.
-///
-/// A few block intervals, enough for a single-shard transaction selected
-/// before a split's cut to finalize by the terminal block. Disabled
-/// (zero) in [`MempoolConfig::default`].
-pub const DEFAULT_QUIESCE_SINGLE_SHARD_MARGIN: Duration = Duration::from_secs(2);
 
 /// Mempool configuration. Operator-tunable knobs only.
 #[derive(Debug, Clone, Deserialize)]
@@ -93,23 +74,6 @@ pub struct MempoolConfig {
     /// Set to zero to disable (default).
     #[serde(default = "default_min_dwell_time")]
     pub min_dwell_time: Duration,
-
-    /// Split-boundary quiesce margin for cross-shard transactions. In a
-    /// shard's final epoch before a split, the proposer stops selecting a
-    /// cross-shard transaction once the chain anchor plus this margin
-    /// reaches the cut, so it can't be selected too late to settle on
-    /// every shard before the terminal block. Zero disables quiesce (the
-    /// default — straddlers then fall to the counterpart abort backstop);
-    /// [`DEFAULT_QUIESCE_CROSS_SHARD_MARGIN`] is the operator recommendation.
-    #[serde(default = "default_quiesce_cross_shard_margin")]
-    pub quiesce_cross_shard_margin: Duration,
-
-    /// Split-boundary quiesce margin for single-shard transactions. Sized
-    /// to a few block intervals (single-shard work finalizes far faster
-    /// than a 2PC round). Zero disables quiesce (the default);
-    /// [`DEFAULT_QUIESCE_SINGLE_SHARD_MARGIN`] is the operator recommendation.
-    #[serde(default = "default_quiesce_single_shard_margin")]
-    pub quiesce_single_shard_margin: Duration,
 }
 
 const fn default_max_pending() -> usize {
@@ -120,21 +84,11 @@ const fn default_min_dwell_time() -> Duration {
     DEFAULT_MIN_DWELL_TIME
 }
 
-const fn default_quiesce_cross_shard_margin() -> Duration {
-    Duration::ZERO
-}
-
-const fn default_quiesce_single_shard_margin() -> Duration {
-    Duration::ZERO
-}
-
 impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
             max_pending: DEFAULT_MAX_PENDING,
             min_dwell_time: DEFAULT_MIN_DWELL_TIME,
-            quiesce_cross_shard_margin: Duration::ZERO,
-            quiesce_single_shard_margin: Duration::ZERO,
         }
     }
 }
@@ -1000,12 +954,12 @@ impl MempoolCoordinator {
         }
         let max_count = max_count.min(MAX_TX_IN_FLIGHT - in_flight);
 
-        // Split-boundary quiesce is inert with both margins zero (the
-        // default) — drop the per-transaction classification entirely.
-        let quiesce = quiesce.filter(|_| {
-            !self.config.quiesce_cross_shard_margin.is_zero()
-                || !self.config.quiesce_single_shard_margin.is_zero()
-        });
+        // The reshape quiesce is a property of the boundary, not of any
+        // transaction: inside the margin nothing this shard could select
+        // would settle before its last content block.
+        if quiesce.is_some_and(|cut| cut.now_wt.plus(QUIESCE_MARGIN) >= cut.cut_wt) {
+            return Vec::new();
+        }
 
         let min_dwell = self.config.min_dwell_time;
         self.pool
@@ -1016,34 +970,8 @@ impl MempoolCoordinator {
                     && now.saturating_sub(entry.admitted_at) >= min_dwell
             })
             .map(|(_, entry)| Arc::clone(&entry.tx))
-            .filter(|tx| self.passes_quiesce(tx, quiesce))
             .take(max_count)
             .collect()
-    }
-
-    /// Whether `tx` may still be selected under the split-boundary quiesce.
-    ///
-    /// With no pending cut, always selectable. Otherwise the transaction
-    /// is held once the proposer's anchor plus the per-class margin reaches
-    /// the cut — cross-shard work gets the wider margin (a full 2PC round)
-    /// since it needs every shard to settle before the terminal block,
-    /// single-shard the narrower one. Classification reads the
-    /// admission-time `cross_shard` flag, which already captures whether
-    /// the transaction's declared nodes reach a remote shard.
-    fn passes_quiesce(&self, tx: &Arc<Verified<Transaction>>, quiesce: Option<QuiesceCut>) -> bool {
-        let Some(cut) = quiesce else {
-            return true;
-        };
-        let cross_shard = self
-            .pool
-            .get(&tx.hash())
-            .is_some_and(|entry| entry.cross_shard);
-        let margin = if cross_shard {
-            self.config.quiesce_cross_shard_margin
-        } else {
-            self.config.quiesce_single_shard_margin
-        };
-        cut.now_wt.plus(margin) < cut.cut_wt
     }
 
     /// The number of transactions still awaiting inclusion, parked ones
@@ -2035,68 +1963,64 @@ mod tests {
         )
     }
 
+    /// The quiesce holds the whole shard, not a class of transaction: a
+    /// terminating shard inside the margin selects nothing, because the
+    /// margin is the settlement round and nothing it could select would
+    /// finish inside it.
     #[test]
-    fn ready_transactions_quiesce_holds_cross_shard_but_keeps_single_shard() {
+    fn ready_transactions_quiesce_holds_every_class_inside_the_margin() {
         let topology_snapshot = make_cross_shard_topology();
-        let config = MempoolConfig {
-            quiesce_cross_shard_margin: DEFAULT_QUIESCE_CROSS_SHARD_MARGIN,
-            quiesce_single_shard_margin: DEFAULT_QUIESCE_SINGLE_SHARD_MARGIN,
-            ..MempoolConfig::default()
-        };
-        let mut mempool = MempoolCoordinator::with_config(ShardId::leaf(1, 0), config);
+        let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
 
-        let cross = test_cross_shard_transaction(10);
-        let single = unique_test_tx(99);
-        let cross_hash = cross.hash();
-        let single_hash = single.hash();
         mempool.on_submit_transaction(
             &topology_snapshot,
-            Arc::new(verified(cross)),
+            Arc::new(verified(test_cross_shard_transaction(10))),
             LocalTimestamp::ZERO,
         );
         mempool.on_submit_transaction(
             &topology_snapshot,
-            Arc::new(verified(single)),
+            Arc::new(verified(unique_test_tx(99))),
             LocalTimestamp::ZERO,
         );
 
         // Past the dwell time so both are eligible.
         let now = LocalTimestamp::from_millis(500);
 
-        // No pending split → no quiesce, both selectable.
         assert_eq!(
             mempool.ready_transactions(10, 0, now, None).len(),
             2,
             "without a cut the quiesce is inert",
         );
 
-        // A cut 10s out: the cross-shard margin (a full 2PC round) reaches
-        // it, so the cross-shard tx is held; the single-shard margin (a few
-        // block intervals) does not, so the single-shard tx is kept.
-        let cut = QuiesceCut {
+        // A cut 10s out is inside the settlement round: nothing selected.
+        let inside = QuiesceCut {
             now_wt: WeightedTimestamp::from_millis(0),
             cut_wt: WeightedTimestamp::from_millis(10_000),
         };
-        let selected: Vec<TxHash> = mempool
-            .ready_transactions(10, 0, now, Some(cut))
-            .iter()
-            .map(|tx| tx.hash())
-            .collect();
         assert!(
-            selected.contains(&single_hash),
-            "single-shard tx stays selectable 10s before the cut",
+            mempool
+                .ready_transactions(10, 0, now, Some(inside))
+                .is_empty(),
+            "inside the margin a terminating shard selects nothing",
         );
-        assert!(
-            !selected.contains(&cross_hash),
-            "cross-shard tx is held — a 2PC round can't settle before the cut",
+
+        // A cut a full round clear: both classes flow again.
+        let clear = QuiesceCut {
+            now_wt: WeightedTimestamp::from_millis(0),
+            cut_wt: WeightedTimestamp::from_millis(600_000),
+        };
+        assert_eq!(
+            mempool.ready_transactions(10, 0, now, Some(clear)).len(),
+            2,
+            "clear of the margin the shard proposes normally",
         );
     }
 
+    /// The quiesce is a property of the boundary, not of configuration:
+    /// a transaction that cannot settle before the cut is not selected,
+    /// on every replica, without anyone opting in.
     #[test]
-    fn ready_transactions_quiesce_inert_with_zero_margins() {
-        // The simulation default: zero margins keep every transaction
-        // selectable right up to the cut, so reshape tests keep producing
-        // boundary straddlers for the abort backstop.
+    fn quiesce_holds_work_that_cannot_settle_before_the_cut() {
         let topology_snapshot = make_cross_shard_topology();
         let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
         let cross = test_cross_shard_transaction(10);
@@ -2107,14 +2031,26 @@ mod tests {
         );
 
         let now = LocalTimestamp::from_millis(500);
-        let cut = QuiesceCut {
+        let at_the_cut = QuiesceCut {
             now_wt: WeightedTimestamp::from_millis(9_999),
             cut_wt: WeightedTimestamp::from_millis(10_000),
         };
+        assert!(
+            mempool
+                .ready_transactions(10, 0, now, Some(at_the_cut))
+                .is_empty(),
+            "a cross-shard transaction one millisecond from the cut cannot settle",
+        );
+
+        // The same transaction, a full settlement round clear of the cut.
+        let clear = QuiesceCut {
+            now_wt: WeightedTimestamp::from_millis(0),
+            cut_wt: WeightedTimestamp::from_millis(600_000),
+        };
         assert_eq!(
-            mempool.ready_transactions(10, 0, now, Some(cut)).len(),
+            mempool.ready_transactions(10, 0, now, Some(clear)).len(),
             1,
-            "zero margins disable quiesce even at the cut",
+            "with the whole window ahead of it, the same transaction is selectable",
         );
     }
 
