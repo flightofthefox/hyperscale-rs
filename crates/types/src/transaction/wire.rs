@@ -138,6 +138,21 @@ impl Transaction {
         keys
     }
 
+    /// What including this transaction costs a block, in work units:
+    /// the fixed admit-and-track charge, the declared footprint, and the
+    /// signed gas limit.
+    ///
+    /// The packing bound sums this over the drain. Derived locally, so
+    /// it is not something a sender can understate.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Self::routing`].
+    #[must_use]
+    pub fn work(&self) -> u64 {
+        self.derived().work
+    }
+
     /// Half-open `WeightedTimestamp` range during which this tx may be
     /// included in a block. Anchored on the parent QC's `weighted_timestamp`
     /// at every check site. Signer-chosen, chain-enforced.
@@ -420,7 +435,10 @@ mod tests {
 
     use super::*;
     use crate::test_utils::test_validity_range;
-    use crate::{Ed25519PrivateKey, SubintentSig, TransactionBody, VmStatics, install_vm_statics};
+    use crate::{
+        Ed25519PrivateKey, SubintentSig, TX_ADMISSION_WORK, TransactionBody, VmStatics,
+        install_vm_statics,
+    };
 
     struct StubStatics;
 
@@ -449,6 +467,7 @@ mod tests {
                     provision_prefixes: vec![Address([0x11; 16])],
                 },
                 subintent_hashes,
+                work: TX_ADMISSION_WORK,
             })
         }
     }

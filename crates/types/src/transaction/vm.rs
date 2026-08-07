@@ -140,6 +140,20 @@ pub struct Derived {
     /// fee settlement debits. The owner half is the envelope's
     /// `fee_payer`.
     pub fee_vault_local: [u8; 16],
+    /// What including this transaction costs a block, in work units.
+    ///
+    /// A fixed admit-and-track charge, the declared footprint, and the
+    /// signed gas limit. The fixed term is what makes a budget over this
+    /// quantity bound the *number* of transactions in the drain as well
+    /// as their weight: a minimal declaration prices at almost nothing
+    /// and a gas limit may be zero, while every committed transaction
+    /// costs a wave entry, a tick-chain entry, a receipt and mempool
+    /// tracking whatever it declared.
+    ///
+    /// Derived locally from the manifest and published metadata like
+    /// every other routing quantity — nothing about it travels on the
+    /// wire, so a sender cannot understate it.
+    pub work: u64,
 }
 
 /// Why VM static derivation refused an envelope. Deterministic: every

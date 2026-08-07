@@ -49,6 +49,31 @@ pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
 /// determined by block size and pipeline depth.
 pub const MAX_TX_IN_FLIGHT: usize = MAX_TXS_PER_BLOCK * 3;
 
+/// What admitting and tracking any transaction costs a block, before
+/// anything it declares.
+///
+/// Every committed transaction occupies a wave entry, a tick-chain
+/// entry, a receipt and mempool tracking whatever its manifest touches,
+/// and that cost is per transaction rather than per unit of declared
+/// work. Without this term a budget over declared work alone would
+/// bound weight and not number, and a flood of minimal zero-gas
+/// transactions would be close to free.
+///
+/// A placeholder like every other quantity in the fee model: phase 6
+/// sets it against measured baselines.
+pub const TX_ADMISSION_WORK: u64 = 1_000;
+
+/// What one block may add to the unexecuted drain, in work units.
+///
+/// The packing bound: a proposer adds transactions only while the
+/// drain's summed work stays under this, so a shard that is not settling
+/// admits less until it does. Replaces the transaction *count* as the
+/// packing rule — counting priced a publish and a transfer the same.
+///
+/// Generous placeholder; phase 6 calibrates it beside
+/// [`TX_ADMISSION_WORK`] against measured throughput.
+pub const MAX_BLOCK_WORK: u64 = 4_096 * (TX_ADMISSION_WORK + 1_000_000);
+
 /// Hard cap on `header.round() - header.parent_qc().round()` — how many
 /// skipped consensus rounds a single block may span.
 ///

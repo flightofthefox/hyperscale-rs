@@ -15,11 +15,11 @@ use crate::{
     EnvelopeExt, ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
     GlobalReceiptRoot, Hash, InFlightCount, LocalReceiptRoot, NetworkDefinition, NetworkId,
     ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, Routing,
-    ShardForkProof, ShardId, ShardLoad, SignerBitfield, StateRoot, TimestampRange,
-    TopologySnapshot, Transaction, TransactionBody, TransactionDecision, TransactionEnvelope,
-    TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-    Verified, VmStatics, VmStaticsError, WaveCertificate, WaveId, WeightedTimestamp,
-    WitnessSources, install_vm_statics, signed_bytes, vm_statics_installed,
+    ShardForkProof, ShardId, ShardLoad, SignerBitfield, StateRoot, TX_ADMISSION_WORK,
+    TimestampRange, TopologySnapshot, Transaction, TransactionBody, TransactionDecision,
+    TransactionEnvelope, TransactionRoot, TxHash, TxOutcome, ValidatorId, ValidatorInfo,
+    ValidatorSet, Verifiable, Verified, VmStatics, VmStaticsError, WaveCertificate, WaveId,
+    WeightedTimestamp, WitnessSources, install_vm_statics, signed_bytes, vm_statics_installed,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -915,6 +915,11 @@ impl VmStatics for StubVmStatics {
             },
             subintent_hashes: Vec::new(),
             fee_vault_local: [0xEE; 16],
+            // The stub prices a declared key like the real derivation
+            // prices an effect: one unit each, over the fixed charge.
+            work: TX_ADMISSION_WORK
+                + (read_prefixes.len() + write_prefixes.len()) as u64
+                + vm.gas_limit,
         })
     }
 }
