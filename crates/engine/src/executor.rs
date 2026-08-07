@@ -76,6 +76,9 @@ pub struct PreparedTx {
     pub declaration: Declaration,
     /// The subintent nullifier keys the batch entry enforces.
     pub nullifiers: Vec<SubstateKey>,
+    /// The envelope's signed execution ceiling, in fuel — one budget for
+    /// the whole transaction, however many nodes its manifest walks.
+    pub gas_limit: u64,
 }
 
 /// The protocol crypto hash behind the kernel's hashing host function
@@ -265,6 +268,7 @@ impl Executor {
                 .iter()
                 .map(|record| record.nullifier)
                 .collect(),
+            gas_limit: vm.gas_limit,
         })
     }
 }
@@ -841,6 +845,7 @@ impl Executor {
                 )
                 .with_calls(entry.calls.clone())
                 .with_nullifiers(entry.nullifiers.clone())
+                .with_gas_limit(entry.gas_limit)
             })
             .collect();
         let walk = ManifestWalk {

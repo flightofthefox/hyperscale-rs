@@ -13,7 +13,8 @@
 
 use crate::host::HostState;
 
-/// Per-invocation fuel budget.
+/// The ceiling on what one invocation may consume, whatever its
+/// transaction declared.
 ///
 /// Consensus content: exhaustion is a deterministic trap, so the two
 /// engines have to meter against one number. It lives outside both
@@ -86,13 +87,17 @@ mod native {
 
     impl Backend for EngineBackend {
         fn invoke(&self, session: KernelSession, call: &GuestCall<'_>) -> InvokeResult {
+            // What the transaction has left, under the per-invocation
+            // ceiling: a manifest's nodes draw from one signed budget.
+            let budget = call.fuel_budget.min(FUEL);
             let mut store = Store::new(&self.engine, HostState(session));
-            store.set_fuel(FUEL).expect("fuel metering is enabled");
+            store.set_fuel(budget).expect("fuel metering is enabled");
             let Some(pre) = self.packages.get(&call.package) else {
                 return InvokeResult {
                     session: store.into_data().0,
                     fuel: 0,
                     result: Err("no compiled code for the called package".to_string()),
+                    exhausted: false,
                 };
             };
             let instance = match pre.instantiate(&mut store) {
@@ -102,17 +107,21 @@ mod native {
                         session: store.into_data().0,
                         fuel: 0,
                         result: Err(format!("instantiate: {error:#}")),
+                        exhausted: false,
                     };
                 }
             };
             let args: Vec<HostArg<'_>> = call.args.iter().map(host_arg).collect();
             let result = call_export(&mut store, &instance, call.export, &args, call.returns)
                 .map_err(|trap| format!("{trap:#}"));
-            let fuel = FUEL - store.get_fuel().expect("fuel metering is enabled");
+            let remaining = store.get_fuel().expect("fuel metering is enabled");
+            let fuel = budget - remaining;
+            let exhausted = remaining == 0 && result.is_err();
             InvokeResult {
                 session: store.into_data().0,
                 fuel,
                 result,
+                exhausted,
             }
         }
     }
@@ -153,7 +162,9 @@ mod reference {
     use hyperscale_vm_kernel::{
         CellKind, GuestArg, GuestBackend as Backend, GuestCall, InvokeResult, KernelSession,
     };
-    use hyperscale_vm_ref::{CVal, RefComponent, RefComponentInstance, ResourceKind};
+    use hyperscale_vm_ref::{
+        CVal, ExecError, RefComponent, RefComponentInstance, ResourceKind, Trap as RefTrap,
+    };
     use hyperscale_vm_runtime::validate_component;
 
     use super::{FUEL, HostState};
@@ -197,6 +208,7 @@ mod reference {
                     session,
                     fuel: 0,
                     result: Err("no decoded code for the called package".to_string()),
+                    exhausted: false,
                 };
             };
             let mut instance = RefComponentInstance::instantiate(component, HostState(session))
@@ -204,8 +216,9 @@ mod reference {
             // The same ceiling the blessed engine meters against. Without
             // it this engine is unbounded, and a guest past the budget
             // traps on one target and runs on the other.
-            instance.set_fuel_limit(FUEL);
+            instance.set_fuel_limit(call.fuel_budget.min(FUEL));
             let outcome = instance.invoke(call.export, &args);
+            let exhausted = matches!(outcome, Ok(Err(ExecError::Trap(RefTrap::OutOfFuel))));
             let fuel = instance.fuel_consumed();
             let session = instance.into_host().0;
             let result = match outcome {
@@ -221,6 +234,7 @@ mod reference {
                 session,
                 fuel,
                 result,
+                exhausted,
             }
         }
     }
