@@ -29,11 +29,11 @@ mod verifiable;
 
 // Consensus types
 mod beacon;
+mod execution;
 mod receipt;
 mod shard;
 mod topology;
 mod transaction;
-mod wave;
 
 pub use beacon::{
     BEACON_SIGNER_COUNT, BeaconBlock, BeaconCert, BeaconChainConfig, BeaconGenesisConfig,
@@ -75,6 +75,23 @@ pub use beacon::{
 };
 pub use crypto::Ed25519PrivateKey;
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
+pub use execution::certificate::{
+    MAX_EXECUTION_CERTIFICATES_PER_WAVE, WaveCertificate, wave_receipt_hash,
+};
+pub use execution::computation::{compute_cross_shard_txs, tick_leader, tick_leader_at};
+pub use execution::execution_certificate::{
+    ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
+};
+pub use execution::finalized::{
+    FinalizedWave, FinalizedWaveContext, FinalizedWaveVerifyError, ReceiptValidationError, Settles,
+    refused_transactions, settles,
+};
+pub use execution::outcome::{ExecutionOutcome, TxOutcome};
+pub use execution::receipt_tree::{
+    compute_global_receipt_root, compute_global_receipt_root_with_proof, tx_outcome_leaf,
+};
+pub use execution::tick_id::TickId;
+pub use execution::vote::{ExecutionVote, ExecutionVoteContext, ExecutionVoteVerifyError};
 pub use hyperscale_crypto::{
     AggregateError, AggregateSignature, CONSENSUS_PUBLIC_KEY_BYTES, CONSENSUS_SIGNATURE_BYTES,
     ConsensusPublicKey, ConsensusSignature, SignError, Signer, VRF_PROOF_BYTES, Verifier,
@@ -206,23 +223,6 @@ pub use transaction::vm::{
 };
 pub use transaction::wire::{Transaction, TransactionVerifyError};
 pub use verifiable::{Verifiable, Verified, Verify};
-pub use wave::certificate::{
-    MAX_EXECUTION_CERTIFICATES_PER_WAVE, WaveCertificate, wave_receipt_hash,
-};
-pub use wave::computation::{compute_cross_shard_txs, tick_leader, tick_leader_at};
-pub use wave::execution_certificate::{
-    ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
-};
-pub use wave::finalized::{
-    FinalizedWave, FinalizedWaveContext, FinalizedWaveVerifyError, ReceiptValidationError, Settles,
-    refused_transactions, settles,
-};
-pub use wave::outcome::{ExecutionOutcome, TxOutcome};
-pub use wave::receipt_tree::{
-    compute_global_receipt_root, compute_global_receipt_root_with_proof, tx_outcome_leaf,
-};
-pub use wave::tick_id::TickId;
-pub use wave::vote::{ExecutionVote, ExecutionVoteContext, ExecutionVoteVerifyError};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;

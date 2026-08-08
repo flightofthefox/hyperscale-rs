@@ -1,26 +1,30 @@
-//! Wave types and utilities for cross-shard execution.
+//! What a shard attests about the transactions it executes.
 //!
-//! Transactions in a block are partitioned into waves by their provision
-//! dependency set (the set of remote shards they need provisions from).
-//! All validators compute identical wave assignments from block contents,
-//! enabling wave-level signature aggregation instead of per-transaction
-//! signatures.
+//! A shard executes the transactions a block commits as one batch — the
+//! tick — and attests the batch's outcomes together, so one aggregate
+//! signature and one cross-shard exchange cover every transaction in it
+//! rather than one apiece.
 //!
-//! # Wave Assignment
+//! A batch is not homogeneous. It carries whatever the tick admitted:
+//! transactions that reach beyond this shard alongside transactions that
+//! do not. Which of the two a transaction is decides whether its
+//! contributions are provisional and whether a counterpart's verdict can
+//! still abort it, so both are per-transaction facts rather than
+//! properties of the batch.
 //!
-//! - **Wave ∅** (ZERO): Single-shard txs — no provisions needed
-//! - **Wave {B}**: Txs needing provisions only from shard B
-//! - **Wave {B,C}**: Txs needing provisions from both B and C
+//! # Lifecycle
 //!
-//! Tx ordering within a wave preserves block ordering (stable partition).
-//!
-//! # Wave Lifecycle
-//!
-//! 1. [`id::TickId`] — identity, computed from block contents
-//! 2. [`vote::ExecutionVote`] — per-validator signed vote on wave outcomes
-//! 3. [`execution_certificate::ExecutionCertificate`] — aggregated 2f+1 shard-local certificate
-//! 4. [`certificate::WaveCertificate`] — cross-shard proof of finalization (holds ECs directly)
-//! 5. [`finalized::FinalizedWave`] — all data needed for block commit
+//! 1. [`tick_id::TickId`] — the batch's identity: its shard, and the
+//!    height of the block whose commit chained it onto the last
+//! 2. [`vote::ExecutionVote`] — per-validator signed vote on the batch's
+//!    outcomes
+//! 3. [`execution_certificate::ExecutionCertificate`] — the aggregated
+//!    2f+1 shard-local certificate over them
+//! 4. [`certificate::WaveCertificate`] — every participating shard's
+//!    certificate for one batch, which is what proves a cross-shard
+//!    transaction reached the same verdict everywhere
+//! 5. [`finalized::FinalizedWave`] — that proof plus the local receipts:
+//!    everything a block needs to commit the outcome
 
 pub mod certificate;
 pub mod computation;
@@ -89,21 +93,21 @@ mod tests {
         )
     }
 
-    fn make_wave_id(shard: u64, height: BlockHeight, _remote: &[u64]) -> TickId {
+    fn make_tick_id(shard: u64, height: BlockHeight) -> TickId {
         TickId::new(ShardId::leaf(3, shard), height)
     }
 
     #[test]
-    fn test_wave_id_deterministic() {
-        let w1 = make_wave_id(0, BlockHeight::new(42), &[1]);
-        let w2 = make_wave_id(0, BlockHeight::new(42), &[1]);
+    fn tick_id_is_deterministic() {
+        let w1 = make_tick_id(0, BlockHeight::new(42));
+        let w2 = make_tick_id(0, BlockHeight::new(42));
         assert_eq!(w1, w2);
     }
 
     #[test]
-    fn test_wave_id_differs_by_height() {
-        let w1 = make_wave_id(0, BlockHeight::new(42), &[1]);
-        let w2 = make_wave_id(0, BlockHeight::new(43), &[1]);
+    fn tick_id_differs_by_height() {
+        let w1 = make_tick_id(0, BlockHeight::new(42));
+        let w2 = make_tick_id(0, BlockHeight::new(43));
         assert_ne!(w1, w2);
     }
 
@@ -260,15 +264,15 @@ mod tests {
 
     #[test]
     fn ec_deadline_is_vote_anchor_ts_plus_retention_horizon() {
-        let ec = make_test_wave_ec(0, 1);
+        let ec = make_test_ec(0, 1);
         assert_eq!(ec.deadline(), ec.vote_anchor_ts().plus(RETENTION_HORIZON));
     }
 
-    fn make_test_wave_ec(shard: u64, seed: u8) -> Arc<ExecutionCertificate> {
+    fn make_test_ec(shard: u64, seed: u8) -> Arc<ExecutionCertificate> {
         let outcomes = vec![make_outcome(seed)];
         let global_receipt_root = compute_global_receipt_root(&outcomes);
         Arc::new(ExecutionCertificate::new(
-            make_wave_id(shard, BlockHeight::new(42), &[1]),
+            make_tick_id(shard, BlockHeight::new(42)),
             WeightedTimestamp::from_millis(43),
             global_receipt_root,
             outcomes,
@@ -280,8 +284,8 @@ mod tests {
     #[test]
     fn test_receipt_hash_deterministic() {
         let wc = WaveCertificate::new(
-            make_wave_id(0, BlockHeight::new(42), &[1]),
-            vec![make_test_wave_ec(0, 1), make_test_wave_ec(1, 2)],
+            make_tick_id(0, BlockHeight::new(42)),
+            vec![make_test_ec(0, 1), make_test_ec(1, 2)],
         );
         assert_eq!(wc.receipt_hash(), wc.receipt_hash());
         assert_ne!(wc.receipt_hash(), WaveReceiptHash::ZERO);
@@ -291,17 +295,17 @@ mod tests {
     fn test_receipt_hash_changes_with_ec() {
         // `receipt_hash` commits to `(shard_id, tick_id)` pairs, so two
         // ECs with distinct tick_ids must produce distinct receipt hashes.
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
-        let wc1 = WaveCertificate::new(tick_id, vec![make_test_wave_ec(0, 1)]);
-        let wc2 = WaveCertificate::new(tick_id, vec![make_test_wave_ec(1, 2)]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
+        let wc1 = WaveCertificate::new(tick_id, vec![make_test_ec(0, 1)]);
+        let wc2 = WaveCertificate::new(tick_id, vec![make_test_ec(1, 2)]);
         assert_ne!(wc1.receipt_hash(), wc2.receipt_hash());
     }
 
     #[test]
     fn test_wave_cert_hbor_roundtrip() {
         let wc = WaveCertificate::new(
-            make_wave_id(0, BlockHeight::new(42), &[1]),
-            vec![make_test_wave_ec(0, 1), make_test_wave_ec(1, 2)],
+            make_tick_id(0, BlockHeight::new(42)),
+            vec![make_test_ec(0, 1), make_test_ec(1, 2)],
         );
         let encoded = hbor_to_vec(&wc).unwrap();
         let decoded: WaveCertificate = hbor_from_slice(&encoded).unwrap();
@@ -314,8 +318,8 @@ mod tests {
         // ec.tick_id() matches wc.tick_id. Pre-fix this decoded successfully
         // and then panicked the IO loop on first call to local_ec().
         let wc = WaveCertificate::new(
-            make_wave_id(0, BlockHeight::new(42), &[1]),
-            vec![make_test_wave_ec(1, 1)],
+            make_tick_id(0, BlockHeight::new(42)),
+            vec![make_test_ec(1, 1)],
         );
         let bytes = hbor_to_vec(&wc).unwrap();
         let err = hbor_from_slice::<WaveCertificate>(&bytes).unwrap_err();
@@ -332,7 +336,7 @@ mod tests {
         // Distinct seeds yield distinct canonical hashes so the inner
         // EC-decode invariants don't reject before we get to the local-EC
         // count check.
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let ec_a = make_local_ec(&tick_id, vec![make_outcome(1)]);
         let ec_b = make_local_ec(&tick_id, vec![make_outcome(2)]);
         let wc = WaveCertificate::new(tick_id, vec![ec_a, ec_b]);
@@ -346,7 +350,7 @@ mod tests {
         // Forge a WC whose execution_certificates count claims one past the
         // cap, padded to input-satisfiability so the protocol cap is what
         // fires, before any per-EC decode work happens.
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let mut buf = hbor_to_vec(&tick_id).unwrap();
         varint::write(&mut buf, MAX_EXECUTION_CERTIFICATES_PER_WAVE + 1).unwrap();
         buf.extend(std::iter::repeat_n(
@@ -366,7 +370,7 @@ mod tests {
     fn decode_rejects_oversized_tx_outcomes_count() {
         use crate::{GlobalReceiptRoot, MAX_TXS_PER_BLOCK};
 
-        let tick_id = make_wave_id(0, BlockHeight::new(1), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(1));
         let mut buf = hbor_to_vec(&tick_id).unwrap();
         buf.extend_from_slice(&hbor_to_vec(&WeightedTimestamp::ZERO).unwrap());
         buf.extend_from_slice(&hbor_to_vec(&GlobalReceiptRoot::ZERO).unwrap());
@@ -399,7 +403,7 @@ mod tests {
             signers: SignerBitfield,
         }
 
-        let tick_id = make_wave_id(0, BlockHeight::new(7), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(7));
         let outcomes = vec![make_outcome(1), make_outcome(2)];
         assert_ne!(
             compute_global_receipt_root(&outcomes),
@@ -425,7 +429,7 @@ mod tests {
     fn decode_rejects_finalized_wave_with_oversized_receipts_count() {
         use crate::MAX_TXS_PER_BLOCK;
 
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let wc = WaveCertificate::new(tick_id, vec![make_local_ec(&tick_id, vec![])]);
 
         let mut buf = hbor_to_vec(&wc).unwrap();
@@ -440,14 +444,14 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_leader_is_attempt_zero() {
+    fn tick_leader_is_attempt_zero() {
         let committee = vec![
             ValidatorId::new(1),
             ValidatorId::new(2),
             ValidatorId::new(3),
             ValidatorId::new(4),
         ];
-        let tick_id = make_wave_id(0, BlockHeight::new(100), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(100));
         assert_eq!(
             tick_leader(&tick_id, &committee),
             tick_leader_at(&tick_id, Attempt::INITIAL, &committee)
@@ -455,14 +459,14 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_leader_at_rotates() {
+    fn tick_leader_at_rotates() {
         let committee = vec![
             ValidatorId::new(1),
             ValidatorId::new(2),
             ValidatorId::new(3),
             ValidatorId::new(4),
         ];
-        let tick_id = make_wave_id(0, BlockHeight::new(100), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(100));
         let mut leaders: HashSet<ValidatorId> = HashSet::new();
         for attempt in 0..4 {
             leaders.insert(tick_leader_at(&tick_id, Attempt::new(attempt), &committee));
@@ -476,13 +480,13 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_leader_at_wraps() {
+    fn tick_leader_at_wraps() {
         let committee = vec![
             ValidatorId::new(1),
             ValidatorId::new(2),
             ValidatorId::new(3),
         ];
-        let tick_id = make_wave_id(0, BlockHeight::new(100), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(100));
         // Large attempt values should not panic — they wrap via modulo.
         let _ = tick_leader_at(&tick_id, Attempt::new(1000), &committee);
     }
@@ -495,7 +499,7 @@ mod tests {
             ValidatorId::new(3),
             ValidatorId::new(4),
         ];
-        let tick_id = make_wave_id(0, BlockHeight::new(100), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(100));
         let leader1 = tick_leader_at(&tick_id, Attempt::new(2), &committee);
         let leader2 = tick_leader_at(&tick_id, Attempt::new(2), &committee);
         assert_eq!(leader1, leader2);
@@ -523,7 +527,7 @@ mod tests {
 
     #[test]
     fn reconstruct_from_all_success_outcomes() {
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let tx_a = TxHash::from(Hash::from_bytes(b"tx_a"));
         let tx_b = TxHash::from(Hash::from_bytes(b"tx_b"));
 
@@ -558,7 +562,7 @@ mod tests {
 
     #[test]
     fn reconstruct_skips_aborted_tx_without_receipt() {
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let tx_a = TxHash::from(Hash::from_bytes(b"tx_a"));
         let tx_b = TxHash::from(Hash::from_bytes(b"tx_b_aborted"));
 
@@ -593,7 +597,7 @@ mod tests {
 
     #[test]
     fn reconstruct_fails_when_non_aborted_receipt_missing() {
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let tx_a = TxHash::from(Hash::from_bytes(b"tx_a"));
 
         let outcomes = vec![TxOutcome::new(
@@ -616,8 +620,8 @@ mod tests {
 
     #[test]
     fn reconstruct_fails_when_local_ec_missing() {
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
-        let remote_wave_id = make_wave_id(1, BlockHeight::new(42), &[0]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
+        let remote_wave_id = make_tick_id(1, BlockHeight::new(42));
         let remote_ec = make_local_ec(
             &remote_wave_id,
             vec![TxOutcome::new(
@@ -633,7 +637,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_receipts_matching_outcomes() {
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let tx_a = TxHash::from(Hash::from_bytes(b"tx_a"));
         let tx_b = TxHash::from(Hash::from_bytes(b"tx_b_aborted"));
         let tx_c = TxHash::from(Hash::from_bytes(b"tx_c_fail"));
@@ -677,7 +681,7 @@ mod tests {
     #[test]
     fn validate_rejects_unexpected_failure() {
         // EC says Succeeded, receipt says Failed.
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let tx_a = TxHash::from(Hash::from_bytes(b"tx_a"));
         let outcomes = vec![TxOutcome::new(
             tx_a,
@@ -705,7 +709,7 @@ mod tests {
     #[test]
     fn validate_rejects_unexpected_success() {
         // EC says Failed, receipt says Succeeded.
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let tx_a = TxHash::from(Hash::from_bytes(b"tx_a"));
         let outcomes = vec![TxOutcome::new(tx_a, ExecutionOutcome::Failed)];
         let fw = FinalizedWave::new(
@@ -733,7 +737,7 @@ mod tests {
     #[test]
     fn validate_rejects_receipt_hash_mismatch() {
         // Both Succeeded but receipt_hashes disagree — divergent state for the same tx.
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let tx_a = TxHash::from(Hash::from_bytes(b"tx_a"));
         let ec_hash = GlobalReceiptHash::from_raw(Hash::from_bytes(b"ec"));
         let receipt_hash = GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt"));
@@ -768,7 +772,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_missing_receipt() {
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let tx_a = TxHash::from(Hash::from_bytes(b"tx_a"));
         let outcomes = vec![TxOutcome::new(
             tx_a,
@@ -791,7 +795,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_extra_receipt() {
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let tx_a = TxHash::from(Hash::from_bytes(b"tx_a"));
         let outcomes = vec![TxOutcome::new(tx_a, ExecutionOutcome::Aborted)];
         let fw = FinalizedWave::new(
@@ -818,7 +822,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_tx_hash_mismatch() {
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let tx_a = TxHash::from(Hash::from_bytes(b"tx_a"));
         let tx_b = TxHash::from(Hash::from_bytes(b"tx_b"));
         let outcomes = vec![TxOutcome::new(
@@ -851,8 +855,8 @@ mod tests {
 
     #[test]
     fn validate_rejects_missing_local_ec() {
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
-        let remote_wave_id = make_wave_id(1, BlockHeight::new(42), &[0]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
+        let remote_wave_id = make_tick_id(1, BlockHeight::new(42));
         let remote_ec = make_local_ec(&remote_wave_id, vec![]);
         let fw = FinalizedWave::new(
             Arc::new(WaveCertificate::new(tick_id, vec![remote_ec])),
@@ -866,7 +870,7 @@ mod tests {
 
     #[test]
     fn validate_all_aborted_wave_with_empty_receipts_passes() {
-        let tick_id = make_wave_id(0, BlockHeight::new(42), &[1]);
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
         let outcomes = vec![TxOutcome::new(
             TxHash::from(Hash::from_bytes(b"aborted")),
             ExecutionOutcome::Aborted,
