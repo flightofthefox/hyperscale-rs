@@ -241,10 +241,12 @@ impl ExecutionSim {
         // in commit order and last-writer-wins per cell — the same
         // projection `merge_writes_from_receipts` performs into the JMT.
         for fw in &certificates {
-            self.base.apply(
-                self.height,
-                &merge_writes_from_receipts(&fw.settling_receipts()),
-            );
+            // Movements resolve against the state they land on, which is
+            // whatever the certificates before this one already settled.
+            let resolved = merge_writes_from_receipts(&fw.settling_receipts(), &mut |key| {
+                self.base.substate(key)
+            });
+            self.base.apply(self.height, &resolved);
         }
         let block = make_live_block(
             self.local_shard,

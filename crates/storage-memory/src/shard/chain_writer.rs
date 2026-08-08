@@ -8,7 +8,7 @@ use hyperscale_storage::tree::{
     resolve_materialized_root,
 };
 use hyperscale_storage::{
-    BaseReadCache, JmtSnapshot, ShardChainWriter, merge_writes_from_receipts,
+    BaseReadCache, JmtSnapshot, ShardChainWriter, SubstateDatabase, merge_writes_from_receipts,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, FinalizedWave, PreparedCommit,
@@ -111,8 +111,12 @@ impl ShardChainWriter for SimShardStorage {
 
         drop(s); // Release read lock
 
-        // Merge for commit-time substate writes (off the state_root critical path).
-        let merged_writes = merge_writes_from_receipts(&settling);
+        // Merge for commit-time substate writes (off the state_root
+        // critical path). Movements resolve against the committed tip:
+        // the read lock is already released, and what a receipt moved
+        // lands on whatever the cell holds when it settles.
+        let merged_writes =
+            merge_writes_from_receipts(&settling, &mut |key| self.as_ref().substate(key));
 
         let prepared = build_prepared_commit(
             Arc::clone(self),
@@ -142,6 +146,7 @@ impl ShardChainWriter for SimShardStorage {
                 .iter()
                 .flat_map(|fw| fw.settling_receipts())
                 .collect::<Vec<_>>(),
+            &mut |key| self.substate(key),
         );
         self.append_beacon_witnesses(witness);
         self.commit_block_inner(&merged_writes, block, qc, &receipts)

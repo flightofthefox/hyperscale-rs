@@ -7,7 +7,8 @@ use hyperscale_storage::tree::{
     resolve_materialized_root,
 };
 use hyperscale_storage::{
-    BaseReadCache, JmtSnapshot, ShardChainWriter, merge_state_writes, merge_writes_from_receipts,
+    BaseReadCache, JmtSnapshot, ShardChainWriter, SubstateDatabase, merge_state_writes,
+    merge_writes_from_receipts,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, FinalizedWave, PreparedCommit,
@@ -149,7 +150,7 @@ impl ShardChainWriter for RocksDbShardStorage {
             .iter()
             .flat_map(|fw| fw.settling_receipts())
             .collect();
-        let merged_writes = merge_writes_from_receipts(&settling);
+        let merged_writes = merge_writes_from_receipts(&settling, &mut |key| self.substate(key));
         let _commit_guard = self.commit_lock.lock().unwrap();
         self.commit_block_inner_locked(&merged_writes, block, qc, &receipts, witness)
     }
@@ -257,7 +258,8 @@ fn build_prepared_commit(
                 .iter()
                 .flat_map(|fw| fw.settling_receipts())
                 .collect();
-            let merged_writes = merge_writes_from_receipts(&settling);
+            let merged_writes =
+                merge_writes_from_receipts(&settling, &mut |key| storage.substate(key));
             storage.commit_block_inner_locked(&merged_writes, block, qc, &receipts, witness)
         },
     )

@@ -190,7 +190,7 @@ impl BoundaryStore for SimShardStorage {
         height: BlockHeight,
         receipts: &[StoredReceipt],
     ) -> Result<StateRoot, String> {
-        let merged = merge_writes_from_receipts(receipts);
+        let merged = merge_writes_from_receipts(receipts, &mut |key| self.substate(key));
         let mut state = write_or_recover(&self.state);
         if height <= state.current_block_height {
             return Err(format!(

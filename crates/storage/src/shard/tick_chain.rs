@@ -26,7 +26,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
-use hyperscale_types::{BlockHeight, ProvisionalHolds, StateWrites, SubstateKey, TxHash, WaveId};
+use hyperscale_types::{
+    BlockHeight, Movement, ProvisionalHolds, StateWrites, SubstateKey, TxHash, WaveId, amount_cell,
+    read_amount,
+};
 
 use crate::lock_recover::{read_or_recover, write_or_recover};
 use crate::{SubstateDatabase, VersionedStore};
@@ -93,11 +96,58 @@ pub enum TickResolution {
     },
 }
 
+/// What a fold knows about one cell.
+///
+/// A cell an exclusive write reached has a value. A cell only movements
+/// reached has no value until something says what it started from, so it
+/// stays relative until a reader supplies the base.
+#[derive(Clone, Debug)]
+enum CellState {
+    /// The value the cell holds, or `None` for a removal.
+    Absolute(Option<Vec<u8>>),
+    /// What the cell has moved by, against a base not yet read.
+    Moved(Movement),
+}
+
+impl CellState {
+    /// This state with `next` applied after it.
+    ///
+    /// An absolute supersedes whatever stood before, because that is what
+    /// exclusive means. A movement composes: onto an absolute it resolves
+    /// on the spot, onto an earlier movement it accumulates, and onto
+    /// nothing it waits for the base.
+    fn then(current: Option<&Self>, next: &Self) -> Self {
+        match (current, next) {
+            (_, Self::Absolute(value)) => Self::Absolute(value.clone()),
+            (Some(Self::Absolute(value)), Self::Moved(movement)) => {
+                let before = value.as_deref().and_then(read_amount).unwrap_or(0);
+                let after = movement.apply(before).unwrap_or(0);
+                Self::Absolute(amount_cell(after).map(|cell| cell.to_vec()))
+            }
+            (Some(Self::Moved(held)), Self::Moved(movement)) => Self::Moved(held.then(*movement)),
+            (None, Self::Moved(movement)) => Self::Moved(*movement),
+        }
+    }
+
+    /// The value this state names, resolving against `base` if it is
+    /// still relative.
+    fn value(&self, base: impl FnOnce() -> Option<Vec<u8>>) -> Option<Vec<u8>> {
+        match self {
+            Self::Absolute(value) => value.clone(),
+            Self::Moved(movement) => {
+                let before = base().as_deref().and_then(read_amount).unwrap_or(0);
+                amount_cell(movement.apply(before).unwrap_or(0)).map(|cell| cell.to_vec())
+            }
+        }
+    }
+}
+
 /// One tick's retained state.
 struct TickEntry {
     /// Folded readable cells: determined at append, plus entries promoted
-    /// by resolution.
-    readable: HashMap<SubstateKey, Option<Vec<u8>>>,
+    /// by resolution. A cell only movements reached stays relative here
+    /// and resolves where the base is in reach.
+    readable: HashMap<SubstateKey, CellState>,
     /// Waves whose fate is still unknown. Includes the single-shard wave
     /// (with no provisional entries) so eviction waits for its
     /// settlement.
@@ -124,9 +174,7 @@ impl TickEntry {
     /// appending coordinator holds its own verdict for that wave until
     /// its tick lands, and emits it immediately after.
     fn absorb(&mut self, output: TickOutput) {
-        for (key, change) in output.determined.cells {
-            self.readable.insert(key, change);
-        }
+        self.fold(&output.determined);
         for (wave, txs) in output.provisional {
             self.pending.entry(wave).or_insert(txs);
         }
@@ -151,9 +199,7 @@ impl TickEntry {
                         tx.writes
                     };
                     if let Some(writes) = promoted {
-                        for (key, change) in writes.cells {
-                            self.readable.insert(key, change);
-                        }
+                        self.fold(&writes);
                     }
                 }
                 *height
@@ -161,6 +207,21 @@ impl TickEntry {
             TickResolution::Aborted { height } => *height,
         };
         self.max_resolution = self.max_resolution.max(height);
+    }
+
+    /// Fold one receipt's writes into this entry, absolutes overwriting
+    /// and movements composing.
+    fn fold(&mut self, writes: &StateWrites) {
+        for (key, change) in &writes.cells {
+            let next = CellState::Absolute(change.clone());
+            let folded = CellState::then(self.readable.get(key), &next);
+            self.readable.insert(*key, folded);
+        }
+        for (key, movement) in &writes.movements {
+            let next = CellState::Moved(*movement);
+            let folded = CellState::then(self.readable.get(key), &next);
+            self.readable.insert(*key, folded);
+        }
     }
 }
 
@@ -286,12 +347,16 @@ where
     /// persisted tip and `tick` belong to ticks at or below `tick`, and a
     /// tick is only evicted once the base has absorbed it.
     pub fn view_at(&self, tick: BlockHeight) -> TickView<S> {
-        let mut overlay: HashMap<SubstateKey, Option<Vec<u8>>> = HashMap::new();
+        // Ascending, because an exclusive write supersedes what stood
+        // before it and a movement composes onto it — an order the fold
+        // has to respect even though movements commute among themselves.
+        let mut overlay: HashMap<SubstateKey, CellState> = HashMap::new();
         {
             let entries = read_or_recover(&self.entries);
             for (_, entry) in entries.range(..=tick) {
                 for (key, change) in &entry.readable {
-                    overlay.insert(*key, change.clone());
+                    let folded = CellState::then(overlay.get(key), change);
+                    overlay.insert(*key, folded);
                 }
             }
         }
@@ -333,7 +398,7 @@ where
 pub struct TickView<S> {
     base: Arc<S>,
     anchor: BlockHeight,
-    overlay: Arc<HashMap<SubstateKey, Option<Vec<u8>>>>,
+    overlay: Arc<HashMap<SubstateKey, CellState>>,
     holds: Arc<ProvisionalHolds>,
 }
 
@@ -362,15 +427,17 @@ impl<S: VersionedStore> TickView<S> {
 /// snapshot.
 pub struct TickViewSnapshot<Snap> {
     base_snapshot: Snap,
-    overlay: Arc<HashMap<SubstateKey, Option<Vec<u8>>>>,
+    overlay: Arc<HashMap<SubstateKey, CellState>>,
 }
 
 impl<Snap: SubstateDatabase> SubstateDatabase for TickViewSnapshot<Snap> {
     fn substate(&self, key: SubstateKey) -> Option<Vec<u8>> {
-        if let Some(change) = self.overlay.get(&key) {
-            return change.clone();
-        }
-        self.base_snapshot.substate(key)
+        // A cell the folds only moved resolves here, where the base it
+        // moved from is finally in reach.
+        self.overlay.get(&key).map_or_else(
+            || self.base_snapshot.substate(key),
+            |change| change.value(|| self.base_snapshot.substate(key)),
+        )
     }
 }
 

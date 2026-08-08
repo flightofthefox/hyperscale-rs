@@ -546,7 +546,7 @@ impl BoundaryStore for RocksDbShardStorage {
             ));
         }
 
-        let merged = merge_writes_from_receipts(receipts);
+        let merged = merge_writes_from_receipts(receipts, &mut |key| self.substate(key));
         let filtered = filter_writes_to_prefix(&merged, &self.root_path);
         if filtered.is_empty() {
             return Ok(base_root);

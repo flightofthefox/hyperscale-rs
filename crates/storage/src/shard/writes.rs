@@ -1,28 +1,47 @@
 //! Merging and filtering [`StateWrites`].
 
 use hyperscale_jmt::NibblePath;
-use hyperscale_types::{StateWrites, StoredReceipt};
+use hyperscale_types::{StateWrites, StoredReceipt, SubstateKey};
 
-/// Extract and merge the writes from stored receipts.
+/// Extract and merge the writes from stored receipts, resolving what
+/// they moved against the state they land on.
 ///
 /// Canonical projection from receipts to JMT/substate-write input.
 /// Failed receipts contribute nothing (`ConsensusReceipt::writes`
-/// returns `None`). Later receipts win per cell, matching the receipts'
-/// commit order.
+/// returns `None`).
+///
+/// Two rules, because a receipt says two kinds of thing. An exclusive
+/// write is an absolute and the last one wins, matching commit order — a
+/// rule that is only sound while settlement order agrees with execution
+/// order, which is what the pre-vote settlement-order gate enforces. A
+/// movement is relative and composes with every other movement on the
+/// cell, so the pair needs no ordering at all and cannot overwrite each
+/// other whichever way round they arrive.
+///
+/// `prior` reads the state being settled into. It is consulted only for
+/// cells something moved and nothing in this batch wrote, which is the
+/// one case where the starting value is not already here.
 #[must_use]
-pub fn merge_writes_from_receipts(receipts: &[StoredReceipt]) -> StateWrites {
+pub fn merge_writes_from_receipts(
+    receipts: &[StoredReceipt],
+    prior: &mut dyn FnMut(SubstateKey) -> Option<Vec<u8>>,
+) -> StateWrites {
     let mut merged = StateWrites::default();
     for receipt in receipts {
         if let Some(writes) = receipt.consensus.writes() {
-            merged.cells.extend(
-                writes
-                    .cells
-                    .iter()
-                    .map(|(key, change)| (*key, change.clone())),
-            );
+            for (key, change) in &writes.cells {
+                merged.cells.insert(*key, change.clone());
+                // An exclusive write supersedes what earlier receipts
+                // moved: the cell's value is now stated outright.
+                merged.movements.remove(key);
+            }
+            for (key, movement) in &writes.movements {
+                let entry = merged.movements.entry(*key).or_default();
+                *entry = entry.then(*movement);
+            }
         }
     }
-    merged
+    merged.resolve(prior)
 }
 
 /// Merge writes in order; later entries win per cell.

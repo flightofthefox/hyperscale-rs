@@ -280,9 +280,22 @@ pub fn noop_jmt_snapshot<S: TreeReader>(
 
 /// Flatten writes into `(key, optional_value)` work items; `None`
 /// values are deletes.
+///
+/// # Panics
+///
+/// Panics on writes that still carry movements. A movement is relative
+/// and the tree stores values, so one arriving here has skipped the
+/// resolution that turns it into a value — and since only `cells` is
+/// walked, the alternative to panicking is dropping the change silently
+/// and attesting a root that omits it.
 fn flatten_work_items<'a>(writes_list: &[&'a StateWrites]) -> Vec<(SubstateKey, Option<&'a [u8]>)> {
     let mut work_items: Vec<(SubstateKey, Option<&[u8]>)> = Vec::new();
     for writes in writes_list {
+        assert!(
+            writes.movements.is_empty(),
+            "state writes reach the tree resolved; {} movement(s) did not",
+            writes.movements.len(),
+        );
         for (key, change) in &writes.cells {
             work_items.push((*key, change.as_deref()));
         }
