@@ -525,6 +525,15 @@ where
         self.base.get_execution_certificates_batch(ids)
     }
 
+    /// The execution certificates carrying outcomes for `tx_hashes`,
+    /// deduplicated. Pass-through to base storage.
+    pub fn execution_certificates_for_txs(
+        &self,
+        tx_hashes: &[TxHash],
+    ) -> Vec<Verified<ExecutionCertificate>> {
+        self.base.get_execution_certificates_for_txs(tx_hashes)
+    }
+
     /// Beacon-witness payloads in leaf-index order up to (but not
     /// including) `end`. Pass-through to base storage.
     pub fn get_beacon_witness_payloads(
@@ -1127,6 +1136,12 @@ mod tests {
         fn get_execution_certificates_batch(
             &self,
             _wave_ids: &[WaveId],
+        ) -> Vec<Verified<ExecutionCertificate>> {
+            Vec::new()
+        }
+        fn get_execution_certificates_for_txs(
+            &self,
+            _tx_hashes: &[TxHash],
         ) -> Vec<Verified<ExecutionCertificate>> {
             Vec::new()
         }

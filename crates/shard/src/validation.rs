@@ -19,7 +19,7 @@ use std::sync::Arc;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY,
     MAX_TIMESTAMP_RUSH, ProvisionHash, QuorumCertificate, ShardId, ShardLoad, TopologySnapshot,
-    Transaction, TxHash, Verifiable, VoteCount, WaveId, compute_waves,
+    Transaction, TxHash, Verifiable, VoteCount, WaveId, compute_cross_shard_txs,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -244,25 +244,22 @@ pub fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
     verify_hash_sorted(block.transactions(), "transactions")
 }
 
-/// Validate that a block's `waves` field matches the value recomputed from
-/// its transactions. Prevents a Byzantine proposer from lying about which
-/// waves exist.
-pub fn validate_waves(
+/// Validate that a block's `cross_shard_txs` field matches the value
+/// recomputed from its transactions. Prevents a Byzantine proposer from
+/// lying to remote shards about which of its transactions reach them —
+/// either hiding one so no counterpart ever expects an outcome, or naming
+/// one that does not exist.
+pub fn validate_cross_shard_txs(
     topology_snapshot: &TopologySnapshot,
     local_shard: ShardId,
     block: &Block,
 ) -> Result<(), String> {
-    let expected = compute_waves(
-        local_shard,
-        topology_snapshot,
-        block.height(),
-        block.transactions(),
-    );
+    let expected = compute_cross_shard_txs(local_shard, topology_snapshot, block.transactions());
 
-    if block.header().waves() != &expected {
+    if block.header().cross_shard_txs() != &expected {
         return Err(format!(
-            "waves mismatch: header={:?}, computed={:?}",
-            block.header().waves(),
+            "cross-shard transactions mismatch: header={:?}, computed={:?}",
+            block.header().cross_shard_txs(),
             expected
         ));
     }
@@ -490,7 +487,7 @@ pub fn validate_block_for_vote(
     validate_block_work(block, parent_load)?;
     validate_transactions_verified(block)?;
     validate_transaction_ordering(block)?;
-    validate_waves(topology_snapshot, local_shard, block)?;
+    validate_cross_shard_txs(topology_snapshot, local_shard, block)?;
     validate_no_duplicate_transactions(block, qc_chain_tx_hashes, dedup_index)?;
     validate_no_duplicate_certificates(block, qc_chain_cert_ids, dedup_index)?;
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
@@ -561,8 +558,6 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::test_utils::{TestCommittee, make_finalized_wave};
     use hyperscale_types::{
@@ -572,7 +567,7 @@ mod tests {
         QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, Signer, SignerBitfield,
         StateRoot, TimestampRange, Transaction, TransactionDecision, TransactionRoot, ValidatorId,
         ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources,
-        WorkInFlight, compute_waves, test_utils,
+        WorkInFlight, test_utils,
     };
 
     use super::*;
@@ -645,7 +640,7 @@ mod tests {
             base.certificate_root(),
             base.local_receipt_root(),
             base.provision_root(),
-            base.waves().clone(),
+            base.cross_shard_txs().clone(),
             base.provision_tx_roots().clone(),
             base.work_in_flight(),
             BeaconWitnessRoot::ZERO,
@@ -658,7 +653,7 @@ mod tests {
         )
     }
 
-    fn block_with_waves(height: BlockHeight, waves: Vec<WaveId>) -> Block {
+    fn block_with_cross_shard_txs(height: BlockHeight, cross_shard_txs: Vec<TxHash>) -> Block {
         let header = BlockHeader::new(
             ShardId::ROOT,
             height,
@@ -673,7 +668,7 @@ mod tests {
             CertificateRoot::ZERO,
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
-            waves,
+            cross_shard_txs,
             std::collections::BTreeMap::new(),
             WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
@@ -694,26 +689,24 @@ mod tests {
     }
 
     #[test]
-    fn validate_waves_accepts_recomputed_waves() {
+    fn validate_cross_shard_txs_accepts_recomputed_list() {
         let topo = topology_snapshot();
         let height = BlockHeight::new(1);
-        let expected = compute_waves(local_shard(), &topo, height, &[]);
-        let block = block_with_waves(height, expected);
-        assert!(validate_waves(&topo, local_shard(), &block).is_ok());
+        let expected = compute_cross_shard_txs(local_shard(), &topo, &[]);
+        let block = block_with_cross_shard_txs(height, expected);
+        assert!(validate_cross_shard_txs(&topo, local_shard(), &block).is_ok());
     }
 
+    /// A proposer naming a transaction the block does not contain is
+    /// refused: a counterpart would arm an expectation nothing can fulfil.
     #[test]
-    fn validate_waves_rejects_tampered_waves() {
+    fn validate_cross_shard_txs_rejects_a_fabricated_transaction() {
         let topo = topology_snapshot();
-        let block = block_with_waves(
+        let block = block_with_cross_shard_txs(
             BlockHeight::new(1),
-            vec![WaveId::new(
-                ShardId::leaf(8, 99),
-                BlockHeight::new(1),
-                BTreeSet::new(),
-            )],
+            vec![TxHash::from(Hash::from_bytes(b"never in this block"))],
         );
-        assert!(validate_waves(&topo, local_shard(), &block).is_err());
+        assert!(validate_cross_shard_txs(&topo, local_shard(), &block).is_err());
     }
 
     // ═══════════════════════════════════════════════════════════════════════

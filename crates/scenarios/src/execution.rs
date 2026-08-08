@@ -938,6 +938,16 @@ pub fn abort_floor_settles_on_deadline(c: &mut impl FaultableCluster) {
     );
 
     // The floor left the payer's vault; the transfer did not.
+    //
+    // A terminal status is reported the moment this shard decides the
+    // abort, which is a block or more before the finalization carrying its
+    // fee receipt commits — so the charge has to be waited for rather than
+    // read at the instant the status flips. Waiting on the balance moving
+    // at all keeps the amount itself unasserted until below.
+    assert!(
+        c.run_until(epochs(8), |c| vault_balance(c, payer_shard, from) != before),
+        "the abort's charge must reach committed state"
+    );
     let after = vault_balance(c, payer_shard, from);
     assert_eq!(
         before.saturating_sub(after),

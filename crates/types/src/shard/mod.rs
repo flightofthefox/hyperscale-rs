@@ -266,7 +266,7 @@ mod tests {
                 header.certificate_root(),
                 header.local_receipt_root(),
                 header.provision_root(),
-                header.waves().clone(),
+                header.cross_shard_txs().clone(),
                 header.provision_tx_roots().clone(),
                 header.work_in_flight(),
                 header.beacon_witness_root(),

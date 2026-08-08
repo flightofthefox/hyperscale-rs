@@ -150,43 +150,44 @@ fn certificate_tracking_debug_reports_no_assignment_for_unknown_tx() {
 }
 
 #[test]
-fn on_verified_remote_header_registers_expectation_for_wave_targeting_local_shard() {
+fn on_verified_remote_header_registers_an_expectation_per_named_transaction() {
     let (mut coord, topology_schedule) = fresh_coordinator_with_topology();
-    let local_shard = ShardId::ROOT;
     let _ = &topology_schedule;
-    // A remote shard's wave that targets our local shard must register an
-    // expectation. With committed_ts still ZERO the initial-deadline
-    // gate is silenced, but the expectation count must reflect the header.
+    // Every cross-shard transaction a remote header names gets an
+    // expectation against that shard. With committed_ts still ZERO the
+    // initial-deadline gate is silenced, but the count must reflect the
+    // header.
     let remote_shard = ShardId::leaf(8, 99);
-    let wave = WaveId::new(
+    coord.on_verified_remote_header(
         remote_shard,
-        BlockHeight::new(5),
-        std::iter::once(local_shard).collect(),
+        &[
+            TxHash::from(Hash::from_bytes(b"tx one")),
+            TxHash::from(Hash::from_bytes(b"tx two")),
+        ],
     );
-    coord.on_verified_remote_header(remote_shard, BlockHeight::new(5), &[wave]);
 
     assert_eq!(
         coord.memory_stats().expected_exec_certs,
-        1,
-        "expectation must register for a wave targeting the local shard"
+        2,
+        "one expectation per transaction the header names"
     );
 }
 
+/// A header names every cross-shard transaction in its block, including
+/// ones bound for other shards — it has no way to say which are ours. Those
+/// register, but our own wave set gates the fetch, so nothing is requested
+/// for a transaction we hold no wave for.
 #[test]
-fn on_verified_remote_header_ignores_waves_not_targeting_local_shard() {
+fn a_transaction_no_local_wave_holds_is_never_fetched() {
     let (mut coord, _topology) = fresh_coordinator_with_topology();
-    // Wave targets ShardId::leaf(3, 7) only; local is ShardId::ROOT. No
-    // expectation should land.
-    let wave = WaveId::new(
+    coord.on_verified_remote_header(
         ShardId::leaf(8, 99),
-        BlockHeight::new(5),
-        std::iter::once(ShardId::leaf(3, 7)).collect(),
+        &[TxHash::from(Hash::from_bytes(b"someone else's business"))],
     );
-    coord.on_verified_remote_header(ShardId::leaf(8, 99), BlockHeight::new(5), &[wave]);
 
-    assert_eq!(
-        coord.memory_stats().expected_exec_certs,
-        0,
-        "no expectation should register for a wave that doesn't target us"
+    assert_eq!(coord.memory_stats().expected_exec_certs, 1);
+    assert!(
+        coord.flush_expected_certs().is_empty(),
+        "a transaction we are not party to must never be fetched"
     );
 }

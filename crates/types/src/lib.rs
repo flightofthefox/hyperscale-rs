@@ -209,7 +209,7 @@ pub use verifiable::{Verifiable, Verified, Verify};
 pub use wave::certificate::{
     MAX_EXECUTION_CERTIFICATES_PER_WAVE, WaveCertificate, wave_receipt_hash,
 };
-pub use wave::computation::{compute_waves, wave_leader, wave_leader_at};
+pub use wave::computation::{compute_cross_shard_txs, compute_waves, wave_leader, wave_leader_at};
 pub use wave::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
 };

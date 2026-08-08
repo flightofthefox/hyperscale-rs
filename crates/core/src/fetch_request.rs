@@ -83,14 +83,17 @@ pub enum FetchRequest {
         /// Optional class override; see enum-level doc.
         class: Option<MessageClass>,
     },
-    /// Cross-shard execution-cert fetch by `WaveId`. Routing shard is
-    /// `wave_id.shard_id()` (the shard that committed the source
-    /// block). `preferred` is `None` — the wave's designated broadcaster
-    /// role is computable but health-weighted selection works equally
-    /// well empirically.
+    /// Cross-shard execution-cert fetch by transaction. Routing shard is
+    /// `source_shard`, which has to be carried: the requester knows only
+    /// that the transaction is the source shard's business too, not which
+    /// of its certificates ends up covering it. `preferred` is `None` —
+    /// the designated broadcaster role is computable but health-weighted
+    /// selection works equally well empirically.
     ExecutionCerts {
-        /// Wave whose execution certificate is missing.
-        wave_id: WaveId,
+        /// Shard whose outcome for the transaction is missing.
+        source_shard: ShardId,
+        /// Transaction whose outcome is missing.
+        tx_hash: TxHash,
         /// Always `None` for this variant; see variant-level doc.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.

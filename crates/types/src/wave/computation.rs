@@ -7,9 +7,52 @@ use std::sync::Arc;
 use hyperscale_hbor::to_vec as hbor_to_vec;
 
 use crate::{
-    Attempt, BlockHeight, Hash, ShardId, TopologySnapshot, Transaction, ValidatorId, Verifiable,
-    WaveId,
+    Attempt, BlockHeight, Hash, ShardId, TopologySnapshot, Transaction, TxHash, ValidatorId,
+    Verifiable, WaveId,
 };
+
+/// The block's transactions that reach beyond this shard, in block order.
+///
+/// This is what a remote shard reads a committed header for: which of the
+/// block's transactions it might be party to, and so which outcomes it
+/// should expect. Whether it *is* party is a question about its own state,
+/// which it answers more precisely than any shard set carried here could.
+///
+/// Used in both block proposal (to populate `BlockHeader::cross_shard_txs`)
+/// and validation (to verify the header's field). Membership is the same
+/// predicate [`compute_waves`] groups on, and has to stay that way: the
+/// source shard creates waves from one and a remote shard arms its
+/// expectations from the other, so a transaction listed here but absent
+/// from every wave would leave an expectation nothing can ever fulfil.
+pub fn compute_cross_shard_txs(
+    local_shard: ShardId,
+    topology_snapshot: &TopologySnapshot,
+    transactions: &[Arc<Verifiable<Transaction>>],
+) -> Vec<TxHash> {
+    transactions
+        .iter()
+        .filter(|tx| remote_shards_for(local_shard, topology_snapshot, tx).is_some())
+        .map(|tx| tx.hash())
+        .collect()
+}
+
+/// The shards other than `local_shard` that `tx` touches, or `None` when it
+/// touches none of them and is this shard's business alone.
+fn remote_shards_for(
+    local_shard: ShardId,
+    topology_snapshot: &TopologySnapshot,
+    tx: &Arc<Verifiable<Transaction>>,
+) -> Option<BTreeSet<ShardId>> {
+    if topology_snapshot.is_single_shard_transaction(tx) {
+        return None;
+    }
+    let remote_shards: BTreeSet<ShardId> = topology_snapshot
+        .all_shards_for_transaction(tx)
+        .into_iter()
+        .filter(|&s| s != local_shard)
+        .collect();
+    (!remote_shards.is_empty()).then_some(remote_shards)
+}
 
 /// Compute the set of cross-shard waves for a block's transactions.
 ///
@@ -27,21 +70,10 @@ pub fn compute_waves(
     block_height: BlockHeight,
     transactions: &[Arc<Verifiable<Transaction>>],
 ) -> Vec<WaveId> {
-    let mut remote_shard_sets: BTreeSet<BTreeSet<ShardId>> = BTreeSet::new();
-
-    for tx in transactions {
-        if topology_snapshot.is_single_shard_transaction(tx) {
-            continue;
-        }
-        let remote_shards: BTreeSet<ShardId> = topology_snapshot
-            .all_shards_for_transaction(tx)
-            .into_iter()
-            .filter(|&s| s != local_shard)
-            .collect();
-        if !remote_shards.is_empty() {
-            remote_shard_sets.insert(remote_shards);
-        }
-    }
+    let remote_shard_sets: BTreeSet<BTreeSet<ShardId>> = transactions
+        .iter()
+        .filter_map(|tx| remote_shards_for(local_shard, topology_snapshot, tx))
+        .collect();
 
     remote_shard_sets
         .into_iter()

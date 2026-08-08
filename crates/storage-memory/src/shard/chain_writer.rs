@@ -196,6 +196,10 @@ fn build_prepared_commit(
             c.insert_receipts(&receipts);
             for fw in block.certificates().iter() {
                 for ec in fw.certificate().execution_certificates() {
+                    for outcome in ec.tx_outcomes() {
+                        c.tx_cert_index
+                            .insert(outcome.tx_hash(), ec.wave_id().clone());
+                    }
                     c.execution_certs
                         .insert(ec.wave_id().clone(), ec.as_unverified().clone());
                 }
@@ -283,6 +287,10 @@ impl SimShardStorage {
             // Store execution certificates (extracted from wave certs) atomically.
             for fw in block.certificates().iter() {
                 for ec in fw.certificate().execution_certificates() {
+                    for outcome in ec.tx_outcomes() {
+                        c.tx_cert_index
+                            .insert(outcome.tx_hash(), ec.wave_id().clone());
+                    }
                     c.execution_certs
                         .insert(ec.wave_id().clone(), ec.as_unverified().clone());
                 }

@@ -4,7 +4,7 @@
 //! `Verified<BlockHeader>`; predicate at [`impl Verify<()>`](Verify::verify)
 //! below.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
@@ -13,8 +13,8 @@ use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
     ChainOrigin, Hash, LocalReceiptRoot, MAX_REMOTE_SHARDS_PER_WAVE, MAX_TXS_PER_BLOCK,
     ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
-    SettledWavesRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot, TransactionRoot, ValidatorId,
-    Verifiable, Verified, Verify, WaveId, WeightedTimestamp, WorkInFlight,
+    SettledWavesRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot, TransactionRoot, TxHash,
+    ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, WorkInFlight,
 };
 
 /// Block header containing consensus metadata.
@@ -41,7 +41,7 @@ pub struct BlockHeader {
     local_receipt_root: LocalReceiptRoot,
     provision_root: ProvisionsRoot,
     #[hbor(max = MAX_TXS_PER_BLOCK)]
-    waves: Vec<WaveId>,
+    cross_shard_txs: Vec<TxHash>,
     #[hbor(max = MAX_REMOTE_SHARDS_PER_WAVE)]
     provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
     work_in_flight: WorkInFlight,
@@ -94,7 +94,7 @@ impl BlockHeader {
     ///
     /// # Panics
     ///
-    /// Panics if `waves.len() > MAX_TXS_PER_BLOCK` or
+    /// Panics if `cross_shard_txs.len() > MAX_TXS_PER_BLOCK` or
     /// `provision_tx_roots.len() > MAX_REMOTE_SHARDS_PER_WAVE`.
     #[allow(clippy::too_many_arguments)] // mirrors the 23 stored fields
     #[must_use]
@@ -112,7 +112,7 @@ impl BlockHeader {
         certificate_root: CertificateRoot,
         local_receipt_root: LocalReceiptRoot,
         provision_root: ProvisionsRoot,
-        waves: Vec<WaveId>,
+        cross_shard_txs: Vec<TxHash>,
         provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
         work_in_flight: WorkInFlight,
         beacon_witness_root: BeaconWitnessRoot,
@@ -137,7 +137,7 @@ impl BlockHeader {
             certificate_root,
             local_receipt_root,
             provision_root,
-            waves,
+            cross_shard_txs,
             provision_tx_roots,
             work_in_flight,
             beacon_witness_root,
@@ -181,7 +181,7 @@ impl BlockHeader {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: Vec::new(),
+            cross_shard_txs: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             work_in_flight: WorkInFlight::ZERO,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
@@ -233,7 +233,7 @@ impl BlockHeader {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: Vec::new(),
+            cross_shard_txs: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             work_in_flight: WorkInFlight::ZERO,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
@@ -299,7 +299,7 @@ impl BlockHeader {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            waves: Vec::new(),
+            cross_shard_txs: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             work_in_flight: WorkInFlight::ZERO,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
@@ -429,23 +429,24 @@ impl BlockHeader {
         self.provision_root
     }
 
-    /// Cross-shard execution waves in this block.
-    ///
-    /// Each `WaveId` is the set of remote shards that a group of transactions
-    /// depends on for provisions. Transactions with identical remote shard sets
-    /// share a wave. Wave-zero (single-shard txs) is excluded.
+    /// The block's transactions that reach beyond this shard, in block
+    /// order. Single-shard transactions are excluded.
     ///
     /// QC-attested (covered by the block hash), so a byzantine proposer
     /// cannot forge it without the block being rejected by honest validators —
-    /// `validate_waves` recomputes this from `transactions` and compares.
+    /// `validate_cross_shard_txs` recomputes this from `transactions` and
+    /// compares.
     ///
-    /// Used by remote shards to know which execution certificates to expect.
-    /// Provisions completeness is handled separately via
+    /// This is what a remote shard reads to know which outcomes to expect
+    /// from us. It does not say which shards are party to each transaction:
+    /// a reader answers that from its own state, which is both more precise
+    /// than a carried shard set and the only view that can be trusted about
+    /// itself. Provisions completeness is handled separately via
     /// [`BlockHeader::provision_tx_roots`]. Empty for genesis, fallback, and
     /// sync blocks.
     #[must_use]
-    pub const fn waves(&self) -> &Vec<WaveId> {
-        &self.waves
+    pub const fn cross_shard_txs(&self) -> &Vec<TxHash> {
+        &self.cross_shard_txs
     }
 
     /// Per-target-shard merkle commitment over the tx hashes a target shard
@@ -566,7 +567,7 @@ impl BlockHeader {
         CertificateRoot,
         LocalReceiptRoot,
         ProvisionsRoot,
-        Vec<WaveId>,
+        Vec<TxHash>,
         BTreeMap<ShardId, ProvisionTxRoot>,
         WorkInFlight,
         BeaconWitnessRoot,
@@ -591,7 +592,7 @@ impl BlockHeader {
             self.certificate_root,
             self.local_receipt_root,
             self.provision_root,
-            self.waves,
+            self.cross_shard_txs,
             self.provision_tx_roots,
             self.work_in_flight,
             self.beacon_witness_root,
@@ -602,18 +603,6 @@ impl BlockHeader {
             self.settled_waves_root,
             self.load,
         )
-    }
-
-    /// Derive provision targets from waves (union of all shards across all waves).
-    ///
-    /// Returns the sorted set of all remote shards that need provisions from this block.
-    #[must_use]
-    pub fn provision_targets(&self) -> Vec<ShardId> {
-        let mut set = BTreeSet::new();
-        for wave in &self.waves {
-            set.extend(wave.remote_shards().iter().copied());
-        }
-        set.into_iter().collect()
     }
 
     /// Compute hash of this block header.
@@ -860,7 +849,7 @@ mod tests {
             certificate_root,
             local_receipt_root,
             provision_root,
-            waves,
+            cross_shard_txs,
             provision_tx_roots,
             in_flight,
             beacon_witness_root,
@@ -885,7 +874,7 @@ mod tests {
             certificate_root,
             local_receipt_root,
             provision_root,
-            waves,
+            cross_shard_txs,
             provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
             in_flight,
             beacon_witness_root,
@@ -923,7 +912,7 @@ mod tests {
             certificate_root,
             local_receipt_root,
             provision_root,
-            waves,
+            cross_shard_txs,
             provision_tx_roots,
             in_flight,
             beacon_witness_root,
@@ -948,7 +937,7 @@ mod tests {
             certificate_root,
             local_receipt_root,
             provision_root,
-            waves,
+            cross_shard_txs,
             provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
             in_flight,
             beacon_witness_root,
@@ -965,12 +954,12 @@ mod tests {
         assert_ne!(carrying.hash(), bare.hash());
     }
 
-    /// Forge a `BlockHeader` whose `waves` length claims one past the cap,
+    /// Forge a `BlockHeader` whose `cross_shard_txs` length claims one past the cap,
     /// padded so the claim is input-satisfiable — the protocol cap, not the
     /// wire-level length bound, is what must fire, before any per-element
     /// work happens.
     #[test]
-    fn decode_rejects_oversized_waves_count() {
+    fn decode_rejects_oversized_cross_shard_txs_count() {
         let h = sample_header();
         let mut buf = Vec::new();
         for part in [
@@ -1022,8 +1011,8 @@ mod tests {
         ] {
             buf.extend_from_slice(&part);
         }
-        // Empty waves.
-        buf.extend_from_slice(&hbor_to_vec(&Vec::<WaveId>::new()).unwrap());
+        // No cross-shard transactions.
+        buf.extend_from_slice(&hbor_to_vec(&Vec::<TxHash>::new()).unwrap());
         // Oversized provision_tx_roots claim, padded to satisfiability.
         varint::write(&mut buf, MAX_REMOTE_SHARDS_PER_WAVE + 1).unwrap();
         buf.extend(std::iter::repeat_n(

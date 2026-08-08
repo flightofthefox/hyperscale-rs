@@ -28,7 +28,7 @@ use hyperscale_types::{
     Stopwatch, StoredReceipt, SubstateKey, Timeout, TimeoutContext, TopologySnapshot, Transaction,
     TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified, Verifier, Verify,
     VoteCount, VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, absorb_committed_cells,
-    commit_witness_window, compute_waves, derive_leaves, local_settled_wave_ids,
+    commit_witness_window, compute_cross_shard_txs, derive_leaves, local_settled_wave_ids,
     missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
     vrf_output_from_proof, work_over_certificates,
 };
@@ -304,7 +304,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
     let local_receipt_root = Verified::<LocalReceiptRoot>::compute(&receipts).into_inner();
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
     let provision_root = Verified::<ProvisionsRoot>::compute(&raw_provision_hashes).into_inner();
-    let waves = compute_waves(local_shard, topology_snapshot, height, &transactions);
+    let cross_shard_txs = compute_cross_shard_txs(local_shard, topology_snapshot, &transactions);
     let provision_tx_roots =
         Verified::<ProvisionTxRootsMap>::compute(local_shard, topology_snapshot, &transactions)
             .into_inner();
@@ -345,7 +345,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
         certificate_root,
         local_receipt_root,
         provision_root,
-        waves,
+        cross_shard_txs,
         provision_tx_roots,
         work_in_flight,
         beacon_witness_root,

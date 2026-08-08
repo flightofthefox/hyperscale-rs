@@ -55,16 +55,18 @@ pub enum FetchAbandon {
         /// Wave ids whose in-flight fetch should be cancelled.
         ids: Vec<WaveId>,
     },
-    /// Cross-shard execution-certificate fetch keyed by [`WaveId`]. Emitted
-    /// when an EC's admission path silently drops the cert (unresolvable
-    /// committee keys, invalid signature, sub-quorum signers). Multiple
-    /// aggregations can arrive per `wave_id`; if a later valid aggregation
-    /// admits successfully, the abandon is a no-op on the FSM, while the
-    /// failure-only case correctly releases the slot for cleanup-timer
-    /// to re-fetch.
+    /// Cross-shard execution-certificate fetch keyed by
+    /// `(source_shard, tx_hash)`. Emitted when an EC's admission path
+    /// silently drops the cert (unresolvable committee keys, invalid
+    /// signature, sub-quorum signers). A dropped certificate releases every
+    /// transaction it covered, since none of them got an outcome from it.
+    /// Multiple aggregations can arrive for the same transactions; if a
+    /// later valid one admits successfully, the abandon is a no-op on the
+    /// FSM, while the failure-only case correctly releases the slot for
+    /// cleanup-timer to re-fetch.
     ExecutionCerts {
-        /// Wave ids whose in-flight EC fetch should be cancelled.
-        ids: Vec<WaveId>,
+        /// Transactions whose in-flight EC fetch should be cancelled.
+        ids: Vec<(ShardId, TxHash)>,
     },
     /// Missing-proposal fetch keyed by `(epoch, validator)`. Emitted by
     /// the beacon coordinator when a pending commit-assembly stash is

@@ -485,7 +485,7 @@ mod tests {
             certificate_root.unwrap_or_else(|| h.certificate_root()),
             local_receipt_root.unwrap_or_else(|| h.local_receipt_root()),
             h.provision_root(),
-            h.waves().clone(),
+            h.cross_shard_txs().clone(),
             h.provision_tx_roots().clone(),
             h.work_in_flight(),
             BeaconWitnessRoot::ZERO,

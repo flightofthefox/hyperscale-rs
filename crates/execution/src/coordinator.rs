@@ -56,7 +56,7 @@ use crate::expected_certs::ExpectedCertTracker;
 use crate::finalized_waves::FinalizedWaveStore;
 use crate::lookups::{
     assign_waves, build_provision_requests, committee_public_keys_for_shard,
-    ec_has_shard_quorum_power, peers_excluding_self,
+    ec_has_shard_quorum_power, fetch_keys_covered, peers_excluding_self,
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisional::ProvisionalCells;
@@ -1444,7 +1444,7 @@ impl ExecutionCoordinator {
             );
             self.pending_ec_verifications.remove(&wire_hash);
             return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: vec![cert.wave_id().clone()],
+                ids: fetch_keys_covered(&cert),
             })];
         }
 
@@ -1511,7 +1511,7 @@ impl ExecutionCoordinator {
                 );
                 self.pending_ec_verifications.remove(&wire_hash);
                 return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                    ids: vec![cert.wave_id().clone()],
+                    ids: fetch_keys_covered(&cert),
                 })];
             }
         };
@@ -1524,7 +1524,7 @@ impl ExecutionCoordinator {
             // so a subsequent arrival isn't permanently shadowed.
             self.pending_ec_verifications.remove(&wire_hash);
             return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: vec![cert.wave_id().clone()],
+                ids: fetch_keys_covered(&cert),
             })];
         };
 
@@ -1567,7 +1567,7 @@ impl ExecutionCoordinator {
                     "Invalid execution certificate signature"
                 );
                 return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                    ids: vec![raw.wave_id().clone()],
+                    ids: fetch_keys_covered(&raw),
                 })];
             }
         };
@@ -1586,7 +1586,7 @@ impl ExecutionCoordinator {
                 "Discarding execution certificate — epoch evicted from schedule before verification completed"
             );
             return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: vec![ec_arc.wave_id().clone()],
+                ids: fetch_keys_covered(&ec_arc),
             })];
         };
         if !ec_has_shard_quorum_power(committee, &ec_arc) {
@@ -1596,7 +1596,7 @@ impl ExecutionCoordinator {
                 "Discarding sub-quorum execution certificate"
             );
             return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: vec![ec_arc.wave_id().clone()],
+                ids: fetch_keys_covered(&ec_arc),
             })];
         }
         // The recovery freeze, re-checked here: an EC dispatched before the
@@ -1612,7 +1612,7 @@ impl ExecutionCoordinator {
                 "Discarding verified EC from a recovering shard past the freeze frontier"
             );
             return vec![Action::AbandonFetch(FetchAbandon::ExecutionCerts {
-                ids: vec![ec_arc.wave_id().clone()],
+                ids: fetch_keys_covered(&ec_arc),
             })];
         }
 
@@ -1625,7 +1625,6 @@ impl ExecutionCoordinator {
         // indefinitely while the verify pool silently rejects the forgery.
         let cleared = self.expected_certs.mark_fulfilled(
             shard,
-            ec_arc.block_height(),
             ec_arc.wave_id(),
             ec_arc.tx_outcomes().iter().map(TxOutcome::tx_hash),
             ec_arc.deadline(),
@@ -1634,7 +1633,7 @@ impl ExecutionCoordinator {
             tracing::debug!(
                 source_shard = shard.inner(),
                 block_height = ec_arc.block_height().inner(),
-                wave = %ec_arc.wave_id(),
+                txs = ec_arc.tx_outcomes().len(),
                 at_local_ts_ms = self.committed_ts.as_millis(),
                 "Fulfilled expected exec cert"
             );
@@ -1666,28 +1665,18 @@ impl ExecutionCoordinator {
     // Expected Execution Certificate Tracking
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Register expected execution certificates from a remote block header.
+    /// Register expected outcomes from a remote block header.
     ///
-    /// Called when a remote shard's committed block header is received. For each
-    /// wave in the header that includes our shard, we register an expected cert.
-    /// If the cert doesn't arrive within the timeout, we request it via fallback.
-    pub fn on_verified_remote_header(
-        &mut self,
-        source_shard: ShardId,
-        block_height: BlockHeight,
-        waves: &[WaveId],
-    ) {
-        let local_shard = self.local_shard;
-
-        for wave in waves {
-            if wave.remote_shards().contains(&local_shard) {
-                self.expected_certs.register(
-                    source_shard,
-                    block_height,
-                    wave.clone(),
-                    self.committed_ts,
-                );
-            }
+    /// Called when a remote shard's committed block header is received. Every
+    /// cross-shard transaction the header names gets an expectation against
+    /// that shard; the header cannot say which of them we are party to, so
+    /// the ones that turn out not to be ours are dropped by
+    /// [`Self::check_exec_cert_timeouts`]'s retention pass and never fetched
+    /// — the fetch gate is our own wave set, not the header's claim.
+    pub fn on_verified_remote_header(&mut self, source_shard: ShardId, cross_shard_txs: &[TxHash]) {
+        for &tx_hash in cross_shard_txs {
+            self.expected_certs
+                .register(source_shard, tx_hash, self.committed_ts);
         }
     }
 
@@ -1725,12 +1714,14 @@ impl ExecutionCoordinator {
     /// break the deadlock.
     pub fn flush_expected_certs(&mut self) -> Vec<Action> {
         let now_ts = self.committed_ts;
+        let awaited = self.awaited_txs();
         self.expected_certs
-            .flush_all(now_ts)
+            .flush_all(&awaited, now_ts)
             .into_iter()
-            .map(|wave_id| {
+            .map(|(source_shard, tx_hash)| {
                 Action::Fetch(FetchRequest::ExecutionCerts {
-                    wave_id,
+                    source_shard,
+                    tx_hash,
                     preferred: None,
                     class: None,
                 })
@@ -1744,42 +1735,55 @@ impl ExecutionCoordinator {
     /// that have exceeded the timeout.
     fn check_exec_cert_timeouts(&mut self) -> Vec<Action> {
         let now_ts = self.committed_ts;
-        let fetches = self.expected_certs.check_timeouts(now_ts);
+
+        // Our own wave set is the authority on which transactions we are
+        // party to, so it gates both the fetch and the retention pass — a
+        // source header names every cross-shard transaction in its block,
+        // including ones bound for other shards.
+        let awaited = self.awaited_txs();
+        let fetches = self.expected_certs.check_timeouts(&awaited, now_ts);
 
         let mut actions = Vec::with_capacity(fetches.len());
-        for (wave_id, is_retry) in fetches {
+        for (source_shard, tx_hash, is_retry) in fetches {
             tracing::info!(
-                source_shard = wave_id.shard_id().inner(),
-                block_height = wave_id.block_height().inner(),
-                wave = %wave_id,
+                source_shard = source_shard.inner(),
+                tx = %tx_hash,
                 retry = is_retry,
                 "Execution cert timeout — requesting fallback"
             );
             actions.push(Action::Fetch(FetchRequest::ExecutionCerts {
-                wave_id,
+                source_shard,
+                tx_hash,
                 preferred: None,
                 class: None,
             }));
         }
 
-        // Retain expectations while any local wave still needs an EC from
-        // that source shard. `self.waves` is the authoritative "what am I
-        // still waiting on" set — entries are removed by `finalize_wave`
-        // once a wave is complete. Keyed by source shard (not wave_id)
-        // because expected entries carry the remote shard's wave
-        // decomposition, which cannot be matched against local wave ids.
-        let local_shard = self.local_shard;
-        let shards_needed: HashSet<ShardId> = self
-            .waves
-            .waves_iter()
-            .flat_map(|(wid, _)| wid.remote_shards().iter().copied())
-            .filter(|s| *s != local_shard)
-            .collect();
-        self.expected_certs
-            .retain_if_shard_needed(&shards_needed, now_ts);
+        self.expected_certs.retain_if_tx_needed(&awaited, now_ts);
         self.expected_certs.prune_fulfilled(now_ts);
 
         actions
+    }
+
+    /// Transactions an outstanding local wave still holds — the authority on
+    /// what this shard is waiting for coverage on. Wave entries are removed
+    /// by `finalize_wave` once a wave completes, so a transaction leaves this
+    /// set exactly when it stops needing any counterpart's outcome.
+    fn awaited_txs(&self) -> HashSet<TxHash> {
+        self.waves
+            .waves_iter()
+            .flat_map(|(_, state)| state.tx_hashes().iter().copied())
+            .collect()
+    }
+
+    /// The subset of [`Self::awaited_txs`] whose waves name `shard` as a
+    /// participant — what this shard owes us specifically.
+    fn awaited_txs_from(&self, shard: ShardId) -> HashSet<TxHash> {
+        self.waves
+            .waves_iter()
+            .filter(|(wave_id, _)| wave_id.remote_shards().contains(&shard))
+            .flat_map(|(_, state)| state.tx_hashes().iter().copied())
+            .collect()
     }
 
     /// Re-send votes to rotated leaders for waves that haven't produced an EC.
@@ -2529,21 +2533,26 @@ impl ExecutionCoordinator {
     pub fn record_settled_waves(&mut self, shard: ShardId, settled: SettledWaveSet) {
         let local_shard = self.local_shard;
         let now_ts = self.committed_ts;
-        let mut outstanding: HashSet<WaveId> = HashSet::new();
-        for wave in &settled.waves {
-            if !wave.remote_shards().contains(&local_shard) {
-                continue;
-            }
-            if self
-                .expected_certs
-                .is_fulfilled(shard, wave.block_height(), wave)
-            {
-                continue;
-            }
-            self.expected_certs
-                .register(shard, wave.block_height(), wave.clone(), now_ts);
-            outstanding.insert(wave.clone());
+
+        // Arm the fallback fetch from local state: the transactions we await
+        // from this shard are the ones whose outcome can still arrive, and
+        // the header that first named them may never have reached us.
+        for tx_hash in self.awaited_txs_from(shard) {
+            self.expected_certs.register(shard, tx_hash, now_ts);
         }
+
+        // The fire condition comes from the settled set, not from what we
+        // await: a partner that settled nothing naming us has nothing left
+        // to send, and the sweep must fire immediately rather than wait on
+        // coverage that will never come.
+        let outstanding: HashSet<WaveId> = settled
+            .waves
+            .iter()
+            .filter(|wave| wave.remote_shards().contains(&local_shard))
+            .filter(|wave| !self.expected_certs.has_ingested(shard, wave))
+            .cloned()
+            .collect();
+
         self.pending_counterpart_sweeps.insert(shard, outstanding);
         self.settled_sets.insert(shard, settled);
     }
@@ -3791,10 +3800,10 @@ mod tests {
     fn on_certificate_verified_rejects_subquorum_ec() {
         // A single Byzantine signer can produce a signature-valid EC. Without a
         // quorum-power gate, that sub-quorum EC would clear the expected-
-        // cert tombstone, populate the local-shard fallback-serving cache,
-        // and feed wave attestation. The rejection now also emits an
-        // `AbandonFetch::ExecutionCerts` so any pinned EC fetch on this
-        // wave_id releases its FSM slot.
+        // cert record, populate the local-shard fallback-serving cache,
+        // and feed wave attestation. The rejection also emits an
+        // `AbandonFetch::ExecutionCerts` naming every transaction the cert
+        // claimed, so each pinned fetch releases its FSM slot.
         let topo = make_test_topology();
         let mut state = make_test_state();
         state.committed_height = BlockHeight::new(10);
@@ -3803,11 +3812,17 @@ mod tests {
 
         let mut signers = SignerBitfield::new(4);
         signers.set(0); // single signer — well below 2f+1 = 3
+        let covered_tx = TxHash::from(Hash::from_bytes(b"covered by the refused cert"));
         let cert = Arc::new(ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            vec![TxOutcome::new(
+                covered_tx,
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )],
             AggregateSignature::ZERO,
             signers,
         ));
@@ -3824,7 +3839,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::ExecutionCerts { ids }) if ids == &vec![wave_id.clone()]
+                Action::AbandonFetch(FetchAbandon::ExecutionCerts { ids }) if ids == &vec![(wave_id.shard_id(), covered_tx)]
             )),
             "sub-quorum drop must emit AbandonFetch::ExecutionCerts, got: {actions:?}"
         );
@@ -3847,11 +3862,17 @@ mod tests {
         signers.set(0);
         signers.set(1);
         signers.set(2);
+        let covered_tx = TxHash::from(Hash::from_bytes(b"covered by the refused cert"));
         let cert = Arc::new(ExecutionCertificate::new(
             wave_id.clone(),
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
-            vec![],
+            vec![TxOutcome::new(
+                covered_tx,
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )],
             AggregateSignature::ZERO,
             signers,
         ));
@@ -3866,7 +3887,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::ExecutionCerts { ids }) if ids == &vec![wave_id.clone()]
+                Action::AbandonFetch(FetchAbandon::ExecutionCerts { ids }) if ids == &vec![(wave_id.shard_id(), covered_tx)]
             )),
             "invalid-sig drop must emit AbandonFetch::ExecutionCerts, got: {actions:?}"
         );
@@ -4609,19 +4630,21 @@ mod tests {
             BlockHeight::new(5),
             std::iter::once(ShardId::leaf(1, 0)).collect(),
         );
-        state.on_verified_remote_header(
-            remote_shard,
-            BlockHeight::new(5),
-            std::slice::from_ref(&wave_id),
-        );
+        let cross_shard_tx = TxHash::from(Hash::from_bytes(b"cross-shard tx"));
+        state.on_verified_remote_header(remote_shard, std::slice::from_ref(&cross_shard_tx));
         assert_eq!(state.expected_certs.expected_len(), 1);
         assert_eq!(state.expected_certs.fulfilled_len(), 0);
 
         let cert = ExecutionCertificate::new(
-            wave_id.clone(),
+            wave_id,
             WeightedTimestamp::from_millis(1_000_000),
             GlobalReceiptRoot::ZERO,
-            vec![],
+            vec![TxOutcome::new(
+                cross_shard_tx,
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )],
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -4994,11 +5017,10 @@ mod tests {
         );
     }
 
-    /// Expected-cert entries must be retained while any local `WaveState`
-    /// still lists their source shard as a participating remote — otherwise
-    /// a cross-shard wave whose remote EC missed the broadcast window would
-    /// be stranded once the expectation aged out, with no fallback fetch
-    /// continuing to fire.
+    /// Expected-cert entries must be retained while a local wave still holds
+    /// their transaction — otherwise a cross-shard transaction whose remote
+    /// EC missed the broadcast window would be stranded once the expectation
+    /// aged out, with no fallback fetch continuing to fire.
     #[test]
     fn test_expected_exec_cert_retained_while_tracker_pending() {
         use std::collections::BTreeSet;
@@ -5009,20 +5031,13 @@ mod tests {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
 
         let remote_shard = ShardId::leaf(1, 1);
-        let remote_wave = WaveId::new(
-            remote_shard,
-            BlockHeight::new(5),
-            std::iter::once(ShardId::leaf(1, 0)).collect(),
-        );
-        state.on_verified_remote_header(
-            remote_shard,
-            BlockHeight::new(5),
-            std::slice::from_ref(&remote_wave),
-        );
+        let tx = Arc::new(test_transaction(7));
+        let tx_hash = tx.hash();
+        state.on_verified_remote_header(remote_shard, std::slice::from_ref(&tx_hash));
         assert_eq!(
             state.expected_certs.expected_len(),
             1,
-            "expectation should register for wave targeting local shard"
+            "expectation should register for a transaction the source names"
         );
 
         // Simulate an outstanding local cross-shard wave needing shard 1's EC.
@@ -5031,8 +5046,6 @@ mod tests {
             BlockHeight::new(10),
             std::iter::once(remote_shard).collect(),
         );
-        let tx = Arc::new(test_transaction(7));
-        let tx_hash = tx.hash();
         let mut participating = BTreeSet::new();
         participating.insert(ShardId::leaf(1, 0));
         participating.insert(remote_shard);
@@ -5802,24 +5815,15 @@ mod tests {
 
         // Pre-first-commit: register an expectation. discovered_at is ZERO.
         let remote_shard = ShardId::leaf(1, 1);
-        let remote_wave = WaveId::new(
-            remote_shard,
-            BlockHeight::new(5),
-            std::iter::once(ShardId::leaf(1, 0)).collect(),
-        );
-        state.on_verified_remote_header(
-            remote_shard,
-            BlockHeight::new(5),
-            std::slice::from_ref(&remote_wave),
-        );
-        // Also seed a local wave that needs shard 1's EC, so the retention
+        let tx = Arc::new(test_transaction(1));
+        state.on_verified_remote_header(remote_shard, &[tx.hash()]);
+        // Also seed a local wave holding that transaction, so the retention
         // check in `check_exec_cert_timeouts` keeps the expectation alive.
         let local_wave = WaveId::new(
             ShardId::leaf(1, 0),
             BlockHeight::new(10),
             std::iter::once(remote_shard).collect(),
         );
-        let tx = Arc::new(test_transaction(1));
         let mut participating = BTreeSet::new();
         participating.insert(ShardId::leaf(1, 0));
         participating.insert(remote_shard);

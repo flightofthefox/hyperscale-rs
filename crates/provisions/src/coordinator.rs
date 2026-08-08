@@ -957,7 +957,7 @@ mod tests {
         BlockHeader, CertificateRoot, ChainOrigin, Hash, LocalReceiptRoot, MerkleInclusionProof,
         NetworkDefinition, ProposerTimestamp, ProvisionEntry, ProvisionTxRoot, ProvisionsRoot,
         QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot,
-        TopologySnapshot, TransactionRoot, TxHash, ValidatorId, ValidatorSet, Verifiable, WaveId,
+        TopologySnapshot, TransactionRoot, TxHash, ValidatorId, ValidatorSet, Verifiable,
         WeightedTimestamp, WitnessSources, WorkInFlight, compute_merkle_root,
     };
     use proptest::bool::ANY as ANY_BOOL;
@@ -1029,7 +1029,7 @@ mod tests {
             header.certificate_root(),
             header.local_receipt_root(),
             header.provision_root(),
-            header.waves().clone(),
+            header.cross_shard_txs().clone(),
             roots,
             header.work_in_flight(),
             BeaconWitnessRoot::ZERO,
@@ -1910,16 +1910,10 @@ mod tests {
         height: BlockHeight,
         provision_targets: Vec<ShardId>,
     ) -> Arc<Verified<CertifiedBlockHeader>> {
-        // Each target shard gets its own single-dependency wave so that
-        // `provision_targets()` on the resulting header yields the input
-        // set, and a placeholder `provision_tx_roots` entry — the
-        // commitment the expectation tracker keys on. Tests that fire
+        // Each target shard gets a placeholder `provision_tx_roots` entry —
+        // the commitment the expectation tracker keys on. Tests that fire
         // matching bundles overwrite the entry with a real root via
         // `make_certified_header_committing`.
-        let waves: Vec<WaveId> = provision_targets
-            .iter()
-            .map(|&s| WaveId::new(shard, height, std::collections::BTreeSet::from([s])))
-            .collect();
         let provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot> = provision_targets
             .into_iter()
             .map(|s| {
@@ -1945,7 +1939,7 @@ mod tests {
             CertificateRoot::ZERO,
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
-            waves,
+            Vec::new(),
             provision_tx_roots,
             WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,

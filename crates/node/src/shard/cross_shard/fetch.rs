@@ -18,7 +18,7 @@ use hyperscale_types::network::request::{
     GetProvisionsRequest,
 };
 use hyperscale_types::{
-    BlockHeight, ExecutionCertificate, FinalizedWave, MessageClass, ProvisionHash, ShardId,
+    BlockHeight, ExecutionCertificate, FinalizedWave, MessageClass, ProvisionHash, ShardId, TxHash,
     ValidatorId, Verifiable, WaveId,
 };
 
@@ -31,7 +31,7 @@ pub type LocalProvisionFetch = Fetch<ProvisionHash>;
 /// Finalized-wave fetch keyed by [`WaveId`].
 pub type FinalizedWaveFetch = Fetch<WaveId>;
 /// Cross-shard execution-cert fetch keyed by [`WaveId`].
-pub type ExecCertFetch = Fetch<WaveId>;
+pub type ExecCertFetch = Fetch<(ShardId, TxHash)>;
 /// Cross-shard provision fetch keyed by
 /// `(source_shard, target_shard, block_height)`. `source_shard` selects
 /// the responding committee; `target_shard` rides in the body for
@@ -71,7 +71,7 @@ impl FetchBinding for LocalProvisionBinding {
             Box::new(move |result| {
                 if let Ok(resp) = result {
                     let split =
-                        partition_solicited(resp.entries, &hs, |entry| entry.provisions.hash());
+                        partition_solicited(resp.entries, &hs, |entry| [entry.provisions.hash()]);
                     // Push the bundled source header BEFORE the provisions
                     // so the verification pipeline has a chance to admit it
                     // first. The header is QC-self-authenticating; sender is
@@ -156,7 +156,7 @@ impl FetchBinding for FinalizedWaveBinding {
             Box::new(move |result| {
                 if let Ok(resp) = result {
                     let split =
-                        partition_solicited(resp.waves, &requested_ids, |w| w.wave_id().clone());
+                        partition_solicited(resp.waves, &requested_ids, |w| [w.wave_id().clone()]);
                     if !split.kept.is_empty() {
                         // Refcount is 1 right after decode, so each unwrap moves.
                         let waves: Vec<Arc<Verifiable<FinalizedWave>>> = split
@@ -203,16 +203,21 @@ impl FetchBinding for FinalizedWaveBinding {
 pub struct ExecCertBinding;
 
 impl FetchBinding for ExecCertBinding {
-    type Id = WaveId;
+    /// `(source_shard, tx_hash)` — the shard whose outcome is missing and
+    /// the transaction it is missing for. The certificate's own identity
+    /// is not a key here: the requester learned of the transaction from
+    /// the source shard's header and cannot know which certificate will
+    /// carry it.
+    type Id = (ShardId, TxHash);
 
     const NAME: &'static str = "exec_cert";
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<WaveId> {
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<(ShardId, TxHash)> {
         &mut shard.cross_shard.exec_cert
     }
 
     fn dispatch_chunk<N: Network>(
-        ids: Vec<WaveId>,
+        ids: Vec<(ShardId, TxHash)>,
         local_shard: ShardId,
         shard: ShardId,
         preferred: Option<ValidatorId>,
@@ -225,12 +230,22 @@ impl FetchBinding for ExecCertBinding {
         network.request(
             shard,
             preferred,
-            GetExecutionCertsRequest { wave_ids: ids },
+            GetExecutionCertsRequest {
+                tx_hashes: ids.into_iter().map(|(_, tx_hash)| tx_hash).collect(),
+            },
             class,
             Box::new(move |result| {
                 if let Ok(response) = result {
                     let certs = response.certificates.unwrap_or_default();
-                    let split = partition_solicited(certs, &failed_ids, |c| c.wave_id().clone());
+                    // One certificate answers for every transaction of its
+                    // batch, so it clears every requested key it covers.
+                    let split = partition_solicited(certs, &failed_ids, |c| {
+                        let cert_shard = c.shard_id();
+                        c.tx_outcomes()
+                            .iter()
+                            .map(|outcome| (cert_shard, outcome.tx_hash()))
+                            .collect::<Vec<_>>()
+                    });
                     let had_misses = !split.missing.is_empty();
                     if !split.kept.is_empty() {
                         // Refcount is 1 right after decode, so each unwrap moves.

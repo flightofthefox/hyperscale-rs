@@ -1,15 +1,16 @@
 //! `ShardChainReader` implementation for `RocksDbShardStorage`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-    ConsensusReceipt, ExecutionCertificate, QuorumCertificate, ShardWitnessPayload, Transaction,
-    TxHash, Verified, WaveCertificate, WaveId,
+    ConsensusReceipt, ExecutionCertificate, Hash, QuorumCertificate, ShardWitnessPayload,
+    Transaction, TxHash, Verified, WaveCertificate, WaveId,
 };
 
-use super::column_families::{BeaconWitnessesCf, ExecutionCertsCf};
+use super::column_families::{BeaconWitnessesCf, ExecutionCertsCf, TxCertIndexCf};
 use super::core::RocksDbShardStorage;
 use crate::typed_cf::{TypedCf, get, iter_all, iter_from};
 
@@ -81,6 +82,23 @@ impl ShardChainReader for RocksDbShardStorage {
         wave_ids
             .iter()
             .filter_map(|wid| get::<ExecutionCertsCf>(&*self.db, certs_cf, wid))
+            .map(Verified::<ExecutionCertificate>::from_persisted)
+            .collect()
+    }
+
+    fn get_execution_certificates_for_txs(
+        &self,
+        tx_hashes: &[TxHash],
+    ) -> Vec<Verified<ExecutionCertificate>> {
+        let cfs = self.cf();
+        let index_cf = TxCertIndexCf::handle(&cfs);
+        let certs_cf = ExecutionCertsCf::handle(&cfs);
+        let mut seen: HashSet<WaveId> = HashSet::new();
+        tx_hashes
+            .iter()
+            .filter_map(|tx| get::<TxCertIndexCf>(&*self.db, index_cf, &Hash::from(*tx)))
+            .filter(|wave_id| seen.insert(wave_id.clone()))
+            .filter_map(|wave_id| get::<ExecutionCertsCf>(&*self.db, certs_cf, &wave_id))
             .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()
     }

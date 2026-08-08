@@ -171,6 +171,11 @@ pub struct ConsensusState {
     pub receipt_heights: HashMap<TxHash, BlockHeight>,
     /// Execution certificates keyed by [`WaveId`].
     pub execution_certs: HashMap<WaveId, ExecutionCertificate>,
+    /// Index: attested transaction → the certificate carrying its
+    /// outcome. Mirrors the production `tx_cert_index` CF so simulation
+    /// integration tests serve the by-transaction certificate fetch the
+    /// same way a real node does.
+    pub tx_cert_index: HashMap<TxHash, WaveId>,
     /// Index: `block_height` → `WaveId`s at that height.
     pub wave_certs_by_height: HashMap<BlockHeight, Vec<WaveId>>,
     /// Beacon-witness leaves keyed by leaf index. Mirrors the production
@@ -205,6 +210,7 @@ impl ConsensusState {
             execution_metadata: HashMap::new(),
             receipt_heights: HashMap::new(),
             execution_certs: HashMap::new(),
+            tx_cert_index: HashMap::new(),
             wave_certs_by_height: HashMap::new(),
             beacon_witnesses: BTreeMap::new(),
             chain_origin: ChainOrigin::ROOT,

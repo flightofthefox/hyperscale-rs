@@ -11,7 +11,7 @@ use std::sync::Arc;
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_types::{
     BlockHeight, ConsensusPublicKey, DeclaredKey, ExecutionCertificate, ShardId, ShardTrie,
-    SubstateKey, TopologySnapshot, Transaction, ValidatorId, Verifiable, VoteCount, WaveId,
+    SubstateKey, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, VoteCount, WaveId,
 };
 
 /// Per-shard recipient lists for provision broadcasting.
@@ -40,6 +40,20 @@ pub fn peers_excluding_self(
         .iter()
         .copied()
         .filter(|&v| v != me)
+        .collect()
+}
+
+/// The fetch keys a dropped certificate releases: its own shard paired with
+/// every transaction it claimed an outcome for.
+///
+/// A certificate the admission path refuses answers for none of those
+/// transactions, so each goes back to being expected and re-fetchable.
+#[must_use]
+pub fn fetch_keys_covered(ec: &ExecutionCertificate) -> Vec<(ShardId, TxHash)> {
+    let shard = ec.shard_id();
+    ec.tx_outcomes()
+        .iter()
+        .map(|outcome| (shard, outcome.tx_hash()))
         .collect()
 }
 

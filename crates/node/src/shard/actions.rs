@@ -623,13 +623,13 @@ where
                 });
             }
             FetchRequest::ExecutionCerts {
-                wave_id,
+                source_shard,
+                tx_hash,
                 preferred,
                 class,
             } => {
-                let source_shard = wave_id.shard_id();
                 self.drive_fetch::<ExecCertBinding>(FetchInput::Request {
-                    ids: vec![wave_id],
+                    ids: vec![(source_shard, tx_hash)],
                     shard: source_shard,
                     preferred,
                     class,

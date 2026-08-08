@@ -84,6 +84,17 @@ pub const EXECUTION_METADATA_CF: &str = "execution_metadata";
 /// Column family for execution certificates keyed by [`WaveId`].
 pub const EXECUTION_CERTS_CF: &str = "execution_certs";
 
+/// Column family mapping a transaction to the certificate carrying its
+/// outcome, keyed by tx hash with a [`WaveId`] value.
+///
+/// A counterpart shard asks for outcomes by transaction — it learned of
+/// the transaction from our committed header and has no way to know which
+/// certificate we ended up putting it in. This index is how the fetch
+/// responder answers that from storage once the in-memory cache has
+/// evicted. Written in the same batch as [`EXECUTION_CERTS_CF`], one entry
+/// per attested outcome.
+pub const TX_CERT_INDEX_CF: &str = "tx_cert_index";
+
 /// Column family for beacon-witness leaves on this shard.
 ///
 /// Key: `leaf_index` as a big-endian `u64` — lex order matches
@@ -149,6 +160,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     CONSENSUS_RECEIPTS_CF,
     EXECUTION_METADATA_CF,
     EXECUTION_CERTS_CF,
+    TX_CERT_INDEX_CF,
     BEACON_WITNESSES_CF,
     SUBSTATE_BYTES_CF,
     SAFE_VOTE_REGISTERS_CF,
@@ -175,6 +187,7 @@ pub struct CfHandles<'a> {
     consensus_receipts: &'a ColumnFamily,
     execution_metadata: &'a ColumnFamily,
     execution_certs: &'a ColumnFamily,
+    tx_cert_index: &'a ColumnFamily,
     beacon_witnesses: &'a ColumnFamily,
     substate_bytes: &'a ColumnFamily,
     safe_vote_registers: &'a ColumnFamily,
@@ -203,6 +216,7 @@ impl<'a> CfHandles<'a> {
             consensus_receipts: resolve(CONSENSUS_RECEIPTS_CF),
             execution_metadata: resolve(EXECUTION_METADATA_CF),
             execution_certs: resolve(EXECUTION_CERTS_CF),
+            tx_cert_index: resolve(TX_CERT_INDEX_CF),
             beacon_witnesses: resolve(BEACON_WITNESSES_CF),
             substate_bytes: resolve(SUBSTATE_BYTES_CF),
             safe_vote_registers: resolve(SAFE_VOTE_REGISTERS_CF),
@@ -426,6 +440,19 @@ impl TypedCf for ExecutionCertsCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.execution_certs
+    }
+}
+
+pub struct TxCertIndexCf;
+impl TypedCf for TxCertIndexCf {
+    const NAME: &'static str = TX_CERT_INDEX_CF;
+    type Key = Hash;
+    type Value = WaveId;
+    type KeyCodec = HashCodec;
+    type ValueCodec = HborCodec<WaveId>;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.tx_cert_index
     }
 }
 

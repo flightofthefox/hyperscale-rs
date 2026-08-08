@@ -1,5 +1,6 @@
 //! `ShardChainReader` implementation for `SimShardStorage`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_storage::lock_recover::read_or_recover;
@@ -106,6 +107,21 @@ impl ShardChainReader for SimShardStorage {
         wave_ids
             .iter()
             .filter_map(|wid| c.execution_certs.get(wid).cloned())
+            .map(Verified::<ExecutionCertificate>::from_persisted)
+            .collect()
+    }
+
+    fn get_execution_certificates_for_txs(
+        &self,
+        tx_hashes: &[TxHash],
+    ) -> Vec<Verified<ExecutionCertificate>> {
+        let c = read_or_recover(&self.consensus);
+        let mut seen: HashSet<&WaveId> = HashSet::new();
+        tx_hashes
+            .iter()
+            .filter_map(|tx| c.tx_cert_index.get(tx))
+            .filter(|wave_id| seen.insert(wave_id))
+            .filter_map(|wave_id| c.execution_certs.get(wave_id).cloned())
             .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()
     }

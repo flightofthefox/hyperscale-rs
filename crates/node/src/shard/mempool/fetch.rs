@@ -48,7 +48,8 @@ impl FetchBinding for TransactionBinding {
             class,
             Box::new(move |result| {
                 if let Ok(resp) = result {
-                    let split = partition_solicited(resp.into_transactions(), &hs, |tx| tx.hash());
+                    let split =
+                        partition_solicited(resp.into_transactions(), &hs, |tx| [tx.hash()]);
                     if !split.kept.is_empty() {
                         push_shard_input(
                             &es,

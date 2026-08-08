@@ -1,5 +1,6 @@
 //! Inbound execution-certificate fetch request handling.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_execution::ExecCertStore;
@@ -7,7 +8,7 @@ use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetExecutionCertsRequest;
 use hyperscale_types::network::response::GetExecutionCertsResponse;
-use hyperscale_types::{ExecutionCertificate, WaveId};
+use hyperscale_types::{ExecutionCertificate, TxHash, WaveId};
 
 /// Serve an inbound execution-certificate fetch request.
 ///
@@ -15,23 +16,34 @@ use hyperscale_types::{ExecutionCertificate, WaveId};
 /// EC aggregation and the wave's containing block committing) and chain
 /// storage via [`PendingChain`]. Cache eviction happens at wave-cert
 /// commit, at which point storage is the authoritative source.
+///
+/// The request names transactions, and one certificate covers a whole
+/// batch of them, so several requested transactions commonly resolve to
+/// the same certificate — it is sent once.
 pub fn serve_execution_certs_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     exec_cert_store: &ExecCertStore,
     req: &GetExecutionCertsRequest,
 ) -> GetExecutionCertsResponse {
     let mut certs: Vec<Arc<ExecutionCertificate>> = Vec::new();
-    let mut missing: Vec<WaveId> = Vec::new();
-    for wave_id in &req.wave_ids {
-        match exec_cert_store.get(wave_id) {
-            Some(cert) => certs.push(Arc::new((**cert).clone())),
-            None => missing.push(wave_id.clone()),
+    let mut served: HashSet<WaveId> = HashSet::new();
+    let mut missing: Vec<TxHash> = Vec::new();
+    for &tx_hash in &req.tx_hashes {
+        match exec_cert_store.get_for_tx(tx_hash) {
+            Some(cert) => {
+                if served.insert(cert.wave_id().clone()) {
+                    certs.push(Arc::new((**cert).clone()));
+                }
+            }
+            None => missing.push(tx_hash),
         }
     }
 
     if !missing.is_empty() {
-        for cert in pending_chain.execution_certificates_batch(&missing) {
-            certs.push(Arc::new(cert.into_inner()));
+        for cert in pending_chain.execution_certificates_for_txs(&missing) {
+            if served.insert(cert.wave_id().clone()) {
+                certs.push(Arc::new(cert.into_inner()));
+            }
         }
     }
 

@@ -287,6 +287,13 @@ impl ShardChainReader for SharedStorage {
         self.0.get_execution_certificates_batch(wave_ids)
     }
 
+    fn get_execution_certificates_for_txs(
+        &self,
+        tx_hashes: &[TxHash],
+    ) -> Vec<Verified<ExecutionCertificate>> {
+        self.0.get_execution_certificates_for_txs(tx_hashes)
+    }
+
     fn get_beacon_witness_payloads(&self, end: BeaconWitnessLeafCount) -> Vec<ShardWitnessPayload> {
         self.0.get_beacon_witness_payloads(end)
     }

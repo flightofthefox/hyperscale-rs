@@ -378,8 +378,8 @@ pub enum ShardScopedInput {
 
     /// An execution certificate fetch request failed.
     ExecCertFetchFailed {
-        /// Wave ids that weren't returned.
-        hashes: Vec<WaveId>,
+        /// `(source_shard, tx_hash)` pairs that weren't answered.
+        hashes: Vec<(ShardId, TxHash)>,
     },
 
     /// A shard-witness chunk fetch failed (network error, empty response,

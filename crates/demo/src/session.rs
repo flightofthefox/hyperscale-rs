@@ -754,7 +754,7 @@ impl Session {
                     header.round(),
                     header.is_fallback(),
                     header.proposer().inner(),
-                    u32::try_from(header.waves().len()).unwrap_or(u32::MAX),
+                    u32::try_from(header.cross_shard_txs().len()).unwrap_or(u32::MAX),
                 ));
                 // A settled-waves root rides every header of a terminating
                 // shard's final epoch, so the first one seen opens the

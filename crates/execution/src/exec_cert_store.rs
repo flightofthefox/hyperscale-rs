@@ -20,9 +20,10 @@
 //! [`ShardStorage::get_execution_certificates_by_height`] and the network handler
 //! falls through to that on cache miss.
 //!
-//! Mirrors [`hyperscale_mempool::TxStore`] in shape and intent: a single
-//! primary index keyed by the natural identifier (`WaveId` here, `TxHash`
-//! there), no secondary indexes (EC fetches are wave-id-keyed only).
+//! Mirrors [`hyperscale_mempool::TxStore`] in shape and intent: a primary
+//! index keyed by the natural identifier (`WaveId` here, `TxHash` there),
+//! plus a transaction index — a counterpart fetches an outcome by naming
+//! the transaction, having no way to know which certificate carries it.
 //!
 //! Backed by [`papaya::HashMap`] — a lock-free concurrent map. Reads from the
 //! network worker are wait-free in the common case and never contend with
@@ -34,7 +35,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{ExecutionCertificate, Verified, WaveId};
+use hyperscale_types::{ExecutionCertificate, TxHash, TxOutcome, Verified, WaveId};
 use papaya::HashMap;
 
 /// Shared, content-addressed store of aggregated [`ExecutionCertificate`]s
@@ -45,6 +46,8 @@ use papaya::HashMap;
 /// commit) are infrequent and single-threaded (state machine).
 pub struct ExecCertStore {
     inner: HashMap<WaveId, Arc<Verified<ExecutionCertificate>>>,
+    /// Attested transaction → the certificate carrying its outcome.
+    by_tx: HashMap<TxHash, WaveId>,
 }
 
 impl ExecCertStore {
@@ -53,6 +56,7 @@ impl ExecCertStore {
     pub fn new() -> Self {
         Self {
             inner: HashMap::new(),
+            by_tx: HashMap::new(),
         }
     }
 
@@ -61,7 +65,20 @@ impl ExecCertStore {
     /// callers holding clones keep pointing at the same allocation).
     pub fn insert(&self, cert: Arc<Verified<ExecutionCertificate>>) {
         let wave_id = cert.wave_id().clone();
+        // Index before the primary insert, so a concurrent reader that
+        // resolves a transaction always finds the certificate behind it.
+        let by_tx = self.by_tx.pin();
+        for tx_hash in cert.tx_outcomes().iter().map(TxOutcome::tx_hash) {
+            by_tx.insert(tx_hash, wave_id.clone());
+        }
         self.inner.pin().get_or_insert_with(wave_id, || cert);
+    }
+
+    /// Look up the verified certificate carrying `tx_hash`'s outcome.
+    #[must_use]
+    pub fn get_for_tx(&self, tx_hash: TxHash) -> Option<Arc<Verified<ExecutionCertificate>>> {
+        let wave_id = self.by_tx.pin().get(&tx_hash).cloned()?;
+        self.get(&wave_id)
     }
 
     /// Look up a verified execution certificate by `WaveId`.
@@ -70,9 +87,19 @@ impl ExecCertStore {
         self.inner.pin().get(wave_id).cloned()
     }
 
-    /// Drop the entry for `wave_id`, if any.
+    /// Drop the entry for `wave_id`, if any, along with its transaction
+    /// index entries.
     pub fn evict(&self, wave_id: &WaveId) {
-        self.inner.pin().remove(wave_id);
+        if let Some(cert) = self.inner.pin().remove(wave_id) {
+            let by_tx = self.by_tx.pin();
+            for tx_hash in cert.tx_outcomes().iter().map(TxOutcome::tx_hash) {
+                // A later certificate re-indexing the same transaction owns
+                // the entry; only drop the one this certificate still holds.
+                if by_tx.get(&tx_hash) == Some(wave_id) {
+                    by_tx.remove(&tx_hash);
+                }
+            }
+        }
     }
 
     /// Number of certificates currently held.

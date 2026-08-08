@@ -147,11 +147,8 @@ impl NodeStateMachine {
             return Vec::new();
         };
 
-        s.execution_coordinator.on_verified_remote_header(
-            shard,
-            certified_header.header().height(),
-            certified_header.header().waves(),
-        );
+        s.execution_coordinator
+            .on_verified_remote_header(shard, certified_header.header().cross_shard_txs());
 
         let mut actions = s
             .provisions_coordinator

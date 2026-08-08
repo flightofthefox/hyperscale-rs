@@ -144,7 +144,6 @@ impl ShardParticipation {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use hyperscale_core::{Action, FetchRequest, ProtocolEvent, StateMachine};
@@ -152,7 +151,7 @@ mod tests {
     use hyperscale_types::{
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
         CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp, ProvisionTxRoot,
-        QuorumCertificate, RevealChain, ShardId, ShardLoad, ValidatorId, Verified, WaveId,
+        QuorumCertificate, RevealChain, ShardId, ShardLoad, TxHash, ValidatorId, Verified,
     };
 
     use crate::assert_emits;
@@ -171,9 +170,7 @@ mod tests {
 
         // Seed provisions.expected via a verified remote header whose
         // wave depends on local.
-        let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardId::ROOT);
-        let wave = WaveId::new(ShardId::leaf(1, 1), BlockHeight::new(5), remote_shards);
+        let cross_shard_tx = TxHash::from(Hash::from_bytes(b"cross-shard tx"));
         let mut block = make_live_block(
             ShardId::leaf(1, 1),
             BlockHeight::new(5),
@@ -197,7 +194,7 @@ mod tests {
                 header.certificate_root(),
                 header.local_receipt_root(),
                 header.provision_root(),
-                vec![wave],
+                vec![cross_shard_tx],
                 // The expectation tracker keys on the header owing us a
                 // bundle — a provision_tx_roots entry for our shard.
                 std::collections::BTreeMap::from([(

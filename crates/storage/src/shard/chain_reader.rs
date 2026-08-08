@@ -98,6 +98,20 @@ pub trait ShardChainReader: Send + Sync + 'static {
         wave_ids: &[WaveId],
     ) -> Vec<Verified<ExecutionCertificate>>;
 
+    /// Retrieve the execution certificates carrying outcomes for
+    /// `tx_hashes`, deduplicated — one certificate covers every
+    /// transaction of its batch, so several requested transactions
+    /// commonly resolve to the same certificate.
+    ///
+    /// This is the key a counterpart shard asks by: it knows the
+    /// transaction from our committed header and cannot know which
+    /// certificate we put it in. Transactions with no attested outcome
+    /// here are skipped.
+    fn get_execution_certificates_for_txs(
+        &self,
+        tx_hashes: &[TxHash],
+    ) -> Vec<Verified<ExecutionCertificate>>;
+
     /// Read retained beacon-witness payloads in leaf-index order, up to
     /// (but not including) `end`. Storage is scoped per-shard, so the
     /// shard tag is implicit in the storage handle.

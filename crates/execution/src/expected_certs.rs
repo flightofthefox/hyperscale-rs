@@ -1,16 +1,25 @@
 //! Timeout-driven fallback detection for expected execution certificates.
 //!
-//! A remote shard's committed block header carries one or more `WaveId`s
-//! that target our shard. For each such wave we expect to receive an
-//! aggregated execution certificate within a bounded window. If the cert
-//! doesn't land in time, we fall back to explicitly fetching it from the
-//! source shard's committee.
+//! A remote shard's committed block header lists the cross-shard
+//! transactions in that block. For each one we are party to we expect an
+//! aggregated execution certificate carrying that shard's outcome within a
+//! bounded window. If it doesn't land in time, we fall back to explicitly
+//! fetching it from the source shard's committee.
 //!
 //! ## Key type
 //!
-//! Expectations and fulfilments are both keyed by
-//! `(source_shard, block_height, wave_id)` — the remote-shard identity of the
-//! wave, not any local decomposition.
+//! Expectations and fulfilments are both keyed by `(source_shard, tx_hash)`
+//! — the question actually being asked, which is per transaction. The
+//! certificate's own identity is not what a requester holds: a header names
+//! transactions, and which certificate the source shard puts each one in is
+//! the source shard's business. One arriving certificate therefore fulfils
+//! every expectation for the transactions it covers.
+//!
+//! Alongside that, an admitted certificate is also recorded under its own
+//! identity — see [`has_ingested`](ExpectedCertTracker::has_ingested). A
+//! terminating shard's settled set names the waves it settled, so the
+//! counterpart abort sweep has to ask its question in that shard's terms.
+//! That record retires when the settled set is keyed by transaction.
 //!
 //! ## Deadlines
 //!
@@ -24,15 +33,11 @@
 //!
 //! ## Fulfilled-tombstone lifetime
 //!
-//! **Primary signal — state-based**: each fulfilled entry tracks the
-//! `tx_hashes` from the EC's `tx_outcomes` that haven't yet been
-//! observed in a finalized local wave. The set drains via
-//! [`on_txs_terminated`](ExpectedCertTracker::on_txs_terminated) hooked
-//! into `remove_finalized_wave`; when it empties, the EC is exhausted
-//! and the tombstone evicts. The wave's participating shards always
-//! include our shard (we wouldn't register otherwise), so every tx in
-//! the EC reaches a finalized local wave in healthy operation —
-//! footprint tracks in-flight work, not gossip windows.
+//! **Primary signal — state-based**: a fulfilled entry is dropped by
+//! [`on_txs_terminated`](ExpectedCertTracker::on_txs_terminated), hooked
+//! into `remove_finalized_wave`. A transaction that has reached terminal
+//! state locally needs no shard's outcome, so the whole entry goes at once
+//! — footprint tracks in-flight work, not gossip windows.
 //!
 //! **Backstop — time-based**: each entry also carries a deadline
 //! (`vote_anchor_ts + RETENTION_HORIZON`), pruned by
@@ -42,20 +47,17 @@
 //! duplicate header then arrives within the gossip window, `register`
 //! re-creates an expectation, the fallback fetch returns the EC,
 //! `mark_fulfilled` re-creates the tombstone — but no future
-//! `remove_finalized_wave` will fire for those txs, so the
-//! re-registered tombstone's pending-set never drains. The deadline
-//! evicts it.
+//! `remove_finalized_wave` will fire for those txs. The deadline evicts it.
 //!
-//! Retention pruning by source shard (waves that still need an EC from a
-//! given remote shard) is orchestrated by the coordinator via
-//! [`retain_if_shard_needed`](ExpectedCertTracker::retain_if_shard_needed),
+//! Retention pruning against the transactions still awaiting coverage is
+//! orchestrated by the coordinator via
+//! [`retain_if_tx_needed`](ExpectedCertTracker::retain_if_tx_needed),
 //! because the tracker cannot see the wave set.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
-use hyperscale_types::{BlockHeight, ShardId, TxHash, WAVE_TIMEOUT, WaveId, WeightedTimestamp};
+use hyperscale_types::{ShardId, TxHash, WAVE_TIMEOUT, WaveId, WeightedTimestamp};
 
 /// How long to wait before the first fallback request. Anchored on the
 /// committing QC's `weighted_timestamp_ms`, so the window stays meaningful
@@ -68,22 +70,16 @@ const EXEC_CERT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const EXEC_CERT_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Grace window during which a freshly-registered expectation is retained
-/// even when no local wave references its source shard yet. Remote
-/// committed-block headers can arrive ahead of the local block that
-/// creates the dependent wave; without this window, the registration is
-/// silently pruned by `retain_if_shard_needed` and the EC never gets
-/// fetched. Sized to comfortably exceed the worst-case lag between
-/// receiving the remote header and committing the local block referencing
-/// the same cross-shard tx.
+/// even when no local wave holds its transaction yet. Remote committed-block
+/// headers can arrive ahead of the local block that commits the same
+/// transaction; without this window, the registration is silently pruned by
+/// `retain_if_tx_needed` and the EC never gets fetched. Sized to comfortably
+/// exceed the worst-case lag between receiving the remote header and
+/// committing the local block referencing the same cross-shard tx.
 const EXPECTED_RETENTION_GRACE: Duration = WAVE_TIMEOUT;
 
-type ExpectedCertKey = (ShardId, BlockHeight, WaveId);
-
-/// Shared key handle: tracker tables hold an `Arc` so the per-tx reverse
-/// index can register a key with a refcount bump rather than cloning the
-/// `(ShardId, BlockHeight, WaveId)` tuple (and the `WaveId`'s inner
-/// `BTreeSet`) once per tx.
-type SharedKey = Arc<ExpectedCertKey>;
+/// One shard's outcome for one transaction — what an expectation is for.
+type ExpectedCertKey = (ShardId, TxHash);
 
 /// Per-expectation bookkeeping.
 #[derive(Debug, Clone)]
@@ -95,25 +91,34 @@ struct ExpectedEntry {
     last_requested_at: Option<WeightedTimestamp>,
 }
 
-/// Per-fulfilled-entry bookkeeping.
+/// Per-transaction record of which shards' outcomes have already arrived.
 #[derive(Debug, Clone)]
 struct FulfilledEntry {
-    /// Tx hashes from the EC's `tx_outcomes` not yet observed in a
-    /// finalized local wave. Empty → entry is exhausted and evicts.
-    pending_txs: HashSet<TxHash>,
-    /// `vote_anchor_ts + RETENTION_HORIZON`. Backstop for the
-    /// late-re-registration race documented in the module-level
-    /// fulfilled-tombstone lifetime section.
+    /// Shards whose certificate for this transaction we have ingested.
+    /// Suppresses re-registration from a duplicate header.
+    shards: BTreeSet<ShardId>,
+    /// The latest `vote_anchor_ts + RETENTION_HORIZON` across the
+    /// certificates recorded here. Backstop for the late-re-registration
+    /// race documented in the module-level fulfilled-tombstone lifetime
+    /// section.
     deadline: WeightedTimestamp,
 }
 
 pub struct ExpectedCertTracker {
-    expected: HashMap<SharedKey, ExpectedEntry>,
-    fulfilled: HashMap<SharedKey, FulfilledEntry>,
-    /// Reverse index `tx_hash → fulfilled keys still awaiting that tx`.
-    /// Lets [`on_txs_terminated`](ExpectedCertTracker::on_txs_terminated)
-    /// be `O(matched)` rather than `O(num_fulfilled)` per finalized wave.
-    by_tx: HashMap<TxHash, HashSet<SharedKey>>,
+    expected: HashMap<ExpectedCertKey, ExpectedEntry>,
+    /// Keyed by transaction alone: a transaction reaching terminal state
+    /// retires every shard's outcome for it at once, which is exactly what
+    /// [`on_txs_terminated`](Self::on_txs_terminated) is told about.
+    fulfilled: HashMap<TxHash, FulfilledEntry>,
+    /// Certificates admitted, in their own shard's vocabulary, with the
+    /// deadline of the [`FulfilledEntry`] they arrived alongside.
+    ///
+    /// A terminating shard's settled set names the waves it settled, so
+    /// asking whether we hold one of them is a question posed in that
+    /// shard's terms rather than ours. Retires when the settled set is
+    /// keyed by transaction, at which point
+    /// [`is_fulfilled`](Self::is_fulfilled) answers it directly.
+    ingested: HashMap<(ShardId, WaveId), WeightedTimestamp>,
 }
 
 impl ExpectedCertTracker {
@@ -121,117 +126,99 @@ impl ExpectedCertTracker {
         Self {
             expected: HashMap::new(),
             fulfilled: HashMap::new(),
-            by_tx: HashMap::new(),
+            ingested: HashMap::new(),
         }
     }
 
-    /// Register an expected EC for `(source_shard, block_height, wave_id)`.
+    /// Register an expected outcome from `source_shard` for `tx_hash`.
     ///
     /// Idempotent: re-registering an active expectation does not reset the
-    /// discovery timestamp. Skipped entirely when the key has already been
-    /// marked fulfilled — guards against late-arriving duplicate headers
-    /// re-opening a closed expectation.
-    pub fn register(
-        &mut self,
-        source_shard: ShardId,
-        block_height: BlockHeight,
-        wave_id: WaveId,
-        now_ts: WeightedTimestamp,
-    ) {
-        let key: ExpectedCertKey = (source_shard, block_height, wave_id);
-        if self.fulfilled.contains_key(&key) {
+    /// discovery timestamp. Skipped entirely when that shard's outcome has
+    /// already been ingested — guards against late-arriving duplicate
+    /// headers re-opening a closed expectation.
+    pub fn register(&mut self, source_shard: ShardId, tx_hash: TxHash, now_ts: WeightedTimestamp) {
+        if self.is_fulfilled(source_shard, tx_hash) {
             return;
         }
-        self.expected.entry(Arc::new(key)).or_insert(ExpectedEntry {
-            discovered_at: now_ts,
-            last_requested_at: None,
-        });
+        self.expected
+            .entry((source_shard, tx_hash))
+            .or_insert(ExpectedEntry {
+                discovered_at: now_ts,
+                last_requested_at: None,
+            });
     }
 
-    /// Record that the expected EC arrived. `tx_hashes` is the EC's
-    /// `tx_outcomes`'s `tx_hash` set — drained by
-    /// [`on_txs_terminated`](Self::on_txs_terminated) as each tx
-    /// reaches terminal state in a finalized local wave. `deadline` is
-    /// the EC's own `vote_anchor_ts + RETENTION_HORIZON`, used as a
-    /// backstop by [`prune_fulfilled`](Self::prune_fulfilled).
-    /// Returns `true` if an active expectation was cleared.
+    /// Record that `source_shard`'s certificate arrived, covering
+    /// `tx_hashes` — the EC's `tx_outcomes`'s `tx_hash` set. Clears every
+    /// expectation it answers for. `deadline` is the EC's own
+    /// `vote_anchor_ts + RETENTION_HORIZON`, used as a backstop by
+    /// [`prune_fulfilled`](Self::prune_fulfilled).
+    ///
+    /// Returns `true` if at least one active expectation was cleared.
     pub fn mark_fulfilled(
         &mut self,
         source_shard: ShardId,
-        block_height: BlockHeight,
         wave_id: &WaveId,
         tx_hashes: impl IntoIterator<Item = TxHash>,
         deadline: WeightedTimestamp,
     ) -> bool {
-        let key: SharedKey = Arc::new((source_shard, block_height, wave_id.clone()));
-        let cleared = self.expected.remove(&key).is_some();
-        let pending_txs: HashSet<TxHash> = tx_hashes.into_iter().collect();
-        for tx in &pending_txs {
-            self.by_tx.entry(*tx).or_default().insert(Arc::clone(&key));
-        }
-        self.fulfilled.insert(
-            key,
-            FulfilledEntry {
-                pending_txs,
+        self.ingested
+            .insert((source_shard, wave_id.clone()), deadline);
+        let mut cleared = false;
+        for tx_hash in tx_hashes {
+            cleared |= self.expected.remove(&(source_shard, tx_hash)).is_some();
+            let entry = self.fulfilled.entry(tx_hash).or_insert(FulfilledEntry {
+                shards: BTreeSet::new(),
                 deadline,
-            },
-        );
+            });
+            entry.shards.insert(source_shard);
+            // A second certificate for the same transaction extends the
+            // backstop rather than shortening it: the tombstone has to
+            // outlive every certificate it stands in for.
+            entry.deadline = entry.deadline.max(deadline);
+        }
         cleared
     }
 
-    /// Drain pending-tx sets for `tx_hashes` that just reached terminal
-    /// state (a finalized local wave landed in a committed block). Drops
-    /// any fulfilled entry whose pending set becomes empty — the EC is
-    /// exhausted and no longer needs a tombstone.
+    /// Drop the records for `tx_hashes` that just reached terminal state (a
+    /// finalized local wave landed in a committed block). No shard's outcome
+    /// for a terminal transaction is wanted anymore.
     pub fn on_txs_terminated(&mut self, tx_hashes: impl IntoIterator<Item = TxHash>) {
-        for tx in tx_hashes {
-            let Some(keys) = self.by_tx.remove(&tx) else {
-                continue;
-            };
-            for key in keys {
-                let drop_entry = self.fulfilled.get_mut(&key).is_some_and(|entry| {
-                    entry.pending_txs.remove(&tx);
-                    entry.pending_txs.is_empty()
-                });
-                if drop_entry {
-                    self.fulfilled.remove(&key);
-                }
-            }
+        for tx_hash in tx_hashes {
+            self.fulfilled.remove(&tx_hash);
         }
     }
 
     /// Backstop sweep: drop fulfilled tombstones whose deadline has
     /// elapsed. Catches the late-re-registration race — see the
-    /// module-level fulfilled-tombstone lifetime section. Cleans
-    /// `by_tx` reverse-index entries for any txs that were still
-    /// pending on the evicted tombstones.
+    /// module-level fulfilled-tombstone lifetime section.
     pub fn prune_fulfilled(&mut self, now_ts: WeightedTimestamp) {
-        let by_tx = &mut self.by_tx;
-        self.fulfilled.retain(|key, entry| {
-            if entry.deadline > now_ts {
-                return true;
-            }
-            for tx in &entry.pending_txs {
-                if let Some(keys) = by_tx.get_mut(tx) {
-                    keys.remove(key);
-                    if keys.is_empty() {
-                        by_tx.remove(tx);
-                    }
-                }
-            }
-            false
-        });
+        self.fulfilled.retain(|_, entry| entry.deadline > now_ts);
+        self.ingested.retain(|_, deadline| *deadline > now_ts);
     }
 
-    /// Drive the timeout state machine. Returns `(wave_id, is_retry)` for
-    /// each expectation that has crossed either the initial or the retry
-    /// deadline at `now_ts`. Records `last_requested_at = now_ts` on each
-    /// returned entry so the retry cooldown starts ticking. Source shard
-    /// and block height are derivable from `wave_id` if the caller needs
-    /// them.
-    pub fn check_timeouts(&mut self, now_ts: WeightedTimestamp) -> Vec<(WaveId, bool)> {
+    /// Drive the timeout state machine. Returns `(source_shard, tx_hash,
+    /// is_retry)` for each expectation on a transaction in `txs_needed` that
+    /// has crossed either the initial or the retry deadline at `now_ts`.
+    /// Records `last_requested_at = now_ts` on each returned entry so the
+    /// retry cooldown starts ticking.
+    ///
+    /// A source header names every cross-shard transaction in its block,
+    /// including ones bound for other shards, so `txs_needed` is what keeps
+    /// this from fetching other shards' business. The cadence is only
+    /// stamped on entries actually returned: an expectation held back
+    /// because our own block committing the transaction hasn't landed yet
+    /// still gets its full initial window once it does.
+    pub fn check_timeouts(
+        &mut self,
+        txs_needed: &HashSet<TxHash>,
+        now_ts: WeightedTimestamp,
+    ) -> Vec<(ShardId, TxHash, bool)> {
         let mut fetches = Vec::new();
-        for (key, entry) in &mut self.expected {
+        for (&(source_shard, tx_hash), entry) in &mut self.expected {
+            if !txs_needed.contains(&tx_hash) {
+                continue;
+            }
             let should_request = match entry.last_requested_at {
                 None => now_ts.elapsed_since(entry.discovered_at) >= EXEC_CERT_FALLBACK_TIMEOUT,
                 Some(last) => now_ts.elapsed_since(last) >= EXEC_CERT_RETRY_INTERVAL,
@@ -239,7 +226,7 @@ impl ExpectedCertTracker {
             if should_request {
                 let is_retry = entry.last_requested_at.is_some();
                 entry.last_requested_at = Some(now_ts);
-                fetches.push((key.2.clone(), is_retry));
+                fetches.push((source_shard, tx_hash, is_retry));
             }
         }
         fetches
@@ -252,48 +239,45 @@ impl ExpectedCertTracker {
     /// fetches recover; a commit-independent caller flushes through here so
     /// the fallback still fires. Records `last_requested_at` so the `io_loop`
     /// owns retries from this point.
-    pub fn flush_all(&mut self, now_ts: WeightedTimestamp) -> Vec<WaveId> {
+    pub fn flush_all(
+        &mut self,
+        txs_needed: &HashSet<TxHash>,
+        now_ts: WeightedTimestamp,
+    ) -> Vec<ExpectedCertKey> {
         let mut fetches = Vec::new();
-        for (key, entry) in &mut self.expected {
-            if entry.last_requested_at.is_some() {
+        for (&key, entry) in &mut self.expected {
+            if entry.last_requested_at.is_some() || !txs_needed.contains(&key.1) {
                 continue;
             }
             entry.last_requested_at = Some(now_ts);
-            fetches.push(key.2.clone());
+            fetches.push(key);
         }
         fetches
     }
 
-    /// Drop expectations whose source shard is no longer referenced by any
-    /// outstanding local wave. The coordinator computes the set from
-    /// `WaveRegistry` and passes it in — the tracker has no view of waves.
-    pub fn retain_if_shard_needed(
-        &mut self,
-        shards_needed: &HashSet<ShardId>,
-        now_ts: WeightedTimestamp,
-    ) {
-        // Retain expectations whose source shard is still referenced by a
-        // local wave OR whose registration is recent enough that the
-        // matching local wave may not have been committed yet. Without the
-        // grace window, a remote header arriving slightly ahead of the
-        // local block that creates the dependent wave is silently pruned
-        // and the EC never gets fetched.
-        self.expected.retain(|key, entry| {
-            shards_needed.contains(&key.0)
+    /// Drop expectations for transactions no outstanding local wave is
+    /// waiting on. The coordinator computes the set from `WaveRegistry` and
+    /// passes it in — the tracker has no view of waves.
+    pub fn retain_if_tx_needed(&mut self, txs_needed: &HashSet<TxHash>, now_ts: WeightedTimestamp) {
+        // Retain expectations whose transaction is still held by a local
+        // wave OR whose registration is recent enough that the local block
+        // committing it may not have landed yet. Without the grace window,
+        // a remote header arriving slightly ahead of our own commit of the
+        // same transaction is silently pruned and the EC never gets
+        // fetched.
+        self.expected.retain(|(_, tx_hash), entry| {
+            txs_needed.contains(tx_hash)
                 || now_ts.elapsed_since(entry.discovered_at) < EXPECTED_RETENTION_GRACE
         });
     }
 
-    /// Drop every active expectation, returning the wave ids so the
-    /// caller can abandon their in-flight fallback fetches. Used when
-    /// the local chain terminates at a reshape boundary — no local wave
-    /// can consume a fetched EC anymore. Fulfilled tombstones stay;
-    /// they only suppress re-registration.
-    pub fn drain_expected(&mut self) -> Vec<WaveId> {
-        self.expected
-            .drain()
-            .map(|(key, _)| key.2.clone())
-            .collect()
+    /// Drop every active expectation, returning its keys so the caller can
+    /// abandon their in-flight fallback fetches. Used when the local chain
+    /// terminates at a reshape boundary — no local wave can consume a
+    /// fetched EC anymore. Fulfilled tombstones stay; they only suppress
+    /// re-registration.
+    pub fn drain_expected(&mut self) -> Vec<ExpectedCertKey> {
+        self.expected.drain().map(|(key, _)| key).collect()
     }
 
     /// Retro-stamp `discovered_at == ZERO` entries with `now_ts`.
@@ -308,19 +292,24 @@ impl ExpectedCertTracker {
         }
     }
 
-    /// Whether the EC for `(source_shard, block_height, wave_id)` has
-    /// already been ingested (a [`mark_fulfilled`](Self::mark_fulfilled)
-    /// tombstone exists). The counterpart abort sweep reads this to decide
-    /// which settled waves naming us are still outstanding.
+    /// Whether `source_shard`'s outcome for `tx_hash` has already been
+    /// ingested (a [`mark_fulfilled`](Self::mark_fulfilled) tombstone
+    /// exists). The counterpart abort sweep reads this to decide which
+    /// settled transactions naming us are still outstanding.
     #[must_use]
-    pub fn is_fulfilled(
-        &self,
-        source_shard: ShardId,
-        block_height: BlockHeight,
-        wave_id: &WaveId,
-    ) -> bool {
+    pub fn is_fulfilled(&self, source_shard: ShardId, tx_hash: TxHash) -> bool {
         self.fulfilled
-            .contains_key(&(source_shard, block_height, wave_id.clone()))
+            .get(&tx_hash)
+            .is_some_and(|entry| entry.shards.contains(&source_shard))
+    }
+
+    /// Whether `source_shard`'s certificate for `wave_id` has been
+    /// admitted. The counterpart abort sweep reads this to decide which of
+    /// a terminated partner's settled waves are still outstanding — the
+    /// partner names them by wave, so the question is asked that way.
+    #[must_use]
+    pub fn has_ingested(&self, source_shard: ShardId, wave_id: &WaveId) -> bool {
+        self.ingested.contains_key(&(source_shard, wave_id.clone()))
     }
 
     pub fn expected_len(&self) -> usize {
@@ -334,30 +323,35 @@ impl ExpectedCertTracker {
 
 #[cfg(test)]
 impl ExpectedCertTracker {
-    fn is_expected(
-        &self,
-        source_shard: ShardId,
-        block_height: BlockHeight,
-        wave_id: &WaveId,
-    ) -> bool {
-        self.expected
-            .contains_key(&(source_shard, block_height, wave_id.clone()))
+    fn is_expected(&self, source_shard: ShardId, tx_hash: TxHash) -> bool {
+        self.expected.contains_key(&(source_shard, tx_hash))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::Hash;
+    use hyperscale_types::{BlockHeight, Hash};
     use proptest::collection::vec as prop_vec;
 
     use super::*;
 
-    fn wave(height: u64) -> WaveId {
-        WaveId::new(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(height),
-            std::iter::once(ShardId::leaf(2, 0)).collect(),
-        )
+    fn shard(index: u8) -> ShardId {
+        ShardId::leaf(2, u64::from(index))
+    }
+
+    fn tx(seed: u8) -> TxHash {
+        TxHash::from(Hash::from_bytes(&[seed]))
+    }
+
+    /// The certificate's own identity, in its shard's vocabulary.
+    fn cert_of(source: ShardId, height: u64) -> WaveId {
+        WaveId::new(source, BlockHeight::new(height), BTreeSet::new())
+    }
+
+    /// Every transaction is one a local wave awaits, unless a test says
+    /// otherwise — the fetch gate is exercised on its own below.
+    fn all() -> HashSet<TxHash> {
+        (0u8..=255).map(tx).collect()
     }
 
     fn ms(value: u64) -> WeightedTimestamp {
@@ -367,349 +361,371 @@ mod tests {
     #[test]
     fn register_inserts_expectation_with_discovery_timestamp() {
         let mut t = ExpectedCertTracker::new();
-        let w = wave(5);
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            w.clone(),
-            ms(1000),
-        );
+        t.register(shard(1), tx(5), ms(1000));
 
-        assert!(t.is_expected(ShardId::leaf(2, 1), BlockHeight::new(5), &w));
+        assert!(t.is_expected(shard(1), tx(5)));
         assert_eq!(t.expected_len(), 1);
     }
 
     #[test]
-    fn drain_expected_empties_and_returns_wave_ids() {
+    fn drain_expected_empties_and_returns_keys() {
         let mut t = ExpectedCertTracker::new();
-        let w5 = wave(5);
-        let w6 = wave(6);
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            w5.clone(),
-            ms(1000),
-        );
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(6),
-            w6.clone(),
-            ms(1000),
-        );
+        t.register(shard(1), tx(5), ms(1000));
+        t.register(shard(1), tx(6), ms(1000));
 
         let mut drained = t.drain_expected();
         drained.sort();
-        let mut registered = vec![w5.clone(), w6];
+        let mut registered = vec![(shard(1), tx(5)), (shard(1), tx(6))];
         registered.sort();
         assert_eq!(drained, registered);
         assert_eq!(t.expected_len(), 0);
-        assert!(!t.is_expected(ShardId::leaf(2, 1), BlockHeight::new(5), &w5));
+        assert!(!t.is_expected(shard(1), tx(5)));
     }
 
     #[test]
     fn register_is_idempotent_and_does_not_reset_discovery() {
         let mut t = ExpectedCertTracker::new();
-        let w = wave(5);
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            w.clone(),
-            ms(1000),
-        );
-        // Second register at a later timestamp; discovery timestamp must
-        // stick to the earlier value, otherwise the fallback deadline gets
-        // perpetually pushed out.
-        t.register(ShardId::leaf(2, 1), BlockHeight::new(5), w, ms(9999));
-        let fetches = t.check_timeouts(ms(1000 + 5_000));
-        assert_eq!(fetches.len(), 1, "deadline anchors on first register");
-    }
+        t.register(shard(1), tx(5), ms(1_000));
+        // Re-register far later; the original discovery anchor must stand,
+        // so the fallback still fires relative to the first sighting.
+        t.register(shard(1), tx(5), ms(9_000));
 
-    fn tx(seed: u8) -> TxHash {
-        TxHash::from(Hash::from_bytes(&[seed; 32]))
+        assert_eq!(t.expected_len(), 1);
+        let fetches = t.check_timeouts(&all(), ms(6_000));
+        assert_eq!(fetches.len(), 1);
     }
 
     #[test]
     fn register_skipped_when_already_fulfilled() {
         let mut t = ExpectedCertTracker::new();
-        let w = wave(5);
         t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &w,
-            std::iter::once(tx(1)),
-            ms(500),
-        );
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            w.clone(),
-            ms(1000),
+            shard(1),
+            &cert_of(shard(1), 1),
+            std::iter::once(tx(5)),
+            ms(60_000),
         );
 
-        assert!(!t.is_expected(ShardId::leaf(2, 1), BlockHeight::new(5), &w));
+        t.register(shard(1), tx(5), ms(1_000));
+
+        assert!(!t.is_expected(shard(1), tx(5)));
         assert_eq!(t.expected_len(), 0);
     }
 
     #[test]
     fn mark_fulfilled_returns_true_when_clearing_active_expectation() {
         let mut t = ExpectedCertTracker::new();
-        let w = wave(5);
-        t.register(ShardId::leaf(2, 1), BlockHeight::new(5), w.clone(), ms(0));
+        t.register(shard(1), tx(5), ms(1_000));
 
-        let cleared = t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &w,
-            std::iter::once(tx(1)),
-            ms(1000),
-        );
-        assert!(cleared);
+        assert!(t.mark_fulfilled(
+            shard(1),
+            &cert_of(shard(1), 1),
+            std::iter::once(tx(5)),
+            ms(60_000)
+        ));
         assert_eq!(t.expected_len(), 0);
-        assert_eq!(t.fulfilled_len(), 1);
+        assert!(t.is_fulfilled(shard(1), tx(5)));
     }
 
     #[test]
     fn mark_fulfilled_returns_false_when_no_expectation_was_active() {
         let mut t = ExpectedCertTracker::new();
-        let w = wave(5);
-        let cleared = t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &w,
-            std::iter::once(tx(1)),
-            ms(1000),
+        assert!(!t.mark_fulfilled(
+            shard(1),
+            &cert_of(shard(1), 1),
+            std::iter::once(tx(5)),
+            ms(60_000)
+        ));
+        assert!(t.is_fulfilled(shard(1), tx(5)));
+    }
+
+    /// One certificate covers every transaction of its batch, so it clears
+    /// every expectation for those transactions at once. This is the whole
+    /// reason the tracker keys by transaction rather than by certificate.
+    #[test]
+    fn one_certificate_fulfils_every_transaction_it_covers() {
+        let mut t = ExpectedCertTracker::new();
+        t.register(shard(1), tx(1), ms(0));
+        t.register(shard(1), tx(2), ms(0));
+        t.register(shard(1), tx(3), ms(0));
+
+        assert!(t.mark_fulfilled(
+            shard(1),
+            &cert_of(shard(1), 1),
+            [tx(1), tx(2), tx(3)],
+            ms(60_000)
+        ));
+
+        assert_eq!(t.expected_len(), 0);
+        assert!(t.check_timeouts(&all(), ms(50_000)).is_empty());
+    }
+
+    /// A transaction spanning two counterparts needs an outcome from each.
+    /// One shard reporting leaves the other's expectation standing.
+    #[test]
+    fn fulfilment_is_per_shard() {
+        let mut t = ExpectedCertTracker::new();
+        t.register(shard(1), tx(5), ms(0));
+        t.register(shard(2), tx(5), ms(0));
+
+        t.mark_fulfilled(
+            shard(1),
+            &cert_of(shard(1), 1),
+            std::iter::once(tx(5)),
+            ms(60_000),
         );
-        assert!(!cleared);
+
+        assert!(t.is_fulfilled(shard(1), tx(5)));
+        assert!(!t.is_fulfilled(shard(2), tx(5)));
+        assert!(t.is_expected(shard(2), tx(5)));
+        let fetches = t.check_timeouts(&all(), ms(5_000));
+        assert_eq!(fetches, vec![(shard(2), tx(5), false)]);
+    }
+
+    /// A transaction that has reached terminal state locally needs no
+    /// shard's outcome, so terminating it drops every shard's record at
+    /// once rather than one per certificate.
+    #[test]
+    fn on_txs_terminated_drops_every_shards_record_for_the_transaction() {
+        let mut t = ExpectedCertTracker::new();
+        t.mark_fulfilled(
+            shard(1),
+            &cert_of(shard(1), 1),
+            std::iter::once(tx(5)),
+            ms(60_000),
+        );
+        t.mark_fulfilled(
+            shard(2),
+            &cert_of(shard(2), 1),
+            std::iter::once(tx(5)),
+            ms(60_000),
+        );
+        t.mark_fulfilled(
+            shard(1),
+            &cert_of(shard(1), 1),
+            std::iter::once(tx(6)),
+            ms(60_000),
+        );
+
+        t.on_txs_terminated(std::iter::once(tx(5)));
+
+        assert!(!t.is_fulfilled(shard(1), tx(5)));
+        assert!(!t.is_fulfilled(shard(2), tx(5)));
+        assert!(t.is_fulfilled(shard(1), tx(6)), "unrelated tx survives");
         assert_eq!(t.fulfilled_len(), 1);
     }
 
+    /// A second certificate for the same transaction extends the backstop
+    /// rather than shortening it — the record has to outlive every
+    /// certificate it stands in for.
     #[test]
-    fn on_txs_terminated_drops_entry_when_pending_set_drains() {
+    fn a_second_certificate_extends_the_backstop() {
         let mut t = ExpectedCertTracker::new();
-        let w = wave(5);
-        let tx_a = tx(1);
-        let tx_b = tx(2);
         t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &w,
-            [tx_a, tx_b],
-            ms(60_000),
+            shard(1),
+            &cert_of(shard(1), 1),
+            std::iter::once(tx(5)),
+            ms(70_000),
         );
-        assert_eq!(t.fulfilled_len(), 1);
+        t.mark_fulfilled(
+            shard(2),
+            &cert_of(shard(2), 1),
+            std::iter::once(tx(5)),
+            ms(10_000),
+        );
 
-        // Partial drain: entry survives.
-        t.on_txs_terminated(std::iter::once(tx_a));
-        assert_eq!(t.fulfilled_len(), 1);
+        t.prune_fulfilled(ms(60_000));
+        assert_eq!(t.fulfilled_len(), 1, "the later deadline governs");
 
-        // Final drain: entry evicts.
-        t.on_txs_terminated(std::iter::once(tx_b));
+        t.prune_fulfilled(ms(70_000));
         assert_eq!(t.fulfilled_len(), 0);
+    }
+
+    /// A certificate with no outcomes answers for no transaction, so it
+    /// clears no expectation — but it was still admitted, which the
+    /// counterpart sweep needs to know.
+    #[test]
+    fn mark_fulfilled_with_no_outcomes_records_only_the_ingestion() {
+        let mut t = ExpectedCertTracker::new();
+        let cert = cert_of(shard(1), 1);
+        assert!(!t.mark_fulfilled(shard(1), &cert, std::iter::empty(), ms(60_000)));
+        assert_eq!(t.fulfilled_len(), 0);
+        assert!(t.has_ingested(shard(1), &cert));
+    }
+
+    /// The sweep asks whether a terminated partner's settled wave has
+    /// reached us, which is a question about the certificate's own identity
+    /// rather than about any transaction.
+    #[test]
+    fn ingestion_is_recorded_against_the_certificates_own_identity() {
+        let mut t = ExpectedCertTracker::new();
+        let arrived = cert_of(shard(1), 1);
+        let never_sent = cert_of(shard(1), 2);
+        t.mark_fulfilled(shard(1), &arrived, std::iter::once(tx(5)), ms(60_000));
+
+        assert!(t.has_ingested(shard(1), &arrived));
+        assert!(!t.has_ingested(shard(1), &never_sent));
+        // Another shard's certificate of the same shape is a different one.
+        assert!(!t.has_ingested(shard(2), &arrived));
+    }
+
+    /// The ingestion record shares the deadline backstop, so a partner that
+    /// terminated long ago stops occupying memory.
+    #[test]
+    fn prune_fulfilled_evicts_the_ingestion_record_too() {
+        let mut t = ExpectedCertTracker::new();
+        let cert = cert_of(shard(1), 1);
+        t.mark_fulfilled(shard(1), &cert, std::iter::once(tx(5)), ms(1_000));
+
+        t.prune_fulfilled(ms(2_000));
+
+        assert!(!t.has_ingested(shard(1), &cert));
     }
 
     #[test]
     fn check_timeouts_fires_after_initial_window_and_records_request_ts() {
         let mut t = ExpectedCertTracker::new();
-        let w = wave(5);
-        t.register(ShardId::leaf(2, 1), BlockHeight::new(5), w, ms(1_000));
+        t.register(shard(1), tx(5), ms(0));
 
-        // Just before the deadline: no fetch.
-        let fetches = t.check_timeouts(ms(1_000 + 4_999));
-        assert!(fetches.is_empty());
-
-        // Crossing the deadline: exactly one fetch, not a retry.
-        let fetches = t.check_timeouts(ms(1_000 + 5_000));
-        assert_eq!(fetches.len(), 1);
-        assert!(!fetches[0].1);
+        assert!(t.check_timeouts(&all(), ms(4_999)).is_empty());
+        let fetches = t.check_timeouts(&all(), ms(5_000));
+        assert_eq!(fetches, vec![(shard(1), tx(5), false)]);
+        // The request timestamp is recorded, so an immediate re-poll is
+        // inside the retry cooldown and emits nothing.
+        assert!(t.check_timeouts(&all(), ms(5_001)).is_empty());
     }
 
     #[test]
     fn check_timeouts_respects_retry_interval_after_first_request() {
         let mut t = ExpectedCertTracker::new();
-        let w = wave(5);
-        t.register(ShardId::leaf(2, 1), BlockHeight::new(5), w, ms(0));
+        t.register(shard(1), tx(5), ms(0));
+        t.check_timeouts(&all(), ms(5_000));
 
-        // First fetch fires.
-        let _ = t.check_timeouts(ms(5_000));
+        assert!(t.check_timeouts(&all(), ms(14_999)).is_empty());
+        let fetches = t.check_timeouts(&all(), ms(15_000));
+        assert_eq!(fetches, vec![(shard(1), tx(5), true)], "flagged as retry");
+    }
 
-        // Before retry interval elapses: nothing.
-        assert!(t.check_timeouts(ms(5_000 + 9_999)).is_empty());
+    /// A transaction no local wave holds is not ours to fetch — a source
+    /// header names every cross-shard transaction in its block, including
+    /// ones bound elsewhere.
+    #[test]
+    fn check_timeouts_skips_a_transaction_no_local_wave_holds() {
+        let mut t = ExpectedCertTracker::new();
+        t.register(shard(1), tx(5), ms(0));
 
-        // After retry interval: is_retry = true.
-        let fetches = t.check_timeouts(ms(5_000 + 10_000));
-        assert_eq!(fetches.len(), 1);
-        assert!(fetches[0].1);
+        assert!(t.check_timeouts(&HashSet::new(), ms(5_000)).is_empty());
+    }
+
+    /// Holding a fetch back must not consume its cadence: a transaction our
+    /// own block commits after the source's header arrives still gets its
+    /// full initial window, rather than dropping straight into the retry
+    /// interval having never been requested.
+    #[test]
+    fn a_held_back_fetch_keeps_its_initial_window() {
+        let mut t = ExpectedCertTracker::new();
+        t.register(shard(1), tx(5), ms(0));
+
+        // Past the initial deadline, but not yet ours.
+        assert!(t.check_timeouts(&HashSet::new(), ms(5_000)).is_empty());
+
+        // Our block commits it. The very next poll fires, and as an initial
+        // request rather than a retry.
+        let fetches = t.check_timeouts(&HashSet::from([tx(5)]), ms(5_001));
+        assert_eq!(fetches, vec![(shard(1), tx(5), false)]);
     }
 
     #[test]
-    fn retain_if_shard_needed_drops_expectations_whose_shard_is_no_longer_tracked() {
+    fn check_timeouts_fires_at_exactly_the_fallback_deadline() {
         let mut t = ExpectedCertTracker::new();
-        let w1 = wave(5);
-        let w2 = wave(6);
-        t.register(ShardId::leaf(2, 1), BlockHeight::new(5), w1.clone(), ms(0));
-        t.register(ShardId::leaf(2, 2), BlockHeight::new(6), w2.clone(), ms(0));
-
-        let needed: HashSet<ShardId> = std::iter::once(ShardId::leaf(2, 1)).collect();
-        // Advance past the grace window so the unneeded entry is actually pruned.
-        let now = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap() + 1);
-        t.retain_if_shard_needed(&needed, now);
-
-        assert!(t.is_expected(ShardId::leaf(2, 1), BlockHeight::new(5), &w1));
-        assert!(!t.is_expected(ShardId::leaf(2, 2), BlockHeight::new(6), &w2));
+        t.register(shard(1), tx(5), ms(0));
+        let boundary = ms(u64::try_from(EXEC_CERT_FALLBACK_TIMEOUT.as_millis()).unwrap());
+        assert_eq!(t.check_timeouts(&all(), boundary).len(), 1);
     }
 
     #[test]
-    fn retain_if_shard_needed_keeps_recent_unneeded_expectation() {
-        // A remote header can register an expectation before the local block
-        // creating the dependent wave commits — the grace window protects
-        // that race.
+    fn check_timeouts_can_mix_initial_and_retry_emissions_in_one_call() {
         let mut t = ExpectedCertTracker::new();
-        let w = wave(5);
-        t.register(ShardId::leaf(2, 1), BlockHeight::new(5), w.clone(), ms(0));
+        let early = tx(1);
+        let late = tx(2);
+        t.register(shard(1), early, ms(0));
+        // Fire the early one so it enters the retry cadence.
+        t.check_timeouts(&all(), ms(5_000));
+        // Register the second after that, so at t=15_000 the first is due
+        // for a retry and the second for its initial request.
+        t.register(shard(1), late, ms(9_000));
 
-        // Within grace window, no local wave references shard 1 yet —
-        // expectation must still be retained.
-        let needed: HashSet<ShardId> = HashSet::new();
-        t.retain_if_shard_needed(&needed, ms(1_000));
+        let mut fetches = t.check_timeouts(&all(), ms(15_000));
+        fetches.sort();
+        let mut expected = vec![(shard(1), early, true), (shard(1), late, false)];
+        expected.sort();
+        assert_eq!(fetches, expected);
+    }
 
-        assert!(t.is_expected(ShardId::leaf(2, 1), BlockHeight::new(5), &w));
+    #[test]
+    fn retain_if_tx_needed_drops_expectations_whose_tx_is_no_longer_tracked() {
+        let mut t = ExpectedCertTracker::new();
+        t.register(shard(1), tx(5), ms(0));
+
+        // Past the grace window with the tx absent from every local wave.
+        let past_grace = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap() + 1);
+        t.retain_if_tx_needed(&HashSet::new(), past_grace);
+
+        assert_eq!(t.expected_len(), 0);
+    }
+
+    #[test]
+    fn retain_if_tx_needed_keeps_a_tx_a_local_wave_still_awaits() {
+        let mut t = ExpectedCertTracker::new();
+        t.register(shard(1), tx(5), ms(0));
+
+        let past_grace = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap() + 1);
+        t.retain_if_tx_needed(&HashSet::from([tx(5)]), past_grace);
+
+        assert!(t.is_expected(shard(1), tx(5)));
+    }
+
+    /// The grace window covers a remote header arriving ahead of our own
+    /// commit of the same transaction: it is not in any local wave yet, and
+    /// pruning it would leave the certificate unfetched.
+    #[test]
+    fn retain_if_tx_needed_keeps_recent_unneeded_expectation() {
+        let mut t = ExpectedCertTracker::new();
+        t.register(shard(1), tx(5), ms(0));
+
+        t.retain_if_tx_needed(&HashSet::new(), ms(1_000));
+
+        assert!(t.is_expected(shard(1), tx(5)));
+    }
+
+    #[test]
+    fn retain_if_tx_needed_prunes_at_exactly_grace_boundary() {
+        let mut t = ExpectedCertTracker::new();
+        t.register(shard(1), tx(5), ms(0));
+        let boundary = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap());
+        t.retain_if_tx_needed(&HashSet::new(), boundary);
+        assert_eq!(t.expected_len(), 0);
     }
 
     #[test]
     fn prune_fulfilled_drops_entries_past_their_deadline() {
         let mut t = ExpectedCertTracker::new();
-        let w_old = wave(5);
-        let w_fresh = wave(6);
-        // Per-entry deadlines. Old entry's deadline has passed by now_ts;
-        // fresh entry's deadline is in the future.
         t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &w_old,
+            shard(1),
+            &cert_of(shard(1), 1),
             std::iter::once(tx(1)),
-            ms(60_000),
-        );
-        t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(6),
-            &w_fresh,
-            std::iter::once(tx(2)),
-            ms(70_000),
-        );
-
-        t.prune_fulfilled(ms(65_000));
-
-        assert_eq!(t.fulfilled_len(), 1, "fresh entry survives");
-    }
-
-    #[test]
-    fn retro_stamp_updates_zero_entries_and_leaves_others_intact() {
-        let mut t = ExpectedCertTracker::new();
-        let w_zero = wave(5);
-        let w_stamped = wave(6);
-        // Pre-first-commit entry has discovery timestamp ZERO. A
-        // freshly-registered entry at a post-stamp timestamp simulates the
-        // ordinary case the retro-stamp must leave alone.
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            w_zero.clone(),
-            ms(0),
-        );
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(6),
-            w_stamped.clone(),
-            ms(9_000),
-        );
-
-        t.retro_stamp_zero_timestamps(ms(10_000));
-
-        // Just short of the 5_000 ms fallback window from the retro-stamp
-        // point: neither entry fires. Had the zero-stamped entry NOT been
-        // touched, its deadline would have elapsed many seconds ago and a
-        // fallback fetch would have already fired.
-        assert!(t.check_timeouts(ms(14_000 - 1)).is_empty());
-
-        // Cross the stamped entry's deadline first (registered at 9_000,
-        // deadline at 14_000) while the retro-stamped entry is still fresh
-        // (its new anchor is 10_000, deadline 15_000).
-        let fetches = t.check_timeouts(ms(14_000));
-        assert_eq!(fetches.len(), 1);
-        assert_eq!(fetches[0].0, w_stamped);
-
-        // And finally cross the retro-stamped entry's deadline.
-        let fetches = t.check_timeouts(ms(15_000));
-        assert_eq!(fetches.len(), 1);
-        assert_eq!(fetches[0].0, w_zero);
-    }
-
-    #[test]
-    fn on_txs_terminated_cleans_reverse_index_when_entry_evicts() {
-        let mut t = ExpectedCertTracker::new();
-        t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &wave(5),
-            std::iter::once(tx(1)),
-            ms(60_000),
-        );
-        assert_eq!(t.by_tx.len(), 1);
-
-        t.on_txs_terminated(std::iter::once(tx(1)));
-
-        assert_eq!(t.fulfilled_len(), 0);
-        assert!(t.by_tx.is_empty());
-    }
-
-    #[test]
-    fn on_txs_terminated_drains_one_of_many_entries_sharing_a_tx() {
-        // Two fulfilled entries reference the same tx via `by_tx`.
-        // Terminating the shared tx must update both entries' pending sets
-        // and only evict the one whose set actually drains.
-        let mut t = ExpectedCertTracker::new();
-        let shared = tx(1);
-        let only_in_first = tx(2);
-        let w1 = wave(5);
-        let w2 = wave(6);
-        t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &w1,
-            [shared, only_in_first],
-            ms(60_000),
-        );
-        t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(6),
-            &w2,
-            std::iter::once(shared),
-            ms(60_000),
-        );
-
-        t.on_txs_terminated(std::iter::once(shared));
-
-        assert_eq!(t.fulfilled_len(), 1, "first entry survives");
-        assert!(!t.by_tx.contains_key(&shared));
-        assert!(t.by_tx.contains_key(&only_in_first));
-    }
-
-    #[test]
-    fn prune_fulfilled_cleans_reverse_index_for_evicted_entries() {
-        let mut t = ExpectedCertTracker::new();
-        t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &wave(5),
-            [tx(1), tx(2)],
             ms(1_000),
         );
-        assert_eq!(t.by_tx.len(), 2);
+        t.mark_fulfilled(
+            shard(1),
+            &cert_of(shard(1), 1),
+            std::iter::once(tx(2)),
+            ms(60_000),
+        );
 
         t.prune_fulfilled(ms(2_000));
 
-        assert_eq!(t.fulfilled_len(), 0);
-        assert!(t.by_tx.is_empty());
+        assert!(!t.is_fulfilled(shard(1), tx(1)));
+        assert!(t.is_fulfilled(shard(1), tx(2)));
     }
 
     #[test]
@@ -718,9 +734,8 @@ mod tests {
         // equality the entry is dropped.
         let mut t = ExpectedCertTracker::new();
         t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &wave(5),
+            shard(1),
+            &cert_of(shard(1), 1),
             std::iter::once(tx(1)),
             ms(1_000),
         );
@@ -729,135 +744,45 @@ mod tests {
     }
 
     #[test]
-    fn check_timeouts_fires_at_exactly_the_fallback_deadline() {
-        let mut t = ExpectedCertTracker::new();
-        t.register(ShardId::leaf(2, 1), BlockHeight::new(5), wave(5), ms(0));
-        let fetches = t.check_timeouts(ms(5_000));
-        assert_eq!(fetches.len(), 1);
-        assert!(!fetches[0].1);
-    }
-
-    #[test]
-    fn check_timeouts_can_mix_initial_and_retry_emissions_in_one_call() {
-        let mut t = ExpectedCertTracker::new();
-        let w_old = wave(5);
-        let w_new = wave(6);
-        // Old entry crosses initial deadline at 5_000 then is due for retry
-        // at 15_000 (cooldown = 10s). New entry registered at 10_000 crosses
-        // its initial deadline at 15_000.
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            w_old.clone(),
-            ms(0),
-        );
-        let _ = t.check_timeouts(ms(5_000));
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(6),
-            w_new.clone(),
-            ms(10_000),
-        );
-
-        let fetches = t.check_timeouts(ms(15_000));
-        assert_eq!(fetches.len(), 2);
-        let old_is_retry = fetches.iter().find(|(w, _)| *w == w_old).map(|(_, r)| *r);
-        let new_is_retry = fetches.iter().find(|(w, _)| *w == w_new).map(|(_, r)| *r);
-        assert_eq!(old_is_retry, Some(true));
-        assert_eq!(new_is_retry, Some(false));
-    }
-
-    #[test]
-    fn retain_if_shard_needed_prunes_at_exactly_grace_boundary() {
-        // `elapsed_since < EXPECTED_RETENTION_GRACE` — at equality the entry
-        // is pruned.
-        let mut t = ExpectedCertTracker::new();
-        t.register(ShardId::leaf(2, 1), BlockHeight::new(5), wave(5), ms(0));
-        let boundary = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap());
-        t.retain_if_shard_needed(&HashSet::new(), boundary);
-        assert_eq!(t.expected_len(), 0);
-    }
-
-    #[test]
-    fn mark_fulfilled_overwrites_pending_set_when_called_twice_for_same_key() {
-        // Re-fulfillment can occur after the deadline backstop evicts a
-        // tombstone and a duplicate EC arrives — the newer call must
-        // replace the pending set wholesale rather than merge with stale
-        // hashes from the prior fulfillment, otherwise drains will not
-        // empty the new set.
-        let mut t = ExpectedCertTracker::new();
-        let w = wave(5);
-        let original_tx = tx(1);
-        let new_tx = tx(2);
-
-        t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &w,
-            std::iter::once(original_tx),
-            ms(1_000),
-        );
-        t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &w,
-            std::iter::once(new_tx),
-            ms(70_000),
-        );
-
-        // Terminating only the new tx must drain the surviving entry; the
-        // original tx is no longer part of the pending set.
-        t.on_txs_terminated(std::iter::once(new_tx));
-        assert_eq!(t.fulfilled_len(), 0);
-    }
-
-    #[test]
-    fn mark_fulfilled_with_empty_tx_set_persists_until_deadline() {
-        // ECs with empty tx_outcomes leave a tombstone that only the
-        // deadline backstop can evict — there's nothing to drain.
-        let mut t = ExpectedCertTracker::new();
-        t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &wave(5),
-            std::iter::empty(),
-            ms(60_000),
-        );
-        assert_eq!(t.fulfilled_len(), 1);
-
-        t.on_txs_terminated(std::iter::once(tx(1)));
-        assert_eq!(t.fulfilled_len(), 1);
-
-        t.prune_fulfilled(ms(60_000));
-        assert_eq!(t.fulfilled_len(), 0);
-    }
-
-    #[test]
-    fn register_succeeds_after_fulfilled_tombstone_drains() {
-        // Once on_txs_terminated empties a tombstone, a duplicate header
+    fn register_succeeds_after_fulfilled_record_drains() {
+        // Once on_txs_terminated drops a record, a duplicate header
         // arriving later is allowed to re-register the expectation. The
         // deadline backstop on `prune_fulfilled` exists precisely because
-        // this re-registration path can recreate a tombstone whose pending
-        // set never drains again.
+        // this re-registration path can recreate a record that no future
+        // termination will drain.
         let mut t = ExpectedCertTracker::new();
-        let w = wave(5);
         t.mark_fulfilled(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            &w,
-            std::iter::once(tx(1)),
+            shard(1),
+            &cert_of(shard(1), 1),
+            std::iter::once(tx(5)),
             ms(60_000),
         );
-        t.on_txs_terminated(std::iter::once(tx(1)));
+        t.on_txs_terminated(std::iter::once(tx(5)));
 
-        t.register(
-            ShardId::leaf(2, 1),
-            BlockHeight::new(5),
-            w.clone(),
-            ms(70_000),
-        );
+        t.register(shard(1), tx(5), ms(70_000));
 
-        assert!(t.is_expected(ShardId::leaf(2, 1), BlockHeight::new(5), &w));
+        assert!(t.is_expected(shard(1), tx(5)));
+    }
+
+    #[test]
+    fn retro_stamp_updates_zero_entries_and_leaves_others_intact() {
+        let mut t = ExpectedCertTracker::new();
+        let zero_anchored = tx(1);
+        let stamped = tx(2);
+        t.register(shard(1), zero_anchored, WeightedTimestamp::ZERO);
+        t.register(shard(1), stamped, ms(9_000));
+
+        t.retro_stamp_zero_timestamps(ms(10_000));
+
+        // Cross the stamped entry's deadline first (registered at 9_000,
+        // deadline at 14_000) while the retro-stamped entry is still fresh
+        // (its new anchor is 10_000, deadline 15_000).
+        let fetches = t.check_timeouts(&all(), ms(14_000));
+        assert_eq!(fetches, vec![(shard(1), stamped, false)]);
+
+        // And finally cross the retro-stamped entry's deadline.
+        let fetches = t.check_timeouts(&all(), ms(15_000));
+        assert_eq!(fetches, vec![(shard(1), zero_anchored, false)]);
     }
 
     // ─── Property test ──────────────────────────────────────────────────
@@ -870,44 +795,33 @@ mod tests {
     proptest! {
         #[test]
         fn fulfilled_before_deadline_never_triggers_fallback(
-            heights in prop_vec(0u64..20, 1..10),
-            fulfill_indices in prop_vec(0u64..100, 0..10),
+            seeds in prop_vec(0u8..20, 1..10),
+            fulfill_indices in prop_vec(0usize..100, 0..10),
             timeouts in prop_vec(0u64..100_000, 1..10),
         ) {
             let mut t = ExpectedCertTracker::new();
-            let shard = ShardId::leaf(2, 1);
+            let source = shard(1);
 
             // Register expectations at t=0 so deadlines are all crossed
             // well before the latest poll time.
-            let waves: Vec<WaveId> = heights.iter().map(|h| wave(*h)).collect();
-            for w in &waves {
-                t.register(shard, w.block_height(), w.clone(), ms(0));
+            let txs: Vec<TxHash> = seeds.iter().map(|s| tx(*s)).collect();
+            for tx_hash in &txs {
+                t.register(source, *tx_hash, ms(0));
             }
 
-            // Fulfill a subset BEFORE any deadline could fire. Using ms(1)
-            // keeps us well inside the 5_000 ms window.
+            // Fulfill a subset BEFORE any deadline could fire. Using a
+            // 60s deadline keeps the records alive past every poll.
             for idx in &fulfill_indices {
-                let w = &waves[usize::try_from(*idx).unwrap_or(usize::MAX) % waves.len()];
-                t.mark_fulfilled(
-                    shard,
-                    w.block_height(),
-                    w,
-                    std::iter::once(tx(1)),
-                    ms(60_000),
-                );
+                let tx_hash = txs[idx % txs.len()];
+                t.mark_fulfilled(source, &cert_of(source, 1), std::iter::once(tx_hash), ms(60_000));
             }
 
             // Run check_timeouts at a range of later timestamps.
             for now_ms in &timeouts {
-                let now = ms(*now_ms);
-                let fetches = t.check_timeouts(now);
-                // Any fetch emitted must correspond to a still-expected key.
-                for (wave_id, _) in &fetches {
-                    let key = (wave_id.shard_id(), wave_id.block_height(), wave_id.clone());
+                for (fetch_shard, fetch_tx, _) in t.check_timeouts(&all(), ms(*now_ms)) {
                     prop_assert!(
-                        !t.fulfilled.contains_key(&key),
-                        "fallback fetch emitted for a fulfilled key: {:?}",
-                        key
+                        !t.is_fulfilled(fetch_shard, fetch_tx),
+                        "fallback fetch emitted for a fulfilled key: {fetch_shard:?} {fetch_tx:?}"
                     );
                 }
             }

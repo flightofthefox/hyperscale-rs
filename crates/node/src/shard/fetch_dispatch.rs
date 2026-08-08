@@ -122,9 +122,15 @@ where
                 self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Admitted { ids });
             }
             ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
-                self.drive_fetch::<ExecCertBinding>(FetchInput::Admitted {
-                    ids: vec![certificate.wave_id().clone()],
-                });
+                // The certificate answers for every transaction it covers,
+                // so admitting it closes each of those fetches.
+                let shard = certificate.shard_id();
+                let ids: Vec<_> = certificate
+                    .tx_outcomes()
+                    .iter()
+                    .map(|outcome| (shard, outcome.tx_hash()))
+                    .collect();
+                self.drive_fetch::<ExecCertBinding>(FetchInput::Admitted { ids });
             }
             _ => {}
         }

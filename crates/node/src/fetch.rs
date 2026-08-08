@@ -411,23 +411,35 @@ pub struct Partition<T, Id> {
 /// Filtering at the response boundary keeps unsolicited items from
 /// reaching pre-verification state mutations and from racing the legitimate
 /// fetch path.
-pub fn partition_solicited<T, Id, F>(
+///
+/// `extract` yields every id a returned item answers for, which is one id
+/// for most payloads and several for an execution certificate — a single
+/// certificate covers every transaction of its tick, so it settles each
+/// requested transaction it names at once. An item is kept when it answers
+/// for at least one requested id, and unsolicited when it answers for none.
+pub fn partition_solicited<T, Id, F, I>(
     returned: Vec<T>,
     requested: &[Id],
     extract: F,
 ) -> Partition<T, Id>
 where
     Id: Clone + Eq + Hash,
-    F: Fn(&T) -> Id,
+    F: Fn(&T) -> I,
+    I: IntoIterator<Item = Id>,
 {
     let requested_set: HashSet<Id> = requested.iter().cloned().collect();
     let mut kept = Vec::with_capacity(returned.len().min(requested.len()));
     let mut delivered: HashSet<Id> = HashSet::with_capacity(requested.len());
     let mut unsolicited = 0usize;
     for item in returned {
-        let id = extract(&item);
-        if requested_set.contains(&id) {
-            delivered.insert(id);
+        let mut answers_for_a_requested_id = false;
+        for id in extract(&item) {
+            if requested_set.contains(&id) {
+                delivered.insert(id);
+                answers_for_a_requested_id = true;
+            }
+        }
+        if answers_for_a_requested_id {
             kept.push(item);
         } else {
             unsolicited += 1;
@@ -657,9 +669,13 @@ mod partition_tests {
         Arc::new(test_transaction(seed))
     }
 
-    fn tx_hash(tx: &Arc<Transaction>) -> TxHash {
-        tx.hash()
+    fn tx_hash(tx: &Arc<Transaction>) -> [TxHash; 1] {
+        [tx.hash()]
     }
+
+    /// A returned item that answers for several ids at once, the way an
+    /// execution certificate answers for every transaction of its batch.
+    struct Cover(Vec<TxHash>);
 
     #[test]
     fn partition_keeps_only_solicited_and_flags_extras() {
@@ -709,6 +725,36 @@ mod partition_tests {
         assert_eq!(split.missing.len(), 2);
     }
 
+    /// One returned item answering for several requested ids delivers all
+    /// of them. An execution certificate covers every transaction of its
+    /// tick, so a requester that asked for three of them and got one
+    /// certificate is missing nothing.
+    #[test]
+    fn partition_credits_every_id_a_single_item_answers_for() {
+        let a = tx_arc(1).hash();
+        let b = tx_arc(2).hash();
+        let c = tx_arc(3).hash();
+        let split = partition_solicited(vec![Cover(vec![a, b, c])], &[a, b], |item| item.0.clone());
+        assert_eq!(split.kept.len(), 1);
+        assert!(split.missing.is_empty());
+        assert_eq!(split.unsolicited, 0);
+    }
+
+    /// An item covering nothing we asked for is unsolicited, however many
+    /// ids it answers for.
+    #[test]
+    fn partition_counts_a_multi_id_item_covering_nothing_requested() {
+        let wanted = tx_arc(1).hash();
+        let split = partition_solicited(
+            vec![Cover(vec![tx_arc(50).hash(), tx_arc(51).hash()])],
+            &[wanted],
+            |item| item.0.clone(),
+        );
+        assert!(split.kept.is_empty());
+        assert_eq!(split.unsolicited, 1);
+        assert_eq!(split.missing, vec![wanted]);
+    }
+
     #[test]
     fn partition_works_for_non_copy_id_via_clone() {
         // Sanity-check that the generic helper accepts a Clone (non-Copy)
@@ -722,7 +768,7 @@ mod partition_tests {
         let split = partition_solicited(
             vec![a, b],
             &[CompoundId("a".into()), CompoundId("c".into())],
-            |it| it.0.clone(),
+            |it| [it.0.clone()],
         );
         assert_eq!(split.kept.len(), 1);
         assert_eq!(split.unsolicited, 1);
@@ -767,7 +813,7 @@ mod partition_tests {
         let split = partition_solicited(
             vec![Arc::clone(&asked), Arc::clone(&extra)],
             &[asked_hash],
-            |p| p.hash(),
+            |p| [p.hash()],
         );
         assert_eq!(split.kept.len(), 1);
         assert_eq!(split.kept[0].hash(), asked_hash);
