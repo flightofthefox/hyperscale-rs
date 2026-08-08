@@ -9,6 +9,8 @@
 //! limits down on a single node only degrades that node's responsiveness
 //! without reducing the protocol-wide load it has to keep up with.
 
+use crate::WorkInFlight;
+
 /// Hard cap on the number of live transactions any single block can carry.
 ///
 /// Bounds the `tx_hashes` array in [`BlockManifest`](crate::BlockManifest),
@@ -82,6 +84,14 @@ pub const TX_ADMISSION_WORK: u64 = MAX_GAS_LIMIT / (DRAIN_COUNT_SLACK - 1);
 /// bounded the drain by how many transactions it held rather than by
 /// what they would cost to execute and settle.
 ///
+/// Enforced as a bound on *adding* to the drain rather than on the drain
+/// itself. The total advances on commit and retreats on settlement, and
+/// a wave that never certifies retreats nothing — abandonment leaves no
+/// chain artifact to release against — so the total is not something a
+/// chain can always get back under. A block that adds no transactions
+/// stays valid whatever the total reads, which keeps the blocks that
+/// bring it down from being the ones refused.
+///
 /// Sized like the count it replaces: a full pipeline of blocks
 /// (commit → execute → certify) at a representative gas limit, so a
 /// shard settling normally never feels it. Every number here is a
@@ -96,6 +106,24 @@ const _: () = assert!(
     MAX_DRAIN_WORK / TX_ADMISSION_WORK <= DRAIN_COUNT_SLACK * 3 * MAX_TXS_PER_BLOCK as u64,
     "the work budget must bound the drain's transaction count, not only its weight",
 );
+
+/// Whether a block carrying `tx_count` transactions, and leaving the
+/// drain owing `work_in_flight`, is one a validator may vote for.
+///
+/// A block that adds nothing to the drain is always admissible, whatever
+/// the total reads. Those are the blocks that carry the certificates that
+/// bring it down, so refusing them is refusing the only way back under
+/// the budget — and the total is not always recoverable, because a wave
+/// that never certifies strands its reservation with nothing to release
+/// it against.
+///
+/// The bound is therefore on growth, not on level, and it is still a real
+/// bound: an over-budget drain admits no new work at all, and an
+/// under-budget one can be pushed over by at most a single block.
+#[must_use]
+pub const fn drain_admits_block(work_in_flight: WorkInFlight, tx_count: usize) -> bool {
+    tx_count == 0 || work_in_flight.inner() <= MAX_DRAIN_WORK
+}
 
 /// The largest execution ceiling a transaction may sign for.
 ///
@@ -133,3 +161,27 @@ pub const MAX_GAS_LIMIT: u64 = 1_000_000;
 /// must be the same constant: the view must never enter a round where no
 /// proposal extending an adoptable QC would be wire-valid.
 pub const MAX_ROUND_GAP: u64 = 100_000;
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_DRAIN_WORK, WorkInFlight, drain_admits_block};
+
+    /// The bound bites on growth: a block bringing new work while the
+    /// drain already owes more than the budget is refused.
+    #[test]
+    fn an_over_budget_drain_admits_no_new_work() {
+        let over = WorkInFlight::new(MAX_DRAIN_WORK + 1);
+        assert!(!drain_admits_block(over, 1));
+        assert!(drain_admits_block(WorkInFlight::new(MAX_DRAIN_WORK), 1));
+    }
+
+    /// And it never bites on a block that adds nothing. Those carry the
+    /// certificates that release the drain, so refusing them would leave a
+    /// chain that touched the ceiling unable to come back under it — and
+    /// the total is not always recoverable in any case, since a wave that
+    /// never certifies strands its reservation for good.
+    #[test]
+    fn a_block_adding_nothing_is_admitted_at_any_total() {
+        assert!(drain_admits_block(WorkInFlight::new(u64::MAX), 0));
+    }
+}

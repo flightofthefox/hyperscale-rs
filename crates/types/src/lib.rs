@@ -136,7 +136,7 @@ pub use shard::header::{BlockHeader, BlockHeaderParentQcMismatch, BlockHeaderVer
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
     MAX_DRAIN_WORK, MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT, MAX_PROVISIONS_PER_BLOCK,
-    MAX_ROUND_GAP, MAX_TXS_PER_BLOCK, TX_ADMISSION_WORK,
+    MAX_ROUND_GAP, MAX_TXS_PER_BLOCK, TX_ADMISSION_WORK, drain_admits_block,
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};

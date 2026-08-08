@@ -64,9 +64,9 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_DRAIN_WORK,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate,
-    ShardForkProof, TopologySchedule, Verifiable, Verified,
+    BlockHash, BlockHeader, BlockManifest, CertifiedBlock, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, QuorumCertificate, ShardForkProof,
+    TopologySchedule, Verifiable, Verified, drain_admits_block,
 };
 
 use super::ShardParticipation;
@@ -373,12 +373,29 @@ impl ShardParticipation {
         // total is chain-derived, so every replica reaches the same
         // verdict at every height instead of one that drifts with local
         // pipeline position.
-        if header.work_in_flight().inner() > MAX_DRAIN_WORK {
+        //
+        // The rule is that a block may not *add* to a drain already over
+        // budget, not that an over-budget drain is invalid. A block
+        // carrying no transactions adds nothing, so it stays valid — and
+        // it has to, because those are the blocks that bring the total
+        // back down. Refusing them would mean a chain that touched the
+        // ceiling could never leave it.
+        //
+        // That distinction is important for a second reason. The total
+        // advances on commit and retreats on settlement, and a wave that
+        // never certifies retreats nothing: a counterpart shard
+        // terminating under it, or a gate rejection, strands its
+        // reservation with no chain artifact to release against. Stranded
+        // work therefore lowers this shard's admission ceiling for good,
+        // and the failure that has to stay impossible is the chain
+        // stopping rather than the ceiling dropping.
+        if !drain_admits_block(header.work_in_flight(), total_tx_count) {
             tracing::warn!(
                 block_hash = ?header.hash(),
                 height = header.height().inner(),
                 work_in_flight = header.work_in_flight().inner(),
-                "Rejecting block whose drain exceeds the work budget"
+                tx_count = total_tx_count,
+                "Rejecting block that adds to a drain already over the work budget"
             );
             return vec![];
         }
