@@ -43,20 +43,12 @@ impl ShardParticipation {
         let (ancestor_certified, ancestor_txs, _) =
             self.shard_coordinator.collect_qc_chain_hashes(parent);
         let max_txs = MAX_TXS_PER_BLOCK + ancestor_txs.len();
-        // Reshape-boundary quiesce: in a shard's final epoch before it
-        // terminates at a split or merge, stop selecting transactions that
-        // can't settle before the cut. `None` in steady state, so the
-        // mempool filter is inert.
-        let quiesce = self.shard_coordinator.quiesce_cut(sched);
         // The budget reads the chain, not a local claim set: the parent
         // header carries what this shard still owes in work.
         let in_flight = self.shard_coordinator.proposal_parent_in_flight();
-        let ready_txs = self.mempool_coordinator.ready_transactions(
-            max_txs,
-            in_flight.inner(),
-            self.now,
-            quiesce,
-        );
+        let ready_txs =
+            self.mempool_coordinator
+                .ready_transactions(max_txs, in_flight.inner(), self.now);
         let finalized_waves = self
             .execution_coordinator
             .get_finalized_waves(&ancestor_certified);

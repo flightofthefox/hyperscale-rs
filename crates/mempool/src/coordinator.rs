@@ -36,9 +36,8 @@ use hyperscale_core::{Action, FetchAbandon, FetchRequest, ProtocolEvent};
 use hyperscale_metrics::{record_expected_tx_dropped, record_transaction_aborted};
 use hyperscale_types::{
     BlockHeight, CertifiedBlock, CompletedRecovery, ForkFence, LocalTimestamp, MAX_DRAIN_WORK,
-    MAX_GAS_LIMIT, MessageClass, QUIESCE_MARGIN, QuiesceCut, RETENTION_HORIZON, ShardId,
-    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, Verified,
-    WeightedTimestamp,
+    MAX_GAS_LIMIT, MessageClass, RETENTION_HORIZON, ShardId, TopologySnapshot, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, Verified, WeightedTimestamp,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -959,7 +958,6 @@ impl MempoolCoordinator {
         max_count: usize,
         in_flight: u64,
         now: LocalTimestamp,
-        quiesce: Option<QuiesceCut>,
     ) -> Vec<Arc<Verified<Transaction>>> {
         // `max_count` is the wire cap on a block's transaction list, not
         // a packing bound: what decides how far selection goes is the
@@ -969,13 +967,6 @@ impl MempoolCoordinator {
         let Some(mut budget) = MAX_DRAIN_WORK.checked_sub(in_flight) else {
             return Vec::new();
         };
-
-        // The reshape quiesce is a property of the boundary, not of any
-        // transaction: inside the margin nothing this shard could select
-        // would settle before its last content block.
-        if quiesce.is_some_and(|cut| cut.now_wt.plus(QUIESCE_MARGIN) >= cut.cut_wt) {
-            return Vec::new();
-        }
 
         let min_dwell = self.config.min_dwell_time;
         let mut selected = Vec::new();
@@ -1948,16 +1939,6 @@ mod tests {
     // Backpressure Tests
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Build a `Transaction` whose write set is a single
-    /// index-derived prefix, so callers can mint up to a block's worth of
-    /// distinct, non-conflicting txs by feeding sequential indices.
-    fn unique_test_tx(idx: usize) -> Transaction {
-        let seed = idx.to_le_bytes();
-        let mut prefix = [0u8; 16];
-        prefix[..seed.len()].copy_from_slice(&seed);
-        test_transaction_with_prefixes(&seed, &[], &[prefix])
-    }
-
     /// Create a topology with 2 shards for cross-shard testing
     fn make_cross_shard_topology() -> TopologySnapshot {
         TestCommittee::new(8, 42).topology_snapshot(2)
@@ -1990,97 +1971,6 @@ mod tests {
         )
     }
 
-    /// The quiesce holds the whole shard, not a class of transaction: a
-    /// terminating shard inside the margin selects nothing, because the
-    /// margin is the settlement round and nothing it could select would
-    /// finish inside it.
-    #[test]
-    fn ready_transactions_quiesce_holds_every_class_inside_the_margin() {
-        let topology_snapshot = make_cross_shard_topology();
-        let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
-
-        mempool.on_submit_transaction(
-            &topology_snapshot,
-            Arc::new(verified(test_cross_shard_transaction(10))),
-            LocalTimestamp::ZERO,
-        );
-        mempool.on_submit_transaction(
-            &topology_snapshot,
-            Arc::new(verified(unique_test_tx(99))),
-            LocalTimestamp::ZERO,
-        );
-
-        // Past the dwell time so both are eligible.
-        let now = LocalTimestamp::from_millis(500);
-
-        assert_eq!(
-            mempool.ready_transactions(10, 0, now, None).len(),
-            2,
-            "without a cut the quiesce is inert",
-        );
-
-        // A cut 10s out is inside the settlement round: nothing selected.
-        let inside = QuiesceCut {
-            now_wt: WeightedTimestamp::from_millis(0),
-            cut_wt: WeightedTimestamp::from_millis(10_000),
-        };
-        assert!(
-            mempool
-                .ready_transactions(10, 0, now, Some(inside))
-                .is_empty(),
-            "inside the margin a terminating shard selects nothing",
-        );
-
-        // A cut a full round clear: both classes flow again.
-        let clear = QuiesceCut {
-            now_wt: WeightedTimestamp::from_millis(0),
-            cut_wt: WeightedTimestamp::from_millis(600_000),
-        };
-        assert_eq!(
-            mempool.ready_transactions(10, 0, now, Some(clear)).len(),
-            2,
-            "clear of the margin the shard proposes normally",
-        );
-    }
-
-    /// The quiesce is a property of the boundary, not of configuration:
-    /// a transaction that cannot settle before the cut is not selected,
-    /// on every replica, without anyone opting in.
-    #[test]
-    fn quiesce_holds_work_that_cannot_settle_before_the_cut() {
-        let topology_snapshot = make_cross_shard_topology();
-        let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
-        let cross = test_cross_shard_transaction(10);
-        mempool.on_submit_transaction(
-            &topology_snapshot,
-            Arc::new(verified(cross)),
-            LocalTimestamp::ZERO,
-        );
-
-        let now = LocalTimestamp::from_millis(500);
-        let at_the_cut = QuiesceCut {
-            now_wt: WeightedTimestamp::from_millis(9_999),
-            cut_wt: WeightedTimestamp::from_millis(10_000),
-        };
-        assert!(
-            mempool
-                .ready_transactions(10, 0, now, Some(at_the_cut))
-                .is_empty(),
-            "a cross-shard transaction one millisecond from the cut cannot settle",
-        );
-
-        // The same transaction, a full settlement round clear of the cut.
-        let clear = QuiesceCut {
-            now_wt: WeightedTimestamp::from_millis(0),
-            cut_wt: WeightedTimestamp::from_millis(600_000),
-        };
-        assert_eq!(
-            mempool.ready_transactions(10, 0, now, Some(clear)).len(),
-            1,
-            "with the whole window ahead of it, the same transaction is selectable",
-        );
-    }
-
     #[test]
     fn test_backpressure_allows_txns_below_limit() {
         // A few txs is far below the work budget, so ready_transactions
@@ -2107,7 +1997,7 @@ mod tests {
         );
 
         // Below limit: all TXs should be returned
-        let ready = mempool.ready_transactions(10, 0, read_at, None);
+        let ready = mempool.ready_transactions(10, 0, read_at);
         assert_eq!(ready.len(), 2, "All TXs should be allowed below limit");
     }
 
@@ -2124,7 +2014,7 @@ mod tests {
         );
 
         // The drain the chain reports is already at the cap.
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::ZERO, None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::ZERO);
         assert!(
             ready.is_empty(),
             "No TXs should be returned at in-flight limit"
@@ -2157,7 +2047,7 @@ mod tests {
         );
 
         // Not at limit: all TXs should be allowed
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::ZERO, None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::ZERO);
         assert_eq!(ready.len(), 2);
     }
 
@@ -2178,7 +2068,7 @@ mod tests {
         let tx = test_transaction(1);
         mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), now);
 
-        let ready = mempool.ready_transactions(10, 0, now, None);
+        let ready = mempool.ready_transactions(10, 0, now);
         assert_eq!(ready.len(), 1, "Zero dwell time should select immediately");
     }
 
@@ -2193,7 +2083,7 @@ mod tests {
         mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), submitted_at);
 
         // At t=10.1s — not yet eligible (100ms < 150ms)
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_100), None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_100));
         assert_eq!(
             ready.len(),
             0,
@@ -2201,7 +2091,7 @@ mod tests {
         );
 
         // At t=10.15s — eligible (150ms >= 150ms)
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_150), None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_150));
         assert_eq!(ready.len(), 1, "Should select after 150ms default dwell");
     }
 
@@ -2220,11 +2110,11 @@ mod tests {
         mempool.on_submit_transaction(&topology_snapshot, Arc::new(verified(tx)), submitted_at);
 
         // Still at t=10s — dwell time not met
-        let ready = mempool.ready_transactions(10, 0, submitted_at, None);
+        let ready = mempool.ready_transactions(10, 0, submitted_at);
         assert_eq!(ready.len(), 0, "Should not select before dwell time");
 
         // Advance to t=10.3s — still not enough
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_300), None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_300));
         assert_eq!(
             ready.len(),
             0,
@@ -2232,7 +2122,7 @@ mod tests {
         );
 
         // Advance to t=10.5s — exactly at dwell time
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_500), None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(10_500));
         assert_eq!(ready.len(), 1, "Should select after dwell time elapses");
     }
 
@@ -2262,11 +2152,11 @@ mod tests {
         );
 
         // At t=1.4s — tx1 has 400ms dwell (eligible), tx2 has 100ms (not eligible).
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(1_400), None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(1_400));
         assert_eq!(ready.len(), 1, "Only tx1 should be eligible");
 
         // At t=1.5s — both eligible
-        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(1_500), None);
+        let ready = mempool.ready_transactions(10, 0, LocalTimestamp::from_millis(1_500));
         assert_eq!(ready.len(), 2, "Both should be eligible");
     }
 
@@ -2552,13 +2442,13 @@ mod tests {
         let now = LocalTimestamp::from_millis(1_000);
 
         // An idle chain offers everything the block can hold.
-        let idle = mempool.ready_transactions(10, 0, now, None);
+        let idle = mempool.ready_transactions(10, 0, now);
         assert_eq!(idle.len(), 8, "an undrained budget selects freely");
 
         // Halfway to the budget, only what fits is offered.
         let each = idle[0].work();
         let room_for_three = MAX_DRAIN_WORK - each * 3;
-        let squeezed = mempool.ready_transactions(10, room_for_three, now, None);
+        let squeezed = mempool.ready_transactions(10, room_for_three, now);
         assert_eq!(
             squeezed.len(),
             3,
@@ -2568,7 +2458,7 @@ mod tests {
         // At the budget it offers nothing, whatever is pooled.
         assert!(
             mempool
-                .ready_transactions(10, MAX_DRAIN_WORK, now, None)
+                .ready_transactions(10, MAX_DRAIN_WORK, now)
                 .is_empty(),
             "a shard at its budget admits nothing until the drain clears"
         );
@@ -2591,16 +2481,14 @@ mod tests {
         }
         let now = LocalTimestamp::from_millis(1_000);
 
-        let each = mempool.ready_transactions(10, 0, now, None)[0].work();
+        let each = mempool.ready_transactions(10, 0, now)[0].work();
         assert!(
             each >= TX_ADMISSION_WORK,
             "every transaction costs the fixed charge whatever it declared: {each}"
         );
         let room_for_two = MAX_DRAIN_WORK - each * 2;
         assert_eq!(
-            mempool
-                .ready_transactions(10, room_for_two, now, None)
-                .len(),
+            mempool.ready_transactions(10, room_for_two, now).len(),
             2,
             "the fixed charge is what makes the budget count them"
         );
@@ -2624,7 +2512,7 @@ mod tests {
         assert_eq!(mempool.parked_count(), 1);
         assert!(
             mempool
-                .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000), None)
+                .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000))
                 .is_empty()
         );
 
@@ -2639,7 +2527,7 @@ mod tests {
             LocalTimestamp::ZERO,
         );
         let ready: Vec<TxHash> = mempool
-            .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000), None)
+            .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000))
             .iter()
             .map(|tx| tx.hash())
             .collect();
@@ -2655,7 +2543,7 @@ mod tests {
         mempool.on_engagement_evidence(payer_shard, [parked_hash]);
         assert_eq!(mempool.parked_count(), 0);
         let mut ready: Vec<TxHash> = mempool
-            .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000), None)
+            .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000))
             .iter()
             .map(|tx| tx.hash())
             .collect();
@@ -2682,7 +2570,7 @@ mod tests {
 
         assert_eq!(mempool.parked_count(), 0);
         let ready: Vec<TxHash> = mempool
-            .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000), None)
+            .ready_transactions(10, 0, LocalTimestamp::from_millis(1_000))
             .iter()
             .map(|tx| tx.hash())
             .collect();

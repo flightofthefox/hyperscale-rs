@@ -71,26 +71,6 @@ pub enum SplitAtBoundary {
     Children(ShardId, ShardId),
 }
 
-/// A reshape-boundary quiesce window for a shard in its final epoch.
-///
-/// `cut_wt` is the weighted timestamp at which the shard terminates — a
-/// split or a merge — at the end of the current epoch window; `now_wt` is
-/// the proposer's current chain anchor. A proposer stops selecting a
-/// transaction once `now_wt + margin` reaches `cut_wt` — cross-shard work
-/// needs a wider margin (a full 2PC round) than single-shard, so a
-/// transaction selected before the cut can still settle on every shard by
-/// the terminal block. Pure proposer policy: a non-compliant proposer's
-/// late transactions simply land in the counterpart abort backstop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QuiesceCut {
-    /// Where the proposer's chain sits on the weighted-time grid: the
-    /// committee anchor of the block it would build next, so the window this
-    /// cut closes is the one that committee is drawn from.
-    pub now_wt: WeightedTimestamp,
-    /// The weighted timestamp at which the shard splits.
-    pub cut_wt: WeightedTimestamp,
-}
-
 /// Result of resolving a weighted timestamp against the retained window.
 pub enum ScheduleLookup<'a> {
     /// The epoch's committee is retained.

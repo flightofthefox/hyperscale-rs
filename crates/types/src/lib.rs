@@ -177,16 +177,16 @@ pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};
 pub use time::stopwatch::Stopwatch;
 pub use time::timeouts::{
-    EPOCH_DURATION, MAX_PROGRESS_WAIT, QUIESCE_MARGIN, RATIFY_ROUND_TIMEOUT,
-    REMOTE_HEADER_RETENTION, RETENTION_HORIZON, SKIP_TIMEOUT, VIEW_CHANGE_TIMEOUT,
-    VIEW_CHANGE_TIMEOUT_INCREMENT, VIEW_CHANGE_TIMEOUT_MAX, WAVE_TIMEOUT,
+    EPOCH_DURATION, MAX_PROGRESS_WAIT, RATIFY_ROUND_TIMEOUT, REMOTE_HEADER_RETENTION,
+    RETENTION_HORIZON, SKIP_TIMEOUT, VIEW_CHANGE_TIMEOUT, VIEW_CHANGE_TIMEOUT_INCREMENT,
+    VIEW_CHANGE_TIMEOUT_MAX, WAVE_TIMEOUT,
 };
 pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::awaiting::AwaitingTopologyBuffer;
 pub use topology::genesis::GenesisValidators;
 pub use topology::network::{NetworkDefinition, UnknownNetwork};
 pub use topology::schedule::{
-    QuiesceCut, RoutingCommittees, ScheduleLookup, SplitAtBoundary, TopologySchedule,
+    RoutingCommittees, ScheduleLookup, SplitAtBoundary, TopologySchedule,
 };
 pub use topology::settled_set::{SettledSetVerdict, SettledWaveSet, settled_set_verdict};
 pub use topology::shard_prefix::shard_prefix_path;
