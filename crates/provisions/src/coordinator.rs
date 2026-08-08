@@ -953,12 +953,11 @@ impl ProvisionCoordinator {
 mod tests {
     use hyperscale_core::FetchRequest;
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
-        BlockHeader, CertificateRoot, ChainOrigin, Hash, LocalReceiptRoot, MerkleInclusionProof,
-        NetworkDefinition, ProposerTimestamp, ProvisionEntry, ProvisionTxRoot, ProvisionsRoot,
-        QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot,
-        TopologySnapshot, TransactionRoot, TxHash, ValidatorId, ValidatorSet, Verifiable,
-        WeightedTimestamp, WitnessSources, WorkInFlight, compute_merkle_root,
+        AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Hash,
+        MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
+        ProvisionTxRoot, QuorumCertificate, RevealChain, Round, ShardId, SignerBitfield, StateRoot,
+        TopologySnapshot, TxHash, ValidatorId, ValidatorSet, Verifiable, WeightedTimestamp,
+        WitnessSources, compute_merkle_root,
     };
     use proptest::bool::ANY as ANY_BOOL;
     use proptest::collection::vec as prop_vec;
@@ -1015,31 +1014,25 @@ mod tests {
         let (header, qc) = Arc::unwrap_or_clone(header_arc).into_inner().into_parts();
         let mut roots = header.provision_tx_roots().clone();
         roots.insert(local_shard, root);
-        let header = BlockHeader::new(
-            header.shard_id(),
-            header.height(),
-            header.parent_block_hash(),
-            header.parent_qc().clone(),
-            header.proposer(),
-            header.timestamp(),
-            header.round(),
-            header.is_fallback(),
-            header.state_root(),
-            header.transaction_root(),
-            header.certificate_root(),
-            header.local_receipt_root(),
-            header.provision_root(),
-            header.cross_shard_txs().clone(),
-            roots,
-            header.work_in_flight(),
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: header.shard_id(),
+            height: header.height(),
+            parent_block_hash: header.parent_block_hash(),
+            parent_qc: header.parent_qc().clone().into(),
+            proposer: header.proposer(),
+            timestamp: header.timestamp(),
+            round: header.round(),
+            is_fallback: header.is_fallback(),
+            state_root: header.state_root(),
+            transaction_root: header.transaction_root(),
+            certificate_root: header.certificate_root(),
+            local_receipt_root: header.local_receipt_root(),
+            provision_root: header.provision_root(),
+            cross_shard_txs: header.cross_shard_txs().clone(),
+            provision_tx_roots: roots,
+            work_in_flight: header.work_in_flight(),
+            ..Default::default()
+        });
         Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
             header, qc,
         )))
@@ -1923,33 +1916,18 @@ mod tests {
                 )
             })
             .collect();
-        let header = BlockHeader::new(
-            shard,
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
             height,
-            BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::leaf(2, 0), ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(1000 + height.inner()),
-            Round::INITIAL,
-            false,
-            StateRoot::from_raw(Hash::from_bytes(
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_qc: QuorumCertificate::genesis(ShardId::leaf(2, 0), ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(1000 + height.inner()),
+            state_root: StateRoot::from_raw(Hash::from_bytes(
                 format!("root_{shard}_{height}").as_bytes(),
             )),
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
             provision_tx_roots,
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+            ..Default::default()
+        });
         let header_hash = header.hash();
         let qc = QuorumCertificate::new(
             header_hash,
@@ -1991,31 +1969,14 @@ mod tests {
     /// Make a minimal `Block` at the given height for `on_block_committed` calls.
     /// The block's `parent_qc` weighted timestamp is `height * TEST_BLOCK_INTERVAL_MS`.
     fn make_block(height: BlockHeight) -> CertifiedBlock {
-        let header = BlockHeader::new(
-            ShardId::leaf(2, 0),
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: ShardId::leaf(2, 0),
             height,
-            BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
-            genesis_qc_at(ShardId::leaf(2, 0), height.inner() * TEST_BLOCK_INTERVAL_MS),
-            ValidatorId::new(0),
-            ProposerTimestamp::ZERO,
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
+            parent_qc: genesis_qc_at(ShardId::leaf(2, 0), height.inner() * TEST_BLOCK_INTERVAL_MS)
+                .into(),
+            ..Default::default()
+        });
         let block = Block::Live {
             header,
             transactions: Arc::new(Vec::new()),
@@ -2302,31 +2263,14 @@ mod tests {
         height: BlockHeight,
         provisions: Arc<Provisions>,
     ) -> CertifiedBlock {
-        let header = BlockHeader::new(
-            ShardId::leaf(2, 0),
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: ShardId::leaf(2, 0),
             height,
-            BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
-            genesis_qc_at(ShardId::leaf(2, 0), height.inner() * TEST_BLOCK_INTERVAL_MS),
-            ValidatorId::new(0),
-            ProposerTimestamp::ZERO,
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
+            parent_qc: genesis_qc_at(ShardId::leaf(2, 0), height.inner() * TEST_BLOCK_INTERVAL_MS)
+                .into(),
+            ..Default::default()
+        });
         let provisions_verifiable: Arc<Verifiable<Provisions>> =
             Arc::new(Arc::unwrap_or_clone(provisions).into());
         let block = Block::Live {

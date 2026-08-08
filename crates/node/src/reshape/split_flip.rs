@@ -57,13 +57,10 @@ pub fn split_genesis_from_terminal(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
-        CertificateRoot, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, SplitChildRoots,
-        StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp, WorkInFlight,
+        AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, Hash, QuorumCertificate,
+        Round, ShardId, SignerBitfield, SplitChildRoots, StateRoot, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -75,31 +72,17 @@ mod tests {
         state_root: StateRoot,
         pair: Option<SplitChildRoots>,
     ) -> BlockHeader {
-        BlockHeader::new(
-            shard,
+        BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
             height,
-            BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            parent_qc,
-            ValidatorId::new(2),
-            ProposerTimestamp::ZERO,
-            Round::new(7),
-            false,
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_qc: parent_qc.into(),
+            proposer: ValidatorId::new(2),
+            round: Round::new(7),
             state_root,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            pair,
-            None,
-            ShardLoad::ZERO,
-        )
+            split_child_roots: pair,
+            ..Default::default()
+        })
     }
 
     fn certifying_qc(terminal: &BlockHeader, wt: u64) -> QuorumCertificate {

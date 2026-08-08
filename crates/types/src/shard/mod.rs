@@ -65,41 +65,24 @@ mod tests {
     use super::*;
     use crate::test_utils::{install_stub_vm_statics, stub_transaction, test_validity_range};
     use crate::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-        BlockHeight, CertificateRoot, ChainOrigin, ExecutionCertificate, ExecutionOutcome,
-        Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
-        ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot, TxHash, TxOutcome,
-        ValidatorId, Verifiable, Verified, WeightedTimestamp, WorkInFlight,
+        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot,
+        ChainOrigin, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash,
+        GlobalReceiptRoot, Hash, ProposerTimestamp, QuorumCertificate, ShardId, SignerBitfield,
+        StateRoot, TickId, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+        WeightedTimestamp,
     };
 
     #[test]
     fn test_block_header_hash_deterministic() {
-        let header = BlockHeader::new(
-            ShardId::leaf(1, 0),
-            BlockHeight::new(1),
-            BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(1_234_567_890),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: ShardId::leaf(1, 0),
+            height: BlockHeight::new(1),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            ..Default::default()
+        });
 
         let hash1 = header.hash();
         let hash2 = header.hash();
@@ -229,7 +212,7 @@ mod tests {
 
     #[test]
     fn certified_block_decode_rejects_qc_block_hash_mismatch() {
-        use crate::{CertifiedBlock, ShardLoad};
+        use crate::CertifiedBlock;
 
         // Forge a non-genesis block paired with a genesis QC. Without the
         // pairing check at decode this slips past the synced-block apply
@@ -243,31 +226,28 @@ mod tests {
         .into_sealed()
         .into_live(Arc::new(Vec::new()));
         if let Block::Live { ref mut header, .. } = bad_block {
-            *header = BlockHeader::new(
-                header.shard_id(),
-                BlockHeight::new(7),
-                header.parent_block_hash(),
-                header.parent_qc().clone(),
-                header.proposer(),
-                header.timestamp(),
-                header.round(),
-                header.is_fallback(),
-                header.state_root(),
-                header.transaction_root(),
-                header.certificate_root(),
-                header.local_receipt_root(),
-                header.provision_root(),
-                header.cross_shard_txs().clone(),
-                header.provision_tx_roots().clone(),
-                header.work_in_flight(),
-                header.beacon_witness_root(),
-                header.beacon_witness_leaf_count(),
-                header.beacon_witness_base(),
-                RevealChain::ZERO,
-                None,
-                None,
-                ShardLoad::ZERO,
-            );
+            *header = BlockHeader::new(BlockHeaderParts {
+                shard_id: header.shard_id(),
+                height: BlockHeight::new(7),
+                parent_block_hash: header.parent_block_hash(),
+                parent_qc: header.parent_qc().clone().into(),
+                proposer: header.proposer(),
+                timestamp: header.timestamp(),
+                round: header.round(),
+                is_fallback: header.is_fallback(),
+                state_root: header.state_root(),
+                transaction_root: header.transaction_root(),
+                certificate_root: header.certificate_root(),
+                local_receipt_root: header.local_receipt_root(),
+                provision_root: header.provision_root(),
+                cross_shard_txs: header.cross_shard_txs().clone(),
+                provision_tx_roots: header.provision_tx_roots().clone(),
+                work_in_flight: header.work_in_flight(),
+                beacon_witness_root: header.beacon_witness_root(),
+                beacon_witness_leaf_count: header.beacon_witness_leaf_count(),
+                beacon_witness_base: header.beacon_witness_base(),
+                ..Default::default()
+            });
         }
         let genesis_qc = QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT);
         let bytes = hbor_to_vec(&CertifiedBlockWire {

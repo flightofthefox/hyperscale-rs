@@ -565,10 +565,9 @@ pub enum RecordResult {
 mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, CertificateRoot, ChainOrigin, Hash,
-        LocalReceiptRoot, NetworkDefinition, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
-        RevealChain, ShardId, ShardLoad, Signer, StateRoot, TransactionRoot, ValidatorId,
-        ValidatorInfo, ValidatorSet, WorkInFlight, verify_shard_vote_equivocation,
+        BlockHeaderParts, ChainOrigin, Hash, NetworkDefinition, ProposerTimestamp,
+        QuorumCertificate, ShardId, Signer, ValidatorId, ValidatorInfo, ValidatorSet,
+        verify_shard_vote_equivocation,
     };
 
     use super::*;
@@ -586,31 +585,15 @@ mod tests {
     }
 
     fn make_header_at_round(height: BlockHeight, round: Round) -> BlockHeader {
-        BlockHeader::new(
-            ShardId::ROOT,
+        BlockHeader::new(BlockHeaderParts {
             height,
-            BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(1_234_567_890),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
             round,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            ..Default::default()
+        })
     }
 
     #[test]

@@ -424,12 +424,11 @@ mod tests {
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
-        BlockHeader, CertificateRoot, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
-        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
-        ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot, TxHash, TxOutcome,
-        ValidatorId, Verifiable, WeightedTimestamp, WitnessSources, WorkInFlight,
+        AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, CertificateRoot,
+        ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, Finalization,
+        GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProposerTimestamp,
+        QuorumCertificate, Round, ShardId, SignerBitfield, TickId, TransactionRoot, TxHash,
+        TxOutcome, Verifiable, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -437,31 +436,14 @@ mod tests {
     const HEIGHT: BlockHeight = BlockHeight::new(1);
 
     fn header() -> BlockHeader {
-        BlockHeader::new(
-            ShardId::ROOT,
-            HEIGHT,
-            BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(1_000),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+        BlockHeader::new(BlockHeaderParts {
+            height: HEIGHT,
+            parent_block_hash: BlockHash::ZERO,
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(1_000),
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            ..Default::default()
+        })
     }
 
     /// Rebuild a header with selected roots overridden.
@@ -471,31 +453,25 @@ mod tests {
         certificate_root: Option<CertificateRoot>,
         local_receipt_root: Option<LocalReceiptRoot>,
     ) -> BlockHeader {
-        BlockHeader::new(
-            h.shard_id(),
-            h.height(),
-            h.parent_block_hash(),
-            h.parent_qc().clone(),
-            h.proposer(),
-            h.timestamp(),
-            h.round(),
-            h.is_fallback(),
-            h.state_root(),
-            transaction_root.unwrap_or_else(|| h.transaction_root()),
-            certificate_root.unwrap_or_else(|| h.certificate_root()),
-            local_receipt_root.unwrap_or_else(|| h.local_receipt_root()),
-            h.provision_root(),
-            h.cross_shard_txs().clone(),
-            h.provision_tx_roots().clone(),
-            h.work_in_flight(),
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+        BlockHeader::new(BlockHeaderParts {
+            shard_id: h.shard_id(),
+            height: h.height(),
+            parent_block_hash: h.parent_block_hash(),
+            parent_qc: h.parent_qc().clone().into(),
+            proposer: h.proposer(),
+            timestamp: h.timestamp(),
+            round: h.round(),
+            is_fallback: h.is_fallback(),
+            state_root: h.state_root(),
+            transaction_root: transaction_root.unwrap_or_else(|| h.transaction_root()),
+            certificate_root: certificate_root.unwrap_or_else(|| h.certificate_root()),
+            local_receipt_root: local_receipt_root.unwrap_or_else(|| h.local_receipt_root()),
+            provision_root: h.provision_root(),
+            cross_shard_txs: h.cross_shard_txs().clone(),
+            provision_tx_roots: h.provision_tx_roots().clone(),
+            work_in_flight: h.work_in_flight(),
+            ..Default::default()
+        })
     }
 
     fn qc_for(block: &Block) -> QuorumCertificate {

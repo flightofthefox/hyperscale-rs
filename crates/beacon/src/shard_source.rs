@@ -594,14 +594,12 @@ const fn pending_id(shard: ShardId, anchor: BlockHash, pending: &PendingFetch) -
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-        BlockHeight, CertificateRoot, CertifiedBlockHeader, Hash, LeafIndex, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
-        ShardLoad, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId, StateRoot,
-        TransactionRoot, ValidatorId, Verified, WeightedTimestamp, WorkInFlight,
+        BlockHeaderParts, BlockHeight, CertifiedBlockHeader, Hash, LeafIndex, QuorumCertificate,
+        Round, ShardId, ShardWitnessPayload, SignerBitfield, Stake, StakePoolId, Verified,
+        WeightedTimestamp,
     };
 
     use super::*;
@@ -634,31 +632,18 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_wt),
         );
-        let header = BlockHeader::new(
-            s,
-            BlockHeight::new(height),
-            parent_hash,
-            parent_qc,
-            ValidatorId::new(0),
-            ProposerTimestamp::ZERO,
-            Round::new(round),
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::from_raw(Hash::from_bytes(format!("r-{s:?}-{height}").as_bytes())),
-            BeaconWitnessLeafCount::new(leaf_count),
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: s,
+            height: BlockHeight::new(height),
+            parent_block_hash: parent_hash,
+            parent_qc: parent_qc.into(),
+            round: Round::new(round),
+            beacon_witness_root: BeaconWitnessRoot::from_raw(Hash::from_bytes(
+                format!("r-{s:?}-{height}").as_bytes(),
+            )),
+            beacon_witness_leaf_count: BeaconWitnessLeafCount::new(leaf_count),
+            ..Default::default()
+        });
         let block_hash = header.hash();
         let qc = QuorumCertificate::new(
             block_hash,

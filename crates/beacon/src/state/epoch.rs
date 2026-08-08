@@ -1267,13 +1267,12 @@ mod tests {
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
         AggregateSignature, BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
-        BlockHeader, BlockHeight, CertificateRoot, ChainOrigin, Epoch, Hash, LocalReceiptRoot,
-        MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, RevealChain, Round, SettledTxsRoot, ShardBoundary, ShardCommittee,
-        ShardForkProof, ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield,
-        SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TransactionRoot,
-        TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, WorkInFlight,
-        compute_merkle_root, compute_range_proof,
+        BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin, Epoch, Hash,
+        MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, QuorumCertificate, Round, SettledTxsRoot,
+        ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardLoad, ShardRecovery,
+        ShardWitnessPayload, SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId,
+        StateRoot, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root,
+        compute_range_proof,
     };
 
     use super::*;
@@ -1321,31 +1320,18 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(pred_wt),
         );
-        BlockHeader::new(
-            shard,
-            BlockHeight::new(height),
-            BlockHash::ZERO,
-            parent_qc,
-            ValidatorId::new(0),
-            ProposerTimestamp::ZERO,
-            Round::INITIAL,
-            false,
+        BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
+            height: BlockHeight::new(height),
+            parent_block_hash: BlockHash::ZERO,
+            parent_qc: parent_qc.into(),
             state_root,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            root,
-            BeaconWitnessLeafCount::new(leaf_count),
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
+            beacon_witness_root: root,
+            beacon_witness_leaf_count: BeaconWitnessLeafCount::new(leaf_count),
             split_child_roots,
             settled_txs_root,
-            ShardLoad::ZERO,
-        )
+            ..Default::default()
+        })
     }
 
     /// A boundary block carrying no witness accumulator (`ZERO` root).
@@ -1495,7 +1481,7 @@ mod tests {
             settled_txs_root,
             _,
         ) = header.into_parts();
-        BlockHeader::new(
+        BlockHeader::new(BlockHeaderParts {
             shard_id,
             height,
             parent_block_hash,
@@ -1509,9 +1495,9 @@ mod tests {
             certificate_root,
             local_receipt_root,
             provision_root,
-            waves,
-            provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
-            in_flight,
+            cross_shard_txs: waves,
+            provision_tx_roots: provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
+            work_in_flight: in_flight,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
@@ -1519,7 +1505,7 @@ mod tests {
             split_child_roots,
             settled_txs_root,
             load,
-        )
+        })
     }
 
     /// The two attested-load quantities land on the record in their own
@@ -4335,30 +4321,15 @@ mod tests {
     /// A terminal header carrying `pair`, with the composed root as its own
     /// committed state root so the pair self-verifies.
     fn terminal_header_with_pair(shard: ShardId, pair: SplitChildRoots) -> BlockHeader {
-        BlockHeader::new(
-            shard,
-            BlockHeight::new(9),
-            BlockHash::ZERO,
-            QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::ZERO,
-            Round::new(3),
-            false,
-            pair.composed_root(),
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            Some(pair),
-            None,
-            ShardLoad::ZERO,
-        )
+        BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
+            height: BlockHeight::new(9),
+            parent_block_hash: BlockHash::ZERO,
+            parent_qc: QuorumCertificate::genesis(shard, ChainOrigin::ROOT).into(),
+            round: Round::new(3),
+            state_root: pair.composed_root(),
+            split_child_roots: Some(pair),
+            ..Default::default()
+        })
     }
 }

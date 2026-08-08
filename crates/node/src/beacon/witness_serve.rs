@@ -141,7 +141,7 @@ fn build_chunk<S: ShardStorage>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+
     use std::sync::Arc;
 
     use hyperscale_storage::{PendingChain, ShardChainWriter};
@@ -149,11 +149,10 @@ mod tests {
     use hyperscale_types::network::request::beacon::GetShardWitnessesRequest;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
-        BlockHash, BlockHeader, BlockHeight, CertificateRoot, CertifiedBlock, ChainOrigin, Hash,
-        LeafIndex, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
-        RevealChain, Round, ShardId, ShardLoad, ShardWitnessPayload, SignerBitfield, Stake,
-        StakePoolId, StateRoot, TransactionRoot, ValidatorId, Verified, WeightedTimestamp,
-        WitnessSources, WorkInFlight, compute_merkle_root, verify_range_inclusion,
+        BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, ChainOrigin, Hash,
+        LeafIndex, ProposerTimestamp, QuorumCertificate, Round, ShardId, ShardWitnessPayload,
+        SignerBitfield, Stake, StakePoolId, Verified, WeightedTimestamp, WitnessSources,
+        compute_merkle_root, verify_range_inclusion,
     };
 
     use super::*;
@@ -172,31 +171,16 @@ mod tests {
         beacon_witness_root: BeaconWitnessRoot,
         beacon_witness_leaf_count: BeaconWitnessLeafCount,
     ) -> BlockHeader {
-        BlockHeader::new(
-            SHARD,
+        BlockHeader::new(BlockHeaderParts {
+            shard_id: SHARD,
             height,
-            BlockHash::ZERO,
-            QuorumCertificate::genesis(SHARD, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(1_000 * height.inner()),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
+            parent_block_hash: BlockHash::ZERO,
+            parent_qc: QuorumCertificate::genesis(SHARD, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(1_000 * height.inner()),
             beacon_witness_root,
             beacon_witness_leaf_count,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+            ..Default::default()
+        })
     }
 
     fn make_qc_for(block: &Block) -> QuorumCertificate {

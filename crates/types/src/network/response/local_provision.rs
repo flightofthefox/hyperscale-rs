@@ -110,11 +110,10 @@ mod tests {
     #[test]
     fn entry_with_bundled_header_roundtrips() {
         use crate::{
-            BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight,
-            CertificateRoot, CertifiedBlockHeader, ChainOrigin, Hash, LocalReceiptRoot,
-            MerkleInclusionProof, ProposerTimestamp, ProvisionEntry, ProvisionsRoot,
-            QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot,
-            TransactionRoot, TxHash, ValidatorId, WeightedTimestamp, WorkInFlight,
+            BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlockHeader,
+            ChainOrigin, Hash, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry,
+            QuorumCertificate, RevealChain, Round, ShardId, SignerBitfield, TxHash,
+            WeightedTimestamp,
         };
 
         let source_shard = ShardId::leaf(1, 1);
@@ -132,31 +131,15 @@ mod tests {
                 vec![],
             )],
         ));
-        let header = BlockHeader::new(
-            source_shard,
-            source_height,
-            BlockHash::ZERO,
-            QuorumCertificate::genesis(source_shard, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(0),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: source_shard,
+            height: source_height,
+            parent_block_hash: BlockHash::ZERO,
+            parent_qc: QuorumCertificate::genesis(source_shard, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            ..Default::default()
+        });
         let header_hash = header.hash();
         let qc = QuorumCertificate::new(
             header_hash,

@@ -8,17 +8,16 @@ use hyperscale_vm_types::{Address, Mode};
 
 use crate::crypto::Ed25519PrivateKey;
 use crate::{
-    AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
-    BlockHeight, BlockVoteMessage, CertificateRoot, CertifiedBlock, CertifiedBlockHeader,
-    ChainOrigin, CommitProof, ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derived,
-    EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash,
-    GlobalReceiptRoot, Hash, LocalReceiptRoot, NetworkDefinition, NetworkId, ProposerTimestamp,
-    ProvisionsRoot, QuorumCertificate, RevealChain, Round, Routing, ShardForkProof, ShardId,
-    ShardLoad, SignerBitfield, StateRoot, TickId, TimestampRange, TopologySnapshot, Transaction,
-    TransactionBody, TransactionDecision, TransactionEnvelope, TransactionRoot, TxHash, TxOutcome,
-    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, VmStatics, VmStaticsError,
-    WeightedTimestamp, WitnessSources, WorkInFlight, declared_work, install_vm_statics,
-    signed_bytes, vm_statics_installed,
+    AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
+    BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof,
+    ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derived, EnvelopeExt,
+    ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
+    Hash, NetworkDefinition, NetworkId, ProposerTimestamp, QuorumCertificate, Round, Routing,
+    ShardForkProof, ShardId, SignerBitfield, TickId, TimestampRange, TopologySnapshot, Transaction,
+    TransactionBody, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, ValidatorId,
+    ValidatorInfo, ValidatorSet, Verifiable, Verified, VmStatics, VmStaticsError,
+    WeightedTimestamp, WitnessSources, declared_work, install_vm_statics, signed_bytes,
+    vm_statics_installed,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -271,31 +270,16 @@ pub fn make_live_block(
     transactions: Vec<Arc<Transaction>>,
     certificates: Vec<Arc<Verifiable<Finalization>>>,
 ) -> Block {
-    let header = BlockHeader::new(
+    let header = BlockHeader::new(BlockHeaderParts {
         shard_id,
         height,
-        BlockHash::ZERO,
-        QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
+        parent_block_hash: BlockHash::ZERO,
+        parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
         proposer,
-        ProposerTimestamp::from_millis(timestamp_ms),
-        Round::INITIAL,
-        false,
-        StateRoot::ZERO,
-        TransactionRoot::ZERO,
-        CertificateRoot::ZERO,
-        LocalReceiptRoot::ZERO,
-        ProvisionsRoot::ZERO,
-        Vec::new(),
-        std::collections::BTreeMap::new(),
-        WorkInFlight::ZERO,
-        BeaconWitnessRoot::ZERO,
-        BeaconWitnessLeafCount::ZERO,
-        BeaconWitnessLeafCount::ZERO,
-        RevealChain::ZERO,
-        None,
-        None,
-        ShardLoad::ZERO,
-    );
+        timestamp: ProposerTimestamp::from_millis(timestamp_ms),
+        provision_tx_roots: std::collections::BTreeMap::new(),
+        ..Default::default()
+    });
     let transactions: Vec<Arc<Verifiable<Transaction>>> = transactions
         .into_iter()
         .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
@@ -462,31 +446,16 @@ pub(crate) fn fork_header(
     parent_block_hash: BlockHash,
     salt: u64,
 ) -> BlockHeader {
-    BlockHeader::new(
-        shard,
+    BlockHeader::new(BlockHeaderParts {
+        shard_id: shard,
         height,
         parent_block_hash,
-        QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
-        ValidatorId::new(0),
-        ProposerTimestamp::from_millis(salt),
+        parent_qc: QuorumCertificate::genesis(shard, ChainOrigin::ROOT).into(),
+        timestamp: ProposerTimestamp::from_millis(salt),
         round,
-        false,
-        StateRoot::ZERO,
-        TransactionRoot::ZERO,
-        CertificateRoot::ZERO,
-        LocalReceiptRoot::ZERO,
-        ProvisionsRoot::ZERO,
-        Vec::new(),
-        std::collections::BTreeMap::new(),
-        WorkInFlight::ZERO,
-        BeaconWitnessRoot::ZERO,
-        BeaconWitnessLeafCount::ZERO,
-        BeaconWitnessLeafCount::ZERO,
-        RevealChain::ZERO,
-        None,
-        None,
-        ShardLoad::ZERO,
-    )
+        provision_tx_roots: std::collections::BTreeMap::new(),
+        ..Default::default()
+    })
 }
 
 /// Pair a fork-fixture header with a genuine QC signed by `committee`'s
@@ -641,31 +610,16 @@ pub(crate) fn live_fork_header(
     wt: WeightedTimestamp,
     salt: u64,
 ) -> BlockHeader {
-    BlockHeader::new(
-        shard,
+    BlockHeader::new(BlockHeaderParts {
+        shard_id: shard,
         height,
         parent_block_hash,
-        anchor_qc(shard, wt),
-        ValidatorId::new(0),
-        ProposerTimestamp::from_millis(salt),
+        parent_qc: anchor_qc(shard, wt).into(),
+        timestamp: ProposerTimestamp::from_millis(salt),
         round,
-        false,
-        StateRoot::ZERO,
-        TransactionRoot::ZERO,
-        CertificateRoot::ZERO,
-        LocalReceiptRoot::ZERO,
-        ProvisionsRoot::ZERO,
-        Vec::new(),
-        std::collections::BTreeMap::new(),
-        WorkInFlight::ZERO,
-        BeaconWitnessRoot::ZERO,
-        BeaconWitnessLeafCount::ZERO,
-        BeaconWitnessLeafCount::ZERO,
-        RevealChain::ZERO,
-        None,
-        None,
-        ShardLoad::ZERO,
-    )
+        provision_tx_roots: std::collections::BTreeMap::new(),
+        ..Default::default()
+    })
 }
 
 /// A placeholder `parent_qc` carrying only a weighted timestamp. The fork
@@ -770,11 +724,11 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             pqc.aggregated_signature(),
             WeightedTimestamp::from_millis(weighted_timestamp_ms),
         );
-        BlockHeader::new(
+        BlockHeader::new(BlockHeaderParts {
             shard_id,
             height,
             parent_block_hash,
-            stamped,
+            parent_qc: stamped.into(),
             proposer,
             timestamp,
             round,
@@ -784,9 +738,9 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             certificate_root,
             local_receipt_root,
             provision_root,
-            waves,
+            cross_shard_txs: waves,
             provision_tx_roots,
-            in_flight,
+            work_in_flight: in_flight,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
@@ -794,7 +748,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             split_child_roots,
             settled_txs_root,
             load,
-        )
+        })
     };
     match block {
         Block::Live {

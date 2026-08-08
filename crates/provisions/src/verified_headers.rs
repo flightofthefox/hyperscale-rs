@@ -94,40 +94,22 @@ impl VerifiedHeaderBuffer {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-        CertificateRoot, ChainOrigin, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, RevealChain, Round, ShardLoad, SignerBitfield, StateRoot,
-        TransactionRoot, ValidatorId, WeightedTimestamp, WorkInFlight,
+        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
+        ProposerTimestamp, QuorumCertificate, Round, SignerBitfield, WeightedTimestamp,
     };
 
     use super::*;
 
     fn make_header(shard: ShardId, height: BlockHeight) -> Arc<Verified<CertifiedBlockHeader>> {
-        let header = BlockHeader::new(
-            shard,
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
             height,
-            BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(0),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+            parent_block_hash: BlockHash::ZERO,
+            parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            ..Default::default()
+        });
         let header_hash = header.hash();
         let qc = QuorumCertificate::new(
             header_hash,

@@ -1550,11 +1550,7 @@ mod tests {
 
     // ── Boundary trigger ─────────────────────────────────────────────────
 
-    use hyperscale_types::{
-        BeaconWitnessRoot, Block, BlockHeader, CertificateRoot, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, RevealChain, Round, ShardLoad, TransactionRoot,
-        WorkInFlight,
-    };
+    use hyperscale_types::{Block, BlockHeader, BlockHeaderParts, ProposerTimestamp};
 
     /// Tag the pin hook pushes into the sink, distinguishing pins from
     /// block commits (which use their height as the tag).
@@ -1590,31 +1586,14 @@ mod tests {
         parent_qc_wt_ms: u64,
         sink: CommitSink,
     ) -> (PendingCommit, PreparedCommit, BlockHash) {
-        let header = BlockHeader::new(
-            ShardId::ROOT,
-            BlockHeight::new(height),
-            parent_hash,
-            linked_qc(parent_hash, parent_qc_wt_ms),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(1_000 + height),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+        let header = BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(height),
+            parent_block_hash: parent_hash,
+            parent_qc: linked_qc(parent_hash, parent_qc_wt_ms).into(),
+            timestamp: ProposerTimestamp::from_millis(1_000 + height),
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            ..Default::default()
+        });
         let block = Block::Live {
             header,
             transactions: Arc::new(vec![]),

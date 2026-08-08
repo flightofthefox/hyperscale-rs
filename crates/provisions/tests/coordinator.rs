@@ -10,12 +10,10 @@ use std::sync::Arc;
 use hyperscale_provisions::{ProvisionConfig, ProvisionCoordinator, ProvisionMemoryStats};
 use hyperscale_types::test_utils::TestCommittee;
 use hyperscale_types::{
-    AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
-    BlockHeight, CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash,
-    LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionHash, ProvisionTxRoot,
-    ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, SignerBitfield,
-    StateRoot, TopologySchedule, TopologySnapshot, TransactionRoot, ValidatorId, Verified,
-    WeightedTimestamp, WitnessSources, WorkInFlight,
+    AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
+    CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp, ProposerTimestamp,
+    ProvisionHash, ProvisionTxRoot, QuorumCertificate, Round, ShardId, SignerBitfield,
+    TopologySchedule, TopologySnapshot, Verified, WeightedTimestamp, WitnessSources,
 };
 
 const TEST_BLOCK_INTERVAL_MS: u64 = 500;
@@ -34,31 +32,14 @@ fn sched() -> TopologySchedule {
 }
 
 fn make_block(height: BlockHeight) -> CertifiedBlock {
-    let header = BlockHeader::new(
-        ShardId::leaf(1, 0),
+    let header = BlockHeader::new(BlockHeaderParts {
+        shard_id: ShardId::leaf(1, 0),
         height,
-        BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
-        QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT),
-        ValidatorId::new(0),
-        ProposerTimestamp::ZERO,
-        Round::INITIAL,
-        false,
-        StateRoot::ZERO,
-        TransactionRoot::ZERO,
-        CertificateRoot::ZERO,
-        LocalReceiptRoot::ZERO,
-        ProvisionsRoot::ZERO,
-        Vec::new(),
-        std::collections::BTreeMap::new(),
-        WorkInFlight::ZERO,
-        BeaconWitnessRoot::ZERO,
-        BeaconWitnessLeafCount::ZERO,
-        BeaconWitnessLeafCount::ZERO,
-        RevealChain::ZERO,
-        None,
-        None,
-        ShardLoad::ZERO,
-    );
+        parent_block_hash: BlockHash::from_raw(Hash::from_bytes(&[0u8; 32])),
+        parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
+        provision_tx_roots: std::collections::BTreeMap::new(),
+        ..Default::default()
+    });
     let block = Block::Live {
         header,
         transactions: Arc::new(Vec::new()),
@@ -96,31 +77,15 @@ fn make_remote_header_targeting(
         local_shard,
         ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),
     )]);
-    let header = BlockHeader::new(
-        source_shard,
+    let header = BlockHeader::new(BlockHeaderParts {
+        shard_id: source_shard,
         height,
-        BlockHash::from_raw(Hash::from_bytes(b"parent")),
-        QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT),
-        ValidatorId::new(0),
-        ProposerTimestamp::from_millis(1000 + height.inner()),
-        Round::INITIAL,
-        false,
-        StateRoot::ZERO,
-        TransactionRoot::ZERO,
-        CertificateRoot::ZERO,
-        LocalReceiptRoot::ZERO,
-        ProvisionsRoot::ZERO,
-        Vec::new(),
+        parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+        parent_qc: QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT).into(),
+        timestamp: ProposerTimestamp::from_millis(1000 + height.inner()),
         provision_tx_roots,
-        WorkInFlight::ZERO,
-        BeaconWitnessRoot::ZERO,
-        BeaconWitnessLeafCount::ZERO,
-        BeaconWitnessLeafCount::ZERO,
-        RevealChain::ZERO,
-        None,
-        None,
-        ShardLoad::ZERO,
-    );
+        ..Default::default()
+    });
     let header_hash = header.hash();
     let qc = QuorumCertificate::new(
         header_hash,

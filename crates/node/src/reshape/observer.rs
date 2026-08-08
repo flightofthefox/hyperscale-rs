@@ -765,10 +765,9 @@ mod tests {
     use hyperscale_storage::{BoundaryStore, SubstateStore, WitnessSeed};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, CertificateRoot,
-        CommitProofVerifyError, ElidedCertifiedBlock, Hash, Inventory, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, RevealChain, Round, ShardLoad, SignerBitfield,
-        SplitChildRoots, TransactionRoot, VoteCount, WitnessSources, WorkInFlight,
+        AggregateSignature, BeaconWitnessLeafCount, BlockHeaderParts, CommitProofVerifyError,
+        ElidedCertifiedBlock, Hash, Inventory, Round, SignerBitfield, SplitChildRoots, VoteCount,
+        WitnessSources,
     };
 
     use super::*;
@@ -966,31 +965,16 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(pred_wt),
         );
-        let header = BlockHeader::new(
-            ShardId::ROOT,
-            BlockHeight::new(height),
-            parent,
-            parent_qc,
-            ValidatorId::new(0),
-            ProposerTimestamp::ZERO,
-            Round::new(round),
-            false,
+        let header = BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(height),
+            parent_block_hash: parent,
+            parent_qc: parent_qc.into(),
+            round: Round::new(round),
             state_root,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            pair,
-            None,
-            ShardLoad::ZERO,
-        );
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            split_child_roots: pair,
+            ..Default::default()
+        });
         Block::Live {
             header,
             transactions: Arc::new(Vec::new()),

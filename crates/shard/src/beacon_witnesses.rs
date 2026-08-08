@@ -266,12 +266,11 @@ mod tests {
 
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessRoot, BlockHeader, BlockHeight, CertificateRoot,
-        ConsensusSignature, Epoch, LocalReceiptRoot, LocalTimestamp, NetworkDefinition,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, ReadySignal, ReshapeSeat,
-        ReshapeTrigger, RevealChain, Round, ShardLoad, SignerBitfield, Stake, StakePoolId,
-        StateRoot, TopologySnapshot, TransactionRoot, ValidatorId, ValidatorInfo, ValidatorSet,
-        VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, compute_merkle_root,
+        AggregateSignature, BeaconWitnessRoot, BlockHeader, BlockHeaderParts, BlockHeight,
+        ConsensusSignature, Epoch, LocalTimestamp, NetworkDefinition, QuorumCertificate,
+        ReadySignal, ReshapeSeat, ReshapeTrigger, Round, SignerBitfield, Stake, StakePoolId,
+        TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, VrfProof, WeightedTimestamp,
+        WitnessSources, compute_merkle_root,
     };
 
     use super::*;
@@ -379,31 +378,13 @@ mod tests {
             WeightedTimestamp::from_millis(anchor_ms),
         );
         Block::Live {
-            header: BlockHeader::new(
-                ShardId::ROOT,
+            header: BlockHeader::new(BlockHeaderParts {
                 height,
-                parent_hash,
-                parent_qc,
-                ValidatorId::new(0),
-                ProposerTimestamp::ZERO,
-                Round::new(parent_round.inner() + 1 + skipped),
-                false,
-                StateRoot::ZERO,
-                TransactionRoot::ZERO,
-                CertificateRoot::ZERO,
-                LocalReceiptRoot::ZERO,
-                ProvisionsRoot::ZERO,
-                Vec::new(),
-                BTreeMap::new(),
-                WorkInFlight::ZERO,
-                BeaconWitnessRoot::ZERO,
-                BeaconWitnessLeafCount::ZERO,
-                BeaconWitnessLeafCount::ZERO,
-                RevealChain::ZERO,
-                None,
-                None,
-                ShardLoad::ZERO,
-            ),
+                parent_block_hash: parent_hash,
+                parent_qc: parent_qc.into(),
+                round: Round::new(parent_round.inner() + 1 + skipped),
+                ..Default::default()
+            }),
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),

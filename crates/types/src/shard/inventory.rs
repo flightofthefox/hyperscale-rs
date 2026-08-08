@@ -440,7 +440,6 @@ fn wave_is_held(filter: Option<&BloomFilter<TxHash>>, fw: &Finalization) -> bool
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use hyperscale_hbor::{
         DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
@@ -449,42 +448,22 @@ mod tests {
     use super::*;
     use crate::test_utils::test_transaction;
     use crate::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
-        BloomFilter, CertificateRoot, ChainOrigin, ExecutionCertificate, ExecutionOutcome,
-        GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot,
-        TransactionRoot, TxOutcome, ValidatorId, WeightedTimestamp, WorkInFlight,
+        AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, BloomFilter, ChainOrigin,
+        ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+        ProposerTimestamp, ShardId, SignerBitfield, TxOutcome, WeightedTimestamp,
     };
 
     fn create_test_block() -> Block {
         let tx = test_transaction(1);
 
         Block::Live {
-            header: BlockHeader::new(
-                ShardId::ROOT,
-                BlockHeight::new(1),
-                BlockHash::from_raw(Hash::from_bytes(b"parent")),
-                QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-                ValidatorId::new(0),
-                ProposerTimestamp::from_millis(1_234_567_890),
-                Round::INITIAL,
-                false,
-                StateRoot::ZERO,
-                TransactionRoot::ZERO,
-                CertificateRoot::ZERO,
-                LocalReceiptRoot::ZERO,
-                ProvisionsRoot::ZERO,
-                Vec::new(),
-                BTreeMap::new(),
-                WorkInFlight::ZERO,
-                BeaconWitnessRoot::ZERO,
-                BeaconWitnessLeafCount::ZERO,
-                BeaconWitnessLeafCount::ZERO,
-                RevealChain::ZERO,
-                None,
-                None,
-                ShardLoad::ZERO,
-            ),
+            header: BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(1),
+                parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+                parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+                timestamp: ProposerTimestamp::from_millis(1_234_567_890),
+                ..Default::default()
+            }),
             transactions: Arc::new(vec![Arc::new(Verifiable::from(tx))]),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),

@@ -860,44 +860,25 @@ impl BlockSyncManager {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+
     use std::sync::Arc;
 
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeader,
-        CertificateRoot, ChainOrigin, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot, TransactionRoot,
-        ValidatorId, WeightedTimestamp, WitnessSources, WorkInFlight,
+        AggregateSignature, Block, BlockHeader, BlockHeaderParts, ChainOrigin, Hash,
+        ProposerTimestamp, Round, ShardId, SignerBitfield, ValidatorId, WeightedTimestamp,
+        WitnessSources,
     };
 
     use super::*;
 
     fn header(height: BlockHeight, tag: &[u8]) -> BlockHeader {
-        BlockHeader::new(
-            ShardId::ROOT,
+        BlockHeader::new(BlockHeaderParts {
             height,
-            BlockHash::from_raw(Hash::from_bytes(tag)),
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(0),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(tag)),
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            ..Default::default()
+        })
     }
 
     fn certified(height: BlockHeight, tag: &[u8]) -> CertifiedBlock {

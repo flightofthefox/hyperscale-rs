@@ -149,9 +149,9 @@ mod tests {
     use hyperscale_core::{Action, FetchRequest, ProtocolEvent, StateMachine};
     use hyperscale_types::test_utils::make_live_block;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
-        CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp, ProvisionTxRoot,
-        QuorumCertificate, RevealChain, ShardId, ShardLoad, TxHash, ValidatorId, Verified,
+        Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlockHeader,
+        ChainOrigin, Hash, LocalTimestamp, ProvisionTxRoot, QuorumCertificate, ShardId, TxHash,
+        ValidatorId, Verified,
     };
 
     use crate::assert_emits;
@@ -180,36 +180,28 @@ mod tests {
             vec![],
         );
         if let Block::Live { ref mut header, .. } = block {
-            *header = BlockHeader::new(
-                header.shard_id(),
-                header.height(),
-                header.parent_block_hash(),
-                header.parent_qc().clone(),
-                header.proposer(),
-                header.timestamp(),
-                header.round(),
-                header.is_fallback(),
-                header.state_root(),
-                header.transaction_root(),
-                header.certificate_root(),
-                header.local_receipt_root(),
-                header.provision_root(),
-                vec![cross_shard_tx],
-                // The expectation tracker keys on the header owing us a
-                // bundle — a provision_tx_roots entry for our shard.
-                std::collections::BTreeMap::from([(
+            *header = BlockHeader::new(BlockHeaderParts {
+                shard_id: header.shard_id(),
+                height: header.height(),
+                parent_block_hash: header.parent_block_hash(),
+                parent_qc: header.parent_qc().clone().into(),
+                proposer: header.proposer(),
+                timestamp: header.timestamp(),
+                round: header.round(),
+                is_fallback: header.is_fallback(),
+                state_root: header.state_root(),
+                transaction_root: header.transaction_root(),
+                certificate_root: header.certificate_root(),
+                local_receipt_root: header.local_receipt_root(),
+                provision_root: header.provision_root(),
+                cross_shard_txs: vec![cross_shard_tx],
+                provision_tx_roots: std::collections::BTreeMap::from([(
                     ShardId::ROOT,
                     ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),
                 )]),
-                header.work_in_flight(),
-                BeaconWitnessRoot::ZERO,
-                BeaconWitnessLeafCount::ZERO,
-                BeaconWitnessLeafCount::ZERO,
-                RevealChain::ZERO,
-                None,
-                None,
-                ShardLoad::ZERO,
-            );
+                work_in_flight: header.work_in_flight(),
+                ..Default::default()
+            });
         }
         let certified_header =
             Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(

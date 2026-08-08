@@ -235,13 +235,11 @@ mod tests {
     use hyperscale_storage::{PendingChain, ShardChainWriter};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
-        BlockHash, BlockHeader, CertificateRoot, ExecutionCertificate, ExecutionOutcome,
-        Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
-        ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot, TxHash, TxOutcome,
-        ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources, WorkInFlight,
-        settled_txs_root_from_hashes,
+        AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
+        BlockHeader, BlockHeaderParts, CertificateRoot, ExecutionCertificate, ExecutionOutcome,
+        Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, ProposerTimestamp,
+        QuorumCertificate, Round, ShardId, SignerBitfield, TickId, TxHash, TxOutcome, ValidatorId,
+        Verifiable, Verified, WeightedTimestamp, WitnessSources, settled_txs_root_from_hashes,
     };
 
     use super::*;
@@ -311,31 +309,16 @@ mod tests {
                 AggregateSignature::new([0u8; 96]),
                 WeightedTimestamp::from_millis(1_000 * h),
             );
-            let header = BlockHeader::new(
-                SHARD,
-                BlockHeight::new(h),
-                parent,
-                parent_qc,
-                ValidatorId::new(0),
-                ProposerTimestamp::from_millis(1_000 * h),
-                Round::INITIAL,
-                false,
-                StateRoot::ZERO,
-                TransactionRoot::ZERO,
-                *Verified::<CertificateRoot>::compute(&certs).as_ref(),
-                LocalReceiptRoot::ZERO,
-                ProvisionsRoot::ZERO,
-                Vec::new(),
-                std::collections::BTreeMap::new(),
-                WorkInFlight::ZERO,
-                BeaconWitnessRoot::ZERO,
-                BeaconWitnessLeafCount::ZERO,
-                BeaconWitnessLeafCount::ZERO,
-                RevealChain::ZERO,
-                None,
-                None,
-                ShardLoad::ZERO,
-            );
+            let header = BlockHeader::new(BlockHeaderParts {
+                shard_id: SHARD,
+                height: BlockHeight::new(h),
+                parent_block_hash: parent,
+                parent_qc: parent_qc.into(),
+                timestamp: ProposerTimestamp::from_millis(1_000 * h),
+                certificate_root: *Verified::<CertificateRoot>::compute(&certs).as_ref(),
+                provision_tx_roots: std::collections::BTreeMap::new(),
+                ..Default::default()
+            });
             let block = Block::Live {
                 header,
                 transactions: Arc::new(Vec::new()),

@@ -148,7 +148,9 @@ pub use shard::evidence::{
     ShardVoteEquivocationVerifyError, verify_shard_vote_equivocation,
 };
 pub use shard::fork_fence::ForkFence;
-pub use shard::header::{BlockHeader, BlockHeaderParentQcMismatch, BlockHeaderVerifyError};
+pub use shard::header::{
+    BlockHeader, BlockHeaderParentQcMismatch, BlockHeaderParts, BlockHeaderVerifyError,
+};
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
     MAX_DRAIN_WORK, MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT, MAX_PROVISION_TARGET_SHARDS,

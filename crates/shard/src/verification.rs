@@ -2393,9 +2393,9 @@ mod tests {
         }
     }
     use hyperscale_types::{
-        BeaconWitnessLeafCount, CertificateRoot, Epoch, Hash, LocalReceiptRoot, LocalTimestamp,
-        ProposerTimestamp, QuorumCertificate, RevealChain, Round, ShardId, ShardLoad,
-        SignerBitfield, Transaction, TransactionRoot, ValidatorId, WeightedTimestamp,
+        BlockHeaderParts, Epoch, Hash, LocalTimestamp, ProposerTimestamp, QuorumCertificate, Round,
+        ShardId, ShardLoad, SignerBitfield, Transaction, TransactionRoot, ValidatorId,
+        WeightedTimestamp,
     };
 
     use super::*;
@@ -2416,31 +2416,16 @@ mod tests {
         in_flight: u32,
         substate_bytes: Option<u64>,
     ) -> BlockHeader {
-        BlockHeader::new(
-            ShardId::ROOT,
+        BlockHeader::new(BlockHeaderParts {
             height,
             parent_block_hash,
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(0),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::new(u64::from(in_flight)),
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO.advance(0, substate_bytes),
-        )
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            work_in_flight: WorkInFlight::new(u64::from(in_flight)),
+            load: ShardLoad::ZERO.advance(0, substate_bytes),
+            ..Default::default()
+        })
     }
 
     fn block_with(
@@ -3035,31 +3020,15 @@ mod tests {
     #[test]
     fn track_pending_assembly_rejects_nonzero_root_on_empty_content() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
-        let forged_header = BlockHeader::new(
-            ShardId::ROOT,
-            BlockHeight::new(1),
-            BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(0),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::from_raw(Hash::from_bytes(b"forged-tx-root")),
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+        let forged_header = BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(1),
+            parent_block_hash: BlockHash::ZERO,
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            transaction_root: TransactionRoot::from_raw(Hash::from_bytes(b"forged-tx-root")),
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            ..Default::default()
+        });
         let block = Block::Live {
             header: forged_header,
             transactions: Arc::new(Vec::new()),

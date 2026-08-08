@@ -2692,15 +2692,14 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::{
         AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconChainConfig, BeaconGenesisConfig,
-        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeight, CertificateRoot,
+        BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeader, BlockHeaderParts, BlockHeight,
         CertifiedBlockHeader, ChainOrigin, ConsensusPublicKey, ConsensusSignature, Epoch,
         GenesisConfigHash, GenesisPool, GenesisValidator, Hash, JailReason, KeptSeat, LeafIndex,
-        LocalReceiptRoot, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition,
-        ObserverSeat, PcScope, PcVector, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
-        Randomness, RevealChain, Round, ShardBoundary, ShardCommittee, ShardEpochContribution,
-        ShardId, ShardLoad, ShardWitnessPayload, Signer, SignerBitfield, SpcCert, SpcView, Stake,
-        StakePoolId, StateRoot, TransactionRoot, ValidatorId, VrfProof, WeightedTimestamp,
-        WorkInFlight, build_qc1, build_qc2, build_qc3, build_ratify_cert, compute_merkle_root,
+        MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition, ObserverSeat, PcScope,
+        PcVector, QuorumCertificate, Randomness, Round, ShardBoundary, ShardCommittee,
+        ShardEpochContribution, ShardId, ShardWitnessPayload, Signer, SignerBitfield, SpcCert,
+        SpcView, Stake, StakePoolId, StateRoot, ValidatorId, VrfProof, WeightedTimestamp,
+        build_qc1, build_qc2, build_qc3, build_ratify_cert, compute_merkle_root,
         compute_range_proof, genesis_config_hash, sign_ratify_vote, sign_vote1, sign_vote2,
         sign_vote3,
     };
@@ -2809,31 +2808,17 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(pred_wt),
         );
-        let header = BlockHeader::new(
-            shard,
-            BlockHeight::new(height),
-            BlockHash::ZERO,
-            parent_qc,
-            ValidatorId::new(0),
-            ProposerTimestamp::ZERO,
-            Round::new(height),
-            false,
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
+            height: BlockHeight::new(height),
+            parent_block_hash: BlockHash::ZERO,
+            parent_qc: parent_qc.into(),
+            round: Round::new(height),
             state_root,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            root,
-            BeaconWitnessLeafCount::new(leaf_count),
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+            beacon_witness_root: root,
+            beacon_witness_leaf_count: BeaconWitnessLeafCount::new(leaf_count),
+            ..Default::default()
+        });
         let block_hash = header.hash();
         let qc = QuorumCertificate::new(
             block_hash,
@@ -2931,31 +2916,18 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_wt),
         );
-        let header = BlockHeader::new(
-            shard,
-            BlockHeight::new(height),
-            parent_hash,
-            parent_qc,
-            ValidatorId::new(0),
-            ProposerTimestamp::ZERO,
-            Round::new(height),
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::from_raw(Hash::from_bytes(format!("bw-{height}").as_bytes())),
-            BeaconWitnessLeafCount::new(leaf_count),
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
+            height: BlockHeight::new(height),
+            parent_block_hash: parent_hash,
+            parent_qc: parent_qc.into(),
+            round: Round::new(height),
+            beacon_witness_root: BeaconWitnessRoot::from_raw(Hash::from_bytes(
+                format!("bw-{height}").as_bytes(),
+            )),
+            beacon_witness_leaf_count: BeaconWitnessLeafCount::new(leaf_count),
+            ..Default::default()
+        });
         let block_hash = header.hash();
         let qc = QuorumCertificate::new(
             block_hash,
@@ -5330,31 +5302,15 @@ mod tests {
 
         let parent_qc = QuorumCertificate::genesis(shard, ChainOrigin::ROOT);
         let parent_block_hash = BlockHash::ZERO;
-        let header = BlockHeader::new(
-            shard,
-            BlockHeight::new(height),
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
+            height: BlockHeight::new(height),
             parent_block_hash,
-            parent_qc,
-            ValidatorId::new(0),
-            ProposerTimestamp::ZERO,
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            beacon_root,
-            BeaconWitnessLeafCount::new(total_leaves),
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+            parent_qc: parent_qc.into(),
+            beacon_witness_root: beacon_root,
+            beacon_witness_leaf_count: BeaconWitnessLeafCount::new(total_leaves),
+            ..Default::default()
+        });
         let block_hash = header.hash();
         let qc = QuorumCertificate::new(
             block_hash,

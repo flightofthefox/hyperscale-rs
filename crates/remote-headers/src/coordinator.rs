@@ -1631,11 +1631,9 @@ impl RemoteHeaderCoordinator {
 mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-        CertificateRoot, ChainOrigin, Epoch, Hash, LocalReceiptRoot, NetworkDefinition,
-        ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
-        ShardLoad, Signer, SignerBitfield, StateRoot, TransactionRoot, ValidatorId, ValidatorInfo,
-        ValidatorSet, WorkInFlight,
+        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Epoch, Hash,
+        NetworkDefinition, ProposerTimestamp, QuorumCertificate, Round, ShardId, Signer,
+        SignerBitfield, ValidatorId, ValidatorInfo, ValidatorSet,
     };
 
     use super::*;
@@ -1655,31 +1653,14 @@ mod tests {
     #[test]
     fn test_structural_precheck_rejects_mismatched_qc_hash() {
         // This test verifies the structural pre-check without needing a real topology.
-        let header = BlockHeader::new(
-            ShardId::leaf(2, 2),
-            BlockHeight::new(5),
-            BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::leaf(2, 0), ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(1_234_567_890),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: ShardId::leaf(2, 2),
+            height: BlockHeight::new(5),
+            parent_block_hash: BlockHash::ZERO,
+            parent_qc: QuorumCertificate::genesis(ShardId::leaf(2, 0), ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
+            ..Default::default()
+        });
         // Deliberately set wrong block_hash
         let qc = QuorumCertificate::new(
             BlockHash::from_raw(Hash::from_bytes(b"wrong")),
@@ -1753,31 +1734,14 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_qc_wt),
         );
-        let header = BlockHeader::new(
-            shard,
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
             height,
-            parent_qc.block_hash(),
-            parent_qc,
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(0),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+            parent_block_hash: parent_qc.block_hash(),
+            parent_qc: parent_qc.into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            ..Default::default()
+        });
         let qc = QuorumCertificate::new(
             header.hash(),
             shard,
@@ -1810,31 +1774,14 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(parent_qc_wt),
         );
-        let header = BlockHeader::new(
-            shard,
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
             height,
-            parent_hash,
-            parent_qc,
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(0),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+            parent_block_hash: parent_hash,
+            parent_qc: parent_qc.into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            ..Default::default()
+        });
         let qc = QuorumCertificate::new(
             header.hash(),
             shard,
@@ -2258,31 +2205,15 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(height * 1_000),
         );
-        let header = BlockHeader::new(
-            shard,
-            BlockHeight::new(height),
-            parent_hash,
-            parent_qc,
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(0),
-            Round::new(round),
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
+            height: BlockHeight::new(height),
+            parent_block_hash: parent_hash,
+            parent_qc: parent_qc.into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            round: Round::new(round),
+            ..Default::default()
+        });
         let qc = QuorumCertificate::new(
             header.hash(),
             shard,

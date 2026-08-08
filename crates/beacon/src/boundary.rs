@@ -370,16 +370,14 @@ fn boundary_qc_authentic(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+
     use std::sync::Arc;
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeight, BlockVote,
-        CertificateRoot, CertifiedBlockHeader, Epoch, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionsRoot, RevealChain, Round, ShardLoad, SignerBitfield, StateRoot, TransactionRoot,
-        WeightedTimestamp, WorkInFlight,
+        AggregateSignature, BlockHeaderParts, BlockHeight, BlockVote, CertifiedBlockHeader, Epoch,
+        ProposerTimestamp, Round, SignerBitfield, WeightedTimestamp,
     };
 
     use super::*;
@@ -405,31 +403,15 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(anchor_ms),
         );
-        BlockHeader::new(
-            SHARD,
-            BlockHeight::new(height),
-            parent_hash,
-            parent_qc,
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(0),
-            Round::new(round),
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+        BlockHeader::new(BlockHeaderParts {
+            shard_id: SHARD,
+            height: BlockHeight::new(height),
+            parent_block_hash: parent_hash,
+            parent_qc: parent_qc.into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            round: Round::new(round),
+            ..Default::default()
+        })
     }
 
     /// A genuine 2f+1 QC over `header`, signed by `committee`'s first three

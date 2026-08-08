@@ -804,72 +804,34 @@ impl PendingBlock {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeight, CertificateRoot,
-        ChainOrigin, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
-        RevealChain, Round, ShardId, ShardLoad, StateRoot, TickId, TransactionRoot, ValidatorId,
-        Verified, WitnessSources, WorkInFlight,
+        Block, BlockHeaderParts, BlockHeight, ChainOrigin, Hash, ProposerTimestamp,
+        QuorumCertificate, Round, ShardId, TickId, Verified, WitnessSources,
     };
 
     use super::*;
 
     fn make_header(height: BlockHeight) -> BlockHeader {
-        BlockHeader::new(
-            ShardId::ROOT,
+        BlockHeader::new(BlockHeaderParts {
             height,
-            BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(1_234_567_890),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
+            ..Default::default()
+        })
     }
 
     fn make_header_round(height: BlockHeight, round: Round) -> BlockHeader {
-        BlockHeader::new(
-            ShardId::ROOT,
+        BlockHeader::new(BlockHeaderParts {
             height,
-            BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(1_234_567_890),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
             round,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+            ..Default::default()
+        })
     }
 
     fn insert_at(pending: &mut PendingBlocks, height: BlockHeight, round: Round) -> BlockHash {

@@ -561,13 +561,12 @@ mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::test_utils::{TestCommittee, make_finalization};
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-        CertificateRoot, ChainOrigin, Finalization, Hash, LocalReceiptRoot, MerkleInclusionProof,
-        NetworkDefinition, ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot,
-        QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, Signer, SignerBitfield,
-        StateRoot, TimestampRange, Transaction, TransactionDecision, TransactionRoot, ValidatorId,
+        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Finalization,
+        Hash, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
+        Provisions, QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, Signer,
+        SignerBitfield, TimestampRange, Transaction, TransactionDecision, ValidatorId,
         ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources,
-        WorkInFlight, test_utils,
+        test_utils,
     };
 
     use super::*;
@@ -592,31 +591,16 @@ mod tests {
     }
 
     fn header_at_height(height: BlockHeight, timestamp_ms: u64) -> BlockHeader {
-        BlockHeader::new(
-            ShardId::ROOT,
+        BlockHeader::new(BlockHeaderParts {
             height,
-            BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-            ValidatorId::new(height.inner() % 4),
-            ProposerTimestamp::from_millis(timestamp_ms),
-            Round::new(0),
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            proposer: ValidatorId::new(height.inner() % 4),
+            timestamp: ProposerTimestamp::from_millis(timestamp_ms),
+            round: Round::new(0),
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            ..Default::default()
+        })
     }
 
     fn header_with_overrides(
@@ -626,59 +610,37 @@ mod tests {
         parent_block_hash: Option<BlockHash>,
         proposer: Option<ValidatorId>,
     ) -> BlockHeader {
-        BlockHeader::new(
-            base.shard_id(),
-            base.height(),
-            parent_block_hash.unwrap_or_else(|| base.parent_block_hash()),
-            base.parent_qc().clone(),
-            proposer.unwrap_or_else(|| base.proposer()),
-            base.timestamp(),
-            round.unwrap_or_else(|| base.round()),
-            is_fallback.unwrap_or_else(|| base.is_fallback()),
-            base.state_root(),
-            base.transaction_root(),
-            base.certificate_root(),
-            base.local_receipt_root(),
-            base.provision_root(),
-            base.cross_shard_txs().clone(),
-            base.provision_tx_roots().clone(),
-            base.work_in_flight(),
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+        BlockHeader::new(BlockHeaderParts {
+            shard_id: base.shard_id(),
+            height: base.height(),
+            parent_block_hash: parent_block_hash.unwrap_or_else(|| base.parent_block_hash()),
+            parent_qc: base.parent_qc().clone().into(),
+            proposer: proposer.unwrap_or_else(|| base.proposer()),
+            timestamp: base.timestamp(),
+            round: round.unwrap_or_else(|| base.round()),
+            is_fallback: is_fallback.unwrap_or_else(|| base.is_fallback()),
+            state_root: base.state_root(),
+            transaction_root: base.transaction_root(),
+            certificate_root: base.certificate_root(),
+            local_receipt_root: base.local_receipt_root(),
+            provision_root: base.provision_root(),
+            cross_shard_txs: base.cross_shard_txs().clone(),
+            provision_tx_roots: base.provision_tx_roots().clone(),
+            work_in_flight: base.work_in_flight(),
+            ..Default::default()
+        })
     }
 
     fn block_with_cross_shard_txs(height: BlockHeight, cross_shard_txs: Vec<TxHash>) -> Block {
-        let header = BlockHeader::new(
-            ShardId::ROOT,
+        let header = BlockHeader::new(BlockHeaderParts {
             height,
-            BlockHash::ZERO,
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(0),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
+            parent_block_hash: BlockHash::ZERO,
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(0),
             cross_shard_txs,
-            std::collections::BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        );
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            ..Default::default()
+        });
         Block::Live {
             header,
             transactions: Arc::new(Vec::new()),
@@ -862,31 +824,16 @@ mod tests {
     fn header_extending(parent_qc: QuorumCertificate, now: LocalTimestamp) -> BlockHeader {
         let round = Round::new(1);
         let proposer = topology_snapshot().proposer_for(local_shard(), round);
-        BlockHeader::new(
-            ShardId::ROOT,
-            BlockHeight::new(2),
-            parent_qc.block_hash(),
-            parent_qc,
+        BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(2),
+            parent_block_hash: parent_qc.block_hash(),
+            parent_qc: parent_qc.into(),
             proposer,
-            ProposerTimestamp::from_millis(now.as_millis()),
+            timestamp: ProposerTimestamp::from_millis(now.as_millis()),
             round,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            ..Default::default()
+        })
     }
 
     #[test]
@@ -1009,31 +956,16 @@ mod tests {
         proposer: ValidatorId,
         now: LocalTimestamp,
     ) -> BlockHeader {
-        BlockHeader::new(
-            ShardId::ROOT,
-            BlockHeight::new(2),
-            parent_qc.block_hash(),
-            parent_qc,
+        BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(2),
+            parent_block_hash: parent_qc.block_hash(),
+            parent_qc: parent_qc.into(),
             proposer,
-            ProposerTimestamp::from_millis(now.as_millis()),
-            Round::new(1),
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+            timestamp: ProposerTimestamp::from_millis(now.as_millis()),
+            round: Round::new(1),
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            ..Default::default()
+        })
     }
 
     #[test]

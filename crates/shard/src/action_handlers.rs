@@ -17,17 +17,18 @@ use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, ReadySignalNotification, TimeoutNotification,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BeaconWitnessRootContext, Block, BlockHash, BlockHeader, BlockHeight,
-    BlockProposalMessage, BlockVote, BlockVoteMessage, CertificateRoot, CertificateRootContext,
-    CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError,
-    ConsensusPublicKey, ConsensusReceipt, Epoch, Finalization, Hash, LocalReceiptRoot,
-    LocalReceiptRootContext, NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
-    ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, RevealChain,
-    Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot, StateRootContext,
-    Stopwatch, StoredReceipt, SubstateKey, Timeout, TimeoutContext, TopologySnapshot, Transaction,
-    TransactionRoot, TransactionRootContext, ValidatorId, Verifiable, Verified, Verifier, Verify,
-    VoteCount, VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, absorb_committed_cells,
+    BeaconWitnessLeafCount, BeaconWitnessRootContext, Block, BlockHash, BlockHeader,
+    BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote, BlockVoteMessage,
+    CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
+    CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError, ConsensusPublicKey,
+    ConsensusReceipt, Epoch, Finalization, Hash, LocalReceiptRoot, LocalReceiptRootContext,
+    NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
+    QuorumCertificate, ReadySignal, ReshapeTrigger, RevealChain, Round, SettledTxsRoot, ShardId,
+    ShardLoad, SplitChildRoots, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateKey,
+    Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
+    TransactionRootContext, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
+    VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, absorb_committed_cells,
     commit_witness_window, compute_cross_shard_txs, derive_leaves, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
     vrf_output_from_proof, work_over_certificates,
@@ -331,11 +332,11 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
         .unwrap_or(ShardLoad::ZERO)
         .advance(work_over_certificates(&certificates), substate_bytes);
 
-    let header = BlockHeader::new(
-        local_shard,
+    let header = BlockHeader::new(BlockHeaderParts {
+        shard_id: local_shard,
         height,
         parent_block_hash,
-        parent_qc,
+        parent_qc: parent_qc.into(),
         proposer,
         timestamp,
         round,
@@ -355,7 +356,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
         split_child_roots,
         settled_txs_root,
         load,
-    );
+    });
 
     let block = Block::Live {
         header,

@@ -23,8 +23,8 @@ use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_types::{
     AggregateSignature, BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig,
     BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-    BlockHeight, BlockVote, CandidateBeaconBlock, CandidateVerifyContext, CertificateRoot,
-    CertifiedBeaconBlock, CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader,
+    BlockHeaderParts, BlockHeight, BlockVote, CandidateBeaconBlock, CandidateVerifyContext,
+    CertificateRoot, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader,
     ConsensusPublicKey, Epoch, GenesisPool, GenesisValidator, Hash, LeafIndex, LocalReceiptRoot,
     LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, PcScope, PcValueElement, PcVector, PcVote1,
     PcVote2, PcVote3, PcVoteEquivocation, PcVoteVerifyContext, ProposerTimestamp, ProvisionsRoot,
@@ -1551,34 +1551,17 @@ fn make_source_header_with_parent_qc(
 ) -> Arc<Verified<CertifiedBlockHeader>> {
     let parent_hash = parent_qc.block_hash();
     let parent_wt = parent_qc.weighted_timestamp();
-    let header = BlockHeader::new(
-        shard,
-        BlockHeight::new(height),
-        parent_hash,
-        parent_qc,
-        ValidatorId::new(0),
-        ProposerTimestamp::ZERO,
-        // Track height so consecutive fixture headers form the
-        // round-contiguous two-chain commit evidence the crossing
-        // recorder and boundary-QC admission demand.
-        Round::new(height),
-        false,
+    let header = BlockHeader::new(BlockHeaderParts {
+        shard_id: shard,
+        height: BlockHeight::new(height),
+        parent_block_hash: parent_hash,
+        parent_qc: parent_qc.into(),
+        round: Round::new(height),
         state_root,
-        TransactionRoot::ZERO,
-        CertificateRoot::ZERO,
-        LocalReceiptRoot::ZERO,
-        ProvisionsRoot::ZERO,
-        Vec::new(),
-        BTreeMap::new(),
-        WorkInFlight::ZERO,
-        witness_root,
-        BeaconWitnessLeafCount::new(leaf_count),
-        BeaconWitnessLeafCount::ZERO,
-        RevealChain::ZERO,
-        None,
-        None,
-        ShardLoad::ZERO,
-    );
+        beacon_witness_root: witness_root,
+        beacon_witness_leaf_count: BeaconWitnessLeafCount::new(leaf_count),
+        ..Default::default()
+    });
     let block_hash = header.hash();
     let qc = QuorumCertificate::new(
         block_hash,

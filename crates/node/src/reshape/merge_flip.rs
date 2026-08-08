@@ -68,43 +68,26 @@ pub fn merge_genesis_from_terminals(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
-        CertificateRoot, ChainOrigin, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, SplitChildRoots,
-        StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp, WorkInFlight,
+        AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, ChainOrigin, Hash,
+        QuorumCertificate, Round, ShardId, SignerBitfield, SplitChildRoots, StateRoot, ValidatorId,
+        WeightedTimestamp,
     };
 
     use super::*;
 
     fn terminal_header(shard: ShardId, height: u64, state_root: StateRoot) -> BlockHeader {
-        BlockHeader::new(
-            shard,
-            BlockHeight::new(height),
-            BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(shard, ChainOrigin::ROOT),
-            ValidatorId::new(2),
-            ProposerTimestamp::ZERO,
-            Round::new(7),
-            false,
+        BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
+            height: BlockHeight::new(height),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_qc: QuorumCertificate::genesis(shard, ChainOrigin::ROOT).into(),
+            proposer: ValidatorId::new(2),
+            round: Round::new(7),
             state_root,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+            ..Default::default()
+        })
     }
 
     fn certifying_qc(terminal: &BlockHeader, wt: u64) -> QuorumCertificate {

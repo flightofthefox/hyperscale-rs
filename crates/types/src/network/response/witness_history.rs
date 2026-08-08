@@ -72,44 +72,25 @@ impl NetworkMessage for GetWitnessHistoryResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
     use crate::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
-        CertificateRoot, ChainOrigin, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, Stake,
-        StakePoolId, StateRoot, TransactionRoot, ValidatorId, WeightedTimestamp, WorkInFlight,
+        AggregateSignature, BeaconWitnessLeafCount, BlockHash, BlockHeaderParts, BlockHeight,
+        ChainOrigin, Hash, ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield,
+        Stake, StakePoolId, WeightedTimestamp,
     };
 
     fn make_header() -> BlockHeader {
-        BlockHeader::new(
-            ShardId::ROOT,
-            BlockHeight::new(7),
-            BlockHash::from_raw(Hash::from_bytes(b"parent")),
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(1_234_567_890),
-            Round::INITIAL,
-            false,
-            StateRoot::ZERO,
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            BTreeMap::new(),
-            WorkInFlight::ZERO,
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::new(2),
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+        BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(7),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(1_234_567_890),
+            beacon_witness_leaf_count: BeaconWitnessLeafCount::new(2),
+            ..Default::default()
+        })
     }
 
     #[test]

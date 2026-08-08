@@ -89,6 +89,77 @@ pub struct BlockHeader {
     load: ShardLoad,
 }
 
+/// Every field of a [`BlockHeader`], named.
+///
+/// The header commits two dozen things and grows with the protocol, so
+/// its constructor takes them by name: a fixture states the handful its
+/// case turns on and takes [`Default`] for the rest, and a new
+/// commitment costs the sites that set it rather than every site that
+/// builds a header.
+///
+/// The defaults are the empty chain's values — the same ones
+/// [`BlockHeader::genesis`] uses — so a partially-specified header is a
+/// header about nothing rather than a header with plausible-looking
+/// content it never meant to claim.
+#[derive(Debug, Clone)]
+#[allow(missing_docs)] // one field per header commitment; documented on `BlockHeader` itself
+pub struct BlockHeaderParts {
+    pub shard_id: ShardId,
+    pub height: BlockHeight,
+    pub parent_block_hash: BlockHash,
+    pub parent_qc: Verifiable<QuorumCertificate>,
+    pub proposer: ValidatorId,
+    pub timestamp: ProposerTimestamp,
+    pub round: Round,
+    pub is_fallback: bool,
+    pub state_root: StateRoot,
+    pub transaction_root: TransactionRoot,
+    pub certificate_root: CertificateRoot,
+    pub local_receipt_root: LocalReceiptRoot,
+    pub provision_root: ProvisionsRoot,
+    pub cross_shard_txs: Vec<TxHash>,
+    pub provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
+    pub work_in_flight: WorkInFlight,
+    pub beacon_witness_root: BeaconWitnessRoot,
+    pub beacon_witness_leaf_count: BeaconWitnessLeafCount,
+    pub beacon_witness_base: BeaconWitnessLeafCount,
+    pub reveal_chain: RevealChain,
+    pub split_child_roots: Option<SplitChildRoots>,
+    pub settled_txs_root: Option<SettledTxsRoot>,
+    pub load: ShardLoad,
+}
+
+impl Default for BlockHeaderParts {
+    fn default() -> Self {
+        Self {
+            shard_id: ShardId::ROOT,
+            height: BlockHeight::GENESIS,
+            parent_block_hash: BlockHash::from_raw(Hash::ZERO),
+            parent_qc: Verified::<QuorumCertificate>::genesis(ShardId::ROOT, ChainOrigin::ROOT)
+                .into(),
+            proposer: ValidatorId::new(0),
+            timestamp: ProposerTimestamp::ZERO,
+            round: Round::INITIAL,
+            is_fallback: false,
+            state_root: StateRoot::ZERO,
+            transaction_root: TransactionRoot::ZERO,
+            certificate_root: CertificateRoot::ZERO,
+            local_receipt_root: LocalReceiptRoot::ZERO,
+            provision_root: ProvisionsRoot::ZERO,
+            cross_shard_txs: Vec::new(),
+            provision_tx_roots: BTreeMap::new(),
+            work_in_flight: WorkInFlight::ZERO,
+            beacon_witness_root: BeaconWitnessRoot::ZERO,
+            beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            beacon_witness_base: BeaconWitnessLeafCount::ZERO,
+            reveal_chain: RevealChain::ZERO,
+            split_child_roots: None,
+            settled_txs_root: None,
+            load: ShardLoad::ZERO,
+        }
+    }
+}
+
 impl BlockHeader {
     /// Build a `BlockHeader` from its parts.
     ///
@@ -98,36 +169,37 @@ impl BlockHeader {
     /// `provision_tx_roots.len() > MAX_PROVISION_TARGET_SHARDS`.
     #[allow(clippy::too_many_arguments)] // mirrors the 23 stored fields
     #[must_use]
-    pub fn new(
-        shard_id: ShardId,
-        height: BlockHeight,
-        parent_block_hash: BlockHash,
-        parent_qc: impl Into<Verifiable<QuorumCertificate>>,
-        proposer: ValidatorId,
-        timestamp: ProposerTimestamp,
-        round: Round,
-        is_fallback: bool,
-        state_root: StateRoot,
-        transaction_root: TransactionRoot,
-        certificate_root: CertificateRoot,
-        local_receipt_root: LocalReceiptRoot,
-        provision_root: ProvisionsRoot,
-        cross_shard_txs: Vec<TxHash>,
-        provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
-        work_in_flight: WorkInFlight,
-        beacon_witness_root: BeaconWitnessRoot,
-        beacon_witness_leaf_count: BeaconWitnessLeafCount,
-        beacon_witness_base: BeaconWitnessLeafCount,
-        reveal_chain: RevealChain,
-        split_child_roots: Option<SplitChildRoots>,
-        settled_txs_root: Option<SettledTxsRoot>,
-        load: ShardLoad,
-    ) -> Self {
+    pub fn new(parts: BlockHeaderParts) -> Self {
+        let BlockHeaderParts {
+            shard_id,
+            height,
+            parent_block_hash,
+            parent_qc,
+            proposer,
+            timestamp,
+            round,
+            is_fallback,
+            state_root,
+            transaction_root,
+            certificate_root,
+            local_receipt_root,
+            provision_root,
+            cross_shard_txs,
+            provision_tx_roots,
+            work_in_flight,
+            beacon_witness_root,
+            beacon_witness_leaf_count,
+            beacon_witness_base,
+            reveal_chain,
+            split_child_roots,
+            settled_txs_root,
+            load,
+        } = parts;
         Self {
             shard_id,
             height,
             parent_block_hash,
-            parent_qc: parent_qc.into(),
+            parent_qc,
             proposer,
             timestamp,
             round,
@@ -860,7 +932,7 @@ mod tests {
             _,
             _,
         ) = bare.clone().into_parts();
-        let carrying = BlockHeader::new(
+        let carrying = BlockHeader::new(BlockHeaderParts {
             shard_id,
             height,
             parent_block_hash,
@@ -875,16 +947,15 @@ mod tests {
             local_receipt_root,
             provision_root,
             cross_shard_txs,
-            provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
-            in_flight,
+            provision_tx_roots: provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
+            work_in_flight: in_flight,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
             reveal_chain,
-            Some(pair),
-            None,
-            ShardLoad::ZERO,
-        );
+            split_child_roots: Some(pair),
+            ..Default::default()
+        });
 
         let decoded: BlockHeader = hbor_from_slice(&hbor_to_vec(&carrying).unwrap()).unwrap();
         assert_eq!(decoded.split_child_roots(), Some(pair));
@@ -923,7 +994,7 @@ mod tests {
             _,
             _,
         ) = bare.clone().into_parts();
-        let carrying = BlockHeader::new(
+        let carrying = BlockHeader::new(BlockHeaderParts {
             shard_id,
             height,
             parent_block_hash,
@@ -938,16 +1009,16 @@ mod tests {
             local_receipt_root,
             provision_root,
             cross_shard_txs,
-            provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
-            in_flight,
+            provision_tx_roots: provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
+            work_in_flight: in_flight,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
             reveal_chain,
             split_child_roots,
-            Some(root),
-            ShardLoad::ZERO,
-        );
+            settled_txs_root: Some(root),
+            ..Default::default()
+        });
 
         let decoded: BlockHeader = hbor_from_slice(&hbor_to_vec(&carrying).unwrap()).unwrap();
         assert_eq!(decoded.settled_txs_root(), Some(root));

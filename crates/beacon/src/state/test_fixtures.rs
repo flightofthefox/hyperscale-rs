@@ -14,14 +14,12 @@ pub use hyperscale_crypto_bls::{
 };
 use hyperscale_types::{
     AggregateSignature, BeaconChainConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount,
-    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, CertificateRoot, ConsensusSignature,
-    Epoch, Hash, LocalReceiptRoot, MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation,
-    PendingWithdrawal, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
-    ShardCommittee, ShardEpochContribution, ShardId, ShardLoad, ShardVoteEquivocation,
-    ShardWitnessPayload, SignerBitfield, SlotEffects, Stake, StakePool, StakePoolId, StateRoot,
-    TransactionRoot, ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp,
-    WorkInFlight, beacon_reveal_sign, compute_merkle_root, compute_range_proof,
-    validator_possession_proof_sign,
+    BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, ConsensusSignature,
+    Epoch, Hash, MIN_STAKE_FLOOR, NetworkDefinition, PcVoteEquivocation, PendingWithdrawal,
+    QuorumCertificate, Round, ShardCommittee, ShardEpochContribution, ShardId,
+    ShardVoteEquivocation, ShardWitnessPayload, SignerBitfield, SlotEffects, Stake, StakePool,
+    StakePoolId, ValidatorId, ValidatorRecord, ValidatorStatus, VrfProof, WeightedTimestamp,
+    beacon_reveal_sign, compute_merkle_root, compute_range_proof, validator_possession_proof_sign,
 };
 
 use crate::state::{ApplyEpochInput, apply_epoch};
@@ -325,31 +323,15 @@ fn boundary_header(shard: ShardId, root: BeaconWitnessRoot, leaf_count: u64) -> 
         AggregateSignature::ZERO,
         WeightedTimestamp::from_millis(1),
     );
-    BlockHeader::new(
-        shard,
-        BlockHeight::new(5),
-        BlockHash::ZERO,
-        parent_qc,
-        ValidatorId::new(0),
-        ProposerTimestamp::ZERO,
-        Round::INITIAL,
-        false,
-        StateRoot::ZERO,
-        TransactionRoot::ZERO,
-        CertificateRoot::ZERO,
-        LocalReceiptRoot::ZERO,
-        ProvisionsRoot::ZERO,
-        Vec::new(),
-        BTreeMap::new(),
-        WorkInFlight::ZERO,
-        root,
-        BeaconWitnessLeafCount::new(leaf_count),
-        BeaconWitnessLeafCount::ZERO,
-        RevealChain::ZERO,
-        None,
-        None,
-        ShardLoad::ZERO,
-    )
+    BlockHeader::new(BlockHeaderParts {
+        shard_id: shard,
+        height: BlockHeight::new(5),
+        parent_block_hash: BlockHash::ZERO,
+        parent_qc: parent_qc.into(),
+        beacon_witness_root: root,
+        beacon_witness_leaf_count: BeaconWitnessLeafCount::new(leaf_count),
+        ..Default::default()
+    })
 }
 
 /// Build a single-pool state with `n_actives` active validators

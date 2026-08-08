@@ -227,40 +227,24 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockManifest,
-        CertificateRoot, Hash, LocalReceiptRoot, LocalTimestamp, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, Transaction,
-        TransactionRoot, ValidatorId, Verifiable, WeightedTimestamp, WitnessSources, test_utils,
+        AggregateSignature, Block, BlockHeaderParts, BlockManifest, Hash, LocalTimestamp,
+        ProposerTimestamp, QuorumCertificate, Round, ShardId, SignerBitfield, Transaction,
+        Verifiable, WeightedTimestamp, WitnessSources, test_utils,
     };
 
     use super::*;
 
     fn make_header(height: u8, parent_block_hash: BlockHash) -> BlockHeader {
-        BlockHeader::new(
-            ShardId::ROOT,
-            BlockHeight::new(u64::from(height)),
+        BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(u64::from(height)),
             parent_block_hash,
-            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-            ValidatorId::new(0),
-            ProposerTimestamp::from_millis(1000),
-            Round::INITIAL,
-            false,
-            StateRoot::from_raw(Hash::from_bytes(&[height; 32])),
-            TransactionRoot::ZERO,
-            CertificateRoot::ZERO,
-            LocalReceiptRoot::ZERO,
-            ProvisionsRoot::ZERO,
-            Vec::new(),
-            std::collections::BTreeMap::new(),
-            WorkInFlight::new(u64::from(height)),
-            BeaconWitnessRoot::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            BeaconWitnessLeafCount::ZERO,
-            RevealChain::ZERO,
-            None,
-            None,
-            ShardLoad::ZERO,
-        )
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(1000),
+            state_root: StateRoot::from_raw(Hash::from_bytes(&[height; 32])),
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            work_in_flight: WorkInFlight::new(u64::from(height)),
+            ..Default::default()
+        })
     }
 
     fn make_block(height: u8, parent_block_hash: BlockHash) -> Block {
