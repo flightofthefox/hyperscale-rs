@@ -476,6 +476,7 @@ fn build_fee_receipt(
 
     let writes = StateWrites {
         cells: BTreeMap::from([(vault, Some(debited.to_le_bytes().to_vec()))]),
+        movements: BTreeMap::new(),
     };
     let receipt_hash = GlobalReceipt::new(
         true,

@@ -462,7 +462,10 @@ fn stub_execute(
         let next = counter(snapshot.substate(cell)) + 1;
         cells.insert(cell, Some(next.to_le_bytes().to_vec()));
     }
-    let writes = StateWrites { cells };
+    let writes = StateWrites {
+        cells,
+        movements: BTreeMap::new(),
+    };
     let receipt_hash = GlobalReceipt::new(
         true,
         EventRoot::ZERO,

@@ -465,6 +465,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (*k, v.map(<[u8]>::to_vec)))
                 .collect(),
+            movements: BTreeMap::new(),
         }
     }
 
