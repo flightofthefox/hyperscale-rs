@@ -15,5 +15,6 @@ pub mod pending_chain;
 pub mod recovered_state;
 pub mod store;
 pub mod tick_chain;
+pub mod unresolved;
 pub mod vote_registers;
 pub mod writes;

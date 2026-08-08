@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_jmt::TreeReader;
+use hyperscale_types::test_utils::{make_finalization, test_transaction};
 use hyperscale_types::{
     Address, AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconCert, BeaconChainConfig,
     BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
@@ -17,10 +18,12 @@ use hyperscale_types::{
     PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, QuorumCertificate,
     Randomness, RatifyCert, RatifyRound, Round, SettledWrites, ShardAnchor, ShardId,
     ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, TickId, TxHash, TxOutcome, Verifiable,
-    Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root, compute_merkle_root,
+    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, TickId, Transaction,
+    TransactionDecision, TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp,
+    WitnessSources, compute_global_receipt_root, compute_merkle_root,
 };
 
+use crate::shard::unresolved::fold_unresolved_txs;
 use crate::tree::Jmt;
 use crate::{
     BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, ShardChainReader,
@@ -777,5 +780,73 @@ where
     // A second import is rejected — the store is no longer empty.
     assert!(
         import_boundary_state(fresh, BlockHeight::new(6), &[], WitnessSeed::default()).is_err()
+    );
+}
+
+/// Attach `txs` to a live block, preserving everything else.
+fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Block {
+    match block {
+        Block::Live {
+            header,
+            certificates,
+            provisions,
+            witness_sources,
+            ..
+        } => Block::Live {
+            header,
+            transactions: Arc::new(txs),
+            certificates,
+            provisions,
+            witness_sources,
+        },
+        sealed @ Block::Sealed { .. } => sealed,
+    }
+}
+
+/// Shared rebuild test: a replica that lost its execution state replays
+/// the chain and names exactly the transactions it committed and never
+/// resolved.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)) {
+    let resolved = test_transaction(1);
+    let open = test_transaction(2);
+
+    commit_empty_blocks_up_to(storage, BlockHeight::new(1));
+    let committing = with_transactions(
+        make_test_block(BlockHeight::new(1)),
+        vec![
+            Arc::new(Verifiable::from(resolved.clone())),
+            Arc::new(Verifiable::from(open.clone())),
+        ],
+    );
+    storage.commit_block(&make_test_certified(committing), &empty_witness());
+
+    // Only one of them gets an outcome. An abort resolves a transaction
+    // exactly as a settlement does, and owes no receipt — which is what
+    // lets the rebuilt block carry it on every backend.
+    let resolving = push_certificate(
+        make_test_block(BlockHeight::new(2)),
+        Arc::new(Verifiable::from(make_finalization(
+            BlockHeight::new(2),
+            resolved.hash(),
+            TransactionDecision::Aborted,
+        ))),
+    );
+    storage.commit_block(&make_test_certified(resolving), &empty_witness());
+
+    let rebuilt = fold_unresolved_txs(storage, BlockHeight::new(2), WeightedTimestamp::ZERO);
+    let names: Vec<TxHash> = rebuilt.iter().map(|(tx_hash, _)| *tx_hash).collect();
+    assert_eq!(
+        names,
+        vec![open.hash()],
+        "the replay must name what committed and never resolved, and only that"
+    );
+    assert_eq!(
+        rebuilt[0].1,
+        open.validity_range().end_timestamp_exclusive,
+        "carrying the validity end the abort deadline derives from"
     );
 }

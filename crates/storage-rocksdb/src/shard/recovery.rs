@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use hyperscale_metrics::record_storage_operation;
-use hyperscale_storage::{RecoveredState, SubstateStore};
+use hyperscale_storage::{RecoveredState, SubstateStore, fold_unresolved_txs};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, Hash, RevealChain,
     SafeVoteRegisters, ShardLoad, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
@@ -66,15 +66,21 @@ impl RocksDbShardStorage {
 
         let chain_origin = read_chain_origin(&*self.db);
 
+        let committed_block_anchor_wt = self.anchor_ts_at(committed_height);
         RecoveredState {
             committed_height,
+            unresolved_txs: fold_unresolved_txs(
+                self,
+                committed_height,
+                committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
+            ),
             committed_hash: committed_hash.map(BlockHash::from_raw),
             latest_qc,
             anchor_qc: None,
             committed_in_flight: None,
             committed_reveal_chain: self.committed_reveal_chain(committed_height),
             committed_load: self.committed_load(committed_height),
-            committed_block_anchor_wt: self.anchor_ts_at(committed_height),
+            committed_block_anchor_wt,
             committed_committee_anchor_wt: committed_height
                 .prev()
                 .and_then(|parent_height| self.anchor_ts_at(parent_height)),

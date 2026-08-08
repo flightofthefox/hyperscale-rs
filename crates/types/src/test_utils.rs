@@ -11,13 +11,13 @@ use crate::{
     AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
     BlockVoteMessage, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommitProof,
     ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derived, EnvelopeExt,
-    ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
-    Hash, NetworkDefinition, NetworkId, ProposerTimestamp, QuorumCertificate, Round, Routing,
+    ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
+    NetworkDefinition, NetworkId, ProposerTimestamp, QuorumCertificate, Round, Routing,
     ShardForkProof, ShardId, SignerBitfield, TickId, TimestampRange, TopologySnapshot, Transaction,
     TransactionBody, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, ValidatorId,
     ValidatorInfo, ValidatorSet, Verifiable, Verified, VmStatics, VmStaticsError,
-    WeightedTimestamp, WitnessSources, declared_work, install_vm_statics, signed_bytes,
-    vm_statics_installed,
+    WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
+    install_vm_statics, signed_bytes, vm_statics_installed,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -802,11 +802,15 @@ pub fn make_finalization(
         TransactionDecision::Aborted => ExecutionOutcome::Aborted,
     };
     let tick_id = TickId::new(ShardId::ROOT, block_height);
+    let outcomes = vec![TxOutcome::new(tx_hash, outcome)];
     let ec = ExecutionCertificate::new(
         tick_id,
         WeightedTimestamp::from_millis(block_height.inner() + 1),
-        GlobalReceiptRoot::ZERO,
-        vec![TxOutcome::new(tx_hash, outcome)],
+        // The real root over the real outcomes: anything else fails the
+        // rebuild every decode runs, so the fixture would not survive a
+        // round trip through storage.
+        compute_global_receipt_root(&outcomes),
+        outcomes,
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );

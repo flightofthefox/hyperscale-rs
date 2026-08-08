@@ -16,10 +16,11 @@ use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::put_at_version;
 use hyperscale_storage::{
     GenesisCommit, ImportProgress, RecoveredState, SubstateDatabase, SubstateStore,
+    fold_unresolved_txs,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, SettledWrites, StateRoot,
-    SubstateKey, Verified,
+    SubstateKey, Verified, WeightedTimestamp,
 };
 
 use super::state::{ConsensusState, SharedState, apply_writes};
@@ -195,6 +196,11 @@ impl SimShardStorage {
 
         RecoveredState {
             committed_height,
+            unresolved_txs: fold_unresolved_txs(
+                self,
+                committed_height,
+                committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
+            ),
             committed_hash,
             latest_qc,
             anchor_qc: None,

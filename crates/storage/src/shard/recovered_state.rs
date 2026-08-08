@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash,
-    QuorumCertificate, RevealChain, SafeVoteRegisters, ShardAnchor, ShardLoad, StateRoot,
+    QuorumCertificate, RevealChain, SafeVoteRegisters, ShardAnchor, ShardLoad, StateRoot, TxHash,
     ValidatorId, Verified, WeightedTimestamp, WorkInFlight,
 };
 
@@ -18,6 +18,14 @@ use hyperscale_types::{
 pub struct RecoveredState {
     /// Last committed height; the resume point for proposal/voting after restart.
     pub committed_height: BlockHeight,
+
+    /// Transactions this shard committed and has no outcome for, each
+    /// with the validity end its abort deadline derives from. Replayed
+    /// from the committed chain by
+    /// [`fold_unresolved_txs`](super::unresolved::fold_unresolved_txs),
+    /// because execution's own account of what is in flight does not
+    /// survive the restart this state exists to recover from.
+    pub unresolved_txs: Vec<(TxHash, WeightedTimestamp)>,
 
     /// Last committed block hash (None for fresh start).
     pub committed_hash: Option<BlockHash>,
@@ -154,6 +162,9 @@ impl RecoveredState {
     ) -> Self {
         Self {
             committed_height: anchor.height,
+            // Nothing below the anchor is imported, so a snap-synced
+            // replica knows of nothing in flight beneath it.
+            unresolved_txs: Vec::new(),
             committed_hash: Some(anchor.block_hash),
             latest_qc: None,
             anchor_qc: Some(anchor_qc),

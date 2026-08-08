@@ -661,6 +661,12 @@ fn historical_substate_reads_resolve_per_version() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
+fn a_replay_names_what_committed_and_never_resolved() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_unresolved_fold(&storage);
+}
+
+#[test]
 fn test_ec_storage_roundtrip() {
     let storage = SimShardStorage::default();
     test_helpers::test_ec_storage_roundtrip(&storage);

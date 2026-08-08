@@ -6,7 +6,7 @@ use hyperscale_storage::test_helpers::{
     make_settled_writes, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
     make_test_execution_certificate, make_test_finalization, make_test_qc, make_test_receipt,
     state_key, test_ec_storage_batch as helpers_test_ec_storage_batch,
-    test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
+    test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip, test_unresolved_fold,
     test_witness_payload_range_reads as helpers_test_witness_payload_range_reads,
 };
 use hyperscale_storage::{
@@ -907,6 +907,13 @@ fn test_receipt_survives_reopen() {
 // ═══════════════════════════════════════════════════════════════════════
 // Execution certificate storage
 // ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn a_replay_names_what_committed_and_never_resolved() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_unresolved_fold(&storage);
+}
 
 #[test]
 fn test_ec_storage_roundtrip() {

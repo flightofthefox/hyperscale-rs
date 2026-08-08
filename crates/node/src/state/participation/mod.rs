@@ -109,15 +109,19 @@ impl ShardParticipation {
         exec_cert_store: Arc<ExecCertStore>,
         finalization_store: Arc<FinalizationStore>,
     ) -> Self {
-        // Execution's commit frontier seeds from the same recovered tip the
-        // shard coordinator restores, so the first post-restart commit
-        // classifies its waves under the carried committee anchor exactly as
-        // a non-restarted peer does.
-        let committed_height = recovered.committed_height;
-        let committed_block_anchor_wt = recovered.block_anchor_wt();
-        let committed_committee_anchor_wt = recovered.committee_anchor_wt();
         let mempool_coordinator =
             MempoolCoordinator::with_tx_store(local_shard, mempool_config, tx_store);
+        // Execution's commit frontier and its account of what is still in
+        // flight both seed from the same recovered tip the shard
+        // coordinator restores, so the first post-restart commit
+        // classifies its waves exactly as a non-restarted peer's does.
+        let execution_coordinator = ExecutionCoordinator::with_shared_stores(
+            me,
+            local_shard,
+            &recovered,
+            exec_cert_store,
+            finalization_store,
+        );
         Self {
             local_shard,
             shard_coordinator: ShardCoordinator::new(
@@ -127,15 +131,7 @@ impl ShardParticipation {
                 shard_config.clone(),
                 recovered,
             ),
-            execution_coordinator: ExecutionCoordinator::with_shared_stores(
-                me,
-                local_shard,
-                committed_height,
-                committed_block_anchor_wt,
-                committed_committee_anchor_wt,
-                exec_cert_store,
-                finalization_store,
-            ),
+            execution_coordinator,
             mempool_coordinator,
             provisions_coordinator: ProvisionCoordinator::with_config_and_store(
                 local_shard,

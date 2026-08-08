@@ -38,7 +38,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, FetchAbandon, FetchRequest, ProtocolEvent, TickExecutionGroup, WaveExecutionResult,
 };
-use hyperscale_storage::TickResolution;
+use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, DeclaredKey, ExecutionCertificate, ExecutionCertificateVerifyError,
@@ -391,9 +391,7 @@ impl ExecutionCoordinator {
         Self::with_shared_stores(
             me,
             local_shard,
-            BlockHeight::GENESIS,
-            WeightedTimestamp::ZERO,
-            WeightedTimestamp::ZERO,
+            &RecoveredState::default(),
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
         )
@@ -420,12 +418,13 @@ impl ExecutionCoordinator {
     pub fn with_shared_stores(
         me: ValidatorId,
         local_shard: ShardId,
-        committed_height: BlockHeight,
-        committed_block_anchor_wt: WeightedTimestamp,
-        committed_committee_anchor_wt: WeightedTimestamp,
+        recovered: &RecoveredState,
         exec_certs: Arc<ExecCertStore>,
         finalized: Arc<FinalizationStore>,
     ) -> Self {
+        let committed_height = recovered.committed_height;
+        let committed_block_anchor_wt = recovered.block_anchor_wt();
+        let committed_committee_anchor_wt = recovered.committee_anchor_wt();
         Self {
             finalized,
             committed_height,
@@ -435,7 +434,7 @@ impl ExecutionCoordinator {
             tick_in_flight: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked_waves: BTreeMap::new(),
-            unresolved: UnresolvedTxs::new(),
+            unresolved: UnresolvedTxs::restored(recovered.unresolved_txs.clone()),
             pending_tick_resolutions: Vec::new(),
             waves: WaveRegistry::new(),
             early: EarlyArrivalBuffer::new(),
@@ -5440,9 +5439,12 @@ mod tests {
         let mut state = ExecutionCoordinator::with_shared_stores(
             ValidatorId::new(0),
             ShardId::ROOT,
-            BlockHeight::new(5),
-            WeightedTimestamp::from_millis(900),
-            WeightedTimestamp::from_millis(800),
+            &RecoveredState {
+                committed_height: BlockHeight::new(5),
+                committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(900)),
+                committed_committee_anchor_wt: Some(WeightedTimestamp::from_millis(800)),
+                ..RecoveredState::default()
+            },
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
         );

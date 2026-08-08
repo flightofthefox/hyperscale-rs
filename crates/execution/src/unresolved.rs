@@ -36,9 +36,21 @@ pub struct UnresolvedTxs {
 }
 
 impl UnresolvedTxs {
+    /// Rebuild from a replay of the committed chain: each transaction
+    /// still owed an outcome, against the validity end its deadline
+    /// derives from.
+    ///
+    /// The deadline rule lives here and only here, so a rebuilt ledger
+    /// and a live one cannot disagree about when a transaction stops
+    /// being able to finalize.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn restored(entries: Vec<(TxHash, WeightedTimestamp)>) -> Self {
+        Self {
+            deadlines: entries
+                .into_iter()
+                .map(|(tx_hash, validity_end)| (tx_hash, validity_end.plus(WAVE_TIMEOUT)))
+                .collect(),
+        }
     }
 
     /// Record what a committed block puts in flight.
@@ -117,7 +129,7 @@ mod tests {
     /// block commits until a committed block carries one.
     #[test]
     fn a_committed_transaction_is_owed_an_outcome_until_one_commits() {
-        let mut ledger = UnresolvedTxs::new();
+        let mut ledger = UnresolvedTxs::default();
         let tx = tx(1, 60_000);
         ledger.register_committed(std::iter::once(&tx));
         assert_eq!(ledger.len(), 1);
@@ -133,7 +145,7 @@ mod tests {
     /// certificate answer for both.
     #[test]
     fn an_abort_releases_as_a_settlement_does() {
-        let mut ledger = UnresolvedTxs::new();
+        let mut ledger = UnresolvedTxs::default();
         let tx = tx(2, 60_000);
         ledger.register_committed(std::iter::once(&tx));
 
@@ -148,7 +160,7 @@ mod tests {
     /// the block once and one that replays it.
     #[test]
     fn re_registering_does_not_move_the_deadline() {
-        let mut ledger = UnresolvedTxs::new();
+        let mut ledger = UnresolvedTxs::default();
         let tx = tx(3, 60_000);
         ledger.register_committed(std::iter::once(&tx));
         ledger.register_committed(std::iter::once(&tx));
@@ -162,7 +174,7 @@ mod tests {
     /// still reference the transaction at all.
     #[test]
     fn an_entry_outlives_its_deadline_and_not_the_retention_window() {
-        let mut ledger = UnresolvedTxs::new();
+        let mut ledger = UnresolvedTxs::default();
         let tx = tx(7, 60_000);
         ledger.register_committed(std::iter::once(&tx));
 
