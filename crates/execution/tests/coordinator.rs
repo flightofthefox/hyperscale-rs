@@ -81,14 +81,14 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
 }
 
 #[test]
-fn fresh_get_wave_assignment_returns_none_for_any_tx() {
+fn fresh_tick_assignment_for_returns_none_for_any_tx() {
     let coord = fresh_coordinator();
     assert!(
         coord
-            .get_wave_assignment(TxHash::from(Hash::from_bytes(b"tx1")))
+            .tick_assignment_for(TxHash::from(Hash::from_bytes(b"tx1")))
             .is_none()
     );
-    assert!(coord.get_wave_assignment(TxHash::ZERO).is_none());
+    assert!(coord.tick_assignment_for(TxHash::ZERO).is_none());
 }
 
 #[test]
@@ -115,12 +115,6 @@ fn fresh_cross_shard_pending_count_is_zero() {
 }
 
 #[test]
-fn fresh_is_awaiting_provisioning_is_false_for_any_tx() {
-    let coord = fresh_coordinator();
-    assert!(!coord.is_awaiting_provisioning(TxHash::from(Hash::from_bytes(b"tx1"))));
-}
-
-#[test]
 fn fresh_emit_vote_actions_is_empty() {
     let (mut coord, topology_schedule) = fresh_coordinator_with_topology();
     let actions = coord.emit_vote_actions(&topology_schedule);
@@ -128,9 +122,9 @@ fn fresh_emit_vote_actions_is_empty() {
 }
 
 #[test]
-fn fresh_scan_complete_waves_is_empty() {
+fn fresh_scan_votable_ticks_is_empty() {
     let (mut coord, topology_schedule) = fresh_coordinator_with_topology();
-    assert!(coord.scan_complete_waves(&topology_schedule).is_empty());
+    assert!(coord.scan_votable_ticks(&topology_schedule).is_empty());
 }
 
 #[test]

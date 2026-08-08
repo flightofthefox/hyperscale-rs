@@ -142,7 +142,7 @@ impl EarlyArrivalBuffer {
     /// Remove and return all buffered votes for `tick_id`. Called when the
     /// coordinator creates a leader or fallback-leader `VoteTracker` and
     /// needs to replay the backlog.
-    pub fn drain_votes_for_wave(&mut self, tick_id: &TickId) -> Vec<Verifiable<ExecutionVote>> {
+    pub fn drain_votes_for_tick(&mut self, tick_id: &TickId) -> Vec<Verifiable<ExecutionVote>> {
         let drained = self.votes.remove(tick_id).unwrap_or_default();
         self.buffered -= drained.len();
         drained
@@ -400,12 +400,12 @@ mod tests {
         b.buffer_vote(w, make_vote(w, ms(100)).into());
         b.buffer_vote(w, make_vote(w, ms(200)).into());
 
-        let drained = b.drain_votes_for_wave(&w);
+        let drained = b.drain_votes_for_tick(&w);
         assert_eq!(drained.len(), 2);
         assert_eq!(b.vote_len(), 0);
 
         // Idempotent: second drain returns empty.
-        assert!(b.drain_votes_for_wave(&w).is_empty());
+        assert!(b.drain_votes_for_tick(&w).is_empty());
     }
 
     #[test]
@@ -416,7 +416,7 @@ mod tests {
         b.buffer_vote(w1, make_vote(w1, ms(100)).into());
         b.buffer_vote(w2, make_vote(w2, ms(100)).into());
 
-        let drained = b.drain_votes_for_wave(&w1);
+        let drained = b.drain_votes_for_tick(&w1);
         assert_eq!(drained.len(), 1);
         assert_eq!(b.vote_len(), 1);
     }
@@ -432,8 +432,8 @@ mod tests {
         b.retain_votes(|tick_id, _| tick_id == &w1);
 
         assert_eq!(b.vote_len(), 1);
-        assert_eq!(b.drain_votes_for_wave(&w1).len(), 1);
-        assert!(b.drain_votes_for_wave(&w2).is_empty());
+        assert_eq!(b.drain_votes_for_tick(&w1).len(), 1);
+        assert!(b.drain_votes_for_tick(&w2).is_empty());
     }
 
     #[test]
@@ -459,7 +459,7 @@ mod tests {
         }
         assert!(!b.buffer_vote(wave(2), cheap_vote(wave(2))));
 
-        let drained = b.drain_votes_for_wave(&w);
+        let drained = b.drain_votes_for_tick(&w);
         assert_eq!(drained.len(), MAX_BUFFERED_EARLY_VOTES);
         // The reclaimed budget lets fresh votes buffer again.
         assert!(b.buffer_vote(wave(2), cheap_vote(wave(2))));
@@ -621,7 +621,7 @@ mod tests {
 
     use proptest::prelude::*;
 
-    // drain_votes_for_wave is idempotent: draining returns all buffered
+    // drain_votes_for_tick is idempotent: draining returns all buffered
     // votes and a subsequent drain returns empty.
     proptest! {
         #[test]
@@ -641,10 +641,10 @@ mod tests {
             let tick_ids: Vec<TickId> = heights.iter().map(|h| wave(*h)).collect();
             let mut first_counts = Vec::new();
             for w in &tick_ids {
-                first_counts.push(b.drain_votes_for_wave(w).len());
+                first_counts.push(b.drain_votes_for_tick(w).len());
             }
             for w in &tick_ids {
-                prop_assert!(b.drain_votes_for_wave(w).is_empty());
+                prop_assert!(b.drain_votes_for_tick(w).is_empty());
             }
             // Total drained = total buffered.
             prop_assert_eq!(first_counts.iter().sum::<usize>(), heights.len());

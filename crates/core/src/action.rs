@@ -56,20 +56,6 @@ pub struct CrossShardExecutionRequest {
     pub reaches_beyond: bool,
 }
 
-/// The members of one tick's batch.
-///
-/// Every member carries its resolved per-transaction environment: a
-/// single-shard member holds empty provisions and the committing block's
-/// anchors, a cross-shard leg its provisions and the payer-resolved
-/// anchors.
-#[derive(Debug, Clone)]
-pub struct TickExecutionGroup {
-    /// The tick these members belong to; execution results fan back to it.
-    pub tick_id: TickId,
-    /// The members with their provisions and environments.
-    pub requests: Vec<CrossShardExecutionRequest>,
-}
-
 /// A change to the local vnode's reshape-observer duty, carried on
 /// [`ParticipationChange::observe`].
 ///
@@ -1000,7 +986,8 @@ pub enum Action {
         tick_reveal: RevealChain,
         /// Wave-attributed members of the batch. Results fan back to each
         /// wave by `tick_id`.
-        groups: Vec<TickExecutionGroup>,
+        /// The members, each with its provisions and environment.
+        requests: Vec<CrossShardExecutionRequest>,
     },
 
     /// Resolve wave fates on the tick chain: promote a settled transaction's

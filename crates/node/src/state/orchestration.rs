@@ -113,7 +113,7 @@ impl NodeStateMachine {
         {
             s.terminal_chain_swept = true;
             actions.extend(s.mempool_coordinator.abort_in_flight());
-            actions.extend(s.execution_coordinator.abort_pending_waves());
+            actions.extend(s.execution_coordinator.abort_pending_ticks());
         }
 
         s.shard_coordinator.queue_ready_proposal();

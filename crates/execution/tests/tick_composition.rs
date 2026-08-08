@@ -16,8 +16,8 @@
 mod common;
 
 use common::sim::{ExecutionSim, LEFT, Schedule, cell_of, counter, settle};
-use hyperscale_types::Transaction;
 use hyperscale_types::test_utils::{test_prefix, test_transaction_with_prefixes};
+use hyperscale_types::{ShardId, Transaction};
 
 /// The cell both the crossing and the follower write.
 const SHARED: u8 = 7;
@@ -61,37 +61,37 @@ fn a_leg_claims_against_the_tick_it_joins() {
     let control = local(2, OTHER);
     let control_hash = control.hash();
 
+    // The counterpart engages first, so the leg is ready to run in the
+    // very tick its own block composes — which is what puts it and the
+    // follower in contention for the cell.
+    sim.engage(ShardId::leaf(1, 1), &[leg_hash]);
     sim.commit(vec![leg, follower, control], Vec::new());
     sim.drain();
 
-    let wave = sim.wave_of(leg_hash).expect("the crossing has a tick");
+    let wave = sim.wave_of(leg_hash).expect("the crossing joined a tick");
     assert!(
         !sim.receipts_for(&wave).is_empty(),
         "the crossing itself executes"
     );
 
-    let single = sim.wave_of(follower_hash).expect("the follower has a tick");
-    let executed: Vec<_> = sim
-        .receipts_for(&single)
-        .into_iter()
-        .map(|receipt| receipt.tx_hash)
-        .collect();
     assert!(
-        !executed.contains(&follower_hash),
+        sim.wave_of(follower_hash).is_none(),
         "the follower shared a batch with a leg whose writes it could read"
     );
     assert!(
-        executed.contains(&control_hash),
+        sim.receipts_for(&wave)
+            .iter()
+            .any(|receipt| receipt.tx_hash == control_hash),
         "the control declares nothing the leg claimed and must not wait"
     );
 
-    // Nothing of the crossing is readable while its wave is open, which
+    // Nothing of the crossing is readable while it is unresolved, which
     // is exactly what the follower would have folded over.
     assert_eq!(counter(sim.read(cell_of(test_prefix(SHARED)))), 0);
 
-    // Once the wave settles the claim clears, and the follower enters
-    // the next tick composed — reading the promoted value, not the one
-    // its own block saw.
+    // Once the crossing settles the claim clears, and the follower
+    // enters the next tick composed — reading the promoted value, not
+    // the one its own block saw.
     let receipts = sim.receipts_for(&wave);
     sim.commit(Vec::new(), vec![settle(&wave, &receipts)]);
     sim.commit(Vec::new(), Vec::new());
@@ -107,13 +107,13 @@ fn a_leg_claims_against_the_tick_it_joins() {
 /// Two legs of *one* wave sharing a cell are the same hazard, and the
 /// wave envelope does not close it.
 ///
-/// A wave settles each member on its own verdict — `TickResolution`
+/// A tick settles each member on its own verdict — `TickResolution`
 /// carries the aborted set per transaction — so a counterpart can refuse
-/// one leg while accepting its sibling. A sibling that folded over the
-/// refused leg's writes carries them into state anyway, which is the
-/// one-sided settlement the whole cross-shard design exists to prevent.
-/// Two crossings with the same remote set land in one wave, so this is
-/// the commonest shape rather than an exotic one.
+/// one leg while accepting another. A leg that folded over the refused
+/// one's writes carries them into state anyway, which is the one-sided
+/// settlement the whole cross-shard design exists to prevent. So the
+/// claim is per transaction, and two legs over one cell never share a
+/// tick however alike they are.
 #[test]
 fn one_leg_claims_against_its_own_sibling() {
     let mut sim = ExecutionSim::with_shards(Schedule::Eager, 2, LEFT);
@@ -123,19 +123,20 @@ fn one_leg_claims_against_its_own_sibling() {
     let second = crossing(4, SHARED);
     let second_hash = second.hash();
 
+    sim.engage(ShardId::leaf(1, 1), &[first_hash, second_hash]);
     sim.commit(vec![first, second], Vec::new());
     sim.drain();
 
-    let wave = sim.wave_of(first_hash).expect("the crossing has a wave");
+    let tick = sim.wave_of(first_hash).expect("the crossing joined a tick");
     assert_eq!(
-        sim.wave_of(second_hash).as_ref(),
-        Some(&wave),
-        "two crossings over one remote set share a wave"
-    );
-    assert_eq!(
-        sim.receipts_for(&wave).len(),
+        sim.receipts_for(&tick).len(),
         1,
         "one leg claims the cell; its sibling waits for the verdict"
+    );
+    assert_ne!(
+        sim.wave_of(second_hash).as_ref(),
+        Some(&tick),
+        "so the sibling is attested by whichever tick does run it",
     );
 }
 

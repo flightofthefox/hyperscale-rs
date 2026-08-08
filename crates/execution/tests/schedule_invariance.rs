@@ -16,7 +16,7 @@ use common::sim::{
 };
 use hyperscale_storage::TickOutput;
 use hyperscale_types::test_utils::{test_prefix, test_transaction_with_prefixes};
-use hyperscale_types::{BlockHeight, Transaction};
+use hyperscale_types::{BlockHeight, ShardId, Transaction};
 
 /// A local prefix — under a two-shard partition it routes to [`LEFT`].
 const LOCAL: u8 = 7;
@@ -99,8 +99,11 @@ fn with_a_crossing(schedule: Schedule) -> (Vec<(BlockHeight, TickOutput)>, u64) 
     let leg = crossing(0, LOCAL);
     let leg_hash = leg.hash();
     sim.commit(vec![leg], Vec::new());
+    // The payer's leg runs in the tick that attests it, so it waits for
+    // the counterpart's engagement echo before executing.
+    sim.engage(ShardId::leaf(1, 1), &[leg_hash]);
     sim.drain();
-    let wave = sim.wave_of(leg_hash).expect("the crossing has a tick");
+    let wave = sim.wave_of(leg_hash).expect("the crossing joined a tick");
     assert_eq!(
         counter(sim.read(cell_of(test_prefix(LOCAL)))),
         0,

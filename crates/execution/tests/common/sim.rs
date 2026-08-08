@@ -27,7 +27,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use hyperscale_core::{Action, TickExecutionGroup, WaveExecutionResult};
+use hyperscale_core::{Action, CrossShardExecutionRequest, TickBatchOutcome};
 use hyperscale_engine::ExecutedTx;
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_execution::ExecutionCoordinator;
@@ -40,12 +40,13 @@ use hyperscale_storage::{
 };
 use hyperscale_types::test_utils::{TestCommittee, certify, make_live_block};
 use hyperscale_types::{
-    Address, AggregateSignature, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, EventRoot,
-    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, Finalization, GlobalReceipt,
-    LocalKey, MerkleInclusionProof, Movement, SettledWrites, ShardId, ShardTrie, SignerBitfield,
-    StateRoot, StateWrites, StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    compute_global_receipt_root, read_amount,
+    Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, ConsensusReceipt,
+    EventRoot, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, Finalization,
+    GlobalReceipt, LocalKey, MerkleInclusionProof, Movement, ProvisionEntry, Provisions,
+    RevealChain, SettledWrites, ShardId, ShardTrie, SignerBitfield, StateRoot, StateWrites,
+    StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, compute_global_receipt_root,
+    read_amount,
 };
 
 /// The shard a single-shard fixture runs on.
@@ -172,7 +173,7 @@ impl VersionedStore for StubBase {
 /// A tick dispatched but not yet completed.
 struct PendingBatch {
     tick: BlockHeight,
-    groups: Vec<TickExecutionGroup>,
+    requests: Vec<CrossShardExecutionRequest>,
     /// Height at which the schedule releases it.
     release_at: BlockHeight,
 }
@@ -272,6 +273,54 @@ impl ExecutionSim {
         self.release_due();
     }
 
+    /// Commit a counterpart's engagement for `tx_hashes`: the bundle a
+    /// shard sends the payer because its own block committed the
+    /// transaction. A payer's leg waits for this before executing, since
+    /// the tick that runs it is the tick that attests it.
+    pub fn engage(&mut self, from: ShardId, tx_hashes: &[TxHash]) {
+        let bundle = Provisions::new(
+            from,
+            self.local_shard,
+            self.height,
+            WeightedTimestamp::from_millis(self.height.inner() * BLOCK_INTERVAL_MS),
+            RevealChain::ZERO,
+            MerkleInclusionProof::dummy(),
+            tx_hashes
+                .iter()
+                .map(|h| ProvisionEntry::new(*h, vec![]))
+                .collect(),
+        );
+        self.height = self.height.next();
+        let block = match make_live_block(
+            self.local_shard,
+            self.height,
+            self.height.inner() * BLOCK_INTERVAL_MS,
+            ValidatorId::new(0),
+            Vec::new(),
+            Vec::new(),
+        ) {
+            Block::Live {
+                header,
+                transactions,
+                certificates,
+                witness_sources,
+                ..
+            } => Block::Live {
+                header,
+                transactions,
+                certificates,
+                provisions: Arc::new(vec![Arc::new(Verifiable::from(bundle))]),
+                witness_sources,
+            },
+            sealed @ Block::Sealed { .. } => sealed,
+        };
+        let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
+        let actions = self.coord.on_block_committed(&self.topology, &certified);
+        self.absorb(actions);
+        self.chain.prune_persisted(self.height);
+        self.release_due();
+    }
+
     /// Complete every tick the schedule has released at the current height.
     fn release_due(&mut self) {
         while self
@@ -301,7 +350,7 @@ impl ExecutionSim {
     fn absorb(&mut self, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::ExecuteTransactions { tick, groups, .. } => {
+                Action::ExecuteTransactions { tick, requests, .. } => {
                     let release_at = match self.schedule {
                         Schedule::Eager => self.height,
                         Schedule::Lagged(n) => BlockHeight::new(
@@ -310,7 +359,7 @@ impl ExecutionSim {
                     };
                     self.pending.push_back(PendingBatch {
                         tick,
-                        groups,
+                        requests,
                         release_at,
                     });
                 }
@@ -332,58 +381,55 @@ impl ExecutionSim {
     /// coordinator dispatches the next tick on that notification and its
     /// baseline has to include this one.
     fn run_batch(&mut self, batch: PendingBatch) -> Vec<Action> {
-        let PendingBatch { tick, groups, .. } = batch;
+        let PendingBatch { tick, requests, .. } = batch;
         let view = self
             .chain
             .view_at(BlockHeight::new(tick.inner().saturating_sub(1)));
         let snapshot = view.snapshot();
         let trie = self.snapshot.shard_trie();
 
+        let tick_id = TickId::new(self.local_shard, tick);
+        let executed: Vec<ExecutedTx> = requests
+            .iter()
+            .map(|request| {
+                stub_execute(
+                    &snapshot,
+                    trie,
+                    self.local_shard,
+                    request.tx_hash,
+                    &request.transaction,
+                    request.reaches_beyond,
+                )
+            })
+            .collect();
         let mut output = TickOutput::default();
-        let mut waves = Vec::with_capacity(groups.len());
-        for group in &groups {
-            let executed: Vec<ExecutedTx> = group
-                .requests
-                .iter()
-                .map(|request| {
-                    stub_execute(
-                        &snapshot,
-                        trie,
-                        self.local_shard,
-                        request.tx_hash,
-                        &request.transaction,
-                        request.reaches_beyond,
-                    )
-                })
-                .collect();
-            accumulate_tick_output(&mut output, group, &executed);
-            let ExecutionOutputs {
-                outcomes,
-                results,
-                fee_receipts,
-                attested_work,
-            } = split_execution_outputs(executed);
-            self.receipts
-                .entry(group.tick_id)
-                .or_default()
-                .extend(results.iter().cloned());
-            self.charges
-                .entry(group.tick_id)
-                .or_default()
-                .extend(fee_receipts.iter().cloned());
-            waves.push(WaveExecutionResult {
-                tick_id: group.tick_id,
-                results,
-                tx_outcomes: outcomes,
-                fee_receipts,
-                attested_work,
-            });
-        }
+        accumulate_tick_output(&mut output, tick_id, &requests, &executed);
+        let ExecutionOutputs {
+            outcomes,
+            results,
+            fee_receipts,
+            attested_work,
+        } = split_execution_outputs(executed);
+        self.receipts
+            .entry(tick_id)
+            .or_default()
+            .extend(results.iter().cloned());
+        self.charges
+            .entry(tick_id)
+            .or_default()
+            .extend(fee_receipts.iter().cloned());
+        let outcome = TickBatchOutcome {
+            tick_id,
+            results,
+            tx_outcomes: outcomes,
+            fee_receipts,
+            attested_work,
+        };
 
         self.outputs.push((tick, output.clone()));
         self.chain.append(tick, output);
         self.coord
-            .on_execution_batch_completed(&self.topology, tick, waves)
+            .on_execution_batch_completed(&self.topology, tick, outcome)
     }
 
     /// Every tick output this run produced, in order.
@@ -433,7 +479,7 @@ impl ExecutionSim {
     /// tracks it.
     #[must_use]
     pub fn wave_of(&self, tx_hash: TxHash) -> Option<TickId> {
-        self.coord.get_wave_assignment(tx_hash)
+        self.coord.tick_assignment_for(tx_hash)
     }
 }
 

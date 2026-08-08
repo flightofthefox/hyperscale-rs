@@ -2,7 +2,7 @@
 //!
 //! Drives transaction execution after blocks are committed. Transactions are
 //! grouped into waves (same provision dependency set within a block) and each
-//! wave runs through its lifecycle inside a [`WaveState`](crate::WaveState).
+//! wave runs through its lifecycle inside a [`TickState`](crate::TickState).
 //!
 //! # Transaction Types
 //!
@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use hyperscale_core::{
-    Action, FetchAbandon, FetchRequest, ProtocolEvent, TickExecutionGroup, WaveExecutionResult,
+    Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
 use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
@@ -45,26 +45,27 @@ use hyperscale_types::{
     ExecutionVote, Finalization, FinalizationVerifyError, GlobalReceiptRoot, Hash, Mode,
     Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledTxSet,
     ShardId, TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
-    TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, settled_set_verdict,
-    tick_leader, tick_leader_at,
+    TxOutcome, ValidatorId, Verifiable, Verified, WAVE_TIMEOUT, WeightedTimestamp,
+    settled_set_verdict, tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
+use crate::candidates::TickCandidates;
 use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
 use crate::exec_cert_store::ExecCertStore;
 use crate::expected_certs::ExpectedCertTracker;
 use crate::finalizations::FinalizationStore;
 use crate::lookups::{
-    assign_waves, build_provision_requests, committee_public_keys_for_shard,
+    assign_participants, build_provision_requests, committee_public_keys_for_shard,
     ec_has_shard_quorum_power, fetch_keys_covered, peers_excluding_self,
 };
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
+use crate::tick_state::{Divergence, TickState};
+use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::unresolved::UnresolvedTxs;
 use crate::vote_tracker::VoteTracker;
-use crate::wave_state::{Divergence, WaveState};
-use crate::waves::{PendingVoteRetry, RetryEffect, WaveRegistry};
 
 /// One payer-side engagement wait: the transaction, the counterpart
 /// shards whose echo its vote waits on, and the signed window end that
@@ -83,30 +84,26 @@ struct CommittingBlock {
     reveal: RevealChain,
 }
 
-/// A wave with entries on the tick chain and no committed fate yet.
-struct TickedWave {
-    /// The last tick it contributed to — what a resolution waits for,
-    /// and the order its certificate must settle in relative to waves it
-    /// shares a cell with.
-    tick: BlockHeight,
+/// A tick with entries on the tick chain and no committed fate yet.
+struct TickedBatch {
     /// What its members declared they would mutate.
     claims: Vec<(DeclaredKey, Mode)>,
-    /// Whether those claims are held *provisionally* — true for a
-    /// cross-shard wave, whose writes nothing may read until it resolves.
-    /// A single-shard wave's writes are determined at commit and block no
-    /// later transaction from executing; its claims exist only to order
-    /// its certificate against the waves that read them.
+    /// Whether those claims are held *provisionally* — true when the tick
+    /// ran a leg reaching beyond this shard, whose writes nothing may read
+    /// until a counterpart resolves it. A tick of purely local members
+    /// leaves writes determined at once, and its claims exist only to
+    /// order its certificate against the ticks that read them.
     provisional: bool,
 }
 
-/// One composed-but-undispatched tick: the committing block's identity
-/// anchors plus every wave group that joined at its commit.
+/// One composed-but-undispatched tick: the block's identity anchors plus
+/// the members that joined at its commit.
 struct PendingTick {
     tick: BlockHeight,
     block_hash: BlockHash,
     tick_ts: WeightedTimestamp,
     tick_reveal: RevealChain,
-    groups: Vec<TickExecutionGroup>,
+    requests: Vec<CrossShardExecutionRequest>,
 }
 
 /// Data returned when a wave is ready for voting.
@@ -225,7 +222,7 @@ pub struct ExecutionCoordinator {
     /// Waves with entries on the tick chain whose fate is still open. A
     /// wave absent from the map — never dispatched, or committed by a
     /// shard past the execution window — resolves nothing.
-    ticked_waves: BTreeMap<TickId, TickedWave>,
+    ticked: BTreeMap<TickId, TickedBatch>,
 
     /// Committed transactions still owed an outcome, folded from the
     /// chain rather than read off live wave state — the only account of
@@ -248,13 +245,18 @@ pub struct ExecutionCoordinator {
     provisioning: ProvisioningTracker,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Per-wave execution
+    // Per-tick execution
     // ═══════════════════════════════════════════════════════════════════════
-    /// Owns in-flight `WaveState`s, their `VoteTracker`s, the EC-dispatched
-    /// gate, vote-retry bookkeeping, and the `tx_hash → TickId` reverse
-    /// index. Every per-wave mutation the coordinator drives flows through
-    /// this field.
-    waves: WaveRegistry,
+    /// Committed transactions no tick has taken yet, each waiting on the
+    /// provisions, engagement echoes or cells it needs to reach its
+    /// outcome. Nothing here has said anything, so nothing here is owed.
+    candidates: TickCandidates,
+
+    /// Owns in-flight `TickState`s, their `VoteTracker`s, the
+    /// certificate-dispatched gate, vote-retry bookkeeping, and the
+    /// `tx_hash → TickId` reverse index. Every per-tick mutation the
+    /// coordinator drives flows through this field.
+    ticks: TickRegistry,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Early arrivals (buffered until tracking starts at block commit)
@@ -415,10 +417,11 @@ impl ExecutionCoordinator {
             pending_ticks: VecDeque::new(),
             tick_in_flight: false,
             last_completed_tick: BlockHeight::GENESIS,
-            ticked_waves: BTreeMap::new(),
+            ticked: BTreeMap::new(),
             unresolved: UnresolvedTxs::restored(recovered.unresolved_txs.clone()),
             pending_tick_resolutions: Vec::new(),
-            waves: WaveRegistry::new(),
+            candidates: TickCandidates::new(local_shard),
+            ticks: TickRegistry::new(),
             early: EarlyArrivalBuffer::new(),
             provisioning: ProvisioningTracker::new(),
             expected_certs: ExpectedCertTracker::new(),
@@ -489,7 +492,7 @@ impl ExecutionCoordinator {
 
     /// Set up per-wave execution state for a newly committed block.
     ///
-    /// For each distinct wave, creates a [`WaveState`], records tx → wave
+    /// For each distinct wave, creates a [`TickState`], records tx → wave
     /// assignments, and pre-populates provisions that arrived before the
     /// block.
     ///
@@ -565,151 +568,188 @@ impl ExecutionCoordinator {
         engagement_waits
     }
 
-    fn setup_waves_and_dispatch(
+    /// Record what a committed block puts in flight: the ledger entry it
+    /// owes an outcome for, the provisions and engagement echoes its
+    /// cross-shard members wait on, and the candidate itself.
+    ///
+    /// Nothing executes here. Whether a transaction can reach its outcome
+    /// at this commit is composition's question, asked again at every one.
+    fn register_committed_txs(
         &mut self,
-        topology_schedule: &TopologySchedule,
         classification: &TopologySnapshot,
         block: CommittingBlock,
         transactions: &[Arc<Verifiable<Transaction>>],
-        abandoned: &[(TxHash, u64)],
-    ) -> (BTreeSet<TickId>, Vec<Verifiable<ExecutionVote>>) {
-        let CommittingBlock {
-            hash: block_hash,
-            height: block_height,
-            ts: block_ts,
-            reveal: block_reveal,
-        } = block;
-        let mut waves = assign_waves(classification, self.local_shard, block_height, transactions);
-        // The tick attests what this shard abandons alongside what it
-        // executes, so a commit that carries nothing to execute still
-        // composes one to say so.
-        if !abandoned.is_empty() {
-            waves
-                .entry(TickId::new(self.local_shard, block_height))
-                .or_default();
-        }
-        // Setup-time leader/quorum key on the wave-start timestamp — a
-        // best-effort guess, since the wave's `vote_anchor_ts` isn't fixed
-        // until it votes. When that lands in a later epoch, the
-        // fallback-tracker path rebuilds under the correct committee; `None`
-        // (beacon hasn't reached this epoch) just skips the optimization.
-        let setup_committee = topology_schedule.at(block_ts);
+    ) {
         let local_shard = self.local_shard;
-        let mut candidates: BTreeSet<TickId> = BTreeSet::new();
-        let mut votes_to_replay: Vec<Verifiable<ExecutionVote>> = Vec::new();
+        self.unresolved.register_committed(transactions.iter());
 
-        for (tick_id, txs) in waves {
-            // The chain-derived account of what this block puts in flight,
-            // recorded from the same participation the waves are built on.
-            self.unresolved
-                .register_committed(txs.iter().map(|(tx, _)| tx));
-            let tx_hashes: Vec<TxHash> = txs.iter().map(|(tx, _)| tx.hash()).collect();
-            for &tx_hash in &tx_hashes {
-                self.waves.assign_tx(tx_hash, tick_id);
-            }
+        let members = assign_participants(classification, transactions);
+        let reaches_beyond: Vec<_> = members
+            .iter()
+            .filter(|(_, shards)| shards.iter().any(|&s| s != local_shard))
+            .cloned()
+            .collect();
+        let engagement_waits = if reaches_beyond.is_empty() {
+            Vec::new()
+        } else {
+            self.register_cross_shard_txs(classification, &reaches_beyond)
+        };
 
-            // A batch is not homogeneous: the transactions that reach
-            // beyond this shard need provision tracking and the engagement
-            // echoes the payer's vote waits on, and the rest need neither.
-            let reaches_beyond: Vec<_> = txs
-                .iter()
-                .filter(|(_, shards)| shards.iter().any(|&s| s != local_shard))
-                .cloned()
-                .collect();
-            let engagement_waits = if reaches_beyond.is_empty() {
-                Vec::new()
-            } else {
-                self.register_cross_shard_txs(classification, &reaches_beyond)
+        for (tx, participating) in members {
+            // Block-container entries decoded from the wire land as
+            // `Unverified`; lift via `from_persisted` under the same
+            // BFT-transitive trust that gates the containing block. Honest
+            // live-consensus blocks already carry `Verified` entries (the
+            // `.into_verified()` arm short-circuits without re-validating).
+            let verified: Arc<Verified<Transaction>> = match (*tx).clone().into_verified() {
+                Ok(v) => Arc::new(v),
+                Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
             };
-            // Nothing reaching beyond means nothing to wait for, so the
-            // batch is provisioned the moment it is created.
-            let provisioned_at_once = reaches_beyond.is_empty();
-
-            let mut wave_state = WaveState::new(tick_id, block_hash, block_ts, block_reveal, txs);
-
-            for (tx_hash, counterparts, validity_end) in engagement_waits {
-                wave_state.record_engagement_wait(tx_hash, counterparts, validity_end);
-            }
-
-            for &(tx_hash, declared_work) in abandoned {
-                wave_state.absorb_abandoned(tx_hash, declared_work, block_ts);
-                self.waves.assign_tx(tx_hash, tick_id);
-            }
-
-            // For cross-shard waves: fold in any provisions that already arrived.
-            // If every tx is fully covered, the wave transitions to
-            // "provisioned" at block_height.
-            if !provisioned_at_once {
-                wave_state.absorb_ready_provisions(&self.provisioning, block_ts);
-                wave_state.absorb_engagement_evidence(&self.provisioning);
-            }
-
-            self.waves.insert_wave(tick_id, wave_state);
-            candidates.insert(tick_id);
-
-            // Only the wave leader creates a VoteTracker for aggregation.
-            // Resolved under `setup_committee` (the wave-start guess); the
-            // fallback-tracker path corrects a boundary-straddling wave whose
-            // real committee differs.
-            if let Some(committee) = setup_committee
-                && self.me
-                    == tick_leader(
-                        &tick_id,
-                        committee.consensus_committee_for_shard(local_shard),
-                    )
-            {
-                let quorum = committee.quorum_threshold_for_shard(local_shard);
-                let tracker = VoteTracker::new(tick_id, block_hash, quorum);
-                self.waves.insert_tracker(tick_id, tracker);
-
-                let early_votes = self.early.drain_votes_for_wave(&tick_id);
-                if !early_votes.is_empty() {
-                    tracing::debug!(
-                        block_hash = ?block_hash,
-                        wave = %tick_id,
-                        count = early_votes.len(),
-                        "Replaying early execution votes"
-                    );
-                    votes_to_replay.extend(early_votes);
-                }
-            }
+            self.candidates
+                .register(verified, participating, block.ts, block.reveal);
         }
 
-        (candidates, votes_to_replay)
+        for (tx_hash, counterparts, validity_end) in engagement_waits {
+            self.candidates.record_engagement_wait(
+                tx_hash,
+                counterparts,
+                validity_end.plus(WAVE_TIMEOUT),
+            );
+        }
     }
 
-    /// Scan all waves and return completion data for any that can emit a vote.
+    /// Compose this commit's tick and set it up to be attested.
     ///
-    /// Called at each block commit AFTER conflicts have been processed,
-    /// and also when provisions arrive or execution results complete.
+    /// The tick takes the candidates that can reach their outcome in it
+    /// and the transactions past their deadline that nothing else will,
+    /// and nothing else. That is what makes it votable the moment its
+    /// batch returns: every member of a tick has an outcome there, so no
+    /// member of one waits on another.
     ///
-    /// A wave can emit a vote when:
-    /// 1. It's fully provisioned and every tx has an outcome, OR
-    /// 2. The `WAVE_TIMEOUT` deadline has passed (wave aborts entirely)
+    /// Returns the tick, if the commit composed one, and any early votes
+    /// its leader can now replay.
+    fn compose_tick(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        block: CommittingBlock,
+        held: &mut ProvisionalCells,
+    ) -> (
+        Option<PendingTick>,
+        Vec<Verifiable<ExecutionVote>>,
+        Vec<TxHash>,
+    ) {
+        let local_shard = self.local_shard;
+        let tick_id = TickId::new(local_shard, block.height);
+        let admitted = self
+            .candidates
+            .compose(&self.provisioning, held, self.committed_ts);
+
+        let mut state = TickState::new(tick_id, block.hash, block.ts);
+        let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
+        let mut claims: Vec<(DeclaredKey, Mode)> = Vec::new();
+        let mut provisional = false;
+        for member in admitted {
+            state.admit(
+                member.request.tx_hash,
+                member.participating,
+                member.request.transaction.work(),
+                member.forced_abort,
+            );
+            self.ticks.assign_tx(member.request.tx_hash, tick_id);
+            claims.extend(member.request.transaction.routing().declared_modes.clone());
+            provisional |= member.request.reaches_beyond;
+            requests.push(member.request);
+        }
+
+        // Read after admission, so a member that just joined this tick is
+        // not abandoned out from under it — the tick is about to attest
+        // it, which is what `will_attest` reports.
+        let abandoned = self.abandonable();
+        self.discard_ticks_holding(&abandoned);
+        for (tx_hash, declared_work) in abandoned {
+            state.abandon(tx_hash, declared_work);
+            self.candidates.remove(tx_hash);
+            self.provisioning.remove_tx(tx_hash);
+            self.ticks.assign_tx(tx_hash, tick_id);
+        }
+
+        if state.is_empty() {
+            return (None, Vec::new(), Vec::new());
+        }
+        let members: Vec<TxHash> = state.tx_hashes().to_vec();
+
+        self.ticks.insert_tick(tick_id, state);
+        self.ticked.insert(
+            tick_id,
+            TickedBatch {
+                claims,
+                provisional,
+            },
+        );
+
+        // Only the tick leader creates a `VoteTracker` for aggregation.
+        // Resolved under the committee seated at the tick's own block,
+        // which is the one that will verify the certificate.
+        let mut votes_to_replay: Vec<Verifiable<ExecutionVote>> = Vec::new();
+        if let Some(committee) = topology_schedule.at(block.ts)
+            && self.me
+                == tick_leader(
+                    &tick_id,
+                    committee.consensus_committee_for_shard(local_shard),
+                )
+        {
+            let quorum = committee.quorum_threshold_for_shard(local_shard);
+            self.ticks
+                .insert_tracker(tick_id, VoteTracker::new(tick_id, block.hash, quorum));
+            let early_votes = self.early.drain_votes_for_tick(&tick_id);
+            if !early_votes.is_empty() {
+                tracing::debug!(
+                    block_hash = ?block.hash,
+                    tick = %tick_id,
+                    count = early_votes.len(),
+                    "Replaying early execution votes"
+                );
+                votes_to_replay.extend(early_votes);
+            }
+        }
+
+        let pending = (!requests.is_empty()).then(|| PendingTick {
+            tick: block.height,
+            block_hash: block.hash,
+            tick_ts: block.ts,
+            tick_reveal: block.reveal,
+            requests,
+        });
+        (pending, votes_to_replay, members)
+    }
+
+    /// Return completion data for every tick that can emit its vote.
     ///
-    /// Waves that already had an EC formed are skipped, as are waves whose
-    /// committee the schedule cannot resolve.
+    /// A tick becomes votable when its batch comes back — composition
+    /// admitted only members that could reach their outcome in it, so
+    /// there is nothing else to wait for.
     ///
-    /// That last condition is part of votability rather than a check on the
-    /// way out because building the vote consumes it: `build_vote_data` is
-    /// one-shot and nothing clears the mark, so a wave scanned here and
-    /// dropped afterwards has spent its vote without emitting one and can
-    /// never vote again. A wave the schedule cannot route stays votable and
-    /// is picked up by a later commit instead.
+    /// Ticks whose certificate is already dispatched or received are
+    /// skipped, as are ticks whose committee the schedule cannot resolve.
+    /// That last condition is part of votability rather than a check on
+    /// the way out because building the vote consumes it: `build_vote_data`
+    /// is one-shot and nothing clears the mark, so a tick scanned here and
+    /// dropped afterwards has spent its vote without emitting one. A tick
+    /// the schedule cannot route stays votable and is picked up by a later
+    /// commit instead.
     ///
     /// # Panics
     ///
-    /// Panics if `waves_iter()` and `get_wave_mut()` disagree about wave
+    /// Panics if `ticks_iter()` and `get_tick_mut()` disagree about tick
     /// presence — unreachable, no concurrent mutation between them.
-    pub fn scan_complete_waves(
+    pub fn scan_votable_ticks(
         &mut self,
         topology_schedule: &TopologySchedule,
     ) -> Vec<CompletionData> {
-        let committed_ts = self.committed_ts;
         let local_shard = self.local_shard;
-        let routable = |wave: &WaveState| {
+        let routable = |tick: &TickState| {
             topology_schedule
-                .at(wave.vote_anchor_ts())
+                .at(tick.vote_anchor_ts())
                 .is_some_and(|snapshot| {
                     !snapshot
                         .consensus_committee_for_shard(local_shard)
@@ -717,28 +757,27 @@ impl ExecutionCoordinator {
                 })
         };
 
-        let votable_wave_ids: Vec<TickId> = self
-            .waves
-            .waves_iter()
-            .filter(|(wid, w)| {
-                !self.waves.is_ec_dispatched(wid)
-                    && !w.local_ec_emitted()
-                    && w.can_emit_vote(committed_ts)
-                    && routable(w)
+        let votable: Vec<TickId> = self
+            .ticks
+            .ticks_iter()
+            .filter(|(tick_id, tick)| {
+                !self.ticks.is_ec_dispatched(tick_id)
+                    && !tick.local_ec_emitted()
+                    && tick.can_emit_vote()
+                    && routable(tick)
             })
-            .map(|(wid, _)| *wid)
+            .map(|(tick_id, _)| *tick_id)
             .collect();
 
         let mut completions = Vec::new();
-        for tick_id in votable_wave_ids {
-            let wave = self
-                .waves
-                .get_wave_mut(&tick_id)
-                .expect("tick_id was just produced by waves_iter() in this method");
-            let block_hash = wave.block_hash();
-            let block_height = wave.block_height();
-            let Some((vote_anchor_ts, global_receipt_root, tx_outcomes)) =
-                wave.build_vote_data(committed_ts)
+        for tick_id in votable {
+            let tick = self
+                .ticks
+                .get_tick_mut(&tick_id)
+                .expect("tick_id was just produced by ticks_iter() in this method");
+            let block_hash = tick.block_hash();
+            let block_height = tick.block_height();
+            let Some((vote_anchor_ts, global_receipt_root, tx_outcomes)) = tick.build_vote_data()
             else {
                 continue;
             };
@@ -753,96 +792,74 @@ impl ExecutionCoordinator {
             });
         }
 
-        // Building a vote is one of the two places a wave learns its
+        // Building a vote is one of the two places a tick learns its
         // receipts disagree with its committee's.
         self.escalate_divergence();
 
-        // Sort for deterministic ordering (waves is a HashMap).
         completions.sort_by_key(|a| a.tick_id);
-
         completions
     }
 
-    /// Absorb a completed execution provisions: route receipts into the cache and
-    /// record per-tx outcomes on the wave.
+    /// Absorb a completed batch: route receipts and per-member outcomes
+    /// onto the tick that ran them, then vote and, where the tick is
+    /// already covered, finalize.
     ///
-    /// Returns any actions that became newly possible because the provisions
-    /// unblocked a wave that was waiting only on local receipts. In
-    /// particular, a cross-shard wave whose local EC arrived before this
-    /// validator's engine finished will defer finalization under the
-    /// `has_local_receipts_for_non_aborted` gate in `WaveState::is_complete`;
-    /// once the provisions lands, the wave becomes complete and we finalize
-    /// here rather than waiting for some unrelated trigger.
+    /// Finalization can fall due here rather than at a commit: a tick
+    /// whose local certificate arrived before this validator's engine
+    /// finished defers under the `has_local_receipts_for_non_aborted`
+    /// gate, and the batch landing is what releases it.
     pub fn on_execution_batch_completed(
         &mut self,
         topology_schedule: &TopologySchedule,
         tick: BlockHeight,
-        waves: Vec<WaveExecutionResult>,
+        outcome: TickBatchOutcome,
     ) -> Vec<Action> {
         self.tick_in_flight = false;
         self.last_completed_tick = self.last_completed_tick.max(tick);
         let mut actions = Vec::new();
 
-        for wave_result in waves {
-            let WaveExecutionResult {
-                tick_id,
-                results,
-                tx_outcomes,
-                fee_receipts,
-                attested_work,
-            } = wave_result;
-            if results.is_empty() && tx_outcomes.is_empty() {
-                tracing::warn!(
-                    tick = tick.inner(),
-                    wave = %tick_id,
-                    "ExecutionBatchCompleted produced ZERO results for wave"
-                );
-                continue;
-            }
-
-            let Some(wave) = self.waves.get_wave_mut(&tick_id) else {
-                // The coordinator stopped tracking the wave between its
-                // dispatch and its batch returning. That says where this
-                // coordinator is, not what the wave's fate was, so it
-                // resolves nothing: the first resolution recorded for a
-                // wave is the one the chain applies, and claiming an
-                // abandonment here would consume the entry the wave's
-                // real verdict needs.
-                //
-                // Every fate that reaches the chain reaches it elsewhere.
-                // The tick that abandons a transaction discards the wave
-                // holding it and records that, a committed certificate
-                // records its settlement ahead of the block work that
-                // untracks the wave, and a reshape terminal tears the
-                // chain down outright.
-                tracing::warn!(
-                    tick = tick.inner(),
-                    wave = %tick_id,
-                    "ExecutionBatchCompleted for unknown wave — dropping (wave was pruned or never created)"
-                );
-                continue;
-            };
+        let TickBatchOutcome {
+            tick_id,
+            results,
+            tx_outcomes,
+            fee_receipts,
+            attested_work,
+        } = outcome;
+        if let Some(state) = self.ticks.get_tick_mut(&tick_id) {
             for result in results {
-                wave.record_receipt(result);
+                state.record_receipt(result);
             }
             for fee in fee_receipts {
-                wave.record_fee_receipt(fee);
+                state.record_fee_receipt(fee);
             }
             for (tx_hash, work) in attested_work {
-                wave.record_attested_work(tx_hash, work);
+                state.record_attested_work(tx_hash, work);
             }
             for wr in tx_outcomes {
                 let (tx_hash, outcome) = wr.into_parts();
-                wave.record_execution_result(tx_hash, outcome);
+                state.record_execution_result(tx_hash, outcome);
             }
-
-            // With local receipts in hand, the wave may have crossed into
-            // `is_complete` if its local EC arrived ahead of the engine.
-            // Drive finalization from here so the deferred finalize
-            // happens on the same event that unblocked it.
-            if wave.is_complete() {
+            if state.is_complete() {
                 actions.extend(self.finalize(topology_schedule, &tick_id));
             }
+        } else {
+            // The coordinator stopped tracking the tick between its
+            // dispatch and its batch returning. That says where this
+            // coordinator is, not what the tick's fate was, so it
+            // resolves nothing: the first resolution recorded for a tick
+            // is the one the chain applies, and claiming an abandonment
+            // here would consume the entry the tick's real verdict needs.
+            //
+            // Every fate that reaches the chain reaches it elsewhere. The
+            // tick that abandons a transaction discards the one holding
+            // it and records that, a committed certificate records its
+            // settlement ahead of the block work that untracks it, and a
+            // reshape terminal tears the chain down outright.
+            tracing::warn!(
+                tick = tick.inner(),
+                %tick_id,
+                "ExecutionBatchCompleted for an untracked tick — dropping"
+            );
         }
 
         // The completed tick's output is on the chain (the handler
@@ -863,7 +880,7 @@ impl ExecutionCoordinator {
     /// for timeout-abort).
     pub fn emit_vote_actions(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let local_vid = self.me;
-        let completions = self.scan_complete_waves(topology_schedule);
+        let completions = self.scan_votable_ticks(topology_schedule);
         let mut actions = Vec::with_capacity(completions.len());
         for completion in completions {
             // The wave's committee is the one seated at its vote anchor — the
@@ -876,7 +893,7 @@ impl ExecutionCoordinator {
                 .map(|s| s.consensus_committee_for_shard(self.local_shard).to_vec())
                 .filter(|committee| !committee.is_empty())
             else {
-                debug_assert!(false, "scan_complete_waves admitted an unroutable wave");
+                debug_assert!(false, "scan_votable_ticks admitted an unroutable wave");
                 continue;
             };
             let leader = tick_leader(&completion.tick_id, &committee);
@@ -884,7 +901,7 @@ impl ExecutionCoordinator {
             // rotated leader if this one doesn't produce an EC.
             let tx_outcomes = Arc::new(completion.tx_outcomes);
             if local_vid != leader {
-                self.waves.record_vote_retry(
+                self.ticks.record_vote_retry(
                     completion.tick_id,
                     PendingVoteRetry {
                         sent_at: self.committed_ts,
@@ -929,9 +946,9 @@ impl ExecutionCoordinator {
 
     /// Apply provisions committed in a block.
     ///
-    /// Absorbs every batch before touching wave readiness: interleaving
-    /// would let a wave's dispatch decision read a partially-absorbed map
-    /// whose contents depend on provisions iteration order.
+    /// Absorbs every batch before reading any of it back: interleaving
+    /// would let a candidate's readiness turn on provisions iteration
+    /// order.
     ///
     /// Each batch is peeked for its [`Verifiable::verified`] marker before
     /// re-wrapping. Same-process upstream paths leave the marker live, so
@@ -939,62 +956,28 @@ impl ExecutionCoordinator {
     /// clone. Wire-decoded blocks land at `Unverified`; the
     /// [`Verified::<Provisions>::from_committed_block`] gate then carries
     /// the BFT-transitive trust source via a re-wrap (one body clone).
-    fn apply_committed_provisions(
-        &mut self,
-        batches: &[Arc<Verifiable<Provisions>>],
-        committed_ts: WeightedTimestamp,
-    ) -> BTreeSet<TickId> {
+    fn apply_committed_provisions(&mut self, batches: &[Arc<Verifiable<Provisions>>]) {
         // Sort for deterministic iteration (logs, action vector order).
         let mut ordered: Vec<&Arc<Verifiable<Provisions>>> = batches.iter().collect();
         ordered.sort_by_key(|b| b.hash());
 
-        // Absorb all provisions first. Populated unconditionally so
-        // `setup_waves_and_dispatch` can replay them at wave-creation time.
-        let mut affected_waves: BTreeSet<TickId> = BTreeSet::new();
         for provisions in &ordered {
-            let touched = if let Some(v) = provisions.verified() {
-                self.provisioning.absorb_provisions(v)
+            if let Some(v) = provisions.verified() {
+                self.provisioning.absorb_provisions(v);
             } else {
                 let verified = Verified::<Provisions>::from_committed_block(
                     provisions.as_unverified().clone(),
                 );
-                self.provisioning.absorb_provisions(&verified)
-            };
-            for tx_hash in touched {
-                if let Some(tick_id) = self.waves.wave_assignment(tx_hash) {
-                    affected_waves.insert(tick_id);
-                }
+                self.provisioning.absorb_provisions(&verified);
             }
         }
 
-        // Then, for each affected wave, drain engagement coverage and
-        // mark newly-ready txs provisioned. A wave that transitions from
-        // partial → fully provisioned becomes a candidate for this
-        // commit's tick; whether it joins is composition's question.
-        // Membership is one-shot, but engagement coverage keeps draining
-        // past it: the payer's leg executes on its own requirement long
-        // before the echoes its vote waits for arrive.
-        let mut candidates: BTreeSet<TickId> = BTreeSet::new();
-        for tick_id in affected_waves {
-            let Some(wave) = self.waves.get_wave_mut(&tick_id) else {
-                continue;
-            };
-
-            wave.absorb_engagement_evidence(&self.provisioning);
-
-            if wave.fully_dispatched() {
-                continue;
-            }
-
-            wave.absorb_ready_provisions(&self.provisioning, committed_ts);
-            candidates.insert(tick_id);
-        }
-
-        candidates
+        self.candidates
+            .absorb_engagement_evidence(&self.provisioning);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Wave Vote Handling
+    // Vote handling
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Handle a locally-produced, pre-verified execution vote.
@@ -1072,13 +1055,13 @@ impl ExecutionCoordinator {
             return vec![];
         }
 
-        if !self.waves.contains_tracker(&tick_id) {
-            if !self.waves.contains_wave(&tick_id) {
+        if !self.ticks.contains_tracker(&tick_id) {
+            if !self.ticks.contains_tick(&tick_id) {
                 // Block hasn't committed yet — buffer as early vote.
                 self.early.buffer_vote(tick_id, vote);
                 return vec![];
             }
-            if self.waves.is_ec_dispatched(&tick_id) {
+            if self.ticks.is_ec_dispatched(&tick_id) {
                 // Already have EC for this wave — discard late vote.
                 return vec![];
             }
@@ -1086,21 +1069,21 @@ impl ExecutionCoordinator {
             // was targeted as a fallback leader (rotated attempt). Create tracker.
             let quorum = committee.quorum_threshold_for_shard(self.local_shard);
             let block_hash = self
-                .waves
-                .get_wave(&tick_id)
-                .expect("contains_wave returned true two lines above")
+                .ticks
+                .get_tick(&tick_id)
+                .expect("contains_tick returned true two lines above")
                 .block_hash();
             tracing::info!(
                 wave = %tick_id,
                 "Creating fallback VoteTracker — receiving votes as rotated leader"
             );
             let tracker = VoteTracker::new(tick_id, block_hash, quorum);
-            self.waves.insert_tracker(tick_id, tracker);
+            self.ticks.insert_tracker(tick_id, tracker);
 
             // Replay any early votes that were buffered before block commit.
             // These may include retried votes from other validators who
             // committed faster and rotated to us before our block committed.
-            let early = self.early.drain_votes_for_wave(&tick_id);
+            let early = self.early.drain_votes_for_tick(&tick_id);
             if !early.is_empty() {
                 tracing::debug!(
                     wave = %tick_id,
@@ -1132,7 +1115,7 @@ impl ExecutionCoordinator {
             .expect("committee member has public key (TopologySnapshot invariant)");
 
         let tracker = self
-            .waves
+            .ticks
             .get_tracker_mut(&tick_id)
             .expect("tracker was inserted above when contains_tracker returned false");
 
@@ -1147,7 +1130,7 @@ impl ExecutionCoordinator {
 
     /// Check if we should trigger provisions verification for a wave's votes.
     fn maybe_trigger_vote_verification(&mut self, tick_id: TickId) -> Vec<Action> {
-        let Some(tracker) = self.waves.get_tracker_mut(&tick_id) else {
+        let Some(tracker) = self.ticks.get_tracker_mut(&tick_id) else {
             return vec![];
         };
 
@@ -1189,7 +1172,7 @@ impl ExecutionCoordinator {
             return vec![];
         }
 
-        let Some(tracker) = self.waves.get_tracker_mut(&tick_id) else {
+        let Some(tracker) = self.ticks.get_tracker_mut(&tick_id) else {
             return vec![];
         };
 
@@ -1215,7 +1198,7 @@ impl ExecutionCoordinator {
             .and_then(|v| topology_schedule.at(v.vote_anchor_ts()))
             .map(|s| s.quorum_threshold_for_shard(self.local_shard));
 
-        let Some(tracker) = self.waves.get_tracker_mut(&tick_id) else {
+        let Some(tracker) = self.ticks.get_tracker_mut(&tick_id) else {
             return vec![];
         };
 
@@ -1255,7 +1238,7 @@ impl ExecutionCoordinator {
         tick_id: TickId,
     ) -> Vec<Action> {
         let local_shard = self.local_shard;
-        let Some(tracker) = self.waves.get_tracker_mut(&tick_id) else {
+        let Some(tracker) = self.ticks.get_tracker_mut(&tick_id) else {
             return vec![];
         };
 
@@ -1288,9 +1271,9 @@ impl ExecutionCoordinator {
         let votes = tracker.take_votes(global_receipt_root, vote_anchor_ts);
 
         // Remove the vote tracker — this EC is the shard's final answer.
-        // Mark wave as having an EC to skip it in scan_complete_waves.
-        self.waves.remove_tracker(&tick_id);
-        self.waves.mark_ec_dispatched(tick_id);
+        // Mark wave as having an EC to skip it in scan_votable_ticks.
+        self.ticks.remove_tracker(&tick_id);
+        self.ticks.mark_ec_dispatched(tick_id);
 
         tracing::debug!(
             block_hash = ?block_hash,
@@ -1302,8 +1285,8 @@ impl ExecutionCoordinator {
         // Stamp phase times for txs covered by the new local EC. Pure
         // telemetry — IoLoop's slow-tx finalization log reads it.
         let ec_tx_hashes = self
-            .waves
-            .get_wave(&tick_id)
+            .ticks
+            .get_tick(&tick_id)
             .map(|w| w.tx_hashes().to_vec())
             .unwrap_or_default();
 
@@ -1352,8 +1335,8 @@ impl ExecutionCoordinator {
         // is sized by its own stake in the batch rather than by the
         // batch.
         let per_target: Vec<(ShardId, HashSet<TxHash>)> = self
-            .waves
-            .get_wave(tick_id)
+            .ticks
+            .get_tick(tick_id)
             .map(|wave| {
                 wave.counterpart_shards()
                     .into_iter()
@@ -1407,7 +1390,7 @@ impl ExecutionCoordinator {
         );
 
         // Feed the EC to the wave-level certificate tracker for finalization.
-        actions.extend(self.handle_wave_attestation(topology_schedule, certificate));
+        actions.extend(self.handle_attestation(topology_schedule, certificate));
 
         actions
     }
@@ -1567,7 +1550,7 @@ impl ExecutionCoordinator {
 
     /// Handle execution certificate signature verification result.
     ///
-    /// If valid, hand the cert to `handle_wave_attestation` which routes
+    /// If valid, hand the cert to `handle_attestation` which routes
     /// per-tx outcomes into any local wave trackers and buffers txs whose
     /// blocks haven't committed yet for replay.
     pub fn on_certificate_verified(
@@ -1676,18 +1659,18 @@ impl ExecutionCoordinator {
         )];
 
         // If this is a local shard EC, mark the wave as having an EC to skip
-        // it in scan_complete_waves, and persist it for fallback serving to
+        // it in scan_votable_ticks, and persist it for fallback serving to
         // remote shards.
         if shard == self.local_shard {
-            self.waves.mark_ec_dispatched(*ec_arc.tick_id());
+            self.ticks.mark_ec_dispatched(*ec_arc.tick_id());
             // EC received from wave leader — cancel any pending vote retry.
-            self.waves.clear_vote_retry(ec_arc.tick_id());
+            self.ticks.clear_vote_retry(ec_arc.tick_id());
             // Make the verified cert available to the io_loop's inbound EC
             // fetch handler for fallback serving until block commit.
             self.exec_certs.insert(Arc::clone(&ec_arc));
         }
 
-        actions.extend(self.handle_wave_attestation(topology_schedule, &ec_arc));
+        actions.extend(self.handle_attestation(topology_schedule, &ec_arc));
         actions
     }
 
@@ -1800,8 +1783,8 @@ impl ExecutionCoordinator {
     /// by `finalize` once a wave completes, so a transaction leaves this
     /// set exactly when it stops needing any counterpart's outcome.
     fn awaited_txs(&self) -> HashSet<TxHash> {
-        self.waves
-            .waves_iter()
+        self.ticks
+            .ticks_iter()
             .flat_map(|(_, state)| state.tx_hashes().iter().copied())
             .collect()
     }
@@ -1809,8 +1792,8 @@ impl ExecutionCoordinator {
     /// The subset of [`Self::awaited_txs`] whose waves name `shard` as a
     /// participant — what this shard owes us specifically.
     fn awaited_txs_from(&self, shard: ShardId) -> HashSet<TxHash> {
-        self.waves
-            .waves_iter()
+        self.ticks
+            .ticks_iter()
             .flat_map(|(_, state)| state.txs_awaiting(shard))
             .collect()
     }
@@ -1823,7 +1806,7 @@ impl ExecutionCoordinator {
     /// number; the coordinator resolves the rotated leader via topology
     /// and lifts each effect to `Action::SignAndSendExecutionVote`.
     fn check_vote_retry_timeouts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
-        let effects = self.waves.check_vote_retry_timeouts(self.committed_ts);
+        let effects = self.ticks.check_vote_retry_timeouts(self.committed_ts);
         if effects.is_empty() {
             return Vec::new();
         }
@@ -1993,7 +1976,7 @@ impl ExecutionCoordinator {
             });
         }
 
-        for (_, wave) in self.waves.waves_iter_mut() {
+        for (_, wave) in self.ticks.ticks_iter_mut() {
             wave.log_if_overdue(self.committed_ts);
         }
 
@@ -2078,92 +2061,50 @@ impl ExecutionCoordinator {
             }
         }
 
-        // What earlier ticks hold, and the set this commit's own
-        // composition will add to.
-        let mut held = self.provisional_cells();
+        let block = CommittingBlock {
+            hash: block_hash,
+            height,
+            ts: self.committed_ts,
+            reveal: header.reveal_chain(),
+        };
 
-        // The deadline reads the claims a member has actually been
-        // waiting on, which are the ones standing before this commit
-        // composes anything: a member this tick is about to defer has
-        // waited no time at all.
-        let now = self.committed_ts;
-        for (_, wave) in self.waves.waves_iter_mut() {
-            wave.abort_members_blocked_past_deadline(&held, now);
+        // Everything this commit puts in flight or unblocks, before
+        // anything is composed from it: the block's own transactions, and
+        // the provisions and engagement echoes its batches carry.
+        if !transactions.is_empty() {
+            self.register_committed_txs(anchored, block, transactions);
         }
+        if !provisions.is_empty() {
+            self.apply_committed_provisions(provisions);
+        }
+        // Every commit, not only one carrying provisions: a bundle that
+        // committed before its transaction did is evidence already in
+        // hand, and a payer whose wait only ever cleared on a later
+        // bundle would never execute.
+        self.candidates
+            .absorb_engagement_evidence(&self.provisioning);
 
-        let mut candidates: BTreeSet<TickId> = self.waves_owing_members();
-
-        // What this shard can no longer finalize, and so has to say so
-        // about. Read before the block's own transactions register: their
-        // deadlines all sit ahead of this commit, but the two sets have to
-        // be disjoint by construction, not by arithmetic.
-        let abandoned = self.abandonable();
-        self.discard_waves_holding(&abandoned);
-
-        if !transactions.is_empty() || !abandoned.is_empty() {
+        // What earlier ticks hold provisionally, and the set this commit's
+        // own composition adds to.
+        let mut held = self.provisional_cells();
+        let (pending, early_votes, members) =
+            self.compose_tick(topology_schedule, block, &mut held);
+        for vote in early_votes {
+            actions.extend(self.dispatch_execution_vote(topology_schedule, vote));
+        }
+        // The members that just gained an assignment: a counterpart's
+        // certificate that arrived while they waited has a tick to route
+        // to now, and nothing else will offer it one.
+        if !members.is_empty() {
+            actions.extend(self.replay_early_attestations(topology_schedule, &members));
+        }
+        if let Some(pending) = pending {
             tracing::debug!(
                 height = height.inner(),
-                tx_count = transactions.len(),
-                abandoned = abandoned.len(),
-                "Composing this commit's tick"
+                members = pending.requests.len(),
+                "Dispatching this commit's tick"
             );
-
-            let (created, early_votes) = self.setup_waves_and_dispatch(
-                topology_schedule,
-                anchored,
-                CommittingBlock {
-                    hash: block_hash,
-                    height,
-                    ts: self.committed_ts,
-                    reveal: header.reveal_chain(),
-                },
-                transactions,
-                &abandoned,
-            );
-            candidates.extend(created);
-            for vote in early_votes {
-                actions.extend(self.dispatch_execution_vote(topology_schedule, vote));
-            }
-
-            actions.extend(self.replay_early_wave_attestations(topology_schedule, transactions));
-        }
-
-        // Apply this block's provisions after wave setup so newly-created
-        // waves can transition to provisioned from the same block's batches.
-        if !provisions.is_empty() {
-            candidates.extend(self.apply_committed_provisions(provisions, self.committed_ts));
-        }
-
-        // Compose this commit's tick: the single-shard wave plus every
-        // wave that became fully provisioned at this commit, in the one
-        // order every replica derives from the candidate set.
-        let tick_groups = self.compose_tick(candidates, &mut held);
-        if !tick_groups.is_empty() {
-            for group in &tick_groups {
-                let claims = self
-                    .waves
-                    .get_wave(&group.tick_id)
-                    .map(WaveState::declared_mutations)
-                    .unwrap_or_default();
-                // A wave contributing to a second tick records the later
-                // one: that is the tick a resolution has to wait for, and
-                // the position its certificate settles from.
-                self.ticked_waves.insert(
-                    group.tick_id,
-                    TickedWave {
-                        tick: height,
-                        claims,
-                        provisional: group.requests.iter().any(|r| r.reaches_beyond),
-                    },
-                );
-            }
-            self.pending_ticks.push_back(PendingTick {
-                tick: height,
-                block_hash,
-                tick_ts: self.committed_ts,
-                tick_reveal: header.reveal_chain(),
-                groups: tick_groups,
-            });
+            self.pending_ticks.push_back(pending);
         }
         actions.extend(self.dispatch_next_tick());
 
@@ -2183,20 +2124,14 @@ impl ExecutionCoordinator {
     /// later tick reading a wrong baseline would have diverged too, so
     /// the earliest report is the origin.
     fn escalate_divergence(&mut self) {
-        // Ranked by tick rather than by origin block, because that is
-        // what the report names: a wave joins whichever tick it became
-        // executable at, which is not always the block that created it.
-        let ticked = &self.ticked_waves;
         let mut earliest: Option<(BlockHeight, TickId, Divergence)> = None;
-        for (tick_id, wave) in self.waves.waves_iter_mut() {
-            let Some(divergence) = wave.take_divergence() else {
+        for (tick_id, tick) in self.ticks.ticks_iter_mut() {
+            let Some(divergence) = tick.take_divergence() else {
                 continue;
             };
-            let tick = ticked
-                .get(tick_id)
-                .map_or_else(|| tick_id.block_height(), |entry| entry.tick);
-            if earliest.as_ref().is_none_or(|(seen, ..)| tick < *seen) {
-                earliest = Some((tick, *tick_id, divergence));
+            let height = tick_id.block_height();
+            if earliest.as_ref().is_none_or(|(seen, ..)| height < *seen) {
+                earliest = Some((height, *tick_id, divergence));
             }
         }
         let Some((tick, tick_id, divergence)) = earliest else {
@@ -2225,69 +2160,15 @@ impl ExecutionCoordinator {
 
     /// The cells unresolved cross-shard waves hold provisionally.
     ///
-    /// Rebuilt per commit from `ticked_waves`, which is small: one entry
+    /// Rebuilt per commit from `ticked`, which is small: one entry
     /// per wave that has joined a tick and whose fate has not committed,
     /// and the in-flight cap bounds how many that can be.
     fn provisional_cells(&self) -> ProvisionalCells {
         let mut cells = ProvisionalCells::default();
-        for ticked in self.ticked_waves.values().filter(|t| t.provisional) {
+        for ticked in self.ticked.values().filter(|t| t.provisional) {
             cells.claim(&ticked.claims);
         }
         cells
-    }
-
-    /// Every wave still holding a member that has not joined a tick.
-    ///
-    /// Candidates, not entrants: whether a member joins is composition's
-    /// question, and it is asked again on every commit. Read after the
-    /// commit's resolutions are recorded, so a member enters the first
-    /// tick composed after the wave it waited on resolved.
-    fn waves_owing_members(&self) -> BTreeSet<TickId> {
-        self.waves
-            .waves_iter()
-            .filter(|(_, wave)| !wave.fully_dispatched())
-            .map(|(tick_id, _)| *tick_id)
-            .collect()
-    }
-
-    /// Compose this commit's tick from the waves that could join it.
-    ///
-    /// A cross-shard leg's writes are provisional, and the batch is one
-    /// overlay: a transaction sharing the tick reads what that leg left,
-    /// which an abort would retract. The claim that keeps a later tick
-    /// off a provisional cell has to hold inside the tick as well, so it
-    /// accumulates as the tick is built rather than being fixed before
-    /// it — `held` carries in what earlier ticks claimed and leaves with
-    /// what this one adds.
-    ///
-    /// Cross-shard waves compose first. Their writes are the provisional
-    /// ones, so they are what everything else has to be compatible with,
-    /// and a determined member is the cheaper of the two to defer — it
-    /// waits on latency where a leg waits on a deadline. Within each
-    /// half the order is `TickId`, so the composition is a function of
-    /// the candidate set and nothing else.
-    ///
-    /// The claim itself is per transaction, not per wave — a wave settles
-    /// each member on its own verdict, so its own legs are no more able
-    /// to share a provisional cell than two waves' are.
-    fn compose_tick(
-        &mut self,
-        candidates: BTreeSet<TickId>,
-        held: &mut ProvisionalCells,
-    ) -> Vec<TickExecutionGroup> {
-        let mut ordered: Vec<TickId> = candidates.into_iter().collect();
-        ordered.sort();
-
-        let mut groups = Vec::with_capacity(ordered.len());
-        for tick_id in ordered {
-            let Some(wave) = self.waves.get_wave_mut(&tick_id) else {
-                continue;
-            };
-            if let Some(group) = wave.tick_group_if_ready(&self.provisioning, held) {
-                groups.push(group);
-            }
-        }
-        groups
     }
 
     /// The transactions this commit's tick attests `Aborted`.
@@ -2320,9 +2201,9 @@ impl ExecutionCoordinator {
                     .values()
                     .any(|fw| fw.contains_tx(&tx_hash))
                 || self
-                    .waves
-                    .wave_assignment(tx_hash)
-                    .and_then(|tick_id| self.waves.get_wave(&tick_id))
+                    .ticks
+                    .tick_assignment(tx_hash)
+                    .and_then(|tick_id| self.ticks.get_tick(&tick_id))
                     .is_some_and(|wave| wave.will_attest(tx_hash))
         };
         self.unresolved
@@ -2339,13 +2220,13 @@ impl ExecutionCoordinator {
     /// Its remaining members are not aborted here — each waits for its own
     /// deadline — but they lose the wave, which by this point has failed
     /// to resolve them for the whole width of a deadline.
-    fn discard_waves_holding(&mut self, abandoned: &[(TxHash, u64)]) {
+    fn discard_ticks_holding(&mut self, abandoned: &[(TxHash, u64)]) {
         let doomed: BTreeSet<TickId> = abandoned
             .iter()
-            .filter_map(|(tx_hash, _)| self.waves.wave_assignment(*tx_hash))
+            .filter_map(|(tx_hash, _)| self.ticks.tick_assignment(*tx_hash))
             .collect();
         for tick_id in doomed {
-            let Some(wave) = self.waves.remove_wave(&tick_id) else {
+            let Some(wave) = self.ticks.remove_tick(&tick_id) else {
                 continue;
             };
             tracing::info!(
@@ -2361,7 +2242,7 @@ impl ExecutionCoordinator {
                 },
             );
             for &tx_hash in wave.tx_hashes() {
-                self.waves.remove_assignment(tx_hash);
+                self.ticks.remove_assignment(tx_hash);
                 self.provisioning.remove_tx(tx_hash);
             }
         }
@@ -2380,9 +2261,9 @@ impl ExecutionCoordinator {
         // both the commit path and the tick-completion pump emit pending
         // resolutions before dispatching, so the chain is always at least
         // as resolved as the claim set says by the time a later tick runs.
-        if let Some(ticked) = self.ticked_waves.remove(tick_id) {
+        if self.ticked.remove(tick_id).is_some() {
             self.pending_tick_resolutions
-                .push((*tick_id, ticked.tick, resolution));
+                .push((*tick_id, tick_id.block_height(), resolution));
         }
     }
 
@@ -2423,13 +2304,13 @@ impl ExecutionCoordinator {
             block_hash: tick.block_hash,
             tick_ts: tick.tick_ts,
             tick_reveal: tick.tick_reveal,
-            groups: tick.groups,
+            requests: tick.requests,
         }]
     }
 
     /// Sealed path: past the cross-shard execution window. Waves will
     /// finalize from the already-aggregated cert + receipts included
-    /// downstream, so we skip `WaveState` creation, dispatch, and vote
+    /// downstream, so we skip `TickState` creation, dispatch, and vote
     /// tracking. Only the tx → wave mapping is recorded (plus any early
     /// ECs replayed) so a late-arriving cert still routes back to each
     /// tx for mempool terminal-state bookkeeping.
@@ -2444,21 +2325,25 @@ impl ExecutionCoordinator {
         }
         let anchored =
             self.classification_committee(topology_schedule, self.committed_committee_anchor_wt);
-        self.register_sealed_wave_assignments(anchored, header.height(), transactions);
-        self.replay_early_wave_attestations(topology_schedule, transactions)
+        self.register_sealed_assignments(anchored, header.height(), transactions);
+        let tx_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
+        self.replay_early_attestations(topology_schedule, &tx_hashes)
     }
 
-    /// Replay buffered early ECs for txs that have just received wave
-    /// assignments. Invoked from both the live and sealed commit paths —
-    /// in either case, a cert that arrived ahead of the commit now has a
-    /// tx target to route to.
-    fn replay_early_wave_attestations(
+    /// Replay buffered certificates for transactions that have just
+    /// gained a tick assignment.
+    ///
+    /// Driven by assignment rather than by commit, because those are no
+    /// longer the same moment: a member waits in the candidate pool until
+    /// a tick can take it, and a counterpart's certificate arriving in
+    /// that window has nowhere to route. Composition is what gives it
+    /// one, so composition is what replays.
+    fn replay_early_attestations(
         &mut self,
         topology_schedule: &TopologySchedule,
-        transactions: &[Arc<Verifiable<Transaction>>],
+        tx_hashes: &[TxHash],
     ) -> Vec<Action> {
-        let tx_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
-        let ecs_to_replay = self.early.drain_ecs_for_txs(&tx_hashes);
+        let ecs_to_replay = self.early.drain_ecs_for_txs(tx_hashes);
         if ecs_to_replay.is_empty() {
             return Vec::new();
         }
@@ -2468,32 +2353,26 @@ impl ExecutionCoordinator {
         );
         let mut actions = Vec::new();
         for ec in &ecs_to_replay {
-            actions.extend(self.handle_wave_attestation(topology_schedule, ec));
+            actions.extend(self.handle_attestation(topology_schedule, ec));
         }
         actions
     }
 
     /// Register tx → wave assignments for a `Sealed` block without any of
-    /// the execution-side state setup (`WaveState`, vote tracker, conflict
+    /// the execution-side state setup (`TickState`, vote tracker, conflict
     /// detector, required-provision tracking). The block's waves are
     /// already settled; we only need the mapping so a future cert can
     /// route back to the tx for mempool terminal-state bookkeeping.
-    fn register_sealed_wave_assignments(
+    fn register_sealed_assignments(
         &mut self,
         topology_snapshot: &TopologySnapshot,
         block_height: BlockHeight,
         transactions: &[Arc<Verifiable<Transaction>>],
     ) {
-        let waves = assign_waves(
-            topology_snapshot,
-            self.local_shard,
-            block_height,
-            transactions,
-        );
-        for (tick_id, txs) in waves {
-            for (tx, _) in &txs {
-                self.waves.assign_tx(tx.hash(), tick_id);
-            }
+        let _ = topology_snapshot;
+        let tick_id = TickId::new(self.local_shard, block_height);
+        for tx in transactions {
+            self.ticks.assign_tx(tx.hash(), tick_id);
         }
     }
 
@@ -2512,17 +2391,17 @@ impl ExecutionCoordinator {
     /// local assignment are buffered (or kept buffered) via `pending_routing`
     /// until their blocks commit; routed `tx_hashes` are cleared from the
     /// pending set, dropping the EC entirely once fully routed.
-    fn handle_wave_attestation(
+    fn handle_attestation(
         &mut self,
         topology_schedule: &TopologySchedule,
         ec: &Arc<Verified<ExecutionCertificate>>,
     ) -> Vec<Action> {
-        let routing = self.waves.classify_attestation(ec);
+        let routing = self.ticks.classify_attestation(ec);
 
         self.early.clear_routed(ec, &routing.routed_tx_hashes);
         self.early.buffer_ec(ec, &routing.unrouted_tx_hashes);
 
-        if routing.affected_waves.is_empty() {
+        if routing.affected_ticks.is_empty() {
             return vec![];
         }
 
@@ -2531,8 +2410,8 @@ impl ExecutionCoordinator {
         // terminal-covered). Once `local_ec_emitted` is true, every tx
         // already has an outcome and a matching receipt in the cache.
         let mut actions = Vec::new();
-        for tick_id in &routing.affected_waves {
-            let Some(wave) = self.waves.get_wave_mut(tick_id) else {
+        for tick_id in &routing.affected_ticks {
+            let Some(wave) = self.ticks.get_tick_mut(tick_id) else {
                 continue;
             };
             if wave.add_execution_certificate(Arc::clone(ec)) && wave.is_complete() {
@@ -2551,7 +2430,7 @@ impl ExecutionCoordinator {
     /// Called when the wave's local EC is present and every non-aborted tx is
     /// covered by all participating shards.
     fn finalize(&mut self, topology_schedule: &TopologySchedule, tick_id: &TickId) -> Vec<Action> {
-        let Some(wave) = self.waves.remove_wave(tick_id) else {
+        let Some(wave) = self.ticks.remove_tick(tick_id) else {
             return vec![];
         };
 
@@ -2881,8 +2760,8 @@ impl ExecutionCoordinator {
 
     /// Get the local wave assignment for a transaction.
     #[must_use]
-    pub fn get_wave_assignment(&self, tx_hash: TxHash) -> Option<TickId> {
-        self.waves.wave_assignment(tx_hash)
+    pub fn tick_assignment_for(&self, tx_hash: TxHash) -> Option<TickId> {
+        self.ticks.tick_assignment(tx_hash)
     }
 
     /// Finalizations ready for a block, in an order state can be
@@ -2932,13 +2811,15 @@ impl ExecutionCoordinator {
         emitted
     }
 
-    /// The tick a wave settles from. A wave the coordinator no longer
-    /// tracks has already resolved, so it sorts ahead of everything still
-    /// in flight.
+    /// The tick a certificate settles from. A tick the coordinator no
+    /// longer tracks has already resolved, so it sorts ahead of
+    /// everything still in flight.
     fn settlement_position(&self, tick_id: &TickId) -> BlockHeight {
-        self.ticked_waves
-            .get(tick_id)
-            .map_or(BlockHeight::GENESIS, |ticked| ticked.tick)
+        if self.ticked.contains_key(tick_id) {
+            tick_id.block_height()
+        } else {
+            BlockHeight::GENESIS
+        }
     }
 
     /// Whether some wave that executed before `tick_id` reaches a cell it
@@ -2951,7 +2832,7 @@ impl ExecutionCoordinator {
     /// applied after a change it does not contain reverts that change.
     ///
     /// A predecessor is in order when it has resolved — absence from
-    /// `ticked_waves`, whose entry clears when the fate commits — when an
+    /// `ticked`, whose entry clears when the fate commits — when an
     /// uncommitted ancestor block already carries its certificate, or when
     /// it sits earlier in this same block's list.
     fn predecessors_unsettled(
@@ -2960,13 +2841,13 @@ impl ExecutionCoordinator {
         placed: &BTreeSet<TickId>,
         ancestor_certified: &HashSet<TickId>,
     ) -> bool {
-        let Some(ticked) = self.ticked_waves.get(tick_id) else {
+        let Some(ticked) = self.ticked.get(tick_id) else {
             return false;
         };
         let mut own = ProvisionalCells::default();
         own.claim(&ticked.claims);
-        self.ticked_waves.iter().any(|(other_id, other)| {
-            other.tick < ticked.tick
+        self.ticked.iter().any(|(other_id, other)| {
+            other_id.block_height() < tick_id.block_height()
                 && !placed.contains(other_id)
                 && !ancestor_certified.contains(other_id)
                 && own.blocks(&other.claims)
@@ -3056,11 +2937,11 @@ impl ExecutionCoordinator {
         // The wave may already have been removed by `finalize` (local
         // aggregation path) or be absent entirely (sync path: the block was
         // received as committed without local tracking). Either case is fine.
-        self.waves.remove_wave(tick_id);
+        self.ticks.remove_tick(tick_id);
 
         let tx_hashes: Vec<TxHash> = fw.tx_hashes().collect();
         for &tx_hash in &tx_hashes {
-            self.waves.remove_assignment(tx_hash);
+            self.ticks.remove_assignment(tx_hash);
             self.provisioning.remove_tx(tx_hash);
         }
         // Drain pending-tx sets on fulfilled-cert tombstones referencing
@@ -3076,12 +2957,12 @@ impl ExecutionCoordinator {
     /// no later block, so every pending wave here is permanently
     /// undecidable. Serving state (aggregated ECs, finalizations)
     /// stays — peers still fetch what this chain produced.
-    pub fn abort_pending_waves(&mut self) -> Vec<Action> {
-        let counts = self.waves.drain_all();
+    pub fn abort_pending_ticks(&mut self) -> Vec<Action> {
+        let counts = self.ticks.drain_all();
         let mut expected = self.expected_certs.drain_expected();
         expected.sort();
         tracing::info!(
-            waves = counts.waves,
+            waves = counts.ticks,
             trackers = counts.trackers,
             assignments = counts.assignments,
             expected_certs = expected.len(),
@@ -3093,7 +2974,7 @@ impl ExecutionCoordinator {
         // chain, so its completion must be able to release the queue.
         self.pending_tick_resolutions.clear();
         self.pending_ticks.clear();
-        self.ticked_waves.clear();
+        self.ticked.clear();
         self.tick_in_flight = false;
         let mut actions = vec![Action::ClearTickChain];
         if !expected.is_empty() {
@@ -3113,7 +2994,7 @@ impl ExecutionCoordinator {
     /// separate policy tied to the registry's state plus a timestamp
     /// retention floor.
     fn prune_execution_state(&mut self) {
-        let counts = self.waves.prune_resolved();
+        let counts = self.ticks.prune_resolved();
 
         // Early execution votes:
         // - Wave resolved (EC formed) → votes no longer needed
@@ -3126,7 +3007,7 @@ impl ExecutionCoordinator {
         // into the on-demand VoteTracker created in `on_execution_vote`.
         let ev_cutoff = self.committed_ts.minus(EARLY_VOTE_RETENTION);
         let before_ev = self.early.vote_len();
-        let registry = &self.waves;
+        let registry = &self.ticks;
         self.early.retain_votes(|key, votes| {
             if registry.is_ec_dispatched(key) {
                 return false;
@@ -3134,7 +3015,7 @@ impl ExecutionCoordinator {
             if registry.contains_tracker(key) {
                 return false;
             }
-            if registry.contains_wave(key) {
+            if registry.contains_tick(key) {
                 return true;
             }
             votes
@@ -3143,9 +3024,9 @@ impl ExecutionCoordinator {
         });
         let pruned_ev = before_ev - self.early.vote_len();
 
-        if counts.waves > 0 || counts.trackers > 0 || pruned_ev > 0 || counts.assignments > 0 {
+        if counts.ticks > 0 || counts.trackers > 0 || pruned_ev > 0 || counts.assignments > 0 {
             tracing::debug!(
-                pruned_waves = counts.waves,
+                pruned_waves = counts.ticks,
                 pruned_vt = counts.trackers,
                 pruned_ev,
                 pruned_wa = counts.assignments,
@@ -3168,19 +3049,13 @@ impl ExecutionCoordinator {
         self.finalized.all_tx_hashes()
     }
 
-    /// Check if we're waiting for provisioning to complete for a transaction.
-    #[must_use]
-    pub fn is_awaiting_provisioning(&self, tx_hash: TxHash) -> bool {
-        self.waves.is_awaiting_provisioning(tx_hash)
-    }
-
     /// Get debug info about wave state for a transaction.
     #[must_use]
     pub fn certificate_tracking_debug(&self, tx_hash: TxHash) -> String {
-        let wave_info = self.waves.wave_assignment(tx_hash).map_or_else(
+        let wave_info = self.ticks.tick_assignment(tx_hash).map_or_else(
             || "no wave assignment".to_string(),
             |tick_id| {
-                self.waves.get_wave(&tick_id).map_or_else(
+                self.ticks.get_tick(&tick_id).map_or_else(
                     || {
                         if self.finalized.contains(&tick_id) {
                             format!("wave={tick_id}, finalized")
@@ -3206,22 +3081,22 @@ impl ExecutionCoordinator {
     pub fn memory_stats(&self) -> ExecutionMemoryStats {
         ExecutionMemoryStats {
             wave_execution_receipts: self
-                .waves
-                .waves_iter()
+                .ticks
+                .ticks_iter()
                 .map(|(_, w)| w.receipt_count())
                 .sum(),
             finalizations: self.finalized.len(),
-            waves: self.waves.waves_len(),
+            waves: self.ticks.ticks_len(),
             unresolved_txs: self.unresolved.len(),
-            vote_trackers: self.waves.trackers_len(),
+            vote_trackers: self.ticks.trackers_len(),
             early_votes: self.early.vote_len(),
             expected_exec_certs: self.expected_certs.expected_len(),
             verified_provisions: self.provisioning.verified_len(),
             required_provision_shards: self.provisioning.required_len(),
             received_provision_shards: self.provisioning.received_len(),
-            waves_with_ec: self.waves.ec_dispatched_len(),
-            pending_vote_retries: self.waves.retries_len(),
-            wave_assignments: self.waves.assignments_len(),
+            waves_with_ec: self.ticks.ec_dispatched_len(),
+            pending_vote_retries: self.ticks.retries_len(),
+            wave_assignments: self.ticks.assignments_len(),
             early_wave_attestations: self.early.tx_index_len(),
             pending_routing: self.early.pending_routing_len(),
             fulfilled_exec_certs: self.expected_certs.fulfilled_len(),
@@ -3235,10 +3110,10 @@ impl ExecutionCoordinator {
     ///
     /// Counts unique transaction hashes in cross-shard waves that haven't yet
     /// finalized. Covers provisioning, voting, and certificate collection
-    /// phases uniformly (one `WaveState` tracks all of them).
+    /// phases uniformly (one `TickState` tracks all of them).
     #[must_use]
     pub fn cross_shard_pending_count(&self) -> usize {
-        self.waves.cross_shard_pending_count()
+        self.ticks.cross_shard_pending_count()
     }
 }
 
@@ -3246,7 +3121,7 @@ impl std::fmt::Debug for ExecutionCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionCoordinator")
             .field("finalizations", &self.finalized.len())
-            .field("waves", &self.waves.waves_len())
+            .field("waves", &self.ticks.ticks_len())
             .finish_non_exhaustive()
     }
 }
@@ -3321,6 +3196,28 @@ mod tests {
         ))
     }
 
+    /// A tick holding `txs`, each admitted with its participating shards.
+    fn tick_holding(
+        tick_id: TickId,
+        tick_ts: WeightedTimestamp,
+        txs: Vec<(Arc<Verified<Transaction>>, BTreeSet<ShardId>)>,
+    ) -> TickState {
+        let mut state = TickState::new(
+            tick_id,
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
+            tick_ts,
+        );
+        for (tx, participating) in txs {
+            state.admit(tx.hash(), participating, tx.work(), false);
+        }
+        state
+    }
+
+    /// Lift a test transaction into the verified form a tick holds.
+    fn verified_arc(tx: &Arc<Transaction>) -> Arc<Verified<Transaction>> {
+        Arc::new(Verified::new_unchecked_for_test((**tx).clone()))
+    }
+
     fn make_test_state() -> ExecutionCoordinator {
         make_test_state_for(ValidatorId::new(0))
     }
@@ -3389,10 +3286,10 @@ mod tests {
                 .any(|a| matches!(a, Action::ExecuteTransactions { .. }))
         );
 
-        // WaveState should be set up for this wave.
-        let tick_id = state.waves.wave_assignment(tx_hash);
+        // TickState should be set up for this wave.
+        let tick_id = state.ticks.tick_assignment(tx_hash);
         assert!(tick_id.is_some());
-        assert!(state.waves.contains_wave(&tick_id.unwrap()));
+        assert!(state.ticks.contains_tick(&tick_id.unwrap()));
     }
 
     fn make_topology() -> TopologySchedule {
@@ -3444,31 +3341,31 @@ mod tests {
         state.on_block_committed(&schedule, &test_certify(block, 1_000));
 
         let tick_id = state
-            .waves
-            .wave_assignment(tx_hash)
+            .ticks
+            .tick_assignment(tx_hash)
             .expect("the committed tx is assigned to a wave");
         assert!(
-            state.ticked_waves.contains_key(&tick_id),
+            state.ticked.contains_key(&tick_id),
             "the wave joined a tick at commit",
         );
 
         // The wave finalizes locally, which untracks it, and its batch
         // returns afterwards.
-        state.waves.remove_wave(&tick_id);
+        state.ticks.remove_tick(&tick_id);
         state.on_execution_batch_completed(
             &schedule,
             BlockHeight::new(1),
-            vec![WaveExecutionResult {
+            TickBatchOutcome {
                 tick_id,
                 results: vec![],
                 tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
                 fee_receipts: vec![],
                 attested_work: vec![],
-            }],
+            },
         );
 
         assert!(
-            state.ticked_waves.contains_key(&tick_id),
+            state.ticked.contains_key(&tick_id),
             "the wave's tick entry must survive for its real verdict to claim",
         );
         assert!(
@@ -3515,19 +3412,19 @@ mod tests {
 
         // Execution lands, so the wave is complete and ready to vote.
         let tick_id = state
-            .waves
-            .wave_assignment(tx_hash)
+            .ticks
+            .tick_assignment(tx_hash)
             .expect("the committed tx is assigned to a wave");
         state.on_execution_batch_completed(
             &unresolvable,
             BlockHeight::new(1),
-            vec![WaveExecutionResult {
+            TickBatchOutcome {
                 tick_id,
                 results: vec![],
                 tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
                 fee_receipts: vec![],
                 attested_work: vec![],
-            }],
+            },
         );
 
         let blocked = state.emit_vote_actions(&unresolvable);
@@ -3565,8 +3462,8 @@ mod tests {
         let mut state0 = make_test_state();
         state0.on_block_committed(&topo0, &certify(block));
         let tick_id = state0
-            .waves
-            .waves_iter()
+            .ticks
+            .ticks_iter()
             .next()
             .map(|(wid, _)| *wid)
             .unwrap();
@@ -3584,7 +3481,7 @@ mod tests {
         let mut state_leader = make_test_state_for(leader);
         state_leader.on_block_committed(&topo_leader, &certify(block_leader));
         assert!(
-            state_leader.waves.contains_tracker(&tick_id),
+            state_leader.ticks.contains_tracker(&tick_id),
             "Leader should have VoteTracker"
         );
 
@@ -3600,7 +3497,7 @@ mod tests {
         let mut state_non = make_test_state_for(non_leader_id);
         state_non.on_block_committed(&topo_non, &certify(block_non));
         assert!(
-            !state_non.waves.contains_tracker(&tick_id),
+            !state_non.ticks.contains_tracker(&tick_id),
             "Non-leader should NOT have VoteTracker"
         );
     }
@@ -3622,8 +3519,8 @@ mod tests {
         state.on_block_committed(&topo, &certify(block));
 
         let tick_id = state
-            .waves
-            .waves_iter()
+            .ticks
+            .ticks_iter()
             .next()
             .map(|(wid, _)| *wid)
             .unwrap();
@@ -3641,8 +3538,8 @@ mod tests {
         let mut state_non = make_test_state_for(*non_leader_id);
         state_non.on_block_committed(&topo_non, &certify(block_non));
 
-        assert!(!state_non.waves.contains_tracker(&tick_id));
-        assert!(state_non.waves.contains_wave(&tick_id));
+        assert!(!state_non.ticks.contains_tracker(&tick_id));
+        assert!(state_non.ticks.contains_tick(&tick_id));
 
         // Simulate receiving a vote (as if we're a fallback leader).
         let fake_vote = ExecutionVote::new(
@@ -3662,7 +3559,7 @@ mod tests {
 
         // Should have created a fallback VoteTracker.
         assert!(
-            state_non.waves.contains_tracker(&tick_id),
+            state_non.ticks.contains_tracker(&tick_id),
             "Fallback VoteTracker should be created"
         );
     }
@@ -3699,7 +3596,7 @@ mod tests {
         let actions = state.on_unverified_execution_vote(&topo, vote);
         assert!(actions.is_empty(), "non-committee vote must be dropped");
         assert!(
-            !state.waves.contains_tracker(&tick_id),
+            !state.ticks.contains_tracker(&tick_id),
             "rejected vote must not seed a fallback VoteTracker"
         );
         assert_eq!(
@@ -3711,7 +3608,7 @@ mod tests {
 
     #[test]
     fn test_vote_retry_timeout_emits_rotated_action() {
-        use crate::waves::VOTE_RETRY_TIMEOUT;
+        use crate::ticks::VOTE_RETRY_TIMEOUT;
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let topo = make_test_topology();
         let committee = topo.head().committee_for_shard(ShardId::ROOT).to_vec();
@@ -3722,7 +3619,7 @@ mod tests {
         state.committed_ts = WeightedTimestamp::from_millis(10_000).plus(VOTE_RETRY_TIMEOUT);
 
         // Manually insert a pending retry as if we'd sent a vote at t=10_000ms.
-        state.waves.record_vote_retry(
+        state.ticks.record_vote_retry(
             tick_id,
             PendingVoteRetry {
                 sent_at: WeightedTimestamp::from_millis(10_000),
@@ -3771,13 +3668,13 @@ mod tests {
 
     #[test]
     fn test_vote_retry_cancelled_on_ec_receipt() {
-        use crate::waves::VOTE_RETRY_TIMEOUT;
+        use crate::ticks::VOTE_RETRY_TIMEOUT;
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let topo = make_test_topology();
 
         let mut state = make_test_state();
         state.committed_height = BlockHeight::new(10);
-        state.waves.record_vote_retry(
+        state.ticks.record_vote_retry(
             tick_id,
             PendingVoteRetry {
                 sent_at: WeightedTimestamp::from_millis(5_000),
@@ -3946,14 +3843,12 @@ mod tests {
         let tx = Arc::new(test_transaction(3));
         let participating: BTreeSet<ShardId> =
             [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect();
-        state.waves.insert_wave(
+        state.ticks.insert_tick(
             tick_id,
-            WaveState::new(
+            tick_holding(
                 tick_id,
-                BlockHash::from_raw(Hash::from_bytes(b"block")),
                 WeightedTimestamp::ZERO,
-                RevealChain::ZERO,
-                vec![(Arc::new(Verifiable::from((*tx).clone())), participating)],
+                vec![(verified_arc(&tx), participating)],
             ),
         );
 
@@ -4014,20 +3909,18 @@ mod tests {
 
         let shared = Arc::new(test_transaction(3));
         let ours = Arc::new(test_transaction(4));
-        state.waves.insert_wave(
+        state.ticks.insert_tick(
             tick_id,
-            WaveState::new(
+            tick_holding(
                 tick_id,
-                BlockHash::from_raw(Hash::from_bytes(b"block")),
                 WeightedTimestamp::ZERO,
-                RevealChain::ZERO,
                 vec![
                     (
-                        Arc::new(Verifiable::from((*shared).clone())),
+                        verified_arc(&shared),
                         [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect(),
                     ),
                     (
-                        Arc::new(Verifiable::from((*ours).clone())),
+                        verified_arc(&ours),
                         std::iter::once(ShardId::ROOT).collect(),
                     ),
                 ],
@@ -4976,8 +4869,8 @@ mod tests {
         let block_hash = block.hash();
         coord.on_block_committed(&schedule, &test_certify(block, ED));
         let tick_id = coord
-            .waves
-            .waves_iter()
+            .ticks
+            .ticks_iter()
             .next()
             .map(|(w, _)| *w)
             .expect("single-shard wave created on commit");
@@ -5130,17 +5023,15 @@ mod tests {
         let mut participating = BTreeSet::new();
         participating.insert(ShardId::leaf(1, 0));
         participating.insert(remote_shard);
-        state.waves.insert_wave(
+        state.ticks.insert_tick(
             local_wave,
-            WaveState::new(
+            tick_holding(
                 local_wave,
-                BlockHash::from_raw(Hash::from_bytes(b"block")),
                 WeightedTimestamp::from_millis(5_000),
-                RevealChain::ZERO,
-                vec![(Arc::new(Verifiable::from((*tx).clone())), participating)],
+                vec![(verified_arc(&tx), participating)],
             ),
         );
-        state.waves.assign_tx(tx_hash, local_wave);
+        state.ticks.assign_tx(tx_hash, local_wave);
 
         // Advance committed time past fallback + retry thresholds so the
         // age-based gate would fire. The expectation must survive regardless
@@ -5163,8 +5054,8 @@ mod tests {
 
         // Once the local wave resolves (simulating finalize), the
         // expectation is no longer needed and gets pruned.
-        state.waves.remove_wave(&local_wave);
-        state.waves.remove_assignment(tx_hash);
+        state.ticks.remove_tick(&local_wave);
+        state.ticks.remove_assignment(tx_hash);
         state.committed_height = BlockHeight::new(600);
         state.committed_ts = WeightedTimestamp::from_millis(120_000);
         let _ = state.check_exec_cert_timeouts();
@@ -5182,27 +5073,21 @@ mod tests {
 
     /// Build a single-shard wave in the "ready to finalize" state: every tx
     /// has an execution result and a local receipt, and the local EC has
-    /// been added. `WaveState::is_complete` returns true.
-    fn make_ready_single_shard_wave(tx_seeds: &[u8]) -> (TickId, WaveState) {
+    /// been added. `TickState::is_complete` returns true.
+    fn make_ready_single_shard_wave(tx_seeds: &[u8]) -> (TickId, TickState) {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let txs: Vec<(Arc<Verifiable<Transaction>>, BTreeSet<ShardId>)> = tx_seeds
+        let txs: Vec<(Arc<Verified<Transaction>>, BTreeSet<ShardId>)> = tx_seeds
             .iter()
             .map(|s| {
                 let mut participating = BTreeSet::new();
                 participating.insert(ShardId::ROOT);
                 (
-                    Arc::new(Verifiable::from(test_transaction(*s))),
+                    Arc::new(Verified::new_unchecked_for_test(test_transaction(*s))),
                     participating,
                 )
             })
             .collect();
-        let mut wave = WaveState::new(
-            tick_id,
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            WeightedTimestamp::from_millis(1_000),
-            RevealChain::ZERO,
-            txs,
-        );
+        let mut wave = tick_holding(tick_id, WeightedTimestamp::from_millis(1_000), txs);
 
         // Record per-tx execution results + receipts.
         let tx_hashes: Vec<TxHash> = wave.tx_hashes().to_vec();
@@ -5259,11 +5144,11 @@ mod tests {
     fn test_finalize_wave_populates_finalized_store() {
         let mut state = make_test_state();
         let (tick_id, wave) = make_ready_single_shard_wave(&[1, 2]);
-        state.waves.insert_wave(tick_id, wave);
+        state.ticks.insert_tick(tick_id, wave);
 
         let _actions = state.finalize(&make_test_topology(), &tick_id);
 
-        assert!(!state.waves.contains_wave(&tick_id), "wave handed off");
+        assert!(!state.ticks.contains_tick(&tick_id), "wave handed off");
         assert!(
             state.finalized.contains(&tick_id),
             "finalized store populated"
@@ -5275,7 +5160,7 @@ mod tests {
     fn test_finalize_wave_emits_admission_event() {
         let mut state = make_test_state();
         let (tick_id, wave) = make_ready_single_shard_wave(&[1, 2]);
-        state.waves.insert_wave(tick_id, wave);
+        state.ticks.insert_tick(tick_id, wave);
 
         let actions = state.finalize(&make_test_topology(), &tick_id);
 
@@ -5734,7 +5619,7 @@ mod tests {
         );
         state.on_block_committed(schedule, &test_certify(block, now_ms));
         state
-            .scan_complete_waves(schedule)
+            .scan_votable_ticks(schedule)
             .into_iter()
             .flat_map(|completion| completion.tx_outcomes)
             .collect()
@@ -5770,8 +5655,8 @@ mod tests {
         // Its own wave never finalizes; the shard drops it so nothing can
         // attest a second verdict for it.
         state
-            .waves
-            .remove_wave(&TickId::new(ShardId::ROOT, BlockHeight::new(1)));
+            .ticks
+            .remove_tick(&TickId::new(ShardId::ROOT, BlockHeight::new(1)));
 
         let outcomes = abandonment_vote(&mut state, &schedule, 2, deadline_ms);
         assert_eq!(
@@ -5810,8 +5695,8 @@ mod tests {
             ),
         );
         state
-            .waves
-            .remove_wave(&TickId::new(ShardId::ROOT, BlockHeight::new(1)));
+            .ticks
+            .remove_tick(&TickId::new(ShardId::ROOT, BlockHeight::new(1)));
 
         let outcomes = abandonment_vote(&mut state, &schedule, 2, deadline_ms - 1);
         assert!(
@@ -5863,12 +5748,13 @@ mod tests {
         let tx_hash = tx.hash();
         let participating: BTreeSet<ShardId> =
             [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect();
-        let mut wave = WaveState::new(
+        let mut wave = tick_holding(
             tick_id,
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
             WeightedTimestamp::from_millis(1_000),
-            RevealChain::ZERO,
-            vec![(Arc::new(Verifiable::from(tx)), participating)],
+            vec![(
+                Arc::new(Verified::new_unchecked_for_test(tx)),
+                participating,
+            )],
         );
         wave.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
             ExecutionCertificate::new(
@@ -5880,8 +5766,8 @@ mod tests {
                 SignerBitfield::new(4),
             ),
         )));
-        state.waves.insert_wave(tick_id, wave);
-        state.waves.assign_tx(tx_hash, tick_id);
+        state.ticks.insert_tick(tick_id, wave);
+        state.ticks.assign_tx(tx_hash, tick_id);
 
         state.unresolved =
             UnresolvedTxs::restored(vec![(tx_hash, WeightedTimestamp::from_millis(1_000), 42)]);
@@ -5893,9 +5779,9 @@ mod tests {
             vec![(tx_hash, 42)],
             "a wave that has attested and waits on a counterpart is stranded",
         );
-        state.discard_waves_holding(&abandoned);
+        state.discard_ticks_holding(&abandoned);
         assert!(
-            !state.waves.contains_wave(&tick_id),
+            !state.ticks.contains_tick(&tick_id),
             "and the stranded wave is discarded with it",
         );
     }
@@ -5992,8 +5878,8 @@ mod tests {
             ),
         );
         state
-            .waves
-            .remove_wave(&TickId::new(ShardId::ROOT, BlockHeight::new(1)));
+            .ticks
+            .remove_tick(&TickId::new(ShardId::ROOT, BlockHeight::new(1)));
 
         let outcomes = abandonment_vote(&mut state, &schedule, 2, deadline_ms);
         assert_eq!(outcomes.len(), 1, "the tick at the deadline abandons it");
@@ -6003,8 +5889,8 @@ mod tests {
         );
         assert!(
             state
-                .waves
-                .contains_wave(&TickId::new(ShardId::ROOT, BlockHeight::new(2))),
+                .ticks
+                .contains_tick(&TickId::new(ShardId::ROOT, BlockHeight::new(2))),
             "so the wave attesting the abort survives to be certified",
         );
         assert_eq!(state.unresolved.len(), 1, "released only when it commits");
@@ -6023,8 +5909,8 @@ mod tests {
         let tx_hash = wave.tx_hashes()[0];
 
         // Seed every sub-machine with state for this wave's tx.
-        state.waves.insert_wave(tick_id, wave);
-        state.waves.assign_tx(tx_hash, tick_id);
+        state.ticks.insert_tick(tick_id, wave);
+        state.ticks.assign_tx(tx_hash, tick_id);
         state
             .provisioning
             .record_required(tx_hash, std::iter::once(ShardId::leaf(1, 1)).collect());
@@ -6074,14 +5960,12 @@ mod tests {
         let mut participating = BTreeSet::new();
         participating.insert(ShardId::leaf(1, 0));
         participating.insert(remote_shard);
-        state.waves.insert_wave(
+        state.ticks.insert_tick(
             local_wave,
-            WaveState::new(
+            tick_holding(
                 local_wave,
-                BlockHash::from_raw(Hash::from_bytes(b"block")),
                 WeightedTimestamp::from_millis(0),
-                RevealChain::ZERO,
-                vec![(Arc::new(Verifiable::from((*tx).clone())), participating)],
+                vec![(verified_arc(&tx), participating)],
             ),
         );
 

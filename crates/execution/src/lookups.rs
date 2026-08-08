@@ -5,24 +5,17 @@
 //! the coordinator so the topology-only parts are unit-testable without a
 //! full driver fixture.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_types::{
-    BlockHeight, ConsensusPublicKey, DeclaredKey, ExecutionCertificate, ShardId, ShardTrie,
-    SubstateKey, TickId, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, VoteCount,
+    ConsensusPublicKey, DeclaredKey, ExecutionCertificate, ShardId, ShardTrie, SubstateKey,
+    TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, VoteCount,
 };
 
 /// Per-shard recipient lists for provision broadcasting.
 pub type ShardRecipients = HashMap<ShardId, Vec<ValidatorId>>;
-
-/// A single tx's layout within a wave: the transaction plus the set of shards
-/// that participate in its execution (local + any remote provision sources).
-pub type WaveTxEntry = (Arc<Verifiable<Transaction>>, BTreeSet<ShardId>);
-
-/// Deterministic grouping of a block's transactions into waves.
-pub type WaveAssignments = BTreeMap<TickId, Vec<WaveTxEntry>>;
 
 /// Committee members of `shard` with the local validator filtered out.
 ///
@@ -99,34 +92,25 @@ pub fn committee_public_keys_for_shard(
     Some(pubkeys)
 }
 
-/// Compute deterministic wave assignments for a block's transactions.
+/// Pair each of a block's transactions with the shards party to it —
+/// the ones whose certificates its settlement needs, this one included.
 ///
-/// Partitions transactions by their provision dependency set (remote shards
-/// needed). All validators compute identical assignments from the same block.
-///
-/// Returns a map from `TickId` to list of (tx, `participating_shards`) in
-/// block order within each wave.
-pub fn assign_waves(
+/// Derived from committed content and the block's own committee, so every
+/// replica pairs them identically. In block order.
+pub fn assign_participants(
     topology_snapshot: &TopologySnapshot,
-    local_shard: ShardId,
-    block_height: BlockHeight,
     transactions: &[Arc<Verifiable<Transaction>>],
-) -> WaveAssignments {
-    let mut waves: WaveAssignments = BTreeMap::new();
-
-    let tick_id = TickId::new(local_shard, block_height);
-    for tx in transactions {
-        let all_shards: BTreeSet<ShardId> = topology_snapshot
-            .all_shards_for_transaction(tx)
-            .into_iter()
-            .collect();
-        waves
-            .entry(tick_id)
-            .or_default()
-            .push((Arc::clone(tx), all_shards));
-    }
-
-    waves
+) -> Vec<(Arc<Verifiable<Transaction>>, BTreeSet<ShardId>)> {
+    transactions
+        .iter()
+        .map(|tx| {
+            let all_shards: BTreeSet<ShardId> = topology_snapshot
+                .all_shards_for_transaction(tx)
+                .into_iter()
+                .collect();
+            (Arc::clone(tx), all_shards)
+        })
+        .collect()
 }
 
 /// One transaction's provision request: the locally owned read-set keys

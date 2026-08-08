@@ -39,9 +39,12 @@ fn settled_local_effect(refused: bool) -> (u64, u128, u128) {
     let leg = crossing(0);
     let hash = leg.hash();
     sim.commit(vec![leg], Vec::new());
+    // The payer's leg runs in the tick that attests it, so it waits for
+    // the counterpart to commit the transaction and echo that back.
+    sim.engage(ShardId::leaf(1, 1), &[hash]);
     sim.drain();
 
-    let wave = sim.wave_of(hash).expect("the crossing has a wave");
+    let wave = sim.wave_of(hash).expect("the crossing joined a tick");
     let receipts = sim.receipts_for(&wave);
     assert!(!receipts.is_empty(), "the local half executed");
 

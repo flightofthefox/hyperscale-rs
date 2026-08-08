@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{
-    Action, ActionContext, ProtocolEvent, TickExecutionGroup, WaveExecutionResult,
+    Action, ActionContext, CrossShardExecutionRequest, ProtocolEvent, TickBatchOutcome,
 };
 use hyperscale_engine::{ExecutedTx, TickTxInput, WaveBatchContext};
 use hyperscale_metrics::record_execution_latency;
@@ -24,7 +24,7 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::{
     BlockHeight, ConsensusReceipt, DeclaredKey, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificatesSenderMessage, ExecutionVote, ExecutionVotesSenderMessage,
-    FinalizationContext, Mode, StateWrites, Stopwatch, StoredReceipt, SubstateKey, TxHash,
+    FinalizationContext, Mode, StateWrites, Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash,
     TxOutcome, Verifiable, Verified, signed_bytes,
 };
 
@@ -88,7 +88,8 @@ pub struct ExecutionOutputs {
 /// all for ordinary payment traffic.
 pub fn accumulate_tick_output(
     output: &mut TickOutput,
-    group: &TickExecutionGroup,
+    tick_id: TickId,
+    requests: &[CrossShardExecutionRequest],
     executed: &[ExecutedTx],
 ) {
     let mut ordered: Vec<&ExecutedTx> = executed.iter().collect();
@@ -99,8 +100,7 @@ pub fn accumulate_tick_output(
     // a provisional contribution no later tick may read until a
     // counterpart resolves it, and one that does not is determined the
     // moment it executes.
-    let reaches_beyond: HashSet<TxHash> = group
-        .requests
+    let reaches_beyond: HashSet<TxHash> = requests
         .iter()
         .filter(|r| r.reaches_beyond)
         .map(|r| r.tx_hash)
@@ -126,7 +126,7 @@ pub fn accumulate_tick_output(
         }
     }
     if !members.is_empty() {
-        output.determined.insert(group.tick_id, members);
+        output.determined.insert(tick_id, members);
     }
 
     if !beyond.is_empty() {
@@ -140,14 +140,14 @@ pub fn accumulate_tick_output(
                     .as_ref()
                     .and_then(|fee| fee.writes())
                     .cloned(),
-                reserved: granted_reservations(group, tx),
+                reserved: granted_reservations(requests, tx),
             })
             .collect();
-        output.provisional.insert(group.tick_id, entries);
+        output.provisional.insert(tick_id, entries);
     }
 }
 
-/// What one member of `group` holds in reservations, by cell.
+/// What one member of `requests` holds in reservations, by cell.
 ///
 /// Only a leg that ran to completion holds anything. A reservation is
 /// granted or refused when the kernel judges it, and an attempt that
@@ -165,18 +165,14 @@ pub fn accumulate_tick_output(
 /// ride along and are dropped where locality is known — a declaration
 /// spans every participating shard, and this one does not.
 fn granted_reservations(
-    group: &TickExecutionGroup,
+    requests: &[CrossShardExecutionRequest],
     executed: &ExecutedTx,
 ) -> BTreeMap<SubstateKey, u128> {
     let mut reserved = BTreeMap::new();
     if executed.consensus.writes().is_none() {
         return reserved;
     }
-    let Some(request) = group
-        .requests
-        .iter()
-        .find(|r| r.tx_hash == executed.tx_hash)
-    else {
+    let Some(request) = requests.iter().find(|r| r.tx_hash == executed.tx_hash) else {
         return reserved;
     };
     for (key, mode) in &request.transaction.routing().declared_modes {
@@ -271,7 +267,7 @@ where
             block_hash,
             tick_ts,
             tick_reveal,
-            groups,
+            requests,
         } => {
             let start = Stopwatch::start();
             let shard_trie = ctx.topology_snapshot.shard_trie();
@@ -294,16 +290,14 @@ where
                 wave_start_reveal: tick_reveal,
                 holds: &holds,
             };
-            let inputs: Vec<TickTxInput<'_>> = groups
+            let inputs: Vec<TickTxInput<'_>> = requests
                 .iter()
-                .flat_map(|group| {
-                    group.requests.iter().map(|r| TickTxInput {
-                        transaction: &r.transaction,
-                        provisions: &r.provisions,
-                        clock: r.clock,
-                        randomness: r.randomness,
-                        wave_abortable: r.reaches_beyond,
-                    })
+                .map(|r| TickTxInput {
+                    transaction: &r.transaction,
+                    provisions: &r.provisions,
+                    clock: r.clock,
+                    randomness: r.randomness,
+                    wave_abortable: r.reaches_beyond,
                 })
                 .collect();
             let executed = ctx
@@ -311,34 +305,29 @@ where
                 .execute_tick_batch(&wave_ctx, &view_snap, &inputs);
             record_execution_latency(start.elapsed().as_secs_f64());
 
-            // Fan the flat result vector (input order) back to its groups,
-            // building the tick output alongside the per-wave results.
-            let mut remaining = executed;
+            let tick_id = TickId::new(ctx.shard, tick);
             let mut output = TickOutput::default();
-            let mut waves: Vec<WaveExecutionResult> = Vec::with_capacity(groups.len());
-            for group in &groups {
-                let rest = remaining.split_off(group.requests.len());
-                let executed_group = std::mem::replace(&mut remaining, rest);
-                accumulate_tick_output(&mut output, group, &executed_group);
-                let ExecutionOutputs {
-                    outcomes: tx_outcomes,
-                    results,
-                    fee_receipts,
-                    attested_work,
-                } = split_execution_outputs(executed_group);
-                waves.push(WaveExecutionResult {
-                    tick_id: group.tick_id,
-                    results,
-                    tx_outcomes,
-                    fee_receipts,
-                    attested_work,
-                });
-            }
+            accumulate_tick_output(&mut output, tick_id, &requests, &executed);
+            let ExecutionOutputs {
+                outcomes: tx_outcomes,
+                results,
+                fee_receipts,
+                attested_work,
+            } = split_execution_outputs(executed);
 
             // Append before notifying: the coordinator dispatches the next
             // tick on this event, and its baseline must include this one.
             ctx.tick_chain.append(tick, output);
-            ctx.notify_protocol(ProtocolEvent::ExecutionBatchCompleted { tick, waves });
+            ctx.notify_protocol(ProtocolEvent::ExecutionBatchCompleted {
+                tick,
+                outcome: TickBatchOutcome {
+                    tick_id,
+                    results,
+                    tx_outcomes,
+                    fee_receipts,
+                    attested_work,
+                },
+            });
         }
 
         // ── Sign + broadcast actions ──────────────────────────────────────

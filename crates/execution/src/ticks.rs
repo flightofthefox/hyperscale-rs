@@ -1,36 +1,36 @@
-//! In-flight wave registry: owns [`WaveState`], [`VoteTracker`], EC-dispatch
+//! In-flight tick registry: owns [`TickState`], [`VoteTracker`], EC-dispatch
 //! gating, vote-retry bookkeeping, and the `tx_hash → TickId` reverse index.
 //!
 //! The registry is the execution coordinator's "what's currently in flight"
 //! sub-machine. Everything else is keyed against it:
 //!
-//! - Incoming votes look up waves by `tick_id` to decide buffering vs
+//! - Incoming votes look up ticks by `tick_id` to decide buffering vs
 //!   tracker creation.
 //! - Incoming cross-shard ECs route by `tx_hash → tick_id` via
-//!   [`classify_attestation`](WaveRegistry::classify_attestation).
+//!   [`classify_attestation`](TickRegistry::classify_attestation).
 //! - [`EarlyArrivalBuffer`](crate::early_arrivals) retention reads from the
-//!   registry to tell "wave still active" from "wave long gone".
+//!   registry to tell "tick still active" from "tick long gone".
 //! - [`FinalizationStore`](crate::finalizations::FinalizationStore)
-//!   receives waves handed off from the registry at finalization.
+//!   receives ticks handed off from the registry at finalization.
 //!
 //! ## Assignments as an inverted index
 //!
-//! `assignments[tx_hash] = tick_id` is the reverse of the wave's
+//! `assignments[tx_hash] = tick_id` is the reverse of the tick's
 //! `tx_hashes()` list. Pruning the two sides atomically is the registry's
-//! job — see [`prune_resolved`](WaveRegistry::prune_resolved), which drops
+//! job — see [`prune_resolved`](TickRegistry::prune_resolved), which drops
 //! states whose keys no longer appear in `assignments.values()` and then
 //! drops assignments whose `tick_ids` no longer appear in `states`.
 //!
 //! ## Typed effects
 //!
-//! - [`check_vote_retry_timeouts`](WaveRegistry::check_vote_retry_timeouts)
+//! - [`check_vote_retry_timeouts`](TickRegistry::check_vote_retry_timeouts)
 //!   returns a `Vec<RetryEffect>` — the coordinator resolves the rotated
 //!   leader via topology and wraps each as
 //!   `Action::SignAndSendExecutionVote`.
-//! - [`classify_attestation`](WaveRegistry::classify_attestation) returns
+//! - [`classify_attestation`](TickRegistry::classify_attestation) returns
 //!   [`AttestationRouting`] — the coordinator fans out into
 //!   `EarlyArrivalBuffer::buffer_ec` / `clear_routed` and walks the affected
-//!   waves.
+//!   ticks.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -41,21 +41,20 @@ use hyperscale_types::{
     TxOutcome, VoteCount, WeightedTimestamp,
 };
 
+use crate::tick_state::TickState;
 use crate::vote_tracker::VoteTracker;
-use crate::wave_state::WaveState;
 
-/// How long to wait before retrying a vote with the next rotated wave
-/// leader. Must exceed typical wave-leader aggregation latency so we don't
+/// How long to wait before retrying a vote with the next rotated tick
+/// leader. Must exceed typical tick-leader aggregation latency so we don't
 /// rotate past a leader that's about to succeed. Measured against the
 /// BFT-authenticated `weighted_timestamp_ms` of locally committed blocks.
 pub const VOTE_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Tracks a pending vote sent to a wave leader, for retry on timeout.
+/// Tracks a pending vote sent to a tick leader, for retry on timeout.
 ///
 /// Retries are unbounded — the loop self-terminates when a working leader
 /// aggregates the EC and broadcasts it back. Capping retries would stall
-/// waves that haven't resolved yet (including timeout-abort waves, which
-/// still need a leader to aggregate the timeout votes).
+/// ticks that have not produced one yet.
 #[derive(Debug, Clone)]
 pub struct PendingVoteRetry {
     /// Local weighted timestamp when this vote was last dispatched.
@@ -86,55 +85,55 @@ pub struct RetryEffect {
 
 /// Classification of an incoming cross-shard [`ExecutionCertificate`].
 ///
-/// `routed_tx_hashes` are the `tx_hashes` covered by an existing local wave
-/// — the coordinator feeds the EC into each wave and clears them from the
-/// early-arrival buffer. `unrouted_tx_hashes` have no local wave yet —
+/// `routed_tx_hashes` are the `tx_hashes` covered by an existing local tick
+/// — the coordinator feeds the certificate into each tick and clears them
+/// from the early-arrival buffer. `unrouted_tx_hashes` have no local tick yet —
 /// they're buffered for replay when their blocks commit.
 #[derive(Debug, Default, Clone)]
 pub struct AttestationRouting {
-    pub affected_waves: BTreeSet<TickId>,
+    pub affected_ticks: BTreeSet<TickId>,
     pub routed_tx_hashes: Vec<TxHash>,
     pub unrouted_tx_hashes: Vec<TxHash>,
 }
 
-/// Counts returned by [`WaveRegistry::prune_resolved`] so the coordinator
+/// Counts returned by [`TickRegistry::prune_resolved`] so the coordinator
 /// can fold in its own early-vote pruning before the final log line.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PruneCounts {
-    pub waves: usize,
+    pub ticks: usize,
     pub trackers: usize,
     pub assignments: usize,
 }
 
-pub struct WaveRegistry {
-    /// Per-wave state. The authoritative "wave exists" signal; every other
+pub struct TickRegistry {
+    /// Per-tick state. The authoritative "tick exists" signal; every other
     /// field is keyed off this presence.
-    states: BTreeMap<TickId, WaveState>,
+    states: BTreeMap<TickId, TickState>,
 
-    /// Per-wave vote trackers. Only populated at the wave leader (primary
+    /// Per-tick vote trackers. Only populated at the tick leader (primary
     /// or fallback via rotation) to collect execution votes for EC
     /// aggregation.
     trackers: BTreeMap<TickId, VoteTracker>,
 
-    /// Waves whose local EC aggregation has been dispatched OR whose local
+    /// Ticks whose local certificate aggregation has been dispatched OR whose local
     /// EC has already been received. Guards against creating a duplicate
     /// fallback tracker during the aggregation window — the
     /// `AggregateExecutionCertificate` action fires before
-    /// `WaveState.local_ec_emitted` flips on receipt.
+    /// `TickState::local_ec_emitted` flips on receipt.
     ec_dispatched: BTreeSet<TickId>,
 
-    /// Pending vote retries for waves whose leader hasn't produced an EC.
+    /// Pending vote retries for ticks whose leader hasn't produced a certificate.
     /// Populated by non-leaders at vote emission. Cleared on EC receipt or
-    /// wave removal.
+    /// tick removal.
     retries: BTreeMap<TickId, PendingVoteRetry>,
 
     /// `tx_hash → tick_id` reverse index. The authoritative lookup for
-    /// "what local wave does this tx belong to" — drives EC routing,
-    /// `is_awaiting_provisioning`, `get_wave_assignment`.
+    /// "what local tick does this transaction belong to" — drives certificate routing,
+    /// certificate routing and proposal lookups.
     assignments: BTreeMap<TxHash, TickId>,
 }
 
-impl WaveRegistry {
+impl TickRegistry {
     pub const fn new() -> Self {
         Self {
             states: BTreeMap::new(),
@@ -145,33 +144,33 @@ impl WaveRegistry {
         }
     }
 
-    // ─── Wave state ─────────────────────────────────────────────────────
+    // ─── Tick state ─────────────────────────────────────────────────────
 
-    pub fn insert_wave(&mut self, tick_id: TickId, state: WaveState) {
+    pub fn insert_tick(&mut self, tick_id: TickId, state: TickState) {
         self.states.insert(tick_id, state);
     }
 
-    pub fn remove_wave(&mut self, tick_id: &TickId) -> Option<WaveState> {
+    pub fn remove_tick(&mut self, tick_id: &TickId) -> Option<TickState> {
         self.states.remove(tick_id)
     }
 
-    pub fn contains_wave(&self, tick_id: &TickId) -> bool {
+    pub fn contains_tick(&self, tick_id: &TickId) -> bool {
         self.states.contains_key(tick_id)
     }
 
-    pub fn get_wave(&self, tick_id: &TickId) -> Option<&WaveState> {
+    pub fn get_tick(&self, tick_id: &TickId) -> Option<&TickState> {
         self.states.get(tick_id)
     }
 
-    pub fn get_wave_mut(&mut self, tick_id: &TickId) -> Option<&mut WaveState> {
+    pub fn get_tick_mut(&mut self, tick_id: &TickId) -> Option<&mut TickState> {
         self.states.get_mut(tick_id)
     }
 
-    pub fn waves_iter(&self) -> impl Iterator<Item = (&TickId, &WaveState)> {
+    pub fn ticks_iter(&self) -> impl Iterator<Item = (&TickId, &TickState)> {
         self.states.iter()
     }
 
-    pub fn waves_iter_mut(&mut self) -> impl Iterator<Item = (&TickId, &mut WaveState)> {
+    pub fn ticks_iter_mut(&mut self) -> impl Iterator<Item = (&TickId, &mut TickState)> {
         self.states.iter_mut()
     }
 
@@ -213,7 +212,7 @@ impl WaveRegistry {
         self.assignments.remove(&tx_hash);
     }
 
-    pub fn wave_assignment(&self, tx_hash: TxHash) -> Option<TickId> {
+    pub fn tick_assignment(&self, tx_hash: TxHash) -> Option<TickId> {
         self.assignments.get(&tx_hash).copied()
     }
 
@@ -263,16 +262,16 @@ impl WaveRegistry {
 
     // ─── Attestation routing ────────────────────────────────────────────
 
-    /// Classify `ec`'s `tx_outcomes` by whether they have a local wave
+    /// Classify `ec`'s `tx_outcomes` by whether they have a local tick
     /// assignment. Read-only — mutation happens through the coordinator's
-    /// follow-up calls to [`WaveRegistry::get_wave_mut`] and to the
+    /// follow-up calls to [`TickRegistry::get_tick_mut`] and to the
     /// early-arrival buffer.
     pub fn classify_attestation(&self, ec: &ExecutionCertificate) -> AttestationRouting {
         let mut routing = AttestationRouting::default();
         for outcome in ec.tx_outcomes() {
             match self.assignments.get(&outcome.tx_hash()) {
                 Some(tick_id) => {
-                    routing.affected_waves.insert(*tick_id);
+                    routing.affected_ticks.insert(*tick_id);
                     routing.routed_tx_hashes.push(outcome.tx_hash());
                 }
                 None => routing.unrouted_tx_hashes.push(outcome.tx_hash()),
@@ -283,25 +282,13 @@ impl WaveRegistry {
 
     // ─── Queries that span multiple fields ──────────────────────────────
 
-    /// Whether `tx_hash` is assigned to a wave that's still waiting on
-    /// provisions. False when the tx has no assignment, the wave is gone,
-    /// or the wave is already fully provisioned.
-    pub fn is_awaiting_provisioning(&self, tx_hash: TxHash) -> bool {
-        let Some(tick_id) = self.assignments.get(&tx_hash) else {
-            return false;
-        };
-        self.states
-            .get(tick_id)
-            .is_some_and(|w| !w.is_fully_provisioned())
-    }
-
     /// Count of unique transactions still awaiting a counterpart's
     /// outcome. Used by observability to gauge the outstanding cross-shard
     /// backlog.
     pub fn cross_shard_pending_count(&self) -> usize {
         let mut pending_txs: HashSet<TxHash> = HashSet::new();
-        for wave in self.states.values() {
-            for h in wave.cross_shard_tx_hashes() {
+        for tick in self.states.values() {
+            for h in tick.cross_shard_tx_hashes() {
                 pending_txs.insert(h);
             }
         }
@@ -310,14 +297,14 @@ impl WaveRegistry {
 
     // ─── Pruning ────────────────────────────────────────────────────────
 
-    /// Drop every wave and everything keyed against it, returning the
+    /// Drop every tick and everything keyed against it, returning the
     /// counts. Used when the local chain terminates at a reshape
     /// boundary: finalization is a finalization in a later block,
     /// and a terminated chain commits no later block, so every pending
-    /// wave here is permanently undecidable.
+    /// tick here is permanently undecidable.
     pub fn drain_all(&mut self) -> PruneCounts {
         let counts = PruneCounts {
-            waves: self.states.len(),
+            ticks: self.states.len(),
             trackers: self.trackers.len(),
             assignments: self.assignments.len(),
         };
@@ -329,12 +316,12 @@ impl WaveRegistry {
         counts
     }
 
-    /// Drop resolved waves and everything keyed against them.
+    /// Drop resolved ticks and everything keyed against them.
     ///
-    /// Waves whose `tick_id` no longer appears in `assignments.values()`
+    /// Ticks whose `tick_id` no longer appears in `assignments.values()`
     /// are considered resolved — their txs reached terminal state and the
     /// assignments were cleared by finalization. Trackers, EC-dispatch
-    /// marks, retries, and assignments pointing at now-gone waves all
+    /// marks, retries, and assignments pointing at now-gone ticks all
     /// cascade.
     ///
     /// Emits a warning for vote trackers pruned with non-zero verified
@@ -343,9 +330,9 @@ impl WaveRegistry {
     pub fn prune_resolved(&mut self) -> PruneCounts {
         let active_keys: HashSet<&TickId> = self.assignments.values().collect();
 
-        let before_waves = self.states.len();
+        let before_ticks = self.states.len();
         self.states.retain(|key, _| active_keys.contains(key));
-        let waves_pruned = before_waves - self.states.len();
+        let ticks_pruned = before_ticks - self.states.len();
 
         let before_trackers = self.trackers.len();
         let states = &self.states;
@@ -357,13 +344,13 @@ impl WaveRegistry {
             if root_count > 1 {
                 let summary = tracker.global_receipt_root_power_summary();
                 tracing::warn!(
-                    wave = %key,
+                    tick = %key,
                     global_receipt_root_split = ?summary,
                     "Pruning vote tracker that never reached quorum — global receipt roots were split"
                 );
             } else if tracker.total_verified_power() > VoteCount::ZERO {
                 tracing::warn!(
-                    wave = %key,
+                    tick = %key,
                     verified_power = tracker.total_verified_power().inner(),
                     "Pruning vote tracker that never reached quorum — insufficient votes"
                 );
@@ -381,7 +368,7 @@ impl WaveRegistry {
         let assignments_pruned = before_assignments - self.assignments.len();
 
         PruneCounts {
-            waves: waves_pruned,
+            ticks: ticks_pruned,
             trackers: trackers_pruned,
             assignments: assignments_pruned,
         }
@@ -389,7 +376,7 @@ impl WaveRegistry {
 
     // ─── Stats ──────────────────────────────────────────────────────────
 
-    pub fn waves_len(&self) -> usize {
+    pub fn ticks_len(&self) -> usize {
         self.states.len()
     }
 
@@ -415,7 +402,7 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         AggregateSignature, BlockHash, BlockHeight, ExecutionOutcome, GlobalReceiptHash, Hash,
-        RevealChain, ShardId, SignerBitfield, Verifiable,
+        ShardId, SignerBitfield,
     };
     use proptest::collection::vec as prop_vec;
 
@@ -425,7 +412,7 @@ mod tests {
         ShardId::ROOT
     }
 
-    fn wave(height: u64) -> TickId {
+    fn tick(height: u64) -> TickId {
         TickId::new(shard(), BlockHeight::new(height))
     }
 
@@ -433,17 +420,15 @@ mod tests {
         WeightedTimestamp::from_millis(value)
     }
 
-    fn make_wave_state(tick_id: TickId, block_hash: BlockHash, tx_seed: u8) -> WaveState {
-        let tx = Arc::new(Verifiable::from(test_transaction(tx_seed)));
-        let mut participating = BTreeSet::new();
-        participating.insert(shard());
-        WaveState::new(
-            tick_id,
-            block_hash,
-            ms(0),
-            RevealChain::ZERO,
-            vec![(tx, participating)],
-        )
+    fn make_tick_state(tick_id: TickId, block_hash: BlockHash, tx_seed: u8) -> TickState {
+        let mut state = TickState::new(tick_id, block_hash, ms(0));
+        state.admit(
+            test_transaction(tx_seed).hash(),
+            BTreeSet::from([shard()]),
+            1,
+            false,
+        );
+        state
     }
 
     fn make_tracker(tick_id: TickId, block_hash: BlockHash) -> VoteTracker {
@@ -474,8 +459,8 @@ mod tests {
 
     #[test]
     fn fresh_registry_is_empty() {
-        let r = WaveRegistry::new();
-        assert_eq!(r.waves_len(), 0);
+        let r = TickRegistry::new();
+        assert_eq!(r.ticks_len(), 0);
         assert_eq!(r.trackers_len(), 0);
         assert_eq!(r.ec_dispatched_len(), 0);
         assert_eq!(r.retries_len(), 0);
@@ -483,19 +468,19 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_query_wave_state() {
-        let mut r = WaveRegistry::new();
-        let wid = wave(1);
-        r.insert_wave(wid, make_wave_state(wid, BlockHash::ZERO, 1));
-        assert!(r.contains_wave(&wid));
-        assert!(r.get_wave(&wid).is_some());
-        assert_eq!(r.waves_len(), 1);
+    fn insert_and_query_tick_state() {
+        let mut r = TickRegistry::new();
+        let wid = tick(1);
+        r.insert_tick(wid, make_tick_state(wid, BlockHash::ZERO, 1));
+        assert!(r.contains_tick(&wid));
+        assert!(r.get_tick(&wid).is_some());
+        assert_eq!(r.ticks_len(), 1);
     }
 
     #[test]
     fn insert_and_remove_tracker() {
-        let mut r = WaveRegistry::new();
-        let wid = wave(1);
+        let mut r = TickRegistry::new();
+        let wid = tick(1);
         r.insert_tracker(wid, make_tracker(wid, BlockHash::ZERO));
         assert!(r.contains_tracker(&wid));
 
@@ -506,8 +491,8 @@ mod tests {
 
     #[test]
     fn ec_dispatched_is_idempotent() {
-        let mut r = WaveRegistry::new();
-        let wid = wave(1);
+        let mut r = TickRegistry::new();
+        let wid = tick(1);
         r.mark_ec_dispatched(wid);
         r.mark_ec_dispatched(wid);
         assert_eq!(r.ec_dispatched_len(), 1);
@@ -516,14 +501,14 @@ mod tests {
 
     #[test]
     fn assign_and_lookup_tx() {
-        let mut r = WaveRegistry::new();
+        let mut r = TickRegistry::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        let wid = wave(1);
+        let wid = tick(1);
         r.assign_tx(tx, wid);
-        assert_eq!(r.wave_assignment(tx), Some(wid));
+        assert_eq!(r.tick_assignment(tx), Some(wid));
 
         r.remove_assignment(tx);
-        assert_eq!(r.wave_assignment(tx), None);
+        assert_eq!(r.tick_assignment(tx), None);
     }
 
     // ─── Vote-retry timeouts ───────────────────────────────────────────
@@ -542,8 +527,8 @@ mod tests {
 
     #[test]
     fn check_vote_retry_timeouts_fires_after_window_and_bumps_attempt() {
-        let mut r = WaveRegistry::new();
-        let wid = wave(1);
+        let mut r = TickRegistry::new();
+        let wid = tick(1);
         r.record_vote_retry(wid, make_retry(ms(0)));
 
         let timeout_ms = u64::try_from(VOTE_RETRY_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
@@ -563,8 +548,8 @@ mod tests {
 
     #[test]
     fn clear_vote_retry_stops_further_effects() {
-        let mut r = WaveRegistry::new();
-        let wid = wave(1);
+        let mut r = TickRegistry::new();
+        let wid = tick(1);
         r.record_vote_retry(wid, make_retry(ms(0)));
         r.clear_vote_retry(&wid);
 
@@ -576,10 +561,10 @@ mod tests {
 
     #[test]
     fn classify_attestation_splits_routed_and_unrouted() {
-        let mut r = WaveRegistry::new();
+        let mut r = TickRegistry::new();
         let tx_known = TxHash::from(Hash::from_bytes(b"known"));
         let tx_unknown = TxHash::from(Hash::from_bytes(b"unknown"));
-        let wid = wave(1);
+        let wid = tick(1);
 
         r.assign_tx(tx_known, wid);
 
@@ -588,77 +573,54 @@ mod tests {
 
         assert_eq!(routing.routed_tx_hashes, vec![tx_known]);
         assert_eq!(routing.unrouted_tx_hashes, vec![tx_unknown]);
-        assert!(routing.affected_waves.contains(&wid));
-    }
-
-    // ─── is_awaiting_provisioning ──────────────────────────────────────
-
-    #[test]
-    fn is_awaiting_provisioning_false_without_assignment() {
-        let r = WaveRegistry::new();
-        assert!(!r.is_awaiting_provisioning(TxHash::from(Hash::from_bytes(b"orphan"))));
-    }
-
-    #[test]
-    fn is_awaiting_provisioning_false_when_single_shard_wave_is_ready() {
-        // Single-shard waves pass `is_fully_provisioned = true` at creation.
-        let mut r = WaveRegistry::new();
-        let tx = TxHash::from(Hash::from_bytes(b"tx"));
-        let wid = wave(1);
-        let ws = make_wave_state(wid, BlockHash::ZERO, 1);
-        let tx_hash_in_wave = ws.tx_hashes()[0];
-        r.insert_wave(wid, ws);
-        r.assign_tx(tx_hash_in_wave, wid);
-
-        assert!(!r.is_awaiting_provisioning(tx_hash_in_wave));
-        let _ = tx;
+        assert!(routing.affected_ticks.contains(&wid));
     }
 
     // ─── Pruning ───────────────────────────────────────────────────────
 
     #[test]
     fn drain_all_empties_every_table() {
-        let mut r = WaveRegistry::new();
-        let wid1 = wave(1);
-        let wid2 = wave(2);
-        let ws1 = make_wave_state(wid1, BlockHash::ZERO, 1);
+        let mut r = TickRegistry::new();
+        let wid1 = tick(1);
+        let wid2 = tick(2);
+        let ws1 = make_tick_state(wid1, BlockHash::ZERO, 1);
         let tx1 = ws1.tx_hashes()[0];
-        r.insert_wave(wid1, ws1);
+        r.insert_tick(wid1, ws1);
         r.assign_tx(tx1, wid1);
-        r.insert_wave(wid2, make_wave_state(wid2, BlockHash::ZERO, 2));
+        r.insert_tick(wid2, make_tick_state(wid2, BlockHash::ZERO, 2));
         r.mark_ec_dispatched(wid2);
 
         let counts = r.drain_all();
-        assert_eq!(counts.waves, 2);
+        assert_eq!(counts.ticks, 2);
         assert_eq!(counts.assignments, 1);
-        assert!(!r.contains_wave(&wid1));
-        assert!(!r.contains_wave(&wid2));
+        assert!(!r.contains_tick(&wid1));
+        assert!(!r.contains_tick(&wid2));
         assert!(!r.is_ec_dispatched(&wid2));
-        assert!(r.wave_assignment(tx1).is_none());
+        assert!(r.tick_assignment(tx1).is_none());
     }
 
     #[test]
-    fn prune_resolved_drops_waves_without_active_assignments() {
-        let mut r = WaveRegistry::new();
-        let wid1 = wave(1);
-        let wid2 = wave(2);
-        r.insert_wave(wid1, make_wave_state(wid1, BlockHash::ZERO, 1));
-        r.insert_wave(wid2, make_wave_state(wid2, BlockHash::ZERO, 2));
+    fn prune_resolved_drops_ticks_without_active_assignments() {
+        let mut r = TickRegistry::new();
+        let wid1 = tick(1);
+        let wid2 = tick(2);
+        r.insert_tick(wid1, make_tick_state(wid1, BlockHash::ZERO, 1));
+        r.insert_tick(wid2, make_tick_state(wid2, BlockHash::ZERO, 2));
         r.assign_tx(TxHash::from(Hash::from_bytes(b"a")), wid1);
         // wid2 has no assignment — it's resolved.
 
         let counts = r.prune_resolved();
-        assert_eq!(counts.waves, 1);
-        assert!(r.contains_wave(&wid1));
-        assert!(!r.contains_wave(&wid2));
+        assert_eq!(counts.ticks, 1);
+        assert!(r.contains_tick(&wid1));
+        assert!(!r.contains_tick(&wid2));
     }
 
     #[test]
-    fn prune_resolved_drops_assignments_whose_waves_are_gone() {
-        let mut r = WaveRegistry::new();
-        let wid1 = wave(1);
-        let wid_gone = wave(99);
-        r.insert_wave(wid1, make_wave_state(wid1, BlockHash::ZERO, 1));
+    fn prune_resolved_drops_assignments_whose_ticks_are_gone() {
+        let mut r = TickRegistry::new();
+        let wid1 = tick(1);
+        let wid_gone = tick(99);
+        r.insert_tick(wid1, make_tick_state(wid1, BlockHash::ZERO, 1));
         r.assign_tx(TxHash::from(Hash::from_bytes(b"a")), wid1);
         r.assign_tx(TxHash::from(Hash::from_bytes(b"dangling")), wid_gone);
 
@@ -672,24 +634,24 @@ mod tests {
     use proptest::prelude::*;
 
     // After prune_resolved, every surviving assignment points to a
-    // surviving wave, and every surviving wave's key appears in the
+    // surviving tick, and every surviving tick's key appears in the
     // assignments values. Trackers, EC-dispatch marks, and retries for
-    // removed waves are all dropped.
+    // removed ticks are all dropped.
     proptest! {
         #[test]
         fn prune_resolved_leaves_registry_consistent(
-            wave_heights in prop_vec(0u64..10, 1..10),
+            tick_heights in prop_vec(0u64..10, 1..10),
             assignment_indices in prop_vec(0usize..20, 0..20),
         ) {
-            let mut r = WaveRegistry::new();
-            let tick_ids: Vec<TickId> = wave_heights.iter().map(|h| wave(*h)).collect();
+            let mut r = TickRegistry::new();
+            let tick_ids: Vec<TickId> = tick_heights.iter().map(|h| tick(*h)).collect();
             for wid in &tick_ids {
-                r.insert_wave(*wid, make_wave_state(*wid, BlockHash::ZERO, 1));
+                r.insert_tick(*wid, make_tick_state(*wid, BlockHash::ZERO, 1));
                 r.insert_tracker(*wid, make_tracker(*wid, BlockHash::ZERO));
                 r.mark_ec_dispatched(*wid);
                 r.record_vote_retry(*wid, make_retry(ms(0)));
             }
-            // Assign some subset of txs to some subset of waves.
+            // Assign some subset of txs to some subset of ticks.
             for (i, idx) in assignment_indices.iter().enumerate() {
                 let tx = TxHash::from(Hash::from_bytes(&[u8::try_from(i).unwrap_or(u8::MAX); 32]));
                 let wid = &tick_ids[idx % tick_ids.len()];
@@ -698,23 +660,23 @@ mod tests {
 
             let _ = r.prune_resolved();
 
-            // Invariant 1: every assignment points to a live wave.
+            // Invariant 1: every assignment points to a live tick.
             for wid in (0_u8..20).filter_map(|i| {
-                r.wave_assignment(TxHash::from(Hash::from_bytes(&[i; 32])))
+                r.tick_assignment(TxHash::from(Hash::from_bytes(&[i; 32])))
             }) {
-                prop_assert!(r.contains_wave(&wid));
+                prop_assert!(r.contains_tick(&wid));
             }
-            // Invariant 2: every tracker / ec_dispatched / retry key has a live wave
-            // (tracker may exceptionally be retained if its key points to a wave,
+            // Invariant 2: every tracker / ec_dispatched / retry key has a live tick
+            // (tracker may exceptionally be retained if its key points to a tick,
             // which is the same invariant).
-            for (wid, _) in r.waves_iter() {
-                // Surviving waves must have at least one assignment.
+            for (wid, _) in r.ticks_iter() {
+                // Surviving ticks must have at least one assignment.
                 let referenced = (0_u8..20).any(|i| {
-                    r.wave_assignment(TxHash::from(Hash::from_bytes(&[i; 32])))
+                    r.tick_assignment(TxHash::from(Hash::from_bytes(&[i; 32])))
                         .as_ref()
                         == Some(wid)
                 });
-                prop_assert!(referenced, "surviving wave {wid:?} not referenced by any assignment");
+                prop_assert!(referenced, "surviving tick {wid:?} not referenced by any assignment");
             }
         }
     }

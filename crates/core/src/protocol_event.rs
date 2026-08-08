@@ -26,23 +26,24 @@ use hyperscale_types::{
     Verifiable, Verified, WeightedTimestamp,
 };
 
-/// One wave's share of a tick's execution results.
+/// What one tick's batch produced.
 #[derive(Debug, Clone)]
-pub struct WaveExecutionResult {
-    /// The wave whose execution produced these results.
+pub struct TickBatchOutcome {
+    /// The tick whose execution produced these results.
     pub tick_id: TickId,
-    /// Per-tx stored receipts (consensus portion + metadata) ready to be
-    /// persisted alongside the wave's commit.
+    /// Per-member stored receipts (consensus portion + metadata) ready to
+    /// be persisted alongside the settling block.
     pub results: Vec<StoredReceipt>,
-    /// Per-tx outcomes extracted on the handler thread for vote signing.
+    /// Per-member outcomes extracted on the handler thread for vote
+    /// signing.
     pub tx_outcomes: Vec<TxOutcome>,
     /// Fee receipts built beside the execution receipts, for the
-    /// transactions this shard pays for and a wave can still abort.
-    /// Held in reserve: an abort settles one of these in place of the
-    /// discarded execution receipt.
+    /// transactions this shard pays for and a counterpart can still
+    /// refuse. Held in reserve: an abort settles one of these in place of
+    /// the discarded execution receipt.
     pub fee_receipts: Vec<StoredReceipt>,
-    /// What this shard attests it did per transaction, carried to the
-    /// wave so the outcomes it votes report it.
+    /// What this shard attests it did per member, carried to the tick so
+    /// the outcomes it votes report it.
     pub attested_work: Vec<(TxHash, u64)>,
 }
 
@@ -551,15 +552,15 @@ pub enum ProtocolEvent {
     /// dispatch.
     ///
     /// Results carry the full execution output (writes, receipts) — stays
-    /// local. Each wave in the tick gets exactly one entry in `waves` and
-    /// no further results ever arrive for it. The tick's output has been
-    /// appended to the tick chain before this event reaches the state
-    /// machine, so the coordinator may dispatch the next tick on it.
+    /// local. A tick's batch completes once and no further results ever
+    /// arrive for it. Its output has been appended to the tick chain
+    /// before this event reaches the state machine, so the coordinator may
+    /// dispatch the next tick on it.
     ExecutionBatchCompleted {
-        /// The tick whose batch completed: the committing block's height.
+        /// The tick whose batch completed: the composing block's height.
         tick: BlockHeight,
-        /// Per-wave results, fanned back to each `WaveState`.
-        waves: Vec<WaveExecutionResult>,
+        /// What the batch produced, fanned back to the tick that ran it.
+        outcome: TickBatchOutcome,
     },
 
     /// Received an execution vote whose signature has already been

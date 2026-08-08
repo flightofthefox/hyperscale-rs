@@ -1,0 +1,415 @@
+//! Committed transactions waiting to join a tick.
+//!
+//! A block commits transactions; a tick executes them. The two are not
+//! the same set — a cross-shard leg waits for its counterparts'
+//! provisions, a payer's leg waits for their engagement echoes, and a
+//! member whose declared cells another leg holds provisionally waits for
+//! that leg's fate. This is where they wait, and it is per transaction
+//! because every one of those waits is.
+//!
+//! What leaves is what the tick attests. Nothing here has an outcome:
+//! a candidate that cannot join a tick has said nothing and owes nothing,
+//! so it is free to wait as long as its own deadline allows, and the
+//! [`ledger`](crate::unresolved) is what ends that wait.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use hyperscale_core::CrossShardExecutionRequest;
+use hyperscale_types::{RevealChain, ShardId, Transaction, TxHash, Verified, WeightedTimestamp};
+
+use crate::provisional::ProvisionalCells;
+use crate::provisioning::ProvisioningTracker;
+
+/// One committed transaction awaiting a tick.
+#[derive(Debug)]
+struct Candidate {
+    tx: Arc<Verified<Transaction>>,
+    /// Shards whose certificates its settlement needs, this one included.
+    participating: BTreeSet<ShardId>,
+    /// The committing block's weighted timestamp — the clock a member
+    /// executes under when no payer bundle names another. It stays the
+    /// committing block's however many ticks later the member runs: the
+    /// transaction was admitted against that clock.
+    committed_ts: WeightedTimestamp,
+    /// The committing block's reveal chain, the randomness anchor under
+    /// the same rule.
+    committed_reveal: RevealChain,
+    /// Counterpart shards whose engagement echo this shard, as the fee
+    /// payer, still waits for. Empty for every other transaction.
+    engagement_pending: BTreeSet<ShardId>,
+    /// The moment past which the payer stops waiting for those echoes and
+    /// executes anyway, to be attested `Aborted` by the tick that runs it.
+    /// `None` when nothing is engagement-gated.
+    engagement_deadline: Option<WeightedTimestamp>,
+}
+
+impl Candidate {
+    /// Whether the transaction reaches beyond this shard — the fact that
+    /// makes its writes provisional and its verdict a counterpart's to
+    /// share.
+    fn reaches_beyond(&self, local: ShardId) -> bool {
+        self.participating.iter().any(|&s| s != local)
+    }
+
+    /// Whether the payer's wait for engagement echoes is over, either
+    /// covered or past its deadline.
+    fn engagement_settled(&self, now: WeightedTimestamp) -> bool {
+        self.engagement_pending.is_empty()
+            || self
+                .engagement_deadline
+                .is_some_and(|deadline| now >= deadline)
+    }
+}
+
+/// The committed transactions no tick has taken yet.
+#[derive(Debug)]
+pub struct TickCandidates {
+    local_shard: ShardId,
+    /// Keyed and iterated in hash order so composition is a function of
+    /// the candidate set and nothing about arrival.
+    candidates: BTreeMap<TxHash, Candidate>,
+}
+
+/// One member's admission to the tick being composed.
+pub struct Admitted {
+    /// The request the engine runs.
+    pub request: CrossShardExecutionRequest,
+    /// The shards whose certificates its settlement needs.
+    pub participating: BTreeSet<ShardId>,
+    /// Whether the tick must attest it `Aborted` whatever its execution
+    /// says — the payer's leg whose counterparts never engaged. It still
+    /// executes, because the charge the abort settles is what that
+    /// execution builds.
+    pub forced_abort: bool,
+}
+
+impl TickCandidates {
+    /// An empty pool for `local_shard`.
+    #[must_use]
+    pub const fn new(local_shard: ShardId) -> Self {
+        Self {
+            local_shard,
+            candidates: BTreeMap::new(),
+        }
+    }
+
+    /// Record a transaction the committing block puts in flight.
+    ///
+    /// Idempotent: a re-registered hash keeps the anchors it was admitted
+    /// under, which is what makes composition identical on a replica that
+    /// sees the block once and one that replays it.
+    pub fn register(
+        &mut self,
+        tx: Arc<Verified<Transaction>>,
+        participating: BTreeSet<ShardId>,
+        committed_ts: WeightedTimestamp,
+        committed_reveal: RevealChain,
+    ) {
+        self.candidates.entry(tx.hash()).or_insert(Candidate {
+            tx,
+            participating,
+            committed_ts,
+            committed_reveal,
+            engagement_pending: BTreeSet::new(),
+            engagement_deadline: None,
+        });
+    }
+
+    /// Record that this shard, as `tx_hash`'s fee payer, waits for
+    /// `counterparts` to echo their engagement before executing it.
+    /// `validity_end` is the signed window end the wait is bounded by.
+    pub fn record_engagement_wait(
+        &mut self,
+        tx_hash: TxHash,
+        counterparts: BTreeSet<ShardId>,
+        deadline: WeightedTimestamp,
+    ) {
+        if counterparts.is_empty() {
+            return;
+        }
+        if let Some(candidate) = self.candidates.get_mut(&tx_hash) {
+            candidate.engagement_pending = counterparts;
+            candidate.engagement_deadline = Some(deadline);
+        }
+    }
+
+    /// Drain engagement coverage from committed provisions: a bundle from
+    /// a counterpart names the transaction only because that shard's block
+    /// committed it, so absorption is the engagement evidence.
+    pub fn absorb_engagement_evidence(&mut self, provisioning: &ProvisioningTracker) {
+        for (tx_hash, candidate) in &mut self.candidates {
+            candidate
+                .engagement_pending
+                .retain(|shard| !provisioning.has_received_from(*tx_hash, *shard));
+        }
+    }
+
+    /// Take the members that can execute at this commit, in hash order.
+    ///
+    /// A member joins when it has everything it needs to reach its final
+    /// outcome in this tick: its counterparts' provisions, its payer
+    /// engagement settled one way or the other, and no cell another
+    /// provisional leg is holding. `held` carries in what earlier ticks
+    /// claim and leaves with what this one adds, so a member of this very
+    /// batch can be what keeps the next one out — a batch is one overlay,
+    /// and a leg reading what another left would carry writes an abort
+    /// retracts.
+    ///
+    /// Cross-shard members are offered first for the same reason: theirs
+    /// are the provisional writes everything else has to be compatible
+    /// with, and a determined member is the cheaper of the two to defer.
+    pub fn compose(
+        &mut self,
+        provisioning: &ProvisioningTracker,
+        held: &mut ProvisionalCells,
+        now: WeightedTimestamp,
+    ) -> Vec<Admitted> {
+        let local = self.local_shard;
+        let mut ordered: Vec<TxHash> = self.candidates.keys().copied().collect();
+        ordered.sort_by_key(|tx_hash| {
+            let reaches_beyond = self.candidates[tx_hash].reaches_beyond(local);
+            (!reaches_beyond, *tx_hash)
+        });
+
+        let mut taken: Vec<TxHash> = Vec::new();
+        let mut admitted: Vec<Admitted> = Vec::with_capacity(ordered.len());
+        for tx_hash in ordered {
+            let candidate = &self.candidates[&tx_hash];
+            let reaches_beyond = candidate.reaches_beyond(local);
+            // A transaction reaching no further than this shard needs no
+            // provisions; one that does waits for every shard it named.
+            if reaches_beyond && !provisioning.is_fully_provisioned(tx_hash) {
+                continue;
+            }
+            if !candidate.engagement_settled(now) {
+                continue;
+            }
+            let declared = &candidate.tx.routing().declared_modes;
+            if !held.is_empty() && held.blocks(declared) {
+                continue;
+            }
+            // After the test, never before: a transaction is not what
+            // keeps itself out.
+            if reaches_beyond {
+                held.claim(declared);
+            }
+
+            // A remote-payer leg executes under the anchor its payer
+            // bundle carried; every other member under its own committing
+            // block's.
+            let anchor = provisioning.payer_anchor(tx_hash);
+            admitted.push(Admitted {
+                request: CrossShardExecutionRequest {
+                    tx_hash,
+                    transaction: Arc::clone(&candidate.tx),
+                    provisions: if reaches_beyond {
+                        provisioning
+                            .provisions_for(tx_hash)
+                            .map(<[_]>::to_vec)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
+                    clock: anchor.map_or(candidate.committed_ts, |a| a.clock),
+                    randomness: anchor.map_or(candidate.committed_reveal, |a| a.randomness),
+                    reaches_beyond,
+                },
+                participating: candidate.participating.clone(),
+                forced_abort: !candidate.engagement_pending.is_empty(),
+            });
+            taken.push(tx_hash);
+        }
+
+        for tx_hash in taken {
+            self.candidates.remove(&tx_hash);
+        }
+        admitted
+    }
+
+    /// Drop a candidate no tick will take — abandoned at its deadline, or
+    /// dropped with the chain at a reshape terminal.
+    pub fn remove(&mut self, tx_hash: TxHash) {
+        self.candidates.remove(&tx_hash);
+    }
+
+    /// Whether a transaction is still waiting for a tick.
+    #[must_use]
+    pub fn contains(&self, tx_hash: TxHash) -> bool {
+        self.candidates.contains_key(&tx_hash)
+    }
+
+    /// Drop every candidate. Called when the local chain terminates: a
+    /// tick is a block's, and a terminated chain commits no further block.
+    pub fn clear(&mut self) {
+        self.candidates.clear();
+    }
+
+    /// How many transactions are waiting.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.candidates.len()
+    }
+
+    /// Whether nothing is waiting.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::WeightedTimestamp;
+    use hyperscale_types::test_utils::{test_prefix, test_transaction_with_prefixes};
+
+    use super::*;
+
+    const LOCAL: ShardId = ShardId::ROOT;
+
+    fn tx(seed: u8) -> Arc<Verified<Transaction>> {
+        Arc::new(Verified::new_unchecked_for_test(
+            test_transaction_with_prefixes(
+                &[seed, seed + 1, seed + 2],
+                &[test_prefix(seed)],
+                &[test_prefix(seed.wrapping_add(10))],
+            ),
+        ))
+    }
+
+    fn ms(v: u64) -> WeightedTimestamp {
+        WeightedTimestamp::from_millis(v)
+    }
+
+    fn local_only(candidates: &mut TickCandidates, tx: Arc<Verified<Transaction>>) -> TxHash {
+        let hash = tx.hash();
+        candidates.register(tx, BTreeSet::from([LOCAL]), ms(1_000), RevealChain::ZERO);
+        hash
+    }
+
+    /// A transaction reaching no further than this shard needs nothing
+    /// from anyone, so it joins the first tick composed after its commit.
+    #[test]
+    fn a_local_transaction_joins_at_once() {
+        let mut candidates = TickCandidates::new(LOCAL);
+        let hash = local_only(&mut candidates, tx(1));
+
+        let admitted = candidates.compose(
+            &ProvisioningTracker::new(),
+            &mut ProvisionalCells::default(),
+            ms(1_000),
+        );
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].request.tx_hash, hash);
+        assert!(!admitted[0].request.reaches_beyond);
+        assert!(candidates.is_empty(), "and leaves the pool with the tick");
+    }
+
+    /// A cross-shard member waits for the provisions its counterparts owe
+    /// it, and waiting costs it nothing but latency — it has said nothing.
+    #[test]
+    fn a_cross_shard_member_waits_for_its_provisions() {
+        let mut candidates = TickCandidates::new(LOCAL);
+        let remote = ShardId::leaf(1, 1);
+        let tx = tx(2);
+        let hash = tx.hash();
+        candidates.register(
+            tx,
+            BTreeSet::from([LOCAL, remote]),
+            ms(1_000),
+            RevealChain::ZERO,
+        );
+
+        let mut provisioning = ProvisioningTracker::new();
+        assert!(
+            candidates
+                .compose(&provisioning, &mut ProvisionalCells::default(), ms(1_000))
+                .is_empty(),
+            "nothing has arrived for it",
+        );
+        assert!(candidates.contains(hash), "so it is still waiting");
+
+        provisioning.record_required(hash, BTreeSet::new());
+        let admitted =
+            candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(1_000));
+        assert_eq!(admitted.len(), 1);
+        assert!(admitted[0].request.reaches_beyond);
+    }
+
+    /// The payer's leg does not execute until its counterparts have
+    /// engaged: the tick that runs it is the tick that attests it, so it
+    /// must not run before it knows which verdict it owes.
+    #[test]
+    fn the_payer_leg_waits_for_the_echoes_its_verdict_turns_on() {
+        let mut candidates = TickCandidates::new(LOCAL);
+        let remote = ShardId::leaf(1, 1);
+        let tx = tx(3);
+        let hash = tx.hash();
+        candidates.register(
+            tx,
+            BTreeSet::from([LOCAL, remote]),
+            ms(1_000),
+            RevealChain::ZERO,
+        );
+        candidates.record_engagement_wait(hash, BTreeSet::from([remote]), ms(60_000));
+
+        let mut provisioning = ProvisioningTracker::new();
+        provisioning.record_required(hash, BTreeSet::new());
+
+        assert!(
+            candidates
+                .compose(&provisioning, &mut ProvisionalCells::default(), ms(1_000))
+                .is_empty(),
+            "the payer holds while a counterpart has not engaged",
+        );
+    }
+
+    /// Past its deadline the payer stops waiting and runs anyway, marked
+    /// for the abort its tick attests — the charge that abort settles is
+    /// what the execution builds, so it cannot be skipped.
+    #[test]
+    fn the_payer_leg_runs_at_its_deadline_to_be_aborted() {
+        let mut candidates = TickCandidates::new(LOCAL);
+        let remote = ShardId::leaf(1, 1);
+        let tx = tx(4);
+        let hash = tx.hash();
+        candidates.register(
+            tx,
+            BTreeSet::from([LOCAL, remote]),
+            ms(1_000),
+            RevealChain::ZERO,
+        );
+        candidates.record_engagement_wait(hash, BTreeSet::from([remote]), ms(60_000));
+
+        let mut provisioning = ProvisioningTracker::new();
+        provisioning.record_required(hash, BTreeSet::new());
+
+        let admitted =
+            candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(60_000));
+        assert_eq!(admitted.len(), 1);
+        assert!(
+            admitted[0].forced_abort,
+            "it executes to build the charge, and is attested aborted",
+        );
+    }
+
+    /// A member whose declared cells a provisional leg holds waits for
+    /// that leg's fate rather than reading what it left.
+    #[test]
+    fn a_member_waits_on_a_cell_a_provisional_leg_holds() {
+        let mut candidates = TickCandidates::new(LOCAL);
+        let contender = tx(5);
+        let hash = local_only(&mut candidates, Arc::clone(&contender));
+
+        let mut held = ProvisionalCells::default();
+        held.claim(&contender.routing().declared_modes);
+
+        assert!(
+            candidates
+                .compose(&ProvisioningTracker::new(), &mut held, ms(1_000))
+                .is_empty(),
+            "the cell is spoken for",
+        );
+        assert!(candidates.contains(hash));
+    }
+}
