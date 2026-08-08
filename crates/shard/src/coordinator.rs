@@ -1541,6 +1541,7 @@ impl ShardCoordinator {
         // here to avoid repeating items across consecutive blocks.
         let (qc_chain_cert_hashes, qc_chain_tx_hashes, qc_chain_provision_hashes) =
             self.collect_qc_chain_hashes(parent_block_hash);
+        let qc_chain_resolved_txs = self.chain_view().ancestor_resolved_txs(parent_block_hash);
 
         // Anchor validity-window filtering on the parent QC's weighted
         // timestamp — the deterministic clock voters will use to verify
@@ -1556,6 +1557,7 @@ impl ShardCoordinator {
         let (finalizations, _finalized_tx_count) = select_finalizations(
             finalizations,
             &qc_chain_cert_hashes,
+            &qc_chain_resolved_txs,
             &self.dedup_index,
             MAX_FINALIZED_TX_PER_BLOCK,
         );
@@ -3112,14 +3114,17 @@ impl ShardCoordinator {
         block: &Block,
         coasting: bool,
     ) -> bool {
+        let parent = block.header().parent_block_hash();
         let (qc_chain_cert_ids, qc_chain_tx_hashes, qc_chain_provision_hashes) =
-            self.collect_qc_chain_hashes(block.header().parent_block_hash());
+            self.collect_qc_chain_hashes(parent);
+        let qc_chain_resolved_txs = self.chain_view().ancestor_resolved_txs(parent);
         if let Err(e) = validate_block_for_vote(
             topology_snapshot,
             self.local_shard,
             block,
             &qc_chain_tx_hashes,
             &qc_chain_cert_ids,
+            &qc_chain_resolved_txs,
             &qc_chain_provision_hashes,
             &self.dedup_index,
             coasting,

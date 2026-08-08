@@ -220,6 +220,32 @@ impl<'a> ChainView<'a> {
 
         (cert_ids, tx_hashes, provision_hashes)
     }
+
+    /// The transactions the QC chain's uncommitted ancestors have already
+    /// reached a verdict for, from `parent_block_hash` back to committed
+    /// height.
+    ///
+    /// Read from the finalizations themselves rather than the manifest,
+    /// which names ticks and not the transactions under them. An ancestor
+    /// whose finalizations this node is still fetching contributes
+    /// nothing, so the answer is what this node can see — the same
+    /// direction every content rule here takes, since a node that under-
+    /// reports can only fail to reject, and the rule needs a quorum of
+    /// enforcers rather than every node.
+    pub fn ancestor_resolved_txs(&self, parent_block_hash: BlockHash) -> HashSet<TxHash> {
+        let mut resolved: HashSet<TxHash> = HashSet::new();
+        let mut current_hash = parent_block_hash;
+        while let Some(pending) = self.pending.get(current_hash) {
+            if pending.header().height() <= self.committed_height {
+                break;
+            }
+            for fw in pending.finalizations() {
+                resolved.extend(fw.tx_hashes());
+            }
+            current_hash = pending.header().parent_block_hash();
+        }
+        resolved
+    }
 }
 
 #[cfg(test)]

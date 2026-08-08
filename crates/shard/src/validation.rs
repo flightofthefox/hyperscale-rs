@@ -299,23 +299,40 @@ pub fn validate_no_duplicate_transactions(
     Ok(())
 }
 
-/// Validate that no finalization in the block has already been committed
-/// or appears in an ancestor block above committed height. Mirrors
-/// [`validate_no_duplicate_transactions`] but for `tick_id`.
+/// Validate that no transaction the block's finalizations resolve has
+/// already been resolved — by an earlier finalization in this same block,
+/// by an ancestor above committed height, or by a committed block within
+/// the retention window.
+///
+/// **This is what makes settlement and abandonment exclusive.** A shard
+/// abandons a transaction its counterpart left in flight, and settles one
+/// whose coverage completed; both are verdicts, and a transaction that
+/// took two of them would be settled on one reading of the chain and
+/// aborted on another. One rule covers both directions because it asks
+/// about the transaction rather than about which kind of verdict each
+/// certificate carried.
+///
+/// The tick check beside it is the same rule at a coarser key, for the
+/// case the fine key cannot reach: a manifest names the ticks an ancestor
+/// carries but not the transactions under them, so an ancestor whose
+/// finalizations this node has not yet fetched contributes nothing to
+/// `qc_chain_resolved_txs` and is caught here instead.
 ///
 /// Both proposer and validator hit `record_block_committed` synchronously
 /// during their respective commit handlers, so their `dedup_index` reflects
 /// the same just-committed waves at the same logical moment. Validation
 /// against this shared state is therefore safe under the on-qc-formed race.
-pub fn validate_no_duplicate_certificates(
+pub fn validate_no_duplicate_resolutions(
     block: &Block,
     qc_chain_cert_ids: &HashSet<TickId>,
+    qc_chain_resolved_txs: &HashSet<TxHash>,
     dedup_index: &CommitDedupIndex,
 ) -> Result<(), String> {
     if block.certificates().is_empty() {
         return Ok(());
     }
 
+    let mut resolved_here: HashSet<TxHash> = HashSet::new();
     for fw in block.certificates().iter() {
         let tick_id = fw.tick_id();
         if qc_chain_cert_ids.contains(tick_id) {
@@ -327,6 +344,23 @@ pub fn validate_no_duplicate_certificates(
             return Err(format!(
                 "finalization {tick_id:?} already committed within its retention window"
             ));
+        }
+        for tx_hash in fw.tx_hashes() {
+            if !resolved_here.insert(tx_hash) {
+                return Err(format!(
+                    "transaction {tx_hash} resolved twice within the same block"
+                ));
+            }
+            if qc_chain_resolved_txs.contains(&tx_hash) {
+                return Err(format!(
+                    "transaction {tx_hash} already resolved by a QC chain ancestor"
+                ));
+            }
+            if dedup_index.contains_resolved_tx(&tx_hash) {
+                return Err(format!(
+                    "transaction {tx_hash} already resolved within its retention window"
+                ));
+            }
         }
     }
     Ok(())
@@ -476,6 +510,7 @@ pub fn validate_block_for_vote(
     block: &Block,
     qc_chain_tx_hashes: &HashSet<TxHash>,
     qc_chain_cert_ids: &HashSet<TickId>,
+    qc_chain_resolved_txs: &HashSet<TxHash>,
     qc_chain_provision_hashes: &HashSet<ProvisionHash>,
     dedup_index: &CommitDedupIndex,
     coasting: bool,
@@ -489,7 +524,12 @@ pub fn validate_block_for_vote(
     validate_transaction_ordering(block)?;
     validate_cross_shard_txs(topology_snapshot, local_shard, block)?;
     validate_no_duplicate_transactions(block, qc_chain_tx_hashes, dedup_index)?;
-    validate_no_duplicate_certificates(block, qc_chain_cert_ids, dedup_index)?;
+    validate_no_duplicate_resolutions(
+        block,
+        qc_chain_cert_ids,
+        qc_chain_resolved_txs,
+        dedup_index,
+    )?;
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
     validate_provisions_not_fenced(topology_snapshot, block)?;
     validate_engagement(topology_snapshot, local_shard, block, dedup_index)?;
@@ -1206,43 +1246,125 @@ mod tests {
         ))
     }
 
+    /// A finalization over `tx_hash`, on a tick distinct from any other
+    /// built at the same height — the shape a second verdict takes.
+    fn finalization_over(height: u64, tx_hash: TxHash) -> Arc<Finalization> {
+        Arc::new(make_finalization(
+            BlockHeight::new(height),
+            tx_hash,
+            TransactionDecision::Aborted,
+        ))
+    }
+
+    fn no_resolutions(
+        block: &Block,
+        qc_chain: &HashSet<TickId>,
+        dedup_index: &CommitDedupIndex,
+    ) -> Result<(), String> {
+        validate_no_duplicate_resolutions(block, qc_chain, &HashSet::new(), dedup_index)
+    }
+
     #[test]
-    fn validate_no_duplicate_certificates_accepts_empty_block() {
+    fn validate_no_duplicate_resolutions_accepts_empty_block() {
         let block = block_with_certificates(BlockHeight::new(5), vec![]);
-        let qc_chain = HashSet::new();
-        let dedup_index = CommitDedupIndex::new();
-        assert!(validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).is_ok());
+        assert!(no_resolutions(&block, &HashSet::new(), &CommitDedupIndex::new()).is_ok());
     }
 
     #[test]
-    fn validate_no_duplicate_certificates_accepts_unique() {
+    fn validate_no_duplicate_resolutions_accepts_unique() {
         let block = block_with_certificates(BlockHeight::new(5), vec![finalization_at(1)]);
-        let qc_chain = HashSet::new();
-        let dedup_index = CommitDedupIndex::new();
-        assert!(validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).is_ok());
+        assert!(no_resolutions(&block, &HashSet::new(), &CommitDedupIndex::new()).is_ok());
     }
 
     #[test]
-    fn validate_no_duplicate_certificates_rejects_qc_chain_dup() {
+    fn validate_no_duplicate_resolutions_rejects_qc_chain_dup() {
         let fw = finalization_at(1);
         let dup_id = *fw.tick_id();
         let block = block_with_certificates(BlockHeight::new(6), vec![fw]);
         let qc_chain: HashSet<_> = std::iter::once(dup_id).collect();
-        let dedup_index = CommitDedupIndex::new();
-        let err = validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).unwrap_err();
+        let err = no_resolutions(&block, &qc_chain, &CommitDedupIndex::new()).unwrap_err();
         assert!(err.contains("already in QC chain ancestor"));
     }
 
     #[test]
-    fn validate_no_duplicate_certificates_rejects_retention_dup() {
+    fn validate_no_duplicate_resolutions_rejects_retention_dup() {
         let fw = finalization_at(1);
         let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
-        let qc_chain = HashSet::new();
         let mut dedup_index = CommitDedupIndex::new();
-        let fw_verifiable = Arc::new((*fw).clone().into());
-        dedup_index.register_committed_certs(&[fw_verifiable]);
-        let err = validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).unwrap_err();
+        dedup_index.register_committed_certs(&[Arc::new((*fw).clone().into())]);
+        let err = no_resolutions(&block, &HashSet::new(), &dedup_index).unwrap_err();
         assert!(err.contains("already committed"));
+    }
+
+    /// A second verdict for one transaction is refused however it is
+    /// dressed. The tick differs, so nothing about the certificate's
+    /// identity gives it away — settlement and abandonment are exclusive
+    /// because the rule asks about the transaction.
+    #[test]
+    fn a_transaction_a_committed_block_resolved_cannot_be_resolved_again() {
+        let settled = finalization_at(1);
+        let tx_hash = settled
+            .tx_hashes()
+            .next()
+            .expect("a wave names its members");
+        let mut dedup_index = CommitDedupIndex::new();
+        dedup_index.register_committed_certs(&[Arc::new((*settled).clone().into())]);
+
+        let abandoned = finalization_over(9, tx_hash);
+        assert_ne!(abandoned.tick_id(), settled.tick_id());
+        let block = block_with_certificates(BlockHeight::new(6), vec![abandoned]);
+
+        let err = no_resolutions(&block, &HashSet::new(), &dedup_index).unwrap_err();
+        assert!(
+            err.contains("already resolved within its retention window"),
+            "{err}"
+        );
+    }
+
+    /// The same, one block earlier: an ancestor above committed height
+    /// has resolved it and nothing has committed yet.
+    #[test]
+    fn a_transaction_an_ancestor_resolved_cannot_be_resolved_again() {
+        let settled = finalization_at(1);
+        let tx_hash = settled
+            .tx_hashes()
+            .next()
+            .expect("a wave names its members");
+        let ancestor_resolved: HashSet<TxHash> = std::iter::once(tx_hash).collect();
+
+        let block =
+            block_with_certificates(BlockHeight::new(6), vec![finalization_over(9, tx_hash)]);
+        let err = validate_no_duplicate_resolutions(
+            &block,
+            &HashSet::new(),
+            &ancestor_resolved,
+            &CommitDedupIndex::new(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("already resolved by a QC chain ancestor"),
+            "{err}"
+        );
+    }
+
+    /// And within one block, where neither the ancestor walk nor the
+    /// retention window can see it.
+    #[test]
+    fn a_transaction_cannot_be_resolved_twice_within_one_block() {
+        let settled = finalization_at(1);
+        let tx_hash = settled
+            .tx_hashes()
+            .next()
+            .expect("a wave names its members");
+        let block = block_with_certificates(
+            BlockHeight::new(6),
+            vec![settled, finalization_over(9, tx_hash)],
+        );
+        let err = no_resolutions(&block, &HashSet::new(), &CommitDedupIndex::new()).unwrap_err();
+        assert!(
+            err.contains("resolved twice within the same block"),
+            "{err}"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1432,6 +1554,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
             &CommitDedupIndex::new(),
             false,
             Some(ShardLoad::ZERO),
@@ -1453,6 +1576,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashSet::new(),
             &CommitDedupIndex::new(),
             true,
             Some(ShardLoad::ZERO),
@@ -1466,6 +1590,7 @@ mod tests {
                 &topo,
                 local_shard(),
                 &empty,
+                &HashSet::new(),
                 &HashSet::new(),
                 &HashSet::new(),
                 &HashSet::new(),

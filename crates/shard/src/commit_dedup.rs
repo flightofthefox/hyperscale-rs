@@ -44,6 +44,11 @@ pub struct CommitDedupIndex {
     /// wave covered has terminated everywhere, so no future block can
     /// legitimately reference the same `tick_id`.
     cert_retention: HashMap<TickId, WeightedTimestamp>,
+    /// `tx_hash → the same deadline as the finalization that resolved it`.
+    /// Every transaction a committed finalization reached a verdict for,
+    /// under whichever verdict — which is what makes settlement and
+    /// abandonment exclusive rather than two rules that have to agree.
+    resolved_tx_retention: HashMap<TxHash, WeightedTimestamp>,
     /// `provision_hash → local_committed_ts + RETENTION_HORIZON`. Pruned
     /// when `deadline <= current_committed_ts`. Past the horizon, every tx
     /// the batch carried has expired its `validity_range` and terminated
@@ -67,6 +72,7 @@ impl CommitDedupIndex {
         Self {
             tx_retention: HashMap::new(),
             cert_retention: HashMap::new(),
+            resolved_tx_retention: HashMap::new(),
             provision_retention: HashMap::new(),
             provision_tx_retention: HashMap::new(),
         }
@@ -82,14 +88,19 @@ impl CommitDedupIndex {
         }
     }
 
-    /// Record a block's finalizations in the retention lookup. Each
-    /// entry's deadline is the wave's local EC `vote_anchor_ts +
-    /// RETENTION_HORIZON`.
+    /// Record a block's finalizations in the retention lookup, by tick and
+    /// by every transaction each one resolved. Each entry's deadline is
+    /// the wave's local EC `vote_anchor_ts + RETENTION_HORIZON`.
     pub fn register_committed_certs(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         for fw in finalizations {
             let tick_id = *fw.tick_id();
             let deadline = fw.local_ec().deadline();
             self.cert_retention.entry(tick_id).or_insert(deadline);
+            for tx_hash in fw.tx_hashes() {
+                self.resolved_tx_retention
+                    .entry(tx_hash)
+                    .or_insert(deadline);
+            }
         }
     }
 
@@ -136,6 +147,8 @@ impl CommitDedupIndex {
     pub fn prune(&mut self, now: WeightedTimestamp) {
         self.tx_retention.retain(|_, end| *end > now);
         self.cert_retention.retain(|_, deadline| *deadline > now);
+        self.resolved_tx_retention
+            .retain(|_, deadline| *deadline > now);
         self.provision_retention
             .retain(|_, deadline| *deadline > now);
         self.provision_tx_retention
@@ -148,6 +161,12 @@ impl CommitDedupIndex {
 
     pub fn contains_cert(&self, tick_id: &TickId) -> bool {
         self.cert_retention.contains_key(tick_id)
+    }
+
+    /// Whether a committed finalization already reached a verdict for
+    /// `tx_hash`, within the retention window.
+    pub fn contains_resolved_tx(&self, tx_hash: &TxHash) -> bool {
+        self.resolved_tx_retention.contains_key(tx_hash)
     }
 
     pub fn contains_provision(&self, provision_hash: &ProvisionHash) -> bool {
@@ -280,6 +299,27 @@ mod tests {
             .deadline()
             .plus(std::time::Duration::from_millis(1));
         idx.prune(past);
+        assert!(!idx.contains_cert(fw.tick_id()));
+    }
+
+    /// A committed finalization records every transaction it reached a
+    /// verdict for, so a later block naming one of them under a different
+    /// tick is refusable. Both keys expire together — the transactions
+    /// share the finalization's deadline.
+    #[test]
+    fn register_certs_records_what_they_resolved() {
+        let mut idx = CommitDedupIndex::new();
+        let fw = make_fw(1);
+        let tx_hash = fw.tx_hashes().next().expect("a wave names its members");
+        idx.register_committed_certs(std::slice::from_ref(&fw));
+        assert!(idx.contains_resolved_tx(&tx_hash));
+
+        idx.prune(
+            fw.local_ec()
+                .deadline()
+                .plus(std::time::Duration::from_millis(1)),
+        );
+        assert!(!idx.contains_resolved_tx(&tx_hash));
         assert!(!idx.contains_cert(fw.tick_id()));
     }
 

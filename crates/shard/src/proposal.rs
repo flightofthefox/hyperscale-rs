@@ -197,10 +197,16 @@ pub fn select_transactions(
     filtered
 }
 
-/// Select finalizations for inclusion: drop those already in the QC
-/// chain or committed within the retention window, and cap the total
-/// finalized-tx count at the `max_finalized_txs` limit. Returns
-/// `(waves, total_tx_count)`.
+/// Select finalizations for inclusion: drop those whose tick or whose
+/// transactions the QC chain or the retention window has already
+/// resolved, and cap the total finalized-tx count at the
+/// `max_finalized_txs` limit. Returns `(waves, total_tx_count)`.
+///
+/// The per-transaction half mirrors `validate_no_duplicate_resolutions`,
+/// so a proposer never offers a second verdict its own voters refuse —
+/// which is reachable without any misbehaviour: a settlement and an
+/// abandonment for one transaction are different ticks, and only the
+/// transaction they name says they are the same verdict twice.
 ///
 /// Order is the caller's and is preserved. It arrives in the order the
 /// waves executed, which is the order their receipts have to settle in —
@@ -218,14 +224,27 @@ pub fn select_transactions(
 pub fn select_finalizations(
     finalizations: Vec<Arc<Verifiable<Finalization>>>,
     qc_chain_cert_ids: &HashSet<TickId>,
+    qc_chain_resolved_txs: &HashSet<TxHash>,
     dedup_index: &CommitDedupIndex,
     max_finalized_txs: usize,
 ) -> (Vec<Arc<Verifiable<Finalization>>>, usize) {
     let mut finalized_tx_count = 0usize;
+    let mut resolved_here: HashSet<TxHash> = HashSet::new();
     let waves_to_propose: Vec<_> = finalizations
         .into_iter()
         .filter(|fw| {
-            !qc_chain_cert_ids.contains(fw.tick_id()) && !dedup_index.contains_cert(fw.tick_id())
+            if qc_chain_cert_ids.contains(fw.tick_id()) || dedup_index.contains_cert(fw.tick_id()) {
+                return false;
+            }
+            let unresolved = fw.tx_hashes().all(|tx_hash| {
+                !resolved_here.contains(&tx_hash)
+                    && !qc_chain_resolved_txs.contains(&tx_hash)
+                    && !dedup_index.contains_resolved_tx(&tx_hash)
+            });
+            if unresolved {
+                resolved_here.extend(fw.tx_hashes());
+            }
+            unresolved
         })
         .take_while(|fw| {
             let new_total = finalized_tx_count.saturating_add(fw.tx_count());
@@ -505,10 +524,66 @@ pub fn dispatch_or_defer(
 mod tests {
     use std::time::Duration;
 
-    use hyperscale_types::TimestampRange;
-    use hyperscale_types::test_utils::{install_stub_vm_statics, stub_transaction, test_prefix};
+    use hyperscale_types::test_utils::{
+        install_stub_vm_statics, make_finalization, stub_transaction, test_prefix,
+    };
+    use hyperscale_types::{Hash, MAX_FINALIZED_TX_PER_BLOCK, TimestampRange, TransactionDecision};
 
     use super::*;
+
+    /// A proposer offers one verdict per transaction. A settlement and an
+    /// abandonment for the same transaction are different ticks, so
+    /// nothing about their identity separates them — the second is
+    /// dropped because of the transaction it names, which is the rule the
+    /// voters apply to the same list.
+    #[test]
+    fn select_finalizations_offers_one_verdict_per_transaction() {
+        let tx_hash = TxHash::from(Hash::from_bytes(b"contested"));
+        let settled: Arc<Verifiable<Finalization>> = Arc::new(
+            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept).into(),
+        );
+        let abandoned: Arc<Verifiable<Finalization>> = Arc::new(
+            make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into(),
+        );
+        assert_ne!(settled.tick_id(), abandoned.tick_id());
+
+        let (selected, count) = select_finalizations(
+            vec![Arc::clone(&settled), abandoned],
+            &HashSet::new(),
+            &HashSet::new(),
+            &CommitDedupIndex::new(),
+            MAX_FINALIZED_TX_PER_BLOCK,
+        );
+        assert_eq!(selected.len(), 1, "the second verdict is dropped");
+        assert_eq!(selected[0].tick_id(), settled.tick_id());
+        assert_eq!(count, 1);
+    }
+
+    /// A transaction a committed block already resolved keeps its
+    /// finalization out of the next proposal, whichever verdict each
+    /// carried.
+    #[test]
+    fn select_finalizations_drops_what_the_retention_window_resolved() {
+        let tx_hash = TxHash::from(Hash::from_bytes(b"already resolved"));
+        let committed: Arc<Verifiable<Finalization>> = Arc::new(
+            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept).into(),
+        );
+        let mut dedup_index = CommitDedupIndex::new();
+        dedup_index.register_committed_certs(std::slice::from_ref(&committed));
+
+        let abandoned: Arc<Verifiable<Finalization>> = Arc::new(
+            make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into(),
+        );
+        let (selected, count) = select_finalizations(
+            vec![abandoned],
+            &HashSet::new(),
+            &HashSet::new(),
+            &dedup_index,
+            MAX_FINALIZED_TX_PER_BLOCK,
+        );
+        assert!(selected.is_empty());
+        assert_eq!(count, 0);
+    }
 
     #[test]
     fn start_records_pending_slot() {
