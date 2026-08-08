@@ -84,10 +84,10 @@ const DRAIN_COUNT_SLACK: u64 = 2;
 /// on, and refusing them would leave a chain that somehow sat above the
 /// budget no way back down.
 ///
-/// The total is not self-clearing. It advances on commit and retreats on
-/// settlement, and a tick that never certifies retreats nothing —
-/// abandonment leaves no chain artifact to release against — so stranded
-/// work lowers what this shard can admit for as long as the chain runs.
+/// The total advances on commit and retreats when a certificate resolves
+/// the transaction, whichever verdict it carries: one still unresolved at
+/// its own deadline is certified aborted at the reservation its block
+/// took, so a shard that stops receiving traffic returns to zero.
 ///
 /// Sized like the count it replaces: a full pipeline of blocks
 /// (commit → execute → certify) at a representative gas limit, so a
@@ -119,11 +119,7 @@ const _: () = assert!(
 ///
 /// A block that adds nothing is exempt from the level entirely. Those are
 /// the blocks that carry the certificates the drain retreats on, so
-/// refusing them would be refusing the only way back under — which
-/// matters because the total is not always recoverable: a tick that never
-/// certifies strands its reservation with nothing to release it against,
-/// and what has to stay impossible is the chain stopping rather than the
-/// ceiling dropping.
+/// refusing them would be refusing the only way back under.
 #[must_use]
 pub const fn drain_admits_block(work_in_flight: WorkInFlight, tx_count: usize) -> bool {
     tx_count == 0 || work_in_flight.inner() <= MAX_DRAIN_WORK
@@ -188,9 +184,7 @@ mod tests {
 
     /// And it never bites on a block that adds nothing. Those carry the
     /// certificates that release the drain, so refusing them would leave a
-    /// chain that touched the ceiling unable to come back under it — and
-    /// the total is not always recoverable in any case, since a tick that
-    /// never certifies strands its reservation for good.
+    /// chain that touched the ceiling unable to come back under it.
     #[test]
     fn a_block_adding_nothing_is_admitted_at_any_total() {
         assert!(drain_admits_block(WorkInFlight::new(u64::MAX), 0));
