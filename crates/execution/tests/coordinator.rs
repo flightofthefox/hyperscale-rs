@@ -41,6 +41,7 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
         wave_execution_receipts,
         finalizations,
         waves,
+        unresolved_txs,
         vote_trackers,
         early_votes,
         expected_exec_certs,
@@ -60,6 +61,7 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
 
     assert_eq!(wave_execution_receipts, 0);
     assert_eq!(finalizations, 0);
+    assert_eq!(unresolved_txs, 0);
     assert_eq!(waves, 0);
     assert_eq!(vote_trackers, 0);
     assert_eq!(early_votes, 0);

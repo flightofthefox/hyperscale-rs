@@ -61,6 +61,7 @@ use crate::lookups::{
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
+use crate::unresolved::UnresolvedTxs;
 use crate::vote_tracker::VoteTracker;
 use crate::wave_state::{Divergence, WaveState};
 use crate::waves::{PendingVoteRetry, RetryEffect, WaveRegistry};
@@ -139,6 +140,8 @@ pub struct ExecutionMemoryStats {
     pub finalizations: usize,
     /// In-flight wave states (created, not yet finalized or evicted).
     pub waves: usize,
+    /// Committed transactions still owed an outcome.
+    pub unresolved_txs: usize,
     /// Per-wave vote trackers awaiting quorum.
     pub vote_trackers: usize,
     /// Buffered execution votes waiting for their wave to begin.
@@ -223,6 +226,12 @@ pub struct ExecutionCoordinator {
     /// wave absent from the map — never dispatched, or committed by a
     /// shard past the execution window — resolves nothing.
     ticked_waves: BTreeMap<TickId, TickedWave>,
+
+    /// Committed transactions still owed an outcome, folded from the
+    /// chain rather than read off live wave state — the only account of
+    /// what this shard has in flight that can be rebuilt after losing
+    /// that state.
+    unresolved: UnresolvedTxs,
 
     /// Wave fates known but not yet emittable, each with the tick that
     /// carries its entries. Drained whenever a tick completes or a block
@@ -426,6 +435,7 @@ impl ExecutionCoordinator {
             tick_in_flight: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked_waves: BTreeMap::new(),
+            unresolved: UnresolvedTxs::new(),
             pending_tick_resolutions: Vec::new(),
             waves: WaveRegistry::new(),
             early: EarlyArrivalBuffer::new(),
@@ -601,6 +611,10 @@ impl ExecutionCoordinator {
         let mut votes_to_replay: Vec<Verifiable<ExecutionVote>> = Vec::new();
 
         for (tick_id, txs) in waves {
+            // The chain-derived account of what this block puts in flight,
+            // recorded from the same participation the waves are built on.
+            self.unresolved
+                .register_committed(txs.iter().map(|(tx, _)| tx));
             let tx_hashes: Vec<TxHash> = txs.iter().map(|(tx, _)| tx.hash()).collect();
             for &tx_hash in &tx_hashes {
                 self.waves.assign_tx(tx_hash, tick_id);
@@ -1935,6 +1949,11 @@ impl ExecutionCoordinator {
         }
         self.provisioning.advance_clock(self.committed_ts);
         self.gc_settled_sets();
+        // Every verdict this block carries resolves its transactions,
+        // whichever way it went; what is left past every window that
+        // could still carry one is nobody's to resolve.
+        self.unresolved.release_resolved(block.certificates());
+        self.unresolved.prune(self.committed_ts);
 
         // Retro-stamp entries recorded before the first local commit. Remote
         // headers can register expected exec certs while `committed_ts` is
@@ -3218,6 +3237,7 @@ impl ExecutionCoordinator {
                 .sum(),
             finalizations: self.finalized.len(),
             waves: self.waves.waves_len(),
+            unresolved_txs: self.unresolved.len(),
             vote_trackers: self.waves.trackers_len(),
             early_votes: self.early.vote_len(),
             expected_exec_certs: self.expected_certs.expected_len(),
