@@ -4,7 +4,9 @@
 //! plus an index from each attested transaction to the certificate
 //! carrying its outcome — the key a counterpart shard actually asks by.
 
-use hyperscale_types::{Block, ExecutionCertificate, Hash};
+use std::collections::BTreeMap;
+
+use hyperscale_types::{Block, ExecutionCertificate, Hash, TickId};
 use rocksdb::{ColumnFamily, WriteBatch};
 
 use super::column_families::{ExecutionCertsCf, TxCertIndexCf};
@@ -28,10 +30,27 @@ pub fn append_block_certs_to_batch(
     let cf = storage.cf();
     let primary_cf = ExecutionCertsCf::handle(&cf);
     let index_cf = TxCertIndexCf::handle(&cf);
+    // A certificate carries the outcomes naming its holder, so one tick
+    // can reach a finalization as more than one copy — a broadcast and a
+    // narrower fetch answer for the same batch. The column family is
+    // keyed by tick, so keep the widest: a later request can be answered
+    // from a copy covering more of the batch, never less.
+    let mut widest: BTreeMap<TickId, &ExecutionCertificate> = BTreeMap::new();
     for fw in block.certificates().iter() {
         for ec in fw.execution_certificates() {
-            append_ec_to_batch(batch, primary_cf, index_cf, ec.as_unverified());
+            let ec = ec.as_unverified();
+            widest
+                .entry(*ec.tick_id())
+                .and_modify(|held| {
+                    if ec.tx_outcomes().len() > held.tx_outcomes().len() {
+                        *held = ec;
+                    }
+                })
+                .or_insert(ec);
         }
+    }
+    for cert in widest.into_values() {
+        append_ec_to_batch(batch, primary_cf, index_cf, cert);
     }
 }
 

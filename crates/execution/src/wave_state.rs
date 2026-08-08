@@ -183,10 +183,6 @@ pub struct WaveState {
     tx_has_failure: HashSet<TxHash>,
     /// All collected ECs (local + remote).
     execution_certificates: Vec<Arc<Verified<ExecutionCertificate>>>,
-    /// Deduplication of received ECs by `tick_id`. At most one valid EC
-    /// exists per `tick_id` (signature verification upstream ensures this),
-    /// so `tick_id` is a content-equivalent identity for dedup.
-    seen_ec_wave_ids: HashSet<TickId>,
 }
 
 impl WaveState {
@@ -283,7 +279,6 @@ impl WaveState {
             tracker_aborted: HashSet::new(),
             tx_has_failure: HashSet::new(),
             execution_certificates: Vec::new(),
-            seen_ec_wave_ids: HashSet::new(),
         }
     }
 
@@ -920,8 +915,8 @@ impl WaveState {
 
     // ── Cross-shard EC collection ───────────────────────────────────────
 
-    /// Feed an EC into the wave. Handles dedup (by canonical hash), updates
-    /// per-tx coverage, and tracks aborts/failures. For our own local EC
+    /// Feed an EC into the wave: update per-tx coverage, track
+    /// aborts/failures, and keep the certificate. For our own local EC
     /// (`ec.tick_id() == &self.tick_id`), records the admitted root and runs
     /// `reconcile_local_ec_decision` — which compares against the local
     /// vote when both are known. The local EC may arrive before the local
@@ -929,14 +924,37 @@ impl WaveState {
     /// validator finishes executing; the reconciliation runs again from
     /// `build_vote_data` once the local vote lands.
     ///
+    /// **A certificate is kept exactly when it covers something this wave
+    /// does not already have covered.** A certificate carries the outcomes
+    /// naming its holder, so two copies of one tick can differ — the
+    /// broadcast a shard sends and a narrower one a fetch answered with —
+    /// and dropping the second because its tick is familiar would leave
+    /// this wave believing a transaction covered by an outcome it does not
+    /// hold. That is not a missing optimisation but a hole: the outcome it
+    /// would have dropped could be the counterpart's abort, and settling
+    /// its sibling without it moves value one-sidedly.
+    ///
+    /// The same test is the bound. A peer can synthesise arbitrarily many
+    /// valid narrower copies of one tick, so keeping every distinct copy
+    /// would be unbounded; keeping only those that cover something new
+    /// caps the collection at one certificate per transaction.
+    ///
     /// Returns `true` if the wave is now complete (ready for `finalize`).
     pub fn add_execution_certificate(&mut self, ec: Arc<Verified<ExecutionCertificate>>) -> bool {
-        if !self.seen_ec_wave_ids.insert(*ec.tick_id()) {
-            return self.is_complete();
-        }
-
         let shard = ec.shard_id();
         let is_local = ec.tick_id() == &self.tick_id;
+
+        let covers_something_new = ec.tx_outcomes().iter().any(|outcome| {
+            self.covered_shards
+                .get(&outcome.tx_hash())
+                .is_some_and(|covered| !covered.contains(&shard))
+        });
+        // An empty batch's own certificate covers nothing yet still has to
+        // land: `is_complete` gates on having emitted it.
+        let first_local = is_local && !self.local_ec_emitted;
+        if !covers_something_new && !first_local {
+            return self.is_complete();
+        }
 
         for outcome in ec.tx_outcomes() {
             if let Some(covered) = self.covered_shards.get_mut(&outcome.tx_hash()) {
@@ -2349,5 +2367,77 @@ mod tests {
                 .is_none()
         );
         assert!(!w.fully_dispatched());
+    }
+
+    /// A counterpart's certificate carries the outcomes naming this
+    /// shard, so one tick can arrive as two copies covering different
+    /// transactions — a broadcast, and a narrower answer to a fetch. The
+    /// second must land: dropping it because its tick is familiar would
+    /// leave the wave believing a transaction covered by an outcome it
+    /// does not hold.
+    #[test]
+    fn a_second_narrower_copy_of_a_tick_still_adds_its_coverage() {
+        let mut w = make_cross_shard_wave(2);
+        let [first, second] = [w.tx_hashes()[0], w.tx_hashes()[1]];
+        let remote = ShardId::leaf(1, 1);
+
+        // The narrower copy arrives first, covering one transaction.
+        w.add_execution_certificate(make_ec(w.tick_id(), remote, &[first], true));
+        assert!(
+            w.lacks_coverage_from(remote),
+            "the second transaction is still uncovered"
+        );
+
+        // The fuller copy follows and completes the counterpart's coverage.
+        w.add_execution_certificate(make_ec(w.tick_id(), remote, &[first, second], true));
+        assert!(
+            !w.lacks_coverage_from(remote),
+            "the fuller copy must be absorbed, not dropped as a duplicate"
+        );
+    }
+
+    /// The counterpart's abort of one leg reaches the wave even when a
+    /// narrower copy of the same tick already covered its sibling. This
+    /// is the safety edge under the rule above: settling that sibling
+    /// without the abort would move value one-sidedly.
+    #[test]
+    fn a_later_copy_carrying_an_abort_is_not_dropped_as_a_duplicate() {
+        let mut w = make_cross_shard_wave(2);
+        let [first, second] = [w.tx_hashes()[0], w.tx_hashes()[1]];
+        let remote = ShardId::leaf(1, 1);
+        w.add_execution_certificate(make_ec(
+            w.tick_id(),
+            ShardId::leaf(1, 0),
+            &[first, second],
+            true,
+        ));
+
+        w.add_execution_certificate(make_ec(w.tick_id(), remote, &[first], true));
+        w.add_execution_certificate(make_ec(w.tick_id(), remote, &[second], false));
+
+        let decisions: HashMap<TxHash, TransactionDecision> =
+            w.attestation().tx_decisions().into_iter().collect();
+        assert_eq!(decisions.get(&second), Some(&TransactionDecision::Aborted));
+    }
+
+    /// A copy that covers nothing new is not retained. A peer can
+    /// synthesise arbitrarily many valid narrower copies of one tick, so
+    /// without this the collection would be unbounded.
+    #[test]
+    fn a_copy_covering_nothing_new_is_not_retained() {
+        let mut w = make_cross_shard_wave(2);
+        let both: Vec<TxHash> = w.tx_hashes().to_vec();
+        let remote = ShardId::leaf(1, 1);
+
+        w.add_execution_certificate(make_ec(w.tick_id(), remote, &both, true));
+        let after_first = w.execution_certificates.len();
+
+        w.add_execution_certificate(make_ec(w.tick_id(), remote, &both, true));
+        w.add_execution_certificate(make_ec(w.tick_id(), remote, &both[..1], true));
+        assert_eq!(
+            w.execution_certificates.len(),
+            after_first,
+            "copies telling the wave nothing new must not accumulate"
+        );
     }
 }

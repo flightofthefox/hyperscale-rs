@@ -1,5 +1,6 @@
 //! `ShardChainWriter` implementation for `SimShardStorage`.
 
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
@@ -17,7 +18,7 @@ use hyperscale_types::{
 };
 
 use super::core::SimShardStorage;
-use super::state::{apply_state_writes, apply_writes};
+use super::state::{ConsensusState, apply_state_writes, apply_writes};
 
 impl ShardChainWriter for SimShardStorage {
     fn prepare_block_commit(
@@ -193,15 +194,7 @@ fn build_prepared_commit(
                     .push(tick_id);
             }
             c.insert_receipts(&receipts);
-            for fw in block.certificates().iter() {
-                for ec in fw.execution_certificates() {
-                    for outcome in ec.tx_outcomes() {
-                        c.tx_cert_index.insert(outcome.tx_hash(), *ec.tick_id());
-                    }
-                    c.execution_certs
-                        .insert(*ec.tick_id(), ec.as_unverified().clone());
-                }
-            }
+            record_execution_certs(&mut c, block);
             c.committed_height = block.height();
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some(qc.as_ref().clone());
@@ -282,15 +275,7 @@ impl SimShardStorage {
             // Store receipts atomically with block commit.
             c.insert_receipts(receipts);
             // Store execution certificates (extracted from finalizations) atomically.
-            for fw in block.certificates().iter() {
-                for ec in fw.execution_certificates() {
-                    for outcome in ec.tx_outcomes() {
-                        c.tx_cert_index.insert(outcome.tx_hash(), *ec.tick_id());
-                    }
-                    c.execution_certs
-                        .insert(*ec.tick_id(), ec.as_unverified().clone());
-                }
-            }
+            record_execution_certs(&mut c, block);
             c.committed_height = block.height();
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some(qc.as_ref().clone());
@@ -298,5 +283,36 @@ impl SimShardStorage {
         }
 
         new_root
+    }
+}
+
+/// Fold a block's execution certificates into the consensus map: index
+/// every attested transaction, and keep the widest copy of each tick.
+///
+/// A certificate carries the outcomes naming its holder, so one tick can
+/// reach a finalization as more than one copy — a broadcast and a
+/// narrower fetch answer for the same batch. The map is keyed by tick, so
+/// keeping the widest means a later request is answered from a copy
+/// covering more of the batch, never less.
+fn record_execution_certs(consensus: &mut ConsensusState, block: &Block) {
+    for fw in block.certificates().iter() {
+        for ec in fw.execution_certificates() {
+            let ec = ec.as_unverified();
+            for outcome in ec.tx_outcomes() {
+                consensus
+                    .tx_cert_index
+                    .insert(outcome.tx_hash(), *ec.tick_id());
+            }
+            match consensus.execution_certs.entry(*ec.tick_id()) {
+                Entry::Occupied(mut held) => {
+                    if ec.tx_outcomes().len() > held.get().tx_outcomes().len() {
+                        held.insert(ec.clone());
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(ec.clone());
+                }
+            }
+        }
     }
 }

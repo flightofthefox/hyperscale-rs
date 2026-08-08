@@ -1337,10 +1337,21 @@ impl ExecutionCoordinator {
         // participants name, less our own. Read off the batch's own
         // record rather than the provision accumulator, which may have
         // been pruned by the time the certificate is aggregated.
-        let remote_shards: Vec<ShardId> = self
+        //
+        // The same record answers what each of them receives. A shard is
+        // party to the transactions naming it and to no others, so that
+        // is what its copy carries — the certificate a remote shard gets
+        // is sized by its own stake in the batch rather than by the
+        // batch.
+        let per_target: Vec<(ShardId, HashSet<TxHash>)> = self
             .waves
             .get_wave(tick_id)
-            .map(WaveState::counterpart_shards)
+            .map(|wave| {
+                wave.counterpart_shards()
+                    .into_iter()
+                    .map(|shard| (shard, wave.txs_awaiting(shard).collect()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         // Make the cert available to the io_loop's inbound EC fetch handler
@@ -1357,19 +1368,25 @@ impl ExecutionCoordinator {
             });
         }
 
-        // Broadcast EC to remote participating shards. Track each per-target
-        // send so a dropped notify is re-emitted before the source's 24s
-        // fallback timer trips — symmetric to ef4eb45a on provisions.
-        for target_shard in &remote_shards {
+        // Broadcast each target shard its own projection. Track the
+        // per-target send so a dropped notify is re-emitted before the
+        // source's 24s fallback timer trips — symmetric to ef4eb45a on
+        // provisions; the tracker holds what was sent, so a re-broadcast
+        // repeats it byte for byte.
+        for (target_shard, txs) in &per_target {
             let recipients: Vec<ValidatorId> = head.committee_for_shard(*target_shard).to_vec();
+            let Some(projected) = certificate.project_to(txs) else {
+                continue;
+            };
+            let projected = Arc::new(projected);
             self.outbound_certs.on_broadcast(
-                Arc::clone(certificate),
+                Arc::clone(&projected),
                 *target_shard,
                 recipients.clone(),
             );
             actions.push(Action::BroadcastExecutionCertificate {
                 shard: *target_shard,
-                certificate: Arc::clone(certificate),
+                certificate: projected,
                 recipients,
             });
         }
@@ -1377,7 +1394,7 @@ impl ExecutionCoordinator {
         tracing::debug!(
             wave = %tick_id,
             tx_count = certificate.tx_outcomes().len(),
-            remote_shards = remote_shards.len(),
+            remote_shards = per_target.len(),
             "Wave leader broadcasting EC to local peers and remote shards"
         );
 
@@ -3920,9 +3937,11 @@ mod tests {
     /// Who a certificate is broadcast to is a question about the batch's
     /// transactions, not its identity: the shards their participants name.
     /// A batch holding a transaction shard 1 is party to owes shard 1 the
-    /// certificate.
+    /// certificate — and what shard 1 receives is the outcome for that
+    /// transaction, not the batch.
     #[test]
     fn test_leader_broadcasts_ec_locally() {
+        use hyperscale_types::compute_global_receipt_root;
         use hyperscale_types::test_utils::test_transaction;
 
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
@@ -3943,11 +3962,12 @@ mod tests {
             ),
         );
 
+        let outcomes = vec![TxOutcome::new(tx.hash(), ExecutionOutcome::Aborted)];
         let cert = ExecutionCertificate::new(
             tick_id,
             WeightedTimestamp::ZERO,
-            GlobalReceiptRoot::ZERO,
-            vec![],
+            compute_global_receipt_root(&outcomes),
+            outcomes,
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
@@ -3983,6 +4003,93 @@ mod tests {
             _ => false,
         });
         assert!(has_remote, "Should include remote shard broadcast");
+    }
+
+    /// A shard receives the outcomes for the transactions it is party to
+    /// and nothing else, while this shard's own peers receive the whole
+    /// batch — they are building the same finalization we are.
+    #[test]
+    fn a_remote_shard_receives_only_its_own_transactions() {
+        use hyperscale_types::compute_global_receipt_root;
+        use hyperscale_types::test_utils::test_transaction;
+
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        let topo = make_test_topology();
+        let mut state = make_test_state();
+
+        let shared = Arc::new(test_transaction(3));
+        let ours = Arc::new(test_transaction(4));
+        state.waves.insert_wave(
+            tick_id,
+            WaveState::new(
+                tick_id,
+                BlockHash::from_raw(Hash::from_bytes(b"block")),
+                WeightedTimestamp::ZERO,
+                RevealChain::ZERO,
+                vec![
+                    (
+                        Arc::new(Verifiable::from((*shared).clone())),
+                        [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect(),
+                    ),
+                    (
+                        Arc::new(Verifiable::from((*ours).clone())),
+                        std::iter::once(ShardId::ROOT).collect(),
+                    ),
+                ],
+            ),
+        );
+
+        let outcomes = vec![
+            TxOutcome::new(shared.hash(), ExecutionOutcome::Aborted),
+            TxOutcome::new(ours.hash(), ExecutionOutcome::Aborted),
+        ];
+        let cert = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::ZERO,
+            compute_global_receipt_root(&outcomes),
+            outcomes,
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+
+        let actions = state.on_certificate_aggregated(
+            &topo,
+            &tick_id,
+            &Arc::new(Verified::new_unchecked_for_test(cert)),
+        );
+
+        let sent = |target: ShardId| -> Arc<Verified<ExecutionCertificate>> {
+            actions
+                .iter()
+                .find_map(|a| match a {
+                    Action::BroadcastExecutionCertificate {
+                        shard, certificate, ..
+                    } if *shard == target => Some(Arc::clone(certificate)),
+                    _ => None,
+                })
+                .expect("a broadcast for the target shard")
+        };
+
+        let remote = sent(ShardId::leaf(1, 1));
+        assert_eq!(
+            remote.tx_outcomes().len(),
+            1,
+            "the remote shard is party to one of the two"
+        );
+        assert!(remote.covers(&shared.hash()));
+        assert!(!remote.covers(&ours.hash()));
+        assert_eq!(
+            remote.tx_count(),
+            2,
+            "the projection still names the whole batch it proves against"
+        );
+        assert_eq!(
+            remote.global_receipt_root(),
+            sent(ShardId::ROOT).global_receipt_root()
+        );
+
+        let local = sent(ShardId::ROOT);
+        assert!(local.is_complete(), "our own peers get the whole batch");
     }
 
     /// `admit_finalization` must NOT emit `FinalizationsAdmitted`

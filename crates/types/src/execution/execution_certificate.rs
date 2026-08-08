@@ -365,6 +365,16 @@ impl ExecutionCertificate {
         &self.leaf_indices
     }
 
+    /// Whether this copy carries an outcome for `tx_hash`. A transaction
+    /// of the tick this copy leaves out answers `false` — the certificate
+    /// says nothing about it.
+    #[must_use]
+    pub fn covers(&self, tx_hash: &TxHash) -> bool {
+        self.tx_outcomes
+            .iter()
+            .any(|outcome| &outcome.tx_hash() == tx_hash)
+    }
+
     /// Self-contained wave identifier (shard + height + remote dependencies).
     #[must_use]
     pub const fn tick_id(&self) -> &TickId {
@@ -648,6 +658,27 @@ impl Verified<ExecutionCertificate> {
             aggregated_signature,
             signers,
         ))
+    }
+
+    /// The projection of this certificate a shard party to `keep`
+    /// needs, carrying the verification marker through.
+    ///
+    /// Trust source: [`ExecutionCertificate::project_to`] moves neither
+    /// the signed root nor the aggregated signature nor the signer set,
+    /// so the predicate that held for the certificate it came from holds
+    /// unchanged for the projection.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a certificate that is not itself complete; see
+    /// [`ExecutionCertificate::project_to`].
+    #[must_use]
+    pub fn project_to(&self, keep: &HashSet<TxHash>) -> Option<Self> {
+        // SAFETY: the projection carries the same `(vote_anchor_ts,
+        // tick_id, shard_id, global_receipt_root, tx_count)` signing
+        // message and the same aggregate, so aggregate-verify against
+        // the same committee succeeds exactly as it did before.
+        (**self).project_to(keep).map(Self::new_unchecked)
     }
 
     /// Re-wrap a certificate that satisfied the predicate at write
