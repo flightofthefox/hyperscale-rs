@@ -30,7 +30,7 @@ Rust implementation of the Hyperscale protocol: a sharded smart-contract network
 | [`dispatch-pooled`](crates/dispatch-pooled) | Production dispatch using rayon thread pools with core allocation and pinning |
 | [`dispatch-sync`](crates/dispatch-sync) | Deterministic inline dispatch for simulation (runs closures on calling thread) |
 | [`effects-bridge`](crates/effects-bridge) | The workspace's binding to the VM effect vocabulary: decode, admit, and route transactions |
-| [`engine`](crates/engine) | Batch executor over the VM kernel: wave execution, fee settlement, receipt projection |
+| [`engine`](crates/engine) | Batch executor over the VM kernel: tick execution, fee settlement, receipt projection |
 | [`execution`](crates/execution) | Transaction execution with cross-shard coordination |
 | [`jmt`](crates/jmt) | Jellyfish Merkle Tree with generic hasher and batched multiproofs |
 | [`mempool`](crates/mempool) | Transaction pool management |

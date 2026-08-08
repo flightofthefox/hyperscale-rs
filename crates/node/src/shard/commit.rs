@@ -180,7 +180,7 @@ where
     );
 
     // The sync-block ingress validator rejects peer-shipped divergent
-    // receipts before shard consensus sees the block; and `WaveState`'s divergence
+    // receipts before shard consensus sees the block; and `TickState`'s divergence
     // detector keeps locally-produced bad receipts out of `finalized`.
     // A mismatch here means our local parent state itself diverged from
     // canonical — a JMT or commit-batch bug, or pre-existing corruption

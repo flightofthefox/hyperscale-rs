@@ -63,7 +63,7 @@ fn make_block(height: BlockHeight) -> CertifiedBlock {
     CertifiedBlock::new_unchecked(block, qc)
 }
 
-/// Build a remote certified header whose only wave targets `local_shard`,
+/// Build a remote certified header whose only tick targets `local_shard`,
 /// so a `ProvisionCoordinator` running on `local_shard` will register an
 /// expectation on receipt.
 fn make_remote_header_targeting(
@@ -192,7 +192,7 @@ fn on_verified_remote_header_targeting_local_shard_registers_expectation() {
     let stats = coord.memory_stats();
     assert_eq!(
         stats.expected_provisions, 1,
-        "expectation must register when the remote wave targets us"
+        "expectation must register when the remote tick targets us"
     );
     assert_eq!(
         stats.verified_remote_headers, 0,

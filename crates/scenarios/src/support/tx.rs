@@ -38,7 +38,7 @@ pub fn signer_from_seed(seed: u8) -> Ed25519PrivateKey {
 pub const STRADDLER_SPLITTER: ShardId = ShardId::leaf(1, 0);
 
 /// The surviving sibling — `leaf(1, 1)`, the lighter child that stays under the
-/// threshold. Straddler payers live here; their cross-shard waves name the
+/// threshold. Straddler payers live here; their cross-shard ticks name the
 /// terminating splitter.
 pub const STRADDLER_SURVIVOR: ShardId = ShardId::leaf(1, 1);
 
@@ -66,13 +66,13 @@ pub const STRADDLER_COUNT: usize = 8;
 ///
 /// The heaviest engine-bootstrap quarter, bulk-funded over `merge_bytes` so its
 /// sibling pair never merges. Straddler payers live here; their cross-shard
-/// waves name the terminating merge-left child.
+/// ticks name the terminating merge-left child.
 pub const MERGE_STRADDLER_SURVIVOR: ShardId = ShardId::leaf(2, 0);
 
 /// The merge-left child — `leaf(2, 2)`.
 ///
 /// Light enough to fall under `merge_bytes` and collapse into `leaf(1, 1)` with
-/// its sibling. Straddler recipients live here, so the survivor's wave names the
+/// its sibling. Straddler recipients live here, so the survivor's tick names the
 /// shard that terminates at the merge.
 pub const MERGE_STRADDLER_LEFT: ShardId = ShardId::leaf(2, 2);
 
@@ -89,7 +89,7 @@ const MERGE_SURVIVOR_BULK: usize = 500;
 /// Merge-straddler pairs submitted across the merge.
 ///
 /// Each payer in the survivor `leaf(2, 0)`, each recipient in the merging
-/// `leaf(2, 2)`. Submitted in two waves — the first settles before the
+/// `leaf(2, 2)`. Submitted in two ticks — the first settles before the
 /// merge-left terminal, the second straddles it.
 pub const MERGE_STRADDLER_COUNT: usize = 4;
 
@@ -127,7 +127,7 @@ pub fn witness_payer() -> Ed25519PrivateKey {
 /// Probe pairs per submission batch of the halted-shard straddler scenario.
 ///
 /// Two transfers sourced on the surviving sibling into the halting shard,
-/// one sourced on the halting shard itself, so both wave directions cross
+/// one sourced on the halting shard itself, so both tick directions cross
 /// each phase of the freeze.
 pub const HALT_STRADDLER_BATCH: usize = 3;
 
@@ -227,7 +227,7 @@ pub struct SplitStraddlerSetup {
     /// splitter)`.
     pub straddlers: Vec<(Ed25519PrivateKey, [u8; 16], [u8; 16])>,
     /// The leg whose payer sits in the *terminating* splitter, so the
-    /// reservation it engages is held by a shard that dies before the wave
+    /// reservation it engages is held by a shard that dies before the tick
     /// can resolve: `(payer key, payer in the splitter's left child,
     /// recipient in the survivor)`.
     pub terminating: (Ed25519PrivateKey, [u8; 16], [u8; 16]),
@@ -385,7 +385,7 @@ pub fn split_straddler_setup() -> SplitStraddlerSetup {
 /// while the lighter merging pair (`leaf(2, 2)`/`leaf(2, 3)`) stays under it and
 /// collapses into `leaf(1, 1)`. Straddler payers sit in the survivor
 /// `leaf(2, 0)` and recipients in the merging `leaf(2, 2)`, so each cross-shard
-/// wave names the shard that terminates at the merge.
+/// tick names the shard that terminates at the merge.
 #[must_use]
 pub fn merge_straddler_setup() -> MergeStraddlerSetup {
     let num_shards = 4;
@@ -572,7 +572,7 @@ pub fn participant_sweep_genesis_accounts(num_shards: u64) -> Vec<([u8; 16], u12
 ///
 /// Ground onto opposite children so the two transfers are genuinely
 /// cross-shard and share their whole account set — each is the other's
-/// mirror, which is the shape that would livelock if conflicting waves
+/// mirror, which is the shape that would livelock if conflicting ticks
 /// could starve each other.
 #[must_use]
 pub fn livelock_pair() -> Vec<(Ed25519PrivateKey, [u8; 16])> {
@@ -851,7 +851,7 @@ pub fn nullifier_race_genesis_accounts() -> Vec<([u8; 16], u128)> {
 /// direction over the pair, plus an intra-shard control pair per child.
 /// The controls must be disjoint from the crossing pair: a transfer
 /// between the crossing accounts would declare the same vault cells as
-/// the in-flight cross-shard wave and queue behind it instead of proving
+/// the in-flight cross-shard tick and queue behind it instead of proving
 /// the shard still settles locally.
 pub struct CrossShardFaultCast {
     /// The payer and account in `leaf(1, 0)`.

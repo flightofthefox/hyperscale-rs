@@ -18,7 +18,7 @@ use crate::WorkInFlight;
 /// Bounds the `tx_hashes` array in [`BlockManifest`](crate::BlockManifest),
 /// the `transactions` array inside [`Block`](crate::Block), the
 /// `tx_outcomes` array inside any one
-/// [`ExecutionCertificate`](crate::ExecutionCertificate) for a wave from
+/// [`ExecutionCertificate`](crate::ExecutionCertificate) for a tick from
 /// this block, and the `transactions` (per-tx state-entry sets) inside
 /// any one [`Provisions`](crate::Provisions) batch sourced from this
 /// block.
@@ -37,10 +37,10 @@ pub const MAX_PROVISION_TARGET_SHARDS: usize = 1_024;
 /// single block, summed across all finalizations.
 ///
 /// Truncation is a suffix of the order the proposer offers, which is the
-/// order the waves executed in — a wave settling ahead of one it shares a
+/// order the ticks executed in — a tick settling ahead of one it shares a
 /// cell with reverts a committed write, so nothing here may reorder to
 /// fit. Also serves as the outer-`Vec<Finalization>` decode bound: every
-/// wave's local EC carries at least one outcome in practice, so the count
+/// tick's local EC carries at least one outcome in practice, so the count
 /// of finalizations a block can carry is implicitly bounded by this
 /// same cap.
 pub const MAX_FINALIZED_TX_PER_BLOCK: usize = 8_192;
@@ -85,7 +85,7 @@ const DRAIN_COUNT_SLACK: u64 = 2;
 /// budget no way back down.
 ///
 /// The total is not self-clearing. It advances on commit and retreats on
-/// settlement, and a wave that never certifies retreats nothing —
+/// settlement, and a tick that never certifies retreats nothing —
 /// abandonment leaves no chain artifact to release against — so stranded
 /// work lowers what this shard can admit for as long as the chain runs.
 ///
@@ -120,7 +120,7 @@ const _: () = assert!(
 /// A block that adds nothing is exempt from the level entirely. Those are
 /// the blocks that carry the certificates the drain retreats on, so
 /// refusing them would be refusing the only way back under — which
-/// matters because the total is not always recoverable: a wave that never
+/// matters because the total is not always recoverable: a tick that never
 /// certifies strands its reservation with nothing to release it against,
 /// and what has to stay impossible is the chain stopping rather than the
 /// ceiling dropping.
@@ -189,7 +189,7 @@ mod tests {
     /// And it never bites on a block that adds nothing. Those carry the
     /// certificates that release the drain, so refusing them would leave a
     /// chain that touched the ceiling unable to come back under it — and
-    /// the total is not always recoverable in any case, since a wave that
+    /// the total is not always recoverable in any case, since a tick that
     /// never certifies strands its reservation for good.
     #[test]
     fn a_block_adding_nothing_is_admitted_at_any_total() {

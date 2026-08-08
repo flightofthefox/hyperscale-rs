@@ -37,7 +37,7 @@
 //! (`vote_anchor_ts + RETENTION_HORIZON`), pruned by
 //! [`prune_fulfilled`](ExpectedCertTracker::prune_fulfilled). This
 //! catches a specific late-arrival race: state-based drain runs at
-//! `remove_finalization`, after which the wave is gone. If a
+//! `remove_finalization`, after which the tick is gone. If a
 //! duplicate header then arrives within the gossip window, `register`
 //! re-creates an expectation, the fallback fetch returns the EC,
 //! `mark_fulfilled` re-creates the tombstone — but no future
@@ -46,17 +46,17 @@
 //! Retention pruning against the transactions still awaiting coverage is
 //! orchestrated by the coordinator via
 //! [`retain_if_tx_needed`](ExpectedCertTracker::retain_if_tx_needed),
-//! because the tracker cannot see the wave set.
+//! because the tracker cannot see the tick set.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
-use hyperscale_types::{ShardId, TxHash, WAVE_TIMEOUT, WeightedTimestamp};
+use hyperscale_types::{MAX_FINALIZATION_DELAY, ShardId, TxHash, WeightedTimestamp};
 
 /// How long to wait before the first fallback request. Anchored on the
 /// committing QC's `weighted_timestamp_ms`, so the window stays meaningful
 /// regardless of local block production rate. Sized comfortably below
-/// `WAVE_TIMEOUT` so fallback fetches rescue missing ECs before the wave
+/// `MAX_FINALIZATION_DELAY` so fallback fetches rescue missing ECs before the tick
 /// aborts.
 const EXEC_CERT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -64,13 +64,13 @@ const EXEC_CERT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const EXEC_CERT_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Grace window during which a freshly-registered expectation is retained
-/// even when no local wave holds its transaction yet. Remote committed-block
+/// even when no local tick holds its transaction yet. Remote committed-block
 /// headers can arrive ahead of the local block that commits the same
 /// transaction; without this window, the registration is silently pruned by
 /// `retain_if_tx_needed` and the EC never gets fetched. Sized to comfortably
 /// exceed the worst-case lag between receiving the remote header and
 /// committing the local block referencing the same cross-shard tx.
-const EXPECTED_RETENTION_GRACE: Duration = WAVE_TIMEOUT;
+const EXPECTED_RETENTION_GRACE: Duration = MAX_FINALIZATION_DELAY;
 
 /// One shard's outcome for one transaction — what an expectation is for.
 type ExpectedCertKey = (ShardId, TxHash);
@@ -162,7 +162,7 @@ impl ExpectedCertTracker {
     }
 
     /// Drop the records for `tx_hashes` that just reached terminal state (a
-    /// finalized local wave landed in a committed block). No shard's outcome
+    /// finalized local tick landed in a committed block). No shard's outcome
     /// for a terminal transaction is wanted anymore.
     pub fn on_txs_terminated(&mut self, tx_hashes: impl IntoIterator<Item = TxHash>) {
         for tx_hash in tx_hashes {
@@ -235,12 +235,12 @@ impl ExpectedCertTracker {
         fetches
     }
 
-    /// Drop expectations for transactions no outstanding local wave is
-    /// waiting on. The coordinator computes the set from `WaveRegistry` and
-    /// passes it in — the tracker has no view of waves.
+    /// Drop expectations for transactions no outstanding local tick is
+    /// waiting on. The coordinator computes the set from `TickRegistry` and
+    /// passes it in — the tracker has no view of ticks.
     pub fn retain_if_tx_needed(&mut self, txs_needed: &HashSet<TxHash>, now_ts: WeightedTimestamp) {
         // Retain expectations whose transaction is still held by a local
-        // wave OR whose registration is recent enough that the local block
+        // tick OR whose registration is recent enough that the local block
         // committing it may not have landed yet. Without the grace window,
         // a remote header arriving slightly ahead of our own commit of the
         // same transaction is silently pruned and the EC never gets
@@ -253,7 +253,7 @@ impl ExpectedCertTracker {
 
     /// Drop every active expectation, returning its keys so the caller can
     /// abandon their in-flight fallback fetches. Used when the local chain
-    /// terminates at a reshape boundary — no local wave can consume a
+    /// terminates at a reshape boundary — no local tick can consume a
     /// fetched EC anymore. Fulfilled tombstones stay; they only suppress
     /// re-registration.
     pub fn drain_expected(&mut self) -> Vec<ExpectedCertKey> {
@@ -314,7 +314,7 @@ mod tests {
         TxHash::from(Hash::from_bytes(&[seed]))
     }
 
-    /// Every transaction is one a local wave awaits, unless a test says
+    /// Every transaction is one a local tick awaits, unless a test says
     /// otherwise — the fetch gate is exercised on its own below.
     fn all() -> HashSet<TxHash> {
         (0u8..=255).map(tx).collect()
@@ -489,11 +489,11 @@ mod tests {
         assert_eq!(fetches, vec![(shard(1), tx(5), true)], "flagged as retry");
     }
 
-    /// A transaction no local wave holds is not ours to fetch — a source
+    /// A transaction no local tick holds is not ours to fetch — a source
     /// header names every cross-shard transaction in its block, including
     /// ones bound elsewhere.
     #[test]
-    fn check_timeouts_skips_a_transaction_no_local_wave_holds() {
+    fn check_timeouts_skips_a_transaction_no_local_tick_holds() {
         let mut t = ExpectedCertTracker::new();
         t.register(shard(1), tx(5), ms(0));
 
@@ -550,7 +550,7 @@ mod tests {
         let mut t = ExpectedCertTracker::new();
         t.register(shard(1), tx(5), ms(0));
 
-        // Past the grace window with the tx absent from every local wave.
+        // Past the grace window with the tx absent from every local tick.
         let past_grace = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap() + 1);
         t.retain_if_tx_needed(&HashSet::new(), past_grace);
 
@@ -558,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn retain_if_tx_needed_keeps_a_tx_a_local_wave_still_awaits() {
+    fn retain_if_tx_needed_keeps_a_tx_a_local_tick_still_awaits() {
         let mut t = ExpectedCertTracker::new();
         t.register(shard(1), tx(5), ms(0));
 
@@ -569,7 +569,7 @@ mod tests {
     }
 
     /// The grace window covers a remote header arriving ahead of our own
-    /// commit of the same transaction: it is not in any local wave yet, and
+    /// commit of the same transaction: it is not in any local tick yet, and
     /// pruning it would leave the certificate unfetched.
     #[test]
     fn retain_if_tx_needed_keeps_recent_unneeded_expectation() {

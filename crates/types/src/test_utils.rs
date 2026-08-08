@@ -251,11 +251,11 @@ impl TestCommittee {
 ///
 /// Every non-essential header field takes a zero default: all merkle roots
 /// are `Hash::ZERO`, `parent_qc` is the ZERO-anchored root-shard genesis QC,
-/// `round` is `Round::INITIAL`, and there are no wave roots or provisions.
+/// `round` is `Round::INITIAL`, and there are no tick roots or provisions.
 /// Callers pass only the bits that vary between tests.
 ///
 /// Transactions are wrapped as `Verifiable::Unverified` — adequate for the
-/// `on_block_committed` path (`WaveState` lifts via
+/// `on_block_committed` path (`TickState` lifts via
 /// [`Verified::<Transaction>::from_persisted`]) and for storage
 /// fixtures. The pre-vote path (`validate_block_for_vote`) refuses to vote
 /// on blocks with any un-`Verified` entry; tests targeting that path must
@@ -702,7 +702,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             certificate_root,
             local_receipt_root,
             provision_root,
-            waves,
+            ticks,
             provision_tx_roots,
             in_flight,
             beacon_witness_root,
@@ -738,7 +738,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             certificate_root,
             local_receipt_root,
             provision_root,
-            cross_shard_txs: waves,
+            cross_shard_txs: ticks,
             provision_tx_roots,
             work_in_flight: in_flight,
             beacon_witness_root,
@@ -782,7 +782,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
 
 /// Build a minimal `Finalization` carrying a single tx decision.
 ///
-/// The wave is anchored on `ShardId::ROOT` with `block_height` as its
+/// The tick is anchored on `ShardId::ROOT` with `block_height` as its
 /// identity and no remote shard dependencies — sufficient for driving
 /// `on_block_committed` when tests only care about tx-terminal-state side
 /// effects. The inner EC carries a zeroed signature and a 4-seat

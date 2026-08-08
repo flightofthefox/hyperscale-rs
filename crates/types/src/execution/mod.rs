@@ -47,11 +47,11 @@ mod tests {
     use crate::test_utils::test_transaction_with_prefixes;
     use crate::{
         Address, AggregateSignature, Attempt, BlockHeight, ConsensusReceipt, ExecutionCertificate,
-        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash,
-        MAX_EXECUTION_CERTIFICATES_PER_WAVE, NetworkDefinition, ProvisionTxRoot,
+        ExecutionOutcome, Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot,
+        Hash, MAX_EXECUTION_CERTIFICATES_PER_TICK, NetworkDefinition, ProvisionTxRoot,
         ProvisionTxRootsMap, RETENTION_HORIZON, ReceiptValidationError, ShardId, SignerBitfield,
         StateWrites, StoredReceipt, TickId, TopologySnapshot, TxHash, TxOutcome, ValidatorId,
-        ValidatorInfo, ValidatorSet, Verifiable, Verified, WaveReceiptHash, WeightedTimestamp,
+        ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
         compute_global_receipt_root, compute_global_receipt_root_with_proof, compute_merkle_root,
         tick_leader, tick_leader_at, tx_outcome_leaf, verify_merkle_inclusion,
     };
@@ -287,7 +287,7 @@ mod tests {
             vec![],
         );
         assert_eq!(fw.receipt_hash(), fw.receipt_hash());
-        assert_ne!(fw.receipt_hash(), WaveReceiptHash::ZERO);
+        assert_ne!(fw.receipt_hash(), FinalizationHash::ZERO);
     }
 
     #[test]
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_finalization_missing_local_ec() {
-        // The wave's tick_id has shard=0 but its only EC is for shard=1,
+        // The tick's tick_id has shard=0 but its only EC is for shard=1,
         // so no ec.tick_id() matches. Pre-fix this decoded successfully
         // and then panicked the IO loop on first call to local_ec().
         let fw = Finalization::new(
@@ -327,8 +327,8 @@ mod tests {
         assert!(matches!(err, DecodeError::FailedValidation(_)));
     }
 
-    /// The exactly-one-local-EC invariant rejects waves with more than one
-    /// EC matching the wave's own `tick_id`. Without this, downstream helpers
+    /// The exactly-one-local-EC invariant rejects ticks with more than one
+    /// EC matching the tick's own `tick_id`. Without this, downstream helpers
     /// like `Finalization::local_ec()` would silently pick the first match,
     /// letting two paths disagree on which EC is authoritative.
     #[test]
@@ -348,22 +348,22 @@ mod tests {
 
     #[test]
     fn decode_rejects_finalization_with_oversized_ec_count() {
-        // Forge a wave whose execution_certificates count claims one past
+        // Forge a tick whose execution_certificates count claims one past
         // the cap, padded to input-satisfiability so the protocol cap is
         // what fires, before any per-EC decode work happens.
         let tick_id = make_tick_id(0, BlockHeight::new(42));
         let mut buf = hbor_to_vec(&tick_id).unwrap();
-        varint::write(&mut buf, MAX_EXECUTION_CERTIFICATES_PER_WAVE + 1).unwrap();
+        varint::write(&mut buf, MAX_EXECUTION_CERTIFICATES_PER_TICK + 1).unwrap();
         buf.extend(std::iter::repeat_n(
             0u8,
-            (MAX_EXECUTION_CERTIFICATES_PER_WAVE + 1) * 256,
+            (MAX_EXECUTION_CERTIFICATES_PER_TICK + 1) * 256,
         ));
         let err = hbor_from_slice::<Finalization>(&buf).unwrap_err();
         assert!(matches!(
             err,
             DecodeError::BoundExceeded { max, actual }
-                if max == MAX_EXECUTION_CERTIFICATES_PER_WAVE
-                    && actual == MAX_EXECUTION_CERTIFICATES_PER_WAVE + 1
+                if max == MAX_EXECUTION_CERTIFICATES_PER_TICK
+                    && actual == MAX_EXECUTION_CERTIFICATES_PER_TICK + 1
         ));
     }
 
@@ -432,7 +432,7 @@ mod tests {
 
     /// Decoding a single `Finalization` directly must still bound the
     /// receipts vec: without the cap a peer could claim billions of
-    /// receipts on one wave.
+    /// receipts on one tick.
     #[test]
     fn decode_rejects_finalization_with_oversized_receipts_count() {
         use crate::MAX_TXS_PER_BLOCK;
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_leader_deterministic() {
+    fn tick_leader_is_deterministic() {
         let committee = vec![
             ValidatorId::new(1),
             ValidatorId::new(2),
@@ -669,9 +669,9 @@ mod tests {
     #[test]
     fn reconstruct_fails_when_local_ec_missing() {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
-        let remote_wave_id = make_tick_id(1, BlockHeight::new(42));
+        let remote_tick_id = make_tick_id(1, BlockHeight::new(42));
         let remote_ec = make_local_ec(
-            &remote_wave_id,
+            &remote_tick_id,
             vec![TxOutcome::new(
                 TxHash::from(Hash::from_bytes(b"tx")),
                 ExecutionOutcome::Aborted,
@@ -886,8 +886,8 @@ mod tests {
     #[test]
     fn validate_rejects_missing_local_ec() {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
-        let remote_wave_id = make_tick_id(1, BlockHeight::new(42));
-        let remote_ec = make_local_ec(&remote_wave_id, vec![]);
+        let remote_tick_id = make_tick_id(1, BlockHeight::new(42));
+        let remote_ec = make_local_ec(&remote_tick_id, vec![]);
         let fw = Finalization::new(tick_id, vec![remote_ec], vec![]);
         assert_eq!(
             fw.validate_receipts_against_ec(),
@@ -896,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_all_aborted_wave_with_empty_receipts_passes() {
+    fn validate_all_aborted_tick_with_empty_receipts_passes() {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
         let outcomes = vec![TxOutcome::new(
             TxHash::from(Hash::from_bytes(b"aborted")),

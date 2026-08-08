@@ -8,8 +8,8 @@
 //! store answers tx-membership and tick-id lookups for peers that need
 //! to fetch the finalized data to vote.
 //!
-//! This is write-once, read-many — [`WaveRegistry`](crate::waves::WaveRegistry)
-//! owns the mutable in-flight lifecycle (waves, vote trackers, retries) and
+//! This is write-once, read-many — [`TickRegistry`](crate::ticks::TickRegistry)
+//! owns the mutable in-flight lifecycle (ticks, vote trackers, retries) and
 //! hands them off to this store at the moment of finalization.
 //!
 //! The underlying map is a `BTreeMap<TickId, Arc<Finalization>>` so
@@ -30,7 +30,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use hyperscale_types::{BloomFilter, DEFAULT_FPR, Finalization, TickId, TxHash, Verifiable};
 
-/// Waves by id, plus the transaction index derived from them. Both live
+/// Ticks by id, plus the transaction index derived from them. Both live
 /// under one lock so a reader can never observe a transaction indexed
 /// against a finalization the map has already dropped.
 struct Inner {
@@ -138,7 +138,7 @@ impl FinalizationStore {
             .map(Arc::clone)
     }
 
-    /// Wave containing `tx_hash`, if any. Used to answer terminal-state
+    /// Tick containing `tx_hash`, if any. Used to answer terminal-state
     /// queries for a single transaction (e.g. RPC, mempool status).
     /// Returns `None` once the finalization has been removed — callers then fall
     /// back to persisted storage.

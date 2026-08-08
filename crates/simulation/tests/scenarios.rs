@@ -33,7 +33,7 @@ use hyperscale_scenarios::{
     gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
     grow_reaches_two_shard_topology, halted_shard_recovers_by_committee_redraw,
     halted_shard_straddler_atomic, hot_recipient, insolvent_payer_engages_nothing,
-    inter_shard_partition_strands_waves_until_it_heals, isolated_validator_still_settles,
+    inter_shard_partition_strands_ticks_until_it_heals, isolated_validator_still_settles,
     livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
     merge_seats_full_keeper_committee, merge_straddler_atomic,
     minority_fragment_rejoins_after_partition, multi_vnode_progress,
@@ -300,7 +300,7 @@ fn withdrawals_compose_over_one_vault_sim() {
     println!("withdrawals_compose_over_one_vault count=50 blocks={blocks}");
 }
 
-/// Deterministic parallel wave execution on committed blocks: one seed,
+/// Deterministic parallel tick execution on committed blocks: one seed,
 /// serial vs parallel batch scheduling, identical committed state
 /// roots. Receipts are
 /// schedule-invariant by kernel construction; this pins that the
@@ -444,7 +444,7 @@ fn cross_shard_provisions_recovers_after_transient_outage_sim() {
 }
 
 #[test]
-fn inter_shard_partition_strands_waves_until_it_heals_sim() {
+fn inter_shard_partition_strands_ticks_until_it_heals_sim() {
     // A dedicated host per pool validator, so the split seats the two children on
     // disjoint host sets — matching production's one-validator-per-host layout —
     // and a host partition can sever every inter-shard edge without cutting
@@ -454,7 +454,7 @@ fn inter_shard_partition_strands_waves_until_it_heals_sim() {
         11,
         &cross_shard_fault_genesis_accounts(),
     );
-    cluster.run_faultable(inter_shard_partition_strands_waves_until_it_heals);
+    cluster.run_faultable(inter_shard_partition_strands_ticks_until_it_heals);
 }
 
 #[test]

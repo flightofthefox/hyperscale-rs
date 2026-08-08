@@ -69,7 +69,7 @@ impl BlockManifest {
         &self.tx_hashes
     }
 
-    /// Wave identifiers in block order.
+    /// Tick identifiers in block order.
     /// Validators use these to match against what they finalized locally.
     #[must_use]
     pub const fn cert_ids(&self) -> &Vec<TickId> {

@@ -45,7 +45,7 @@ pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
 /// Uses padded merkle tree (power-of-2 padding with `Hash::ZERO`) so that
 /// merkle inclusion proofs have a fixed `ceil(log2(N))` siblings.
 ///
-/// Outcomes must be in wave order (= block order within the wave).
+/// Outcomes must be in tick order (= block order within the tick).
 pub fn compute_global_receipt_root(outcomes: &[TxOutcome]) -> GlobalReceiptRoot {
     let leaves: Vec<Hash> = outcomes.iter().map(tx_outcome_leaf).collect();
     GlobalReceiptRoot::from_raw(compute_merkle_root(&leaves))

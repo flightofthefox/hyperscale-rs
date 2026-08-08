@@ -14,7 +14,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, ActionContext, CrossShardExecutionRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_engine::{ExecutedTx, TickTxInput, WaveBatchContext};
+use hyperscale_engine::{ExecutedTx, TickBatchContext, TickTxInput};
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{ProvisionalTx, ShardStorage, TickOutput, fold_state_writes};
@@ -29,11 +29,11 @@ use hyperscale_types::{
 };
 
 // ============================================================================
-// Wave-based execution voting handlers
+// Tick-based execution voting handlers
 // ============================================================================
 
 /// Split a batch's executed records into the three parallel streams the
-/// wave consumes: outcomes for the vote, execution receipts, and the fee
+/// tick consumes: outcomes for the vote, execution receipts, and the fee
 /// receipts held in reserve against an abort.
 #[must_use]
 pub fn split_execution_outputs(executed: Vec<ExecutedTx>) -> ExecutionOutputs {
@@ -57,28 +57,28 @@ pub fn split_execution_outputs(executed: Vec<ExecutedTx>) -> ExecutionOutputs {
     }
 }
 
-/// The four per-batch products execution hands the wave: the outcomes it
+/// The four per-batch products execution hands the tick: the outcomes it
 /// votes, the receipts it stores, the charges an attempt that applied
 /// nothing still settles, and what this shard attests it did.
 pub struct ExecutionOutputs {
-    /// Per-tx outcomes the wave votes.
+    /// Per-tx outcomes the tick votes.
     pub outcomes: Vec<TxOutcome>,
     /// Per-tx execution receipts.
     pub results: Vec<StoredReceipt>,
-    /// Charges held in reserve against a wave abort.
+    /// Charges held in reserve against a tick abort.
     pub fee_receipts: Vec<StoredReceipt>,
     /// What this shard attests it did per transaction.
     pub attested_work: Vec<(TxHash, u64)>,
 }
 
-/// Fold one wave group's executed records into the tick output.
+/// Fold one tick's executed records into the tick output.
 ///
-/// The single-shard wave's writes are determined at commit: each member
+/// The local-only tick's writes are determined at commit: each member
 /// contributes its execution receipt and its unconditional fee charge,
 /// in canonical (tx-hash) order — the order the batch fold ran in. A
-/// cross-shard wave's records sit beside them as per-tx provisional
-/// entries until the wave resolves: the execution writes on one side,
-/// the reserve fee charge on the other, whichever the wave's verdict
+/// cross-shard tick's records sit beside them as per-tx provisional
+/// entries until the tick resolves: the execution writes on one side,
+/// the reserve fee charge on the other, whichever the tick's verdict
 /// picks.
 ///
 /// Either way the receipt goes in whole. A receipt states absolutes
@@ -275,13 +275,13 @@ where
             // From the same view as the baseline, so a leg's debit and
             // the hold standing for it are never both visible.
             let holds = view.holds();
-            let wave_ctx = WaveBatchContext {
+            let tick_ctx = TickBatchContext {
                 par: ctx.par,
                 local_shard: ctx.shard,
                 shard_trie,
                 block_hash,
-                wave_start_ts: tick_ts,
-                wave_start_reveal: tick_reveal,
+                tick_ts,
+                tick_reveal,
                 holds: &holds,
             };
             let inputs: Vec<TickTxInput<'_>> = requests
@@ -291,12 +291,12 @@ where
                     provisions: &r.provisions,
                     clock: r.clock,
                     randomness: r.randomness,
-                    wave_abortable: r.reaches_beyond,
+                    abortable: r.reaches_beyond,
                 })
                 .collect();
             let executed = ctx
                 .executor
-                .execute_tick_batch(&wave_ctx, &view_snap, &inputs);
+                .execute_tick_batch(&tick_ctx, &view_snap, &inputs);
             record_execution_latency(start.elapsed().as_secs_f64());
 
             let tick_id = TickId::new(ctx.shard, tick);
@@ -353,7 +353,7 @@ where
                 return;
             };
 
-            // Send vote to the wave leader (unicast). When the leader is a
+            // Send vote to the tick leader (unicast). When the leader is a
             // colocated vnode the local-dispatch fast path preserves the
             // `Verifiable::Verified` marker, letting the handler skip
             // re-verification of our own signature.

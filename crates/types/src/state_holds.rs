@@ -1,9 +1,9 @@
-//! Reservations that legs no wave has resolved still hold.
+//! Reservations that legs no tick has resolved still hold.
 //!
 //! A cross-shard leg's reservation is engaged the moment its block
-//! commits and released only when its wave's fate does, and in between it
+//! commits and released only when its tick's fate does, and in between it
 //! is invisible: the settled state a later tick reads still shows the
-//! whole balance, because nothing a wave has not resolved may be read.
+//! whole balance, because nothing a tick has not resolved may be read.
 //! Judging a second withdrawal against that balance is what lets one
 //! vault fund two.
 //!

@@ -3,7 +3,7 @@
 //! A wallet's question before it signs is what a transaction moves and
 //! what it costs. [`Executor::preview`] answers it by running the
 //! envelope through the same derivation, the same kernel, and the same
-//! fee arithmetic a wave would, against a snapshot the caller supplies —
+//! fee arithmetic a tick would, against a snapshot the caller supplies —
 //! and then reporting the receipt's movements and settles rather than
 //! folding them into anything.
 //!
@@ -253,10 +253,10 @@ impl Executor {
             vault: vault_key(vm.fee_payer.0, XRD),
             max_fee: vm.max_fee,
             floor: vm.abort_floor(),
-            // A preview is one envelope against one snapshot: no wave can
+            // A preview is one envelope against one snapshot: no tick can
             // discard effects it completed, so the reserve-receipt shape
             // does not arise.
-            wave_abortable: false,
+            abortable: false,
         };
         if let Some(artifact) = vm.artifact() {
             return preview_publish(snapshot, artifact, payer, inputs.grants);
@@ -287,7 +287,7 @@ impl Executor {
         let base = Arc::new(VmBase {
             cells,
             // A preview judges against committed state alone: it is
-            // not in a tick, so no wave's reservation is in flight
+            // not in a tick, so no tick's reservation is in flight
             // over the baseline it reads.
             holds: ProvisionalHolds::new(),
         });
@@ -367,7 +367,7 @@ fn preview_publish(
 
 /// The kernel's verdict as a preview reports it.
 ///
-/// The reason is the one a wave would record, so a wallet reads the same
+/// The reason is the one a tick would record, so a wallet reads the same
 /// text the chain would.
 fn preview_outcome(outcome: &Outcome) -> PreviewOutcome {
     match outcome {

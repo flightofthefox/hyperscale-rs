@@ -120,8 +120,8 @@ struct WantedProof {
 /// Downstream consumers:
 /// - **Shard consensus**: Uses verified `transaction_root` for deferral merkle proofs
 /// - **Provision**: Uses verified `state_root` for merkle proof verification;
-///   `waves` field to register expected provisions
-/// - **Execution**: Uses `waves` field to register expected execution certs
+///   `ticks` field to register expected provisions
+/// - **Execution**: Uses `ticks` field to register expected execution certs
 pub struct RemoteHeaderCoordinator {
     // ═══════════════════════════════════════════════════════════════════
     // Pending Verification
@@ -690,7 +690,7 @@ impl RemoteHeaderCoordinator {
         // `lookup_for_shard_certified_fenced` admission gate governs
         // validity over the fold-to-completion window. Clearing releases
         // the promotions the fence withheld: everything proven below the
-        // recovery's frontier is canonical history whose waves are still
+        // recovery's frontier is canonical history whose ticks are still
         // decidable, and stranding it would abort them.
         let cleared = self
             .fork_fence

@@ -1,4 +1,4 @@
-//! Per-validator [`ExecutionVote`] over an entire wave's transactions.
+//! Per-validator [`ExecutionVote`] over an entire tick's transactions.
 //!
 //! [`ExecutionVote`] is the raw wire form. Its verified form is
 //! `Verified<ExecutionVote>`; predicate at
@@ -16,7 +16,7 @@ use crate::{
     ValidatorId, Verified, Verify, WeightedTimestamp, compute_global_receipt_root, signed_bytes,
 };
 
-/// A validator's vote on all transactions in an execution wave.
+/// A validator's vote on all transactions in an execution tick.
 ///
 /// One vote covers all transactions sharing the same provision dependency
 /// set, with `global_receipt_root` being a padded merkle root over per-tx
@@ -73,13 +73,13 @@ impl ExecutionVote {
         }
     }
 
-    /// Block this wave belongs to.
+    /// Block this tick belongs to.
     #[must_use]
     pub const fn block_hash(&self) -> BlockHash {
         self.block_hash
     }
 
-    /// Block height (the block containing the wave's transactions).
+    /// Block height (the block containing the tick's transactions).
     #[must_use]
     pub const fn block_height(&self) -> BlockHeight {
         self.block_height
@@ -87,7 +87,7 @@ impl ExecutionVote {
 
     /// BFT-authenticated anchor at which this vote was cast.
     ///
-    /// Validators vote at each block commit where the wave is complete.
+    /// Validators vote at each block commit where the tick is complete.
     /// Including `vote_anchor_ts` in the signed message prevents
     /// cross-height aggregation, ensuring that if an abort intent changes
     /// the `global_receipt_root` between heights, stale votes cannot combine.
@@ -96,7 +96,7 @@ impl ExecutionVote {
         self.vote_anchor_ts
     }
 
-    /// Which wave within the block.
+    /// Which tick within the block.
     #[must_use]
     pub const fn tick_id(&self) -> &TickId {
         &self.tick_id
@@ -114,13 +114,13 @@ impl ExecutionVote {
         self.global_receipt_root
     }
 
-    /// Number of transactions in this wave.
+    /// Number of transactions in this tick.
     #[must_use]
     pub const fn tx_count(&self) -> u32 {
         self.tx_count
     }
 
-    /// Per-tx execution outcomes in wave order.
+    /// Per-tx execution outcomes in tick order.
     ///
     /// Carried alongside the vote so any aggregator can extract `tx_outcomes`
     /// directly from quorum votes when building the EC. Not included in the

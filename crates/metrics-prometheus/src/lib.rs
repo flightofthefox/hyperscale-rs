@@ -1275,8 +1275,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.exec_finalizations as f64);
         self.metrics
             .memory_exec
-            .with_label_values(&["waves"])
-            .set(m.exec_waves as f64);
+            .with_label_values(&["ticks"])
+            .set(m.exec_ticks as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["vote_trackers"])
@@ -1303,20 +1303,20 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.exec_received_provision_shards as f64);
         self.metrics
             .memory_exec
-            .with_label_values(&["waves_with_ec"])
-            .set(m.exec_waves_with_ec as f64);
+            .with_label_values(&["ticks_with_ec"])
+            .set(m.exec_ticks_with_ec as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["pending_vote_retries"])
             .set(m.exec_pending_vote_retries as f64);
         self.metrics
             .memory_exec
-            .with_label_values(&["wave_assignments"])
-            .set(m.exec_wave_assignments as f64);
+            .with_label_values(&["tick_assignments"])
+            .set(m.exec_tick_assignments as f64);
         self.metrics
             .memory_exec
-            .with_label_values(&["early_wave_attestations"])
-            .set(m.exec_early_wave_attestations as f64);
+            .with_label_values(&["early_attestations"])
+            .set(m.exec_early_attestations as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["pending_routing"])

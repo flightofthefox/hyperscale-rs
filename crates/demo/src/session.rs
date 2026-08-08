@@ -114,7 +114,7 @@ const fn decision_label(decision: TransactionDecision) -> &'static str {
 }
 
 /// Precedence when several hosts have decided: the same order the protocol
-/// itself aggregates outcomes in across a wave's certificates, so the demo
+/// itself aggregates outcomes in across a tick's certificates, so the demo
 /// reduces a transaction the way its own participants would.
 const fn decision_precedence(decision: TransactionDecision) -> u8 {
     match decision {
@@ -172,7 +172,7 @@ fn resolve_status(answers: &[TransactionStatus]) -> Option<Reported> {
 /// the source's QC-attested state root. That is what makes an arc drawn from
 /// one of these a claim about proofs rather than about messages.
 ///
-/// Single-shard waves land here too and produce no arcs of their own: they
+/// Single-shard ticks land here too and produce no arcs of their own: they
 /// carry one certificate, from the committing shard itself.
 fn settlement_events(
     events: &mut Vec<TraceEvent>,
@@ -181,9 +181,9 @@ fn settlement_events(
     height: BlockHeight,
     certificates: &SharedCertificates,
 ) {
-    for wave in certificates.iter() {
-        let wave = wave.as_unverified();
-        for certificate in wave.execution_certificates() {
+    for tick in certificates.iter() {
+        let tick = tick.as_unverified();
+        for certificate in tick.execution_certificates() {
             let id = certificate.tick_id();
             events.push(TraceEvent::execution_certified(
                 wt,
@@ -207,7 +207,7 @@ fn settlement_events(
                 ));
             }
         }
-        events.push(TraceEvent::wave_finalized(wt, shard, height, wave));
+        events.push(TraceEvent::tick_finalized(wt, shard, height, tick));
     }
 }
 

@@ -8,7 +8,7 @@
 //! - rehydrating elided responses against local caches
 //! - structurally validating the rehydrated block (off-thread on
 //!   `ConsensusCrypto`): height + QC binding + every Merkle root the
-//!   header commits to, plus per-wave receipt-vs-EC shape
+//!   header commits to, plus per-tick receipt-vs-EC shape
 //! - delivering valid blocks to shard consensus via `ProtocolEvent::BlockSyncReadyToApply`
 //! - feeding scheduling events back to the FSM
 //!
@@ -137,9 +137,9 @@ where
     /// rejected the response.
     ///
     /// Root-mismatch reasons inspect body components that ride inside
-    /// elidable wave/tx/provision blobs. When rehydration filled those
+    /// elidable tick/tx/provision blobs. When rehydration filled those
     /// from a poisoned local cache (e.g. a `Finalization` holding
-    /// locally-divergent receipts under a canonical wave id), every
+    /// locally-divergent receipts under a canonical tick id), every
     /// rehydrated retry would reject the same bytes. Mark the height for
     /// force-full so the next attempt asks for a non-elided body and
     /// bypasses the cache, then re-queue immediately like the rehydration
@@ -267,7 +267,7 @@ where
             },
             |id| caches.finalization_store.get(id),
             // `provision_store` holds raw bodies; lift into the unverified
-            // transport shape — the wave-cert linkage gates trust on the
+            // transport shape — the tick-cert linkage gates trust on the
             // rehydrated block.
             |h| {
                 caches
@@ -321,7 +321,7 @@ where
 
 /// True for [`validate_synced_block`] failure reasons whose bytes can
 /// originate in local rehydration caches (transaction store, finalized
-/// wave store, provision store). A repeat from the same cache would
+/// tick store, provision store). A repeat from the same cache would
 /// reject identically; force-full bypasses elision on the next attempt.
 /// Header / QC identity mismatches (`height_mismatch`, `qc_hash_mismatch`,
 /// `qc_height_mismatch`) inspect non-elidable fields and are excluded.
@@ -378,10 +378,10 @@ fn validate_synced_block(
             return Err("certificate_root_mismatch");
         }
 
-        // Per-wave shape: receipts must match each wave's EC tx_outcomes
+        // Per-tick shape: receipts must match each tick's EC tx_outcomes
         // (one receipt per non-aborted outcome, canonical order, matching
         // success/failure). `local_receipt_root` below catches content
-        // mismatches but doesn't enforce per-wave grouping.
+        // mismatches but doesn't enforce per-tick grouping.
         for fw in certified.block().certificates().iter() {
             if fw.validate_receipts_against_ec().is_err() {
                 return Err("receipts_vs_ec_mismatch");
@@ -487,11 +487,11 @@ mod tests {
         )
     }
 
-    /// Build a single-tx, single-wave wave with consistent EC + receipt.
-    /// Returns the wave plus the populated `local_receipt_root` and
+    /// Build a single-tx, single-tick tick with consistent EC + receipt.
+    /// Returns the tick plus the populated `local_receipt_root` and
     /// `certificate_root` so the caller can construct a self-consistent
     /// header.
-    fn make_wave(
+    fn make_tick(
         success: bool,
     ) -> (
         Arc<Verifiable<Finalization>>,
@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_certificate_root_mismatch() {
-        let (fw, lrr, _cr) = make_wave(true);
+        let (fw, lrr, _cr) = make_tick(true);
         let h = header_with_roots(
             &header(),
             None,
@@ -686,7 +686,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_receipts_inconsistent_with_ec() {
-        // Wave whose EC attests Success but whose receipt reports Failure.
+        // Tick whose EC attests Success but whose receipt reports Failure.
         // `validate_receipts_against_ec` catches this even when both
         // certificate_root and local_receipt_root are computed off the
         // (corrupted) body and would tautologically match.
@@ -736,11 +736,11 @@ mod tests {
 
     #[test]
     fn validate_rejects_local_receipt_root_mismatch() {
-        // Self-consistent wave (EC matches receipts), but the header's
+        // Self-consistent tick (EC matches receipts), but the header's
         // `local_receipt_root` is wrong. Catches a peer that ships a
         // receipt body with `database_updates` content that doesn't
         // hash to the QC'd root.
-        let (fw, _lrr, cr) = make_wave(true);
+        let (fw, _lrr, cr) = make_tick(true);
         let h = header_with_roots(
             &header(),
             None,
@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn validate_passes_for_canonical_certificate_block() {
-        let (fw, lrr, cr) = make_wave(true);
+        let (fw, lrr, cr) = make_tick(true);
         let h = header_with_roots(&header(), None, Some(cr), Some(lrr));
         let block = Block::Live {
             header: h,

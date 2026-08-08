@@ -69,7 +69,7 @@ impl SimCluster {
     }
 
     /// Build a genesis cluster with funded accounts, batch-scheduling
-    /// waves serially.
+    /// ticks serially.
     #[must_use]
     pub fn with_accounts(
         config: &ScenarioConfig,

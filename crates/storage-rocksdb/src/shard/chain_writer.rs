@@ -32,7 +32,7 @@ impl ShardChainWriter for RocksDbShardStorage {
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
-        // Everything the waves carried, for storage; only what they
+        // Everything the ticks carried, for storage; only what they
         // decided reaches state.
         let receipts: Vec<&StoredReceipt> = finalizations
             .iter()

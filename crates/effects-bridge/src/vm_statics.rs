@@ -695,7 +695,7 @@ mod tests {
     /// The fixed term is the part that matters. Without it a minimal
     /// zero-gas transaction would price at almost nothing, and a budget
     /// over work would bound weight while the transaction count — which
-    /// is what wave entries, tick-chain entries and receipts scale with
+    /// is what tick entries, tick-chain entries and receipts scale with
     /// — ran free.
     #[test]
     fn work_prices_the_fixed_cost_of_carrying_a_transaction() {

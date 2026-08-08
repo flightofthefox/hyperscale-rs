@@ -5,7 +5,7 @@
 //! retaining control-flow decisions (voting, block rejection).
 //!
 //! Pure pre-vote validation helpers (header structure, timestamp bounds,
-//! transaction ordering, `waves` recomputation, cross-ancestor tx uniqueness)
+//! transaction ordering, `ticks` recomputation, cross-ancestor tx uniqueness)
 //! live in [`crate::validation`].
 
 use std::collections::{HashMap, HashSet};
@@ -1060,7 +1060,7 @@ impl VerificationPipeline {
         // Across a recovery bridge, a sync-admitted parent is QC-attested
         // but never locally verified, and its tree materializes only at
         // commit — which needs the successor QC this very verification
-        // gates. A bridge block is wave-less, so its replay applies no
+        // gates. A bridge block is tick-less, so its replay applies no
         // updates and the attested parent root alone decides it; the
         // parent's inline commit lands first in height order, so the
         // prepared successor never applies over a missing tree version.

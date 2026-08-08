@@ -38,9 +38,9 @@ fn fresh_coordinator_reports_no_finalized_state() {
 fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
     let coord = fresh_coordinator();
     let ExecutionMemoryStats {
-        wave_execution_receipts,
+        tick_execution_receipts,
         finalizations,
-        waves,
+        ticks,
         unresolved_txs,
         vote_trackers,
         early_votes,
@@ -48,10 +48,10 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
         verified_provisions,
         required_provision_shards,
         received_provision_shards,
-        waves_with_ec,
+        ticks_with_ec,
         pending_vote_retries,
-        wave_assignments,
-        early_wave_attestations,
+        tick_assignments,
+        early_attestations,
         pending_routing,
         fulfilled_exec_certs,
         outbound_certs,
@@ -59,20 +59,20 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
         unproven_ecs,
     } = coord.memory_stats();
 
-    assert_eq!(wave_execution_receipts, 0);
+    assert_eq!(tick_execution_receipts, 0);
     assert_eq!(finalizations, 0);
     assert_eq!(unresolved_txs, 0);
-    assert_eq!(waves, 0);
+    assert_eq!(ticks, 0);
     assert_eq!(vote_trackers, 0);
     assert_eq!(early_votes, 0);
     assert_eq!(expected_exec_certs, 0);
     assert_eq!(verified_provisions, 0);
     assert_eq!(required_provision_shards, 0);
     assert_eq!(received_provision_shards, 0);
-    assert_eq!(waves_with_ec, 0);
+    assert_eq!(ticks_with_ec, 0);
     assert_eq!(pending_vote_retries, 0);
-    assert_eq!(wave_assignments, 0);
-    assert_eq!(early_wave_attestations, 0);
+    assert_eq!(tick_assignments, 0);
+    assert_eq!(early_attestations, 0);
     assert_eq!(pending_routing, 0);
     assert_eq!(fulfilled_exec_certs, 0);
     assert_eq!(outbound_certs, 0);
@@ -132,11 +132,11 @@ fn certificate_tracking_debug_reports_no_assignment_for_unknown_tx() {
     let coord = fresh_coordinator();
     let debug = coord.certificate_tracking_debug(TxHash::from(Hash::from_bytes(b"tx1")));
     assert!(
-        debug.contains("no wave assignment"),
+        debug.contains("no tick assignment"),
         "unexpected debug output: {debug}"
     );
     assert!(
-        debug.contains("early_wave_attestations=0"),
+        debug.contains("early_attestations=0"),
         "unexpected debug output: {debug}"
     );
 }
@@ -167,10 +167,10 @@ fn on_verified_remote_header_registers_an_expectation_per_named_transaction() {
 
 /// A header names every cross-shard transaction in its block, including
 /// ones bound for other shards — it has no way to say which are ours. Those
-/// register, but our own wave set gates the fetch, so nothing is requested
-/// for a transaction we hold no wave for.
+/// register, but our own tick set gates the fetch, so nothing is requested
+/// for a transaction we hold no tick for.
 #[test]
-fn a_transaction_no_local_wave_holds_is_never_fetched() {
+fn a_transaction_no_local_tick_holds_is_never_fetched() {
     let (mut coord, _topology) = fresh_coordinator_with_topology();
     coord.on_verified_remote_header(
         ShardId::leaf(8, 99),

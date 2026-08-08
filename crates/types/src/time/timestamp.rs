@@ -66,7 +66,7 @@ impl WeightedTimestamp {
     /// Duration elapsed between two weighted timestamps, saturating at zero.
     ///
     /// Reads as "how long after `earlier` was `self` produced". Used for
-    /// deadline checks like `committed.elapsed_since(wave_start) >= WAVE_TIMEOUT`.
+    /// deadline checks like `committed.elapsed_since(tick_start) >= MAX_FINALIZATION_DELAY`.
     #[must_use]
     pub const fn elapsed_since(self, earlier: Self) -> Duration {
         Duration::from_millis(self.0.saturating_sub(earlier.0))

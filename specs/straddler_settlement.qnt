@@ -6,22 +6,22 @@
 // One cross-shard transaction straddles the boundary, in flight during P's
 // reshape: P has an admitted terminating reshape throughout (the model's
 // premise — this is the window the fence governs). The fence decides Q's
-// side from frozen chain content: P settled the wave on-chain at or before
-// its terminal block, or the wave finalizes nowhere.
+// side from frozen chain content: P settled the transaction on-chain at or before
+// its terminal block, or the transaction finalizes nowhere.
 //
 // The fence engages from the moment P is *scheduled* to terminate — an
 // admitted reshape — not only once P is past-terminal. A survivor that
 // finalized on EC-completeness in the pre-boundary window could apply a
-// wave P never settles: P produces its own EC yet, under an asymmetric
+// transaction P never settles: P produces its own EC yet, under an asymmetric
 // partition, never receives Q's before its terminal block. So while P is
 // scheduled-but-live the fence defers — on evidence only, never a clock
 // deadline; once P terminates it resolves against S_P (present -> pass,
 // absent -> abort). The three twins each break one load-bearing piece:
 // `straddler_preboundary` fences only past-terminal (the survivor commits
 // one-sided in the scheduled window), `straddler_unfenced` fences nothing
-// (a late-materialized EC — H2 — completes an unsettled wave after
+// (a late-materialized EC — H2 — completes an unsettled transaction after
 // termination), and `straddler_windowed` shrinks S_P to a fixed span
-// behind the terminal (the sweep aborts a wave P settled early in the
+// behind the terminal (the deadline abandons a transaction P settled early in the
 // scheduled window — verdict divergence with no partition).
 //
 // Code anchors:
@@ -33,24 +33,24 @@
 //     scheduled-terminal test is `TopologySchedule::termination_scheduled`
 //     (active and lookahead `split_pending`/`merge_pending`, plus the
 //     coast via `terminates_at_next_boundary`). Enforced at vote and at
-//     local finalization. A deferred wave holds until evidence resolves
+//     local finalization. A deferred transaction holds until evidence resolves
 //     it (`emit_or_gate_finalized` / `redrive_gated_finalizations`,
 //     crates/execution/src/coordinator.rs) — no clock evicts the hold.
-//   - The window: the terminal's `settled_waves_root` commits P's
-//     settlements over `[admission − wave lifetime, terminal]` —
+//   - The window: the terminal's `settled_txs_root` commits P's
+//     settlements over `[admission − finalization delay, terminal]` —
 //     `TopologySchedule::settled_window_floor` supplies the floor,
-//     `PendingChain::settled_waves_in_window`
+//     `PendingChain::settled_txs_in_window`
 //     (crates/storage/src/shard/pending_chain.rs) walks it. SP_HORIZON
 //     parameterizes this coverage here.
 //   - Acquisition: one-shot verified fetch against the beacon-attested
-//     `settled_waves_root` read from the node's own fold
+//     `settled_txs_root` read from the node's own fold
 //     (crates/node/src/shard/cross_shard/settled_set.rs) — INV-RESHAPE-6
 //     is taken as an oracle: acquisition delivers exactly S_P.
-//   - Counterpart sweep: `record_settled_waves` +
+//   - Abandonment at the deadline: `record_settled_txs` +
 //     `take_ready_counterpart_aborts`
 //     (crates/execution/src/coordinator.rs) — once the partner's settled
 //     coverage naming us is fully ingested (or the horizon passes), any
-//     wave still lacking the partner's coverage is doomed: locks release,
+//     transaction still lacking the partner's coverage is doomed: locks release,
 //     transactions abort.
 //   - Parent-side termination: writes apply only at finalization, so a
 //     transaction unfinalized at P's terminal block never enters the
@@ -68,11 +68,11 @@
 //     modeled parameter: `SP_HORIZON < 0` is the shipped window, floored
 //     at the reshape's admission, which covers every settlement the
 //     fence can hold a straddler against — S_P is then exact over fenced
-//     waves. A window that misses a settlement makes absence stop
-//     implying "unsettled", and the sweep turns the gap into a verdict
+//     transactions. A window that misses a settlement makes absence stop
+//     implying "unsettled", and abandonment turns the gap into a verdict
 //     divergence — widening the absent case is the unsafe direction
 //     (`straddler_windowed`).
-//   - Single transaction, wave = transaction, as in Model C.
+//   - Single transaction, transaction = transaction, as in Model C.
 //
 // Run:
 //   quint typecheck specs/straddler_settlement.qnt
@@ -81,16 +81,16 @@
 //   quint verify --main=straddler_preboundary --invariant=invAtomic --max-steps=10 specs/straddler_settlement.qnt
 //     (past-terminal-only fence: the pre-boundary one-sided commit)
 //   quint test   --main=straddler_unfenced    --match=h2Attack specs/straddler_settlement.qnt
-//     (scripted H2: a late EC completes an unsettled wave after termination)
+//     (scripted H2: a late EC completes an unsettled transaction after termination)
 //   quint test   --main=straddler_windowed    --match=spWindowMiss specs/straddler_settlement.qnt
-//     (scripted window miss: the sweep aborts a wave P settled early)
+//     (scripted window miss: the deadline abandons a transaction P settled early)
 
 module straddler_settlement {
-  // Wave timeout in clock units.
+  // Finalization delay in clock units.
   const TIMEOUT: int
   // Max clock advance per step.
   const MAX_TICK: int
-  // Fence a wave naming P once P is past-terminal (require S_P).
+  // Fence a transaction naming P once P is past-terminal (require S_P).
   const FENCE_PAST_TERMINAL: bool
   // Additionally defer while P is scheduled-but-not-yet-terminal — the
   // pre-boundary layer the shipped fence adds.
@@ -98,9 +98,9 @@ module straddler_settlement {
   // The span behind P's terminal that the S_P reconstruction covers, in
   // P's clock units. Negative models the shipped window, floored at the
   // reshape's admission: the fence holds straddlers from admission and a
-  // wave's settlement cannot precede the hold by more than a wave
+  // transaction's settlement cannot precede the hold by more than a transaction
   // lifetime, so the admission-floored window covers every settlement Q
-  // can still be holding against — S_P is exact over fenced waves.
+  // can still be holding against — S_P is exact over fenced transactions.
   // Non-negative models a fixed terminal-relative span, which misses
   // settlements once P's coast outlives it.
   const SP_HORIZON: int
@@ -129,12 +129,12 @@ module straddler_settlement {
   var terminal: int -> int
   // P has reached its terminal block.
   var pTerminal: bool
-  // Frozen at termination: did the wave settle (finalize on P's chain at
+  // Frozen at termination: did the transaction settle (finalize on P's chain at
   // or before the terminal block)? Meaningful only once pTerminal.
   var settledOnP: bool
   // Q has acquired S_P (root-verified against its own beacon fold).
   var qHasSP: bool
-  // P's clock when its chain finalized the wave (either verdict) — the
+  // P's clock when its chain finalized the transaction (either verdict) — the
   // settlement instant the reconstruction horizon measures from.
   var pSettledAt: int
   // P's clock at its terminal block. Meaningful only once pTerminal.
@@ -244,7 +244,7 @@ module straddler_settlement {
     deliverEcTo(dst, o)
   }
 
-  // Whether S_P resolves the wave as settled for Q: P finalized it at or
+  // Whether S_P resolves the transaction as settled for Q: P finalized it at or
   // before its terminal block AND the settlement lies within the
   // reconstruction horizon. Under the shipped admission-floored window
   // (`SP_HORIZON < 0`) this equals `settledOnP`; a terminal-relative span
@@ -259,7 +259,7 @@ module straddler_settlement {
   // The survivor's finalization fence. Q may finalize iff P's termination
   // does not forbid it: while P is scheduled-but-live, `FENCE_SCHEDULED`
   // defers — on evidence only, never a clock deadline; once P is
-  // past-terminal, `FENCE_PAST_TERMINAL` requires S_P to resolve the wave
+  // past-terminal, `FENCE_PAST_TERMINAL` requires S_P to resolve the transaction
   // (acquired and in the reconstructed set). P itself finalizes only
   // while its chain lives.
   def fenceAdmits(s: int): bool =
@@ -323,10 +323,10 @@ module straddler_settlement {
     pSettledAt' = pSettledAt, pTerminalAt' = pTerminalAt,
   }
 
-  // The counterpart sweep: with S_P acquired and the wave not in it, no
+  // The abandonment at the deadline: with S_P acquired and the transaction not in it, no
   // admissible P coverage can ever exist (any late EC is fence-rejected),
-  // so the wave is doomed — locks release, the transaction aborts. Sound
-  // exactly when absence from S_P implies P never settled the wave — the
+  // so the transaction is doomed — locks release, the transaction aborts. Sound
+  // exactly when absence from S_P implies P never settled the transaction — the
   // coverage premise the windowed twin breaks.
   action sweepQ = all {
     FENCE_PAST_TERMINAL,
@@ -355,7 +355,7 @@ module straddler_settlement {
     terminal.get(x) == terminal.get(y)))
 
   // INV-RESHAPE-5 stated directly: the survivor finalizes success for a
-  // wave naming past-terminal P only if P settled it.
+  // transaction naming past-terminal P only if P settled it.
   val invFence = not(pTerminal and terminal.get(Q) == SUCC and not(settledOnP))
 
   val invAll = invAtomic and invFence
@@ -396,10 +396,10 @@ module straddler_settlement {
     pSettledAt' = pSettledAt, pTerminalAt' = pTerminalAt,
   }
 
-  // The windowed-S_P miss, scripted: P settles the wave early in its
+  // The windowed-S_P miss, scripted: P settles the transaction early in its
   // scheduled window, coasts past the reconstruction horizon, and
   // terminates; Q — correctly fenced the whole time — acquires an S_P
-  // that no longer reaches the settlement, and the sweep aborts a wave
+  // that no longer reaches the settlement, and the deadline abandons a transaction
   // P settled. The verdicts diverge with no partition and no Byzantine
   // behavior: the exact shape the production-epoch straddler sims caught.
   run spWindowMiss =
@@ -457,7 +457,7 @@ module straddler_preboundary {
   ).*
 }
 
-// Twin — unfenced: a late-materialized EC completes an unsettled wave on
+// Twin — unfenced: a late-materialized EC completes an unsettled transaction on
 // the survivor after termination (H2). One-sided commit.
 module straddler_unfenced {
   import straddler_settlement(
@@ -468,8 +468,8 @@ module straddler_unfenced {
 
 // Twin — terminal-relative S_P window: the reconstruction spans a fixed
 // horizon behind P's terminal instead of reaching the reshape's admission,
-// so a wave P settled early in the scheduled window vanishes from S_P once
-// the coast outlives the horizon. The sweep then aborts a wave P settled —
+// so a transaction P settled early in the scheduled window vanishes from S_P once
+// the coast outlives the horizon. The sweep then aborts a transaction P settled —
 // the regression the admission-floored window closes.
 module straddler_windowed {
   import straddler_settlement(

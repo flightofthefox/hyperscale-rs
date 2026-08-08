@@ -3,7 +3,7 @@
 //! Owns the per-shard state and code for everything a shard does *across*
 //! shard boundaries: tracking other shards' certified headers, fetching and
 //! serving cross-shard data (provisions, execution certificates, finalized
-//! waves), and reconstructing the settled-transaction fence at a split boundary.
+//! ticks), and reconstructing the settled-transaction fence at a split boundary.
 //!
 //! [`CrossShardState`] is the per-shard state struct `ShardIo` composes;
 //! subsystem-specific FSM instances, bindings, serves, and glue live here
@@ -55,7 +55,7 @@ pub struct CrossShardState {
     /// Local-provision fetch (pinned to proposer).
     pub local_provision: LocalProvisionFetch,
 
-    /// Settled-waves acquisition drivers — one per past-terminal remote
+    /// Settled-ticks acquisition drivers — one per past-terminal remote
     /// shard whose `S_P` this node is acquiring for the split-boundary fence.
     pub settled_set_sync: SettledTxsAcquisition,
 }

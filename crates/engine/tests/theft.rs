@@ -18,7 +18,7 @@ use std::sync::Arc;
 use hyperscale_effects_bridge::{account_address, encode_tree};
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_engine::{
-    ExecutedTx, ExecutionMode, Executor, Parallelism, WaveBatchContext, XRD, genesis_writes,
+    ExecutedTx, ExecutionMode, Executor, Parallelism, TickBatchContext, XRD, genesis_writes,
 };
 use hyperscale_storage::SubstateDatabase;
 use hyperscale_types::{
@@ -131,17 +131,17 @@ fn signed_transfer(from: [u8; 16], to: [u8; 16], amount: u128) -> Transaction {
 fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
     let store = MapDb::genesis(&world_accounts());
     let trie = ShardTrie::single();
-    let ctx = WaveBatchContext {
+    let ctx = TickBatchContext {
         par: Parallelism::Sequential,
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
-        wave_start_ts: WeightedTimestamp::from_millis(1_000),
-        wave_start_reveal: RevealChain::ZERO,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        tick_reveal: RevealChain::ZERO,
         holds: &ProvisionalHolds::new(),
     };
     let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
-    executor.execute_wave_batch(&ctx, &store, std::slice::from_ref(&verified))
+    executor.execute_batch(&ctx, &store, std::slice::from_ref(&verified))
 }
 
 /// A receipt's writes as they settle onto `accounts`.

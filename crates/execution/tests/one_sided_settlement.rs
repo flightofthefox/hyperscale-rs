@@ -44,19 +44,19 @@ fn settled_local_effect(refused: bool) -> (u64, u128, u128) {
     sim.engage(ShardId::leaf(1, 1), &[hash]);
     sim.drain();
 
-    let wave = sim.wave_of(hash).expect("the crossing joined a tick");
-    let receipts = sim.receipts_for(&wave);
+    let tick = sim.tick_of(hash).expect("the crossing joined a tick");
+    let receipts = sim.receipts_for(&tick);
     assert!(!receipts.is_empty(), "the local half executed");
 
     let finalized = if refused {
         settle_refused_by_counterpart(
-            &wave,
+            &tick,
             ShardId::leaf(1, 1),
             &receipts,
-            &sim.charges_for(&wave),
+            &sim.charges_for(&tick),
         )
     } else {
-        settle(&wave, &receipts)
+        settle(&tick, &receipts)
     };
     sim.commit(Vec::new(), vec![finalized]);
     sim.drain();

@@ -331,11 +331,11 @@ pub struct ShardBoundary {
     /// records its terminal, so there is nothing to wait for.
     pub terminal_delivered: bool,
     /// The terminal header's `settled_txs_root` — the beacon-attested
-    /// commitment over the wave-ids this shard settled in its retention
+    /// commitment over the tick-ids this shard settled in its retention
     /// window up to its terminal block. `Some` only on a terminated
     /// shard's boundary record; a surviving counterpart projects it onto
     /// [`ShardAnchor`](crate::ShardAnchor) and resolves split-straddling
-    /// waves against it. `None` for a live shard.
+    /// ticks against it. `None` for a live shard.
     pub settled_txs_root: Option<SettledTxsRoot>,
     /// Epoch the reshape that terminates this shard was admitted (split)
     /// or paired (merge), stamped at the reshape's execution alongside
@@ -1551,8 +1551,8 @@ impl BeaconState {
     /// Each terminating leaf's settled-transaction window floor as state stands
     /// right now: the start of the epoch its reshape was admitted (split)
     /// or paired (merge), backed off by [`RETENTION_HORIZON`] to cover a
-    /// wave that finalized against the fence just after it armed but
-    /// executed up to a full wave lifetime earlier. Sourced from
+    /// tick that finalized against the fence just after it armed but
+    /// executed up to a full tick lifetime earlier. Sourced from
     /// `pending_reshapes` while the record lives and from the boundary
     /// stamp once the reshape executes (the coast). The value the next
     /// promotion freezes into [`Self::settled_window_floors`], and what

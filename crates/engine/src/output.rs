@@ -24,7 +24,7 @@ pub struct ExecutedTx {
     pub metadata: ExecutionMetadata,
     /// A receipt carrying the payer's fee debit and nothing else: the
     /// class charge of a failed or infeasible attempt, or the floor a
-    /// cross-shard leg holds in reserve against a wave abort. Built
+    /// cross-shard leg holds in reserve against a tick abort. Built
     /// beside the execution receipt because a transaction whose effects
     /// are discarded still owes its charge, and state moves only through
     /// receipts. Present only where this shard is the fee payer of an

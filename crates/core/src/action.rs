@@ -37,7 +37,7 @@ pub struct CrossShardExecutionRequest {
     pub provisions: Vec<Arc<Vec<SubstateEntry>>>,
     /// The transaction clock: the payer-shard committing block's
     /// parent-QC weighted timestamp. On the payer's own shard this is
-    /// the wave-start anchor; elsewhere it is the value the payer's
+    /// the tick anchor; elsewhere it is the value the payer's
     /// bundle carried, so every participant executes the transaction
     /// under one clock.
     pub clock: WeightedTimestamp,
@@ -267,32 +267,32 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: Execution Layer (domain-specific, batchable by runner)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Sign and send an execution vote to the wave leader for aggregation.
+    /// Sign and send an execution vote to the tick leader for aggregation.
     ///
-    /// Emitted by the state machine when a wave completes (all txs executed).
+    /// Emitted by the state machine when a tick completes (all txs executed).
     /// The `io_loop` signs the vote (it owns the signing key) and sends it to
-    /// the wave leader (unicast). The leader aggregates 2f+1 votes into an EC.
+    /// the tick leader (unicast). The leader aggregates 2f+1 votes into an EC.
     SignAndSendExecutionVote {
-        /// Block whose wave is being voted on.
+        /// Block whose tick is being voted on.
         block_hash: BlockHash,
         /// Block height (for correlation).
         block_height: BlockHeight,
         /// Consensus timestamp at which this vote is being cast.
         vote_anchor_ts: WeightedTimestamp,
-        /// Wave identifier whose execution is being attested to.
+        /// Tick identifier whose execution is being attested to.
         tick_id: TickId,
-        /// Global receipt root over the wave's per-tx outcomes.
+        /// Global receipt root over the tick's per-tx outcomes.
         global_receipt_root: GlobalReceiptRoot,
-        /// Per-tx outcomes in wave order. Carried on the vote so the
+        /// Per-tx outcomes in tick order. Carried on the vote so the
         /// leader can extract them directly when building the EC.
         tx_outcomes: Vec<TxOutcome>,
-        /// The wave leader who collects and aggregates votes for this wave.
+        /// The tick leader who collects and aggregates votes for this tick.
         leader: ValidatorId,
     },
 
     /// Broadcast an execution certificate to local peers or remote shards.
     ///
-    /// The wave leader broadcasts to both local committee peers (who need the
+    /// The tick leader broadcasts to both local committee peers (who need the
     /// EC since they don't aggregate) and remote participating shard committees.
     BroadcastExecutionCertificate {
         /// Target shard receiving the EC.
@@ -475,7 +475,7 @@ pub enum Action {
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::ExecutionCertificateAggregated` when complete.
     AggregateExecutionCertificate {
-        /// Wave identifier. The producing shard is `tick_id.shard_id`.
+        /// Tick identifier. The producing shard is `tick_id.shard_id`.
         tick_id: TickId,
         /// Global receipt root (merkle root over per-tx outcome leaves).
         global_receipt_root: GlobalReceiptRoot,
@@ -491,7 +491,7 @@ pub enum Action {
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::ExecutionVotesVerifiedAndAggregated` when complete.
     VerifyAndAggregateExecutionVotes {
-        /// Wave identifier.
+        /// Tick identifier.
         tick_id: TickId,
         /// Block hash for correlation.
         block_hash: BlockHash,
@@ -959,14 +959,14 @@ pub enum Action {
         /// The block's **anchored** committee snapshot, resolved by the
         /// coordinator as `at_for_shard(local_shard, parent_qc.wt)` — the
         /// same one the verifier recomputes against. Classification
-        /// (`waves`, `provision_tx_roots`) keys on this, not the `ArcSwap`
+        /// (`ticks`, `provision_tx_roots`) keys on this, not the `ArcSwap`
         /// head, so a head-flipped proposer at a reshape boundary produces
         /// a header that resolves identically on every replica.
         classification_topology_snapshot: Arc<TopologySnapshot>,
     },
 
     /// Execute one tick's whole batch: the committing block's
-    /// single-shard wave beside every cross-shard wave whose provisions
+    /// local-only tick beside every cross-shard tick whose provisions
     /// completed at that commit, as one executor batch.
     ///
     /// Delegated to the engine thread pool in production, instant in
@@ -984,18 +984,18 @@ pub enum Action {
         tick_ts: WeightedTimestamp,
         /// The committing block's reveal chain.
         tick_reveal: RevealChain,
-        /// Wave-attributed members of the batch. Results fan back to each
-        /// wave by `tick_id`.
+        /// Tick-attributed members of the batch. Results fan back to each
+        /// tick by `tick_id`.
         /// The members, each with its provisions and environment.
         requests: Vec<CrossShardExecutionRequest>,
     },
 
-    /// Resolve wave fates on the tick chain: promote a settled transaction's
+    /// Resolve tick fates on the tick chain: promote a settled transaction's
     /// provisional entries into the readable fold, or drop an aborted
-    /// wave's. Applied synchronously on the shard thread so a dispatch
+    /// tick's. Applied synchronously on the shard thread so a dispatch
     /// action emitted later in the same commit reads the resolved chain.
-    ResolveTickWaves {
-        /// Wave fates that became known at this commit, in emission order.
+    ResolveTicks {
+        /// Tick fates that became known at this commit, in emission order.
         resolutions: Vec<(TickId, TickResolution)>,
     },
 
@@ -1638,7 +1638,7 @@ impl Action {
             | Self::VerifySpcNewCommit { .. }
             | Self::VerifySpcEmptyView { .. } => Some(DispatchPool::Consensus),
 
-            // Throughput-bound: provision/cert/wave verification,
+            // Throughput-bound: provision/cert/tick verification,
             // execution-vote crypto, and engine execution.
             Self::AggregateExecutionCertificate { .. }
             | Self::VerifyAndAggregateExecutionVotes { .. }
@@ -1715,7 +1715,7 @@ impl Action {
             | Self::VerifyReservations { .. }
             | Self::BuildProposal { .. }
             | Self::ExecuteTransactions { .. }
-            | Self::ResolveTickWaves { .. }
+            | Self::ResolveTicks { .. }
             | Self::ClearTickChain
             | Self::CommitBlock { .. }
             | Self::CommitBlockByQcOnly { .. }
@@ -1851,7 +1851,7 @@ pub enum ActionOwner {
     /// Shard consensus actions: QC build / verify, proposal, header
     /// and vote sign-and-broadcast.
     Shard,
-    /// Execution-coordinator actions: wave / EC aggregation,
+    /// Execution-coordinator actions: tick / EC aggregation,
     /// transaction execution, exec vote / cert sign-and-broadcast.
     Execution,
     /// Provision-coordinator actions: state-provision verification,

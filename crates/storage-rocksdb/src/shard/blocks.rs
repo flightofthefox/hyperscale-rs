@@ -244,7 +244,7 @@ impl RocksDbShardStorage {
 
         // 4. Reconstruct each Finalization from cert + stored receipts.
         //
-        // The reconstructed waves arrive at the Block as
+        // The reconstructed ticks arrive at the Block as
         // [`Verifiable::Unverified`]: the on-disk shape didn't carry the
         // marker, so the upstream verification claim isn't available here.
         // Downstream readers run the predicate when needed.
@@ -385,10 +385,10 @@ impl RocksDbShardStorage {
         }
 
         // 4. Reconstruct each Finalization from cert + stored receipts. If any
-        // wave has a non-aborted tx whose receipt is missing, the block is not
+        // tick has a non-aborted tx whose receipt is missing, the block is not
         // servable and the syncing peer must try a different source.
         //
-        // Reconstructed waves arrive at the Block as
+        // Reconstructed ticks arrive at the Block as
         // [`Verifiable::Unverified`] — see the sibling reader above for
         // rationale.
         let certificates: Option<Vec<Arc<Verifiable<Finalization>>>> = certs
@@ -547,12 +547,12 @@ impl RocksDbShardStorage {
     // Certificate storage
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Store a wave's attestation.
+    /// Store a tick's attestation.
     pub fn put_certificate(&self, id: &TickId, cert: &Finalization) {
         self.cf_put_sync::<CertificatesCf>(id, cert);
     }
 
-    /// Get a wave's attestation by `TickId`.
+    /// Get a tick's attestation by `TickId`.
     pub fn get_certificate(&self, id: &TickId) -> Option<Finalization> {
         self.cf_get::<CertificatesCf>(id)
     }

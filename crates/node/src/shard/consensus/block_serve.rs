@@ -70,7 +70,7 @@ pub fn serve_block_request<S: ShardStorage>(
 
     if !inside_dedup_horizon {
         // Past the execution window — provisions are no longer load-bearing
-        // for dedup or for executor wave state, so serve whatever shape we
+        // for dedup or for executor tick state, so serve whatever shape we
         // already have. The receiver will commit `Sealed` and skip
         // execution; that's the correct outcome at this point.
         return GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory));
@@ -80,7 +80,7 @@ pub fn serve_block_request<S: ShardStorage>(
     // cache round-trip needed. Persisted blocks come back Sealed and need
     // the upgrade even when the block consumed no provisions — the
     // variant tag itself is load-bearing on the requester so its commit
-    // path runs the execution wave through `on_live_block_committed`.
+    // path runs the execution tick through `on_live_block_committed`.
     if block.is_live() {
         return GetBlockResponse::found(ElidedCertifiedBlock::elide(&block, qc, &req.inventory));
     }

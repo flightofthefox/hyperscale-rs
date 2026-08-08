@@ -194,7 +194,7 @@
 <section id="deposit">
   <span class="kicker">03 · Deposit at publication</span>
   <h2>Every certificate is a deposit receipt</h2>
-  <p>The masterstroke is hidden inside consensus itself. A validator votes for a block only while holding <strong>the complete block</strong> — the header and every transaction, wave, and provision body it references. Not a summary, not a hash list: every byte. Which means a quorum certificate does double duty (<a href="overlap.html">the overlap</a> covers its first job): the moment 2f+1 signatures assemble, it is <em>proven</em> that 2f+1 machines each hold a full copy of everything the block carries — recoverable from any one of them.</p>
+  <p>The masterstroke is hidden inside consensus itself. A validator votes for a block only while holding <strong>the complete block</strong> — the header and every transaction, certificate, and provision body it references. Not a summary, not a hash list: every byte. Which means a quorum certificate does double duty (<a href="overlap.html">the overlap</a> covers its first job): the moment 2f+1 signatures assemble, it is <em>proven</em> that 2f+1 machines each hold a full copy of everything the block carries — recoverable from any one of them.</p>
 
   <figure class="panel">
     <svg viewBox="0 0 820 280" role="img" aria-label="A block's full contents held by each voter, whose votes aggregate into a certificate that doubles as a deposit receipt.">
@@ -204,7 +204,7 @@
       <g font-size="11.5" fill="#9fa9c0" class="mono">
         <text x="130" y="124" text-anchor="middle">header</text>
         <text x="130" y="144" text-anchor="middle">every transaction</text>
-        <text x="130" y="164" text-anchor="middle">every wave</text>
+        <text x="130" y="164" text-anchor="middle">every certificate</text>
         <text x="130" y="184" text-anchor="middle">every provision body</text>
       </g>
       <!-- voters -->

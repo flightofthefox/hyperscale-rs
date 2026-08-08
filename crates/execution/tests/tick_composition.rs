@@ -1,6 +1,6 @@
 //! A claim holds inside the tick that makes it, not only after it.
 //!
-//! A cross-shard leg's local writes are provisional: the wave can still
+//! A cross-shard leg's local writes are provisional: the tick can still
 //! refuse them, and then they never happened. What keeps a later
 //! transaction from reading one is the claim its declared cells put on
 //! the tick chain — and a tick is one batch over one overlay, so a
@@ -29,7 +29,7 @@ const OTHER: u8 = 9;
 const REMOTE: u8 = 200;
 
 /// A transaction declaring cells on both sides of the partition: a
-/// cross-shard wave, whose local writes are provisional until it settles.
+/// cross-shard tick, whose local writes are provisional until it settles.
 fn crossing(seed: u8, owner: u8) -> Transaction {
     test_transaction_with_prefixes(
         &[seed, seed ^ 0x33, seed ^ 0xcc],
@@ -68,18 +68,18 @@ fn a_leg_claims_against_the_tick_it_joins() {
     sim.commit(vec![leg, follower, control], Vec::new());
     sim.drain();
 
-    let wave = sim.wave_of(leg_hash).expect("the crossing joined a tick");
+    let tick = sim.tick_of(leg_hash).expect("the crossing joined a tick");
     assert!(
-        !sim.receipts_for(&wave).is_empty(),
+        !sim.receipts_for(&tick).is_empty(),
         "the crossing itself executes"
     );
 
     assert!(
-        sim.wave_of(follower_hash).is_none(),
+        sim.tick_of(follower_hash).is_none(),
         "the follower shared a batch with a leg whose writes it could read"
     );
     assert!(
-        sim.receipts_for(&wave)
+        sim.receipts_for(&tick)
             .iter()
             .any(|receipt| receipt.tx_hash == control_hash),
         "the control declares nothing the leg claimed and must not wait"
@@ -92,8 +92,8 @@ fn a_leg_claims_against_the_tick_it_joins() {
     // Once the crossing settles the claim clears, and the follower
     // enters the next tick composed — reading the promoted value, not
     // the one its own block saw.
-    let receipts = sim.receipts_for(&wave);
-    sim.commit(Vec::new(), vec![settle(&wave, &receipts)]);
+    let receipts = sim.receipts_for(&tick);
+    sim.commit(Vec::new(), vec![settle(&tick, &receipts)]);
     sim.commit(Vec::new(), Vec::new());
     sim.drain();
 
@@ -104,8 +104,8 @@ fn a_leg_claims_against_the_tick_it_joins() {
     );
 }
 
-/// Two legs of *one* wave sharing a cell are the same hazard, and the
-/// wave envelope does not close it.
+/// Two legs of *one* tick sharing a cell are the same hazard, and the
+/// tick envelope does not close it.
 ///
 /// A tick settles each member on its own verdict — `TickResolution`
 /// carries the aborted set per transaction — so a counterpart can refuse
@@ -127,14 +127,14 @@ fn one_leg_claims_against_its_own_sibling() {
     sim.commit(vec![first, second], Vec::new());
     sim.drain();
 
-    let tick = sim.wave_of(first_hash).expect("the crossing joined a tick");
+    let tick = sim.tick_of(first_hash).expect("the crossing joined a tick");
     assert_eq!(
         sim.receipts_for(&tick).len(),
         1,
         "one leg claims the cell; its sibling waits for the verdict"
     );
     assert_ne!(
-        sim.wave_of(second_hash).as_ref(),
+        sim.tick_of(second_hash).as_ref(),
         Some(&tick),
         "so the sibling is attested by whichever tick does run it",
     );
@@ -151,9 +151,9 @@ fn disjoint_declarations_all_join_one_tick() {
     sim.commit(txs, Vec::new());
     sim.drain();
 
-    let wave = sim.wave_of(hashes[0]).expect("a single-shard wave");
+    let tick = sim.tick_of(hashes[0]).expect("a local-only tick");
     let executed: Vec<_> = sim
-        .receipts_for(&wave)
+        .receipts_for(&tick)
         .into_iter()
         .map(|receipt| receipt.tx_hash)
         .collect();

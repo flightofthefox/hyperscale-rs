@@ -2,7 +2,7 @@
 //!
 //! Every scenario drives signed manifest graphs — the account guest's
 //! withdraw+deposit — through the live pipeline: gossip, derived-key
-//! admission, proposal, wave execution on the batch executor,
+//! admission, proposal, tick execution on the batch executor,
 //! receipts, commit. The bodies are portable over [`Cluster`]; the
 //! kernel-level invariants (handle capabilities, snapshot semantics,
 //! schedule invariance) are pinned in the vm repo's differential suite —
@@ -219,7 +219,7 @@ pub fn abort_converges(c: &mut impl Cluster) {
 ///
 /// The second transfer spends more than its payer's genesis balance and
 /// is covered only by the first transfer's committed deposit. It accepts
-/// only if its wave's reads pin to the state its block attests — which
+/// only if its tick's reads pin to the state its block attests — which
 /// includes the funding commit — never a stale baseline; and it cannot
 /// read further forward either, since nothing beyond its baseline
 /// exists. (Submitted after the funding settles: concurrent submission
@@ -357,11 +357,11 @@ pub fn hot_recipient(c: &mut impl Cluster, senders: u8) -> (ContentionReport, u6
 ///
 /// The reserve leg lives on the payer's shard and the delta leg on the
 /// recipient's; neither leg provisions state (both are commutative), so
-/// the payer's wave records an empty dependency set and
+/// the payer's tick records an empty dependency set and
 /// dispatches immediately. The recipient engages only on the transaction
 /// commit proof — the payer's empty-entry bundle, consumable once the
 /// payer's block commit-proves — so its commit trails the payer's by one
-/// cross-shard hop, and its wave's requirement is satisfied by the
+/// cross-shard hop, and its tick's requirement is satisfied by the
 /// bundle committing beside the transaction. Settlement is then the EC
 /// exchange.
 ///
@@ -398,7 +398,7 @@ pub fn cross_shard_transfer(c: &mut impl Cluster) {
 /// The sibling of [`cross_shard_credit_survives_a_later_local_credit`] on
 /// the paying side. A cross-shard leg's reservation is judged against its
 /// tick's baseline, and the debit it settles is provisional until the
-/// wave resolves — so a second withdrawal one tick later would be judged
+/// tick resolves — so a second withdrawal one tick later would be judged
 /// against a balance the first has not come out of, and two withdrawals
 /// the vault cannot jointly cover would each be individually feasible.
 ///
@@ -491,7 +491,7 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
 /// A cross-shard credit and a later local one over the same vault both
 /// survive.
 ///
-/// The cross-shard leg's local writes are provisional until its wave
+/// The cross-shard leg's local writes are provisional until its tick
 /// settles — nothing may read them, or an abort would retroactively
 /// change an answer already given. So a transaction the shard commits
 /// afterwards sees the vault as it was before the leg ran, and both
@@ -501,7 +501,7 @@ pub fn a_payer_cannot_spend_one_balance_twice(c: &mut impl Cluster) {
 ///
 /// The local payment is submitted only once the recipient's shard has
 /// committed the crossing, so the pair is genuinely ordered across two
-/// ticks with the wave still open between them. The balance is the whole
+/// ticks with the tick still open between them. The balance is the whole
 /// assertion — both credits or neither.
 ///
 /// # Panics
@@ -528,7 +528,7 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
     c.submit(Arc::new(crossing));
 
     // The recipient's shard has the leg in a tick from the moment it
-    // commits it; the wave cannot settle for several blocks yet, so the
+    // commits it; the tick cannot settle for several blocks yet, so the
     // local payment below lands in a later tick with the leg's writes
     // still provisional.
     assert!(
@@ -561,7 +561,7 @@ pub fn cross_shard_credit_survives_a_later_local_credit(c: &mut impl Cluster) {
     }
 
     // Settlement trails the decision by the persistence step, and the two
-    // waves settle at different heights — wait for the total rather than
+    // ticks settle at different heights — wait for the total rather than
     // reading whichever landed first.
     let expected = before + CROSSING + LOCAL;
     let held = c.run_until(epochs(8), |c| {

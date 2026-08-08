@@ -986,7 +986,7 @@ fn record_boundaries(
 /// Drop terminal records past their retention horizon. A terminated
 /// shard's record lingers only to project its `settled_txs_root` to
 /// surviving counterparts; past `terminal_wt + RETENTION_HORIZON` the
-/// split-boundary fence rejects any wave naming it regardless, so the
+/// split-boundary fence rejects any tick naming it regardless, so the
 /// record is dead weight. Bounded so a terminated shard can't
 /// accumulate forever.
 ///
@@ -1470,7 +1470,7 @@ mod tests {
             certificate_root,
             local_receipt_root,
             provision_root,
-            waves,
+            ticks,
             provision_tx_roots,
             in_flight,
             beacon_witness_root,
@@ -1495,7 +1495,7 @@ mod tests {
             certificate_root,
             local_receipt_root,
             provision_root,
-            cross_shard_txs: waves,
+            cross_shard_txs: ticks,
             provision_tx_roots: provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
             work_in_flight: in_flight,
             beacon_witness_root,

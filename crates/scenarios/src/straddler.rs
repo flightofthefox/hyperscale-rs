@@ -1,6 +1,6 @@
 //! Straddler atomicity scenarios.
 //!
-//! A *straddler* is a cross-shard wave whose source side commits on a shard that
+//! A *straddler* is a cross-shard tick whose source side commits on a shard that
 //! terminates at a reshape boundary. The surviving counterpart must read the
 //! terminating shard's beacon-attested settled set and settle the straddler only
 //! when the terminating shard settled it by its terminal block — never one-sided,
@@ -32,7 +32,7 @@ use crate::support::wait::{
 use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs};
 
 /// Cut every path by which `shard`'s committee obtains `peer_shard`'s execution
-/// certificate, so a cross-shard wave the two share cannot finalize on `shard`'s
+/// certificate, so a cross-shard tick the two share cannot finalize on `shard`'s
 /// side.
 ///
 /// Fault rules gate pushes (gossip) and request legs, never response legs, so EC
@@ -40,7 +40,7 @@ use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs};
 /// leg: `peer_shard` pushes its EC by gossip (`execution.cert.batch`), and
 /// `shard` pulls the EC and the finalization that bundles it
 /// (`execution_cert.request`, `finalization.request`). Provisions and headers
-/// still flow, so `shard` still executes the wave and produces its own EC; it
+/// still flow, so `shard` still executes the tick and produces its own EC; it
 /// just never receives `peer_shard`'s.
 ///
 /// Faithful only with disjoint committees — if the two shards share a host, its
@@ -185,12 +185,12 @@ pub fn arm_splitter_termination<C: Cluster>(c: &mut C) {
 
 /// The split-straddler choreography, minus the terminal assertion.
 ///
-/// Grows, votes the threshold down, submits settling then straddling waves,
+/// Grows, votes the threshold down, submits settling then straddling ticks,
 /// drives the split, and waits for every straddler to reach a terminal verdict.
 /// Returns the probe hashes, the splitter shard, and its terminal block height
 /// for the caller to judge. `before_settling` runs once after the split is
 /// admitted (committees stable, splitter still live) and before the settling
-/// waves are submitted — the seam a fault probe uses to install a rule keyed on
+/// ticks are submitted — the seam a fault probe uses to install a rule keyed on
 /// the live committees.
 ///
 /// # Panics
@@ -214,7 +214,7 @@ pub fn split_straddler_run<C: Cluster>(
     // before any straddler EC crosses.
     before_settling(c);
 
-    // Settling waves: submitted while the splitter still commits real blocks, so
+    // Settling ticks: submitted while the splitter still commits real blocks, so
     // it finalizes them before its terminal cut — they settle atomically.
     let half = setup.straddlers.len() / 2;
     for (key, from, to) in setup.straddlers.iter().take(half) {
@@ -222,14 +222,14 @@ pub fn split_straddler_run<C: Cluster>(
     }
 
     // Advance until the gate drains the splitter from `pending_reshapes`: the
-    // settling waves finalize on it in this window, and it then coasts to its
+    // settling ticks finalize on it in this window, and it then coasts to its
     // terminal crossing committing only empty blocks.
     assert!(
         c.run_until(epochs(14), |c| !split_admitted(c, splitter)),
         "the splitter's split must gate within budget",
     );
 
-    // Straddling waves: submitted all at once during the coast — the splitter is
+    // Straddling ticks: submitted all at once during the coast — the splitter is
     // still the active leaf, so the survivor provisions to it, but its empty
     // coast blocks settle nothing, leaving them in flight when it terminates.
     for (key, from, to) in setup.straddlers.iter().skip(half) {
@@ -329,10 +329,10 @@ fn assert_payer_is_blocked<C: FaultableCluster>(
 /// [`isolate_ec_intake`] cuts every path by which the splitter obtains the
 /// survivor's execution certificate, which is what keeps that state standing.
 /// The payer's deadline still arrives and it still speaks its abort, so the
-/// transaction goes terminal — but a wave with an engaged counterpart needs
+/// transaction goes terminal — but a tick with an engaged counterpart needs
 /// that counterpart's certificate to finalize, and both the reservation's
 /// release and the settlement that would clear the lock key on a *finalized
-/// wave*, not on a verdict.
+/// tick*, not on a verdict.
 ///
 /// What the middle of this scenario measures is that the payer really is
 /// blocked, and that being blocked is about the payer rather than about the
@@ -374,7 +374,7 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
 
     // Cut the splitter's execution-certificate intake before anything crosses:
     // it will execute its own leg and speak its own verdict, and never hold the
-    // survivor's half, so no wave of its can finalize.
+    // survivor's half, so no tick of its can finalize.
     let _ = isolate_ec_intake(c, splitter, survivor);
 
     let held = build_transfer_tx(
@@ -576,7 +576,7 @@ pub fn surviving_sibling_split_seats_full_committees(c: &mut impl Cluster) {
 /// `leaf(2, 0)`/`leaf(2, 1)` stay above it and keep the left half alive: once the
 /// topology is grown, the merge fires from the byte skew alone. Cross-shard
 /// transfers run from the survivor `leaf(2, 0)` into the merging `leaf(2, 2)`, so
-/// each wave names a shard that terminates at the merge. The first wave settles
+/// each tick names a shard that terminates at the merge. The first tick settles
 /// before `leaf(2, 2)`'s terminal block; the second straddles it, in flight when
 /// it terminates. After the merge the survivor must reach a terminal verdict on
 /// every straddler, consistent with what `leaf(2, 2)` settled by its terminal
@@ -610,7 +610,7 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
     let mut probes: Vec<TxHash> = Vec::new();
     let half = setup.straddlers.len() / 2;
 
-    // Settling waves: submitted while `leaf(2, 2)` still commits real blocks, so
+    // Settling ticks: submitted while `leaf(2, 2)` still commits real blocks, so
     // their cross-shard 2PC can finalize at or below its terminal block and land
     // in the attested settled set. Submitted before the keeper pairing arms the
     // gate, then awaited to finalize on `leaf(2, 2)` so settlement can't lose the
@@ -626,7 +626,7 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
         c.run_until(epochs(12), |c| settling
             .iter()
             .all(|hash| chain_settled(c, merge_left, *hash))),
-        "the settling waves must finalize on the merging child before its terminal",
+        "the settling ticks must finalize on the merging child before its terminal",
     );
 
     // The light merging pair asserts the merge from its genesis byte skew; the
@@ -637,7 +637,7 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
         "the light merging pair must pair a keeper quorum within budget",
     );
 
-    // Straddling waves: submitted once the merge has paired and `leaf(2, 2)` is
+    // Straddling ticks: submitted once the merge has paired and `leaf(2, 2)` is
     // coasting to its terminal — the survivor still provisions to it, but its
     // coast blocks settle nothing, leaving them in flight when it terminates.
     for (key, from, to) in setup.straddlers.iter().skip(half) {
@@ -704,7 +704,7 @@ fn merged_genesis_height<C: Cluster>(c: &C, parent: ShardId) -> Option<BlockHeig
 }
 
 /// Whether `hash` finalized a non-abort decision on `shard`'s committed chain —
-/// the source side of a cross-shard wave settling before a reshape terminal.
+/// the source side of a cross-shard tick settling before a reshape terminal.
 pub fn chain_settled<C: Cluster>(c: &C, shard: ShardId, hash: TxHash) -> bool {
     matches!(
         c.chain_fate(shard, hash).1,

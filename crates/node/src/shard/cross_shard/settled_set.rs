@@ -83,7 +83,7 @@ pub enum SettledTxsAcquisitionOutput {
     Complete {
         /// The terminated shard whose settled set this is.
         shard: ShardId,
-        /// Wave-ids `shard` settled at or before its terminal block.
+        /// Tick-ids `shard` settled at or before its terminal block.
         txs: BTreeSet<TxHash>,
         /// `shard`'s terminal weighted timestamp.
         terminal_wt: WeightedTimestamp,
@@ -247,16 +247,16 @@ mod tests {
 
     const SHARD: ShardId = ShardId::ROOT;
 
-    /// The transaction the wave at `height` settles — distinct per wave,
-    /// so a window over several waves has one entry each.
+    /// The transaction the tick at `height` settles — distinct per tick,
+    /// so a window over several ticks has one entry each.
     fn settled_tx(height: u64) -> TxHash {
         TxHash::from(Hash::from_bytes(&height.to_le_bytes()))
     }
 
     fn finalization(height: u64) -> Arc<Verifiable<Finalization>> {
-        let wave = local_wave(height);
+        let tick = local_tick(height);
         let ec = ExecutionCertificate::new(
-            wave,
+            tick,
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome::new(
@@ -284,14 +284,14 @@ mod tests {
             SignerBitfield::new(4),
         );
         Arc::new(Verifiable::from(Finalization::new(
-            wave,
+            tick,
             vec![Arc::new(ec), Arc::new(remote)],
             vec![],
         )))
     }
 
     /// Commit `count` blocks (1..=count), each carrying its own settled
-    /// wave, and return the storage, the terminal hash, and the attested
+    /// tick, and return the storage, the terminal hash, and the attested
     /// settled root over the whole window.
     fn served_chain(count: u64) -> (Arc<SimShardStorage>, BlockHash, SettledTxsRoot) {
         let storage = Arc::new(SimShardStorage::default());
@@ -338,10 +338,10 @@ mod tests {
         (storage, terminal, root)
     }
 
-    /// A cross-shard wave (non-empty `remote_shards`): the settled set
+    /// A cross-shard tick (non-empty `remote_shards`): the settled set
     /// commits only cross-shard txs, so a single-shard fixture would be
     /// filtered out before the merkle root.
-    fn local_wave(height: u64) -> TickId {
+    fn local_tick(height: u64) -> TickId {
         TickId::new(SHARD, BlockHeight::new(height))
     }
 

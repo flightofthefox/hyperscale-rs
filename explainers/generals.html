@@ -315,7 +315,7 @@
 
   <div class="cards">
     <div class="card"><span class="ok">◦ THE TIEBREAK</span><h4>Genuine conflicts</h4><p>Two cross-shard transactions genuinely deadlocked across shards are detected from committed provisions — the same evidence on both sides — and resolved by a fixed rule: lower transaction hash wins, the loser aborts before executing. Both shards derive the identical verdict.</p></div>
-    <div class="card"><span class="ok">◦ THE DEADLINE</span><h4>Missing provisions</h4><p>Every wave of cross-shard work carries a deadline anchored on <a href="clock.html">the voted clock</a> — BFT-attested time, not anyone's watch. Still unprovisioned at the deadline → the whole wave aborts, identically, on every shard. No two replicas can disagree about whether an attested moment has passed.</p></div>
+    <div class="card"><span class="ok">◦ THE DEADLINE</span><h4>Missing provisions</h4><p>Every transaction carries a deadline anchored on <a href="clock.html">the voted clock</a> — BFT-attested time, not anyone's watch. Still unsettled when it passes → the shard certifies the abort, identically, on every replica. No two replicas can disagree about whether an attested moment has passed, so nobody has to ask whether it is safe to give up.</p></div>
     <div class="card"><span class="ok">◦ THE FENCE</span><h4>A shard that dies mid-flight</h4><p>If a participating shard is terminated by a split or merge, the survivor's verdict comes from the dead shard's frozen final records — <a href="testament.html">its will</a> — never from whether some message happened to arrive in time.</p></div>
   </div>
 
@@ -349,7 +349,7 @@
 <footer>
   <span class="kicker">Go deeper</span>
   <h2 style="font-size:26px">The precise version of this story</h2>
-  <p>The architecture docs specify declared access, the provision proofs, wave grouping and certificates, all three abort paths, and the data-availability machinery that keeps every needed fact fetchable or provably expired.</p>
+  <p>The architecture docs specify declared access, the provision proofs, tick composition and certificates, all three abort paths, and the data-availability machinery that keeps every needed fact fetchable or provably expired.</p>
   <div class="foot-links">
     <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/04-atomic-commitment.md">docs/04 — atomic commitment</a>
     <a href="https://github.com/hyperscalers/hyperscale-rs/blob/main/docs/01-consensus-layers.md">docs/01 — the consensus layers</a>

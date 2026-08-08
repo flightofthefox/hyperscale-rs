@@ -200,7 +200,7 @@ pub fn select_transactions(
 /// Select finalizations for inclusion: drop those whose tick or whose
 /// transactions the QC chain or the retention window has already
 /// resolved, and cap the total finalized-tx count at the
-/// `max_finalized_txs` limit. Returns `(waves, total_tx_count)`.
+/// `max_finalized_txs` limit. Returns `(ticks, total_tx_count)`.
 ///
 /// The per-transaction half mirrors `validate_no_duplicate_resolutions`,
 /// so a proposer never offers a second verdict its own voters refuse —
@@ -209,18 +209,18 @@ pub fn select_transactions(
 /// transaction they name says they are the same verdict twice.
 ///
 /// Order is the caller's and is preserved. It arrives in the order the
-/// waves executed, which is the order their receipts have to settle in —
-/// two waves writing one cell each carry an absolute computed from their
+/// ticks executed, which is the order their receipts have to settle in —
+/// two ticks writing one cell each carry an absolute computed from their
 /// own baseline, and settlement is last writer per cell, so the later
 /// execution must land last. Re-sorting here by kickoff height would
-/// invert exactly the pairs that matter: a wave held back from its own
+/// invert exactly the pairs that matter: a tick held back from its own
 /// block's tick executes after a later-numbered one it shares a cell
 /// with. Order stays deterministic because the caller's is, which is what
 /// verifiers flattening receipts into JMT `work_items` in manifest order
 /// need.
 ///
 /// Truncation is a suffix for the same reason: dropping the tail cannot
-/// leave a wave ahead of a predecessor it should follow.
+/// leave a tick ahead of a predecessor it should follow.
 pub fn select_finalizations(
     finalizations: Vec<Arc<Verifiable<Finalization>>>,
     qc_chain_cert_ids: &HashSet<TickId>,
@@ -230,7 +230,7 @@ pub fn select_finalizations(
 ) -> (Vec<Arc<Verifiable<Finalization>>>, usize) {
     let mut finalized_tx_count = 0usize;
     let mut resolved_here: HashSet<TxHash> = HashSet::new();
-    let waves_to_propose: Vec<_> = finalizations
+    let ticks_to_propose: Vec<_> = finalizations
         .into_iter()
         .filter(|fw| {
             if qc_chain_cert_ids.contains(fw.tick_id()) || dedup_index.contains_cert(fw.tick_id()) {
@@ -256,7 +256,7 @@ pub fn select_finalizations(
             }
         })
         .collect();
-    (waves_to_propose, finalized_tx_count)
+    (ticks_to_propose, finalized_tx_count)
 }
 
 /// Drop cross-shard transactions whose payer bundle is neither among
@@ -487,7 +487,7 @@ pub fn assemble_build_action(
 ///
 /// The one exception is `bridge_over_attested_parent` — the build-side
 /// mirror of the verifier's recovery-bridge escape (see
-/// `initiate_state_root_verification`): a wave-less block in the bridge
+/// `initiate_state_root_verification`): a tick-less block in the bridge
 /// band whose parent is a sync-admitted, QC-attested certified block
 /// dispatches without the parent tree. Its prepare applies no updates and
 /// inherits the attested parent root; the commit pipeline releases store

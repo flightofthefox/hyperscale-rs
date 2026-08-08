@@ -19,7 +19,7 @@ use crate::support::{Cluster, epochs};
 /// here.
 ///
 /// **A symmetric pair resolves by deadline, not by a loser.** There is no
-/// cycle detector: each payer's shard holds a lock the other's wave needs,
+/// cycle detector: each payer's shard holds a lock the other's tick needs,
 /// neither can engage, and the deadline abort is what breaks it — the
 /// fee model's backstop doing the job it exists for. So both aborting is
 /// the expected shape, and asserting "at most one aborts" would be
@@ -51,7 +51,7 @@ pub fn livelock_resolves_promptly(c: &mut impl Cluster) {
 
     // The budget has to outlast a payer's deadline, which is its signed
     // window's end plus the evidence margin — wall-clock, and longer than
-    // the wave a settlement would take. A genuine livelock never resolves
+    // the tick a settlement would take. A genuine livelock never resolves
     // at all, so the assertion still catches one.
     let status_a = await_tx_terminal(c, hash_a, epochs(8));
     let status_b = await_tx_terminal(c, hash_b, epochs(8));

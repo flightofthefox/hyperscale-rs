@@ -431,7 +431,7 @@ impl ProvisionCoordinator {
     /// provisions, bypassing the normal liveness timeout.
     ///
     /// Called when urgency overrides the default patience — sync completion
-    /// (validator needs to catch up before `WAVE_TIMEOUT` runs out) and the
+    /// (validator needs to catch up before `MAX_FINALIZATION_DELAY` runs out) and the
     /// execution advance gate stalling on missing data.
     pub fn flush_expected_provisions(&mut self) -> Vec<Action> {
         self.expected
@@ -473,9 +473,9 @@ impl ProvisionCoordinator {
         }
 
         // Only track headers that owe us a bundle. The commitment is the
-        // header's own `provision_tx_roots` entry — waves can name our
+        // header's own `provision_tx_roots` entry — ticks can name our
         // shard without the source owing state (a counterpart with
-        // nothing to attest), and an expectation keyed on wave naming
+        // nothing to attest), and an expectation keyed on tick naming
         // would fetch a bundle that never exists.
         let targets_us = certified_header
             .header()
@@ -990,7 +990,7 @@ mod tests {
     // Remote Block Header Tracking Tests (Unverified Buffer)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Build a `CertifiedBlockHeader` with waves targeting `ShardId::leaf(2, 0)`
+    /// Build a `CertifiedBlockHeader` with ticks targeting `ShardId::leaf(2, 0)`
     /// (the local shard in most tests) so it gets stored in `verified_remote_headers`.
     fn make_certified_header(
         shard: ShardId,
@@ -1837,7 +1837,7 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new(ShardId::leaf(2, 0));
 
         let source_shard = ShardId::leaf(2, 1);
-        // Header targets our shard via waves but has no provision_tx_roots
+        // Header targets our shard via ticks but has no provision_tx_roots
         // entry for us — mismatched commitment shape.
         let header = make_certified_header(source_shard, BlockHeight::new(10));
         deliver_committed_header(&mut coordinator, &header);

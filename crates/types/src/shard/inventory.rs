@@ -150,7 +150,7 @@ impl ElidedCertifiedBlock {
         &self.transactions
     }
 
-    /// Per-certificate `(wave id, optional body)` pairs; body is `None` when elided.
+    /// Per-certificate `(tick id, optional body)` pairs; body is `None` when elided.
     #[must_use]
     pub const fn certificates(&self) -> &Vec<(TickId, Option<Arc<Verifiable<Finalization>>>)> {
         &self.certificates
@@ -200,7 +200,7 @@ impl ElidedCertifiedBlock {
             .iter()
             .map(|fw| {
                 let id = *fw.tick_id();
-                let body = if wave_is_held(inventory.cert_have.as_ref(), fw) {
+                let body = if finalization_is_held(inventory.cert_have.as_ref(), fw) {
                     None
                 } else {
                     Some(Arc::clone(fw))
@@ -363,7 +363,7 @@ impl ElidedCertifiedBlock {
 pub struct RehydrationMiss {
     /// Transaction hashes whose bodies could not be resolved.
     pub missing_tx: Vec<TxHash>,
-    /// Wave ids whose finalization bodies could not be resolved.
+    /// Tick ids whose finalization bodies could not be resolved.
     pub missing_cert: Vec<TickId>,
     /// Provision hashes whose bodies could not be resolved.
     pub missing_provision: Vec<ProvisionHash>,
@@ -427,10 +427,10 @@ where
 }
 
 /// Whether the requester's transaction filter covers every transaction of
-/// `fw`, which is what it takes to hold the wave itself. A wave with no
+/// `fw`, which is what it takes to hold the tick itself. A tick with no
 /// transactions is never held — a vacuous match would elide a body the
 /// requester has no way to resolve.
-fn wave_is_held(filter: Option<&BloomFilter<TxHash>>, fw: &Finalization) -> bool {
+fn finalization_is_held(filter: Option<&BloomFilter<TxHash>>, fw: &Finalization) -> bool {
     let Some(bf) = filter else {
         return false;
     };
@@ -473,7 +473,7 @@ mod tests {
 
     /// Block carrying one two-transaction finalization and no
     /// transactions of its own.
-    fn create_test_block_with_wave(tx_hashes: &[TxHash]) -> Block {
+    fn create_test_block_with_finalization(tx_hashes: &[TxHash]) -> Block {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
@@ -527,31 +527,31 @@ mod tests {
         }
     }
 
-    /// A wave is held only when the requester has every one of its
+    /// A tick is held only when the requester has every one of its
     /// transactions — a partial match leaves the body inline, because a
-    /// requester holding half a wave holds no wave at all.
+    /// requester holding half a tick holds no tick at all.
     #[test]
-    fn cert_elision_requires_every_transaction_of_the_wave() {
-        let a = TxHash::from(Hash::from_bytes(b"wave tx a"));
-        let b = TxHash::from(Hash::from_bytes(b"wave tx b"));
-        let block = create_test_block_with_wave(&[a, b]);
+    fn cert_elision_requires_every_transaction_of_the_tick() {
+        let a = TxHash::from(Hash::from_bytes(b"tick tx a"));
+        let b = TxHash::from(Hash::from_bytes(b"tick tx b"));
+        let block = create_test_block_with_finalization(&[a, b]);
         let qc = create_test_qc(&block);
 
         let partial = ElidedCertifiedBlock::elide(&block, qc.clone(), &cert_filter(&[a]));
         assert!(
             partial.certificates[0].1.is_some(),
-            "one of two transactions is not the wave"
+            "one of two transactions is not the tick"
         );
 
         let full = ElidedCertifiedBlock::elide(&block, qc, &cert_filter(&[a, b]));
-        assert!(full.certificates[0].1.is_none(), "requester has the wave");
+        assert!(full.certificates[0].1.is_none(), "requester has the tick");
     }
 
-    /// An empty wave would match a filter vacuously; eliding it would
+    /// An empty tick would match a filter vacuously; eliding it would
     /// leave the requester unable to resolve a body it never had.
     #[test]
-    fn cert_elision_never_elides_a_transactionless_wave() {
-        let block = create_test_block_with_wave(&[]);
+    fn cert_elision_never_elides_a_transactionless_tick() {
+        let block = create_test_block_with_finalization(&[]);
         let qc = create_test_qc(&block);
         let elided = ElidedCertifiedBlock::elide(&block, qc, &cert_filter(&[]));
         assert!(elided.certificates[0].1.is_some());

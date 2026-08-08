@@ -4,7 +4,7 @@
 //! coordinators in one pass: shard consensus exits sync mode and re-issues any
 //! pending block fetches it had suppressed; remote-headers and
 //! provisions flush their expected sets so we can immediately
-//! participate in execution for blocks within the `WAVE_TIMEOUT` window.
+//! participate in execution for blocks within the `MAX_FINALIZATION_DELAY` window.
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_shard::SettledTxSet;
@@ -165,7 +165,7 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::builder().build();
 
         // Seed provisions.expected via a verified remote header whose
-        // wave depends on local.
+        // tick depends on local.
         let cross_shard_tx = TxHash::from(Hash::from_bytes(b"cross-shard tx"));
         let mut block = make_live_block(
             ShardId::leaf(1, 1),

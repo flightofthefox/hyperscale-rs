@@ -77,11 +77,11 @@ pub enum TraceKind {
         /// why the timeline draws it differently from a normal block.
         fallback: bool,
         proposer: u64,
-        /// Cross-shard execution waves this block opens. Single-shard
+        /// Cross-shard execution ticks this block opens. Single-shard
         /// transactions never appear here — the header field exists so
         /// remote shards know which certificates to expect — so this stays
         /// zero until the topology has more than one shard.
-        cross_shard_waves: u32,
+        cross_shard_ticks: u32,
     },
     /// The beacon committed an epoch. One block per epoch, wall-clock paced,
     /// carrying no transactions: it decides validator set and topology, and
@@ -123,7 +123,7 @@ pub enum TraceKind {
     /// One shard's execution certificate, as accepted by the shard that
     /// committed it.
     ///
-    /// `shard` and `height` locate the wave on the committee that signed
+    /// `shard` and `height` locate the tick on the committee that signed
     /// the certificate; `into` and `intoHeight` locate the block that
     /// carried it. They differ exactly when the certificate crossed a shard
     /// boundary, which is when the viewer draws an arc.
@@ -131,26 +131,26 @@ pub enum TraceKind {
     ExecutionCertified {
         shard: ShardPath,
         height: u64,
-        wave: WaveLabel,
+        tick: TickLabel,
         into: ShardPath,
         into_height: u64,
         /// Per-transaction `succeeded`, `failed`, or `aborted`, in the
-        /// wave's canonical order.
+        /// tick's canonical order.
         outcomes: Vec<(TxLabel, &'static str)>,
     },
     /// Every participating shard reported and the finalization is
     /// committed — the point where the arcs on both sides converge.
     #[serde(rename_all = "camelCase")]
-    WaveFinalized {
+    TickFinalized {
         shard: ShardPath,
         /// The block that committed the certificate.
         height: u64,
-        /// The block whose transactions opened the wave. The gap between
+        /// The block whose transactions opened the tick. The gap between
         /// the two is the settlement round's latency.
         opened_at: u64,
-        wave: WaveLabel,
-        /// Every shard that signed a certificate in this wave, `shard`
-        /// included. A single entry means the wave never left the shard.
+        tick: TickLabel,
+        /// Every shard that signed a certificate in this tick, `shard`
+        /// included. A single entry means the tick never left the shard.
         participants: Vec<ShardPath>,
         txs: Vec<TxLabel>,
     },
@@ -295,16 +295,16 @@ impl From<TxHash> for TxLabel {
     }
 }
 
-/// A wave's identity on the shard that opened it, `<shard>@<height>` —
+/// A tick's identity on the shard that opened it, `<shard>@<height>` —
 /// the same pair a [`TickId`] binds.
 ///
 /// Not comparable across shards: one logical settlement round gives every
-/// participant its own wave id, so the viewer relates the two sides by the
+/// participant its own tick id, so the viewer relates the two sides by the
 /// shard-and-height endpoints each event carries, never by this string.
 #[derive(Debug, Clone, Serialize)]
-pub struct WaveLabel(pub String);
+pub struct TickLabel(pub String);
 
-impl WaveLabel {
+impl TickLabel {
     fn new(shard: ShardId, height: BlockHeight) -> Self {
         let path = ShardPath::from(shard).0;
         let name = if path.is_empty() { "ROOT" } else { &path };
@@ -340,7 +340,7 @@ impl TraceEvent {
         round: Round,
         fallback: bool,
         proposer: u64,
-        cross_shard_waves: u32,
+        cross_shard_ticks: u32,
     ) -> Self {
         Self {
             wt,
@@ -350,7 +350,7 @@ impl TraceEvent {
                 round: round.inner(),
                 fallback,
                 proposer,
-                cross_shard_waves,
+                cross_shard_ticks,
             },
         }
     }
@@ -400,7 +400,7 @@ impl TraceEvent {
 
     pub(crate) fn execution_certified(
         wt: u64,
-        wave: &TickId,
+        tick: &TickId,
         into: ShardId,
         into_height: BlockHeight,
         outcomes: &[TxOutcome],
@@ -408,9 +408,9 @@ impl TraceEvent {
         Self {
             wt,
             kind: TraceKind::ExecutionCertified {
-                shard: wave.shard_id().into(),
-                height: wave.block_height().inner(),
-                wave: WaveLabel::new(wave.shard_id(), wave.block_height()),
+                shard: tick.shard_id().into(),
+                height: tick.block_height().inner(),
+                tick: TickLabel::new(tick.shard_id(), tick.block_height()),
                 into: into.into(),
                 into_height: into_height.inner(),
                 outcomes: labelled_outcomes(outcomes),
@@ -418,32 +418,32 @@ impl TraceEvent {
         }
     }
 
-    /// The convergence point: `wave`'s certificate, committed on `shard` at
+    /// The convergence point: `tick`'s certificate, committed on `shard` at
     /// `height`.
     ///
-    /// The transaction list is read off the wave's own certificate — the one
-    /// whose id matches the wave — rather than through
+    /// The transaction list is read off the tick's own certificate — the one
+    /// whose id matches the tick — rather than through
     /// [`Finalization::local_ec`], which panics on a malformed certificate.
     /// A viewer must not be able to take the tab down by rendering one.
-    pub(crate) fn wave_finalized(
+    pub(crate) fn tick_finalized(
         wt: u64,
         shard: ShardId,
         height: BlockHeight,
-        wave: &Finalization,
+        tick: &Finalization,
     ) -> Self {
-        let id = wave.tick_id();
-        let certificates = wave.execution_certificates();
+        let id = tick.tick_id();
+        let certificates = tick.execution_certificates();
         let txs = certificates
             .iter()
             .find(|ec| ec.tick_id() == id)
             .map_or_else(Vec::new, |ec| tx_labels(ec.tx_outcomes()));
         Self {
             wt,
-            kind: TraceKind::WaveFinalized {
+            kind: TraceKind::TickFinalized {
                 shard: shard.into(),
                 height: height.inner(),
                 opened_at: id.block_height().inner(),
-                wave: WaveLabel::new(id.shard_id(), id.block_height()),
+                tick: TickLabel::new(id.shard_id(), id.block_height()),
                 participants: certificates
                     .iter()
                     .map(|ec| ec.tick_id().shard_id().into())

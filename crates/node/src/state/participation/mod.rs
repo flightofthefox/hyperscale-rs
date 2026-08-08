@@ -69,7 +69,7 @@ pub(in crate::state) struct ShardParticipation {
 
     /// Latches the one-shot terminal sweep: when the local chain terminates at a
     /// reshape boundary (the first coast commit), every in-flight transaction
-    /// and pending wave is aborted exactly once — no later block can ever decide
+    /// and pending tick is aborted exactly once — no later block can ever decide
     /// them.
     pub(in crate::state) terminal_chain_swept: bool,
 
@@ -114,7 +114,7 @@ impl ShardParticipation {
         // Execution's commit frontier and its account of what is still in
         // flight both seed from the same recovered tip the shard
         // coordinator restores, so the first post-restart commit
-        // classifies its waves exactly as a non-restarted peer's does.
+        // classifies its ticks exactly as a non-restarted peer's does.
         let execution_coordinator = ExecutionCoordinator::with_shared_stores(
             me,
             local_shard,

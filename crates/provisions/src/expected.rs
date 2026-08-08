@@ -448,7 +448,7 @@ mod tests {
     /// catching up) stamps a stale `discovered_at`, but the source block is
     /// recent. The orphan sweep must key on `source_block_ts` and retain it,
     /// or the fallback fetch is evicted before it can fire and the dependent
-    /// cross-shard wave aborts.
+    /// cross-shard tick aborts.
     #[test]
     fn cleanup_orphans_keeps_recent_source_despite_stale_discovery() {
         let mut t = ExpectedProvisionTracker::new();

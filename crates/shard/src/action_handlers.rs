@@ -400,9 +400,9 @@ fn split_child_roots_for_header(
 }
 
 fn collect_finalized_receipts(
-    waves: &[Arc<Verifiable<Finalization>>],
+    ticks: &[Arc<Verifiable<Finalization>>],
 ) -> Vec<Arc<ConsensusReceipt>> {
-    let receipts: Vec<Arc<ConsensusReceipt>> = waves
+    let receipts: Vec<Arc<ConsensusReceipt>> = ticks
         .iter()
         .flat_map(|fw| fw.consensus_receipts())
         .collect();
@@ -782,7 +782,7 @@ where
                 None,
             );
             // A terminating shard's boundary header carries the root over
-            // the wave-ids it settled within the retention window; recompute
+            // the tick-ids it settled within the retention window; recompute
             // it from the committed chain whenever the shard terminates at
             // the next boundary, split or merge.
             let computed_settled_txs_root = settled_txs_root_required.then(|| {
@@ -937,7 +937,7 @@ where
                 kept
             };
             // A terminating shard's boundary header carries the root over
-            // the wave-ids it settled within the retention window —
+            // the tick-ids it settled within the retention window —
             // whenever the shard terminates at the next boundary, split or
             // merge.
             let settled_txs_root = carry_settled_txs_root.then(|| {

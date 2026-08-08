@@ -741,8 +741,8 @@ impl MempoolCoordinator {
         }
 
         // Hard horizon: any expected-tx that survived grace + every realistic
-        // fetch retry past `RETENTION_HORIZON` is provably moot — every wave
-        // that needed it has long since timed out via WAVE_TIMEOUT. Drop with
+        // fetch retry past `RETENTION_HORIZON` is provably moot — every tick
+        // that needed it has long since timed out via MAX_FINALIZATION_DELAY. Drop with
         // warn + metric; non-zero rate here means cross-shard DA failed.
         // Each dropped hash is also handed to `AbandonFetch` so the io_loop's
         // `TransactionBinding` clears any in-flight retry — without this the
@@ -820,7 +820,7 @@ impl MempoolCoordinator {
     ///
     /// Scoped to local-shard nodes. A cross-shard tx's remote nodes are not
     /// owned by this shard's state machine; their lifetime is gated by the
-    /// peer shard's wave finalization, which can stall independently. Locking
+    /// peer shard's finalization, which can stall independently. Locking
     /// them here would permanently defer future local cross-shard txs that
     /// share those remote nodes, cascading the stall.
     /// Remove a transaction's nodes from the locked set.

@@ -599,7 +599,7 @@ impl ObserverTail {
             return TailOutcome::Rejected("elided or mispaired block body");
         };
         let header = certified.block().header();
-        // Only what the waves decided reaches the followed store, the
+        // Only what the ticks decided reaches the followed store, the
         // same projection the chain writers apply.
         let receipts: Vec<StoredReceipt> = certified
             .block()

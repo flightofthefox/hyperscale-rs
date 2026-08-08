@@ -13,7 +13,7 @@ use hyperscale_types::{ExecutionCertificate, TickId, TxHash};
 /// Serve an inbound execution-certificate fetch request.
 ///
 /// Two tiers: the in-memory [`ExecCertStore`] (entries live here between
-/// EC aggregation and the wave's containing block committing) and chain
+/// EC aggregation and the tick's containing block committing) and chain
 /// storage via [`PendingChain`]. Cache eviction happens at finalization
 /// commit, at which point storage is the authoritative source.
 ///

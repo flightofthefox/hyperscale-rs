@@ -32,7 +32,7 @@ const ACCOUNTS: u8 = 8;
 const TRANSFERS: u32 = 24;
 
 /// Simulated time between submissions, and the settle time either side of the
-/// run. Comfortably above the wave lifetime so each transfer terminates.
+/// run. Comfortably above the tick lifetime so each transfer terminates.
 const SPACING: Duration = Duration::from_secs(10);
 
 const fn grow_config() -> ScenarioConfig {

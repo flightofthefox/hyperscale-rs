@@ -16,7 +16,7 @@ pub struct GetExecutionCertsResponse {
     /// The requested execution certificates.
     ///
     /// - `Some(certs)` — successfully found certificates (may be empty if
-    ///   no matching waves were cached).
+    ///   no matching ticks were cached).
     /// - `None` — the source shard cannot serve this request.
     ///
     /// `Arc`-wrapped because the server-side `ExecCertStore` holds each

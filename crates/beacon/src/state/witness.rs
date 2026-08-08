@@ -251,7 +251,7 @@ pub(super) fn apply_shard_payload(
             // current dynamic `min_stake` for one more active validator.
             // The conviction gate is load-bearing, not defensive: a
             // convicted pool has zero actives against positive stake, so
-            // the capacity check alone would wave a replacement seat
+            // the capacity check alone would tick a replacement seat
             // straight back in.
             let pool = state.pools.get(pool_id)?;
             if pool.conviction.is_some() {

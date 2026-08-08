@@ -34,7 +34,7 @@ pub enum TransactionDecision {
 ///
 /// All transitions are driven by committed blocks: `Pending → Committed`
 /// when the block containing the tx commits, and `Committed → Completed`
-/// when a block whose `block.certificates` covers the tx commits (the wave
+/// when a block whose `block.certificates` covers the tx commits (the tick
 /// certificate carries the per-tx decision).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Hbor)]
 pub enum TransactionStatus {
@@ -53,7 +53,7 @@ pub enum TransactionStatus {
     Committed(BlockHeight),
 
     /// Finalization has been committed in a block; locks released.
-    /// Carries the final decision from the wave's per-tx decisions.
+    /// Carries the final decision from the tick's per-tx decisions.
     Completed(TransactionDecision),
 }
 

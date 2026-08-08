@@ -1,6 +1,6 @@
-//! Tracks execution certificates this shard's wave leader broadcast to
+//! Tracks execution certificates this shard's tick leader broadcast to
 //! remote shards, re-broadcasting on a deterministic interval until the
-//! local wave finalizes (proof every participating shard, including the
+//! local tick finalizes (proof every participating shard, including the
 //! target, contributed an EC) or the [`RETENTION_HORIZON`] elapses.
 //!
 //! Symmetric to `OutboundProvisionTracker` in `hyperscale-provisions`:
@@ -12,13 +12,13 @@
 //!
 //! No new wire message: re-broadcasts reuse the existing
 //! `BroadcastExecutionCertificate` action. Eviction is driven by local
-//! wave finalization (the only positive signal available without an
+//! finalization (the only positive signal available without an
 //! explicit ACK round-trip) plus the safety horizon.
 //!
-//! The horizon — `MAX_VALIDITY_RANGE + WAVE_TIMEOUT` — is principled,
+//! The horizon — `MAX_VALIDITY_RANGE + MAX_FINALIZATION_DELAY` — is principled,
 //! not arbitrary: a tx included at the latest possible moment within
-//! its `validity_range` gets `WAVE_TIMEOUT` after that to terminate, so
-//! any EC unacked past that bound references a wave no shard could
+//! its `validity_range` gets `MAX_FINALIZATION_DELAY` after that to terminate, so
+//! any EC unacked past that bound references a tick no shard could
 //! still be processing. Same constant covers `OutboundProvisionTracker`.
 //!
 //! Anchored on `WeightedTimestamp` from the committing QC so every
@@ -40,19 +40,19 @@ pub const REBROADCAST_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OutboundCertMemoryStats {
-    /// Number of (wave, target-shard) entries currently being retained for re-broadcast.
+    /// Number of (tick, target-shard) entries currently being retained for re-broadcast.
     pub tracked_certificates: usize,
 }
 
-/// A single tracked outbound EC for one (wave, `target_shard`) destination.
+/// A single tracked outbound EC for one (tick, `target_shard`) destination.
 struct OutboundCertEntry {
     certificate: Arc<Verified<ExecutionCertificate>>,
     target_shard: ShardId,
     recipients: Vec<ValidatorId>,
     /// Hard deadline past which the EC is provably useless: every tx in the
-    /// wave has expired and terminated. Computed via
-    /// `ExecutionCertificate::deadline()` from the wave's
-    /// `vote_anchor_ts` — the shard consensus-authenticated wave commit time.
+    /// tick has expired and terminated. Computed via
+    /// `ExecutionCertificate::deadline()` from the tick's
+    /// `vote_anchor_ts` — the shard consensus-authenticated tick commit time.
     deadline: WeightedTimestamp,
     last_sent_at: WeightedTimestamp,
     rebroadcast_count: u32,
@@ -70,7 +70,7 @@ pub struct RebroadcastDirective {
 }
 
 /// Sub-state machine that retains and periodically re-broadcasts ECs
-/// destined for remote shards until they ACK by finalizing the wave.
+/// destined for remote shards until they ACK by finalizing the tick.
 pub struct OutboundExecutionCertificateTracker {
     /// (`tick_id`, `target_shard`) → entry. One EC may be tracked once per
     /// remote target shard it was sent to.
@@ -98,8 +98,8 @@ impl OutboundExecutionCertificateTracker {
         }
     }
 
-    /// Register an EC the wave leader just broadcast to a remote shard.
-    /// Idempotent on duplicate (wave, target) — preserves the original
+    /// Register an EC the tick leader just broadcast to a remote shard.
+    /// Idempotent on duplicate (tick, target) — preserves the original
     /// `first_sent_at` so the safety horizon counts from the first send.
     pub fn on_broadcast(
         &mut self,
@@ -115,7 +115,7 @@ impl OutboundExecutionCertificateTracker {
             return;
         }
         debug!(
-            wave = %certificate.tick_id(),
+            tick = %certificate.tick_id(),
             target_shard = target_shard.inner(),
             recipients = recipients.len(),
             "Tracking outbound execution certificate"
@@ -134,14 +134,14 @@ impl OutboundExecutionCertificateTracker {
         );
     }
 
-    /// Drop tracking for a wave that finalized locally. Finalization
+    /// Drop tracking for a tick that finalized locally. Finalization
     /// requires every participating shard's EC; remote shards' ECs only
-    /// arrive once those shards executed the wave, which means they
-    /// observed the same wave structure we did and almost certainly
+    /// arrive once those shards executed the tick, which means they
+    /// observed the same tick structure we did and almost certainly
     /// received our EC contribution (or are about to). This is the
     /// best positive signal available without an explicit ACK message.
     pub fn on_tick_finalized(&mut self, tick_id: &TickId) {
-        // A wave can have multiple target_shard entries — drop them all.
+        // A tick can have multiple target_shard entries — drop them all.
         let stale: Vec<_> = self
             .entries
             .keys()
@@ -151,10 +151,10 @@ impl OutboundExecutionCertificateTracker {
         for key in stale {
             if let Some(entry) = self.entries.remove(&key) {
                 debug!(
-                    wave = %key.0,
+                    tick = %key.0,
                     target_shard = key.1.inner(),
                     rebroadcasts = entry.rebroadcast_count,
-                    "Evicted outbound execution certificate (wave finalized)"
+                    "Evicted outbound execution certificate (tick finalized)"
                 );
             }
         }
@@ -190,12 +190,12 @@ impl OutboundExecutionCertificateTracker {
         for key in to_evict {
             if let Some(entry) = self.entries.remove(&key) {
                 warn!(
-                    wave = %key.0,
+                    tick = %key.0,
                     target_shard = key.1.inner(),
                     rebroadcasts = entry.rebroadcast_count,
                     past_deadline_secs = now.elapsed_since(entry.deadline).as_secs(),
                     "Evicting outbound execution certificate past deadline — \
-                     wave never finalized; remote shard likely missed our EC"
+                     tick never finalized; remote shard likely missed our EC"
                 );
             }
         }
@@ -216,7 +216,7 @@ mod tests {
         WeightedTimestamp::from_millis(ms)
     }
 
-    fn wave(local: u64, h: u64, _remote: &[u64]) -> TickId {
+    fn tick(local: u64, h: u64, _remote: &[u64]) -> TickId {
         TickId::new(ShardId::leaf(2, local), BlockHeight::new(h))
     }
 
@@ -240,7 +240,7 @@ mod tests {
         let mut t = OutboundExecutionCertificateTracker::new();
         t.on_block_committed(ts(1_000));
 
-        let w = wave(0, 100, &[1]);
+        let w = tick(0, 100, &[1]);
         t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4, 5, 6, 7]));
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn on_broadcast_skips_when_no_recipients() {
         let mut t = OutboundExecutionCertificateTracker::new();
-        let w = wave(0, 100, &[1]);
+        let w = tick(0, 100, &[1]);
         t.on_broadcast(cert(w), ShardId::leaf(2, 1), vec![]);
         assert_eq!(t.memory_stats().tracked_certificates, 0);
     }
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn on_broadcast_is_idempotent_per_target() {
         let mut t = OutboundExecutionCertificateTracker::new();
-        let w = wave(0, 100, &[1]);
+        let w = tick(0, 100, &[1]);
         t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
         t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4, 5]));
         assert_eq!(t.memory_stats().tracked_certificates, 1);
@@ -267,7 +267,7 @@ mod tests {
         let mut t = OutboundExecutionCertificateTracker::new();
         t.on_block_committed(ts(0));
 
-        let w = wave(0, 100, &[1]);
+        let w = tick(0, 100, &[1]);
         t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
 
         // Just before interval — no directive.
@@ -290,7 +290,7 @@ mod tests {
         let mut t = OutboundExecutionCertificateTracker::new();
         t.on_block_committed(ts(0));
 
-        let w = wave(0, 100, &[1]);
+        let w = tick(0, 100, &[1]);
         t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
 
         let interval_ms = u64::try_from(REBROADCAST_INTERVAL.as_millis()).unwrap_or(u64::MAX);
@@ -307,7 +307,7 @@ mod tests {
         let mut t = OutboundExecutionCertificateTracker::new();
         t.on_block_committed(ts(1_000));
 
-        let w = wave(0, 100, &[1]);
+        let w = tick(0, 100, &[1]);
         t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
 
         let past = RETENTION_HORIZON + Duration::from_secs(1);
@@ -318,9 +318,9 @@ mod tests {
     }
 
     #[test]
-    fn wave_finalization_evicts_all_targets() {
+    fn finalization_evicts_all_targets() {
         let mut t = OutboundExecutionCertificateTracker::new();
-        let w = wave(0, 100, &[1, 2]);
+        let w = tick(0, 100, &[1, 2]);
         t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
         t.on_broadcast(cert(w), ShardId::leaf(2, 2), vids(&[8]));
         assert_eq!(t.memory_stats().tracked_certificates, 2);
@@ -330,10 +330,10 @@ mod tests {
     }
 
     #[test]
-    fn wave_finalization_for_other_wave_is_noop() {
+    fn finalization_for_another_tick_is_noop() {
         let mut t = OutboundExecutionCertificateTracker::new();
-        let w1 = wave(0, 100, &[1]);
-        let w2 = wave(0, 101, &[1]);
+        let w1 = tick(0, 100, &[1]);
+        let w2 = tick(0, 101, &[1]);
         t.on_broadcast(cert(w1), ShardId::leaf(2, 1), vids(&[4]));
         t.on_tick_finalized(&w2);
         assert_eq!(t.memory_stats().tracked_certificates, 1);

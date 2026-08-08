@@ -43,9 +43,9 @@ fn reaches_beyond(
             .any(|s| s != local_shard)
 }
 
-/// Deterministically select the wave leader for a wave (attempt 0).
+/// Deterministically select the tick leader for a tick (attempt 0).
 ///
-/// The wave leader collects execution votes, aggregates the EC, and
+/// The tick leader collects execution votes, aggregates the EC, and
 /// broadcasts it to local peers and remote shards. Convenience wrapper
 /// for `tick_leader_at(tick_id, 0, committee)`.
 #[must_use]
@@ -53,7 +53,7 @@ pub fn tick_leader(tick_id: &TickId, committee: &[ValidatorId]) -> ValidatorId {
     tick_leader_at(tick_id, Attempt::INITIAL, committee)
 }
 
-/// Deterministically select the wave leader with rotation for fallback.
+/// Deterministically select the tick leader with rotation for fallback.
 ///
 /// Each `attempt` selects a different validator from the committee, enabling
 /// leader rotation when the primary leader (attempt=0) fails. Validators

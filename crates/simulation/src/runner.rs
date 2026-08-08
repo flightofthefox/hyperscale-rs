@@ -240,7 +240,7 @@ pub struct SimulationRunner {
     pools: Vec<StakePoolSeat>,
 
     /// The [`Executor`] every host runs, retained so a harness can reach
-    /// engine-side surfaces that are not part of wave execution, such as
+    /// engine-side surfaces that are not part of tick execution, such as
     /// preview.
     engine: Arc<Executor>,
 
@@ -687,7 +687,7 @@ impl SimulationRunner {
     }
 
     /// The cluster's engine, for engine-side surfaces that are not part
-    /// of wave execution, such as preview.
+    /// of tick execution, such as preview.
     #[must_use]
     pub fn engine(&self) -> &Executor {
         &self.engine

@@ -98,24 +98,24 @@ fn a_submitted_transfer_settles_and_reports_every_transition() {
     );
 
     // Every transaction reaches a terminal outcome — nothing is left in
-    // flight once the wave deadline has long passed (INV-EXEC-5).
+    // flight once the tick deadline has long passed (INV-EXEC-5).
     let terminal = statuses
         .iter()
         .filter(|s| matches!(**s, "succeeded" | "aborted" | "rejected"))
         .count();
     assert_eq!(terminal, 3, "every submission terminates, saw {statuses:?}");
 
-    // A single-shard topology opens no cross-shard waves: that header field
+    // A single-shard topology opens no cross-shard ticks: that header field
     // exists to tell remote shards which certificates to expect.
     assert!(
         events.iter().all(|e| !matches!(
             e.kind,
             TraceKind::BlockCommitted {
-                cross_shard_waves: 1..,
+                cross_shard_ticks: 1..,
                 ..
             }
         )),
-        "one shard means no cross-shard waves",
+        "one shard means no cross-shard ticks",
     );
 }
 
@@ -324,7 +324,7 @@ fn a_cross_shard_transfer_is_provisioned_and_certified_in_both_directions() {
                         .insert(shard.0.clone());
                 }
             }
-            TraceKind::WaveFinalized {
+            TraceKind::TickFinalized {
                 shard,
                 participants,
                 txs,
@@ -371,7 +371,7 @@ fn a_cross_shard_transfer_is_provisioned_and_certified_in_both_directions() {
             "tx {tx} needs a certificate from each participant",
         );
 
-        // And both sides committed the wave, each naming both participants.
+        // And both sides committed the tick, each naming both participants.
         let commits = finalized.get(tx).expect("a certified tx is finalized");
         assert_eq!(
             commits.iter().map(|(s, _)| s).collect::<BTreeSet<_>>(),
@@ -382,7 +382,7 @@ fn a_cross_shard_transfer_is_provisioned_and_certified_in_both_directions() {
             assert_eq!(
                 participants.iter().collect::<BTreeSet<_>>(),
                 shards,
-                "the wave {shard} committed must name both participants",
+                "the tick {shard} committed must name both participants",
             );
         }
     }

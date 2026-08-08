@@ -947,7 +947,7 @@ impl BeaconCoordinator {
     /// the FSM into outbound traffic. Quorum rather than full
     /// coverage keeps one faulty or lagging member from pushing every
     /// epoch onto the dwell timer; requiring the local proposal keeps
-    /// a fast peer wave from feeding an input that omits it. The
+    /// a fast peer tick from feeding an input that omits it. The
     /// post-bootstrap dwell ([`Self::on_spc_input_dwell_timer`])
     /// covers the rest.
     pub fn on_beacon_proposal_received(

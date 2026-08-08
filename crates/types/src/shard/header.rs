@@ -72,11 +72,11 @@ pub struct BlockHeader {
     /// anchors from the terminal header's pair; it cannot decompose
     /// `state_root` itself.
     split_child_roots: Option<SplitChildRoots>,
-    /// Merkle root over the wave-ids this shard settled within its
+    /// Merkle root over the tick-ids this shard settled within its
     /// retention window, carried on a terminating shard's boundary header
     /// (`None` everywhere else). The beacon folds it into
     /// [`ShardBoundary`](crate::ShardBoundary), so a surviving counterpart
-    /// resolves split-straddling waves against the terminated shard's
+    /// resolves split-straddling ticks against the terminated shard's
     /// settled set without walking its chain.
     settled_txs_root: Option<SettledTxsRoot>,
     /// The shard's attested load through this block — attested work as a
@@ -604,7 +604,7 @@ impl BlockHeader {
         self.split_child_roots
     }
 
-    /// Merkle root over the wave-ids this shard settled within its
+    /// Merkle root over the tick-ids this shard settled within its
     /// retention window — present on a terminating shard's boundary
     /// header, `None` everywhere else.
     #[must_use]

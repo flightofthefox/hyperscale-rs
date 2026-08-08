@@ -1,16 +1,16 @@
-//! Engine integration: wave-batch transaction execution.
+//! Engine integration: tick-batch transaction execution.
 //!
 //! Synchronous execution shared by the production runner and the
 //! deterministic simulator. The [`Executor`] does NOT own storage: the
 //! runner owns it and passes a snapshot per call.
 //!
 //! State machines emit `Action::ExecuteTransactions`; the runner drives
-//! the executor over the wave's batch, which projects the shard-invariant
+//! the executor over the tick's batch, which projects the shard-invariant
 //! [`CachedOutput`] into the local shard's [`ExecutedTx`] via
 //! [`project_to_shard`].
 //!
 //! Execution itself is derivation through the effects bridge, an owned
-//! committed base pre-read from the wave's JMT-backed snapshot, the
+//! committed base pre-read from the tick's JMT-backed snapshot, the
 //! kernel's deterministic-parallel batch executor, and the movement fold
 //! that turns schedule-invariant receipts into per-transaction absolute
 //! `database_updates`. Guests run on the blessed wasmtime engine natively
@@ -36,10 +36,10 @@ pub mod genesis;
 /// Shard assignment and write filtering for `StateWrites`.
 pub mod sharding;
 
-pub use batch::{CrossShardTxInput, TickTxInput, WaveBatchContext};
+pub use batch::{CrossShardTxInput, TickBatchContext, TickTxInput};
 pub use executor::Executor;
 pub use genesis::{GenesisConfig, World, XRD, genesis_world, genesis_writes};
-// Re-export the fan-out strategy `WaveBatchContext` carries, so callers
+// Re-export the fan-out strategy `TickBatchContext` carries, so callers
 // and their tests need no separate dispatch dependency.
 pub use hyperscale_dispatch::Parallelism;
 pub use hyperscale_effects_bridge::account_address;

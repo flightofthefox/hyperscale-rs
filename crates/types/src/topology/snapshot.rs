@@ -57,7 +57,7 @@ pub struct ShardAnchor {
     pub witness_base: BeaconWitnessLeafCount,
     /// The terminated shard's beacon-attested settled-transaction commitment, set
     /// only on a terminal boundary record. A surviving counterpart reads it
-    /// to resolve split-straddling waves against the terminated shard's
+    /// to resolve split-straddling ticks against the terminated shard's
     /// settled set; `None` for a live shard's anchor.
     pub settled_txs_root: Option<SettledTxsRoot>,
 }

@@ -1,4 +1,4 @@
-//! [`ExecutionCertificate`] — aggregated 2f+1 signature over a wave's
+//! [`ExecutionCertificate`] — aggregated 2f+1 signature over a tick's
 //! per-tx outcomes.
 //!
 //! [`ExecutionCertificate`] is the raw wire form. Its verified form is
@@ -24,7 +24,7 @@ use crate::{
     verify_sparse_inclusion,
 };
 
-/// Aggregated certificate for an execution wave.
+/// Aggregated certificate for an execution tick.
 ///
 /// Contains the signature aggregated signature from 2f+1 validators plus per-tx
 /// outcomes so remote shards can extract individual transaction results.
@@ -375,7 +375,7 @@ impl ExecutionCertificate {
             .any(|outcome| &outcome.tx_hash() == tx_hash)
     }
 
-    /// Self-contained wave identifier (shard + height + remote dependencies).
+    /// Self-contained tick identifier (shard + height + remote dependencies).
     #[must_use]
     pub const fn tick_id(&self) -> &TickId {
         &self.tick_id
@@ -396,7 +396,7 @@ impl ExecutionCertificate {
         self.global_receipt_root
     }
 
-    /// Per-transaction outcomes (in wave order = block order).
+    /// Per-transaction outcomes (in tick order = block order).
     #[must_use]
     pub const fn tx_outcomes(&self) -> &Vec<TxOutcome> {
         &self.tx_outcomes
@@ -422,16 +422,16 @@ impl ExecutionCertificate {
 
     /// Deadline past which this certificate is provably useless on every shard.
     ///
-    /// Anchored on `vote_anchor_ts` — the wave's BFT-authenticated commit
+    /// Anchored on `vote_anchor_ts` — the tick's BFT-authenticated commit
     /// timestamp. Past `vote_anchor_ts + RETENTION_HORIZON` every tx in the
-    /// wave has expired its `validity_range` and terminated (success or
+    /// tick has expired its `validity_range` and terminated (success or
     /// abort), so no shard can still reference this EC.
     #[must_use]
     pub fn deadline(&self) -> WeightedTimestamp {
         self.vote_anchor_ts.plus(RETENTION_HORIZON)
     }
 
-    /// Block height (the block containing the wave's transactions).
+    /// Block height (the block containing the tick's transactions).
     #[must_use]
     pub const fn block_height(&self) -> BlockHeight {
         self.tick_id.block_height()
@@ -572,7 +572,7 @@ impl Verified<ExecutionCertificate> {
     /// only asserts the predicate (signature aggregation + signer-bit
     /// mapping). Every input vote is assumed to share the same signing
     /// message — the `VoteTracker` bucketing key `(global_receipt_root,
-    /// vote_anchor_ts)` plus the per-wave `tick_id` and `shard_id`
+    /// vote_anchor_ts)` plus the per-tick `tick_id` and `shard_id`
     /// uniquely determine that message, so a single bucket's contents
     /// satisfy this contract by construction.
     ///

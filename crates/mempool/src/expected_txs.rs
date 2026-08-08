@@ -24,7 +24,7 @@ use hyperscale_types::{ShardId, TxHash, WeightedTimestamp};
 /// Grace before mempool emits a fetch for an expected tx.
 ///
 /// Long enough for typical gossip arrival (cross-shard hop is ~tens of ms);
-/// short enough that wave timeout (~24s) doesn't fire in practice if gossip
+/// short enough that finalization deadline (~24s) doesn't fire in practice if gossip
 /// drops and fetch is needed.
 pub const EXPECTED_TX_GRACE: Duration = Duration::from_secs(2);
 

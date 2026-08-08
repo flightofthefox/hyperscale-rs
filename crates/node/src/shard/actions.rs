@@ -113,7 +113,7 @@ where
             // ─── Tick chain maintenance ────────────────────────────────────
             // Applied synchronously on the shard thread so a dispatch
             // action later in the same batch reads the resolved chain.
-            Action::ResolveTickWaves { resolutions } => {
+            Action::ResolveTicks { resolutions } => {
                 for (tick_id, resolution) in &resolutions {
                     self.io.tick_chain.resolve(tick_id, resolution);
                 }
@@ -280,11 +280,11 @@ where
         // Serving-cache insertion is `ShardLoop`'s own state, not an
         // instance concern — keep it here.
         if let ProtocolEvent::FinalizationsAdmitted { finalizations } = &pe {
-            for wave in finalizations {
+            for tick in finalizations {
                 self.io
                     .caches
                     .finalization
-                    .insert(*wave.tick_id(), Arc::clone(wave));
+                    .insert(*tick.tick_id(), Arc::clone(tick));
             }
         }
 

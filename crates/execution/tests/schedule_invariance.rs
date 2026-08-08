@@ -5,7 +5,7 @@
 //! gate are emitted correspondingly later. None of that may reach a receipt.
 //! If it did, two honest replicas on the same chain would derive different
 //! writes, `reconcile_local_ec_root` would latch `locally_divergent`, and the
-//! slower one would quietly stop contributing to every wave it holds.
+//! slower one would quietly stop contributing to every tick it holds.
 //!
 //! So the lane fixes the committed chain and quantifies over the schedule.
 
@@ -35,7 +35,7 @@ fn local_tx(seed: u8, owner: u8) -> Transaction {
 }
 
 /// A transaction declaring cells on both sides of the partition: a
-/// cross-shard wave, whose local writes are provisional until it settles.
+/// cross-shard tick, whose local writes are provisional until it settles.
 /// It provisions nothing either, so it joins its block's tick at once.
 fn crossing(seed: u8, owner: u8) -> Transaction {
     test_transaction_with_prefixes(
@@ -86,7 +86,7 @@ fn tick_outputs_do_not_move_with_execution_lag() {
     }
 }
 
-/// The same over a cross-shard wave, whose writes are provisional.
+/// The same over a cross-shard tick, whose writes are provisional.
 ///
 /// A settlement promotes those entries into the readable fold, so *when*
 /// it is applied relative to a later tick's dispatch is exactly the timing
@@ -103,7 +103,7 @@ fn with_a_crossing(schedule: Schedule) -> (Vec<(BlockHeight, TickOutput)>, u64) 
     // the counterpart's engagement echo before executing.
     sim.engage(ShardId::leaf(1, 1), &[leg_hash]);
     sim.drain();
-    let wave = sim.wave_of(leg_hash).expect("the crossing joined a tick");
+    let tick = sim.tick_of(leg_hash).expect("the crossing joined a tick");
     assert_eq!(
         counter(sim.read(cell_of(test_prefix(LOCAL)))),
         0,
@@ -115,9 +115,9 @@ fn with_a_crossing(schedule: Schedule) -> (Vec<(BlockHeight, TickOutput)>, u64) 
     sim.drain();
 
     // The crossing settles; the follower enters the next tick composed.
-    let receipts = sim.receipts_for(&wave);
+    let receipts = sim.receipts_for(&tick);
     assert!(!receipts.is_empty(), "the crossing produced a receipt");
-    sim.commit(Vec::new(), vec![settle(&wave, &receipts)]);
+    sim.commit(Vec::new(), vec![settle(&tick, &receipts)]);
     sim.commit(Vec::new(), Vec::new());
     sim.drain();
 
@@ -144,7 +144,7 @@ fn tick_outputs_do_not_move_with_resolution_timing() {
 }
 
 /// A tick reads its own anchor, and the chain evicts a fold once the base
-/// "covers" it — but the base covers it at the height its wave *settled*,
+/// "covers" it — but the base covers it at the height its tick *settled*,
 /// which can be above the anchor a queued tick will read from.
 ///
 /// So a tick that runs before the eviction sees its predecessor's write in
@@ -162,10 +162,10 @@ fn evicted_between(schedule: Schedule) -> (u64, u128) {
 
     // The predecessor's certificate. Settling it lets the chain evict its
     // fold, and the base only gains the write at this height.
-    let wave = sim.wave_of(first_hash).expect("wave assigned");
-    let receipts = sim.receipts_for(&wave);
+    let tick = sim.tick_of(first_hash).expect("tick assigned");
+    let receipts = sim.receipts_for(&tick);
     assert!(!receipts.is_empty(), "the predecessor executed");
-    sim.commit(Vec::new(), vec![settle(&wave, &receipts)]);
+    sim.commit(Vec::new(), vec![settle(&tick, &receipts)]);
 
     sim.drain();
     // Read together: the settled fold and the base both carry the

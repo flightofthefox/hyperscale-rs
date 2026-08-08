@@ -5,7 +5,7 @@
 //!
 //! ## Round Voting
 //!
-//! Validators vote at each block commit where their wave is complete.
+//! Validators vote at each block commit where their tick is complete.
 //! Votes include `vote_anchor_ts` in the signed message, so votes at
 //! different heights have different signatures and cannot be aggregated.
 //! The tracker groups by `(global_receipt_root, vote_anchor_ts)` and checks quorum
@@ -31,16 +31,16 @@ use hyperscale_types::{
 /// ones if an abort intent changes the `global_receipt_root` between heights.
 type VoteKey = (GlobalReceiptRoot, WeightedTimestamp);
 
-/// Tracks execution votes for a specific wave within a block.
+/// Tracks execution votes for a specific tick within a block.
 ///
-/// After executing all transactions in a wave, validators create an execution
+/// After executing all transactions in a tick, validators create an execution
 /// vote on the receipt root. This tracker collects votes and determines when
 /// quorum is reached for signature aggregation into an execution certificate.
 #[derive(Debug)]
 pub struct VoteTracker {
-    /// Wave identifier.
+    /// Tick identifier.
     tick_id: TickId,
-    /// Block hash this wave belongs to.
+    /// Block hash this tick belongs to.
     block_hash: BlockHash,
     /// Quorum threshold (2f+1 voting power).
     quorum: VoteCount,
@@ -85,7 +85,7 @@ impl VoteTracker {
         }
     }
 
-    /// Get the wave ID.
+    /// Get the tick ID.
     #[must_use]
     pub const fn tick_id(&self) -> &TickId {
         &self.tick_id

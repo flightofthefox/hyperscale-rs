@@ -22,7 +22,7 @@ fn expected() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
                 "round",
                 "fallback",
                 "proposer",
-                "crossShardWaves",
+                "crossShardTicks",
             ],
         ),
         ("beaconBlockCommitted", &["epoch"]),
@@ -33,11 +33,11 @@ fn expected() -> BTreeMap<&'static str, BTreeSet<&'static str>> {
         ),
         (
             "executionCertified",
-            &["shard", "height", "wave", "into", "intoHeight", "outcomes"],
+            &["shard", "height", "tick", "into", "intoHeight", "outcomes"],
         ),
         (
-            "waveFinalized",
-            &["shard", "height", "openedAt", "wave", "participants", "txs"],
+            "tickFinalized",
+            &["shard", "height", "openedAt", "tick", "participants", "txs"],
         ),
         ("shardTerminal", &["shard", "height", "handoffFrom"]),
         (
@@ -140,7 +140,7 @@ fn an_arcs_payload_reads_as_the_page_expects() {
         .expect("a session under load certifies executions");
     let kind = &certified["kind"];
     assert!(kind["shard"].is_string(), "a shard path is a bare string");
-    assert!(kind["wave"].is_string(), "a wave label is a bare string");
+    assert!(kind["tick"].is_string(), "a tick label is a bare string");
     let outcome = &kind["outcomes"][0];
     assert!(outcome[0].is_string(), "an outcome names its transaction");
     assert!(

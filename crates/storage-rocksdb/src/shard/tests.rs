@@ -451,7 +451,7 @@ fn test_state_root_changes_on_commit() {
 
 /// Append a `Finalization` to a block in place. Because `Block` is an enum,
 /// this replaces the whole value via `std::mem::replace`.
-fn push_wave(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
+fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
     let taken = std::mem::replace(
         block,
         Block::Sealed {
@@ -947,7 +947,7 @@ fn test_ec_survives_reopen() {
         let block = make_test_block(BlockHeight::new(0));
         storage.commit_block(&make_test_certified(block), &no_witness());
         let mut block = make_test_block(BlockHeight::new(1));
-        push_wave(
+        push_finalization(
             &mut block,
             Arc::new(Finalization::new(tick_id, vec![Arc::new(ec)], vec![]).into()),
         );
@@ -971,7 +971,7 @@ fn test_ec_atomic_with_block_commit() {
     let ec = make_test_execution_certificate(1, BlockHeight::new(1));
     let tick_id = *ec.tick_id();
     let mut block = make_test_block(BlockHeight::new(1));
-    push_wave(
+    push_finalization(
         &mut block,
         Arc::new(Finalization::new(tick_id, vec![Arc::new(ec)], vec![]).into()),
     );
@@ -1016,7 +1016,7 @@ fn rocks_commit_with(
             }),
             metadata: None,
         };
-        let wave = Arc::new(
+        let tick = Arc::new(
             Finalization::new(
                 TickId::new(ShardId::ROOT, block.height()),
                 vec![placeholder_local_ec(ShardId::ROOT, block.height())],
@@ -1024,7 +1024,7 @@ fn rocks_commit_with(
             )
             .into(),
         );
-        push_wave(&mut block, wave);
+        push_finalization(&mut block, tick);
     }
     // SAFETY: synthetic test fixture; round-trip tests don't exercise
     // the `Verified<CertifiedBlock>` predicate.

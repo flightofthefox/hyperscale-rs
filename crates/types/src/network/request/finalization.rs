@@ -13,7 +13,7 @@ use crate::{MessageClass, NetworkMessage, Request, TickId};
 /// needed since `TickId` self-contains shard, height, and dependency set.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetFinalizationsRequest {
-    /// Wave IDs being requested.
+    /// Tick IDs being requested.
     pub tick_ids: Vec<TickId>,
 }
 

@@ -5,32 +5,32 @@
 // Shard consensus is an oracle here (Model B): each shard is a monotone
 // attested clock plus an ordered commit of the transaction, and each committee
 // is honest (INV-SEC-1, priced separately in committee_security.md), so a
-// shard emits exactly one ExecutionCertificate per wave. The broken twin
+// shard emits exactly one ExecutionCertificate per transaction. The broken twin
 // removes exactly that — an equivocating committee emits two ECs — and
 // first-wins admission does the rest.
 //
-// Code anchors (crates/execution/src/wave_state.rs unless noted):
+// Code anchors (crates/execution/src/tick_state.rs unless noted):
 //   - Deadline and vote branches: `can_emit_vote` — fully provisioned
 //     (vote real outcomes once committed_ts >= all_provisioned_at) or
-//     timed out (all-abort once committed_ts >= wave_start_ts +
-//     WAVE_TIMEOUT, with wave_start_ts = the LOCAL block's weighted
-//     timestamp, coordinator.rs wave creation). Provisions absorbed after
+//     timed out (all-abort once committed_ts >= tick_ts +
+//     MAX_FINALIZATION_DELAY, with tick_ts = the LOCAL block's weighted
+//     timestamp, coordinator.rs transaction creation). Provisions absorbed after
 //     the deadline but before voting still take the success branch — the
 //     deadline bites only while unprovisioned.
 //   - Abort dominance: `add_execution_certificate` — any shard's EC
 //     reporting abort latches `tracker_aborted`, terminal per tx.
 //   - Success unanimity: `is_complete` — a non-aborted tx needs EC
 //     coverage from every participating shard, plus the local EC.
-//   - First-wins EC admission: `seen_ec_wave_ids` dedup in
+//   - First-wins EC admission: `seen_ec_tick_ids` dedup in
 //     `add_execution_certificate`.
 //   - Cross-shard agreement is per transaction, not per receipt root:
 //     `ExecutionOutcome::Succeeded { receipt_hash }`
-//     (crates/types/src/execution/outcome.rs); wave grouping is per shard, so
+//     (crates/types/src/execution/outcome.rs); transaction grouping is per shard, so
 //     global roots are not comparable across shards.
 //
 // Modeling assumptions:
-//   - One cross-shard transaction on two shards; the wave is the
-//     transaction (per-shard wave grouping affects liveness, not the
+//   - One cross-shard transaction on two shards; the transaction is the
+//     transaction (per-shard transaction grouping affects liveness, not the
 //     atomicity core). INV-EXEC-4 (conflict tiebreak) is deferred to a
 //     later revision of this model.
 //   - Execution determinism is an axiom (INV-DET-1): success outcomes on
@@ -52,7 +52,7 @@
 //   quint verify --main=commit_equiv --invariant=invAtomic --max-steps=12 specs/atomic_commitment.qnt
 
 module atomic_commitment {
-  // Wave timeout in clock units.
+  // Finalization delay in clock units.
   const TIMEOUT: int
   // Max clock advance per step.
   const MAX_TICK: int
@@ -70,7 +70,7 @@ module atomic_commitment {
   // Per-shard attested chain clock (monotone).
   var clock: int -> int
   // Clock value at which the shard committed the tx (NONE before). This is
-  // the wave_start_ts: locks engage, provisions to the counterparty become
+  // the tick_ts: locks engage, provisions to the counterparty become
   // an attested fact.
   var committedAt: int -> int
   // Clock value at which the shard absorbed the counterparty's provisions
@@ -105,7 +105,7 @@ module atomic_commitment {
   }
 
   // The shard's chain commits the tx (consensus oracle): locks engage,
-  // wave_start_ts is stamped, provisions toward the counterparty exist
+  // tick_ts is stamped, provisions toward the counterparty exist
   // from here on as attested facts.
   action commitTx = {
     nondet s = SHARDS.oneOf()
@@ -135,9 +135,9 @@ module atomic_commitment {
   // The shard's committee emits its EC — `can_emit_vote`, both branches.
   // Success: provisioned and the chain clock has reached the absorb stamp.
   // Abort: still unprovisioned once the chain clock passes
-  // wave_start_ts + TIMEOUT.
+  // tick_ts + TIMEOUT.
   // A shard emits its own EC into its admitted row immediately (the local
-  // EC is always included — `WaveState::attestation`).
+  // EC is always included — `TickState::attestation`).
   action emitEc = {
     nondet s = SHARDS.oneOf()
     nondet o = Set(SUCC, ABORT).oneOf()
@@ -164,7 +164,7 @@ module atomic_commitment {
   }
 
   // Network delivers some emitted EC from src's committee to dst;
-  // first-wins admission latches it (`seen_ec_wave_ids`).
+  // first-wins admission latches it (`seen_ec_tick_ids`).
   action deliverEc = {
     nondet dst = SHARDS.oneOf()
     nondet o = emitted.get(other(dst)).oneOf()
@@ -285,7 +285,7 @@ module atomic_commitment {
   }
 }
 
-// Healthy configuration: one EC per committee per wave. Deadline
+// Healthy configuration: one EC per committee per transaction. Deadline
 // heterogeneity, late provisions, and every delivery interleaving are all
 // in scope — atomicity must survive them on the strength of abort
 // dominance + success unanimity alone.

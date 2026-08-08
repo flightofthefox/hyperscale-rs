@@ -223,7 +223,7 @@ pub enum ShardScopedInput {
     },
 
     /// Sync block passed structural validation off-thread (Merkle roots,
-    /// QC binding, per-wave shape). The pinned-thread `NodeHost` re-enters
+    /// QC binding, per-tick shape). The pinned-thread `NodeHost` re-enters
     /// the post-validation delivery path on receipt.
     SyncBlockValidated {
         /// Height of the validated block.
@@ -295,7 +295,7 @@ pub enum ShardScopedInput {
         txs: Option<Vec<TxHash>>,
     },
 
-    /// Settled-waves fetch failed at the transport level. The driver
+    /// Settled-ticks fetch failed at the transport level. The driver
     /// re-arms and the next `FetchTick` retries against a rotated peer.
     SettledTxsFetchFailed {
         /// The terminated shard being acquired.
@@ -316,7 +316,7 @@ pub enum ShardScopedInput {
 
     /// A finalization fetch request failed.
     FinalizationsFetchFailed {
-        /// Wave ids that weren't returned.
+        /// Tick ids that weren't returned.
         ids: Vec<TickId>,
     },
 

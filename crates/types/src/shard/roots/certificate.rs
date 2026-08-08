@@ -5,7 +5,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
-    CertificateRoot, Finalization, Hash, Verifiable, Verified, Verify, WaveReceiptHash,
+    CertificateRoot, Finalization, FinalizationHash, Hash, Verifiable, Verified, Verify,
     compute_merkle_root,
 };
 
@@ -16,7 +16,9 @@ use crate::{
 /// remote verifier that recomputes the root from per-certificate
 /// reveals rather than the certificates themselves.
 #[must_use]
-pub fn certificate_root_from_receipt_hashes(receipt_hashes: &[WaveReceiptHash]) -> CertificateRoot {
+pub fn certificate_root_from_receipt_hashes(
+    receipt_hashes: &[FinalizationHash],
+) -> CertificateRoot {
     if receipt_hashes.is_empty() {
         return CertificateRoot::ZERO;
     }
@@ -48,12 +50,12 @@ pub enum CertRootVerifyError {
 
 impl Verified<CertificateRoot> {
     /// Compute the certificate root from `certificates`. Verified by
-    /// construction. Reads each wave's `receipt_hash` via the
+    /// construction. Reads each tick's `receipt_hash` via the
     /// [`Verifiable`] `Deref` impl so callers can pass the
     /// `Block::Live.certificates` slice without unwrapping.
     #[must_use]
     pub fn compute(certificates: &[Arc<Verifiable<Finalization>>]) -> Self {
-        let receipt_hashes: Vec<WaveReceiptHash> =
+        let receipt_hashes: Vec<FinalizationHash> =
             certificates.iter().map(|fw| fw.receipt_hash()).collect();
         Self::new_unchecked(certificate_root_from_receipt_hashes(&receipt_hashes))
     }

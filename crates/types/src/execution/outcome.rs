@@ -5,7 +5,7 @@ use hyperscale_hbor::Hbor;
 
 use crate::{GlobalReceiptHash, TxHash};
 
-/// Per-transaction execution outcome within a wave.
+/// Per-transaction execution outcome within a tick.
 ///
 /// Carried inside execution certificates so remote shards can extract
 /// individual transaction results for cross-shard finalization.
@@ -51,7 +51,7 @@ pub struct TxOutcome {
     /// every participant.
     ///
     /// Attested rather than re-derived because release has to work
-    /// without the transaction. A block settling a wave releases the
+    /// without the transaction. A block settling a tick releases the
     /// reservation its committing block took, and a validator holding
     /// the certificate but not the transactions — a node that snap-synced
     /// past them — still has to reach the same total. Reserving one

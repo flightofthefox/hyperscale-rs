@@ -7,9 +7,9 @@ use crate::{
     NetworkDefinition, NetworkMessage, ShardId, Signed, ValidatorId, signed_bytes,
 };
 
-/// Batched execution certificates proving quorum for execution waves.
+/// Batched execution certificates proving quorum for execution ticks.
 ///
-/// Each certificate covers all transactions in a deterministic wave
+/// Each certificate covers all transactions in a deterministic tick
 /// partition of a block. Contains per-tx outcomes so remote shards can
 /// extract individual transaction results for cross-shard finalization.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]

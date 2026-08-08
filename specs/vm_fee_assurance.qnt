@@ -45,8 +45,8 @@
 //     and releases the remainder, and posts no bond at all: it wrote no
 //     substates, which is the same fact that makes it atomic.
 //   - P terminating mid-flight (reshape) stamps abort-by-omission for an
-//     unfinalized wave (Model D's rule) and the successor sweep resolves
-//     the reservation it inherited; the sweep is modeled atomic with the
+//     unfinalized transaction (Model D's rule) and the successor sweep resolves
+//     the reservation it inherited; abandonment is modeled atomic with the
 //     terminal stamp.
 //
 // Where this abstraction is stricter than the implementation, and why
@@ -59,7 +59,7 @@
 // so nothing is inherited and there is nothing to sweep. The model
 // therefore verifies a requirement the code discharges by construction.
 // Two consequences of that gap are worth naming rather than reading off
-// the model: a terminal that leaves a wave unfinalized settles no receipt
+// the model: a terminal that leaves a transaction unfinalized settles no receipt
 // and so burns nothing, where the model burns FLOOR; and the abstraction
 // cannot see that a payer's own withdraw declares the vault its fee burns
 // from, which is what makes a reservation's encumbrance indistinguishable
@@ -77,18 +77,18 @@
 //   - Engagement echo: every VM participant's commit emits its bundle
 //     to the payer (`provision_tx_roots` fan-out + the emit/serve
 //     paths); absorption records it per (tx, source shard).
-//   - Payer vote gating: `WaveState::can_emit_vote`
-//     (crates/execution/src/wave_state.rs) gains the engagement-coverage
+//   - Payer vote gating: `TickState::can_emit_vote`
+//     (crates/execution/src/tick_state.rs) gains the engagement-coverage
 //     requirement beside the dispatch requirement, with the same
 //     all-abort vote shape as the unprovisioned timeout.
-//   - Burn and release: wave finalization at the payer shard; the abort
+//   - Burn and release: transaction finalization at the payer shard; the abort
 //     floor rides the fee record on the payer's EC outcomes.
-//   - Successor sweep: the straddler counterpart sweep
+//   - Successor sweep: the straddler abandonment at the deadline
 //     (crates/execution/src/coordinator.rs), extended to resolve
 //     inherited reservations.
 //
 // Modeling assumptions (on top of Model C's):
-//   - One transaction, wave = transaction; amounts are integers with
+//   - One transaction, transaction = transaction; amounts are integers with
 //     FLOOR < ACTUAL < MAX_FEE so the burn classes are distinguishable.
 //   - Execution outcomes are honest-success: a user-error abort at Q
 //     resolves through the same abort-dominant EC exchange and burns the
@@ -443,7 +443,7 @@ module vm_fee_assurance {
   }
 
   // Abort finalization: worst-wins, and a shard's own abort EC needs no
-  // counterpart coverage — the wave completes on it (the tracker-abort
+  // counterpart coverage — the transaction completes on it (the tracker-abort
   // rule). At P this resolves the reservation at the floor.
   action finalizeAbortAt(s: int): bool = {
     val row = admitted.get(s)
@@ -499,7 +499,7 @@ module vm_fee_assurance {
   }
 
   // P reaches its reshape terminal mid-flight: the chain freezes, an
-  // unfinalized wave stamps abort-by-omission (Model D), and the
+  // unfinalized transaction stamps abort-by-omission (Model D), and the
   // successor's sweep resolves the reservation it inherited — the
   // reservation is a substate and moves with the subtree. The sweep is
   // atomic with the stamp here; the twin drops it and the reservation
@@ -598,7 +598,7 @@ module vm_fee_assurance {
   // Scripted: the deadline vote settles the floor. P commits and
   // reserves; no engagement echo ever commits (the bundle is lost or Q
   // never engages); P's clock passes the window; its single all-abort
-  // statement completes its own wave and resolves the reservation.
+  // statement completes its own transaction and resolves the reservation.
   run deadlineFloor =
     init
       .then(pCertify)

@@ -4,7 +4,7 @@
 //! the rules every honest validator applies before voting:
 //!
 //! - Header structure: proposer selection, parent-QC quorum, timestamp bounds.
-//! - Block contents: transaction ordering, `waves` recomputation, and
+//! - Block contents: transaction ordering, `ticks` recomputation, and
 //!   cross-ancestor transaction uniqueness.
 //!
 //! Everything here is stateless — callers supply `committed_height`,
@@ -320,7 +320,7 @@ pub fn validate_no_duplicate_transactions(
 ///
 /// Both proposer and validator hit `record_block_committed` synchronously
 /// during their respective commit handlers, so their `dedup_index` reflects
-/// the same just-committed waves at the same logical moment. Validation
+/// the same just-committed ticks at the same logical moment. Validation
 /// against this shared state is therefore safe under the on-qc-formed race.
 pub fn validate_no_duplicate_resolutions(
     block: &Block,
@@ -499,7 +499,7 @@ fn validate_block_work(block: &Block, parent_load: Option<ShardLoad>) -> Result<
     Ok(())
 }
 
-/// Run all pre-vote block-contents checks: transaction ordering, `waves`
+/// Run all pre-vote block-contents checks: transaction ordering, `ticks`
 /// recomputation, and cross-ancestor uniqueness for txs, certs, and
 /// provisions. Returns a single diagnostic on the first failure so the
 /// caller can log once.
@@ -1306,7 +1306,7 @@ mod tests {
         let tx_hash = settled
             .tx_hashes()
             .next()
-            .expect("a wave names its members");
+            .expect("a tick names its members");
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_certs(&[Arc::new((*settled).clone().into())]);
 
@@ -1329,7 +1329,7 @@ mod tests {
         let tx_hash = settled
             .tx_hashes()
             .next()
-            .expect("a wave names its members");
+            .expect("a tick names its members");
         let ancestor_resolved: HashSet<TxHash> = std::iter::once(tx_hash).collect();
 
         let block =
@@ -1355,7 +1355,7 @@ mod tests {
         let tx_hash = settled
             .tx_hashes()
             .next()
-            .expect("a wave names its members");
+            .expect("a tick names its members");
         let block = block_with_certificates(
             BlockHeight::new(6),
             vec![settled, finalization_over(9, tx_hash)],

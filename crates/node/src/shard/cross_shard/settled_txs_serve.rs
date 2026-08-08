@@ -111,19 +111,19 @@ mod tests {
 
     const SHARD: ShardId = ShardId::ROOT;
 
-    /// The transaction the wave at `height` settles — distinct per wave,
-    /// so a window over several waves has one entry each.
+    /// The transaction the tick at `height` settles — distinct per tick,
+    /// so a window over several ticks has one entry each.
     fn settled_tx(height: u64) -> TxHash {
         TxHash::from(Hash::from_bytes(&height.to_le_bytes()))
     }
 
     fn finalization(height: u64) -> Arc<Verifiable<Finalization>> {
-        // Cross-shard wave (non-empty `remote_shards`): the settled set
-        // commits only cross-shard waves, so single-shard fixtures would be
+        // Cross-shard tick (non-empty `remote_shards`): the settled set
+        // commits only cross-shard ticks, so single-shard fixtures would be
         // filtered out before the merkle root.
-        let wave = TickId::new(SHARD, BlockHeight::new(height));
+        let tick = TickId::new(SHARD, BlockHeight::new(height));
         let ec = ExecutionCertificate::new(
-            wave,
+            tick,
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome::new(
@@ -151,7 +151,7 @@ mod tests {
             SignerBitfield::new(4),
         );
         Arc::new(Verifiable::from(Finalization::new(
-            wave,
+            tick,
             vec![Arc::new(ec), Arc::new(remote)],
             vec![],
         )))

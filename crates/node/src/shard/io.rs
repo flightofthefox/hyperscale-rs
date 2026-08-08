@@ -37,7 +37,7 @@ pub struct ShardIo<S: ShardStorage> {
     pub(crate) pending_chain: Arc<PendingChain<S>>,
 
     /// Execution-baseline tick outputs. The execute handler appends and
-    /// reads views; the shard loop applies wave resolutions and prunes
+    /// reads views; the shard loop applies tick resolutions and prunes
     /// on persistence. Never feeds state-root verification.
     pub(crate) tick_chain: Arc<TickChain<S>>,
 

@@ -5,12 +5,12 @@ Hyperscale runs three consensus mechanisms, each with a different shape because 
 | Layer | Question it answers | Protocol | Cadence | Participants |
 |---|---|---|---|---|
 | **Shard consensus** | In what order do transactions run? | HotStuff-2 (two-chain, pipelined) | Continuous, per-shard | The shard's committee |
-| **Execution consensus** | What did the transactions do? | Vote aggregation into ExecutionCertificates | Per wave, after ordering | The shard's committee (per shard, per wave) |
+| **Execution consensus** | What did the transactions do? | Vote aggregation into ExecutionCertificates | Per tick, after ordering | The shard's committee (per shard, per tick) |
 | **Beacon consensus** | Who governs which shard, when? | Prefix Consensus / Strong Prefix Consensus (PC/SPC) | One block per epoch, wall-clock paced | A sampled global committee |
 
 They are harmonized by a single artifact — the **topology schedule**, a mapping from BFT-attested time to committees — and a single clock, **weighted time**. This document describes each layer and then the harmonization.
 
-Key types are named inline; the main homes are `crates/shard` (shard consensus), `crates/execution` and `crates/types` wave/certificate types (execution consensus), `crates/beacon` (beacon consensus), and `crates/types` topology types (the schedule).
+Key types are named inline; the main homes are `crates/shard` (shard consensus), `crates/execution` and `crates/types` tick/certificate types (execution consensus), `crates/beacon` (beacon consensus), and `crates/types` topology types (the schedule).
 
 ---
 
@@ -36,7 +36,7 @@ Each validator maintains two monotone local registers: `locked_round` (the highe
 
 On voting, both registers ratchet up. On timing out of a round, `last_voted_round` ratchets too, so a timed-out round can never be voted afterwards (INV-SHARD-2). There is **no unlock rule** — `locked_round` never decreases, under any input (INV-SHARD-3). Both registers are durable: they are persisted before any vote or timeout signature leaves the process, and they are recovered on restart floored at the highest known QC's round. A crash costs at most an abstention, never a second signature in a consumed round.
 
-A validator votes only after holding the **complete block** — header plus every transaction, wave, and provision body. This rule turns every QC into a data-availability certificate: 2f+1 validators provably hold the full content, so the block is recoverable from any of them (INV-SHARD-7).
+A validator votes only after holding the **complete block** — header plus every transaction, finalization, and provision body. This rule turns every QC into a data-availability certificate: 2f+1 validators provably hold the full content, so the block is recoverable from any of them (INV-SHARD-7).
 
 Votes are BLS signatures over a domain-separated message binding the vote's full context — the shard, the chain position and round, the block and parent hashes. A vote is sent to the current round's proposer and, for pipelining, to the next couple of rounds' proposers as well.
 
@@ -55,7 +55,7 @@ A block `B` commits when a QC forms for a child at **exactly** `B.round + 1` —
 
 The division of labor between the two rules is the heart of fork safety. The safe-vote rule alone does *not* prevent two QCs at one height: two siblings both extending the same parent QC can each gather a quorum without any validator violating its lock. What it cannot allow is both siblings *committing*. Committing `B` requires a contiguous chain of QCs above it, and quorum intersection (any two 2f+1 quorums share an honest validator, whose lock has ratcheted) forces every subsequent QC to extend the committed branch. One height, at most one committed block (INV-SHARD-1). The `fork_safety` test asserts exactly this under adversarial scheduling.
 
-Every committed block's parent hash must equal the previously committed hash — commit order is exactly chain order (INV-SHARD-5). At commit, the chain state advances atomically: committed height/hash/state-root, the tip's block and committee anchor timestamps, dedup indices for committed transactions/waves/provisions (retention-bounded), the beacon-witness accumulator (§3.3), and byte-growth counters that feed reshape triggers.
+Every committed block's parent hash must equal the previously committed hash — commit order is exactly chain order (INV-SHARD-5). At commit, the chain state advances atomically: committed height/hash/state-root, the tip's block and committee anchor timestamps, dedup indices for committed transactions/certificates/provisions (retention-bounded), the beacon-witness accumulator (§3.3), and byte-growth counters that feed reshape triggers.
 
 ### 1.5 The pacemaker
 
@@ -78,23 +78,23 @@ The `BlockHeader` binds, under the QC, everything other layers depend on. The lo
 
 Ordering and execution are deliberately decoupled. Shard consensus commits blocks *before* executing their transactions; execution then happens against committed order, and its results are agreed by a second, lighter round of consensus. This decoupling is what makes cross-shard atomicity tractable: a shard can commit to running a transaction whose inputs live on four other shards without stalling its consensus on their progress.
 
-### 2.1 Waves
+### 2.1 Ticks
 
-At block commit, the block's transactions are grouped into **waves** — units of execution agreement. Single-shard transactions dispatch immediately. Cross-shard transactions wait in their wave (`WaveState`, `crates/execution`) until provisions from every counterparty shard have arrived and verified ([04-atomic-commitment.md](04-atomic-commitment.md)); then the whole wave executes atomically against the merged state view.
+At block commit the shard composes a **tick** — the unit of execution agreement, and one batch. It takes the committed transactions that can reach their outcome in it: those reaching no further than this shard, and every cross-shard leg whose counterparties' provisions have arrived and verified ([04-atomic-commitment.md](04-atomic-commitment.md)). A transaction that cannot waits (`TickCandidates`, `crates/execution`) and joins whichever later tick can take it; it has attested nothing meanwhile, so waiting costs it latency and nothing else.
 
 ### 2.2 From votes to the ExecutionCertificate
 
-Every validator executes the wave locally — deterministically: same engine, same inputs, same outputs — and sends an `ExecutionVote` asserting the wave's `global_receipt_root`, a merkle root over the per-transaction outcomes. The vote goes to the wave's leader, chosen by a deterministic hash of the wave id over the committee. 2f+1 agreeing votes aggregate into an **`ExecutionCertificate`** (EC). Alongside the usual quorum material (signer bitfield, aggregated BLS signature), the EC carries the wave identity, a BFT-attested anchor timestamp, the receipt root, and the explicit per-transaction outcome vector (succeeded, aborted, or rejected).
+Every validator executes the tick locally — deterministically: same engine, same inputs, same outputs — and sends an `ExecutionVote` asserting the tick's `global_receipt_root`, a merkle root over the per-transaction outcomes. The vote goes to the tick's leader, chosen by a deterministic hash of the tick id over the committee seated at the tick's own block. 2f+1 agreeing votes aggregate into an **`ExecutionCertificate`** (EC). Alongside the usual quorum material (signer bitfield, aggregated BLS signature), the EC carries the tick identity, a BFT-attested anchor timestamp, the receipt root, and the explicit per-transaction outcome vector (succeeded, aborted, or rejected).
 
 A structural detail with safety weight: on decode, an EC's receipt root is **recomputed from its outcome vector** and must match the attested root. A Byzantine aggregator cannot assemble a signature-valid certificate whose claimed root diverges from its claimed outcomes (INV-EXEC-2).
 
 ### 2.3 Finalization
 
-For a cross-shard wave, each participating shard produces its own EC covering the wave's transactions. Wave grouping is per shard — a wave id binds the local shard and block — so a remote participant's coverage can arrive under different wave boundaries, even split across several ECs. A **`Finalization`** bundles the local EC with the verified remote coverage. Finalization is decided per transaction: success requires a success outcome — carrying the transaction's receipt hash — from every participating shard, while an abort outcome from any single shard is terminal for the transaction. Abort is dominant; success is unanimous. Agreement on success content rests on deterministic execution: honest quorums compute identical per-transaction receipt hashes, so unanimity is agreement. It carries the local receipts those certificates attest alongside them, and rides in a subsequent block, making execution results part of the ordered chain. Receipts are validated against the EC's attestation before they are accepted from any source.
+Each participating shard produces its own EC covering the transactions it ran. A tick id binds a shard and one of its blocks, so a remote participant's coverage arrives under its own tick boundaries and may be split across several ECs — a counterpart runs a transaction in whichever tick it could, not in the one this shard did. A **`Finalization`** bundles the local EC with the verified remote coverage. Finalization is decided per transaction: success requires a success outcome — carrying the transaction's receipt hash — from every participating shard, while an abort outcome from any single shard is terminal for the transaction. Abort is dominant; success is unanimous. Agreement on success content rests on deterministic execution: honest quorums compute identical per-transaction receipt hashes, so unanimity is agreement. It carries the local receipts those certificates attest alongside them, and rides in a subsequent block, making execution results part of the ordered chain. Receipts are validated against the EC's attestation before they are accepted from any source.
 
-If a validator's local execution disagrees with the EC its shard's quorum produced, that validator marks the wave locally divergent and never finalizes its own result; it recovers the canonical `Finalization` through block sync instead. A locally-buggy replica cannot leak its receipts into the finalized store (INV-EXEC-8; see divergence recovery in [03-state-and-sync.md](03-state-and-sync.md)).
+If a validator's local execution disagrees with the EC its shard's quorum produced, that validator marks the tick locally divergent and never finalizes its own result; it recovers the canonical `Finalization` through block sync instead. A locally-buggy replica cannot leak its receipts into the finalized store (INV-EXEC-8; see divergence recovery in [03-state-and-sync.md](03-state-and-sync.md)).
 
-Execution consensus also has a liveness backstop: every wave carries a deadline derived from BFT-attested time, and a wave still unprovisioned at its deadline all-aborts deterministically on every shard (INV-EXEC-5).
+Execution consensus also has a liveness backstop, and it belongs to the transaction rather than to any batch: past its own signed validity end plus `MAX_FINALIZATION_DELAY`, a committed transaction still unresolved is attested `Aborted` by a later tick. Both figures are chain content on every replica, so the deadline is derived identically everywhere and abandonment is a certified outcome rather than each node's private cleanup (INV-EXEC-5).
 
 ---
 
@@ -140,7 +140,7 @@ The three layers stay mutually consistent through one discipline:
 
 **Every committee lookup, everywhere, is `schedule.at(weighted_timestamp)`** — `epoch_for(wt) = floor(wt / epoch_duration_ms)` over an attested timestamp; what varies per artifact is only which timestamp keys the lookup.
 
-A shard block's committee — the one that elects its proposer, votes on it, and signs the QC over it — anchors on its **parent**: the lookup keys on the parent header's own `parent_qc.weighted_timestamp`. Anchoring one block up is what makes the committee resolvable *before the block exists*, from a header every replica already holds and reads identically. The block's own anchor cannot serve: it is a quorum aggregate whose timestamp varies by which votes each aggregator held, and within that spread of an epoch cut two replicas would resolve two committees and elect two leaders, splitting the round's votes between proposals that both verify. The same parent-anchored resolution governs every consumer of a shard QC — live voting, synced-block admission, remote-header verification, fork-proof checking (a commit proof carries the certified block's parent header for exactly this reason) — so a block verifies under one committee however it arrives. Artifacts that carry their own attested anchor — a provision's source attestation, an execution certificate's wave anchor — resolve at it, and epoch-crossing detection keys on the crossing pair's own grid positions.
+A shard block's committee — the one that elects its proposer, votes on it, and signs the QC over it — anchors on its **parent**: the lookup keys on the parent header's own `parent_qc.weighted_timestamp`. Anchoring one block up is what makes the committee resolvable *before the block exists*, from a header every replica already holds and reads identically. The block's own anchor cannot serve: it is a quorum aggregate whose timestamp varies by which votes each aggregator held, and within that spread of an epoch cut two replicas would resolve two committees and elect two leaders, splitting the round's votes between proposals that both verify. The same parent-anchored resolution governs every consumer of a shard QC — live voting, synced-block admission, remote-header verification, fork-proof checking (a commit proof carries the certified block's parent header for exactly this reason) — so a block verifies under one committee however it arrives. Artifacts that carry their own attested anchor — a provision's source attestation, an execution certificate's tick anchor — resolve at it, and epoch-crossing detection keys on the crossing pair's own grid positions.
 
 The binding is exact; there is no grace interval in which two committees are simultaneously acceptable (INV-SHARD-9).
 

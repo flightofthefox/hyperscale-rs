@@ -767,7 +767,7 @@ impl Display for Round {
     }
 }
 
-/// Wave-leader rotation counter.
+/// Tick-leader rotation counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Hbor)]
 #[hbor(transparent)]
 pub struct Attempt(u32);

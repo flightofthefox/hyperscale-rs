@@ -6,7 +6,7 @@
 //! - **Primitives**: hashes, merkle roots, signer bitfields, randomness
 //! - **Identifiers**: `ValidatorId`, `ShardId`, `BlockHeight`, etc.
 //! - **Consensus types**: Block, `BlockHeader`, `QuorumCertificate`, etc.
-//! - **Wave types**: `TickId`, `ExecutionVote`, `ExecutionCertificate`, `Finalization`, etc.
+//! - **Tick types**: `TickId`, `ExecutionVote`, `ExecutionCertificate`, `Finalization`, etc.
 //! - **Network traits**: Message markers for serialization
 //!
 //! # Design Philosophy
@@ -81,7 +81,7 @@ pub use execution::execution_certificate::{
 };
 pub use execution::finalization::{
     Finalization, FinalizationContext, FinalizationVerifyError,
-    MAX_EXECUTION_CERTIFICATES_PER_WAVE, ReceiptValidationError, Settles, refused_transactions,
+    MAX_EXECUTION_CERTIFICATES_PER_TICK, ReceiptValidationError, Settles, refused_transactions,
     settles,
 };
 pub use execution::outcome::{ExecutionOutcome, TxOutcome};
@@ -108,10 +108,10 @@ pub use network::{
 pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
-    BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot, EventRoot, GenesisConfigHash,
-    GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot,
-    ProvisionsRoot, RevealChain, SettledTxsRoot, StateRoot, TransactionRoot, TxHash,
-    WaveReceiptHash, WritesRoot,
+    BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot, EventRoot, FinalizationHash,
+    GenesisConfigHash, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash,
+    ProvisionTxRoot, ProvisionsRoot, RevealChain, SettledTxsRoot, StateRoot, TransactionRoot,
+    TxHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex, RatifyRound,
@@ -196,9 +196,9 @@ pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};
 pub use time::stopwatch::Stopwatch;
 pub use time::timeouts::{
-    EPOCH_DURATION, MAX_PROGRESS_WAIT, RATIFY_ROUND_TIMEOUT, REMOTE_HEADER_RETENTION,
-    RETENTION_HORIZON, SKIP_TIMEOUT, VIEW_CHANGE_TIMEOUT, VIEW_CHANGE_TIMEOUT_INCREMENT,
-    VIEW_CHANGE_TIMEOUT_MAX, WAVE_TIMEOUT,
+    EPOCH_DURATION, MAX_FINALIZATION_DELAY, MAX_PROGRESS_WAIT, RATIFY_ROUND_TIMEOUT,
+    REMOTE_HEADER_RETENTION, RETENTION_HORIZON, SKIP_TIMEOUT, VIEW_CHANGE_TIMEOUT,
+    VIEW_CHANGE_TIMEOUT_INCREMENT, VIEW_CHANGE_TIMEOUT_MAX,
 };
 pub use time::timestamp::{LocalTimestamp, ProposerTimestamp, WeightedTimestamp};
 pub use topology::awaiting::AwaitingTopologyBuffer;

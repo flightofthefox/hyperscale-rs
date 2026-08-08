@@ -103,7 +103,7 @@ pub struct Routing {
     /// and reserves provision nothing.
     pub provision_keys: Vec<DeclaredKey>,
     /// Owner prefixes behind `provision_keys`, deduplicated ascending —
-    /// the wave's provision dependency set routes on these.
+    /// the tick's provision dependency set routes on these.
     pub provision_prefixes: Vec<Address>,
     /// What each declared key is accessed under, ascending by key then
     /// mode, with the reservation amount carried where there is one.
@@ -171,7 +171,7 @@ pub struct Derived {
     /// quantity bound the *number* of transactions in the drain as well
     /// as their weight: a minimal declaration prices at almost nothing
     /// and a gas limit may be zero, while every committed transaction
-    /// costs a wave entry, a tick-chain entry, a receipt and mempool
+    /// costs a tick entry, a tick-chain entry, a receipt and mempool
     /// tracking whatever it declared.
     ///
     /// Derived locally from the manifest and published metadata like

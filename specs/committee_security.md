@@ -536,7 +536,7 @@ commit past the tip. Second, that orphan **exports cross-shard**: a consuming
 shard resolves the source committee for an execution certificate by its
 anchor window
 ([`lookup(ec.vote_anchor_ts())`](../crates/execution/src/coordinator.rs)), so
-a stale-anchored forged EC resolves the old committee and finalizes a wave —
+a stale-anchored forged EC resolves the old committee and finalizes a transaction —
 an INV-EXEC-1 break that cascades.
 
 What bounds the leak is the **beacon-mandated freeze** (§10.6): at the
@@ -546,7 +546,7 @@ above the beacon-attested frontier. The beacon is the only actor that is
 honest-majority (pool ratification), globally observed, and unforgeable by
 the halted committee, so the cutoff is authenticated, not a per-consumer
 guess; structurally it is a shard termination (the frozen committee is a cut,
-in-flight waves abort — abort-dominant, so safe — attested finalizations
+in-flight transactions abort — abort-dominant, so safe — attested finalizations
 carry, the fresh committee is the successor), reusing the reshape/straddler
 machinery. `cross_shard_freeze` checks both directions: with the fence the
 residual is bounded to the pre-fold detection-latency window; the no-fence
@@ -958,9 +958,9 @@ Design constraints:
   authority network-wide (§10.1): past the freeze, no shard accepts a new
   old-committee execution certificate from the halted shard above the
   beacon-attested frontier. Without it the orphan a beyond-f committee can
-  still certify exports a forged wave finalization and cascades. The freeze
+  still certify exports a forged transaction finalization and cascades. The freeze
   is authenticated (a fold of the committed block, INV-BEACON-2) and
-  structured as a shard termination — in-flight waves abort (abort-dominant,
+  structured as a shard termination — in-flight transactions abort (abort-dominant,
   so safe), attested finalizations carry to the fresh committee — reusing the
   reshape/straddler machinery. It closes the leak *forward*; pre-freeze
   exports are irreversible, so the residual is the detection-latency window.

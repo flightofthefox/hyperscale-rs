@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 #[derive(Debug, Default)]
 pub struct OrphanedFetches {
     txs: Vec<TxHash>,
-    waves: Vec<TickId>,
+    ticks: Vec<TickId>,
     provisions: Vec<ProvisionHash>,
 }
 
@@ -38,9 +38,9 @@ impl OrphanedFetches {
                 ids: self.txs,
             }));
         }
-        if !self.waves.is_empty() {
+        if !self.ticks.is_empty() {
             actions.push(Action::AbandonFetch(FetchAbandon::Finalizations {
-                ids: self.waves,
+                ids: self.ticks,
             }));
         }
         if !self.provisions.is_empty() {
@@ -86,7 +86,7 @@ impl PendingBlocks {
         let pending = self.0.remove(&block_hash)?;
         Some(self.orphaned_among(
             pending.missing_transaction_hashes,
-            pending.missing_wave_ids,
+            pending.missing_tick_ids,
             pending.missing_provision_hashes,
         ))
     }
@@ -157,18 +157,18 @@ impl PendingBlocks {
     /// cancel the orphaned in-flight fetches and free the FSM's slots.
     pub fn prune_committed(&mut self, committed_height: BlockHeight) -> OrphanedFetches {
         let mut txs: HashSet<TxHash> = HashSet::new();
-        let mut waves: HashSet<TickId> = HashSet::new();
+        let mut ticks: HashSet<TickId> = HashSet::new();
         let mut provisions: HashSet<ProvisionHash> = HashSet::new();
         self.0.retain(|_, pending| {
             if pending.header().height() > committed_height {
                 return true;
             }
             txs.extend(pending.missing_transaction_hashes.iter().copied());
-            waves.extend(pending.missing_wave_ids.iter().copied());
+            ticks.extend(pending.missing_tick_ids.iter().copied());
             provisions.extend(pending.missing_provision_hashes.iter().copied());
             false
         });
-        self.orphaned_among(txs, waves, provisions)
+        self.orphaned_among(txs, ticks, provisions)
     }
 
     /// Narrow a set of missing ids to those no remaining pending block needs.
@@ -177,7 +177,7 @@ impl PendingBlocks {
     fn orphaned_among(
         &self,
         txs: HashSet<TxHash>,
-        waves: HashSet<TickId>,
+        ticks: HashSet<TickId>,
         provisions: HashSet<ProvisionHash>,
     ) -> OrphanedFetches {
         OrphanedFetches {
@@ -185,9 +185,9 @@ impl PendingBlocks {
                 .into_iter()
                 .filter(|h| !self.0.values().any(|p| p.needs_transaction(h)))
                 .collect(),
-            waves: waves
+            ticks: ticks
                 .into_iter()
-                .filter(|w| !self.0.values().any(|p| p.needs_wave(w)))
+                .filter(|w| !self.0.values().any(|p| p.needs_finalization(w)))
                 .collect(),
             provisions: provisions
                 .into_iter()
@@ -203,7 +203,7 @@ impl PendingBlocks {
 
     /// Constructed [`Block`] for `block_hash`, if the pending block has fully
     /// assembled. Returns `None` when the hash is unknown OR when the block
-    /// is still awaiting transactions/waves/provisions.
+    /// is still awaiting transactions/ticks/provisions.
     pub fn get_block(&self, block_hash: BlockHash) -> Option<&Arc<Block>> {
         self.0.get(&block_hash)?.block()
     }
@@ -281,13 +281,13 @@ impl PendingBlocks {
             pending.add_transaction(tx);
         }
 
-        let waves: Vec<Arc<Verifiable<Finalization>>> = pending
+        let ticks: Vec<Arc<Verifiable<Finalization>>> = pending
             .manifest()
             .cert_ids()
             .iter()
             .filter_map(&lookup_finalization)
             .collect();
-        for fw in waves {
+        for fw in ticks {
             pending.add_finalization(fw);
         }
 
@@ -365,7 +365,7 @@ impl PendingBlocks {
     pub fn receive_finalization(&mut self, fw: &Arc<Verifiable<Finalization>>) -> Vec<BlockHash> {
         let tick_id = *fw.tick_id();
         self.fold_arrival(
-            |pending| pending.needs_wave(&tick_id),
+            |pending| pending.needs_finalization(&tick_id),
             |pending| {
                 pending.add_finalization(Arc::clone(fw));
             },
@@ -446,17 +446,17 @@ impl PendingBlocks {
                 }));
             }
 
-            let missing_waves = pending.missing_waves();
-            if !missing_waves.is_empty() {
+            let missing_ticks = pending.missing_ticks();
+            if !missing_ticks.is_empty() {
                 debug!(
                     validator = ?me,
                     block_hash = ?block_hash,
-                    missing_wave_count = missing_waves.len(),
+                    missing_tick_count = missing_ticks.len(),
                     age_ms = age.as_millis(),
                     "Fetch timeout reached, requesting missing finalizations"
                 );
                 actions.push(Action::Fetch(FetchRequest::Finalizations {
-                    ids: missing_waves,
+                    ids: missing_ticks,
                     shard: local_shard,
                     preferred: Some(proposer),
                     class: None,
@@ -477,9 +477,9 @@ impl PendingBlocks {
 ///
 /// # Lifecycle
 ///
-/// 1. Created from `BlockHeader` (all transactions/waves marked as absent by hash)
+/// 1. Created from `BlockHeader` (all transactions/ticks marked as absent by hash)
 /// 2. Full `Transaction` objects arrive via gossip (stored in `received_transactions` map)
-/// 3. `Finalization`s arrive when verifier independently finalizes each wave
+/// 3. `Finalization`s arrive when verifier independently finalizes each tick
 ///    (carries certificate + receipts + ECs)
 /// 4. When all transactions and finalizations received, block can be constructed
 /// 5. Block stored to storage
@@ -501,11 +501,11 @@ pub struct PendingBlock {
     /// Map of `TickId` -> `Arc<Verifiable<Finalization>>` (carries cert + receipts + ECs).
     ///
     /// A block is complete once
-    /// all its waves have been independently finalized by this validator.
-    received_waves: BTreeMap<TickId, Arc<Verifiable<Finalization>>>,
+    /// all its ticks have been independently finalized by this validator.
+    received_finalizations: BTreeMap<TickId, Arc<Verifiable<Finalization>>>,
 
     /// Set of `TickId`s we're still waiting for.
-    missing_wave_ids: HashSet<TickId>,
+    missing_tick_ids: HashSet<TickId>,
 
     /// Received provisions keyed by provisions hash. `BTreeMap` so
     /// `provisions()` iteration is deterministic across validators.
@@ -514,7 +514,7 @@ pub struct PendingBlock {
     /// Set of provisions hashes we're still waiting for.
     missing_provision_hashes: HashSet<ProvisionHash>,
 
-    /// The fully constructed block (None until all transactions/waves received).
+    /// The fully constructed block (None until all transactions/ticks received).
     constructed_block: Option<Arc<Block>>,
 
     /// Time at which this pending block was first observed. Used to schedule
@@ -532,7 +532,7 @@ impl PendingBlock {
         let total_tx_count = manifest.transaction_count();
         let missing_transaction_hashes: HashSet<TxHash> =
             manifest.tx_hashes().iter().copied().collect();
-        let missing_wave_ids: HashSet<TickId> = manifest.cert_ids().iter().copied().collect();
+        let missing_tick_ids: HashSet<TickId> = manifest.cert_ids().iter().copied().collect();
         let missing_provision_hashes: HashSet<ProvisionHash> =
             manifest.provision_hashes().iter().copied().collect();
 
@@ -540,8 +540,8 @@ impl PendingBlock {
             header,
             received_transactions: HashMap::with_capacity(total_tx_count),
             missing_transaction_hashes,
-            received_waves: BTreeMap::new(),
-            missing_wave_ids,
+            received_finalizations: BTreeMap::new(),
+            missing_tick_ids,
             received_provisions: BTreeMap::new(),
             missing_provision_hashes,
             manifest,
@@ -587,8 +587,8 @@ impl PendingBlock {
             header: block.header().clone(),
             received_transactions: HashMap::new(),
             missing_transaction_hashes: HashSet::new(),
-            received_waves: BTreeMap::new(),
-            missing_wave_ids: HashSet::new(),
+            received_finalizations: BTreeMap::new(),
+            missing_tick_ids: HashSet::new(),
             received_provisions,
             missing_provision_hashes: HashSet::new(),
             manifest,
@@ -603,7 +603,7 @@ impl PendingBlock {
         }
         // Fill in all finalizations
         for fw in finalizations {
-            pending.received_waves.insert(*fw.tick_id(), fw);
+            pending.received_finalizations.insert(*fw.tick_id(), fw);
         }
         pending
     }
@@ -623,11 +623,11 @@ impl PendingBlock {
 
     /// Add a finalization (carries certificate + receipts + ECs).
     ///
-    /// Returns true if this wave was needed, false if duplicate or not in this block.
+    /// Returns true if this tick was needed, false if duplicate or not in this block.
     pub fn add_finalization(&mut self, fw: Arc<Verifiable<Finalization>>) -> bool {
         let tick_id = *fw.tick_id();
-        if self.missing_wave_ids.remove(&tick_id) {
-            self.received_waves.insert(tick_id, fw);
+        if self.missing_tick_ids.remove(&tick_id) {
+            self.received_finalizations.insert(tick_id, fw);
             true
         } else {
             false
@@ -637,7 +637,7 @@ impl PendingBlock {
     /// Check if all transactions, finalizations, and provisions have been received.
     pub fn is_complete(&self) -> bool {
         self.missing_transaction_hashes.is_empty()
-            && self.missing_wave_ids.is_empty()
+            && self.missing_tick_ids.is_empty()
             && self.missing_provision_hashes.is_empty()
     }
 
@@ -656,9 +656,9 @@ impl PendingBlock {
         self.missing_transaction_hashes.contains(tx_hash)
     }
 
-    /// Get the number of missing waves.
-    pub fn missing_wave_count(&self) -> usize {
-        self.missing_wave_ids.len()
+    /// Get the number of missing ticks.
+    pub fn missing_tick_count(&self) -> usize {
+        self.missing_tick_ids.len()
     }
 
     /// Get the number of missing provision batches.
@@ -667,8 +667,8 @@ impl PendingBlock {
     }
 
     /// Check if this pending block needs a specific finalization.
-    pub fn needs_wave(&self, tick_id: &TickId) -> bool {
-        self.missing_wave_ids.contains(tick_id)
+    pub fn needs_finalization(&self, tick_id: &TickId) -> bool {
+        self.missing_tick_ids.contains(tick_id)
     }
 
     /// Add a received provisions.
@@ -694,25 +694,25 @@ impl PendingBlock {
         self.missing_provision_hashes.contains(batch_hash)
     }
 
-    /// Get the missing wave ids as a Vec.
-    pub fn missing_waves(&self) -> Vec<TickId> {
-        self.missing_wave_ids.iter().copied().collect()
+    /// Get the missing tick ids as a Vec.
+    pub fn missing_ticks(&self) -> Vec<TickId> {
+        self.missing_tick_ids.iter().copied().collect()
     }
 
     /// Get all received finalizations.
     pub fn finalizations(&self) -> Vec<Arc<Verifiable<Finalization>>> {
-        self.received_waves.values().cloned().collect()
+        self.received_finalizations.values().cloned().collect()
     }
 
-    /// Construct the block from header + received transactions + received waves.
+    /// Construct the block from header + received transactions + received ticks.
     ///
     /// Should only be called when `is_complete()` returns true.
     pub fn construct_block(&mut self) -> Result<Arc<Block>, String> {
         if !self.is_complete() {
             return Err(format!(
-                "Cannot construct block: {} transactions, {} waves still missing",
+                "Cannot construct block: {} transactions, {} ticks still missing",
                 self.missing_transaction_hashes.len(),
-                self.missing_wave_ids.len()
+                self.missing_tick_ids.len()
             ));
         }
 
@@ -736,7 +736,7 @@ impl PendingBlock {
             .manifest
             .cert_ids()
             .iter()
-            .filter_map(|id| self.received_waves.get(id))
+            .filter_map(|id| self.received_finalizations.get(id))
             .cloned()
             .collect();
 
@@ -796,7 +796,7 @@ impl PendingBlock {
 
 #[cfg(test)]
 impl PendingBlock {
-    /// Check if all transactions have been received (waves may still be pending).
+    /// Check if all transactions have been received (ticks may still be pending).
     pub fn has_all_transactions(&self) -> bool {
         self.missing_transaction_hashes.is_empty()
     }
@@ -908,17 +908,17 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_block_with_waves() {
+    fn test_pending_block_with_finalizations() {
         let tx1 = TxHash::from(Hash::from_bytes(b"tx1"));
-        let wave1 = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let wave2 = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let tick1 = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        let tick2 = TickId::new(ShardId::ROOT, BlockHeight::new(2));
         let header = make_header(BlockHeight::new(1));
 
         let pb = PendingBlock::from_manifest(
             header,
             BlockManifest::new(
                 vec![tx1],
-                vec![wave1, wave2],
+                vec![tick1, tick2],
                 vec![],
                 WitnessSources::empty(),
             ),
@@ -926,9 +926,9 @@ mod tests {
         );
 
         assert_eq!(pb.missing_transaction_count(), 1);
-        assert_eq!(pb.missing_wave_count(), 2);
-        assert!(pb.needs_wave(&wave1));
-        assert!(pb.needs_wave(&wave2));
+        assert_eq!(pb.missing_tick_count(), 2);
+        assert!(pb.needs_finalization(&tick1));
+        assert!(pb.needs_finalization(&tick2));
         assert!(!pb.is_complete());
     }
 
@@ -943,7 +943,7 @@ mod tests {
             LocalTimestamp::ZERO,
         );
 
-        assert_eq!(pb.missing_wave_count(), 1);
+        assert_eq!(pb.missing_tick_count(), 1);
         assert!(!pb.is_complete());
 
         let fw = Arc::new(
@@ -952,12 +952,12 @@ mod tests {
 
         let added = pb.add_finalization(fw);
         assert!(added);
-        assert_eq!(pb.missing_wave_count(), 0);
+        assert_eq!(pb.missing_tick_count(), 0);
         assert!(pb.is_complete());
     }
 
     #[test]
-    fn test_block_needs_transactions_and_waves() {
+    fn test_block_needs_transactions_and_finalizations() {
         let tx = Arc::new(Verifiable::from(test_transaction(1)));
         let tx_hash = tx.hash();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
@@ -979,7 +979,7 @@ mod tests {
         // Add transaction
         pb.add_transaction(tx);
         assert!(pb.has_all_transactions());
-        assert!(!pb.is_complete()); // Still missing wave
+        assert!(!pb.is_complete()); // Still missing tick
 
         // Add finalization
         let fw = Arc::new(
@@ -1044,7 +1044,7 @@ mod tests {
         let orphaned = pending_blocks.prune_committed(BlockHeight::new(5));
         let orphaned_provisions: HashSet<_> = orphaned.provisions.into_iter().collect();
         assert_eq!(orphaned_provisions, HashSet::from([prov_a, prov_b]));
-        assert!(orphaned.txs.is_empty() && orphaned.waves.is_empty());
+        assert!(orphaned.txs.is_empty() && orphaned.ticks.is_empty());
         assert_eq!(pending_blocks.len(), 1, "live block must remain");
     }
 

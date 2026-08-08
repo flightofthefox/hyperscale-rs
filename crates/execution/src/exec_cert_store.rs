@@ -1,7 +1,7 @@
 //! Shared execution-certificate store.
 //!
 //! Single source of truth for aggregated [`ExecutionCertificate`]s during the
-//! window between local aggregation/verification and the wave's containing
+//! window between local aggregation/verification and the tick's containing
 //! block committing. Held behind an `Arc` so the single-threaded execution
 //! coordinator (the sole writer) and the network worker thread (read-only,
 //! serving cross-shard EC fetch requests) can share the same map without
@@ -9,13 +9,13 @@
 //!
 //! Two writers — both inside the coordinator — feed this store:
 //!
-//! - **Wave-leader path** inserts on local EC aggregation, before the cert is
+//! - **Tick-leader path** inserts on local EC aggregation, before the cert is
 //!   broadcast to local peers and remote shards.
 //! - **Non-leader path** inserts after verifying a local-shard EC received via
 //!   broadcast, so any node can serve fallback EC fetches for its own shard.
 //!
 //! Eviction is lifecycle-driven: entries are dropped in
-//! [`ExecutionCoordinator::remove_finalization`] once the wave's containing
+//! [`ExecutionCoordinator::remove_finalization`] once the tick's containing
 //! block commits, at which point the EC is durably available via
 //! [`ShardStorage::get_execution_certificates_by_height`] and the network handler
 //! falls through to that on cache miss.
@@ -42,7 +42,7 @@ use papaya::HashMap;
 /// awaiting block commit.
 ///
 /// Read-heavy on the network worker thread (one lookup per inbound EC
-/// fetch); writes (insert on aggregation/verification, evict on wave-cert
+/// fetch); writes (insert on aggregation/verification, evict on tick-cert
 /// commit) are infrequent and single-threaded (state machine).
 pub struct ExecCertStore {
     inner: HashMap<TickId, Arc<Verified<ExecutionCertificate>>>,

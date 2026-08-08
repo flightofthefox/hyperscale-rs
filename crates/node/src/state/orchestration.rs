@@ -38,7 +38,7 @@ impl NodeStateMachine {
     /// 6. `beacon.on_local_block_committed` advances the committee anchor; the
     ///    local commit stream is the beacon's only source view of its own shard,
     ///    so `on_verified_source_header` feeds each certified header in.
-    /// 7. `apply_block_to_execution` runs wave cleanup + dispatch + vote
+    /// 7. `apply_block_to_execution` runs tick cleanup + dispatch + vote
     ///    emission last, after mempool's terminal-state transitions.
     ///
     /// Finally the terminal-chain sweep and a proposal-retry latch

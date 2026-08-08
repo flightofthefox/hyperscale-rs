@@ -1,9 +1,9 @@
-//! The VM engine's wave-batch executor.
+//! The VM engine's tick-batch executor.
 //!
-//! `execute_wave_batch` runs one wave's VM sub-batch end to end: derive
+//! `execute_tick_batch` runs one tick's VM sub-batch end to end: derive
 //! each transaction's manifest and effect set through the bridge
 //! (exactly the derivation admission ran), pre-read the declared cells
-//! from the wave snapshot into an owned committed base, hand the batch
+//! from the tick snapshot into an owned committed base, hand the batch
 //! to `vm_kernel::execute_batch`, then fold the schedule-invariant
 //! receipts into per-transaction absolute `database_updates` in
 //! canonical order against the batch baseline — the same fold the
@@ -45,7 +45,7 @@ use crate::backend::EngineBackend;
 use crate::genesis::{World, genesis_world_with_pools};
 use crate::sharding::writes_root;
 use crate::{
-    CachedOutput, CrossShardTxInput, ExecutedTx, TickTxInput, WaveBatchContext, project_to_shard,
+    CachedOutput, CrossShardTxInput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard,
 };
 
 /// Whether a derivation holds a gated node to its target's authority.
@@ -109,7 +109,7 @@ pub fn tx_randomness(anchor: RevealChain, tx: TxHash) -> [u8; 32] {
 }
 
 /// The batch's committed baseline: the declared cells pre-read from the
-/// wave's JMT-backed snapshot at materialize time.
+/// tick's JMT-backed snapshot at materialize time.
 ///
 /// Cells only — ordered collections and locks are absent from the
 /// current stdlib surface, and reservations never persist across
@@ -119,7 +119,7 @@ pub fn tx_randomness(anchor: RevealChain, tx: TxHash) -> [u8; 32] {
 #[derive(Debug, Default)]
 pub struct VmBase {
     pub cells: BTreeMap<SubstateKey, Vec<u8>>,
-    /// What legs of unresolved waves hold against these cells. Empty for
+    /// What legs of unresolved ticks hold against these cells. Empty for
     /// a baseline with nothing in flight over it — a preview, or a shard
     /// with no cross-shard leg outstanding.
     pub holds: ProvisionalHolds,
@@ -170,7 +170,7 @@ impl Executor {
     /// # Panics
     ///
     /// Panics if the committed stdlib artifact fails validation or
-    /// compilation — a build defect surfaced at boot, not in a wave.
+    /// compilation — a build defect surfaced at boot, not in a tick.
     #[must_use]
     pub fn new(accounts: &[([u8; 16], u128)], mode: ExecutionMode) -> Self {
         Self::with_pools(accounts, &[], mode)
@@ -281,7 +281,7 @@ impl Executor {
 /// How an abort reads in a diagnostic: the kernel's own verdict, or the
 /// deterministic text a trap carried.
 ///
-/// One derivation, because a preview quotes the same verdict a wave
+/// One derivation, because a preview quotes the same verdict a tick
 /// records and two copies would drift apart silently. Never
 /// consensus-critical — it lands in the node-local metadata, which a
 /// syncing replica does not carry.
@@ -349,10 +349,10 @@ pub struct PayerFee {
     /// The class floor: what an attempt owes when nothing it did was its
     /// sender's fault.
     pub floor: u128,
-    /// Whether a wave can abort this transaction after it executed —
+    /// Whether a tick can abort this transaction after it executed —
     /// true for a cross-shard leg, which is the one shape whose effects
     /// are discarded after the engine completed them.
-    pub wave_abortable: bool,
+    pub abortable: bool,
 }
 
 /// What an attempt that applied no effects owes, by why it applied none.
@@ -370,11 +370,11 @@ pub struct PayerFee {
 pub const fn charge_for(outcome: &Outcome, payer: PayerFee) -> Option<u128> {
     match outcome {
         // Completed here means the engine applied the effects. Only a
-        // wave can still discard them, and only for a cross-shard leg —
+        // tick can still discard them, and only for a cross-shard leg —
         // that receipt is built in reserve and settles the floor if the
         // abort comes.
         Outcome::Completed { .. } => {
-            if payer.wave_abortable {
+            if payer.abortable {
                 Some(payer.floor)
             } else {
                 None
@@ -425,7 +425,7 @@ struct FoldState {
 /// computed here could not have expressed without re-deriving their
 /// burns.
 fn build_fee_receipt(
-    ctx: &WaveBatchContext<'_>,
+    ctx: &TickBatchContext<'_>,
     tx_hash: TxHash,
     vault: SubstateKey,
     floor: u128,
@@ -482,7 +482,7 @@ pub const fn publish_work(artifact: &[u8]) -> u64 {
 /// block can be touching either, so there are no earlier burns to layer
 /// on and nothing for the kernel differential to check.
 fn assemble_published_tx(
-    ctx: &WaveBatchContext<'_>,
+    ctx: &TickBatchContext<'_>,
     vm_tx: TxHash,
     publisher: [u8; 16],
     artifact: &[u8],
@@ -565,7 +565,7 @@ struct BatchInputs<'a> {
 }
 
 fn assemble_executed_tx(
-    ctx: &WaveBatchContext<'_>,
+    ctx: &TickBatchContext<'_>,
     inputs: BatchInputs<'_>,
     fold: &mut FoldState,
     vm_tx: TxHash,
@@ -658,12 +658,12 @@ impl Executor {
     /// The batch pipeline every dispatch arm shares: derive, pre-read the
     /// local baseline, layer provisioned remote cells, execute under the
     /// shard's locality, fold local keys, and project. `abortable` names
-    /// the members a wave verdict can still discard — the cross-shard
+    /// the members a tick verdict can still discard — the cross-shard
     /// legs; a batch without any executes under total locality.
     #[allow(clippy::too_many_lines)] // one pipeline, stages in order
     fn run_batch(
         &self,
-        ctx: &WaveBatchContext<'_>,
+        ctx: &TickBatchContext<'_>,
         snapshot: &(dyn SubstateDatabase + Sync),
         transactions: &[Arc<Verified<Transaction>>],
         provisions_by_tx: &BTreeMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
@@ -721,7 +721,7 @@ impl Executor {
         // The committed baseline: provisioned remote cells first — a
         // key's owner prefix routes it to exactly one source, so nothing
         // arbitrates — then the locally owned declared cells from the
-        // wave snapshot.
+        // tick snapshot.
         let mut cells: BTreeMap<SubstateKey, Vec<u8>> = BTreeMap::new();
         for lists in provisions_by_tx.values() {
             for entries in lists {
@@ -750,11 +750,11 @@ impl Executor {
         // cell, and the burn would silently apply to nothing.
         //
         // Collectible means the vault routes to the executing shard by
-        // the trie, not by wave locality: a single-shard wave's
+        // the trie, not by tick locality: a local-only tick's
         // `Locality::All` claims every owner, and reading another
         // shard's cell out of this shard's store is nondeterministic —
         // members disagree on what they hold outside their own subtree,
-        // and a split baseline splits the wave's receipt roots.
+        // and a split baseline splits the tick's receipt roots.
         for tx in transactions {
             let key = tx.fee_vault();
             if ctx.shard_trie.shard_for_prefix(key.owner) == ctx.local_shard
@@ -767,7 +767,7 @@ impl Executor {
         // a declaration spans every participating shard, so the holds it
         // implies do too, and a shard that reported one against a cell it
         // holds none of would judge a reservation as exceeding a balance
-        // it cannot see. A wave's own locality cannot decide this — the
+        // it cannot see. A tick's own locality cannot decide this — the
         // single-shard arm's `Locality::All` claims every owner.
         let holds = ctx
             .holds
@@ -817,10 +817,10 @@ impl Executor {
         // The fee payers this shard settles: a completed transaction
         // burns its attested actual from its payer's vault, on the
         // payer's shard only.
-        // Trie-routed, like the pre-read: a wave's own locality cannot
+        // Trie-routed, like the pre-read: a tick's own locality cannot
         // decide fee ownership, because the single-shard arm's
         // `Locality::All` would claim payers whose vaults live on
-        // shards this wave never engaged.
+        // shards this tick never engaged.
         let fee_by_tx: BTreeMap<TxHash, PayerFee> = transactions
             .iter()
             .filter_map(|tx| {
@@ -835,7 +835,7 @@ impl Executor {
                         vault,
                         max_fee: vm.max_fee,
                         floor: vm.abort_floor(),
-                        wave_abortable: abortable.contains(&tx.hash()),
+                        abortable: abortable.contains(&tx.hash()),
                     },
                 ))
             })
@@ -917,28 +917,31 @@ impl Executor {
 
 impl Executor {
     /// Execute `transactions` against `snapshot` and project each result
-    /// to the context's local shard.
+    /// to the context's local shard, all under the context's own
+    /// environment.
     ///
     /// The unit is the batch: the whole of it goes to the
     /// deterministic-parallel executor at once, which returns one
-    /// [`ExecutedTx`] per input transaction, in input order.
+    /// [`ExecutedTx`] per input transaction, in input order. The
+    /// per-member environments a tick resolves are
+    /// [`execute_tick_batch`](Self::execute_tick_batch)'s business.
     #[must_use]
-    pub fn execute_wave_batch(
+    pub fn execute_batch(
         &self,
-        ctx: &WaveBatchContext<'_>,
+        ctx: &TickBatchContext<'_>,
         snapshot: &(dyn SubstateDatabase + Sync),
         transactions: &[Arc<Verified<Transaction>>],
     ) -> Vec<ExecutedTx> {
-        // A single-shard batch commits in one block, so every member's
-        // environment is anchored on the wave-start block.
+        // Every member reads the context's own clock and randomness:
+        // one block committed them all.
         let env_by_tx: BTreeMap<TxHash, EnvInputs> = transactions
             .iter()
             .map(|tx| {
                 (
                     tx.hash(),
                     EnvInputs {
-                        clock_ms: ctx.wave_start_ts.as_millis(),
-                        randomness: tx_randomness(ctx.wave_start_reveal, tx.hash()),
+                        clock_ms: ctx.tick_ts.as_millis(),
+                        randomness: tx_randomness(ctx.tick_reveal, tx.hash()),
                     },
                 )
             })
@@ -959,7 +962,7 @@ impl Executor {
     #[must_use]
     pub fn execute_cross_shard_batch(
         &self,
-        ctx: &WaveBatchContext<'_>,
+        ctx: &TickBatchContext<'_>,
         snapshot: &(dyn SubstateDatabase + Sync),
         requests: &[CrossShardTxInput<'_>],
     ) -> Vec<ExecutedTx> {
@@ -971,7 +974,7 @@ impl Executor {
             .collect();
         // Each request carries the environment its payer block fixed:
         // remote-payer legs the anchors off the payer's bundle, everything
-        // else the wave-start block's own.
+        // else the tick block's own.
         let env_by_tx: BTreeMap<TxHash, EnvInputs> = requests
             .iter()
             .map(|r| {
@@ -1005,7 +1008,7 @@ impl Executor {
     #[must_use]
     pub fn execute_tick_batch(
         &self,
-        ctx: &WaveBatchContext<'_>,
+        ctx: &TickBatchContext<'_>,
         snapshot: &(dyn SubstateDatabase + Sync),
         inputs: &[TickTxInput<'_>],
     ) -> Vec<ExecutedTx> {
@@ -1030,7 +1033,7 @@ impl Executor {
             .collect();
         let abortable: BTreeSet<TxHash> = inputs
             .iter()
-            .filter(|i| i.wave_abortable)
+            .filter(|i| i.abortable)
             .map(|i| i.transaction.hash())
             .collect();
         self.run_batch(

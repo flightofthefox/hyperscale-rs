@@ -31,7 +31,7 @@ impl ShardChainWriter for SimShardStorage {
         // hint is irrelevant to its perf and is ignored.
         _base_reads: Option<&BaseReadCache>,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
-        // Everything the waves carried, for storage; only what they
+        // Everything the ticks carried, for storage; only what they
         // decided reaches state.
         let receipts: Vec<StoredReceipt> = finalizations
             .iter()

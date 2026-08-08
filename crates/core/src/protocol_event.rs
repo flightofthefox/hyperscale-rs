@@ -534,7 +534,7 @@ pub enum ProtocolEvent {
         target_shard: ShardId,
     },
 
-    /// An execution certificate from a remote shard — for a wave that
+    /// An execution certificate from a remote shard — for a tick that
     /// depended on state provisions from *this* shard — has been verified.
     /// The tracker uses `tx_outcomes` to drain pending transactions from
     /// outbound batches; `Executed` and `Aborted` are both terminal.
@@ -567,7 +567,7 @@ pub enum ProtocolEvent {
     /// established at emit time.
     ///
     /// Produced only by the local sign-and-send handler when this node
-    /// is the wave leader, so its own vote is fed straight into the
+    /// is the tick leader, so its own vote is fed straight into the
     /// verified tally.
     VerifiedExecutionVoteReceived {
         /// Our locally-signed vote, sealed via
@@ -585,7 +585,7 @@ pub enum ProtocolEvent {
 
     /// Batch execution vote verification completed.
     ExecutionVotesVerifiedAndAggregated {
-        /// Wave whose votes were verified.
+        /// Tick whose votes were verified.
         tick_id: TickId,
         /// Source block hash for correlation.
         block_hash: BlockHash,
@@ -595,7 +595,7 @@ pub enum ProtocolEvent {
 
     /// Execution certificate aggregation completed.
     ExecutionCertificateAggregated {
-        /// Wave whose EC was aggregated.
+        /// Tick whose EC was aggregated.
         tick_id: TickId,
         /// The newly aggregated execution certificate.
         certificate: Arc<Verified<ExecutionCertificate>>,
@@ -630,7 +630,7 @@ pub enum ProtocolEvent {
     /// emits the matching `Continuation(FinalizationsAdmitted)` only when
     /// every contained EC's signature passed.
     FinalizationVerified {
-        /// Verified wave on success; the raw wave plus the reason it
+        /// Verified tick on success; the raw tick plus the reason it
         /// failed otherwise.
         result: Result<Arc<Verified<Finalization>>, (Arc<Finalization>, FinalizationVerifyError)>,
     },

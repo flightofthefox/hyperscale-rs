@@ -11,7 +11,7 @@ use crate::{Finalization, MessageClass, NetworkMessage};
 /// Matches the per-collection cap used by [`hyperscale_types::Block`].
 /// The fetch dispatcher chunks finalization requests at 4 ids per call,
 /// so legitimate responses sit in single digits; everything beyond is
-/// rejected before any per-wave decode work.
+/// rejected before any per-tick decode work.
 const MAX_FINALIZATIONS_PER_RESPONSE: usize = 10_000;
 
 /// Response to a finalization fetch request.
@@ -67,9 +67,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_rejects_oversized_waves_count() {
-        // Hand-roll a response whose waves length prefix exceeds the cap.
-        // The cap fires before any per-wave decode work is attempted.
+    fn decode_rejects_oversized_finalization_count() {
+        // Hand-roll a response whose ticks length prefix exceeds the cap.
+        // The cap fires before any per-tick decode work is attempted.
         let mut buf = Vec::new();
         varint::write(&mut buf, MAX_FINALIZATIONS_PER_RESPONSE + 1).unwrap();
         buf.extend(std::iter::repeat_n(

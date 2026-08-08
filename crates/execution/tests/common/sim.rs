@@ -3,13 +3,13 @@
 //! Mirrors the beacon and shard `CoordinatorSim` pattern, minus the
 //! consensus: blocks arrive already committed, so there is no QC chaining,
 //! view change, or round timeout to model. What is left is the part this
-//! crate owns — tick composition, the tick chain, and wave resolution.
+//! crate owns — tick composition, the tick chain, and tick resolution.
 //!
 //! # What it is for
 //!
 //! Control over *ordering*. The full simulator produces whatever interleaving
 //! its network happens to produce; here a test states one. A tick's completion
-//! can be held while later blocks commit, a wave's certificate can be placed
+//! can be held while later blocks commit, a tick's certificate can be placed
 //! in a block of the test's choosing, and both can be varied while the
 //! committed chain stays byte-identical. That is what makes the
 //! schedule-invariance lane a real assertion rather than a restatement of
@@ -58,7 +58,7 @@ pub const SHARD: ShardId = ShardId::ROOT;
 pub const LEFT: ShardId = ShardId::leaf(1, 0);
 
 /// Milliseconds between synthesised block timestamps. Large enough that
-/// nothing in the wave machinery reaches a deadline over a short run.
+/// nothing in the tick machinery reaches a deadline over a short run.
 const BLOCK_INTERVAL_MS: u64 = 500;
 
 /// When the driver releases a dispatched tick's completion.
@@ -190,11 +190,11 @@ pub struct ExecutionSim {
     /// Every tick output produced, in production order — what the
     /// invariance lane compares.
     outputs: Vec<(BlockHeight, TickOutput)>,
-    /// The receipts each wave's tick produced, so a test can settle a wave
+    /// The receipts each tick's tick produced, so a test can settle a tick
     /// with what it actually executed rather than with a stand-in.
     receipts: BTreeMap<TickId, Vec<StoredReceipt>>,
-    /// The charges each wave's tick held in reserve beside those
-    /// receipts — what settles instead of them when the wave refuses.
+    /// The charges each tick's tick held in reserve beside those
+    /// receipts — what settles instead of them when the tick refuses.
     charges: BTreeMap<TickId, Vec<StoredReceipt>>,
     /// The settled state every tick reads through, so the harness models
     /// the whole path: a committed certificate's receipts land here in
@@ -206,7 +206,7 @@ pub struct ExecutionSim {
 
 impl ExecutionSim {
     /// A single-shard driver over a four-validator committee, this node
-    /// seated first. Every wave it composes is single-shard, so every
+    /// seated first. Every tick it composes is single-shard, so every
     /// write is determined at commit.
     #[must_use]
     pub fn new(schedule: Schedule) -> Self {
@@ -215,7 +215,7 @@ impl ExecutionSim {
 
     /// A driver over a `num_shards`-wide topology with `local_shard` as
     /// this node's seat. A transaction declaring prefixes on both sides of
-    /// the partition composes a cross-shard wave, whose writes are
+    /// the partition composes a cross-shard tick, whose writes are
     /// provisional until its certificate commits.
     #[must_use]
     pub fn with_shards(schedule: Schedule, num_shards: u64, local_shard: ShardId) -> Self {
@@ -363,7 +363,7 @@ impl ExecutionSim {
                         release_at,
                     });
                 }
-                Action::ResolveTickWaves { resolutions } => {
+                Action::ResolveTicks { resolutions } => {
                     for (tick_id, resolution) in &resolutions {
                         self.chain.resolve(tick_id, resolution);
                     }
@@ -454,7 +454,7 @@ impl ExecutionSim {
     }
 
     /// Whether a block carrying `certificates` in this order would settle
-    /// two cell-sharing waves out of the order they executed in — the
+    /// two cell-sharing ticks out of the order they executed in — the
     /// pre-vote gate's question. No ancestor blocks here: the harness
     /// models one block at a time.
     #[must_use]
@@ -475,10 +475,10 @@ impl ExecutionSim {
         self.charges.get(tick_id).cloned().unwrap_or_default()
     }
 
-    /// The wave a transaction was assigned to, if the coordinator still
+    /// The tick a transaction was assigned to, if the coordinator still
     /// tracks it.
     #[must_use]
-    pub fn wave_of(&self, tx_hash: TxHash) -> Option<TickId> {
+    pub fn tick_of(&self, tx_hash: TxHash) -> Option<TickId> {
         self.coord.tick_assignment_for(tx_hash)
     }
 }
@@ -514,7 +514,7 @@ pub const CREDIT: u128 = 1;
 
 /// The cell a leg's abort charge reaches, and the amount it carries.
 ///
-/// A cross-shard leg that completes here still owes a floor if the wave
+/// A cross-shard leg that completes here still owes a floor if the tick
 /// refuses it, and that charge rides its own receipt — held in reserve
 /// beside the effects, settled only if the effects are not. Separate
 /// from [`vault_of`] so a test can read what was charged without
@@ -601,9 +601,9 @@ fn stub_execute(
         },
         ExecutionMetadata::empty(),
     );
-    // A leg a wave can still discard carries its charge beside its
+    // A leg a tick can still discard carries its charge beside its
     // effects, exactly as the engine builds one for a cross-shard
-    // member. Which of the two settles is the wave's decision, not this
+    // member. Which of the two settles is the tick's decision, not this
     // shard's.
     if abortable {
         executed.fee_receipt = charged.map(stub_charge);
@@ -668,8 +668,8 @@ pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> Finalization {
 ///
 /// The local shard completed its half and carries the receipts to prove
 /// it; the counterpart's certificate reports failure for the same
-/// transactions, so the wave as a whole decided against them. Two
-/// certificates for one wave is the ordinary cross-shard shape — what the
+/// transactions, so the tick as a whole decided against them. Two
+/// certificates for one tick is the ordinary cross-shard shape — what the
 /// combine exists to reconcile.
 #[must_use]
 pub fn settle_refused_by_counterpart(
@@ -681,7 +681,7 @@ pub fn settle_refused_by_counterpart(
     // The local certificate reports what this shard did and names the
     // charge it holds against a refusal, which is what its own outcomes
     // carry. The stored receipts are the charges, because that is the
-    // side of each outcome the wave's verdict selects.
+    // side of each outcome the tick's verdict selects.
     let outcomes: Vec<TxOutcome> = receipts
         .iter()
         .zip(charges)

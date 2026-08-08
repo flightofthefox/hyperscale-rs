@@ -4,7 +4,7 @@
 //!
 //! Each registered provisions entry is kept in the shared
 //! [`ProvisionStore`]. When a remote shard's `ExecutionCertificate`
-//! arrives and we were a source for its wave, the target shard's
+//! arrives and we were a source for its tick, the target shard's
 //! `tx_outcomes` drain the entry's pending set — `Executed` and `Aborted`
 //! are both terminal, so either removes the tx from the pending set.
 //! When the pending set empties, the entry is evicted from the store.
@@ -13,9 +13,9 @@
 //! that never reach a terminal EC; this is a bug-bound, not a nominal
 //! policy — every firing indicates an upstream liveness failure and is
 //! logged at `warn!`. The bound is principled: a tx included at the
-//! latest possible moment within its `validity_range` gets `WAVE_TIMEOUT`
+//! latest possible moment within its `validity_range` gets `MAX_FINALIZATION_DELAY`
 //! to terminate, so any provisions unacked past `MAX_VALIDITY_RANGE +
-//! WAVE_TIMEOUT` reference a tx no shard could still be processing.
+//! MAX_FINALIZATION_DELAY` reference a tx no shard could still be processing.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

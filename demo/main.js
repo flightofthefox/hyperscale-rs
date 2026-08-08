@@ -99,7 +99,7 @@ const state = {
   // render time, so an arc whose blocks have scrolled off simply stops
   // being drawn.
   arcs: [],             // { wt, from, fromHeight, to, toHeight, txs }
-  waves: [],            // { wt, shard, height, wave, participants, txs }
+  ticks: [],            // { wt, shard, height, tick, participants, txs }
   // The harness clock, advanced by exactly what is handed to `step`. The
   // network view runs on this: a message in flight exists on the clock the
   // session is stepping, where `wt` is what consensus has since attested and
@@ -178,18 +178,18 @@ function apply(event) {
         state.txBlocks.get(tx).add(blockKey(k.shard, k.height));
       }
       break;
-    case "waveFinalized":
-      // A wave with one participant never left its shard; its transactions'
+    case "tickFinalized":
+      // A tick with one participant never left its shard; its transactions'
       // own status already tells that story, and logging it would bury the
       // settlements that did cross.
       if (k.participants.length > 1) {
-        state.waves.push({
+        state.ticks.push({
           wt: event.wt, shard: k.shard, height: k.height,
-          wave: k.wave, participants: k.participants, txs: k.txs,
+          tick: k.tick, participants: k.participants, txs: k.txs,
         });
         note(
           event.wt,
-          `wave ${k.wave} settled across ${k.participants.map(labelOf).join(" + ")}` +
+          `tick ${k.tick} settled across ${k.participants.map(labelOf).join(" + ")}` +
             ` at h${k.height} — opened h${k.openedAt}`,
           "ok",
         );
@@ -300,7 +300,7 @@ function prune() {
 
   const floor = state.wt - WINDOW_MS * 2;
   if (state.arcs.length > 512) state.arcs = state.arcs.filter((a) => a.wt >= floor);
-  if (state.waves.length > 256) state.waves = state.waves.filter((w) => w.wt >= floor);
+  if (state.ticks.length > 256) state.ticks = state.ticks.filter((t) => t.wt >= floor);
   // Transactions and the blocks that carry them are kept long past the
   // window so a settled one can still be traced, but not forever. Both maps
   // are insertion-ordered and drop together, so nothing left in the panel
@@ -477,13 +477,13 @@ function renderLanes() {
   });
 
   // Where a settlement round closed: both sides' arcs land on this block.
-  for (const wave of state.waves) {
-    const y = laneY.get(wave.shard);
-    const wt = state.lanes.get(wave.shard)?.heights.get(wave.height);
+  for (const tick of state.ticks) {
+    const y = laneY.get(tick.shard);
+    const wt = state.lanes.get(tick.shard)?.heights.get(tick.height);
     if (y == null || wt == null || wt < t0) continue;
     el("circle", {
-      class: `converge${dimmed(wave.txs) ? " dim" : ""}`,
-      cx: x(wt), cy: y, r: 6.5, stroke: colorOf(wave.shard),
+      class: `converge${dimmed(tick.txs) ? " dim" : ""}`,
+      cx: x(wt), cy: y, r: 6.5, stroke: colorOf(tick.shard),
     }, svg);
   }
 

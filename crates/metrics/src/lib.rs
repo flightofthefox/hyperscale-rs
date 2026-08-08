@@ -88,9 +88,9 @@ pub struct MemoryMetrics {
     pub exec_cache_entries: usize,
     /// Finalizations ready for block inclusion.
     pub exec_finalizations: usize,
-    /// Active wave states (per-wave execution + finalization tracking).
-    pub exec_waves: usize,
-    /// Execution votes collection per wave.
+    /// Active tick states (per-tick execution + finalization tracking).
+    pub exec_ticks: usize,
+    /// Execution votes collection per tick.
     pub exec_vote_trackers: usize,
     /// Votes that arrived before tracking started.
     pub exec_early_votes: usize,
@@ -102,19 +102,19 @@ pub struct MemoryMetrics {
     pub exec_required_provision_shards: usize,
     /// Received provision shards per transaction.
     pub exec_received_provision_shards: usize,
-    /// Waves that have produced an execution certificate.
-    pub exec_waves_with_ec: usize,
-    /// Waves with pending vote retries.
+    /// Ticks that have produced an execution certificate.
+    pub exec_ticks_with_ec: usize,
+    /// Ticks with pending vote retries.
     pub exec_pending_vote_retries: usize,
-    /// Transaction to wave assignment mapping.
-    pub exec_wave_assignments: usize,
-    /// Wave attestations that arrived before tracking.
-    pub exec_early_wave_attestations: usize,
-    /// Buffered ECs awaiting full routing to local wave trackers.
+    /// Transaction to tick assignment mapping.
+    pub exec_tick_assignments: usize,
+    /// Tick attestations that arrived before tracking.
+    pub exec_early_attestations: usize,
+    /// Buffered ECs awaiting full routing to local tick trackers.
     pub exec_pending_routing: usize,
     /// Fulfilled execution certificates from remote shards.
     pub exec_fulfilled_exec_certs: usize,
-    /// Outbound ECs awaiting wave finalization (re-broadcast tracker).
+    /// Outbound ECs awaiting finalization (re-broadcast tracker).
     pub exec_outbound_certs: usize,
     /// Commit-proven remote source blocks within retention.
     pub exec_proven_remote_blocks: usize,

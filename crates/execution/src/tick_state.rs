@@ -35,9 +35,9 @@ use std::time::Duration;
 
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
-    GlobalReceiptRoot, Settles, ShardId, StoredReceipt, TickId, TransactionDecision, TxHash,
-    TxOutcome, Verified, WAVE_TIMEOUT, WeightedTimestamp, compute_global_receipt_root,
-    refused_transactions, settles,
+    GlobalReceiptRoot, MAX_FINALIZATION_DELAY, Settles, ShardId, StoredReceipt, TickId,
+    TransactionDecision, TxHash, TxOutcome, Verified, WeightedTimestamp,
+    compute_global_receipt_root, refused_transactions, settles,
 };
 
 /// A tick whose local execution disagreed with the quorum's.
@@ -65,7 +65,7 @@ pub struct Divergence {
 /// path passes silently. A firing means the post-inclusion termination
 /// guarantee has failed, so the dump is invariant-violation diagnostics
 /// rather than routine load noise.
-pub const TICK_OVERDUE_WARN: Duration = Duration::from_secs(WAVE_TIMEOUT.as_secs() * 2);
+pub const TICK_OVERDUE_WARN: Duration = Duration::from_secs(MAX_FINALIZATION_DELAY.as_secs() * 2);
 
 /// Per-tick state from composition through finalization.
 #[derive(Debug)]

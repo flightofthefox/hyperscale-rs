@@ -140,26 +140,26 @@ hash_newtype!(
     "StateRoot"
 );
 
-// ── Certificates & waves ─────────────────────────────────────────────────────
+// ── Certificates & ticks ─────────────────────────────────────────────────────
 
 hash_newtype!(
     /// Content identity of a [`Finalization`](crate::Finalization).
     ///
     /// Computed from the ordered `(shard_id, tick_id)` pairs of
-    /// its execution certificates — identifies the set of ECs a wave
+    /// its execution certificates — identifies the set of ECs a tick
     /// committed to.
-    pub WaveReceiptHash,
-    "WaveReceiptHash"
+    pub FinalizationHash,
+    "FinalizationHash"
 );
 
 hash_newtype!(
-    /// Merkle root over the wave-ids a shard settled within its retention
+    /// Merkle root over the tick-ids a shard settled within its retention
     /// window up to a terminal block.
     ///
     /// Carried in [`BlockHeader::settled_txs_root`](crate::BlockHeader) on
     /// a terminating shard's boundary header and folded into
     /// [`ShardBoundary`](crate::ShardBoundary), so a surviving counterpart
-    /// resolves split-straddling waves against the terminated shard's
+    /// resolves split-straddling ticks against the terminated shard's
     /// beacon-attested settled set.
     pub SettledTxsRoot,
     "SettledTxsRoot"

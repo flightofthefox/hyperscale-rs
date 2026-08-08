@@ -9,7 +9,7 @@ use crate::{
 
 /// Batched execution votes within a shard.
 ///
-/// Each vote covers all transactions in a deterministic wave partition
+/// Each vote covers all transactions in a deterministic tick partition
 /// of a block. 2f+1 matching votes create an `ExecutionCertificate`.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ExecutionVotesNotification {

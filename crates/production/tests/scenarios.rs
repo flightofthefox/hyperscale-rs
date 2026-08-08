@@ -28,7 +28,7 @@ use hyperscale_scenarios::{
     gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
     grow_reaches_two_shard_topology, halted_shard_recovers_by_committee_redraw,
     halted_shard_straddler_atomic, hot_recipient,
-    inter_shard_partition_strands_waves_until_it_heals, isolated_validator_still_settles,
+    inter_shard_partition_strands_ticks_until_it_heals, isolated_validator_still_settles,
     livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
     merge_seats_full_keeper_committee, merge_straddler_atomic,
     minority_fragment_rejoins_after_partition, multi_vnode_progress, participant_count_sweep,
@@ -410,14 +410,14 @@ fn cross_shard_provisions_recovers_after_transient_outage_prod() {
     not(feature = "ci"),
     ignore = "real-QUIC production scenario; run with --features ci or -- --ignored"
 )]
-fn inter_shard_partition_strands_waves_until_it_heals_prod() {
+fn inter_shard_partition_strands_ticks_until_it_heals_prod() {
     let mut cluster = ProdCluster::start_with_accounts(
         &split_config(),
         11,
         EPOCH_MS,
         cross_shard_fault_genesis_accounts(),
     );
-    cluster.run_faultable(inter_shard_partition_strands_waves_until_it_heals);
+    cluster.run_faultable(inter_shard_partition_strands_ticks_until_it_heals);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 //! Execution-tick output chain.
 //!
 //! One tick per committed block that carries executable work: the block's
-//! single-shard transactions plus every cross-shard wave whose provisions
+//! single-shard transactions plus every cross-shard tick whose provisions
 //! completed at that commit, executed as one batch. Each tick's output is
 //! the next tick's baseline, overlaid on the persisted base — execution
 //! dispatch reads through [`TickChain::view_at`] instead of the
@@ -17,8 +17,8 @@
 //! replaying committed blocks forward from the persisted tip.
 //!
 //! **Provisional entries are never readable.** A cross-shard
-//! transaction's local writes sit beside the determined fold as per-wave
-//! provisional entries until the wave's certificate commits. Resolution
+//! transaction's local writes sit beside the determined fold as per-tick
+//! provisional entries until the tick's certificate commits. Resolution
 //! either promotes them into the readable fold (settled) or drops them
 //! (aborted) without recomputing any tick output — no chained output ever
 //! depends on an entry that resolution changes.
@@ -27,7 +27,7 @@
 //! both.** A receipt says what an exclusive write left and what a
 //! commutative access moved, and the second of those does not survive
 //! being applied twice. So each contribution records the height its
-//! wave's settlement reaches the base at, and a read folds it only while
+//! tick's settlement reaches the base at, and a read folds it only while
 //! its anchor sits below that height. Overlap is not idempotent and is
 //! therefore not permitted.
 //!
@@ -51,19 +51,19 @@ use crate::{SubstateDatabase, VersionedStore};
 /// One cross-shard transaction's provisional contribution to a tick.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvisionalTx {
-    /// Transaction whose wave verdict decides which side settles.
+    /// Transaction whose tick verdict decides which side settles.
     pub tx_hash: TxHash,
-    /// Local execution writes; promoted when the wave settles this
+    /// Local execution writes; promoted when the tick settles this
     /// transaction as accepted. `None` for a failed attempt, which
     /// produced no effects.
     pub writes: Option<StateWrites>,
     /// The payer-vault charge held beside the effects — the abort floor a
-    /// completed leg owes if its wave aborts, or the class charge of a
-    /// failed attempt. Promoted when the wave settles this transaction as
+    /// completed leg owes if its tick aborts, or the class charge of a
+    /// failed attempt. Promoted when the tick settles this transaction as
     /// aborted (the substitute receipt), dropped with everything else if
-    /// the wave never finalizes.
+    /// the tick never finalizes.
     pub reserve: Option<StateWrites>,
-    /// What this leg holds against each amount cell while its wave is
+    /// What this leg holds against each amount cell while its tick is
     /// unresolved — its declared reservations.
     ///
     /// Recorded here rather than tracked beside the chain so the hold and
@@ -114,7 +114,7 @@ struct Contribution {
     /// What the transaction left, in the form its receipt states it.
     writes: StateWrites,
     /// The height the settled base gains these writes at, known once the
-    /// wave's fate commits.
+    /// tick's fate commits.
     ///
     /// A read anchored below it needs the fold; at or above it the base
     /// already carries the same change. Folding both would leave an
@@ -190,7 +190,7 @@ impl TickEntry {
                 }
             }
             // Nothing settles, so nothing enters the base and no height
-            // is recorded. Only a wave whose whole contribution is
+            // is recorded. Only a tick whose whole contribution is
             // provisional can take this path: its entries were never
             // readable, so dropping them changes no baseline any tick has
             // already read.
@@ -200,18 +200,18 @@ impl TickEntry {
             // them, so stamping a height would drop them from a later
             // baseline while an earlier one kept them, and leaving them
             // unstamped would pin the tick forever. The rule is upstream:
-            // abandonment is a verdict about a cross-shard wave, and a
-            // wave with determined output is not one.
+            // abandonment is a verdict about a cross-shard tick, and a
+            // tick with determined output is not one.
             TickResolution::Aborted { .. } => {
                 if !self.readable.is_empty() {
                     // Left folded rather than dropped or stamped: every
                     // read keeps agreeing with the ones before it, and
                     // the cost is a tick this entry pins.
                     tracing::error!(
-                        wave = %tick_id,
-                        "abandoned a wave whose fold later ticks have read"
+                        tick = %tick_id,
+                        "abandoned a tick whose fold later ticks have read"
                     );
-                    debug_assert!(false, "a wave with a readable fold cannot be abandoned");
+                    debug_assert!(false, "a tick with a readable fold cannot be abandoned");
                 }
             }
         }
@@ -276,7 +276,7 @@ where
     /// first append is the whole of it — which is why a repeat is
     /// dropped rather than folded. Folding it would leave an exclusive
     /// write unchanged and apply every movement it carries a second
-    /// time, and it would re-add waves the chain has since resolved.
+    /// time, and it would re-add ticks the chain has since resolved.
     pub fn append(&self, height: BlockHeight, output: TickOutput) {
         write_or_recover(&self.entries)
             .entry(height)
@@ -306,7 +306,7 @@ where
     ///
     /// The eviction floor is the lower of what has persisted and what has
     /// executed, and the second half is load-bearing. A contribution
-    /// enters the base at the height its wave *settled*, which can be
+    /// enters the base at the height its tick *settled*, which can be
     /// above the anchor a still-queued tick will read from — so dropping
     /// on persistence alone lets eviction outrun a lagging tick queue,
     /// and that tick then finds neither the fold nor a base old enough to
@@ -894,7 +894,7 @@ mod tests {
         assert_eq!(amount(&view.snapshot().substate(key(1)).unwrap()), 900);
     }
 
-    /// A fold survives until nothing can still need it: every wave in it
+    /// A fold survives until nothing can still need it: every tick in it
     /// resolved, the settlement persisted, and execution advanced past the
     /// settling height. The last is what keeps eviction from outrunning a
     /// queued tick, whose anchor can sit below the height the base gained

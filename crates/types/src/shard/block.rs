@@ -67,7 +67,7 @@ pub type SharedCertificates = Arc<Vec<Arc<Verifiable<Finalization>>>>;
 /// Shared provision list — same rationale as [`SharedCertificates`].
 pub type SharedProvisions = Arc<Vec<Arc<Verifiable<Provisions>>>>;
 
-/// Gas a shard consumed across the waves `certificates` settle.
+/// Gas a shard consumed across the ticks `certificates` settle.
 ///
 /// Free-standing so the proposer can price the certificates it selected
 /// before the header those certificates go under exists, while
@@ -75,8 +75,8 @@ pub type SharedProvisions = Arc<Vec<Arc<Verifiable<Provisions>>>>;
 /// One derivation, so the two sides cannot drift.
 #[must_use]
 pub fn work_over_certificates(certificates: &[Arc<Verifiable<Finalization>>]) -> u64 {
-    certificates.iter().fold(0u64, |sum, wave| {
-        sum.saturating_add(wave.as_unverified().attested_work())
+    certificates.iter().fold(0u64, |sum, tick| {
+        sum.saturating_add(tick.as_unverified().attested_work())
     })
 }
 
@@ -86,9 +86,9 @@ pub fn work_over_certificates(certificates: &[Arc<Verifiable<Finalization>>]) ->
 ///
 /// Blocks have two variants reflecting their temporal lifecycle:
 /// - **`Live`**: within the cross-shard execution window. Carries the
-///   provisions needed to execute cross-shard waves locally.
-/// - **`Sealed`**: past the execution window (at least `WAVE_TIMEOUT` of
-///   wall-clock behind the local committed tip). Waves are finalized from
+///   provisions needed to execute cross-shard ticks locally.
+/// - **`Sealed`**: past the execution window (at least `MAX_FINALIZATION_DELAY` of
+///   wall-clock behind the local committed tip). Ticks are finalized from
 ///   certs + receipts alone, so provisions are no longer needed and are
 ///   dropped from memory. The on-disk / storage shape is always `Sealed`.
 ///
@@ -110,7 +110,7 @@ pub enum Block {
         /// Finalizations finalized in this block.
         #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
         certificates: Arc<Vec<Arc<Verifiable<Finalization>>>>,
-        /// Provisions needed to execute cross-shard waves locally.
+        /// Provisions needed to execute cross-shard ticks locally.
         #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
         provisions: Arc<Vec<Arc<Verifiable<Provisions>>>>,
         /// Proposer-supplied beacon-witness inputs. Committed via the
@@ -198,7 +198,7 @@ impl Block {
     /// (see [`QuorumCertificate::genesis`](crate::QuorumCertificate::genesis)).
     ///
     /// Genesis is born `Live` with no provisions — the temporality machinery
-    /// activates only once there are cross-shard waves in flight.
+    /// activates only once there are cross-shard ticks in flight.
     #[must_use]
     pub fn genesis(
         shard_id: ShardId,
@@ -382,7 +382,7 @@ impl Block {
         }
     }
 
-    /// Gas this shard consumed across the waves the block settles.
+    /// Gas this shard consumed across the ticks the block settles.
     ///
     /// The increment behind the header's running gas total, and the reason
     /// that total is checkable: a block's certificates carry their own

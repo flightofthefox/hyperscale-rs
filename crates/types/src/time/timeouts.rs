@@ -3,10 +3,10 @@
 //! Every constant here must be enforced identically on every validator.
 //! Two flavors live side by side:
 //!
-//! - **Retention / abort windows** (`WAVE_TIMEOUT`, `REMOTE_HEADER_RETENTION`,
-//!   `RETENTION_HORIZON`) — durations after which a wave aborts or a piece
+//! - **Retention / abort windows** (`MAX_FINALIZATION_DELAY`, `REMOTE_HEADER_RETENTION`,
+//!   `RETENTION_HORIZON`) — durations after which a tick aborts or a piece
 //!   of derived state becomes safe to drop on every node simultaneously.
-//!   Most downstream invariants derive from `WAVE_TIMEOUT`.
+//!   Most downstream invariants derive from `MAX_FINALIZATION_DELAY`.
 //! - **shard consensus liveness timers** (`VIEW_CHANGE_TIMEOUT*`, `MAX_PROGRESS_WAIT`) —
 //!   round-timer cadences and the absolute ceiling on view-change
 //!   suppression while a proposal is in flight. Validators that disagree on
@@ -20,26 +20,29 @@ use std::time::Duration;
 
 use crate::MAX_VALIDITY_RANGE;
 
-/// How long after wave start before a not-fully-provisioned wave is aborted
-/// in its entirety.
+/// The longest a cross-shard transaction may take to finalize, past the
+/// last block that could have included it.
 ///
-/// This is the cross-shard execution window — every retention window that
-/// must outlive a live wave is sized in terms of this.
+/// This is the cross-shard settlement window — every retention window
+/// that must outlive a transaction in flight is sized in terms of it, and
+/// past it the transaction is abandoned rather than waited for. So the
+/// last moment a transaction can be included plus this is
+/// [`RETENTION_HORIZON`].
 ///
 /// Sized at 3× `VOTE_RETRY_TIMEOUT` (8s) so at least two vote retries can
-/// fire against rotated wave leaders before the timeout-abort path takes over.
+/// fire against rotated tick leaders inside it.
 ///
 /// Deterministic — measured against the shard consensus-authenticated
-/// `weighted_timestamp_ms` of the committing QC, so every validator derives
-/// the same abort anchor.
-pub const WAVE_TIMEOUT: Duration = Duration::from_secs(24);
+/// `weighted_timestamp_ms` of the committing QC, so every validator
+/// derives the same deadline.
+pub const MAX_FINALIZATION_DELAY: Duration = Duration::from_secs(24);
 
 /// How long to retain remote block headers below each shard's tip.
 ///
 /// Shared by `hyperscale-shard` (deferral-proof verification) and
 /// `hyperscale-remote-headers` (provision/exec-cert verification). Measured
 /// against the shard consensus-authenticated `weighted_timestamp_ms` on the tip vs the
-/// stored header. Sized generously above `WAVE_TIMEOUT` so late-arriving
+/// stored header. Sized generously above `MAX_FINALIZATION_DELAY` so late-arriving
 /// proofs still find a header to verify against.
 pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);
 
@@ -47,13 +50,13 @@ pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);
 /// — provisions, ECs, mempool tombstones, conflict-detector entries.
 ///
 /// A tx included at the latest possible moment
-/// (`weighted_ts ≈ end_timestamp_exclusive - 1ms`) gets `WAVE_TIMEOUT`
+/// (`weighted_ts ≈ end_timestamp_exclusive - 1ms`) gets `MAX_FINALIZATION_DELAY`
 /// after that to terminate (success or abort, both via WC). After both
 /// elapse, the tx is provably terminal everywhere — no shard can still
 /// need its provision data, EC, or any other artefact. Safe to drop on
 /// every node simultaneously.
 pub const RETENTION_HORIZON: Duration =
-    Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() + WAVE_TIMEOUT.as_secs());
+    Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() + MAX_FINALIZATION_DELAY.as_secs());
 
 /// Base view-change timeout for the first round at any height.
 ///

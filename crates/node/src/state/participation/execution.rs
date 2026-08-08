@@ -1,6 +1,6 @@
 //! Execution-flow dispatch arms.
 //!
-//! Covers wave-based voting (votes received, aggregated, certificate
+//! Covers tick-based voting (votes received, aggregated, certificate
 //! verified) and the engine results path (`ExecutionBatchCompleted`).
 //!
 //! Cross-shard EC admission has a quirk: if an admitted EC names the local
@@ -72,10 +72,10 @@ impl ShardParticipation {
             }
             ProtocolEvent::FinalizationsReceived { finalizations } => {
                 let mut actions = Vec::new();
-                for wave in finalizations {
+                for tick in finalizations {
                     actions.extend(
                         self.execution_coordinator
-                            .admit_finalization(topology_schedule, wave),
+                            .admit_finalization(topology_schedule, tick),
                     );
                 }
                 actions
@@ -89,7 +89,7 @@ impl ShardParticipation {
             ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
                 let local_shard = self.local_shard;
                 let mut actions = Vec::new();
-                // If the EC is for a remote wave where we were a source, the
+                // If the EC is for a remote tick where we were a source, the
                 // target shard's tx_outcomes acknowledge outbound batches we
                 // sent. Surface the ACK to the outbound tracker.
                 // A remote batch acknowledging outbound work of ours: its

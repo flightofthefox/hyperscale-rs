@@ -1,21 +1,21 @@
 //! Buffer for execution votes and cross-shard execution certificates that
-//! arrive before their local wave is tracked.
+//! arrive before their local tick is tracked.
 //!
 //! Two distinct arrival races need buffering:
 //!
 //! ## Votes that arrive before the block commits
 //!
-//! A validator may receive an execution vote for a wave whose originating
+//! A validator may receive an execution vote for a tick whose originating
 //! block hasn't been committed locally yet — either because we're a few
 //! blocks behind, or because we're the rotated leader for a retry and the
 //! original leader's block reached us before ours did. These votes are
 //! buffered per-`TickId` and replayed into the [`VoteTracker`] when a
 //! leader tracker is eventually created.
 //!
-//! ## ECs that arrive before the tx's wave assignment exists
+//! ## ECs that arrive before the tx's tick assignment exists
 //!
 //! A cross-shard [`ExecutionCertificate`] covers `tx_hashes` from the remote
-//! shard's wave decomposition. Some of those txs may land in local blocks
+//! shard's tick composition. Some of those txs may land in local blocks
 //! that haven't committed yet, so we can't route the EC immediately. The
 //! buffer holds the EC by its `tick_id` with a pending-tx set; as `tx_hashes`
 //! land locally, we drain the EC back into the routing pipeline.
@@ -43,7 +43,7 @@
 //!   [`ExecutionCertificate::deadline`] — `vote_anchor_ts +
 //!   RETENTION_HORIZON`. Past that point every tx the EC could mention
 //!   has expired its `validity_range` and either terminated or aborted,
-//!   so no local wave can still consume it. The anchor is BFT-attested,
+//!   so no local tick can still consume it. The anchor is BFT-attested,
 //!   matching the sender-side deadline used by
 //!   [`OutboundExecutionCertificateTracker`](crate::outbound_certs::OutboundExecutionCertificateTracker).
 
@@ -52,25 +52,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    ExecutionCertificate, ExecutionVote, TickId, TxHash, Verifiable, Verified, WAVE_TIMEOUT,
-    WeightedTimestamp,
+    ExecutionCertificate, ExecutionVote, MAX_FINALIZATION_DELAY, TickId, TxHash, Verifiable,
+    Verified, WeightedTimestamp,
 };
 
 /// How long to retain unmatched early votes whose block never committed
-/// locally. Past `WAVE_TIMEOUT` from the vote's `vote_anchor_ts`, the wave
+/// locally. Past `MAX_FINALIZATION_DELAY` from the vote's `vote_anchor_ts`, the tick
 /// the vote belonged to has aborted (success or all-abort), so the vote can
-/// no longer contribute to a useful wave. Anchored on the committing QC's
+/// no longer contribute to a useful tick. Anchored on the committing QC's
 /// `weighted_timestamp_ms` so the bound is BFT-authenticated.
-pub const EARLY_VOTE_RETENTION: Duration = WAVE_TIMEOUT;
+pub const EARLY_VOTE_RETENTION: Duration = MAX_FINALIZATION_DELAY;
 
-/// Hard ceiling on early votes buffered across all waves.
+/// Hard ceiling on early votes buffered across all ticks.
 ///
 /// Early votes are committee-gated at ingress but their per-vote
 /// signatures aren't checked until a vote tracker spins up, so a Byzantine
 /// committee member could otherwise grow the buffer without bound by
 /// flooding votes for fabricated `TickId`s until the [`EARLY_VOTE_RETENTION`]
-/// sweep. The ceiling is a global vote count, not a per-wave or per-shard
-/// limit: legitimate buffering only spans a handful of in-flight waves at a
+/// sweep. The ceiling is a global vote count, not a per-tick or per-shard
+/// limit: legitimate buffering only spans a handful of in-flight ticks at a
 /// time, so the sum stays far below this bound unless flooded. Past it, new
 /// early votes are dropped — recoverable via the voter's vote-retry once the
 /// block commits.
@@ -79,7 +79,7 @@ pub const MAX_BUFFERED_EARLY_VOTES: usize = 65_536;
 /// Bookkeeping for an EC awaiting local routing.
 ///
 /// Holds a single owning reference to the EC plus the set of `tx_hashes` from
-/// `tx_outcomes` that haven't yet been matched to a local wave. As each
+/// `tx_outcomes` that haven't yet been matched to a local tick. As each
 /// unrouted tx eventually commits locally, the `tx_hash` is removed from
 /// `pending_txs`; when the set drains to empty the EC has been fully routed
 /// and the entry is dropped.
@@ -90,7 +90,7 @@ struct BufferedEc {
 }
 
 pub struct EarlyArrivalBuffer {
-    /// Execution votes that arrived before tracking started, keyed by wave.
+    /// Execution votes that arrived before tracking started, keyed by tick.
     votes: HashMap<TickId, Vec<Verifiable<ExecutionVote>>>,
 
     /// Reverse index from `tx_hash` to any buffered ECs mentioning it.
@@ -122,13 +122,13 @@ impl EarlyArrivalBuffer {
 
     // ─── Votes ──────────────────────────────────────────────────────────
 
-    /// Buffer a vote whose wave isn't yet tracked. Called from the
+    /// Buffer a vote whose tick isn't yet tracked. Called from the
     /// non-leader ingress path. Returns `false` if the vote was dropped
     /// because the buffer is at [`MAX_BUFFERED_EARLY_VOTES`] capacity.
     pub fn buffer_vote(&mut self, tick_id: TickId, vote: Verifiable<ExecutionVote>) -> bool {
         if self.buffered >= MAX_BUFFERED_EARLY_VOTES {
             tracing::debug!(
-                wave = %tick_id,
+                tick = %tick_id,
                 buffered = self.buffered,
                 "Early-vote buffer at capacity — dropping vote"
             );
@@ -149,7 +149,7 @@ impl EarlyArrivalBuffer {
     }
 
     /// Predicate-driven retention for vote entries. The caller owns the
-    /// policy (is the wave still tracked? does it already have an EC?); the
+    /// policy (is the tick still tracked? does it already have an EC?); the
     /// buffer just exposes the retention cutoff and the retain loop.
     pub fn retain_votes<F>(&mut self, mut predicate: F)
     where
@@ -167,7 +167,7 @@ impl EarlyArrivalBuffer {
 
     // ─── ECs ────────────────────────────────────────────────────────────
 
-    /// Buffer an EC under `tx_hashes` that don't yet have a local wave
+    /// Buffer an EC under `tx_hashes` that don't yet have a local tick
     /// assignment. Idempotent: `tx_hashes` already tracked for this EC's
     /// `tick_id` are skipped, so replaying a previously-buffered EC won't
     /// create duplicate entries in the reverse index.
@@ -214,7 +214,7 @@ impl EarlyArrivalBuffer {
     ///
     /// The reverse index is cleared for each drained `tx_hash`; the
     /// `pending_routing` entry is left alone (the caller will typically
-    /// feed the EC into `handle_wave_attestation`, which then calls
+    /// feed the EC into `handle_attestation`, which then calls
     /// `clear_routed` to drop the entry).
     pub fn drain_ecs_for_txs(
         &mut self,
@@ -240,7 +240,7 @@ impl EarlyArrivalBuffer {
     /// remote committee — the same bound the sender uses on the outbound
     /// side. Past it, every tx the EC mentions has expired its
     /// `validity_range` and either terminated or aborted, so no local
-    /// wave can still consume it. Returns the number of ECs evicted.
+    /// tick can still consume it. Returns the number of ECs evicted.
     pub fn gc_stale_ecs(&mut self, now_ts: WeightedTimestamp) -> usize {
         let stale: Vec<TickId> = self
             .pending_routing
@@ -307,7 +307,7 @@ mod tests {
         ShardId::ROOT
     }
 
-    fn wave(height: u64) -> TickId {
+    fn tick(height: u64) -> TickId {
         TickId::new(shard(), BlockHeight::new(height))
     }
 
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn drain_votes_returns_buffered_and_leaves_buffer_empty() {
         let mut b = EarlyArrivalBuffer::new();
-        let w = wave(1);
+        let w = tick(1);
         b.buffer_vote(w, make_vote(w, ms(100)).into());
         b.buffer_vote(w, make_vote(w, ms(200)).into());
 
@@ -409,10 +409,10 @@ mod tests {
     }
 
     #[test]
-    fn drain_votes_is_per_wave() {
+    fn drain_votes_is_per_tick() {
         let mut b = EarlyArrivalBuffer::new();
-        let w1 = wave(1);
-        let w2 = wave(2);
+        let w1 = tick(1);
+        let w2 = tick(2);
         b.buffer_vote(w1, make_vote(w1, ms(100)).into());
         b.buffer_vote(w2, make_vote(w2, ms(100)).into());
 
@@ -424,8 +424,8 @@ mod tests {
     #[test]
     fn retain_votes_drops_entries_matching_predicate() {
         let mut b = EarlyArrivalBuffer::new();
-        let w1 = wave(1);
-        let w2 = wave(2);
+        let w1 = tick(1);
+        let w2 = tick(2);
         b.buffer_vote(w1, make_vote(w1, ms(100)).into());
         b.buffer_vote(w2, make_vote(w2, ms(100)).into());
 
@@ -439,37 +439,37 @@ mod tests {
     #[test]
     fn buffer_vote_enforces_global_cap() {
         let mut b = EarlyArrivalBuffer::new();
-        let w = wave(1);
+        let w = tick(1);
         for _ in 0..MAX_BUFFERED_EARLY_VOTES {
             assert!(b.buffer_vote(w, cheap_vote(w)));
         }
-        // At capacity, further votes are dropped — including for a wave the
+        // At capacity, further votes are dropped — including for a tick the
         // buffer has never seen, so a fabricated-`TickId` flood can't grow it.
-        assert!(!b.buffer_vote(w, cheap_vote(wave(1))));
-        assert!(!b.buffer_vote(wave(2), cheap_vote(wave(2))));
-        assert!(!b.votes.contains_key(&wave(2)));
+        assert!(!b.buffer_vote(w, cheap_vote(tick(1))));
+        assert!(!b.buffer_vote(tick(2), cheap_vote(tick(2))));
+        assert!(!b.votes.contains_key(&tick(2)));
     }
 
     #[test]
-    fn draining_a_wave_frees_buffer_capacity() {
+    fn draining_a_tick_frees_buffer_capacity() {
         let mut b = EarlyArrivalBuffer::new();
-        let w = wave(1);
+        let w = tick(1);
         for _ in 0..MAX_BUFFERED_EARLY_VOTES {
             b.buffer_vote(w, cheap_vote(w));
         }
-        assert!(!b.buffer_vote(wave(2), cheap_vote(wave(2))));
+        assert!(!b.buffer_vote(tick(2), cheap_vote(tick(2))));
 
         let drained = b.drain_votes_for_tick(&w);
         assert_eq!(drained.len(), MAX_BUFFERED_EARLY_VOTES);
         // The reclaimed budget lets fresh votes buffer again.
-        assert!(b.buffer_vote(wave(2), cheap_vote(wave(2))));
+        assert!(b.buffer_vote(tick(2), cheap_vote(tick(2))));
     }
 
     #[test]
-    fn retaining_frees_buffer_capacity_for_dropped_waves() {
+    fn retaining_frees_buffer_capacity_for_dropped_ticks() {
         let mut b = EarlyArrivalBuffer::new();
-        let w1 = wave(1);
-        let w2 = wave(2);
+        let w1 = tick(1);
+        let w2 = tick(2);
         let half = MAX_BUFFERED_EARLY_VOTES / 2;
         for _ in 0..half {
             b.buffer_vote(w1, cheap_vote(w1));
@@ -477,14 +477,14 @@ mod tests {
         for _ in 0..(MAX_BUFFERED_EARLY_VOTES - half) {
             b.buffer_vote(w2, cheap_vote(w2));
         }
-        assert!(!b.buffer_vote(wave(3), cheap_vote(wave(3))));
+        assert!(!b.buffer_vote(tick(3), cheap_vote(tick(3))));
 
         // Dropping `w1` returns exactly its share of the budget.
         b.retain_votes(|tick_id, _| tick_id != &w1);
         for _ in 0..half {
-            assert!(b.buffer_vote(wave(3), cheap_vote(wave(3))));
+            assert!(b.buffer_vote(tick(3), cheap_vote(tick(3))));
         }
-        assert!(!b.buffer_vote(wave(3), cheap_vote(wave(3))));
+        assert!(!b.buffer_vote(tick(3), cheap_vote(tick(3))));
     }
 
     // ─── ECs ────────────────────────────────────────────────────────────
@@ -492,7 +492,7 @@ mod tests {
     #[test]
     fn buffer_ec_records_pending_set_and_reverse_index() {
         let mut b = EarlyArrivalBuffer::new();
-        let w = wave(1);
+        let w = tick(1);
         let tx_a = TxHash::from(Hash::from_bytes(b"a"));
         let tx_b = TxHash::from(Hash::from_bytes(b"b"));
         let ec = make_ec(w, &[tx_a, tx_b]);
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn buffer_ec_idempotent_for_same_tx_hashes() {
         let mut b = EarlyArrivalBuffer::new();
-        let w = wave(1);
+        let w = tick(1);
         let tx = TxHash::from(Hash::from_bytes(b"a"));
         let ec = make_ec(w, &[tx]);
 
@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn clear_routed_drops_entry_once_pending_set_drains() {
         let mut b = EarlyArrivalBuffer::new();
-        let w = wave(1);
+        let w = tick(1);
         let tx_a = TxHash::from(Hash::from_bytes(b"a"));
         let tx_b = TxHash::from(Hash::from_bytes(b"b"));
         let ec = make_ec(w, &[tx_a, tx_b]);
@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn drain_ecs_for_txs_returns_ecs_and_clears_reverse_index() {
         let mut b = EarlyArrivalBuffer::new();
-        let w = wave(1);
+        let w = tick(1);
         let tx_a = TxHash::from(Hash::from_bytes(b"a"));
         let tx_b = TxHash::from(Hash::from_bytes(b"b"));
         let ec = make_ec(w, &[tx_a, tx_b]);
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn drain_ecs_for_txs_dedups_arc_identity() {
         let mut b = EarlyArrivalBuffer::new();
-        let w = wave(1);
+        let w = tick(1);
         let tx_a = TxHash::from(Hash::from_bytes(b"a"));
         let tx_b = TxHash::from(Hash::from_bytes(b"b"));
         // Single EC covers both txs; draining both hashes should yield one EC.
@@ -577,8 +577,8 @@ mod tests {
         // Old EC: anchor at ms(1_000) → deadline at 1_000 + horizon_ms.
         // Fresh EC: anchor at ms(60_000) → deadline at 60_000 + horizon_ms.
         let mut b = EarlyArrivalBuffer::new();
-        let w_old = wave(1);
-        let w_fresh = wave(2);
+        let w_old = tick(1);
+        let w_fresh = tick(2);
         let tx_old = TxHash::from(Hash::from_bytes(b"old"));
         let tx_fresh = TxHash::from(Hash::from_bytes(b"fresh"));
 
@@ -607,7 +607,7 @@ mod tests {
     #[test]
     fn gc_stale_ecs_preserves_entries_within_horizon() {
         let mut b = EarlyArrivalBuffer::new();
-        let w = wave(1);
+        let w = tick(1);
         let tx = TxHash::from(Hash::from_bytes(b"tx"));
         let anchor = ms(100_000);
         b.buffer_ec(&make_ec_with_anchor(w, &[tx], anchor), &[tx]);
@@ -631,14 +631,14 @@ mod tests {
         ) {
             let mut b = EarlyArrivalBuffer::new();
             for (i, h) in heights.iter().enumerate() {
-                let w = wave(*h);
+                let w = tick(*h);
                 let anchor = ms(anchors[i % anchors.len()]);
                 b.buffer_vote(w, make_vote(w, anchor).into());
             }
 
-            // Drain every wave once; collect counts. A second drain of each
+            // Drain every tick once; collect counts. A second drain of each
             // must return zero.
-            let tick_ids: Vec<TickId> = heights.iter().map(|h| wave(*h)).collect();
+            let tick_ids: Vec<TickId> = heights.iter().map(|h| tick(*h)).collect();
             let mut first_counts = Vec::new();
             for w in &tick_ids {
                 first_counts.push(b.drain_votes_for_tick(w).len());
@@ -662,7 +662,7 @@ mod tests {
         ) {
             let mut b = EarlyArrivalBuffer::new();
             for (i, h) in heights.iter().enumerate() {
-                let w = wave(*h);
+                let w = tick(*h);
                 let tx = TxHash::from(Hash::from_bytes(&[u8::try_from(i).unwrap_or(u8::MAX); 32]));
                 let anchor = ms(anchor_ms[i % anchor_ms.len()]);
                 b.buffer_ec(&make_ec_with_anchor(w, &[tx], anchor), &[tx]);

@@ -75,7 +75,7 @@ impl Eq for Transaction {}
 // Manual Clone - OnceLock doesn't implement Clone. Every populated cache
 // is copied so the clone doesn't pay first-access cost twice; in
 // particular the derivation rides across clones, so the work a fresh tx
-// incurs at admission is amortized over every later raw clone (wave-state
+// incurs at admission is amortized over every later raw clone (tick-state
 // extract, mempool block-commit lift, proposal build).
 impl Clone for Transaction {
     fn clone(&self) -> Self {

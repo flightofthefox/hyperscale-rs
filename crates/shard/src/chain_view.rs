@@ -353,13 +353,13 @@ mod tests {
     #[test]
     fn collect_ancestor_hashes_includes_manifest_only_cert_ids() {
         // A manifest-only ancestor (header known, body not yet assembled) still
-        // contributes its certificate wave-ids to dedup, matching the
+        // contributes its certificate tick-ids to dedup, matching the
         // assembled-block walk; otherwise a descendant could re-include a
         // finalization already present above the committed tip.
         let header = make_header(3, BlockHash::ZERO);
         let block_hash = header.hash();
-        let wave = TickId::new(ShardId::ROOT, BlockHeight::new(2));
-        let manifest = BlockManifest::new(vec![], vec![wave], vec![], WitnessSources::empty());
+        let tick = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let manifest = BlockManifest::new(vec![], vec![tick], vec![], WitnessSources::empty());
         let pending_block = PendingBlock::from_manifest(header, manifest, LocalTimestamp::ZERO);
         let mut pending = PendingBlocks::new();
         pending.insert(pending_block);
@@ -378,8 +378,8 @@ mod tests {
                 );
                 let (cert_ids, _txs, _provisions) = view.collect_ancestor_hashes(block_hash);
                 assert!(
-                    cert_ids.contains(&wave),
-                    "manifest-only ancestor cert wave-id missing from dedup set",
+                    cert_ids.contains(&tick),
+                    "manifest-only ancestor cert tick-id missing from dedup set",
                 );
             },
         );

@@ -42,8 +42,8 @@ pub struct ChainEntry {
     pub height: BlockHeight,
     /// Per-tx receipts produced by this block.
     pub receipts: Vec<Arc<ConsensusReceipt>>,
-    /// Wave-ids this shard settled in this block — the local execution
-    /// certificate of each committed wave. Carried from insert (the
+    /// Tick-ids this shard settled in this block — the local execution
+    /// certificate of each committed tick. Carried from insert (the
     /// certificates exist before the QC attaches `certified_block`), so a
     /// settled-transaction window walk reaches a pending ancestor's contribution
     /// during the proposer's build, not just after commit.
@@ -334,7 +334,7 @@ where
         settled_txs_root_from_hashes(set.iter())
     }
 
-    /// The wave-ids `local_shard` settled across the window, unioned with
+    /// The tick-ids `local_shard` settled across the window, unioned with
     /// `own` (the block being built or verified). Walks the parent's
     /// pending prefix by hash (each entry carries its settled transaction-ids
     /// from insert, so a not-yet-attached ancestor still contributes),
@@ -395,7 +395,7 @@ where
     }
 
     /// The committed-tail contribution to a settled-transaction window under a
-    /// schedule-stable floor: every wave `local_shard` settled in a
+    /// schedule-stable floor: every tick `local_shard` settled in a
     /// committed block with weighted timestamp at or above `floor`, at
     /// heights up to `upto` (inclusive).
     ///
@@ -1128,13 +1128,13 @@ mod tests {
         }
         fn get_execution_certificate(
             &self,
-            _wave_id: &TickId,
+            _tick_id: &TickId,
         ) -> Option<Verified<ExecutionCertificate>> {
             None
         }
         fn get_execution_certificates_batch(
             &self,
-            _wave_ids: &[TickId],
+            _tick_ids: &[TickId],
         ) -> Vec<Verified<ExecutionCertificate>> {
             Vec::new()
         }
@@ -1594,28 +1594,28 @@ mod tests {
         assert!(chain.latest_qc().is_none());
     }
 
-    /// A cross-shard wave keyed on `ShardId::ROOT` — the only kind whose
+    /// A cross-shard tick keyed on `ShardId::ROOT` — the only kind whose
     /// transactions land in the settled set, since `local_settled_tx_hashes`
-    /// drops single-shard (`is_zero`) waves.
-    fn wave(n: u64) -> TickId {
+    /// drops single-shard (`is_zero`) ticks.
+    fn tick(n: u64) -> TickId {
         TickId::new(ShardId::ROOT, BlockHeight::new(n))
     }
 
-    /// The transaction a given wave settles. Distinct per wave, so a set
-    /// built from several waves has one entry each.
-    fn settled_tx(wave: &TickId) -> TxHash {
-        TxHash::from(Hash::from_bytes(&wave.block_height().inner().to_le_bytes()))
+    /// The transaction a given tick settles. Distinct per tick, so a set
+    /// built from several ticks has one entry each.
+    fn settled_tx(tick: &TickId) -> TxHash {
+        TxHash::from(Hash::from_bytes(&tick.block_height().inner().to_le_bytes()))
     }
 
     /// A counterpart shard's certificate for the same transaction — the
     /// evidence that makes it reach beyond the settling shard.
-    fn remote_ec_for(wave: &TickId) -> Arc<ExecutionCertificate> {
+    fn remote_ec_for(tick: &TickId) -> Arc<ExecutionCertificate> {
         Arc::new(ExecutionCertificate::new(
-            TickId::new(ShardId::from_heap_index(2), wave.block_height()),
+            TickId::new(ShardId::from_heap_index(2), tick.block_height()),
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome::new(
-                settled_tx(wave),
+                settled_tx(tick),
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
@@ -1625,13 +1625,13 @@ mod tests {
         ))
     }
 
-    fn ec_for(wave: &TickId) -> Arc<ExecutionCertificate> {
+    fn ec_for(tick: &TickId) -> Arc<ExecutionCertificate> {
         Arc::new(ExecutionCertificate::new(
-            *wave,
+            *tick,
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome::new(
-                settled_tx(wave),
+                settled_tx(tick),
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
@@ -1642,7 +1642,7 @@ mod tests {
     }
 
     /// A `BlockForSync` at `height` whose QC carries `wt_ms` and whose
-    /// single finalization settles `settles` (a local-shard wave).
+    /// single finalization settles `settles` (a local-shard tick).
     fn settled_sync_block(height: BlockHeight, wt_ms: u64, settles: &TickId) -> BlockForSync {
         // The block's own `parent_qc` carries `wt_ms` — the canonical clock the
         // floor reads.
@@ -1703,7 +1703,7 @@ mod tests {
         let chain = empty_chain();
         let ancestor = BlockHash::from_raw(Hash::from_bytes(b"ancestor"));
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
-        let (wa, wb, own) = (wave(100), wave(101), wave(102));
+        let (wa, wb, own) = (tick(100), tick(101), tick(102));
         chain.insert(
             ancestor,
             ChainEntry {
@@ -1752,7 +1752,7 @@ mod tests {
     fn settled_txs_window_floors_the_committed_tail() {
         let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
         let anchor = WeightedTimestamp::from_millis(rh_ms + 10_000); // floor = 10_000
-        let (in_window, below_floor, parent_wave) = (wave(200), wave(201), wave(202));
+        let (in_window, below_floor, parent_tick) = (tick(200), tick(201), tick(202));
         let stub = StubStore::default()
             .with_sync_block(
                 BlockHeight::new(3),
@@ -1770,7 +1770,7 @@ mod tests {
                 parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed-tip")),
                 height: BlockHeight::new(4),
                 receipts: Vec::new(),
-                settled_txs: vec![settled_tx(&parent_wave)],
+                settled_txs: vec![settled_tx(&parent_tick)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
@@ -1786,12 +1786,12 @@ mod tests {
         );
         assert_eq!(
             set,
-            BTreeSet::from([settled_tx(&parent_wave), settled_tx(&in_window)])
+            BTreeSet::from([settled_tx(&parent_tick), settled_tx(&in_window)])
         );
     }
 
     /// A schedule-supplied window floor extends the committed walk below
-    /// `anchor − RETENTION_HORIZON`: a wave settled early in a terminating
+    /// `anchor − RETENTION_HORIZON`: a tick settled early in a terminating
     /// shard's scheduled window — outside the anchor-relative span — still
     /// enters the set, so the attested root covers every settlement a
     /// counterpart fence can be holding a straddler against.
@@ -1799,7 +1799,7 @@ mod tests {
     fn window_floor_extends_the_committed_tail_below_the_horizon() {
         let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
         let anchor = WeightedTimestamp::from_millis(rh_ms + 10_000); // anchor floor = 10_000
-        let (in_window, early_settled) = (wave(300), wave(301));
+        let (in_window, early_settled) = (tick(300), tick(301));
         let stub = StubStore::default()
             .with_sync_block(
                 BlockHeight::new(3),
@@ -1832,7 +1832,7 @@ mod tests {
     fn settled_window_memo_extends_at_the_tip_only() {
         let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
         let floor = Some(WeightedTimestamp::from_millis(500));
-        let (w2, w3, w4) = (wave(400), wave(401), wave(402));
+        let (w2, w3, w4) = (tick(400), tick(401), tick(402));
         let stub = StubStore::default()
             .with_sync_block(
                 BlockHeight::new(2),

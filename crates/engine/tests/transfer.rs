@@ -12,7 +12,7 @@ use hyperscale_effects_bridge::{
 use hyperscale_engine::genesis::{account_artifact, entropy_key, vault_key};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, Parallelism, PreviewGrants, PreviewInputs, PreviewOutcome,
-    PreviewReport, ResourceChange, WaveBatchContext, XRD, genesis_writes,
+    PreviewReport, ResourceChange, TickBatchContext, XRD, genesis_writes,
 };
 use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput, VersionedStore};
 use hyperscale_types::{
@@ -310,16 +310,16 @@ fn execute_anchored(
 ) -> Vec<ExecutedTx> {
     let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (bob(), 50)]);
     let trie = ShardTrie::single();
-    let ctx = WaveBatchContext {
+    let ctx = TickBatchContext {
         par: Parallelism::Sequential,
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
-        wave_start_ts: WeightedTimestamp::from_millis(1_000),
-        wave_start_reveal: reveal,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        tick_reveal: reveal,
         holds: &ProvisionalHolds::new(),
     };
-    executor.execute_wave_batch(&ctx, &snapshot_store, transactions)
+    executor.execute_batch(&ctx, &snapshot_store, transactions)
 }
 
 /// The entropy leaf a stamp wrote, if any.
@@ -464,16 +464,16 @@ fn execute_batch_on(
     transactions: &[Arc<Verified<Transaction>>],
 ) -> Vec<ExecutedTx> {
     let trie = ShardTrie::single();
-    let ctx = WaveBatchContext {
+    let ctx = TickBatchContext {
         par: Parallelism::Sequential,
         local_shard: ShardId::ROOT,
         shard_trie: &trie,
         block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
-        wave_start_ts: WeightedTimestamp::from_millis(1_000),
-        wave_start_reveal: RevealChain::ZERO,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        tick_reveal: RevealChain::ZERO,
         holds: &ProvisionalHolds::new(),
     };
-    executor.execute_wave_batch(&ctx, snapshot_store, transactions)
+    executor.execute_batch(&ctx, snapshot_store, transactions)
 }
 
 /// A receipt's writes as they settle onto `accounts`.
@@ -969,16 +969,16 @@ fn execute_on_shard(
 ) -> Vec<ExecutedTx> {
     let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
     let trie = ShardTrie::uniform(1);
-    let ctx = WaveBatchContext {
+    let ctx = TickBatchContext {
         par: Parallelism::Sequential,
         local_shard,
         shard_trie: &trie,
         block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
-        wave_start_ts: WeightedTimestamp::from_millis(1_000),
-        wave_start_reveal: RevealChain::ZERO,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        tick_reveal: RevealChain::ZERO,
         holds: &ProvisionalHolds::new(),
     };
-    executor.execute_wave_batch(&ctx, &snapshot_store, transactions)
+    executor.execute_batch(&ctx, &snapshot_store, transactions)
 }
 
 fn events_of(executed: &ExecutedTx) -> Vec<([u8; 16], u32)> {
@@ -1395,10 +1395,10 @@ fn a_preview_reports_the_resource_changes_a_transfer_would_make() {
     );
 }
 
-/// The preview's arithmetic is the wave's arithmetic: what it says a
+/// The preview's arithmetic is the tick's arithmetic: what it says a
 /// vault would hold is what the committed receipt writes there.
 #[test]
-fn a_preview_agrees_with_the_wave_that_would_commit_it() {
+fn a_preview_agrees_with_the_tick_that_would_commit_it() {
     let PreviewFixture {
         payer,
         accounts,
@@ -1421,7 +1421,7 @@ fn a_preview_agrees_with_the_wave_that_would_commit_it() {
         assert_eq!(
             vault_cell(&settled(database_updates, &world_accounts()), owner),
             Some(encode_amount(change_for(&report, owner).after).to_vec()),
-            "the preview's figure for {owner:?} is what the wave commits"
+            "the preview's figure for {owner:?} is what the tick commits"
         );
     }
 }

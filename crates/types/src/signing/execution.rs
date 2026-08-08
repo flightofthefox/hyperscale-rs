@@ -20,13 +20,13 @@ use crate::{
 pub struct ExecutionVoteMessage {
     /// BFT-authenticated anchor the vote was cast at.
     pub vote_anchor_ts: WeightedTimestamp,
-    /// The wave being voted on.
+    /// The tick being voted on.
     pub tick_id: TickId,
     /// Shard casting the vote.
     pub shard_group: ShardId,
     /// Merkle root over per-tx outcome leaves.
     pub global_receipt_root: GlobalReceiptRoot,
-    /// Number of transactions in the wave.
+    /// Number of transactions in the tick.
     pub tx_count: u32,
 }
 

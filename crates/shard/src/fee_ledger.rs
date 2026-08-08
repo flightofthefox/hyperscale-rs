@@ -1,7 +1,7 @@
 //! In-flight fee reservations at the payer shard.
 //!
 //! A committed transaction whose fee payer routes to this shard holds
-//! `max_fee` against the payer's vault until its wave finalizes — the
+//! `max_fee` against the payer's vault until its tick finalizes — the
 //! window in which the reservation is engaged but not yet settled. The
 //! ledger tracks exactly that window from chain content: entries insert
 //! when a block commits the transaction and release when a committed
@@ -67,8 +67,8 @@ impl FeeReservationLedger {
     /// Release the reservations a committed block's finalizations
     /// resolve — settlement and abort both arrive as finalizations.
     pub fn release_finalized(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
-        for wave in finalizations {
-            for tx_hash in wave.tx_hashes() {
+        for tick in finalizations {
+            for tx_hash in tick.tx_hashes() {
                 self.holds.remove(&tx_hash);
             }
         }
@@ -118,12 +118,12 @@ mod tests {
         assert_eq!(ledger.held_for(PAYER_ADDR), 1_000);
         assert_eq!(ledger.held_for(Address([0xBB; 16])), 0);
 
-        let wave = Arc::new(Verifiable::from(make_finalization(
+        let tick = Arc::new(Verifiable::from(make_finalization(
             BlockHeight::new(1),
             tx.hash(),
             TransactionDecision::Accept,
         )));
-        ledger.release_finalized(std::slice::from_ref(&wave));
+        ledger.release_finalized(std::slice::from_ref(&tick));
         assert_eq!(ledger.held_for(PAYER_ADDR), 0);
     }
 

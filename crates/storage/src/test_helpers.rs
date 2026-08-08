@@ -101,7 +101,7 @@ pub const fn state_key(owner_seed: u8, local_seed: u8) -> SubstateKey {
 /// Build a test attestation at the given height.
 ///
 /// Includes a single placeholder local EC so it satisfies the invariant
-/// enforced at decode time (one EC whose `tick_id` matches the wave's own).
+/// enforced at decode time (one EC whose `tick_id` matches the tick's own).
 #[must_use]
 pub fn make_test_finalization(height: BlockHeight, shard: ShardId) -> Finalization {
     let tick_id = TickId::new(shard, height);
@@ -330,7 +330,7 @@ pub fn make_test_receipt(seed: u8) -> StoredReceipt {
 ///
 /// `seed` also disambiguates the `TickId` (via `remote_shards`), so two ECs
 /// at the same `block_height` with different seeds have distinct identities
-/// — matching the protocol invariant that one wave produces one EC.
+/// — matching the protocol invariant that one tick produces one EC.
 #[must_use]
 pub fn make_test_execution_certificate(
     seed: u8,
@@ -355,7 +355,7 @@ pub fn make_test_execution_certificate(
 
 /// Build a test block that carries ECs inside its finalizations.
 ///
-/// The wave's `tick_id` is taken from the first EC's `tick_id` so
+/// The tick's `tick_id` is taken from the first EC's `tick_id` so
 /// the local-EC decode invariant is satisfied without injecting a placeholder.
 fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertificate>>) -> Block {
     let block = make_test_block(height);
@@ -682,8 +682,8 @@ pub fn test_ec_storage_batch(storage: &(impl ShardChainReader + ShardChainWriter
     let batch = storage.get_execution_certificates_batch(&known);
     assert_eq!(batch.len(), 3);
 
-    let missing_wave_id = TickId::new(known[0].shard_id(), BlockHeight::new(999));
-    let partial = storage.get_execution_certificates_batch(&[*ec3.tick_id(), missing_wave_id]);
+    let missing_tick_id = TickId::new(known[0].shard_id(), BlockHeight::new(999));
+    let partial = storage.get_execution_certificates_batch(&[*ec3.tick_id(), missing_tick_id]);
     assert_eq!(partial.len(), 1);
     assert_eq!(partial[0].tick_id(), ec3.tick_id());
 }

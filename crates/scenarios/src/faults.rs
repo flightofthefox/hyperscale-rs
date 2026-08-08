@@ -99,7 +99,7 @@ pub fn partition_halts_and_heals(c: &mut impl FaultableCluster) {
 }
 
 /// A transaction settles while one validator is isolated: the remaining 3-of-4
-/// quorum holds, and the vote-retry rotation recovers any wave the isolated node
+/// quorum holds, and the vote-retry rotation recovers any tick the isolated node
 /// was leading.
 ///
 /// Requires a four-host single-shard cluster. Submission routes to host 0, so a
@@ -178,7 +178,7 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
     await_halt_recovery(c, &halt);
 }
 
-/// Cross-shard waves stay atomic across a shard halt and its
+/// Cross-shard ticks stay atomic across a shard halt and its
 /// committee-redraw recovery.
 ///
 /// The grown left child freezes exactly as in
@@ -187,15 +187,15 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
 /// finalized on both children before any fault installs, a racing batch
 /// submitted at the freeze edge — the last instant with any chance to
 /// commit on the halting shard — and a doomed batch submitted against the
-/// frozen shard. The surviving sibling must drive every wave it engaged to
+/// frozen shard. The surviving sibling must drive every tick it engaged to
 /// a terminal verdict on its own deadline clock during the halt, never
 /// hanging on the dead counterparty; a probe whose payer is the dead shard
 /// engages nowhere, because no counterpart can hold evidence of a commit
 /// that never happened, and so has no lock or reservation to resolve.
 /// After the recovery the two chains
-/// must agree probe by probe: no wave applied on one side that the other
+/// must agree probe by probe: no tick applied on one side that the other
 /// refused, with absence on the recovered chain counting as an abort (the
-/// fresh committee resolves pre-halt waves from certificates alone and
+/// fresh committee resolves pre-halt ticks from certificates alone and
 /// commits no abort finalization of its own). Once the recovery record
 /// clears, a fresh transfer per direction must settle — the recovered
 /// shard's cross-shard rail serves again.
@@ -208,7 +208,7 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
 /// # Panics
 ///
 /// Panics if the halt or recovery misses a lifecycle budget, an in-flight
-/// wave hangs, the chains disagree on any probe's fate, or the
+/// tick hangs, the chains disagree on any probe's fate, or the
 /// post-recovery transfers fail to settle.
 pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     let (halted, survivor) = ShardId::ROOT.children();
@@ -235,7 +235,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     );
 
     // Racing batch: submitted at the freeze edge, inside the staged cut —
-    // the shard commits at most a couple more heights, so each wave either
+    // the shard commits at most a couple more heights, so each tick either
     // squeezes through or is left in flight when it freezes. No per-batch
     // assertion; each probe lands in whichever tally bucket it raced into.
     let halt = freeze_shard(c, halted, survivor, |c| {
@@ -247,22 +247,22 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
 
     // Doomed batch: submitted against the frozen shard. The survivor still
     // provisions to it — the topology seats the frozen committee until the
-    // redraw — but nothing can commit there, so every wave is unsettleable.
+    // redraw — but nothing can commit there, so every tick is unsettleable.
     for (key, from, to) in &setup.straddlers[2 * HALT_STRADDLER_BATCH..] {
         probes.push(submit_straddler(c, key, *from, *to));
         payers.push(*from);
     }
 
-    // The survivor's deadline clock keeps running through the halt: a wave
+    // The survivor's deadline clock keeps running through the halt: a tick
     // it pays for reaches a terminal verdict well inside the detection
     // window, not hanging on the dead counterparty. The verdict is the
     // survivor's alone — no engagement echo can ever arrive from a frozen
     // committee, so the payer speaks once, at its signed window's end.
     //
-    // A wave the *halted* shard pays for is the opposite case and costs the
+    // A tick the *halted* shard pays for is the opposite case and costs the
     // survivor nothing: a counterpart engages only against evidence the
     // payer shard committed, and a frozen shard commits nothing, so the
-    // survivor takes no lock, opens no wave and holds no reservation. There
+    // survivor takes no lock, opens no tick and holds no reservation. There
     // is nothing to terminate, which is why these are not waited on — doing
     // so would spend the halt's own detection window on probes that were
     // never going to answer.
@@ -274,7 +274,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
         if account_shard(*from, 2) != survivor {
             assert!(
                 c.chain_fate(survivor, *hash).0.is_none(),
-                "the survivor engaged a wave whose payer shard is frozen",
+                "the survivor engaged a tick whose payer shard is frozen",
             );
             continue;
         }
@@ -282,12 +282,12 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
         let status = await_tx_terminal(c, *hash, epochs(6));
         assert!(
             matches!(status, Some(TransactionStatus::Completed(_))),
-            "an in-flight wave must reach a terminal verdict during the halt; status = {status:?}",
+            "an in-flight tick must reach a terminal verdict during the halt; status = {status:?}",
         );
     }
     assert!(
         engaged > 0,
-        "no in-flight wave was paid for by the survivor — the probe batches \
+        "no in-flight tick was paid for by the survivor — the probe batches \
          no longer exercise its deadline clock",
     );
 
@@ -363,7 +363,7 @@ fn assert_chains_agree<C: Cluster>(
     }
     assert_eq!(
         survivor_only, 0,
-        "the survivor applied a wave the halted shard never did:{report}",
+        "the survivor applied a tick the halted shard never did:{report}",
     );
     assert_eq!(
         halted_only, 0,
@@ -758,22 +758,22 @@ pub fn partition_heals_at_exact_quorum(c: &mut impl FaultableCluster) {
 }
 
 /// Severing every edge between two shards strands their in-flight cross-shard
-/// waves without ever splitting one, and healing resolves them.
+/// ticks without ever splitting one, and healing resolves them.
 ///
 /// A two-shard cluster (`split_lifecycle`) whose committees sit on disjoint host
 /// sets, so `partition(committee_hosts(left), committee_hosts(right))` cuts every
 /// inter-shard edge in both directions while leaving intra-shard edges intact —
-/// unlike the drop scenarios, which always leave a fetch route the wave recovers
+/// unlike the drop scenarios, which always leave a fetch route the tick recovers
 /// through.
 ///
-/// No wave aborts while the cut holds, and that is the shape of the cut rather
+/// No tick aborts while the cut holds, and that is the shape of the cut rather
 /// than a slow deadline. The same partition splits the beacon quorum, so epoch
 /// production halts, and both shards coast their `L = 1` lookahead runway and
 /// then hold at the schedule head with their attested clocks frozen. Every
 /// deadline in the system is read from that clock, so none of them can arrive:
-/// the cut that strands a wave is the cut that stops the clock its abort would
+/// the cut that strands a tick is the cut that stops the clock its abort would
 /// be timed against. What must hold under it is the safety half — no stranded
-/// wave settles Accept on either side, and the two shards never disagree — and
+/// tick settles Accept on either side, and the two shards never disagree — and
 /// then, on the heal, that both reach a terminal verdict rather than wedging.
 ///
 /// The deadline itself has its own scenario, which cuts the two message types a
@@ -789,7 +789,7 @@ pub fn partition_heals_at_exact_quorum(c: &mut impl FaultableCluster) {
 ///
 /// Cross-shard transfers run in each direction over the funded pair; the
 /// single-shard controls run on disjoint accounts, so they settle intra-shard
-/// without colliding with the severed waves' declared writes.
+/// without colliding with the severed ticks' declared writes.
 ///
 /// # Panics
 ///
@@ -797,7 +797,7 @@ pub fn partition_heals_at_exact_quorum(c: &mut impl FaultableCluster) {
 /// settle, a severed cross-shard transfer settles or the two shards disagree on
 /// its fate, an in-flight transfer never resolves after the heal, or a fresh
 /// cross-shard transfer fails to settle.
-pub fn inter_shard_partition_strands_waves_until_it_heals(c: &mut impl FaultableCluster) {
+pub fn inter_shard_partition_strands_ticks_until_it_heals(c: &mut impl FaultableCluster) {
     let (left, right) = ShardId::ROOT.children();
     split_lifecycle(c);
 
@@ -830,7 +830,7 @@ pub fn inter_shard_partition_strands_waves_until_it_heals(c: &mut impl Faultable
     c.partition(&left_hosts, &right_hosts);
 
     // A second cross-shard transfer submitted under the severance, sourced on
-    // the far side so each shard pays for one stranded wave.
+    // the far side so each shard pays for one stranded tick.
     let during_tx = build_transfer_tx(
         &cast.right.0,
         cast.right.1,
@@ -842,7 +842,7 @@ pub fn inter_shard_partition_strands_waves_until_it_heals(c: &mut impl Faultable
     c.submit(Arc::new(during_tx));
 
     // A single-shard control per child, on accounts disjoint from the crossing
-    // pair — these must settle purely intra-shard while the cross-shard waves
+    // pair — these must settle purely intra-shard while the cross-shard ticks
     // are stranded.
     for (index, (key, from, to)) in cast.controls.iter().enumerate() {
         let control = build_transfer_tx(key, *from, *to, 100, validity_around(c.now()));
@@ -860,7 +860,7 @@ pub fn inter_shard_partition_strands_waves_until_it_heals(c: &mut impl Faultable
     }
 
     // Both shards kept committing locally throughout — the severance froze the
-    // cross-shard waves, not either side's consensus.
+    // cross-shard ticks, not either side's consensus.
     let left_during = c
         .committed_height(left)
         .expect("left serves during the severance")
@@ -878,9 +878,9 @@ pub fn inter_shard_partition_strands_waves_until_it_heals(c: &mut impl Faultable
         "the right shard wedged under the severance (before={right_before}, during={right_during})",
     );
 
-    // Neither stranded wave may settle while the cut holds. The verdict is
+    // Neither stranded tick may settle while the cut holds. The verdict is
     // read off both chains rather than waited for: with the beacon starved by
-    // the same partition, no attested clock is advancing, so a wave that has
+    // the same partition, no attested clock is advancing, so a tick that has
     // not resolved by now is not going to — and must not have resolved
     // one-sided in the meantime.
     for (hash, label) in [(before_hash, "left→right"), (during_hash, "right→left")] {
@@ -902,7 +902,7 @@ pub fn inter_shard_partition_strands_waves_until_it_heals(c: &mut impl Faultable
     }
 
     // Heal every edge. Epoch production resumes and both clocks restart, so a
-    // wave a shard had already committed resolves — by settling if its signed
+    // tick a shard had already committed resolves — by settling if its signed
     // window is still open, by its payer's deadline if the heal came too late.
     // Which one is a property of the timing, not of the machinery; that it
     // terminates at all is the claim.
@@ -1194,7 +1194,7 @@ pub fn cross_shard_exec_cert_drop_fetch_fallback(c: &mut impl FaultableCluster) 
 /// The two fallback fetches are gated on different timeouts and different fetch
 /// instances, so this proves they compose without deadlock when both primary
 /// cross-shard channels fail together: each shard fetches its provisions and
-/// its execution certificates, and the wave finalizes within its timeout
+/// its execution certificates, and the tick finalizes within its timeout
 /// rather than aborting.
 ///
 /// # Panics
@@ -1333,7 +1333,7 @@ pub fn cross_shard_provisions_fetch_with_request_loss(c: &mut impl FaultableClus
 /// the provision fetch fallback with nothing aborting. The dropped broadcast is
 /// not re-emitted on lift, so the destination shard recovers by fetch either
 /// way; the point is that removing a live drop rule mid-recovery is safe — the
-/// fetch bridge completes and no wave wedges.
+/// fetch bridge completes and no tick wedges.
 ///
 /// One transfer, not two: both accounts of the crossing pair are declared
 /// writes of every transfer between them, so a second overlapping cross-shard

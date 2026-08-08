@@ -954,13 +954,13 @@ module recovery_bridge_honest_old {
 // folds it), and unforgeable by the halted committee — so the cutoff is
 // authenticated and synchronized, not a per-consumer guess. Structurally
 // this is shard termination: the frozen committee is a shard cut at the
-// freeze, in-flight waves abort (abort-dominant, Model C, safe), attested
+// freeze, in-flight transactions abort (abort-dominant, Model C, safe), attested
 // finalizations carry, and the fresh committee is the successor.
 //
 // This module models the consuming side only: an honest consumer shard
-// folds the beacon freeze and decides whether to finalize a wave on an EC
+// folds the beacon freeze and decides whether to finalize a transaction on an EC
 // purportedly from the halted source. It does NOT re-model consensus
-// (Module 2) or the 2PC wave lifecycle (Models C/D) — only the trust
+// (Module 2) or the 2PC transaction lifecycle (Models C/D) — only the trust
 // surface the freeze governs.
 //
 // Code anchors:
@@ -1066,7 +1066,7 @@ module cross_shard_freeze {
   // The fresh committee has advanced the shard post-freeze (liveness).
   var freshAdvanced: bool
 
-  // Whether the honest consumer finalizes a wave on an old-committee EC at
+  // Whether the honest consumer finalizes a transaction on an old-committee EC at
   // `srcHeight`. It resolves the old committee at the EC's stale anchor
   // (`lookup(anchor)`), whose signatures verify. The fence — folded freeze
   // + the beacon-attested frontier — is the only gate; without it, any old
@@ -1074,7 +1074,7 @@ module cross_shard_freeze {
   def acceptsOldEC(srcHeight: int): bool =
     not(FREEZE_FENCE and consumerFolded and srcHeight > attestedFrontier)
 
-  // An honest consumer finalizes a wave on an old-committee EC at
+  // An honest consumer finalizes a transaction on an old-committee EC at
   // `srcHeight`. A finalization at or below the true tip is legit and
   // advances the attested frontier; an orphan (above the tip) accepted
   // before the fence bites poisons it — the residual.

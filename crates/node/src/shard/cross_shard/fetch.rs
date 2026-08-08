@@ -178,7 +178,7 @@ impl FetchBinding for FinalizationBinding {
                             ShardScopedInput::FinalizationsFetchFailed { ids: split.missing },
                         );
                     }
-                    // Reject responses with unsolicited waves (peer scoring;
+                    // Reject responses with unsolicited ticks (peer scoring;
                     // also avoids wasted signature verification on items we never
                     // asked for) or with any missing requested id.
                     if split.unsolicited > 0 || had_misses {

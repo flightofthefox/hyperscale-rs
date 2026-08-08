@@ -1,7 +1,7 @@
 //! What unresolved cross-shard legs hold, and the test a candidate
 //! transaction has to pass to join a tick.
 //!
-//! A cross-shard leg's local writes are provisional until its wave
+//! A cross-shard leg's local writes are provisional until its tick
 //! resolves. Whether that stops a later transaction depends entirely on
 //! *how* each of them reaches the cell, and the kernel already decides
 //! that: [`compatible`] is the same relation it uses to schedule a batch,

@@ -7,7 +7,7 @@
 //!   keyed by `tx_hash`, one `Arc<Vec<SubstateEntry>>` per source shard
 //!   contribution. Feeds the cross-shard dispatch action for each tx.
 //! - `required` — the set of remote shards each cross-shard tx needs
-//!   provisions from. Populated when the tx's wave is created.
+//!   provisions from. Populated when the tx's tick is created.
 //! - `received` — the set of remote shards whose provisions have actually
 //!   landed. Populated by [`absorb_provisions`](ProvisioningTracker::absorb_provisions).
 //!
@@ -36,14 +36,14 @@ pub struct SourceAnchor {
 
 pub struct ProvisioningTracker {
     /// Verified provisions keyed by `tx_hash`. Written when provisions are
-    /// absorbed; read when a cross-shard wave dispatches. Cleared on the
+    /// absorbed; read when a cross-shard tick dispatches. Cleared on the
     /// terminal-state path ([`remove_tx`]) when a finalization
     /// commits, and swept by [`gc_stale_provisions`] for txs whose
     /// retention horizon elapsed without ever finalizing.
     verified: HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
 
     /// Remote shards each cross-shard tx needs provisions from. Populated
-    /// at wave creation.
+    /// at tick creation.
     required: HashMap<TxHash, BTreeSet<ShardId>>,
 
     /// Remote shards whose provisions have been received, each with the
@@ -53,7 +53,7 @@ pub struct ProvisioningTracker {
     received: HashMap<TxHash, BTreeMap<ShardId, SourceAnchor>>,
 
     /// The payer shard of each cross-shard transaction whose payer is
-    /// remote, recorded at wave creation beside `required`. Resolves
+    /// remote, recorded at tick creation beside `required`. Resolves
     /// which `received` entry carries the transaction's environment
     /// without re-deriving topology at dispatch.
     payer_shards: HashMap<TxHash, ShardId>,
@@ -62,7 +62,7 @@ pub struct ProvisioningTracker {
     /// observed at any insert point that touches the tx. Past the
     /// deadline the tx is provably terminal everywhere — every shard
     /// has either committed an EC for it or its `validity_range` has
-    /// expired and any wave that admitted it has timed out. Anchored
+    /// expired and any tick that admitted it has timed out. Anchored
     /// on BFT-attested `committed_ts`, matching the sender-side
     /// deadline used by [`OutboundProvisionTracker`](hyperscale_provisions::OutboundProvisionTracker).
     deadlines: HashMap<TxHash, WeightedTimestamp>,
@@ -113,7 +113,7 @@ impl ProvisioningTracker {
     // ─── Required / received ────────────────────────────────────────────
 
     /// Record the remote shards `tx_hash` needs provisions from. Overwrites
-    /// any previous entry — callers set this once per wave creation.
+    /// any previous entry — callers set this once per tick creation.
     pub fn record_required(&mut self, tx_hash: TxHash, remote_shards: BTreeSet<ShardId>) {
         self.required.insert(tx_hash, remote_shards);
         self.stamp_deadline(tx_hash);
@@ -139,7 +139,7 @@ impl ProvisioningTracker {
 
     /// The environment carried by the remote payer's bundle: the
     /// payer-shard committing block's parent-QC weighted timestamp and
-    /// reveal chain. `None` when the payer is local (the wave-start
+    /// reveal chain. `None` when the payer is local (the tick
     /// block is the anchor) or the bundle has not been absorbed.
     #[must_use]
     pub fn payer_anchor(&self, tx_hash: TxHash) -> Option<SourceAnchor> {
@@ -168,7 +168,7 @@ impl ProvisioningTracker {
     /// records `provisions.source_shard` under `received[tx_hash]`.
     ///
     /// Returns the `tx_hash`es touched — the caller uses these to compute
-    /// which local waves are affected and to drive the dispatch check.
+    /// which local ticks are affected and to drive the dispatch check.
     /// Preserves iteration order of `provisions.transactions` (callers sort
     /// batches upstream for determinism).
     pub fn absorb_provisions(&mut self, provisions: &Verified<Provisions>) -> Vec<TxHash> {
@@ -205,11 +205,11 @@ impl ProvisioningTracker {
     }
 
     /// Drop tracker state for txs whose retention horizon elapsed without
-    /// reaching wave finalization. Past `now + RETENTION_HORIZON` from the
+    /// reaching finalization. Past `now + RETENTION_HORIZON` from the
     /// latest insert touching the tx, the tx is provably terminal everywhere
     /// — every shard has either committed an EC for it or its
-    /// `validity_range` has expired and any wave that admitted it has timed
-    /// out — so no future local wave can still consume the verified
+    /// `validity_range` has expired and any tick that admitted it has timed
+    /// out — so no future local tick can still consume the verified
     /// provisions. Returns the number of txs swept.
     pub fn gc_stale_provisions(&mut self, now_ts: WeightedTimestamp) -> usize {
         let stale: Vec<TxHash> = self
@@ -229,8 +229,8 @@ impl ProvisioningTracker {
 
     /// Verified provision entries for `tx_hash`, one slice element per
     /// source-shard contribution. Threaded into
-    /// [`WaveState::dispatch_if_ready`](crate::wave_state::WaveState::dispatch_if_ready)
-    /// so the wave can assemble cross-shard execution requests with a
+    /// [`TickState::dispatch_if_ready`](crate::tick_state::TickState::dispatch_if_ready)
+    /// so the tick can assemble cross-shard execution requests with a
     /// per-tx lookup against committed provisions.
     pub fn provisions_for(&self, tx_hash: TxHash) -> Option<&[Arc<Vec<SubstateEntry>>]> {
         self.verified.get(&tx_hash).map(Vec::as_slice)

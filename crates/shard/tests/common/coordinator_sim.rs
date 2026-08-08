@@ -6,7 +6,7 @@
 //! (network-first, loopback-second).
 //!
 //! Single-shard by construction (`ShardId::ROOT`), with no
-//! provisions, no remote headers, no execution waves. The full
+//! provisions, no remote headers, no execution ticks. The full
 //! simulator covers those concerns; this sim pins HotStuff-2
 //! safety + liveness machinery in isolation.
 //!
@@ -1939,9 +1939,9 @@ impl ShardCoordinatorSim {
 }
 
 fn collect_finalized_receipts(
-    waves: &[Arc<Verifiable<Finalization>>],
+    ticks: &[Arc<Verifiable<Finalization>>],
 ) -> Vec<Arc<ConsensusReceipt>> {
-    waves
+    ticks
         .iter()
         .flat_map(|fw| fw.consensus_receipts())
         .collect()
@@ -1952,7 +1952,7 @@ fn collect_finalized_receipts(
 /// other field stays identical so the receiver's per-root
 /// verifiers still pass.
 pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
-    let waves: Vec<_> = h.cross_shard_txs().clone();
+    let ticks: Vec<_> = h.cross_shard_txs().clone();
     let provision_tx_roots: BTreeMap<_, _> = h
         .provision_tx_roots()
         .iter()
@@ -1972,7 +1972,7 @@ pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
         certificate_root: h.certificate_root(),
         local_receipt_root: h.local_receipt_root(),
         provision_root: h.provision_root(),
-        cross_shard_txs: waves,
+        cross_shard_txs: ticks,
         provision_tx_roots,
         work_in_flight: h.work_in_flight(),
         beacon_witness_root: h.beacon_witness_root(),

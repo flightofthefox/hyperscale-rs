@@ -3,7 +3,7 @@ name = "hyperscale-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Engine integration: the wave-batch execution seam, the executor behind it, and genesis seeding"
+description = "Engine integration: the tick-batch execution seam, the executor behind it, and genesis seeding"
 
 [dependencies]
 hyperscale-dispatch.workspace = true

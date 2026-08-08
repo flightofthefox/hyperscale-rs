@@ -540,7 +540,7 @@ impl TopologySchedule {
     /// halted tip back in the suffix band, where this resolves the old
     /// committee and its signatures verify. The re-bind narrows the local
     /// orphan but does not close it. The safety-critical leak — a forged
-    /// wave finalization exporting cross-shard — is closed at the height
+    /// finalization exporting cross-shard — is closed at the height
     /// gate [`recovery_fences`](Self::recovery_fences); a purely local
     /// orphan fork surfaces as a commit-linkage divergence and self-halts
     /// (a re-fired recovery, a liveness cost), rather than forking
@@ -755,15 +755,15 @@ impl TopologySchedule {
 
     /// The floor of `shard`'s attested settled-transaction window at `wt`: the
     /// start of the epoch its terminating reshape was admitted, backed off
-    /// by [`RETENTION_HORIZON`] to cover a wave that finalized against the
-    /// fence just after it armed but executed up to a full wave lifetime
+    /// by [`RETENTION_HORIZON`] to cover a tick that finalized against the
+    /// fence just after it armed but executed up to a full tick lifetime
     /// earlier. Counterpart fences hold straddlers from admission, so the
     /// window a terminal's `settled_txs_root` commits must reach back to
     /// it — a fixed span behind the terminal misses settlements the fence
     /// is still holding against.
     ///
     /// Reads the floor off `wt`'s window or its lookahead (the same
-    /// entries [`termination_scheduled`] consults, so any wave the fence
+    /// entries [`termination_scheduled`] consults, so any tick the fence
     /// can hold has a floor at or before its settlement). `None` when
     /// neither retained window records a floor for `shard` — callers then
     /// floor on the block anchor alone. Deterministic in `(schedule,

@@ -7,7 +7,7 @@ use crate::{BlockHeight, MessageClass, NetworkMessage, Request, ShardId};
 
 /// Request to fetch missing provisions from a source shard.
 ///
-/// Sent by target shards when a remote block's `waves` field indicates
+/// Sent by target shards when a remote block's `ticks` field indicates
 /// the target shard but no provisions arrived within the timeout window.
 /// This is the fallback recovery mechanism for byzantine proposers that
 /// silently drop provisions.

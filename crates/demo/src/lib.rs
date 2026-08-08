@@ -9,7 +9,7 @@
 pub mod event;
 mod session;
 
-pub use event::{HostRole, ShardPath, TraceEvent, TraceKind, TxLabel, WaveLabel};
+pub use event::{HostRole, ShardPath, TickLabel, TraceEvent, TraceKind, TxLabel};
 pub use session::{Session, SessionConfig};
 
 #[cfg(target_arch = "wasm32")]

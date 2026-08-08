@@ -10,19 +10,19 @@
 //! outcome resolving it, so every replica's ledger is identical at equal
 //! committed frontiers.
 //!
-//! That is the whole reason it exists apart from [`WaveRegistry`]. Wave
+//! That is the whole reason it exists apart from [`TickRegistry`]. Tick
 //! state is what a node is *working on*, and it does not survive a
 //! restart: a shard whose replicas all came back cannot name what it
 //! committed and never finished, so it can neither finish it nor abort
 //! it. A ledger folded from the chain can be rebuilt from the chain.
 //!
-//! [`WaveRegistry`]: crate::waves::WaveRegistry
+//! [`TickRegistry`]: crate::ticks::TickRegistry
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Finalization, MAX_VALIDITY_RANGE, Transaction, TxHash, Verifiable, WAVE_TIMEOUT,
+    Finalization, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, Transaction, TxHash, Verifiable,
     WeightedTimestamp,
 };
 
@@ -63,7 +63,7 @@ impl UnresolvedTxs {
                     (
                         tx_hash,
                         Owed {
-                            deadline: validity_end.plus(WAVE_TIMEOUT),
+                            deadline: validity_end.plus(MAX_FINALIZATION_DELAY),
                             declared_work,
                         },
                     )
@@ -86,7 +86,7 @@ impl UnresolvedTxs {
                 deadline: tx
                     .validity_range()
                     .end_timestamp_exclusive
-                    .plus(WAVE_TIMEOUT),
+                    .plus(MAX_FINALIZATION_DELAY),
                 declared_work: tx.work(),
             };
             self.owed.entry(tx.hash()).or_insert(owed);
@@ -217,7 +217,7 @@ mod tests {
         let tx = tx(4, 60_000);
         ledger.register_committed(std::iter::once(&tx));
 
-        let deadline = ms(60_000).plus(WAVE_TIMEOUT);
+        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         assert!(
             ledger
                 .past_deadline(deadline.minus(Duration::from_millis(1)))
@@ -240,7 +240,7 @@ mod tests {
         let tx = tx(7, 60_000);
         ledger.register_committed(std::iter::once(&tx));
 
-        let deadline = ms(60_000).plus(WAVE_TIMEOUT);
+        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         ledger.prune(deadline);
         assert_eq!(ledger.len(), 1, "still the shard's to resolve");
 

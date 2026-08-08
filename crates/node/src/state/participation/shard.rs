@@ -48,9 +48,9 @@
 //!    timestamp from the QC so every validator evicts identically. Must
 //!    follow earlier steps because eviction reads the now-up-to-date
 //!    provisions state.
-//! 6. `apply_block_to_execution` — per-wave cleanup, wave dispatch (Live)
-//!    or wave-assignment recording (Sealed), and vote emission. Last
-//!    because (a) execution's wave-cleanup reads `block.certificates` after
+//! 6. `apply_block_to_execution` — per-tick cleanup, tick dispatch (Live)
+//!    or tick-assignment recording (Sealed), and vote emission. Last
+//!    because (a) execution's tick-cleanup reads `block.certificates` after
 //!    mempool has finished its terminal-state transitions, and (b) vote
 //!    emission may produce actions whose ordering with respect to mempool
 //!    state matters.
@@ -382,7 +382,7 @@ impl ShardParticipation {
         // ceiling could never leave it.
         //
         // That distinction is important for a second reason. The total
-        // advances on commit and retreats on settlement, and a wave that
+        // advances on commit and retreats on settlement, and a tick that
         // never certifies retreats nothing: a counterpart shard
         // terminating under it, or a gate rejection, strands its
         // reservation with no chain artifact to release against. Stranded
@@ -401,13 +401,13 @@ impl ShardParticipation {
         }
 
         // Settlement order. A receipt carries the absolute its tick's
-        // baseline produced, so two waves writing one cell have to settle
+        // baseline produced, so two ticks writing one cell have to settle
         // in the order they executed — the reverse reverts a committed
         // write. A predecessor riding an uncommitted ancestor block
         // settles first and so satisfies the order without appearing
         // here; the ancestor walk is what tells this apart from a
         // genuinely skipped predecessor. A node that has not composed a
-        // wave's tick knows of no predecessor for it and passes; the rule
+        // tick's tick knows of no predecessor for it and passes; the rule
         // needs a quorum of enforcers, not every node, and that is the
         // direction that cannot refuse a well-formed block.
         let (ancestor_certified, ..) = self
@@ -420,7 +420,7 @@ impl ShardParticipation {
             tracing::warn!(
                 block_hash = ?header.hash(),
                 height = header.height().inner(),
-                wave = %tick_id,
+                tick = %tick_id,
                 "Rejecting block: a finalization settles ahead of one it shares a cell with"
             );
             return vec![];
@@ -463,8 +463,8 @@ impl ShardParticipation {
         )
     }
 
-    /// Apply a committed block to execution: cert cleanup, wave setup +
-    /// dispatch (Live) or wave-assignment recording only (Sealed), and
+    /// Apply a committed block to execution: cert cleanup, tick setup +
+    /// dispatch (Live) or tick-assignment recording only (Sealed), and
     /// vote emission. Provisions live inline on `Block::Live` — no separate
     /// argument needed.
     pub(in crate::state) fn apply_block_to_execution(
@@ -474,7 +474,7 @@ impl ShardParticipation {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        // Release execution's per-wave bookkeeping for finalizations included
+        // Release execution's per-tick bookkeeping for finalizations included
         // in this block. Per-tx terminal state for the mempool is already
         // handled separately by `on_block_committed` reading
         // `block.certificates`.
@@ -486,7 +486,7 @@ impl ShardParticipation {
                 .on_block_committed(sched, certified),
         );
 
-        // Round voting: scan all incomplete waves and emit votes for
+        // Round voting: scan all incomplete ticks and emit votes for
         // complete ones. Single path to execution voting — abort intents
         // have already been processed above (with override semantics), so
         // the accumulator state is deterministic at this height. All
@@ -516,8 +516,8 @@ mod tests {
     use crate::state::test_support::TestNode;
 
     /// `RemoteHeaderAdmitted` must fan out to **both** execution and
-    /// provisions: each registers its expectations from the header's wave
-    /// list (only for waves whose `remote_shards` includes local). The
+    /// provisions: each registers its expectations from the header's tick
+    /// list (only for ticks whose `remote_shards` includes local). The
     /// header opens for provision verification only on
     /// `RemoteHeaderCommitted`, once its commit proof is held. Dropping
     /// either fan-out side leaves the shard blind to one half of
@@ -526,7 +526,7 @@ mod tests {
     fn remote_header_admitted_fans_to_execution_and_provisions() {
         let TestNode { mut node, .. } = TestNode::builder().build();
 
-        // Wave on a remote leaf shard listing the local root shard as a dependency.
+        // Tick on a remote leaf shard listing the local root shard as a dependency.
         let cross_shard_tx = TxHash::from(Hash::from_bytes(b"cross-shard tx"));
 
         let mut block = make_live_block(
@@ -588,7 +588,7 @@ mod tests {
                 .memory_stats()
                 .expected_exec_certs,
             pre_exec + 1,
-            "execution must register the wave from the verified header as an expected EC",
+            "execution must register the tick from the verified header as an expected EC",
         );
         assert_eq!(
             node.provisions_coordinator()

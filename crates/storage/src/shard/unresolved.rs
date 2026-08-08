@@ -3,7 +3,7 @@
 //! What a shard has committed and not yet resolved is a fold over its own
 //! blocks, so a replica that lost its execution state can recover it by
 //! replaying them. That is the whole point of keeping the account on the
-//! chain rather than in wave state: a shard whose replicas all restarted
+//! chain rather than in tick state: a shard whose replicas all restarted
 //! can still name what it committed and never finished, and therefore
 //! still finish it or abort it.
 

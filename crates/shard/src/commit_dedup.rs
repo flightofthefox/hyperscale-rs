@@ -10,7 +10,7 @@
 //!
 //! - **txs**: each tx's own `end_timestamp_exclusive` (capped by
 //!   `MAX_VALIDITY_RANGE` at admission).
-//! - **certs**: `vote_anchor_ts + RETENTION_HORIZON` from the wave's local
+//! - **certs**: `vote_anchor_ts + RETENTION_HORIZON` from the tick's local
 //!   EC.
 //! - **provisions**: `local_committed_ts + RETENTION_HORIZON`, a
 //!   conservative surrogate for `source_weighted_ts` (the source block was
@@ -41,7 +41,7 @@ pub struct CommitDedupIndex {
     tx_retention: HashMap<TxHash, WeightedTimestamp>,
     /// `tick_id → vote_anchor_ts + RETENTION_HORIZON`. Pruned when
     /// `deadline <= current_committed_ts`. Past the horizon, every tx the
-    /// wave covered has terminated everywhere, so no future block can
+    /// tick covered has terminated everywhere, so no future block can
     /// legitimately reference the same `tick_id`.
     cert_retention: HashMap<TickId, WeightedTimestamp>,
     /// `tx_hash → the same deadline as the finalization that resolved it`.
@@ -90,7 +90,7 @@ impl CommitDedupIndex {
 
     /// Record a block's finalizations in the retention lookup, by tick and
     /// by every transaction each one resolved. Each entry's deadline is
-    /// the wave's local EC `vote_anchor_ts + RETENTION_HORIZON`.
+    /// the tick's local EC `vote_anchor_ts + RETENTION_HORIZON`.
     pub fn register_committed_certs(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         for fw in finalizations {
             let tick_id = *fw.tick_id();
@@ -142,7 +142,7 @@ impl CommitDedupIndex {
 
     /// Drop retention-lookup entries past their deadline. `now` is the
     /// `weighted_timestamp` of the latest committed block. Past expiry,
-    /// independent rules (tx validity check; wave-timeout) reject any
+    /// independent rules (tx validity check; finalization-deadline) reject any
     /// re-inclusion, so the entry is no longer correctness-bearing.
     pub fn prune(&mut self, now: WeightedTimestamp) {
         self.tx_retention.retain(|_, end| *end > now);
@@ -310,7 +310,7 @@ mod tests {
     fn register_certs_records_what_they_resolved() {
         let mut idx = CommitDedupIndex::new();
         let fw = make_fw(1);
-        let tx_hash = fw.tx_hashes().next().expect("a wave names its members");
+        let tx_hash = fw.tx_hashes().next().expect("a tick names its members");
         idx.register_committed_certs(std::slice::from_ref(&fw));
         assert!(idx.contains_resolved_tx(&tx_hash));
 
