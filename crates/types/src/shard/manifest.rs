@@ -5,8 +5,8 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, TxHash,
-    Verifiable, WaveId, WitnessSources,
+    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, TickId, TxHash,
+    Verifiable, WitnessSources,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -22,7 +22,7 @@ pub struct BlockManifest {
     #[hbor(max = MAX_TXS_PER_BLOCK)]
     tx_hashes: Vec<TxHash>,
     #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-    cert_ids: Vec<WaveId>,
+    cert_ids: Vec<TickId>,
     #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
     provision_hashes: Vec<ProvisionHash>,
     /// The block's beacon-witness inputs, mirrored verbatim — the
@@ -51,7 +51,7 @@ impl BlockManifest {
     #[must_use]
     pub const fn new(
         tx_hashes: Vec<TxHash>,
-        cert_ids: Vec<WaveId>,
+        cert_ids: Vec<TickId>,
         provision_hashes: Vec<ProvisionHash>,
         witness_sources: WitnessSources,
     ) -> Self {
@@ -72,7 +72,7 @@ impl BlockManifest {
     /// Wave identifiers in block order.
     /// Validators use these to match against their locally finalized waves.
     #[must_use]
-    pub const fn cert_ids(&self) -> &Vec<WaveId> {
+    pub const fn cert_ids(&self) -> &Vec<TickId> {
         &self.cert_ids
     }
 
@@ -111,11 +111,7 @@ impl BlockManifest {
         // `Block`'s own decode validator, so the manifest cannot outgrow
         // the caps its fields declare.
         let tx_hashes: Vec<_> = block.transactions().iter().map(|tx| tx.hash()).collect();
-        let cert_ids: Vec<_> = block
-            .certificates()
-            .iter()
-            .map(|c| c.wave_id().clone())
-            .collect();
+        let cert_ids: Vec<_> = block.certificates().iter().map(|c| *c.tick_id()).collect();
         let provision_hashes = block.provision_hashes();
         Self::new(
             tx_hashes,
@@ -136,7 +132,7 @@ impl BlockManifest {
 ///
 /// - `"blocks"` CF: `BlockMetadata` (this struct) keyed by height
 /// - `"transactions"` CF: `Transaction` keyed by `tx_hash`
-/// - `"wave_certificates"` CF: `WaveCertificate` keyed by `wave_id` hash
+/// - `"wave_certificates"` CF: `WaveCertificate` keyed by `tick_id` hash
 ///
 /// To reconstruct a full `Block`, fetch the metadata, then batch-fetch
 /// transactions and certificates using the stored hashes.
@@ -283,7 +279,7 @@ mod tests {
     #[test]
     fn decode_rejects_oversized_provision_hashes_count() {
         let mut buf = hbor_to_vec(&Vec::<TxHash>::new()).unwrap();
-        buf.extend_from_slice(&hbor_to_vec(&Vec::<WaveId>::new()).unwrap());
+        buf.extend_from_slice(&hbor_to_vec(&Vec::<TickId>::new()).unwrap());
         // Oversized provision_hashes.
         varint::write(&mut buf, MAX_PROVISIONS_PER_BLOCK + 1).unwrap();
         buf.extend(std::iter::repeat_n(

@@ -18,9 +18,9 @@ use hyperscale_types::{
     RoutingCommittees, SafeVoteRegisters, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad,
     ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
     SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
-    StateRoot, SubstateEntry, SubstateKey, Timeout, TopologySnapshot, Transaction, TransactionRoot,
-    TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WaveId,
-    WeightedTimestamp, WorkInFlight,
+    StateRoot, SubstateEntry, SubstateKey, TickId, Timeout, TopologySnapshot, Transaction,
+    TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    VoteCount, WeightedTimestamp, WorkInFlight,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -45,9 +45,18 @@ pub struct CrossShardExecutionRequest {
     /// resolved the same way, so every participant draws the
     /// transaction's randomness from one attested value.
     pub randomness: RevealChain,
+    /// Whether this transaction reaches beyond the executing shard.
+    ///
+    /// A batch is not homogeneous in this: it carries whatever the tick
+    /// admitted, single-shard and cross-shard alike. Reaching beyond is
+    /// what makes a transaction's contributions provisional — readable by
+    /// no later tick until a counterpart's outcome resolves them — and
+    /// what makes it abortable on a counterpart's verdict, so both are
+    /// decided per transaction rather than per batch.
+    pub reaches_beyond: bool,
 }
 
-/// One wave's members inside a tick's batch.
+/// The members of one tick's batch.
 ///
 /// Every member carries its resolved per-transaction environment: a
 /// single-shard member holds empty provisions and the committing block's
@@ -55,9 +64,9 @@ pub struct CrossShardExecutionRequest {
 /// anchors.
 #[derive(Debug, Clone)]
 pub struct TickExecutionGroup {
-    /// The wave these members belong to; execution results fan back to it.
-    pub wave_id: WaveId,
-    /// The wave's members with their provisions and environments.
+    /// The tick these members belong to; execution results fan back to it.
+    pub tick_id: TickId,
+    /// The members with their provisions and environments.
     pub requests: Vec<CrossShardExecutionRequest>,
 }
 
@@ -285,7 +294,7 @@ pub enum Action {
         /// Consensus timestamp at which this vote is being cast.
         vote_anchor_ts: WeightedTimestamp,
         /// Wave identifier whose execution is being attested to.
-        wave_id: WaveId,
+        tick_id: TickId,
         /// Global receipt root over the wave's per-tx outcomes.
         global_receipt_root: GlobalReceiptRoot,
         /// Per-tx outcomes in wave order. Carried on the vote so the
@@ -480,8 +489,8 @@ pub enum Action {
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::ExecutionCertificateAggregated` when complete.
     AggregateExecutionCertificate {
-        /// Wave identifier. The producing shard is `wave_id.shard_id`.
-        wave_id: WaveId,
+        /// Wave identifier. The producing shard is `tick_id.shard_id`.
+        tick_id: TickId,
         /// Global receipt root (merkle root over per-tx outcome leaves).
         global_receipt_root: GlobalReceiptRoot,
         /// Verified votes to aggregate (with quorum). The first vote's
@@ -497,7 +506,7 @@ pub enum Action {
     /// Returns `ProtocolEvent::ExecutionVotesVerifiedAndAggregated` when complete.
     VerifyAndAggregateExecutionVotes {
         /// Wave identifier.
-        wave_id: WaveId,
+        tick_id: TickId,
         /// Block hash for correlation.
         block_hash: BlockHash,
         /// Votes to verify with their public keys.
@@ -989,7 +998,7 @@ pub enum Action {
         /// The committing block's reveal chain.
         tick_reveal: RevealChain,
         /// Wave-attributed members of the batch. Results fan back to each
-        /// wave by `wave_id`.
+        /// wave by `tick_id`.
         groups: Vec<TickExecutionGroup>,
     },
 
@@ -999,7 +1008,7 @@ pub enum Action {
     /// action emitted later in the same commit reads the resolved chain.
     ResolveTickWaves {
         /// Wave fates that became known at this commit, in emission order.
-        resolutions: Vec<(WaveId, TickResolution)>,
+        resolutions: Vec<(TickId, TickResolution)>,
     },
 
     /// Tear down the tick chain at a reshape terminal: the shard's chain

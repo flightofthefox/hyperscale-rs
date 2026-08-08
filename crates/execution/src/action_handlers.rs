@@ -8,7 +8,7 @@
 //! event plumbing — sharing the handlers between production and
 //! simulation keeps execution behavior identical across both backends.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::{
@@ -93,26 +93,44 @@ pub fn accumulate_tick_output(
 ) {
     let mut ordered: Vec<&ExecutedTx> = executed.iter().collect();
     ordered.sort_by_key(|tx| tx.tx_hash);
-    if group.wave_id.is_zero() {
-        let mut members: Vec<(TxHash, StateWrites)> = Vec::new();
-        for tx in ordered {
-            let mut writes = StateWrites::default();
-            for part in [
-                tx.consensus.writes(),
-                tx.fee_receipt.as_ref().and_then(ConsensusReceipt::writes),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                fold_state_writes(&mut writes, part);
-            }
-            if !writes.is_empty() {
-                members.push((tx.tx_hash, writes));
-            }
+
+    // A batch carries whatever the tick admitted, so it splits here rather
+    // than as a whole: a transaction that reaches beyond this shard leaves
+    // a provisional contribution no later tick may read until a
+    // counterpart resolves it, and one that does not is determined the
+    // moment it executes.
+    let reaches_beyond: HashSet<TxHash> = group
+        .requests
+        .iter()
+        .filter(|r| r.reaches_beyond)
+        .map(|r| r.tx_hash)
+        .collect();
+    let (beyond, local): (Vec<&ExecutedTx>, Vec<&ExecutedTx>) = ordered
+        .into_iter()
+        .partition(|tx| reaches_beyond.contains(&tx.tx_hash));
+
+    let mut members: Vec<(TxHash, StateWrites)> = Vec::new();
+    for tx in local {
+        let mut writes = StateWrites::default();
+        for part in [
+            tx.consensus.writes(),
+            tx.fee_receipt.as_ref().and_then(ConsensusReceipt::writes),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            fold_state_writes(&mut writes, part);
         }
-        output.determined.insert(group.wave_id.clone(), members);
-    } else {
-        let entries: Vec<ProvisionalTx> = ordered
+        if !writes.is_empty() {
+            members.push((tx.tx_hash, writes));
+        }
+    }
+    if !members.is_empty() {
+        output.determined.insert(group.tick_id, members);
+    }
+
+    if !beyond.is_empty() {
+        let entries: Vec<ProvisionalTx> = beyond
             .into_iter()
             .map(|tx| ProvisionalTx {
                 tx_hash: tx.tx_hash,
@@ -125,7 +143,7 @@ pub fn accumulate_tick_output(
                 reserved: granted_reservations(group, tx),
             })
             .collect();
-        output.provisional.insert(group.wave_id.clone(), entries);
+        output.provisional.insert(group.tick_id, entries);
     }
 }
 
@@ -184,25 +202,25 @@ where
 {
     match action {
         Action::AggregateExecutionCertificate {
-            wave_id,
+            tick_id,
             global_receipt_root,
             votes,
             committee,
         } => {
             let certificate = Verified::<ExecutionCertificate>::aggregate(
                 ctx.verifier,
-                &wave_id,
+                &tick_id,
                 global_receipt_root,
                 &votes,
                 &committee,
             );
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateAggregated {
-                wave_id,
+                tick_id,
                 certificate: Arc::new(certificate),
             });
         }
         Action::VerifyAndAggregateExecutionVotes {
-            wave_id,
+            tick_id,
             block_hash,
             votes,
         } => {
@@ -212,7 +230,7 @@ where
                 votes,
             );
             ctx.notify_protocol(ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
-                wave_id,
+                tick_id,
                 block_hash,
                 verified_votes,
             });
@@ -279,13 +297,12 @@ where
             let inputs: Vec<TickTxInput<'_>> = groups
                 .iter()
                 .flat_map(|group| {
-                    let wave_abortable = !group.wave_id.is_zero();
-                    group.requests.iter().map(move |r| TickTxInput {
+                    group.requests.iter().map(|r| TickTxInput {
                         transaction: &r.transaction,
                         provisions: &r.provisions,
                         clock: r.clock,
                         randomness: r.randomness,
-                        wave_abortable,
+                        wave_abortable: r.reaches_beyond,
                     })
                 })
                 .collect();
@@ -310,7 +327,7 @@ where
                     attested_work,
                 } = split_execution_outputs(executed_group);
                 waves.push(WaveExecutionResult {
-                    wave_id: group.wave_id.clone(),
+                    tick_id: group.tick_id,
                     results,
                     tx_outcomes,
                     fee_receipts,
@@ -329,7 +346,7 @@ where
             block_hash,
             block_height,
             vote_anchor_ts,
-            wave_id,
+            tick_id,
             global_receipt_root: _,
             tx_outcomes,
             leader,
@@ -343,7 +360,7 @@ where
                 block_hash,
                 block_height,
                 vote_anchor_ts,
-                wave_id,
+                tick_id,
                 local_shard,
                 tx_outcomes,
                 validator_id,

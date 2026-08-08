@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use hyperscale_execution::{ExecutionCoordinator, ExecutionMemoryStats};
 use hyperscale_types::test_utils::TestCommittee;
-use hyperscale_types::{BlockHeight, Hash, ShardId, TopologySchedule, TxHash, ValidatorId, WaveId};
+use hyperscale_types::{BlockHeight, Hash, ShardId, TickId, TopologySchedule, TxHash, ValidatorId};
 
 fn fresh_coordinator() -> ExecutionCoordinator {
     ExecutionCoordinator::new(ValidatorId::new(0), ShardId::ROOT)
@@ -102,11 +102,7 @@ fn fresh_get_finalized_certificate_returns_none_for_any_tx() {
 #[test]
 fn fresh_get_finalized_wave_returns_none_for_any_id() {
     let coord = fresh_coordinator();
-    let wid = WaveId::new(
-        ShardId::ROOT,
-        BlockHeight::new(1),
-        std::collections::BTreeSet::new(),
-    );
+    let wid = TickId::new(ShardId::ROOT, BlockHeight::new(1));
     assert!(coord.get_finalized_wave(&wid).is_none());
 }
 

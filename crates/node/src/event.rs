@@ -24,7 +24,7 @@ use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
     HeaderFetchCount, LeafIndex, ProvisionHash, ShardForkProof, ShardId, ShardVoteEquivocation,
-    Transaction, TxHash, ValidatorId, Verifiable, Verified, WaveId,
+    TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
 };
 
 use crate::shard::commit::QcOnlyDivergence;
@@ -317,7 +317,7 @@ pub enum ShardScopedInput {
     /// A finalized-wave fetch request failed.
     FinalizedWavesFetchFailed {
         /// Wave ids that weren't returned.
-        ids: Vec<WaveId>,
+        ids: Vec<TickId>,
     },
 
     /// Transaction validated by the validation pipeline. The `NodeHost`

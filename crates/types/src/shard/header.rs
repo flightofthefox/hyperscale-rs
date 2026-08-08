@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
-    ChainOrigin, Hash, LocalReceiptRoot, MAX_REMOTE_SHARDS_PER_WAVE, MAX_TXS_PER_BLOCK,
+    ChainOrigin, Hash, LocalReceiptRoot, MAX_PROVISION_TARGET_SHARDS, MAX_TXS_PER_BLOCK,
     ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
     SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot, TransactionRoot, TxHash,
     ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, WorkInFlight,
@@ -42,7 +42,7 @@ pub struct BlockHeader {
     provision_root: ProvisionsRoot,
     #[hbor(max = MAX_TXS_PER_BLOCK)]
     cross_shard_txs: Vec<TxHash>,
-    #[hbor(max = MAX_REMOTE_SHARDS_PER_WAVE)]
+    #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
     provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
     work_in_flight: WorkInFlight,
     beacon_witness_root: BeaconWitnessRoot,
@@ -95,7 +95,7 @@ impl BlockHeader {
     /// # Panics
     ///
     /// Panics if `cross_shard_txs.len() > MAX_TXS_PER_BLOCK` or
-    /// `provision_tx_roots.len() > MAX_REMOTE_SHARDS_PER_WAVE`.
+    /// `provision_tx_roots.len() > MAX_PROVISION_TARGET_SHARDS`.
     #[allow(clippy::too_many_arguments)] // mirrors the 23 stored fields
     #[must_use]
     pub fn new(
@@ -1014,17 +1014,17 @@ mod tests {
         // No cross-shard transactions.
         buf.extend_from_slice(&hbor_to_vec(&Vec::<TxHash>::new()).unwrap());
         // Oversized provision_tx_roots claim, padded to satisfiability.
-        varint::write(&mut buf, MAX_REMOTE_SHARDS_PER_WAVE + 1).unwrap();
+        varint::write(&mut buf, MAX_PROVISION_TARGET_SHARDS + 1).unwrap();
         buf.extend(std::iter::repeat_n(
             0u8,
-            (MAX_REMOTE_SHARDS_PER_WAVE + 1) * 64,
+            (MAX_PROVISION_TARGET_SHARDS + 1) * 64,
         ));
         let err = hbor_from_slice::<BlockHeader>(&buf).unwrap_err();
         assert!(matches!(
             err,
             DecodeError::BoundExceeded { max, actual }
-                if max == MAX_REMOTE_SHARDS_PER_WAVE
-                    && actual == MAX_REMOTE_SHARDS_PER_WAVE + 1
+                if max == MAX_PROVISION_TARGET_SHARDS
+                    && actual == MAX_PROVISION_TARGET_SHARDS + 1
         ));
     }
 

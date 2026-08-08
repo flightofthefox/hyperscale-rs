@@ -21,16 +21,16 @@ use hyperscale_types::{
     RatifyPhase, RatifyRound, RatifyVote, RatifyVoteVerifyError, ReadySignal, Round,
     ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
-    SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, Timeout,
-    Transaction, TransactionRoot, TxHash, TxOutcome, TxRootVerifyError, ValidatorId, Verifiable,
-    Verified, WaveId, WeightedTimestamp,
+    SpcProposalObjectVerifyError, SpcView, StateRoot, StateRootVerifyError, StoredReceipt, TickId,
+    Timeout, Transaction, TransactionRoot, TxHash, TxOutcome, TxRootVerifyError, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp,
 };
 
 /// One wave's share of a tick's execution results.
 #[derive(Debug, Clone)]
 pub struct WaveExecutionResult {
     /// The wave whose execution produced these results.
-    pub wave_id: WaveId,
+    pub tick_id: TickId,
     /// Per-tx stored receipts (consensus portion + metadata) ready to be
     /// persisted alongside the wave's commit.
     pub results: Vec<StoredReceipt>,
@@ -585,7 +585,7 @@ pub enum ProtocolEvent {
     /// Batch execution vote verification completed.
     ExecutionVotesVerifiedAndAggregated {
         /// Wave whose votes were verified.
-        wave_id: WaveId,
+        tick_id: TickId,
         /// Source block hash for correlation.
         block_hash: BlockHash,
         /// Verified votes.
@@ -595,17 +595,17 @@ pub enum ProtocolEvent {
     /// Execution certificate aggregation completed.
     ExecutionCertificateAggregated {
         /// Wave whose EC was aggregated.
-        wave_id: WaveId,
+        tick_id: TickId,
         /// The newly aggregated execution certificate.
         certificate: Arc<Verified<ExecutionCertificate>>,
     },
 
     /// Execution certificates delivered from any source — fetch response or
     /// peer broadcast (post sender-sig check). Each cert carries its own
-    /// `(shard_id, block_height, wave_id)`. The state machine iterates
+    /// `(shard_id, block_height, tick_id)`. The state machine iterates
     /// the batch and routes each cert to `ExecutionCoordinator::on_wave_certificate`,
     /// which dispatches signature verification. The fetch protocol drain
-    /// hooks this event by `wave_id`.
+    /// hooks this event by `tick_id`.
     ExecutionCertificatesReceived {
         /// Execution certificates to admit. Wire-decoded entries land
         /// `Unverified`; a [`Verifiable::Verified`] entry short-circuits

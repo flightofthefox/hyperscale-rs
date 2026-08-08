@@ -7,7 +7,7 @@
 //!
 //! Peer selection is the network layer's job: the runner derives the
 //! `ShardId` from the variant (local shard for intra-shard variants;
-//! `source_shard` or `wave_id.shard_id()` for cross-shard variants)
+//! `source_shard` or `tick_id.shard_id()` for cross-shard variants)
 //! and hands it to `Network::request` along with `preferred`. Coordinators
 //! never reach into the topology for committee membership when emitting
 //! fetches.
@@ -18,8 +18,8 @@
 //! the fetch key (no id-set to enumerate).
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, LeafIndex, MessageClass, ProvisionHash, ShardId, TxHash,
-    ValidatorId, WaveId,
+    BlockHash, BlockHeight, Epoch, LeafIndex, MessageClass, ProvisionHash, ShardId, TickId, TxHash,
+    ValidatorId,
 };
 
 /// Fetch family — one variant per payload type.
@@ -62,7 +62,7 @@ pub enum FetchRequest {
     /// Intra-shard DA payload — `shard` is always local.
     FinalizedWaves {
         /// Wave ids whose finalized waves are missing.
-        ids: Vec<WaveId>,
+        ids: Vec<TickId>,
         /// Always the local shard for this variant.
         shard: ShardId,
         /// Canonical-source hint, when one exists.

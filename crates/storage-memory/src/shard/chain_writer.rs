@@ -186,22 +186,21 @@ fn build_prepared_commit(
             c.blocks.insert(block.height(), unwrapped);
             for fw in block.certificates().iter() {
                 let cert = fw.certificate();
-                let wave_id = cert.wave_id().clone();
-                c.certificates.insert(wave_id.clone(), (**cert).clone());
+                let tick_id = *cert.tick_id();
+                c.certificates.insert(tick_id, (**cert).clone());
                 c.wave_certs_by_height
-                    .entry(wave_id.block_height())
+                    .entry(tick_id.block_height())
                     .or_default()
-                    .push(wave_id);
+                    .push(tick_id);
             }
             c.insert_receipts(&receipts);
             for fw in block.certificates().iter() {
                 for ec in fw.certificate().execution_certificates() {
                     for outcome in ec.tx_outcomes() {
-                        c.tx_cert_index
-                            .insert(outcome.tx_hash(), ec.wave_id().clone());
+                        c.tx_cert_index.insert(outcome.tx_hash(), *ec.tick_id());
                     }
                     c.execution_certs
-                        .insert(ec.wave_id().clone(), ec.as_unverified().clone());
+                        .insert(*ec.tick_id(), ec.as_unverified().clone());
                 }
             }
             c.committed_height = block.height();
@@ -275,12 +274,12 @@ impl SimShardStorage {
             );
             for fw in block.certificates().iter() {
                 let cert = fw.certificate();
-                let wave_id = cert.wave_id().clone();
-                c.certificates.insert(wave_id.clone(), (**cert).clone());
+                let tick_id = *cert.tick_id();
+                c.certificates.insert(tick_id, (**cert).clone());
                 c.wave_certs_by_height
-                    .entry(wave_id.block_height())
+                    .entry(tick_id.block_height())
                     .or_default()
-                    .push(wave_id);
+                    .push(tick_id);
             }
             // Store receipts atomically with block commit.
             c.insert_receipts(receipts);
@@ -288,11 +287,10 @@ impl SimShardStorage {
             for fw in block.certificates().iter() {
                 for ec in fw.certificate().execution_certificates() {
                     for outcome in ec.tx_outcomes() {
-                        c.tx_cert_index
-                            .insert(outcome.tx_hash(), ec.wave_id().clone());
+                        c.tx_cert_index.insert(outcome.tx_hash(), *ec.tick_id());
                     }
                     c.execution_certs
-                        .insert(ec.wave_id().clone(), ec.as_unverified().clone());
+                        .insert(*ec.tick_id(), ec.as_unverified().clone());
                 }
             }
             c.committed_height = block.height();

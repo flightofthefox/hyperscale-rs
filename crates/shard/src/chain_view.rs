@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, ProvisionHash,
-    QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, TxHash, Verified, WaveId,
+    QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, TickId, TxHash, Verified,
     WorkInFlight,
 };
 use tracing::warn;
@@ -195,8 +195,8 @@ impl<'a> ChainView<'a> {
     pub fn collect_ancestor_hashes(
         &self,
         parent_block_hash: BlockHash,
-    ) -> (HashSet<WaveId>, HashSet<TxHash>, HashSet<ProvisionHash>) {
-        let mut cert_ids: HashSet<WaveId> = HashSet::new();
+    ) -> (HashSet<TickId>, HashSet<TxHash>, HashSet<ProvisionHash>) {
+        let mut cert_ids: HashSet<TickId> = HashSet::new();
         let mut tx_hashes: HashSet<TxHash> = HashSet::new();
         let mut provision_hashes: HashSet<ProvisionHash> = HashSet::new();
 
@@ -210,7 +210,7 @@ impl<'a> ChainView<'a> {
                 tx_hashes.insert(*tx_hash);
             }
             for cert_id in manifest.cert_ids() {
-                cert_ids.insert(cert_id.clone());
+                cert_ids.insert(*cert_id);
             }
             for batch_hash in manifest.provision_hashes() {
                 provision_hashes.insert(*batch_hash);
@@ -348,13 +348,8 @@ mod tests {
         // finalized wave already present above the committed tip.
         let header = make_header(3, BlockHash::ZERO);
         let block_hash = header.hash();
-        let wave = WaveId::new(
-            ShardId::ROOT,
-            BlockHeight::new(2),
-            std::collections::BTreeSet::new(),
-        );
-        let manifest =
-            BlockManifest::new(vec![], vec![wave.clone()], vec![], WitnessSources::empty());
+        let wave = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let manifest = BlockManifest::new(vec![], vec![wave], vec![], WitnessSources::empty());
         let pending_block = PendingBlock::from_manifest(header, manifest, LocalTimestamp::ZERO);
         let mut pending = PendingBlocks::new();
         pending.insert(pending_block);

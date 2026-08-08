@@ -16,7 +16,7 @@ mod common;
 
 use common::sim::{ExecutionSim, Schedule, cell_of, counter, settle};
 use hyperscale_types::test_utils::{test_prefix, test_transaction_with_prefixes};
-use hyperscale_types::{Transaction, WaveId};
+use hyperscale_types::{TickId, Transaction};
 
 /// The one cell both transactions write.
 const CELL: u8 = 7;
@@ -30,7 +30,7 @@ fn tx(seed: u8, cell: u8) -> Transaction {
 
 /// Two transactions over one cell in consecutive blocks. The second reads
 /// what the first wrote, so its receipt carries the count of both.
-fn two_over_one_cell() -> (ExecutionSim, Vec<WaveId>) {
+fn two_over_one_cell() -> (ExecutionSim, Vec<TickId>) {
     let mut sim = ExecutionSim::new(Schedule::Eager);
     let mut waves = Vec::new();
     for seed in 0..2u8 {
@@ -68,12 +68,12 @@ fn settling_in_tick_order_keeps_both_writes() {
 fn a_certificate_settling_ahead_of_its_predecessor_is_refused() {
     let (sim, waves) = two_over_one_cell();
     assert_eq!(
-        sim.settles_out_of_order(&[waves[1].clone(), waves[0].clone()]),
-        Some(waves[1].clone()),
+        sim.settles_out_of_order(&[waves[1], waves[0]]),
+        Some(waves[1]),
         "the later tick's certificate may not settle first"
     );
     assert_eq!(
-        sim.settles_out_of_order(&[waves[0].clone(), waves[1].clone()]),
+        sim.settles_out_of_order(&[waves[0], waves[1]]),
         None,
         "tick order is what the rule asks for, not any order"
     );
@@ -92,8 +92,5 @@ fn waves_over_disjoint_cells_settle_in_any_order() {
         sim.drain();
         waves.push(sim.wave_of(hash).expect("wave assigned"));
     }
-    assert_eq!(
-        sim.settles_out_of_order(&[waves[1].clone(), waves[0].clone()]),
-        None
-    );
+    assert_eq!(sim.settles_out_of_order(&[waves[1], waves[0]]), None);
 }

@@ -20,8 +20,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use hyperscale_types::{
-    BlockHash, ConsensusPublicKey, ExecutionVote, GlobalReceiptRoot, ValidatorId, Verified,
-    VoteCount, WaveId, WeightedTimestamp,
+    BlockHash, ConsensusPublicKey, ExecutionVote, GlobalReceiptRoot, TickId, ValidatorId, Verified,
+    VoteCount, WeightedTimestamp,
 };
 
 /// Key for grouping votes: `(global_receipt_root, vote_anchor_ts)`.
@@ -39,7 +39,7 @@ type VoteKey = (GlobalReceiptRoot, WeightedTimestamp);
 #[derive(Debug)]
 pub struct VoteTracker {
     /// Wave identifier.
-    wave_id: WaveId,
+    tick_id: TickId,
     /// Block hash this wave belongs to.
     block_hash: BlockHash,
     /// Quorum threshold (2f+1 voting power).
@@ -71,9 +71,9 @@ pub struct VoteTracker {
 impl VoteTracker {
     /// Create a new execution vote tracker.
     #[must_use]
-    pub fn new(wave_id: WaveId, block_hash: BlockHash, quorum: VoteCount) -> Self {
+    pub fn new(tick_id: TickId, block_hash: BlockHash, quorum: VoteCount) -> Self {
         Self {
-            wave_id,
+            tick_id,
             block_hash,
             quorum,
             votes_by_key: BTreeMap::new(),
@@ -87,8 +87,8 @@ impl VoteTracker {
 
     /// Get the wave ID.
     #[must_use]
-    pub const fn wave_id(&self) -> &WaveId {
-        &self.wave_id
+    pub const fn tick_id(&self) -> &TickId {
+        &self.tick_id
     }
 
     /// Get the block hash.
@@ -274,7 +274,6 @@ impl VoteTracker {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
 
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{BlockHeight, ConsensusSignature, Hash, ShardId, Signer};
@@ -290,7 +289,7 @@ mod tests {
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             BlockHeight::new(10),
             WeightedTimestamp::from_millis(11),
-            WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
+            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
             ShardId::ROOT,
             global_receipt_root,
             5,
@@ -310,7 +309,7 @@ mod tests {
     #[test]
     fn test_vote_tracker_quorum() {
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
+            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             VoteCount::new(3),
         );
@@ -336,7 +335,7 @@ mod tests {
     #[test]
     fn test_vote_tracker_conflicting_roots() {
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
+            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             VoteCount::new(3),
         );
@@ -360,7 +359,7 @@ mod tests {
         let pk = make_test_public_key();
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
+            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             VoteCount::new(3),
         );
@@ -390,7 +389,7 @@ mod tests {
         let pk = make_test_public_key();
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
+            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             VoteCount::new(3),
         );
@@ -406,7 +405,7 @@ mod tests {
         // re-feed the same own vote; the tally must count it once.
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
+            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             VoteCount::new(3),
         );
@@ -424,7 +423,7 @@ mod tests {
         let pk = make_test_public_key();
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let mut tracker = VoteTracker::new(
-            WaveId::new(ShardId::ROOT, BlockHeight::new(0), BTreeSet::new()),
+            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             VoteCount::new(3),
         );

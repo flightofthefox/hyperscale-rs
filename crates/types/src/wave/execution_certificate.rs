@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::{
     AggregateSignature, BlockHeight, ConsensusPublicKey, ExecutionVote, ExecutionVoteMessage,
     GlobalReceiptRoot, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition, RETENTION_HORIZON, ShardId,
-    SignerBitfield, TxOutcome, ValidatorId, Verified, Verify, WaveId, WeightedTimestamp,
+    SignerBitfield, TickId, TxOutcome, ValidatorId, Verified, Verify, WeightedTimestamp,
     compute_global_receipt_root, signed_bytes,
 };
 
@@ -28,7 +28,7 @@ use crate::{
 /// Contains the signature aggregated signature from 2f+1 validators plus per-tx
 /// outcomes so remote shards can extract individual transaction results.
 pub struct ExecutionCertificate {
-    wave_id: WaveId,
+    tick_id: TickId,
     vote_anchor_ts: WeightedTimestamp,
     global_receipt_root: GlobalReceiptRoot,
     tx_outcomes: Vec<TxOutcome>,
@@ -42,7 +42,7 @@ pub struct ExecutionCertificate {
 impl Debug for ExecutionCertificate {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExecutionCertificate")
-            .field("wave_id", &self.wave_id)
+            .field("tick_id", &self.tick_id)
             .field("vote_anchor_ts", &self.vote_anchor_ts)
             .field("global_receipt_root", &self.global_receipt_root)
             .field("tx_outcomes", &self.tx_outcomes)
@@ -55,7 +55,7 @@ impl Debug for ExecutionCertificate {
 impl Clone for ExecutionCertificate {
     fn clone(&self) -> Self {
         Self {
-            wave_id: self.wave_id.clone(),
+            tick_id: self.tick_id,
             vote_anchor_ts: self.vote_anchor_ts,
             global_receipt_root: self.global_receipt_root,
             tx_outcomes: self.tx_outcomes.clone(),
@@ -68,7 +68,7 @@ impl Clone for ExecutionCertificate {
 
 impl PartialEq for ExecutionCertificate {
     fn eq(&self, other: &Self) -> bool {
-        self.wave_id == other.wave_id
+        self.tick_id == other.tick_id
             && self.vote_anchor_ts == other.vote_anchor_ts
             && self.global_receipt_root == other.global_receipt_root
             && self.tx_outcomes == other.tx_outcomes
@@ -94,7 +94,7 @@ impl HborWidth for ExecutionCertificate {
 
 impl HborEncode for ExecutionCertificate {
     fn encode(&self, encoder: &mut HborEncoder<'_>) -> Result<(), HborEncodeError> {
-        encoder.nested(&self.wave_id)?;
+        encoder.nested(&self.tick_id)?;
         encoder.nested(&self.vote_anchor_ts)?;
         encoder.nested(&self.global_receipt_root)?;
         hbor_bounded::check_encoded_len("tx_outcomes", self.tx_outcomes.len(), MAX_TXS_PER_BLOCK)?;
@@ -106,7 +106,7 @@ impl HborEncode for ExecutionCertificate {
 
 impl HborDecode for ExecutionCertificate {
     fn decode(decoder: &mut HborDecoder<'_>) -> Result<Self, HborDecodeError> {
-        let wave_id: WaveId = decoder.nested()?;
+        let tick_id: TickId = decoder.nested()?;
         let vote_anchor_ts: WeightedTimestamp = decoder.nested()?;
         let global_receipt_root: GlobalReceiptRoot = decoder.nested()?;
         let tx_outcomes: Vec<TxOutcome> = decoder
@@ -119,7 +119,7 @@ impl HborDecode for ExecutionCertificate {
             ));
         }
         let mut ec = Self {
-            wave_id,
+            tick_id,
             vote_anchor_ts,
             global_receipt_root,
             tx_outcomes,
@@ -136,7 +136,7 @@ impl ExecutionCertificate {
     /// Create a new execution certificate.
     #[must_use]
     pub fn new(
-        wave_id: WaveId,
+        tick_id: TickId,
         vote_anchor_ts: WeightedTimestamp,
         global_receipt_root: GlobalReceiptRoot,
         tx_outcomes: Vec<TxOutcome>,
@@ -144,7 +144,7 @@ impl ExecutionCertificate {
         signers: SignerBitfield,
     ) -> Self {
         let mut ec = Self {
-            wave_id,
+            tick_id,
             vote_anchor_ts,
             global_receipt_root,
             tx_outcomes,
@@ -158,8 +158,8 @@ impl ExecutionCertificate {
 
     /// Self-contained wave identifier (shard + height + remote dependencies).
     #[must_use]
-    pub const fn wave_id(&self) -> &WaveId {
-        &self.wave_id
+    pub const fn tick_id(&self) -> &TickId {
+        &self.tick_id
     }
 
     /// Consensus height at which quorum was reached.
@@ -198,7 +198,7 @@ impl ExecutionCertificate {
     /// The shard that produced this certificate.
     #[must_use]
     pub const fn shard_id(&self) -> ShardId {
-        self.wave_id.shard_id()
+        self.tick_id.shard_id()
     }
 
     /// Deadline past which this certificate is provably useless on every shard.
@@ -215,7 +215,7 @@ impl ExecutionCertificate {
     /// Block height (the block containing the wave's transactions).
     #[must_use]
     pub const fn block_height(&self) -> BlockHeight {
-        self.wave_id.block_height()
+        self.tick_id.block_height()
     }
 
     /// Pre-serialized wire bytes, if available.
@@ -258,7 +258,7 @@ impl ExecutionCertificate {
         signed_bytes(
             &ExecutionVoteMessage {
                 vote_anchor_ts: self.vote_anchor_ts,
-                wave_id: self.wave_id.clone(),
+                tick_id: self.tick_id,
                 shard_group: self.shard_id(),
                 global_receipt_root: self.global_receipt_root,
                 tx_count: u32::try_from(self.tx_outcomes.len()).unwrap_or(u32::MAX),
@@ -299,7 +299,7 @@ pub enum ExecutionCertificateVerifyError {
 /// Construction asserts: the aggregated signature validates against
 /// the public key formed by aggregating `public_keys[i]` for every `i`
 /// set in `signers`, over the canonical [`ExecutionVoteMessage`] derived
-/// from the certificate's `(vote_anchor_ts, wave_id, shard_id,
+/// from the certificate's `(vote_anchor_ts, tick_id, shard_id,
 /// global_receipt_root, tx_count)`. Empty signer sets must carry the
 /// zero signature.
 ///
@@ -353,7 +353,7 @@ impl Verified<ExecutionCertificate> {
     /// only asserts the predicate (signature aggregation + signer-bit
     /// mapping). Every input vote is assumed to share the same signing
     /// message — the `VoteTracker` bucketing key `(global_receipt_root,
-    /// vote_anchor_ts)` plus the per-wave `wave_id` and `shard_id`
+    /// vote_anchor_ts)` plus the per-wave `tick_id` and `shard_id`
     /// uniquely determine that message, so a single bucket's contents
     /// satisfy this contract by construction.
     ///
@@ -370,7 +370,7 @@ impl Verified<ExecutionCertificate> {
     #[must_use]
     pub fn aggregate(
         verifier: &dyn Verifier,
-        wave_id: &WaveId,
+        tick_id: &TickId,
         global_receipt_root: GlobalReceiptRoot,
         votes: &[Verified<ExecutionVote>],
         committee: &[ValidatorId],
@@ -425,7 +425,7 @@ impl Verified<ExecutionCertificate> {
 
         // SAFETY: every input vote satisfies the `ExecutionVote`
         // predicate against its own pubkey for the shared signing
-        // message determined by `(vote_anchor_ts, wave_id,
+        // message determined by `(vote_anchor_ts, tick_id,
         // shard_id, global_receipt_root, tx_count)`. Aggregating
         // those signatures and mirroring the committee indices in
         // `signers` produces an EC whose predicate is structurally
@@ -433,7 +433,7 @@ impl Verified<ExecutionCertificate> {
         // the same per-validator pubkeys, and signature aggregate-verify
         // succeeds.
         Self::new_unchecked(ExecutionCertificate::new(
-            wave_id.clone(),
+            *tick_id,
             vote_anchor_ts,
             global_receipt_root,
             tx_outcomes,
@@ -476,12 +476,8 @@ mod tests {
         )
     }
 
-    fn wave_id() -> WaveId {
-        WaveId::new(
-            ShardId::leaf(1, 0),
-            BlockHeight::new(7),
-            std::iter::once(ShardId::leaf(1, 1)).collect(),
-        )
+    fn tick_id() -> TickId {
+        TickId::new(ShardId::leaf(1, 0), BlockHeight::new(7))
     }
 
     /// Build a signed vote with the given signing key. Used for fixture
@@ -498,7 +494,7 @@ mod tests {
             BlockHash::from_raw(Hash::from_bytes(b"block")),
             BlockHeight::new(7),
             WeightedTimestamp::from_millis(11),
-            wave_id(),
+            tick_id(),
             ShardId::leaf(1, 0),
             outcomes,
             ValidatorId::new(validator),
@@ -525,7 +521,7 @@ mod tests {
 
         let cert = Verified::<ExecutionCertificate>::aggregate(
             &BlsVerifier,
-            &wave_id(),
+            &tick_id(),
             root,
             &votes,
             &committee,
@@ -557,7 +553,7 @@ mod tests {
             .collect();
         let cert = Verified::<ExecutionCertificate>::aggregate(
             &BlsVerifier,
-            &wave_id(),
+            &tick_id(),
             root,
             &votes,
             &committee,
@@ -565,7 +561,7 @@ mod tests {
         .into_inner();
 
         let tampered = ExecutionCertificate::new(
-            cert.wave_id().clone(),
+            *cert.tick_id(),
             cert.vote_anchor_ts(),
             cert.global_receipt_root(),
             cert.tx_outcomes().clone(),
@@ -595,7 +591,7 @@ mod tests {
         let outcomes = vec![outcome(1)];
         let root = compute_global_receipt_root(&outcomes);
         let cert = ExecutionCertificate::new(
-            wave_id(),
+            tick_id(),
             WeightedTimestamp::from_millis(11),
             root,
             outcomes,
@@ -626,7 +622,7 @@ mod tests {
         let outcomes = vec![outcome(1)];
         let root = compute_global_receipt_root(&outcomes);
         let cert = ExecutionCertificate::new(
-            wave_id(),
+            tick_id(),
             WeightedTimestamp::from_millis(11),
             root,
             outcomes,
@@ -662,7 +658,7 @@ mod tests {
 
         let cert = Verified::<ExecutionCertificate>::aggregate(
             &BlsVerifier,
-            &wave_id(),
+            &tick_id(),
             root,
             &votes,
             &committee,
@@ -692,7 +688,7 @@ mod tests {
 
         let cert = Verified::<ExecutionCertificate>::aggregate(
             &BlsVerifier,
-            &wave_id(),
+            &tick_id(),
             root,
             &votes,
             &committee,
@@ -721,7 +717,7 @@ mod tests {
             .map(|o| TxOutcome::attesting(o.tx_hash(), o.outcome().clone(), 999))
             .collect();
         let cert = ExecutionCertificate::new(
-            wave_id(),
+            tick_id(),
             WeightedTimestamp::from_millis(11),
             root,
             forged,
@@ -752,7 +748,7 @@ mod tests {
         ];
         let cert = Verified::<ExecutionCertificate>::aggregate(
             &BlsVerifier,
-            &wave_id(),
+            &tick_id(),
             root,
             &votes,
             &committee,

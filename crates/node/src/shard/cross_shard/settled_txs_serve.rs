@@ -103,8 +103,8 @@ mod tests {
         BlockHash, BlockHeader, BlockHeight, CertificateRoot, ExecutionCertificate,
         ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
         LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON,
-        RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot, TransactionRoot, TxHash,
-        TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
+        RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot,
+        TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WeightedTimestamp,
         WitnessSources, WorkInFlight, settled_txs_root_from_hashes,
     };
 
@@ -122,13 +122,24 @@ mod tests {
         // Cross-shard wave (non-empty `remote_shards`): the settled set
         // commits only cross-shard waves, so single-shard fixtures would be
         // filtered out before the merkle root.
-        let wave = WaveId::new(
-            SHARD,
-            BlockHeight::new(height),
-            BTreeSet::from([ShardId::from_heap_index(2)]),
-        );
+        let wave = TickId::new(SHARD, BlockHeight::new(height));
         let ec = ExecutionCertificate::new(
-            wave.clone(),
+            wave,
+            WeightedTimestamp::from_millis(1),
+            GlobalReceiptRoot::ZERO,
+            vec![TxOutcome::new(
+                settled_tx(height),
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )],
+            AggregateSignature::new([0u8; 96]),
+            SignerBitfield::new(4),
+        );
+        // A counterpart's certificate for the same transaction: what makes
+        // it reach beyond this shard, and so what puts it in the settled set.
+        let remote = ExecutionCertificate::new(
+            TickId::new(ShardId::from_heap_index(2), BlockHeight::new(height)),
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome::new(
@@ -141,7 +152,10 @@ mod tests {
             SignerBitfield::new(4),
         );
         Arc::new(Verifiable::from(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(wave, vec![Arc::new(ec)])),
+            Arc::new(WaveCertificate::new(
+                wave,
+                vec![Arc::new(ec), Arc::new(remote)],
+            )),
             vec![],
         )))
     }

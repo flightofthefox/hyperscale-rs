@@ -13,20 +13,25 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::{
-    FinalizedWave, Hash, SettledTxsRoot, ShardId, TxHash, TypedHash, Verifiable,
+    FinalizedWave, Hash, SettledTxsRoot, ShardId, TxHash, TxOutcome, TypedHash, Verifiable,
     compute_merkle_root,
 };
 
 /// The cross-shard transactions `shard` settled in `certificates`.
 ///
-/// One entry per transaction of each committed finalization whose local
-/// execution certificate is keyed on this shard — its block's own shard,
-/// `block.header().shard_id()`. **Single-shard transactions are excluded:**
-/// a purely local transaction's outcome never rides another shard's
-/// finalization, so the split-boundary fence never queries it and the
-/// counterpart sweep already skips it. The settled set therefore commits
-/// exactly the transactions a surviving counterpart can ask about, keeping
-/// it proportional to cross-shard traffic rather than total throughput.
+/// One entry per **cross-shard** transaction of each committed
+/// finalization whose local execution certificate is keyed on this shard —
+/// its block's own shard, `block.header().shard_id()`.
+///
+/// A transaction is cross-shard exactly when some certificate other than
+/// this shard's attests an outcome for it: that is what makes a
+/// counterpart able to ask about it, and the certificates the finalization
+/// carries are the only evidence needed to tell. **Single-shard
+/// transactions are excluded:** a purely local transaction's outcome never
+/// rides another shard's finalization, so the fence never queries it. The
+/// settled set therefore commits exactly the transactions a surviving
+/// counterpart can ask about, keeping it proportional to cross-shard
+/// traffic rather than total throughput.
 ///
 /// The consequence of that exclusion is what a chain observer can conclude:
 /// a single-shard transaction that settled and one abandoned at a terminal
@@ -39,11 +44,17 @@ pub fn local_settled_tx_hashes<'a>(
 ) -> Vec<TxHash> {
     certificates
         .into_iter()
-        .filter(|fw| {
-            let wave_id = fw.wave_id();
-            wave_id.shard_id() == shard && !wave_id.is_zero()
+        .filter(|fw| fw.tick_id().shard_id() == shard)
+        .flat_map(|fw| {
+            let reached_beyond: BTreeSet<TxHash> = fw
+                .execution_certificates()
+                .iter()
+                .filter(|ec| ec.shard_id() != shard)
+                .flat_map(|ec| ec.tx_outcomes().iter().map(TxOutcome::tx_hash))
+                .collect();
+            fw.tx_hashes()
+                .filter(move |tx_hash| reached_beyond.contains(tx_hash))
         })
-        .flat_map(|fw| fw.tx_hashes())
         .collect()
 }
 

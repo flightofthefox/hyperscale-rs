@@ -30,8 +30,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    FinalizedWave, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, Transaction, TxHash,
-    Verifiable, WaveId, WeightedTimestamp,
+    FinalizedWave, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, TickId, Transaction,
+    TxHash, Verifiable, WeightedTimestamp,
 };
 
 #[allow(clippy::struct_field_names)] // shared `_retention` postfix is the artifact-tier convention
@@ -39,11 +39,11 @@ pub struct CommitDedupIndex {
     /// `tx_hash → end_timestamp_exclusive`. Pruned when
     /// `end_timestamp_exclusive <= current_committed_ts`.
     tx_retention: HashMap<TxHash, WeightedTimestamp>,
-    /// `wave_id → vote_anchor_ts + RETENTION_HORIZON`. Pruned when
+    /// `tick_id → vote_anchor_ts + RETENTION_HORIZON`. Pruned when
     /// `deadline <= current_committed_ts`. Past the horizon, every tx the
     /// wave covered has terminated everywhere, so no future block can
-    /// legitimately reference the same `wave_id`.
-    cert_retention: HashMap<WaveId, WeightedTimestamp>,
+    /// legitimately reference the same `tick_id`.
+    cert_retention: HashMap<TickId, WeightedTimestamp>,
     /// `provision_hash → local_committed_ts + RETENTION_HORIZON`. Pruned
     /// when `deadline <= current_committed_ts`. Past the horizon, every tx
     /// the batch carried has expired its `validity_range` and terminated
@@ -87,9 +87,9 @@ impl CommitDedupIndex {
     /// RETENTION_HORIZON`.
     pub fn register_committed_certs(&mut self, finalized_waves: &[Arc<Verifiable<FinalizedWave>>]) {
         for fw in finalized_waves {
-            let wave_id = fw.wave_id().clone();
+            let tick_id = *fw.tick_id();
             let deadline = fw.local_ec().deadline();
-            self.cert_retention.entry(wave_id).or_insert(deadline);
+            self.cert_retention.entry(tick_id).or_insert(deadline);
         }
     }
 
@@ -146,8 +146,8 @@ impl CommitDedupIndex {
         self.tx_retention.contains_key(tx_hash)
     }
 
-    pub fn contains_cert(&self, wave_id: &WaveId) -> bool {
-        self.cert_retention.contains_key(wave_id)
+    pub fn contains_cert(&self, tick_id: &TickId) -> bool {
+        self.cert_retention.contains_key(tick_id)
     }
 
     pub fn contains_provision(&self, provision_hash: &ProvisionHash) -> bool {
@@ -260,7 +260,7 @@ mod tests {
         let mut idx = CommitDedupIndex::new();
         let fw = make_fw(1);
         idx.register_committed_certs(std::slice::from_ref(&fw));
-        assert!(idx.contains_cert(fw.wave_id()));
+        assert!(idx.contains_cert(fw.tick_id()));
         assert_eq!(idx.cert_retention_len(), 1);
     }
 
@@ -273,14 +273,14 @@ mod tests {
         idx.register_committed_certs(&[Arc::clone(&fw)]);
 
         idx.prune(WeightedTimestamp::ZERO);
-        assert!(idx.contains_cert(fw.wave_id()));
+        assert!(idx.contains_cert(fw.tick_id()));
 
         let past = fw
             .local_ec()
             .deadline()
             .plus(std::time::Duration::from_millis(1));
         idx.prune(past);
-        assert!(!idx.contains_cert(fw.wave_id()));
+        assert!(!idx.contains_cert(fw.tick_id()));
     }
 
     // ─── Provisions ─────────────────────────────────────────────────────

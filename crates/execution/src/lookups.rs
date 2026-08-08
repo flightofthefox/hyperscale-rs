@@ -11,7 +11,7 @@ use std::sync::Arc;
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_types::{
     BlockHeight, ConsensusPublicKey, DeclaredKey, ExecutionCertificate, ShardId, ShardTrie,
-    SubstateKey, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, VoteCount, WaveId,
+    SubstateKey, TickId, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, VoteCount,
 };
 
 /// Per-shard recipient lists for provision broadcasting.
@@ -22,7 +22,7 @@ pub type ShardRecipients = HashMap<ShardId, Vec<ValidatorId>>;
 pub type WaveTxEntry = (Arc<Verifiable<Transaction>>, BTreeSet<ShardId>);
 
 /// Deterministic grouping of a block's transactions into waves.
-pub type WaveAssignments = BTreeMap<WaveId, Vec<WaveTxEntry>>;
+pub type WaveAssignments = BTreeMap<TickId, Vec<WaveTxEntry>>;
 
 /// Committee members of `shard` with the local validator filtered out.
 ///
@@ -104,7 +104,7 @@ pub fn committee_public_keys_for_shard(
 /// Partitions transactions by their provision dependency set (remote shards
 /// needed). All validators compute identical assignments from the same block.
 ///
-/// Returns a map from `WaveId` to list of (tx, `participating_shards`) in
+/// Returns a map from `TickId` to list of (tx, `participating_shards`) in
 /// block order within each wave.
 pub fn assign_waves(
     topology_snapshot: &TopologySnapshot,
@@ -114,23 +114,14 @@ pub fn assign_waves(
 ) -> WaveAssignments {
     let mut waves: WaveAssignments = BTreeMap::new();
 
+    let tick_id = TickId::new(local_shard, block_height);
     for tx in transactions {
-        // Compute provision dependency set = remote shards needed
         let all_shards: BTreeSet<ShardId> = topology_snapshot
             .all_shards_for_transaction(tx)
             .into_iter()
             .collect();
-
-        let remote_shards: BTreeSet<ShardId> = all_shards
-            .iter()
-            .filter(|&&s| s != local_shard)
-            .copied()
-            .collect();
-
-        let wave_id = WaveId::new(local_shard, block_height, remote_shards);
-
         waves
-            .entry(wave_id)
+            .entry(tick_id)
             .or_default()
             .push((Arc::clone(tx), all_shards));
     }

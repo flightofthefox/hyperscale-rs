@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_storage::test_helpers::{
@@ -14,8 +14,8 @@ use hyperscale_types::{
     Address, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock,
     ChainOrigin, ConsensusReceipt, FinalizedWave, GlobalReceiptHash, Hash, LocalKey,
     ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId,
-    StateRoot, StoredReceipt, SubstateKey, SyncHint, TxHash, ValidatorId, Verifiable, Verified,
-    WaveCertificate, WaveId, WeightedTimestamp, WitnessSources,
+    StateRoot, StoredReceipt, SubstateKey, SyncHint, TickId, TxHash, ValidatorId, Verifiable,
+    Verified, WaveCertificate, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -52,7 +52,7 @@ impl SimShardStorage {
             .write()
             .unwrap()
             .certificates
-            .insert(certificate.wave_id().clone(), certificate.clone());
+            .insert(*certificate.tick_id(), certificate.clone());
     }
 
     /// Test helper: commits database updates with auto-incrementing JMT version.
@@ -124,7 +124,7 @@ fn commit_with(
         let new_fw: Arc<Verifiable<FinalizedWave>> = Arc::new(
             FinalizedWave::new(
                 Arc::new(WaveCertificate::new(
-                    WaveId::new(ShardId::ROOT, block.height(), BTreeSet::new()),
+                    TickId::new(ShardId::ROOT, block.height()),
                     vec![],
                 )),
                 vec![receipt],

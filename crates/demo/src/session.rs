@@ -184,7 +184,7 @@ fn settlement_events(
     for wave in certificates.iter() {
         let wave = wave.as_unverified();
         for certificate in wave.execution_certificates() {
-            let id = certificate.wave_id();
+            let id = certificate.tick_id();
             events.push(TraceEvent::execution_certified(
                 wt,
                 id,

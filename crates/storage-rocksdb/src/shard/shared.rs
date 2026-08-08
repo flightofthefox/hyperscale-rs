@@ -21,8 +21,8 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
     MerkleInclusionProof, PreparedCommit, QuorumCertificate, SafeVoteRegisters, SettledWrites,
-    ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf, Transaction, TxHash,
-    ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
+    ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf, TickId, Transaction,
+    TxHash, ValidatorId, Verifiable, Verified, WaveCertificate,
 };
 
 use super::core::RocksDbShardStorage;
@@ -265,7 +265,7 @@ impl ShardChainReader for SharedStorage {
         ShardChainReader::get_transactions_batch(&*self.0, hashes)
     }
 
-    fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
+    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<WaveCertificate> {
         self.0.get_certificates_batch(ids)
     }
 
@@ -275,16 +275,16 @@ impl ShardChainReader for SharedStorage {
 
     fn get_execution_certificate(
         &self,
-        wave_id: &WaveId,
+        tick_id: &TickId,
     ) -> Option<Verified<ExecutionCertificate>> {
-        self.0.get_execution_certificate(wave_id)
+        self.0.get_execution_certificate(tick_id)
     }
 
     fn get_execution_certificates_batch(
         &self,
-        wave_ids: &[WaveId],
+        tick_ids: &[TickId],
     ) -> Vec<Verified<ExecutionCertificate>> {
-        self.0.get_execution_certificates_batch(wave_ids)
+        self.0.get_execution_certificates_batch(tick_ids)
     }
 
     fn get_execution_certificates_for_txs(

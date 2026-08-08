@@ -5,7 +5,7 @@ use hyperscale_hbor::Hbor;
 
 use crate::signing::NetworkId;
 use crate::{
-    ExecutionCertificate, ExecutionVote, GlobalReceiptRoot, Hash, ShardId, WaveId,
+    ExecutionCertificate, ExecutionVote, GlobalReceiptRoot, Hash, ShardId, TickId,
     WeightedTimestamp,
 };
 
@@ -13,7 +13,7 @@ use crate::{
 ///
 /// Used for both individual [`ExecutionVote`] signatures and
 /// [`ExecutionCertificate`] aggregated signature verification. The
-/// `wave_id` is self-contained (shard + block height + remote shards), so
+/// `tick_id` is self-contained (shard + block height + remote shards), so
 /// no separate block hash is needed.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 #[hbor(signing_domain = "hyperscale-execution-vote-v1", signing_context = NetworkId)]
@@ -21,7 +21,7 @@ pub struct ExecutionVoteMessage {
     /// BFT-authenticated anchor the vote was cast at.
     pub vote_anchor_ts: WeightedTimestamp,
     /// The wave being voted on.
-    pub wave_id: WaveId,
+    pub tick_id: TickId,
     /// Shard casting the vote.
     pub shard_group: ShardId,
     /// Merkle root over per-tx outcome leaves.

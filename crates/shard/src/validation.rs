@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY,
-    MAX_TIMESTAMP_RUSH, ProvisionHash, QuorumCertificate, ShardId, ShardLoad, TopologySnapshot,
-    Transaction, TxHash, Verifiable, VoteCount, WaveId, compute_cross_shard_txs,
+    MAX_TIMESTAMP_RUSH, ProvisionHash, QuorumCertificate, ShardId, ShardLoad, TickId,
+    TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, compute_cross_shard_txs,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -301,7 +301,7 @@ pub fn validate_no_duplicate_transactions(
 
 /// Validate that no finalized wave in the block has already been committed
 /// or appears in an ancestor block above committed height. Mirrors
-/// [`validate_no_duplicate_transactions`] but for `wave_id`.
+/// [`validate_no_duplicate_transactions`] but for `tick_id`.
 ///
 /// Both proposer and validator hit `record_block_committed` synchronously
 /// during their respective commit handlers, so their `dedup_index` reflects
@@ -309,7 +309,7 @@ pub fn validate_no_duplicate_transactions(
 /// against this shared state is therefore safe under the on-qc-formed race.
 pub fn validate_no_duplicate_certificates(
     block: &Block,
-    qc_chain_cert_ids: &HashSet<WaveId>,
+    qc_chain_cert_ids: &HashSet<TickId>,
     dedup_index: &CommitDedupIndex,
 ) -> Result<(), String> {
     if block.certificates().is_empty() {
@@ -317,15 +317,15 @@ pub fn validate_no_duplicate_certificates(
     }
 
     for fw in block.certificates().iter() {
-        let wave_id = fw.wave_id();
-        if qc_chain_cert_ids.contains(wave_id) {
+        let tick_id = fw.tick_id();
+        if qc_chain_cert_ids.contains(tick_id) {
             return Err(format!(
-                "wave certificate {wave_id:?} already in QC chain ancestor"
+                "wave certificate {tick_id:?} already in QC chain ancestor"
             ));
         }
-        if dedup_index.contains_cert(wave_id) {
+        if dedup_index.contains_cert(tick_id) {
             return Err(format!(
-                "wave certificate {wave_id:?} already committed within its retention window"
+                "wave certificate {tick_id:?} already committed within its retention window"
             ));
         }
     }
@@ -475,7 +475,7 @@ pub fn validate_block_for_vote(
     local_shard: ShardId,
     block: &Block,
     qc_chain_tx_hashes: &HashSet<TxHash>,
-    qc_chain_cert_ids: &HashSet<WaveId>,
+    qc_chain_cert_ids: &HashSet<TickId>,
     qc_chain_provision_hashes: &HashSet<ProvisionHash>,
     dedup_index: &CommitDedupIndex,
     coasting: bool,
@@ -1296,7 +1296,7 @@ mod tests {
     #[test]
     fn validate_no_duplicate_certificates_rejects_qc_chain_dup() {
         let fw = finalized_wave_at(1);
-        let dup_id = fw.wave_id().clone();
+        let dup_id = *fw.tick_id();
         let block = block_with_certificates(BlockHeight::new(6), vec![fw]);
         let qc_chain: HashSet<_> = std::iter::once(dup_id).collect();
         let dedup_index = CommitDedupIndex::new();

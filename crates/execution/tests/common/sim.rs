@@ -43,8 +43,8 @@ use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, EventRoot,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FinalizedWave, GlobalReceipt,
     LocalKey, MerkleInclusionProof, Movement, SettledWrites, ShardId, ShardTrie, SignerBitfield,
-    StateRoot, StateWrites, StoredReceipt, SubstateKey, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
+    StateRoot, StateWrites, StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate,
     WeightedTimestamp, compute_global_receipt_root, read_amount,
 };
 
@@ -191,10 +191,10 @@ pub struct ExecutionSim {
     outputs: Vec<(BlockHeight, TickOutput)>,
     /// The receipts each wave's tick produced, so a test can settle a wave
     /// with what it actually executed rather than with a stand-in.
-    receipts: BTreeMap<WaveId, Vec<StoredReceipt>>,
+    receipts: BTreeMap<TickId, Vec<StoredReceipt>>,
     /// The charges each wave's tick held in reserve beside those
     /// receipts — what settles instead of them when the wave refuses.
-    charges: BTreeMap<WaveId, Vec<StoredReceipt>>,
+    charges: BTreeMap<TickId, Vec<StoredReceipt>>,
     /// The settled state every tick reads through, so the harness models
     /// the whole path: a committed certificate's receipts land here in
     /// commit order, exactly as `merge_writes_from_receipts` lands them in
@@ -315,8 +315,8 @@ impl ExecutionSim {
                     });
                 }
                 Action::ResolveTickWaves { resolutions } => {
-                    for (wave_id, resolution) in &resolutions {
-                        self.chain.resolve(wave_id, resolution);
+                    for (tick_id, resolution) in &resolutions {
+                        self.chain.resolve(tick_id, resolution);
                     }
                 }
                 Action::ClearTickChain => self.chain.clear(),
@@ -352,7 +352,7 @@ impl ExecutionSim {
                         self.local_shard,
                         request.tx_hash,
                         &request.transaction,
-                        !group.wave_id.is_zero(),
+                        request.reaches_beyond,
                     )
                 })
                 .collect();
@@ -364,15 +364,15 @@ impl ExecutionSim {
                 attested_work,
             } = split_execution_outputs(executed);
             self.receipts
-                .entry(group.wave_id.clone())
+                .entry(group.tick_id)
                 .or_default()
                 .extend(results.iter().cloned());
             self.charges
-                .entry(group.wave_id.clone())
+                .entry(group.tick_id)
                 .or_default()
                 .extend(fee_receipts.iter().cloned());
             waves.push(WaveExecutionResult {
-                wave_id: group.wave_id.clone(),
+                tick_id: group.tick_id,
                 results,
                 tx_outcomes: outcomes,
                 fee_receipts,
@@ -412,27 +412,27 @@ impl ExecutionSim {
     /// pre-vote gate's question. No ancestor blocks here: the harness
     /// models one block at a time.
     #[must_use]
-    pub fn settles_out_of_order(&self, certificates: &[WaveId]) -> Option<WaveId> {
+    pub fn settles_out_of_order(&self, certificates: &[TickId]) -> Option<TickId> {
         self.coord
             .certificates_settle_out_of_order(certificates, &HashSet::new())
     }
 
-    /// The receipts `wave_id`'s tick produced.
+    /// The receipts `tick_id`'s tick produced.
     #[must_use]
-    pub fn receipts_for(&self, wave_id: &WaveId) -> Vec<StoredReceipt> {
-        self.receipts.get(wave_id).cloned().unwrap_or_default()
+    pub fn receipts_for(&self, tick_id: &TickId) -> Vec<StoredReceipt> {
+        self.receipts.get(tick_id).cloned().unwrap_or_default()
     }
 
-    /// The charges `wave_id`'s tick held in reserve.
+    /// The charges `tick_id`'s tick held in reserve.
     #[must_use]
-    pub fn charges_for(&self, wave_id: &WaveId) -> Vec<StoredReceipt> {
-        self.charges.get(wave_id).cloned().unwrap_or_default()
+    pub fn charges_for(&self, tick_id: &TickId) -> Vec<StoredReceipt> {
+        self.charges.get(tick_id).cloned().unwrap_or_default()
     }
 
     /// The wave a transaction was assigned to, if the coordinator still
     /// tracks it.
     #[must_use]
-    pub fn wave_of(&self, tx_hash: TxHash) -> Option<WaveId> {
+    pub fn wave_of(&self, tx_hash: TxHash) -> Option<TickId> {
         self.coord.get_wave_assignment(tx_hash)
     }
 }
@@ -590,12 +590,12 @@ fn stub_charge(owner: [u8; 16]) -> ConsensusReceipt {
     }
 }
 
-/// A committed `FinalizedWave` settling `wave_id`, accepting every member.
+/// A committed `FinalizedWave` settling `tick_id`, accepting every member.
 ///
 /// The harness places these in blocks of its own choosing, which is how a
 /// test states a settlement order rather than observing one.
 #[must_use]
-pub fn settle(wave_id: &WaveId, receipts: &[StoredReceipt]) -> FinalizedWave {
+pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> FinalizedWave {
     let outcomes: Vec<TxOutcome> = receipts
         .iter()
         .map(|receipt| {
@@ -608,14 +608,14 @@ pub fn settle(wave_id: &WaveId, receipts: &[StoredReceipt]) -> FinalizedWave {
         })
         .collect();
     let ec = ExecutionCertificate::new(
-        wave_id.clone(),
-        WeightedTimestamp::from_millis(wave_id.block_height().inner() * BLOCK_INTERVAL_MS),
+        *tick_id,
+        WeightedTimestamp::from_millis(tick_id.block_height().inner() * BLOCK_INTERVAL_MS),
         compute_global_receipt_root(&outcomes),
         outcomes,
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
-    let certificate = WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)]);
+    let certificate = WaveCertificate::new(*tick_id, vec![Arc::new(ec)]);
     FinalizedWave::new(Arc::new(certificate), receipts.to_vec())
 }
 
@@ -628,7 +628,7 @@ pub fn settle(wave_id: &WaveId, receipts: &[StoredReceipt]) -> FinalizedWave {
 /// combine exists to reconcile.
 #[must_use]
 pub fn settle_refused_by_counterpart(
-    wave_id: &WaveId,
+    tick_id: &TickId,
     counterpart: ShardId,
     receipts: &[StoredReceipt],
     charges: &[StoredReceipt],
@@ -652,8 +652,8 @@ pub fn settle_refused_by_counterpart(
         })
         .collect();
     let local = ExecutionCertificate::new(
-        wave_id.clone(),
-        WeightedTimestamp::from_millis(wave_id.block_height().inner() * BLOCK_INTERVAL_MS),
+        *tick_id,
+        WeightedTimestamp::from_millis(tick_id.block_height().inner() * BLOCK_INTERVAL_MS),
         compute_global_receipt_root(&outcomes),
         outcomes,
         AggregateSignature::new([0u8; 96]),
@@ -663,20 +663,15 @@ pub fn settle_refused_by_counterpart(
         .iter()
         .map(|receipt| TxOutcome::new(receipt.tx_hash, ExecutionOutcome::Failed))
         .collect();
-    let remote_id = WaveId::new(
-        counterpart,
-        wave_id.block_height(),
-        std::iter::once(wave_id.shard_id()).collect(),
-    );
+    let remote_id = TickId::new(counterpart, tick_id.block_height());
     let remote = ExecutionCertificate::new(
         remote_id,
-        WeightedTimestamp::from_millis(wave_id.block_height().inner() * BLOCK_INTERVAL_MS),
+        WeightedTimestamp::from_millis(tick_id.block_height().inner() * BLOCK_INTERVAL_MS),
         compute_global_receipt_root(&refused),
         refused,
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
-    let certificate =
-        WaveCertificate::new(wave_id.clone(), vec![Arc::new(local), Arc::new(remote)]);
+    let certificate = WaveCertificate::new(*tick_id, vec![Arc::new(local), Arc::new(remote)]);
     FinalizedWave::new(Arc::new(certificate), charges.to_vec())
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use blake3::Hasher;
 use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
 
-use crate::{ExecutionCertificate, Hash, Verifiable, Verified, WaveId, WaveReceiptHash};
+use crate::{ExecutionCertificate, Hash, TickId, Verifiable, Verified, WaveReceiptHash};
 
 /// Cap on execution certificates accepted in a single `WaveCertificate` at
 /// decode time.
@@ -22,23 +22,23 @@ pub const MAX_EXECUTION_CERTIFICATES_PER_WAVE: usize = 1024;
 /// Hash a wave certificate's execution-certificate identities into its
 /// [`WaveReceiptHash`] — the leaf a block's `certificate_root` commits.
 ///
-/// Each EC contributes its `(shard_id, wave_id)` pair; the shard is the
-/// wave's own (`WaveId::shard_id`), so a verifier holding only the
+/// Each EC contributes its `(shard_id, tick_id)` pair; the shard is the
+/// wave's own (`TickId::shard_id`), so a verifier holding only the
 /// certificate's EC wave-ids reproduces the hash without the EC bodies.
 /// Order matters and is the certificate's stored order (sorted by
-/// `(shard_id, wave_id)` at construction); callers reproducing the hash
+/// `(shard_id, tick_id)` at construction); callers reproducing the hash
 /// feed the same order.
 ///
 /// # Panics
 ///
-/// Panics if HBOR encoding of a `ShardId` or `WaveId` fails — closed
+/// Panics if HBOR encoding of a `ShardId` or `TickId` fails — closed
 /// wire types, infallible in practice.
 #[must_use]
-pub fn wave_receipt_hash<'a>(ec_wave_ids: impl IntoIterator<Item = &'a WaveId>) -> WaveReceiptHash {
+pub fn wave_receipt_hash<'a>(ec_tick_ids: impl IntoIterator<Item = &'a TickId>) -> WaveReceiptHash {
     let mut hasher = Hasher::new();
-    for wave_id in ec_wave_ids {
-        hasher.update(&hbor_to_vec(&wave_id.shard_id()).unwrap());
-        hasher.update(&hbor_to_vec(wave_id).unwrap());
+    for tick_id in ec_tick_ids {
+        hasher.update(&hbor_to_vec(&tick_id.shard_id()).unwrap());
+        hasher.update(&hbor_to_vec(tick_id).unwrap());
     }
     WaveReceiptHash::from_raw(Hash::from_hash_bytes(hasher.finalize().as_bytes()))
 }
@@ -52,7 +52,7 @@ pub fn wave_receipt_hash<'a>(ec_wave_ids: impl IntoIterator<Item = &'a WaveId>) 
 /// # Invariant (well-formed WC)
 ///
 /// A well-formed `WaveCertificate` contains **exactly one local EC** — the
-/// EC where `ec.wave_id() == wc.wave_id`. The local EC is the authoritative
+/// EC where `ec.tick_id() == wc.tick_id`. The local EC is the authoritative
 /// source for the wave's tx set and canonical (block) ordering. Remote ECs
 /// attest against their own wave decompositions and may cover only subsets;
 /// the local shard, by construction, produces a single EC per wave.
@@ -64,7 +64,7 @@ pub fn wave_receipt_hash<'a>(ec_wave_ids: impl IntoIterator<Item = &'a WaveId>) 
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 #[hbor(validate = check_wave_certificate)]
 pub struct WaveCertificate {
-    wave_id: WaveId,
+    tick_id: TickId,
     #[hbor(max = MAX_EXECUTION_CERTIFICATES_PER_WAVE)]
     execution_certificates: Vec<Arc<Verifiable<ExecutionCertificate>>>,
 }
@@ -77,7 +77,7 @@ fn check_wave_certificate(wc: &WaveCertificate) -> Result<(), &'static str> {
     let local = wc
         .execution_certificates
         .iter()
-        .filter(|ec| ec.wave_id() == &wc.wave_id)
+        .filter(|ec| ec.tick_id() == &wc.tick_id)
         .count();
     if local == 1 {
         Ok(())
@@ -102,9 +102,9 @@ impl WaveCertificate {
     ///
     /// Panics if `execution_certificates.len() > MAX_EXECUTION_CERTIFICATES_PER_WAVE`.
     #[must_use]
-    pub fn new(wave_id: WaveId, execution_certificates: Vec<Arc<ExecutionCertificate>>) -> Self {
+    pub fn new(tick_id: TickId, execution_certificates: Vec<Arc<ExecutionCertificate>>) -> Self {
         Self {
-            wave_id,
+            tick_id,
             execution_certificates: execution_certificates
                 .into_iter()
                 .map(|ec| Arc::new(Verifiable::from(Arc::unwrap_or_clone(ec))))
@@ -132,11 +132,11 @@ impl WaveCertificate {
     /// Panics if `execution_certificates.len() > MAX_EXECUTION_CERTIFICATES_PER_WAVE`.
     #[must_use]
     pub fn from_verified_ecs(
-        wave_id: WaveId,
+        tick_id: TickId,
         execution_certificates: Vec<Verified<ExecutionCertificate>>,
     ) -> Self {
         Self {
-            wave_id,
+            tick_id,
             execution_certificates: execution_certificates
                 .into_iter()
                 .map(|ec| Arc::new(Verifiable::from(ec)))
@@ -145,10 +145,10 @@ impl WaveCertificate {
     }
 
     /// Self-contained wave identifier (shard + height + remote dependencies).
-    /// Globally unique. `hash(wave_id)` = identity key for manifest/storage.
+    /// Globally unique. `hash(tick_id)` = identity key for manifest/storage.
     #[must_use]
-    pub const fn wave_id(&self) -> &WaveId {
-        &self.wave_id
+    pub const fn tick_id(&self) -> &TickId {
+        &self.tick_id
     }
 
     /// Execution certificates from all participating shards.
@@ -156,7 +156,7 @@ impl WaveCertificate {
     /// May contain multiple ECs from the same remote shard — this happens when
     /// a remote shard committed this wave's transactions across multiple blocks,
     /// producing separate ECs.
-    /// Sorted by (`shard_id`, `wave_id`) for deterministic `receipt_hash`.
+    /// Sorted by (`shard_id`, `tick_id`) for deterministic `receipt_hash`.
     ///
     /// Each EC rides as `Verifiable<ExecutionCertificate>`: wire-decoded
     /// certificates land [`Verifiable::Unverified`]; locally assembled
@@ -169,24 +169,24 @@ impl WaveCertificate {
 
     /// Compute the receipt hash for this wave certificate.
     ///
-    /// Hashes sorted (`shard_id`, `wave_id`) pairs. The vec is
+    /// Hashes sorted (`shard_id`, `tick_id`) pairs. The vec is
     /// pre-sorted at construction time for deterministic ordering. At most
-    /// one valid EC exists per `wave_id` (signature verification upstream
-    /// enforces this), so committing to `wave_id` is content-equivalent.
+    /// one valid EC exists per `tick_id` (signature verification upstream
+    /// enforces this), so committing to `tick_id` is content-equivalent.
     #[must_use]
     pub fn receipt_hash(&self) -> WaveReceiptHash {
-        wave_receipt_hash(self.execution_certificates.iter().map(|ec| ec.wave_id()))
+        wave_receipt_hash(self.execution_certificates.iter().map(|ec| ec.tick_id()))
     }
 
     /// The wave-ids of every execution certificate this certificate
     /// carries, in stored (`receipt_hash`) order. The minimal reveal a
     /// remote verifier needs to reproduce [`Self::receipt_hash`] — the
-    /// shard of each is derivable as `WaveId::shard_id`.
+    /// shard of each is derivable as `TickId::shard_id`.
     #[must_use]
-    pub fn ec_wave_ids(&self) -> Vec<WaveId> {
+    pub fn ec_tick_ids(&self) -> Vec<TickId> {
         self.execution_certificates
             .iter()
-            .map(|ec| ec.wave_id().clone())
+            .map(|ec| *ec.tick_id())
             .collect()
     }
 }

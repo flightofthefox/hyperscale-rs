@@ -758,7 +758,7 @@ mod partition_tests {
     #[test]
     fn partition_works_for_non_copy_id_via_clone() {
         // Sanity-check that the generic helper accepts a Clone (non-Copy)
-        // id type; WaveId is the production motivator here.
+        // id type; TickId is the production motivator here.
         #[derive(Clone, Eq, Hash, PartialEq, Debug)]
         struct CompoundId(String);
         struct Item(CompoundId);

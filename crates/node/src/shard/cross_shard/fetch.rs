@@ -18,8 +18,8 @@ use hyperscale_types::network::request::{
     GetProvisionsRequest,
 };
 use hyperscale_types::{
-    BlockHeight, ExecutionCertificate, FinalizedWave, MessageClass, ProvisionHash, ShardId, TxHash,
-    ValidatorId, Verifiable, WaveId,
+    BlockHeight, ExecutionCertificate, FinalizedWave, MessageClass, ProvisionHash, ShardId, TickId,
+    TxHash, ValidatorId, Verifiable,
 };
 
 use crate::fetch::{Fetch, FetchBinding, partition_solicited};
@@ -28,9 +28,9 @@ use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, pu
 // ─── Type aliases ──────────────────────────────────────────────────────
 /// Local-provision fetch keyed by [`ProvisionHash`].
 pub type LocalProvisionFetch = Fetch<ProvisionHash>;
-/// Finalized-wave fetch keyed by [`WaveId`].
-pub type FinalizedWaveFetch = Fetch<WaveId>;
-/// Cross-shard execution-cert fetch keyed by [`WaveId`].
+/// Finalized-wave fetch keyed by [`TickId`].
+pub type FinalizedWaveFetch = Fetch<TickId>;
+/// Cross-shard execution-cert fetch keyed by [`TickId`].
 pub type ExecCertFetch = Fetch<(ShardId, TxHash)>;
 /// Cross-shard provision fetch keyed by
 /// `(source_shard, target_shard, block_height)`. `source_shard` selects
@@ -129,16 +129,16 @@ impl FetchBinding for LocalProvisionBinding {
 pub struct FinalizedWaveBinding;
 
 impl FetchBinding for FinalizedWaveBinding {
-    type Id = WaveId;
+    type Id = TickId;
 
     const NAME: &'static str = "finalized_wave";
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<WaveId> {
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<TickId> {
         &mut shard.cross_shard.finalized_wave
     }
 
     fn dispatch_chunk<N: Network>(
-        ids: Vec<WaveId>,
+        ids: Vec<TickId>,
         local_shard: ShardId,
         shard: ShardId,
         preferred: Option<ValidatorId>,
@@ -155,8 +155,7 @@ impl FetchBinding for FinalizedWaveBinding {
             class,
             Box::new(move |result| {
                 if let Ok(resp) = result {
-                    let split =
-                        partition_solicited(resp.waves, &requested_ids, |w| [w.wave_id().clone()]);
+                    let split = partition_solicited(resp.waves, &requested_ids, |w| [*w.tick_id()]);
                     if !split.kept.is_empty() {
                         // Refcount is 1 right after decode, so each unwrap moves.
                         let waves: Vec<Arc<Verifiable<FinalizedWave>>> = split

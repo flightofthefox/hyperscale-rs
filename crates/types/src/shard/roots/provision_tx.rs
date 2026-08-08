@@ -25,7 +25,7 @@ pub struct ProvisionTxRootsContext<'a> {
 }
 
 /// Provision-tx roots map type as carried by [`BlockHeader`](crate::BlockHeader),
-/// which caps it at [`MAX_REMOTE_SHARDS_PER_WAVE`] entries on the wire.
+/// which caps it at [`MAX_PROVISION_TARGET_SHARDS`] entries on the wire.
 pub type ProvisionTxRootsMap = BTreeMap<ShardId, ProvisionTxRoot>;
 
 /// Failure modes of provision-tx-roots verification.

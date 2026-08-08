@@ -14,8 +14,8 @@ use thiserror::Error;
 use crate::{
     ConsensusPublicKey, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificateVerifyError, ExecutionOutcome, GlobalReceiptHash, MAX_TXS_PER_BLOCK,
-    NetworkDefinition, StoredReceipt, TransactionDecision, TxHash, TxOutcome, Verifiable, Verified,
-    Verify, WaveCertificate, WaveId,
+    NetworkDefinition, StoredReceipt, TickId, TransactionDecision, TxHash, TxOutcome, Verifiable,
+    Verified, Verify, WaveCertificate,
 };
 
 /// A finalized wave — all participating shards have reported, `WaveCertificate` created.
@@ -28,7 +28,7 @@ use crate::{
 ///
 /// The wave's canonical tx list, ordering, and per-tx decisions are all **derived**
 /// from the `WaveCertificate`, not stored alongside it. See:
-/// - [`FinalizedWave::local_ec`] — the authoritative EC (where `ec.wave_id() == wc.wave_id`)
+/// - [`FinalizedWave::local_ec`] — the authoritative EC (where `ec.tick_id() == wc.tick_id`)
 /// - [`FinalizedWave::tx_hashes`] — iterator over the wave's tx hashes in block order
 /// - [`FinalizedWave::tx_decisions`] — aggregated (Aborted > Reject > Accept) per tx
 ///
@@ -103,7 +103,7 @@ pub fn settles(outcome: &TxOutcome, refused: &BTreeSet<TxHash>) -> Settles {
 /// Reason a `FinalizedWave`'s receipts don't agree with its own EC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptValidationError {
-    /// The `WaveCertificate` has no EC whose `wave_id == wc.wave_id`.
+    /// The `WaveCertificate` has no EC whose `tick_id == wc.tick_id`.
     /// Every committed WC carries exactly one such "local" EC per the
     /// `create_wave_certificate` invariant; this indicates a malformed
     /// or tampered certificate.
@@ -166,8 +166,8 @@ impl FinalizedWave {
 
     /// Get the wave ID from the certificate.
     #[must_use]
-    pub fn wave_id(&self) -> &WaveId {
-        self.certificate.wave_id()
+    pub fn tick_id(&self) -> &TickId {
+        self.certificate.tick_id()
     }
 
     /// Get the execution certificates (from the wave certificate).
@@ -178,7 +178,7 @@ impl FinalizedWave {
 
     /// The local shard's EC — authoritative for wave membership and ordering.
     ///
-    /// A well-formed `WaveCertificate` has exactly one EC with `ec.wave_id() == wc.wave_id`
+    /// A well-formed `WaveCertificate` has exactly one EC with `ec.tick_id() == wc.tick_id`
     /// (invariant established by `WaveCertificateTracker::create_wave_certificate`
     /// and the endorsement + convergence gate).
     ///
@@ -191,7 +191,7 @@ impl FinalizedWave {
         self.certificate
             .execution_certificates()
             .iter()
-            .find(|ec| ec.wave_id() == self.certificate.wave_id())
+            .find(|ec| ec.tick_id() == self.certificate.tick_id())
             .expect("WaveCertificate invariant: local EC must be present")
     }
 
@@ -278,7 +278,7 @@ impl FinalizedWave {
         let local_ec = certificate
             .execution_certificates()
             .iter()
-            .find(|ec| ec.wave_id() == certificate.wave_id())?;
+            .find(|ec| ec.tick_id() == certificate.tick_id())?;
 
         let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
         for outcome in local_ec.tx_outcomes() {
@@ -326,7 +326,7 @@ impl FinalizedWave {
             .certificate
             .execution_certificates()
             .iter()
-            .find(|ec| ec.wave_id() == self.certificate.wave_id())
+            .find(|ec| ec.tick_id() == self.certificate.tick_id())
             .ok_or(ReceiptValidationError::MissingLocalEc)?;
 
         let refused = refused_transactions(&self.certificate);
@@ -633,19 +633,15 @@ mod tests {
         )
     }
 
-    fn wave_id(shard: u64, height: u64, remote: &[u64]) -> WaveId {
-        WaveId::new(
-            ShardId::leaf(3, shard),
-            BlockHeight::new(height),
-            remote.iter().map(|&s| ShardId::leaf(3, s)).collect(),
-        )
+    fn tick_id(shard: u64, height: u64, _remote: &[u64]) -> TickId {
+        TickId::new(ShardId::leaf(3, shard), BlockHeight::new(height))
     }
 
-    /// Build a verified EC for `wave_id` by aggregating real signed votes
+    /// Build a verified EC for `tick_id` by aggregating real signed votes
     /// from `signers`. Output verifies against `signers.public_key()`s.
     fn make_verified_ec(
         net: &NetworkDefinition,
-        wave_id: &WaveId,
+        tick_id: &TickId,
         outcomes: &[TxOutcome],
         signers: &[BlsSigner],
     ) -> Verified<ExecutionCertificate> {
@@ -660,10 +656,10 @@ mod tests {
                 Verified::<ExecutionVote>::sign_local(
                     net,
                     BlockHash::from_raw(Hash::from_bytes(b"block")),
-                    wave_id.block_height(),
-                    WeightedTimestamp::from_millis(wave_id.block_height().inner() + 1),
-                    wave_id.clone(),
-                    wave_id.shard_id(),
+                    tick_id.block_height(),
+                    WeightedTimestamp::from_millis(tick_id.block_height().inner() + 1),
+                    *tick_id,
+                    tick_id.shard_id(),
                     outcomes.to_vec(),
                     ValidatorId::new(u64::try_from(i).unwrap()),
                     sk,
@@ -671,7 +667,7 @@ mod tests {
                 .expect("sign")
             })
             .collect();
-        Verified::<ExecutionCertificate>::aggregate(&BlsVerifier, wave_id, root, &votes, &committee)
+        Verified::<ExecutionCertificate>::aggregate(&BlsVerifier, tick_id, root, &votes, &committee)
     }
 
     /// Honest path: every EC verifies under its committee PKs.
@@ -679,8 +675,8 @@ mod tests {
     fn verify_accepts_finalized_wave_with_valid_ecs() {
         let net = NetworkDefinition::simulator();
 
-        let local_wid = wave_id(0, 7, &[1]);
-        let remote_wid = wave_id(1, 7, &[0]);
+        let local_wid = tick_id(0, 7, &[1]);
+        let remote_wid = tick_id(1, 7, &[0]);
 
         let shard0_signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
         let shard1_signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
@@ -717,8 +713,8 @@ mod tests {
     #[test]
     fn verify_rejects_finalized_wave_with_one_bad_ec() {
         let net = NetworkDefinition::simulator();
-        let local_wid = wave_id(0, 7, &[1]);
-        let remote_wid = wave_id(1, 7, &[0]);
+        let local_wid = tick_id(0, 7, &[1]);
+        let remote_wid = tick_id(1, 7, &[0]);
 
         let shard0_signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
         let shard1_signers: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
@@ -736,7 +732,7 @@ mod tests {
 
         // Tamper the second EC's aggregated signature.
         let tampered_remote = ExecutionCertificate::new(
-            remote_ec.wave_id().clone(),
+            *remote_ec.tick_id(),
             remote_ec.vote_anchor_ts(),
             remote_ec.global_receipt_root(),
             remote_ec.tx_outcomes().clone(),
@@ -772,7 +768,7 @@ mod tests {
     #[test]
     fn from_committed_block_wraps_input_without_modification() {
         let net = NetworkDefinition::simulator();
-        let local_wid = wave_id(0, 7, &[]);
+        let local_wid = tick_id(0, 7, &[]);
         let sks: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
         let outcomes = vec![make_outcome(1)];
         let ec = make_verified_ec(&net, &local_wid, &outcomes, &sks).into_inner();
@@ -788,7 +784,7 @@ mod tests {
     #[test]
     fn verify_rejects_mismatched_public_key_vector_length() {
         let net = NetworkDefinition::simulator();
-        let local_wid = wave_id(0, 7, &[]);
+        let local_wid = tick_id(0, 7, &[]);
         let sks: Vec<BlsSigner> = (0..2).map(|_| BlsSigner::generate()).collect();
 
         let outcomes = vec![make_outcome(1)];

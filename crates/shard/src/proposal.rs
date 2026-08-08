@@ -21,7 +21,7 @@ use hyperscale_core::{Action, FeeDemand};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, FinalizedWave, Hash, LocalTimestamp,
     ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
-    ShardId, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified, WaveId,
+    ShardId, TickId, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified,
     WeightedTimestamp,
 };
 use tracing::debug;
@@ -217,7 +217,7 @@ pub fn select_transactions(
 /// leave a wave ahead of a predecessor it should follow.
 pub fn select_finalized_waves(
     finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
-    qc_chain_cert_ids: &HashSet<WaveId>,
+    qc_chain_cert_ids: &HashSet<TickId>,
     dedup_index: &CommitDedupIndex,
     max_finalized_txs: usize,
 ) -> (Vec<Arc<Verifiable<FinalizedWave>>>, usize) {
@@ -225,7 +225,7 @@ pub fn select_finalized_waves(
     let waves_to_propose: Vec<_> = finalized_waves
         .into_iter()
         .filter(|fw| {
-            !qc_chain_cert_ids.contains(fw.wave_id()) && !dedup_index.contains_cert(fw.wave_id())
+            !qc_chain_cert_ids.contains(fw.tick_id()) && !dedup_index.contains_cert(fw.tick_id())
         })
         .take_while(|fw| {
             let new_total = finalized_tx_count.saturating_add(fw.tx_count());

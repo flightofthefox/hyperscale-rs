@@ -100,11 +100,7 @@ fn with_a_crossing(schedule: Schedule) -> (Vec<(BlockHeight, TickOutput)>, u64) 
     let leg_hash = leg.hash();
     sim.commit(vec![leg], Vec::new());
     sim.drain();
-    let wave = sim.wave_of(leg_hash).expect("the crossing has a wave");
-    assert!(
-        !wave.is_zero(),
-        "the crossing must compose a cross-shard wave, or nothing is provisional"
-    );
+    let wave = sim.wave_of(leg_hash).expect("the crossing has a tick");
     assert_eq!(
         counter(sim.read(cell_of(test_prefix(LOCAL)))),
         0,

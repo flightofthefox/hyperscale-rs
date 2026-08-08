@@ -3,7 +3,7 @@
 //! A committed [`CertifiedBlock`] is sharded across four column families:
 //! [`BlocksCf`] holds per-height [`BlockMetadata`] (header + manifest + qc),
 //! [`TransactionsCf`] holds individual transactions keyed by [`TxHash`],
-//! [`CertificatesCf`] holds wave certificates keyed by [`WaveId`], and
+//! [`CertificatesCf`] holds wave certificates keyed by [`TickId`], and
 //! [`ConsensusReceiptsCf`] holds the consensus receipt for each block.
 //!
 //! Reading a block reconstructs it via `get_block_denormalized`, which
@@ -20,8 +20,8 @@ use std::time::Instant;
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, BlockMetadata, CertifiedBlock,
-    FinalizedWave, Hash, ProvisionHash, QuorumCertificate, Transaction, TxHash, Verifiable,
-    Verified, WaveCertificate, WaveId,
+    FinalizedWave, Hash, ProvisionHash, QuorumCertificate, TickId, Transaction, TxHash, Verifiable,
+    Verified, WaveCertificate,
 };
 use rocksdb::{ColumnFamily, WriteBatch};
 
@@ -151,7 +151,7 @@ impl RocksDbShardStorage {
             batch_put::<CertificatesCf>(
                 batch,
                 certificates_cf,
-                fw.wave_id(),
+                fw.tick_id(),
                 fw.certificate().as_ref(),
             );
         }
@@ -476,7 +476,7 @@ impl RocksDbShardStorage {
             .collect()
     }
 
-    /// Get multiple certificates by `WaveId`, preserving order.
+    /// Get multiple certificates by `TickId`, preserving order.
     ///
     /// Unlike `get_certificates_batch`, this returns results in the same order
     /// as the input ids, with missing entries causing the result to be shorter.
@@ -484,7 +484,7 @@ impl RocksDbShardStorage {
     fn get_certificates_batch_ordered(
         &self,
         certificates_cf: &ColumnFamily,
-        ids: &[WaveId],
+        ids: &[TickId],
     ) -> Vec<Arc<WaveCertificate>> {
         if ids.is_empty() {
             return vec![];
@@ -556,20 +556,20 @@ impl RocksDbShardStorage {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Store a wave certificate.
-    pub fn put_certificate(&self, id: &WaveId, cert: &WaveCertificate) {
+    pub fn put_certificate(&self, id: &TickId, cert: &WaveCertificate) {
         self.cf_put_sync::<CertificatesCf>(id, cert);
     }
 
-    /// Get a wave certificate by `WaveId`.
-    pub fn get_certificate(&self, id: &WaveId) -> Option<WaveCertificate> {
+    /// Get a wave certificate by `TickId`.
+    pub fn get_certificate(&self, id: &TickId) -> Option<WaveCertificate> {
         self.cf_get::<CertificatesCf>(id)
     }
 
-    /// Get multiple certificates by `WaveId` (batch read).
+    /// Get multiple certificates by `TickId` (batch read).
     ///
     /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
     /// Returns only certificates that were found (missing ids are skipped).
-    pub fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
+    pub fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<WaveCertificate> {
         if ids.is_empty() {
             return vec![];
         }
@@ -648,7 +648,7 @@ mod test_helpers {
         /// # Panics
         /// Panics if the synced commit fails.
         #[instrument(level = Level::DEBUG, skip_all, fields(
-            wave_id = ?certificate.wave_id(),
+            tick_id = ?certificate.tick_id(),
             latency_us = Empty,
             otel.kind = "INTERNAL",
         ))]
@@ -661,7 +661,7 @@ mod test_helpers {
             let mut batch = WriteBatch::default();
             let mut write_count = 0usize;
 
-            self.cf_put::<CertificatesCf>(&mut batch, certificate.wave_id(), certificate);
+            self.cf_put::<CertificatesCf>(&mut batch, certificate.tick_id(), certificate);
             write_count += 1;
 
             // Append substate writes to the cert batch at the current JMT
@@ -682,7 +682,7 @@ mod test_helpers {
                 .expect("commit_certificate_with_writes: synced commit failed");
 
             tracing::debug!(
-                wave_id = ?certificate.wave_id(),
+                tick_id = ?certificate.tick_id(),
                 write_count,
                 "Certificate state writes committed (JMT deferred to block commit)"
             );

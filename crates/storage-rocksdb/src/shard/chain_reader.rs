@@ -6,8 +6,8 @@ use std::sync::Arc;
 use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-    ConsensusReceipt, ExecutionCertificate, Hash, QuorumCertificate, ShardWitnessPayload,
-    Transaction, TxHash, Verified, WaveCertificate, WaveId,
+    ConsensusReceipt, ExecutionCertificate, Hash, QuorumCertificate, ShardWitnessPayload, TickId,
+    Transaction, TxHash, Verified, WaveCertificate,
 };
 
 use super::column_families::{BeaconWitnessesCf, ExecutionCertsCf, TxCertIndexCf};
@@ -55,7 +55,7 @@ impl ShardChainReader for RocksDbShardStorage {
             .collect()
     }
 
-    fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
+    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<WaveCertificate> {
         Self::get_certificates_batch(self, ids)
     }
 
@@ -65,21 +65,21 @@ impl ShardChainReader for RocksDbShardStorage {
 
     fn get_execution_certificate(
         &self,
-        wave_id: &WaveId,
+        tick_id: &TickId,
     ) -> Option<Verified<ExecutionCertificate>> {
         let cfs = self.cf();
         let certs_cf = ExecutionCertsCf::handle(&cfs);
-        get::<ExecutionCertsCf>(&*self.db, certs_cf, wave_id)
+        get::<ExecutionCertsCf>(&*self.db, certs_cf, tick_id)
             .map(Verified::<ExecutionCertificate>::from_persisted)
     }
 
     fn get_execution_certificates_batch(
         &self,
-        wave_ids: &[WaveId],
+        tick_ids: &[TickId],
     ) -> Vec<Verified<ExecutionCertificate>> {
         let cfs = self.cf();
         let certs_cf = ExecutionCertsCf::handle(&cfs);
-        wave_ids
+        tick_ids
             .iter()
             .filter_map(|wid| get::<ExecutionCertsCf>(&*self.db, certs_cf, wid))
             .map(Verified::<ExecutionCertificate>::from_persisted)
@@ -93,12 +93,12 @@ impl ShardChainReader for RocksDbShardStorage {
         let cfs = self.cf();
         let index_cf = TxCertIndexCf::handle(&cfs);
         let certs_cf = ExecutionCertsCf::handle(&cfs);
-        let mut seen: HashSet<WaveId> = HashSet::new();
+        let mut seen: HashSet<TickId> = HashSet::new();
         tx_hashes
             .iter()
             .filter_map(|tx| get::<TxCertIndexCf>(&*self.db, index_cf, &Hash::from(*tx)))
-            .filter(|wave_id| seen.insert(wave_id.clone()))
-            .filter_map(|wave_id| get::<ExecutionCertsCf>(&*self.db, certs_cf, &wave_id))
+            .filter(|tick_id| seen.insert(*tick_id))
+            .filter_map(|tick_id| get::<ExecutionCertsCf>(&*self.db, certs_cf, &tick_id))
             .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()
     }

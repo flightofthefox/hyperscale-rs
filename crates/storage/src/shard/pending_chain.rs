@@ -13,8 +13,8 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
     MerkleInclusionProof, PreparedCommit, QuorumCertificate, RETENTION_HORIZON, SettledTxsRoot,
-    ShardId, ShardWitnessPayload, StateRoot, StateWrites, SubstateKey, Transaction, TxHash,
-    Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, local_settled_tx_hashes,
+    ShardId, ShardWitnessPayload, StateRoot, StateWrites, SubstateKey, TickId, Transaction, TxHash,
+    Verifiable, Verified, WaveCertificate, WeightedTimestamp, local_settled_tx_hashes,
     settled_txs_root_from_hashes,
 };
 
@@ -507,7 +507,7 @@ where
     /// Batched wave-certificate read by id. Pass-through to base storage —
     /// pending entries don't carry `WaveCertificate`s, only the receipts
     /// that contribute to them.
-    pub fn certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
+    pub fn certificates_batch(&self, ids: &[TickId]) -> Vec<WaveCertificate> {
         self.base.get_certificates_batch(ids)
     }
 
@@ -516,11 +516,11 @@ where
         self.base.get_consensus_receipt(tx_hash)
     }
 
-    /// Batched execution-certificate read by `WaveId`. Pass-through to
+    /// Batched execution-certificate read by `TickId`. Pass-through to
     /// base storage.
     pub fn execution_certificates_batch(
         &self,
-        ids: &[WaveId],
+        ids: &[TickId],
     ) -> Vec<Verified<ExecutionCertificate>> {
         self.base.get_execution_certificates_batch(ids)
     }
@@ -985,8 +985,8 @@ mod tests {
     use hyperscale_types::{
         Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, LocalKey, Round, SignerBitfield, StateWrites, Transaction, TxHash,
-        TxOutcome, WaveCertificate, WaveId, WitnessSources,
+        GlobalReceiptRoot, Hash, LocalKey, Round, SignerBitfield, StateWrites, TickId, Transaction,
+        TxHash, TxOutcome, WaveCertificate, WitnessSources,
     };
 
     use super::*;
@@ -1121,7 +1121,7 @@ mod tests {
         fn get_transactions_batch(&self, _hashes: &[TxHash]) -> Vec<Verified<Transaction>> {
             Vec::new()
         }
-        fn get_certificates_batch(&self, _ids: &[WaveId]) -> Vec<WaveCertificate> {
+        fn get_certificates_batch(&self, _ids: &[TickId]) -> Vec<WaveCertificate> {
             Vec::new()
         }
         fn get_consensus_receipt(&self, _tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
@@ -1129,13 +1129,13 @@ mod tests {
         }
         fn get_execution_certificate(
             &self,
-            _wave_id: &WaveId,
+            _wave_id: &TickId,
         ) -> Option<Verified<ExecutionCertificate>> {
             None
         }
         fn get_execution_certificates_batch(
             &self,
-            _wave_ids: &[WaveId],
+            _wave_ids: &[TickId],
         ) -> Vec<Verified<ExecutionCertificate>> {
             Vec::new()
         }
@@ -1598,23 +1598,37 @@ mod tests {
     /// A cross-shard wave keyed on `ShardId::ROOT` — the only kind whose
     /// transactions land in the settled set, since `local_settled_tx_hashes`
     /// drops single-shard (`is_zero`) waves.
-    fn wave(n: u64) -> WaveId {
-        WaveId::new(
-            ShardId::ROOT,
-            BlockHeight::new(n),
-            BTreeSet::from([ShardId::from_heap_index(2)]),
-        )
+    fn wave(n: u64) -> TickId {
+        TickId::new(ShardId::ROOT, BlockHeight::new(n))
     }
 
     /// The transaction a given wave settles. Distinct per wave, so a set
     /// built from several waves has one entry each.
-    fn settled_tx(wave: &WaveId) -> TxHash {
+    fn settled_tx(wave: &TickId) -> TxHash {
         TxHash::from(Hash::from_bytes(&wave.block_height().inner().to_le_bytes()))
     }
 
-    fn ec_for(wave: &WaveId) -> Arc<ExecutionCertificate> {
+    /// A counterpart shard's certificate for the same transaction — the
+    /// evidence that makes it reach beyond the settling shard.
+    fn remote_ec_for(wave: &TickId) -> Arc<ExecutionCertificate> {
         Arc::new(ExecutionCertificate::new(
-            wave.clone(),
+            TickId::new(ShardId::from_heap_index(2), wave.block_height()),
+            WeightedTimestamp::from_millis(1),
+            GlobalReceiptRoot::ZERO,
+            vec![TxOutcome::new(
+                settled_tx(wave),
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )],
+            AggregateSignature::new([0u8; 96]),
+            SignerBitfield::new(4),
+        ))
+    }
+
+    fn ec_for(wave: &TickId) -> Arc<ExecutionCertificate> {
+        Arc::new(ExecutionCertificate::new(
+            *wave,
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome::new(
@@ -1630,7 +1644,7 @@ mod tests {
 
     /// A `BlockForSync` at `height` whose QC carries `wt_ms` and whose
     /// single finalized wave settles `settles` (a local-shard wave).
-    fn settled_sync_block(height: BlockHeight, wt_ms: u64, settles: &WaveId) -> BlockForSync {
+    fn settled_sync_block(height: BlockHeight, wt_ms: u64, settles: &TickId) -> BlockForSync {
         // The block's own `parent_qc` carries `wt_ms` — the canonical clock the
         // floor reads.
         let Block::Live {
@@ -1644,7 +1658,13 @@ mod tests {
         };
         let certs = vec![Arc::new(
             FinalizedWave::new(
-                Arc::new(WaveCertificate::new(settles.clone(), vec![ec_for(settles)])),
+                Arc::new(WaveCertificate::new(
+                    *settles,
+                    // A counterpart's certificate for the same transaction:
+                    // what makes it cross-shard, and so what puts it in the
+                    // settled set.
+                    vec![ec_for(settles), remote_ec_for(settles)],
+                )),
                 vec![],
             )
             .into(),

@@ -480,8 +480,14 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
         "the successor must admit what its predecessor refused — no shard's \
          in-flight state outlives the shard; status = {status:?}",
     );
+    // A terminal status is reported when this shard decides the outcome,
+    // which is before the finalization carrying its writes commits — so
+    // the spend has to be waited for rather than read at the instant the
+    // status flips. Waiting on any movement keeps the amount unasserted
+    // until the check below.
     assert!(
-        vault_balance(c, successor, *payer) < TERMINATING_PAYER_FUNDING,
+        c.run_until(epochs(8), |c| vault_balance(c, successor, *payer)
+            < TERMINATING_PAYER_FUNDING),
         "the released transaction must actually have spent from the payer's vault",
     );
 }

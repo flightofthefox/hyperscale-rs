@@ -6,7 +6,7 @@ use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetFinalizedWavesRequest;
 use hyperscale_types::network::response::GetFinalizedWavesResponse;
-use hyperscale_types::{FinalizedWave, Verifiable, WaveId};
+use hyperscale_types::{FinalizedWave, TickId, Verifiable};
 use quick_cache::sync::Cache as QuickCache;
 
 /// Serve an inbound finalized-wave fetch request.
@@ -23,16 +23,16 @@ use quick_cache::sync::Cache as QuickCache;
 /// verification marker is process-local and doesn't cross the network.
 pub fn serve_finalized_waves_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
-    fw_cache: &QuickCache<WaveId, Arc<Verifiable<FinalizedWave>>>,
+    fw_cache: &QuickCache<TickId, Arc<Verifiable<FinalizedWave>>>,
     req: &GetFinalizedWavesRequest,
 ) -> GetFinalizedWavesResponse {
     let mut waves: Vec<Arc<FinalizedWave>> = Vec::new();
-    let mut missing: Vec<WaveId> = Vec::new();
-    for id in &req.wave_ids {
+    let mut missing: Vec<TickId> = Vec::new();
+    for id in &req.tick_ids {
         if let Some(fw) = fw_cache.get(id) {
             waves.push(Arc::new(fw.as_unverified().clone()));
         } else {
-            missing.push(id.clone());
+            missing.push(*id);
         }
     }
 

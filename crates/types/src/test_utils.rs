@@ -1,6 +1,5 @@
 //! Test utilities.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_crypto::{Signer, Verifier};
@@ -15,10 +14,10 @@ use crate::{
     EnvelopeExt, ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
     GlobalReceiptRoot, Hash, LocalReceiptRoot, NetworkDefinition, NetworkId, ProposerTimestamp,
     ProvisionsRoot, QuorumCertificate, RevealChain, Round, Routing, ShardForkProof, ShardId,
-    ShardLoad, SignerBitfield, StateRoot, TimestampRange, TopologySnapshot, Transaction,
+    ShardLoad, SignerBitfield, StateRoot, TickId, TimestampRange, TopologySnapshot, Transaction,
     TransactionBody, TransactionDecision, TransactionEnvelope, TransactionRoot, TxHash, TxOutcome,
     ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, VmStatics, VmStaticsError,
-    WaveCertificate, WaveId, WeightedTimestamp, WitnessSources, WorkInFlight, declared_work,
+    WaveCertificate, WeightedTimestamp, WitnessSources, WorkInFlight, declared_work,
     install_vm_statics, signed_bytes, vm_statics_installed,
 };
 
@@ -848,9 +847,9 @@ pub fn make_finalized_wave(
         TransactionDecision::Reject => ExecutionOutcome::Failed,
         TransactionDecision::Aborted => ExecutionOutcome::Aborted,
     };
-    let wave_id = WaveId::new(ShardId::ROOT, block_height, BTreeSet::new());
+    let tick_id = TickId::new(ShardId::ROOT, block_height);
     let ec = ExecutionCertificate::new(
-        wave_id.clone(),
+        tick_id,
         WeightedTimestamp::from_millis(block_height.inner() + 1),
         GlobalReceiptRoot::ZERO,
         vec![TxOutcome::new(tx_hash, outcome)],
@@ -858,7 +857,7 @@ pub fn make_finalized_wave(
         SignerBitfield::new(4),
     );
     FinalizedWave::new(
-        Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
+        Arc::new(WaveCertificate::new(tick_id, vec![Arc::new(ec)])),
         vec![],
     )
 }

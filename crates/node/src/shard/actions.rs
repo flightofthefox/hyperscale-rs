@@ -114,8 +114,8 @@ where
             // Applied synchronously on the shard thread so a dispatch
             // action later in the same batch reads the resolved chain.
             Action::ResolveTickWaves { resolutions } => {
-                for (wave_id, resolution) in &resolutions {
-                    self.io.tick_chain.resolve(wave_id, resolution);
+                for (tick_id, resolution) in &resolutions {
+                    self.io.tick_chain.resolve(tick_id, resolution);
                 }
             }
             Action::ClearTickChain => {
@@ -284,7 +284,7 @@ where
                 self.io
                     .caches
                     .finalized_wave
-                    .insert(wave.wave_id().clone(), Arc::clone(wave));
+                    .insert(*wave.tick_id(), Arc::clone(wave));
             }
         }
 

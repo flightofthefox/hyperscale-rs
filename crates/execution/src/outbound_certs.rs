@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    ExecutionCertificate, ShardId, ValidatorId, Verified, WaveId, WeightedTimestamp,
+    ExecutionCertificate, ShardId, TickId, ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, warn};
 
@@ -72,9 +72,9 @@ pub struct RebroadcastDirective {
 /// Sub-state machine that retains and periodically re-broadcasts ECs
 /// destined for remote shards until they ACK by finalizing the wave.
 pub struct OutboundExecutionCertificateTracker {
-    /// (`wave_id`, `target_shard`) → entry. One EC may be tracked once per
+    /// (`tick_id`, `target_shard`) → entry. One EC may be tracked once per
     /// remote target shard it was sent to.
-    entries: HashMap<(WaveId, ShardId), OutboundCertEntry>,
+    entries: HashMap<(TickId, ShardId), OutboundCertEntry>,
     now: WeightedTimestamp,
 }
 
@@ -110,12 +110,12 @@ impl OutboundExecutionCertificateTracker {
         if recipients.is_empty() {
             return;
         }
-        let key = (certificate.wave_id().clone(), target_shard);
+        let key = (*certificate.tick_id(), target_shard);
         if self.entries.contains_key(&key) {
             return;
         }
         debug!(
-            wave = %certificate.wave_id(),
+            wave = %certificate.tick_id(),
             target_shard = target_shard.inner(),
             recipients = recipients.len(),
             "Tracking outbound execution certificate"
@@ -140,13 +140,13 @@ impl OutboundExecutionCertificateTracker {
     /// observed the same wave structure we did and almost certainly
     /// received our EC contribution (or are about to). This is the
     /// best positive signal available without an explicit ACK message.
-    pub fn on_wave_finalized(&mut self, wave_id: &WaveId) {
+    pub fn on_wave_finalized(&mut self, tick_id: &TickId) {
         // A wave can have multiple target_shard entries — drop them all.
         let stale: Vec<_> = self
             .entries
             .keys()
-            .filter(|(w, _)| w == wave_id)
-            .cloned()
+            .filter(|(w, _)| w == tick_id)
+            .copied()
             .collect();
         for key in stale {
             if let Some(entry) = self.entries.remove(&key) {
@@ -172,7 +172,7 @@ impl OutboundExecutionCertificateTracker {
 
         for (key, entry) in &mut self.entries {
             if now > entry.deadline {
-                to_evict.push(key.clone());
+                to_evict.push(*key);
                 continue;
             }
             let since_last = now.elapsed_since(entry.last_sent_at);
@@ -216,21 +216,13 @@ mod tests {
         WeightedTimestamp::from_millis(ms)
     }
 
-    fn wave(local: u64, h: u64, remote: &[u64]) -> WaveId {
-        WaveId::new(
-            ShardId::leaf(2, local),
-            BlockHeight::new(h),
-            remote
-                .iter()
-                .copied()
-                .map(|s| ShardId::leaf(2, s))
-                .collect(),
-        )
+    fn wave(local: u64, h: u64, _remote: &[u64]) -> TickId {
+        TickId::new(ShardId::leaf(2, local), BlockHeight::new(h))
     }
 
-    fn cert(wave_id: WaveId) -> Arc<Verified<ExecutionCertificate>> {
+    fn cert(tick_id: TickId) -> Arc<Verified<ExecutionCertificate>> {
         Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
-            wave_id,
+            tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::from_raw(Hash::ZERO),
             Vec::new(),
@@ -265,7 +257,7 @@ mod tests {
     fn on_broadcast_is_idempotent_per_target() {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w = wave(0, 100, &[1]);
-        t.on_broadcast(cert(w.clone()), ShardId::leaf(2, 1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
         t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4, 5]));
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }
@@ -329,8 +321,8 @@ mod tests {
     fn wave_finalization_evicts_all_targets() {
         let mut t = OutboundExecutionCertificateTracker::new();
         let w = wave(0, 100, &[1, 2]);
-        t.on_broadcast(cert(w.clone()), ShardId::leaf(2, 1), vids(&[4]));
-        t.on_broadcast(cert(w.clone()), ShardId::leaf(2, 2), vids(&[8]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 1), vids(&[4]));
+        t.on_broadcast(cert(w), ShardId::leaf(2, 2), vids(&[8]));
         assert_eq!(t.memory_stats().tracked_certificates, 2);
 
         t.on_wave_finalized(&w);

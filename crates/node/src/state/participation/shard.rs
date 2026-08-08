@@ -413,14 +413,14 @@ impl ShardParticipation {
         let (ancestor_certified, ..) = self
             .shard_coordinator
             .collect_qc_chain_hashes(header.parent_block_hash());
-        if let Some(wave_id) = self
+        if let Some(tick_id) = self
             .execution_coordinator
             .certificates_settle_out_of_order(manifest.cert_ids(), &ancestor_certified)
         {
             tracing::warn!(
                 block_hash = ?header.hash(),
                 height = header.height().inner(),
-                wave = %wave_id,
+                wave = %tick_id,
                 "Rejecting block: a wave certificate settles ahead of one it shares a cell with"
             );
             return vec![];

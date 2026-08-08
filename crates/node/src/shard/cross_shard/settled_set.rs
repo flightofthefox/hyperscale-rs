@@ -239,8 +239,8 @@ mod tests {
         BlockHash, BlockHeader, CertificateRoot, ExecutionCertificate, ExecutionOutcome,
         FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
-        ShardLoad, SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
-        Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources,
+        ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot, TxHash, TxOutcome,
+        ValidatorId, Verifiable, Verified, WaveCertificate, WeightedTimestamp, WitnessSources,
         WorkInFlight, settled_txs_root_from_hashes,
     };
 
@@ -258,7 +258,22 @@ mod tests {
     fn finalized_wave(height: u64) -> Arc<Verifiable<FinalizedWave>> {
         let wave = local_wave(height);
         let ec = ExecutionCertificate::new(
-            wave.clone(),
+            wave,
+            WeightedTimestamp::from_millis(1),
+            GlobalReceiptRoot::ZERO,
+            vec![TxOutcome::new(
+                settled_tx(height),
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )],
+            AggregateSignature::new([0u8; 96]),
+            SignerBitfield::new(4),
+        );
+        // A counterpart's certificate for the same transaction: what makes
+        // it reach beyond this shard, and so what puts it in the settled set.
+        let remote = ExecutionCertificate::new(
+            TickId::new(ShardId::from_heap_index(2), BlockHeight::new(height)),
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome::new(
@@ -271,7 +286,10 @@ mod tests {
             SignerBitfield::new(4),
         );
         Arc::new(Verifiable::from(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(wave, vec![Arc::new(ec)])),
+            Arc::new(WaveCertificate::new(
+                wave,
+                vec![Arc::new(ec), Arc::new(remote)],
+            )),
             vec![],
         )))
     }
@@ -342,12 +360,8 @@ mod tests {
     /// A cross-shard wave (non-empty `remote_shards`): the settled set
     /// commits only cross-shard txs, so a single-shard fixture would be
     /// filtered out before the merkle root.
-    fn local_wave(height: u64) -> WaveId {
-        WaveId::new(
-            SHARD,
-            BlockHeight::new(height),
-            BTreeSet::from([ShardId::from_heap_index(2)]),
-        )
+    fn local_wave(height: u64) -> TickId {
+        TickId::new(SHARD, BlockHeight::new(height))
     }
 
     /// One verified fetch against a served chain completes with the whole

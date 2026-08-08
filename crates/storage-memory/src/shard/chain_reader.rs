@@ -8,7 +8,7 @@ use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockManifest, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, QuorumCertificate,
-    ShardWitnessPayload, Transaction, TxHash, Verified, WaveCertificate, WaveId,
+    ShardWitnessPayload, TickId, Transaction, TxHash, Verified, WaveCertificate,
 };
 
 use super::core::SimShardStorage;
@@ -74,7 +74,7 @@ impl ShardChainReader for SimShardStorage {
             .collect()
     }
 
-    fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate> {
+    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<WaveCertificate> {
         let c = read_or_recover(&self.consensus);
         ids.iter()
             .filter_map(|id| c.certificates.get(id).cloned())
@@ -90,21 +90,21 @@ impl ShardChainReader for SimShardStorage {
 
     fn get_execution_certificate(
         &self,
-        wave_id: &WaveId,
+        tick_id: &TickId,
     ) -> Option<Verified<ExecutionCertificate>> {
         read_or_recover(&self.consensus)
             .execution_certs
-            .get(wave_id)
+            .get(tick_id)
             .cloned()
             .map(Verified::<ExecutionCertificate>::from_persisted)
     }
 
     fn get_execution_certificates_batch(
         &self,
-        wave_ids: &[WaveId],
+        tick_ids: &[TickId],
     ) -> Vec<Verified<ExecutionCertificate>> {
         let c = read_or_recover(&self.consensus);
-        wave_ids
+        tick_ids
             .iter()
             .filter_map(|wid| c.execution_certs.get(wid).cloned())
             .map(Verified::<ExecutionCertificate>::from_persisted)
@@ -116,12 +116,12 @@ impl ShardChainReader for SimShardStorage {
         tx_hashes: &[TxHash],
     ) -> Vec<Verified<ExecutionCertificate>> {
         let c = read_or_recover(&self.consensus);
-        let mut seen: HashSet<&WaveId> = HashSet::new();
+        let mut seen: HashSet<&TickId> = HashSet::new();
         tx_hashes
             .iter()
             .filter_map(|tx| c.tx_cert_index.get(tx))
-            .filter(|wave_id| seen.insert(wave_id))
-            .filter_map(|wave_id| c.execution_certs.get(wave_id).cloned())
+            .filter(|tick_id| seen.insert(tick_id))
+            .filter_map(|tick_id| c.execution_certs.get(tick_id).cloned())
             .map(Verified::<ExecutionCertificate>::from_persisted)
             .collect()
     }

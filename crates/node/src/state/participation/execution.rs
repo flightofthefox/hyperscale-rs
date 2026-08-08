@@ -4,7 +4,7 @@
 //! verified) and the engine results path (`ExecutionBatchCompleted`).
 //!
 //! Cross-shard EC admission has a quirk: if an admitted EC names the local
-//! shard among `wave_id.remote_shards`, that EC's `tx_outcomes` ack the
+//! shard among `tick_id.remote_shards`, that EC's `tx_outcomes` ack the
 //! outbound batches we sent — the admission arm captures that ACK and emits
 //! a follow-up `OutboundEcObserved` to feed the outbound provision tracker.
 
@@ -43,21 +43,21 @@ impl ShardParticipation {
                 .execution_coordinator
                 .on_unverified_execution_vote(topology_schedule, vote),
             ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
-                wave_id,
+                tick_id,
                 block_hash,
                 verified_votes,
             } => self.execution_coordinator.on_votes_verified(
                 topology_schedule,
-                wave_id,
+                tick_id,
                 block_hash,
                 verified_votes,
             ),
             ProtocolEvent::ExecutionCertificateAggregated {
-                wave_id,
+                tick_id,
                 certificate,
             } => self.execution_coordinator.on_certificate_aggregated(
                 topology_schedule,
-                &wave_id,
+                &tick_id,
                 &certificate,
             ),
             ProtocolEvent::ExecutionCertificatesReceived { certificates } => {
@@ -92,9 +92,11 @@ impl ShardParticipation {
                 // If the EC is for a remote wave where we were a source, the
                 // target shard's tx_outcomes acknowledge outbound batches we
                 // sent. Surface the ACK to the outbound tracker.
-                if certificate.shard_id() != local_shard
-                    && certificate.wave_id().remote_shards().contains(&local_shard)
-                {
+                // A remote batch acknowledging outbound work of ours: its
+                // outcomes name transactions, and the tracker keys on
+                // those, so an outcome for nothing we sent is a no-op
+                // rather than something to filter on identity here.
+                if certificate.shard_id() != local_shard && !certificate.tx_outcomes().is_empty() {
                     actions.push(Action::Continuation(ProtocolEvent::OutboundEcObserved {
                         target_shard: certificate.shard_id(),
                         tx_outcomes: certificate.tx_outcomes().clone(),
@@ -114,13 +116,13 @@ impl ShardParticipation {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+
     use std::sync::Arc;
 
     use hyperscale_core::{Action, ProtocolEvent, StateMachine};
     use hyperscale_types::{
         AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptRoot,
-        LocalTimestamp, ShardId, SignerBitfield, TxHash, TxOutcome, Verified, WaveId,
+        LocalTimestamp, ShardId, SignerBitfield, TickId, TxHash, TxOutcome, Verified,
         WeightedTimestamp,
     };
 
@@ -129,13 +131,12 @@ mod tests {
 
     fn make_ec(
         shard: ShardId,
-        remote_shards: BTreeSet<ShardId>,
         height: BlockHeight,
         outcomes: Vec<TxOutcome>,
     ) -> Arc<Verified<ExecutionCertificate>> {
-        let wave_id = WaveId::new(shard, height, remote_shards);
+        let tick_id = TickId::new(shard, height);
         Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
-            wave_id,
+            tick_id,
             WeightedTimestamp::from_millis(0),
             GlobalReceiptRoot::ZERO,
             outcomes,
@@ -144,21 +145,17 @@ mod tests {
         )))
     }
 
-    /// `ExecutionCertificateAdmitted` for a remote-shard EC where the
-    /// wave's `remote_shards` includes local must surface an
-    /// `OutboundEcObserved` continuation carrying the EC's `tx_outcomes`
-    /// — that's how the outbound provision tracker learns its batches
-    /// were ack'd.
+    /// `ExecutionCertificateAdmitted` for a remote-shard certificate must
+    /// surface an `OutboundEcObserved` continuation carrying its
+    /// `tx_outcomes` — that's how the outbound provision tracker learns
+    /// its batches were ack'd.
     #[test]
     fn execution_certificate_admitted_emits_outbound_ec_continuation_when_we_were_a_source() {
         // Local home shard is the root; the EC names a distinct leaf shard.
         let TestNode { mut node, .. } = TestNode::builder().build();
 
-        let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardId::ROOT);
         let ec = make_ec(
             ShardId::leaf(1, 1),
-            remote_shards,
             BlockHeight::new(1),
             vec![TxOutcome::new(TxHash::ZERO, ExecutionOutcome::Failed)],
         );
@@ -191,7 +188,7 @@ mod tests {
     fn execution_certificate_admitted_skips_continuation_for_same_shard_ec() {
         let TestNode { mut node, .. } = TestNode::new();
 
-        let ec = make_ec(ShardId::ROOT, BTreeSet::new(), BlockHeight::new(1), vec![]);
+        let ec = make_ec(ShardId::ROOT, BlockHeight::new(1), vec![]);
 
         let actions = node.handle(
             LocalTimestamp::ZERO,
@@ -204,23 +201,16 @@ mod tests {
         );
     }
 
-    /// Cross-shard EC where the wave's `remote_shards` does NOT include
-    /// local: we were not a source for this wave, so no outbound ack to
-    /// surface.
+    /// A certificate attesting nothing carries no acknowledgement, so
+    /// there is nothing to surface. Which of its outcomes we were a source
+    /// for is the outbound tracker's question — it keys on the
+    /// transaction and ignores one it never sent — rather than one this
+    /// seam can answer from the certificate's identity.
     #[test]
-    fn execution_certificate_admitted_skips_continuation_when_local_not_a_source() {
+    fn execution_certificate_admitted_surfaces_nothing_for_an_empty_certificate() {
         let TestNode { mut node, .. } = TestNode::builder().build();
 
-        // EC on one leaf, dependencies on its sibling; the local root shard
-        // is not in the set.
-        let mut remote_shards = BTreeSet::new();
-        remote_shards.insert(ShardId::leaf(1, 1));
-        let ec = make_ec(
-            ShardId::leaf(1, 0),
-            remote_shards,
-            BlockHeight::new(1),
-            vec![],
-        );
+        let ec = make_ec(ShardId::leaf(1, 0), BlockHeight::new(1), vec![]);
 
         let actions = node.handle(
             LocalTimestamp::ZERO,

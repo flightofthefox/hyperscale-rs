@@ -26,7 +26,7 @@ use hyperscale_hbor::Hbor;
 use crate::{
     Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock, FinalizedWave,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    Provisions, QuorumCertificate, Transaction, TxHash, Verifiable, WaveId, WitnessSources,
+    Provisions, QuorumCertificate, TickId, Transaction, TxHash, Verifiable, WitnessSources,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -91,7 +91,7 @@ pub struct ElidedCertifiedBlock {
     #[hbor(max = MAX_TXS_PER_BLOCK)]
     transactions: Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)>,
     #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-    certificates: Vec<(WaveId, Option<Arc<Verifiable<FinalizedWave>>>)>,
+    certificates: Vec<(TickId, Option<Arc<Verifiable<FinalizedWave>>>)>,
     provisions: ElidedProvisions,
     /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
@@ -152,7 +152,7 @@ impl ElidedCertifiedBlock {
 
     /// Per-certificate `(wave id, optional body)` pairs; body is `None` when elided.
     #[must_use]
-    pub const fn certificates(&self) -> &Vec<(WaveId, Option<Arc<Verifiable<FinalizedWave>>>)> {
+    pub const fn certificates(&self) -> &Vec<(TickId, Option<Arc<Verifiable<FinalizedWave>>>)> {
         &self.certificates
     }
 
@@ -199,7 +199,7 @@ impl ElidedCertifiedBlock {
             .certificates()
             .iter()
             .map(|fw| {
-                let id = fw.wave_id().clone();
+                let id = *fw.tick_id();
                 let body = if wave_is_held(inventory.cert_have.as_ref(), fw) {
                     None
                 } else {
@@ -262,7 +262,7 @@ impl ElidedCertifiedBlock {
     ) -> Result<CertifiedBlock, RehydrateError>
     where
         FTx: FnMut(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        FCert: FnMut(&WaveId) -> Option<Arc<Verifiable<FinalizedWave>>>,
+        FCert: FnMut(&TickId) -> Option<Arc<Verifiable<FinalizedWave>>>,
         FProv: FnMut(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     {
         // Header + QC are always inline, so the pairing can be checked
@@ -296,7 +296,7 @@ impl ElidedCertifiedBlock {
                 certs.push(Some(resolved));
             } else {
                 certs.push(None);
-                miss.missing_cert.push(id.clone());
+                miss.missing_cert.push(*id);
             }
         }
 
@@ -364,7 +364,7 @@ pub struct RehydrationMiss {
     /// Transaction hashes whose bodies could not be resolved.
     pub missing_tx: Vec<TxHash>,
     /// Wave ids whose finalized-wave bodies could not be resolved.
-    pub missing_cert: Vec<WaveId>,
+    pub missing_cert: Vec<TickId>,
     /// Provision hashes whose bodies could not be resolved.
     pub missing_provision: Vec<ProvisionHash>,
 }
@@ -440,7 +440,7 @@ fn wave_is_held(filter: Option<&BloomFilter<TxHash>>, fw: &FinalizedWave) -> boo
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     use hyperscale_hbor::{
         DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
@@ -495,7 +495,7 @@ mod tests {
     /// Block carrying one two-transaction finalized wave and no
     /// transactions of its own.
     fn create_test_block_with_wave(tx_hashes: &[TxHash]) -> Block {
-        let wave_id = WaveId::new(ShardId::ROOT, BlockHeight::new(1), BTreeSet::new());
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
             .map(|h| {
@@ -508,14 +508,14 @@ mod tests {
             })
             .collect();
         let ec = ExecutionCertificate::new(
-            wave_id.clone(),
+            tick_id,
             WeightedTimestamp::ZERO,
             GlobalReceiptRoot::ZERO,
             outcomes,
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
-        let wc = WaveCertificate::new(wave_id, vec![Arc::new(ec)]);
+        let wc = WaveCertificate::new(tick_id, vec![Arc::new(ec)]);
         let fw = Verifiable::from(FinalizedWave::new(Arc::new(wc), Vec::new()));
 
         let Block::Live {
@@ -778,7 +778,7 @@ mod tests {
             &hbor_to_vec(&Vec::<(TxHash, Option<Arc<Transaction>>)>::new()).unwrap(),
         );
         buf.extend_from_slice(
-            &hbor_to_vec(&Vec::<(WaveId, Option<Arc<FinalizedWave>>)>::new()).unwrap(),
+            &hbor_to_vec(&Vec::<(TickId, Option<Arc<FinalizedWave>>)>::new()).unwrap(),
         );
         // ElidedProvisions::Live(oversized) — discriminant 0, then the claim.
         buf.push(0);

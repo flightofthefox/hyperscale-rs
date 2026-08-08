@@ -5,8 +5,8 @@
 
 use hyperscale_types::{
     BlockMetadata, ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionMetadata, Hash,
-    Round, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, Transaction, ValidatorId,
-    WaveCertificate, WaveId,
+    Round, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, TickId, Transaction, ValidatorId,
+    WaveCertificate,
 };
 use rocksdb::{ColumnFamily, DB};
 
@@ -81,11 +81,11 @@ pub const CONSENSUS_RECEIPTS_CF: &str = "consensus_receipts";
 /// error), keyed by tx hash. Absent when the tx was synced from a peer.
 pub const EXECUTION_METADATA_CF: &str = "execution_metadata";
 
-/// Column family for execution certificates keyed by [`WaveId`].
+/// Column family for execution certificates keyed by [`TickId`].
 pub const EXECUTION_CERTS_CF: &str = "execution_certs";
 
 /// Column family mapping a transaction to the certificate carrying its
-/// outcome, keyed by tx hash with a [`WaveId`] value.
+/// outcome, keyed by tx hash with a [`TickId`] value.
 ///
 /// A counterpart shard asks for outcomes by transaction — it learned of
 /// the transaction from our committed header and has no way to know which
@@ -258,9 +258,9 @@ impl TypedCf for TransactionsCf {
 pub struct CertificatesCf;
 impl TypedCf for CertificatesCf {
     const NAME: &'static str = CERTIFICATES_CF;
-    type Key = WaveId;
+    type Key = TickId;
     type Value = WaveCertificate;
-    type KeyCodec = HborCodec<WaveId>;
+    type KeyCodec = HborCodec<TickId>;
     type ValueCodec = HborCodec<WaveCertificate>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
@@ -433,9 +433,9 @@ impl TypedCf for ExecutionMetadataCf {
 pub struct ExecutionCertsCf;
 impl TypedCf for ExecutionCertsCf {
     const NAME: &'static str = EXECUTION_CERTS_CF;
-    type Key = WaveId;
+    type Key = TickId;
     type Value = ExecutionCertificate;
-    type KeyCodec = HborCodec<WaveId>;
+    type KeyCodec = HborCodec<TickId>;
     type ValueCodec = HborCodec<ExecutionCertificate>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
@@ -447,9 +447,9 @@ pub struct TxCertIndexCf;
 impl TypedCf for TxCertIndexCf {
     const NAME: &'static str = TX_CERT_INDEX_CF;
     type Key = Hash;
-    type Value = WaveId;
+    type Value = TickId;
     type KeyCodec = HashCodec;
-    type ValueCodec = HborCodec<WaveId>;
+    type ValueCodec = HborCodec<TickId>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.tx_cert_index

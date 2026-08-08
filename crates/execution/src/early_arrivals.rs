@@ -9,7 +9,7 @@
 //! block hasn't been committed locally yet — either because we're a few
 //! blocks behind, or because we're the rotated leader for a retry and the
 //! original leader's block reached us before ours did. These votes are
-//! buffered per-`WaveId` and replayed into the [`VoteTracker`] when a
+//! buffered per-`TickId` and replayed into the [`VoteTracker`] when a
 //! leader tracker is eventually created.
 //!
 //! ## ECs that arrive before the tx's wave assignment exists
@@ -17,10 +17,10 @@
 //! A cross-shard [`ExecutionCertificate`] covers `tx_hashes` from the remote
 //! shard's wave decomposition. Some of those txs may land in local blocks
 //! that haven't committed yet, so we can't route the EC immediately. The
-//! buffer holds the EC by its `wave_id` with a pending-tx set; as `tx_hashes`
+//! buffer holds the EC by its `tick_id` with a pending-tx set; as `tx_hashes`
 //! land locally, we drain the EC back into the routing pipeline.
 //!
-//! The EC buffer has a two-level invariant: `pending_routing[wave_id]`
+//! The EC buffer has a two-level invariant: `pending_routing[tick_id]`
 //! holds one bookkeeping entry per EC with the set of still-unrouted
 //! `tx_hashes`; `tx_index[tx_hash]` holds the reverse index from `tx_hash` to
 //! the ECs that mention it. Both sides must stay consistent — inserts
@@ -35,7 +35,7 @@
 //! - [`MAX_BUFFERED_EARLY_VOTES`]: a hard ceiling on total buffered votes.
 //!   Early votes are committee-gated at ingress but not signature-verified until a
 //!   vote tracker exists, so without a size bound a Byzantine committee
-//!   member could flood votes for fabricated `WaveId`s up to the time-based
+//!   member could flood votes for fabricated `TickId`s up to the time-based
 //!   sweep. Past the ceiling new early votes are dropped; the voter's own
 //!   vote-retry retransmits once the block commits, so a drop costs at most
 //!   one retry interval of latency.
@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    ExecutionCertificate, ExecutionVote, TxHash, Verifiable, Verified, WAVE_TIMEOUT, WaveId,
+    ExecutionCertificate, ExecutionVote, TickId, TxHash, Verifiable, Verified, WAVE_TIMEOUT,
     WeightedTimestamp,
 };
 
@@ -68,7 +68,7 @@ pub const EARLY_VOTE_RETENTION: Duration = WAVE_TIMEOUT;
 /// Early votes are committee-gated at ingress but their per-vote
 /// signatures aren't checked until a vote tracker spins up, so a Byzantine
 /// committee member could otherwise grow the buffer without bound by
-/// flooding votes for fabricated `WaveId`s until the [`EARLY_VOTE_RETENTION`]
+/// flooding votes for fabricated `TickId`s until the [`EARLY_VOTE_RETENTION`]
 /// sweep. The ceiling is a global vote count, not a per-wave or per-shard
 /// limit: legitimate buffering only spans a handful of in-flight waves at a
 /// time, so the sum stays far below this bound unless flooded. Past it, new
@@ -91,7 +91,7 @@ struct BufferedEc {
 
 pub struct EarlyArrivalBuffer {
     /// Execution votes that arrived before tracking started, keyed by wave.
-    votes: HashMap<WaveId, Vec<Verifiable<ExecutionVote>>>,
+    votes: HashMap<TickId, Vec<Verifiable<ExecutionVote>>>,
 
     /// Reverse index from `tx_hash` to any buffered ECs mentioning it.
     /// Multiple `tx_hash` entries may reference the same handle (one EC
@@ -100,10 +100,10 @@ pub struct EarlyArrivalBuffer {
 
     /// Per-EC bookkeeping. `tx_index` and `pending_routing` must stay
     /// consistent: an EC present in `tx_index[tx_hash]` for some `tx_hash`
-    /// MUST have a `BufferedEc` entry in `pending_routing[ec.wave_id()]` with
+    /// MUST have a `BufferedEc` entry in `pending_routing[ec.tick_id()]` with
     /// that `tx_hash` in its `pending_txs` set. Enforced by `buffer_ec`,
     /// `clear_routed`, `drain_ecs_for_txs`, and `gc_stale_ecs`.
-    pending_routing: HashMap<WaveId, BufferedEc>,
+    pending_routing: HashMap<TickId, BufferedEc>,
 
     /// Running total of votes across every `votes` entry, kept in step with
     /// `votes` so the [`MAX_BUFFERED_EARLY_VOTES`] cap is an O(1) check.
@@ -125,25 +125,25 @@ impl EarlyArrivalBuffer {
     /// Buffer a vote whose wave isn't yet tracked. Called from the
     /// non-leader ingress path. Returns `false` if the vote was dropped
     /// because the buffer is at [`MAX_BUFFERED_EARLY_VOTES`] capacity.
-    pub fn buffer_vote(&mut self, wave_id: WaveId, vote: Verifiable<ExecutionVote>) -> bool {
+    pub fn buffer_vote(&mut self, tick_id: TickId, vote: Verifiable<ExecutionVote>) -> bool {
         if self.buffered >= MAX_BUFFERED_EARLY_VOTES {
             tracing::debug!(
-                wave = %wave_id,
+                wave = %tick_id,
                 buffered = self.buffered,
                 "Early-vote buffer at capacity — dropping vote"
             );
             return false;
         }
-        self.votes.entry(wave_id).or_default().push(vote);
+        self.votes.entry(tick_id).or_default().push(vote);
         self.buffered += 1;
         true
     }
 
-    /// Remove and return all buffered votes for `wave_id`. Called when the
+    /// Remove and return all buffered votes for `tick_id`. Called when the
     /// coordinator creates a leader or fallback-leader `VoteTracker` and
     /// needs to replay the backlog.
-    pub fn drain_votes_for_wave(&mut self, wave_id: &WaveId) -> Vec<Verifiable<ExecutionVote>> {
-        let drained = self.votes.remove(wave_id).unwrap_or_default();
+    pub fn drain_votes_for_wave(&mut self, tick_id: &TickId) -> Vec<Verifiable<ExecutionVote>> {
+        let drained = self.votes.remove(tick_id).unwrap_or_default();
         self.buffered -= drained.len();
         drained
     }
@@ -153,11 +153,11 @@ impl EarlyArrivalBuffer {
     /// buffer just exposes the retention cutoff and the retain loop.
     pub fn retain_votes<F>(&mut self, mut predicate: F)
     where
-        F: FnMut(&WaveId, &[Verifiable<ExecutionVote>]) -> bool,
+        F: FnMut(&TickId, &[Verifiable<ExecutionVote>]) -> bool,
     {
         let buffered = &mut self.buffered;
-        self.votes.retain(|wave_id, votes| {
-            let keep = predicate(wave_id, votes);
+        self.votes.retain(|tick_id, votes| {
+            let keep = predicate(tick_id, votes);
             if !keep {
                 *buffered -= votes.len();
             }
@@ -169,7 +169,7 @@ impl EarlyArrivalBuffer {
 
     /// Buffer an EC under `tx_hashes` that don't yet have a local wave
     /// assignment. Idempotent: `tx_hashes` already tracked for this EC's
-    /// `wave_id` are skipped, so replaying a previously-buffered EC won't
+    /// `tick_id` are skipped, so replaying a previously-buffered EC won't
     /// create duplicate entries in the reverse index.
     pub fn buffer_ec(&mut self, ec: &Arc<Verified<ExecutionCertificate>>, tx_hashes: &[TxHash]) {
         if tx_hashes.is_empty() {
@@ -177,7 +177,7 @@ impl EarlyArrivalBuffer {
         }
         let entry = self
             .pending_routing
-            .entry(ec.wave_id().clone())
+            .entry(*ec.tick_id())
             .or_insert_with(|| BufferedEc {
                 ec: Arc::clone(ec),
                 pending_txs: HashSet::new(),
@@ -197,14 +197,14 @@ impl EarlyArrivalBuffer {
     /// The reverse index is NOT touched here — the EC's `tx_hashes` are
     /// drained explicitly by [`drain_ecs_for_txs`] when those txs commit.
     pub fn clear_routed(&mut self, ec: &Arc<Verified<ExecutionCertificate>>, tx_hashes: &[TxHash]) {
-        let Some(entry) = self.pending_routing.get_mut(ec.wave_id()) else {
+        let Some(entry) = self.pending_routing.get_mut(ec.tick_id()) else {
             return;
         };
         for tx_hash in tx_hashes {
             entry.pending_txs.remove(tx_hash);
         }
         if entry.pending_txs.is_empty() {
-            self.pending_routing.remove(ec.wave_id());
+            self.pending_routing.remove(ec.tick_id());
         }
     }
 
@@ -242,11 +242,11 @@ impl EarlyArrivalBuffer {
     /// `validity_range` and either terminated or aborted, so no local
     /// wave can still consume it. Returns the number of ECs evicted.
     pub fn gc_stale_ecs(&mut self, now_ts: WeightedTimestamp) -> usize {
-        let stale: Vec<WaveId> = self
+        let stale: Vec<TickId> = self
             .pending_routing
             .iter()
             .filter(|(_, entry)| entry.ec.deadline() <= now_ts)
-            .map(|(wid, _)| wid.clone())
+            .map(|(wid, _)| *wid)
             .collect();
         if stale.is_empty() {
             return 0;
@@ -291,7 +291,6 @@ impl EarlyArrivalBuffer {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
 
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
@@ -308,8 +307,8 @@ mod tests {
         ShardId::ROOT
     }
 
-    fn wave(height: u64) -> WaveId {
-        WaveId::new(shard(), BlockHeight::new(height), BTreeSet::new())
+    fn wave(height: u64) -> TickId {
+        TickId::new(shard(), BlockHeight::new(height))
     }
 
     fn ms(value: u64) -> WeightedTimestamp {
@@ -325,18 +324,18 @@ mod tests {
         )
     }
 
-    fn make_ec(wave_id: WaveId, tx_hashes: &[TxHash]) -> Arc<Verified<ExecutionCertificate>> {
-        make_ec_with_anchor(wave_id, tx_hashes, WeightedTimestamp::ZERO)
+    fn make_ec(tick_id: TickId, tx_hashes: &[TxHash]) -> Arc<Verified<ExecutionCertificate>> {
+        make_ec_with_anchor(tick_id, tx_hashes, WeightedTimestamp::ZERO)
     }
 
     fn make_ec_with_anchor(
-        wave_id: WaveId,
+        tick_id: TickId,
         tx_hashes: &[TxHash],
         vote_anchor_ts: WeightedTimestamp,
     ) -> Arc<Verified<ExecutionCertificate>> {
         let outcomes: Vec<TxOutcome> = tx_hashes.iter().map(|h| make_tx_outcome(*h)).collect();
         Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
-            wave_id,
+            tick_id,
             vote_anchor_ts,
             GlobalReceiptRoot::ZERO,
             outcomes,
@@ -345,14 +344,14 @@ mod tests {
         )))
     }
 
-    fn make_vote(wave_id: WaveId, anchor_ts: WeightedTimestamp) -> ExecutionVote {
+    fn make_vote(tick_id: TickId, anchor_ts: WeightedTimestamp) -> ExecutionVote {
         let tx_outcomes = vec![make_tx_outcome(TxHash::from(Hash::from_bytes(b"tx")))];
         let global_receipt_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let msg = signed_bytes(
             &ExecutionVoteMessage {
                 vote_anchor_ts: anchor_ts,
-                wave_id: wave_id.clone(),
-                shard_group: wave_id.shard_id(),
+                tick_id,
+                shard_group: tick_id.shard_id(),
                 global_receipt_root,
                 tx_count: u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
             },
@@ -364,7 +363,7 @@ mod tests {
             BlockHash::ZERO,
             BlockHeight::new(1),
             anchor_ts,
-            wave_id,
+            tick_id,
             shard(),
             global_receipt_root,
             u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
@@ -376,12 +375,12 @@ mod tests {
 
     /// A vote with a zero signature — cheap to build (no signing), for
     /// exercising the buffer's size cap at scale.
-    fn cheap_vote(wave_id: WaveId) -> Verifiable<ExecutionVote> {
+    fn cheap_vote(tick_id: TickId) -> Verifiable<ExecutionVote> {
         ExecutionVote::new(
             BlockHash::ZERO,
             BlockHeight::new(1),
             WeightedTimestamp::ZERO,
-            wave_id,
+            tick_id,
             shard(),
             GlobalReceiptRoot::ZERO,
             0,
@@ -398,8 +397,8 @@ mod tests {
     fn drain_votes_returns_buffered_and_leaves_buffer_empty() {
         let mut b = EarlyArrivalBuffer::new();
         let w = wave(1);
-        b.buffer_vote(w.clone(), make_vote(w.clone(), ms(100)).into());
-        b.buffer_vote(w.clone(), make_vote(w.clone(), ms(200)).into());
+        b.buffer_vote(w, make_vote(w, ms(100)).into());
+        b.buffer_vote(w, make_vote(w, ms(200)).into());
 
         let drained = b.drain_votes_for_wave(&w);
         assert_eq!(drained.len(), 2);
@@ -414,8 +413,8 @@ mod tests {
         let mut b = EarlyArrivalBuffer::new();
         let w1 = wave(1);
         let w2 = wave(2);
-        b.buffer_vote(w1.clone(), make_vote(w1.clone(), ms(100)).into());
-        b.buffer_vote(w2.clone(), make_vote(w2, ms(100)).into());
+        b.buffer_vote(w1, make_vote(w1, ms(100)).into());
+        b.buffer_vote(w2, make_vote(w2, ms(100)).into());
 
         let drained = b.drain_votes_for_wave(&w1);
         assert_eq!(drained.len(), 1);
@@ -427,10 +426,10 @@ mod tests {
         let mut b = EarlyArrivalBuffer::new();
         let w1 = wave(1);
         let w2 = wave(2);
-        b.buffer_vote(w1.clone(), make_vote(w1.clone(), ms(100)).into());
-        b.buffer_vote(w2.clone(), make_vote(w2.clone(), ms(100)).into());
+        b.buffer_vote(w1, make_vote(w1, ms(100)).into());
+        b.buffer_vote(w2, make_vote(w2, ms(100)).into());
 
-        b.retain_votes(|wave_id, _| wave_id == &w1);
+        b.retain_votes(|tick_id, _| tick_id == &w1);
 
         assert_eq!(b.vote_len(), 1);
         assert_eq!(b.drain_votes_for_wave(&w1).len(), 1);
@@ -442,10 +441,10 @@ mod tests {
         let mut b = EarlyArrivalBuffer::new();
         let w = wave(1);
         for _ in 0..MAX_BUFFERED_EARLY_VOTES {
-            assert!(b.buffer_vote(w.clone(), cheap_vote(w.clone())));
+            assert!(b.buffer_vote(w, cheap_vote(w)));
         }
         // At capacity, further votes are dropped — including for a wave the
-        // buffer has never seen, so a fabricated-`WaveId` flood can't grow it.
+        // buffer has never seen, so a fabricated-`TickId` flood can't grow it.
         assert!(!b.buffer_vote(w, cheap_vote(wave(1))));
         assert!(!b.buffer_vote(wave(2), cheap_vote(wave(2))));
         assert!(!b.votes.contains_key(&wave(2)));
@@ -456,7 +455,7 @@ mod tests {
         let mut b = EarlyArrivalBuffer::new();
         let w = wave(1);
         for _ in 0..MAX_BUFFERED_EARLY_VOTES {
-            b.buffer_vote(w.clone(), cheap_vote(w.clone()));
+            b.buffer_vote(w, cheap_vote(w));
         }
         assert!(!b.buffer_vote(wave(2), cheap_vote(wave(2))));
 
@@ -473,15 +472,15 @@ mod tests {
         let w2 = wave(2);
         let half = MAX_BUFFERED_EARLY_VOTES / 2;
         for _ in 0..half {
-            b.buffer_vote(w1.clone(), cheap_vote(w1.clone()));
+            b.buffer_vote(w1, cheap_vote(w1));
         }
         for _ in 0..(MAX_BUFFERED_EARLY_VOTES - half) {
-            b.buffer_vote(w2.clone(), cheap_vote(w2.clone()));
+            b.buffer_vote(w2, cheap_vote(w2));
         }
         assert!(!b.buffer_vote(wave(3), cheap_vote(wave(3))));
 
         // Dropping `w1` returns exactly its share of the budget.
-        b.retain_votes(|wave_id, _| wave_id != &w1);
+        b.retain_votes(|tick_id, _| tick_id != &w1);
         for _ in 0..half {
             assert!(b.buffer_vote(wave(3), cheap_vote(wave(3))));
         }
@@ -634,17 +633,17 @@ mod tests {
             for (i, h) in heights.iter().enumerate() {
                 let w = wave(*h);
                 let anchor = ms(anchors[i % anchors.len()]);
-                b.buffer_vote(w.clone(), make_vote(w, anchor).into());
+                b.buffer_vote(w, make_vote(w, anchor).into());
             }
 
             // Drain every wave once; collect counts. A second drain of each
             // must return zero.
-            let wave_ids: Vec<WaveId> = heights.iter().map(|h| wave(*h)).collect();
+            let tick_ids: Vec<TickId> = heights.iter().map(|h| wave(*h)).collect();
             let mut first_counts = Vec::new();
-            for w in &wave_ids {
+            for w in &tick_ids {
                 first_counts.push(b.drain_votes_for_wave(w).len());
             }
-            for w in &wave_ids {
+            for w in &tick_ids {
                 prop_assert!(b.drain_votes_for_wave(w).is_empty());
             }
             // Total drained = total buffered.
@@ -666,7 +665,7 @@ mod tests {
                 let w = wave(*h);
                 let tx = TxHash::from(Hash::from_bytes(&[u8::try_from(i).unwrap_or(u8::MAX); 32]));
                 let anchor = ms(anchor_ms[i % anchor_ms.len()]);
-                b.buffer_ec(&make_ec_with_anchor(w.clone(), &[tx], anchor), &[tx]);
+                b.buffer_ec(&make_ec_with_anchor(w, &[tx], anchor), &[tx]);
             }
             let before = b.pending_routing_len();
 

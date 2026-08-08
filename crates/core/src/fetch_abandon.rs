@@ -11,7 +11,7 @@
 //! `FetchInput::Abandoned` on the corresponding binding.
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, LeafIndex, ProvisionHash, ShardId, TxHash, ValidatorId, WaveId,
+    BlockHash, BlockHeight, Epoch, LeafIndex, ProvisionHash, ShardId, TickId, TxHash, ValidatorId,
 };
 
 /// Fetch-cancel family — one variant per payload type. Variants are added
@@ -46,14 +46,14 @@ pub enum FetchAbandon {
         /// Provision hashes whose in-flight fetch should be cancelled.
         hashes: Vec<ProvisionHash>,
     },
-    /// Per-block finalized-wave fetch keyed by [`WaveId`]. Emitted by the
+    /// Per-block finalized-wave fetch keyed by [`TickId`]. Emitted by the
     /// execution coordinator when a fetched wave fails terminal admission
     /// checks (no quorum power on a contained EC, committee keys not
     /// resolvable, signature invalid) so the FSM clears the in-flight
     /// slot it would otherwise pin on a wave that cannot be admitted.
     FinalizedWaves {
         /// Wave ids whose in-flight fetch should be cancelled.
-        ids: Vec<WaveId>,
+        ids: Vec<TickId>,
     },
     /// Cross-shard execution-certificate fetch keyed by
     /// `(source_shard, tx_hash)`. Emitted when an EC's admission path

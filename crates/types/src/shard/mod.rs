@@ -55,7 +55,7 @@ pub use witness_sources::{SharedWitnessSources, WitnessSources};
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+
     use std::sync::Arc;
 
     use hyperscale_hbor::{
@@ -69,8 +69,8 @@ mod tests {
         BlockHeight, CertificateRoot, ChainOrigin, ExecutionCertificate, ExecutionOutcome,
         FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
-        ShardLoad, SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
-        Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, WorkInFlight,
+        ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot, TxHash, TxOutcome,
+        ValidatorId, Verifiable, Verified, WaveCertificate, WeightedTimestamp, WorkInFlight,
     };
 
     #[test]
@@ -157,11 +157,7 @@ mod tests {
     fn test_compute_certificate_root_deterministic() {
         let make_fw = |seed: u8| -> Arc<Verifiable<FinalizedWave>> {
             let ec = Arc::new(ExecutionCertificate::new(
-                WaveId::new(
-                    ShardId::leaf(1, 0),
-                    BlockHeight::new(10),
-                    BTreeSet::from([ShardId::leaf(1, 1)]),
-                ),
+                TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
                 WeightedTimestamp::from_millis(11),
                 GlobalReceiptRoot::from_raw(Hash::from_bytes(&[seed + 100; 4])),
                 vec![TxOutcome::new(
@@ -178,11 +174,7 @@ mod tests {
             Arc::new(
                 FinalizedWave::new(
                     Arc::new(WaveCertificate::new(
-                        WaveId::new(
-                            ShardId::leaf(1, 0),
-                            BlockHeight::new(10),
-                            BTreeSet::from([ShardId::leaf(1, 1)]),
-                        ),
+                        TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
                         vec![ec],
                     )),
                     vec![],
@@ -201,7 +193,7 @@ mod tests {
     #[test]
     fn test_compute_certificate_root_single_cert() {
         let ec = Arc::new(ExecutionCertificate::new(
-            WaveId::new(ShardId::leaf(1, 0), BlockHeight::new(10), BTreeSet::new()),
+            TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
             WeightedTimestamp::from_millis(11),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt")),
             vec![TxOutcome::new(
@@ -214,7 +206,7 @@ mod tests {
             SignerBitfield::new(4),
         ));
         let cert = Arc::new(WaveCertificate::new(
-            WaveId::new(ShardId::leaf(1, 0), BlockHeight::new(10), BTreeSet::new()),
+            TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
             vec![ec],
         ));
         let expected_receipt_hash = cert.receipt_hash();

@@ -8,7 +8,7 @@ use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetExecutionCertsRequest;
 use hyperscale_types::network::response::GetExecutionCertsResponse;
-use hyperscale_types::{ExecutionCertificate, TxHash, WaveId};
+use hyperscale_types::{ExecutionCertificate, TickId, TxHash};
 
 /// Serve an inbound execution-certificate fetch request.
 ///
@@ -26,12 +26,12 @@ pub fn serve_execution_certs_request<S: ShardStorage>(
     req: &GetExecutionCertsRequest,
 ) -> GetExecutionCertsResponse {
     let mut certs: Vec<Arc<ExecutionCertificate>> = Vec::new();
-    let mut served: HashSet<WaveId> = HashSet::new();
+    let mut served: HashSet<TickId> = HashSet::new();
     let mut missing: Vec<TxHash> = Vec::new();
     for &tx_hash in &req.tx_hashes {
         match exec_cert_store.get_for_tx(tx_hash) {
             Some(cert) => {
-                if served.insert(cert.wave_id().clone()) {
+                if served.insert(*cert.tick_id()) {
                     certs.push(Arc::new((**cert).clone()));
                 }
             }
@@ -41,7 +41,7 @@ pub fn serve_execution_certs_request<S: ShardStorage>(
 
     if !missing.is_empty() {
         for cert in pending_chain.execution_certificates_for_txs(&missing) {
-            if served.insert(cert.wave_id().clone()) {
+            if served.insert(*cert.tick_id()) {
                 certs.push(Arc::new(cert.into_inner()));
             }
         }

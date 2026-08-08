@@ -64,15 +64,13 @@ fn a_leg_claims_against_the_tick_it_joins() {
     sim.commit(vec![leg, follower, control], Vec::new());
     sim.drain();
 
-    let wave = sim.wave_of(leg_hash).expect("the crossing has a wave");
-    assert!(!wave.is_zero(), "the crossing composes a cross-shard wave");
+    let wave = sim.wave_of(leg_hash).expect("the crossing has a tick");
     assert!(
         !sim.receipts_for(&wave).is_empty(),
         "the crossing itself executes"
     );
 
-    let single = sim.wave_of(follower_hash).expect("the follower has a wave");
-    assert!(single.is_zero(), "the follower is single-shard");
+    let single = sim.wave_of(follower_hash).expect("the follower has a tick");
     let executed: Vec<_> = sim
         .receipts_for(&single)
         .into_iter()

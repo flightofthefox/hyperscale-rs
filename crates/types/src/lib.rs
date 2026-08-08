@@ -6,7 +6,7 @@
 //! - **Primitives**: hashes, merkle roots, signer bitfields, randomness
 //! - **Identifiers**: `ValidatorId`, `ShardId`, `BlockHeight`, etc.
 //! - **Consensus types**: Block, `BlockHeader`, `QuorumCertificate`, etc.
-//! - **Wave types**: `WaveId`, `ExecutionVote`, `ExecutionCertificate`, `WaveCertificate`, etc.
+//! - **Wave types**: `TickId`, `ExecutionVote`, `ExecutionCertificate`, `WaveCertificate`, etc.
 //! - **Network traits**: Message markers for serialization
 //!
 //! # Design Philosophy
@@ -136,8 +136,8 @@ pub use shard::fork_fence::ForkFence;
 pub use shard::header::{BlockHeader, BlockHeaderParentQcMismatch, BlockHeaderVerifyError};
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
-    MAX_DRAIN_WORK, MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT, MAX_PROVISIONS_PER_BLOCK,
-    MAX_ROUND_GAP, MAX_TXS_PER_BLOCK, drain_admits_block,
+    MAX_DRAIN_WORK, MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_TXS_PER_BLOCK, drain_admits_block,
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};
@@ -209,7 +209,7 @@ pub use verifiable::{Verifiable, Verified, Verify};
 pub use wave::certificate::{
     MAX_EXECUTION_CERTIFICATES_PER_WAVE, WaveCertificate, wave_receipt_hash,
 };
-pub use wave::computation::{compute_cross_shard_txs, compute_waves, wave_leader, wave_leader_at};
+pub use wave::computation::{compute_cross_shard_txs, tick_leader, tick_leader_at};
 pub use wave::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
 };
@@ -217,11 +217,11 @@ pub use wave::finalized::{
     FinalizedWave, FinalizedWaveContext, FinalizedWaveVerifyError, ReceiptValidationError, Settles,
     refused_transactions, settles,
 };
-pub use wave::id::{MAX_REMOTE_SHARDS_PER_WAVE, WaveId};
 pub use wave::outcome::{ExecutionOutcome, TxOutcome};
 pub use wave::receipt_tree::{
     compute_global_receipt_root, compute_global_receipt_root_with_proof, tx_outcome_leaf,
 };
+pub use wave::tick_id::TickId;
 pub use wave::vote::{ExecutionVote, ExecutionVoteContext, ExecutionVoteVerifyError};
 
 #[cfg(any(test, feature = "test-utils"))]

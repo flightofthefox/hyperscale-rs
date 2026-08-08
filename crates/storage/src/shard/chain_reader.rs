@@ -8,7 +8,7 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     ConsensusReceipt, ExecutionCertificate, ProvisionHash, QuorumCertificate, ShardWitnessPayload,
-    Transaction, TxHash, Verified, WaveCertificate, WaveId,
+    TickId, Transaction, TxHash, Verified, WaveCertificate,
 };
 
 /// A sync-ready block retrieved from storage.
@@ -78,24 +78,24 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Returns only transactions that were found (missing hashes are skipped).
     fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<Verified<Transaction>>;
 
-    /// Get multiple certificates by `WaveId` (batch read).
+    /// Get multiple certificates by `TickId` (batch read).
     ///
     /// Returns only certificates that were found (missing ids are skipped).
-    fn get_certificates_batch(&self, ids: &[WaveId]) -> Vec<WaveCertificate>;
+    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<WaveCertificate>;
 
     /// Retrieve the consensus-bound receipt portion for a transaction.
     fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>>;
 
-    /// Retrieve a single execution certificate by [`WaveId`].
-    fn get_execution_certificate(&self, wave_id: &WaveId)
+    /// Retrieve a single execution certificate by [`TickId`].
+    fn get_execution_certificate(&self, tick_id: &TickId)
     -> Option<Verified<ExecutionCertificate>>;
 
-    /// Retrieve multiple execution certificates by [`WaveId`] (batch read).
+    /// Retrieve multiple execution certificates by [`TickId`] (batch read).
     ///
     /// Returns only certificates that were found (missing ids are skipped).
     fn get_execution_certificates_batch(
         &self,
-        wave_ids: &[WaveId],
+        tick_ids: &[TickId],
     ) -> Vec<Verified<ExecutionCertificate>>;
 
     /// Retrieve the execution certificates carrying outcomes for

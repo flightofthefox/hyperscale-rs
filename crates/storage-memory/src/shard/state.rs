@@ -10,8 +10,8 @@ use hyperscale_storage::tree::{carry_noop_root, jmt_parent_height, put_at_versio
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
     ExecutionMetadata, QuorumCertificate, SafeVoteRegisters, SettledWrites, ShardWitnessPayload,
-    StateRoot, StoredReceipt, SubstateKey, Transaction, TxHash, ValidatorId, WaveCertificate,
-    WaveId,
+    StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash, ValidatorId,
+    WaveCertificate,
 };
 
 use super::tree_store::SimTreeStore;
@@ -161,23 +161,23 @@ pub struct ConsensusState {
     pub committed_qc: Option<QuorumCertificate>,
     /// Transactions indexed by hash.
     pub transactions: HashMap<TxHash, Transaction>,
-    /// Wave certificates indexed by `WaveId`.
-    pub certificates: HashMap<WaveId, WaveCertificate>,
+    /// Wave certificates indexed by `TickId`.
+    pub certificates: HashMap<TickId, WaveCertificate>,
     /// Consensus receipts keyed by transaction hash.
     pub consensus_receipts: HashMap<TxHash, Arc<ConsensusReceipt>>,
     /// Execution output details keyed by transaction hash.
     pub execution_metadata: HashMap<TxHash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
     pub receipt_heights: HashMap<TxHash, BlockHeight>,
-    /// Execution certificates keyed by [`WaveId`].
-    pub execution_certs: HashMap<WaveId, ExecutionCertificate>,
+    /// Execution certificates keyed by [`TickId`].
+    pub execution_certs: HashMap<TickId, ExecutionCertificate>,
     /// Index: attested transaction → the certificate carrying its
     /// outcome. Mirrors the production `tx_cert_index` CF so simulation
     /// integration tests serve the by-transaction certificate fetch the
     /// same way a real node does.
-    pub tx_cert_index: HashMap<TxHash, WaveId>,
-    /// Index: `block_height` → `WaveId`s at that height.
-    pub wave_certs_by_height: HashMap<BlockHeight, Vec<WaveId>>,
+    pub tx_cert_index: HashMap<TxHash, TickId>,
+    /// Index: `block_height` → `TickId`s at that height.
+    pub wave_certs_by_height: HashMap<BlockHeight, Vec<TickId>>,
     /// Beacon-witness leaves keyed by leaf index. Mirrors the production
     /// `RocksDB` `beacon_witnesses` CF so simulation integration tests
     /// can serve fetches and replay the accumulator on restart. Shard

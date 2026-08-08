@@ -4,7 +4,7 @@
 //! `WaveCertificate`, `Block`, and `QuorumCertificate` so that
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_jmt::TreeReader;
@@ -18,8 +18,8 @@ use hyperscale_types::{
     ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, RatifyCert, RatifyRound,
     RevealChain, Round, SettledWrites, ShardAnchor, ShardId, ShardLoad, ShardWitnessPayload,
     SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt,
-    SubstateKey, SubstateLeaf, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
-    Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources, WorkInFlight,
+    SubstateKey, SubstateLeaf, TickId, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
+    Verified, WaveCertificate, WeightedTimestamp, WitnessSources, WorkInFlight,
     compute_global_receipt_root, compute_merkle_root,
 };
 
@@ -100,20 +100,20 @@ pub const fn state_key(owner_seed: u8, local_seed: u8) -> SubstateKey {
 /// Build a test `WaveCertificate` at the given height.
 ///
 /// Includes a single placeholder local EC so the certificate satisfies the
-/// invariant enforced at decode time (one EC per wave whose `wave_id` matches
-/// `wc.wave_id`).
+/// invariant enforced at decode time (one EC per wave whose `tick_id` matches
+/// `wc.tick_id`).
 #[must_use]
 pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardId) -> WaveCertificate {
-    let wave_id = WaveId::new(shard, height, BTreeSet::new());
+    let tick_id = TickId::new(shard, height);
     let local_ec = Arc::new(ExecutionCertificate::new(
-        wave_id.clone(),
+        tick_id,
         WeightedTimestamp::from_millis(0),
         GlobalReceiptRoot::ZERO,
         Vec::new(),
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::empty(),
     ));
-    WaveCertificate::new(wave_id, vec![local_ec])
+    WaveCertificate::new(tick_id, vec![local_ec])
 }
 
 /// Build a minimal `Block` at the given height.
@@ -346,7 +346,7 @@ pub fn make_test_receipt(seed: u8) -> StoredReceipt {
 /// Build a test `ExecutionCertificate` at the given block height with a
 /// deterministic outcome derived from `seed`.
 ///
-/// `seed` also disambiguates the `WaveId` (via `remote_shards`), so two ECs
+/// `seed` also disambiguates the `TickId` (via `remote_shards`), so two ECs
 /// at the same `block_height` with different seeds have distinct identities
 /// — matching the protocol invariant that one wave produces one EC.
 #[must_use]
@@ -361,10 +361,8 @@ pub fn make_test_execution_certificate(
         },
     )];
     let global_receipt_root = compute_global_receipt_root(&outcomes);
-    let mut remote_shards = BTreeSet::new();
-    remote_shards.insert(ShardId::leaf(8, u64::from(seed) + 1));
     ExecutionCertificate::new(
-        WaveId::new(ShardId::ROOT, block_height, remote_shards),
+        TickId::new(ShardId::ROOT, block_height),
         WeightedTimestamp::from_millis(block_height.inner() + 1),
         global_receipt_root,
         outcomes,
@@ -375,14 +373,14 @@ pub fn make_test_execution_certificate(
 
 /// Build a test block that carries ECs inside its wave certificates.
 ///
-/// The wave-certificate's `wave_id` is taken from the first EC's `wave_id` so
+/// The wave-certificate's `tick_id` is taken from the first EC's `tick_id` so
 /// the local-EC decode invariant is satisfied without injecting a placeholder.
 fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertificate>>) -> Block {
     let block = make_test_block(height);
     if ecs.is_empty() {
         return block;
     }
-    let certificate = Arc::new(WaveCertificate::new(ecs[0].wave_id().clone(), ecs));
+    let certificate = Arc::new(WaveCertificate::new(*ecs[0].tick_id(), ecs));
     push_certificate(
         block,
         Arc::new(FinalizedWave::new(certificate, vec![]).into()),
@@ -460,7 +458,7 @@ pub fn commit_block_with_updates(
         metadata: None,
     };
     let certificate = Arc::new(WaveCertificate::new(
-        WaveId::new(ShardId::ROOT, height, BTreeSet::new()),
+        TickId::new(ShardId::ROOT, height),
         vec![],
     ));
     let finalized = Arc::new(FinalizedWave::new(certificate, vec![receipt]).into());
@@ -685,17 +683,17 @@ pub fn test_witness_payload_range_reads(storage: &(impl ShardChainReader + Shard
 }
 
 /// Shared EC roundtrip test: commit a block carrying an EC, then read it
-/// back by `wave_id`.
+/// back by `tick_id`.
 ///
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
 pub fn test_ec_storage_roundtrip(storage: &(impl ShardChainReader + ShardChainWriter)) {
     let ec = make_test_execution_certificate(1, BlockHeight::new(10));
-    let wave_id = ec.wave_id().clone();
+    let tick_id = *ec.tick_id();
 
     // Initially absent.
-    assert!(storage.get_execution_certificate(&wave_id).is_none());
+    assert!(storage.get_execution_certificate(&tick_id).is_none());
 
     commit_empty_blocks_up_to(storage, BlockHeight::new(10));
     let block = make_test_block_with_ecs(BlockHeight::new(10), vec![Arc::new(ec)]);
@@ -703,9 +701,9 @@ pub fn test_ec_storage_roundtrip(storage: &(impl ShardChainReader + ShardChainWr
     storage.commit_block(&certified, &empty_witness());
 
     let direct = storage
-        .get_execution_certificate(&wave_id)
-        .expect("EC must be retrievable by wave_id");
-    assert_eq!(direct.wave_id(), &wave_id);
+        .get_execution_certificate(&tick_id)
+        .expect("EC must be retrievable by tick_id");
+    assert_eq!(direct.tick_id(), &tick_id);
     assert_eq!(direct.block_height(), BlockHeight::new(10));
 }
 
@@ -734,23 +732,14 @@ pub fn test_ec_storage_batch(storage: &(impl ShardChainReader + ShardChainWriter
     let block20 = make_test_block_with_ecs(BlockHeight::new(20), vec![Arc::new(ec3.clone())]);
     storage.commit_block(&make_test_certified(block20), &empty_witness());
 
-    let known = [
-        ec1.wave_id().clone(),
-        ec2.wave_id().clone(),
-        ec3.wave_id().clone(),
-    ];
+    let known = [*ec1.tick_id(), *ec2.tick_id(), *ec3.tick_id()];
     let batch = storage.get_execution_certificates_batch(&known);
     assert_eq!(batch.len(), 3);
 
-    let missing_wave_id = WaveId::new(
-        known[0].shard_id(),
-        BlockHeight::new(999),
-        known[0].remote_shards().iter().copied().collect(),
-    );
-    let partial =
-        storage.get_execution_certificates_batch(&[ec3.wave_id().clone(), missing_wave_id]);
+    let missing_wave_id = TickId::new(known[0].shard_id(), BlockHeight::new(999));
+    let partial = storage.get_execution_certificates_batch(&[*ec3.tick_id(), missing_wave_id]);
     assert_eq!(partial.len(), 1);
-    assert_eq!(partial[0].wave_id(), ec3.wave_id());
+    assert_eq!(partial[0].tick_id(), ec3.tick_id());
 }
 
 /// Shared boundary retention test: pin one height past

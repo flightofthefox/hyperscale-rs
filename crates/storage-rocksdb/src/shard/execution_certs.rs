@@ -1,6 +1,6 @@
 //! Execution certificate persistence helpers.
 //!
-//! Writes ECs to a column family keyed by [`hyperscale_types::WaveId`],
+//! Writes ECs to a column family keyed by [`hyperscale_types::TickId`],
 //! plus an index from each attested transaction to the certificate
 //! carrying its outcome — the key a counterpart shard actually asks by.
 
@@ -44,7 +44,7 @@ fn append_ec_to_batch(
     batch_put_raw::<ExecutionCertsCf>(
         batch,
         primary_cf,
-        cert.wave_id(),
+        cert.tick_id(),
         cert,
         cert.cached_wire_bytes(),
     );
@@ -53,7 +53,7 @@ fn append_ec_to_batch(
             batch,
             index_cf,
             &Hash::from(outcome.tx_hash()),
-            cert.wave_id(),
+            cert.tick_id(),
         );
     }
 }

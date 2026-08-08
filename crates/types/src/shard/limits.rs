@@ -24,6 +24,15 @@ use crate::WorkInFlight;
 /// block.
 pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 
+/// Cap on the number of shards a block can name as provision targets, at
+/// decode time.
+///
+/// A block can export provisions to at most `num_shards - 1` others. Real
+/// deployments run far below this cap; it exists so a peer can't claim a
+/// huge target map and force the decoder to build millions of entries
+/// before the first frame check fires.
+pub const MAX_PROVISION_TARGET_SHARDS: usize = 1_024;
+
 /// Cap on the number of finalized transactions a proposer includes in a
 /// single block, summed across all wave certificates.
 ///

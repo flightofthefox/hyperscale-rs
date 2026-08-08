@@ -18,21 +18,21 @@ use hyperscale_types::{
     BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
     FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, ProposerTimestamp,
     QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot,
-    StoredReceipt, SubstateKey, SyncHint, TxHash, ValidatorId, Verifiable, Verified,
-    WaveCertificate, WaveId, WeightedTimestamp, WitnessSources,
+    StoredReceipt, SubstateKey, SyncHint, TickId, TxHash, ValidatorId, Verifiable, Verified,
+    WaveCertificate, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
     BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO)
 }
 
-/// Build a placeholder EC whose `wave_id` matches the WC the caller is about
+/// Build a placeholder EC whose `tick_id` matches the WC the caller is about
 /// to construct, so the WC satisfies the local-EC invariant enforced at
 /// HBOR decode time. The EC carries no signers / outcomes — these tests
 /// exercise the storage codec, not consensus.
 fn placeholder_local_ec(shard: ShardId, height: BlockHeight) -> Arc<ExecutionCertificate> {
     Arc::new(ExecutionCertificate::new(
-        WaveId::new(shard, height, std::collections::BTreeSet::new()),
+        TickId::new(shard, height),
         WeightedTimestamp::from_millis(0),
         GlobalReceiptRoot::ZERO,
         Vec::new(),
@@ -207,13 +207,13 @@ fn test_commit_certificate_with_writes_persists_both() {
 
     let writes = make_settled_writes(1, 10, vec![99, 88, 77]);
     let cert = make_test_wave_certificate(BlockHeight::new(42), ShardId::ROOT);
-    let wave_id = cert.wave_id().clone();
+    let tick_id = *cert.tick_id();
 
     storage.commit_certificate_with_writes(&cert, &writes);
 
-    let stored_cert = storage.get_certificate(&wave_id);
+    let stored_cert = storage.get_certificate(&tick_id);
     assert!(stored_cert.is_some());
-    assert_eq!(stored_cert.unwrap().wave_id(), &wave_id);
+    assert_eq!(stored_cert.unwrap().tick_id(), &tick_id);
 
     // Verify the substate was written to the state CF via direct key lookup.
     assert_eq!(
@@ -381,14 +381,14 @@ fn test_certificate_idempotency() {
 
     let updates = make_settled_writes(1, 10, vec![99, 88, 77]);
     let cert = make_test_wave_certificate(BlockHeight::new(42), ShardId::ROOT);
-    let wave_id = cert.wave_id().clone();
+    let tick_id = *cert.tick_id();
 
     storage.commit_certificate_with_writes(&cert, &updates);
     storage.commit_certificate_with_writes(&cert, &updates);
 
-    let stored = storage.get_certificate(&wave_id);
+    let stored = storage.get_certificate(&tick_id);
     assert!(stored.is_some());
-    assert_eq!(stored.unwrap().wave_id(), &wave_id);
+    assert_eq!(stored.unwrap().tick_id(), &tick_id);
 }
 
 #[test]
@@ -507,11 +507,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
     let new_fw: Arc<Verifiable<FinalizedWave>> = Arc::new(
         FinalizedWave::new(
             Arc::new(WaveCertificate::new(
-                WaveId::new(
-                    ShardId::ROOT,
-                    block.height(),
-                    std::collections::BTreeSet::new(),
-                ),
+                TickId::new(ShardId::ROOT, block.height()),
                 vec![placeholder_local_ec(ShardId::ROOT, block.height())],
             )),
             receipts,
@@ -645,7 +641,7 @@ fn test_commit_block_stores_certificates() {
 
     let shard = ShardId::ROOT;
     let cert = Arc::new(make_test_wave_certificate(BlockHeight::new(1), shard));
-    let wave_id = cert.wave_id().clone();
+    let tick_id = *cert.tick_id();
 
     // Create a block that includes this certificate
     let block = make_test_block(BlockHeight::new(1));
@@ -678,7 +674,7 @@ fn test_commit_block_stores_certificates() {
     };
     let _ = storage.commit_block(&make_test_certified(block), &no_witness());
 
-    assert!(storage.get_certificate(&wave_id).is_some());
+    assert!(storage.get_certificate(&tick_id).is_some());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -701,23 +697,19 @@ fn test_certificates_batch() {
 
     let cert1 = make_test_wave_certificate(BlockHeight::new(1), ShardId::ROOT);
     let cert2 = make_test_wave_certificate(BlockHeight::new(2), ShardId::ROOT);
-    let id1 = cert1.wave_id().clone();
-    let id2 = cert2.wave_id().clone();
+    let id1 = *cert1.tick_id();
+    let id2 = *cert2.tick_id();
 
     storage.put_certificate(&id1, &cert1);
     storage.put_certificate(&id2, &cert2);
 
-    let result = storage.get_certificates_batch(&[id1.clone(), id2]);
+    let result = storage.get_certificates_batch(&[id1, id2]);
     assert_eq!(result.len(), 2);
 
-    let missing = WaveId::new(
-        ShardId::leaf(8, 99),
-        BlockHeight::new(99),
-        std::collections::BTreeSet::new(),
-    );
-    let partial = storage.get_certificates_batch(&[id1.clone(), missing]);
+    let missing = TickId::new(ShardId::leaf(8, 99), BlockHeight::new(99));
+    let partial = storage.get_certificates_batch(&[id1, missing]);
     assert_eq!(partial.len(), 1);
-    assert_eq!(partial[0].wave_id(), &id1);
+    assert_eq!(partial[0].tick_id(), &id1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -773,23 +765,19 @@ fn test_certificate_store_and_retrieve() {
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     let cert = make_test_wave_certificate(BlockHeight::new(1), ShardId::ROOT);
-    let wave_id = cert.wave_id().clone();
+    let tick_id = *cert.tick_id();
 
-    storage.put_certificate(&wave_id, &cert);
+    storage.put_certificate(&tick_id, &cert);
 
-    let stored = storage.get_certificate(&wave_id).unwrap();
-    assert_eq!(stored.wave_id(), &wave_id);
+    let stored = storage.get_certificate(&tick_id).unwrap();
+    assert_eq!(stored.tick_id(), &tick_id);
 }
 
 #[test]
 fn test_certificate_get_missing() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    let missing = WaveId::new(
-        ShardId::leaf(8, 99),
-        BlockHeight::new(99),
-        std::collections::BTreeSet::new(),
-    );
+    let missing = TickId::new(ShardId::leaf(8, 99), BlockHeight::new(99));
     assert!(storage.get_certificate(&missing).is_none());
 }
 
@@ -821,7 +809,7 @@ fn test_commit_certificate_via_commit_store() {
 
     assert_eq!(storage.jmt_height(), BlockHeight::new(0));
     assert_eq!(storage.state_root(), StateRoot::ZERO);
-    assert!(storage.get_certificate(cert.wave_id()).is_some());
+    assert!(storage.get_certificate(cert.tick_id()).is_some());
 }
 
 #[test]
@@ -849,7 +837,7 @@ fn test_substates_survive_reopen() {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
         let updates = make_settled_writes(1, 10, vec![42]);
         let cert = make_test_wave_certificate(BlockHeight::new(1), ShardId::ROOT);
-        cert_id = cert.wave_id().clone();
+        cert_id = *cert.tick_id();
         storage.commit_certificate_with_writes(&cert, &updates);
         root_after_write = storage.state_root();
         version_after_write = storage.jmt_height();
@@ -863,7 +851,7 @@ fn test_substates_survive_reopen() {
 
         let cert = storage.get_certificate(&cert_id);
         assert!(cert.is_some(), "certificate should survive reopen");
-        assert_eq!(cert.unwrap().wave_id(), &cert_id);
+        assert_eq!(cert.unwrap().tick_id(), &cert_id);
 
         // Verify the substate was written via direct key lookup.
         let value = storage.substate(state_key(1, 10));
@@ -947,7 +935,7 @@ fn witness_payload_range_reads() {
 fn test_ec_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
     let ec = make_test_execution_certificate(1, BlockHeight::new(1));
-    let wave_id = ec.wave_id().clone();
+    let tick_id = *ec.tick_id();
 
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
@@ -958,7 +946,7 @@ fn test_ec_survives_reopen() {
             &mut block,
             Arc::new(
                 FinalizedWave::new(
-                    Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
+                    Arc::new(WaveCertificate::new(tick_id, vec![Arc::new(ec)])),
                     vec![],
                 )
                 .into(),
@@ -970,7 +958,7 @@ fn test_ec_survives_reopen() {
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
         let cert = storage
-            .get_execution_certificate(&wave_id)
+            .get_execution_certificate(&tick_id)
             .expect("EC must survive reopen");
         assert_eq!(cert.block_height(), BlockHeight::new(1));
     }
@@ -982,13 +970,13 @@ fn test_ec_atomic_with_block_commit() {
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     let ec = make_test_execution_certificate(1, BlockHeight::new(1));
-    let wave_id = ec.wave_id().clone();
+    let tick_id = *ec.tick_id();
     let mut block = make_test_block(BlockHeight::new(1));
     push_wave(
         &mut block,
         Arc::new(
             FinalizedWave::new(
-                Arc::new(WaveCertificate::new(wave_id.clone(), vec![Arc::new(ec)])),
+                Arc::new(WaveCertificate::new(tick_id, vec![Arc::new(ec)])),
                 vec![],
             )
             .into(),
@@ -998,7 +986,7 @@ fn test_ec_atomic_with_block_commit() {
     storage.commit_block(&make_test_certified(block), &no_witness());
 
     let cert = storage
-        .get_execution_certificate(&wave_id)
+        .get_execution_certificate(&tick_id)
         .expect("EC must be retrievable after commit");
     assert_eq!(cert.block_height(), BlockHeight::new(1));
 }
@@ -1038,11 +1026,7 @@ fn rocks_commit_with(
         let wave = Arc::new(
             FinalizedWave::new(
                 Arc::new(WaveCertificate::new(
-                    WaveId::new(
-                        ShardId::ROOT,
-                        block.height(),
-                        std::collections::BTreeSet::new(),
-                    ),
+                    TickId::new(ShardId::ROOT, block.height()),
                     vec![placeholder_local_ec(ShardId::ROOT, block.height())],
                 )),
                 vec![receipt],

@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use hyperscale_simulation::{DeliveryDrain, DeliveryRecord};
 use hyperscale_types::{
-    BlockHeight, ExecutionOutcome, FinalizedWave, MessageClass, Round, ShardId, TxHash, TxOutcome,
-    WaveId,
+    BlockHeight, ExecutionOutcome, FinalizedWave, MessageClass, Round, ShardId, TickId, TxHash,
+    TxOutcome,
 };
 use serde::Serialize;
 
@@ -296,7 +296,7 @@ impl From<TxHash> for TxLabel {
 }
 
 /// A wave's identity on the shard that opened it, `<shard>@<height>` —
-/// the same pair a [`WaveId`] binds.
+/// the same pair a [`TickId`] binds.
 ///
 /// Not comparable across shards: one logical settlement round gives every
 /// participant its own wave id, so the viewer relates the two sides by the
@@ -381,7 +381,7 @@ impl TraceEvent {
 
     pub(crate) fn provisions_verified(
         wt: u64,
-        from: &WaveId,
+        from: &TickId,
         to: ShardId,
         to_height: BlockHeight,
         outcomes: &[TxOutcome],
@@ -400,7 +400,7 @@ impl TraceEvent {
 
     pub(crate) fn execution_certified(
         wt: u64,
-        wave: &WaveId,
+        wave: &TickId,
         into: ShardId,
         into_height: BlockHeight,
         outcomes: &[TxOutcome],
@@ -431,11 +431,11 @@ impl TraceEvent {
         height: BlockHeight,
         wave: &FinalizedWave,
     ) -> Self {
-        let id = wave.wave_id();
+        let id = wave.tick_id();
         let certificates = wave.execution_certificates();
         let txs = certificates
             .iter()
-            .find(|ec| ec.wave_id() == id)
+            .find(|ec| ec.tick_id() == id)
             .map_or_else(Vec::new, |ec| tx_labels(ec.tx_outcomes()));
         Self {
             wt,
@@ -446,7 +446,7 @@ impl TraceEvent {
                 wave: WaveLabel::new(id.shard_id(), id.block_height()),
                 participants: certificates
                     .iter()
-                    .map(|ec| ec.wave_id().shard_id().into())
+                    .map(|ec| ec.tick_id().shard_id().into())
                     .collect(),
                 txs,
             },

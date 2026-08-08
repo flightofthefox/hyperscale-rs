@@ -428,8 +428,8 @@ mod tests {
         BlockHeader, CertificateRoot, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
         ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
-        ShardLoad, SignerBitfield, StateRoot, TransactionRoot, TxHash, TxOutcome, ValidatorId,
-        Verifiable, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources, WorkInFlight,
+        ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot, TxHash, TxOutcome,
+        ValidatorId, Verifiable, WaveCertificate, WeightedTimestamp, WitnessSources, WorkInFlight,
     };
 
     use super::*;
@@ -523,7 +523,7 @@ mod tests {
         CertificateRoot,
     ) {
         let tx_hash = TxHash::from(Hash::from_bytes(b"tx"));
-        let wave_id = WaveId::new(ShardId::ROOT, HEIGHT, std::collections::BTreeSet::new());
+        let tick_id = TickId::new(ShardId::ROOT, HEIGHT);
         let outcome = TxOutcome::new(
             tx_hash,
             if success {
@@ -535,7 +535,7 @@ mod tests {
             },
         );
         let ec = ExecutionCertificate::new(
-            wave_id.clone(),
+            tick_id,
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
             vec![outcome],
@@ -559,7 +559,7 @@ mod tests {
         };
         let fw = Arc::new(
             FinalizedWave::new(
-                Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
+                Arc::new(WaveCertificate::new(tick_id, vec![Arc::new(ec)])),
                 vec![receipt.clone()],
             )
             .into(),
@@ -720,9 +720,9 @@ mod tests {
         // certificate_root and local_receipt_root are computed off the
         // (corrupted) body and would tautologically match.
         let tx_hash = TxHash::from(Hash::from_bytes(b"tx_divergent"));
-        let wave_id = WaveId::new(ShardId::ROOT, HEIGHT, std::collections::BTreeSet::new());
+        let tick_id = TickId::new(ShardId::ROOT, HEIGHT);
         let ec = ExecutionCertificate::new(
-            wave_id.clone(),
+            tick_id,
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome::new(
@@ -742,7 +742,7 @@ mod tests {
         };
         let fw = Arc::new(
             FinalizedWave::new(
-                Arc::new(WaveCertificate::new(wave_id, vec![Arc::new(ec)])),
+                Arc::new(WaveCertificate::new(tick_id, vec![Arc::new(ec)])),
                 vec![receipt.clone()],
             )
             .into(),

@@ -2,7 +2,7 @@
 //! derivation, the batch executor, and the movement fold, against a
 //! genesis-seeded snapshot.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_effects_bridge::vm_statics::package_key;
@@ -18,8 +18,8 @@ use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput,
 use hyperscale_types::{
     BlockHash, BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
     MerkleInclusionProof, NetworkId, ProvisionalHolds, RevealChain, SettledWrites, ShardId,
-    ShardTrie, StateRoot, StateWrites, SubstateKey, Transaction, TransactionBody,
-    TransactionEnvelope, Verified, WaveId, WeightedTimestamp, absorb_committed_cells,
+    ShardTrie, StateRoot, StateWrites, SubstateKey, TickId, Transaction, TransactionBody,
+    TransactionEnvelope, Verified, WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
     AbiParam, Address, Constraint, EdgeRef, EnvelopeTree, Expr, GraphArg, GraphNode, IntentDecl,
@@ -437,7 +437,7 @@ fn consecutive_payments_thread_through_the_tick_chain() {
             tick,
             TickOutput {
                 determined: BTreeMap::from([(
-                    WaveId::new(ShardId::ROOT, tick, BTreeSet::new()),
+                    TickId::new(ShardId::ROOT, tick),
                     vec![(executed[0].tx_hash, updates.clone())],
                 )]),
                 provisional: BTreeMap::new(),

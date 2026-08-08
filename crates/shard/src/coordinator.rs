@@ -19,7 +19,7 @@ use hyperscale_types::{
     BlockHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionHash,
     RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup,
-    SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt, SubstateKey, WaveId,
+    SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt, SubstateKey, TickId,
     WeightedTimestamp, WorkInFlight, derive_reshape_trigger, ready_signal_window,
     settled_set_verdict,
 };
@@ -2055,7 +2055,7 @@ impl ShardCoordinator {
         header: &BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        lookup_finalized_wave: impl Fn(&WaveId) -> Option<Arc<Verifiable<FinalizedWave>>>,
+        lookup_finalized_wave: impl Fn(&TickId) -> Option<Arc<Verifiable<FinalizedWave>>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
@@ -5729,7 +5729,7 @@ impl ShardCoordinator {
         for fw in waves {
             if let Err(err) = fw.validate_receipts_against_ec() {
                 warn!(
-                    wave_id = ?fw.wave_id(),
+                    tick_id = ?fw.tick_id(),
                     ?err,
                     "Rejecting FinalizedWave: receipts inconsistent with its EC"
                 );
@@ -6109,7 +6109,7 @@ impl ShardCoordinator {
         &self,
         parent_block_hash: BlockHash,
     ) -> (
-        std::collections::HashSet<WaveId>,
+        std::collections::HashSet<TickId>,
         std::collections::HashSet<TxHash>,
         std::collections::HashSet<ProvisionHash>,
     ) {
@@ -10523,7 +10523,7 @@ mod tests {
             SignerBitfield, TxOutcome, WaveCertificate,
         };
         let ec = |shard: ShardId| {
-            let wave = WaveId::new(shard, BlockHeight::new(height), BTreeSet::new());
+            let wave = TickId::new(shard, BlockHeight::new(height));
             ExecutionCertificate::new(
                 wave,
                 WeightedTimestamp::from_millis(height),
@@ -10538,7 +10538,7 @@ mod tests {
                 SignerBitfield::new(4),
             )
         };
-        let local_wave = WaveId::new(local, BlockHeight::new(height), BTreeSet::new());
+        let local_wave = TickId::new(local, BlockHeight::new(height));
         let wc = WaveCertificate::new(local_wave, vec![Arc::new(ec(local)), Arc::new(ec(remote))]);
         Arc::new(Verifiable::from(FinalizedWave::new(Arc::new(wc), vec![])))
     }

@@ -118,7 +118,7 @@ where
                 });
             }
             ProtocolEvent::FinalizedWavesAdmitted { waves } => {
-                let ids: Vec<_> = waves.iter().map(|w| w.wave_id().clone()).collect();
+                let ids: Vec<_> = waves.iter().map(|w| *w.tick_id()).collect();
                 self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Admitted { ids });
             }
             ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
