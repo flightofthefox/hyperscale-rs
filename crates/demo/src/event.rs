@@ -157,7 +157,7 @@ pub enum TraceKind {
     /// A shard reached its last block.
     ///
     /// `height` is the chain's final height. `handoffFrom` is the first
-    /// height whose header carried a settled-waves root: from there to the
+    /// height whose header carried a settled-transaction root: from there to the
     /// end the shard is certifying its own handoff rather than merely
     /// running, which is the difference between a chain that stopped and one
     /// that finished.

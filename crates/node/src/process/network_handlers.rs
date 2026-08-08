@@ -788,7 +788,7 @@ pub fn register_shard_request_handlers<S, N, D>(
     use std::sync::Arc;
 
     use hyperscale_types::network::request::{
-        GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetSettledWavesRequest,
+        GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetSettledTxsRequest,
         GetStateRangeRequest, GetTransactionsRequest, GetWitnessHistoryRequest,
     };
 
@@ -800,7 +800,7 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::shard::cross_shard::{
         serve_execution_certs_request, serve_finalized_waves_request,
         serve_local_provisions_request, serve_provision_request, serve_remote_headers_request,
-        serve_settled_waves_request,
+        serve_settled_txs_request,
     };
     use crate::shard::mempool::serve_transaction_request;
 
@@ -1087,21 +1087,21 @@ pub fn register_shard_request_handlers<S, N, D>(
             serve_shard_witnesses_request(&pending_chain, &req)
         });
 
-    // ── settled_waves.request → terminated-shard settled window list ──
+    // ── settled_txs.request → terminated-shard settled window list ──
     //
     // A counterpart resolving this shard's settled set across a split
-    // boundary names its terminal block; we serve the complete settled-wave
+    // boundary names its terminal block; we serve the complete settled-transaction
     // window list, which the counterpart accepts against the beacon-attested
-    // settled-waves root. The window floor comes off the live topology
+    // settled-transaction root. The window floor comes off the live topology
     // projection so the served window matches the one the terminal's
     // proposer attested.
     let pending_chain = Arc::clone(&io.pending_chain);
     let topology_snapshot = process.topology_snapshot().clone();
     process
         .network
-        .register_request_handler::<GetSettledWavesRequest>(shard, move |req| {
+        .register_request_handler::<GetSettledTxsRequest>(shard, move |req| {
             let window_floor = topology_snapshot.load().settled_window_floor(shard);
-            serve_settled_waves_request(&pending_chain, window_floor, &req)
+            serve_settled_txs_request(&pending_chain, window_floor, &req)
         });
 
     // ── beacon.proposal.request → process-level serve cache ──────

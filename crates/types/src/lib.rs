@@ -95,7 +95,7 @@ pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
     BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot, EventRoot, GenesisConfigHash,
     GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot,
-    ProvisionsRoot, RevealChain, SettledWavesRoot, StateRoot, TransactionRoot, TxHash,
+    ProvisionsRoot, RevealChain, SettledTxsRoot, StateRoot, TransactionRoot, TxHash,
     WaveReceiptHash, WritesRoot,
 };
 pub use primitives::identifiers::{
@@ -150,9 +150,9 @@ pub use shard::roots::{
     ProvisionTxRootsVerifyError, ProvisionsRootContext, REVEAL_CHAIN_DOMAIN_TAG, SplitChildRoots,
     StateRootContext, StateRootVerifyError, TransactionRootContext, TxRootVerifyError,
     certificate_root_from_receipt_hashes, commit_witness_window, derive_leaves,
-    derive_reshape_trigger, extend_reveal_chain, local_settled_wave_ids,
+    derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
-    settled_waves_root_from_ids,
+    settled_txs_root_from_hashes,
 };
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
@@ -190,7 +190,7 @@ pub use topology::network::{NetworkDefinition, UnknownNetwork};
 pub use topology::schedule::{
     RoutingCommittees, ScheduleLookup, SplitAtBoundary, TopologySchedule,
 };
-pub use topology::settled_set::{SettledSetVerdict, SettledWaveSet, settled_set_verdict};
+pub use topology::settled_set::{SettledSetVerdict, SettledTxSet, settled_set_verdict};
 pub use topology::shard_prefix::shard_prefix_path;
 pub use topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 pub use topology::trie::ShardTrie;

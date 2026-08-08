@@ -139,14 +139,14 @@ where
                 from_height,
                 count,
             } => self.process_fetch_commit_proof(source_shard, from_height, count),
-            Action::StartSettledWavesAcquisition {
+            Action::StartSettledTxsAcquisition {
                 shard,
                 terminal_height,
                 terminal_block_hash,
                 terminal_wt,
                 attested_root,
                 peers,
-            } => self.process_start_settled_waves_acquisition(
+            } => self.process_start_settled_txs_acquisition(
                 shard,
                 terminal_height,
                 terminal_block_hash,

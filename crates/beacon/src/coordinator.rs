@@ -3092,7 +3092,7 @@ mod tests {
             consecutive_misses: 0,
             terminal_epoch: None,
             terminal_delivered: false,
-            settled_waves_root: None,
+            settled_txs_root: None,
             reshape_admitted_epoch: None,
         };
 
@@ -5622,7 +5622,7 @@ mod tests {
             consecutive_misses: 0,
             terminal_epoch: None,
             terminal_delivered: false,
-            settled_waves_root: None,
+            settled_txs_root: None,
             reshape_admitted_epoch: None,
         }
     }

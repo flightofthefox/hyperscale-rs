@@ -503,7 +503,7 @@ mod tests {
                 consecutive_misses: u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits") + 1,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -556,7 +556,7 @@ mod tests {
                 consecutive_misses: 1,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );

@@ -15,12 +15,6 @@
 //! the source shard's business. One arriving certificate therefore fulfils
 //! every expectation for the transactions it covers.
 //!
-//! Alongside that, an admitted certificate is also recorded under its own
-//! identity — see [`has_ingested`](ExpectedCertTracker::has_ingested). A
-//! terminating shard's settled set names the waves it settled, so the
-//! counterpart abort sweep has to ask its question in that shard's terms.
-//! That record retires when the settled set is keyed by transaction.
-//!
 //! ## Deadlines
 //!
 //! All deadlines anchor on the committing QC's `weighted_timestamp` (passed
@@ -57,7 +51,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
-use hyperscale_types::{ShardId, TxHash, WAVE_TIMEOUT, WaveId, WeightedTimestamp};
+use hyperscale_types::{ShardId, TxHash, WAVE_TIMEOUT, WeightedTimestamp};
 
 /// How long to wait before the first fallback request. Anchored on the
 /// committing QC's `weighted_timestamp_ms`, so the window stays meaningful
@@ -110,15 +104,6 @@ pub struct ExpectedCertTracker {
     /// retires every shard's outcome for it at once, which is exactly what
     /// [`on_txs_terminated`](Self::on_txs_terminated) is told about.
     fulfilled: HashMap<TxHash, FulfilledEntry>,
-    /// Certificates admitted, in their own shard's vocabulary, with the
-    /// deadline of the [`FulfilledEntry`] they arrived alongside.
-    ///
-    /// A terminating shard's settled set names the waves it settled, so
-    /// asking whether we hold one of them is a question posed in that
-    /// shard's terms rather than ours. Retires when the settled set is
-    /// keyed by transaction, at which point
-    /// [`is_fulfilled`](Self::is_fulfilled) answers it directly.
-    ingested: HashMap<(ShardId, WaveId), WeightedTimestamp>,
 }
 
 impl ExpectedCertTracker {
@@ -126,7 +111,6 @@ impl ExpectedCertTracker {
         Self {
             expected: HashMap::new(),
             fulfilled: HashMap::new(),
-            ingested: HashMap::new(),
         }
     }
 
@@ -158,12 +142,9 @@ impl ExpectedCertTracker {
     pub fn mark_fulfilled(
         &mut self,
         source_shard: ShardId,
-        wave_id: &WaveId,
         tx_hashes: impl IntoIterator<Item = TxHash>,
         deadline: WeightedTimestamp,
     ) -> bool {
-        self.ingested
-            .insert((source_shard, wave_id.clone()), deadline);
         let mut cleared = false;
         for tx_hash in tx_hashes {
             cleared |= self.expected.remove(&(source_shard, tx_hash)).is_some();
@@ -194,7 +175,6 @@ impl ExpectedCertTracker {
     /// module-level fulfilled-tombstone lifetime section.
     pub fn prune_fulfilled(&mut self, now_ts: WeightedTimestamp) {
         self.fulfilled.retain(|_, entry| entry.deadline > now_ts);
-        self.ingested.retain(|_, deadline| *deadline > now_ts);
     }
 
     /// Drive the timeout state machine. Returns `(source_shard, tx_hash,
@@ -303,15 +283,6 @@ impl ExpectedCertTracker {
             .is_some_and(|entry| entry.shards.contains(&source_shard))
     }
 
-    /// Whether `source_shard`'s certificate for `wave_id` has been
-    /// admitted. The counterpart abort sweep reads this to decide which of
-    /// a terminated partner's settled waves are still outstanding — the
-    /// partner names them by wave, so the question is asked that way.
-    #[must_use]
-    pub fn has_ingested(&self, source_shard: ShardId, wave_id: &WaveId) -> bool {
-        self.ingested.contains_key(&(source_shard, wave_id.clone()))
-    }
-
     pub fn expected_len(&self) -> usize {
         self.expected.len()
     }
@@ -330,7 +301,7 @@ impl ExpectedCertTracker {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BlockHeight, Hash};
+    use hyperscale_types::Hash;
     use proptest::collection::vec as prop_vec;
 
     use super::*;
@@ -341,11 +312,6 @@ mod tests {
 
     fn tx(seed: u8) -> TxHash {
         TxHash::from(Hash::from_bytes(&[seed]))
-    }
-
-    /// The certificate's own identity, in its shard's vocabulary.
-    fn cert_of(source: ShardId, height: u64) -> WaveId {
-        WaveId::new(source, BlockHeight::new(height), BTreeSet::new())
     }
 
     /// Every transaction is one a local wave awaits, unless a test says
@@ -398,12 +364,7 @@ mod tests {
     #[test]
     fn register_skipped_when_already_fulfilled() {
         let mut t = ExpectedCertTracker::new();
-        t.mark_fulfilled(
-            shard(1),
-            &cert_of(shard(1), 1),
-            std::iter::once(tx(5)),
-            ms(60_000),
-        );
+        t.mark_fulfilled(shard(1), std::iter::once(tx(5)), ms(60_000));
 
         t.register(shard(1), tx(5), ms(1_000));
 
@@ -416,12 +377,7 @@ mod tests {
         let mut t = ExpectedCertTracker::new();
         t.register(shard(1), tx(5), ms(1_000));
 
-        assert!(t.mark_fulfilled(
-            shard(1),
-            &cert_of(shard(1), 1),
-            std::iter::once(tx(5)),
-            ms(60_000)
-        ));
+        assert!(t.mark_fulfilled(shard(1), std::iter::once(tx(5)), ms(60_000)));
         assert_eq!(t.expected_len(), 0);
         assert!(t.is_fulfilled(shard(1), tx(5)));
     }
@@ -429,12 +385,7 @@ mod tests {
     #[test]
     fn mark_fulfilled_returns_false_when_no_expectation_was_active() {
         let mut t = ExpectedCertTracker::new();
-        assert!(!t.mark_fulfilled(
-            shard(1),
-            &cert_of(shard(1), 1),
-            std::iter::once(tx(5)),
-            ms(60_000)
-        ));
+        assert!(!t.mark_fulfilled(shard(1), std::iter::once(tx(5)), ms(60_000)));
         assert!(t.is_fulfilled(shard(1), tx(5)));
     }
 
@@ -448,12 +399,7 @@ mod tests {
         t.register(shard(1), tx(2), ms(0));
         t.register(shard(1), tx(3), ms(0));
 
-        assert!(t.mark_fulfilled(
-            shard(1),
-            &cert_of(shard(1), 1),
-            [tx(1), tx(2), tx(3)],
-            ms(60_000)
-        ));
+        assert!(t.mark_fulfilled(shard(1), [tx(1), tx(2), tx(3)], ms(60_000)));
 
         assert_eq!(t.expected_len(), 0);
         assert!(t.check_timeouts(&all(), ms(50_000)).is_empty());
@@ -467,12 +413,7 @@ mod tests {
         t.register(shard(1), tx(5), ms(0));
         t.register(shard(2), tx(5), ms(0));
 
-        t.mark_fulfilled(
-            shard(1),
-            &cert_of(shard(1), 1),
-            std::iter::once(tx(5)),
-            ms(60_000),
-        );
+        t.mark_fulfilled(shard(1), std::iter::once(tx(5)), ms(60_000));
 
         assert!(t.is_fulfilled(shard(1), tx(5)));
         assert!(!t.is_fulfilled(shard(2), tx(5)));
@@ -487,24 +428,9 @@ mod tests {
     #[test]
     fn on_txs_terminated_drops_every_shards_record_for_the_transaction() {
         let mut t = ExpectedCertTracker::new();
-        t.mark_fulfilled(
-            shard(1),
-            &cert_of(shard(1), 1),
-            std::iter::once(tx(5)),
-            ms(60_000),
-        );
-        t.mark_fulfilled(
-            shard(2),
-            &cert_of(shard(2), 1),
-            std::iter::once(tx(5)),
-            ms(60_000),
-        );
-        t.mark_fulfilled(
-            shard(1),
-            &cert_of(shard(1), 1),
-            std::iter::once(tx(6)),
-            ms(60_000),
-        );
+        t.mark_fulfilled(shard(1), std::iter::once(tx(5)), ms(60_000));
+        t.mark_fulfilled(shard(2), std::iter::once(tx(5)), ms(60_000));
+        t.mark_fulfilled(shard(1), std::iter::once(tx(6)), ms(60_000));
 
         t.on_txs_terminated(std::iter::once(tx(5)));
 
@@ -520,18 +446,8 @@ mod tests {
     #[test]
     fn a_second_certificate_extends_the_backstop() {
         let mut t = ExpectedCertTracker::new();
-        t.mark_fulfilled(
-            shard(1),
-            &cert_of(shard(1), 1),
-            std::iter::once(tx(5)),
-            ms(70_000),
-        );
-        t.mark_fulfilled(
-            shard(2),
-            &cert_of(shard(2), 1),
-            std::iter::once(tx(5)),
-            ms(10_000),
-        );
+        t.mark_fulfilled(shard(1), std::iter::once(tx(5)), ms(70_000));
+        t.mark_fulfilled(shard(2), std::iter::once(tx(5)), ms(10_000));
 
         t.prune_fulfilled(ms(60_000));
         assert_eq!(t.fulfilled_len(), 1, "the later deadline governs");
@@ -541,44 +457,12 @@ mod tests {
     }
 
     /// A certificate with no outcomes answers for no transaction, so it
-    /// clears no expectation — but it was still admitted, which the
-    /// counterpart sweep needs to know.
+    /// clears no expectation and records nothing.
     #[test]
-    fn mark_fulfilled_with_no_outcomes_records_only_the_ingestion() {
+    fn mark_fulfilled_with_no_outcomes_records_nothing() {
         let mut t = ExpectedCertTracker::new();
-        let cert = cert_of(shard(1), 1);
-        assert!(!t.mark_fulfilled(shard(1), &cert, std::iter::empty(), ms(60_000)));
+        assert!(!t.mark_fulfilled(shard(1), std::iter::empty(), ms(60_000)));
         assert_eq!(t.fulfilled_len(), 0);
-        assert!(t.has_ingested(shard(1), &cert));
-    }
-
-    /// The sweep asks whether a terminated partner's settled wave has
-    /// reached us, which is a question about the certificate's own identity
-    /// rather than about any transaction.
-    #[test]
-    fn ingestion_is_recorded_against_the_certificates_own_identity() {
-        let mut t = ExpectedCertTracker::new();
-        let arrived = cert_of(shard(1), 1);
-        let never_sent = cert_of(shard(1), 2);
-        t.mark_fulfilled(shard(1), &arrived, std::iter::once(tx(5)), ms(60_000));
-
-        assert!(t.has_ingested(shard(1), &arrived));
-        assert!(!t.has_ingested(shard(1), &never_sent));
-        // Another shard's certificate of the same shape is a different one.
-        assert!(!t.has_ingested(shard(2), &arrived));
-    }
-
-    /// The ingestion record shares the deadline backstop, so a partner that
-    /// terminated long ago stops occupying memory.
-    #[test]
-    fn prune_fulfilled_evicts_the_ingestion_record_too() {
-        let mut t = ExpectedCertTracker::new();
-        let cert = cert_of(shard(1), 1);
-        t.mark_fulfilled(shard(1), &cert, std::iter::once(tx(5)), ms(1_000));
-
-        t.prune_fulfilled(ms(2_000));
-
-        assert!(!t.has_ingested(shard(1), &cert));
     }
 
     #[test]
@@ -709,18 +593,8 @@ mod tests {
     #[test]
     fn prune_fulfilled_drops_entries_past_their_deadline() {
         let mut t = ExpectedCertTracker::new();
-        t.mark_fulfilled(
-            shard(1),
-            &cert_of(shard(1), 1),
-            std::iter::once(tx(1)),
-            ms(1_000),
-        );
-        t.mark_fulfilled(
-            shard(1),
-            &cert_of(shard(1), 1),
-            std::iter::once(tx(2)),
-            ms(60_000),
-        );
+        t.mark_fulfilled(shard(1), std::iter::once(tx(1)), ms(1_000));
+        t.mark_fulfilled(shard(1), std::iter::once(tx(2)), ms(60_000));
 
         t.prune_fulfilled(ms(2_000));
 
@@ -733,12 +607,7 @@ mod tests {
         // Deadline check is `deadline > now_ts` — strictly greater. At
         // equality the entry is dropped.
         let mut t = ExpectedCertTracker::new();
-        t.mark_fulfilled(
-            shard(1),
-            &cert_of(shard(1), 1),
-            std::iter::once(tx(1)),
-            ms(1_000),
-        );
+        t.mark_fulfilled(shard(1), std::iter::once(tx(1)), ms(1_000));
         t.prune_fulfilled(ms(1_000));
         assert_eq!(t.fulfilled_len(), 0);
     }
@@ -751,12 +620,7 @@ mod tests {
         // this re-registration path can recreate a record that no future
         // termination will drain.
         let mut t = ExpectedCertTracker::new();
-        t.mark_fulfilled(
-            shard(1),
-            &cert_of(shard(1), 1),
-            std::iter::once(tx(5)),
-            ms(60_000),
-        );
+        t.mark_fulfilled(shard(1), std::iter::once(tx(5)), ms(60_000));
         t.on_txs_terminated(std::iter::once(tx(5)));
 
         t.register(shard(1), tx(5), ms(70_000));
@@ -813,7 +677,7 @@ mod tests {
             // 60s deadline keeps the records alive past every poll.
             for idx in &fulfill_indices {
                 let tx_hash = txs[idx % txs.len()];
-                t.mark_fulfilled(source, &cert_of(source, 1), std::iter::once(tx_hash), ms(60_000));
+                t.mark_fulfilled(source, std::iter::once(tx_hash), ms(60_000));
             }
 
             // Run check_timeouts at a range of later timestamps.

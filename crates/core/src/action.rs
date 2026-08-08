@@ -15,7 +15,7 @@ use hyperscale_types::{
     PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
     Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
     ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round,
-    RoutingCommittees, SafeVoteRegisters, SettledWavesRoot, ShardForkProof, ShardId, ShardLoad,
+    RoutingCommittees, SafeVoteRegisters, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad,
     ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
     SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
     StateRoot, SubstateEntry, SubstateKey, Timeout, TopologySnapshot, Transaction, TransactionRoot,
@@ -672,24 +672,24 @@ pub enum Action {
         /// final epoch before a split), resolved by the coordinator from
         /// the schedule.
         split_child_roots_required: bool,
-        /// Whether the block's window requires a `settled_waves_root` — set
+        /// Whether the block's window requires a `settled_txs_root` — set
         /// on any terminating boundary header (a split parent's or a merge
         /// child's final epoch), broader than `split_child_roots_required`.
-        settled_waves_root_required: bool,
-        /// The header's `settled_waves_root` claim, recomputed beside the
+        settled_txs_root_required: bool,
+        /// The header's `settled_txs_root` claim, recomputed beside the
         /// state root over the committed retention window when the block
         /// terminates the shard at a boundary.
-        claimed_settled_waves_root: Option<SettledWavesRoot>,
+        claimed_settled_txs_root: Option<SettledTxsRoot>,
         /// The block's parent-QC weighted timestamp — the anchor the
-        /// settled-waves window walk floors at (`anchor − RETENTION_HORIZON`),
+        /// settled-transaction window walk floors at (`anchor − RETENTION_HORIZON`),
         /// resolved identically by the proposer and every verifier.
         parent_weighted_timestamp: WeightedTimestamp,
         /// The schedule's settled-window floor for the shard at the block's
-        /// anchor — extends the settled-waves window back to the reshape's
+        /// anchor — extends the settled-transaction window back to the reshape's
         /// admission, covering every settlement a counterpart fence can
         /// still hold a straddler against. `None` when no retained window
         /// records one.
-        settled_waves_window_floor: Option<WeightedTimestamp>,
+        settled_txs_window_floor: Option<WeightedTimestamp>,
     },
 
     /// Verify a block's beacon-witness root + leaf count.
@@ -953,13 +953,13 @@ pub enum Action {
         /// Whether the block's window is the shard's final epoch before it
         /// terminates at a reshape boundary — a split parent *or* a merge
         /// child, broader than `carry_split_child_roots`. When set, the
-        /// handler computes the `settled_waves_root` over the committed
+        /// handler computes the `settled_txs_root` over the committed
         /// retention window and stamps it into the header.
-        carry_settled_waves_root: bool,
+        carry_settled_txs_root: bool,
         /// The schedule's settled-window floor for the shard at the block's
-        /// anchor, paired with `carry_settled_waves_root` — extends the
+        /// anchor, paired with `carry_settled_txs_root` — extends the
         /// committed window walk back to the reshape's admission.
-        settled_waves_window_floor: Option<WeightedTimestamp>,
+        settled_txs_window_floor: Option<WeightedTimestamp>,
         /// The block's **anchored** committee snapshot, resolved by the
         /// coordinator as `at_for_shard(local_shard, parent_qc.wt)` — the
         /// same one the verifier recomputes against. Classification
@@ -993,7 +993,7 @@ pub enum Action {
         groups: Vec<TickExecutionGroup>,
     },
 
-    /// Resolve wave fates on the tick chain: promote a settled wave's
+    /// Resolve wave fates on the tick chain: promote a settled transaction's
     /// provisional entries into the readable fold, or drop an aborted
     /// wave's. Applied synchronously on the shard thread so a dispatch
     /// action emitted later in the same commit reads the resolved chain.
@@ -1219,16 +1219,16 @@ pub enum Action {
         count: HeaderFetchCount,
     },
 
-    /// Acquire a terminated shard's settled-wave set `S_P` for the
+    /// Acquire a terminated shard's settled-transaction set `S_P` for the
     /// split-boundary fence in one beacon-attested shot.
     ///
     /// Emitted when the node's own beacon fold attests a terminated
-    /// shard's `settled_waves_root` it doesn't yet hold `S_P` for. The
-    /// I/O loop fetches the shard's complete settled-wave window list
+    /// shard's `settled_txs_root` it doesn't yet hold `S_P` for. The
+    /// I/O loop fetches the shard's complete settled-transaction window list
     /// from its terminal committee (`peers`), accepts it only when the
     /// recomputed root equals `attested_root`, and feeds the verified
-    /// set back as [`crate::ProtocolEvent::SettledWavesReconstructed`].
-    StartSettledWavesAcquisition {
+    /// set back as [`crate::ProtocolEvent::SettledTxsReconstructed`].
+    StartSettledTxsAcquisition {
         /// The terminated shard whose settled set to acquire.
         shard: ShardId,
         /// Height of the terminal block `B`.
@@ -1239,9 +1239,9 @@ pub enum Action {
         /// `B`'s weighted timestamp — bounds the fence's retention cutoff
         /// once the set is recorded, and the host's self-expiry.
         terminal_wt: WeightedTimestamp,
-        /// The beacon-attested `settled_waves_root` the fetched list is
+        /// The beacon-attested `settled_txs_root` the fetched list is
         /// checked against; a mismatch rotates the peer.
-        attested_root: SettledWavesRoot,
+        attested_root: SettledTxsRoot,
         /// The terminated shard's terminal committee, asked in rotation.
         peers: Vec<ValidatorId>,
     },
@@ -1730,7 +1730,7 @@ impl Action {
             | Self::StartBeaconBlockSync { .. }
             | Self::StartRemoteHeaderSync { .. }
             | Self::FetchCommitProof { .. }
-            | Self::StartSettledWavesAcquisition { .. }
+            | Self::StartSettledTxsAcquisition { .. }
             | Self::RestoreCommittedState { .. }
             | Self::Fetch(_)
             | Self::AbandonFetch(_)

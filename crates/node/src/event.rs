@@ -284,20 +284,20 @@ pub enum ShardScopedInput {
         headers: Vec<CertifiedBlockHeader>,
     },
 
-    /// A past-terminal shard's complete settled-wave window list, `None`
+    /// A past-terminal shard's complete settled-transaction window list, `None`
     /// when the peer didn't hold the terminal block. The acquisition host
     /// verifies it against the beacon-attested root before recording.
-    SettledWavesResponseReceived {
+    SettledTxsResponseReceived {
         /// The terminated shard being acquired.
         source_shard: ShardId,
-        /// The shard's complete settled-wave window list, or `None` for
+        /// The shard's complete settled-transaction window list, or `None` for
         /// `not_found`.
-        waves: Option<Vec<WaveId>>,
+        txs: Option<Vec<TxHash>>,
     },
 
     /// Settled-waves fetch failed at the transport level. The driver
     /// re-arms and the next `FetchTick` retries against a rotated peer.
-    SettledWavesFetchFailed {
+    SettledTxsFetchFailed {
         /// The terminated shard being acquired.
         source_shard: ShardId,
     },
@@ -498,8 +498,8 @@ impl ShardScopedInput {
             | Self::RemoteHeadersResponseReceived { .. }
             | Self::RemoteHeadersFetchFailed { .. }
             | Self::CommitProofResponseReceived { .. }
-            | Self::SettledWavesResponseReceived { .. }
-            | Self::SettledWavesFetchFailed { .. }
+            | Self::SettledTxsResponseReceived { .. }
+            | Self::SettledTxsFetchFailed { .. }
             | Self::TransactionsFetchFailed { .. }
             | Self::TransactionValidated { .. }
             | Self::TransactionValidationsFailed { .. }

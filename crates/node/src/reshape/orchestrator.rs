@@ -481,7 +481,7 @@ fn terminal_anchor(header: &BlockHeader) -> ShardAnchor {
         height: header.height(),
         weighted_timestamp: header.parent_qc().weighted_timestamp(),
         witness_base: header.beacon_witness_base(),
-        settled_waves_root: header.settled_waves_root(),
+        settled_txs_root: header.settled_txs_root(),
     }
 }
 
@@ -1887,7 +1887,7 @@ mod tests {
             height: BlockHeight::new(8),
             weighted_timestamp: wt,
             witness_base: BeaconWitnessLeafCount::ZERO,
-            settled_waves_root: None,
+            settled_txs_root: None,
         }
     }
 

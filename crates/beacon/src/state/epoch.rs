@@ -915,7 +915,7 @@ fn record_boundaries(
                 consecutive_misses: 0,
                 terminal_epoch: marks.terminal_epoch,
                 terminal_delivered: marks.terminal_delivered,
-                settled_waves_root: header.settled_waves_root(),
+                settled_txs_root: header.settled_txs_root(),
                 reshape_admitted_epoch: marks.reshape_admitted_epoch,
             },
         );
@@ -947,7 +947,7 @@ fn record_boundaries(
         // children from the header's `split_child_roots`; a merge child
         // carries none — its parent composes from both children's terminal
         // roots in the post-loop pass below. The record then lingers,
-        // carrying the terminated shard's `settled_waves_root` for
+        // carrying the terminated shard's `settled_txs_root` for
         // surviving counterparts to read, until the retention GC below
         // drops it.
         if is_terminal_contribution {
@@ -984,7 +984,7 @@ fn record_boundaries(
 }
 
 /// Drop terminal records past their retention horizon. A terminated
-/// shard's record lingers only to project its `settled_waves_root` to
+/// shard's record lingers only to project its `settled_txs_root` to
 /// surviving counterparts; past `terminal_wt + RETENTION_HORIZON` the
 /// split-boundary fence rejects any wave naming it regardless, so the
 /// record is dead weight. Bounded so a terminated shard can't
@@ -1139,7 +1139,7 @@ fn seed_split_children(
                 consecutive_misses: 0,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -1249,7 +1249,7 @@ fn compose_merge_parent(
             consecutive_misses: 0,
             terminal_epoch: None,
             terminal_delivered: false,
-            settled_waves_root: None,
+            settled_txs_root: None,
             reshape_admitted_epoch: None,
         },
     );
@@ -1269,7 +1269,7 @@ mod tests {
         AggregateSignature, BeaconProposal, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash,
         BlockHeader, BlockHeight, CertificateRoot, ChainOrigin, Epoch, Hash, LocalReceiptRoot,
         MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, ProposerTimestamp, ProvisionsRoot,
-        QuorumCertificate, RevealChain, Round, SettledWavesRoot, ShardBoundary, ShardCommittee,
+        QuorumCertificate, RevealChain, Round, SettledTxsRoot, ShardBoundary, ShardCommittee,
         ShardForkProof, ShardId, ShardLoad, ShardRecovery, ShardWitnessPayload, SignerBitfield,
         SplitChildRoots, Stake, StakePool, StakePoolId, StateRoot, TransactionRoot,
         TransitionCause, ValidatorId, VrfProof, WeightedTimestamp, WorkInFlight,
@@ -1309,7 +1309,7 @@ mod tests {
         root: BeaconWitnessRoot,
         leaf_count: u64,
         split_child_roots: Option<SplitChildRoots>,
-        settled_waves_root: Option<SettledWavesRoot>,
+        settled_txs_root: Option<SettledTxsRoot>,
     ) -> BlockHeader {
         let parent_qc = QuorumCertificate::new(
             BlockHash::ZERO,
@@ -1343,7 +1343,7 @@ mod tests {
             BeaconWitnessLeafCount::ZERO,
             RevealChain::ZERO,
             split_child_roots,
-            settled_waves_root,
+            settled_txs_root,
             ShardLoad::ZERO,
         )
     }
@@ -1389,7 +1389,7 @@ mod tests {
         state_root: StateRoot,
         payloads: Vec<ShardWitnessPayload>,
         split_child_roots: Option<SplitChildRoots>,
-        settled_waves_root: Option<SettledWavesRoot>,
+        settled_txs_root: Option<SettledTxsRoot>,
     ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
         let leaf_count = payloads.len() as u64;
         let leaf_hashes: Vec<Hash> = payloads
@@ -1409,7 +1409,7 @@ mod tests {
             root,
             leaf_count,
             split_child_roots,
-            settled_waves_root,
+            settled_txs_root,
         );
         let range_proof = compute_range_proof(&leaf_hashes, 0, leaf_hashes.len());
         (header, payloads, range_proof)
@@ -1492,7 +1492,7 @@ mod tests {
             beacon_witness_base,
             reveal_chain,
             split_child_roots,
-            settled_waves_root,
+            settled_txs_root,
             _,
         ) = header.into_parts();
         BlockHeader::new(
@@ -1517,7 +1517,7 @@ mod tests {
             beacon_witness_base,
             reveal_chain,
             split_child_roots,
-            settled_waves_root,
+            settled_txs_root,
             load,
         )
     }
@@ -1834,7 +1834,7 @@ mod tests {
                 consecutive_misses: 0,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -1891,7 +1891,7 @@ mod tests {
                 consecutive_misses: 0,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2285,7 +2285,7 @@ mod tests {
                 consecutive_misses: 0,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2381,7 +2381,7 @@ mod tests {
                 consecutive_misses: 0,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2456,7 +2456,7 @@ mod tests {
                 consecutive_misses: 0,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3012,7 +3012,7 @@ mod tests {
         pair: SplitChildRoots,
         state_root: StateRoot,
         leaf_count: u64,
-        settled_waves_root: Option<SettledWavesRoot>,
+        settled_txs_root: Option<SettledTxsRoot>,
     ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
         let payloads: Vec<ShardWitnessPayload> = (0..leaf_count)
             .map(|i| ShardWitnessPayload::StakeDeposit {
@@ -3027,7 +3027,7 @@ mod tests {
             state_root,
             payloads,
             Some(pair),
-            settled_waves_root,
+            settled_txs_root,
         )
     }
 
@@ -3052,7 +3052,7 @@ mod tests {
                 consecutive_misses: 0,
                 terminal_epoch: Some(Epoch::new(1)),
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3072,7 +3072,7 @@ mod tests {
                     consecutive_misses: 0,
                     terminal_epoch: None,
                     terminal_delivered: false,
-                    settled_waves_root: None,
+                    settled_txs_root: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -3120,7 +3120,7 @@ mod tests {
     /// QC past its cut, carrying a composing pair — seeds both pending
     /// children with their verified subtree roots and deterministic
     /// genesis hashes, and the parent's terminal record lingers (carrying
-    /// its settled-waves root for surviving counterparts) past the drain.
+    /// its settled-transaction root for surviving counterparts) past the drain.
     #[test]
     fn terminal_contribution_seeds_the_children_and_retains_the_parent() {
         let (mut state, parent, pair, composed) = terminating_state();
@@ -3256,7 +3256,7 @@ mod tests {
     /// children seed at the first terminal fold, the record applies one
     /// chunk and survives, and the next fold's continuation chunk completes
     /// the drain. The record then lingers (within the retention window) to
-    /// project the terminated shard's settled-waves root.
+    /// project the terminated shard's settled-transaction root.
     #[test]
     fn deep_terminal_backlog_drains_over_two_folds() {
         let (mut state, parent, pair, composed) = terminating_state();
@@ -3314,7 +3314,7 @@ mod tests {
     }
 
     /// A terminal record drops once the chain advances past its retention
-    /// horizon — it lingers only to project the settled-waves root, dead
+    /// horizon — it lingers only to project the settled-transaction root, dead
     /// weight once the fence rejects naming the shard regardless.
     #[test]
     fn terminal_record_drops_past_the_retention_horizon() {
@@ -3501,7 +3501,7 @@ mod tests {
                 consecutive_misses: 0,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3523,7 +3523,7 @@ mod tests {
                     consecutive_misses: 0,
                     terminal_epoch: Some(Epoch::new(1)),
                     terminal_delivered: true,
-                    settled_waves_root: None,
+                    settled_txs_root: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -3603,17 +3603,17 @@ mod tests {
         }
     }
 
-    /// A terminal contribution carrying a `settled_waves_root` folds it
+    /// A terminal contribution carrying a `settled_txs_root` folds it
     /// onto the parent's boundary record and projects it onto the
     /// snap-sync anchor — the path a surviving counterpart reads the
-    /// terminated shard's settled-waves commitment from. Folded with a
+    /// terminated shard's settled-transaction commitment from. Folded with a
     /// lingering backlog so the terminal record survives the fold (a
     /// fully drained one drops in-fold).
     #[test]
-    fn terminal_settled_waves_root_folds_and_projects() {
+    fn terminal_settled_txs_root_folds_and_projects() {
         let (mut state, parent, pair, composed) = terminating_state();
         let total = MAX_WITNESSES_PER_SHARD as u64 + 6;
-        let root = SettledWavesRoot::from_raw(Hash::from_bytes(b"settled waves"));
+        let root = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled transaction"));
 
         let (header, payloads, _range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, total, Some(root));
@@ -3630,7 +3630,7 @@ mod tests {
         );
 
         let folded = state.boundaries.get(&parent).expect("lingers mid-drain");
-        assert_eq!(folded.settled_waves_root, Some(root));
+        assert_eq!(folded.settled_txs_root, Some(root));
 
         // The projection carries the root onto the anchor regardless of
         // trie membership: a terminated parent leaves the trie, but its
@@ -3639,7 +3639,7 @@ mod tests {
             .derive_topology_snapshot(net())
             .boundary(parent)
             .expect("terminal record projects");
-        assert_eq!(anchor.settled_waves_root, Some(root));
+        assert_eq!(anchor.settled_txs_root, Some(root));
     }
 
     // ─── merge parent composition ────────────────────────────────────────
@@ -3670,7 +3670,7 @@ mod tests {
                     consecutive_misses: 0,
                     terminal_epoch: Some(Epoch::new(1)),
                     terminal_delivered: false,
-                    settled_waves_root: None,
+                    settled_txs_root: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -3690,7 +3690,7 @@ mod tests {
                 consecutive_misses: 0,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3994,7 +3994,7 @@ mod tests {
         );
 
         // Fold E+2: the children re-source again and, with the parent
-        // composed, linger past the drain (carrying their settled-waves
+        // composed, linger past the drain (carrying their settled-transaction
         // roots for surviving counterparts) until the retention GC.
         let (committed, contributions) = both(2_500, 2_500);
         record_boundaries(
@@ -4085,7 +4085,7 @@ mod tests {
                 consecutive_misses: 0,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             }
         }
@@ -4308,7 +4308,7 @@ mod tests {
                     consecutive_misses: 0,
                     terminal_epoch: None,
                     terminal_delivered: false,
-                    settled_waves_root: None,
+                    settled_txs_root: None,
                     reshape_admitted_epoch: None,
                 },
             );

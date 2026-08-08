@@ -359,8 +359,8 @@ pub fn assemble_build_action(
     parent_committee_anchor_epoch: Epoch,
     committee_anchor_epoch: Epoch,
     carry_split_child_roots: bool,
-    carry_settled_waves_root: bool,
-    settled_waves_window_floor: Option<WeightedTimestamp>,
+    carry_settled_txs_root: bool,
+    settled_txs_window_floor: Option<WeightedTimestamp>,
     classification_topology_snapshot: Arc<TopologySnapshot>,
     fee_checks: Vec<FeeDemand>,
     fee_read_height: BlockHeight,
@@ -445,8 +445,8 @@ pub fn assemble_build_action(
         parent_committee_anchor_epoch,
         committee_anchor_epoch,
         carry_split_child_roots,
-        carry_settled_waves_root,
-        settled_waves_window_floor,
+        carry_settled_txs_root,
+        settled_txs_window_floor,
         classification_topology_snapshot,
     };
 

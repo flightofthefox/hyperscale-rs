@@ -244,7 +244,7 @@ mod tests {
             height: BlockHeight::new(1),
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
-            settled_waves_root: None,
+            settled_txs_root: None,
         }
     }
 

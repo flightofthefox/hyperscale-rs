@@ -1030,7 +1030,7 @@ mod tests {
             height: BlockHeight::new(1),
             weighted_timestamp: WeightedTimestamp::from_millis(4_000),
             witness_base: BeaconWitnessLeafCount::ZERO,
-            settled_waves_root: None,
+            settled_txs_root: None,
         };
         // The terminal's own parent QC sits at the cut exactly — the
         // boundary instant counts as not yet crossed.

@@ -1,23 +1,23 @@
-//! Settled-waves acquisition I/O glue.
+//! Settled-txs acquisition I/O glue.
 //!
 //! Bridges
-//! [`SettledWavesAcquisition`](super::settled_set::SettledWavesAcquisition)'s
+//! [`SettledTxsAcquisition`](super::settled_set::SettledTxsAcquisition)'s
 //! scheduling to the network and to the state machine. It owns the
 //! one-shot fetch-and-verify; this layer turns its
-//! [`SettledWavesAcquisitionOutput`]s into `GetSettledWavesRequest`
-//! fetches and the verified `Complete` into a `SettledWavesReconstructed`
+//! [`SettledTxsAcquisitionOutput`]s into `GetSettledTxsRequest`
+//! fetches and the verified `Complete` into a `SettledTxsReconstructed`
 //! event for the fence.
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::network::response::GetSettledWavesResponse;
+use hyperscale_types::network::response::GetSettledTxsResponse;
 use hyperscale_types::{
-    BlockHash, BlockHeight, SettledWavesRoot, ShardId, ValidatorId, WaveId, WeightedTimestamp,
+    BlockHash, BlockHeight, SettledTxsRoot, ShardId, TxHash, ValidatorId, WeightedTimestamp,
 };
 
-use super::settled_set::SettledWavesAcquisitionOutput;
+use super::settled_set::SettledTxsAcquisitionOutput;
 use crate::shard::{ShardLoop, ShardScopedInput, push_shard_input};
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -28,16 +28,16 @@ where
 {
     // ─── Action dispatch ────────────────────────────────────────────────
 
-    /// Handle `Action::StartSettledWavesAcquisition`: begin (or retry) a
-    /// terminated shard's settled-waves acquisition and dispatch the
+    /// Handle `Action::StartSettledTxsAcquisition`: begin (or retry) a
+    /// terminated shard's settled-set acquisition and dispatch the
     /// window fetch.
-    pub(crate) fn process_start_settled_waves_acquisition(
+    pub(crate) fn process_start_settled_txs_acquisition(
         &mut self,
         shard: ShardId,
         terminal_height: BlockHeight,
         terminal_block_hash: BlockHash,
         terminal_wt: WeightedTimestamp,
-        attested_root: SettledWavesRoot,
+        attested_root: SettledTxsRoot,
         peers: Vec<ValidatorId>,
     ) {
         let outputs = self.io.cross_shard.settled_set_sync.start(
@@ -48,30 +48,30 @@ where
             attested_root,
             peers,
         );
-        self.process_settled_waves_acquisition_outputs(outputs);
+        self.process_settled_txs_acquisition_outputs(outputs);
     }
 
     // ─── step() handlers ────────────────────────────────────────────────
 
-    /// Network callback: a settled-waves window list arrived for
+    /// Network callback: a settled-set window list arrived for
     /// `source_shard` (`None` when the peer didn't hold the terminal).
-    pub(crate) fn handle_settled_waves_response_received(
+    pub(crate) fn handle_settled_txs_response_received(
         &mut self,
         source_shard: ShardId,
-        waves: Option<Vec<WaveId>>,
+        txs: Option<Vec<TxHash>>,
     ) {
-        let response = GetSettledWavesResponse { waves };
+        let response = GetSettledTxsResponse { txs };
         let outputs = self
             .io
             .cross_shard
             .settled_set_sync
             .on_response(source_shard, &response);
-        self.process_settled_waves_acquisition_outputs(outputs);
+        self.process_settled_txs_acquisition_outputs(outputs);
     }
 
-    /// Network callback: a settled-waves fetch failed at the transport
+    /// Network callback: a settled-set fetch failed at the transport
     /// level. The host re-arms and the next `FetchTick` retries.
-    pub(crate) fn handle_settled_waves_fetch_failed(&mut self, source_shard: ShardId) {
+    pub(crate) fn handle_settled_txs_fetch_failed(&mut self, source_shard: ShardId) {
         self.io
             .cross_shard
             .settled_set_sync
@@ -88,21 +88,21 @@ where
             .latest_qc()
             .map(|qc| qc.weighted_timestamp());
         let outputs = self.io.cross_shard.settled_set_sync.on_tick(now_wt);
-        self.process_settled_waves_acquisition_outputs(outputs);
+        self.process_settled_txs_acquisition_outputs(outputs);
     }
 
     // ─── Output processing ──────────────────────────────────────────────
 
     /// Route host outputs: `Fetch` → network request, `Complete` →
-    /// `SettledWavesReconstructed` event for the fence.
-    fn process_settled_waves_acquisition_outputs(
+    /// `SettledTxsReconstructed` event for the fence.
+    fn process_settled_txs_acquisition_outputs(
         &mut self,
-        outputs: Vec<SettledWavesAcquisitionOutput>,
+        outputs: Vec<SettledTxsAcquisitionOutput>,
     ) {
         let local_shard = self.shard;
         for output in outputs {
             match output {
-                SettledWavesAcquisitionOutput::Fetch {
+                SettledTxsAcquisitionOutput::Fetch {
                     shard,
                     peer,
                     request,
@@ -113,20 +113,20 @@ where
                         peer,
                         request,
                         None,
-                        Box::new(move |result: Result<GetSettledWavesResponse, _>| {
+                        Box::new(move |result: Result<GetSettledTxsResponse, _>| {
                             match result {
                                 Ok(response) => push_shard_input(
                                     &es,
                                     local_shard,
-                                    ShardScopedInput::SettledWavesResponseReceived {
+                                    ShardScopedInput::SettledTxsResponseReceived {
                                         source_shard: shard,
-                                        waves: response.waves,
+                                        txs: response.txs,
                                     },
                                 ),
                                 Err(_) => push_shard_input(
                                     &es,
                                     local_shard,
-                                    ShardScopedInput::SettledWavesFetchFailed {
+                                    ShardScopedInput::SettledTxsFetchFailed {
                                         source_shard: shard,
                                     },
                                 ),
@@ -135,14 +135,14 @@ where
                         }),
                     );
                 }
-                SettledWavesAcquisitionOutput::Complete {
+                SettledTxsAcquisitionOutput::Complete {
                     shard,
-                    waves,
+                    txs,
                     terminal_wt,
                 } => {
-                    self.dispatch_event(ProtocolEvent::SettledWavesReconstructed {
+                    self.dispatch_event(ProtocolEvent::SettledTxsReconstructed {
                         shard,
-                        waves,
+                        txs,
                         terminal_wt,
                     });
                 }

@@ -7,7 +7,7 @@
 //! participate in execution for blocks within the `WAVE_TIMEOUT` window.
 
 use hyperscale_core::{Action, ProtocolEvent};
-use hyperscale_shard::SettledWaveSet;
+use hyperscale_shard::SettledTxSet;
 use hyperscale_types::TopologySchedule;
 
 use super::ShardParticipation;
@@ -50,15 +50,15 @@ impl ShardParticipation {
             // A past-terminal shard's settled set is reconstructed: record
             // it for the split-boundary fence, then re-drive any votes
             // that deferred for want of it.
-            ProtocolEvent::SettledWavesReconstructed {
+            ProtocolEvent::SettledTxsReconstructed {
                 shard,
-                waves,
+                txs,
                 terminal_wt,
             } => {
-                let set = SettledWaveSet { waves, terminal_wt };
+                let set = SettledTxSet { txs, terminal_wt };
                 self.execution_coordinator
-                    .record_settled_waves(shard, set.clone());
-                self.shard_coordinator.record_settled_waves(shard, set);
+                    .record_settled_txs(shard, set.clone());
+                self.shard_coordinator.record_settled_txs(shard, set);
                 let mut actions = self
                     .shard_coordinator
                     .redrive_pending_votes(topology_schedule);
@@ -78,7 +78,7 @@ impl ShardParticipation {
 
     /// Beacon advanced an epoch — replay any cross-shard artifacts buffered
     /// because their committee epoch wasn't yet in the schedule (remote headers,
-    /// ECs, finalized waves), then acquire any newly-attested settled-waves set
+    /// ECs, finalized txs), then acquire any newly-attested settled set
     /// the fence needs. Dispatched from `handle_beacon`'s `BeaconBlockPersisted`
     /// arm via the option guard, so a vnode that only follows the beacon no-ops.
     pub(in crate::state) fn on_beacon_block_persisted(
@@ -96,12 +96,12 @@ impl ShardParticipation {
         // round-contiguous commit rule never sees the consecutive rounds it
         // needs. The post-dispatch hook turns the latch into one `try_propose`.
         self.shard_coordinator.queue_ready_proposal();
-        actions.extend(self.scan_settled_waves_acquisitions(sched));
+        actions.extend(self.scan_settled_txs_acquisitions(sched));
         actions
     }
 
-    /// Start a one-shot settled-waves acquisition for every past-terminal shard
-    /// whose beacon-attested `settled_waves_root` this node's own fold now
+    /// Start a one-shot settled-set acquisition for every past-terminal shard
+    /// whose beacon-attested `settled_txs_root` this node's own fold now
     /// carries and whose `S_P` the fence doesn't yet hold.
     ///
     /// Everything the acquisition needs comes from the node's beacon projection:
@@ -110,7 +110,7 @@ impl ShardParticipation {
     /// peers from the terminal-clamped routing committees. A shard already
     /// recorded (or live) is skipped, so the scan re-runs harmlessly each commit
     /// until the set is acquired.
-    fn scan_settled_waves_acquisitions(&self, sched: &TopologySchedule) -> Vec<Action> {
+    fn scan_settled_txs_acquisitions(&self, sched: &TopologySchedule) -> Vec<Action> {
         let head = sched.head();
         let mut actions = Vec::new();
         for (shard, peers) in sched.routing_committees() {
@@ -120,7 +120,7 @@ impl ShardParticipation {
             let Some(anchor) = head.boundary(shard) else {
                 continue;
             };
-            let Some(attested_root) = anchor.settled_waves_root else {
+            let Some(attested_root) = anchor.settled_txs_root else {
                 continue;
             };
             if self.shard_coordinator.settled_set(shard).is_some() {
@@ -129,7 +129,7 @@ impl ShardParticipation {
             let Some(terminal_wt) = sched.terminal_cut_wt(shard) else {
                 continue;
             };
-            actions.push(Action::StartSettledWavesAcquisition {
+            actions.push(Action::StartSettledTxsAcquisition {
                 shard,
                 terminal_height: anchor.height,
                 terminal_block_hash: anchor.block_hash,

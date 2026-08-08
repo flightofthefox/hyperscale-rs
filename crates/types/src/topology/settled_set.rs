@@ -1,35 +1,38 @@
 //! The split-boundary settled-set predicate.
 //!
 //! When a shard `P` splits, its chain terminates at a terminal block `B`.
-//! A cross-shard transaction whose `P`-half settles only if `P` committed
-//! the wave's certificate by `B` — otherwise one side of the transaction
-//! would apply without the other. `S_P` is the set of wave-ids `P` settled
-//! by `B`; a surviving counterpart reconstructs it from `P`'s tail chain.
+//! A cross-shard transaction's `P`-half settles only if `P` committed the
+//! certificate covering it by `B` — otherwise one side of the transaction
+//! would apply without the other. `S_P` is the set of transactions `P`
+//! settled by `B`; a surviving counterpart reconstructs it from `P`'s tail
+//! chain.
 //!
 //! This module holds the shared predicate both sides apply: the shard
-//! coordinator's pre-vote fence (a block carrying such a wave votes only
-//! if every past-terminal EC is settled) and the execution coordinator's
-//! finalize-hygiene gate (don't even produce a wave the fence would
-//! reject). Keeping one predicate keeps the two verdicts from drifting —
-//! a disagreement would let a gate produce what the fence rejects.
+//! coordinator's pre-vote fence (a block carrying such a transaction votes
+//! only if every past-terminal outcome is settled) and the execution
+//! coordinator's finalize-hygiene gate (don't even produce a finalization
+//! the fence would reject). Keeping one predicate keeps the two verdicts
+//! from drifting — a disagreement would let a gate produce what the fence
+//! rejects.
 
 use std::collections::{BTreeSet, HashMap};
 use std::hash::BuildHasher;
 
-use crate::{RETENTION_HORIZON, ShardId, TopologySchedule, WaveId, WeightedTimestamp};
+use crate::{RETENTION_HORIZON, ShardId, TopologySchedule, TxHash, WeightedTimestamp};
 
-/// A terminated shard's settled-wave set.
+/// A terminated shard's settled-transaction set.
 ///
-/// `waves` are the **cross-shard** wave-ids whose certificate committed in
-/// its chain at or before its terminal block — the only ones a counterpart
-/// fence ever queries. `terminal_wt` is the weighted timestamp at which the
-/// shard terminated, bounding how long the set stays relevant —
-/// [`RETENTION_HORIZON`] past it, any wave naming the shard is
+/// `txs` are the **cross-shard** transactions whose certificate committed
+/// in its chain at or before its terminal block — the only ones a
+/// counterpart fence ever queries. `terminal_wt` is the weighted timestamp
+/// at which the shard terminated, bounding how long the set stays relevant
+/// — [`RETENTION_HORIZON`] past it, any outcome naming the shard is
 /// categorically unreachable everywhere.
 #[derive(Clone, Debug)]
-pub struct SettledWaveSet {
-    /// Cross-shard wave-ids the terminated shard settled by its terminal block.
-    pub waves: BTreeSet<WaveId>,
+pub struct SettledTxSet {
+    /// Cross-shard transactions the terminated shard settled by its
+    /// terminal block.
+    pub txs: BTreeSet<TxHash>,
     /// The terminal block's weighted timestamp.
     pub terminal_wt: WeightedTimestamp,
 }
@@ -38,62 +41,65 @@ pub struct SettledWaveSet {
 /// known settled sets, at an anchored weighted timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettledSetVerdict {
-    /// No certificate names a past-terminal shard, or every such
-    /// certificate's wave is in that shard's settled set.
+    /// No outcome names a past-terminal shard, or every such outcome's
+    /// transaction is in that shard's settled set.
     Pass,
-    /// A certificate names a wave a past-terminal shard did not settle,
-    /// names a shard evicted from every retained window, or sits past the
-    /// terminated shard's retention horizon — categorically unreachable.
+    /// An outcome names a transaction a past-terminal shard did not
+    /// settle, names a shard evicted from every retained window, or sits
+    /// past the terminated shard's retention horizon — categorically
+    /// unreachable.
     Reject,
-    /// A certificate names a past-terminal shard whose settled set isn't
+    /// An outcome names a past-terminal shard whose settled set isn't
     /// known yet, or a shard scheduled to terminate whose settled set can
     /// only exist once it does — hold until the set is reconstructed.
     Defer,
 }
 
-/// Resolve cross-shard execution certificates against the known settled
-/// sets at `anchored_wt`.
+/// Resolve cross-shard outcomes against the known settled sets at
+/// `anchored_wt`.
 ///
-/// `ecs` yields `(shard, wave_id)` for each constituent execution
-/// certificate. Past-terminal-ness is read off the **anchored** snapshot
-/// at `anchored_wt`, so callers that must agree across replicas (the
-/// vote fence) pass the voted block's `parent_qc` weighted timestamp;
-/// node-local callers (the finalize gate) pass their committed timestamp.
+/// `outcomes` yields `(shard, tx_hash)` for each transaction a constituent
+/// execution certificate attests — the question the fence actually asks,
+/// which is whether that shard settled that transaction. Past-terminal-ness
+/// is read off the **anchored** snapshot at `anchored_wt`, so callers that
+/// must agree across replicas (the vote fence) pass the voted block's
+/// `parent_qc` weighted timestamp; node-local callers (the finalize gate)
+/// pass their committed timestamp.
 ///
 /// A shard that is not yet past-terminal but is scheduled to terminate (an
 /// admitted split/merge or a coast toward its terminal block) is fenced the
 /// same way: `Defer` until it terminates and its settled set resolves the
-/// wave. This closes the pre-boundary window in which a survivor could
-/// finalize a straddler the terminating side never settled.
-pub fn settled_set_verdict<'a, S, I>(
-    settled_sets: &HashMap<ShardId, SettledWaveSet, S>,
+/// transaction. This closes the pre-boundary window in which a survivor
+/// could finalize a straddler the terminating side never settled.
+pub fn settled_set_verdict<S, I>(
+    settled_sets: &HashMap<ShardId, SettledTxSet, S>,
     topology_schedule: &TopologySchedule,
     local_shard: ShardId,
     anchored_wt: WeightedTimestamp,
-    ecs: I,
+    outcomes: I,
 ) -> SettledSetVerdict
 where
     S: BuildHasher,
-    I: IntoIterator<Item = (ShardId, &'a WaveId)>,
+    I: IntoIterator<Item = (ShardId, TxHash)>,
 {
     let mut defer = false;
-    for (shard, wave_id) in ecs {
+    for (shard, tx_hash) in outcomes {
         if shard == local_shard {
             continue;
         }
         // Evicted from every retained window — terminated so long ago its
-        // waves can never resolve.
+        // transactions can never resolve.
         let Some((_, past_terminal)) = topology_schedule.at_for_shard(shard, anchored_wt) else {
             return SettledSetVerdict::Reject;
         };
         if !past_terminal {
             // `shard` is live now, but if it is scheduled to terminate it may
-            // leave the trie before it settles this wave — and once it does,
-            // only its settled set is authoritative. Finalizing on
-            // EC-completeness alone would then risk applying a wave the
-            // terminating side never settled (it can produce its EC yet still
-            // fail to receive ours before its terminal block). Defer to its
-            // settled set, exactly as for an already-terminated shard.
+            // leave the trie before it settles this transaction — and once it
+            // does, only its settled set is authoritative. Finalizing on
+            // coverage alone would then risk applying a transaction the
+            // terminating side never settled (it can produce its outcome yet
+            // still fail to receive ours before its terminal block). Defer to
+            // its settled set, exactly as for an already-terminated shard.
             if topology_schedule.termination_scheduled(shard, anchored_wt) {
                 defer = true;
             }
@@ -103,7 +109,7 @@ where
             Some(settled) if anchored_wt > settled.terminal_wt.plus(RETENTION_HORIZON) => {
                 return SettledSetVerdict::Reject;
             }
-            Some(settled) if !settled.waves.contains(wave_id) => {
+            Some(settled) if !settled.txs.contains(&tx_hash) => {
                 return SettledSetVerdict::Reject;
             }
             Some(_) => {}

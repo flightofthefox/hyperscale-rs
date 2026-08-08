@@ -56,7 +56,7 @@ pub struct ShardIo<S: ShardStorage> {
     pub(crate) consensus: ConsensusState,
 
     /// Per-shard cross-shard subsystem state (remote-header sync, cross-shard
-    /// fetch instances/stores, settled-waves acquisition).
+    /// fetch instances/stores, settled-transaction acquisition).
     pub(crate) cross_shard: CrossShardState,
 
     /// Per-shard mempool subsystem state (transaction fetch, validation

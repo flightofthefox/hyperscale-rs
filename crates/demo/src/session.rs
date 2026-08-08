@@ -328,7 +328,7 @@ pub struct Session {
     reported_through: BTreeMap<ShardId, BlockHeight>,
     /// The partition as last reported, so a step emits only changes.
     reported_shards: Vec<ShardId>,
-    /// First height seen carrying a settled-waves root, per shard — the
+    /// First height seen carrying a settled-transaction root, per shard — the
     /// start of the handoff window a terminating shard closes with its last
     /// block. Absent for every shard that is not on its way out.
     handoff_from: BTreeMap<ShardId, BlockHeight>,
@@ -756,10 +756,10 @@ impl Session {
                     header.proposer().inner(),
                     u32::try_from(header.cross_shard_txs().len()).unwrap_or(u32::MAX),
                 ));
-                // A settled-waves root rides every header of a terminating
+                // A settled-transaction root rides every header of a terminating
                 // shard's final epoch, so the first one seen opens the
                 // handoff window that the shard's last block closes.
-                if header.settled_waves_root().is_some() {
+                if header.settled_txs_root().is_some() {
                     handoffs.entry(shard).or_insert_with(|| header.height());
                 }
                 settlement_events(

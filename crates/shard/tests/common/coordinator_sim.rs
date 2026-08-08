@@ -48,7 +48,7 @@ use hyperscale_types::{
     StateRootVerifyError, StoredReceipt, Timeout, TimeoutContext, TopologySchedule,
     TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash,
     TxRootVerifyError, ValidatorId, Verifiable, Verified, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, WorkInFlight, local_settled_wave_ids, shard_reveal_sign, signed_bytes,
+    WeightedTimestamp, WorkInFlight, local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -1090,10 +1090,10 @@ impl ShardCoordinatorSim {
                 block_height: ready.block_height,
                 claimed_split_child_roots: ready.claimed_split_child_roots,
                 split_child_roots_required: ready.split_child_roots_required,
-                settled_waves_root_required: ready.settled_waves_root_required,
-                claimed_settled_waves_root: ready.claimed_settled_waves_root,
+                settled_txs_root_required: ready.settled_txs_root_required,
+                claimed_settled_txs_root: ready.claimed_settled_txs_root,
                 parent_weighted_timestamp: ready.parent_weighted_timestamp,
-                settled_waves_window_floor: ready.settled_waves_window_floor,
+                settled_txs_window_floor: ready.settled_txs_window_floor,
             });
         }
         if self.coordinators[to_idx].take_ready_proposal() {
@@ -1423,8 +1423,8 @@ impl ShardCoordinatorSim {
                 parent_committee_anchor_epoch,
                 committee_anchor_epoch,
                 carry_split_child_roots,
-                carry_settled_waves_root,
-                settled_waves_window_floor,
+                carry_settled_txs_root,
+                settled_txs_window_floor,
                 classification_topology_snapshot: classification_topology,
             } => {
                 // ExtendStaleParent re-parents the proposal onto an ancestor
@@ -1472,13 +1472,13 @@ impl ShardCoordinatorSim {
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
                 let pending_snapshots = view.pending_snapshots().to_vec();
-                let settled_waves_root = carry_settled_waves_root.then(|| {
-                    self.pending_chains[emitter_idx].settled_waves_root_in_window(
+                let settled_txs_root = carry_settled_txs_root.then(|| {
+                    self.pending_chains[emitter_idx].settled_txs_root_in_window(
                         shard_id,
                         parent_block_hash,
                         parent_block_height,
                         parent_qc.weighted_timestamp(),
-                        settled_waves_window_floor,
+                        settled_txs_window_floor,
                         &finalized_waves,
                     )
                 });
@@ -1520,7 +1520,7 @@ impl ShardCoordinatorSim {
                     parent_committee_anchor_epoch,
                     committee_anchor_epoch,
                     carry_split_child_roots,
-                    settled_waves_root,
+                    settled_txs_root,
                     &pending_snapshots,
                 );
                 let block_hash = result.block_hash;
@@ -1534,7 +1534,7 @@ impl ShardCoordinatorSim {
                         parent_block_hash,
                         height,
                         receipts: collect_finalized_receipts(&finalized_waves),
-                        settled_waves: local_settled_wave_ids(&finalized_waves, shard_id),
+                        settled_txs: local_settled_tx_hashes(&finalized_waves, shard_id),
                         jmt_snapshot: result.jmt_snapshot,
                         certified_block: None,
                         certified_uncommitted: None,
@@ -1740,10 +1740,10 @@ impl ShardCoordinatorSim {
                 block_height,
                 claimed_split_child_roots,
                 split_child_roots_required,
-                settled_waves_root_required,
-                claimed_settled_waves_root,
+                settled_txs_root_required,
+                claimed_settled_txs_root,
                 parent_weighted_timestamp,
-                settled_waves_window_floor,
+                settled_txs_window_floor,
             } => {
                 // Mirrors the production handler: receipt-root
                 // pre-flight first, then JMT prep on success.
@@ -1766,13 +1766,13 @@ impl ShardCoordinatorSim {
                 if !receipt_ok {
                     return;
                 }
-                let computed_settled_waves_root = settled_waves_root_required.then(|| {
-                    self.pending_chains[emitter_idx].settled_waves_root_in_window(
+                let computed_settled_txs_root = settled_txs_root_required.then(|| {
+                    self.pending_chains[emitter_idx].settled_txs_root_in_window(
                         self.shard,
                         parent_block_hash,
                         parent_block_height,
                         parent_weighted_timestamp,
-                        settled_waves_window_floor,
+                        settled_txs_window_floor,
                         &finalized_waves,
                     )
                 });
@@ -1794,9 +1794,9 @@ impl ShardCoordinatorSim {
                     computed_root: &computed_root,
                     claimed_split_child_roots,
                     split_child_roots_required,
-                    claimed_settled_waves_root,
-                    computed_settled_waves_root,
-                    settled_waves_root_required,
+                    claimed_settled_txs_root,
+                    computed_settled_txs_root,
+                    settled_txs_root_required,
                 });
                 let bytes_delta = jmt_snapshot.bytes_delta;
                 if verify_result.is_ok() {
@@ -1806,7 +1806,7 @@ impl ShardCoordinatorSim {
                             parent_block_hash,
                             height: block_height,
                             receipts: collect_finalized_receipts(&finalized_waves),
-                            settled_waves: local_settled_wave_ids(&finalized_waves, self.shard),
+                            settled_txs: local_settled_tx_hashes(&finalized_waves, self.shard),
                             jmt_snapshot,
                             certified_block: None,
                             certified_uncommitted: None,
@@ -1980,7 +1980,7 @@ pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
         h.beacon_witness_base(),
         h.reveal_chain(),
         h.split_child_roots(),
-        h.settled_waves_root(),
+        h.settled_txs_root(),
         h.load(),
     )
 }

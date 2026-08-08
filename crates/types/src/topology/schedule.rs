@@ -607,7 +607,7 @@ impl TopologySchedule {
     /// A terminated split parent leaves the head trie but lingers in recent
     /// windows until its drain horizon; this returns its terminal cut,
     /// which bounds the split-boundary fence's retention cutoff and the
-    /// settled-waves acquisition's self-expiry.
+    /// settled-set acquisition's self-expiry.
     #[must_use]
     pub fn terminal_cut_wt(&self, shard: ShardId) -> Option<WeightedTimestamp> {
         if self.head.shard_trie().contains(shard) {
@@ -688,7 +688,7 @@ impl TopologySchedule {
     /// Generalizes [`split_at_next_boundary`](Self::split_at_next_boundary)
     /// from its split-only `Children` answer to any terminating reshape:
     /// the terminal-coast boundary header of a split parent *or* a merge
-    /// child carries the `settled_waves_root`, so its carry predicate keys
+    /// child carries the `settled_txs_root`, so its carry predicate keys
     /// on this. A [`single`](Self::single) schedule has no epoch
     /// boundaries, so nothing terminates at one.
     #[must_use]
@@ -753,12 +753,12 @@ impl TopologySchedule {
         pending || self.terminates_at_next_boundary(shard, wt) == Some(true)
     }
 
-    /// The floor of `shard`'s attested settled-waves window at `wt`: the
+    /// The floor of `shard`'s attested settled-transaction window at `wt`: the
     /// start of the epoch its terminating reshape was admitted, backed off
     /// by [`RETENTION_HORIZON`] to cover a wave that finalized against the
     /// fence just after it armed but executed up to a full wave lifetime
     /// earlier. Counterpart fences hold straddlers from admission, so the
-    /// window a terminal's `settled_waves_root` commits must reach back to
+    /// window a terminal's `settled_txs_root` commits must reach back to
     /// it — a fixed span behind the terminal misses settlements the fence
     /// is still holding against.
     ///

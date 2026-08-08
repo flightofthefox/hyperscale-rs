@@ -12,9 +12,9 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
-    DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds, Round,
-    SettledWavesRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId,
-    ValidatorSet, VoteCount, WeightedTimestamp,
+    DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds, Round, SettledTxsRoot,
+    ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId, ValidatorSet,
+    VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -55,11 +55,11 @@ pub struct ShardAnchor {
     /// header's `beacon_witness_root`. Serving shards retain persisted
     /// witness payloads down to this index.
     pub witness_base: BeaconWitnessLeafCount,
-    /// The terminated shard's beacon-attested settled-waves commitment, set
+    /// The terminated shard's beacon-attested settled-transaction commitment, set
     /// only on a terminal boundary record. A surviving counterpart reads it
     /// to resolve split-straddling waves against the terminated shard's
     /// settled set; `None` for a live shard's anchor.
-    pub settled_waves_root: Option<SettledWavesRoot>,
+    pub settled_txs_root: Option<SettledTxsRoot>,
 }
 
 /// One reshape cohort seat as the topology projects it.
@@ -140,7 +140,7 @@ pub struct TopologySnapshot {
     /// the same set. Distinguishes which reshape a scheduled cut belongs
     /// to — a terminating shard splits into its children if this holds
     /// and merges into its parent otherwise — and marks the shards whose
-    /// settled-waves window is fenced open.
+    /// settled-transaction window is fenced open.
     split_pending: BTreeSet<ShardId>,
     /// Each terminating leaf's scheduled final window as of this window's
     /// committee freeze — a split's parent, or both of a merge's
@@ -148,13 +148,13 @@ pub struct TopologySnapshot {
     /// the affirmative half of the same question: `split_pending` rules a
     /// boundary out, this rules one in.
     scheduled_terminals: BTreeMap<ShardId, Epoch>,
-    /// Each terminating leaf's settled-waves window floor as of this
+    /// Each terminating leaf's settled-transaction window floor as of this
     /// window's committee freeze — pending split targets, paired merge
     /// children, and shards coasting to their terminal block, each mapped
     /// to the start of its reshape's admission epoch backed off by the
     /// retention horizon. Frozen with the same discipline as
     /// `split_pending`; the schedule's settled-window floor reads it to
-    /// reach the attested settled-waves window back to the point
+    /// reach the attested settled-transaction window back to the point
     /// counterpart fences began holding straddlers.
     settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
     /// Each recovering shard's in-flight recovery, projected live
@@ -472,7 +472,7 @@ impl TopologySnapshot {
         self
     }
 
-    /// Set each terminating leaf's settled-waves window floor (see
+    /// Set each terminating leaf's settled-transaction window floor (see
     /// [`Self::settled_window_floor`]). Defaults empty; the beacon
     /// projection supplies the frozen (active) or live (lookahead) value.
     /// Builder-set rather than a constructor argument so the many
@@ -643,7 +643,7 @@ impl TopologySnapshot {
         self.reshape_keepers.contains_key(&shard)
     }
 
-    /// The floor of `shard`'s attested settled-waves window, as of this
+    /// The floor of `shard`'s attested settled-transaction window, as of this
     /// window's committee freeze — present while `shard`'s terminating
     /// reshape pends and through its coast to its terminal block: the
     /// start of the reshape's admission epoch, backed off by the
@@ -1436,7 +1436,7 @@ mod tests {
             height: BlockHeight::new(42),
             weighted_timestamp: WeightedTimestamp::from_millis(42),
             witness_base: BeaconWitnessLeafCount::ZERO,
-            settled_waves_root: None,
+            settled_txs_root: None,
         };
         let mut boundaries = HashMap::new();
         boundaries.insert(ShardId::leaf(1, 0), anchor);

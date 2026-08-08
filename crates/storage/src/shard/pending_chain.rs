@@ -12,10 +12,10 @@ use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeRea
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
-    MerkleInclusionProof, PreparedCommit, QuorumCertificate, RETENTION_HORIZON, SettledWavesRoot,
+    MerkleInclusionProof, PreparedCommit, QuorumCertificate, RETENTION_HORIZON, SettledTxsRoot,
     ShardId, ShardWitnessPayload, StateRoot, StateWrites, SubstateKey, Transaction, TxHash,
-    Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, local_settled_wave_ids,
-    settled_waves_root_from_ids,
+    Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp, local_settled_tx_hashes,
+    settled_txs_root_from_hashes,
 };
 
 use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
@@ -46,9 +46,9 @@ pub struct ChainEntry {
     /// Wave-ids this shard settled in this block — the local execution
     /// certificate of each committed wave. Carried from insert (the
     /// certificates exist before the QC attaches `certified_block`), so a
-    /// settled-waves window walk reaches a pending ancestor's contribution
+    /// settled-transaction window walk reaches a pending ancestor's contribution
     /// during the proposer's build, not just after commit.
-    pub settled_waves: Vec<WaveId>,
+    pub settled_txs: Vec<TxHash>,
     /// JMT snapshot from this block's speculative state-root computation.
     pub jmt_snapshot: Arc<JmtSnapshot>,
     /// shard-committed block paired with its QC. `None` until the entry's
@@ -87,7 +87,7 @@ pub struct PendingChain<S> {
 }
 
 /// Memoized committed-tail contribution to a terminating shard's
-/// settled-waves window (see [`PendingChain::settled_waves_in_window`]).
+/// settled-transaction window (see [`PendingChain::settled_txs_in_window`]).
 ///
 /// Valid only under a schedule-stable floor: the committed chain is linear
 /// and immutable, so for a fixed `(shard, floor)` the accumulated set only
@@ -98,7 +98,7 @@ struct SettledWindowMemo {
     floor: WeightedTimestamp,
     /// Highest committed height folded into `set` (inclusive).
     upto: BlockHeight,
-    set: std::collections::BTreeSet<WaveId>,
+    set: std::collections::BTreeSet<TxHash>,
 }
 
 impl<S> PendingChain<S>
@@ -307,7 +307,7 @@ where
         self.base.get_block_for_sync(height)
     }
 
-    /// A terminating shard's settled-waves root over `[min(anchor_wt,
+    /// A terminating shard's settled-transaction root over `[min(anchor_wt,
     /// window_floor) − RETENTION_HORIZON, parent]`, including
     /// `own_certificates` (the block being built or verified). `anchor_wt`
     /// is the block's parent-QC weighted timestamp and `window_floor` the
@@ -315,7 +315,7 @@ where
     /// proposer and every verifier — so the floored window, and thus the
     /// root, agree.
     #[must_use]
-    pub fn settled_waves_root_in_window(
+    pub fn settled_txs_root_in_window(
         &self,
         local_shard: ShardId,
         parent_block_hash: BlockHash,
@@ -323,21 +323,21 @@ where
         anchor_wt: WeightedTimestamp,
         window_floor: Option<WeightedTimestamp>,
         own_certificates: &[Arc<Verifiable<FinalizedWave>>],
-    ) -> SettledWavesRoot {
-        let set = self.settled_waves_in_window(
+    ) -> SettledTxsRoot {
+        let set = self.settled_txs_in_window(
             local_shard,
             parent_block_hash,
             parent_block_height,
             anchor_wt,
             window_floor,
-            local_settled_wave_ids(own_certificates, local_shard),
+            local_settled_tx_hashes(own_certificates, local_shard),
         );
-        settled_waves_root_from_ids(set.iter())
+        settled_txs_root_from_hashes(set.iter())
     }
 
     /// The wave-ids `local_shard` settled across the window, unioned with
     /// `own` (the block being built or verified). Walks the parent's
-    /// pending prefix by hash (each entry carries its settled wave-ids
+    /// pending prefix by hash (each entry carries its settled transaction-ids
     /// from insert, so a not-yet-attached ancestor still contributes),
     /// then the committed tail by height until a block falls below the
     /// floor: `RETENTION_HORIZON` behind `anchor_wt`, extended down to
@@ -347,21 +347,21 @@ where
     ///
     /// Pure over the parent chain: the proposer (parent still pending) and
     /// every verifier (parent committed) walk the same ancestors and
-    /// produce the same set, so the settled-waves root they derive agrees.
+    /// produce the same set, so the settled-transaction root they derive agrees.
     /// A terminal committee serving a counterpart its window list reads the
     /// same set off the committed tail (`own` is the terminal block's own
-    /// settled wave-ids, its prefix the committed ancestors), so the served
+    /// settled transaction-ids, its prefix the committed ancestors), so the served
     /// list recomputes to the attested root.
-    pub fn settled_waves_in_window(
+    pub fn settled_txs_in_window(
         &self,
         local_shard: ShardId,
         parent_block_hash: BlockHash,
         parent_block_height: BlockHeight,
         anchor_wt: WeightedTimestamp,
         window_floor: Option<WeightedTimestamp>,
-        own: Vec<WaveId>,
-    ) -> std::collections::BTreeSet<WaveId> {
-        let mut set: std::collections::BTreeSet<WaveId> = own.into_iter().collect();
+        own: Vec<TxHash>,
+    ) -> std::collections::BTreeSet<TxHash> {
+        let mut set: std::collections::BTreeSet<TxHash> = own.into_iter().collect();
         // Pending prefix: walk by hash so a certified-but-unattached
         // ancestor still resolves. These ancestors sit within the window by
         // construction (they are the recent uncommitted tip), so they need
@@ -371,7 +371,7 @@ where
         {
             let entries = read_or_recover(&self.entries);
             while let Some(entry) = entries.get(&hash) {
-                set.extend(entry.settled_waves.iter().cloned());
+                set.extend(entry.settled_txs.iter().copied());
                 hash = entry.parent_block_hash;
                 let Some(prev) = height.prev() else { break };
                 height = prev;
@@ -395,7 +395,7 @@ where
         set
     }
 
-    /// The committed-tail contribution to a settled-waves window under a
+    /// The committed-tail contribution to a settled-transaction window under a
     /// schedule-stable floor: every wave `local_shard` settled in a
     /// committed block with weighted timestamp at or above `floor`, at
     /// heights up to `upto` (inclusive).
@@ -412,8 +412,8 @@ where
         local_shard: ShardId,
         floor: WeightedTimestamp,
         upto: BlockHeight,
-    ) -> std::collections::BTreeSet<WaveId> {
-        let covered: Option<(BlockHeight, std::collections::BTreeSet<WaveId>)> =
+    ) -> std::collections::BTreeSet<TxHash> {
+        let covered: Option<(BlockHeight, std::collections::BTreeSet<TxHash>)> =
             read_or_recover(&self.settled_window_memo)
                 .as_ref()
                 .filter(|m| m.local_shard == local_shard && m.floor == floor && m.upto <= upto)
@@ -440,7 +440,7 @@ where
     }
 
     /// Walk the committed chain downward from `upto`, folding
-    /// `local_shard`'s settled wave-ids into `set`, stopping below `floor`
+    /// `local_shard`'s settled transaction-ids into `set`, stopping below `floor`
     /// or at `covered_upto` (heights at or below it are already folded).
     ///
     /// The floor reads each block's own `parent_qc` weighted timestamp —
@@ -455,7 +455,7 @@ where
         floor: WeightedTimestamp,
         upto: BlockHeight,
         covered_upto: Option<BlockHeight>,
-        set: &mut std::collections::BTreeSet<WaveId>,
+        set: &mut std::collections::BTreeSet<TxHash>,
     ) {
         let mut h = upto;
         while covered_upto != Some(h) {
@@ -466,7 +466,7 @@ where
             if block_wt.as_millis() < floor.as_millis() {
                 break;
             }
-            set.extend(local_settled_wave_ids(
+            set.extend(local_settled_tx_hashes(
                 entry.block.certificates().iter(),
                 local_shard,
             ));
@@ -1205,7 +1205,7 @@ mod tests {
             parent_block_hash: parent,
             height,
             receipts: vec![make_receipt(writes)],
-            settled_waves: Vec::new(),
+            settled_txs: Vec::new(),
             jmt_snapshot: empty_snapshot(),
             certified_block: None,
             certified_uncommitted: None,
@@ -1408,7 +1408,7 @@ mod tests {
                 parent_block_hash: BlockHash::ZERO,
                 height,
                 receipts: Vec::new(),
-                settled_waves: Vec::new(),
+                settled_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
@@ -1500,7 +1500,7 @@ mod tests {
                 parent_block_hash: BlockHash::ZERO,
                 height: BlockHeight::new(5),
                 receipts: Vec::new(),
-                settled_waves: Vec::new(),
+                settled_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
@@ -1595,9 +1595,9 @@ mod tests {
         assert!(chain.latest_qc().is_none());
     }
 
-    /// A cross-shard wave keyed on `ShardId::ROOT` — the only kind that
-    /// lands in the settled set, since `local_settled_wave_ids` drops
-    /// single-shard (`is_zero`) waves.
+    /// A cross-shard wave keyed on `ShardId::ROOT` — the only kind whose
+    /// transactions land in the settled set, since `local_settled_tx_hashes`
+    /// drops single-shard (`is_zero`) waves.
     fn wave(n: u64) -> WaveId {
         WaveId::new(
             ShardId::ROOT,
@@ -1606,13 +1606,19 @@ mod tests {
         )
     }
 
+    /// The transaction a given wave settles. Distinct per wave, so a set
+    /// built from several waves has one entry each.
+    fn settled_tx(wave: &WaveId) -> TxHash {
+        TxHash::from(Hash::from_bytes(&wave.block_height().inner().to_le_bytes()))
+    }
+
     fn ec_for(wave: &WaveId) -> Arc<ExecutionCertificate> {
         Arc::new(ExecutionCertificate::new(
             wave.clone(),
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome::new(
-                TxHash::from(Hash::from_bytes(b"tx")),
+                settled_tx(wave),
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
@@ -1672,11 +1678,11 @@ mod tests {
 
     /// The pending prefix contributes a parent and an ancestor whose
     /// `certified_block` has not attached yet — the exact state that left
-    /// `block_for_sync` blind and made a proposer's settled-waves root
-    /// diverge from the verifiers'. The walk reads `settled_waves` straight
+    /// `block_for_sync` blind and made a proposer's settled-transaction root
+    /// diverge from the verifiers'. The walk reads `settled_txs` straight
     /// off the entry, so both sides agree.
     #[test]
-    fn settled_waves_window_collects_unattached_pending_ancestors() {
+    fn settled_txs_window_collects_unattached_pending_ancestors() {
         let chain = empty_chain();
         let ancestor = BlockHash::from_raw(Hash::from_bytes(b"ancestor"));
         let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
@@ -1687,7 +1693,7 @@ mod tests {
                 parent_block_hash: BlockHash::ZERO,
                 height: BlockHeight::new(4),
                 receipts: Vec::new(),
-                settled_waves: vec![wa.clone()],
+                settled_txs: vec![settled_tx(&wa)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
@@ -1699,21 +1705,24 @@ mod tests {
                 parent_block_hash: ancestor,
                 height: BlockHeight::new(5),
                 receipts: Vec::new(),
-                settled_waves: vec![wb.clone()],
+                settled_txs: vec![settled_tx(&wb)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
             },
         );
-        let set = chain.settled_waves_in_window(
+        let set = chain.settled_txs_in_window(
             ShardId::ROOT,
             parent,
             BlockHeight::new(5),
             WeightedTimestamp::from_millis(10_000),
             None,
-            vec![own.clone()],
+            vec![settled_tx(&own)],
         );
-        assert_eq!(set, BTreeSet::from([wa, wb, own]));
+        assert_eq!(
+            set,
+            BTreeSet::from([settled_tx(&wa), settled_tx(&wb), settled_tx(&own)])
+        );
     }
 
     /// The committed tail walks by height and stops at the retention floor:
@@ -1723,7 +1732,7 @@ mod tests {
     /// the below-floor block a certifying QC far above the floor, so a floor
     /// that read the served QC would wrongly include it.
     #[test]
-    fn settled_waves_window_floors_the_committed_tail() {
+    fn settled_txs_window_floors_the_committed_tail() {
         let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
         let anchor = WeightedTimestamp::from_millis(rh_ms + 10_000); // floor = 10_000
         let (in_window, below_floor, parent_wave) = (wave(200), wave(201), wave(202));
@@ -1744,13 +1753,13 @@ mod tests {
                 parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed-tip")),
                 height: BlockHeight::new(4),
                 receipts: Vec::new(),
-                settled_waves: vec![parent_wave.clone()],
+                settled_txs: vec![settled_tx(&parent_wave)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
                 certified_uncommitted: None,
             },
         );
-        let set = chain.settled_waves_in_window(
+        let set = chain.settled_txs_in_window(
             ShardId::ROOT,
             parent,
             BlockHeight::new(4),
@@ -1758,7 +1767,10 @@ mod tests {
             None,
             Vec::new(),
         );
-        assert_eq!(set, BTreeSet::from([parent_wave, in_window]));
+        assert_eq!(
+            set,
+            BTreeSet::from([settled_tx(&parent_wave), settled_tx(&in_window)])
+        );
     }
 
     /// A schedule-supplied window floor extends the committed walk below
@@ -1781,7 +1793,7 @@ mod tests {
                 settled_sync_block(BlockHeight::new(2), 9_999, &early_settled),
             );
         let chain = Arc::new(PendingChain::new(Arc::new(stub)));
-        let set = chain.settled_waves_in_window(
+        let set = chain.settled_txs_in_window(
             ShardId::ROOT,
             BlockHash::from_raw(Hash::from_bytes(b"missing-parent")),
             BlockHeight::new(3),
@@ -1789,7 +1801,10 @@ mod tests {
             Some(WeightedTimestamp::from_millis(9_000)),
             Vec::new(),
         );
-        assert_eq!(set, BTreeSet::from([in_window, early_settled]));
+        assert_eq!(
+            set,
+            BTreeSet::from([settled_tx(&in_window), settled_tx(&early_settled)])
+        );
     }
 
     /// The memoized window walk extends at the tip and never leaks later
@@ -1816,7 +1831,7 @@ mod tests {
             );
         let chain = Arc::new(PendingChain::new(Arc::new(stub)));
         let at = |h: u64| {
-            chain.settled_waves_in_window(
+            chain.settled_txs_in_window(
                 ShardId::ROOT,
                 BlockHash::from_raw(Hash::from_bytes(b"missing-parent")),
                 BlockHeight::new(h),
@@ -1825,10 +1840,13 @@ mod tests {
                 Vec::new(),
             )
         };
-        assert_eq!(at(3), BTreeSet::from([w2.clone(), w3.clone()]));
+        assert_eq!(at(3), BTreeSet::from([settled_tx(&w2), settled_tx(&w3)]));
         // The higher call folds only block 4 onto the memo.
-        assert_eq!(at(4), BTreeSet::from([w2.clone(), w3.clone(), w4]));
+        assert_eq!(
+            at(4),
+            BTreeSet::from([settled_tx(&w2), settled_tx(&w3), settled_tx(&w4)])
+        );
         // Back below the memo's coverage: full recompute, no leak of block 4.
-        assert_eq!(at(3), BTreeSet::from([w2, w3]));
+        assert_eq!(at(3), BTreeSet::from([settled_tx(&w2), settled_tx(&w3)]));
     }
 }

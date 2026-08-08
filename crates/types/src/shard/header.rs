@@ -13,7 +13,7 @@ use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
     ChainOrigin, Hash, LocalReceiptRoot, MAX_REMOTE_SHARDS_PER_WAVE, MAX_TXS_PER_BLOCK,
     ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
-    SettledWavesRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot, TransactionRoot, TxHash,
+    SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot, TransactionRoot, TxHash,
     ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, WorkInFlight,
 };
 
@@ -78,7 +78,7 @@ pub struct BlockHeader {
     /// [`ShardBoundary`](crate::ShardBoundary), so a surviving counterpart
     /// resolves split-straddling waves against the terminated shard's
     /// settled set without walking its chain.
-    settled_waves_root: Option<SettledWavesRoot>,
+    settled_txs_root: Option<SettledTxsRoot>,
     /// The shard's attested load through this block — attested work as a
     /// running total, and the byte total behind the parent state. The
     /// beacon reads it off the boundary header it already sources and
@@ -120,7 +120,7 @@ impl BlockHeader {
         beacon_witness_base: BeaconWitnessLeafCount,
         reveal_chain: RevealChain,
         split_child_roots: Option<SplitChildRoots>,
-        settled_waves_root: Option<SettledWavesRoot>,
+        settled_txs_root: Option<SettledTxsRoot>,
         load: ShardLoad,
     ) -> Self {
         Self {
@@ -145,7 +145,7 @@ impl BlockHeader {
             beacon_witness_base,
             reveal_chain,
             split_child_roots,
-            settled_waves_root,
+            settled_txs_root,
             load,
         }
     }
@@ -189,7 +189,7 @@ impl BlockHeader {
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
             reveal_chain: RevealChain::ZERO,
             split_child_roots: None,
-            settled_waves_root: None,
+            settled_txs_root: None,
             load: ShardLoad::ZERO,
         }
     }
@@ -241,7 +241,7 @@ impl BlockHeader {
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
             reveal_chain: RevealChain::ZERO,
             split_child_roots: None,
-            settled_waves_root: None,
+            settled_txs_root: None,
             load: ShardLoad::ZERO,
         }
     }
@@ -307,7 +307,7 @@ impl BlockHeader {
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
             reveal_chain: RevealChain::ZERO,
             split_child_roots: None,
-            settled_waves_root: None,
+            settled_txs_root: None,
             load: ShardLoad::ZERO,
         }
     }
@@ -536,8 +536,8 @@ impl BlockHeader {
     /// retention window — present on a terminating shard's boundary
     /// header, `None` everywhere else.
     #[must_use]
-    pub const fn settled_waves_root(&self) -> Option<SettledWavesRoot> {
-        self.settled_waves_root
+    pub const fn settled_txs_root(&self) -> Option<SettledTxsRoot> {
+        self.settled_txs_root
     }
 
     /// The shard's attested load through this block: attested work as a
@@ -575,7 +575,7 @@ impl BlockHeader {
         BeaconWitnessLeafCount,
         RevealChain,
         Option<SplitChildRoots>,
-        Option<SettledWavesRoot>,
+        Option<SettledTxsRoot>,
         ShardLoad,
     ) {
         (
@@ -600,7 +600,7 @@ impl BlockHeader {
             self.beacon_witness_base,
             self.reveal_chain,
             self.split_child_roots,
-            self.settled_waves_root,
+            self.settled_txs_root,
             self.load,
         )
     }
@@ -891,13 +891,13 @@ mod tests {
         assert_ne!(carrying.hash(), bare.hash());
     }
 
-    /// `settled_waves_root` is hash-affecting header content: a populated
+    /// `settled_txs_root` is hash-affecting header content: a populated
     /// root survives the wire round-trip and produces a different block
     /// hash than the same header without it.
     #[test]
-    fn settled_waves_root_round_trip_and_hash() {
+    fn settled_txs_root_round_trip_and_hash() {
         let bare = sample_header();
-        let root = SettledWavesRoot::from_raw(Hash::from_bytes(b"settled window"));
+        let root = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled window"));
         let (
             shard_id,
             height,
@@ -950,7 +950,7 @@ mod tests {
         );
 
         let decoded: BlockHeader = hbor_from_slice(&hbor_to_vec(&carrying).unwrap()).unwrap();
-        assert_eq!(decoded.settled_waves_root(), Some(root));
+        assert_eq!(decoded.settled_txs_root(), Some(root));
         assert_ne!(carrying.hash(), bare.hash());
     }
 

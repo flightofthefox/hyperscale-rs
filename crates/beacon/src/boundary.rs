@@ -82,7 +82,7 @@ pub fn proposal_boundary_qcs_admissible(
 /// fine.
 ///
 /// A terminated shard's record lingers past its final epoch — to carry the
-/// terminal contribution to the fold and project its settled-waves root —
+/// terminal contribution to the fold and project its settled-transaction root —
 /// so its terminal crossing stays sourced until the fold consumes it. Once
 /// a split parent's terminal has folded (the boundary record names it, its
 /// children seeded), re-sourcing only forces every beacon member that never

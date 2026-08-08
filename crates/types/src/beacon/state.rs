@@ -38,7 +38,7 @@ use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, NetworkDefinition,
-    RETENTION_HORIZON, Randomness, SettledWavesRoot, ShardId, Stake, StakePoolId, StateRoot,
+    RETENTION_HORIZON, Randomness, SettledTxsRoot, ShardId, Stake, StakePoolId, StateRoot,
     ValidatorId, WeightedTimestamp,
 };
 
@@ -330,17 +330,17 @@ pub struct ShardBoundary {
     /// parent never sets it — its children seed in the same fold that
     /// records its terminal, so there is nothing to wait for.
     pub terminal_delivered: bool,
-    /// The terminal header's `settled_waves_root` — the beacon-attested
+    /// The terminal header's `settled_txs_root` — the beacon-attested
     /// commitment over the wave-ids this shard settled in its retention
     /// window up to its terminal block. `Some` only on a terminated
     /// shard's boundary record; a surviving counterpart projects it onto
     /// [`ShardAnchor`](crate::ShardAnchor) and resolves split-straddling
     /// waves against it. `None` for a live shard.
-    pub settled_waves_root: Option<SettledWavesRoot>,
+    pub settled_txs_root: Option<SettledTxsRoot>,
     /// Epoch the reshape that terminates this shard was admitted (split)
     /// or paired (merge), stamped at the reshape's execution alongside
     /// [`terminal_epoch`](Self::terminal_epoch). Floors the shard's
-    /// attested settled-waves window: counterpart fences hold straddlers
+    /// attested settled-transaction window: counterpart fences hold straddlers
     /// from the moment the reshape projects, so the window must reach back
     /// to that point, not a fixed span behind the terminal. `None` for a
     /// live shard.
@@ -586,7 +586,7 @@ pub struct FrozenWindow {
     pub witness_bases: BTreeMap<ShardId, BeaconWitnessLeafCount>,
     /// Shards with an admitted, not-yet-applied split. The schedule's
     /// boundary predicates read it to tell which reshape a scheduled cut
-    /// belongs to, and it marks the shards whose settled-waves window is
+    /// belongs to, and it marks the shards whose settled-transaction window is
     /// fenced open.
     pub split_pending: BTreeSet<ShardId>,
     /// Each terminating leaf's scheduled final window — the affirmative
@@ -598,7 +598,7 @@ pub struct FrozenWindow {
     /// a self-naming schedule would land after this snapshot and diverge a
     /// window's two writes.
     pub scheduled_terminals: BTreeMap<ShardId, Epoch>,
-    /// Each terminating leaf's settled-waves window floor: pending split
+    /// Each terminating leaf's settled-transaction window floor: pending split
     /// targets and paired merge children from the live records, plus
     /// shards already coasting to their terminal.
     pub settled_window_floors: BTreeMap<ShardId, WeightedTimestamp>,
@@ -615,7 +615,7 @@ pub struct FrozenWindow {
     pub reshape_observers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
     /// Each pending merge's keepers, keyed by the child each keeper runs,
     /// mapping keeper to its seat on the merging parent. Drives a child's
-    /// `ReshapeReady` classification and the merge-terminal settled-waves
+    /// `ReshapeReady` classification and the merge-terminal settled-transaction
     /// carry; the applying fold consumes the keepers mid-fold, under the
     /// same argument as the observer cohort.
     pub reshape_keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
@@ -1548,7 +1548,7 @@ impl BeaconState {
         scheduled
     }
 
-    /// Each terminating leaf's settled-waves window floor as state stands
+    /// Each terminating leaf's settled-transaction window floor as state stands
     /// right now: the start of the epoch its reshape was admitted (split)
     /// or paired (merge), backed off by [`RETENTION_HORIZON`] to cover a
     /// wave that finalized against the fence just after it armed but
@@ -1696,7 +1696,7 @@ impl BeaconState {
                         height: b.height,
                         weighted_timestamp: b.weighted_timestamp,
                         witness_base: b.witness_base,
-                        settled_waves_root: b.settled_waves_root,
+                        settled_txs_root: b.settled_txs_root,
                     },
                 )
             })
@@ -1978,7 +1978,7 @@ mod tests {
             consecutive_misses: 0,
             terminal_epoch: None,
             terminal_delivered: false,
-            settled_waves_root: None,
+            settled_txs_root: None,
             reshape_admitted_epoch: None,
         };
         state.boundaries.insert(child, pending(Epoch::new(4)));
@@ -2046,7 +2046,7 @@ mod tests {
             consecutive_misses: misses,
             terminal_epoch: None,
             terminal_delivered: false,
-            settled_waves_root: None,
+            settled_txs_root: None,
             reshape_admitted_epoch: None,
         };
 
@@ -2346,7 +2346,7 @@ mod tests {
                 consecutive_misses: 0,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_waves_root: None,
+                settled_txs_root: None,
                 reshape_admitted_epoch: None,
             })
             .witness_leaf_count = BeaconWitnessLeafCount::new(7);

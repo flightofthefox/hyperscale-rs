@@ -101,7 +101,7 @@ const STRADDLER_SPLIT_BYTES: u64 = 25_000;
 ///
 /// # Panics
 ///
-/// Panics if the grow or split misses its budget, or the settled-waves fence is
+/// Panics if the grow or split misses its budget, or the settled-transaction fence is
 /// breached (a one-sided application, a mismatch, or a hung straddler).
 pub fn split_straddler_atomic(c: &mut impl Cluster) {
     let (probes, splitter, terminal_b) = split_straddler_run(c, |_| {});
@@ -258,7 +258,7 @@ pub fn split_straddler_run<C: Cluster>(
         let status = await_tx_terminal(c, *hash, epochs(10));
         assert!(
             matches!(status, Some(TransactionStatus::Completed(_))),
-            "a straddler hung on the settled-waves fence; status = {status:?}",
+            "a straddler hung on the settled-transaction fence; status = {status:?}",
         );
     }
 
@@ -499,7 +499,7 @@ fn vault_balance<C: Cluster>(c: &C, shard: ShardId, owner: [u8; 16]) -> u128 {
 /// Verify a surviving sibling's second-generation split seats correctly.
 ///
 /// Composes [`split_straddler_atomic`] (grow → vote the threshold down so only
-/// the splitter crosses → settled-waves fence), then layers the seating outcome:
+/// the splitter crosses → settled-transaction fence), then layers the seating outcome:
 /// the splitter retires into two full-strength child committees while the survivor
 /// keeps its own, each child's committed root reproduces the beacon-composed
 /// anchor, and both children commit a real block past their seeded genesis.
@@ -575,14 +575,14 @@ pub fn surviving_sibling_split_seats_full_committees(c: &mut impl Cluster) {
 /// it terminates. After the merge the survivor must reach a terminal verdict on
 /// every straddler, consistent with what `leaf(2, 2)` settled by its terminal
 /// block — never one-sided, never contradicting a settlement, never hanging.
-/// Exercises the merge-child terminal's settled-waves attestation, the path a
+/// Exercises the merge-child terminal's settled-transaction attestation, the path a
 /// split child's terminal cannot cover. Requires the [`merge_straddler_setup`]
 /// funding on a config grown to four shards.
 ///
 /// # Panics
 ///
 /// Panics if the merge misses its budget, the merged parent never seats, or the
-/// settled-waves fence is breached (a one-sided application, a mismatch, or a
+/// settled-transaction fence is breached (a one-sided application, a mismatch, or a
 /// hung straddler).
 pub fn merge_straddler_atomic(c: &mut impl Cluster) {
     let survivor = MERGE_STRADDLER_SURVIVOR;
@@ -675,7 +675,7 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
         let status = await_tx_terminal(c, *hash, epochs(12));
         assert!(
             matches!(status, Some(TransactionStatus::Completed(_))),
-            "a straddler hung on the settled-waves fence; status = {status:?}",
+            "a straddler hung on the settled-transaction fence; status = {status:?}",
         );
     }
 
@@ -726,7 +726,7 @@ pub fn submit_straddler<C: Cluster>(
     hash
 }
 
-/// Assert the settled-waves fence held for `probes`: every straddler the
+/// Assert the settled-transaction fence held for `probes`: every straddler the
 /// survivor reached agrees with what the splitter settled by `terminal_b`, none
 /// applied one-sided or contradicted a settlement, and at least one settled
 /// atomically.

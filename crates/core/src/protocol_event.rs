@@ -790,15 +790,15 @@ pub enum ProtocolEvent {
         block_height: BlockHeight,
     },
 
-    /// The `io_loop`'s settled-waves acquisition verified a past-terminal
-    /// shard's complete settled-wave set against its beacon-attested root.
+    /// The `io_loop`'s settled-set acquisition verified a past-terminal
+    /// shard's complete settled-transaction set against its beacon-attested root.
     /// `ShardCoordinator` records it for the split-boundary fence and
     /// re-drives any votes that deferred for want of it.
-    SettledWavesReconstructed {
+    SettledTxsReconstructed {
         /// The terminated shard whose settled set this is.
         shard: ShardId,
-        /// Wave-ids that shard settled at or before its terminal block.
-        waves: BTreeSet<WaveId>,
+        /// Transactions that shard settled at or before its terminal block.
+        txs: BTreeSet<TxHash>,
         /// The terminated shard's terminal weighted timestamp — bounds
         /// the fence's retention cutoff.
         terminal_wt: WeightedTimestamp,

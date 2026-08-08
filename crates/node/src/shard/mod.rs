@@ -463,14 +463,11 @@ where
                     headers,
                 );
             }
-            ShardScopedInput::SettledWavesResponseReceived {
-                source_shard,
-                waves,
-            } => {
-                self.handle_settled_waves_response_received(source_shard, waves);
+            ShardScopedInput::SettledTxsResponseReceived { source_shard, txs } => {
+                self.handle_settled_txs_response_received(source_shard, txs);
             }
-            ShardScopedInput::SettledWavesFetchFailed { source_shard } => {
-                self.handle_settled_waves_fetch_failed(source_shard);
+            ShardScopedInput::SettledTxsFetchFailed { source_shard } => {
+                self.handle_settled_txs_fetch_failed(source_shard);
             }
 
             // ── Fetch protocol ─────────────────────────────────────────

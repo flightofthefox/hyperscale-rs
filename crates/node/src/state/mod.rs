@@ -455,7 +455,7 @@ impl StateMachine for NodeStateMachine {
             evt @ (ProtocolEvent::BlockSyncReadyToApply { .. }
             | ProtocolEvent::BlockSyncComplete { .. }
             | ProtocolEvent::RemoteHeaderSyncComplete { .. }
-            | ProtocolEvent::SettledWavesReconstructed { .. }) => {
+            | ProtocolEvent::SettledTxsReconstructed { .. }) => {
                 self.with_shard(move |s, sched| s.handle_sync(sched, evt))
             }
 
@@ -521,10 +521,10 @@ impl StateMachine for NodeStateMachine {
                     block_height: ready.block_height,
                     claimed_split_child_roots: ready.claimed_split_child_roots,
                     split_child_roots_required: ready.split_child_roots_required,
-                    settled_waves_root_required: ready.settled_waves_root_required,
-                    claimed_settled_waves_root: ready.claimed_settled_waves_root,
+                    settled_txs_root_required: ready.settled_txs_root_required,
+                    claimed_settled_txs_root: ready.claimed_settled_txs_root,
                     parent_weighted_timestamp: ready.parent_weighted_timestamp,
-                    settled_waves_window_floor: ready.settled_waves_window_floor,
+                    settled_txs_window_floor: ready.settled_txs_window_floor,
                 });
             }
 

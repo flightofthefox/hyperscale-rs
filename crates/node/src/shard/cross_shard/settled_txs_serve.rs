@@ -1,26 +1,26 @@
-//! Inbound settled-waves window request handling.
+//! Inbound settled-transaction window request handling.
 //!
-//! Serves a terminated shard's complete settled-wave window list to a
-//! surviving counterpart resolving cross-shard waves across a split
+//! Serves a terminated shard's complete settled-transaction window list to a
+//! surviving counterpart resolving cross-shard transactions across a split
 //! boundary. The request names the terminal block `B`; the server
 //! reconstructs `S_P` off its committed chain over the window reaching
 //! back to the terminating reshape's admission — the same set `B`'s
-//! `settled_waves_root` commits — so the requester accepts the list
+//! `settled_txs_root` commits — so the requester accepts the list
 //! against the beacon-attested root. No
 //! per-block QC: completeness is the merkle root, not block-by-block
 //! verification.
 
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{BlockForSync, PendingChain, ShardStorage};
-use hyperscale_types::network::request::GetSettledWavesRequest;
-use hyperscale_types::network::response::GetSettledWavesResponse;
-use hyperscale_types::{MAX_FINALIZED_TX_PER_BLOCK, WeightedTimestamp, local_settled_wave_ids};
+use hyperscale_types::network::request::GetSettledTxsRequest;
+use hyperscale_types::network::response::GetSettledTxsResponse;
+use hyperscale_types::{MAX_FINALIZED_TX_PER_BLOCK, WeightedTimestamp, local_settled_tx_hashes};
 
-/// Serve an inbound settled-waves window request from the local chain.
+/// Serve an inbound settled-transaction window request from the local chain.
 ///
-/// The served set is the **cross-shard** waves the terminated shard settled
+/// The served set is the **cross-shard** transactions the terminated shard settled
 /// in the window — the only ones a counterpart's fence can query (see
-/// [`local_settled_wave_ids`]) — so it stays proportional to cross-shard
+/// [`local_settled_tx_hashes`]) — so it stays proportional to cross-shard
 /// traffic, not total throughput.
 ///
 /// `window_floor` is the shard's settled-window floor read off the serving
@@ -34,28 +34,28 @@ use hyperscale_types::{MAX_FINALIZED_TX_PER_BLOCK, WeightedTimestamp, local_sett
 /// rotates peers. Returns `not_found` too when the window set exceeds the
 /// wire cap (logged loudly; within-cap for any realistic cross-shard load).
 #[must_use]
-pub fn serve_settled_waves_request<S: ShardStorage>(
+pub fn serve_settled_txs_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
     window_floor: Option<WeightedTimestamp>,
-    req: &GetSettledWavesRequest,
-) -> GetSettledWavesResponse {
+    req: &GetSettledTxsRequest,
+) -> GetSettledTxsResponse {
     let Some(BlockForSync { block, .. }) = pending_chain.block_for_sync(req.terminal_height) else {
-        record_fetch_response_sent("settled_waves", 0);
-        return GetSettledWavesResponse::not_found();
+        record_fetch_response_sent("settled_txs", 0);
+        return GetSettledTxsResponse::not_found();
     };
     if block.hash() != req.terminal_block_hash {
-        record_fetch_response_sent("settled_waves", 0);
-        return GetSettledWavesResponse::not_found();
+        record_fetch_response_sent("settled_txs", 0);
+        return GetSettledTxsResponse::not_found();
     }
 
     let shard = block.header().shard_id();
-    let own = local_settled_wave_ids(block.certificates().iter(), shard);
+    let own = local_settled_tx_hashes(block.certificates().iter(), shard);
     let Some(parent_height) = block.height().prev() else {
         // Genesis carries no certificates and never terminates a split.
-        record_fetch_response_sent("settled_waves", 0);
-        return GetSettledWavesResponse::not_found();
+        record_fetch_response_sent("settled_txs", 0);
+        return GetSettledTxsResponse::not_found();
     };
-    let set = pending_chain.settled_waves_in_window(
+    let set = pending_chain.settled_txs_in_window(
         shard,
         block.header().parent_block_hash(),
         parent_height,
@@ -66,12 +66,13 @@ pub fn serve_settled_waves_request<S: ShardStorage>(
 
     // A window exceeding the wire cap serves `not_found` rather than
     // shipping a response the receiver would reject at decode. The set is
-    // the cross-shard settled waves only, so a within-cap window covers
-    // any realistic cross-shard load; an overflow means cross-shard
-    // throughput outran the single-shot transfer and the design must
-    // escalate to paged or JMT-absence-proof delivery (c2). Log it loudly
-    // rather than letting the requester read the overflow `not_found` as a
-    // plain "block not held" and rotate peers forever.
+    // the cross-shard settled transactions only — one entry each, across a
+    // window spanning the retention horizon — so the headroom is that many
+    // cross-shard transactions per horizon, not per block. An overflow
+    // means cross-shard throughput outran the single-shot transfer and the
+    // design must escalate to paged or JMT-absence-proof delivery (c2).
+    // Log it loudly rather than letting the requester read the overflow
+    // `not_found` as a plain "block not held" and rotate peers forever.
     let window = set.len();
     if window > MAX_FINALIZED_TX_PER_BLOCK {
         tracing::warn!(
@@ -79,14 +80,14 @@ pub fn serve_settled_waves_request<S: ShardStorage>(
             terminal_height = req.terminal_height.inner(),
             window,
             cap = MAX_FINALIZED_TX_PER_BLOCK,
-            "settled-waves window exceeds the wire cap; serving not_found — \
+            "settled-transaction window exceeds the wire cap; serving not_found — \
              cross-shard load outran the one-shot transfer (escalate to c2)"
         );
-        record_fetch_response_sent("settled_waves", 0);
-        return GetSettledWavesResponse::not_found();
+        record_fetch_response_sent("settled_txs", 0);
+        return GetSettledTxsResponse::not_found();
     }
-    record_fetch_response_sent("settled_waves", 1);
-    GetSettledWavesResponse::found(set.into_iter().collect())
+    record_fetch_response_sent("settled_txs", 1);
+    GetSettledTxsResponse::found(set.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -104,12 +105,18 @@ mod tests {
         LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON,
         RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot, TransactionRoot, TxHash,
         TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
-        WitnessSources, WorkInFlight, settled_waves_root_from_ids,
+        WitnessSources, WorkInFlight, settled_txs_root_from_hashes,
     };
 
     use super::*;
 
     const SHARD: ShardId = ShardId::ROOT;
+
+    /// The transaction the wave at `height` settles — distinct per wave,
+    /// so a window over several waves has one entry each.
+    fn settled_tx(height: u64) -> TxHash {
+        TxHash::from(Hash::from_bytes(&height.to_le_bytes()))
+    }
 
     fn finalized_wave(height: u64) -> Arc<Verifiable<FinalizedWave>> {
         // Cross-shard wave (non-empty `remote_shards`): the settled set
@@ -125,7 +132,7 @@ mod tests {
             WeightedTimestamp::from_millis(1),
             GlobalReceiptRoot::ZERO,
             vec![TxOutcome::new(
-                TxHash::from(Hash::from_bytes(b"tx")),
+                settled_tx(height),
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
@@ -197,7 +204,7 @@ mod tests {
     }
 
     /// The served window list recomputes to the terminal block's
-    /// `settled_waves_root` — every block's settled wave over the window.
+    /// `settled_txs_root` — every block's settled transaction over the window.
     #[test]
     fn serves_the_full_settled_window() {
         let storage = SimShardStorage::default();
@@ -208,29 +215,21 @@ mod tests {
         let terminal = parent;
         let pending_chain = PendingChain::new(Arc::new(storage));
 
-        let req = GetSettledWavesRequest::new(BlockHeight::new(3), terminal);
-        let response = serve_settled_waves_request(&pending_chain, None, &req);
-        let waves = response.waves.expect("terminal block is held");
+        let req = GetSettledTxsRequest::new(BlockHeight::new(3), terminal);
+        let response = serve_settled_txs_request(&pending_chain, None, &req);
+        let served = response.txs.expect("terminal block is held");
 
-        let expected: BTreeSet<WaveId> = (1..=3)
-            .map(|h| {
-                WaveId::new(
-                    SHARD,
-                    BlockHeight::new(h),
-                    BTreeSet::from([ShardId::from_heap_index(2)]),
-                )
-            })
-            .collect();
-        assert_eq!(waves.iter().cloned().collect::<BTreeSet<_>>(), expected);
+        let expected: BTreeSet<TxHash> = (1..=3).map(settled_tx).collect();
+        assert_eq!(served.iter().copied().collect::<BTreeSet<_>>(), expected);
         // The fence accepts iff the recomputed root equals the attested one.
         assert_eq!(
-            settled_waves_root_from_ids(waves.iter()),
-            settled_waves_root_from_ids(expected.iter()),
+            settled_txs_root_from_hashes(served.iter()),
+            settled_txs_root_from_hashes(expected.iter()),
         );
     }
 
     /// A schedule-supplied floor reaches settlements older than the
-    /// anchor-relative horizon: a wave settled early in the terminating
+    /// anchor-relative horizon: a transaction settled early in the terminating
     /// shard's scheduled window — below `terminal − RETENTION_HORIZON` —
     /// is served only when the floor covers it.
     #[test]
@@ -241,21 +240,21 @@ mod tests {
         parent = commit_block(&storage, 2, parent, rh_ms + 10_000, &[finalized_wave(2)]);
         let terminal = commit_block(&storage, 3, parent, rh_ms + 11_000, &[finalized_wave(3)]);
         let pending_chain = PendingChain::new(Arc::new(storage));
-        let req = GetSettledWavesRequest::new(BlockHeight::new(3), terminal);
+        let req = GetSettledTxsRequest::new(BlockHeight::new(3), terminal);
 
         // Anchor-only floor: the early settlement falls outside the window.
-        let narrow = serve_settled_waves_request(&pending_chain, None, &req)
-            .waves
+        let narrow = serve_settled_txs_request(&pending_chain, None, &req)
+            .txs
             .expect("terminal block is held");
         assert_eq!(narrow.len(), 2);
 
         // The floor reaches back past the early settlement.
-        let wide = serve_settled_waves_request(
+        let wide = serve_settled_txs_request(
             &pending_chain,
             Some(WeightedTimestamp::from_millis(500)),
             &req,
         )
-        .waves
+        .txs
         .expect("terminal block is held");
         assert_eq!(wide.len(), 3);
     }
@@ -266,13 +265,13 @@ mod tests {
         let storage = SimShardStorage::default();
         let _ = commit_block(&storage, 1, BlockHash::ZERO, 1_000, &[finalized_wave(1)]);
         let pending_chain = PendingChain::new(Arc::new(storage));
-        let req = GetSettledWavesRequest::new(
+        let req = GetSettledTxsRequest::new(
             BlockHeight::new(1),
             BlockHash::from_raw(Hash::from_bytes(b"other-chain")),
         );
         assert!(
-            serve_settled_waves_request(&pending_chain, None, &req)
-                .waves
+            serve_settled_txs_request(&pending_chain, None, &req)
+                .txs
                 .is_none()
         );
     }
@@ -282,10 +281,10 @@ mod tests {
     fn unheld_height_serves_not_found() {
         let storage = Arc::new(SimShardStorage::default());
         let pending_chain = PendingChain::new(storage);
-        let req = GetSettledWavesRequest::new(BlockHeight::new(7), BlockHash::ZERO);
+        let req = GetSettledTxsRequest::new(BlockHeight::new(7), BlockHash::ZERO);
         assert!(
-            serve_settled_waves_request(&pending_chain, None, &req)
-                .waves
+            serve_settled_txs_request(&pending_chain, None, &req)
+                .txs
                 .is_none()
         );
     }

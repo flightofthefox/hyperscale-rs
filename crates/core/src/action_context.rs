@@ -15,7 +15,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BeaconProposal, BlockHash, BlockHeight, ConsensusReceipt, Epoch, PreparedCommit, ShardId,
-    Signer, TopologySnapshot, ValidatorId, Verified, Verifier, WaveId,
+    Signer, TopologySnapshot, TxHash, ValidatorId, Verified, Verifier,
 };
 
 use crate::ProtocolEvent;
@@ -158,5 +158,5 @@ pub struct PreparedBlock {
     pub prepared: PreparedCommit,
     pub jmt_snapshot: Arc<JmtSnapshot>,
     pub receipts: Vec<Arc<ConsensusReceipt>>,
-    pub settled_waves: Vec<WaveId>,
+    pub settled_txs: Vec<TxHash>,
 }

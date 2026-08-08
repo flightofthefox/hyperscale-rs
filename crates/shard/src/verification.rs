@@ -16,7 +16,7 @@ use hyperscale_types::{
     BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
     CertifiedBlock, ChainOrigin, FinalizedWave, LinkageError, LocalReceiptRoot,
     ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds, RevealChain,
-    SettledWavesRoot, ShardId, SplitChildRoots, StateRoot, TopologySchedule, TopologySnapshot,
+    SettledTxsRoot, ShardId, SplitChildRoots, StateRoot, TopologySchedule, TopologySnapshot,
     TransactionRoot, Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp,
     WorkInFlight,
 };
@@ -116,19 +116,19 @@ pub struct ReadyStateRootVerification {
     /// Whether the block's window requires the claim (the shard's final
     /// epoch before a split).
     pub split_child_roots_required: bool,
-    /// Whether the block's window requires a `settled_waves_root` — set on
+    /// Whether the block's window requires a `settled_txs_root` — set on
     /// any terminating boundary header (a split parent's or a merge
     /// child's final epoch), broader than [`Self::split_child_roots_required`].
-    pub settled_waves_root_required: bool,
-    /// The header's `settled_waves_root` claim, verified beside the state
+    pub settled_txs_root_required: bool,
+    /// The header's `settled_txs_root` claim, verified beside the state
     /// root over the committed retention window.
-    pub claimed_settled_waves_root: Option<SettledWavesRoot>,
-    /// The block's parent-QC weighted timestamp — the settled-waves window
+    pub claimed_settled_txs_root: Option<SettledTxsRoot>,
+    /// The block's parent-QC weighted timestamp — the settled-transaction window
     /// anchor.
     pub parent_weighted_timestamp: WeightedTimestamp,
     /// The schedule's settled-window floor at the anchor — extends the
     /// window back to the reshape's admission.
-    pub settled_waves_window_floor: Option<WeightedTimestamp>,
+    pub settled_txs_window_floor: Option<WeightedTimestamp>,
 }
 
 /// Classification of the in-flight check outcome for the vote path.
@@ -156,10 +156,10 @@ pub struct PendingStateRootVerification {
     pub block_height: BlockHeight,
     pub claimed_split_child_roots: Option<SplitChildRoots>,
     pub split_child_roots_required: bool,
-    pub settled_waves_root_required: bool,
-    pub claimed_settled_waves_root: Option<SettledWavesRoot>,
+    pub settled_txs_root_required: bool,
+    pub claimed_settled_txs_root: Option<SettledTxsRoot>,
     pub parent_weighted_timestamp: WeightedTimestamp,
-    pub settled_waves_window_floor: Option<WeightedTimestamp>,
+    pub settled_txs_window_floor: Option<WeightedTimestamp>,
 }
 
 /// Why [`VerificationPipeline::try_complete_assembly`] rejected the
@@ -1032,8 +1032,8 @@ impl VerificationPipeline {
         parent_block_height: BlockHeight,
         recovery_bridge: bool,
         split_child_roots_required: bool,
-        settled_waves_root_required: bool,
-        settled_waves_window_floor: Option<WeightedTimestamp>,
+        settled_txs_root_required: bool,
+        settled_txs_window_floor: Option<WeightedTimestamp>,
     ) {
         let parent_block_hash = block.header().parent_block_hash();
         let ready = PendingStateRootVerification {
@@ -1045,10 +1045,10 @@ impl VerificationPipeline {
             block_height: block.height(),
             claimed_split_child_roots: block.header().split_child_roots(),
             split_child_roots_required,
-            settled_waves_root_required,
-            claimed_settled_waves_root: block.header().settled_waves_root(),
+            settled_txs_root_required,
+            claimed_settled_txs_root: block.header().settled_txs_root(),
             parent_weighted_timestamp: block.header().parent_qc().weighted_timestamp(),
-            settled_waves_window_floor,
+            settled_txs_window_floor,
         };
 
         // The parent's tree nodes must be available — either committed to
@@ -1846,7 +1846,7 @@ impl VerificationPipeline {
         block: &Block,
         count_source: SubstateCountSource<'_>,
         split_child_roots_required: bool,
-        settled_waves_root_required: bool,
+        settled_txs_root_required: bool,
         fee_demands: Vec<FeeDemand>,
         fee_read_height: BlockHeight,
         fee_read_ready: bool,
@@ -1856,7 +1856,7 @@ impl VerificationPipeline {
 
         if self.needs_state_root_verification(block) {
             let parent_block_height = h.parent_qc().height();
-            let settled_waves_window_floor =
+            let settled_txs_window_floor =
                 schedule.settled_window_floor(local_shard, h.parent_qc().weighted_timestamp());
             // Whether this block rides an in-flight halt recovery's bridge:
             // anchored below the bridge epoch while the recovery pends. Only
@@ -1871,8 +1871,8 @@ impl VerificationPipeline {
                 parent_block_height,
                 recovery_bridge,
                 split_child_roots_required,
-                settled_waves_root_required,
-                settled_waves_window_floor,
+                settled_txs_root_required,
+                settled_txs_window_floor,
             );
         }
 
@@ -2093,10 +2093,10 @@ impl VerificationPipeline {
             block_height: pending.block_height,
             claimed_split_child_roots: pending.claimed_split_child_roots,
             split_child_roots_required: pending.split_child_roots_required,
-            settled_waves_root_required: pending.settled_waves_root_required,
-            claimed_settled_waves_root: pending.claimed_settled_waves_root,
+            settled_txs_root_required: pending.settled_txs_root_required,
+            claimed_settled_txs_root: pending.claimed_settled_txs_root,
             parent_weighted_timestamp: pending.parent_weighted_timestamp,
-            settled_waves_window_floor: pending.settled_waves_window_floor,
+            settled_txs_window_floor: pending.settled_txs_window_floor,
         })
     }
 

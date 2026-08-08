@@ -27,7 +27,7 @@ use hyperscale_storage::{ChainEntry, ParentAnchor, PendingChain, ShardChainWrite
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, EpochWindows,
     FinalizedWave, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SyncHint, Verifiable,
-    Verified, WeightedTimestamp, absorb_committed_cells, local_settled_wave_ids,
+    Verified, WeightedTimestamp, absorb_committed_cells, local_settled_tx_hashes,
 };
 use tracing::debug;
 
@@ -207,14 +207,14 @@ where
     // executed: both read it out of the same block content.
     absorb_committed_cells(receipts.iter().map(AsRef::as_ref));
     let parent_block_hash = block.header().parent_block_hash();
-    let settled_waves = local_settled_wave_ids(finalized_waves.iter(), block.header().shard_id());
+    let settled_txs = local_settled_tx_hashes(finalized_waves.iter(), block.header().shard_id());
     pending_chain.insert(
         block_hash,
         ChainEntry {
             parent_block_hash,
             height,
             receipts,
-            settled_waves,
+            settled_txs,
             jmt_snapshot,
             certified_block: None,
             certified_uncommitted: None,
@@ -259,7 +259,7 @@ where
             prepared,
             jmt_snapshot,
             receipts,
-            settled_waves,
+            settled_txs,
         } = prep;
         pending_chain.insert(
             block_hash,
@@ -267,7 +267,7 @@ where
                 parent_block_hash,
                 height: block_height,
                 receipts,
-                settled_waves,
+                settled_txs,
                 jmt_snapshot,
                 certified_block: None,
                 certified_uncommitted: None,

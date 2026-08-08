@@ -89,5 +89,5 @@ mod vote_set;
 
 pub use config::ShardConsensusConfig;
 pub use coordinator::{ShardCoordinator, ShardMemoryStats, ShardStats};
-pub use hyperscale_types::SettledWaveSet;
+pub use hyperscale_types::SettledTxSet;
 pub use verification::ReadyStateRootVerification;

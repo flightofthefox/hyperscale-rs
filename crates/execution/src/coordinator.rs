@@ -43,7 +43,7 @@ use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, DeclaredKey, ExecutionCertificate, ExecutionCertificateVerifyError,
     ExecutionVote, FinalizedWave, FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Mode,
-    Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledWaveSet,
+    Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledTxSet,
     ShardId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
     TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
     settled_set_verdict, wave_leader, wave_leader_at,
@@ -332,11 +332,11 @@ pub struct ExecutionCoordinator {
     // Split-boundary finalize gate
     // ═══════════════════════════════════════════════════════════════════════
     /// Settled-wave sets of past-terminal shards, fed by the `io_loop`'s
-    /// settled-waves acquisition (mirrors the shard coordinator's vote fence).
+    /// settled-transaction acquisition (mirrors the shard coordinator's vote fence).
     /// The finalize gate reads them so a wave naming a shard that didn't
     /// settle it is never produced — the shared [`settled_set_verdict`]
     /// keeps this verdict identical to the vote fence's.
-    settled_sets: HashMap<ShardId, SettledWaveSet>,
+    settled_sets: HashMap<ShardId, SettledTxSet>,
 
     /// Finalized waves built but withheld because a contained EC names a
     /// shard that is scheduled to terminate, or past-terminal with its
@@ -349,12 +349,12 @@ pub struct ExecutionCoordinator {
     /// Past-terminal partner shards whose settled set is recorded but whose
     /// counterpart abort sweep is still awaiting the ingestion of every
     /// settled execution certificate naming us. Each value is the subset of
-    /// that shard's settled waves naming us whose EC we have not yet
+    /// that shard's settled transaction naming us whose EC we have not yet
     /// ingested. When the set empties (or the shard's retention horizon
     /// passes), [`Self::take_ready_counterpart_aborts`] drops every local
     /// wave still lacking the partner's coverage — its transactions can
     /// never finalize, so they abort.
-    pending_counterpart_sweeps: HashMap<ShardId, HashSet<WaveId>>,
+    pending_counterpart_sweeps: HashMap<ShardId, HashSet<TxHash>>,
 
     /// Transactions whose finalized wave the gate **rejected** — a late
     /// execution certificate completed a wave naming a past-terminal
@@ -1625,7 +1625,6 @@ impl ExecutionCoordinator {
         // indefinitely while the verify pool silently rejects the forgery.
         let cleared = self.expected_certs.mark_fulfilled(
             shard,
-            ec_arc.wave_id(),
             ec_arc.tx_outcomes().iter().map(TxOutcome::tx_hash),
             ec_arc.deadline(),
         );
@@ -2401,7 +2400,8 @@ impl ExecutionCoordinator {
         // A settled certificate naming us from a terminated partner drains
         // its outstanding-coverage set, arming the counterpart abort sweep
         // once the partner's settled coverage is complete.
-        self.note_settled_ec_ingested(ec.shard_id(), ec.wave_id());
+        let covered: Vec<TxHash> = ec.tx_outcomes().iter().map(TxOutcome::tx_hash).collect();
+        self.note_settled_ec_ingested(ec.shard_id(), &covered);
 
         let routing = self.waves.classify_attestation(ec);
 
@@ -2478,16 +2478,21 @@ impl ExecutionCoordinator {
     ) -> Vec<Action> {
         let wave_id = finalized_arc.wave_id().clone();
         let verdict = {
-            let ecs = finalized_arc
+            let outcomes = finalized_arc
                 .execution_certificates()
                 .iter()
-                .map(|ec| (ec.shard_id(), ec.wave_id()));
+                .flat_map(|ec| {
+                    let shard = ec.shard_id();
+                    ec.tx_outcomes()
+                        .iter()
+                        .map(move |outcome| (shard, outcome.tx_hash()))
+                });
             settled_set_verdict(
                 &self.settled_sets,
                 topology_schedule,
                 self.local_shard,
                 self.committed_ts,
-                ecs,
+                outcomes,
             )
         };
         match verdict {
@@ -2520,46 +2525,47 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Record a past-terminal shard's settled-wave set for the finalize
+    /// Record a past-terminal shard's settled-transaction set for the finalize
     /// gate (mirrors the shard coordinator's fence feed). Pair with
     /// [`Self::redrive_gated_finalizations`] to release waves that the
     /// gate held while the set was unknown.
     ///
-    /// Also arms the counterpart abort sweep: the settled waves naming us
+    /// Also arms the counterpart abort sweep: the settled transaction naming us
     /// are exactly the cross-shard certificates we still expect from the
     /// terminated partner. We register the ones we haven't ingested yet so
     /// the fallback fetch drives them, and track the outstanding set so
     /// [`Self::take_ready_counterpart_aborts`] fires once every one lands.
-    pub fn record_settled_waves(&mut self, shard: ShardId, settled: SettledWaveSet) {
-        let local_shard = self.local_shard;
+    pub fn record_settled_txs(&mut self, shard: ShardId, settled: SettledTxSet) {
         let now_ts = self.committed_ts;
 
-        // Arm the fallback fetch from local state: the transactions we await
-        // from this shard are the ones whose outcome can still arrive, and
-        // the header that first named them may never have reached us.
-        for tx_hash in self.awaited_txs_from(shard) {
+        // What the partner still owes us is the intersection of what it
+        // says it settled with what we are waiting on: a transaction it
+        // settled that we hold no wave for is not ours to wait for, and one
+        // we await that it never settled will never arrive. A partner that
+        // settled nothing naming us therefore leaves an empty set, and the
+        // sweep fires at once rather than waiting on coverage that cannot
+        // come.
+        let outstanding: HashSet<TxHash> = self
+            .awaited_txs_from(shard)
+            .into_iter()
+            .filter(|tx_hash| settled.txs.contains(tx_hash))
+            .filter(|tx_hash| !self.expected_certs.is_fulfilled(shard, *tx_hash))
+            .collect();
+
+        // Arm the fallback fetch for each: the header that first named them
+        // may never have reached us, and the partner is gone.
+        for &tx_hash in &outstanding {
             self.expected_certs.register(shard, tx_hash, now_ts);
         }
-
-        // The fire condition comes from the settled set, not from what we
-        // await: a partner that settled nothing naming us has nothing left
-        // to send, and the sweep must fire immediately rather than wait on
-        // coverage that will never come.
-        let outstanding: HashSet<WaveId> = settled
-            .waves
-            .iter()
-            .filter(|wave| wave.remote_shards().contains(&local_shard))
-            .filter(|wave| !self.expected_certs.has_ingested(shard, wave))
-            .cloned()
-            .collect();
 
         self.pending_counterpart_sweeps.insert(shard, outstanding);
         self.settled_sets.insert(shard, settled);
     }
 
-    /// Drop settled-wave sets past their retention horizon. Past
-    /// `terminal_wt + RETENTION_HORIZON` the gate rejects any wave naming
-    /// the shard regardless of the set, so retaining it only leaks memory.
+    /// Drop settled sets past their retention horizon. Past
+    /// `terminal_wt + RETENTION_HORIZON` the gate rejects any outcome
+    /// naming the shard regardless of the set, so retaining it only leaks
+    /// memory.
     /// The counterpart-sweep entry for the same shard clears itself on the
     /// same horizon, so the two stay consistent.
     fn gc_settled_sets(&mut self) {
@@ -2573,9 +2579,11 @@ impl ExecutionCoordinator {
     /// [`Self::take_ready_counterpart_aborts`] can fire once the partner's
     /// settled coverage is complete. A no-op for any EC not belonging to a
     /// pending counterpart sweep.
-    fn note_settled_ec_ingested(&mut self, source_shard: ShardId, wave_id: &WaveId) {
+    fn note_settled_ec_ingested(&mut self, source_shard: ShardId, covered: &[TxHash]) {
         if let Some(outstanding) = self.pending_counterpart_sweeps.get_mut(&source_shard) {
-            outstanding.remove(wave_id);
+            for tx_hash in covered {
+                outstanding.remove(tx_hash);
+            }
         }
     }
 
@@ -2587,7 +2595,7 @@ impl ExecutionCoordinator {
     /// naming us, or once its retention horizon passes (the late half can
     /// never arrive). Any local wave that still lacks the partner's
     /// coverage at that point can never finalize — the certificate that
-    /// would cover it is either from an unsettled wave the fence bars or
+    /// would cover it is either from an unsettled transaction the fence bars or
     /// will never come — so its transactions are aborted and its execution
     /// state dropped.
     pub fn take_ready_counterpart_aborts(&mut self) -> Vec<TxHash> {
@@ -2891,7 +2899,7 @@ impl ExecutionCoordinator {
     ///
     /// `ancestor_certified` names the waves an uncommitted ancestor block
     /// already carries. Those settle strictly before anything this block
-    /// can hold, so they satisfy the order exactly as a settled wave does
+    /// can hold, so they satisfy the order exactly as a settled transaction does
     /// — and they have to be counted, because a wave's tick entry clears
     /// on the certificate *committing*, not on its being proposed. The
     /// emitted order is the block's order, so the caller must preserve it.
@@ -4781,7 +4789,7 @@ mod tests {
                 height,
                 weighted_timestamp: WeightedTimestamp::from_millis(1),
                 witness_base: BeaconWitnessLeafCount::ZERO,
-                settled_waves_root: None,
+                settled_txs_root: None,
             },
         );
         TopologySchedule::single(Arc::new(TopologySnapshot::from_explicit_committees(
@@ -5450,11 +5458,10 @@ mod tests {
         assert!(state.gated_finalized.contains_key(&wave_id));
         assert!(!state.finalized.contains(&wave_id));
 
-        let settled = WaveId::new(ShardId::ROOT, BlockHeight::new(1), BTreeSet::new());
-        state.record_settled_waves(
+        state.record_settled_txs(
             ShardId::ROOT,
-            SettledWaveSet {
-                waves: std::iter::once(settled).collect(),
+            SettledTxSet {
+                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
         );
@@ -5480,10 +5487,10 @@ mod tests {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
         state.committed_ts = WeightedTimestamp::from_millis(1500);
         let sched = terminating_schedule();
-        state.record_settled_waves(
+        state.record_settled_txs(
             ShardId::ROOT,
-            SettledWaveSet {
-                waves: BTreeSet::new(),
+            SettledTxSet {
+                txs: BTreeSet::new(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
         );
@@ -5515,7 +5522,7 @@ mod tests {
     /// settled the wave, the gate **rejects** it and the transaction
     /// aborts. The fence/gate defer-release that `reshape_sibling`'s
     /// natural straddler can't reach (it finalizes pre-cut) is exercised
-    /// here against a genuinely post-cut, unsettled wave.
+    /// here against a genuinely post-cut, unsettled transaction.
     #[test]
     fn late_unsettled_ec_defers_then_rejects_and_aborts_no_one_sided() {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
@@ -5537,17 +5544,17 @@ mod tests {
 
         // ROOT terminated having settled nothing → the held wave rejects on
         // redrive, is never finalized, and its tx aborts (not wedged).
-        state.record_settled_waves(
+        state.record_settled_txs(
             ShardId::ROOT,
-            SettledWaveSet {
-                waves: BTreeSet::new(),
+            SettledTxSet {
+                txs: BTreeSet::new(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
         );
         let released = state.redrive_gated_finalizations(&sched);
         assert!(
             released.is_empty(),
-            "an unsettled wave is never finalized — no one-sided application",
+            "an unsettled transaction is never finalized — no one-sided application",
         );
         assert!(state.gated_finalized.is_empty());
         assert!(!state.finalized.contains(&wave_id));
@@ -5683,10 +5690,10 @@ mod tests {
         // The partner terminated and settled nothing naming us — its
         // coverage will never come.
         state.committed_ts = WeightedTimestamp::from_millis(6_000);
-        state.record_settled_waves(
+        state.record_settled_txs(
             partner,
-            SettledWaveSet {
-                waves: BTreeSet::new(),
+            SettledTxSet {
+                txs: BTreeSet::new(),
                 terminal_wt: WeightedTimestamp::from_millis(5_500),
             },
         );
@@ -5731,18 +5738,13 @@ mod tests {
         );
         state.waves.assign_tx(tx_hash, wave_id.clone());
 
-        // The partner settled a wave naming us — until we ingest its
-        // certificate the sweep must not fire.
+        // The partner settled our transaction — until we ingest its
+        // outcome the sweep must not fire.
         state.committed_ts = WeightedTimestamp::from_millis(6_000);
-        let settled_naming_us = WaveId::new(
+        state.record_settled_txs(
             partner,
-            BlockHeight::new(3),
-            std::iter::once(ShardId::leaf(1, 0)).collect(),
-        );
-        state.record_settled_waves(
-            partner,
-            SettledWaveSet {
-                waves: std::iter::once(settled_naming_us.clone()).collect(),
+            SettledTxSet {
+                txs: std::iter::once(tx_hash).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(5_500),
             },
         );
@@ -5753,7 +5755,7 @@ mod tests {
         );
         assert!(state.waves.get_wave(&wave_id).is_some());
 
-        state.note_settled_ec_ingested(partner, &settled_naming_us);
+        state.note_settled_ec_ingested(partner, &[tx_hash]);
         let aborted = state.take_ready_counterpart_aborts();
         assert_eq!(aborted, vec![tx_hash]);
         assert!(state.waves.get_wave(&wave_id).is_none());

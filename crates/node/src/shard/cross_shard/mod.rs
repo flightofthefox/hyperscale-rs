@@ -3,7 +3,7 @@
 //! Owns the per-shard state and code for everything a shard does *across*
 //! shard boundaries: tracking other shards' certified headers, fetching and
 //! serving cross-shard data (provisions, execution certificates, finalized
-//! waves), and reconstructing the settled-waves fence at a split boundary.
+//! waves), and reconstructing the settled-transaction fence at a split boundary.
 //!
 //! [`CrossShardState`] is the per-shard state struct `ShardIo` composes;
 //! subsystem-specific FSM instances, bindings, serves, and glue live here
@@ -19,7 +19,7 @@ mod remote_header_serve;
 mod remote_header_sync;
 mod settled_set;
 mod settled_set_sync;
-mod settled_waves_serve;
+mod settled_txs_serve;
 
 pub use exec_cert_serve::serve_execution_certs_request;
 pub use fetch::{
@@ -32,8 +32,8 @@ pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::serve_provision_request;
 use remote_header::{RemoteHeaderSync, RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
 pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
-pub use settled_set::SettledWavesAcquisition;
-pub use settled_waves_serve::serve_settled_waves_request;
+pub use settled_set::SettledTxsAcquisition;
+pub use settled_txs_serve::serve_settled_txs_request;
 
 use crate::config::NodeConfig;
 use crate::fetch::FetchConfig;
@@ -57,7 +57,7 @@ pub struct CrossShardState {
 
     /// Settled-waves acquisition drivers — one per past-terminal remote
     /// shard whose `S_P` this node is acquiring for the split-boundary fence.
-    pub settled_set_sync: SettledWavesAcquisition,
+    pub settled_set_sync: SettledTxsAcquisition,
 }
 
 impl CrossShardState {
@@ -84,12 +84,12 @@ impl CrossShardState {
                     parallel_chunks_per_tick: 2,
                 },
             ),
-            settled_set_sync: SettledWavesAcquisition::new(),
+            settled_set_sync: SettledTxsAcquisition::new(),
         }
     }
 
     /// True if any cross-shard FSM (remote-header sync, the cross-shard
-    /// fetches, or settled-waves acquisition) has pending work — keeps this
+    /// fetches, or settled-transaction acquisition) has pending work — keeps this
     /// shard's `FetchTick` alive so deferred work retries.
     #[must_use]
     pub fn has_pending(&self) -> bool {

@@ -19,7 +19,7 @@ use hyperscale_hbor::Hbor;
 use hyperscale_jmt::{Blake3Hasher, Hasher};
 use thiserror::Error;
 
-use crate::{Hash, SettledWavesRoot, StateRoot, Verified, Verify};
+use crate::{Hash, SettledTxsRoot, StateRoot, Verified, Verify};
 
 /// The two child hashes of the JMT root node behind a header's
 /// `state_root` — `r_p0` / `r_p1` for a shard whose split executes at the
@@ -75,14 +75,14 @@ pub struct StateRootContext<'a> {
     /// the next epoch's trie replaces the shard with its two children
     /// (the split-pending shard's final epoch).
     pub split_child_roots_required: bool,
-    /// The header's `settled_waves_root` claim.
-    pub claimed_settled_waves_root: Option<SettledWavesRoot>,
+    /// The header's `settled_txs_root` claim.
+    pub claimed_settled_txs_root: Option<SettledTxsRoot>,
     /// Root recomputed by walking the committed retention window, present
-    /// exactly when [`Self::settled_waves_root_required`] is set.
-    pub computed_settled_waves_root: Option<SettledWavesRoot>,
-    /// Whether the block's window requires the settled-waves claim — set
+    /// exactly when [`Self::settled_txs_root_required`] is set.
+    pub computed_settled_txs_root: Option<SettledTxsRoot>,
+    /// Whether the block's window requires the settled-transaction claim — set
     /// on a terminating shard's boundary header.
-    pub settled_waves_root_required: bool,
+    pub settled_txs_root_required: bool,
 }
 
 /// Failure modes of [`StateRoot`] verification.
@@ -127,23 +127,23 @@ pub enum StateRootVerifyError {
     },
 
     /// The block terminates the shard at a boundary but the header carries
-    /// no `settled_waves_root`.
-    #[error("settled waves root required at a terminating boundary but absent")]
-    MissingSettledWavesRoot,
+    /// no `settled_txs_root`.
+    #[error("settled transaction root required at a terminating boundary but absent")]
+    MissingSettledTxsRoot,
 
-    /// The header carries `settled_waves_root` outside a terminating
+    /// The header carries `settled_txs_root` outside a terminating
     /// boundary header.
-    #[error("settled waves root carried outside a terminating boundary")]
-    UnexpectedSettledWavesRoot,
+    #[error("settled transaction root carried outside a terminating boundary")]
+    UnexpectedSettledTxsRoot,
 
-    /// The claimed settled-waves root differs from the root recomputed
+    /// The claimed settled-transaction root differs from the root recomputed
     /// over the committed retention window.
-    #[error("settled waves root {claimed:?} ≠ recomputed {computed:?}")]
-    SettledWavesRootMismatch {
-        /// Header's claimed settled-waves root.
-        claimed: SettledWavesRoot,
+    #[error("settled transaction root {claimed:?} ≠ recomputed {computed:?}")]
+    SettledTxsRootMismatch {
+        /// Header's claimed settled-transaction root.
+        claimed: SettledTxsRoot,
         /// Root recomputed by walking the committed retention window.
-        computed: Option<SettledWavesRoot>,
+        computed: Option<SettledTxsRoot>,
     },
 }
 
@@ -188,16 +188,13 @@ impl Verify<&StateRootContext<'_>> for StateRoot {
             }
             _ => {}
         }
-        match (
-            ctx.settled_waves_root_required,
-            ctx.claimed_settled_waves_root,
-        ) {
-            (true, None) => return Err(StateRootVerifyError::MissingSettledWavesRoot),
-            (false, Some(_)) => return Err(StateRootVerifyError::UnexpectedSettledWavesRoot),
-            (true, Some(claimed)) if Some(claimed) != ctx.computed_settled_waves_root => {
-                return Err(StateRootVerifyError::SettledWavesRootMismatch {
+        match (ctx.settled_txs_root_required, ctx.claimed_settled_txs_root) {
+            (true, None) => return Err(StateRootVerifyError::MissingSettledTxsRoot),
+            (false, Some(_)) => return Err(StateRootVerifyError::UnexpectedSettledTxsRoot),
+            (true, Some(claimed)) if Some(claimed) != ctx.computed_settled_txs_root => {
+                return Err(StateRootVerifyError::SettledTxsRootMismatch {
                     claimed,
-                    computed: ctx.computed_settled_waves_root,
+                    computed: ctx.computed_settled_txs_root,
                 });
             }
             _ => {}
@@ -229,9 +226,9 @@ mod tests {
                 computed_root: &root,
                 claimed_split_child_roots: Some(pair),
                 split_child_roots_required: true,
-                claimed_settled_waves_root: None,
-                computed_settled_waves_root: None,
-                settled_waves_root_required: false,
+                claimed_settled_txs_root: None,
+                computed_settled_txs_root: None,
+                settled_txs_root_required: false,
             })
             .is_ok()
         );
@@ -245,9 +242,9 @@ mod tests {
                 computed_root: &root,
                 claimed_split_child_roots: None,
                 split_child_roots_required: true,
-                claimed_settled_waves_root: None,
-                computed_settled_waves_root: None,
-                settled_waves_root_required: false,
+                claimed_settled_txs_root: None,
+                computed_settled_txs_root: None,
+                settled_txs_root_required: false,
             })
             .unwrap_err(),
             StateRootVerifyError::MissingSplitChildRoots,
@@ -262,9 +259,9 @@ mod tests {
                 computed_root: &root,
                 claimed_split_child_roots: Some(pair),
                 split_child_roots_required: false,
-                claimed_settled_waves_root: None,
-                computed_settled_waves_root: None,
-                settled_waves_root_required: false,
+                claimed_settled_txs_root: None,
+                computed_settled_txs_root: None,
+                settled_txs_root_required: false,
             })
             .unwrap_err(),
             StateRootVerifyError::UnexpectedSplitChildRoots,
@@ -283,9 +280,9 @@ mod tests {
                 computed_root: &root,
                 claimed_split_child_roots: Some(forged),
                 split_child_roots_required: true,
-                claimed_settled_waves_root: None,
-                computed_settled_waves_root: None,
-                settled_waves_root_required: false,
+                claimed_settled_txs_root: None,
+                computed_settled_txs_root: None,
+                settled_txs_root_required: false,
             })
             .unwrap_err(),
             StateRootVerifyError::SplitChildRootsMismatch {
@@ -306,37 +303,37 @@ mod tests {
                     computed_root: &root,
                     claimed_split_child_roots: Some(pair),
                     split_child_roots_required: true,
-                    claimed_settled_waves_root: None,
-                    computed_settled_waves_root: None,
-                    settled_waves_root_required: false,
+                    claimed_settled_txs_root: None,
+                    computed_settled_txs_root: None,
+                    settled_txs_root_required: false,
                 })
                 .unwrap_err(),
             StateRootVerifyError::Mismatch { .. },
         ));
     }
 
-    /// A context isolating the settled-waves checks: the state root matches
+    /// A context isolating the settled-transaction checks: the state root matches
     /// and no split-child-roots claim is in play.
     fn settled_ctx(
         root: &StateRoot,
-        claimed: Option<SettledWavesRoot>,
-        computed: Option<SettledWavesRoot>,
+        claimed: Option<SettledTxsRoot>,
+        computed: Option<SettledTxsRoot>,
         required: bool,
     ) -> StateRootContext<'_> {
         StateRootContext {
             computed_root: root,
             claimed_split_child_roots: None,
             split_child_roots_required: false,
-            claimed_settled_waves_root: claimed,
-            computed_settled_waves_root: computed,
-            settled_waves_root_required: required,
+            claimed_settled_txs_root: claimed,
+            computed_settled_txs_root: computed,
+            settled_txs_root_required: required,
         }
     }
 
     #[test]
-    fn settled_waves_root_matching_the_recompute_verifies() {
+    fn settled_txs_root_matching_the_recompute_verifies() {
         let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let settled = SettledWavesRoot::from_raw(Hash::from_bytes(b"settled"));
+        let settled = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled"));
         assert!(
             root.verify(&settled_ctx(&root, Some(settled), Some(settled), true))
                 .is_ok()
@@ -344,36 +341,36 @@ mod tests {
     }
 
     #[test]
-    fn missing_settled_waves_root_at_a_boundary_is_rejected() {
+    fn missing_settled_txs_root_at_a_boundary_is_rejected() {
         let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let recomputed = SettledWavesRoot::from_raw(Hash::from_bytes(b"settled"));
+        let recomputed = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled"));
         assert_eq!(
             root.verify(&settled_ctx(&root, None, Some(recomputed), true))
                 .unwrap_err(),
-            StateRootVerifyError::MissingSettledWavesRoot,
+            StateRootVerifyError::MissingSettledTxsRoot,
         );
     }
 
     #[test]
-    fn settled_waves_root_outside_a_boundary_is_rejected() {
+    fn settled_txs_root_outside_a_boundary_is_rejected() {
         let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let settled = SettledWavesRoot::from_raw(Hash::from_bytes(b"settled"));
+        let settled = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled"));
         assert_eq!(
             root.verify(&settled_ctx(&root, Some(settled), None, false))
                 .unwrap_err(),
-            StateRootVerifyError::UnexpectedSettledWavesRoot,
+            StateRootVerifyError::UnexpectedSettledTxsRoot,
         );
     }
 
     #[test]
-    fn settled_waves_root_diverging_from_the_recompute_is_rejected() {
+    fn settled_txs_root_diverging_from_the_recompute_is_rejected() {
         let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let claimed = SettledWavesRoot::from_raw(Hash::from_bytes(b"claimed"));
-        let computed = SettledWavesRoot::from_raw(Hash::from_bytes(b"computed"));
+        let claimed = SettledTxsRoot::from_raw(Hash::from_bytes(b"claimed"));
+        let computed = SettledTxsRoot::from_raw(Hash::from_bytes(b"computed"));
         assert_eq!(
             root.verify(&settled_ctx(&root, Some(claimed), Some(computed), true))
                 .unwrap_err(),
-            StateRootVerifyError::SettledWavesRootMismatch {
+            StateRootVerifyError::SettledTxsRootMismatch {
                 claimed,
                 computed: Some(computed),
             },
