@@ -31,7 +31,7 @@ use std::time::Duration;
 use hyperscale_core::{CrossShardExecutionRequest, TickExecutionGroup};
 use hyperscale_types::{
     BlockHash, BlockHeight, DeclaredKey, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
-    GlobalReceiptRoot, RevealChain, ShardId, StoredReceipt, Transaction, TransactionDecision,
+    GlobalReceiptRoot, Mode, RevealChain, ShardId, StoredReceipt, Transaction, TransactionDecision,
     TxHash, TxOutcome, Verifiable, Verified, WAVE_TIMEOUT, WaveCertificate, WaveId,
     WeightedTimestamp, compute_global_receipt_root,
 };
@@ -318,18 +318,18 @@ impl WaveState {
             .all(|tx_hash| self.dispatched.contains(tx_hash))
     }
 
-    /// The cells this wave's members declare they will mutate.
+    /// How this wave's members declare they will reach each cell.
     ///
-    /// What a later tick may not read while the wave is unresolved: its
-    /// legs' writes are provisional, so a reader would see the value as
-    /// it stood before them. Declared rather than actual, so the claim
-    /// stands from the moment the wave joins a tick rather than from when
-    /// its batch comes back.
+    /// What a later tick has to be compatible with while the wave is
+    /// unresolved: its legs' effects are provisional, and whether that
+    /// stops a candidate depends on the modes on both sides. Declared
+    /// rather than actual, so the claim stands from the moment the wave
+    /// joins a tick rather than from when its batch comes back.
     #[must_use]
-    pub fn declared_mutations(&self) -> Vec<DeclaredKey> {
+    pub fn declared_mutations(&self) -> Vec<(DeclaredKey, Mode)> {
         self.transactions
             .values()
-            .flat_map(|tx| tx.admission_write_keys())
+            .flat_map(|tx| tx.routing().declared_modes.clone())
             .collect()
     }
 
@@ -425,7 +425,7 @@ impl WaveState {
                 continue;
             }
             let tx = self.transactions.get(&tx_hash)?;
-            if !blocked.is_empty() && blocked.blocks(&tx.admission_keys()) {
+            if !blocked.is_empty() && blocked.blocks(&tx.routing().declared_modes) {
                 continue;
             }
             if self.wave_id.is_zero() {
@@ -634,7 +634,7 @@ impl WaveState {
                     && self
                         .transactions
                         .get(tx_hash)
-                        .is_some_and(|tx| blocked.blocks(&tx.admission_keys()))
+                        .is_some_and(|tx| blocked.blocks(&tx.routing().declared_modes))
             })
             .collect();
         let mut complete = false;
@@ -1944,7 +1944,7 @@ mod tests {
         // `make_tx(seed)` declares `test_prefix(seed + 50)` exclusively,
         // so claiming the first member's prefix names it alone.
         let mut blocked = ProvisionalCells::default();
-        blocked.claim(&[DeclaredKey::prefix(test_prefix(50))]);
+        blocked.claim(&[(DeclaredKey::prefix(test_prefix(50)), Mode::Write)]);
 
         let group = w
             .tick_group_if_ready(&provisioning, &blocked)

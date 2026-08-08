@@ -42,10 +42,10 @@ use hyperscale_storage::TickResolution;
 use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, DeclaredKey, ExecutionCertificate, ExecutionCertificateVerifyError,
-    ExecutionVote, FinalizedWave, FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Provisions,
-    RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledWaveSet, ShardId,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
-    ValidatorId, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
+    ExecutionVote, FinalizedWave, FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Mode,
+    Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledWaveSet,
+    ShardId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
+    TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
     settled_set_verdict, wave_leader, wave_leader_at,
 };
 use tracing::instrument;
@@ -89,7 +89,7 @@ struct TickedWave {
     /// shares a cell with.
     tick: BlockHeight,
     /// What its members declared they would mutate.
-    claims: Vec<DeclaredKey>,
+    claims: Vec<(DeclaredKey, Mode)>,
     /// Whether those claims are held *provisionally* — true for a
     /// cross-shard wave, whose writes nothing may read until it resolves.
     /// A single-shard wave's writes are determined at commit and block no
@@ -2897,8 +2897,14 @@ impl ExecutionCoordinator {
             .map_or(BlockHeight::GENESIS, |ticked| ticked.tick)
     }
 
-    /// Whether some wave that executed before `wave_id` writes a cell it
-    /// writes and settles no earlier.
+    /// Whether some wave that executed before `wave_id` reaches a cell it
+    /// reaches incompatibly, and settles no earlier.
+    ///
+    /// Order matters only where composition does not. Two waves that both
+    /// moved a cell each carry what they moved, so settlement adds them
+    /// and either sequence lands on the same value — nothing to order. It
+    /// is the exclusive writes that carry an absolute, and an absolute
+    /// applied after a change it does not contain reverts that change.
     ///
     /// A predecessor is in order when it has resolved — absence from
     /// `ticked_waves`, whose entry clears when the fate commits — when an
