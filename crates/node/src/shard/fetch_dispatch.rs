@@ -11,7 +11,7 @@ use super::{ShardLoop, TimerOp};
 use crate::beacon;
 use crate::fetch::{FetchBinding, FetchInput, FetchOutput};
 use crate::shard::cross_shard::{
-    ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
+    ExecCertBinding, FinalizationBinding, LocalProvisionBinding, ProvisionBinding,
 };
 use crate::shard::mempool::TransactionBinding;
 
@@ -117,9 +117,9 @@ where
                     )],
                 });
             }
-            ProtocolEvent::FinalizedWavesAdmitted { waves } => {
-                let ids: Vec<_> = waves.iter().map(|w| *w.tick_id()).collect();
-                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Admitted { ids });
+            ProtocolEvent::FinalizationsAdmitted { finalizations } => {
+                let ids: Vec<_> = finalizations.iter().map(|w| *w.tick_id()).collect();
+                self.drive_fetch::<FinalizationBinding>(FetchInput::Admitted { ids });
             }
             ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {
                 // The certificate answers for every transaction it covers,

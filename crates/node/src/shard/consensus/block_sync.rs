@@ -138,7 +138,7 @@ where
     ///
     /// Root-mismatch reasons inspect body components that ride inside
     /// elidable wave/tx/provision blobs. When rehydration filled those
-    /// from a poisoned local cache (e.g. a `FinalizedWave` holding
+    /// from a poisoned local cache (e.g. a `Finalization` holding
     /// locally-divergent receipts under a canonical wave id), every
     /// rehydrated retry would reject the same bytes. Mark the height for
     /// force-full so the next attempt asks for a non-elided body and
@@ -240,14 +240,14 @@ where
         );
     }
 
-    /// Snapshot local mempool / finalized-wave / provision store into
+    /// Snapshot local mempool / finalization / provision store into
     /// an [`Inventory`] so the responder can elide bodies the requester
     /// already has.
     fn build_sync_inventory(&self) -> Inventory {
         let caches = &self.io.caches;
         Inventory {
             tx_have: caches.tx_store.tx_bloom_snapshot(),
-            cert_have: caches.finalized_wave_store.cert_bloom_snapshot(),
+            cert_have: caches.finalization_store.cert_bloom_snapshot(),
             provision_have: caches.provision_store.provision_bloom_snapshot(),
         }
     }
@@ -265,7 +265,7 @@ where
                     .get(h)
                     .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
             },
-            |id| caches.finalized_wave_store.get(id),
+            |id| caches.finalization_store.get(id),
             // `provision_store` holds raw bodies; lift into the unverified
             // transport shape — the wave-cert linkage gates trust on the
             // rehydrated block.
@@ -340,7 +340,7 @@ fn cache_sensitive_validation_failure(reason: &str) -> bool {
 ///
 /// Confirms identity (height + QC binding) and that every Merkle root
 /// the block header commits to is reproducible from the body the
-/// requester now holds. Receipts ride inside `FinalizedWave`s, so
+/// requester now holds. Receipts ride inside `Finalization`s, so
 /// `local_receipt_root` is checked when certificates are present.
 /// Provisions only ride on `Block::Live`, so `provision_root` is checked
 /// only when the response carried provision bodies.
@@ -426,7 +426,7 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
         BlockHeader, CertificateRoot, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
-        ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
+        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
         ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot, TxHash, TxOutcome,
         ValidatorId, Verifiable, WeightedTimestamp, WitnessSources, WorkInFlight,
@@ -518,7 +518,7 @@ mod tests {
     fn make_wave(
         success: bool,
     ) -> (
-        Arc<Verifiable<FinalizedWave>>,
+        Arc<Verifiable<Finalization>>,
         LocalReceiptRoot,
         CertificateRoot,
     ) {
@@ -558,7 +558,7 @@ mod tests {
             metadata: None,
         };
         let fw =
-            Arc::new(FinalizedWave::new(tick_id, vec![Arc::new(ec)], vec![receipt.clone()]).into());
+            Arc::new(Finalization::new(tick_id, vec![Arc::new(ec)], vec![receipt.clone()]).into());
         let lrr = Verified::<LocalReceiptRoot>::compute(&[receipt]).into_inner();
         let cr = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
         (fw, lrr, cr)
@@ -736,7 +736,7 @@ mod tests {
             metadata: None,
         };
         let fw =
-            Arc::new(FinalizedWave::new(tick_id, vec![Arc::new(ec)], vec![receipt.clone()]).into());
+            Arc::new(Finalization::new(tick_id, vec![Arc::new(ec)], vec![receipt.clone()]).into());
         let h = header_with_roots(
             &header(),
             None,
@@ -791,7 +791,7 @@ mod tests {
         // The classifier gates `mark_force_full_refetch` after a rehydrated
         // response fails `validate_synced_block`. Each cache-sensitive
         // reason inspects bytes that ride inside elidable bodies
-        // (transactions, finalized waves, provisions). Each non-sensitive
+        // (transactions, finalizations, provisions). Each non-sensitive
         // reason inspects non-elidable header / QC identity fields. If a
         // new failure reason is added to `validate_synced_block`, decide
         // which bucket it belongs in and add it here.

@@ -29,7 +29,7 @@
 //!
 //! **Primary signal — state-based**: a fulfilled entry is dropped by
 //! [`on_txs_terminated`](ExpectedCertTracker::on_txs_terminated), hooked
-//! into `remove_finalized_wave`. A transaction that has reached terminal
+//! into `remove_finalization`. A transaction that has reached terminal
 //! state locally needs no shard's outcome, so the whole entry goes at once
 //! — footprint tracks in-flight work, not gossip windows.
 //!
@@ -37,11 +37,11 @@
 //! (`vote_anchor_ts + RETENTION_HORIZON`), pruned by
 //! [`prune_fulfilled`](ExpectedCertTracker::prune_fulfilled). This
 //! catches a specific late-arrival race: state-based drain runs at
-//! `remove_finalized_wave`, after which the wave is gone. If a
+//! `remove_finalization`, after which the wave is gone. If a
 //! duplicate header then arrives within the gossip window, `register`
 //! re-creates an expectation, the fallback fetch returns the EC,
 //! `mark_fulfilled` re-creates the tombstone — but no future
-//! `remove_finalized_wave` will fire for those txs. The deadline evicts it.
+//! `remove_finalization` will fire for those txs. The deadline evicts it.
 //!
 //! Retention pruning against the transactions still awaiting coverage is
 //! orchestrated by the coordinator via

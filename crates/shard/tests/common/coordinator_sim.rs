@@ -39,7 +39,7 @@ use hyperscale_types::{
     BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError, Block, BlockHash,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError, CertificateRoot,
     CertificateRootContext, CertifiedBlock, ConsensusPublicKey, ConsensusReceipt, Epoch,
-    FinalizedWave, Hash, HborSigned, LocalReceiptRoot, LocalReceiptRootContext,
+    Finalization, Hash, HborSigned, LocalReceiptRoot, LocalReceiptRootContext,
     LocalReceiptRootVerifyError, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
     ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
@@ -215,7 +215,7 @@ enum SimEvent {
         round: Round,
         block: Arc<Block>,
         block_hash: BlockHash,
-        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         bytes_delta: i64,
     },
@@ -857,7 +857,7 @@ impl ShardCoordinatorSim {
 
     /// Call `try_propose` on `idx` with its current admitted-tx
     /// pool as `ready_txs`. Tx-only equivalent of the production
-    /// `gather_proposal_inputs` (no finalized waves, no provisions).
+    /// `gather_proposal_inputs` (no finalizations, no provisions).
     fn try_propose_for(&mut self, idx: usize) -> Vec<Action> {
         let ready_txs: Vec<Arc<Verified<Transaction>>> =
             self.tx_pools[idx].values().cloned().collect();
@@ -1086,7 +1086,7 @@ impl ShardCoordinatorSim {
                 parent_block_height: ready.parent_block_height,
                 expected_root: ready.expected_root,
                 expected_local_receipt_root: ready.expected_local_receipt_root,
-                finalized_waves: ready.finalized_waves,
+                finalizations: ready.finalizations,
                 block_height: ready.block_height,
                 claimed_split_child_roots: ready.claimed_split_child_roots,
                 split_child_roots_required: ready.split_child_roots_required,
@@ -1143,7 +1143,7 @@ impl ShardCoordinatorSim {
                 round,
                 block,
                 block_hash,
-                finalized_waves,
+                finalizations,
                 provisions,
                 bytes_delta,
             } => coord.on_proposal_built(
@@ -1152,7 +1152,7 @@ impl ShardCoordinatorSim {
                 round,
                 &block,
                 block_hash,
-                finalized_waves,
+                finalizations,
                 provisions,
                 bytes_delta,
             ),
@@ -1408,7 +1408,7 @@ impl ShardCoordinatorSim {
                 parent_state_root,
                 parent_block_height,
                 transactions,
-                finalized_waves,
+                finalizations,
                 provisions,
                 fee_checks: _,
                 fee_read_height: _,
@@ -1479,7 +1479,7 @@ impl ShardCoordinatorSim {
                         parent_block_height,
                         parent_qc.weighted_timestamp(),
                         settled_txs_window_floor,
-                        &finalized_waves,
+                        &finalizations,
                     )
                 });
                 let result = build_proposal(
@@ -1494,7 +1494,7 @@ impl ShardCoordinatorSim {
                     parent_state_root,
                     parent_block_height,
                     transactions,
-                    finalized_waves.clone(),
+                    finalizations.clone(),
                     shard_id,
                     &classification_topology,
                     provisions.clone(),
@@ -1533,8 +1533,8 @@ impl ShardCoordinatorSim {
                     ChainEntry {
                         parent_block_hash,
                         height,
-                        receipts: collect_finalized_receipts(&finalized_waves),
-                        settled_txs: local_settled_tx_hashes(&finalized_waves, shard_id),
+                        receipts: collect_finalized_receipts(&finalizations),
+                        settled_txs: local_settled_tx_hashes(&finalizations, shard_id),
                         jmt_snapshot: result.jmt_snapshot,
                         certified_block: None,
                         certified_uncommitted: None,
@@ -1547,7 +1547,7 @@ impl ShardCoordinatorSim {
                         round,
                         block: Arc::new(result.block),
                         block_hash,
-                        finalized_waves,
+                        finalizations,
                         provisions,
                         bytes_delta,
                     },
@@ -1695,10 +1695,10 @@ impl ShardCoordinatorSim {
                 substate_bytes,
                 claimed_substate_bytes,
                 thresholds,
-                finalized_waves,
+                finalizations,
                 topology_snapshot,
             } => {
-                let receipts: Vec<StoredReceipt> = finalized_waves
+                let receipts: Vec<StoredReceipt> = finalizations
                     .iter()
                     .flat_map(|fw| fw.receipts().iter().cloned())
                     .collect();
@@ -1736,7 +1736,7 @@ impl ShardCoordinatorSim {
                 parent_block_height,
                 expected_root,
                 expected_local_receipt_root,
-                finalized_waves,
+                finalizations,
                 block_height,
                 claimed_split_child_roots,
                 split_child_roots_required,
@@ -1747,7 +1747,7 @@ impl ShardCoordinatorSim {
             } => {
                 // Mirrors the production handler: receipt-root
                 // pre-flight first, then JMT prep on success.
-                let stored_receipts: Vec<StoredReceipt> = finalized_waves
+                let stored_receipts: Vec<StoredReceipt> = finalizations
                     .iter()
                     .flat_map(|fw| fw.receipts().iter().cloned())
                     .collect();
@@ -1773,7 +1773,7 @@ impl ShardCoordinatorSim {
                         parent_block_height,
                         parent_weighted_timestamp,
                         settled_txs_window_floor,
-                        &finalized_waves,
+                        &finalizations,
                     )
                 });
                 let view = self.pending_chains[emitter_idx]
@@ -1785,7 +1785,7 @@ impl ShardCoordinatorSim {
                         height: parent_block_height,
                         state: view.as_ref(),
                     },
-                    &finalized_waves,
+                    &finalizations,
                     block_height,
                     &pending_snapshots,
                     None,
@@ -1805,8 +1805,8 @@ impl ShardCoordinatorSim {
                         ChainEntry {
                             parent_block_hash,
                             height: block_height,
-                            receipts: collect_finalized_receipts(&finalized_waves),
-                            settled_txs: local_settled_tx_hashes(&finalized_waves, self.shard),
+                            receipts: collect_finalized_receipts(&finalizations),
+                            settled_txs: local_settled_tx_hashes(&finalizations, self.shard),
                             jmt_snapshot,
                             certified_block: None,
                             certified_uncommitted: None,
@@ -1939,7 +1939,7 @@ impl ShardCoordinatorSim {
 }
 
 fn collect_finalized_receipts(
-    waves: &[Arc<Verifiable<FinalizedWave>>],
+    waves: &[Arc<Verifiable<Finalization>>],
 ) -> Vec<Arc<ConsensusReceipt>> {
     waves
         .iter()

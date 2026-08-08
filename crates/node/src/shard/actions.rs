@@ -29,7 +29,7 @@ use crate::shard::commit::{
 };
 use crate::shard::consensus::BlockSyncInput;
 use crate::shard::cross_shard::{
-    ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
+    ExecCertBinding, FinalizationBinding, LocalProvisionBinding, ProvisionBinding,
 };
 use crate::shard::mempool::TransactionBinding;
 
@@ -61,7 +61,7 @@ where
             Action::AggregateExecutionCertificate { .. }
             | Action::VerifyAndAggregateExecutionVotes { .. }
             | Action::VerifyExecutionCertificateSignature { .. }
-            | Action::VerifyFinalizedWave { .. }
+            | Action::VerifyFinalization { .. }
             | Action::BuildProposal { .. }
             | Action::VerifyAndBuildQuorumCertificate { .. }
             | Action::VerifyQcSignature { .. }
@@ -279,11 +279,11 @@ where
 
         // Serving-cache insertion is `ShardLoop`'s own state, not an
         // instance concern — keep it here.
-        if let ProtocolEvent::FinalizedWavesAdmitted { waves } = &pe {
-            for wave in waves {
+        if let ProtocolEvent::FinalizationsAdmitted { finalizations } = &pe {
+            for wave in finalizations {
                 self.io
                     .caches
-                    .finalized_wave
+                    .finalization
                     .insert(*wave.tick_id(), Arc::clone(wave));
             }
         }
@@ -595,13 +595,13 @@ where
                     class,
                 });
             }
-            FetchRequest::FinalizedWaves {
+            FetchRequest::Finalizations {
                 ids,
                 shard,
                 preferred,
                 class,
             } => {
-                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Request {
+                self.drive_fetch::<FinalizationBinding>(FetchInput::Request {
                     ids,
                     shard,
                     preferred,
@@ -695,8 +695,8 @@ where
             FetchAbandon::LocalProvisions { hashes } => {
                 self.drive_fetch::<LocalProvisionBinding>(FetchInput::Abandoned { ids: hashes });
             }
-            FetchAbandon::FinalizedWaves { ids } => {
-                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Abandoned { ids });
+            FetchAbandon::Finalizations { ids } => {
+                self.drive_fetch::<FinalizationBinding>(FetchInput::Abandoned { ids });
             }
             FetchAbandon::ExecutionCerts { ids } => {
                 self.drive_fetch::<ExecCertBinding>(FetchInput::Abandoned { ids });

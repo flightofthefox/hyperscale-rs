@@ -14,7 +14,7 @@ use hyperscale_types::{
 #[derive(Debug, Clone)]
 pub struct ExecutedTx {
     /// Identity of the executed transaction; primary key in downstream
-    /// receipt stores and the join key against `FinalizedWave` outcomes.
+    /// receipt stores and the join key against `Finalization` outcomes.
     pub tx_hash: TxHash,
     /// Hash-stable, peer-transferable portion. Signed over (indirectly,
     /// via `local_receipt_root`) and shipped on sync.
@@ -31,7 +31,7 @@ pub struct ExecutedTx {
     /// outcome that charges one.
     pub fee_receipt: Option<ConsensusReceipt>,
     /// What this shard attests it did for the transaction, under the
-    /// engine's schedule. Rides the wave certificate's outcome rather than
+    /// engine's schedule. Rides the finalization's outcome rather than
     /// the receipt: a receipt is the effect record every participant
     /// derives identically, while this is the shard's own share, and it
     /// covers the verdicts that produce no receipt at all.

@@ -1,7 +1,7 @@
 //! Shared test helpers for storage crate tests.
 //!
 //! Provides reusable builder functions for [`StateWrites`],
-//! `FinalizedWave`, `Block`, and `QuorumCertificate` so that
+//! `Finalization`, `Block`, and `QuorumCertificate` so that
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
 use std::collections::BTreeMap;
@@ -13,7 +13,7 @@ use hyperscale_types::{
     BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
     BlockHeader, BlockHeight, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin,
     ConsensusReceipt, Epoch, Event, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
-    FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey,
+    FeeSummary, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey,
     LocalReceiptRoot, LogLevel, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof,
     ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, RatifyCert, RatifyRound,
     RevealChain, Round, SettledWrites, ShardAnchor, ShardId, ShardLoad, ShardWitnessPayload,
@@ -102,7 +102,7 @@ pub const fn state_key(owner_seed: u8, local_seed: u8) -> SubstateKey {
 /// Includes a single placeholder local EC so it satisfies the invariant
 /// enforced at decode time (one EC whose `tick_id` matches the wave's own).
 #[must_use]
-pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardId) -> FinalizedWave {
+pub fn make_test_finalization(height: BlockHeight, shard: ShardId) -> Finalization {
     let tick_id = TickId::new(shard, height);
     let local_ec = Arc::new(ExecutionCertificate::new(
         tick_id,
@@ -112,7 +112,7 @@ pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardId) -> Finali
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::empty(),
     ));
-    FinalizedWave::new(tick_id, vec![local_ec], vec![])
+    Finalization::new(tick_id, vec![local_ec], vec![])
 }
 
 /// Build a minimal `Block` at the given height.
@@ -370,7 +370,7 @@ pub fn make_test_execution_certificate(
     )
 }
 
-/// Build a test block that carries ECs inside its finalized waves.
+/// Build a test block that carries ECs inside its finalizations.
 ///
 /// The wave's `tick_id` is taken from the first EC's `tick_id` so
 /// the local-EC decode invariant is satisfied without injecting a placeholder.
@@ -379,13 +379,13 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
     if ecs.is_empty() {
         return block;
     }
-    let certificate = FinalizedWave::new(*ecs[0].tick_id(), ecs, vec![]);
+    let certificate = Finalization::new(*ecs[0].tick_id(), ecs, vec![]);
     push_certificate(block, Arc::new(certificate.into()))
 }
 
-/// Append a finalized wave to `block`'s certificate list, preserving
+/// Append a finalization to `block`'s certificate list, preserving
 /// the block variant.
-fn push_certificate(block: Block, fw: Arc<Verifiable<FinalizedWave>>) -> Block {
+fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
     match block {
         Block::Live {
             header,
@@ -435,7 +435,7 @@ fn commit_empty_blocks_up_to(storage: &impl ShardChainWriter, target: BlockHeigh
 
 /// Commit `writes` at `height` through the production block-commit path.
 ///
-/// The writes ride a single-receipt finalized wave inside a test block,
+/// The writes ride a single-receipt finalization inside a test block,
 /// so substates, state history, and the JMT all land exactly as a live
 /// commit writes them. Returns the resulting state root.
 pub fn commit_block_with_updates(
@@ -454,7 +454,7 @@ pub fn commit_block_with_updates(
         metadata: None,
     };
     let finalized = Arc::new(
-        FinalizedWave::new(TickId::new(ShardId::ROOT, height), vec![], vec![receipt]).into(),
+        Finalization::new(TickId::new(ShardId::ROOT, height), vec![], vec![receipt]).into(),
     );
     let block = push_certificate(make_test_block(height), finalized);
     storage.commit_block(&make_test_certified(block), &empty_witness())

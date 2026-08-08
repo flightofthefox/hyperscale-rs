@@ -1,9 +1,9 @@
-//! [`FinalizedWave`] — every participating shard's certificate for one
+//! [`Finalization`] — every participating shard's certificate for one
 //! tick, plus the receipts that tick's own execution produced.
 //!
-//! [`FinalizedWave`] is the raw wire form. Its verified form is
-//! `Verified<FinalizedWave>`; predicate at
-//! [`impl Verify<&FinalizedWaveContext<'_>>`](Verify::verify) below.
+//! [`Finalization`] is the raw wire form. Its verified form is
+//! `Verified<Finalization>`; predicate at
+//! [`impl Verify<&FinalizationContext<'_>>`](Verify::verify) below.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use crate::{
     Verified, Verify, WaveReceiptHash,
 };
 
-/// Cap on execution certificates accepted in a single [`FinalizedWave`] at
+/// Cap on execution certificates accepted in a single [`Finalization`] at
 /// decode time.
 ///
 /// A wave's EC set is one local EC plus at most one EC per participating
@@ -31,7 +31,7 @@ use crate::{
 /// validator at decode time.
 pub const MAX_EXECUTION_CERTIFICATES_PER_WAVE: usize = 1024;
 
-/// A finalized wave — every participating shard has attested the tick's
+/// A finalization — every participating shard has attested the tick's
 /// transactions, and the local receipts stand beside the proof.
 ///
 /// Receipts are written atomically with the block at commit time (not
@@ -42,30 +42,30 @@ pub const MAX_EXECUTION_CERTIFICATES_PER_WAVE: usize = 1024;
 /// The wave's canonical tx list, ordering, and per-tx decisions are all
 /// **derived** from the execution certificates, not stored alongside them.
 /// See:
-/// - [`FinalizedWave::local_ec`] — the authoritative EC (where `ec.tick_id() == tick_id`)
-/// - [`FinalizedWave::tx_hashes`] — iterator over the wave's tx hashes in block order
-/// - [`FinalizedWave::tx_decisions`] — aggregated (Aborted > Reject > Accept) per tx
+/// - [`Finalization::local_ec`] — the authoritative EC (where `ec.tick_id() == tick_id`)
+/// - [`Finalization::tx_hashes`] — iterator over the wave's tx hashes in block order
+/// - [`Finalization::tx_decisions`] — aggregated (Aborted > Reject > Accept) per tx
 ///
 /// `receipts` contains only txs that actually executed (sparse subset of
 /// `tx_hashes()`, same block order). Aborted txs produce no receipt.
 ///
 /// # Invariant (well-formed)
 ///
-/// A well-formed `FinalizedWave` contains **exactly one local EC** — the
+/// A well-formed `Finalization` contains **exactly one local EC** — the
 /// EC where `ec.tick_id() == fw.tick_id`. The local EC is the authoritative
 /// source for the wave's tx set and canonical (block) ordering. Remote ECs
 /// attest against their own ticks and may cover only subsets; the local
 /// shard, by construction, produces a single EC per tick.
 ///
 /// Enforced at construction by `WaveState::attestation` and at
-/// the wire boundary by the decode impl. [`FinalizedWave::local_ec`]
+/// the wire boundary by the decode impl. [`Finalization::local_ec`]
 /// `expect`s it.
 ///
 /// Shared via `Arc` across the system — flows from execution state through
 /// pending blocks, actions, and into the commit path.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
-#[hbor(validate = check_finalized_wave)]
-pub struct FinalizedWave {
+#[hbor(validate = check_finalization)]
+pub struct Finalization {
     tick_id: TickId,
     #[hbor(max = MAX_EXECUTION_CERTIFICATES_PER_WAVE)]
     execution_certificates: Vec<Arc<Verifiable<ExecutionCertificate>>>,
@@ -74,10 +74,10 @@ pub struct FinalizedWave {
 }
 
 /// The exactly-one-local-EC invariant, enforced at the wire boundary. Zero
-/// local ECs would crash [`FinalizedWave::local_ec`]; multiple would let
+/// local ECs would crash [`Finalization::local_ec`]; multiple would let
 /// downstream code silently disagree on which EC is authoritative for tx
 /// ordering.
-fn check_finalized_wave(wave: &FinalizedWave) -> Result<(), &'static str> {
+fn check_finalization(wave: &Finalization) -> Result<(), &'static str> {
     let local = wave
         .execution_certificates
         .iter()
@@ -86,7 +86,7 @@ fn check_finalized_wave(wave: &FinalizedWave) -> Result<(), &'static str> {
     if local == 1 {
         Ok(())
     } else {
-        Err("a finalized wave carries exactly one local execution certificate")
+        Err("a finalization carries exactly one local execution certificate")
     }
 }
 
@@ -147,7 +147,7 @@ pub fn settles(outcome: &TxOutcome, refused: &BTreeSet<TxHash>) -> Settles {
     }
 }
 
-/// Reason a `FinalizedWave`'s receipts don't agree with its own EC.
+/// Reason a `Finalization`'s receipts don't agree with its own EC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptValidationError {
     /// The wave has no EC whose `tick_id` is the wave's own. Every
@@ -196,7 +196,7 @@ pub enum ReceiptValidationError {
     },
 }
 
-impl FinalizedWave {
+impl Finalization {
     /// Stored receipts for txs that executed. Aborted txs are absent —
     /// `receipts.len() <= tx_count()`. Preserves canonical block order.
     /// Held in-memory until block commit, then written atomically with block metadata.
@@ -243,7 +243,7 @@ impl FinalizedWave {
         self.execution_certificates
             .iter()
             .find(|ec| ec.tick_id() == &self.tick_id)
-            .expect("finalized-wave invariant: local EC must be present")
+            .expect("finalization invariant: local EC must be present")
     }
 
     /// The leaf a block's `certificate_root` commits for this wave.
@@ -356,7 +356,7 @@ impl FinalizedWave {
     /// Used on the storage/sync serving side to rebuild the in-memory shape
     /// from committed state. Walks the local EC's `tx_outcomes` (canonical block
     /// order) and fetches each receipt via `lookup`. Aborted txs are skipped —
-    /// they produce no receipt (matches the shape in `execution::finalize_wave`).
+    /// they produce no receipt (matches the shape in `execution::finalize`).
     ///
     /// Returns `None` if:
     /// - The wave lacks a local EC (malformed — should not happen for a
@@ -387,7 +387,7 @@ impl FinalizedWave {
         Some(attestation.with_receipts(receipts))
     }
 
-    /// Build a `FinalizedWave` from raw inputs. Each EC lands
+    /// Build a `Finalization` from raw inputs. Each EC lands
     /// [`Verifiable::Unverified`] — this is the constructor for wire
     /// reconstruction and tests, where the ECs carry no verification
     /// marker. Locally aggregated waves that already hold
@@ -414,17 +414,17 @@ impl FinalizedWave {
         }
     }
 
-    /// Build a receiptless `FinalizedWave` from execution certificates
+    /// Build a receiptless `Finalization` from execution certificates
     /// that have already cleared their per-EC signature predicate,
     /// carrying the [`Verifiable::Verified`] marker on each. Receipts
     /// arrive through [`Self::with_receipts`], which is what the caller
     /// needs the certificates to decide.
     ///
-    /// Used by `WaveState::into_finalized`, whose ECs were produced
+    /// Used by `WaveState::into_finalization`, whose ECs were produced
     /// through the [`Verified::<ExecutionCertificate>::aggregate`] gate.
     /// Keeping the marker leaves the ECs internally consistent with the
-    /// [`Verified<FinalizedWave>`](Verified) they're sealed into, so a
-    /// later [`FinalizedWave::verify`](Verify::verify) short-circuits
+    /// [`Verified<Finalization>`](Verified) they're sealed into, so a
+    /// later [`Finalization::verify`](Verify::verify) short-circuits
     /// them instead of re-checking.
     #[must_use]
     pub fn from_verified_ecs(
@@ -620,10 +620,10 @@ impl FinalizedWave {
     }
 }
 
-/// Inputs the [`FinalizedWave`] verifier reads against. Borrows
+/// Inputs the [`Finalization`] verifier reads against. Borrows
 /// everything; nothing is consumed.
 #[derive(Debug, Clone, Copy)]
-pub struct FinalizedWaveContext<'a> {
+pub struct FinalizationContext<'a> {
     /// Network identifier — feeds the domain-separated signing message
     /// for each constituent EC.
     pub network: &'a NetworkDefinition,
@@ -635,9 +635,9 @@ pub struct FinalizedWaveContext<'a> {
     pub verifier: &'a dyn Verifier,
 }
 
-/// Failure modes of [`FinalizedWave`] verification.
+/// Failure modes of [`Finalization`] verification.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
-pub enum FinalizedWaveVerifyError {
+pub enum FinalizationVerifyError {
     /// `ec_public_keys.len() != wave.execution_certificates().len()`.
     /// Caller-side packaging error.
     #[error(
@@ -665,25 +665,25 @@ pub enum FinalizedWaveVerifyError {
 ///
 /// Construction goes through one of four gates:
 ///
-/// - [`<FinalizedWave as Verify>::verify`](Verify::verify) — runs the
+/// - [`<Finalization as Verify>::verify`](Verify::verify) — runs the
 ///   embedded-EC predicate over every constituent EC that doesn't
 ///   already carry a live verification marker.
-/// - [`Verified::<FinalizedWave>::seal`] — wraps a locally-finalized
+/// - [`Verified::<Finalization>::seal`] — wraps a locally-finalized
 ///   wave whose ECs were produced through the
 ///   [`Verified::<ExecutionCertificate>::aggregate`] gate.
-/// - [`Verified::<FinalizedWave>::from_committed_block`] — wraps a
+/// - [`Verified::<Finalization>::from_committed_block`] — wraps a
 ///   wave reaching downstream consumers via a
 ///   [`Verified<CertifiedBlock>`], where the source committee's QC
 ///   BFT-transitively attests the per-EC signature claim.
 ///
 /// [`Verified<CertifiedBlock>`]: crate::CertifiedBlock
-impl Verify<&FinalizedWaveContext<'_>> for FinalizedWave {
-    type Error = FinalizedWaveVerifyError;
+impl Verify<&FinalizationContext<'_>> for Finalization {
+    type Error = FinalizationVerifyError;
 
-    fn verify(&self, ctx: &FinalizedWaveContext<'_>) -> Result<Verified<Self>, Self::Error> {
+    fn verify(&self, ctx: &FinalizationContext<'_>) -> Result<Verified<Self>, Self::Error> {
         let ecs = self.execution_certificates();
         if ctx.ec_public_keys.len() != ecs.len() {
-            return Err(FinalizedWaveVerifyError::PublicKeyVectorLengthMismatch {
+            return Err(FinalizationVerifyError::PublicKeyVectorLengthMismatch {
                 expected: ecs.len(),
                 actual: ctx.ec_public_keys.len(),
             });
@@ -701,26 +701,26 @@ impl Verify<&FinalizedWaveContext<'_>> for FinalizedWave {
                 verifier: ctx.verifier,
             };
             ec.as_unverified().verify(&ec_ctx).map_err(|source| {
-                FinalizedWaveVerifyError::ExecutionCertificate { index, source }
+                FinalizationVerifyError::ExecutionCertificate { index, source }
             })?;
         }
         Ok(Verified::new_unchecked(self.clone()))
     }
 }
 
-impl Verified<FinalizedWave> {
-    /// Wrap a locally-finalized wave whose ECs were built through the
+impl Verified<Finalization> {
+    /// Wrap a locally-finalization whose ECs were built through the
     /// [`Verified::<ExecutionCertificate>::aggregate`] gate.
     ///
     /// Trust source: every EC the wave carries was produced from a
     /// quorum of verified votes on this validator, so
     /// the predicate (per-EC signature verify against the matching committee)
-    /// holds by construction. Used at the [`WaveState::into_finalized`]
+    /// holds by construction. Used at the [`WaveState::into_finalization`]
     /// boundary.
     ///
-    /// [`WaveState::into_finalized`]: crate::WaveState::into_finalized
+    /// [`WaveState::into_finalization`]: crate::WaveState::into_finalization
     #[must_use]
-    pub const fn seal(wave: FinalizedWave) -> Self {
+    pub const fn seal(wave: Finalization) -> Self {
         // SAFETY: every EC in `wave.execution_certificates()` was
         // built by the local aggregator from verified votes (see
         // `Verified::<ExecutionCertificate>::aggregate`); the per-EC
@@ -729,7 +729,7 @@ impl Verified<FinalizedWave> {
         Self::new_unchecked(wave)
     }
 
-    /// Wrap a finalized wave reaching the system via a committed block.
+    /// Wrap a finalization reaching the system via a committed block.
     ///
     /// Trust source: the wave was carried inside a
     /// [`Verified<CertifiedBlock>`]; 2f+1 of the block's committee
@@ -737,7 +737,7 @@ impl Verified<FinalizedWave> {
     /// wave via the header's `certificate_root` and to each wave's
     /// receipt set via `local_receipt_root`. Honest signers ran the
     /// per-EC signature predicate before voting, so the predicate
-    /// [`<FinalizedWave as Verify>::verify`] would run is
+    /// [`<Finalization as Verify>::verify`] would run is
     /// BFT-transitively attested by that committee.
     ///
     /// Used at sync admission, where the QC chain replaces local
@@ -745,7 +745,7 @@ impl Verified<FinalizedWave> {
     ///
     /// [`Verified<CertifiedBlock>`]: crate::CertifiedBlock
     #[must_use]
-    pub const fn from_committed_block(wave: FinalizedWave) -> Self {
+    pub const fn from_committed_block(wave: Finalization) -> Self {
         // SAFETY: the wave was carried in a `Verified<CertifiedBlock>`;
         // the source committee's QC attests its inclusion and per-EC
         // signature checks via the block's `certificate_root` and
@@ -815,7 +815,7 @@ mod tests {
 
     /// Honest path: every EC verifies under its committee PKs.
     #[test]
-    fn verify_accepts_finalized_wave_with_valid_ecs() {
+    fn verify_accepts_finalization_with_valid_ecs() {
         let net = NetworkDefinition::simulator();
 
         let local_wid = tick_id(0, 7, &[1]);
@@ -835,26 +835,25 @@ mod tests {
         let remote_ec =
             make_verified_ec(&net, &remote_wid, &remote_outcomes, &shard1_signers).into_inner();
 
-        let wave = FinalizedWave::new(
+        let wave = Finalization::new(
             local_wid,
             vec![Arc::new(local_ec), Arc::new(remote_ec)],
             vec![],
         );
 
         let ec_pks = vec![shard0_pks, shard1_pks];
-        let ctx = FinalizedWaveContext {
+        let ctx = FinalizationContext {
             verifier: &BlsVerifier,
             network: &net,
             ec_public_keys: &ec_pks,
         };
-        wave.verify(&ctx)
-            .expect("honest finalized wave must verify");
+        wave.verify(&ctx).expect("honest finalization must verify");
     }
 
     /// One tampered EC fails its own predicate; the error names the
     /// failing index.
     #[test]
-    fn verify_rejects_finalized_wave_with_one_bad_ec() {
+    fn verify_rejects_finalization_with_one_bad_ec() {
         let net = NetworkDefinition::simulator();
         let local_wid = tick_id(0, 7, &[1]);
         let remote_wid = tick_id(1, 7, &[0]);
@@ -883,14 +882,14 @@ mod tests {
             remote_ec.signers().clone(),
         );
 
-        let wave = FinalizedWave::new(
+        let wave = Finalization::new(
             local_wid,
             vec![Arc::new(local_ec), Arc::new(tampered_remote)],
             vec![],
         );
 
         let ec_pks = vec![shard0_pks, shard1_pks];
-        let ctx = FinalizedWaveContext {
+        let ctx = FinalizationContext {
             verifier: &BlsVerifier,
             network: &net,
             ec_public_keys: &ec_pks,
@@ -898,7 +897,7 @@ mod tests {
         let err = wave.verify(&ctx).expect_err("tampered EC must fail verify");
         assert!(matches!(
             err,
-            FinalizedWaveVerifyError::ExecutionCertificate { index: 1, .. }
+            FinalizationVerifyError::ExecutionCertificate { index: 1, .. }
         ));
     }
 
@@ -916,9 +915,9 @@ mod tests {
         let outcomes = vec![make_outcome(1)];
         let ec = make_verified_ec(&net, &local_wid, &outcomes, &sks).into_inner();
 
-        let wave = FinalizedWave::new(local_wid, vec![Arc::new(ec)], vec![]);
+        let wave = Finalization::new(local_wid, vec![Arc::new(ec)], vec![]);
 
-        let verified = Verified::<FinalizedWave>::from_committed_block(wave.clone());
+        let verified = Verified::<Finalization>::from_committed_block(wave.clone());
         assert_eq!(verified.into_inner(), wave);
     }
 
@@ -932,18 +931,18 @@ mod tests {
         let outcomes = vec![make_outcome(1)];
         let ec = make_verified_ec(&net, &local_wid, &outcomes, &sks).into_inner();
 
-        let wave = FinalizedWave::new(local_wid, vec![Arc::new(ec)], vec![]);
+        let wave = Finalization::new(local_wid, vec![Arc::new(ec)], vec![]);
 
         // Supply two public-key vectors for a single-EC wave.
         let ec_pks: Vec<Vec<ConsensusPublicKey>> = vec![vec![], vec![]];
-        let ctx = FinalizedWaveContext {
+        let ctx = FinalizationContext {
             verifier: &BlsVerifier,
             network: &net,
             ec_public_keys: &ec_pks,
         };
         assert_eq!(
             wave.verify(&ctx),
-            Err(FinalizedWaveVerifyError::PublicKeyVectorLengthMismatch {
+            Err(FinalizationVerifyError::PublicKeyVectorLengthMismatch {
                 expected: 1,
                 actual: 2,
             })

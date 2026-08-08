@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::{
     BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, CertificateRoot, ChainOrigin,
-    FinalizedWave, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
+    Finalization, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
     MAX_TXS_PER_BLOCK, ProvisionHash, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
     QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateRoot, Transaction,
     TransactionRoot, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
@@ -56,13 +56,13 @@ pub fn shared_transactions_from_raw(txs: Vec<Arc<Transaction>>) -> SharedTransac
 /// Shared certificate list — same rationale as [`SharedTransactions`].
 ///
 /// Elements are wrapped in [`Verifiable`] so an in-process upstream's
-/// [`Verified<FinalizedWave>`] marker survives across block construction
+/// [`Verified<Finalization>`] marker survives across block construction
 /// and downstream dispatch; wire-decoded blocks land at
 /// [`Verifiable::Unverified`] because HBOR decode is a transparent
 /// passthrough into that variant. Same rationale as
 /// [`BlockHeader::parent_qc`](crate::BlockHeader) which carries
 /// `Verifiable<QuorumCertificate>` for the same reason.
-pub type SharedCertificates = Arc<Vec<Arc<Verifiable<FinalizedWave>>>>;
+pub type SharedCertificates = Arc<Vec<Arc<Verifiable<Finalization>>>>;
 
 /// Shared provision list — same rationale as [`SharedCertificates`].
 pub type SharedProvisions = Arc<Vec<Arc<Verifiable<Provisions>>>>;
@@ -74,7 +74,7 @@ pub type SharedProvisions = Arc<Vec<Arc<Verifiable<Provisions>>>>;
 /// [`Block::gas_consumed`] answers the same question for a built block.
 /// One derivation, so the two sides cannot drift.
 #[must_use]
-pub fn work_over_certificates(certificates: &[Arc<Verifiable<FinalizedWave>>]) -> u64 {
+pub fn work_over_certificates(certificates: &[Arc<Verifiable<Finalization>>]) -> u64 {
     certificates.iter().fold(0u64, |sum, wave| {
         sum.saturating_add(wave.as_unverified().attested_work())
     })
@@ -107,9 +107,9 @@ pub enum Block {
         /// collection it bounds.
         #[hbor(max = MAX_TXS_PER_BLOCK)]
         transactions: Arc<Vec<Arc<Verifiable<Transaction>>>>,
-        /// Wave certificates finalized in this block.
+        /// Finalizations finalized in this block.
         #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-        certificates: Arc<Vec<Arc<Verifiable<FinalizedWave>>>>,
+        certificates: Arc<Vec<Arc<Verifiable<Finalization>>>>,
         /// Provisions needed to execute cross-shard waves locally.
         #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
         provisions: Arc<Vec<Arc<Verifiable<Provisions>>>>,
@@ -132,9 +132,9 @@ pub enum Block {
         /// collection it bounds.
         #[hbor(max = MAX_TXS_PER_BLOCK)]
         transactions: Arc<Vec<Arc<Verifiable<Transaction>>>>,
-        /// Wave certificates finalized in this block.
+        /// Finalizations finalized in this block.
         #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-        certificates: Arc<Vec<Arc<Verifiable<FinalizedWave>>>>,
+        certificates: Arc<Vec<Arc<Verifiable<Finalization>>>>,
         /// Content hashes of the provisions the block consumed while
         /// `Live`. Empty iff the block consumed no provisions.
         #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
@@ -176,8 +176,8 @@ impl PartialEq for Block {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.hash() == y.hash())
         }
         fn cert_lists_equal(
-            a: &[Arc<Verifiable<FinalizedWave>>],
-            b: &[Arc<Verifiable<FinalizedWave>>],
+            a: &[Arc<Verifiable<Finalization>>],
+            b: &[Arc<Verifiable<Finalization>>],
         ) -> bool {
             // Compare by inner FW content; the `Verifiable` marker is
             // irrelevant to whether two blocks are content-equal.
@@ -373,7 +373,7 @@ impl Block {
         }
     }
 
-    /// Finalized waves (certificates) in the block — present in both variants.
+    /// Finalizations (certificates) in the block — present in both variants.
     /// See [`Self::transactions`] for the sharing rationale.
     #[must_use]
     pub const fn certificates(&self) -> &SharedCertificates {
@@ -546,7 +546,7 @@ impl Block {
         self.header().is_genesis()
     }
 
-    /// Get number of wave certificates in this block.
+    /// Get number of finalizations in this block.
     #[must_use]
     pub fn certificate_count(&self) -> usize {
         self.certificates().len()

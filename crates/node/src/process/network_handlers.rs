@@ -26,7 +26,7 @@ use hyperscale_types::network::request::beacon::{
     GetBeaconBlockRequest, GetBeaconProposalRequest, GetShardWitnessesRequest,
 };
 use hyperscale_types::network::request::{
-    GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
+    GetExecutionCertsRequest, GetFinalizationsRequest, GetLocalProvisionsRequest,
 };
 use hyperscale_types::network::response::GetProvisionResponse;
 use hyperscale_types::{ExecutionCertificate, ShardId, Verifiable, signed_bytes};
@@ -798,9 +798,8 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::bootstrap::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        serve_execution_certs_request, serve_finalized_waves_request,
-        serve_local_provisions_request, serve_provision_request, serve_remote_headers_request,
-        serve_settled_txs_request,
+        serve_execution_certs_request, serve_finalizations_request, serve_local_provisions_request,
+        serve_provision_request, serve_remote_headers_request, serve_settled_txs_request,
     };
     use crate::shard::mempool::serve_transaction_request;
 
@@ -1044,14 +1043,14 @@ pub fn register_shard_request_handlers<S, N, D>(
             serve_local_provisions_request(&provision_store, &verified_headers, &req)
         });
 
-    // ── finalized_wave.request → cache lookup + pending_chain fallback ─
+    // ── finalization.request → cache lookup + pending_chain fallback ─
 
-    let fw_cache = Arc::clone(&io.caches.finalized_wave);
+    let fw_cache = Arc::clone(&io.caches.finalization);
     let pending_chain = Arc::clone(&io.pending_chain);
     process
         .network
-        .register_request_handler::<GetFinalizedWavesRequest>(shard, move |req| {
-            serve_finalized_waves_request(&pending_chain, &fw_cache, &req)
+        .register_request_handler::<GetFinalizationsRequest>(shard, move |req| {
+            serve_finalizations_request(&pending_chain, &fw_cache, &req)
         });
 
     // ── execution_cert.request → cert store lookup ────────────────

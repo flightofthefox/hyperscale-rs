@@ -49,7 +49,7 @@ pub struct ShardMetrics {
     pub fetch_provision: usize,
     pub fetch_local_provision: usize,
     pub fetch_exec_cert: usize,
-    pub fetch_finalized_wave: usize,
+    pub fetch_finalization: usize,
 }
 
 /// Per-vnode consensus counts.
@@ -117,7 +117,7 @@ pub fn record_metrics(
         set_fetch_in_flight("provision", s, shard.fetch_provision);
         set_fetch_in_flight("local_provision", s, shard.fetch_local_provision);
         set_fetch_in_flight("exec_cert", s, shard.fetch_exec_cert);
-        set_fetch_in_flight("finalized_wave", s, shard.fetch_finalized_wave);
+        set_fetch_in_flight("finalization", s, shard.fetch_finalization);
     }
 
     for (validator_id, vnode) in &snapshot.vnodes {
@@ -161,7 +161,7 @@ where
         set_fetch_in_flight("provision", s, fetches.provision_in_flight);
         set_fetch_in_flight("local_provision", s, fetches.local_provision_in_flight);
         set_fetch_in_flight("exec_cert", s, fetches.exec_cert_in_flight);
-        set_fetch_in_flight("finalized_wave", s, fetches.finalized_wave_in_flight);
+        set_fetch_in_flight("finalization", s, fetches.finalization_in_flight);
         set_fetch_oldest_in_flight_age_ms(
             "transaction",
             s,
@@ -183,9 +183,9 @@ where
             fetches.exec_cert_oldest_in_flight_age_ms,
         );
         set_fetch_oldest_in_flight_age_ms(
-            "finalized_wave",
+            "finalization",
             s,
-            fetches.finalized_wave_oldest_in_flight_age_ms,
+            fetches.finalization_oldest_in_flight_age_ms,
         );
 
         for vnode in &self.vnodes {
@@ -239,7 +239,7 @@ where
                     fetch_provision: fetches.provision_in_flight,
                     fetch_local_provision: fetches.local_provision_in_flight,
                     fetch_exec_cert: fetches.exec_cert_in_flight,
-                    fetch_finalized_wave: fetches.finalized_wave_in_flight,
+                    fetch_finalization: fetches.finalization_in_flight,
                 },
             );
 
@@ -298,7 +298,7 @@ where
             shard_pending_synced_block_verifications: shard_mem.pending_synced_block_verifications,
             // Execution
             exec_cache_entries: exec_mem.wave_execution_receipts,
-            exec_finalized_wave_certificates: exec_mem.finalized_wave_certificates,
+            exec_finalizations: exec_mem.finalizations,
             exec_waves: exec_mem.waves,
             exec_vote_trackers: exec_mem.vote_trackers,
             exec_early_votes: exec_mem.early_votes,
@@ -335,7 +335,7 @@ where
             // Node (io_loop, per-shard)
             node_tx_store: self.shard_io(primary_shard).caches.tx_store.len(),
             node_tx_status_cache: self.process.tx_status.len(),
-            node_finalized_wave_cache: self.shard_io(primary_shard).caches.finalized_wave.len(),
+            node_finalization_cache: self.shard_io(primary_shard).caches.finalization.len(),
             node_provision_cache: self.shard_io(primary_shard).caches.provision_store.len(),
             node_exec_cert_cache: self.shard_io(primary_shard).caches.exec_cert_store.len(),
             node_prepared_commits: self.shard_io(primary_shard).block_commit.prepared_len(),
@@ -356,7 +356,7 @@ where
             node_block_sync_in_flight_fetches: block_sync_status.pending_fetches,
             node_tx_fetch_blocks: fetches.transaction_pending,
             node_local_provision_fetch_pending: fetches.local_provision_pending,
-            node_finalized_wave_fetch_pending: fetches.finalized_wave_pending,
+            node_finalization_fetch_pending: fetches.finalization_pending,
             node_provision_fetch_pending: fetches.provision_pending,
             node_exec_cert_fetch_pending: fetches.exec_cert_pending,
             node_remote_header_fetch_pending: self

@@ -183,7 +183,7 @@ impl ShardParticipation {
                 round,
                 block,
                 block_hash,
-                finalized_waves,
+                finalizations,
                 provisions,
                 bytes_delta,
             } => self.shard_coordinator.on_proposal_built(
@@ -192,7 +192,7 @@ impl ShardParticipation {
                 round,
                 &block,
                 block_hash,
-                finalized_waves,
+                finalizations,
                 provisions,
                 bytes_delta,
             ),
@@ -220,9 +220,9 @@ impl ShardParticipation {
                 }
                 actions
             }
-            ProtocolEvent::FinalizedWavesAdmitted { waves } => self
+            ProtocolEvent::FinalizationsAdmitted { finalizations } => self
                 .shard_coordinator
-                .on_finalized_waves_admitted(topology_schedule, &waves),
+                .on_finalizations_admitted(topology_schedule, &finalizations),
             // Locally assembled from already-verified headers — engage the
             // fence and re-gossip directly (no re-verification needed).
             ProtocolEvent::ShardForkDetected { proof } => {
@@ -421,7 +421,7 @@ impl ShardParticipation {
                 block_hash = ?header.hash(),
                 height = header.height().inner(),
                 wave = %tick_id,
-                "Rejecting block: a wave certificate settles ahead of one it shares a cell with"
+                "Rejecting block: a finalization settles ahead of one it shares a cell with"
             );
             return vec![];
         }
@@ -435,7 +435,7 @@ impl ShardParticipation {
                     .get_transaction(h)
                     .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
             },
-            |id| self.execution_coordinator.get_finalized_wave(id),
+            |id| self.execution_coordinator.get_finalization(id),
             |h| {
                 self.provisions_coordinator
                     .get_provisions_by_hash(*h)
@@ -458,7 +458,7 @@ impl ShardParticipation {
             block_hash,
             qc,
             &inputs.ready_txs,
-            inputs.finalized_waves,
+            inputs.finalizations,
             inputs.provisions,
         )
     }
@@ -474,12 +474,12 @@ impl ShardParticipation {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        // Release execution's per-wave bookkeeping for wave certs included
+        // Release execution's per-wave bookkeeping for finalizations included
         // in this block. Per-tx terminal state for the mempool is already
         // handled separately by `on_block_committed` reading
         // `block.certificates`.
         self.execution_coordinator
-            .cleanup_committed_waves(certified.block().certificates());
+            .cleanup_committed_finalizations(certified.block().certificates());
 
         actions.extend(
             self.execution_coordinator

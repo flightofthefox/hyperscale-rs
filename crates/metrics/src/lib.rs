@@ -68,7 +68,7 @@ pub struct MemoryMetrics {
     pub shard_received_votes_by_height: usize,
     /// Committed transaction hash lookup.
     pub shard_committed_tx_lookup: usize,
-    /// Committed wave certificate lookup.
+    /// Committed finalization lookup.
     pub shard_committed_cert_lookup: usize,
     /// Committed provision batch lookup.
     pub shard_committed_provision_lookup: usize,
@@ -86,8 +86,8 @@ pub struct MemoryMetrics {
     // ── Execution ──
     /// In-memory write sets per transaction.
     pub exec_cache_entries: usize,
-    /// Wave certificates ready for block inclusion.
-    pub exec_finalized_wave_certificates: usize,
+    /// Finalizations ready for block inclusion.
+    pub exec_finalizations: usize,
     /// Active wave states (per-wave execution + finalization tracking).
     pub exec_waves: usize,
     /// Execution votes collection per wave.
@@ -161,8 +161,8 @@ pub struct MemoryMetrics {
     pub node_tx_store: usize,
     /// LRU cache of transaction statuses (fixed capacity, ~100k).
     pub node_tx_status_cache: usize,
-    /// LRU cache of finalized wave certificates (fixed capacity, ~10k).
-    pub node_finalized_wave_cache: usize,
+    /// LRU cache of finalizations (fixed capacity, ~10k).
+    pub node_finalization_cache: usize,
     /// Time-bounded cache of provision bodies for cross-shard fetch service.
     pub node_provision_cache: usize,
     /// Fallback execution certificate cache keyed by `tick_id`.
@@ -187,8 +187,8 @@ pub struct MemoryMetrics {
     pub node_tx_fetch_blocks: usize,
     /// Blocks with pending local provision fetches.
     pub node_local_provision_fetch_pending: usize,
-    /// Blocks with pending finalized-wave fetches.
-    pub node_finalized_wave_fetch_pending: usize,
+    /// Blocks with pending finalization fetches.
+    pub node_finalization_fetch_pending: usize,
     /// (shard, height) keys with pending cross-shard provision fetches.
     pub node_provision_fetch_pending: usize,
     /// (shard, height) keys with pending cross-shard execution-cert fetches.

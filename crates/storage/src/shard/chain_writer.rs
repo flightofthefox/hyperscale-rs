@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHeight, CertifiedBlock, FinalizedWave, PreparedCommit, StateRoot,
+    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, StateRoot,
     Verifiable, Verified,
 };
 
@@ -48,7 +48,7 @@ pub struct ParentAnchor<'a> {
 /// 4. If no closure is available (e.g. sync blocks without verification),
 ///    `commit_block` recomputes from scratch.
 ///
-/// Execution certificates are extracted from `block.certificates` (wave certs
+/// Execution certificates are extracted from `block.certificates` (finalizations
 /// contain the ECs directly) — no separate parameter needed.
 ///
 /// All methods take `&self` — implementations use interior mutability.
@@ -56,7 +56,7 @@ pub trait ShardChainWriter: Send + Sync + 'static {
     /// Compute speculative state root and return precomputed commit work
     /// as a closure.
     ///
-    /// Extracts and merges the writes from each finalized wave's receipts
+    /// Extracts and merges the writes from each finalization's receipts
     /// internally, then computes the speculative JMT root.
     ///
     /// `parent_block_height` is the height of the parent block whose state we
@@ -82,7 +82,7 @@ pub trait ShardChainWriter: Send + Sync + 'static {
     fn prepare_block_commit(
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
-        finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
+        finalizations: &[Arc<Verifiable<Finalization>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,

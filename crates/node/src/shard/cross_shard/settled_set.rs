@@ -3,7 +3,7 @@
 //! When a remote shard `P` terminates — a split's parent, or either child
 //! of a merge — a surviving counterpart must learn `S_P`, the transactions `P`
 //! settled at or before its terminal block, so the boundary fence can
-//! resolve cross-shard `FinalizedWave`s naming `P`. The acquisition scan
+//! resolve cross-shard `Finalization`s naming `P`. The acquisition scan
 //! keys on a shard having left the trie, so it covers both reshapes
 //! identically. It owns one acquisition per
 //! past-terminal shard: a single verified fetch of `P`'s complete settled
@@ -237,7 +237,7 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
         BlockHash, BlockHeader, CertificateRoot, ExecutionCertificate, ExecutionOutcome,
-        FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
+        Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
         ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot, TxHash, TxOutcome,
         ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources, WorkInFlight,
@@ -255,7 +255,7 @@ mod tests {
         TxHash::from(Hash::from_bytes(&height.to_le_bytes()))
     }
 
-    fn finalized_wave(height: u64) -> Arc<Verifiable<FinalizedWave>> {
+    fn finalization(height: u64) -> Arc<Verifiable<Finalization>> {
         let wave = local_wave(height);
         let ec = ExecutionCertificate::new(
             wave,
@@ -285,7 +285,7 @@ mod tests {
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         );
-        Arc::new(Verifiable::from(FinalizedWave::new(
+        Arc::new(Verifiable::from(Finalization::new(
             wave,
             vec![Arc::new(ec), Arc::new(remote)],
             vec![],
@@ -300,7 +300,7 @@ mod tests {
         let mut parent = BlockHash::ZERO;
         let mut terminal = BlockHash::ZERO;
         for h in 1..=count {
-            let certs = [finalized_wave(h)];
+            let certs = [finalization(h)];
             let parent_qc = QuorumCertificate::new(
                 parent,
                 SHARD,

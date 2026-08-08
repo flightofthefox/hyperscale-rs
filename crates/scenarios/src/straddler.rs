@@ -38,8 +38,8 @@ use crate::support::{Cluster, FaultHandle, FaultableCluster, epochs};
 /// Fault rules gate pushes (gossip) and request legs, never response legs, so EC
 /// intake is cut on the push and on the pulls, with the correct direction per
 /// leg: `peer_shard` pushes its EC by gossip (`execution.cert.batch`), and
-/// `shard` pulls the EC and the finalized wave that bundles it
-/// (`execution_cert.request`, `finalized_wave.request`). Provisions and headers
+/// `shard` pulls the EC and the finalization that bundles it
+/// (`execution_cert.request`, `finalization.request`). Provisions and headers
 /// still flow, so `shard` still executes the wave and produces its own EC; it
 /// just never receives `peer_shard`'s.
 ///
@@ -57,7 +57,7 @@ pub fn isolate_ec_intake(
     let handles = [
         c.drop_type_between(&peer_hosts, &shard_hosts, "execution.cert.batch"),
         c.drop_type_between(&shard_hosts, &peer_hosts, "execution_cert.request"),
-        c.drop_type_between(&shard_hosts, &peer_hosts, "finalized_wave.request"),
+        c.drop_type_between(&shard_hosts, &peer_hosts, "finalization.request"),
     ];
     FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
 }
@@ -408,7 +408,7 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
 
     // The payer's deadline arrives and it speaks its abort. No certificate
     // follows it: the counterpart engaged, so finalization needs a certificate
-    // the cut will never deliver — and release keys on a finalized wave, not on
+    // the cut will never deliver — and release keys on a finalization, not on
     // a verdict, so the hold the probes just measured stands through the
     // transaction's own resolution and on to the terminal.
     let verdict = await_tx_terminal(c, held_hash, epochs(12));
@@ -422,7 +422,7 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
     );
     assert!(
         c.chain_fate(splitter, held_hash).1.is_none(),
-        "no wave certificate may finalize while the counterpart's is cut off — \
+        "nothing may finalize while the counterpart's certificate is cut off — \
          without that, the reservation would release and the probe below would \
          prove nothing",
     );

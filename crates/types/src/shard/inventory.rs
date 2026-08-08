@@ -24,7 +24,7 @@ use std::sync::Arc;
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock, FinalizedWave,
+    Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock, Finalization,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
     Provisions, QuorumCertificate, TickId, Transaction, TxHash, Verifiable, WitnessSources,
 };
@@ -43,8 +43,8 @@ pub struct Inventory {
     /// recently-evicted cache. Responder may omit the corresponding
     /// transaction body.
     pub tx_have: Option<BloomFilter<TxHash>>,
-    /// Transactions the requester already holds a finalized wave for.
-    /// Responder may omit a `FinalizedWave` body once every one of its
+    /// Transactions the requester already holds a finalization for.
+    /// Responder may omit a `Finalization` body once every one of its
     /// transactions matches.
     pub cert_have: Option<BloomFilter<TxHash>>,
     /// Provisions the requester already has in its provision store.
@@ -91,7 +91,7 @@ pub struct ElidedCertifiedBlock {
     #[hbor(max = MAX_TXS_PER_BLOCK)]
     transactions: Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)>,
     #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-    certificates: Vec<(TickId, Option<Arc<Verifiable<FinalizedWave>>>)>,
+    certificates: Vec<(TickId, Option<Arc<Verifiable<Finalization>>>)>,
     provisions: ElidedProvisions,
     /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
@@ -152,7 +152,7 @@ impl ElidedCertifiedBlock {
 
     /// Per-certificate `(wave id, optional body)` pairs; body is `None` when elided.
     #[must_use]
-    pub const fn certificates(&self) -> &Vec<(TickId, Option<Arc<Verifiable<FinalizedWave>>>)> {
+    pub const fn certificates(&self) -> &Vec<(TickId, Option<Arc<Verifiable<Finalization>>>)> {
         &self.certificates
     }
 
@@ -262,7 +262,7 @@ impl ElidedCertifiedBlock {
     ) -> Result<CertifiedBlock, RehydrateError>
     where
         FTx: FnMut(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        FCert: FnMut(&TickId) -> Option<Arc<Verifiable<FinalizedWave>>>,
+        FCert: FnMut(&TickId) -> Option<Arc<Verifiable<Finalization>>>,
         FProv: FnMut(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     {
         // Header + QC are always inline, so the pairing can be checked
@@ -323,7 +323,7 @@ impl ElidedCertifiedBlock {
         }
 
         let txs: Vec<Arc<Verifiable<Transaction>>> = txs.into_iter().map(Option::unwrap).collect();
-        let certs: Vec<Arc<Verifiable<FinalizedWave>>> =
+        let certs: Vec<Arc<Verifiable<Finalization>>> =
             certs.into_iter().map(Option::unwrap).collect();
         let txs = Arc::new(txs);
         let certs = Arc::new(certs);
@@ -357,13 +357,13 @@ impl ElidedCertifiedBlock {
 /// Hashes whose bodies [`ElidedCertifiedBlock::try_rehydrate`] couldn't
 /// resolve from the provided lookups.
 ///
-/// Drives follow-up fetches for the missing transactions, wave certificates,
+/// Drives follow-up fetches for the missing transactions, finalizations,
 /// and provisions via the per-payload fetch protocols.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RehydrationMiss {
     /// Transaction hashes whose bodies could not be resolved.
     pub missing_tx: Vec<TxHash>,
-    /// Wave ids whose finalized-wave bodies could not be resolved.
+    /// Wave ids whose finalization bodies could not be resolved.
     pub missing_cert: Vec<TickId>,
     /// Provision hashes whose bodies could not be resolved.
     pub missing_provision: Vec<ProvisionHash>,
@@ -430,7 +430,7 @@ where
 /// `fw`, which is what it takes to hold the wave itself. A wave with no
 /// transactions is never held — a vacuous match would elide a body the
 /// requester has no way to resolve.
-fn wave_is_held(filter: Option<&BloomFilter<TxHash>>, fw: &FinalizedWave) -> bool {
+fn wave_is_held(filter: Option<&BloomFilter<TxHash>>, fw: &Finalization) -> bool {
     let Some(bf) = filter else {
         return false;
     };
@@ -492,7 +492,7 @@ mod tests {
         }
     }
 
-    /// Block carrying one two-transaction finalized wave and no
+    /// Block carrying one two-transaction finalization and no
     /// transactions of its own.
     fn create_test_block_with_wave(tx_hashes: &[TxHash]) -> Block {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
@@ -515,7 +515,7 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
-        let fw = Verifiable::from(FinalizedWave::new(tick_id, vec![Arc::new(ec)], Vec::new()));
+        let fw = Verifiable::from(Finalization::new(tick_id, vec![Arc::new(ec)], Vec::new()));
 
         let Block::Live {
             header,
@@ -777,7 +777,7 @@ mod tests {
             &hbor_to_vec(&Vec::<(TxHash, Option<Arc<Transaction>>)>::new()).unwrap(),
         );
         buf.extend_from_slice(
-            &hbor_to_vec(&Vec::<(TickId, Option<Arc<FinalizedWave>>)>::new()).unwrap(),
+            &hbor_to_vec(&Vec::<(TickId, Option<Arc<Finalization>>)>::new()).unwrap(),
         );
         // ElidedProvisions::Live(oversized) — discriminant 0, then the claim.
         buf.push(0);

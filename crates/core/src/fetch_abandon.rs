@@ -46,12 +46,12 @@ pub enum FetchAbandon {
         /// Provision hashes whose in-flight fetch should be cancelled.
         hashes: Vec<ProvisionHash>,
     },
-    /// Per-block finalized-wave fetch keyed by [`TickId`]. Emitted by the
+    /// Per-block finalization fetch keyed by [`TickId`]. Emitted by the
     /// execution coordinator when a fetched wave fails terminal admission
     /// checks (no quorum power on a contained EC, committee keys not
     /// resolvable, signature invalid) so the FSM clears the in-flight
     /// slot it would otherwise pin on a wave that cannot be admitted.
-    FinalizedWaves {
+    Finalizations {
         /// Wave ids whose in-flight fetch should be cancelled.
         ids: Vec<TickId>,
     },

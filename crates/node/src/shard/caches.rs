@@ -1,7 +1,7 @@
 //! Inbound request-serving caches.
 //!
 //! [`SharedCaches`] groups the in-memory caches that back peer-facing
-//! request handlers (transaction, finalized-wave, execution-cert,
+//! request handlers (transaction, finalization, execution-cert,
 //! provision) plus the cross-thread transaction-status view used by
 //! external RPC consumers. Each field is `Arc`-shared, so the same
 //! handles flow into the network handler closures (registered once at
@@ -9,15 +9,15 @@
 //!
 //! The caches are independent of the consensus state machine; the `io_loop`
 //! mutates them in response to outbound events
-//! (`Continuation(FinalizedWavesAdmitted)`, validated transactions, terminal
+//! (`Continuation(FinalizationsAdmitted)`, validated transactions, terminal
 //! status), and handlers read them on remote-peer requests.
 
 use std::sync::Arc;
 
-use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
+use hyperscale_execution::{ExecCertStore, FinalizationStore};
 use hyperscale_mempool::TxStore;
 use hyperscale_provisions::{ProvisionStore, VerifiedHeaderBuffer};
-use hyperscale_types::{FinalizedWave, TickId, Verifiable};
+use hyperscale_types::{Finalization, TickId, Verifiable};
 use quick_cache::sync::Cache as QuickCache;
 
 /// Default certificate cache capacity.
@@ -32,10 +32,10 @@ pub struct SharedCaches {
     /// — both hold `Arc<TxStore>` pointing at the same map, so the network
     /// worker can read bodies without contending on a mempool lock.
     pub tx_store: Arc<TxStore>,
-    /// Finalized waves, keyed by `TickId`. Populated by `io_loop`'s
-    /// `Continuation(FinalizedWavesAdmitted)` interception; queried by the
-    /// inbound finalized-wave handler.
-    pub finalized_wave: Arc<QuickCache<TickId, Arc<Verifiable<FinalizedWave>>>>,
+    /// Finalizations, keyed by `TickId`. Populated by `io_loop`'s
+    /// `Continuation(FinalizationsAdmitted)` interception; queried by the
+    /// inbound finalization handler.
+    pub finalization: Arc<QuickCache<TickId, Arc<Verifiable<Finalization>>>>,
     /// Outbound + local provision store, owned by the
     /// [`ProvisionCoordinator`]. Cloned here so handlers (block, block-topup,
     /// local-provision, cross-shard provision) can read it without going
@@ -59,14 +59,14 @@ pub struct SharedCaches {
     ///
     /// [`ExecutionCoordinator`]: hyperscale_execution::ExecutionCoordinator
     pub exec_cert_store: Arc<ExecCertStore>,
-    /// Per-shard finalized-wave store, shared with every same-shard
+    /// Per-shard finalization store, shared with every same-shard
     /// `ExecutionCoordinator`.
-    pub finalized_wave_store: Arc<FinalizedWaveStore>,
+    pub finalization_store: Arc<FinalizationStore>,
 }
 
 impl SharedCaches {
     /// Construct caches at `io_loop` startup. The `ProvisionStore`,
-    /// `TxStore`, `ExecCertStore`, and `FinalizedWaveStore` are owned
+    /// `TxStore`, `ExecCertStore`, and `FinalizationStore` are owned
     /// by their respective state machines; clones are passed in so the
     /// same `Arc`s flow into network handler closures and sync helpers.
     pub fn new(
@@ -74,15 +74,15 @@ impl SharedCaches {
         verified_headers: Arc<VerifiedHeaderBuffer>,
         tx_store: Arc<TxStore>,
         exec_cert_store: Arc<ExecCertStore>,
-        finalized_wave_store: Arc<FinalizedWaveStore>,
+        finalization_store: Arc<FinalizationStore>,
     ) -> Self {
         Self {
             tx_store,
-            finalized_wave: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
+            finalization: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             provision_store,
             verified_headers,
             exec_cert_store,
-            finalized_wave_store,
+            finalization_store,
         }
     }
 }

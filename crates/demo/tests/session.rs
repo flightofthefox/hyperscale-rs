@@ -300,7 +300,7 @@ fn a_cross_shard_transfer_is_provisioned_and_certified_in_both_directions() {
     let mut provisioned: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
     // Which shards signed a certificate covering each transaction.
     let mut certified: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    // Which shards committed a wave certificate covering it, and who they
+    // Which shards committed a finalization covering it, and who they
     // named as participants.
     let mut finalized: BTreeMap<String, BTreeSet<(String, Vec<String>)>> = BTreeMap::new();
 

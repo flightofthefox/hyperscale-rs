@@ -37,7 +37,7 @@ pub struct SourceAnchor {
 pub struct ProvisioningTracker {
     /// Verified provisions keyed by `tx_hash`. Written when provisions are
     /// absorbed; read when a cross-shard wave dispatches. Cleared on the
-    /// terminal-state path ([`remove_tx`]) when a wave certificate
+    /// terminal-state path ([`remove_tx`]) when a finalization
     /// commits, and swept by [`gc_stale_provisions`] for txs whose
     /// retention horizon elapsed without ever finalizing.
     verified: HashMap<TxHash, Vec<Arc<Vec<SubstateEntry>>>>,
@@ -195,7 +195,7 @@ impl ProvisioningTracker {
     // ─── Terminal cleanup ───────────────────────────────────────────────
 
     /// Drop all state for `tx_hash` across every owned map. Called when a
-    /// wave certificate commits and the transaction reaches terminal state.
+    /// finalization commits and the transaction reaches terminal state.
     pub fn remove_tx(&mut self, tx_hash: TxHash) {
         self.verified.remove(&tx_hash);
         self.required.remove(&tx_hash);

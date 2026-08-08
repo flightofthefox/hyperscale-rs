@@ -26,7 +26,7 @@ use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::{ChainEntry, ParentAnchor, PendingChain, ShardChainWriter, ShardStorage};
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, EpochWindows,
-    FinalizedWave, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SyncHint, Verifiable,
+    Finalization, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SyncHint, Verifiable,
     Verified, WeightedTimestamp, absorb_committed_cells, local_settled_tx_hashes,
 };
 use tracing::debug;
@@ -166,14 +166,14 @@ where
     );
     let pending_snapshots = view.pending_snapshots().to_vec();
 
-    let finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>> = block.certificates().to_vec();
+    let finalizations: Vec<Arc<Verifiable<Finalization>>> = block.certificates().to_vec();
     let (computed_root, jmt_snapshot, prepared) = view.prepare_block_commit(
         ParentAnchor {
             state_root: pending.parent_state_root,
             height: pending.parent_block_height,
             state: view.as_ref(),
         },
-        &finalized_waves,
+        &finalizations,
         height,
         &pending_snapshots,
         None,
@@ -199,7 +199,7 @@ where
         }));
     }
 
-    let receipts: Vec<Arc<ConsensusReceipt>> = finalized_waves
+    let receipts: Vec<Arc<ConsensusReceipt>> = finalizations
         .iter()
         .flat_map(|fw| fw.consensus_receipts())
         .collect();
@@ -207,7 +207,7 @@ where
     // executed: both read it out of the same block content.
     absorb_committed_cells(receipts.iter().map(AsRef::as_ref));
     let parent_block_hash = block.header().parent_block_hash();
-    let settled_txs = local_settled_tx_hashes(finalized_waves.iter(), block.header().shard_id());
+    let settled_txs = local_settled_tx_hashes(finalizations.iter(), block.header().shard_id());
     pending_chain.insert(
         block_hash,
         ChainEntry {

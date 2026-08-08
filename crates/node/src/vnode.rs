@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::{BeaconCoordinator, retention_floor};
-use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
+use hyperscale_execution::{ExecCertStore, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
@@ -94,7 +94,7 @@ pub struct SeatVnodeGroup<'a> {
 /// resolvable.
 ///
 /// One fresh `ProvisionStore` + `TxStore` + `ExecCertStore` +
-/// `FinalizedWaveStore` is shared across the group (and into the
+/// `FinalizationStore` is shared across the group (and into the
 /// `NodeHost`'s `SharedCaches`). Determinism guarantees same-shard
 /// vnodes admit identical sets, but co-owning the stores makes the
 /// canonical view explicit and gives the request/sync handlers one
@@ -130,7 +130,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
     let provision_store = Arc::new(ProvisionStore::new());
     let tx_store = Arc::new(TxStore::new());
     let exec_cert_store = Arc::new(ExecCertStore::new());
-    let finalized_wave_store = Arc::new(FinalizedWaveStore::new());
+    let finalization_store = Arc::new(FinalizationStore::new());
 
     args.vnodes
         .into_iter()
@@ -168,7 +168,7 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
                 Arc::clone(&provision_store),
                 Arc::clone(&tx_store),
                 Arc::clone(&exec_cert_store),
-                Arc::clone(&finalized_wave_store),
+                Arc::clone(&finalization_store),
             );
             VnodeInit { state, signer }
         })

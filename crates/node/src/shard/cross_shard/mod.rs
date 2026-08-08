@@ -11,7 +11,7 @@
 
 mod exec_cert_serve;
 mod fetch;
-mod finalized_wave_serve;
+mod finalization_serve;
 mod local_provision_serve;
 mod provision_serve;
 mod remote_header;
@@ -23,10 +23,10 @@ mod settled_txs_serve;
 
 pub use exec_cert_serve::serve_execution_certs_request;
 pub use fetch::{
-    ExecCertBinding, ExecCertFetch, FinalizedWaveBinding, FinalizedWaveFetch,
-    LocalProvisionBinding, LocalProvisionFetch, ProvisionBinding, ProvisionFetch,
+    ExecCertBinding, ExecCertFetch, FinalizationBinding, FinalizationFetch, LocalProvisionBinding,
+    LocalProvisionFetch, ProvisionBinding, ProvisionFetch,
 };
-pub use finalized_wave_serve::serve_finalized_waves_request;
+pub use finalization_serve::serve_finalizations_request;
 use hyperscale_types::{BlockHeight, LocalTimestamp, ShardId};
 pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::serve_provision_request;
@@ -50,8 +50,8 @@ pub struct CrossShardState {
     pub provision: ProvisionFetch,
     /// Cross-shard execution-cert fetch (rotates through source committee).
     pub exec_cert: ExecCertFetch,
-    /// Finalized-wave fetch (rotates through committee).
-    pub finalized_wave: FinalizedWaveFetch,
+    /// Finalization fetch (rotates through committee).
+    pub finalization: FinalizationFetch,
     /// Local-provision fetch (pinned to proposer).
     pub local_provision: LocalProvisionFetch,
 
@@ -68,8 +68,8 @@ impl CrossShardState {
             remote_header_sync: RemoteHeaderSync::new(remote_header::default_config()),
             provision: ProvisionFetch::new("provision", config.provision_fetch.clone()),
             exec_cert: ExecCertFetch::new("exec_cert", config.exec_cert_fetch.clone()),
-            finalized_wave: FinalizedWaveFetch::new(
-                "finalized_wave",
+            finalization: FinalizationFetch::new(
+                "finalization",
                 FetchConfig {
                     max_in_flight: 8,
                     max_ids_per_request: 4,
@@ -97,7 +97,7 @@ impl CrossShardState {
             || self.remote_header_sync.is_syncing()
             || self.provision.has_pending()
             || self.exec_cert.has_pending()
-            || self.finalized_wave.has_pending()
+            || self.finalization.has_pending()
             || self.local_provision.has_pending()
             || self.settled_set_sync.has_pending()
     }

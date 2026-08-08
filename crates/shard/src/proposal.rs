@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, FinalizedWave, Hash, LocalTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash, LocalTimestamp,
     ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
     ShardId, TickId, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified,
     WeightedTimestamp,
@@ -40,7 +40,7 @@ pub enum ProposalKind {
     /// Normal proposal with a filtered payload and a real-clock timestamp.
     Normal {
         transactions: Vec<Arc<Verified<Transaction>>>,
-        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
     },
     /// View-change fallback: empty payload, parent's weighted timestamp
@@ -197,7 +197,7 @@ pub fn select_transactions(
     filtered
 }
 
-/// Select finalized waves for inclusion: drop those already in the QC
+/// Select finalizations for inclusion: drop those already in the QC
 /// chain or committed within the retention window, and cap the total
 /// finalized-tx count at the `max_finalized_txs` limit. Returns
 /// `(waves, total_tx_count)`.
@@ -215,14 +215,14 @@ pub fn select_transactions(
 ///
 /// Truncation is a suffix for the same reason: dropping the tail cannot
 /// leave a wave ahead of a predecessor it should follow.
-pub fn select_finalized_waves(
-    finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+pub fn select_finalizations(
+    finalizations: Vec<Arc<Verifiable<Finalization>>>,
     qc_chain_cert_ids: &HashSet<TickId>,
     dedup_index: &CommitDedupIndex,
     max_finalized_txs: usize,
-) -> (Vec<Arc<Verifiable<FinalizedWave>>>, usize) {
+) -> (Vec<Arc<Verifiable<Finalization>>>, usize) {
     let mut finalized_tx_count = 0usize;
-    let waves_to_propose: Vec<_> = finalized_waves
+    let waves_to_propose: Vec<_> = finalizations
         .into_iter()
         .filter(|fw| {
             !qc_chain_cert_ids.contains(fw.tick_id()) && !dedup_index.contains_cert(fw.tick_id())
@@ -376,20 +376,20 @@ pub fn assemble_build_action(
         timestamp,
         is_fallback,
         transactions,
-        finalized_waves,
+        finalizations,
         provisions,
         log_label,
         record_leader_activity,
     ) = match kind {
         ProposalKind::Normal {
             transactions,
-            finalized_waves,
+            finalizations,
             provisions,
         } => (
             ProposerTimestamp::from_local(now),
             false,
             transactions,
-            finalized_waves,
+            finalizations,
             provisions,
             "Requesting block build for proposal",
             false,
@@ -430,7 +430,7 @@ pub fn assemble_build_action(
         parent_state_root,
         parent_block_height,
         transactions,
-        finalized_waves,
+        finalizations,
         provisions,
         fee_checks,
         fee_read_height,

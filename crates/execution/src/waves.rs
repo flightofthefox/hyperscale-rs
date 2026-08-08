@@ -10,7 +10,7 @@
 //!   [`classify_attestation`](WaveRegistry::classify_attestation).
 //! - [`EarlyArrivalBuffer`](crate::early_arrivals) retention reads from the
 //!   registry to tell "wave still active" from "wave long gone".
-//! - [`FinalizedWaveStore`](crate::finalized_waves::FinalizedWaveStore)
+//! - [`FinalizationStore`](crate::finalizations::FinalizationStore)
 //!   receives waves handed off from the registry at finalization.
 //!
 //! ## Assignments as an inverted index
@@ -312,7 +312,7 @@ impl WaveRegistry {
 
     /// Drop every wave and everything keyed against it, returning the
     /// counts. Used when the local chain terminates at a reshape
-    /// boundary: finalization is a wave certificate in a later block,
+    /// boundary: finalization is a finalization in a later block,
     /// and a terminated chain commits no later block, so every pending
     /// wave here is permanently undecidable.
     pub fn drain_all(&mut self) -> PruneCounts {

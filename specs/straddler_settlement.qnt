@@ -419,7 +419,7 @@ module straddler_settlement {
       .expect(not(invAtomic))
 
   // H2, scripted (unfenced twin): both sides commit and provision; P's
-  // validators vote but no FinalizedWave lands before the terminal block;
+  // validators vote but no Finalization lands before the terminal block;
   // P terminates — the transaction aborts by omission in frozen content.
   // The EC then materializes from held shares, reaches Q, and Q finalizes
   // success against a chain that never applied it.

@@ -299,7 +299,7 @@ pub fn validate_no_duplicate_transactions(
     Ok(())
 }
 
-/// Validate that no finalized wave in the block has already been committed
+/// Validate that no finalization in the block has already been committed
 /// or appears in an ancestor block above committed height. Mirrors
 /// [`validate_no_duplicate_transactions`] but for `tick_id`.
 ///
@@ -320,12 +320,12 @@ pub fn validate_no_duplicate_certificates(
         let tick_id = fw.tick_id();
         if qc_chain_cert_ids.contains(tick_id) {
             return Err(format!(
-                "wave certificate {tick_id:?} already in QC chain ancestor"
+                "finalization {tick_id:?} already in QC chain ancestor"
             ));
         }
         if dedup_index.contains_cert(tick_id) {
             return Err(format!(
-                "wave certificate {tick_id:?} already committed within its retention window"
+                "finalization {tick_id:?} already committed within its retention window"
             ));
         }
     }
@@ -559,10 +559,10 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::BlsSigner;
-    use hyperscale_types::test_utils::{TestCommittee, make_finalized_wave};
+    use hyperscale_types::test_utils::{TestCommittee, make_finalization};
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-        CertificateRoot, ChainOrigin, FinalizedWave, Hash, LocalReceiptRoot, MerkleInclusionProof,
+        CertificateRoot, ChainOrigin, Finalization, Hash, LocalReceiptRoot, MerkleInclusionProof,
         NetworkDefinition, ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot,
         QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, Signer, SignerBitfield,
         StateRoot, TimestampRange, Transaction, TransactionDecision, TransactionRoot, ValidatorId,
@@ -1250,11 +1250,8 @@ mod tests {
     // validate_no_duplicate_certificates
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn block_with_certificates(
-        height: BlockHeight,
-        certificates: Vec<Arc<FinalizedWave>>,
-    ) -> Block {
-        let wrapped: Vec<Arc<Verifiable<FinalizedWave>>> = certificates
+    fn block_with_certificates(height: BlockHeight, certificates: Vec<Arc<Finalization>>) -> Block {
+        let wrapped: Vec<Arc<Verifiable<Finalization>>> = certificates
             .into_iter()
             .map(|fw| Arc::new((*fw).clone().into()))
             .collect();
@@ -1267,8 +1264,8 @@ mod tests {
         }
     }
 
-    fn finalized_wave_at(height: u64) -> Arc<FinalizedWave> {
-        Arc::new(make_finalized_wave(
+    fn finalization_at(height: u64) -> Arc<Finalization> {
+        Arc::new(make_finalization(
             BlockHeight::new(height),
             TxHash::from(Hash::from_bytes(
                 &[u8::try_from(height).unwrap_or(u8::MAX); 32],
@@ -1287,7 +1284,7 @@ mod tests {
 
     #[test]
     fn validate_no_duplicate_certificates_accepts_unique() {
-        let block = block_with_certificates(BlockHeight::new(5), vec![finalized_wave_at(1)]);
+        let block = block_with_certificates(BlockHeight::new(5), vec![finalization_at(1)]);
         let qc_chain = HashSet::new();
         let dedup_index = CommitDedupIndex::new();
         assert!(validate_no_duplicate_certificates(&block, &qc_chain, &dedup_index).is_ok());
@@ -1295,7 +1292,7 @@ mod tests {
 
     #[test]
     fn validate_no_duplicate_certificates_rejects_qc_chain_dup() {
-        let fw = finalized_wave_at(1);
+        let fw = finalization_at(1);
         let dup_id = *fw.tick_id();
         let block = block_with_certificates(BlockHeight::new(6), vec![fw]);
         let qc_chain: HashSet<_> = std::iter::once(dup_id).collect();
@@ -1306,7 +1303,7 @@ mod tests {
 
     #[test]
     fn validate_no_duplicate_certificates_rejects_retention_dup() {
-        let fw = finalized_wave_at(1);
+        let fw = finalization_at(1);
         let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
         let qc_chain = HashSet::new();
         let mut dedup_index = CommitDedupIndex::new();

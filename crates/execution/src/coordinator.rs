@@ -30,7 +30,7 @@
 //!
 //! ## Phase 5: Finalization
 //! Validators collect shard execution proofs from all participating shards. When all
-//! proofs are received, a `FinalizedWave` is created.
+//! proofs are received, a `Finalization` is created.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -42,7 +42,7 @@ use hyperscale_storage::TickResolution;
 use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, DeclaredKey, ExecutionCertificate, ExecutionCertificateVerifyError,
-    ExecutionVote, FinalizedWave, FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Mode,
+    ExecutionVote, Finalization, FinalizationVerifyError, GlobalReceiptRoot, Hash, Mode,
     Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledTxSet,
     ShardId, TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
     TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, settled_set_verdict,
@@ -53,7 +53,7 @@ use tracing::instrument;
 use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
 use crate::exec_cert_store::ExecCertStore;
 use crate::expected_certs::ExpectedCertTracker;
-use crate::finalized_waves::FinalizedWaveStore;
+use crate::finalizations::FinalizationStore;
 use crate::lookups::{
     assign_waves, build_provision_requests, committee_public_keys_for_shard,
     ec_has_shard_quorum_power, fetch_keys_covered, peers_excluding_self,
@@ -135,8 +135,8 @@ pub struct CompletionData {
 pub struct ExecutionMemoryStats {
     /// Total receipts held across all in-flight waves, awaiting finalization.
     pub wave_execution_receipts: usize,
-    /// Finalized waves cached in memory until their proposing block commits.
-    pub finalized_wave_certificates: usize,
+    /// Finalizations cached in memory until their proposing block commits.
+    pub finalizations: usize,
     /// In-flight wave states (created, not yet finalized or evicted).
     pub waves: usize,
     /// Per-wave vote trackers awaiting quorum.
@@ -177,14 +177,14 @@ pub struct ExecutionMemoryStats {
 ///
 /// Handles transaction execution after blocks are committed.
 pub struct ExecutionCoordinator {
-    /// Finalized wave certificates ready for block inclusion, keyed by
+    /// Finalizations ready for block inclusion, keyed by
     /// `TickId`. Terminal-state lookup surface for wave-id fetches,
     /// tx-membership queries, and proposal building. Held behind an
     /// `Arc` and shared across same-shard `ExecutionCoordinator`s so
     /// `IoLoop`'s sync-inventory bloom and elided-block rehydration read
     /// from one canonical store per shard rather than vnode-0's
     /// incidentally-convergent copy.
-    finalized: Arc<FinalizedWaveStore>,
+    finalized: Arc<FinalizationStore>,
 
     /// Current committed height for pruning stale entries.
     committed_height: BlockHeight,
@@ -278,7 +278,7 @@ pub struct ExecutionCoordinator {
     /// fetch handler can serve cross-shard fallback requests without taking
     /// a coordinator lock. Populated on local aggregation and on verifying
     /// a local-shard EC received via broadcast; evicted in
-    /// `remove_finalized_wave` once the containing block commits.
+    /// `remove_finalization` once the containing block commits.
     exec_certs: Arc<ExecCertStore>,
 
     /// In-flight EC verifications, keyed by a content hash over the
@@ -289,10 +289,10 @@ pub struct ExecutionCoordinator {
     /// a peer follows up with a valid one.
     pending_ec_verifications: HashSet<Hash>,
 
-    /// In-flight `FinalizedWave` verifications, keyed by `TickId`. The
+    /// In-flight `Finalization` verifications, keyed by `TickId`. The
     /// wave is content-addressed by id (one wave per `TickId`), so a second
     /// fetch arrival for the same wave can short-circuit the crypto pool.
-    pending_finalized_wave_verifications: HashSet<TickId>,
+    pending_finalization_verifications: HashSet<TickId>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Beacon-sync-lag buffers
@@ -304,10 +304,10 @@ pub struct ExecutionCoordinator {
     /// behind, since under lookahead its committee is already globally fixed.
     awaiting_certs: AwaitingTopologyBuffer<Verifiable<ExecutionCertificate>>,
 
-    /// Fetched `FinalizedWave`s deferred for the same reason — a contained EC's
+    /// Fetched `Finalization`s deferred for the same reason — a contained EC's
     /// committee epoch isn't in our schedule yet. Keyed by the wave's own shard;
     /// re-attempted on `BeaconBlockPersisted`.
-    awaiting_waves: AwaitingTopologyBuffer<Arc<Verifiable<FinalizedWave>>>,
+    awaiting_finalizations: AwaitingTopologyBuffer<Arc<Verifiable<Finalization>>>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Commit-proof gate
@@ -338,13 +338,13 @@ pub struct ExecutionCoordinator {
     /// keeps this verdict identical to the vote fence's.
     settled_sets: HashMap<ShardId, SettledTxSet>,
 
-    /// Finalized waves built but withheld because a contained EC names a
+    /// Finalizations built but withheld because a contained EC names a
     /// shard that is scheduled to terminate, or past-terminal with its
     /// settled set not yet known (the gate's `Defer`). Re-checked on every
     /// commit and when a set is recorded; a wave leaves only on evidence —
     /// settled-set membership, the scheduled termination clearing, or the
     /// schedule evicting the shard — never on a clock. Keyed by `TickId`.
-    gated_finalized: BTreeMap<TickId, Arc<Verifiable<FinalizedWave>>>,
+    gated_finalized: BTreeMap<TickId, Arc<Verifiable<Finalization>>>,
 
     /// Past-terminal partner shards whose settled set is recorded but whose
     /// counterpart abort sweep is still awaiting the ingestion of every
@@ -356,10 +356,10 @@ pub struct ExecutionCoordinator {
     /// never finalize, so they abort.
     pending_counterpart_sweeps: HashMap<ShardId, HashSet<TxHash>>,
 
-    /// Transactions whose finalized wave the gate **rejected** — a late
+    /// Transactions whose finalization the gate **rejected** — a late
     /// execution certificate completed a wave naming a past-terminal
     /// partner that never settled it. The wave is already gone from the
-    /// registry (`finalize_wave` removed it before the gate ran), so the
+    /// registry (`finalize` removed it before the gate ran), so the
     /// pending counterpart sweep can't reach the transaction; it drains
     /// here instead, through [`Self::take_ready_counterpart_aborts`].
     gate_rejected_aborts: Vec<TxHash>,
@@ -386,12 +386,12 @@ impl ExecutionCoordinator {
             WeightedTimestamp::ZERO,
             WeightedTimestamp::ZERO,
             Arc::new(ExecCertStore::new()),
-            Arc::new(FinalizedWaveStore::new()),
+            Arc::new(FinalizationStore::new()),
         )
     }
 
     /// Create a new execution state machine sharing both externally-owned
-    /// `ExecCertStore` and `FinalizedWaveStore`. Same-shard vnodes share
+    /// `ExecCertStore` and `FinalizationStore`. Same-shard vnodes share
     /// one set of stores so the `IoLoop`'s inbound fetch handler and
     /// sync-inventory bloom read from a single canonical view per shard
     /// rather than vnode-0's incidentally-convergent copy.
@@ -415,7 +415,7 @@ impl ExecutionCoordinator {
         committed_block_anchor_wt: WeightedTimestamp,
         committed_committee_anchor_wt: WeightedTimestamp,
         exec_certs: Arc<ExecCertStore>,
-        finalized: Arc<FinalizedWaveStore>,
+        finalized: Arc<FinalizationStore>,
     ) -> Self {
         Self {
             finalized,
@@ -434,9 +434,9 @@ impl ExecutionCoordinator {
             outbound_certs: OutboundExecutionCertificateTracker::new(),
             exec_certs,
             pending_ec_verifications: HashSet::new(),
-            pending_finalized_wave_verifications: HashSet::new(),
+            pending_finalization_verifications: HashSet::new(),
             awaiting_certs: AwaitingTopologyBuffer::new(),
-            awaiting_waves: AwaitingTopologyBuffer::new(),
+            awaiting_finalizations: AwaitingTopologyBuffer::new(),
             proven_remote: HashMap::new(),
             unproven_ecs: AwaitingTopologyBuffer::new(),
             settled_sets: HashMap::new(),
@@ -448,13 +448,13 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Reference to the shared finalized-wave store. The `io_loop`
+    /// Reference to the shared finalization store. The `io_loop`
     /// clones this `Arc` into its `SharedCaches` so sync-inventory
     /// blooms and elided-block rehydration read from a single canonical
     /// per-shard store rather than vnode-0's incidentally-convergent
     /// copy.
     #[must_use]
-    pub const fn finalized_wave_store(&self) -> &Arc<FinalizedWaveStore> {
+    pub const fn finalization_store(&self) -> &Arc<FinalizationStore> {
         &self.finalized
     }
 
@@ -833,7 +833,7 @@ impl ExecutionCoordinator {
             // Drive finalization from here so the deferred finalize
             // happens on the same event that unblocked it.
             if wave.is_complete() {
-                actions.extend(self.finalize_wave(topology_schedule, &tick_id));
+                actions.extend(self.finalize(topology_schedule, &tick_id));
             }
         }
 
@@ -902,17 +902,20 @@ impl ExecutionCoordinator {
         actions
     }
 
-    /// Clean up execution-local per-wave state for wave certs included in the
+    /// Clean up execution-local per-wave state for finalizations included in the
     /// committed block.
     ///
     /// Per-tx terminal state for the mempool is driven by
     /// `mempool::on_block_committed` reading `block.certificates` directly.
     /// This function only handles execution's own bookkeeping.
-    pub fn cleanup_committed_waves(&mut self, certificates: &[Arc<Verifiable<FinalizedWave>>]) {
+    pub fn cleanup_committed_finalizations(
+        &mut self,
+        certificates: &[Arc<Verifiable<Finalization>>],
+    ) {
         for fw in certificates {
             // No-op for synced waves we never aggregated locally; for waves we
             // tracked, releases accumulator/cache state for the wave's txs.
-            self.remove_finalized_wave(fw.as_unverified());
+            self.remove_finalization(fw.as_unverified());
         }
     }
 
@@ -1392,7 +1395,7 @@ impl ExecutionCoordinator {
     /// once the crypto pool confirms the signature — buffering here without
     /// verifying would let a Byzantine remote inject forged `tx_outcomes`
     /// that the replay path later trusts.
-    pub fn on_wave_certificate(
+    pub fn on_execution_certificate(
         &mut self,
         topology_schedule: &TopologySchedule,
         cert: Verifiable<ExecutionCertificate>,
@@ -1578,7 +1581,7 @@ impl ExecutionCoordinator {
         // A single Byzantine signer can produce a cryptographically valid
         // EC; require 2f+1 voting power on the EC's own shard before any
         // state mutation downstream. The committee is the one seated at the
-        // EC's anchor. `on_wave_certificate` already resolved it to dispatch
+        // EC's anchor. `on_execution_certificate` already resolved it to dispatch
         // this verification, so `None` here means that epoch aged out of the
         // schedule in the interim (the beacon advanced past retention) — the
         // EC is stale, so abandon it.
@@ -1686,7 +1689,7 @@ impl ExecutionCoordinator {
     ///
     /// Marks the source block proven — opening the commit-proof gate for
     /// its ECs — and replays the shard's deferred ECs through
-    /// [`Self::on_wave_certificate`]. Entries whose source block is still
+    /// [`Self::on_execution_certificate`]. Entries whose source block is still
     /// unproven re-buffer.
     pub fn on_committed_remote_header(
         &mut self,
@@ -1704,7 +1707,7 @@ impl ExecutionCoordinator {
         let deferred = self.unproven_ecs.drain_shard(source_shard);
         let mut actions = Vec::new();
         for cert in deferred {
-            actions.extend(self.on_wave_certificate(topology_schedule, cert));
+            actions.extend(self.on_execution_certificate(topology_schedule, cert));
         }
         actions
     }
@@ -1769,7 +1772,7 @@ impl ExecutionCoordinator {
 
     /// Transactions an outstanding local wave still holds — the authority on
     /// what this shard is waiting for coverage on. Wave entries are removed
-    /// by `finalize_wave` once a wave completes, so a transaction leaves this
+    /// by `finalize` once a wave completes, so a transaction leaves this
     /// set exactly when it stops needing any counterpart's outcome.
     fn awaited_txs(&self) -> HashSet<TxHash> {
         self.waves
@@ -1942,7 +1945,7 @@ impl ExecutionCoordinator {
         let horizon = self.committed_ts.minus(RETENTION_HORIZON);
         self.proven_remote.retain(|_, ts| *ts >= horizon);
 
-        // Re-check gate-held finalized waves against the advanced schedule:
+        // Re-check gate-held finalizations against the advanced schedule:
         // emit any it now resolves, and drop any whose partner it has
         // evicted from every retained window. Runs every block so a settled
         // set that never reconstructs can't pin the buffer; rejected
@@ -2424,7 +2427,7 @@ impl ExecutionCoordinator {
                 continue;
             };
             if wave.add_execution_certificate(Arc::clone(ec)) && wave.is_complete() {
-                actions.extend(self.finalize_wave(topology_schedule, tick_id));
+                actions.extend(self.finalize(topology_schedule, tick_id));
             }
         }
         // The other: an admitted local EC that contradicts the vote this
@@ -2433,16 +2436,12 @@ impl ExecutionCoordinator {
         actions
     }
 
-    /// Finalize a wave: build the [`FinalizedWave`], then admit it or hold
+    /// Finalize a wave: build the [`Finalization`], then admit it or hold
     /// it at the split-boundary gate.
     ///
     /// Called when the wave's local EC is present and every non-aborted tx is
     /// covered by all participating shards.
-    fn finalize_wave(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        tick_id: &TickId,
-    ) -> Vec<Action> {
+    fn finalize(&mut self, topology_schedule: &TopologySchedule, tick_id: &TickId) -> Vec<Action> {
         let Some(wave) = self.waves.remove_wave(tick_id) else {
             return vec![];
         };
@@ -2451,17 +2450,18 @@ impl ExecutionCoordinator {
         // means each remote shard executed this wave — strong evidence they
         // also received our outbound EC (or are about to). Drop the
         // re-broadcast tracker entry to stop wasting bandwidth.
-        self.outbound_certs.on_wave_finalized(tick_id);
+        self.outbound_certs.on_tick_finalized(tick_id);
 
-        // Local-finalization gate produces `Verified<FinalizedWave>`; lift
+        // Local-finalization gate produces `Verified<Finalization>`; lift
         // into the `Block::Live.certificates` transport shape once so the
         // store, the admission event, and any downstream `PendingBlock`
         // entry share the same `Arc` without further per-consumer cloning.
-        let finalized_arc = Arc::new(Verified::<FinalizedWave>::seal(wave.into_finalized()).into());
+        let finalized_arc =
+            Arc::new(Verified::<Finalization>::seal(wave.into_finalization()).into());
         self.emit_or_gate_finalized(topology_schedule, finalized_arc)
     }
 
-    /// Admit a freshly built finalized wave downstream, or withhold it at
+    /// Admit a freshly built finalization downstream, or withhold it at
     /// the split-boundary gate so we never produce a wave the vote fence
     /// would reject.
     ///
@@ -2476,7 +2476,7 @@ impl ExecutionCoordinator {
     fn emit_or_gate_finalized(
         &mut self,
         topology_schedule: &TopologySchedule,
-        finalized_arc: Arc<Verifiable<FinalizedWave>>,
+        finalized_arc: Arc<Verifiable<Finalization>>,
     ) -> Vec<Action> {
         let tick_id = *finalized_arc.tick_id();
         let verdict = {
@@ -2500,11 +2500,9 @@ impl ExecutionCoordinator {
         match verdict {
             SettledSetVerdict::Pass => {
                 self.finalized.insert(tick_id, Arc::clone(&finalized_arc));
-                vec![Action::Continuation(
-                    ProtocolEvent::FinalizedWavesAdmitted {
-                        waves: vec![finalized_arc],
-                    },
-                )]
+                vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
+                    finalizations: vec![finalized_arc],
+                })]
             }
             SettledSetVerdict::Defer => {
                 // Hold until evidence resolves the wave: the partner's
@@ -2518,7 +2516,7 @@ impl ExecutionCoordinator {
             }
             SettledSetVerdict::Reject => {
                 // The partner never settled this wave, so it must never be
-                // produced — and `finalize_wave` already removed it from the
+                // produced — and `finalize` already removed it from the
                 // registry, so the pending counterpart sweep can't reach its
                 // transactions. Queue them for the same abort path.
                 self.gate_rejected_aborts.extend(finalized_arc.tx_hashes());
@@ -2659,7 +2657,7 @@ impl ExecutionCoordinator {
         aborted
     }
 
-    /// Re-check every gate-held finalized wave against the current settled
+    /// Re-check every gate-held finalization against the current settled
     /// sets and schedule: emit the ones now resolvable, drop the ones now
     /// known unsettled or schedule-evicted, and re-hold the rest.
     pub fn redrive_gated_finalizations(
@@ -2669,7 +2667,7 @@ impl ExecutionCoordinator {
         if self.gated_finalized.is_empty() {
             return Vec::new();
         }
-        let gated: Vec<Arc<Verifiable<FinalizedWave>>> = std::mem::take(&mut self.gated_finalized)
+        let gated: Vec<Arc<Verifiable<Finalization>>> = std::mem::take(&mut self.gated_finalized)
             .into_values()
             .collect();
         let mut actions = Vec::new();
@@ -2680,28 +2678,28 @@ impl ExecutionCoordinator {
     }
 
     /// Admission entry point for fetch-delivered (or otherwise externally
-    /// sourced) finalized waves.
+    /// sourced) finalizations.
     ///
     /// Runs the cheap synchronous gates inline (per-EC quorum power and
     /// committee-key resolution) and dispatches signature verification to the
-    /// crypto pool via [`Action::VerifyFinalizedWave`]. The matching
-    /// [`ProtocolEvent::FinalizedWaveVerified`] feeds
-    /// [`Self::on_finalized_wave_verified`], which emits
-    /// `Continuation(FinalizedWavesAdmitted)` only when every EC's
+    /// crypto pool via [`Action::VerifyFinalization`]. The matching
+    /// [`ProtocolEvent::FinalizationVerified`] feeds
+    /// [`Self::on_finalization_verified`], which emits
+    /// `Continuation(FinalizationsAdmitted)` only when every EC's
     /// signature passed.
     ///
-    /// Without this gate a peer answering a `finalized_wave.request` could
-    /// poison `caches.finalized_wave` with a bogus wave we'd re-serve.
-    /// Locally finalized waves bypass this path: `finalize_wave` emits the
+    /// Without this gate a peer answering a `finalization.request` could
+    /// poison `caches.finalization` with a bogus wave we'd re-serve.
+    /// Locally produced finalizations bypass this path: `finalize` emits the
     /// same event from a WC built out of already-verified ECs. Synced
     /// blocks are likewise trusted at admission — the QC chain plus the
     /// synced-block apply path's quorum gate established their integrity
     /// upstream.
     #[must_use]
-    pub fn admit_finalized_wave(
+    pub fn admit_finalization(
         &mut self,
         topology_schedule: &TopologySchedule,
-        wave: Arc<Verifiable<FinalizedWave>>,
+        wave: Arc<Verifiable<Finalization>>,
     ) -> Vec<Action> {
         let tick_id = *wave.tick_id();
 
@@ -2710,17 +2708,17 @@ impl ExecutionCoordinator {
         if self.finalized.contains(&tick_id) {
             tracing::debug!(
                 wave = %tick_id,
-                "FinalizedWave already in canonical store — skipping verification"
+                "Finalization already in canonical store — skipping verification"
             );
             return Vec::new();
         }
 
         // In-flight dedup — guards against a peer flooding the same fetched
         // wave while the first dispatch is still running.
-        if !self.pending_finalized_wave_verifications.insert(tick_id) {
+        if !self.pending_finalization_verifications.insert(tick_id) {
             tracing::debug!(
                 wave = %tick_id,
-                "Duplicate FinalizedWave verification dispatch suppressed"
+                "Duplicate Finalization verification dispatch suppressed"
             );
             return Vec::new();
         }
@@ -2740,11 +2738,11 @@ impl ExecutionCoordinator {
                     wave = %wave.tick_id(),
                     shard = shard.inner(),
                     height = ec.block_height().inner(),
-                    "Rejecting fetched FinalizedWave: contained EC from a recovering \
+                    "Rejecting fetched Finalization: contained EC from a recovering \
                      shard past the freeze frontier"
                 );
-                self.pending_finalized_wave_verifications.remove(&tick_id);
-                return vec![Action::AbandonFetch(FetchAbandon::FinalizedWaves {
+                self.pending_finalization_verifications.remove(&tick_id);
+                return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
                     ids: vec![tick_id],
                 })];
             }
@@ -2764,11 +2762,11 @@ impl ExecutionCoordinator {
                     tracing::warn!(
                         wave = %wave.tick_id(),
                         shard = shard.inner(),
-                        "Rejecting fetched FinalizedWave: contained EC's committee epoch is \
+                        "Rejecting fetched Finalization: contained EC's committee epoch is \
                          below the schedule floor"
                     );
-                    self.pending_finalized_wave_verifications.remove(&tick_id);
-                    return vec![Action::AbandonFetch(FetchAbandon::FinalizedWaves {
+                    self.pending_finalization_verifications.remove(&tick_id);
+                    return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
                         ids: vec![tick_id],
                     })];
                 }
@@ -2777,10 +2775,10 @@ impl ExecutionCoordinator {
                 tracing::warn!(
                     wave = %wave.tick_id(),
                     shard = shard.inner(),
-                    "Rejecting fetched FinalizedWave: contained EC lacks quorum power"
+                    "Rejecting fetched Finalization: contained EC lacks quorum power"
                 );
-                self.pending_finalized_wave_verifications.remove(&tick_id);
-                return vec![Action::AbandonFetch(FetchAbandon::FinalizedWaves {
+                self.pending_finalization_verifications.remove(&tick_id);
+                return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
                     ids: vec![tick_id],
                 })];
             }
@@ -2788,10 +2786,10 @@ impl ExecutionCoordinator {
                 tracing::warn!(
                     wave = %wave.tick_id(),
                     shard = shard.inner(),
-                    "Rejecting fetched FinalizedWave: cannot resolve EC committee keys"
+                    "Rejecting fetched Finalization: cannot resolve EC committee keys"
                 );
-                self.pending_finalized_wave_verifications.remove(&tick_id);
-                return vec![Action::AbandonFetch(FetchAbandon::FinalizedWaves {
+                self.pending_finalization_verifications.remove(&tick_id);
+                return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
                     ids: vec![tick_id],
                 })];
             };
@@ -2800,17 +2798,18 @@ impl ExecutionCoordinator {
         if beacon_behind {
             // Buffer the whole wave; replayed on `BeaconBlockPersisted` once the
             // beacon reaches the deferred EC's epoch.
-            self.pending_finalized_wave_verifications.remove(&tick_id);
-            self.awaiting_waves.push(wave.tick_id().shard_id(), wave);
+            self.pending_finalization_verifications.remove(&tick_id);
+            self.awaiting_finalizations
+                .push(wave.tick_id().shard_id(), wave);
             return Vec::new();
         }
-        vec![Action::VerifyFinalizedWave {
-            wave,
+        vec![Action::VerifyFinalization {
+            finalization: wave,
             ec_public_keys,
         }]
     }
 
-    /// Re-attempt every buffered cross-shard EC and finalized wave now that the
+    /// Re-attempt every buffered cross-shard EC and finalization now that the
     /// beacon has advanced. Drains both buffers and replays each through its
     /// normal admission path, which re-resolves the committee and re-buffers
     /// any still beyond the schedule. Called on `BeaconBlockPersisted`.
@@ -2820,41 +2819,38 @@ impl ExecutionCoordinator {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for cert in self.awaiting_certs.drain() {
-            actions.extend(self.on_wave_certificate(topology_schedule, cert));
+            actions.extend(self.on_execution_certificate(topology_schedule, cert));
         }
-        for wave in self.awaiting_waves.drain() {
-            actions.extend(self.admit_finalized_wave(topology_schedule, wave));
+        for wave in self.awaiting_finalizations.drain() {
+            actions.extend(self.admit_finalization(topology_schedule, wave));
         }
         actions
     }
 
-    /// Handle the result of [`Action::VerifyFinalizedWave`]. Emits the
+    /// Handle the result of [`Action::VerifyFinalization`]. Emits the
     /// admission continuation only when every EC's signature passed.
     #[must_use]
-    pub fn on_finalized_wave_verified(
+    pub fn on_finalization_verified(
         &mut self,
-        result: Result<
-            Arc<Verified<FinalizedWave>>,
-            (Arc<FinalizedWave>, FinalizedWaveVerifyError),
-        >,
+        result: Result<Arc<Verified<Finalization>>, (Arc<Finalization>, FinalizationVerifyError)>,
     ) -> Vec<Action> {
         // Release the in-flight slot regardless of outcome — future
         // arrivals can dispatch again.
         let wave = match result {
             Ok(verified) => {
-                self.pending_finalized_wave_verifications
+                self.pending_finalization_verifications
                     .remove(verified.tick_id());
                 verified
             }
             Err((raw, err)) => {
-                self.pending_finalized_wave_verifications
+                self.pending_finalization_verifications
                     .remove(raw.tick_id());
                 tracing::warn!(
                     wave = %raw.tick_id(),
                     error = ?err,
-                    "Dropping fetched FinalizedWave: contained EC signature invalid"
+                    "Dropping fetched Finalization: contained EC signature invalid"
                 );
-                return vec![Action::AbandonFetch(FetchAbandon::FinalizedWaves {
+                return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
                     ids: vec![*raw.tick_id()],
                 })];
             }
@@ -2863,9 +2859,9 @@ impl ExecutionCoordinator {
         // transport shape exactly once so the admission event and any
         // downstream pending-block storage share the same `Arc`.
         let wave = Arc::new((*wave).clone().into());
-        vec![Action::Continuation(
-            ProtocolEvent::FinalizedWavesAdmitted { waves: vec![wave] },
-        )]
+        vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
+            finalizations: vec![wave],
+        })]
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2878,7 +2874,7 @@ impl ExecutionCoordinator {
         self.waves.wave_assignment(tx_hash)
     }
 
-    /// Finalized waves ready for a block, in an order state can be
+    /// Finalizations ready for a block, in an order state can be
     /// applied in. Returns the `Block::Live.certificates` transport shape
     /// so the proposer can hand the result straight to the action without
     /// a per-element conversion.
@@ -2903,17 +2899,17 @@ impl ExecutionCoordinator {
     /// on the certificate *committing*, not on its being proposed. The
     /// emitted order is the block's order, so the caller must preserve it.
     #[must_use]
-    pub fn get_finalized_waves(
+    pub fn get_finalizations(
         &self,
         ancestor_certified: &HashSet<TickId>,
-    ) -> Vec<Arc<Verifiable<FinalizedWave>>> {
-        let ready = self.finalized.all_waves();
-        let mut ordered: Vec<Arc<Verifiable<FinalizedWave>>> = ready;
-        // Ties keep `TickId` order, which `all_waves` already imposes, so
+    ) -> Vec<Arc<Verifiable<Finalization>>> {
+        let ready = self.finalized.all();
+        let mut ordered: Vec<Arc<Verifiable<Finalization>>> = ready;
+        // Ties keep `TickId` order, which `all` already imposes, so
         // the result is a pure function of the ready set.
         ordered.sort_by_key(|fw| self.settlement_position(fw.tick_id()));
 
-        let mut emitted: Vec<Arc<Verifiable<FinalizedWave>>> = Vec::with_capacity(ordered.len());
+        let mut emitted: Vec<Arc<Verifiable<Finalization>>> = Vec::with_capacity(ordered.len());
         let mut placed: BTreeSet<TickId> = BTreeSet::new();
         for fw in ordered {
             if self.predecessors_unsettled(fw.tick_id(), &placed, ancestor_certified) {
@@ -2969,7 +2965,7 @@ impl ExecutionCoordinator {
     /// Whether `certificates` — a block's list, in order — settles two
     /// cell-sharing waves out of the order they executed in.
     ///
-    /// The mirror of what [`Self::get_finalized_waves`] emits, read by the
+    /// The mirror of what [`Self::get_finalizations`] emits, read by the
     /// pre-vote gate, and it has to read the same ancestor set: the
     /// proposer's list is what survives the QC-chain duplicate filter, so
     /// a predecessor riding an ancestor block is absent from the block
@@ -3004,49 +3000,49 @@ impl ExecutionCoordinator {
         self.provisioning.has_received_from(tx_hash, shard)
     }
 
-    /// Get a finalized wave by its `TickId` (returns `Arc` for sharing).
+    /// Get a finalization by its `TickId` (returns `Arc` for sharing).
     #[must_use]
-    pub fn get_finalized_wave(&self, tick_id: &TickId) -> Option<Arc<Verifiable<FinalizedWave>>> {
+    pub fn get_finalization(&self, tick_id: &TickId) -> Option<Arc<Verifiable<Finalization>>> {
         self.finalized.get(tick_id)
     }
 
-    /// Bloom filter over every transaction in a tracked finalized wave.
+    /// Bloom filter over every transaction in a tracked finalization.
     /// Attached to outgoing `GetBlockRequest`s so the responder can elide
-    /// wave certificates the requester already has. Returns `None` when the
+    /// finalizations the requester already has. Returns `None` when the
     /// cached set is too large to size a filter within the configured cap.
     #[must_use]
     pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<TxHash>> {
         self.finalized.cert_bloom_snapshot()
     }
 
-    /// Get the finalized wave containing a specific transaction.
+    /// Get the finalization containing a specific transaction.
     ///
     /// Returns the wave if the tx is part of one that finalized. Once
     /// committed, waves are persisted to storage and should be fetched
     /// from there.
     #[must_use]
-    pub fn get_finalized_wave_for_tx(
+    pub fn get_finalization_for_tx(
         &self,
         tx_hash: TxHash,
-    ) -> Option<Arc<Verifiable<FinalizedWave>>> {
-        self.finalized.get_wave_for_tx(tx_hash)
+    ) -> Option<Arc<Verifiable<Finalization>>> {
+        self.finalized.get_for_tx(tx_hash)
     }
 
-    /// Remove a finalized wave (after its wave cert has been committed in a block).
+    /// Remove a finalization (after its finalization has been committed in a block).
     ///
     /// Cleans up all per-tx tracking state for transactions in this wave.
-    /// Takes the `FinalizedWave` directly (rather than just a `TickId`) so
+    /// Takes the `Finalization` directly (rather than just a `TickId`) so
     /// cleanup works even when the wave was never aggregated locally — e.g.
-    /// for blocks received via sync. The committed `FinalizedWave` is the
+    /// for blocks received via sync. The committed `Finalization` is the
     /// authoritative tx-set source.
-    pub fn remove_finalized_wave(&mut self, fw: &FinalizedWave) {
+    pub fn remove_finalization(&mut self, fw: &Finalization) {
         let tick_id = fw.tick_id();
         self.finalized.remove(tick_id);
         // The local-shard EC is now durable in storage via the committed
-        // wave certificate; drop the in-memory copy so peers fetching after
+        // finalization; drop the in-memory copy so peers fetching after
         // this point fall through to storage.
         self.exec_certs.evict(tick_id);
-        // The wave may already have been removed by `finalize_wave` (local
+        // The wave may already have been removed by `finalize` (local
         // aggregation path) or be absent entirely (sync path: the block was
         // received as committed without local tracking). Either case is fine.
         self.waves.remove_wave(tick_id);
@@ -3065,9 +3061,9 @@ impl ExecutionCoordinator {
 
     /// Drop every pending wave and EC expectation. Called once when the
     /// local chain terminates at a reshape boundary: finalization is a
-    /// wave certificate in a later block, and a terminated chain commits
+    /// finalization in a later block, and a terminated chain commits
     /// no later block, so every pending wave here is permanently
-    /// undecidable. Serving state (aggregated ECs, finalized waves)
+    /// undecidable. Serving state (aggregated ECs, finalizations)
     /// stays — peers still fetch what this chain produced.
     pub fn abort_pending_waves(&mut self) -> Vec<Action> {
         let counts = self.waves.drain_all();
@@ -3147,7 +3143,7 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Check if a transaction is finalized (part of a finalized wave).
+    /// Check if a transaction is finalized (part of a finalization).
     #[must_use]
     pub fn is_finalized(&self, tx_hash: TxHash) -> bool {
         self.finalized.is_finalized(tx_hash)
@@ -3203,7 +3199,7 @@ impl ExecutionCoordinator {
                 .waves_iter()
                 .map(|(_, w)| w.receipt_count())
                 .sum(),
-            finalized_wave_certificates: self.finalized.len(),
+            finalizations: self.finalized.len(),
             waves: self.waves.waves_len(),
             vote_trackers: self.waves.trackers_len(),
             early_votes: self.early.vote_len(),
@@ -3237,7 +3233,7 @@ impl ExecutionCoordinator {
 impl std::fmt::Debug for ExecutionCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionCoordinator")
-            .field("finalized_wave_certificates", &self.finalized.len())
+            .field("finalizations", &self.finalized.len())
             .field("waves", &self.waves.waves_len())
             .finish_non_exhaustive()
     }
@@ -3911,7 +3907,7 @@ mod tests {
         );
     }
 
-    // Note: the committee-keys-fail branch of `on_wave_certificate` is
+    // Note: the committee-keys-fail branch of `on_execution_certificate` is
     // structurally covered (emits the abandon when
     // `committee_public_keys_for_shard` returns `None`) but is not
     // exercised by a unit test here — `None` only fires when a known
@@ -3989,13 +3985,13 @@ mod tests {
         assert!(has_remote, "Should include remote shard broadcast");
     }
 
-    /// `admit_finalized_wave` must NOT emit `FinalizedWavesAdmitted`
+    /// `admit_finalization` must NOT emit `FinalizationsAdmitted`
     /// inline — that would mean signature verification ran on the state-machine
     /// thread, bringing back the pre-async stall on the consensus path.
-    /// The expected output is a single `VerifyFinalizedWave` action; the
+    /// The expected output is a single `VerifyFinalization` action; the
     /// admission continuation only fires once the verify event lands.
     #[test]
-    fn admit_finalized_wave_dispatches_async_verify() {
+    fn admit_finalization_dispatches_async_verify() {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
@@ -4012,28 +4008,28 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let wave: Arc<Verifiable<FinalizedWave>> =
-            Arc::new(FinalizedWave::new(tick_id, vec![ec], vec![]).into());
+        let wave: Arc<Verifiable<Finalization>> =
+            Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
 
-        let actions = state.admit_finalized_wave(&topo, wave);
+        let actions = state.admit_finalization(&topo, wave);
         assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], Action::VerifyFinalizedWave { .. }));
+        assert!(matches!(actions[0], Action::VerifyFinalization { .. }));
         assert!(
             !actions.iter().any(|a| matches!(
                 a,
-                Action::Continuation(ProtocolEvent::FinalizedWavesAdmitted { .. })
+                Action::Continuation(ProtocolEvent::FinalizationsAdmitted { .. })
             )),
             "admission continuation must only fire after async verify"
         );
     }
 
-    /// `on_finalized_wave_verified` with `valid = false` must drop the wave
+    /// `on_finalization_verified` with `valid = false` must drop the wave
     /// rather than emit the admission continuation — that's exactly the
     /// poisoning vector this gate exists to close. The dropped wave also
-    /// surfaces a `FetchAbandon::FinalizedWaves` so any pinned fetch
+    /// surfaces a `FetchAbandon::Finalizations` so any pinned fetch
     /// FSM entry releases its slot.
     #[test]
-    fn on_finalized_wave_verified_drops_invalid() {
+    fn on_finalization_verified_drops_invalid() {
         let mut state = make_test_state();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let ec = Arc::new(ExecutionCertificate::new(
@@ -4044,10 +4040,10 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         ));
-        let wave = Arc::new(FinalizedWave::new(tick_id, vec![ec], vec![]));
-        let actions = state.on_finalized_wave_verified(Err((
+        let wave = Arc::new(Finalization::new(tick_id, vec![ec], vec![]));
+        let actions = state.on_finalization_verified(Err((
             wave,
-            FinalizedWaveVerifyError::ExecutionCertificate {
+            FinalizationVerifyError::ExecutionCertificate {
                 index: 0,
                 source: ExecutionCertificateVerifyError::BadAggregatedSignature,
             },
@@ -4055,25 +4051,25 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::FinalizedWaves { ids }) if ids == &vec![tick_id]
+                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![tick_id]
             )),
-            "Signature-invalid drop must emit AbandonFetch::FinalizedWaves, got: {actions:?}"
+            "Signature-invalid drop must emit AbandonFetch::Finalizations, got: {actions:?}"
         );
         assert!(
             !actions.iter().any(|a| matches!(
                 a,
-                Action::Continuation(ProtocolEvent::FinalizedWavesAdmitted { .. })
+                Action::Continuation(ProtocolEvent::FinalizationsAdmitted { .. })
             )),
             "must not emit admission continuation on invalid"
         );
     }
 
-    /// `admit_finalized_wave` with an EC lacking quorum power must emit
+    /// `admit_finalization` with an EC lacking quorum power must emit
     /// the abandon (so the FSM doesn't pin) AND must clear the in-flight
     /// dedup set so future arrivals can retry — without that the same
     /// `TickId` would silently fail every subsequent admission.
     #[test]
-    fn admit_finalized_wave_quorum_power_fail_abandons_and_clears_dedup() {
+    fn admit_finalization_quorum_power_fail_abandons_and_clears_dedup() {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
@@ -4090,35 +4086,35 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let wave: Arc<Verifiable<FinalizedWave>> =
-            Arc::new(FinalizedWave::new(tick_id, vec![ec], vec![]).into());
+        let wave: Arc<Verifiable<Finalization>> =
+            Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
 
-        let actions = state.admit_finalized_wave(&topo, Arc::clone(&wave));
+        let actions = state.admit_finalization(&topo, Arc::clone(&wave));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::FinalizedWaves { ids }) if ids == &vec![tick_id]
+                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![tick_id]
             )),
-            "quorum-power drop must emit AbandonFetch::FinalizedWaves, got: {actions:?}"
+            "quorum-power drop must emit AbandonFetch::Finalizations, got: {actions:?}"
         );
 
         // Regression: dedup set must NOT retain this wave so a fresh
         // arrival of the same id (e.g., a peer retransmitting after
         // gossiping a corrected wave) is allowed to dispatch.
-        let retry_actions = state.admit_finalized_wave(&topo, wave);
+        let retry_actions = state.admit_finalization(&topo, wave);
         assert!(
             retry_actions
                 .iter()
-                .any(|a| matches!(a, Action::AbandonFetch(FetchAbandon::FinalizedWaves { .. }))),
+                .any(|a| matches!(a, Action::AbandonFetch(FetchAbandon::Finalizations { .. }))),
             "retry must still reach the quorum gate, got: {retry_actions:?}"
         );
     }
 
-    /// `admit_finalized_wave` with an unresolvable committee shard must
+    /// `admit_finalization` with an unresolvable committee shard must
     /// emit the abandon AND clear the dedup set, same shape as the
     /// quorum-power path.
     #[test]
-    fn admit_finalized_wave_unknown_committee_abandons_and_clears_dedup() {
+    fn admit_finalization_unknown_committee_abandons_and_clears_dedup() {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
@@ -4137,32 +4133,32 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let wave: Arc<Verifiable<FinalizedWave>> =
-            Arc::new(FinalizedWave::new(tick_id, vec![ec], vec![]).into());
+        let wave: Arc<Verifiable<Finalization>> =
+            Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
 
-        let actions = state.admit_finalized_wave(&topo, Arc::clone(&wave));
+        let actions = state.admit_finalization(&topo, Arc::clone(&wave));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::FinalizedWaves { ids }) if ids == &vec![tick_id]
+                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![tick_id]
             )),
-            "unknown-committee drop must emit AbandonFetch::FinalizedWaves, got: {actions:?}"
+            "unknown-committee drop must emit AbandonFetch::Finalizations, got: {actions:?}"
         );
 
         // Regression: dedup set clear lets retries through.
-        let retry_actions = state.admit_finalized_wave(&topo, wave);
+        let retry_actions = state.admit_finalization(&topo, wave);
         assert!(
             retry_actions
                 .iter()
-                .any(|a| matches!(a, Action::AbandonFetch(FetchAbandon::FinalizedWaves { .. }))),
+                .any(|a| matches!(a, Action::AbandonFetch(FetchAbandon::Finalizations { .. }))),
             "retry must still reach the committee-keys gate, got: {retry_actions:?}"
         );
     }
 
-    /// `on_finalized_wave_verified` with `valid = true` emits exactly the
+    /// `on_finalization_verified` with `valid = true` emits exactly the
     /// admission continuation — same shape as the prior synchronous path.
     #[test]
-    fn on_finalized_wave_verified_admits_valid() {
+    fn on_finalization_verified_admits_valid() {
         let mut state = make_test_state();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let ec = Arc::new(ExecutionCertificate::new(
@@ -4173,16 +4169,16 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         ));
-        let wave = Arc::new(Verified::new_unchecked_for_test(FinalizedWave::new(
+        let wave = Arc::new(Verified::new_unchecked_for_test(Finalization::new(
             tick_id,
             vec![ec],
             vec![],
         )));
-        let actions = state.on_finalized_wave_verified(Ok(wave));
+        let actions = state.on_finalization_verified(Ok(wave));
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
-            Action::Continuation(ProtocolEvent::FinalizedWavesAdmitted { .. })
+            Action::Continuation(ProtocolEvent::FinalizationsAdmitted { .. })
         ));
     }
 
@@ -4190,7 +4186,7 @@ mod tests {
     /// must produce only one `VerifyExecutionCertificateSignature`
     /// dispatch. This shields the crypto pool from a flooding peer.
     #[test]
-    fn on_wave_certificate_dedups_byte_identical_retransmit() {
+    fn on_execution_certificate_dedups_byte_identical_retransmit() {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
@@ -4208,7 +4204,7 @@ mod tests {
             signers,
         );
 
-        let first = state.on_wave_certificate(&topo, cert.clone().into());
+        let first = state.on_execution_certificate(&topo, cert.clone().into());
         assert_eq!(first.len(), 1);
         assert!(matches!(
             first[0],
@@ -4217,7 +4213,7 @@ mod tests {
 
         // Same bytes mid-flight — must drop without dispatching another
         // verify.
-        let second = state.on_wave_certificate(&topo, cert.into());
+        let second = state.on_execution_certificate(&topo, cert.into());
         assert!(second.is_empty());
     }
 
@@ -4227,7 +4223,7 @@ mod tests {
     /// One at or below the frontier is legitimate pre-halt history and still
     /// dispatches.
     #[test]
-    fn on_wave_certificate_fences_ec_past_recovery_frontier() {
+    fn on_execution_certificate_fences_ec_past_recovery_frontier() {
         let recovering = ShardId::ROOT;
         let topo = make_test_topology_recovering(recovering, BlockHeight::new(5));
 
@@ -4248,7 +4244,7 @@ mod tests {
 
         // Above the frontier — the orphan. Fenced.
         let mut state = make_test_state();
-        let orphan = state.on_wave_certificate(&topo, ec_at(6).into());
+        let orphan = state.on_execution_certificate(&topo, ec_at(6).into());
         assert!(
             matches!(
                 orphan.as_slice(),
@@ -4259,7 +4255,7 @@ mod tests {
 
         // At the frontier — legitimate suffix, still dispatches to verify.
         let mut state = make_test_state();
-        let suffix = state.on_wave_certificate(&topo, ec_at(5).into());
+        let suffix = state.on_execution_certificate(&topo, ec_at(5).into());
         assert!(
             matches!(
                 suffix.as_slice(),
@@ -4273,7 +4269,7 @@ mod tests {
     /// QC-certified header is not consumability, and the committed event
     /// replays the deferred EC into verify dispatch.
     #[test]
-    fn on_wave_certificate_defers_until_source_block_commit_proven() {
+    fn on_execution_certificate_defers_until_source_block_commit_proven() {
         let topo = make_two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
 
@@ -4291,7 +4287,7 @@ mod tests {
             SignerBitfield::new(4),
         );
 
-        let actions = state.on_wave_certificate(&topo, cert.into());
+        let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
             actions.is_empty(),
             "an EC from an unproven source block must defer, got {actions:?}"
@@ -4340,7 +4336,7 @@ mod tests {
 
         // At the boundary: below the sync anchor — the defer asks for the
         // commit proof.
-        let actions = state.on_wave_certificate(&topo, cert_at(10).into());
+        let actions = state.on_execution_certificate(&topo, cert_at(10).into());
         assert!(
             matches!(
                 actions.as_slice(),
@@ -4353,7 +4349,7 @@ mod tests {
         );
 
         // Above the boundary: an ordinary silent defer.
-        let actions = state.on_wave_certificate(&topo, cert_at(11).into());
+        let actions = state.on_execution_certificate(&topo, cert_at(11).into());
         assert!(
             actions.is_empty(),
             "an above-anchor defer needs no explicit request, got {actions:?}"
@@ -4363,7 +4359,7 @@ mod tests {
     /// No pending recovery for the shard: the fence is inert, an EC at any
     /// height dispatches as usual.
     #[test]
-    fn on_wave_certificate_fence_inert_without_recovery() {
+    fn on_execution_certificate_fence_inert_without_recovery() {
         let topo = make_test_topology();
         let mut state = make_test_state();
         let mut signers = SignerBitfield::new(4);
@@ -4378,7 +4374,7 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         );
-        let actions = state.on_wave_certificate(&topo, cert.into());
+        let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(matches!(
             actions.as_slice(),
             [Action::VerifyExecutionCertificateSignature { .. }]
@@ -4389,7 +4385,7 @@ mod tests {
     /// slot is released and a subsequent retransmit is allowed to
     /// re-dispatch.
     #[test]
-    fn on_wave_certificate_releases_slot_after_verification() {
+    fn on_execution_certificate_releases_slot_after_verification() {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
@@ -4407,7 +4403,7 @@ mod tests {
             signers,
         );
 
-        let _ = state.on_wave_certificate(&topo, cert.clone().into());
+        let _ = state.on_execution_certificate(&topo, cert.clone().into());
         // Simulate the crypto pool returning an invalid result. The slot is
         // released so a follow-up arrival can re-dispatch.
         let _ = state.on_certificate_verified(
@@ -4417,7 +4413,7 @@ mod tests {
                 ExecutionCertificateVerifyError::BadAggregatedSignature,
             )),
         );
-        let again = state.on_wave_certificate(&topo, cert.into());
+        let again = state.on_execution_certificate(&topo, cert.into());
         assert_eq!(again.len(), 1);
         assert!(matches!(
             again[0],
@@ -4429,7 +4425,7 @@ mod tests {
     /// aggregation, or by an earlier verification of the same wire bytes)
     /// short-circuits the verify dispatch on a wire-hash match.
     #[test]
-    fn on_wave_certificate_skips_dispatch_on_cached_wire_hash_match() {
+    fn on_execution_certificate_skips_dispatch_on_cached_wire_hash_match() {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
@@ -4450,7 +4446,7 @@ mod tests {
             .exec_certs
             .insert(Arc::new(Verified::new_unchecked_for_test(cert.clone())));
 
-        let actions = state.on_wave_certificate(&topo, cert.into());
+        let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
             actions.is_empty(),
             "cached wire-hash match must short-circuit"
@@ -4462,7 +4458,7 @@ mod tests {
     /// short-circuited by an earlier cache entry — it still needs its own
     /// signature check.
     #[test]
-    fn on_wave_certificate_falls_through_on_cached_wave_id_with_wire_hash_mismatch() {
+    fn on_execution_certificate_falls_through_on_cached_wave_id_with_wire_hash_mismatch() {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
@@ -4497,7 +4493,7 @@ mod tests {
             .exec_certs
             .insert(Arc::new(Verified::new_unchecked_for_test(cached)));
 
-        let actions = state.on_wave_certificate(&topo, incoming.into());
+        let actions = state.on_execution_certificate(&topo, incoming.into());
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
@@ -4505,10 +4501,10 @@ mod tests {
         ));
     }
 
-    /// `admit_finalized_wave` dedups a second arrival for the same
+    /// `admit_finalization` dedups a second arrival for the same
     /// `TickId` while verification is still in flight.
     #[test]
-    fn admit_finalized_wave_dedups_in_flight_arrival() {
+    fn admit_finalization_dedups_in_flight_arrival() {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
@@ -4525,21 +4521,21 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let wave: Arc<Verifiable<FinalizedWave>> =
-            Arc::new(FinalizedWave::new(tick_id, vec![ec], vec![]).into());
+        let wave: Arc<Verifiable<Finalization>> =
+            Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
 
-        let first = state.admit_finalized_wave(&topo, Arc::clone(&wave));
+        let first = state.admit_finalization(&topo, Arc::clone(&wave));
         assert_eq!(first.len(), 1);
-        assert!(matches!(first[0], Action::VerifyFinalizedWave { .. }));
+        assert!(matches!(first[0], Action::VerifyFinalization { .. }));
 
-        let second = state.admit_finalized_wave(&topo, wave);
+        let second = state.admit_finalization(&topo, wave);
         assert!(second.is_empty());
     }
 
-    /// A `FinalizedWave` already in the canonical store short-circuits
+    /// A `Finalization` already in the canonical store short-circuits
     /// before any verify dispatch.
     #[test]
-    fn admit_finalized_wave_skips_when_already_finalized() {
+    fn admit_finalization_skips_when_already_finalized() {
         let topo = make_test_topology();
         let mut state = make_test_state();
 
@@ -4556,24 +4552,24 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let raw_wave = FinalizedWave::new(tick_id, vec![ec], vec![]);
+        let raw_wave = Finalization::new(tick_id, vec![ec], vec![]);
         let verifiable_wave = Arc::new(Verified::new_unchecked_for_test(raw_wave.clone()).into());
-        // Seed the canonical store directly (mirrors what `finalize_wave`
+        // Seed the canonical store directly (mirrors what `finalize`
         // does on the local-aggregation path).
         state.finalized.insert(tick_id, verifiable_wave);
 
-        let actions = state.admit_finalized_wave(&topo, Arc::new(Verifiable::from(raw_wave)));
+        let actions = state.admit_finalization(&topo, Arc::new(Verifiable::from(raw_wave)));
         assert!(actions.is_empty());
     }
 
-    /// A `FinalizedWave` delivered by `admit_finalized_wave` (the fetch
+    /// A `Finalization` delivered by `admit_finalization` (the fetch
     /// entry point) must reject any wave whose contained ECs lack quorum
     /// power or signature validity. Otherwise a peer answering
-    /// `finalized_wave.request` can poison the `io_loop` serving cache
-    /// (via the `Continuation(FinalizedWavesAdmitted)` interception) and
+    /// `finalization.request` can poison the `io_loop` serving cache
+    /// (via the `Continuation(FinalizationsAdmitted)` interception) and
     /// we re-serve the bogus wave to other peers.
     #[test]
-    fn test_admit_finalized_wave_rejects_subquorum_ec() {
+    fn test_admit_finalization_rejects_subquorum_ec() {
         let topo = make_two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
 
@@ -4586,26 +4582,26 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::empty(), // no signers — far below 2f+1
         ));
-        let wave: Arc<Verifiable<FinalizedWave>> =
-            Arc::new(FinalizedWave::new(tick_id, vec![bogus_ec], vec![]).into());
+        let wave: Arc<Verifiable<Finalization>> =
+            Arc::new(Finalization::new(tick_id, vec![bogus_ec], vec![]).into());
 
-        let actions = state.admit_finalized_wave(&topo, wave);
+        let actions = state.admit_finalization(&topo, wave);
         // No admission continuation — the poisoning vector this gate
         // exists to close. The rejection now emits a `FetchAbandon` so
         // any pinned fetch FSM entry releases its slot.
         assert!(
             !actions.iter().any(|a| matches!(
                 a,
-                Action::Continuation(ProtocolEvent::FinalizedWavesAdmitted { .. })
+                Action::Continuation(ProtocolEvent::FinalizationsAdmitted { .. })
             )),
-            "sub-quorum FinalizedWave must produce no admission Continuation"
+            "sub-quorum Finalization must produce no admission Continuation"
         );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::FinalizedWaves { ids }) if ids == &vec![tick_id]
+                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![tick_id]
             )),
-            "sub-quorum drop must emit AbandonFetch::FinalizedWaves, got: {actions:?}"
+            "sub-quorum drop must emit AbandonFetch::Finalizations, got: {actions:?}"
         );
     }
 
@@ -4616,7 +4612,7 @@ mod tests {
     /// fallback fetches are suppressed, and the verify pool's silent
     /// rejection leaves us stranded.
     #[test]
-    fn test_on_wave_certificate_does_not_mark_fulfilled_before_verification() {
+    fn test_on_execution_certificate_does_not_mark_fulfilled_before_verification() {
         let topo = make_two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
 
@@ -4640,7 +4636,7 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
-        let _ = state.on_wave_certificate(&topo, cert.clone().into());
+        let _ = state.on_execution_certificate(&topo, cert.clone().into());
         assert_eq!(
             state.expected_certs.expected_len(),
             1,
@@ -4671,7 +4667,7 @@ mod tests {
     /// forged `tx_outcomes` that the replay path later trusts at commit
     /// time.
     #[test]
-    fn test_on_wave_certificate_always_dispatches_verification_even_without_tracker() {
+    fn test_on_execution_certificate_always_dispatches_verification_even_without_tracker() {
         let topo = make_two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
 
@@ -4698,7 +4694,7 @@ mod tests {
             BlockHeight::new(5),
             WeightedTimestamp::ZERO,
         );
-        let actions = state.on_wave_certificate(&topo, cert.into());
+        let actions = state.on_execution_certificate(&topo, cert.into());
         assert!(
             actions
                 .iter()
@@ -4834,7 +4830,7 @@ mod tests {
             SignerBitfield::new(4),
         );
 
-        let actions = coord.on_wave_certificate(&schedule, Verifiable::from(cert));
+        let actions = coord.on_execution_certificate(&schedule, Verifiable::from(cert));
         let public_keys = actions
             .iter()
             .find_map(|a| match a {
@@ -4843,7 +4839,7 @@ mod tests {
                 }
                 _ => None,
             })
-            .expect("on_wave_certificate dispatches a signature verification");
+            .expect("on_execution_certificate dispatches a signature verification");
         assert_eq!(
             *public_keys, keys_b,
             "remote EC must verify against the committee at its vote_anchor_ts, not the head",
@@ -4940,7 +4936,7 @@ mod tests {
             SignerBitfield::new(4),
         );
 
-        let actions = coord.on_wave_certificate(&behind, Verifiable::from(cert));
+        let actions = coord.on_execution_certificate(&behind, Verifiable::from(cert));
         assert!(
             !actions
                 .iter()
@@ -4959,7 +4955,7 @@ mod tests {
     }
 
     #[test]
-    fn finalized_wave_buffers_when_beacon_behind_then_drains_on_catch_up() {
+    fn finalization_buffers_when_beacon_behind_then_drains_on_catch_up() {
         const ED: u64 = 1_000;
         let shard = ShardId::ROOT;
 
@@ -4983,15 +4979,15 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let wave: Arc<Verifiable<FinalizedWave>> =
-            Arc::new(FinalizedWave::new(tick_id, vec![ec], vec![]).into());
+        let wave: Arc<Verifiable<Finalization>> =
+            Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
 
-        let actions = coord.admit_finalized_wave(&behind, Arc::clone(&wave));
+        let actions = coord.admit_finalization(&behind, Arc::clone(&wave));
         assert!(
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::VerifyFinalizedWave { .. })),
-            "a finalized wave whose EC epoch the beacon hasn't reached must buffer, not dispatch",
+                .any(|a| matches!(a, Action::VerifyFinalization { .. })),
+            "a finalization whose EC epoch the beacon hasn't reached must buffer, not dispatch",
         );
 
         let caught_up = TopologySchedule::single(Arc::new(committee_snapshot(&[0, 1, 2, 3]).0));
@@ -4999,7 +4995,7 @@ mod tests {
         assert!(
             drained
                 .iter()
-                .any(|a| matches!(a, Action::VerifyFinalizedWave { .. })),
+                .any(|a| matches!(a, Action::VerifyFinalization { .. })),
             "draining on catch-up must dispatch the buffered wave's verification",
         );
     }
@@ -5063,7 +5059,7 @@ mod tests {
             "fallback fetch must keep firing while the expectation is retained"
         );
 
-        // Once the local wave resolves (simulating finalize_wave), the
+        // Once the local wave resolves (simulating finalize), the
         // expectation is no longer needed and gets pruned.
         state.waves.remove_wave(&local_wave);
         state.waves.remove_assignment(tx_hash);
@@ -5078,7 +5074,7 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // finalize_wave — verifies the critical cross-sub-machine fanout that
+    // finalize — verifies the critical cross-sub-machine fanout that
     // happens when a wave reaches terminal state.
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -5163,7 +5159,7 @@ mod tests {
         let (tick_id, wave) = make_ready_single_shard_wave(&[1, 2]);
         state.waves.insert_wave(tick_id, wave);
 
-        let _actions = state.finalize_wave(&make_test_topology(), &tick_id);
+        let _actions = state.finalize(&make_test_topology(), &tick_id);
 
         assert!(!state.waves.contains_wave(&tick_id), "wave handed off");
         assert!(
@@ -5179,12 +5175,12 @@ mod tests {
         let (tick_id, wave) = make_ready_single_shard_wave(&[1, 2]);
         state.waves.insert_wave(tick_id, wave);
 
-        let actions = state.finalize_wave(&make_test_topology(), &tick_id);
+        let actions = state.finalize(&make_test_topology(), &tick_id);
 
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
-            Action::Continuation(ProtocolEvent::FinalizedWavesAdmitted { .. })
+            Action::Continuation(ProtocolEvent::FinalizationsAdmitted { .. })
         ));
     }
 
@@ -5192,7 +5188,7 @@ mod tests {
     fn test_finalize_wave_is_noop_for_absent_wave_id() {
         let mut state = make_test_state();
         let unknown = TickId::new(ShardId::ROOT, BlockHeight::new(99));
-        let actions = state.finalize_wave(&make_test_topology(), &unknown);
+        let actions = state.finalize(&make_test_topology(), &unknown);
         assert!(actions.is_empty());
         assert!(state.finalized.is_empty());
     }
@@ -5321,7 +5317,7 @@ mod tests {
             WeightedTimestamp::from_millis(900),
             WeightedTimestamp::from_millis(800),
             Arc::new(ExecCertStore::new()),
-            Arc::new(FinalizedWaveStore::new()),
+            Arc::new(FinalizationStore::new()),
         );
 
         // The first post-restart commit extends the tip and dates itself
@@ -5383,13 +5379,13 @@ mod tests {
         );
     }
 
-    /// A finalized wave whose certificate carries `local`'s EC plus a
+    /// A finalization whose certificate carries `local`'s EC plus a
     /// remote EC on `remote` — the cross-shard shape the gate inspects.
-    fn cross_shard_finalized_wave(
+    fn cross_shard_finalization(
         local: ShardId,
         remote: ShardId,
         height: u64,
-    ) -> Arc<Verifiable<FinalizedWave>> {
+    ) -> Arc<Verifiable<Finalization>> {
         let ec = |shard: ShardId| {
             let wave = TickId::new(shard, BlockHeight::new(height));
             ExecutionCertificate::new(
@@ -5407,7 +5403,7 @@ mod tests {
             )
         };
         let local_wave = TickId::new(local, BlockHeight::new(height));
-        let wave = FinalizedWave::new(
+        let wave = Finalization::new(
             local_wave,
             vec![Arc::new(ec(local)), Arc::new(ec(remote))],
             vec![],
@@ -5424,7 +5420,7 @@ mod tests {
         // Past ROOT's terminal window — the gate's anchor is the committed ts.
         state.committed_ts = WeightedTimestamp::from_millis(1500);
         let sched = terminating_schedule();
-        let wave = cross_shard_finalized_wave(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let wave = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
         let tick_id = *wave.tick_id();
 
         let deferred = state.emit_or_gate_finalized(&sched, wave);
@@ -5447,7 +5443,7 @@ mod tests {
             matches!(
                 released.as_slice(),
                 [Action::Continuation(
-                    ProtocolEvent::FinalizedWavesAdmitted { .. }
+                    ProtocolEvent::FinalizationsAdmitted { .. }
                 )],
             ),
             "recording the settled set releases the held wave for admission",
@@ -5471,7 +5467,7 @@ mod tests {
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
         );
-        let wave = cross_shard_finalized_wave(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let wave = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
         let tick_id = *wave.tick_id();
         let tx_hash: Vec<TxHash> = wave.tx_hashes().collect();
 
@@ -5506,7 +5502,7 @@ mod tests {
         // Post-cut: any epoch-1 timestamp is past ROOT's terminal window.
         state.committed_ts = WeightedTimestamp::from_millis(1500);
         let sched = terminating_schedule();
-        let wave = cross_shard_finalized_wave(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let wave = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
         let tick_id = *wave.tick_id();
         let tx_hashes: Vec<TxHash> = wave.tx_hashes().collect();
 
@@ -5587,7 +5583,7 @@ mod tests {
 
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
         state.committed_ts = WeightedTimestamp::from_millis(1500);
-        let wave = cross_shard_finalized_wave(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let wave = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
         let tick_id = *wave.tick_id();
         let tx_hashes: Vec<TxHash> = wave.tx_hashes().collect();
 
@@ -5729,13 +5725,13 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // remove_finalized_wave — cascade correctness across all sub-machines.
+    // remove_finalization — cascade correctness across all sub-machines.
     // Refactor plan called this out as a key risk: any new sub-machine added
     // to the coordinator must be updated here or its per-tx state leaks.
     // ═══════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_remove_finalized_wave_cascades_across_every_sub_machine() {
+    fn test_remove_finalization_cascades_across_every_sub_machine() {
         let mut state = make_test_state();
         let (tick_id, wave) = make_ready_single_shard_wave(&[7]);
         let tx_hash = wave.tx_hashes()[0];
@@ -5746,23 +5742,23 @@ mod tests {
         state
             .provisioning
             .record_required(tx_hash, std::iter::once(ShardId::leaf(1, 1)).collect());
-        // Drive finalize_wave to populate the FinalizedWaveStore naturally.
-        let _ = state.finalize_wave(&make_test_topology(), &tick_id);
+        // Drive finalize to populate the FinalizationStore naturally.
+        let _ = state.finalize(&make_test_topology(), &tick_id);
         let finalized = state
             .finalized
             .get(&tick_id)
-            .expect("wave must be in the finalized store after finalize_wave");
+            .expect("wave must be in the finalized store after finalize");
 
         // Sanity: state is populated across sub-machines.
         let before = state.memory_stats();
-        assert_eq!(before.finalized_wave_certificates, 1);
+        assert_eq!(before.finalizations, 1);
         assert_eq!(before.wave_assignments, 1);
         assert_eq!(before.required_provision_shards, 1);
 
-        state.remove_finalized_wave(&finalized);
+        state.remove_finalization(&finalized);
 
         let after = state.memory_stats();
-        assert_eq!(after.finalized_wave_certificates, 0);
+        assert_eq!(after.finalizations, 0);
         assert_eq!(after.waves, 0);
         assert_eq!(after.wave_assignments, 0);
         assert_eq!(after.verified_provisions, 0);

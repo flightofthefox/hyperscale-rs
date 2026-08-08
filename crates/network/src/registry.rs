@@ -96,7 +96,7 @@ pub trait LocalNotificationDispatcher: Send + Sync {
 /// Takes ownership of the typed request (so callers don't have to
 /// clone) and returns the typed response as `Box<dyn Any + Send>` for
 /// the caller to downcast back. Skipping the codec keeps `Arc`-shared
-/// payloads (transactions, finalized waves, execution certificates)
+/// payloads (transactions, finalizations, execution certificates)
 /// reference-counted instead of deep-copied through bytes.
 pub trait LocalRequestDispatcher: Send + Sync {
     /// Dispatch a boxed-Any request to the typed handler. The dispatcher
@@ -690,7 +690,7 @@ impl HandlerRegistry {
     /// encode/decode. Returns `None` if no handler is registered for
     /// `(R, shard)`. Used by network backends to serve requests for
     /// shards the host carries on-process — `Arc`-shared payloads on the
-    /// response (transactions, finalized waves, execution certificates)
+    /// response (transactions, finalizations, execution certificates)
     /// flow through reference-counted instead of being deep-copied
     /// through wire bytes.
     ///

@@ -101,7 +101,7 @@ impl NodeStateMachine {
         actions.extend(s.sweep_ready_counterpart_straddlers());
 
         // The first coast commit quiesces the chain's content: finalization is a
-        // wave certificate in a later block, and no later content block will
+        // finalization in a later block, and no later content block will
         // exist, so every still-in-flight transaction is permanently undecidable
         // here. Drive them to their terminal abort and drop the execution state
         // that was waiting on them — once. Keyed on quiescence, not dissolution:

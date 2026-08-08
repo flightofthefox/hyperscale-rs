@@ -43,7 +43,7 @@ pub enum TransactionStatus {
 
     /// Block containing transaction has been committed; the tx is in flight,
     /// holding locks on its declared nodes until a committed block carries
-    /// the wave certificate that decides it.
+    /// the finalization that decides it.
     ///
     /// For cross-shard transactions this encompasses:
     /// - State provisioning (collecting state from other shards)
@@ -52,7 +52,7 @@ pub enum TransactionStatus {
     /// - Certificate collection (gathering certificates from all shards)
     Committed(BlockHeight),
 
-    /// Wave certificate has been committed in a block; locks released.
+    /// Finalization has been committed in a block; locks released.
     /// Carries the final decision from the wave's per-tx decisions.
     Completed(TransactionDecision),
 }

@@ -14,7 +14,7 @@ use hyperscale_types::{
     CandidateBeaconBlockVerifyError, CertRootVerifyError, CertificateRoot, CertifiedBeaconBlock,
     CertifiedBeaconBlockVerifyError, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, Epoch, ExecutionCertificate, ExecutionCertificateVerifyError,
-    ExecutionVote, FinalizedWave, FinalizedWaveVerifyError, Hash, LeafIndex, LocalReceiptRoot,
+    ExecutionVote, Finalization, FinalizationVerifyError, Hash, LeafIndex, LocalReceiptRoot,
     LocalReceiptRootVerifyError, PcVote1, PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3,
     PcVote3VerifyError, ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
     Provisions, ProvisionsRoot, ProvisionsVerifyError, QcVerifyError, QuorumCertificate,
@@ -454,8 +454,8 @@ pub enum ProtocolEvent {
         block: Arc<Block>,
         /// Hash of the constructed block, cached for callers.
         block_hash: BlockHash,
-        /// Finalized waves included in the block (carry certs + receipts + ECs).
-        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        /// Finalizations included in the block (carry certs + receipts + ECs).
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
         /// Net substate byte total change from the build's JMT
         /// computation. Feeds the coordinator's count frontier for
         /// reshape-trigger derivation.
@@ -603,7 +603,7 @@ pub enum ProtocolEvent {
     /// Execution certificates delivered from any source — fetch response or
     /// peer broadcast (post sender-sig check). Each cert carries its own
     /// `(shard_id, block_height, tick_id)`. The state machine iterates
-    /// the batch and routes each cert to `ExecutionCoordinator::on_wave_certificate`,
+    /// the batch and routes each cert to `ExecutionCoordinator::on_execution_certificate`,
     /// which dispatches signature verification. The fetch protocol drain
     /// hooks this event by `tick_id`.
     ExecutionCertificatesReceived {
@@ -623,16 +623,15 @@ pub enum ProtocolEvent {
         >,
     },
 
-    /// All signature verifications for a fetched [`FinalizedWave`] completed.
+    /// All signature verifications for a fetched [`Finalization`] completed.
     ///
-    /// Routed to `ExecutionCoordinator::on_finalized_wave_verified`, which
-    /// emits the matching `Continuation(FinalizedWavesAdmitted)` only when
+    /// Routed to `ExecutionCoordinator::on_finalization_verified`, which
+    /// emits the matching `Continuation(FinalizationsAdmitted)` only when
     /// every contained EC's signature passed.
-    FinalizedWaveVerified {
+    FinalizationVerified {
         /// Verified wave on success; the raw wave plus the reason it
         /// failed otherwise.
-        result:
-            Result<Arc<Verified<FinalizedWave>>, (Arc<FinalizedWave>, FinalizedWaveVerifyError)>,
+        result: Result<Arc<Verified<Finalization>>, (Arc<Finalization>, FinalizationVerifyError)>,
     },
 
     /// An execution certificate was just admitted to the canonical EC store.
@@ -645,36 +644,36 @@ pub enum ProtocolEvent {
         certificate: Arc<Verified<ExecutionCertificate>>,
     },
 
-    /// Finalized waves delivered from a peer in response to a fetch request.
+    /// Finalizations delivered from a peer in response to a fetch request.
     ///
-    /// Routed to `ExecutionCoordinator::admit_finalized_wave` per wave.
-    /// The fetch protocol drain hooks the subsequent `FinalizedWavesAdmitted`
+    /// Routed to `ExecutionCoordinator::admit_finalization`, one at a time.
+    /// The fetch protocol drain hooks the subsequent `FinalizationsAdmitted`
     /// continuation, not this event.
-    FinalizedWavesReceived {
-        /// Finalized waves returned by the peer. Wire-decoded entries
+    FinalizationsReceived {
+        /// Finalizations returned by the peer. Wire-decoded entries
         /// land `Unverified`; a [`Verifiable::Verified`] entry
         /// short-circuits verify dispatch at the coordinator.
-        waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
     },
 
-    /// Finalized waves were just admitted to the canonical execution store.
+    /// Finalizations were just admitted to the canonical execution store.
     ///
     /// Emitted by `ExecutionCoordinator` (wrapped in `Action::Continuation`)
-    /// for both locally finalized waves and fetch-delivered waves. Drives
+    /// for both locally produced finalizations and fetch-delivered ones. Drives
     /// two consumers:
     ///
     /// - `io_loop` intercepts the matching `Continuation` arm and drains the
-    ///   finalized-wave fetch protocol's in-flight tracking.
-    /// - state.rs forwards the event to `shard.on_finalized_waves_admitted`,
-    ///   which validates each wave's receipts against its EC and populates
+    ///   finalization fetch protocol's in-flight tracking.
+    /// - state.rs forwards the event to `shard.on_finalizations_admitted`,
+    ///   which validates each finalization's receipts against its EC and populates
     ///   any pending block waiting on its hash.
-    FinalizedWavesAdmitted {
-        /// Finalized waves newly admitted on this admission call. Carried
+    FinalizationsAdmitted {
+        /// Finalizations newly admitted on this admission call. Carried
         /// in the `Block::Live.certificates` transport shape — every
         /// entry is in the [`Verifiable::Verified`] variant by virtue of
-        /// the typed gates the emitter went through (`finalize_wave`'s
-        /// `seal`, or `admit_finalized_wave`'s `Verify::verify`).
-        waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        /// the typed gates the emitter went through (`finalize`'s
+        /// `seal`, or `admit_finalization`'s `Verify::verify`).
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::{
-    CertificateRoot, FinalizedWave, Hash, Verifiable, Verified, Verify, WaveReceiptHash,
+    CertificateRoot, Finalization, Hash, Verifiable, Verified, Verify, WaveReceiptHash,
     compute_merkle_root,
 };
 
@@ -27,9 +27,9 @@ pub fn certificate_root_from_receipt_hashes(receipt_hashes: &[WaveReceiptHash]) 
 /// Inputs the [`CertificateRoot`] verifier reads against.
 #[derive(Debug, Clone, Copy)]
 pub struct CertificateRootContext<'a> {
-    /// The block's finalized wave certificates — each contributes one
+    /// The block's finalizations — each contributes one
     /// leaf (its `receipt_hash`) to the recomputed root.
-    pub certificates: &'a [Arc<Verifiable<FinalizedWave>>],
+    pub certificates: &'a [Arc<Verifiable<Finalization>>],
 }
 
 /// Failure modes of [`CertificateRoot`] verification.
@@ -52,7 +52,7 @@ impl Verified<CertificateRoot> {
     /// [`Verifiable`] `Deref` impl so callers can pass the
     /// `Block::Live.certificates` slice without unwrapping.
     #[must_use]
-    pub fn compute(certificates: &[Arc<Verifiable<FinalizedWave>>]) -> Self {
+    pub fn compute(certificates: &[Arc<Verifiable<Finalization>>]) -> Self {
         let receipt_hashes: Vec<WaveReceiptHash> =
             certificates.iter().map(|fw| fw.receipt_hash()).collect();
         Self::new_unchecked(certificate_root_from_receipt_hashes(&receipt_hashes))
@@ -69,7 +69,7 @@ impl Verified<CertificateRoot> {
 }
 
 /// Construction asserts: the wrapped [`CertificateRoot`] equals
-/// `compute_merkle_root` of each underlying wave certificate's
+/// `compute_merkle_root` of each underlying finalization's
 /// `receipt_hash`, in block order.
 impl Verify<&CertificateRootContext<'_>> for CertificateRoot {
     type Error = CertRootVerifyError;

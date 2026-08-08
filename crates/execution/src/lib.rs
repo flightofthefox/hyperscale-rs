@@ -12,7 +12,7 @@
 //! wave is provisioned by the source shards (state entries with JMT
 //! proofs), executed once provisions are complete, and certified by an
 //! `ExecutionCertificate` aggregating execution votes from the committee.
-//! Resolved waves are finalized into a `FinalizedWave` receipt that lives
+//! Resolved waves are finalized into a `Finalization` receipt that lives
 //! in the corresponding block.
 //!
 pub mod action_handlers;
@@ -22,7 +22,7 @@ mod coordinator;
 mod early_arrivals;
 mod exec_cert_store;
 mod expected_certs;
-mod finalized_waves;
+mod finalizations;
 mod lookups;
 mod outbound_certs;
 mod provisional;
@@ -32,7 +32,7 @@ mod waves;
 
 pub use coordinator::{CompletionData, ExecutionCoordinator, ExecutionMemoryStats};
 pub use exec_cert_store::ExecCertStore;
-pub use finalized_waves::FinalizedWaveStore;
+pub use finalizations::FinalizationStore;
 pub use lookups::provision_request;
 pub use vote_tracker::VoteTracker;
 pub use wave_state::WaveState;

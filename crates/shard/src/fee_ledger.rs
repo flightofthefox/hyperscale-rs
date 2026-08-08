@@ -5,12 +5,12 @@
 //! window in which the reservation is engaged but not yet settled. The
 //! ledger tracks exactly that window from chain content: entries insert
 //! when a block commits the transaction and release when a committed
-//! block carries the wave certificate resolving it, so every replica's
+//! block carries the finalization resolving it, so every replica's
 //! ledger is identical at equal committed frontiers.
 //!
 //! Entries are deadline-bounded like [`crate::commit_dedup`]'s tiers: a
 //! transaction resolved outside the certificate path — a reshape
-//! terminal's abort-by-omission, where no finalized wave ever commits —
+//! terminal's abort-by-omission, where no finalization ever commits —
 //! prunes at its validity end plus the retention horizon rather than
 //! encumbering the payer forever.
 
@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Address, FinalizedWave, RETENTION_HORIZON, Transaction, TxHash, Verifiable, WeightedTimestamp,
+    Address, Finalization, RETENTION_HORIZON, Transaction, TxHash, Verifiable, WeightedTimestamp,
 };
 
 /// One engaged reservation: the payer's owner prefix, the held ceiling,
@@ -64,10 +64,10 @@ impl FeeReservationLedger {
         }
     }
 
-    /// Release the reservations a committed block's wave certificates
-    /// resolve — settlement and abort both arrive as finalized waves.
-    pub fn release_finalized(&mut self, finalized_waves: &[Arc<Verifiable<FinalizedWave>>]) {
-        for wave in finalized_waves {
+    /// Release the reservations a committed block's finalizations
+    /// resolve — settlement and abort both arrive as finalizations.
+    pub fn release_finalized(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
+        for wave in finalizations {
             for tx_hash in wave.tx_hashes() {
                 self.holds.remove(&tx_hash);
             }
@@ -92,7 +92,7 @@ impl FeeReservationLedger {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::test_utils::{make_finalized_wave, stub_transaction};
+    use hyperscale_types::test_utils::{make_finalization, stub_transaction};
     use hyperscale_types::{BlockHeight, TimestampRange, TransactionDecision, Verified};
 
     use super::*;
@@ -111,14 +111,14 @@ mod tests {
     }
 
     #[test]
-    fn holds_accumulate_and_release_on_finalized_waves() {
+    fn holds_accumulate_and_release_on_finalizations() {
         let mut ledger = FeeReservationLedger::new();
         let tx = transaction(1_000, 60_000);
         ledger.register_committed(std::slice::from_ref(&tx), |_| true);
         assert_eq!(ledger.held_for(PAYER_ADDR), 1_000);
         assert_eq!(ledger.held_for(Address([0xBB; 16])), 0);
 
-        let wave = Arc::new(Verifiable::from(make_finalized_wave(
+        let wave = Arc::new(Verifiable::from(make_finalization(
             BlockHeight::new(1),
             tx.hash(),
             TransactionDecision::Accept,

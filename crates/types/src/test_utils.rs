@@ -11,7 +11,7 @@ use crate::{
     AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader,
     BlockHeight, BlockVoteMessage, CertificateRoot, CertifiedBlock, CertifiedBlockHeader,
     ChainOrigin, CommitProof, ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derived,
-    EnvelopeExt, ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
+    EnvelopeExt, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash,
     GlobalReceiptRoot, Hash, LocalReceiptRoot, NetworkDefinition, NetworkId, ProposerTimestamp,
     ProvisionsRoot, QuorumCertificate, RevealChain, Round, Routing, ShardForkProof, ShardId,
     ShardLoad, SignerBitfield, StateRoot, TickId, TimestampRange, TopologySnapshot, Transaction,
@@ -269,7 +269,7 @@ pub fn make_live_block(
     timestamp_ms: u64,
     proposer: ValidatorId,
     transactions: Vec<Arc<Transaction>>,
-    certificates: Vec<Arc<Verifiable<FinalizedWave>>>,
+    certificates: Vec<Arc<Verifiable<Finalization>>>,
 ) -> Block {
     let header = BlockHeader::new(
         shard_id,
@@ -826,7 +826,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
     }
 }
 
-/// Build a minimal `FinalizedWave` carrying a single tx decision.
+/// Build a minimal `Finalization` carrying a single tx decision.
 ///
 /// The wave is anchored on `ShardId::ROOT` with `block_height` as its
 /// identity and no remote shard dependencies — sufficient for driving
@@ -835,11 +835,11 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
 /// signer bitfield, so callers should not feed the result through
 /// verification paths.
 #[must_use]
-pub fn make_finalized_wave(
+pub fn make_finalization(
     block_height: BlockHeight,
     tx_hash: TxHash,
     decision: TransactionDecision,
-) -> FinalizedWave {
+) -> Finalization {
     let outcome = match decision {
         TransactionDecision::Accept => ExecutionOutcome::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
@@ -856,7 +856,7 @@ pub fn make_finalized_wave(
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
-    FinalizedWave::new(tick_id, vec![Arc::new(ec)], vec![])
+    Finalization::new(tick_id, vec![Arc::new(ec)], vec![])
 }
 
 /// A deterministic [`VmStatics`](crate::VmStatics) stub for consensus-crate

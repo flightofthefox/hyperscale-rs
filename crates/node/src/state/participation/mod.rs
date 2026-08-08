@@ -25,7 +25,7 @@ mod transactions;
 
 use std::sync::Arc;
 
-use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizedWaveStore};
+use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, TxStore};
 use hyperscale_provisions::{
     OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator, ProvisionStore,
@@ -107,7 +107,7 @@ impl ShardParticipation {
         provision_store: Arc<ProvisionStore>,
         tx_store: Arc<TxStore>,
         exec_cert_store: Arc<ExecCertStore>,
-        finalized_wave_store: Arc<FinalizedWaveStore>,
+        finalization_store: Arc<FinalizationStore>,
     ) -> Self {
         // Execution's commit frontier seeds from the same recovered tip the
         // shard coordinator restores, so the first post-restart commit
@@ -134,7 +134,7 @@ impl ShardParticipation {
                 committed_block_anchor_wt,
                 committed_committee_anchor_wt,
                 exec_cert_store,
-                finalized_wave_store,
+                finalization_store,
             ),
             mempool_coordinator,
             provisions_coordinator: ProvisionCoordinator::with_config_and_store(

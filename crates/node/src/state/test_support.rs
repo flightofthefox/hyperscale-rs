@@ -16,7 +16,7 @@ use std::sync::Arc;
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_crypto_bls::BlsVerifier;
-use hyperscale_execution::{ExecCertStore, FinalizedWaveStore};
+use hyperscale_execution::{ExecCertStore, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
 use hyperscale_provisions::{ProvisionConfig, ProvisionStore};
 use hyperscale_shard::ShardConsensusConfig;
@@ -81,7 +81,7 @@ impl TestNodeBuilder {
             provision_store,
             Arc::new(TxStore::new()),
             Arc::new(ExecCertStore::new()),
-            Arc::new(FinalizedWaveStore::new()),
+            Arc::new(FinalizationStore::new()),
         );
 
         TestNode { node, committee }

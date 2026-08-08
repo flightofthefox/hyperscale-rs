@@ -1,23 +1,23 @@
-//! Finalized wave fetch request (intra-shard DA).
+//! Finalization fetch request (intra-shard DA).
 
 use hyperscale_hbor::Hbor;
 
-use crate::network::response::GetFinalizedWavesResponse;
+use crate::network::response::GetFinalizationsResponse;
 use crate::{MessageClass, NetworkMessage, Request, TickId};
 
-/// Request to fetch finalized waves by id.
+/// Request to fetch finalizations by id.
 ///
-/// Used when a validator is missing finalized waves referenced by a pending
-/// block. The responder resolves each id from the local finalized-wave cache
+/// Used when a validator is missing finalizations referenced by a pending
+/// block. The responder resolves each id from the local finalization cache
 /// (and falls through to storage where supported) — no scope information is
 /// needed since `TickId` self-contains shard, height, and dependency set.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
-pub struct GetFinalizedWavesRequest {
+pub struct GetFinalizationsRequest {
     /// Wave IDs being requested.
     pub tick_ids: Vec<TickId>,
 }
 
-impl GetFinalizedWavesRequest {
+impl GetFinalizationsRequest {
     /// Build a request for the listed `tick_ids`.
     #[must_use]
     pub const fn new(tick_ids: Vec<TickId>) -> Self {
@@ -25,9 +25,9 @@ impl GetFinalizedWavesRequest {
     }
 }
 
-impl NetworkMessage for GetFinalizedWavesRequest {
+impl NetworkMessage for GetFinalizationsRequest {
     fn message_type_id() -> &'static str {
-        "finalized_wave.request"
+        "finalization.request"
     }
 
     fn class() -> MessageClass {
@@ -35,11 +35,11 @@ impl NetworkMessage for GetFinalizedWavesRequest {
     }
 }
 
-impl Request for GetFinalizedWavesRequest {
-    type Response = GetFinalizedWavesResponse;
+impl Request for GetFinalizationsRequest {
+    type Response = GetFinalizationsResponse;
 
     fn is_empty_response(response: &Self::Response) -> bool {
-        response.waves.is_empty()
+        response.finalizations.is_empty()
     }
 }
 
@@ -53,14 +53,14 @@ mod tests {
 
     #[test]
     fn test_hbor_roundtrip() {
-        let request = GetFinalizedWavesRequest {
+        let request = GetFinalizationsRequest {
             tick_ids: vec![
                 TickId::new(ShardId::ROOT, BlockHeight::new(1)),
                 TickId::new(ShardId::ROOT, BlockHeight::new(2)),
             ],
         };
         let encoded = hbor_to_vec(&request).unwrap();
-        let decoded: GetFinalizedWavesRequest = hbor_from_slice(&encoded).unwrap();
+        let decoded: GetFinalizationsRequest = hbor_from_slice(&encoded).unwrap();
         assert_eq!(request, decoded);
     }
 }

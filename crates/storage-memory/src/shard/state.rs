@@ -9,7 +9,7 @@ use hyperscale_storage::JmtSnapshot;
 use hyperscale_storage::tree::{carry_noop_root, jmt_parent_height, put_at_version};
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
-    ExecutionMetadata, FinalizedWave, QuorumCertificate, SafeVoteRegisters, SettledWrites,
+    ExecutionMetadata, Finalization, QuorumCertificate, SafeVoteRegisters, SettledWrites,
     ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash,
     ValidatorId,
 };
@@ -161,8 +161,8 @@ pub struct ConsensusState {
     pub committed_qc: Option<QuorumCertificate>,
     /// Transactions indexed by hash.
     pub transactions: HashMap<TxHash, Transaction>,
-    /// Wave certificates indexed by `TickId`.
-    pub certificates: HashMap<TickId, FinalizedWave>,
+    /// Finalizations indexed by `TickId`.
+    pub certificates: HashMap<TickId, Finalization>,
     /// Consensus receipts keyed by transaction hash.
     pub consensus_receipts: HashMap<TxHash, Arc<ConsensusReceipt>>,
     /// Execution output details keyed by transaction hash.
@@ -177,7 +177,7 @@ pub struct ConsensusState {
     /// same way a real node does.
     pub tx_cert_index: HashMap<TxHash, TickId>,
     /// Index: `block_height` → `TickId`s at that height.
-    pub wave_certs_by_height: HashMap<BlockHeight, Vec<TickId>>,
+    pub finalizations_by_height: HashMap<BlockHeight, Vec<TickId>>,
     /// Beacon-witness leaves keyed by leaf index. Mirrors the production
     /// `RocksDB` `beacon_witnesses` CF so simulation integration tests
     /// can serve fetches and replay the accumulator on restart. Shard
@@ -211,7 +211,7 @@ impl ConsensusState {
             receipt_heights: HashMap::new(),
             execution_certs: HashMap::new(),
             tx_cert_index: HashMap::new(),
-            wave_certs_by_height: HashMap::new(),
+            finalizations_by_height: HashMap::new(),
             beacon_witnesses: BTreeMap::new(),
             chain_origin: ChainOrigin::ROOT,
             safe_vote_registers: HashMap::new(),

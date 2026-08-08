@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_core::{Action, ProtocolEvent, StateMachine};
-use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizedWaveStore};
+use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, TxStore};
 use hyperscale_provisions::{
     OutboundProvisionTracker, ProvisionConfig, ProvisionCoordinator, ProvisionStore,
@@ -87,7 +87,7 @@ impl NodeStateMachine {
     /// Create a new node state machine seated on `local_shard`.
     ///
     /// `provision_store`, `tx_store`, `exec_cert_store`, and
-    /// `finalized_wave_store` are scoped per shard so same-shard vnodes
+    /// `finalization_store` are scoped per shard so same-shard vnodes
     /// converge on one canonical store. Use `RecoveredState::default()`
     /// for a fresh start.
     #[must_use]
@@ -103,7 +103,7 @@ impl NodeStateMachine {
         provision_store: Arc<ProvisionStore>,
         tx_store: Arc<TxStore>,
         exec_cert_store: Arc<ExecCertStore>,
-        finalized_wave_store: Arc<FinalizedWaveStore>,
+        finalization_store: Arc<FinalizationStore>,
     ) -> Self {
         let verifier = Arc::clone(beacon_coordinator.verifier());
         Self {
@@ -121,7 +121,7 @@ impl NodeStateMachine {
                 provision_store,
                 tx_store,
                 exec_cert_store,
-                finalized_wave_store,
+                finalization_store,
             )),
         }
     }
@@ -351,7 +351,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::StateRootVerified { .. }
             | ProtocolEvent::ProposalBuilt { .. }
             | ProtocolEvent::BlockPersisted { .. }
-            | ProtocolEvent::FinalizedWavesAdmitted { .. }
+            | ProtocolEvent::FinalizationsAdmitted { .. }
             | ProtocolEvent::ReadySignalReceived { .. }
             | ProtocolEvent::UnverifiedShardForkProofReceived { .. }
             | ProtocolEvent::CommitProofNeeded { .. }) => {
@@ -439,8 +439,8 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ExecutionCertificatesReceived { .. }
             | ProtocolEvent::ExecutionCertificateSignatureVerified { .. }
             | ProtocolEvent::ExecutionCertificateAdmitted { .. }
-            | ProtocolEvent::FinalizedWavesReceived { .. }
-            | ProtocolEvent::FinalizedWaveVerified { .. }) => {
+            | ProtocolEvent::FinalizationsReceived { .. }
+            | ProtocolEvent::FinalizationVerified { .. }) => {
                 self.with_shard(move |s, sched| s.handle_execution(sched, evt))
             }
 
@@ -517,7 +517,7 @@ impl StateMachine for NodeStateMachine {
                     parent_block_height: ready.parent_block_height,
                     expected_root: ready.expected_root,
                     expected_local_receipt_root: ready.expected_local_receipt_root,
-                    finalized_waves: ready.finalized_waves,
+                    finalizations: ready.finalizations,
                     block_height: ready.block_height,
                     claimed_split_child_roots: ready.claimed_split_child_roots,
                     split_child_roots_required: ready.split_child_roots_required,

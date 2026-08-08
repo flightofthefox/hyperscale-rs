@@ -86,7 +86,7 @@ impl Eq for ExecutionCertificate {}
 // this check a Byzantine aggregator could ship a signature-valid EC whose
 // outcomes don't hash to the signed root, slipping bogus per-tx results
 // past every downstream consumer (gossip ingress, fetch ingress,
-// FinalizedWave admission).
+// Finalization admission).
 
 impl HborWidth for ExecutionCertificate {
     const MIN_ENCODED_LEN: usize = 1;
@@ -443,7 +443,7 @@ impl Verified<ExecutionCertificate> {
     }
 
     /// Re-wrap a certificate that satisfied the predicate at write
-    /// time. ECs ride into storage embedded inside `Verified<FinalizedWave>`
+    /// time. ECs ride into storage embedded inside `Verified<Finalization>`
     /// values inside the `Verified<CertifiedBlock>` argument to
     /// `commit_block`, so unverified ECs can't reach the write path.
     /// Storage rehydration paths use this gate to avoid re-running

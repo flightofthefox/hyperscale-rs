@@ -67,7 +67,7 @@ mod tests {
     use crate::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
         BlockHeight, CertificateRoot, ChainOrigin, ExecutionCertificate, ExecutionOutcome,
-        FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
+        Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
         ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot, TxHash, TxOutcome,
         ValidatorId, Verifiable, Verified, WeightedTimestamp, WorkInFlight,
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_compute_certificate_root_deterministic() {
-        let make_fw = |seed: u8| -> Arc<Verifiable<FinalizedWave>> {
+        let make_fw = |seed: u8| -> Arc<Verifiable<Finalization>> {
             let ec = Arc::new(ExecutionCertificate::new(
                 TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
                 WeightedTimestamp::from_millis(11),
@@ -172,7 +172,7 @@ mod tests {
                 SignerBitfield::new(4),
             ));
             Arc::new(
-                FinalizedWave::new(
+                Finalization::new(
                     TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
                     vec![ec],
                     vec![],
@@ -203,13 +203,13 @@ mod tests {
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         ));
-        let cert = FinalizedWave::new(
+        let cert = Finalization::new(
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
             vec![ec],
             vec![],
         );
         let expected_receipt_hash = cert.receipt_hash();
-        let fw: Arc<Verifiable<FinalizedWave>> = Arc::new(cert.into());
+        let fw: Arc<Verifiable<Finalization>> = Arc::new(cert.into());
 
         let root = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
         // Single cert: certificate_root should equal the cert's receipt_hash

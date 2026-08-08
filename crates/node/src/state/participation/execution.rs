@@ -65,24 +65,24 @@ impl ShardParticipation {
                 for cert in certificates {
                     actions.extend(
                         self.execution_coordinator
-                            .on_wave_certificate(topology_schedule, cert),
+                            .on_execution_certificate(topology_schedule, cert),
                     );
                 }
                 actions
             }
-            ProtocolEvent::FinalizedWavesReceived { waves } => {
+            ProtocolEvent::FinalizationsReceived { finalizations } => {
                 let mut actions = Vec::new();
-                for wave in waves {
+                for wave in finalizations {
                     actions.extend(
                         self.execution_coordinator
-                            .admit_finalized_wave(topology_schedule, wave),
+                            .admit_finalization(topology_schedule, wave),
                     );
                 }
                 actions
             }
-            ProtocolEvent::FinalizedWaveVerified { result } => self
-                .execution_coordinator
-                .on_finalized_wave_verified(result),
+            ProtocolEvent::FinalizationVerified { result } => {
+                self.execution_coordinator.on_finalization_verified(result)
+            }
             ProtocolEvent::ExecutionCertificateSignatureVerified { result } => self
                 .execution_coordinator
                 .on_certificate_verified(topology_schedule, result),

@@ -20,7 +20,7 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRootContext, Block, BlockHash, BlockHeader, BlockHeight,
     BlockProposalMessage, BlockVote, BlockVoteMessage, CertificateRoot, CertificateRootContext,
     CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError,
-    ConsensusPublicKey, ConsensusReceipt, Epoch, FinalizedWave, Hash, LocalReceiptRoot,
+    ConsensusPublicKey, ConsensusReceipt, Epoch, Finalization, Hash, LocalReceiptRoot,
     LocalReceiptRootContext, NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash,
     ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
     ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, RevealChain,
@@ -205,7 +205,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
     parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
     transactions: Vec<Arc<Verified<Transaction>>>,
-    certificates: Vec<Arc<Verifiable<FinalizedWave>>>,
+    certificates: Vec<Arc<Verifiable<Finalization>>>,
     local_shard: ShardId,
     topology_snapshot: &TopologySnapshot,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
@@ -399,7 +399,7 @@ fn split_child_roots_for_header(
 }
 
 fn collect_finalized_receipts(
-    waves: &[Arc<Verifiable<FinalizedWave>>],
+    waves: &[Arc<Verifiable<Finalization>>],
 ) -> Vec<Arc<ConsensusReceipt>> {
     let receipts: Vec<Arc<ConsensusReceipt>> = waves
         .iter()
@@ -673,11 +673,11 @@ where
             substate_bytes,
             claimed_substate_bytes,
             thresholds,
-            finalized_waves,
+            finalizations,
             topology_snapshot,
         } => {
             let start = Stopwatch::start();
-            let receipts: Vec<StoredReceipt> = finalized_waves
+            let receipts: Vec<StoredReceipt> = finalizations
                 .iter()
                 .flat_map(|fw| fw.receipts().iter().cloned())
                 .collect();
@@ -722,7 +722,7 @@ where
             parent_block_height,
             expected_root,
             expected_local_receipt_root,
-            finalized_waves,
+            finalizations,
             block_height,
             claimed_split_child_roots,
             split_child_roots_required,
@@ -737,7 +737,7 @@ where
             // so short-circuit on the receipt-root failure alone — the
             // pipeline rejects the block on the `LocalReceiptRootVerified`
             // error without needing a synthetic state-root failure event.
-            let stored_receipts: Vec<StoredReceipt> = finalized_waves
+            let stored_receipts: Vec<StoredReceipt> = finalizations
                 .iter()
                 .flat_map(|fw| fw.receipts().iter().cloned())
                 .collect();
@@ -775,7 +775,7 @@ where
                     height: parent_block_height,
                     state: view.as_ref(),
                 },
-                &finalized_waves,
+                &finalizations,
                 block_height,
                 &pending_snapshots,
                 None,
@@ -791,7 +791,7 @@ where
                     parent_block_height,
                     parent_weighted_timestamp,
                     settled_txs_window_floor,
-                    &finalized_waves,
+                    &finalizations,
                 )
             });
             let verify_result = expected_root.verify(&StateRootContext {
@@ -814,8 +814,8 @@ where
                     block_height,
                     prepared,
                     jmt_snapshot,
-                    receipts: collect_finalized_receipts(&finalized_waves),
-                    settled_txs: local_settled_tx_hashes(&finalized_waves, ctx.shard),
+                    receipts: collect_finalized_receipts(&finalizations),
+                    settled_txs: local_settled_tx_hashes(&finalizations, ctx.shard),
                 });
             } else if let Err(e) = &verify_result {
                 tracing::warn!(
@@ -845,7 +845,7 @@ where
             parent_state_root,
             parent_block_height,
             transactions,
-            finalized_waves,
+            finalizations,
             provisions,
             fee_checks,
             fee_read_height,
@@ -946,7 +946,7 @@ where
                     parent_block_height,
                     parent_qc.weighted_timestamp(),
                     settled_txs_window_floor,
-                    &finalized_waves,
+                    &finalizations,
                 )
             });
             let result = build_proposal(
@@ -961,7 +961,7 @@ where
                 parent_state_root,
                 parent_block_height,
                 transactions,
-                finalized_waves.clone(),
+                finalizations.clone(),
                 shard_id,
                 &classification_topology,
                 provisions.clone(),
@@ -988,15 +988,15 @@ where
                 block_height: height,
                 prepared: result.prepared_commit,
                 jmt_snapshot: result.jmt_snapshot,
-                receipts: collect_finalized_receipts(&finalized_waves),
-                settled_txs: local_settled_tx_hashes(&finalized_waves, shard_id),
+                receipts: collect_finalized_receipts(&finalizations),
+                settled_txs: local_settled_tx_hashes(&finalizations, shard_id),
             });
             ctx.notify_protocol(ProtocolEvent::ProposalBuilt {
                 height,
                 round,
                 block: Arc::new(result.block),
                 block_hash,
-                finalized_waves,
+                finalizations,
                 provisions,
                 bytes_delta,
             });
@@ -1734,7 +1734,7 @@ mod tests {
 
     #[test]
     fn verify_certificate_root_matches_compute_certificate_root() {
-        let certs: Vec<Arc<Verifiable<FinalizedWave>>> = Vec::new();
+        let certs: Vec<Arc<Verifiable<Finalization>>> = Vec::new();
         let root = Verified::<CertificateRoot>::compute(&certs).into_inner();
         let ctx = CertificateRootContext {
             certificates: &certs,

@@ -936,11 +936,11 @@ module recovery_bridge_honest_old {
 // The cross-shard freeze — INV-SEC-8's other half, and the fix for the
 // cascade escalation of finding G-1. A halted shard's committed suffix
 // made cross-shard commitments (execution certificates other shards
-// finalized waves on); the retained beyond-f committee can forge NEW ECs
+// finalized on); the retained beyond-f committee can forge NEW ECs
 // extending the halted tip, and a consuming shard resolves the source
 // committee for an EC by its anchor window
 // (`topology_schedule.lookup(cert.vote_anchor_ts())` in
-// `on_wave_certificate`, crates/execution/src/coordinator.rs) — the PLAIN
+// `on_execution_certificate`, crates/execution/src/coordinator.rs) — the PLAIN
 // lookup, no recovery bridge — so a stale-anchored orphan EC resolves the
 // old committee and its beyond-f signatures verify. Without the fence, the
 // orphan exports a forged finalization cross-shard: an f+1 liveness halt
@@ -965,7 +965,7 @@ module recovery_bridge_honest_old {
 //
 // Code anchors:
 //   - Cross-shard EC committee resolution: crates/execution/src/coordinator.rs
-//     `on_wave_certificate` / `admit_finalized_wave`
+//     `on_execution_certificate` / `admit_finalization`
 //     (`topology_schedule.lookup(cert.vote_anchor_ts())`);
 //     `ec_has_shard_quorum_power` (crates/execution/src/lookups.rs)
 //     checks the signer power against that resolved committee.
@@ -975,8 +975,8 @@ module recovery_bridge_honest_old {
 //     `recover_committee` (crates/beacon/src/state/committee.rs).
 //     `TopologySchedule::recovery_fences` (crates/types/src/topology/schedule.rs)
 //     turns it into a height gate applied before the anchor lookup on
-//     every EC ingress path (`on_wave_certificate`,
-//     `on_certificate_verified`, `admit_finalized_wave`), and
+//     every EC ingress path (`on_execution_certificate`,
+//     `on_certificate_verified`, `admit_finalization`), and
 //     `lookup_for_shard_certified_fenced` applies the same cutoff to
 //     remote-header sync (crates/remote-headers/src/coordinator.rs) and
 //     the beacon boundary fold (crates/beacon/src/boundary.rs).

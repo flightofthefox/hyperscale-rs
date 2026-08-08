@@ -314,8 +314,8 @@ pub enum ShardScopedInput {
         hashes: Vec<ProvisionHash>,
     },
 
-    /// A finalized-wave fetch request failed.
-    FinalizedWavesFetchFailed {
+    /// A finalization fetch request failed.
+    FinalizationsFetchFailed {
         /// Wave ids that weren't returned.
         ids: Vec<TickId>,
     },
@@ -471,7 +471,7 @@ impl ShardScopedInput {
                 | ProtocolEvent::VerifiedProvisionsReceived { .. }
                 | ProtocolEvent::UnverifiedProvisionsReceived { .. }
                 | ProtocolEvent::ExecutionCertificatesReceived { .. }
-                | ProtocolEvent::FinalizedWavesReceived { .. }
+                | ProtocolEvent::FinalizationsReceived { .. }
                 | ProtocolEvent::TransactionsReceived { .. }
                 | ProtocolEvent::ReadySignalReceived { .. } => EventPriority::Network,
                 // Fetch delivery events are processed callbacks from the
@@ -506,7 +506,7 @@ impl ShardScopedInput {
             | Self::ProvisionsFetchFailed { .. }
             | Self::ExecCertFetchFailed { .. }
             | Self::LocalProvisionsFetchFailed { .. }
-            | Self::FinalizedWavesFetchFailed { .. }
+            | Self::FinalizationsFetchFailed { .. }
             | Self::ShardWitnessesFetchFailed { .. }
             | Self::ShardWitnessesFetchFulfilled { .. }
             | Self::BeaconProposalFetchFailed { .. }

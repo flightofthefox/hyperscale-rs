@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use hyperscale_mempool::{MempoolConfig, MempoolCoordinator, MempoolMemoryStats};
 use hyperscale_types::test_utils::{
-    TestCommittee, certify, make_finalized_wave, make_live_block, test_transaction,
+    TestCommittee, certify, make_finalization, make_live_block, test_transaction,
 };
 use hyperscale_types::{
     BlockHeight, Hash, LocalTimestamp, ShardId, TopologySnapshot, Transaction, TransactionDecision,
@@ -153,7 +153,7 @@ fn on_block_committed_transitions_pending_to_committed() {
 }
 
 #[test]
-fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
+fn on_block_committed_with_finalization_tombstones_and_evicts() {
     let topology_snapshot = test_topology();
     let mut coord = MempoolCoordinator::new(ShardId::ROOT);
 
@@ -165,9 +165,9 @@ fn on_block_committed_with_finalized_wave_tombstones_and_evicts() {
         LocalTimestamp::ZERO,
     );
 
-    // Single block that both includes the tx and carries the wave cert
+    // Single block that both includes the tx and carries the finalization
     // completing it — drives Pending → Committed → Completed in one call.
-    let fw = make_finalized_wave(BlockHeight::new(1), tx_hash, TransactionDecision::Accept);
+    let fw = make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept);
     let block = make_live_block(
         ShardId::ROOT,
         BlockHeight::new(1),

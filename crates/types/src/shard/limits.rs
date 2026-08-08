@@ -34,14 +34,14 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 pub const MAX_PROVISION_TARGET_SHARDS: usize = 1_024;
 
 /// Cap on the number of finalized transactions a proposer includes in a
-/// single block, summed across all wave certificates.
+/// single block, summed across all finalizations.
 ///
 /// Truncation is a suffix of the order the proposer offers, which is the
 /// order the waves executed in — a wave settling ahead of one it shares a
 /// cell with reverts a committed write, so nothing here may reorder to
-/// fit. Also serves as the outer-`Vec<FinalizedWave>` decode bound: every
+/// fit. Also serves as the outer-`Vec<Finalization>` decode bound: every
 /// wave's local EC carries at least one outcome in practice, so the count
-/// of wave certificates a block can carry is implicitly bounded by this
+/// of finalizations a block can carry is implicitly bounded by this
 /// same cap.
 pub const MAX_FINALIZED_TX_PER_BLOCK: usize = 8_192;
 

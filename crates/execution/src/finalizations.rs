@@ -1,26 +1,26 @@
-//! Terminal-state lookup for finalized waves.
+//! Terminal-state lookup for finalizations.
 //!
-//! A wave lands here after its local EC is aggregated and every remote shard
+//! A finalization lands here after its local EC is aggregated and every remote shard
 //! has attested coverage — at that point every participating shard's
 //! certificate is in hand and the receipts are ready for block inclusion.
 //! Entries are removed by the
-//! coordinator once the containing wave-cert block commits; until then the
-//! store answers tx-membership and wave-id-hash lookups for peers that need
+//! coordinator once the containing block commits; until then the
+//! store answers tx-membership and tick-id lookups for peers that need
 //! to fetch the finalized data to vote.
 //!
 //! This is write-once, read-many — [`WaveRegistry`](crate::waves::WaveRegistry)
 //! owns the mutable in-flight lifecycle (waves, vote trackers, retries) and
-//! hands waves off to this store at the moment of finalization.
+//! hands them off to this store at the moment of finalization.
 //!
-//! The underlying map is a `BTreeMap<TickId, Arc<FinalizedWave>>` so
+//! The underlying map is a `BTreeMap<TickId, Arc<Finalization>>` so
 //! iteration is deterministic — load-bearing for simulation determinism and
 //! for proposal building, which iterates the store to include finalized
-//! waves in block order. Beside it, a `TxHash → TickId` index answers the
-//! questions that are per transaction rather than per wave: whether a
-//! transaction has reached terminal state, which wave carries it, and
+//! finalizations in block order. Beside it, a `TxHash → TickId` index answers the
+//! questions that are per transaction rather than per tick: whether a
+//! transaction has reached terminal state, which finalization carries it, and
 //! what a sync requester already holds.
 //!
-//! Held behind an `RwLock` so an `Arc<FinalizedWaveStore>` can be shared
+//! Held behind an `RwLock` so an `Arc<FinalizationStore>` can be shared
 //! across every same-shard vnode's `ExecutionCoordinator`. In practice
 //! the pinned thread serializes every write, so the lock never contends
 //! — it exists to satisfy the type system around shared mutability.
@@ -28,128 +28,128 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use hyperscale_types::{BloomFilter, DEFAULT_FPR, FinalizedWave, TickId, TxHash, Verifiable};
+use hyperscale_types::{BloomFilter, DEFAULT_FPR, Finalization, TickId, TxHash, Verifiable};
 
 /// Waves by id, plus the transaction index derived from them. Both live
 /// under one lock so a reader can never observe a transaction indexed
-/// against a wave the map has already dropped.
+/// against a finalization the map has already dropped.
 struct Inner {
-    waves: BTreeMap<TickId, Arc<Verifiable<FinalizedWave>>>,
+    finalizations: BTreeMap<TickId, Arc<Verifiable<Finalization>>>,
     by_tx: HashMap<TxHash, TickId>,
 }
 
-/// Per-shard finalized-wave store. See module docs for lifecycle.
+/// Per-shard finalization store. See module docs for lifecycle.
 ///
-/// Stored values are [`Verifiable<FinalizedWave>`] in the
+/// Stored values are [`Verifiable<Finalization>`] in the
 /// [`Verifiable::Verified`] variant. Holding the `Block::Live.certificates`
 /// transport shape directly lets the proposal-build path source verifiable
 /// arcs without a per-extraction conversion; the typed-gate `insert` is
 /// the single place where the conversion (and body clone) happens.
-pub struct FinalizedWaveStore {
+pub struct FinalizationStore {
     inner: RwLock<Inner>,
 }
 
-impl Default for FinalizedWaveStore {
+impl Default for FinalizationStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl FinalizedWaveStore {
+impl FinalizationStore {
     /// Construct an empty store.
     #[must_use]
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(Inner {
-                waves: BTreeMap::new(),
+                finalizations: BTreeMap::new(),
                 by_tx: HashMap::new(),
             }),
         }
     }
 
-    /// True if no finalized waves are currently tracked.
+    /// True if no finalizations are currently tracked.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .waves
+            .finalizations
             .is_empty()
     }
 
-    /// Record a newly-finalized wave under its `TickId`. Callers wrap
-    /// their upstream [`Verified<FinalizedWave>`] into
+    /// Record a newly-finalization under its `TickId`. Callers wrap
+    /// their upstream [`Verified<Finalization>`] into
     /// [`Verifiable::Verified`] before insertion so the same `Arc` can be
-    /// shared with downstream `FinalizedWavesAdmitted` consumers without
+    /// shared with downstream `FinalizationsAdmitted` consumers without
     /// re-cloning. The store enforces — by virtue of its `Verifiable`
     /// argument type and the typed gates the caller went through to
     /// produce it — that every value held here is in the
     /// `Verifiable::Verified` variant.
-    pub fn insert(&self, tick_id: TickId, fw: Arc<Verifiable<FinalizedWave>>) {
+    pub fn insert(&self, tick_id: TickId, fw: Arc<Verifiable<Finalization>>) {
         debug_assert!(
             fw.verified().is_some(),
-            "FinalizedWaveStore invariant: only Verifiable::Verified entries are admitted"
+            "FinalizationStore invariant: only Verifiable::Verified entries are admitted"
         );
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         for tx_hash in fw.tx_hashes() {
             inner.by_tx.insert(tx_hash, tick_id);
         }
-        inner.waves.insert(tick_id, fw);
+        inner.finalizations.insert(tick_id, fw);
     }
 
     /// Remove the entry for `tick_id`, if any. No-op when absent (sync
-    /// paths may remove a wave the local node never aggregated).
+    /// paths may remove a finalization the local node never aggregated).
     pub fn remove(&self, tick_id: &TickId) {
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
-        let Some(fw) = inner.waves.remove(tick_id) else {
+        let Some(fw) = inner.finalizations.remove(tick_id) else {
             return;
         };
         for tx_hash in fw.tx_hashes() {
-            // A later wave re-indexing the same transaction would own the
-            // entry; only drop the one this wave still holds.
+            // A later finalization re-indexing the same transaction would
+            // own the entry; only drop the one this one still holds.
             if inner.by_tx.get(&tx_hash) == Some(tick_id) {
                 inner.by_tx.remove(&tx_hash);
             }
         }
     }
 
-    /// All finalized waves in `TickId` order. Used by the proposer to
-    /// include finalized waves in the next block.
+    /// All finalizations in `TickId` order. Used by the proposer to
+    /// include finalizations in the next block.
     #[must_use]
-    pub fn all_waves(&self) -> Vec<Arc<Verifiable<FinalizedWave>>> {
+    pub fn all(&self) -> Vec<Arc<Verifiable<Finalization>>> {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .waves
+            .finalizations
             .values()
             .map(Arc::clone)
             .collect()
     }
 
-    /// Lookup by `TickId`. Peers reference waves by id in fetch requests,
-    /// so this is the primary ingress lookup for serving finalized-wave data.
+    /// Lookup by `TickId`. Peers reference finalizations by tick in fetch requests,
+    /// so this is the primary ingress lookup for serving finalization data.
     #[must_use]
-    pub fn get(&self, tick_id: &TickId) -> Option<Arc<Verifiable<FinalizedWave>>> {
+    pub fn get(&self, tick_id: &TickId) -> Option<Arc<Verifiable<Finalization>>> {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .waves
+            .finalizations
             .get(tick_id)
             .map(Arc::clone)
     }
 
     /// Wave containing `tx_hash`, if any. Used to answer terminal-state
     /// queries for a single transaction (e.g. RPC, mempool status).
-    /// Returns `None` once the wave has been removed — callers then fall
+    /// Returns `None` once the finalization has been removed — callers then fall
     /// back to persisted storage.
     #[must_use]
-    pub fn get_wave_for_tx(&self, tx_hash: TxHash) -> Option<Arc<Verifiable<FinalizedWave>>> {
+    pub fn get_for_tx(&self, tx_hash: TxHash) -> Option<Arc<Verifiable<Finalization>>> {
         let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
         let tick_id = inner.by_tx.get(&tx_hash)?;
-        inner.waves.get(tick_id).map(Arc::clone)
+        inner.finalizations.get(tick_id).map(Arc::clone)
     }
 
-    /// Whether `tx_hash` is part of any currently-tracked finalized wave.
+    /// Whether `tx_hash` is part of any currently-tracked finalization.
     #[must_use]
     pub fn is_finalized(&self, tx_hash: TxHash) -> bool {
         self.inner
@@ -159,10 +159,10 @@ impl FinalizedWaveStore {
             .contains_key(&tx_hash)
     }
 
-    /// Every transaction in a tracked finalized wave.
+    /// Every transaction in a tracked finalization.
     ///
     /// The node passes this to shard consensus for conflict filtering — a transaction
-    /// whose wave is already finalized should not be re-proposed.
+    /// already finalized should not be re-proposed.
     #[must_use]
     pub fn all_tx_hashes(&self) -> HashSet<TxHash> {
         self.inner
@@ -174,30 +174,30 @@ impl FinalizedWaveStore {
             .collect()
     }
 
-    /// Whether a wave with this `TickId` is tracked. Used by debug/query
-    /// paths to distinguish "wave is finalized" from "wave has no tracker".
+    /// Whether a finalization for this `TickId` is tracked. Used by debug/query
+    /// paths to distinguish "tick is finalized" from "tick has no tracker".
     #[must_use]
     pub fn contains(&self, tick_id: &TickId) -> bool {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .waves
+            .finalizations
             .contains_key(tick_id)
     }
 
-    /// Number of finalized waves currently tracked.
+    /// Number of finalizations currently tracked.
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .waves
+            .finalizations
             .len()
     }
 
-    /// Build a bloom filter over every transaction in a tracked wave. Sync
+    /// Build a bloom filter over every transaction in a tracked finalization. Sync
     /// inventory attaches this to `GetBlockRequest` so the responder can
-    /// elide the finalized waves the requester already has — a wave whose
+    /// elide the finalizations the requester already has — one whose
     /// every transaction is in the filter.
     #[must_use]
     pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<TxHash>> {
@@ -230,15 +230,15 @@ mod tests {
 
     use super::*;
 
-    fn make_wave_id(block_height: u64) -> TickId {
+    fn make_tick_id(block_height: u64) -> TickId {
         TickId::new(ShardId::ROOT, BlockHeight::new(block_height))
     }
 
-    fn make_finalized_wave(
+    fn make_finalization(
         block_height: u64,
         tx_hashes: &[TxHash],
-    ) -> (TickId, Arc<Verifiable<FinalizedWave>>) {
-        let tick_id = make_wave_id(block_height);
+    ) -> (TickId, Arc<Verifiable<Finalization>>) {
+        let tick_id = make_tick_id(block_height);
         let tx_outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
             .map(|h| {
@@ -260,7 +260,7 @@ mod tests {
         );
         // Lookups in this module only inspect the certificates' outcomes; an
         // empty receipts vector is fine for the store's contract.
-        let verified = Verified::new_unchecked_for_test(FinalizedWave::new(
+        let verified = Verified::new_unchecked_for_test(Finalization::new(
             tick_id,
             vec![Arc::new(ec)],
             vec![],
@@ -271,52 +271,52 @@ mod tests {
 
     #[test]
     fn empty_store_reports_no_finalized_state() {
-        let store = FinalizedWaveStore::new();
+        let store = FinalizationStore::new();
         assert_eq!(store.len(), 0);
         assert!(store.is_empty());
         assert!(!store.is_finalized(TxHash::from(Hash::from_bytes(b"anything"))));
         assert!(store.all_tx_hashes().is_empty());
-        assert!(store.all_waves().is_empty());
+        assert!(store.all().is_empty());
     }
 
     #[test]
     fn insert_then_lookup_by_tx_hash() {
-        let store = FinalizedWaveStore::new();
+        let store = FinalizationStore::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx1"));
-        let (wid, fw) = make_finalized_wave(1, &[tx]);
+        let (wid, fw) = make_finalization(1, &[tx]);
 
         store.insert(wid, fw);
 
         assert!(store.is_finalized(tx));
         assert!(store.contains(&wid));
         assert_eq!(store.len(), 1);
-        let wave = store.get_wave_for_tx(tx).expect("wave present");
-        assert_eq!(wave.tick_id(), &wid);
+        let found = store.get_for_tx(tx).expect("finalization present");
+        assert_eq!(found.tick_id(), &wid);
     }
 
     #[test]
-    fn lookup_by_wave_id_matches_inserted_wave() {
-        let store = FinalizedWaveStore::new();
+    fn lookup_by_tick_id_matches_inserted_finalization() {
+        let store = FinalizationStore::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx1"));
-        let (wid, fw) = make_finalized_wave(1, &[tx]);
+        let (wid, fw) = make_finalization(1, &[tx]);
 
         store.insert(wid, fw);
 
-        let looked_up = store.get(&wid).expect("wave present by id");
+        let looked_up = store.get(&wid).expect("finalization present by tick");
         assert_eq!(looked_up.tick_id(), &wid);
 
         // Unknown id returns None.
-        assert!(store.get(&make_wave_id(99)).is_none());
+        assert!(store.get(&make_tick_id(99)).is_none());
     }
 
     #[test]
-    fn all_tx_hashes_flattens_across_waves() {
-        let store = FinalizedWaveStore::new();
+    fn all_tx_hashes_flattens_across_finalizations() {
+        let store = FinalizationStore::new();
         let a = TxHash::from(Hash::from_bytes(b"a"));
         let b = TxHash::from(Hash::from_bytes(b"b"));
         let c = TxHash::from(Hash::from_bytes(b"c"));
-        let (wid1, fw1) = make_finalized_wave(1, &[a, b]);
-        let (wid2, fw2) = make_finalized_wave(2, &[c]);
+        let (wid1, fw1) = make_finalization(1, &[a, b]);
+        let (wid2, fw2) = make_finalization(2, &[c]);
 
         store.insert(wid1, fw1);
         store.insert(wid2, fw2);
@@ -329,12 +329,12 @@ mod tests {
     }
 
     #[test]
-    fn remove_drops_only_the_named_wave() {
-        let store = FinalizedWaveStore::new();
+    fn remove_drops_only_the_named_finalization() {
+        let store = FinalizationStore::new();
         let tx1 = TxHash::from(Hash::from_bytes(b"tx1"));
         let tx2 = TxHash::from(Hash::from_bytes(b"tx2"));
-        let (wid1, fw1) = make_finalized_wave(1, &[tx1]);
-        let (wid2, fw2) = make_finalized_wave(2, &[tx2]);
+        let (wid1, fw1) = make_finalization(1, &[tx1]);
+        let (wid2, fw2) = make_finalization(2, &[tx2]);
 
         store.insert(wid1, fw1);
         store.insert(wid2, fw2);
@@ -350,11 +350,11 @@ mod tests {
 
     #[test]
     fn cert_bloom_snapshot_contains_every_tracked_transaction() {
-        let store = FinalizedWaveStore::new();
+        let store = FinalizationStore::new();
         let tx1 = TxHash::from(Hash::from_bytes(b"tx1"));
         let tx2 = TxHash::from(Hash::from_bytes(b"tx2"));
-        let (wid1, fw1) = make_finalized_wave(1, &[tx1]);
-        let (wid2, fw2) = make_finalized_wave(2, &[tx2]);
+        let (wid1, fw1) = make_finalization(1, &[tx1]);
+        let (wid2, fw2) = make_finalization(2, &[tx2]);
         store.insert(wid1, fw1);
         store.insert(wid2, fw2);
 
@@ -365,15 +365,15 @@ mod tests {
         assert!(!bf.contains(&TxHash::from(Hash::from_bytes(b"absent"))));
     }
 
-    /// Removing one wave leaves another wave's transactions indexed —
-    /// the index is per wave, not a single shared set.
+    /// Removing one finalization leaves another's transactions indexed —
+    /// the index is per finalization, not a single shared set.
     #[test]
-    fn remove_drops_only_the_removed_wave_from_the_tx_index() {
-        let store = FinalizedWaveStore::new();
+    fn remove_drops_only_the_removed_finalization_from_the_tx_index() {
+        let store = FinalizationStore::new();
         let a = TxHash::from(Hash::from_bytes(b"a"));
         let b = TxHash::from(Hash::from_bytes(b"b"));
-        let (wid1, fw1) = make_finalized_wave(1, &[a]);
-        let (wid2, fw2) = make_finalized_wave(2, &[b]);
+        let (wid1, fw1) = make_finalization(1, &[a]);
+        let (wid2, fw2) = make_finalization(2, &[b]);
         store.insert(wid1, fw1);
         store.insert(wid2, fw2);
 
@@ -381,33 +381,33 @@ mod tests {
 
         assert!(!store.is_finalized(a));
         assert!(store.is_finalized(b));
-        assert!(store.get_wave_for_tx(a).is_none());
-        assert!(store.get_wave_for_tx(b).is_some());
+        assert!(store.get_for_tx(a).is_none());
+        assert!(store.get_for_tx(b).is_some());
         assert_eq!(store.all_tx_hashes(), HashSet::from([b]));
     }
 
     #[test]
-    fn remove_absent_wave_is_noop() {
-        let store = FinalizedWaveStore::new();
-        let missing = make_wave_id(42);
+    fn remove_absent_finalization_is_noop() {
+        let store = FinalizationStore::new();
+        let missing = make_tick_id(42);
         // No panic, no state change.
         store.remove(&missing);
         assert!(store.is_empty());
     }
 
     #[test]
-    fn all_waves_iterates_in_wave_id_order() {
-        let store = FinalizedWaveStore::new();
-        let (wid_high, fw_high) = make_finalized_wave(5, &[TxHash::from(Hash::from_bytes(b"hi"))]);
-        let (wid_low, fw_low) = make_finalized_wave(1, &[TxHash::from(Hash::from_bytes(b"lo"))]);
+    fn all_iterates_in_tick_id_order() {
+        let store = FinalizationStore::new();
+        let (wid_high, fw_high) = make_finalization(5, &[TxHash::from(Hash::from_bytes(b"hi"))]);
+        let (wid_low, fw_low) = make_finalization(1, &[TxHash::from(Hash::from_bytes(b"lo"))]);
 
         store.insert(wid_high, fw_high);
         store.insert(wid_low, fw_low);
 
-        let waves = store.all_waves();
-        assert_eq!(waves.len(), 2);
+        let all = store.all();
+        assert_eq!(all.len(), 2);
         // BTreeMap iteration is ordered by key; lower block_height comes first.
-        assert_eq!(waves[0].tick_id().block_height().inner(), 1);
-        assert_eq!(waves[1].tick_id().block_height().inner(), 5);
+        assert_eq!(all[0].tick_id().block_height().inner(), 1);
+        assert_eq!(all[1].tick_id().block_height().inner(), 5);
     }
 }

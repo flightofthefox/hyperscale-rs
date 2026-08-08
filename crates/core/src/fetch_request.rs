@@ -60,8 +60,8 @@ pub enum FetchRequest {
         class: Option<MessageClass>,
     },
     /// Intra-shard DA payload — `shard` is always local.
-    FinalizedWaves {
-        /// Wave ids whose finalized waves are missing.
+    Finalizations {
+        /// Wave ids whose finalizations are missing.
         ids: Vec<TickId>,
         /// Always the local shard for this variant.
         shard: ShardId,

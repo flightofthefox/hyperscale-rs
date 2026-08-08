@@ -10,7 +10,7 @@ use hyperscale_types::{
     BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
     BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
     CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader,
-    ConsensusPublicKey, Epoch, ExecutionCertificate, ExecutionVote, FinalizedWave,
+    ConsensusPublicKey, Epoch, ExecutionCertificate, ExecutionVote, Finalization,
     GlobalReceiptRoot, Hash, HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1,
     PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
     Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
@@ -526,19 +526,20 @@ pub enum Action {
         public_keys: Vec<ConsensusPublicKey>,
     },
 
-    /// Verify every EC inside a fetched [`FinalizedWave`] in one async dispatch.
+    /// Verify every EC inside a fetched [`Finalization`] in one async dispatch.
     ///
-    /// Used by `ExecutionCoordinator::admit_finalized_wave` to keep the
+    /// Used by `ExecutionCoordinator::admit_finalization` to keep the
     /// state-machine call off the signature verification critical path. Carries
-    /// per-EC public-key vectors aligned with `wave.execution_certificates()`.
-    /// Returns `ProtocolEvent::FinalizedWaveVerified` when complete.
-    VerifyFinalizedWave {
-        /// The wave whose every EC needs signature verification before admission.
-        /// A [`Verifiable::Verified`] wrapper short-circuits
-        /// verification.
-        wave: Arc<Verifiable<FinalizedWave>>,
+    /// per-EC public-key vectors aligned with
+    /// `finalization.execution_certificates()`.
+    /// Returns `ProtocolEvent::FinalizationVerified` when complete.
+    VerifyFinalization {
+        /// The finalization whose every EC needs signature verification
+        /// before admission. A [`Verifiable::Verified`] wrapper
+        /// short-circuits verification.
+        finalization: Arc<Verifiable<Finalization>>,
         /// Public keys for each EC, indexed parallel to
-        /// `wave.execution_certificates()`.
+        /// `finalization.execution_certificates()`.
         ec_public_keys: Vec<Vec<ConsensusPublicKey>>,
     },
 
@@ -639,7 +640,7 @@ pub enum Action {
     /// Verify a block's local-receipt root and state root against the JMT.
     ///
     /// Runs the receipt-root check as a pre-flight: hashes the receipts in
-    /// `finalized_waves` and compares to `expected_local_receipt_root`. If
+    /// `finalizations` and compares to `expected_local_receipt_root`. If
     /// receipts diverge, the JMT recomputation cannot match `expected_root`
     /// either (receipts ARE the JMT input), so the handler short-circuits
     /// without touching the JMT. On receipt-root pass, applies the block's
@@ -668,10 +669,10 @@ pub enum Action {
         expected_root: StateRoot,
         /// Expected local-receipt root (pre-flight check before JMT).
         expected_local_receipt_root: LocalReceiptRoot,
-        /// Finalized waves whose receipts contribute to both the receipt
+        /// Finalizations whose receipts contribute to both the receipt
         /// root and the state root. The thread pool merges the receipts' writes
         /// from these.
-        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
         /// Block height being verified.
         block_height: BlockHeight,
         /// The header's `split_child_roots` claim, verified beside the
@@ -704,7 +705,7 @@ pub enum Action {
     /// Verify a block's beacon-witness root + leaf count.
     ///
     /// Re-derives the new witness leaves from the same deterministic
-    /// sources the proposer used — receipts (via `finalized_waves`), the
+    /// sources the proposer used — receipts (via `finalizations`), the
     /// missed-round walk over `(parent_round, round)` against
     /// `topology_snapshot`, and the block's carried `witness_sources` —
     /// then applies them against `parent_witness_leaves` (the accumulator
@@ -764,9 +765,9 @@ pub enum Action {
         claimed_substate_bytes: Option<u64>,
         /// Reshape thresholds in force for this network.
         thresholds: ReshapeThresholds,
-        /// Finalized waves whose receipts contribute receipt-sourced
+        /// Finalizations whose receipts contribute receipt-sourced
         /// witness events.
-        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
         /// Topology snapshot for `proposer_for` lookups in the
         /// missed-round walk.
         topology_snapshot: TopologySnapshot,
@@ -824,7 +825,7 @@ pub enum Action {
         block_hash: BlockHash,
         /// Expected receipt root from block header.
         expected_root: CertificateRoot,
-        /// Finalized waves whose underlying cert `receipt_hash` values form the merkle leaves.
+        /// Finalizations whose underlying cert `receipt_hash` values form the merkle leaves.
         certificates: SharedCertificates,
     },
 
@@ -898,8 +899,8 @@ pub enum Action {
         parent_block_height: BlockHeight,
         /// Transactions to include in the proposal.
         transactions: Vec<Arc<Verified<Transaction>>>,
-        /// Finalized waves to include in the block (carries certs + receipts + ECs).
-        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        /// Finalizations to include in the block (carries certs + receipts + ECs).
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
         /// Provisions from remote shards, included in this block.
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         /// Prior fee-reservation demand per local payer among the
@@ -924,7 +925,7 @@ pub enum Action {
         /// agree on one value. `None` takes the reshape predicate out of
         /// play, and the header states that absence rather than guessing.
         substate_bytes: Option<u64>,
-        /// Number of transactions finalized by wave certificates in this block.
+        /// Number of transactions finalized by finalizations in this block.
         /// Dwell-eligible [`ReadySignal`]s drained from the proposer's pool
         /// for inclusion in the block's manifest. Beacon's `Ready` witness
         /// derives one entry per included signal at block-assembly time.
@@ -1086,7 +1087,7 @@ pub enum Action {
     /// - Pending: Transaction accepted into mempool
     /// - Committed: Transaction included in a committed block
     /// - Executed: Transaction execution complete (accept/reject decision made)
-    /// - Completed: Wave certificate committed, can be evicted
+    /// - Completed: Finalization committed, can be evicted
     /// - Deferred: Transaction deferred due to cross-shard livelock
     /// - Retried: Transaction superseded by retry transaction
     ///
@@ -1655,7 +1656,7 @@ impl Action {
             Self::AggregateExecutionCertificate { .. }
             | Self::VerifyAndAggregateExecutionVotes { .. }
             | Self::VerifyExecutionCertificateSignature { .. }
-            | Self::VerifyFinalizedWave { .. }
+            | Self::VerifyFinalization { .. }
             | Self::VerifyProvisions { .. }
             | Self::FetchAndBroadcastProvisions { .. }
             | Self::SignAndSendExecutionVote { .. }
@@ -1712,7 +1713,7 @@ impl Action {
             | Self::AggregateExecutionCertificate { .. }
             | Self::VerifyAndAggregateExecutionVotes { .. }
             | Self::VerifyExecutionCertificateSignature { .. }
-            | Self::VerifyFinalizedWave { .. }
+            | Self::VerifyFinalization { .. }
             | Self::VerifyQcSignature { .. }
             | Self::VerifyTimeout { .. }
             | Self::VerifyRemoteHeaderQc { .. }
@@ -1823,7 +1824,7 @@ impl Action {
             Self::AggregateExecutionCertificate { .. }
             | Self::VerifyAndAggregateExecutionVotes { .. }
             | Self::VerifyExecutionCertificateSignature { .. }
-            | Self::VerifyFinalizedWave { .. }
+            | Self::VerifyFinalization { .. }
             | Self::ExecuteTransactions { .. }
             | Self::SignAndSendExecutionVote { .. }
             | Self::BroadcastExecutionCertificate { .. } => ActionOwner::Execution,

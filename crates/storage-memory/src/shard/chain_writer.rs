@@ -12,7 +12,7 @@ use hyperscale_storage::{
     merge_writes_from_receipts,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, FinalizedWave, PreparedCommit,
+    BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
     QuorumCertificate, SettledWrites, StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
 };
 
@@ -23,7 +23,7 @@ impl ShardChainWriter for SimShardStorage {
     fn prepare_block_commit(
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
-        finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
+        finalizations: &[Arc<Verifiable<Finalization>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         // Memory backend already keeps state in-memory — the priors
@@ -32,11 +32,11 @@ impl ShardChainWriter for SimShardStorage {
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         // Everything the waves carried, for storage; only what they
         // decided reaches state.
-        let receipts: Vec<StoredReceipt> = finalized_waves
+        let receipts: Vec<StoredReceipt> = finalizations
             .iter()
             .flat_map(|fw| fw.receipts().iter().cloned())
             .collect();
-        let settling: Vec<StoredReceipt> = finalized_waves
+        let settling: Vec<StoredReceipt> = finalizations
             .iter()
             .flat_map(|fw| fw.settling_receipts())
             .collect();
@@ -187,7 +187,7 @@ fn build_prepared_commit(
             for fw in block.certificates().iter() {
                 let tick_id = *fw.tick_id();
                 c.certificates.insert(tick_id, fw.attestation());
-                c.wave_certs_by_height
+                c.finalizations_by_height
                     .entry(tick_id.block_height())
                     .or_default()
                     .push(tick_id);
@@ -274,14 +274,14 @@ impl SimShardStorage {
             for fw in block.certificates().iter() {
                 let tick_id = *fw.tick_id();
                 c.certificates.insert(tick_id, fw.attestation());
-                c.wave_certs_by_height
+                c.finalizations_by_height
                     .entry(tick_id.block_height())
                     .or_default()
                     .push(tick_id);
             }
             // Store receipts atomically with block commit.
             c.insert_receipts(receipts);
-            // Store execution certificates (extracted from wave certs) atomically.
+            // Store execution certificates (extracted from finalizations) atomically.
             for fw in block.certificates().iter() {
                 for ec in fw.execution_certificates() {
                     for outcome in ec.tx_outcomes() {

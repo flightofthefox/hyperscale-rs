@@ -4,7 +4,7 @@ use std::sync::Arc;
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::test_helpers::{
     make_settled_writes, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
-    make_test_execution_certificate, make_test_qc, make_test_receipt, make_test_wave_certificate,
+    make_test_execution_certificate, make_test_finalization, make_test_qc, make_test_receipt,
     state_key, test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
     test_witness_payload_range_reads as helpers_test_witness_payload_range_reads,
@@ -15,11 +15,11 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-    BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
-    FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, ProposerTimestamp,
-    QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot,
-    StoredReceipt, SubstateKey, SyncHint, TickId, TxHash, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, WitnessSources,
+    BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate, Finalization,
+    GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, ProposerTimestamp, QuorumCertificate,
+    Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot, StoredReceipt,
+    SubstateKey, SyncHint, TickId, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -206,7 +206,7 @@ fn test_commit_certificate_with_writes_persists_both() {
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     let writes = make_settled_writes(1, 10, vec![99, 88, 77]);
-    let cert = make_test_wave_certificate(BlockHeight::new(42), ShardId::ROOT);
+    let cert = make_test_finalization(BlockHeight::new(42), ShardId::ROOT);
     let tick_id = *cert.tick_id();
 
     storage.commit_certificate_with_writes(&cert, &writes);
@@ -380,7 +380,7 @@ fn test_certificate_idempotency() {
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     let updates = make_settled_writes(1, 10, vec![99, 88, 77]);
-    let cert = make_test_wave_certificate(BlockHeight::new(42), ShardId::ROOT);
+    let cert = make_test_finalization(BlockHeight::new(42), ShardId::ROOT);
     let tick_id = *cert.tick_id();
 
     storage.commit_certificate_with_writes(&cert, &updates);
@@ -449,9 +449,9 @@ fn test_state_root_changes_on_commit() {
 // ShardChainWriter
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Append a `FinalizedWave` to a block in place. Because `Block` is an enum,
+/// Append a `Finalization` to a block in place. Because `Block` is an enum,
 /// this replaces the whole value via `std::mem::replace`.
-fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
+fn push_wave(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
     let taken = std::mem::replace(
         block,
         Block::Sealed {
@@ -500,12 +500,12 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
     };
 }
 
-/// Wrap receipts into a single `FinalizedWave` attached to `block.certificates`,
+/// Wrap receipts into a single `Finalization` attached to `block.certificates`,
 /// so the new `commit_block` (which derives receipts from `block.certificates`)
 /// can apply them.
 fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
-    let new_fw: Arc<Verifiable<FinalizedWave>> = Arc::new(
-        FinalizedWave::new(
+    let new_fw: Arc<Verifiable<Finalization>> = Arc::new(
+        Finalization::new(
             TickId::new(ShardId::ROOT, block.height()),
             vec![placeholder_local_ec(ShardId::ROOT, block.height())],
             receipts,
@@ -638,7 +638,7 @@ fn test_commit_block_stores_certificates() {
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     let shard = ShardId::ROOT;
-    let cert = make_test_wave_certificate(BlockHeight::new(1), shard);
+    let cert = make_test_finalization(BlockHeight::new(1), shard);
     let tick_id = *cert.tick_id();
 
     // Create a block that includes this certificate
@@ -693,8 +693,8 @@ fn test_certificates_batch() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
-    let cert1 = make_test_wave_certificate(BlockHeight::new(1), ShardId::ROOT);
-    let cert2 = make_test_wave_certificate(BlockHeight::new(2), ShardId::ROOT);
+    let cert1 = make_test_finalization(BlockHeight::new(1), ShardId::ROOT);
+    let cert2 = make_test_finalization(BlockHeight::new(2), ShardId::ROOT);
     let id1 = *cert1.tick_id();
     let id2 = *cert2.tick_id();
 
@@ -762,7 +762,7 @@ fn test_certificate_store_and_retrieve() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
-    let cert = make_test_wave_certificate(BlockHeight::new(1), ShardId::ROOT);
+    let cert = make_test_finalization(BlockHeight::new(1), ShardId::ROOT);
     let tick_id = *cert.tick_id();
 
     storage.put_certificate(&tick_id, &cert);
@@ -801,7 +801,7 @@ fn test_commit_certificate_via_commit_store() {
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     let updates = make_settled_writes(1, 10, vec![42]);
-    let cert = make_test_wave_certificate(BlockHeight::new(1), ShardId::ROOT);
+    let cert = make_test_finalization(BlockHeight::new(1), ShardId::ROOT);
 
     storage.commit_certificate_with_writes(&cert, &updates);
 
@@ -834,7 +834,7 @@ fn test_substates_survive_reopen() {
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
         let updates = make_settled_writes(1, 10, vec![42]);
-        let cert = make_test_wave_certificate(BlockHeight::new(1), ShardId::ROOT);
+        let cert = make_test_finalization(BlockHeight::new(1), ShardId::ROOT);
         cert_id = *cert.tick_id();
         storage.commit_certificate_with_writes(&cert, &updates);
         root_after_write = storage.state_root();
@@ -942,7 +942,7 @@ fn test_ec_survives_reopen() {
         let mut block = make_test_block(BlockHeight::new(1));
         push_wave(
             &mut block,
-            Arc::new(FinalizedWave::new(tick_id, vec![Arc::new(ec)], vec![]).into()),
+            Arc::new(Finalization::new(tick_id, vec![Arc::new(ec)], vec![]).into()),
         );
         storage.commit_block(&make_test_certified(block), &no_witness());
     }
@@ -966,7 +966,7 @@ fn test_ec_atomic_with_block_commit() {
     let mut block = make_test_block(BlockHeight::new(1));
     push_wave(
         &mut block,
-        Arc::new(FinalizedWave::new(tick_id, vec![Arc::new(ec)], vec![]).into()),
+        Arc::new(Finalization::new(tick_id, vec![Arc::new(ec)], vec![]).into()),
     );
     // Commit block with EC atomically
     storage.commit_block(&make_test_certified(block), &no_witness());
@@ -990,7 +990,7 @@ fn test_ec_atomic_with_block_commit() {
 // snapshot isolation, column family) so backend parity is not free.
 
 /// Helper: port of `commit_with` from the memory tests. Injects the updates
-/// as a single-tx `FinalizedWave` receipt inside a block and commits it.
+/// as a single-tx `Finalization` receipt inside a block and commits it.
 fn rocks_commit_with(
     storage: &RocksDbShardStorage,
     writes: &SettledWrites,
@@ -1010,7 +1010,7 @@ fn rocks_commit_with(
             metadata: None,
         };
         let wave = Arc::new(
-            FinalizedWave::new(
+            Finalization::new(
                 TickId::new(ShardId::ROOT, block.height()),
                 vec![placeholder_local_ec(ShardId::ROOT, block.height())],
                 vec![receipt],

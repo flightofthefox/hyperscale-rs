@@ -25,7 +25,7 @@
 //!
 //! 2. **`BlockCompletion`** — DA gap-closure for the *current* proposal. Delay
 //!    extends the voting window but the round still completes
-//!    (`GetTransactions`, `GetLocalProvisions`, `GetFinalizedWaves` on the
+//!    (`GetTransactions`, `GetLocalProvisions`, `GetFinalizations` on the
 //!    pending-block path).
 //!
 //! 3. **`CrossShardProgress`** — Execution and finalization across shards.
@@ -77,7 +77,7 @@ pub enum MessageClass {
     /// Includes (on the hot pending-block path):
     /// - `GetTransactionsRequest/Response`
     /// - `GetLocalProvisionsRequest/Response`
-    /// - `GetFinalizedWavesRequest/Response`
+    /// - `GetFinalizationsRequest/Response`
     ///
     /// Delay extends the voting window but the round still completes.
     BlockCompletion = 1,

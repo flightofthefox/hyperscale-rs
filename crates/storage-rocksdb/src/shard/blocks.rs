@@ -3,7 +3,7 @@
 //! A committed [`CertifiedBlock`] is sharded across four column families:
 //! [`BlocksCf`] holds per-height [`BlockMetadata`] (header + manifest + qc),
 //! [`TransactionsCf`] holds individual transactions keyed by [`TxHash`],
-//! [`CertificatesCf`] holds wave certificates keyed by [`TickId`], and
+//! [`CertificatesCf`] holds finalizations keyed by [`TickId`], and
 //! [`ConsensusReceiptsCf`] holds the consensus receipt for each block.
 //!
 //! Reading a block reconstructs it via `get_block_denormalized`, which
@@ -20,7 +20,7 @@ use std::time::Instant;
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, BlockMetadata, CertifiedBlock,
-    FinalizedWave, Hash, ProvisionHash, QuorumCertificate, TickId, Transaction, TxHash, Verifiable,
+    Finalization, Hash, ProvisionHash, QuorumCertificate, TickId, Transaction, TxHash, Verifiable,
     Verified,
 };
 use rocksdb::{ColumnFamily, WriteBatch};
@@ -242,16 +242,16 @@ impl RocksDbShardStorage {
             return None;
         }
 
-        // 4. Reconstruct each FinalizedWave from cert + stored receipts.
+        // 4. Reconstruct each Finalization from cert + stored receipts.
         //
         // The reconstructed waves arrive at the Block as
         // [`Verifiable::Unverified`]: the on-disk shape didn't carry the
         // marker, so the upstream verification claim isn't available here.
         // Downstream readers run the predicate when needed.
-        let certificates: Option<Vec<Arc<Verifiable<FinalizedWave>>>> = certs
+        let certificates: Option<Vec<Arc<Verifiable<Finalization>>>> = certs
             .into_iter()
             .map(|cert| {
-                FinalizedWave::reconstruct(cert, |h| {
+                Finalization::reconstruct(cert, |h| {
                     get::<ConsensusReceiptsCf>(&*self.db, consensus_cf, &Hash::from(*h))
                         .map(Arc::new)
                 })
@@ -261,7 +261,7 @@ impl RocksDbShardStorage {
         let Some(certificates) = certificates else {
             tracing::warn!(
                 height = height.inner(),
-                "Block has missing receipts for a non-aborted tx - cannot reconstruct FinalizedWave"
+                "Block has missing receipts for a non-aborted tx - cannot reconstruct Finalization"
             );
             return None;
         };
@@ -384,17 +384,17 @@ impl RocksDbShardStorage {
             return None;
         }
 
-        // 4. Reconstruct each FinalizedWave from cert + stored receipts. If any
+        // 4. Reconstruct each Finalization from cert + stored receipts. If any
         // wave has a non-aborted tx whose receipt is missing, the block is not
         // servable and the syncing peer must try a different source.
         //
         // Reconstructed waves arrive at the Block as
         // [`Verifiable::Unverified`] — see the sibling reader above for
         // rationale.
-        let certificates: Option<Vec<Arc<Verifiable<FinalizedWave>>>> = certs
+        let certificates: Option<Vec<Arc<Verifiable<Finalization>>>> = certs
             .into_iter()
             .map(|cert| {
-                FinalizedWave::reconstruct(cert, |h| {
+                Finalization::reconstruct(cert, |h| {
                     get::<ConsensusReceiptsCf>(&*self.db, consensus_cf, &Hash::from(*h))
                         .map(Arc::new)
                 })
@@ -404,7 +404,7 @@ impl RocksDbShardStorage {
         let Some(certificates) = certificates else {
             tracing::debug!(
                 height = height.inner(),
-                "Block has missing receipts - cannot reconstruct FinalizedWave for sync"
+                "Block has missing receipts - cannot reconstruct Finalization for sync"
             );
             let elapsed = start.elapsed().as_secs_f64();
             record_storage_operation("get_block_for_sync_incomplete", elapsed);
@@ -480,7 +480,7 @@ impl RocksDbShardStorage {
         &self,
         certificates_cf: &ColumnFamily,
         ids: &[TickId],
-    ) -> Vec<FinalizedWave> {
+    ) -> Vec<Finalization> {
         if ids.is_empty() {
             return vec![];
         }
@@ -548,12 +548,12 @@ impl RocksDbShardStorage {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Store a wave's attestation.
-    pub fn put_certificate(&self, id: &TickId, cert: &FinalizedWave) {
+    pub fn put_certificate(&self, id: &TickId, cert: &Finalization) {
         self.cf_put_sync::<CertificatesCf>(id, cert);
     }
 
     /// Get a wave's attestation by `TickId`.
-    pub fn get_certificate(&self, id: &TickId) -> Option<FinalizedWave> {
+    pub fn get_certificate(&self, id: &TickId) -> Option<Finalization> {
         self.cf_get::<CertificatesCf>(id)
     }
 
@@ -561,7 +561,7 @@ impl RocksDbShardStorage {
     ///
     /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
     /// Returns only certificates that were found (missing ids are skipped).
-    pub fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<FinalizedWave> {
+    pub fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<Finalization> {
         if ids.is_empty() {
             return vec![];
         }
@@ -591,7 +591,7 @@ mod test_helpers {
         record_certificate_persisted, record_storage_batch_size, record_storage_operation,
         record_storage_write,
     };
-    use hyperscale_types::{BlockHeight, FinalizedWave, Hash, QuorumCertificate, SettledWrites};
+    use hyperscale_types::{BlockHeight, Finalization, Hash, QuorumCertificate, SettledWrites};
     use rocksdb::{WriteBatch, WriteOptions};
     use tracing::field::Empty;
     use tracing::{Level, Span, instrument};
@@ -632,7 +632,7 @@ mod test_helpers {
                 .expect("set_chain_metadata: synced write failed");
         }
 
-        /// Test-only deferred-commit shim for a single wave certificate
+        /// Test-only deferred-commit shim for a single finalization
         /// plus its state writes. Production goes through `commit_block`,
         /// which folds the cert and state writes into the atomic
         /// JMT-update batch under `commit_lock`.
@@ -646,7 +646,7 @@ mod test_helpers {
         ))]
         pub fn commit_certificate_with_writes(
             &self,
-            certificate: &FinalizedWave,
+            certificate: &Finalization,
             writes: &SettledWrites,
         ) {
             let start = Instant::now();

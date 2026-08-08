@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-    ConsensusReceipt, ExecutionCertificate, FinalizedWave, ProvisionHash, QuorumCertificate,
+    ConsensusReceipt, ExecutionCertificate, Finalization, ProvisionHash, QuorumCertificate,
     ShardWitnessPayload, TickId, Transaction, TxHash, Verified,
 };
 
@@ -81,7 +81,7 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Get multiple certificates by `TickId` (batch read).
     ///
     /// Returns only certificates that were found (missing ids are skipped).
-    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<FinalizedWave>;
+    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<Finalization>;
 
     /// Retrieve the consensus-bound receipt portion for a transaction.
     fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>>;

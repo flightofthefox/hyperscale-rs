@@ -11,7 +11,7 @@ use hyperscale_storage::{
     merge_writes_from_receipts,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, FinalizedWave, PreparedCommit,
+    BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
     QuorumCertificate, SettledWrites, StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
 };
 use rocksdb::{WriteBatch, WriteOptions};
@@ -27,18 +27,18 @@ impl ShardChainWriter for RocksDbShardStorage {
     fn prepare_block_commit(
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
-        finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
+        finalizations: &[Arc<Verifiable<Finalization>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         // Everything the waves carried, for storage; only what they
         // decided reaches state.
-        let receipts: Vec<&StoredReceipt> = finalized_waves
+        let receipts: Vec<&StoredReceipt> = finalizations
             .iter()
             .flat_map(|fw| fw.receipts().iter())
             .collect();
-        let settling: Vec<StoredReceipt> = finalized_waves
+        let settling: Vec<StoredReceipt> = finalizations
             .iter()
             .flat_map(|fw| fw.settling_receipts())
             .collect();

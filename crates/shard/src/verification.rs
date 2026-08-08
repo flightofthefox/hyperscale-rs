@@ -14,11 +14,10 @@ use std::sync::Arc;
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_types::{
     BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
-    CertifiedBlock, ChainOrigin, FinalizedWave, LinkageError, LocalReceiptRoot,
-    ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds, RevealChain,
-    SettledTxsRoot, ShardId, SplitChildRoots, StateRoot, TopologySchedule, TopologySnapshot,
-    TransactionRoot, Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp,
-    WorkInFlight,
+    CertifiedBlock, ChainOrigin, Finalization, LinkageError, LocalReceiptRoot, ProvisionTxRootsMap,
+    ProvisionsRoot, QuorumCertificate, ReshapeThresholds, RevealChain, SettledTxsRoot, ShardId,
+    SplitChildRoots, StateRoot, TopologySchedule, TopologySnapshot, TransactionRoot, Verifiable,
+    Verified, VerifiedBlockAssembleError, WeightedTimestamp, WorkInFlight,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -38,7 +37,7 @@ pub enum VerificationKind {
     StateRoot,
     /// Merkle root over the block's transactions plus per-tx validity-window check.
     TransactionRoot,
-    /// Merkle root over included wave certificates' receipt hashes.
+    /// Merkle root over included finalizations' receipt hashes.
     CertificateRoot,
     /// Merkle root over the block's local receipts.
     LocalReceiptRoot,
@@ -80,7 +79,7 @@ pub struct PendingQcVerification {
 /// State root verification that is ready to dispatch (JMT is at the correct root).
 ///
 /// The `NodeStateMachine` drains these after each shard consensus call and emits
-/// `VerifyStateRoot` actions. `parent_state_root` and `finalized_waves` are
+/// `VerifyStateRoot` actions. `parent_state_root` and `finalizations` are
 /// resolved at drain time from the current chain/pending-block state, not
 /// captured at `initiate_state_root_verification` time — capturing at initiate
 /// time produced a stale-snapshot race where an entry deferred before its
@@ -105,9 +104,9 @@ pub struct ReadyStateRootVerification {
     pub expected_root: StateRoot,
     /// Local-receipt root from the block header (pre-flight check).
     pub expected_local_receipt_root: LocalReceiptRoot,
-    /// Finalized waves from the `PendingBlock` — these carry the proposer's receipts,
+    /// Finalizations from the `PendingBlock` — these carry the proposer's receipts,
     /// ensuring all validators verify against the same execution outputs.
-    pub finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+    pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
     /// Height of the block being verified.
     pub block_height: BlockHeight,
     /// The header's `split_child_roots` claim, verified beside the
@@ -144,7 +143,7 @@ pub enum InFlightCheck {
 }
 
 /// Internal queue entry for state root verification. Holds only block identity
-/// — `parent_state_root` and `finalized_waves` are resolved freshly at drain
+/// — `parent_state_root` and `finalizations` are resolved freshly at drain
 /// time against the current chain view.
 #[derive(Debug, Clone)]
 pub struct PendingStateRootVerification {
@@ -1020,7 +1019,7 @@ impl VerificationPipeline {
     ///
     /// If JMT is ready, pushes to the ready queue for immediate dispatch.
     /// Otherwise, queues for later when JMT catches up. Only block identity
-    /// is captured; `parent_state_root` and `finalized_waves` are resolved
+    /// is captured; `parent_state_root` and `finalizations` are resolved
     /// freshly at drain time to avoid stale-snapshot races where an entry
     /// deferred before its parent committed would dispatch with the wrong
     /// base state.
@@ -1308,7 +1307,7 @@ impl VerificationPipeline {
     /// Pure CPU check that runs in parallel with the other per-root
     /// verifiers. Pulls the deterministic inputs (`parent_witness_leaves`
     /// from the in-chain pending-block walk, `witness_sources` and
-    /// `finalized_waves` from the block itself) so callers only thread
+    /// `finalizations` from the block itself) so callers only thread
     /// the parts they own.
     /// The handler re-derives the leaf list and emits
     /// `BeaconWitnessRootVerified { block_hash, valid }`.
@@ -1376,7 +1375,7 @@ impl VerificationPipeline {
                 return Vec::new();
             }
         };
-        let finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>> =
+        let finalizations: Vec<Arc<Verifiable<Finalization>>> =
             block.certificates().iter().cloned().collect();
         debug!(
             ?block_hash,
@@ -1425,7 +1424,7 @@ impl VerificationPipeline {
             substate_bytes,
             claimed_substate_bytes: header.load().substate_bytes,
             thresholds,
-            finalized_waves,
+            finalizations,
             topology_snapshot: topology_snapshot.clone(),
         }]
     }
@@ -2046,7 +2045,7 @@ impl VerificationPipeline {
     /// Drain state root verifications that are ready to dispatch.
     ///
     /// Each drained entry is enriched at drain time (not when it was queued)
-    /// with a fresh `parent_state_root` and `finalized_waves` snapshot.
+    /// with a fresh `parent_state_root` and `finalizations` snapshot.
     /// Capturing these eagerly produced a stale-snapshot race: an entry
     /// deferred before its parent committed would still hold the
     /// pre-commit `parent_state_root`, causing the dispatched verification
@@ -2058,12 +2057,12 @@ impl VerificationPipeline {
     }
 
     /// Resolve one taken entry's dispatch inputs against the caller's chain
-    /// view — `parent_state_root` and `finalized_waves` freshly at drain
+    /// view — `parent_state_root` and `finalizations` freshly at drain
     /// time, avoiding stale-snapshot races where an entry deferred before
     /// its parent committed would dispatch with the wrong base state.
     /// `None` when the pending block was removed between queue-up and drain
     /// (a sibling verification fails, view change, etc.) — dispatching with
-    /// empty `finalized_waves` would recompute the wrong state root against
+    /// empty `finalizations` would recompute the wrong state root against
     /// ghost inputs.
     pub(crate) fn resolve_ready_state_root_verification(
         pending: &PendingStateRootVerification,
@@ -2080,7 +2079,7 @@ impl VerificationPipeline {
                 None
             })?;
         let parent_state_root = chain.parent_state_root(pending.parent_block_hash);
-        let finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>> =
+        let finalizations: Vec<Arc<Verifiable<Finalization>>> =
             block.certificates().iter().cloned().collect();
         Some(ReadyStateRootVerification {
             block_hash: pending.block_hash,
@@ -2089,7 +2088,7 @@ impl VerificationPipeline {
             parent_block_height: pending.parent_block_height,
             expected_root: pending.expected_root,
             expected_local_receipt_root: pending.expected_local_receipt_root,
-            finalized_waves,
+            finalizations,
             block_height: pending.block_height,
             claimed_split_child_roots: pending.claimed_split_child_roots,
             split_child_roots_required: pending.split_child_roots_required,
@@ -2643,7 +2642,7 @@ mod tests {
     fn drain_skips_entries_whose_pending_block_is_gone() {
         // A sibling verification can call `remove_pending_block` between
         // queue-up and drain. Drain must skip the orphaned entry rather than
-        // dispatch with empty `finalized_waves` against the wrong inputs.
+        // dispatch with empty `finalizations` against the wrong inputs.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let parent_block_hash = bh(b"parent");
         let block = block_with(BlockHeight::new(1), parent_block_hash, 0, vec![]);

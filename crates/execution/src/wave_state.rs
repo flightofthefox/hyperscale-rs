@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use hyperscale_core::{CrossShardExecutionRequest, TickExecutionGroup};
 use hyperscale_types::{
-    BlockHash, BlockHeight, DeclaredKey, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
+    BlockHash, BlockHeight, DeclaredKey, ExecutionCertificate, ExecutionOutcome, Finalization,
     GlobalReceiptRoot, Mode, RevealChain, Settles, ShardId, StoredReceipt, TickId, Transaction,
     TransactionDecision, TxHash, TxOutcome, Verifiable, Verified, WAVE_TIMEOUT, WeightedTimestamp,
     compute_global_receipt_root, refused_transactions, settles,
@@ -60,7 +60,7 @@ pub struct Divergence {
 ///
 /// Under the two-stage lifecycle (windows gate admission, the wave/execution
 /// timeout owns termination), every tx is supposed to terminate with a
-/// `FinalizedWave` — success via vote aggregation or abort via the
+/// `Finalization` — success via vote aggregation or abort via the
 /// deterministic all-abort fallback. The threshold is set past
 /// `WAVE_TIMEOUT` so waves resolving via the normal abort path
 /// (including cross-shard cert gossip) pass silently. If a wave reaches
@@ -134,9 +134,9 @@ pub struct WaveState {
     /// Execution results from the engine (per-tx). Non-abort outcomes only.
     execution_results: HashMap<TxHash, ExecutionOutcome>,
     /// Local receipts from the engine, one per executed tx. Drained into the
-    /// `FinalizedWave` at finalization via `take_receipt`. Scoping these to
+    /// `Finalization` at finalization via `take_receipt`. Scoping these to
     /// the wave (rather than a process-wide cache) prevents a receipt from a
-    /// locally-executed tx from leaking into a `FinalizedWave` whose EC later
+    /// locally-executed tx from leaking into a `Finalization` whose EC later
     /// attests that tx as `Aborted` — the `ExtraReceipt` race.
     execution_receipts: HashMap<TxHash, StoredReceipt>,
     /// Explicit aborts from `ConflictDetector`. Distinct from remote-reported
@@ -656,7 +656,7 @@ impl WaveState {
     }
 
     /// Take the receipt for a tx, removing it from the wave. Used internally
-    /// by [`Self::into_finalized`] to drain receipts in canonical order.
+    /// by [`Self::into_finalization`] to drain receipts in canonical order.
     fn take_receipt(&mut self, tx_hash: TxHash) -> Option<StoredReceipt> {
         self.execution_receipts.remove(&tx_hash)
     }
@@ -742,22 +742,22 @@ impl WaveState {
     /// True if, for every non-aborted outcome in the local EC, this validator
     /// has produced a matching local receipt. Aborted outcomes need no receipt.
     ///
-    /// Gates [`Self::is_complete`] so `finalize_wave` can't produce a
-    /// [`FinalizedWave`] that fails
-    /// [`FinalizedWave::validate_receipts_against_ec`]. The check mirrors that
+    /// Gates [`Self::is_complete`] so `finalize` can't produce a
+    /// [`Finalization`] that fails
+    /// [`Finalization::validate_receipts_against_ec`]. The check mirrors that
     /// invariant: a receipt is needed exactly for the outcomes the EC attests
     /// as `Executed`. When this validator's local abort decision disagrees
     /// with the quorum's EC (e.g. its conflict detector aborted a tx peers
     /// executed), the gate blocks here rather than synthesizing a
-    /// `FinalizedWave` with missing receipts. Recovery flows through the
+    /// `Finalization` with missing receipts. Recovery flows through the
     /// existing peer-fetch path.
     ///
     /// Returns false if the local EC hasn't arrived yet; `local_ec_emitted`
     /// is checked separately by [`Self::is_complete`] for the same reason.
     ///
-    /// [`FinalizedWave`]: hyperscale_types::FinalizedWave
-    /// [`FinalizedWave::validate_receipts_against_ec`]:
-    ///     hyperscale_types::FinalizedWave::validate_receipts_against_ec
+    /// [`Finalization`]: hyperscale_types::Finalization
+    /// [`Finalization::validate_receipts_against_ec`]:
+    ///     hyperscale_types::Finalization::validate_receipts_against_ec
     fn has_local_receipts_for_non_aborted(&self) -> bool {
         let Some(local_ec) = self
             .execution_certificates
@@ -929,7 +929,7 @@ impl WaveState {
     /// validator finishes executing; the reconciliation runs again from
     /// `build_vote_data` once the local vote lands.
     ///
-    /// Returns `true` if the wave is now complete (ready for `finalize_wave`).
+    /// Returns `true` if the wave is now complete (ready for `finalize`).
     pub fn add_execution_certificate(&mut self, ec: Arc<Verified<ExecutionCertificate>>) -> bool {
         if !self.seen_ec_wave_ids.insert(*ec.tick_id()) {
             return self.is_complete();
@@ -1018,8 +1018,8 @@ impl WaveState {
     /// The local-receipt gate prevents the race where a cross-shard wave's
     /// local EC arrives (aggregated from other validators' votes) before
     /// this validator's engine finishes executing — without it,
-    /// `finalize_wave` silently drops the pending txs' receipt slots and
-    /// produces a divergent `FinalizedWave`.
+    /// `finalize` silently drops the pending txs' receipt slots and
+    /// produces a divergent `Finalization`.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         if !self.local_ec_emitted {
@@ -1074,7 +1074,7 @@ impl WaveState {
     /// Emit a `warn!` log exactly once, when the wave reaches
     /// `WAVE_OVERDUE_WARN` of age without completing. A firing here is an
     /// invariant violation under the two-stage lifecycle — every tx is
-    /// supposed to terminate with a `FinalizedWave` — so the dump
+    /// supposed to terminate with a `Finalization` — so the dump
     /// captures enough state to diagnose where the post-inclusion
     /// termination guarantee broke (provisioning / dispatch / voting /
     /// EC collection). Latched at the first crossing of the threshold so
@@ -1154,7 +1154,7 @@ impl WaveState {
     /// set — so pruning on `tracker_aborted` alone discards the only
     /// artifact carrying that verdict. Every downstream reader derives the
     /// outcome from the certificate and nothing else
-    /// ([`FinalizedWave::tx_decisions`]), so what that drops is not merely
+    /// ([`Finalization::tx_decisions`]), so what that drops is not merely
     /// redundant: the local EC's success stands unopposed and this shard
     /// commits an accept against the counterparty's abort. An abort the
     /// local EC reports itself needs no such corroboration, which is why a
@@ -1162,7 +1162,7 @@ impl WaveState {
     ///
     /// Callers should invoke only when `is_complete()` is true.
     #[must_use]
-    pub fn attestation(&self) -> FinalizedWave {
+    pub fn attestation(&self) -> Finalization {
         // What the local EC says on its own. A tx it already reports as
         // aborted needs no remote to corroborate it.
         let locally_aborted: HashSet<TxHash> = self
@@ -1208,10 +1208,10 @@ impl WaveState {
 
         ecs.sort_by(|a, b| (&a.shard_id(), a.tick_id()).cmp(&(&b.shard_id(), b.tick_id())));
 
-        FinalizedWave::from_verified_ecs(self.tick_id, ecs)
+        Finalization::from_verified_ecs(self.tick_id, ecs)
     }
 
-    /// Consume the wave and produce its terminal [`FinalizedWave`].
+    /// Consume the wave and produce its terminal [`Finalization`].
     ///
     /// Builds the [`attestation`](Self::attestation) and drains one stored
     /// receipt per outcome that settles anything, in canonical order.
@@ -1226,7 +1226,7 @@ impl WaveState {
     /// guarantees both the local EC's presence and a receipt for every
     /// non-aborted outcome. A missing receipt under those conditions is an
     /// invariant violation, logged but not fatal so the canonical
-    /// `FinalizedWave` admitted via block sync can still recover the node.
+    /// `Finalization` admitted via block sync can still recover the node.
     ///
     /// # Panics
     ///
@@ -1235,13 +1235,13 @@ impl WaveState {
     /// `execution_certificates` — and thus in the attestation — is
     /// guaranteed at the legitimate call site.
     #[must_use]
-    pub fn into_finalized(mut self) -> FinalizedWave {
+    pub fn into_finalization(mut self) -> Finalization {
         let attestation = self.attestation();
         let local_ec = attestation
             .execution_certificates()
             .iter()
             .find(|ec| ec.tick_id() == attestation.tick_id())
-            .expect("finalized-wave invariant: local EC must be present")
+            .expect("finalization invariant: local EC must be present")
             .clone();
         let refused = refused_transactions(attestation.execution_certificates());
         let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
@@ -1264,7 +1264,7 @@ impl WaveState {
                 tracing::error!(
                     wave = %self.tick_id,
                     tx_hash = ?outcome.tx_hash(),
-                    "into_finalized: an outcome that settles something is missing \
+                    "into_finalization: an outcome that settles something is missing \
                      its stored receipt (is_complete gate bypassed)"
                 );
             }
@@ -1619,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_abort_survives_into_the_wave_certificate() {
+    fn a_remote_abort_survives_into_the_finalization() {
         // A remote shard's abort is only ever carried by that shard's EC, and
         // the certificate is the whole of what a committed block keeps: every
         // downstream reader derives the outcome from it alone. Pruning the EC
@@ -1662,7 +1662,7 @@ mod tests {
         // local EC is aggregated from *other* validators' votes while this
         // validator's engine is still running. Coverage looks good but
         // there are no local receipts yet — finalizing here would produce
-        // a `FinalizedWave` with missing receipts. Gate must hold until
+        // a `Finalization` with missing receipts. Gate must hold until
         // the engine catches up.
         let mut w = make_cross_shard_wave(2);
         let h0 = w.tx_hashes()[0];
@@ -1720,8 +1720,8 @@ mod tests {
         // This validator's conflict detector aborted h0 locally (e.g. because
         // it was behind on commits and saw different prior provisions). The
         // quorum executed h0 and aggregated a local EC attesting Executed.
-        // Without a receipt-vs-EC gate, finalize_wave would build a
-        // FinalizedWave missing h0's receipt — which later fails
+        // Without a receipt-vs-EC gate, finalize would build a
+        // Finalization missing h0's receipt — which later fails
         // `validate_receipts_against_ec` on any peer. The gate must block
         // and let the existing peer-fetch path recover.
         let mut w = make_cross_shard_wave(2);
@@ -1748,7 +1748,7 @@ mod tests {
         // Quorum aggregated EC with root R2 (other validators' agreed root).
         // R1 != R2 ⇒ this validator's `ConsensusReceipt::Succeeded.database_updates`
         // differs from canonical. Wave must not finalize locally; the
-        // canonical `FinalizedWave` is recovered later via block-sync.
+        // canonical `Finalization` is recovered later via block-sync.
         let mut w = make_single_shard_wave(2);
         let h0 = w.tx_hashes()[0];
         let h1 = w.tx_hashes()[1];
@@ -1899,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn wave_certificate_excludes_remote_covering_only_aborts() {
+    fn finalization_excludes_remote_covering_only_aborts() {
         let mut w = make_cross_shard_wave(2);
         let h0 = w.tx_hashes()[0];
         let h1 = w.tx_hashes()[1];
@@ -2167,7 +2167,7 @@ mod tests {
         // The engine builds a fee receipt beside the execution receipt for
         // a leg this shard pays for. The deadline abort discards the
         // transaction's effects and settles that fee instead — so the
-        // finalized wave carries the fee receipt, not the execution one.
+        // finalization carries the fee receipt, not the execution one.
         let validity_end = ts_for(WAVE_START + 20);
         let (mut w, tx) = payer_wave_awaiting_echo(validity_end);
         let fee = fee_receipt_for(tx);
@@ -2186,7 +2186,7 @@ mod tests {
 
         let tick_id = *w.tick_id();
         w.add_execution_certificate(make_ec_from(&tick_id, outcomes));
-        let finalized = w.into_finalized();
+        let finalized = w.into_finalization();
         assert_eq!(finalized.receipts().len(), 1);
         assert_eq!(finalized.receipts()[0].tx_hash, tx);
         assert_eq!(finalized.receipts()[0].consensus.receipt_hash(), fee_hash);
@@ -2226,7 +2226,7 @@ mod tests {
         w.add_execution_certificate(make_ec_from(&tick_id, outcomes));
         w.add_execution_certificate(make_ec(&tick_id, ShardId::leaf(1, 1), &[tx], false));
 
-        let finalized = w.into_finalized();
+        let finalized = w.into_finalization();
         finalized
             .validate_receipts_against_ec()
             .expect("the receipt is the one the outcomes name");

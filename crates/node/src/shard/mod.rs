@@ -72,7 +72,7 @@ use crate::fetch::FetchInput;
 use crate::process::ProcessIo;
 use crate::shard::commit::PreparedCommitMap;
 use crate::shard::cross_shard::{
-    ExecCertBinding, FinalizedWaveBinding, LocalProvisionBinding, ProvisionBinding,
+    ExecCertBinding, FinalizationBinding, LocalProvisionBinding, ProvisionBinding,
 };
 use crate::shard::mempool::TransactionBinding;
 use crate::vnode::Vnode;
@@ -489,8 +489,8 @@ where
             ShardScopedInput::LocalProvisionsFetchFailed { hashes } => {
                 self.drive_fetch::<LocalProvisionBinding>(FetchInput::Failed { ids: hashes });
             }
-            ShardScopedInput::FinalizedWavesFetchFailed { ids } => {
-                self.drive_fetch::<FinalizedWaveBinding>(FetchInput::Failed { ids });
+            ShardScopedInput::FinalizationsFetchFailed { ids } => {
+                self.drive_fetch::<FinalizationBinding>(FetchInput::Failed { ids });
             }
             ShardScopedInput::ShardWitnessesFetchFailed { ids } => {
                 self.drive_fetch::<ShardWitnessBinding>(FetchInput::Failed { ids });

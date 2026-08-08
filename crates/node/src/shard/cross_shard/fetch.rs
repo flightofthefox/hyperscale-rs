@@ -1,7 +1,7 @@
 //! Cross-shard fetch bindings.
 //!
 //! The [`FetchBinding`] impls for the cross-shard data-availability payloads —
-//! provisions, execution certificates, finalized waves, and local provisions.
+//! provisions, execution certificates, finalizations, and local provisions.
 //! Each `fetch_mut` resolves the binding's `Fetch` instance out of this shard's
 //! [`CrossShardState`](super::CrossShardState). The generic engine, the
 //! `FetchBinding` trait, and the shared `partition_solicited` helper live in
@@ -14,11 +14,11 @@ use hyperscale_core::ProtocolEvent;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
-    GetExecutionCertsRequest, GetFinalizedWavesRequest, GetLocalProvisionsRequest,
+    GetExecutionCertsRequest, GetFinalizationsRequest, GetLocalProvisionsRequest,
     GetProvisionsRequest,
 };
 use hyperscale_types::{
-    BlockHeight, ExecutionCertificate, FinalizedWave, MessageClass, ProvisionHash, ShardId, TickId,
+    BlockHeight, ExecutionCertificate, Finalization, MessageClass, ProvisionHash, ShardId, TickId,
     TxHash, ValidatorId, Verifiable,
 };
 
@@ -28,8 +28,8 @@ use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, pu
 // ─── Type aliases ──────────────────────────────────────────────────────
 /// Local-provision fetch keyed by [`ProvisionHash`].
 pub type LocalProvisionFetch = Fetch<ProvisionHash>;
-/// Finalized-wave fetch keyed by [`TickId`].
-pub type FinalizedWaveFetch = Fetch<TickId>;
+/// Finalization fetch keyed by [`TickId`].
+pub type FinalizationFetch = Fetch<TickId>;
 /// Cross-shard execution-cert fetch keyed by [`TickId`].
 pub type ExecCertFetch = Fetch<(ShardId, TxHash)>;
 /// Cross-shard provision fetch keyed by
@@ -125,16 +125,16 @@ impl FetchBinding for LocalProvisionBinding {
     }
 }
 
-/// Marker type for the per-block finalized-wave fetch.
-pub struct FinalizedWaveBinding;
+/// Marker type for the per-block finalization fetch.
+pub struct FinalizationBinding;
 
-impl FetchBinding for FinalizedWaveBinding {
+impl FetchBinding for FinalizationBinding {
     type Id = TickId;
 
-    const NAME: &'static str = "finalized_wave";
+    const NAME: &'static str = "finalization";
 
     fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<TickId> {
-        &mut shard.cross_shard.finalized_wave
+        &mut shard.cross_shard.finalization
     }
 
     fn dispatch_chunk<N: Network>(
@@ -151,14 +151,15 @@ impl FetchBinding for FinalizedWaveBinding {
         network.request(
             shard,
             preferred,
-            GetFinalizedWavesRequest::new(ids),
+            GetFinalizationsRequest::new(ids),
             class,
             Box::new(move |result| {
                 if let Ok(resp) = result {
-                    let split = partition_solicited(resp.waves, &requested_ids, |w| [*w.tick_id()]);
+                    let split =
+                        partition_solicited(resp.finalizations, &requested_ids, |w| [*w.tick_id()]);
                     if !split.kept.is_empty() {
                         // Refcount is 1 right after decode, so each unwrap moves.
-                        let waves: Vec<Arc<Verifiable<FinalizedWave>>> = split
+                        let finalizations: Vec<Arc<Verifiable<Finalization>>> = split
                             .kept
                             .into_iter()
                             .map(|arc| Arc::new(Arc::unwrap_or_clone(arc).into()))
@@ -166,7 +167,7 @@ impl FetchBinding for FinalizedWaveBinding {
                         push_protocol_event(
                             &es,
                             local_shard,
-                            ProtocolEvent::FinalizedWavesReceived { waves },
+                            ProtocolEvent::FinalizationsReceived { finalizations },
                         );
                     }
                     let had_misses = !split.missing.is_empty();
@@ -174,7 +175,7 @@ impl FetchBinding for FinalizedWaveBinding {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::FinalizedWavesFetchFailed { ids: split.missing },
+                            ShardScopedInput::FinalizationsFetchFailed { ids: split.missing },
                         );
                     }
                     // Reject responses with unsolicited waves (peer scoring;
@@ -189,7 +190,7 @@ impl FetchBinding for FinalizedWaveBinding {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::FinalizedWavesFetchFailed { ids: requested_ids },
+                        ShardScopedInput::FinalizationsFetchFailed { ids: requested_ids },
                     );
                     ResponseVerdict::Accept
                 }

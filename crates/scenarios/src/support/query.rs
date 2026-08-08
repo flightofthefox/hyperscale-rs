@@ -21,7 +21,7 @@ use super::Cluster;
 ///
 /// Returns the height at which `tx` was committed (rides a block's
 /// `transactions`) and the height plus decision at which it was finalized
-/// (rides a `FinalizedWave` certificate). The decision matters at a reshape
+/// (rides a `Finalization` certificate). The decision matters at a reshape
 /// boundary: a counterpart abort finalizes the straddler with `Aborted`,
 /// which a presence-only check would misread as a one-sided apply.
 #[must_use]

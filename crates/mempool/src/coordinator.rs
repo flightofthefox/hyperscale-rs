@@ -564,7 +564,7 @@ impl MempoolCoordinator {
     /// Drive every in-flight (`Committed`) transaction to
     /// `Completed(Aborted)` via [`Self::abort_one`]. Called once when the
     /// local chain terminates at a reshape boundary: finalization is a
-    /// wave certificate in a later block, and a terminated chain commits
+    /// finalization in a later block, and a terminated chain commits
     /// no later block, so an in-flight tx here is permanently undecidable —
     /// abort is its terminal state.
     pub fn abort_in_flight(&mut self) -> Vec<Action> {
@@ -784,8 +784,8 @@ impl MempoolCoordinator {
             }));
         }
 
-        // Per-tx terminal state from committed wave certificates. Decisions are
-        // derived from each FinalizedWave directly, so this works identically
+        // Per-tx terminal state from committed finalizations. Decisions are
+        // derived from each Finalization directly, so this works identically
         // for consensus and sync commit paths.
         for fw in block.certificates().iter() {
             for (tx_hash, decision) in fw.tx_decisions() {
@@ -801,7 +801,7 @@ impl MempoolCoordinator {
         actions
     }
 
-    /// Mark a transaction as terminal in response to a committed wave certificate.
+    /// Mark a transaction as terminal in response to a committed finalization.
     ///
     /// Called from `on_block_committed` once per tx in `block.certificates`.
     /// Emits the terminal status update and evicts/tombstones the entry.
@@ -1129,7 +1129,7 @@ mod tests {
     use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
     use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_types::test_utils::{
-        TestCommittee, certify, install_stub_vm_statics, make_finalized_wave, make_live_block,
+        TestCommittee, certify, install_stub_vm_statics, make_finalization, make_live_block,
         stub_transaction, test_prefix, test_transaction, test_transaction_with_prefixes,
         test_validity_range,
     };
@@ -1141,7 +1141,7 @@ mod tests {
         Verified::new_unchecked_for_test(tx)
     }
     use hyperscale_types::{
-        Block, FinalizedWave, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId, TX_UNITS,
+        Block, Finalization, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId, TX_UNITS,
         ValidatorId,
     };
 
@@ -1156,12 +1156,12 @@ mod tests {
     /// "block count" intuition when reading test scenarios.
     const TEST_BLOCK_INTERVAL_MS: u64 = 500;
 
-    /// Assemble a certified single-tx block carrying one finalized-wave
+    /// Assemble a certified single-tx block carrying one finalization
     /// decision, with its QC timestamp stamped from the block height.
     fn certified_commit_block(
         height: BlockHeight,
         tx: Transaction,
-        fw: FinalizedWave,
+        fw: Finalization,
     ) -> CertifiedBlock {
         let block = make_live_block(
             ShardId::ROOT,
@@ -1373,7 +1373,7 @@ mod tests {
         let certified = certified_commit_block(
             BlockHeight::new(2),
             tx,
-            make_finalized_wave(BlockHeight::new(2), tx_hash, TransactionDecision::Accept),
+            make_finalization(BlockHeight::new(2), tx_hash, TransactionDecision::Accept),
         );
         mempool.on_block_committed(&topology_snapshot, &certified);
         assert_eq!(mempool.pending_expected_count(), 0);
@@ -1587,7 +1587,7 @@ mod tests {
         let certified = certified_commit_block(
             BlockHeight::new(2),
             tx,
-            make_finalized_wave(BlockHeight::new(2), tx_hash, TransactionDecision::Accept),
+            make_finalization(BlockHeight::new(2), tx_hash, TransactionDecision::Accept),
         );
         let actions = mempool.on_block_committed(&topology_snapshot, &certified);
 
@@ -1691,7 +1691,7 @@ mod tests {
         let topology_snapshot = make_test_topology();
         let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
 
-        // Submit a TX, then commit a block whose FinalizedWave aborts it.
+        // Submit a TX, then commit a block whose Finalization aborts it.
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
         mempool.on_submit_transaction(
@@ -1703,7 +1703,7 @@ mod tests {
         let certified = certified_commit_block(
             BlockHeight::new(1),
             tx,
-            make_finalized_wave(BlockHeight::new(1), tx_hash, TransactionDecision::Aborted),
+            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Aborted),
         );
         let actions = mempool.on_block_committed(&topology_snapshot, &certified);
 
@@ -1735,7 +1735,7 @@ mod tests {
         let tx = test_transaction_with_prefixes(b"straddler", &[test_prefix(7)], &[test_prefix(8)]);
         let tx_hash = tx.hash();
 
-        // Commit the tx with no deciding wave certificate: in flight,
+        // Commit the tx with no deciding finalization: in flight,
         // holding its declared-node locks.
         let block = make_live_block(
             ShardId::ROOT,
@@ -1774,7 +1774,7 @@ mod tests {
         let kept = test_transaction_with_prefixes(b"kept", &[test_prefix(9)], &[test_prefix(10)]);
         let kept_hash = kept.hash();
 
-        // Both commit with no deciding wave certificate, so both are
+        // Both commit with no deciding finalization, so both are
         // still in the drain.
         let block = make_live_block(
             ShardId::ROOT,
@@ -1838,7 +1838,7 @@ mod tests {
         let certified = certified_commit_block(
             BlockHeight::new(1),
             tx_done,
-            make_finalized_wave(
+            make_finalization(
                 BlockHeight::new(1),
                 tx_done_hash,
                 TransactionDecision::Accept,
@@ -1866,7 +1866,7 @@ mod tests {
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
 
-        // Submit and complete the transaction (commit + Accept wave cert in one block).
+        // Submit and complete the transaction (commit + Accept finalization in one block).
         mempool.on_submit_transaction(
             &topology_snapshot,
             Arc::new(verified(tx.clone())),
@@ -1875,7 +1875,7 @@ mod tests {
         let certified = certified_commit_block(
             BlockHeight::new(1),
             tx.clone(),
-            make_finalized_wave(BlockHeight::new(1), tx_hash, TransactionDecision::Accept),
+            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept),
         );
         mempool.on_block_committed(&topology_snapshot, &certified);
 
@@ -1903,7 +1903,7 @@ mod tests {
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
 
-        // Submit and complete the transaction (commit + Accept wave cert in one block).
+        // Submit and complete the transaction (commit + Accept finalization in one block).
         mempool.on_submit_transaction(
             &topology_snapshot,
             Arc::new(verified(tx.clone())),
@@ -1912,7 +1912,7 @@ mod tests {
         let certified = certified_commit_block(
             BlockHeight::new(1),
             tx.clone(),
-            make_finalized_wave(BlockHeight::new(1), tx_hash, TransactionDecision::Accept),
+            make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept),
         );
         mempool.on_block_committed(&topology_snapshot, &certified);
 

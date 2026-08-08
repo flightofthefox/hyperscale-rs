@@ -101,7 +101,7 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block,
         BlockHash, BlockHeader, BlockHeight, CertificateRoot, ExecutionCertificate,
-        ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash,
         LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON,
         RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot,
         TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
@@ -118,7 +118,7 @@ mod tests {
         TxHash::from(Hash::from_bytes(&height.to_le_bytes()))
     }
 
-    fn finalized_wave(height: u64) -> Arc<Verifiable<FinalizedWave>> {
+    fn finalization(height: u64) -> Arc<Verifiable<Finalization>> {
         // Cross-shard wave (non-empty `remote_shards`): the settled set
         // commits only cross-shard waves, so single-shard fixtures would be
         // filtered out before the merkle root.
@@ -151,7 +151,7 @@ mod tests {
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         );
-        Arc::new(Verifiable::from(FinalizedWave::new(
+        Arc::new(Verifiable::from(Finalization::new(
             wave,
             vec![Arc::new(ec), Arc::new(remote)],
             vec![],
@@ -163,7 +163,7 @@ mod tests {
         height: u64,
         parent: BlockHash,
         pred_wt: u64,
-        certs: &[Arc<Verifiable<FinalizedWave>>],
+        certs: &[Arc<Verifiable<Finalization>>],
     ) -> BlockHash {
         let parent_qc = QuorumCertificate::new(
             parent,
@@ -222,7 +222,7 @@ mod tests {
         let storage = SimShardStorage::default();
         let mut parent = BlockHash::ZERO;
         for h in 1..=3 {
-            parent = commit_block(&storage, h, parent, 1_000 * h, &[finalized_wave(h)]);
+            parent = commit_block(&storage, h, parent, 1_000 * h, &[finalization(h)]);
         }
         let terminal = parent;
         let pending_chain = PendingChain::new(Arc::new(storage));
@@ -248,9 +248,9 @@ mod tests {
     fn window_floor_serves_early_settlements() {
         let rh_ms = RETENTION_HORIZON.as_secs() * 1000;
         let storage = SimShardStorage::default();
-        let mut parent = commit_block(&storage, 1, BlockHash::ZERO, 1_000, &[finalized_wave(1)]);
-        parent = commit_block(&storage, 2, parent, rh_ms + 10_000, &[finalized_wave(2)]);
-        let terminal = commit_block(&storage, 3, parent, rh_ms + 11_000, &[finalized_wave(3)]);
+        let mut parent = commit_block(&storage, 1, BlockHash::ZERO, 1_000, &[finalization(1)]);
+        parent = commit_block(&storage, 2, parent, rh_ms + 10_000, &[finalization(2)]);
+        let terminal = commit_block(&storage, 3, parent, rh_ms + 11_000, &[finalization(3)]);
         let pending_chain = PendingChain::new(Arc::new(storage));
         let req = GetSettledTxsRequest::new(BlockHeight::new(3), terminal);
 
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn wrong_terminal_hash_serves_not_found() {
         let storage = SimShardStorage::default();
-        let _ = commit_block(&storage, 1, BlockHash::ZERO, 1_000, &[finalized_wave(1)]);
+        let _ = commit_block(&storage, 1, BlockHash::ZERO, 1_000, &[finalization(1)]);
         let pending_chain = PendingChain::new(Arc::new(storage));
         let req = GetSettledTxsRequest::new(
             BlockHeight::new(1),

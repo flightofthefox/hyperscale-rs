@@ -1,6 +1,6 @@
 //! State-root verification typestate.
 //!
-//! [`StateRoot`] is verified by replaying a block's finalized waves
+//! [`StateRoot`] is verified by replaying a block's finalizations
 //! against the JMT rooted at the parent's state root and comparing the
 //! resulting root against the header's claim. The JMT replay itself
 //! happens inside the storage backend's `prepare_block_commit`; the
@@ -66,7 +66,7 @@ impl SplitChildRoots {
 ///
 /// [`StateRoot`]: crate::StateRoot
 pub struct StateRootContext<'a> {
-    /// Root produced by replaying the block's finalized waves against
+    /// Root produced by replaying the block's finalizations against
     /// the JMT.
     pub computed_root: &'a StateRoot,
     /// The header's `split_child_roots` claim.
@@ -159,7 +159,7 @@ impl Verified<StateRoot> {
 }
 
 /// Construction asserts: the supplied `computed_root` (produced by
-/// replaying the block's finalized waves against the JMT rooted at the
+/// replaying the block's finalizations against the JMT rooted at the
 /// parent's state root) equals the wrapped [`StateRoot`], and the
 /// header's `split_child_roots` claim is present exactly when the window
 /// requires it and composes to the computed root.

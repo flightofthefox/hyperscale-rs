@@ -178,7 +178,7 @@ impl NodeStateMachine {
             ProtocolEvent::BeaconBlockPersisted { .. } => {
                 // Beacon advanced an epoch — drive the shard coordinators to
                 // replay buffered cross-shard artifacts (remote headers, ECs,
-                // finalized waves) and acquire any newly-attested settled-transaction
+                // finalizations) and acquire any newly-attested settled-transaction
                 // set the fence needs. Skipped for a vnode that only follows the
                 // beacon.
                 self.with_shard(ShardParticipation::on_beacon_block_persisted)

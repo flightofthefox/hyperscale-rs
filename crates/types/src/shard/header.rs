@@ -407,7 +407,7 @@ impl BlockHeader {
 
     /// Merkle root of per-tx consensus-receipt hashes
     /// ([`ConsensusReceipt::local_receipt_hash`](crate::ConsensusReceipt::local_receipt_hash))
-    /// for all transactions covered by this block's wave certificates.
+    /// for all transactions covered by this block's finalizations.
     ///
     /// Commits to the specific per-tx state deltas (shard-filtered writes)
     /// that were applied to produce `state_root`. Enables per-tx delta attribution

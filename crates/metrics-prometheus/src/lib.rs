@@ -416,7 +416,7 @@ impl Metrics {
 
             storage_certificates_persisted: register_counter!(
                 "hyperscale_storage_certificates_persisted_total",
-                "Total number of wave certificates persisted"
+                "Total number of finalizations persisted"
             )
             .unwrap(),
 
@@ -1271,8 +1271,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.exec_cache_entries as f64);
         self.metrics
             .memory_exec
-            .with_label_values(&["finalized_wave_certificates"])
-            .set(m.exec_finalized_wave_certificates as f64);
+            .with_label_values(&["finalizations"])
+            .set(m.exec_finalizations as f64);
         self.metrics
             .memory_exec
             .with_label_values(&["waves"])
@@ -1411,8 +1411,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.node_tx_status_cache as f64);
         self.metrics
             .memory_node
-            .with_label_values(&["finalized_wave_cache"])
-            .set(m.node_finalized_wave_cache as f64);
+            .with_label_values(&["finalization_cache"])
+            .set(m.node_finalization_cache as f64);
         self.metrics
             .memory_node
             .with_label_values(&["provision_cache"])
@@ -1463,8 +1463,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.node_local_provision_fetch_pending as f64);
         self.metrics
             .memory_node
-            .with_label_values(&["finalized_wave_fetch_pending"])
-            .set(m.node_finalized_wave_fetch_pending as f64);
+            .with_label_values(&["finalization_fetch_pending"])
+            .set(m.node_finalization_fetch_pending as f64);
         self.metrics
             .memory_node
             .with_label_values(&["provision_fetch_pending"])

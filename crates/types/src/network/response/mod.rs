@@ -6,7 +6,7 @@ pub mod beacon;
 
 mod block;
 mod execution_cert;
-mod finalized_wave;
+mod finalization;
 mod local_provision;
 mod provision;
 mod remote_header;
@@ -17,7 +17,7 @@ mod witness_history;
 
 pub use block::GetBlockResponse;
 pub use execution_cert::GetExecutionCertsResponse;
-pub use finalized_wave::GetFinalizedWavesResponse;
+pub use finalization::GetFinalizationsResponse;
 pub use local_provision::{GetLocalProvisionsResponse, LocalProvisionEntry};
 pub use provision::GetProvisionResponse;
 pub use remote_header::GetRemoteHeadersResponse;

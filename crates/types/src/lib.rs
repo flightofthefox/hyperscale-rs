@@ -6,7 +6,7 @@
 //! - **Primitives**: hashes, merkle roots, signer bitfields, randomness
 //! - **Identifiers**: `ValidatorId`, `ShardId`, `BlockHeight`, etc.
 //! - **Consensus types**: Block, `BlockHeader`, `QuorumCertificate`, etc.
-//! - **Wave types**: `TickId`, `ExecutionVote`, `ExecutionCertificate`, `FinalizedWave`, etc.
+//! - **Wave types**: `TickId`, `ExecutionVote`, `ExecutionCertificate`, `Finalization`, etc.
 //! - **Network traits**: Message markers for serialization
 //!
 //! # Design Philosophy
@@ -79,8 +79,8 @@ pub use execution::computation::{compute_cross_shard_txs, tick_leader, tick_lead
 pub use execution::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
 };
-pub use execution::finalized::{
-    FinalizedWave, FinalizedWaveContext, FinalizedWaveVerifyError,
+pub use execution::finalization::{
+    Finalization, FinalizationContext, FinalizationVerifyError,
     MAX_EXECUTION_CERTIFICATES_PER_WAVE, ReceiptValidationError, Settles, refused_transactions,
     settles,
 };

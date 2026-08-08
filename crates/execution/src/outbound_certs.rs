@@ -140,7 +140,7 @@ impl OutboundExecutionCertificateTracker {
     /// observed the same wave structure we did and almost certainly
     /// received our EC contribution (or are about to). This is the
     /// best positive signal available without an explicit ACK message.
-    pub fn on_wave_finalized(&mut self, tick_id: &TickId) {
+    pub fn on_tick_finalized(&mut self, tick_id: &TickId) {
         // A wave can have multiple target_shard entries — drop them all.
         let stale: Vec<_> = self
             .entries
@@ -325,7 +325,7 @@ mod tests {
         t.on_broadcast(cert(w), ShardId::leaf(2, 2), vids(&[8]));
         assert_eq!(t.memory_stats().tracked_certificates, 2);
 
-        t.on_wave_finalized(&w);
+        t.on_tick_finalized(&w);
         assert_eq!(t.memory_stats().tracked_certificates, 0);
     }
 
@@ -335,7 +335,7 @@ mod tests {
         let w1 = wave(0, 100, &[1]);
         let w2 = wave(0, 101, &[1]);
         t.on_broadcast(cert(w1), ShardId::leaf(2, 1), vids(&[4]));
-        t.on_wave_finalized(&w2);
+        t.on_tick_finalized(&w2);
         assert_eq!(t.memory_stats().tracked_certificates, 1);
     }
 }

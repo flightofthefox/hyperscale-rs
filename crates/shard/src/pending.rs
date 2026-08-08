@@ -1,6 +1,6 @@
 //! Pending block assembly.
 //!
-//! Tracks blocks being assembled from headers + gossiped transactions + finalized waves.
+//! Tracks blocks being assembled from headers + gossiped transactions + finalizations.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use hyperscale_core::{Action, FetchAbandon, FetchRequest};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, FinalizedWave, LocalTimestamp,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, Finalization, LocalTimestamp,
     ProvisionHash, Provisions, Round, ShardId, TickId, Transaction, TxHash, ValidatorId,
     Verifiable,
 };
@@ -28,7 +28,7 @@ pub struct OrphanedFetches {
 impl OrphanedFetches {
     /// One [`Action::AbandonFetch`] per non-empty payload type, so the fetch
     /// FSM releases the in-flight slots these ids were pinning. Symmetric
-    /// across transactions, finalized waves, and local provisions — a dropped
+    /// across transactions, finalizations, and local provisions — a dropped
     /// block can leave any of the three in flight.
     #[must_use]
     pub fn into_abandon_actions(self) -> Vec<Action> {
@@ -39,7 +39,7 @@ impl OrphanedFetches {
             }));
         }
         if !self.waves.is_empty() {
-            actions.push(Action::AbandonFetch(FetchAbandon::FinalizedWaves {
+            actions.push(Action::AbandonFetch(FetchAbandon::Finalizations {
                 ids: self.waves,
             }));
         }
@@ -264,7 +264,7 @@ impl PendingBlocks {
         manifest: BlockManifest,
         now: LocalTimestamp,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        lookup_finalized_wave: impl Fn(&TickId) -> Option<Arc<Verifiable<FinalizedWave>>>,
+        lookup_finalization: impl Fn(&TickId) -> Option<Arc<Verifiable<Finalization>>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     ) {
         let mut pending = PendingBlock::from_manifest(header, manifest, now);
@@ -281,14 +281,14 @@ impl PendingBlocks {
             pending.add_transaction(tx);
         }
 
-        let waves: Vec<Arc<Verifiable<FinalizedWave>>> = pending
+        let waves: Vec<Arc<Verifiable<Finalization>>> = pending
             .manifest()
             .cert_ids()
             .iter()
-            .filter_map(&lookup_finalized_wave)
+            .filter_map(&lookup_finalization)
             .collect();
         for fw in waves {
-            pending.add_finalized_wave(fw);
+            pending.add_finalization(fw);
         }
 
         let provisions: Vec<Arc<Verifiable<Provisions>>> = pending
@@ -360,17 +360,14 @@ impl PendingBlocks {
         )
     }
 
-    /// Record an arrived finalized wave against any pending block that needs
+    /// Record an arrived finalization against any pending block that needs
     /// it. Returns the hashes of blocks that became complete as a result.
-    pub fn receive_finalized_wave(
-        &mut self,
-        fw: &Arc<Verifiable<FinalizedWave>>,
-    ) -> Vec<BlockHash> {
+    pub fn receive_finalization(&mut self, fw: &Arc<Verifiable<Finalization>>) -> Vec<BlockHash> {
         let tick_id = *fw.tick_id();
         self.fold_arrival(
             |pending| pending.needs_wave(&tick_id),
             |pending| {
-                pending.add_finalized_wave(Arc::clone(fw));
+                pending.add_finalization(Arc::clone(fw));
             },
         )
     }
@@ -456,9 +453,9 @@ impl PendingBlocks {
                     block_hash = ?block_hash,
                     missing_wave_count = missing_waves.len(),
                     age_ms = age.as_millis(),
-                    "Fetch timeout reached, requesting missing finalized waves"
+                    "Fetch timeout reached, requesting missing finalizations"
                 );
-                actions.push(Action::Fetch(FetchRequest::FinalizedWaves {
+                actions.push(Action::Fetch(FetchRequest::Finalizations {
                     ids: missing_waves,
                     shard: local_shard,
                     preferred: Some(proposer),
@@ -476,15 +473,15 @@ impl PendingBlocks {
     }
 }
 
-/// Tracks a block being assembled from header + gossiped transactions + finalized waves.
+/// Tracks a block being assembled from header + gossiped transactions + finalizations.
 ///
 /// # Lifecycle
 ///
 /// 1. Created from `BlockHeader` (all transactions/waves marked as absent by hash)
 /// 2. Full `Transaction` objects arrive via gossip (stored in `received_transactions` map)
-/// 3. `FinalizedWave`s arrive when verifier independently finalizes each wave
+/// 3. `Finalization`s arrive when verifier independently finalizes each wave
 ///    (carries certificate + receipts + ECs)
-/// 4. When all transactions and finalized waves received, block can be constructed
+/// 4. When all transactions and finalizations received, block can be constructed
 /// 5. Block stored to storage
 /// 6. Block ready for voting
 #[derive(Debug, Clone)]
@@ -501,11 +498,11 @@ pub struct PendingBlock {
     /// Set of transaction hashes we're still waiting for (`HashSet` for O(1) lookup).
     missing_transaction_hashes: HashSet<TxHash>,
 
-    /// Map of `TickId` -> `Arc<Verifiable<FinalizedWave>>` (carries cert + receipts + ECs).
+    /// Map of `TickId` -> `Arc<Verifiable<Finalization>>` (carries cert + receipts + ECs).
     ///
     /// A block is complete once
     /// all its waves have been independently finalized by this validator.
-    received_waves: BTreeMap<TickId, Arc<Verifiable<FinalizedWave>>>,
+    received_waves: BTreeMap<TickId, Arc<Verifiable<Finalization>>>,
 
     /// Set of `TickId`s we're still waiting for.
     missing_wave_ids: HashSet<TickId>,
@@ -555,7 +552,7 @@ impl PendingBlock {
 
     /// Create a pending block from a complete block (proposer's own block).
     ///
-    /// The proposer already has all transactions, finalized waves, and provision
+    /// The proposer already has all transactions, finalizations, and provision
     /// batches. Provision hashes are derived (and sorted) from the batches so the
     /// resulting `PendingBlock` is self-contained: both the manifest hashes and
     /// `received_provisions` are populated from the same source.
@@ -566,7 +563,7 @@ impl PendingBlock {
     /// exactly or every replica rejects the broadcast.
     pub fn from_complete_block(
         block: &Block,
-        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         created_at: LocalTimestamp,
     ) -> Self {
@@ -604,8 +601,8 @@ impl PendingBlock {
                 .received_transactions
                 .insert(tx.hash(), Arc::clone(tx));
         }
-        // Fill in all finalized waves
-        for fw in finalized_waves {
+        // Fill in all finalizations
+        for fw in finalizations {
             pending.received_waves.insert(*fw.tick_id(), fw);
         }
         pending
@@ -624,10 +621,10 @@ impl PendingBlock {
         }
     }
 
-    /// Add a finalized wave (carries certificate + receipts + ECs).
+    /// Add a finalization (carries certificate + receipts + ECs).
     ///
     /// Returns true if this wave was needed, false if duplicate or not in this block.
-    pub fn add_finalized_wave(&mut self, fw: Arc<Verifiable<FinalizedWave>>) -> bool {
+    pub fn add_finalization(&mut self, fw: Arc<Verifiable<Finalization>>) -> bool {
         let tick_id = *fw.tick_id();
         if self.missing_wave_ids.remove(&tick_id) {
             self.received_waves.insert(tick_id, fw);
@@ -637,7 +634,7 @@ impl PendingBlock {
         }
     }
 
-    /// Check if all transactions, finalized waves, and provisions have been received.
+    /// Check if all transactions, finalizations, and provisions have been received.
     pub fn is_complete(&self) -> bool {
         self.missing_transaction_hashes.is_empty()
             && self.missing_wave_ids.is_empty()
@@ -669,7 +666,7 @@ impl PendingBlock {
         self.missing_provision_hashes.len()
     }
 
-    /// Check if this pending block needs a specific finalized wave.
+    /// Check if this pending block needs a specific finalization.
     pub fn needs_wave(&self, tick_id: &TickId) -> bool {
         self.missing_wave_ids.contains(tick_id)
     }
@@ -702,8 +699,8 @@ impl PendingBlock {
         self.missing_wave_ids.iter().copied().collect()
     }
 
-    /// Get all received finalized waves.
-    pub fn finalized_waves(&self) -> Vec<Arc<Verifiable<FinalizedWave>>> {
+    /// Get all received finalizations.
+    pub fn finalizations(&self) -> Vec<Arc<Verifiable<Finalization>>> {
         self.received_waves.values().cloned().collect()
     }
 
@@ -731,11 +728,11 @@ impl PendingBlock {
             .filter_map(|hash| self.received_transactions.remove(hash))
             .collect();
 
-        // Pass finalized waves into the block in manifest order. The
-        // upstream-verified marker on each `Arc<Verifiable<FinalizedWave>>`
+        // Pass finalizations into the block in manifest order. The
+        // upstream-verified marker on each `Arc<Verifiable<Finalization>>`
         // rides through unchanged so downstream consumers (apply phase,
         // verification pipeline) can peek `.verified()` and short-circuit.
-        let certificates: Vec<Arc<Verifiable<FinalizedWave>>> = self
+        let certificates: Vec<Arc<Verifiable<Finalization>>> = self
             .manifest
             .cert_ids()
             .iter()
@@ -974,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_finalized_wave() {
+    fn test_add_finalization() {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let header = make_header(BlockHeight::new(1));
 
@@ -988,10 +985,10 @@ mod tests {
         assert!(!pb.is_complete());
 
         let fw = Arc::new(
-            Verified::new_unchecked_for_test(FinalizedWave::new(tick_id, vec![], vec![])).into(),
+            Verified::new_unchecked_for_test(Finalization::new(tick_id, vec![], vec![])).into(),
         );
 
-        let added = pb.add_finalized_wave(fw);
+        let added = pb.add_finalization(fw);
         assert!(added);
         assert_eq!(pb.missing_wave_count(), 0);
         assert!(pb.is_complete());
@@ -1022,18 +1019,18 @@ mod tests {
         assert!(pb.has_all_transactions());
         assert!(!pb.is_complete()); // Still missing wave
 
-        // Add finalized wave
+        // Add finalization
         let fw = Arc::new(
-            Verified::new_unchecked_for_test(FinalizedWave::new(tick_id, vec![], vec![])).into(),
+            Verified::new_unchecked_for_test(Finalization::new(tick_id, vec![], vec![])).into(),
         );
-        pb.add_finalized_wave(fw);
+        pb.add_finalization(fw);
         assert!(pb.is_complete());
     }
 
     #[test]
     fn test_from_complete_block_is_complete() {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let fw = Arc::new(FinalizedWave::new(tick_id, vec![], vec![]));
+        let fw = Arc::new(Finalization::new(tick_id, vec![], vec![]));
         let verified_fw = Arc::new(Verified::new_unchecked_for_test((*fw).clone()).into());
         let wire_fw = Arc::new((*fw).clone().into());
 

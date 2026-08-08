@@ -86,7 +86,7 @@ use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError,
-    CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, FinalizedWave,
+    CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Finalization,
     LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, ProvisionRootVerifyError,
     ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
     QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round, SafeVoteRegisters,
@@ -112,7 +112,7 @@ use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::proposal::{
     ProposalKind, ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
-    filter_engaged_transactions, select_finalized_waves, select_provisions, select_transactions,
+    filter_engaged_transactions, select_finalizations, select_provisions, select_transactions,
 };
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
@@ -406,7 +406,7 @@ pub struct ShardCoordinator {
 
     /// Settled-wave sets for shards that have terminated at a split,
     /// keyed by the terminated shard. The split-boundary fence consults
-    /// this when voting on a block whose finalized waves carry a
+    /// this when voting on a block whose finalizations carry a
     /// certificate from a past-terminal shard: a cross-shard wave names
     /// that shard, so the vote may only commit if the shard actually
     /// settled the wave. Populated by the settled-transaction acquisition via
@@ -799,7 +799,7 @@ impl ShardCoordinator {
     /// split-boundary fence. A one-shot acquisition fetches the complete
     /// window list and verifies it against the beacon-attested
     /// `settled_txs_root` before feeding it here; voting on a block
-    /// whose finalized waves name `shard` then resolves against the set
+    /// whose finalizations name `shard` then resolves against the set
     /// instead of deferring. Pair with [`Self::redrive_pending_votes`] to
     /// re-drive votes that deferred at the fence before the set was known.
     pub fn record_settled_txs(&mut self, shard: ShardId, settled: SettledTxSet) {
@@ -844,9 +844,9 @@ impl ShardCoordinator {
         actions
     }
 
-    /// The split-boundary fence over a block's committed finalized waves.
+    /// The split-boundary fence over a block's committed finalizations.
     ///
-    /// A finalized wave's certificate carries one execution certificate
+    /// A finalization's certificate carries one execution certificate
     /// per participating shard. When a constituent certificate names a
     /// shard that is **past-terminal** at the block's anchored window,
     /// the cross-shard wave straddled that shard's split: committing this
@@ -863,7 +863,7 @@ impl ShardCoordinator {
     /// reject. A past-terminal shard whose settled set isn't known yet
     /// defers the vote; past `terminal_wt + RETENTION_HORIZON` the wave
     /// is categorically unreachable and rejects.
-    fn fence_finalized_waves(
+    fn fence_finalizations(
         &self,
         topology_schedule: &TopologySchedule,
         block: &Block,
@@ -897,7 +897,7 @@ impl ShardCoordinator {
         block: &Block,
         block_hash: BlockHash,
     ) -> bool {
-        match self.fence_finalized_waves(
+        match self.fence_finalizations(
             topology_schedule,
             block,
             block.header().parent_qc().weighted_timestamp(),
@@ -907,7 +907,7 @@ impl ShardCoordinator {
                 warn!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
-                    "Finalized wave names a past-terminal shard that didn't settle it — not voting"
+                    "Finalization names a past-terminal shard that didn't settle it — not voting"
                 );
                 true
             }
@@ -1444,15 +1444,15 @@ impl ShardCoordinator {
     /// Returns empty if preconditions aren't met (not proposer, build in-flight,
     /// already voted at this height, etc.). No periodic rescheduling — callers
     /// are responsible for triggering the next attempt via events.
-    #[instrument(skip(self, topology_schedule, ready_txs, finalized_waves), fields(
+    #[instrument(skip(self, topology_schedule, ready_txs, finalizations), fields(
         tx_count = ready_txs.len(),
-        cert_count = finalized_waves.len(),
+        cert_count = finalizations.len(),
     ))]
     pub fn try_propose(
         &mut self,
         topology_schedule: &TopologySchedule,
         ready_txs: &[Arc<Verified<Transaction>>],
-        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
@@ -1504,7 +1504,7 @@ impl ShardCoordinator {
                 round,
                 ProposalKind::Normal {
                     transactions: Vec::new(),
-                    finalized_waves: Vec::new(),
+                    finalizations: Vec::new(),
                     provisions: Vec::new(),
                 },
             );
@@ -1528,7 +1528,7 @@ impl ShardCoordinator {
                 round,
                 ProposalKind::Normal {
                     transactions: Vec::new(),
-                    finalized_waves: Vec::new(),
+                    finalizations: Vec::new(),
                     provisions: Vec::new(),
                 },
             );
@@ -1553,8 +1553,8 @@ impl ShardCoordinator {
             &self.dedup_index,
             validity_anchor,
         );
-        let (finalized_waves, _finalized_tx_count) = select_finalized_waves(
-            finalized_waves,
+        let (finalizations, _finalized_tx_count) = select_finalizations(
+            finalizations,
             &qc_chain_cert_hashes,
             &self.dedup_index,
             MAX_FINALIZED_TX_PER_BLOCK,
@@ -1582,7 +1582,7 @@ impl ShardCoordinator {
             round,
             ProposalKind::Normal {
                 transactions,
-                finalized_waves,
+                finalizations,
                 provisions,
             },
         )
@@ -1853,9 +1853,7 @@ impl ShardCoordinator {
         kind: ProposalKind,
     ) -> Vec<Action> {
         let waveless = match &kind {
-            ProposalKind::Normal {
-                finalized_waves, ..
-            } => finalized_waves.is_empty(),
+            ProposalKind::Normal { finalizations, .. } => finalizations.is_empty(),
             ProposalKind::Fallback | ProposalKind::Sync => true,
         };
         let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
@@ -2042,7 +2040,7 @@ impl ShardCoordinator {
     /// Handle a received block header. Sender identity is taken from the
     /// header's signed `proposer` field — there's no separate peer-id
     /// parameter because sync detection doesn't need it.
-    #[instrument(skip(self, topology_schedule, header, manifest, lookup_tx, lookup_finalized_wave, lookup_provision), fields(
+    #[instrument(skip(self, topology_schedule, header, manifest, lookup_tx, lookup_finalization, lookup_provision), fields(
         height = header.height().inner(),
         round = header.round().inner(),
         proposer = ?header.proposer(),
@@ -2055,7 +2053,7 @@ impl ShardCoordinator {
         header: &BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        lookup_finalized_wave: impl Fn(&TickId) -> Option<Arc<Verifiable<FinalizedWave>>>,
+        lookup_finalization: impl Fn(&TickId) -> Option<Arc<Verifiable<Finalization>>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
@@ -2157,7 +2155,7 @@ impl ShardCoordinator {
             manifest,
             self.now,
             lookup_tx,
-            lookup_finalized_wave,
+            lookup_finalization,
             lookup_provision,
         );
         self.adopt_deferred_qc_if_matches(block_hash);
@@ -2890,7 +2888,7 @@ impl ShardCoordinator {
                     chain.parent_in_flight_checked(block.header().parent_block_hash())
                 };
                 let finalized_tx_count: u32 = chain.get_pending(block_hash).map_or(0, |p| {
-                    p.finalized_waves()
+                    p.finalizations()
                         .iter()
                         .map(|fw| u32::try_from(fw.tx_count()).unwrap_or(u32::MAX))
                         .sum()
@@ -2937,7 +2935,7 @@ impl ShardCoordinator {
                 return vec![];
             };
 
-            // Split-boundary fence over the block's finalized waves.
+            // Split-boundary fence over the block's finalizations.
             if self.fence_blocks_vote(topology_schedule, block, block_hash) {
                 return vec![];
             }
@@ -3945,7 +3943,7 @@ impl ShardCoordinator {
     /// Called when the runner completes `Action::BuildProposal`. The runner has
     /// computed the state root, built the complete block, and cached the `WriteBatch`
     /// for efficient commit later.
-    #[instrument(skip(self, topology_schedule, block, finalized_waves), fields(height = %height.inner(), round = round.inner()))]
+    #[instrument(skip(self, topology_schedule, block, finalizations), fields(height = %height.inner(), round = round.inner()))]
     #[allow(clippy::too_many_arguments)]
     pub fn on_proposal_built(
         &mut self,
@@ -3954,7 +3952,7 @@ impl ShardCoordinator {
         round: Round,
         block: &Block,
         block_hash: BlockHash,
-        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
         bytes_delta: i64,
     ) -> Vec<Action> {
@@ -3982,9 +3980,9 @@ impl ShardCoordinator {
 
         let has_certificates = !block.certificates().is_empty();
 
-        // Store our own block as pending (with all finalized waves + provisions).
+        // Store our own block as pending (with all finalizations + provisions).
         let mut pending_block =
-            PendingBlock::from_complete_block(block, finalized_waves, provisions, self.now);
+            PendingBlock::from_complete_block(block, finalizations, provisions, self.now);
 
         let total_tx_count = pending_block.transaction_count();
         info!(
@@ -4156,7 +4154,7 @@ impl ShardCoordinator {
     ///
     /// `state_root` is the computed JMT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, topology_schedule, qc, ready_txs, finalized_waves), fields(
+    #[instrument(skip(self, topology_schedule, qc, ready_txs, finalizations), fields(
         height = qc.height().inner(),
         block_hash = ?block_hash
     ))]
@@ -4167,7 +4165,7 @@ impl ShardCoordinator {
         block_hash: BlockHash,
         qc: &Verified<QuorumCertificate>,
         ready_txs: &[Arc<Verified<Transaction>>],
-        finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
     ) -> Vec<Action> {
         let height = qc.height();
@@ -4242,7 +4240,7 @@ impl ShardCoordinator {
         // block N+1 is what certifies block N, so any gap in proposing N+1
         // stalls the finalization of N and everything pending behind it.
         // `try_propose` handles the proposer-rotation / backpressure checks.
-        actions.extend(self.try_propose(topology_schedule, ready_txs, finalized_waves, provisions));
+        actions.extend(self.try_propose(topology_schedule, ready_txs, finalizations, provisions));
 
         actions
     }
@@ -4576,8 +4574,8 @@ impl ShardCoordinator {
     }
 
     /// Commit-time fee-ledger bookkeeping: engage reservations for the
-    /// block's local payers, release those its wave certificates
-    /// resolve, and prune holds whose deadlines passed — the cover for
+    /// block's local payers, release those its finalizations resolve,
+    /// and prune holds whose deadlines passed — the cover for
     /// resolution paths that never produce a certificate (a reshape
     /// terminal's abort by omission).
     fn register_fee_holds(
@@ -5007,7 +5005,7 @@ impl ShardCoordinator {
         // per-EC signature predicate via the source committee's signature over
         // `certificate_root` + `local_receipt_root`, so the waves can be
         // admitted to the canonical store on receipt.
-        let synced_waves: Vec<Arc<Verifiable<FinalizedWave>>> = block
+        let synced_waves: Vec<Arc<Verifiable<Finalization>>> = block
             .certificates()
             .iter()
             .map(|fw| {
@@ -5017,7 +5015,7 @@ impl ShardCoordinator {
                     Arc::clone(fw)
                 } else {
                     let verified =
-                        Verified::<FinalizedWave>::from_committed_block(fw.as_unverified().clone());
+                        Verified::<Finalization>::from_committed_block(fw.as_unverified().clone());
                     Arc::new(verified.into())
                 }
             })
@@ -5060,11 +5058,9 @@ impl ShardCoordinator {
         let mut actions = self.try_two_chain_commit(certified.qc_verified(), CommitSource::Sync);
 
         if !synced_waves.is_empty() {
-            actions.push(Action::Continuation(
-                ProtocolEvent::FinalizedWavesAdmitted {
-                    waves: synced_waves,
-                },
-            ));
+            actions.push(Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
+                finalizations: synced_waves,
+            }));
         }
 
         actions
@@ -5711,7 +5707,7 @@ impl ShardCoordinator {
     // Receipt Availability
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// React to finalized waves newly admitted to the canonical execution
+    /// React to finalizations newly admitted to the canonical execution
     /// store. Same shape as `on_transactions_admitted` and
     /// `on_provisions_admitted`.
     ///
@@ -5720,10 +5716,10 @@ impl ShardCoordinator {
     /// with the outcomes the EC attests to. Rejecting such a wave leaves the
     /// pending block incomplete; the fetch protocol retries from a different
     /// peer.
-    pub fn on_finalized_waves_admitted(
+    pub fn on_finalizations_admitted(
         &mut self,
         topology_schedule: &TopologySchedule,
-        waves: &[Arc<Verifiable<FinalizedWave>>],
+        waves: &[Arc<Verifiable<Finalization>>],
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for fw in waves {
@@ -5731,11 +5727,11 @@ impl ShardCoordinator {
                 warn!(
                     tick_id = ?fw.tick_id(),
                     ?err,
-                    "Rejecting FinalizedWave: receipts inconsistent with its EC"
+                    "Rejecting Finalization: receipts inconsistent with its EC"
                 );
                 continue;
             }
-            for block_hash in self.pending_blocks.receive_finalized_wave(fw) {
+            for block_hash in self.pending_blocks.receive_finalization(fw) {
                 actions.extend(self.dispatch_block_complete(topology_schedule, block_hash));
             }
         }
@@ -5787,7 +5783,7 @@ impl ShardCoordinator {
     /// Clean up old state after commit. Drops pending-block, vote, and
     /// commit-tracking entries at or below `committed_height`. Returns
     /// `AbandonFetch` actions for the dropped blocks' orphaned transaction,
-    /// finalized-wave, and provision fetches — those no surviving block still
+    /// finalization, and provision fetches — those no surviving block still
     /// needs — so the FSM releases their slots.
     fn cleanup_old_state(&mut self, committed_height: BlockHeight) -> Vec<Action> {
         let orphaned = self.pending_blocks.prune_committed(committed_height);
@@ -5956,7 +5952,7 @@ impl ShardCoordinator {
     /// retains in-place.
     ///
     /// Returns `AbandonFetch` actions for the dropped block's outstanding
-    /// transaction, finalized-wave, and provision fetches that no surviving
+    /// transaction, finalization, and provision fetches that no surviving
     /// block still needs — without this the FSM's `in_flight` entries pinned
     /// for this block would linger past its lifetime, eating slots in the
     /// `max_in_flight` cap.
@@ -9129,7 +9125,7 @@ mod tests {
         let Action::BuildProposal {
             is_fallback,
             transactions,
-            finalized_waves,
+            finalizations,
             ..
         } = proposal
         else {
@@ -9137,7 +9133,7 @@ mod tests {
         };
         assert!(!is_fallback);
         assert!(transactions.is_empty());
-        assert!(finalized_waves.is_empty());
+        assert!(finalizations.is_empty());
     }
 
     #[test]
@@ -10510,14 +10506,14 @@ mod tests {
         )
     }
 
-    /// A finalized wave whose certificate carries this validator's local
+    /// A finalization whose certificate carries this validator's local
     /// EC plus a remote EC on `remote` — the cross-shard shape the fence
     /// inspects.
     fn cross_shard_wave(
         local: ShardId,
         remote: ShardId,
         height: u64,
-    ) -> Arc<Verifiable<FinalizedWave>> {
+    ) -> Arc<Verifiable<Finalization>> {
         use hyperscale_types::{
             ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot,
             SignerBitfield, TxOutcome,
@@ -10539,14 +10535,14 @@ mod tests {
             )
         };
         let local_wave = TickId::new(local, BlockHeight::new(height));
-        Arc::new(Verifiable::from(FinalizedWave::new(
+        Arc::new(Verifiable::from(Finalization::new(
             local_wave,
             vec![Arc::new(ec(local)), Arc::new(ec(remote))],
             vec![],
         )))
     }
 
-    fn block_with_certs(certs: Vec<Arc<Verifiable<FinalizedWave>>>) -> Block {
+    fn block_with_certs(certs: Vec<Arc<Verifiable<Finalization>>>) -> Block {
         Block::Live {
             header: make_header_at_height(BlockHeight::new(1), 1500),
             transactions: Arc::new(Vec::new()),
@@ -10556,7 +10552,7 @@ mod tests {
         }
     }
 
-    /// A finalized wave naming a past-terminal shard whose settled set is
+    /// A finalization naming a past-terminal shard whose settled set is
     /// unknown defers the vote.
     #[test]
     fn fence_defers_when_settled_set_unknown() {
@@ -10568,7 +10564,7 @@ mod tests {
             1,
         )]);
         assert_eq!(
-            coord.fence_finalized_waves(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
             SettledSetVerdict::Defer,
         );
     }
@@ -10592,7 +10588,7 @@ mod tests {
             1,
         )]);
         assert_eq!(
-            coord.fence_finalized_waves(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
             SettledSetVerdict::Pass,
         );
     }
@@ -10615,7 +10611,7 @@ mod tests {
             1,
         )]);
         assert_eq!(
-            coord.fence_finalized_waves(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
             SettledSetVerdict::Reject,
         );
     }
@@ -10643,7 +10639,7 @@ mod tests {
             .plus(RETENTION_HORIZON)
             .plus(Duration::from_millis(1));
         assert_eq!(
-            coord.fence_finalized_waves(&sched, &block, beyond),
+            coord.fence_finalizations(&sched, &block, beyond),
             SettledSetVerdict::Reject,
         );
     }
@@ -10662,14 +10658,14 @@ mod tests {
             1,
         )]);
         assert_eq!(
-            coord.fence_finalized_waves(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
             SettledSetVerdict::Pass,
         );
     }
 
     /// A height-1 block on `leaf(1,0)` anchored in epoch 1 (`parent_qc`
     /// weighted timestamp 1500, past ROOT's terminal window in
-    /// [`make_terminating_schedule`]) carrying a finalized wave whose
+    /// [`make_terminating_schedule`]) carrying a finalization whose
     /// certificate names the past-terminal shard ROOT.
     fn straddling_block() -> Block {
         let parent_qc = QuorumCertificate::new(
@@ -10745,10 +10741,10 @@ mod tests {
         let block_hash = block.hash();
         let height = block.height();
         let round = block.header().round();
-        // Install with the block's finalized waves threaded through, so the
+        // Install with the block's finalizations threaded through, so the
         // constructed pending block carries its certificates (the default
         // `install_complete_block` helper drops them).
-        let waves: Vec<Arc<Verifiable<FinalizedWave>>> =
+        let waves: Vec<Arc<Verifiable<Finalization>>> =
             block.certificates().iter().cloned().collect();
         let mut pending =
             PendingBlock::from_complete_block(&block, waves, vec![], LocalTimestamp::ZERO);

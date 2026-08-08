@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use hyperscale_simulation::{DeliveryDrain, DeliveryRecord};
 use hyperscale_types::{
-    BlockHeight, ExecutionOutcome, FinalizedWave, MessageClass, Round, ShardId, TickId, TxHash,
+    BlockHeight, ExecutionOutcome, Finalization, MessageClass, Round, ShardId, TickId, TxHash,
     TxOutcome,
 };
 use serde::Serialize;
@@ -138,7 +138,7 @@ pub enum TraceKind {
         /// wave's canonical order.
         outcomes: Vec<(TxLabel, &'static str)>,
     },
-    /// Every participating shard reported and the wave certificate is
+    /// Every participating shard reported and the finalization is
     /// committed — the point where the arcs on both sides converge.
     #[serde(rename_all = "camelCase")]
     WaveFinalized {
@@ -423,13 +423,13 @@ impl TraceEvent {
     ///
     /// The transaction list is read off the wave's own certificate — the one
     /// whose id matches the wave — rather than through
-    /// [`FinalizedWave::local_ec`], which panics on a malformed certificate.
+    /// [`Finalization::local_ec`], which panics on a malformed certificate.
     /// A viewer must not be able to take the tab down by rendering one.
     pub(crate) fn wave_finalized(
         wt: u64,
         shard: ShardId,
         height: BlockHeight,
-        wave: &FinalizedWave,
+        wave: &Finalization,
     ) -> Self {
         let id = wave.tick_id();
         let certificates = wave.execution_certificates();

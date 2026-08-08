@@ -41,7 +41,7 @@ use hyperscale_storage::{
 use hyperscale_types::test_utils::{TestCommittee, certify, make_live_block};
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, EventRoot,
-    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FinalizedWave, GlobalReceipt,
+    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, Finalization, GlobalReceipt,
     LocalKey, MerkleInclusionProof, Movement, SettledWrites, ShardId, ShardTrie, SignerBitfield,
     StateRoot, StateWrites, StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot,
     Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
@@ -239,7 +239,7 @@ impl ExecutionSim {
 
     /// Commit a block carrying `txs` and `certificates`, then run whatever
     /// the schedule releases.
-    pub fn commit(&mut self, txs: Vec<Transaction>, certificates: Vec<FinalizedWave>) {
+    pub fn commit(&mut self, txs: Vec<Transaction>, certificates: Vec<Finalization>) {
         self.height = self.height.next();
         // Settlement: a committed certificate's receipts reach state here,
         // in commit order and last-writer-wins per cell — the same
@@ -590,12 +590,12 @@ fn stub_charge(owner: [u8; 16]) -> ConsensusReceipt {
     }
 }
 
-/// A committed `FinalizedWave` settling `tick_id`, accepting every member.
+/// A committed `Finalization` settling `tick_id`, accepting every member.
 ///
 /// The harness places these in blocks of its own choosing, which is how a
 /// test states a settlement order rather than observing one.
 #[must_use]
-pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> FinalizedWave {
+pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> Finalization {
     let outcomes: Vec<TxOutcome> = receipts
         .iter()
         .map(|receipt| {
@@ -615,10 +615,10 @@ pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> FinalizedWave {
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
-    FinalizedWave::new(*tick_id, vec![Arc::new(ec)], receipts.to_vec())
+    Finalization::new(*tick_id, vec![Arc::new(ec)], receipts.to_vec())
 }
 
-/// A committed `FinalizedWave` whose counterpart refused every member.
+/// A committed `Finalization` whose counterpart refused every member.
 ///
 /// The local shard completed its half and carries the receipts to prove
 /// it; the counterpart's certificate reports failure for the same
@@ -631,7 +631,7 @@ pub fn settle_refused_by_counterpart(
     counterpart: ShardId,
     receipts: &[StoredReceipt],
     charges: &[StoredReceipt],
-) -> FinalizedWave {
+) -> Finalization {
     // The local certificate reports what this shard did and names the
     // charge it holds against a refusal, which is what its own outcomes
     // carry. The stored receipts are the charges, because that is the
@@ -671,7 +671,7 @@ pub fn settle_refused_by_counterpart(
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
-    FinalizedWave::new(
+    Finalization::new(
         *tick_id,
         vec![Arc::new(local), Arc::new(remote)],
         charges.to_vec(),

@@ -6,7 +6,7 @@ pub mod beacon;
 
 mod block;
 mod execution_cert;
-mod finalized_wave;
+mod finalization;
 mod local_provision;
 mod provision;
 mod remote_header;
@@ -18,7 +18,7 @@ mod witness_history;
 
 pub use block::GetBlockRequest;
 pub use execution_cert::GetExecutionCertsRequest;
-pub use finalized_wave::GetFinalizedWavesRequest;
+pub use finalization::GetFinalizationsRequest;
 pub use local_provision::GetLocalProvisionsRequest;
 pub use provision::GetProvisionsRequest;
 pub use remote_header::{GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST};

@@ -19,7 +19,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
-    CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
+    CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, ExecutionCertificate, Finalization,
     MerkleInclusionProof, PreparedCommit, QuorumCertificate, SafeVoteRegisters, SettledWrites,
     ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf, TickId, Transaction,
     TxHash, ValidatorId, Verifiable, Verified,
@@ -199,14 +199,14 @@ impl ShardChainWriter for SharedStorage {
     fn prepare_block_commit(
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
-        finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
+        finalizations: &[Arc<Verifiable<Finalization>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         self.0.prepare_block_commit(
             parent,
-            finalized_waves,
+            finalizations,
             block_height,
             pending_snapshots,
             base_reads,
@@ -265,7 +265,7 @@ impl ShardChainReader for SharedStorage {
         ShardChainReader::get_transactions_batch(&*self.0, hashes)
     }
 
-    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<FinalizedWave> {
+    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<Finalization> {
         self.0.get_certificates_batch(ids)
     }
 

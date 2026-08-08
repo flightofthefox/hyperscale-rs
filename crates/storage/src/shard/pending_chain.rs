@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
-    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
+    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization,
     MerkleInclusionProof, PreparedCommit, QuorumCertificate, RETENTION_HORIZON, SettledTxsRoot,
     ShardId, ShardWitnessPayload, StateRoot, StateWrites, SubstateKey, TickId, Transaction, TxHash,
     Verifiable, Verified, WeightedTimestamp, local_settled_tx_hashes, settled_txs_root_from_hashes,
@@ -321,7 +321,7 @@ where
         parent_block_height: BlockHeight,
         anchor_wt: WeightedTimestamp,
         window_floor: Option<WeightedTimestamp>,
-        own_certificates: &[Arc<Verifiable<FinalizedWave>>],
+        own_certificates: &[Arc<Verifiable<Finalization>>],
     ) -> SettledTxsRoot {
         let set = self.settled_txs_in_window(
             local_shard,
@@ -506,7 +506,7 @@ where
     /// Batched attestation read by tick id. Pass-through to base storage —
     /// pending entries don't carry attestations, only the receipts that
     /// contribute to them.
-    pub fn certificates_batch(&self, ids: &[TickId]) -> Vec<FinalizedWave> {
+    pub fn certificates_batch(&self, ids: &[TickId]) -> Vec<Finalization> {
         self.base.get_certificates_batch(ids)
     }
 
@@ -939,7 +939,7 @@ impl<S: ShardChainWriter> ShardChainWriter for SubstateView<S> {
     fn prepare_block_commit(
         self: &Arc<Self>,
         parent: ParentAnchor<'_>,
-        finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
+        finalizations: &[Arc<Verifiable<Finalization>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
@@ -956,7 +956,7 @@ impl<S: ShardChainWriter> ShardChainWriter for SubstateView<S> {
         let effective = base_reads.or(drained.as_ref());
         self.base.prepare_block_commit(
             parent,
-            finalized_waves,
+            finalizations,
             block_height,
             pending_snapshots,
             effective,
@@ -983,9 +983,9 @@ mod tests {
 
     use hyperscale_types::{
         Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader,
-        ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, LocalKey, Round, SignerBitfield, StateWrites, TickId, Transaction,
-        TxHash, TxOutcome, WitnessSources,
+        ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
+        Hash, LocalKey, Round, SignerBitfield, StateWrites, TickId, Transaction, TxHash, TxOutcome,
+        WitnessSources,
     };
 
     use super::*;
@@ -1120,7 +1120,7 @@ mod tests {
         fn get_transactions_batch(&self, _hashes: &[TxHash]) -> Vec<Verified<Transaction>> {
             Vec::new()
         }
-        fn get_certificates_batch(&self, _ids: &[TickId]) -> Vec<FinalizedWave> {
+        fn get_certificates_batch(&self, _ids: &[TickId]) -> Vec<Finalization> {
             Vec::new()
         }
         fn get_consensus_receipt(&self, _tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
@@ -1642,7 +1642,7 @@ mod tests {
     }
 
     /// A `BlockForSync` at `height` whose QC carries `wt_ms` and whose
-    /// single finalized wave settles `settles` (a local-shard wave).
+    /// single finalization settles `settles` (a local-shard wave).
     fn settled_sync_block(height: BlockHeight, wt_ms: u64, settles: &TickId) -> BlockForSync {
         // The block's own `parent_qc` carries `wt_ms` — the canonical clock the
         // floor reads.
@@ -1656,7 +1656,7 @@ mod tests {
             unreachable!("make_test_block returns a Live block")
         };
         let certs = vec![Arc::new(
-            FinalizedWave::new(
+            Finalization::new(
                 *settles,
                 // A counterpart's certificate for the same transaction:
                 // what makes it cross-shard, and so what puts it in the

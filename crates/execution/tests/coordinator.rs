@@ -27,7 +27,7 @@ fn fresh_coordinator_reports_no_finalized_state() {
     let coord = fresh_coordinator();
     assert!(!coord.is_finalized(TxHash::from(Hash::from_bytes(b"anything"))));
     assert!(coord.finalized_tx_hashes().is_empty());
-    assert!(coord.get_finalized_waves(&HashSet::new()).is_empty());
+    assert!(coord.get_finalizations(&HashSet::new()).is_empty());
 }
 
 /// Destructures every field of `ExecutionMemoryStats`, so adding a field
@@ -39,7 +39,7 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
     let coord = fresh_coordinator();
     let ExecutionMemoryStats {
         wave_execution_receipts,
-        finalized_wave_certificates,
+        finalizations,
         waves,
         vote_trackers,
         early_votes,
@@ -59,7 +59,7 @@ fn memory_stats_destructures_all_fields_for_fresh_coordinator() {
     } = coord.memory_stats();
 
     assert_eq!(wave_execution_receipts, 0);
-    assert_eq!(finalized_wave_certificates, 0);
+    assert_eq!(finalizations, 0);
     assert_eq!(waves, 0);
     assert_eq!(vote_trackers, 0);
     assert_eq!(early_votes, 0);
@@ -90,20 +90,20 @@ fn fresh_get_wave_assignment_returns_none_for_any_tx() {
 }
 
 #[test]
-fn fresh_get_finalized_wave_returns_none_for_any_tx() {
+fn fresh_get_finalization_returns_none_for_any_tx() {
     let coord = fresh_coordinator();
     assert!(
         coord
-            .get_finalized_wave_for_tx(TxHash::from(Hash::from_bytes(b"tx1")))
+            .get_finalization_for_tx(TxHash::from(Hash::from_bytes(b"tx1")))
             .is_none()
     );
 }
 
 #[test]
-fn fresh_get_finalized_wave_returns_none_for_any_id() {
+fn fresh_get_finalization_returns_none_for_any_id() {
     let coord = fresh_coordinator();
     let wid = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-    assert!(coord.get_finalized_wave(&wid).is_none());
+    assert!(coord.get_finalization(&wid).is_none());
 }
 
 #[test]

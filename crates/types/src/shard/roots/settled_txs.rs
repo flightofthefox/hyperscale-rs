@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::{
-    FinalizedWave, Hash, SettledTxsRoot, ShardId, TxHash, TxOutcome, TypedHash, Verifiable,
+    Finalization, Hash, SettledTxsRoot, ShardId, TxHash, TxOutcome, TypedHash, Verifiable,
     compute_merkle_root,
 };
 
@@ -39,7 +39,7 @@ use crate::{
 /// record of its own, not the absence of one.
 #[must_use]
 pub fn local_settled_tx_hashes<'a>(
-    certificates: impl IntoIterator<Item = &'a Arc<Verifiable<FinalizedWave>>>,
+    certificates: impl IntoIterator<Item = &'a Arc<Verifiable<Finalization>>>,
     shard: ShardId,
 ) -> Vec<TxHash> {
     certificates

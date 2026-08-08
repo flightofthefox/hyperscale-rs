@@ -1,14 +1,14 @@
 //! Block-proposal helpers used by the shard consensus-driven dispatch arms.
 //!
 //! Both the post-dispatch proposal-retry hook and the QC-formed path build
-//! proposals from the same triple — ready txs from mempool, finalized waves
+//! proposals from the same triple — ready txs from mempool, finalizations
 //! from execution, queued provisions — so the gather logic lives once here.
 
 use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    FinalizedWave, MAX_TXS_PER_BLOCK, Provisions, TopologySchedule, TopologySnapshot, Transaction,
+    Finalization, MAX_TXS_PER_BLOCK, Provisions, TopologySchedule, TopologySnapshot, Transaction,
     Verifiable, Verified,
 };
 
@@ -17,7 +17,7 @@ use super::ShardParticipation;
 /// Inputs gathered for building a block proposal.
 pub(in crate::state) struct ProposalInputs {
     pub ready_txs: Vec<Arc<Verified<Transaction>>>,
-    pub finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
+    pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
     pub provisions: Vec<Arc<Verifiable<Provisions>>>,
 }
 
@@ -49,9 +49,9 @@ impl ShardParticipation {
         let ready_txs =
             self.mempool_coordinator
                 .ready_transactions(max_txs, in_flight.inner(), self.now);
-        let finalized_waves = self
+        let finalizations = self
             .execution_coordinator
-            .get_finalized_waves(&ancestor_certified);
+            .get_finalizations(&ancestor_certified);
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard
@@ -77,7 +77,7 @@ impl ShardParticipation {
 
         ProposalInputs {
             ready_txs,
-            finalized_waves,
+            finalizations,
             provisions,
         }
     }
@@ -121,7 +121,7 @@ impl ShardParticipation {
         self.shard_coordinator.try_propose(
             sched,
             &inputs.ready_txs,
-            inputs.finalized_waves,
+            inputs.finalizations,
             inputs.provisions,
         )
     }

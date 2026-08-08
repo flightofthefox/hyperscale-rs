@@ -7,7 +7,7 @@ use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockManifest, CertifiedBlock,
-    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave, QuorumCertificate,
+    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, QuorumCertificate,
     ShardWitnessPayload, TickId, Transaction, TxHash, Verified,
 };
 
@@ -74,7 +74,7 @@ impl ShardChainReader for SimShardStorage {
             .collect()
     }
 
-    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<FinalizedWave> {
+    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<Finalization> {
         let c = read_or_recover(&self.consensus);
         ids.iter()
             .filter_map(|id| c.certificates.get(id).cloned())

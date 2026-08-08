@@ -70,7 +70,7 @@ impl BlockManifest {
     }
 
     /// Wave identifiers in block order.
-    /// Validators use these to match against their locally finalized waves.
+    /// Validators use these to match against what they finalized locally.
     #[must_use]
     pub const fn cert_ids(&self) -> &Vec<TickId> {
         &self.cert_ids
@@ -132,7 +132,7 @@ impl BlockManifest {
 ///
 /// - `"blocks"` CF: `BlockMetadata` (this struct) keyed by height
 /// - `"transactions"` CF: `Transaction` keyed by `tx_hash`
-/// - `"wave_certificates"` CF: `FinalizedWave` attestations keyed by `tick_id` hash
+/// - `"certificates"` CF: `Finalization` attestations keyed by `tick_id` hash
 ///
 /// To reconstruct a full `Block`, fetch the metadata, then batch-fetch
 /// transactions and certificates using the stored hashes.

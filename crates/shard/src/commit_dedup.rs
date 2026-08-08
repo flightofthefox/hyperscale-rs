@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    FinalizedWave, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, TickId, Transaction,
+    Finalization, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, TickId, Transaction,
     TxHash, Verifiable, WeightedTimestamp,
 };
 
@@ -82,11 +82,11 @@ impl CommitDedupIndex {
         }
     }
 
-    /// Record a block's finalized waves in the retention lookup. Each
+    /// Record a block's finalizations in the retention lookup. Each
     /// entry's deadline is the wave's local EC `vote_anchor_ts +
     /// RETENTION_HORIZON`.
-    pub fn register_committed_certs(&mut self, finalized_waves: &[Arc<Verifiable<FinalizedWave>>]) {
-        for fw in finalized_waves {
+    pub fn register_committed_certs(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
+        for fw in finalizations {
             let tick_id = *fw.tick_id();
             let deadline = fw.local_ec().deadline();
             self.cert_retention.entry(tick_id).or_insert(deadline);
@@ -176,7 +176,7 @@ impl CommitDedupIndex {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::{
-        install_stub_vm_statics, make_finalized_wave, stub_transaction, test_prefix,
+        install_stub_vm_statics, make_finalization, stub_transaction, test_prefix,
     };
     use hyperscale_types::{
         BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, RevealChain, ShardId,
@@ -200,9 +200,9 @@ mod tests {
         )))
     }
 
-    fn make_fw(height: u64) -> Arc<Verifiable<FinalizedWave>> {
+    fn make_fw(height: u64) -> Arc<Verifiable<Finalization>> {
         Arc::new(
-            make_finalized_wave(
+            make_finalization(
                 BlockHeight::new(height),
                 TxHash::from(Hash::from_bytes(
                     &[u8::try_from(height).unwrap_or(u8::MAX); 32],
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn prune_drops_certs_past_their_deadline() {
-        // make_finalized_wave sets vote_anchor_ts = block_height + 1.
+        // make_finalization sets vote_anchor_ts = block_height + 1.
         // Deadline = vote_anchor_ts + RETENTION_HORIZON.
         let mut idx = CommitDedupIndex::new();
         let fw = make_fw(1);

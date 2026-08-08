@@ -15,7 +15,7 @@
 //!   broadcast, so any node can serve fallback EC fetches for its own shard.
 //!
 //! Eviction is lifecycle-driven: entries are dropped in
-//! [`ExecutionCoordinator::remove_finalized_wave`] once the wave's containing
+//! [`ExecutionCoordinator::remove_finalization`] once the wave's containing
 //! block commits, at which point the EC is durably available via
 //! [`ShardStorage::get_execution_certificates_by_height`] and the network handler
 //! falls through to that on cache miss.
@@ -30,7 +30,7 @@
 //! the single state-machine writer.
 //!
 //! [`ExecutionCertificate`]: hyperscale_types::ExecutionCertificate
-//! [`ExecutionCoordinator::remove_finalized_wave`]: crate::ExecutionCoordinator::remove_finalized_wave
+//! [`ExecutionCoordinator::remove_finalization`]: crate::ExecutionCoordinator::remove_finalization
 //! [`ShardStorage::get_execution_certificates_by_height`]: hyperscale_storage::ShardStorage::get_execution_certificates_by_height
 
 use std::sync::Arc;

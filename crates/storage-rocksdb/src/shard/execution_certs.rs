@@ -13,7 +13,7 @@ use crate::typed_cf::{TypedCf, batch_put, batch_put_raw};
 
 /// Append execution certificate writes for a block to an existing `WriteBatch`.
 ///
-/// Extracts ECs from the block's wave certificates and folds them into the
+/// Extracts ECs from the block's finalizations and folds them into the
 /// same atomic batch as JMT + block data (one fsync per block). The
 /// transaction index rides the same batch, so a crash can't leave an index
 /// entry pointing at a certificate that was never written.

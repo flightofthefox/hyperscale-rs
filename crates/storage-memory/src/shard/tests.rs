@@ -12,7 +12,7 @@ use hyperscale_storage::{
 use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
     Address, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock,
-    ChainOrigin, ConsensusReceipt, FinalizedWave, GlobalReceiptHash, Hash, LocalKey,
+    ChainOrigin, ConsensusReceipt, Finalization, GlobalReceiptHash, Hash, LocalKey,
     ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId,
     StateRoot, StoredReceipt, SubstateKey, SyncHint, TickId, TxHash, ValidatorId, Verifiable,
     Verified, WeightedTimestamp, WitnessSources,
@@ -40,7 +40,7 @@ impl SimShardStorage {
     #[allow(clippy::significant_drop_tightening)] // both reads need the lock
     pub fn commit_certificate_with_writes(
         &self,
-        certificate: &FinalizedWave,
+        certificate: &Finalization,
         writes: &SettledWrites,
     ) {
         {
@@ -89,7 +89,7 @@ impl CommittableSubstateDatabase for SimShardStorage {
 }
 
 /// Helper: commit a block with given updates by injecting them via a single-tx
-/// `FinalizedWave` inside `block.certificates`.
+/// `Finalization` inside `block.certificates`.
 /// The union of already-settled fixtures — values, so nothing to fold.
 fn union_of(parts: &[SettledWrites]) -> SettledWrites {
     SettledWrites::from_absolutes(
@@ -121,8 +121,8 @@ fn commit_with(
             }),
             metadata: None,
         };
-        let new_fw: Arc<Verifiable<FinalizedWave>> = Arc::new(
-            FinalizedWave::new(
+        let new_fw: Arc<Verifiable<Finalization>> = Arc::new(
+            Finalization::new(
                 TickId::new(ShardId::ROOT, block.height()),
                 vec![],
                 vec![receipt],

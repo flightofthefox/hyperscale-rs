@@ -67,7 +67,7 @@ impl<'a> ChainView<'a> {
     }
 
     /// Borrow a pending block by hash. Used by callers that need to inspect
-    /// per-block state (received transactions, finalized waves) beyond what
+    /// per-block state (received transactions, finalizations) beyond what
     /// the dedicated header / state-root accessors expose.
     pub fn get_pending(&self, block_hash: BlockHash) -> Option<&PendingBlock> {
         self.pending.get(block_hash)
@@ -345,7 +345,7 @@ mod tests {
         // A manifest-only ancestor (header known, body not yet assembled) still
         // contributes its certificate wave-ids to dedup, matching the
         // assembled-block walk; otherwise a descendant could re-include a
-        // finalized wave already present above the committed tip.
+        // finalization already present above the committed tip.
         let header = make_header(3, BlockHash::ZERO);
         let block_hash = header.hash();
         let wave = TickId::new(ShardId::ROOT, BlockHeight::new(2));

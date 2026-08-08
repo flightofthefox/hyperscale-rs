@@ -24,7 +24,7 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::{
     BlockHeight, ConsensusReceipt, DeclaredKey, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificatesSenderMessage, ExecutionVote, ExecutionVotesSenderMessage,
-    FinalizedWaveContext, Mode, StateWrites, Stopwatch, StoredReceipt, SubstateKey, TxHash,
+    FinalizationContext, Mode, StateWrites, Stopwatch, StoredReceipt, SubstateKey, TxHash,
     TxOutcome, Verifiable, Verified, signed_bytes,
 };
 
@@ -251,20 +251,20 @@ where
                 .map_err(|(raw, err)| (Arc::new(raw), err));
             ctx.notify_protocol(ProtocolEvent::ExecutionCertificateSignatureVerified { result });
         }
-        Action::VerifyFinalizedWave {
-            wave,
+        Action::VerifyFinalization {
+            finalization,
             ec_public_keys,
         } => {
-            let fw_ctx = FinalizedWaveContext {
+            let fw_ctx = FinalizationContext {
                 verifier: ctx.verifier,
                 network: ctx.topology_snapshot.network(),
                 ec_public_keys: &ec_public_keys,
             };
-            let result = Arc::unwrap_or_clone(wave)
+            let result = Arc::unwrap_or_clone(finalization)
                 .upgrade(&fw_ctx)
                 .map(Arc::new)
                 .map_err(|(raw, err)| (Arc::new(raw), err));
-            ctx.notify_protocol(ProtocolEvent::FinalizedWaveVerified { result });
+            ctx.notify_protocol(ProtocolEvent::FinalizationVerified { result });
         }
         Action::ExecuteTransactions {
             tick,

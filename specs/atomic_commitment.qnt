@@ -25,7 +25,7 @@
 //     `add_execution_certificate`.
 //   - Cross-shard agreement is per transaction, not per receipt root:
 //     `ExecutionOutcome::Succeeded { receipt_hash }`
-//     (crates/types/src/wave/outcome.rs); wave grouping is per shard, so
+//     (crates/types/src/execution/outcome.rs); wave grouping is per shard, so
 //     global roots are not comparable across shards.
 //
 // Modeling assumptions:
@@ -137,7 +137,7 @@ module atomic_commitment {
   // Abort: still unprovisioned once the chain clock passes
   // wave_start_ts + TIMEOUT.
   // A shard emits its own EC into its admitted row immediately (the local
-  // EC is always included — `create_wave_certificate`).
+  // EC is always included — `WaveState::attestation`).
   action emitEc = {
     nondet s = SHARDS.oneOf()
     nondet o = Set(SUCC, ABORT).oneOf()

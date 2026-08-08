@@ -5,7 +5,7 @@
 
 use hyperscale_types::{
     BlockMetadata, ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionMetadata,
-    FinalizedWave, Hash, Round, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, TickId,
+    Finalization, Hash, Round, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, TickId,
     Transaction, ValidatorId,
 };
 use rocksdb::{ColumnFamily, DB};
@@ -45,7 +45,7 @@ pub const BLOCKS_CF: &str = "blocks";
 /// Column family name for transactions keyed by hash.
 pub const TRANSACTIONS_CF: &str = "transactions";
 
-/// Column family name for wave certificates keyed by hash.
+/// Column family name for finalizations keyed by hash.
 pub const CERTIFICATES_CF: &str = "certificates";
 
 /// Column family name for JMT tree nodes.
@@ -259,9 +259,9 @@ pub struct CertificatesCf;
 impl TypedCf for CertificatesCf {
     const NAME: &'static str = CERTIFICATES_CF;
     type Key = TickId;
-    type Value = FinalizedWave;
+    type Value = Finalization;
     type KeyCodec = HborCodec<TickId>;
-    type ValueCodec = HborCodec<FinalizedWave>;
+    type ValueCodec = HborCodec<Finalization>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.certificates

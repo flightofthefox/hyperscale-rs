@@ -162,9 +162,9 @@ fn resolve_status(answers: &[TransactionStatus]) -> Option<Reported> {
         })
 }
 
-/// Derive the cross-shard events a block's wave certificates attest to.
+/// Derive the cross-shard events a block's finalizations attest to.
 ///
-/// A wave certificate reaches a block only once every participating shard's
+/// A finalization reaches a block only once every participating shard's
 /// execution certificate is in hand and verified, so a certificate committed
 /// here stands for artifacts this committee checked: 2f+1 aggregated
 /// signatures per certificate, and — transitively, because the shard could
