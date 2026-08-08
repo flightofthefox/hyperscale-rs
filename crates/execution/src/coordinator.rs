@@ -797,17 +797,24 @@ impl ExecutionCoordinator {
             }
 
             let Some(wave) = self.waves.get_wave_mut(&wave_id) else {
-                // The wave was swept between joining the tick and the
-                // batch completing (counterpart abort, terminal). Its
-                // provisional entries are already in the appended tick
-                // output; resolve them away so the tick can evict.
+                // The coordinator stopped tracking the wave between its
+                // dispatch and its batch returning. That says where this
+                // coordinator is, not what the wave's fate was, so it
+                // resolves nothing: the first resolution recorded for a
+                // wave is the one the chain applies, and claiming an
+                // abandonment here would consume the entry the wave's
+                // real verdict needs.
+                //
+                // Every fate that reaches the chain reaches it elsewhere.
+                // A counterpart sweep records its own abort, a committed
+                // certificate records its settlement ahead of the block
+                // work that untracks the wave, and a reshape terminal
+                // tears the chain down outright.
                 tracing::warn!(
                     tick = tick.inner(),
                     wave = %wave_id,
                     "ExecutionBatchCompleted for unknown wave — dropping (wave was pruned or never created)"
                 );
-                let height = self.committed_height;
-                self.record_tick_resolution(&wave_id, TickResolution::Aborted { height });
                 continue;
             };
             for result in results {
@@ -3386,6 +3393,62 @@ mod tests {
     /// happens afterwards, in `emit_vote_actions`, so a scan that finds no
     /// committee spends the vote and emits nothing — no action, no retry
     /// registration, and `can_emit_vote` false forever after. The wave then
+    /// A batch returning for a wave this coordinator has stopped tracking
+    /// says where the coordinator is, not what the wave's fate was.
+    ///
+    /// The first resolution recorded for a wave is the one the chain
+    /// applies, so claiming an abandonment here would consume the entry
+    /// the wave's real verdict needs — and the verdict that follows a
+    /// local finalization is a settlement, which promotes writes an abort
+    /// would have dropped.
+    #[test]
+    fn a_batch_for_an_untracked_wave_resolves_nothing() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+        let block = make_live_block(
+            BlockHeight::new(1),
+            1_000,
+            ValidatorId::new(0),
+            vec![Arc::new(tx)],
+        );
+        state.on_block_committed(&schedule, &test_certify(block, 1_000));
+
+        let wave_id = state
+            .waves
+            .wave_assignment(tx_hash)
+            .expect("the committed tx is assigned to a wave");
+        assert!(
+            state.ticked_waves.contains_key(&wave_id),
+            "the wave joined a tick at commit",
+        );
+
+        // The wave finalizes locally, which untracks it, and its batch
+        // returns afterwards.
+        state.waves.remove_wave(&wave_id);
+        state.on_execution_batch_completed(
+            &schedule,
+            BlockHeight::new(1),
+            vec![WaveExecutionResult {
+                wave_id: wave_id.clone(),
+                results: vec![],
+                tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
+                fee_receipts: vec![],
+                attested_work: vec![],
+            }],
+        );
+
+        assert!(
+            state.ticked_waves.contains_key(&wave_id),
+            "the wave's tick entry must survive for its real verdict to claim",
+        );
+        assert!(
+            state.pending_tick_resolutions.is_empty(),
+            "no fate was decided, so none may be recorded",
+        );
+    }
+
     /// holds its locks and never certifies, which is indistinguishable at
     /// the mempool from a wave that was never ready.
     #[test]

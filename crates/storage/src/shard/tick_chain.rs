@@ -172,7 +172,7 @@ impl TickEntry {
         let Some(txs) = self.pending.remove(wave_id) else {
             return;
         };
-        let height = match resolution {
+        match resolution {
             TickResolution::Settled { height, aborted } => {
                 for tx in txs {
                     let promoted = if aborted.contains(&tx.tx_hash) {
@@ -191,17 +191,38 @@ impl TickEntry {
                         );
                     }
                 }
-                *height
+                // The base gains everything this wave settled, at the
+                // height that settled it.
+                for contribution in self.readable.values_mut() {
+                    if contribution.wave == *wave_id {
+                        contribution.in_base_from = Some(*height);
+                    }
+                }
             }
-            // Nothing settles. A cross-shard wave's contributions never
-            // reached `readable`; the single-shard wave's stay, because
-            // later ticks have already read them, and become evictable so
-            // the chain does not pin a fold nothing will settle.
-            TickResolution::Aborted { height } => *height,
-        };
-        for contribution in self.readable.values_mut() {
-            if contribution.wave == *wave_id {
-                contribution.in_base_from = Some(height);
+            // Nothing settles, so nothing enters the base and no height
+            // is recorded. Only a wave whose whole contribution is
+            // provisional can take this path: its entries were never
+            // readable, so dropping them changes no baseline any tick has
+            // already read.
+            //
+            // A readable fold here would have no correct handling. Later
+            // ticks have read those writes and no base will ever carry
+            // them, so stamping a height would drop them from a later
+            // baseline while an earlier one kept them, and leaving them
+            // unstamped would pin the tick forever. The rule is upstream:
+            // abandonment is a verdict about a cross-shard wave, and a
+            // wave with determined output is not one.
+            TickResolution::Aborted { .. } => {
+                if self.readable.values().any(|c| c.wave == *wave_id) {
+                    // Left folded rather than dropped or stamped: every
+                    // read keeps agreeing with the ones before it, and
+                    // the cost is a tick this entry pins.
+                    tracing::error!(
+                        wave = %wave_id,
+                        "abandoned a wave whose fold later ticks have read"
+                    );
+                    debug_assert!(false, "a wave with a readable fold cannot be abandoned");
+                }
             }
         }
     }
