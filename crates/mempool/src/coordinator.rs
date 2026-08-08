@@ -583,23 +583,6 @@ impl MempoolCoordinator {
         actions
     }
 
-    /// Drive a specific set of transactions to `Completed(Aborted)` via
-    /// [`Self::abort_one`] — the counterpart abort sweep on a surviving
-    /// shard, once a terminated partner's settled set proves the
-    /// transaction's cross-shard half will never finalize. Hashes not in
-    /// the pool (already terminal) are skipped.
-    pub fn abort_transactions(&mut self, tx_hashes: &[TxHash]) -> Vec<Action> {
-        let mut sorted: Vec<TxHash> = tx_hashes.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-
-        let mut actions = Vec::with_capacity(sorted.len());
-        for tx_hash in sorted {
-            actions.extend(self.abort_one(tx_hash));
-        }
-        actions
-    }
-
     /// Engage the gossip-timed fork-fence quiesce for `shard`: stop admitting
     /// transactions that touch it. Idempotent; a liveness measure only. See
     /// [`ForkFence::engage`] for the tightening and replay rules.
@@ -1762,55 +1745,6 @@ mod tests {
         assert!(mempool.status(&tx_hash).is_none());
         assert!(mempool.is_tombstoned(&tx_hash));
     }
-
-    #[test]
-    fn abort_transactions_releases_only_the_named_txs() {
-        let topology_snapshot = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
-
-        let doomed =
-            test_transaction_with_prefixes(b"doomed", &[test_prefix(7)], &[test_prefix(8)]);
-        let doomed_hash = doomed.hash();
-        let kept = test_transaction_with_prefixes(b"kept", &[test_prefix(9)], &[test_prefix(10)]);
-        let kept_hash = kept.hash();
-
-        // Both commit with no deciding finalization, so both are
-        // still in the drain.
-        let block = make_live_block(
-            ShardId::ROOT,
-            BlockHeight::new(1),
-            1_234_567_890,
-            ValidatorId::new(0),
-            vec![Arc::new(doomed), Arc::new(kept)],
-            vec![],
-        );
-        mempool.on_block_committed(&topology_snapshot, &certify(block, TEST_BLOCK_INTERVAL_MS));
-
-        let actions = mempool.abort_transactions(&[doomed_hash]);
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::EmitTransactionStatus {
-                    tx_hash: h,
-                    status: TransactionStatus::Completed(TransactionDecision::Aborted),
-                    ..
-                } if *h == doomed_hash
-            )),
-            "the named tx is driven to terminal abort",
-        );
-        assert!(mempool.is_tombstoned(&doomed_hash));
-        assert!(
-            matches!(
-                mempool.status(&kept_hash),
-                Some(TransactionStatus::Committed(_))
-            ),
-            "the unnamed tx stays committed",
-        );
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Bloom-inventory snapshot
-    // ═══════════════════════════════════════════════════════════════════════════
 
     #[test]
     fn tx_store_bloom_snapshot_covers_pool_and_tombstone_window() {

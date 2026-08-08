@@ -85,8 +85,14 @@ pub struct WaveState {
     /// O(1) membership check (mirrors `tx_hashes`).
     tx_hash_set: HashSet<TxHash>,
     /// Transactions owned by the wave, used to build execution requests at
-    /// dispatch time.
+    /// dispatch time. Absent for an abandoned member, which the ledger
+    /// names by hash alone.
     transactions: HashMap<TxHash, Arc<Verified<Transaction>>>,
+    /// Per-tx, the reservation its committing block took against the
+    /// drain. Carried separately from the transaction because an
+    /// abandoned member has no body here and still has to release exactly
+    /// what was taken.
+    reserved_work: HashMap<TxHash, u64>,
 
     /// BFT-authenticated weighted timestamp of the wave-starting block.
     /// Anchor for wave-level wall-clock timeouts (wave abort, vote anchor
@@ -125,6 +131,9 @@ pub struct WaveState {
     /// What this shard attests it did per transaction, carried from
     /// execution onto the outcomes it votes.
     attested_work: HashMap<TxHash, u64>,
+    /// Members this tick attests as abandoned rather than executes: past
+    /// their deadline, carried by the ledger and by nothing else here.
+    abandoned: HashSet<TxHash>,
     /// Members that have joined a tick. A wave usually joins one whole,
     /// but a member whose declared cells another wave holds provisionally
     /// waits for a later tick, so membership is tracked per transaction.
@@ -206,10 +215,12 @@ impl WaveState {
             HashMap::with_capacity(txs.len());
         let mut covered_shards: HashMap<TxHash, BTreeSet<ShardId>> =
             HashMap::with_capacity(txs.len());
+        let mut reserved_work: HashMap<TxHash, u64> = HashMap::with_capacity(txs.len());
 
         for (tx, shards) in txs {
             let h = tx.hash();
             tx_hashes.push(h);
+            reserved_work.insert(h, tx.work());
             // Block-container entries decoded from the wire land as
             // `Unverified`; lift via `from_persisted` under the same
             // BFT-transitive trust that gates the containing block. Honest
@@ -257,6 +268,7 @@ impl WaveState {
             participating_shards,
             tx_hash_set,
             transactions,
+            reserved_work,
             provisioned_txs,
             provisioned_tx_ts,
             all_provisioned_at,
@@ -264,6 +276,7 @@ impl WaveState {
             engagement_deadline: None,
             fee_receipts: HashMap::new(),
             attested_work: HashMap::new(),
+            abandoned: HashSet::new(),
             dispatched: HashSet::new(),
             execution_results: HashMap::new(),
             execution_receipts: HashMap::new(),
@@ -280,6 +293,50 @@ impl WaveState {
             tx_has_failure: HashSet::new(),
             execution_certificates: Vec::new(),
         }
+    }
+
+    /// Add a transaction this shard can no longer finalize, to be attested
+    /// `Aborted` by the tick being composed.
+    ///
+    /// It joins as a member with an outcome already decided and no body:
+    /// the ledger names it by hash and by the work its committing block
+    /// reserved, which is all an abort has to state. Nothing is dispatched
+    /// for it, so it claims no cell and needs no provisions, and the only
+    /// shard whose certificate it waits for is this one — an abort is
+    /// dominant, so no counterpart can contradict it.
+    ///
+    /// A hash the wave already holds is left alone: its own outcome is the
+    /// one the tick attests.
+    pub fn absorb_abandoned(
+        &mut self,
+        tx_hash: TxHash,
+        declared_work: u64,
+        now: WeightedTimestamp,
+    ) {
+        if !self.tx_hash_set.insert(tx_hash) {
+            return;
+        }
+        self.tx_hashes.push(tx_hash);
+        self.abandoned.insert(tx_hash);
+        self.reserved_work.insert(tx_hash, declared_work);
+        self.participating_shards
+            .insert(tx_hash, BTreeSet::from([self.tick_id.shard_id()]));
+        self.covered_shards.insert(tx_hash, BTreeSet::new());
+        self.explicit_aborts.insert(tx_hash);
+        self.mark_tx_provisioned(tx_hash, now);
+    }
+
+    /// Whether this wave is still going to attest `tx_hash`: its own
+    /// certificate has not formed yet, or the verdict that certificate
+    /// carries is the abandonment.
+    ///
+    /// The negative case is the one that matters — a wave whose local
+    /// certificate exists has said everything it will say, so a member of
+    /// it still awaiting a counterpart is stranded rather than in hand.
+    #[must_use]
+    pub fn will_attest(&self, tx_hash: TxHash) -> bool {
+        self.tx_hash_set.contains(&tx_hash)
+            && (!self.local_ec_emitted || self.abandoned.contains(&tx_hash))
     }
 
     // ── Identity getters ────────────────────────────────────────────────
@@ -888,12 +945,11 @@ impl WaveState {
                 // that. A member the wave could not price would release
                 // less than its block took, and the drain keeps the
                 // difference for as long as the chain runs — so the
-                // transaction is required, not defaulted.
-                let reserved = self
-                    .transactions
+                // figure is required, not defaulted.
+                let reserved = *self
+                    .reserved_work
                     .get(tx_hash)
-                    .expect("a wave holds every member it names")
-                    .work();
+                    .expect("a wave prices every member it names");
                 let charge = self
                     .fee_receipts
                     .get(tx_hash)
@@ -1064,22 +1120,6 @@ impl WaveState {
             }
         }
         true
-    }
-
-    /// Whether any non-aborted tx still lacks an execution certificate from
-    /// `shard`. The counterpart abort sweep reads this once a past-terminal
-    /// partner shard's settled set is fully ingested: a wave that still
-    /// lacks the partner's coverage can never gain it, so it is doomed and
-    /// its transactions abort.
-    #[must_use]
-    pub fn lacks_coverage_from(&self, shard: ShardId) -> bool {
-        self.tx_hashes.iter().any(|tx_hash| {
-            !self.tracker_aborted.contains(tx_hash)
-                && self
-                    .covered_shards
-                    .get(tx_hash)
-                    .is_some_and(|covered| !covered.contains(&shard))
-        })
     }
 
     /// Whether a tx was aborted before dispatch (pre-dispatch reverse-conflict).
@@ -2380,18 +2420,28 @@ mod tests {
         let mut w = make_cross_shard_wave(2);
         let [first, second] = [w.tx_hashes()[0], w.tx_hashes()[1]];
         let remote = ShardId::leaf(1, 1);
+        w.mark_tx_provisioned(first, ts_for(WAVE_START + 1));
+        w.mark_tx_provisioned(second, ts_for(WAVE_START + 1));
+        record_executed(&mut w, first, true);
+        record_executed(&mut w, second, true);
+        w.add_execution_certificate(make_ec(
+            w.tick_id(),
+            ShardId::leaf(1, 0),
+            &[first, second],
+            true,
+        ));
 
         // The narrower copy arrives first, covering one transaction.
         w.add_execution_certificate(make_ec(w.tick_id(), remote, &[first], true));
         assert!(
-            w.lacks_coverage_from(remote),
+            !w.is_complete(),
             "the second transaction is still uncovered"
         );
 
         // The fuller copy follows and completes the counterpart's coverage.
         w.add_execution_certificate(make_ec(w.tick_id(), remote, &[first, second], true));
         assert!(
-            !w.lacks_coverage_from(remote),
+            w.is_complete(),
             "the fuller copy must be absorbed, not dropped as a duplicate"
         );
     }
@@ -2418,6 +2468,57 @@ mod tests {
         let decisions: HashMap<TxHash, TransactionDecision> =
             w.attestation().tx_decisions().into_iter().collect();
         assert_eq!(decisions.get(&second), Some(&TransactionDecision::Aborted));
+    }
+
+    /// A transaction this shard can no longer finalize joins the tick
+    /// with its outcome already decided: `Aborted`, priced at what its own
+    /// block reserved, waiting on this shard's certificate and no other.
+    #[test]
+    fn an_abandoned_member_votes_aborted_at_its_reservation() {
+        let mut w = make_single_shard_wave(1);
+        let executed = w.tx_hashes()[0];
+        record_executed(&mut w, executed, true);
+
+        let abandoned = TxHash::from(Hash::from_bytes(b"abandoned"));
+        w.absorb_abandoned(abandoned, 4_242, ts_for(WAVE_START));
+
+        let (_, _, outcomes) = w
+            .build_vote_data(ts_for(WAVE_START))
+            .expect("an abandoned member has an outcome from the moment it joins");
+        let voted: HashMap<TxHash, &TxOutcome> =
+            outcomes.iter().map(|o| (o.tx_hash(), o)).collect();
+        assert!(voted[&abandoned].is_aborted());
+        assert_eq!(voted[&abandoned].declared_work(), 4_242);
+        assert!(
+            !voted[&executed].is_aborted(),
+            "and its siblings vote their own outcomes",
+        );
+    }
+
+    /// An abandoned member is dispatched to nothing: it produced no
+    /// effects and claims no cell, so it cannot keep a later tick out.
+    #[test]
+    fn an_abandoned_member_executes_nothing_and_claims_nothing() {
+        let mut w = make_single_shard_wave(1);
+        let claims_before = w.declared_mutations().len();
+        w.absorb_abandoned(
+            TxHash::from(Hash::from_bytes(b"abandoned")),
+            1,
+            ts_for(WAVE_START),
+        );
+
+        let group = w
+            .tick_group_if_ready(
+                &ProvisioningTracker::new(),
+                &mut ProvisionalCells::default(),
+            )
+            .expect("the executable member still dispatches");
+        assert_eq!(group.requests.len(), 1, "only the member with a body");
+        assert_eq!(
+            w.declared_mutations().len(),
+            claims_before,
+            "an abandonment declares nothing",
+        );
     }
 
     /// A copy that covers nothing new is not retained. A peer can

@@ -838,7 +838,7 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)
     storage.commit_block(&make_test_certified(resolving), &empty_witness());
 
     let rebuilt = fold_unresolved_txs(storage, BlockHeight::new(2), WeightedTimestamp::ZERO);
-    let names: Vec<TxHash> = rebuilt.iter().map(|(tx_hash, _)| *tx_hash).collect();
+    let names: Vec<TxHash> = rebuilt.iter().map(|(tx_hash, ..)| *tx_hash).collect();
     assert_eq!(
         names,
         vec![open.hash()],
@@ -848,5 +848,10 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)
         rebuilt[0].1,
         open.validity_range().end_timestamp_exclusive,
         "carrying the validity end the abort deadline derives from"
+    );
+    assert_eq!(
+        rebuilt[0].2,
+        open.work(),
+        "and the reservation an abandonment has to release"
     );
 }

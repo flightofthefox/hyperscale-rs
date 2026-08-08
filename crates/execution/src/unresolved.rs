@@ -26,29 +26,48 @@ use hyperscale_types::{
     WeightedTimestamp,
 };
 
-/// Committed-but-unresolved transactions, each against the moment past
-/// which it can no longer finalize anywhere: the last block that could
-/// have included it, plus the longest a cross-shard transaction can take
-/// to finalize.
+/// One committed transaction's outstanding account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Owed {
+    /// The moment past which the transaction can no longer finalize
+    /// anywhere: the last block that could have included it, plus the
+    /// longest a cross-shard transaction can take to finalize.
+    deadline: WeightedTimestamp,
+    /// The reservation its committing block took against the drain, held
+    /// here because an abandonment has no execution to read it from and
+    /// must release exactly what was taken.
+    declared_work: u64,
+}
+
+/// Committed-but-unresolved transactions, each against its deadline and
+/// the reservation it holds.
 #[derive(Debug, Default)]
 pub struct UnresolvedTxs {
-    deadlines: BTreeMap<TxHash, WeightedTimestamp>,
+    owed: BTreeMap<TxHash, Owed>,
 }
 
 impl UnresolvedTxs {
     /// Rebuild from a replay of the committed chain: each transaction
     /// still owed an outcome, against the validity end its deadline
-    /// derives from.
+    /// derives from and the work its block reserved for it.
     ///
     /// The deadline rule lives here and only here, so a rebuilt ledger
     /// and a live one cannot disagree about when a transaction stops
     /// being able to finalize.
     #[must_use]
-    pub fn restored(entries: Vec<(TxHash, WeightedTimestamp)>) -> Self {
+    pub fn restored(entries: Vec<(TxHash, WeightedTimestamp, u64)>) -> Self {
         Self {
-            deadlines: entries
+            owed: entries
                 .into_iter()
-                .map(|(tx_hash, validity_end)| (tx_hash, validity_end.plus(WAVE_TIMEOUT)))
+                .map(|(tx_hash, validity_end, declared_work)| {
+                    (
+                        tx_hash,
+                        Owed {
+                            deadline: validity_end.plus(WAVE_TIMEOUT),
+                            declared_work,
+                        },
+                    )
+                })
                 .collect(),
         }
     }
@@ -63,11 +82,14 @@ impl UnresolvedTxs {
         txs: impl IntoIterator<Item = &'a Arc<Verifiable<Transaction>>>,
     ) {
         for tx in txs {
-            let deadline = tx
-                .validity_range()
-                .end_timestamp_exclusive
-                .plus(WAVE_TIMEOUT);
-            self.deadlines.entry(tx.hash()).or_insert(deadline);
+            let owed = Owed {
+                deadline: tx
+                    .validity_range()
+                    .end_timestamp_exclusive
+                    .plus(WAVE_TIMEOUT),
+                declared_work: tx.work(),
+            };
+            self.owed.entry(tx.hash()).or_insert(owed);
         }
     }
 
@@ -77,9 +99,25 @@ impl UnresolvedTxs {
     pub fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         for finalization in finalizations {
             for tx_hash in finalization.tx_hashes() {
-                self.deadlines.remove(&tx_hash);
+                self.owed.remove(&tx_hash);
             }
         }
+    }
+
+    /// The transactions this shard can no longer finalize, each with the
+    /// reservation it still holds.
+    ///
+    /// Read off committed content alone — the ledger is a fold over
+    /// committed blocks and `now` is the committed weighted timestamp —
+    /// so every replica at the same frontier names the same set, which is
+    /// what lets a committee sign the abort it composes.
+    #[must_use]
+    pub fn past_deadline(&self, now: WeightedTimestamp) -> Vec<(TxHash, u64)> {
+        self.owed
+            .iter()
+            .filter(|(_, owed)| now >= owed.deadline)
+            .map(|(tx_hash, owed)| (*tx_hash, owed.declared_work))
+            .collect()
     }
 
     /// Drop entries so old that no block could still reference them.
@@ -90,18 +128,20 @@ impl UnresolvedTxs {
     /// dropped the transaction and a certificate naming it would be
     /// refused, so holding the entry only leaks memory.
     pub fn prune(&mut self, now: WeightedTimestamp) {
-        self.deadlines
-            .retain(|_, deadline| deadline.plus(MAX_VALIDITY_RANGE) > now);
+        self.owed
+            .retain(|_, owed| owed.deadline.plus(MAX_VALIDITY_RANGE) > now);
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.deadlines.len()
+        self.owed.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use hyperscale_types::test_utils::{make_finalization, stub_transaction};
     use hyperscale_types::{
         Address, BlockHeight, TimestampRange, TransactionDecision, Verified, WeightedTimestamp,
@@ -167,6 +207,28 @@ mod tests {
 
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger.len(), 1);
+    }
+
+    /// A transaction becomes abandonable at its own deadline and not
+    /// before, carrying the reservation its committing block took.
+    #[test]
+    fn a_transaction_is_abandonable_at_its_deadline_and_not_before() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(4, 60_000);
+        ledger.register_committed(std::iter::once(&tx));
+
+        let deadline = ms(60_000).plus(WAVE_TIMEOUT);
+        assert!(
+            ledger
+                .past_deadline(deadline.minus(Duration::from_millis(1)))
+                .is_empty(),
+            "merely slow is not abandonable",
+        );
+        assert_eq!(
+            ledger.past_deadline(deadline),
+            vec![(tx.hash(), tx.work())],
+            "at the deadline, named with what it reserved",
+        );
     }
 
     /// An entry survives its deadline: the window past it is the room the

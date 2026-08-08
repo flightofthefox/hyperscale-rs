@@ -20,12 +20,12 @@ pub struct RecoveredState {
     pub committed_height: BlockHeight,
 
     /// Transactions this shard committed and has no outcome for, each
-    /// with the validity end its abort deadline derives from. Replayed
-    /// from the committed chain by
+    /// with the validity end its abort deadline derives from and the work
+    /// its committing block reserved. Replayed from the committed chain by
     /// [`fold_unresolved_txs`](super::unresolved::fold_unresolved_txs),
     /// because execution's own account of what is in flight does not
     /// survive the restart this state exists to recover from.
-    pub unresolved_txs: Vec<(TxHash, WeightedTimestamp)>,
+    pub unresolved_txs: Vec<(TxHash, WeightedTimestamp, u64)>,
 
     /// Last committed block hash (None for fresh start).
     pub committed_hash: Option<BlockHash>,

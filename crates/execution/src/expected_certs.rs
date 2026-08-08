@@ -274,8 +274,8 @@ impl ExpectedCertTracker {
 
     /// Whether `source_shard`'s outcome for `tx_hash` has already been
     /// ingested (a [`mark_fulfilled`](Self::mark_fulfilled) tombstone
-    /// exists). The counterpart abort sweep reads this to decide which
-    /// settled transactions naming us are still outstanding.
+    /// exists). Read when a terminated partner's settled set arrives, to
+    /// decide which of the certificates it owes us to fetch.
     #[must_use]
     pub fn is_fulfilled(&self, source_shard: ShardId, tx_hash: TxHash) -> bool {
         self.fulfilled

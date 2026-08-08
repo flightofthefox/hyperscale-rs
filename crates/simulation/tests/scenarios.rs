@@ -908,8 +908,8 @@ fn split_straddler_atomic_sim() {
 /// Drives the portable [`split_straddler_ec_partition_atomic`] scenario, seating
 /// disjoint splitter/survivor committees via dedicated pool hosts so no
 /// co-hosted vnode bridges the EC cut in-process. The seed varies how the
-/// survivor's finalization races its own counterpart-abort sweep; none may
-/// resolve one-sided.
+/// survivor's finalization races the settled-set fence deciding it; none
+/// may resolve one-sided.
 fn split_straddler_ec_partition_atomic_at_seed(seed: u64) {
     let setup = split_straddler_setup();
     let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(

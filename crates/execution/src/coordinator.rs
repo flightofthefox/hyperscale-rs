@@ -355,24 +355,6 @@ pub struct ExecutionCoordinator {
     /// schedule evicting the shard — never on a clock. Keyed by `TickId`.
     gated_finalized: BTreeMap<TickId, Arc<Verifiable<Finalization>>>,
 
-    /// Past-terminal partner shards whose settled set is recorded but whose
-    /// counterpart abort sweep is still awaiting the ingestion of every
-    /// settled execution certificate naming us. Each value is the subset of
-    /// that shard's settled transaction naming us whose EC we have not yet
-    /// ingested. When the set empties (or the shard's retention horizon
-    /// passes), [`Self::take_ready_counterpart_aborts`] drops every local
-    /// wave still lacking the partner's coverage — its transactions can
-    /// never finalize, so they abort.
-    pending_counterpart_sweeps: HashMap<ShardId, HashSet<TxHash>>,
-
-    /// Transactions whose finalization the gate **rejected** — a late
-    /// execution certificate completed a wave naming a past-terminal
-    /// partner that never settled it. The wave is already gone from the
-    /// registry (`finalize` removed it before the gate ran), so the
-    /// pending counterpart sweep can't reach the transaction; it drains
-    /// here instead, through [`Self::take_ready_counterpart_aborts`].
-    gate_rejected_aborts: Vec<TxHash>,
-
     /// This validator's identity.
     me: ValidatorId,
 
@@ -450,8 +432,6 @@ impl ExecutionCoordinator {
             unproven_ecs: AwaitingTopologyBuffer::new(),
             settled_sets: HashMap::new(),
             gated_finalized: BTreeMap::new(),
-            pending_counterpart_sweeps: HashMap::new(),
-            gate_rejected_aborts: Vec::new(),
             me,
             local_shard,
         }
@@ -591,6 +571,7 @@ impl ExecutionCoordinator {
         classification: &TopologySnapshot,
         block: CommittingBlock,
         transactions: &[Arc<Verifiable<Transaction>>],
+        abandoned: &[(TxHash, u64)],
     ) -> (BTreeSet<TickId>, Vec<Verifiable<ExecutionVote>>) {
         let CommittingBlock {
             hash: block_hash,
@@ -598,7 +579,15 @@ impl ExecutionCoordinator {
             ts: block_ts,
             reveal: block_reveal,
         } = block;
-        let waves = assign_waves(classification, self.local_shard, block_height, transactions);
+        let mut waves = assign_waves(classification, self.local_shard, block_height, transactions);
+        // The tick attests what this shard abandons alongside what it
+        // executes, so a commit that carries nothing to execute still
+        // composes one to say so.
+        if !abandoned.is_empty() {
+            waves
+                .entry(TickId::new(self.local_shard, block_height))
+                .or_default();
+        }
         // Setup-time leader/quorum key on the wave-start timestamp — a
         // best-effort guess, since the wave's `vote_anchor_ts` isn't fixed
         // until it votes. When that lands in a later epoch, the
@@ -640,6 +629,11 @@ impl ExecutionCoordinator {
 
             for (tx_hash, counterparts, validity_end) in engagement_waits {
                 wave_state.record_engagement_wait(tx_hash, counterparts, validity_end);
+            }
+
+            for &(tx_hash, declared_work) in abandoned {
+                wave_state.absorb_abandoned(tx_hash, declared_work, block_ts);
+                self.waves.assign_tx(tx_hash, tick_id);
             }
 
             // For cross-shard waves: fold in any provisions that already arrived.
@@ -816,10 +810,11 @@ impl ExecutionCoordinator {
                 // real verdict needs.
                 //
                 // Every fate that reaches the chain reaches it elsewhere.
-                // A counterpart sweep records its own abort, a committed
-                // certificate records its settlement ahead of the block
-                // work that untracks the wave, and a reshape terminal
-                // tears the chain down outright.
+                // The tick that abandons a transaction discards the wave
+                // holding it and records that, a committed certificate
+                // records its settlement ahead of the block work that
+                // untracks the wave, and a reshape terminal tears the
+                // chain down outright.
                 tracing::warn!(
                     tick = tick.inner(),
                     wave = %tick_id,
@@ -1983,9 +1978,8 @@ impl ExecutionCoordinator {
         // Re-check gate-held finalizations against the advanced schedule:
         // emit any it now resolves, and drop any whose partner it has
         // evicted from every retained window. Runs every block so a settled
-        // set that never reconstructs can't pin the buffer; rejected
-        // straddlers ride `gate_rejected_aborts` into the commit's
-        // counterpart sweep.
+        // set that never reconstructs can't pin the buffer; a rejected
+        // straddler's transactions stay owed until their deadline.
         actions.extend(self.redrive_gated_finalizations(topology_schedule));
 
         // Re-broadcast outbound ECs that haven't been ACKed via wave
@@ -2099,11 +2093,19 @@ impl ExecutionCoordinator {
 
         let mut candidates: BTreeSet<TickId> = self.waves_owing_members();
 
-        if !transactions.is_empty() {
+        // What this shard can no longer finalize, and so has to say so
+        // about. Read before the block's own transactions register: their
+        // deadlines all sit ahead of this commit, but the two sets have to
+        // be disjoint by construction, not by arithmetic.
+        let abandoned = self.abandonable();
+        self.discard_waves_holding(&abandoned);
+
+        if !transactions.is_empty() || !abandoned.is_empty() {
             tracing::debug!(
                 height = height.inner(),
                 tx_count = transactions.len(),
-                "Starting execution for new transactions"
+                abandoned = abandoned.len(),
+                "Composing this commit's tick"
             );
 
             let (created, early_votes) = self.setup_waves_and_dispatch(
@@ -2116,6 +2118,7 @@ impl ExecutionCoordinator {
                     reveal: header.reveal_chain(),
                 },
                 transactions,
+                &abandoned,
             );
             candidates.extend(created);
             for vote in early_votes {
@@ -2287,6 +2290,83 @@ impl ExecutionCoordinator {
         groups
     }
 
+    /// The transactions this commit's tick attests `Aborted`.
+    ///
+    /// The trigger is the transaction's own deadline: the last block that
+    /// could have included it anywhere, plus the longest a cross-shard
+    /// transaction can take to finalize. Both figures are its own and the
+    /// clock is the committed weighted timestamp, so no replica can reach
+    /// the deadline at a frontier where another has not — which is what
+    /// lets a committee sign a verdict about it.
+    ///
+    /// Past it, only the transactions this shard has no outcome for and
+    /// none coming. A finalization already assembled, one the
+    /// split-boundary gate is holding, and a wave that has yet to speak
+    /// are each an outcome on its way, and an abort beside one would be a
+    /// second verdict. What is left is stranded: a wave that attested and
+    /// waits on a counterpart's certificate, or — after a restart — no
+    /// wave at all.
+    ///
+    /// That narrowing is local, and it is safe for it to be: it only ever
+    /// withholds. Every wait it defers to ends — a block carries the
+    /// finalization, the schedule evicts a gate-held partner, a wave votes
+    /// at its own deadline — and the next commit asks again, so a
+    /// withheld abort is late rather than lost.
+    fn abandonable(&self) -> Vec<(TxHash, u64)> {
+        let outcome_coming = |tx_hash: TxHash| {
+            self.finalized.is_finalized(tx_hash)
+                || self
+                    .gated_finalized
+                    .values()
+                    .any(|fw| fw.contains_tx(&tx_hash))
+                || self
+                    .waves
+                    .wave_assignment(tx_hash)
+                    .and_then(|tick_id| self.waves.get_wave(&tick_id))
+                    .is_some_and(|wave| wave.will_attest(tx_hash))
+        };
+        self.unresolved
+            .past_deadline(self.committed_ts)
+            .into_iter()
+            .filter(|(tx_hash, _)| !outcome_coming(*tx_hash))
+            .collect()
+    }
+
+    /// Drop every wave still holding a transaction this tick abandons.
+    ///
+    /// A wave that outlived an abandoned member would go on to attest a
+    /// second verdict for it, and the abort is the one the chain has.
+    /// Its remaining members are not aborted here — each waits for its own
+    /// deadline — but they lose the wave, which by this point has failed
+    /// to resolve them for the whole width of a deadline.
+    fn discard_waves_holding(&mut self, abandoned: &[(TxHash, u64)]) {
+        let doomed: BTreeSet<TickId> = abandoned
+            .iter()
+            .filter_map(|(tx_hash, _)| self.waves.wave_assignment(*tx_hash))
+            .collect();
+        for tick_id in doomed {
+            let Some(wave) = self.waves.remove_wave(&tick_id) else {
+                continue;
+            };
+            tracing::info!(
+                wave = %tick_id,
+                txs = wave.tx_hashes().len(),
+                "Discarding a wave that held a transaction past its deadline"
+            );
+            self.outbound_certs.on_tick_finalized(&tick_id);
+            self.record_tick_resolution(
+                &tick_id,
+                TickResolution::Aborted {
+                    height: self.committed_height,
+                },
+            );
+            for &tx_hash in wave.tx_hashes() {
+                self.waves.remove_assignment(tx_hash);
+                self.provisioning.remove_tx(tx_hash);
+            }
+        }
+    }
+
     /// Record a wave's fate for the tick chain.
     ///
     /// A wave with no tick entry — never dispatched, or committed by a
@@ -2437,12 +2517,6 @@ impl ExecutionCoordinator {
         topology_schedule: &TopologySchedule,
         ec: &Arc<Verified<ExecutionCertificate>>,
     ) -> Vec<Action> {
-        // A settled certificate naming us from a terminated partner drains
-        // its outstanding-coverage set, arming the counterpart abort sweep
-        // once the partner's settled coverage is complete.
-        let covered: Vec<TxHash> = ec.tx_outcomes().iter().map(TxOutcome::tx_hash).collect();
-        self.note_settled_ec_ingested(ec.shard_id(), &covered);
-
         let routing = self.waves.classify_attestation(ec);
 
         self.early.clear_routed(ec, &routing.routed_tx_hashes);
@@ -2506,8 +2580,9 @@ impl ExecutionCoordinator {
     /// settled set resolves it or its scheduled termination clears
     /// ([`Self::redrive_gated_finalizations`]).
     /// `Reject` drops it — the wave names a past-terminal shard that
-    /// didn't settle it, so it must never be produced; the counterpart
-    /// abort sweep terminates the underlying transaction.
+    /// didn't settle it, so it must never be produced. Nothing here
+    /// resolves its transactions; they stay owed, and the tick at their
+    /// deadline abandons them.
     fn emit_or_gate_finalized(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -2551,10 +2626,9 @@ impl ExecutionCoordinator {
             }
             SettledSetVerdict::Reject => {
                 // The partner never settled this wave, so it must never be
-                // produced — and `finalize` already removed it from the
-                // registry, so the pending counterpart sweep can't reach its
-                // transactions. Queue them for the same abort path.
-                self.gate_rejected_aborts.extend(finalized_arc.tx_hashes());
+                // produced. `finalize` already removed it from the registry
+                // and nothing here resolves its transactions, so they stay
+                // owed and the tick at their deadline abandons them.
                 vec![]
             }
         }
@@ -2565,35 +2639,22 @@ impl ExecutionCoordinator {
     /// [`Self::redrive_gated_finalizations`] to release waves that the
     /// gate held while the set was unknown.
     ///
-    /// Also arms the counterpart abort sweep: the settled transaction naming us
-    /// are exactly the cross-shard certificates we still expect from the
-    /// terminated partner. We register the ones we haven't ingested yet so
-    /// the fallback fetch drives them, and track the outstanding set so
-    /// [`Self::take_ready_counterpart_aborts`] fires once every one lands.
+    /// Also arms the fallback fetch: what the partner says it settled and
+    /// we are still waiting on is exactly the certificates it owes us, and
+    /// the header that first named them may never have reached us.
     pub fn record_settled_txs(&mut self, shard: ShardId, settled: SettledTxSet) {
         let now_ts = self.committed_ts;
 
-        // What the partner still owes us is the intersection of what it
-        // says it settled with what we are waiting on: a transaction it
-        // settled that we hold no wave for is not ours to wait for, and one
-        // we await that it never settled will never arrive. A partner that
-        // settled nothing naming us therefore leaves an empty set, and the
-        // sweep fires at once rather than waiting on coverage that cannot
-        // come.
-        let outstanding: HashSet<TxHash> = self
+        let owed: Vec<TxHash> = self
             .awaited_txs_from(shard)
             .into_iter()
             .filter(|tx_hash| settled.txs.contains(tx_hash))
             .filter(|tx_hash| !self.expected_certs.is_fulfilled(shard, *tx_hash))
             .collect();
-
-        // Arm the fallback fetch for each: the header that first named them
-        // may never have reached us, and the partner is gone.
-        for &tx_hash in &outstanding {
+        for tx_hash in owed {
             self.expected_certs.register(shard, tx_hash, now_ts);
         }
 
-        self.pending_counterpart_sweeps.insert(shard, outstanding);
         self.settled_sets.insert(shard, settled);
     }
 
@@ -2601,95 +2662,10 @@ impl ExecutionCoordinator {
     /// `terminal_wt + RETENTION_HORIZON` the gate rejects any outcome
     /// naming the shard regardless of the set, so retaining it only leaks
     /// memory.
-    /// The counterpart-sweep entry for the same shard clears itself on the
-    /// same horizon, so the two stay consistent.
     fn gc_settled_sets(&mut self) {
         let now = self.committed_ts;
         self.settled_sets
             .retain(|_, settled| now <= settled.terminal_wt.plus(RETENTION_HORIZON));
-    }
-
-    /// Note that a settled execution certificate naming us has been
-    /// ingested. Drains it from the awaiting partner's outstanding set so
-    /// [`Self::take_ready_counterpart_aborts`] can fire once the partner's
-    /// settled coverage is complete. A no-op for any EC not belonging to a
-    /// pending counterpart sweep.
-    fn note_settled_ec_ingested(&mut self, source_shard: ShardId, covered: &[TxHash]) {
-        if let Some(outstanding) = self.pending_counterpart_sweeps.get_mut(&source_shard) {
-            for tx_hash in covered {
-                outstanding.remove(tx_hash);
-            }
-        }
-    }
-
-    /// Drop every local wave doomed by a past-terminal partner whose
-    /// settled-coverage ingestion is complete, returning the transaction
-    /// hashes so the mempool releases their locks and marks them aborted.
-    ///
-    /// A partner is ready once we have ingested every settled certificate
-    /// naming us, or once its retention horizon passes (the late half can
-    /// never arrive). Any local wave that still lacks the partner's
-    /// coverage at that point can never finalize — the certificate that
-    /// would cover it is either from an unsettled transaction the fence bars or
-    /// will never come — so its transactions are aborted and its execution
-    /// state dropped.
-    pub fn take_ready_counterpart_aborts(&mut self) -> Vec<TxHash> {
-        let now_ts = self.committed_ts;
-        let ready: Vec<ShardId> =
-            self.pending_counterpart_sweeps
-                .iter()
-                .filter(|(shard, outstanding)| {
-                    outstanding.is_empty()
-                        || self.settled_sets.get(shard).is_some_and(|settled| {
-                            now_ts > settled.terminal_wt.plus(RETENTION_HORIZON)
-                        })
-                })
-                .map(|(shard, _)| *shard)
-                .collect();
-
-        let mut aborted: Vec<TxHash> = Vec::new();
-        for shard in ready {
-            self.pending_counterpart_sweeps.remove(&shard);
-            let doomed: Vec<TickId> = self
-                .waves
-                .waves_iter()
-                .filter(|(_, wave)| {
-                    wave.txs_awaiting(shard).next().is_some() && wave.lacks_coverage_from(shard)
-                })
-                .map(|(tick_id, _)| *tick_id)
-                .collect();
-            for tick_id in doomed {
-                let Some(wave) = self.waves.remove_wave(&tick_id) else {
-                    continue;
-                };
-                let height = self.committed_height;
-                self.record_tick_resolution(&tick_id, TickResolution::Aborted { height });
-                for &tx_hash in wave.tx_hashes() {
-                    self.waves.remove_assignment(tx_hash);
-                    self.provisioning.remove_tx(tx_hash);
-                    aborted.push(tx_hash);
-                }
-            }
-        }
-
-        // Transactions whose wave the gate rejected (a late certificate
-        // completed it after the partner terminated without settling it).
-        // Their wave is already gone, so they ride the same abort path.
-        for tx_hash in self.gate_rejected_aborts.drain(..) {
-            self.waves.remove_assignment(tx_hash);
-            self.provisioning.remove_tx(tx_hash);
-            aborted.push(tx_hash);
-        }
-
-        aborted.sort_unstable();
-        aborted.dedup();
-        if !aborted.is_empty() {
-            tracing::info!(
-                aborted = aborted.len(),
-                "Counterpart settled set complete — aborting straddlers a terminated partner never settled"
-            );
-        }
-        aborted
     }
 
     /// Re-check every gate-held finalization against the current settled
@@ -3287,7 +3263,7 @@ mod tests {
         AggregateSignature, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Epoch,
         ExecutionOutcome, GlobalReceiptHash, Hash, NetworkDefinition, QuorumCertificate,
         RecoveryCause, ShardRecovery, Signer, SignerBitfield, StoredReceipt, ValidatorInfo,
-        ValidatorSet,
+        ValidatorSet, WAVE_TIMEOUT,
     };
 
     use super::*;
@@ -5582,8 +5558,8 @@ mod tests {
     }
 
     /// A wave a past-terminal shard never settled is dropped, not produced
-    /// and not buffered for retry — its transaction aborts via the
-    /// counterpart sweep instead.
+    /// and not buffered for retry. Nothing here resolves its transaction:
+    /// it stays owed, and the tick at its deadline abandons it.
     #[test]
     fn finalize_gate_drops_unsettled_wave() {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
@@ -5598,7 +5574,13 @@ mod tests {
         );
         let wave = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
         let tick_id = *wave.tick_id();
-        let tx_hash: Vec<TxHash> = wave.tx_hashes().collect();
+        // The rejection must resolve nothing: the transaction stays owed,
+        // and the tick at its deadline is what abandons it.
+        state.unresolved = UnresolvedTxs::restored(
+            wave.tx_hashes()
+                .map(|tx_hash| (tx_hash, WeightedTimestamp::from_millis(60_000), 1))
+                .collect(),
+        );
 
         let dropped = state.emit_or_gate_finalized(&sched, wave);
         assert!(
@@ -5610,30 +5592,29 @@ mod tests {
             "a rejected wave is not buffered for retry",
         );
         assert!(!state.finalized.contains(&tick_id));
-
-        // The rejected wave's tx rides the counterpart abort path rather
-        // than wedging in flight (its wave is already out of the registry).
-        let aborted = state.take_ready_counterpart_aborts();
-        assert_eq!(aborted, tx_hash, "a gate-rejected wave's tx is aborted");
+        assert_eq!(
+            state.unresolved.len(),
+            1,
+            "a gate rejection is not a verdict — the transaction stays owed",
+        );
     }
 
     /// A late execution certificate completes a wave naming a terminated
     /// partner *after* the cut. While the
     /// partner's settled set is unknown the gate **defers** (never emits —
     /// no one-sided application); once the set proves the partner never
-    /// settled the wave, the gate **rejects** it and the transaction
-    /// aborts. The fence/gate defer-release that `reshape_sibling`'s
-    /// natural straddler can't reach (it finalizes pre-cut) is exercised
-    /// here against a genuinely post-cut, unsettled transaction.
+    /// settled the wave, the gate **rejects** it. The fence/gate
+    /// defer-release that `reshape_sibling`'s natural straddler can't
+    /// reach (it finalizes pre-cut) is exercised here against a genuinely
+    /// post-cut, unsettled transaction.
     #[test]
-    fn late_unsettled_ec_defers_then_rejects_and_aborts_no_one_sided() {
+    fn late_unsettled_ec_defers_then_rejects_no_one_sided() {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
         // Post-cut: any epoch-1 timestamp is past ROOT's terminal window.
         state.committed_ts = WeightedTimestamp::from_millis(1500);
         let sched = terminating_schedule();
         let wave = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
         let tick_id = *wave.tick_id();
-        let tx_hashes: Vec<TxHash> = wave.tx_hashes().collect();
 
         // The late certificate completes the wave before the settled set is
         // reconstructed: the gate defers — held, never emitted.
@@ -5660,12 +5641,6 @@ mod tests {
         );
         assert!(state.gated_finalized.is_empty());
         assert!(!state.finalized.contains(&tick_id));
-
-        let aborted = state.take_ready_counterpart_aborts();
-        assert_eq!(
-            aborted, tx_hashes,
-            "the rejected wave's tx aborts rather than wedging in flight",
-        );
     }
 
     /// A gate-held wave is never dropped on a clock: held past its own
@@ -5673,8 +5648,7 @@ mod tests {
     /// scheduled termination still stands, it stays held — the partner may
     /// yet prove it settled the wave, and a deadline abort would contradict
     /// that settlement. Only the schedule evicting the partner from every
-    /// retained window rejects it, so its straddler aborts rather than the
-    /// buffer pinning forever.
+    /// retained window rejects it, so the buffer cannot pin forever.
     #[test]
     fn gate_held_wave_survives_the_horizon_until_schedule_eviction() {
         // Windows long enough that the commit clock can pass the wave's
@@ -5714,7 +5688,6 @@ mod tests {
         state.committed_ts = WeightedTimestamp::from_millis(1500);
         let wave = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
         let tick_id = *wave.tick_id();
-        let tx_hashes: Vec<TxHash> = wave.tx_hashes().collect();
 
         // ROOT is live in epoch 0 but leaves the trie at its boundary: the
         // gate defers on the scheduled termination.
@@ -5735,122 +5708,306 @@ mod tests {
             state.gated_finalized.contains_key(&tick_id),
             "a gate-held wave is never dropped on a clock",
         );
-        assert!(
-            state.take_ready_counterpart_aborts().is_empty(),
-            "no abort while the wave can still resolve",
-        );
 
         // ROOT falls out of every retained window: no honest artifact can
-        // resolve the wave anymore, so the redrive rejects it and its
-        // straddler aborts.
+        // resolve the wave anymore, so the redrive rejects it.
         let evicted = TopologySchedule::new(epoch_ms, Epoch::new(0), post_split);
         let released = state.redrive_gated_finalizations(&evicted);
         assert!(released.is_empty(), "an unresolved wave is never finalized");
         assert!(state.gated_finalized.is_empty());
         assert!(!state.finalized.contains(&tick_id));
+    }
 
-        let aborted = state.take_ready_counterpart_aborts();
+    /// The transactions the ledger names past their deadline, and what
+    /// this shard's next tick attests about them.
+    fn abandonment_vote(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        height: u64,
+        now_ms: u64,
+    ) -> Vec<TxOutcome> {
+        let block = make_live_block(
+            BlockHeight::new(height),
+            now_ms,
+            ValidatorId::new(0),
+            vec![],
+        );
+        state.on_block_committed(schedule, &test_certify(block, now_ms));
+        state
+            .scan_complete_waves(schedule)
+            .into_iter()
+            .flat_map(|completion| completion.tx_outcomes)
+            .collect()
+    }
+
+    /// Committed and never resolved, a transaction is abandoned by the
+    /// tick composed at the first commit past its deadline — attested
+    /// `Aborted`, carrying the reservation its own block took, on a tick
+    /// no wave stands behind.
+    #[test]
+    fn a_transaction_past_its_deadline_is_attested_aborted() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+        let reserved = tx.work();
+        let deadline_ms = 60_000 + u64::try_from(WAVE_TIMEOUT.as_millis()).unwrap();
+
+        state.on_block_committed(
+            &schedule,
+            &test_certify(
+                make_live_block(
+                    BlockHeight::new(1),
+                    1_000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(tx)],
+                ),
+                1_000,
+            ),
+        );
+        assert_eq!(state.unresolved.len(), 1, "committed and owed an outcome");
+
+        // Its own wave never finalizes; the shard drops it so nothing can
+        // attest a second verdict for it.
+        state
+            .waves
+            .remove_wave(&TickId::new(ShardId::ROOT, BlockHeight::new(1)));
+
+        let outcomes = abandonment_vote(&mut state, &schedule, 2, deadline_ms);
         assert_eq!(
-            aborted, tx_hashes,
-            "the held wave's straddler aborts once the partner is evicted",
+            outcomes.len(),
+            1,
+            "the tick attests exactly what it abandons"
+        );
+        assert_eq!(outcomes[0].tx_hash(), tx_hash);
+        assert!(outcomes[0].is_aborted(), "abandonment is an abort");
+        assert_eq!(
+            outcomes[0].declared_work(),
+            reserved,
+            "releasing exactly what the committing block reserved",
         );
     }
 
-    /// A local cross-shard wave still lacking a terminated partner's
-    /// coverage, where the partner settled nothing naming us, is doomed:
-    /// the counterpart sweep drops it and returns its tx for the mempool to
-    /// abort.
+    /// Before its deadline a transaction is merely slow, and nothing
+    /// abandons it — that is what stops a proposer discarding work.
     #[test]
-    fn counterpart_sweep_aborts_uncovered_wave_when_partner_settled() {
-        use std::collections::BTreeSet;
+    fn a_transaction_before_its_deadline_is_not_abandoned() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let tx = test_transaction(1);
+        let deadline_ms = 60_000 + u64::try_from(WAVE_TIMEOUT.as_millis()).unwrap();
 
-        use hyperscale_types::test_utils::test_transaction;
-
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
-        let partner = ShardId::leaf(1, 1);
-        let tick_id = TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10));
-        let tx = Arc::new(test_transaction(7));
-        let tx_hash = tx.hash();
-        let participating: BTreeSet<ShardId> = [ShardId::leaf(1, 0), partner].into_iter().collect();
-        state.waves.insert_wave(
-            tick_id,
-            WaveState::new(
-                tick_id,
-                BlockHash::from_raw(Hash::from_bytes(b"block")),
-                WeightedTimestamp::from_millis(5_000),
-                RevealChain::ZERO,
-                vec![(Arc::new(Verifiable::from((*tx).clone())), participating)],
+        state.on_block_committed(
+            &schedule,
+            &test_certify(
+                make_live_block(
+                    BlockHeight::new(1),
+                    1_000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(tx)],
+                ),
+                1_000,
             ),
         );
-        state.waves.assign_tx(tx_hash, tick_id);
+        state
+            .waves
+            .remove_wave(&TickId::new(ShardId::ROOT, BlockHeight::new(1)));
 
-        // The partner terminated and settled nothing naming us — its
-        // coverage will never come.
-        state.committed_ts = WeightedTimestamp::from_millis(6_000);
-        state.record_settled_txs(
-            partner,
-            SettledTxSet {
-                txs: BTreeSet::new(),
-                terminal_wt: WeightedTimestamp::from_millis(5_500),
-            },
-        );
-
-        let aborted = state.take_ready_counterpart_aborts();
-        assert_eq!(aborted, vec![tx_hash], "the doomed straddler aborts");
+        let outcomes = abandonment_vote(&mut state, &schedule, 2, deadline_ms - 1);
         assert!(
-            state.waves.get_wave(&tick_id).is_none(),
-            "its wave state is dropped",
+            outcomes.is_empty(),
+            "a transaction short of its deadline is not abandoned"
+        );
+        assert_eq!(state.unresolved.len(), 1, "and stays owed");
+    }
+
+    /// A wave that has not yet spoken withholds the abort — it is about
+    /// to attest the transaction itself, at its own deadline, and that
+    /// verdict can carry a charge an abandonment cannot.
+    #[test]
+    fn a_wave_that_has_not_voted_withholds_the_abort() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let tx = test_transaction(1);
+        let deadline_ms = 60_000 + u64::try_from(WAVE_TIMEOUT.as_millis()).unwrap();
+
+        state.on_block_committed(
+            &schedule,
+            &test_certify(
+                make_live_block(
+                    BlockHeight::new(1),
+                    1_000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(tx)],
+                ),
+                1_000,
+            ),
+        );
+        state.committed_ts = WeightedTimestamp::from_millis(deadline_ms);
+
+        assert!(
+            state.abandonable().is_empty(),
+            "a wave still to vote is an outcome on its way",
         );
     }
 
-    /// While a settled certificate naming us is still unfetched, the sweep
-    /// holds — that certificate might cover the very tx we would abort.
-    /// Ingesting it completes the partner's coverage and releases the sweep.
+    /// A wave whose own certificate exists and which waits on a
+    /// counterpart's is stranded: it speaks no further, so the tick at
+    /// the deadline abandons its transaction and discards the wave —
+    /// which would otherwise go on to attest a second verdict.
     #[test]
-    fn counterpart_sweep_defers_until_partner_coverage_ingested() {
-        use std::collections::BTreeSet;
-
-        use hyperscale_types::test_utils::test_transaction;
-
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
-        let partner = ShardId::leaf(1, 1);
-        let tick_id = TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10));
-        let tx = Arc::new(test_transaction(7));
+    fn a_stranded_wave_is_discarded_by_the_tick_that_abandons_it() {
+        let mut state = make_test_state();
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        let participating: BTreeSet<ShardId> = [ShardId::leaf(1, 0), partner].into_iter().collect();
-        state.waves.insert_wave(
+        let participating: BTreeSet<ShardId> =
+            [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect();
+        let mut wave = WaveState::new(
             tick_id,
-            WaveState::new(
-                tick_id,
-                BlockHash::from_raw(Hash::from_bytes(b"block")),
-                WeightedTimestamp::from_millis(5_000),
-                RevealChain::ZERO,
-                vec![(Arc::new(Verifiable::from((*tx).clone())), participating)],
-            ),
+            BlockHash::from_raw(Hash::from_bytes(b"block")),
+            WeightedTimestamp::from_millis(1_000),
+            RevealChain::ZERO,
+            vec![(Arc::new(Verifiable::from(tx)), participating)],
         );
+        wave.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
+                vec![TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)],
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        state.waves.insert_wave(tick_id, wave);
         state.waves.assign_tx(tx_hash, tick_id);
 
-        // The partner settled our transaction — until we ingest its
-        // outcome the sweep must not fire.
-        state.committed_ts = WeightedTimestamp::from_millis(6_000);
-        state.record_settled_txs(
-            partner,
-            SettledTxSet {
-                txs: std::iter::once(tx_hash).collect(),
-                terminal_wt: WeightedTimestamp::from_millis(5_500),
-            },
+        state.unresolved =
+            UnresolvedTxs::restored(vec![(tx_hash, WeightedTimestamp::from_millis(1_000), 42)]);
+        state.committed_ts = WeightedTimestamp::from_millis(1_000).plus(WAVE_TIMEOUT);
+
+        let abandoned = state.abandonable();
+        assert_eq!(
+            abandoned,
+            vec![(tx_hash, 42)],
+            "a wave that has attested and waits on a counterpart is stranded",
         );
+        state.discard_waves_holding(&abandoned);
+        assert!(
+            !state.waves.contains_wave(&tick_id),
+            "and the stranded wave is discarded with it",
+        );
+    }
+
+    /// A gate-held finalization withholds the abort. The gate defers
+    /// while it cannot tell whether a terminating counterpart settled the
+    /// transaction, and aborting under it would contradict a settlement
+    /// the partner may already have committed. The hold ends when the
+    /// schedule evicts the partner, so the abort is delayed, not lost.
+    #[test]
+    fn a_gate_held_finalization_withholds_the_abort() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
+        let sched = terminating_schedule();
+        state.committed_ts = WeightedTimestamp::from_millis(1500);
+
+        let wave = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let tick_id = *wave.tick_id();
+        let tx_hashes: Vec<TxHash> = wave.tx_hashes().collect();
+        assert!(
+            state.emit_or_gate_finalized(&sched, wave).is_empty(),
+            "held while the partner's settled set is unknown",
+        );
+        assert!(state.gated_finalized.contains_key(&tick_id));
+
+        state.unresolved = UnresolvedTxs::restored(
+            tx_hashes
+                .iter()
+                .map(|tx_hash| (*tx_hash, WeightedTimestamp::from_millis(1500), 42))
+                .collect(),
+        );
+        state.committed_ts = WeightedTimestamp::from_millis(1500).plus(WAVE_TIMEOUT);
 
         assert!(
-            state.take_ready_counterpart_aborts().is_empty(),
-            "the sweep holds while the partner's settled coverage is unfetched",
+            state.abandonable().is_empty(),
+            "an outcome the gate is holding is not abandoned under it",
         );
-        assert!(state.waves.get_wave(&tick_id).is_some());
 
-        state.note_settled_ec_ingested(partner, &[tx_hash]);
-        let aborted = state.take_ready_counterpart_aborts();
-        assert_eq!(aborted, vec![tx_hash]);
-        assert!(state.waves.get_wave(&tick_id).is_none());
+        // Once the partner leaves every retained window the gate rejects
+        // the finalization, and the transaction is abandonable.
+        state.gated_finalized.clear();
+        assert_eq!(
+            state
+                .abandonable()
+                .iter()
+                .map(|(h, _)| *h)
+                .collect::<Vec<_>>(),
+            tx_hashes,
+        );
+    }
+
+    /// A finalization this node has already assembled withholds the abort
+    /// too: the outcome exists and is waiting on a block to carry it, and
+    /// an abort beside it would be a second verdict.
+    #[test]
+    fn an_assembled_finalization_withholds_the_abort() {
+        let mut state = make_test_state();
+        let (tick_id, wave) = make_ready_single_shard_wave(&[7]);
+        let tx_hash = wave.tx_hashes()[0];
+        state.finalized.insert(
+            tick_id,
+            Arc::new(Verified::<Finalization>::seal(wave.into_finalization()).into()),
+        );
+
+        state.unresolved =
+            UnresolvedTxs::restored(vec![(tx_hash, WeightedTimestamp::from_millis(1_000), 42)]);
+        state.committed_ts = WeightedTimestamp::from_millis(1_000).plus(WAVE_TIMEOUT);
+
+        assert!(state.abandonable().is_empty());
+
+        state.finalized.remove(&tick_id);
+        assert_eq!(state.abandonable(), vec![(tx_hash, 42)]);
+    }
+
+    /// A tick already attesting the abandonment withholds the next one:
+    /// the ledger releases when that certificate commits, so re-composing
+    /// it every commit in between would discard the wave carrying it.
+    #[test]
+    fn a_tick_already_abandoning_it_withholds_the_next() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let tx = test_transaction(1);
+        let deadline_ms = 60_000 + u64::try_from(WAVE_TIMEOUT.as_millis()).unwrap();
+
+        state.on_block_committed(
+            &schedule,
+            &test_certify(
+                make_live_block(
+                    BlockHeight::new(1),
+                    1_000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(tx)],
+                ),
+                1_000,
+            ),
+        );
+        state
+            .waves
+            .remove_wave(&TickId::new(ShardId::ROOT, BlockHeight::new(1)));
+
+        let outcomes = abandonment_vote(&mut state, &schedule, 2, deadline_ms);
+        assert_eq!(outcomes.len(), 1, "the tick at the deadline abandons it");
+        assert!(
+            state.abandonable().is_empty(),
+            "and the next commit leaves that tick alone",
+        );
+        assert!(
+            state
+                .waves
+                .contains_wave(&TickId::new(ShardId::ROOT, BlockHeight::new(2))),
+            "so the wave attesting the abort survives to be certified",
+        );
+        assert_eq!(state.unresolved.len(), 1, "released only when it commits");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

@@ -41,9 +41,9 @@ impl NodeStateMachine {
     /// 7. `apply_block_to_execution` runs wave cleanup + dispatch + vote
     ///    emission last, after mempool's terminal-state transitions.
     ///
-    /// Finally the counterpart sweep, the terminal-chain sweep, and a
-    /// proposal-retry latch (in-flight counts changed) for the post-dispatch hook
-    /// to turn into one `try_event_driven_proposal`.
+    /// Finally the terminal-chain sweep and a proposal-retry latch
+    /// (in-flight counts changed) for the post-dispatch hook to turn into one
+    /// `try_event_driven_proposal`.
     pub(super) fn on_block_committed(
         &mut self,
         certified: &Verified<CertifiedBlock>,
@@ -97,8 +97,6 @@ impl NodeStateMachine {
         actions.extend(
             s.apply_block_to_execution(self.beacon_coordinator.topology_schedule(), certified),
         );
-
-        actions.extend(s.sweep_ready_counterpart_straddlers());
 
         // The first coast commit quiesces the chain's content: finalization is a
         // finalization in a later block, and no later content block will

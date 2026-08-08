@@ -25,7 +25,8 @@ use super::chain_reader::ShardChainReader;
 const FOLD_WINDOW: Duration = MAX_VALIDITY_RANGE.saturating_add(RETENTION_HORIZON);
 
 /// Replay the committed chain into the transactions still owed an
-/// outcome, each with the validity end its deadline derives from.
+/// outcome, each with the validity end its deadline derives from and the
+/// work its committing block reserved.
 ///
 /// Reads forward from the oldest block in the window, so a transaction
 /// and the finalization resolving it are seen in the order they
@@ -40,7 +41,7 @@ pub fn fold_unresolved_txs<R: ShardChainReader + ?Sized>(
     reader: &R,
     committed_height: BlockHeight,
     committed_ts: WeightedTimestamp,
-) -> Vec<(TxHash, WeightedTimestamp)> {
+) -> Vec<(TxHash, WeightedTimestamp, u64)> {
     let cutoff = committed_ts.minus(FOLD_WINDOW);
 
     // Walk back to the window's edge, then fold forward from there.
@@ -54,13 +55,16 @@ pub fn fold_unresolved_txs<R: ShardChainReader + ?Sized>(
         }
     }
 
-    let mut unresolved: BTreeMap<TxHash, WeightedTimestamp> = BTreeMap::new();
+    let mut unresolved: BTreeMap<TxHash, (WeightedTimestamp, u64)> = BTreeMap::new();
     let mut height = oldest;
     loop {
         if let Some(certified) = reader.get_block(height) {
             let block = certified.block();
             for tx in block.transactions().iter() {
-                unresolved.insert(tx.hash(), tx.validity_range().end_timestamp_exclusive);
+                unresolved.insert(
+                    tx.hash(),
+                    (tx.validity_range().end_timestamp_exclusive, tx.work()),
+                );
             }
             for finalization in block.certificates().iter() {
                 for tx_hash in finalization.tx_hashes() {
@@ -73,5 +77,8 @@ pub fn fold_unresolved_txs<R: ShardChainReader + ?Sized>(
         }
         height = height.next();
     }
-    unresolved.into_iter().collect()
+    unresolved
+        .into_iter()
+        .map(|(tx_hash, (validity_end, work))| (tx_hash, validity_end, work))
+        .collect()
 }

@@ -495,19 +495,6 @@ impl ShardParticipation {
 
         actions
     }
-
-    /// Run any counterpart abort sweeps whose terminated partner's settled
-    /// coverage is now complete: execution drops the doomed local waves and
-    /// hands back their transaction hashes; the mempool releases their locks
-    /// and drives them to `Completed(Aborted)`. A no-op when no partner is
-    /// past-terminal.
-    pub(in crate::state) fn sweep_ready_counterpart_straddlers(&mut self) -> Vec<Action> {
-        let aborts = self.execution_coordinator.take_ready_counterpart_aborts();
-        if aborts.is_empty() {
-            return Vec::new();
-        }
-        self.mempool_coordinator.abort_transactions(&aborts)
-    }
 }
 
 #[cfg(test)]
