@@ -19,8 +19,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_types::{
-    DeclaredKey, Derived, EnvelopeExt, Routing, TX_ADMISSION_WORK, TransactionEnvelope, VmStatics,
-    VmStaticsError,
+    DeclaredKey, Derived, EnvelopeExt, Routing, TransactionEnvelope, VmStatics, VmStaticsError,
+    declared_work,
 };
 use hyperscale_vm_effects::stdlib::{ENTROPY, VALIDATORS, VAULT};
 use hyperscale_vm_effects::{
@@ -307,14 +307,12 @@ impl BridgeStatics {
         write_keys.dedup();
 
         // A publish never reaches the kernel, so it declares no effects
-        // to price. What it costs is the fixed charge, the two exclusive
-        // cells it claims, and the artifact it writes whole into state —
-        // which is the largest transaction the protocol admits and would
-        // otherwise price as the smallest.
-        let work = TX_ADMISSION_WORK
-            .saturating_add(write_keys.len() as u64)
-            .saturating_add(artifact.len() as u64)
-            .saturating_add(vm.gas_limit);
+        // for `footprint` to price. Its footprint stands in as the two
+        // exclusive cells it claims plus the artifact it writes whole
+        // into state — the largest transaction the protocol admits, and
+        // one the declared side would otherwise price as the smallest.
+        let footprint = (write_keys.len() as u64).saturating_add(artifact.len() as u64);
+        let work = declared_work(footprint, vm.gas_limit);
 
         Ok(Derived {
             work,
@@ -491,17 +489,18 @@ impl VmStatics for BridgeStatics {
                 .into_iter()
                 .collect()
         };
-        // What this transaction costs a block: the fixed admit-and-track
-        // charge, what it declared it would touch, and the ceiling it
-        // signed for its own execution.
-        let work = TX_ADMISSION_WORK
-            .saturating_add(
-                routing
-                    .per_shard
-                    .values()
-                    .fold(0u64, |total, set| total.saturating_add(footprint(set))),
-            )
-            .saturating_add(vm.gas_limit);
+        // What this transaction costs a block, on the engine's own
+        // schedule: the fixed charge for carrying it, what it declared it
+        // would touch, and the ceiling it signed for its own execution.
+        // The declaration spans every shard it routes to, because the
+        // reservation is taken once against the whole of it.
+        let work = declared_work(
+            routing
+                .per_shard
+                .values()
+                .fold(0u64, |total, set| total.saturating_add(footprint(set))),
+            vm.gas_limit,
+        );
         Ok(Derived {
             work,
             routing: Routing {
@@ -525,7 +524,7 @@ impl VmStatics for BridgeStatics {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Ed25519PrivateKey, NetworkId, SubintentSig, TransactionBody};
+    use hyperscale_types::{Ed25519PrivateKey, NetworkId, SubintentSig, TX_UNITS, TransactionBody};
     use hyperscale_vm_effects::stdlib::{VAULT, account_metadata};
     use hyperscale_vm_effects::{
         Constraint, EdgeRef, GraphArg, GraphNode, Hasher, InstanceMeta, IntentDecl, ManifestGraph,
@@ -709,7 +708,7 @@ mod tests {
         // The envelope's own ceiling is in there, and so is a charge no
         // declaration can shrink.
         assert!(
-            derived.work > TX_ADMISSION_WORK + 1_000_000,
+            derived.work > TX_UNITS + 1_000_000,
             "work must carry the fixed charge and the signed limit: {}",
             derived.work
         );

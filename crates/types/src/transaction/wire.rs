@@ -436,7 +436,7 @@ mod tests {
     use super::*;
     use crate::test_utils::test_validity_range;
     use crate::{
-        Ed25519PrivateKey, SubintentSig, TX_ADMISSION_WORK, TransactionBody, VmStatics,
+        Ed25519PrivateKey, SubintentSig, TransactionBody, VmStatics, declared_work,
         install_vm_statics,
     };
 
@@ -471,7 +471,7 @@ mod tests {
                     ],
                 },
                 subintent_hashes,
-                work: TX_ADMISSION_WORK,
+                work: declared_work(0, 0),
             })
         }
     }

@@ -1138,8 +1138,8 @@ mod tests {
         Verified::new_unchecked_for_test(tx)
     }
     use hyperscale_types::{
-        Block, FinalizedWave, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId,
-        TX_ADMISSION_WORK, ValidatorId,
+        Block, FinalizedWave, MerkleInclusionProof, ProvisionEntry, Provisions, ShardId, TX_UNITS,
+        ValidatorId,
     };
 
     use super::*;
@@ -2473,7 +2473,7 @@ mod tests {
 
         let each = mempool.ready_transactions(10, 0, now)[0].work();
         assert!(
-            each >= TX_ADMISSION_WORK,
+            each >= TX_UNITS,
             "every transaction costs the fixed charge whatever it declared: {each}"
         );
         let room_for_two = MAX_DRAIN_WORK - each * 2;

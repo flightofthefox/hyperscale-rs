@@ -83,7 +83,8 @@ pub use hyperscale_crypto::{
 pub use hyperscale_hbor::HborSigned;
 pub use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, Address, LocalKey, MAX_CELL_VALUE_LEN, Mode, ModeKind, Movement,
-    SettledWrites, StateWrites, SubstateKey, amount_cell, compatible, encode_amount, read_amount,
+    SettledWrites, StateWrites, SubstateKey, TX_UNITS, amount_cell, compatible, declared_work,
+    encode_amount, read_amount,
 };
 pub use network::{
     GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,
@@ -136,7 +137,7 @@ pub use shard::header::{BlockHeader, BlockHeaderParentQcMismatch, BlockHeaderVer
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
     MAX_DRAIN_WORK, MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT, MAX_PROVISIONS_PER_BLOCK,
-    MAX_ROUND_GAP, MAX_TXS_PER_BLOCK, TX_ADMISSION_WORK, drain_admits_block,
+    MAX_ROUND_GAP, MAX_TXS_PER_BLOCK, drain_admits_block,
 };
 pub use shard::load::ShardLoad;
 pub use shard::manifest::{BlockManifest, BlockMetadata};
