@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use blake3::Hasher as Blake3;
 use hyperscale_hbor::HborSigned;
 pub use hyperscale_vm_types::{
-    MAX_MESSAGE_LEN, MAX_SUBINTENTS, SubintentSig, TransactionBody, TransactionEnvelope,
+    MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SubintentSig, TransactionBody, TransactionEnvelope,
 };
 use thiserror::Error;
 
@@ -105,6 +105,19 @@ pub struct Routing {
     /// Owner prefixes behind `provision_keys`, deduplicated ascending —
     /// the wave's provision dependency set routes on these.
     pub provision_prefixes: Vec<Address>,
+    /// What each declared key is accessed under, ascending by key then
+    /// mode, with the reservation amount carried where there is one.
+    ///
+    /// The key sets above answer "does this transaction touch that
+    /// cell"; this answers "how", which is what decides whether two
+    /// transactions touching one cell can be in flight together. A
+    /// reservation also has to say how much, because feasibility is
+    /// judged against committed balance less what is already held, and
+    /// the amount is statically declared for exactly that reason.
+    ///
+    /// One key can appear more than once: a manifest may declare several
+    /// effects on one cell, and a payer reserving twice reserves the sum.
+    pub declared_modes: Vec<(DeclaredKey, Mode)>,
 }
 
 impl Routing {
@@ -120,6 +133,17 @@ impl Routing {
         prefixes.sort_unstable();
         prefixes.dedup();
         prefixes
+    }
+
+    /// What `key` is declared under by this transaction, if anything.
+    ///
+    /// A key declared more than once yields each declaration: the caller
+    /// decides whether it wants every mode or the sum of the amounts.
+    pub fn modes_for<'a>(&'a self, key: &'a DeclaredKey) -> impl Iterator<Item = Mode> + 'a {
+        self.declared_modes
+            .iter()
+            .filter(move |(declared, _)| declared == key)
+            .map(|(_, mode)| *mode)
     }
 }
 

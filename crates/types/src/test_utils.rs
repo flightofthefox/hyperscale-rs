@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-use hyperscale_vm_types::Address;
+use hyperscale_vm_types::{Address, Mode};
 
 use crate::crypto::Ed25519PrivateKey;
 use crate::{
@@ -912,6 +912,22 @@ impl VmStatics for StubVmStatics {
                 provision_prefixes: read_prefixes.iter().copied().map(Address).collect(),
                 read_prefixes: read_prefixes.iter().copied().map(Address).collect(),
                 write_prefixes: write_prefixes.iter().copied().map(Address).collect(),
+                // The stub's two classes map to the two exclusive modes:
+                // a shared read and an exclusive write. It has no way to
+                // express a delta or a reservation, so a test that needs
+                // commutative contention builds its declaration through
+                // the effects bridge instead.
+                declared_modes: read_prefixes
+                    .iter()
+                    .copied()
+                    .map(|owner| (DeclaredKey::prefix(owner), Mode::Read))
+                    .chain(
+                        write_prefixes
+                            .iter()
+                            .copied()
+                            .map(|owner| (DeclaredKey::prefix(owner), Mode::Write)),
+                    )
+                    .collect(),
             },
             subintent_hashes: Vec::new(),
             fee_vault_local: [0xEE; 16],

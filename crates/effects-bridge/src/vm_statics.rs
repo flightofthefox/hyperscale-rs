@@ -25,8 +25,9 @@ use hyperscale_types::{
 use hyperscale_vm_effects::stdlib::{ENTROPY, VALIDATORS, VAULT};
 use hyperscale_vm_effects::{
     Accessibility, Address, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry, ManifestHash,
-    MetadataCache, Mode, PackageHash, PackageMetadata, PrefixShardResolver, RoleId, SubstateKey,
-    Value, admit_tree, child_key, footprint, package_hash, route_tree,
+    MetadataCache, Mode, PackageHash, PackageMetadata, PrefixShardResolver, RoleId,
+    Routing as RoutedTransaction, SubstateKey, Value, admit_tree, child_key, footprint,
+    package_hash, route_tree,
 };
 
 use crate::ProtocolHasher;
@@ -132,6 +133,59 @@ pub fn encode_tree(tree: &EnvelopeTree) -> Vec<u8> {
 /// [`VmStaticsError`] on malformed or non-canonical bytes.
 pub fn decode_tree(bytes: &[u8]) -> Result<EnvelopeTree, VmStaticsError> {
     hbor_from_slice(bytes).map_err(|error| VmStaticsError(format!("tree decode: {error}")))
+}
+
+/// How a routed declaration lands in the workspace's admission
+/// vocabulary: the three key classes, and the mode behind each key.
+struct DeclaredAccess {
+    read_keys: BTreeSet<DeclaredKey>,
+    write_keys: BTreeSet<DeclaredKey>,
+    provision_keys: BTreeSet<DeclaredKey>,
+    declared_modes: Vec<(DeclaredKey, Mode)>,
+}
+
+/// Sort a routed transaction's effects into the classes admission,
+/// provisioning, and scheduling each read.
+///
+/// Fresh reads share, mutations exclude, and a locked read takes no
+/// admission key and makes no participant — its target cannot change, so
+/// nothing can contend on it. The provision set is what a counterpart
+/// shard cannot execute without: fresh reads and read-modify-write
+/// priors, never a delta or a reservation, neither of which depends on
+/// the value it changes.
+///
+/// The modes ride alongside rather than being recoverable from the sets,
+/// because the sets have collapsed delta, reserve and write into one
+/// exclusive class by the time they are built — and which of the three a
+/// key holds is exactly what decides whether two transactions may be in
+/// flight on it together.
+fn classify_declared_access(routing: &RoutedTransaction) -> DeclaredAccess {
+    let mut access = DeclaredAccess {
+        read_keys: BTreeSet::new(),
+        write_keys: BTreeSet::new(),
+        provision_keys: BTreeSet::new(),
+        declared_modes: Vec::new(),
+    };
+    for effect in routing.per_shard.values().flat_map(EffectSet::iter) {
+        let key = admission_key(&effect.target);
+        match effect.mode {
+            Mode::Read => {
+                access.read_keys.insert(key);
+                access.provision_keys.insert(key);
+            }
+            Mode::Write => {
+                access.write_keys.insert(key);
+                access.provision_keys.insert(key);
+            }
+            Mode::Delta | Mode::Reserve { .. } => {
+                access.write_keys.insert(key);
+            }
+            Mode::Locked => continue,
+        }
+        access.declared_modes.push((key, effect.mode));
+    }
+    access.declared_modes.sort_unstable();
+    access
 }
 
 /// The admission key for one effect target: substate-granular for points,
@@ -269,6 +323,7 @@ impl BridgeStatics {
                 write_prefixes: vec![publisher],
                 provision_prefixes: Vec::new(),
                 read_keys: Vec::new(),
+                declared_modes: write_keys.iter().map(|key| (*key, Mode::Write)).collect(),
                 write_keys,
                 provision_keys: Vec::new(),
             },
@@ -423,31 +478,12 @@ impl VmStatics for BridgeStatics {
         )
         .map_err(|error| VmStaticsError(format!("routing: {error}")))?;
 
-        // Fresh reads share, mutations exclude, and a locked read takes
-        // no admission key and makes no participant — its target cannot
-        // change, so nothing can contend on it. The provision set is the read set:
-        // fresh reads plus read-modify-write priors, the values a
-        // counterpart shard cannot execute without.
-        let mut read_keys = BTreeSet::new();
-        let mut write_keys = BTreeSet::new();
-        let mut provision_keys = BTreeSet::new();
-        for effect in routing.per_shard.values().flat_map(EffectSet::iter) {
-            let key = admission_key(&effect.target);
-            match effect.mode {
-                Mode::Read => {
-                    read_keys.insert(key);
-                    provision_keys.insert(key);
-                }
-                Mode::Write => {
-                    write_keys.insert(key);
-                    provision_keys.insert(key);
-                }
-                Mode::Delta | Mode::Reserve { .. } => {
-                    write_keys.insert(key);
-                }
-                Mode::Locked => {}
-            }
-        }
+        let DeclaredAccess {
+            read_keys,
+            write_keys,
+            provision_keys,
+            declared_modes,
+        } = classify_declared_access(&routing);
         let prefixes = |keys: &BTreeSet<DeclaredKey>| -> Vec<Address> {
             keys.iter()
                 .map(DeclaredKey::owner)
@@ -475,6 +511,7 @@ impl VmStatics for BridgeStatics {
                 read_keys: read_keys.into_iter().collect(),
                 write_keys: write_keys.into_iter().collect(),
                 provision_keys: provision_keys.into_iter().collect(),
+                declared_modes,
             },
             subintent_hashes: admitted
                 .subintents

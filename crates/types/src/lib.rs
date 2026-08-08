@@ -80,7 +80,9 @@ pub use hyperscale_crypto::{
     VrfOutput, VrfProof,
 };
 pub use hyperscale_hbor::HborSigned;
-pub use hyperscale_vm_types::{Address, LocalKey, MAX_CELL_VALUE_LEN, StateWrites, SubstateKey};
+pub use hyperscale_vm_types::{
+    Address, LocalKey, MAX_CELL_VALUE_LEN, Mode, ModeKind, StateWrites, SubstateKey, compatible,
+};
 pub use network::{
     GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,
     TopicScope,

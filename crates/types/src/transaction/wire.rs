@@ -431,7 +431,7 @@ mod tests {
     use hyperscale_hbor::{
         DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
-    use hyperscale_vm_types::Address;
+    use hyperscale_vm_types::{Address, Mode};
 
     use super::*;
     use crate::test_utils::test_validity_range;
@@ -465,6 +465,10 @@ mod tests {
                     write_prefixes: vec![Address([0x22; 16])],
                     provision_keys: vec![DeclaredKey::prefix([0x11; 16])],
                     provision_prefixes: vec![Address([0x11; 16])],
+                    declared_modes: vec![
+                        (DeclaredKey::prefix([0x11; 16]), Mode::Read),
+                        (DeclaredKey::substate([0x22; 16], [0x01; 16]), Mode::Write),
+                    ],
                 },
                 subintent_hashes,
                 work: TX_ADMISSION_WORK,
