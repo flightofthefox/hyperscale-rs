@@ -6,8 +6,8 @@ use std::sync::Arc;
 use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-    ConsensusReceipt, ExecutionCertificate, Hash, QuorumCertificate, ShardWitnessPayload, TickId,
-    Transaction, TxHash, Verified, WaveCertificate,
+    ConsensusReceipt, ExecutionCertificate, FinalizedWave, Hash, QuorumCertificate,
+    ShardWitnessPayload, TickId, Transaction, TxHash, Verified,
 };
 
 use super::column_families::{BeaconWitnessesCf, ExecutionCertsCf, TxCertIndexCf};
@@ -55,7 +55,7 @@ impl ShardChainReader for RocksDbShardStorage {
             .collect()
     }
 
-    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<WaveCertificate> {
+    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<FinalizedWave> {
         Self::get_certificates_batch(self, ids)
     }
 

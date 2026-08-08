@@ -17,8 +17,8 @@ use crate::{
     ShardLoad, SignerBitfield, StateRoot, TickId, TimestampRange, TopologySnapshot, Transaction,
     TransactionBody, TransactionDecision, TransactionEnvelope, TransactionRoot, TxHash, TxOutcome,
     ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, VmStatics, VmStaticsError,
-    WaveCertificate, WeightedTimestamp, WitnessSources, WorkInFlight, declared_work,
-    install_vm_statics, signed_bytes, vm_statics_installed,
+    WeightedTimestamp, WitnessSources, WorkInFlight, declared_work, install_vm_statics,
+    signed_bytes, vm_statics_installed,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -856,10 +856,7 @@ pub fn make_finalized_wave(
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
-    FinalizedWave::new(
-        Arc::new(WaveCertificate::new(tick_id, vec![Arc::new(ec)])),
-        vec![],
-    )
+    FinalizedWave::new(tick_id, vec![Arc::new(ec)], vec![])
 }
 
 /// A deterministic [`VmStatics`](crate::VmStatics) stub for consensus-crate

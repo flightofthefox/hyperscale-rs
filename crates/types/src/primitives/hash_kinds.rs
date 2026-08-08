@@ -143,7 +143,7 @@ hash_newtype!(
 // ── Certificates & waves ─────────────────────────────────────────────────────
 
 hash_newtype!(
-    /// Content identity of a [`WaveCertificate`](crate::WaveCertificate).
+    /// Content identity of a [`FinalizedWave`](crate::FinalizedWave).
     ///
     /// Computed from the ordered `(shard_id, tick_id)` pairs of
     /// its execution certificates — identifies the set of ECs a wave

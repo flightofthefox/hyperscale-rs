@@ -240,8 +240,8 @@ mod tests {
         FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
         ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot, TxHash, TxOutcome,
-        ValidatorId, Verifiable, Verified, WaveCertificate, WeightedTimestamp, WitnessSources,
-        WorkInFlight, settled_txs_root_from_hashes,
+        ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources, WorkInFlight,
+        settled_txs_root_from_hashes,
     };
 
     use super::*;
@@ -286,10 +286,8 @@ mod tests {
             SignerBitfield::new(4),
         );
         Arc::new(Verifiable::from(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(
-                wave,
-                vec![Arc::new(ec), Arc::new(remote)],
-            )),
+            wave,
+            vec![Arc::new(ec), Arc::new(remote)],
             vec![],
         )))
     }

@@ -814,7 +814,7 @@ mod tests {
         BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHeight, CertificateRoot,
         ChainOrigin, Hash, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, QuorumCertificate,
         RevealChain, Round, ShardId, ShardLoad, StateRoot, TickId, TransactionRoot, ValidatorId,
-        Verified, WaveCertificate, WitnessSources, WorkInFlight,
+        Verified, WitnessSources, WorkInFlight,
     };
 
     use super::*;
@@ -988,11 +988,7 @@ mod tests {
         assert!(!pb.is_complete());
 
         let fw = Arc::new(
-            Verified::new_unchecked_for_test(FinalizedWave::new(
-                Arc::new(WaveCertificate::new(tick_id, vec![])),
-                vec![],
-            ))
-            .into(),
+            Verified::new_unchecked_for_test(FinalizedWave::new(tick_id, vec![], vec![])).into(),
         );
 
         let added = pb.add_finalized_wave(fw);
@@ -1028,11 +1024,7 @@ mod tests {
 
         // Add finalized wave
         let fw = Arc::new(
-            Verified::new_unchecked_for_test(FinalizedWave::new(
-                Arc::new(WaveCertificate::new(tick_id, vec![])),
-                vec![],
-            ))
-            .into(),
+            Verified::new_unchecked_for_test(FinalizedWave::new(tick_id, vec![], vec![])).into(),
         );
         pb.add_finalized_wave(fw);
         assert!(pb.is_complete());
@@ -1041,9 +1033,7 @@ mod tests {
     #[test]
     fn test_from_complete_block_is_complete() {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let cert = Arc::new(WaveCertificate::new(tick_id, vec![]));
-
-        let fw = Arc::new(FinalizedWave::new(cert, vec![]));
+        let fw = Arc::new(FinalizedWave::new(tick_id, vec![], vec![]));
         let verified_fw = Arc::new(Verified::new_unchecked_for_test((*fw).clone()).into());
         let wire_fw = Arc::new((*fw).clone().into());
 

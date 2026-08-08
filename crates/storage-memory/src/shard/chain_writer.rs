@@ -185,9 +185,8 @@ fn build_prepared_commit(
             }
             c.blocks.insert(block.height(), unwrapped);
             for fw in block.certificates().iter() {
-                let cert = fw.certificate();
-                let tick_id = *cert.tick_id();
-                c.certificates.insert(tick_id, (**cert).clone());
+                let tick_id = *fw.tick_id();
+                c.certificates.insert(tick_id, fw.attestation());
                 c.wave_certs_by_height
                     .entry(tick_id.block_height())
                     .or_default()
@@ -195,7 +194,7 @@ fn build_prepared_commit(
             }
             c.insert_receipts(&receipts);
             for fw in block.certificates().iter() {
-                for ec in fw.certificate().execution_certificates() {
+                for ec in fw.execution_certificates() {
                     for outcome in ec.tx_outcomes() {
                         c.tx_cert_index.insert(outcome.tx_hash(), *ec.tick_id());
                     }
@@ -273,9 +272,8 @@ impl SimShardStorage {
                 CertifiedBlock::new_unchecked(block.clone().into_sealed(), qc.clone()),
             );
             for fw in block.certificates().iter() {
-                let cert = fw.certificate();
-                let tick_id = *cert.tick_id();
-                c.certificates.insert(tick_id, (**cert).clone());
+                let tick_id = *fw.tick_id();
+                c.certificates.insert(tick_id, fw.attestation());
                 c.wave_certs_by_height
                     .entry(tick_id.block_height())
                     .or_default()
@@ -285,7 +283,7 @@ impl SimShardStorage {
             c.insert_receipts(receipts);
             // Store execution certificates (extracted from wave certs) atomically.
             for fw in block.certificates().iter() {
-                for ec in fw.certificate().execution_certificates() {
+                for ec in fw.execution_certificates() {
                     for outcome in ec.tx_outcomes() {
                         c.tx_cert_index.insert(outcome.tx_hash(), *ec.tick_id());
                     }

@@ -132,7 +132,7 @@ impl BlockManifest {
 ///
 /// - `"blocks"` CF: `BlockMetadata` (this struct) keyed by height
 /// - `"transactions"` CF: `Transaction` keyed by `tx_hash`
-/// - `"wave_certificates"` CF: `WaveCertificate` keyed by `tick_id` hash
+/// - `"wave_certificates"` CF: `FinalizedWave` attestations keyed by `tick_id` hash
 ///
 /// To reconstruct a full `Block`, fetch the metadata, then batch-fetch
 /// transactions and certificates using the stored hashes.

@@ -70,7 +70,7 @@ mod tests {
         FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
         ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot, TxHash, TxOutcome,
-        ValidatorId, Verifiable, Verified, WaveCertificate, WeightedTimestamp, WorkInFlight,
+        ValidatorId, Verifiable, Verified, WeightedTimestamp, WorkInFlight,
     };
 
     #[test]
@@ -173,10 +173,8 @@ mod tests {
             ));
             Arc::new(
                 FinalizedWave::new(
-                    Arc::new(WaveCertificate::new(
-                        TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
-                        vec![ec],
-                    )),
+                    TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
+                    vec![ec],
                     vec![],
                 )
                 .into(),
@@ -205,12 +203,13 @@ mod tests {
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         ));
-        let cert = Arc::new(WaveCertificate::new(
+        let cert = FinalizedWave::new(
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
             vec![ec],
-        ));
+            vec![],
+        );
         let expected_receipt_hash = cert.receipt_hash();
-        let fw: Arc<Verifiable<FinalizedWave>> = Arc::new(FinalizedWave::new(cert, vec![]).into());
+        let fw: Arc<Verifiable<FinalizedWave>> = Arc::new(cert.into());
 
         let root = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
         // Single cert: certificate_root should equal the cert's receipt_hash

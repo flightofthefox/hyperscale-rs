@@ -453,7 +453,7 @@ mod tests {
         BloomFilter, CertificateRoot, ChainOrigin, ExecutionCertificate, ExecutionOutcome,
         GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
         ProvisionsRoot, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot,
-        TransactionRoot, TxOutcome, ValidatorId, WaveCertificate, WeightedTimestamp, WorkInFlight,
+        TransactionRoot, TxOutcome, ValidatorId, WeightedTimestamp, WorkInFlight,
     };
 
     fn create_test_block() -> Block {
@@ -515,8 +515,7 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
-        let wc = WaveCertificate::new(tick_id, vec![Arc::new(ec)]);
-        let fw = Verifiable::from(FinalizedWave::new(Arc::new(wc), Vec::new()));
+        let fw = Verifiable::from(FinalizedWave::new(tick_id, vec![Arc::new(ec)], Vec::new()));
 
         let Block::Live {
             header,

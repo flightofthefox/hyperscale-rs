@@ -4,9 +4,9 @@
 //! what they store, and how their keys/values are encoded.
 
 use hyperscale_types::{
-    BlockMetadata, ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionMetadata, Hash,
-    Round, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, TickId, Transaction, ValidatorId,
-    WaveCertificate,
+    BlockMetadata, ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionMetadata,
+    FinalizedWave, Hash, Round, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, TickId,
+    Transaction, ValidatorId,
 };
 use rocksdb::{ColumnFamily, DB};
 
@@ -259,9 +259,9 @@ pub struct CertificatesCf;
 impl TypedCf for CertificatesCf {
     const NAME: &'static str = CERTIFICATES_CF;
     type Key = TickId;
-    type Value = WaveCertificate;
+    type Value = FinalizedWave;
     type KeyCodec = HborCodec<TickId>;
-    type ValueCodec = HborCodec<WaveCertificate>;
+    type ValueCodec = HborCodec<FinalizedWave>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.certificates

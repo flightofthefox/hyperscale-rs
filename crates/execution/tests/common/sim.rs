@@ -44,8 +44,8 @@ use hyperscale_types::{
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FinalizedWave, GlobalReceipt,
     LocalKey, MerkleInclusionProof, Movement, SettledWrites, ShardId, ShardTrie, SignerBitfield,
     StateRoot, StateWrites, StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate,
-    WeightedTimestamp, compute_global_receipt_root, read_amount,
+    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    compute_global_receipt_root, read_amount,
 };
 
 /// The shard a single-shard fixture runs on.
@@ -615,8 +615,7 @@ pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> FinalizedWave {
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
-    let certificate = WaveCertificate::new(*tick_id, vec![Arc::new(ec)]);
-    FinalizedWave::new(Arc::new(certificate), receipts.to_vec())
+    FinalizedWave::new(*tick_id, vec![Arc::new(ec)], receipts.to_vec())
 }
 
 /// A committed `FinalizedWave` whose counterpart refused every member.
@@ -672,6 +671,9 @@ pub fn settle_refused_by_counterpart(
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
-    let certificate = WaveCertificate::new(*tick_id, vec![Arc::new(local), Arc::new(remote)]);
-    FinalizedWave::new(Arc::new(certificate), charges.to_vec())
+    FinalizedWave::new(
+        *tick_id,
+        vec![Arc::new(local), Arc::new(remote)],
+        charges.to_vec(),
+    )
 }

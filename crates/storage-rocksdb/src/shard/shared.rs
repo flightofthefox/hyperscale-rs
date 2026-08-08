@@ -22,7 +22,7 @@ use hyperscale_types::{
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
     MerkleInclusionProof, PreparedCommit, QuorumCertificate, SafeVoteRegisters, SettledWrites,
     ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf, TickId, Transaction,
-    TxHash, ValidatorId, Verifiable, Verified, WaveCertificate,
+    TxHash, ValidatorId, Verifiable, Verified,
 };
 
 use super::core::RocksDbShardStorage;
@@ -265,7 +265,7 @@ impl ShardChainReader for SharedStorage {
         ShardChainReader::get_transactions_batch(&*self.0, hashes)
     }
 
-    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<WaveCertificate> {
+    fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<FinalizedWave> {
         self.0.get_certificates_batch(ids)
     }
 

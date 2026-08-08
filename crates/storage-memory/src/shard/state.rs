@@ -9,9 +9,9 @@ use hyperscale_storage::JmtSnapshot;
 use hyperscale_storage::tree::{carry_noop_root, jmt_parent_height, put_at_version};
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
-    ExecutionMetadata, QuorumCertificate, SafeVoteRegisters, SettledWrites, ShardWitnessPayload,
-    StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash, ValidatorId,
-    WaveCertificate,
+    ExecutionMetadata, FinalizedWave, QuorumCertificate, SafeVoteRegisters, SettledWrites,
+    ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash,
+    ValidatorId,
 };
 
 use super::tree_store::SimTreeStore;
@@ -162,7 +162,7 @@ pub struct ConsensusState {
     /// Transactions indexed by hash.
     pub transactions: HashMap<TxHash, Transaction>,
     /// Wave certificates indexed by `TickId`.
-    pub certificates: HashMap<TickId, WaveCertificate>,
+    pub certificates: HashMap<TickId, FinalizedWave>,
     /// Consensus receipts keyed by transaction hash.
     pub consensus_receipts: HashMap<TxHash, Arc<ConsensusReceipt>>,
     /// Execution output details keyed by transaction hash.

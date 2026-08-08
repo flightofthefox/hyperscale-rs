@@ -90,11 +90,11 @@ fn fresh_get_wave_assignment_returns_none_for_any_tx() {
 }
 
 #[test]
-fn fresh_get_finalized_certificate_returns_none_for_any_tx() {
+fn fresh_get_finalized_wave_returns_none_for_any_tx() {
     let coord = fresh_coordinator();
     assert!(
         coord
-            .get_finalized_certificate(TxHash::from(Hash::from_bytes(b"tx1")))
+            .get_finalized_wave_for_tx(TxHash::from(Hash::from_bytes(b"tx1")))
             .is_none()
     );
 }

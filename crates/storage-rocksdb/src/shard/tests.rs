@@ -19,7 +19,7 @@ use hyperscale_types::{
     FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, ProposerTimestamp,
     QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot,
     StoredReceipt, SubstateKey, SyncHint, TickId, TxHash, ValidatorId, Verifiable, Verified,
-    WaveCertificate, WeightedTimestamp, WitnessSources,
+    WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -506,10 +506,8 @@ fn push_wave(block: &mut Block, fw: Arc<Verifiable<FinalizedWave>>) {
 fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
     let new_fw: Arc<Verifiable<FinalizedWave>> = Arc::new(
         FinalizedWave::new(
-            Arc::new(WaveCertificate::new(
-                TickId::new(ShardId::ROOT, block.height()),
-                vec![placeholder_local_ec(ShardId::ROOT, block.height())],
-            )),
+            TickId::new(ShardId::ROOT, block.height()),
+            vec![placeholder_local_ec(ShardId::ROOT, block.height())],
             receipts,
         )
         .into(),
@@ -640,12 +638,12 @@ fn test_commit_block_stores_certificates() {
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     let shard = ShardId::ROOT;
-    let cert = Arc::new(make_test_wave_certificate(BlockHeight::new(1), shard));
+    let cert = make_test_wave_certificate(BlockHeight::new(1), shard);
     let tick_id = *cert.tick_id();
 
     // Create a block that includes this certificate
     let block = make_test_block(BlockHeight::new(1));
-    let fw_certificates = Arc::new(vec![Arc::new(FinalizedWave::new(cert, vec![]).into())]);
+    let fw_certificates = Arc::new(vec![Arc::new(cert.into())]);
     let block = match block {
         Block::Live {
             header,
@@ -944,13 +942,7 @@ fn test_ec_survives_reopen() {
         let mut block = make_test_block(BlockHeight::new(1));
         push_wave(
             &mut block,
-            Arc::new(
-                FinalizedWave::new(
-                    Arc::new(WaveCertificate::new(tick_id, vec![Arc::new(ec)])),
-                    vec![],
-                )
-                .into(),
-            ),
+            Arc::new(FinalizedWave::new(tick_id, vec![Arc::new(ec)], vec![]).into()),
         );
         storage.commit_block(&make_test_certified(block), &no_witness());
     }
@@ -974,13 +966,7 @@ fn test_ec_atomic_with_block_commit() {
     let mut block = make_test_block(BlockHeight::new(1));
     push_wave(
         &mut block,
-        Arc::new(
-            FinalizedWave::new(
-                Arc::new(WaveCertificate::new(tick_id, vec![Arc::new(ec)])),
-                vec![],
-            )
-            .into(),
-        ),
+        Arc::new(FinalizedWave::new(tick_id, vec![Arc::new(ec)], vec![]).into()),
     );
     // Commit block with EC atomically
     storage.commit_block(&make_test_certified(block), &no_witness());
@@ -1025,10 +1011,8 @@ fn rocks_commit_with(
         };
         let wave = Arc::new(
             FinalizedWave::new(
-                Arc::new(WaveCertificate::new(
-                    TickId::new(ShardId::ROOT, block.height()),
-                    vec![placeholder_local_ec(ShardId::ROOT, block.height())],
-                )),
+                TickId::new(ShardId::ROOT, block.height()),
+                vec![placeholder_local_ec(ShardId::ROOT, block.height())],
                 vec![receipt],
             )
             .into(),

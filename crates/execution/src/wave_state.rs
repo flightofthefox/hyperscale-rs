@@ -32,8 +32,8 @@ use hyperscale_core::{CrossShardExecutionRequest, TickExecutionGroup};
 use hyperscale_types::{
     BlockHash, BlockHeight, DeclaredKey, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
     GlobalReceiptRoot, Mode, RevealChain, Settles, ShardId, StoredReceipt, TickId, Transaction,
-    TransactionDecision, TxHash, TxOutcome, Verifiable, Verified, WAVE_TIMEOUT, WaveCertificate,
-    WeightedTimestamp, compute_global_receipt_root, refused_transactions, settles,
+    TransactionDecision, TxHash, TxOutcome, Verifiable, Verified, WAVE_TIMEOUT, WeightedTimestamp,
+    compute_global_receipt_root, refused_transactions, settles,
 };
 
 use crate::provisional::ProvisionalCells;
@@ -60,7 +60,7 @@ pub struct Divergence {
 ///
 /// Under the two-stage lifecycle (windows gate admission, the wave/execution
 /// timeout owns termination), every tx is supposed to terminate with a
-/// `WaveCertificate` — success via vote aggregation or abort via the
+/// `FinalizedWave` — success via vote aggregation or abort via the
 /// deterministic all-abort fallback. The threshold is set past
 /// `WAVE_TIMEOUT` so waves resolving via the normal abort path
 /// (including cross-shard cert gossip) pass silently. If a wave reaches
@@ -1074,7 +1074,7 @@ impl WaveState {
     /// Emit a `warn!` log exactly once, when the wave reaches
     /// `WAVE_OVERDUE_WARN` of age without completing. A firing here is an
     /// invariant violation under the two-stage lifecycle — every tx is
-    /// supposed to terminate with a `WaveCertificate` — so the dump
+    /// supposed to terminate with a `FinalizedWave` — so the dump
     /// captures enough state to diagnose where the post-inclusion
     /// termination guarantee broke (provisioning / dispatch / voting /
     /// EC collection). Latched at the first crossing of the threshold so
@@ -1142,7 +1142,8 @@ impl WaveState {
         );
     }
 
-    /// Build the final `WaveCertificate`. Local EC is always included;
+    /// Build the wave's attestation — the tick and the execution
+    /// certificates proving its transactions. Local EC is always included;
     /// a remote EC is included when it covers a tx this wave still needs a
     /// verdict on, or when it is the EC carrying that tx's abort.
     /// Deterministic order: `(shard_id, tick_id)`.
@@ -1161,7 +1162,7 @@ impl WaveState {
     ///
     /// Callers should invoke only when `is_complete()` is true.
     #[must_use]
-    pub fn create_wave_certificate(&self) -> WaveCertificate {
+    pub fn attestation(&self) -> FinalizedWave {
         // What the local EC says on its own. A tx it already reports as
         // aborted needs no remote to corroborate it.
         let locally_aborted: HashSet<TxHash> = self
@@ -1207,13 +1208,14 @@ impl WaveState {
 
         ecs.sort_by(|a, b| (&a.shard_id(), a.tick_id()).cmp(&(&b.shard_id(), b.tick_id())));
 
-        WaveCertificate::from_verified_ecs(self.tick_id, ecs)
+        FinalizedWave::from_verified_ecs(self.tick_id, ecs)
     }
 
     /// Consume the wave and produce its terminal [`FinalizedWave`].
     ///
-    /// Builds the [`WaveCertificate`] and drains one stored receipt per
-    /// outcome that settles anything, in canonical order. Which side of an
+    /// Builds the [`attestation`](Self::attestation) and drains one stored
+    /// receipt per outcome that settles anything, in canonical order.
+    /// Which side of an
     /// outcome settles is [`settles`]'s question, read against the whole
     /// certificate rather than against this shard's own verdict: a leg
     /// that completed here and was refused by a counterpart settles its
@@ -1228,20 +1230,20 @@ impl WaveState {
     ///
     /// # Panics
     ///
-    /// Panics if the constructed [`WaveCertificate`] doesn't carry the
-    /// local EC. `is_complete` requires `local_ec_emitted`, so that ECs
-    /// presence in `execution_certificates` — and thus in the WC — is
+    /// Panics if the constructed attestation doesn't carry the local EC.
+    /// `is_complete` requires `local_ec_emitted`, so that EC's presence in
+    /// `execution_certificates` — and thus in the attestation — is
     /// guaranteed at the legitimate call site.
     #[must_use]
     pub fn into_finalized(mut self) -> FinalizedWave {
-        let wc = self.create_wave_certificate();
-        let local_ec = wc
+        let attestation = self.attestation();
+        let local_ec = attestation
             .execution_certificates()
             .iter()
-            .find(|ec| ec.tick_id() == wc.tick_id())
-            .expect("WaveCertificate invariant: local EC must be present")
+            .find(|ec| ec.tick_id() == attestation.tick_id())
+            .expect("finalized-wave invariant: local EC must be present")
             .clone();
-        let refused = refused_transactions(&wc);
+        let refused = refused_transactions(attestation.execution_certificates());
         let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
         for outcome in local_ec.tx_outcomes() {
             let drained = match settles(outcome, &refused) {
@@ -1267,7 +1269,7 @@ impl WaveState {
                 );
             }
         }
-        FinalizedWave::new(Arc::new(wc), receipts)
+        attestation.with_receipts(receipts)
     }
 
     /// Per-tx terminal decisions derived from collected ECs.
@@ -1634,8 +1636,8 @@ mod tests {
         w.add_execution_certificate(local);
         assert!(w.add_execution_certificate(remote), "wave completes");
 
-        let wc = w.create_wave_certificate();
-        let signers: BTreeSet<ShardId> = wc
+        let attestation = w.attestation();
+        let signers: BTreeSet<ShardId> = attestation
             .execution_certificates()
             .iter()
             .map(|ec| ec.tick_id().shard_id())
@@ -1646,7 +1648,7 @@ mod tests {
             "every participant's verdict must reach the certificate",
         );
 
-        let decisions = FinalizedWave::new(Arc::new(wc), vec![]).tx_decisions();
+        let decisions = attestation.tx_decisions();
         assert_eq!(
             decisions,
             vec![(tx, TransactionDecision::Aborted)],
@@ -1908,10 +1910,10 @@ mod tests {
         w.add_execution_certificate(ec_local);
         w.add_execution_certificate(ec_remote);
 
-        let wc = w.create_wave_certificate();
-        assert_eq!(wc.execution_certificates().len(), 1);
+        let attestation = w.attestation();
+        assert_eq!(attestation.execution_certificates().len(), 1);
         assert_eq!(
-            wc.execution_certificates()[0].tick_id().shard_id(),
+            attestation.execution_certificates()[0].tick_id().shard_id(),
             ShardId::leaf(1, 0)
         );
     }

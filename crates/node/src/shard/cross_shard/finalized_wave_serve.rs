@@ -13,9 +13,9 @@ use quick_cache::sync::Cache as QuickCache;
 ///
 /// Two tiers: an in-memory cache (entries live here between EC aggregation
 /// and the wave's containing block committing) and chain storage via
-/// [`PendingChain`]. Storage holds `WaveCertificate`s and per-tx receipts
+/// [`PendingChain`]. Storage holds wave attestations and per-tx receipts
 /// separately; for any wave missed by the cache, we reconstruct the full
-/// `FinalizedWave` by pulling the certificate + receipts. Peers requesting
+/// `FinalizedWave` by pulling both halves. Peers requesting
 /// waves past the cache window must still get a complete answer from
 /// durable storage.
 ///
@@ -40,7 +40,7 @@ pub fn serve_finalized_waves_request<S: ShardStorage>(
         let certs = pending_chain.certificates_batch(&missing);
         for cert in certs {
             if let Some(fw) =
-                FinalizedWave::reconstruct(Arc::new(cert), |h| pending_chain.consensus_receipt(h))
+                FinalizedWave::reconstruct(cert, |h| pending_chain.consensus_receipt(h))
             {
                 waves.push(Arc::new(fw));
             }

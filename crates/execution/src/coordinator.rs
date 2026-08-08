@@ -30,7 +30,7 @@
 //!
 //! ## Phase 5: Finalization
 //! Validators collect shard execution proofs from all participating shards. When all
-//! proofs are received, a `WaveCertificate` is created.
+//! proofs are received, a `FinalizedWave` is created.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -45,8 +45,8 @@ use hyperscale_types::{
     ExecutionVote, FinalizedWave, FinalizedWaveVerifyError, GlobalReceiptRoot, Hash, Mode,
     Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledTxSet,
     ShardId, TickId, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
-    TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WeightedTimestamp,
-    settled_set_verdict, tick_leader, tick_leader_at,
+    TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, settled_set_verdict,
+    tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -3019,13 +3019,17 @@ impl ExecutionCoordinator {
         self.finalized.cert_bloom_snapshot()
     }
 
-    /// Get the finalized wave certificate containing a specific transaction.
+    /// Get the finalized wave containing a specific transaction.
     ///
-    /// Returns the wave certificate if the tx is part of a finalized wave.
-    /// Once committed, certificates are persisted to storage and should be fetched from there.
+    /// Returns the wave if the tx is part of one that finalized. Once
+    /// committed, waves are persisted to storage and should be fetched
+    /// from there.
     #[must_use]
-    pub fn get_finalized_certificate(&self, tx_hash: TxHash) -> Option<Arc<WaveCertificate>> {
-        self.finalized.get_certificate_for_tx(tx_hash)
+    pub fn get_finalized_wave_for_tx(
+        &self,
+        tx_hash: TxHash,
+    ) -> Option<Arc<Verifiable<FinalizedWave>>> {
+        self.finalized.get_wave_for_tx(tx_hash)
     }
 
     /// Remove a finalized wave (after its wave cert has been committed in a block).
@@ -4008,9 +4012,8 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
-            FinalizedWave::new(Arc::new(WaveCertificate::new(tick_id, vec![ec])), vec![]).into(),
-        );
+        let wave: Arc<Verifiable<FinalizedWave>> =
+            Arc::new(FinalizedWave::new(tick_id, vec![ec], vec![]).into());
 
         let actions = state.admit_finalized_wave(&topo, wave);
         assert_eq!(actions.len(), 1);
@@ -4041,10 +4044,7 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         ));
-        let wave = Arc::new(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(tick_id, vec![ec])),
-            vec![],
-        ));
+        let wave = Arc::new(FinalizedWave::new(tick_id, vec![ec], vec![]));
         let actions = state.on_finalized_wave_verified(Err((
             wave,
             FinalizedWaveVerifyError::ExecutionCertificate {
@@ -4090,9 +4090,8 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
-            FinalizedWave::new(Arc::new(WaveCertificate::new(tick_id, vec![ec])), vec![]).into(),
-        );
+        let wave: Arc<Verifiable<FinalizedWave>> =
+            Arc::new(FinalizedWave::new(tick_id, vec![ec], vec![]).into());
 
         let actions = state.admit_finalized_wave(&topo, Arc::clone(&wave));
         assert!(
@@ -4138,9 +4137,8 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
-            FinalizedWave::new(Arc::new(WaveCertificate::new(tick_id, vec![ec])), vec![]).into(),
-        );
+        let wave: Arc<Verifiable<FinalizedWave>> =
+            Arc::new(FinalizedWave::new(tick_id, vec![ec], vec![]).into());
 
         let actions = state.admit_finalized_wave(&topo, Arc::clone(&wave));
         assert!(
@@ -4176,7 +4174,8 @@ mod tests {
             SignerBitfield::new(4),
         ));
         let wave = Arc::new(Verified::new_unchecked_for_test(FinalizedWave::new(
-            Arc::new(WaveCertificate::new(tick_id, vec![ec])),
+            tick_id,
+            vec![ec],
             vec![],
         )));
         let actions = state.on_finalized_wave_verified(Ok(wave));
@@ -4526,9 +4525,8 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
-            FinalizedWave::new(Arc::new(WaveCertificate::new(tick_id, vec![ec])), vec![]).into(),
-        );
+        let wave: Arc<Verifiable<FinalizedWave>> =
+            Arc::new(FinalizedWave::new(tick_id, vec![ec], vec![]).into());
 
         let first = state.admit_finalized_wave(&topo, Arc::clone(&wave));
         assert_eq!(first.len(), 1);
@@ -4558,8 +4556,7 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let raw_wave =
-            FinalizedWave::new(Arc::new(WaveCertificate::new(tick_id, vec![ec])), vec![]);
+        let raw_wave = FinalizedWave::new(tick_id, vec![ec], vec![]);
         let verifiable_wave = Arc::new(Verified::new_unchecked_for_test(raw_wave.clone()).into());
         // Seed the canonical store directly (mirrors what `finalize_wave`
         // does on the local-aggregation path).
@@ -4589,13 +4586,8 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::empty(), // no signers — far below 2f+1
         ));
-        let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
-            FinalizedWave::new(
-                Arc::new(WaveCertificate::new(tick_id, vec![bogus_ec])),
-                vec![],
-            )
-            .into(),
-        );
+        let wave: Arc<Verifiable<FinalizedWave>> =
+            Arc::new(FinalizedWave::new(tick_id, vec![bogus_ec], vec![]).into());
 
         let actions = state.admit_finalized_wave(&topo, wave);
         // No admission continuation — the poisoning vector this gate
@@ -4991,9 +4983,8 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let wave: Arc<Verifiable<FinalizedWave>> = Arc::new(
-            FinalizedWave::new(Arc::new(WaveCertificate::new(tick_id, vec![ec])), vec![]).into(),
-        );
+        let wave: Arc<Verifiable<FinalizedWave>> =
+            Arc::new(FinalizedWave::new(tick_id, vec![ec], vec![]).into());
 
         let actions = coord.admit_finalized_wave(&behind, Arc::clone(&wave));
         assert!(
@@ -5416,8 +5407,12 @@ mod tests {
             )
         };
         let local_wave = TickId::new(local, BlockHeight::new(height));
-        let wc = WaveCertificate::new(local_wave, vec![Arc::new(ec(local)), Arc::new(ec(remote))]);
-        Arc::new(Verified::new_unchecked_for_test(FinalizedWave::new(Arc::new(wc), vec![])).into())
+        let wave = FinalizedWave::new(
+            local_wave,
+            vec![Arc::new(ec(local)), Arc::new(ec(remote))],
+            vec![],
+        );
+        Arc::new(Verified::new_unchecked_for_test(wave).into())
     }
 
     /// A wave naming a past-terminal shard whose settled set is unknown is

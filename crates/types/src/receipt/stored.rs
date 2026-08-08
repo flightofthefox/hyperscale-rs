@@ -15,7 +15,7 @@ use crate::{ConsensusReceipt, ExecutionMetadata, TxHash};
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct StoredReceipt {
     /// Primary key in the per-tx receipt store and the join key against
-    /// `WaveCertificate` outcomes during validation.
+    /// `FinalizedWave` outcomes during validation.
     pub tx_hash: TxHash,
     /// Shared via `Arc` so flowing a receipt through `PendingChain`,
     /// validation, and persistence is `Arc::clone`-cheap rather than

@@ -53,10 +53,8 @@ impl Verified<CertificateRoot> {
     /// `Block::Live.certificates` slice without unwrapping.
     #[must_use]
     pub fn compute(certificates: &[Arc<Verifiable<FinalizedWave>>]) -> Self {
-        let receipt_hashes: Vec<WaveReceiptHash> = certificates
-            .iter()
-            .map(|fw| fw.certificate().receipt_hash())
-            .collect();
+        let receipt_hashes: Vec<WaveReceiptHash> =
+            certificates.iter().map(|fw| fw.receipt_hash()).collect();
         Self::new_unchecked(certificate_root_from_receipt_hashes(&receipt_hashes))
     }
 

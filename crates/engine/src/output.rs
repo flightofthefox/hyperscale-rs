@@ -14,7 +14,7 @@ use hyperscale_types::{
 #[derive(Debug, Clone)]
 pub struct ExecutedTx {
     /// Identity of the executed transaction; primary key in downstream
-    /// receipt stores and the join key against `WaveCertificate` outcomes.
+    /// receipt stores and the join key against `FinalizedWave` outcomes.
     pub tx_hash: TxHash,
     /// Hash-stable, peer-transferable portion. Signed over (indirectly,
     /// via `local_receipt_root`) and shipped on sync.

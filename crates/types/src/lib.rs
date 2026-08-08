@@ -6,7 +6,7 @@
 //! - **Primitives**: hashes, merkle roots, signer bitfields, randomness
 //! - **Identifiers**: `ValidatorId`, `ShardId`, `BlockHeight`, etc.
 //! - **Consensus types**: Block, `BlockHeader`, `QuorumCertificate`, etc.
-//! - **Wave types**: `TickId`, `ExecutionVote`, `ExecutionCertificate`, `WaveCertificate`, etc.
+//! - **Wave types**: `TickId`, `ExecutionVote`, `ExecutionCertificate`, `FinalizedWave`, etc.
 //! - **Network traits**: Message markers for serialization
 //!
 //! # Design Philosophy
@@ -75,16 +75,14 @@ pub use beacon::{
 };
 pub use crypto::Ed25519PrivateKey;
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
-pub use execution::certificate::{
-    MAX_EXECUTION_CERTIFICATES_PER_WAVE, WaveCertificate, wave_receipt_hash,
-};
 pub use execution::computation::{compute_cross_shard_txs, tick_leader, tick_leader_at};
 pub use execution::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
 };
 pub use execution::finalized::{
-    FinalizedWave, FinalizedWaveContext, FinalizedWaveVerifyError, ReceiptValidationError, Settles,
-    refused_transactions, settles,
+    FinalizedWave, FinalizedWaveContext, FinalizedWaveVerifyError,
+    MAX_EXECUTION_CERTIFICATES_PER_WAVE, ReceiptValidationError, Settles, refused_transactions,
+    settles,
 };
 pub use execution::outcome::{ExecutionOutcome, TxOutcome};
 pub use execution::receipt_tree::{

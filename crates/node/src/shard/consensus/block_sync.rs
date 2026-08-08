@@ -429,7 +429,7 @@ mod tests {
         ExecutionOutcome, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
         ProposerTimestamp, ProvisionsRoot, QuorumCertificate, RevealChain, Round, ShardId,
         ShardLoad, SignerBitfield, StateRoot, TickId, TransactionRoot, TxHash, TxOutcome,
-        ValidatorId, Verifiable, WaveCertificate, WeightedTimestamp, WitnessSources, WorkInFlight,
+        ValidatorId, Verifiable, WeightedTimestamp, WitnessSources, WorkInFlight,
     };
 
     use super::*;
@@ -557,13 +557,8 @@ mod tests {
             }),
             metadata: None,
         };
-        let fw = Arc::new(
-            FinalizedWave::new(
-                Arc::new(WaveCertificate::new(tick_id, vec![Arc::new(ec)])),
-                vec![receipt.clone()],
-            )
-            .into(),
-        );
+        let fw =
+            Arc::new(FinalizedWave::new(tick_id, vec![Arc::new(ec)], vec![receipt.clone()]).into());
         let lrr = Verified::<LocalReceiptRoot>::compute(&[receipt]).into_inner();
         let cr = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
         (fw, lrr, cr)
@@ -740,13 +735,8 @@ mod tests {
             consensus: Arc::new(ConsensusReceipt::Failed),
             metadata: None,
         };
-        let fw = Arc::new(
-            FinalizedWave::new(
-                Arc::new(WaveCertificate::new(tick_id, vec![Arc::new(ec)])),
-                vec![receipt.clone()],
-            )
-            .into(),
-        );
+        let fw =
+            Arc::new(FinalizedWave::new(tick_id, vec![Arc::new(ec)], vec![receipt.clone()]).into());
         let h = header_with_roots(
             &header(),
             None,

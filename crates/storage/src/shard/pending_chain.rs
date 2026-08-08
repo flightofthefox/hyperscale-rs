@@ -14,8 +14,7 @@ use hyperscale_types::{
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
     MerkleInclusionProof, PreparedCommit, QuorumCertificate, RETENTION_HORIZON, SettledTxsRoot,
     ShardId, ShardWitnessPayload, StateRoot, StateWrites, SubstateKey, TickId, Transaction, TxHash,
-    Verifiable, Verified, WaveCertificate, WeightedTimestamp, local_settled_tx_hashes,
-    settled_txs_root_from_hashes,
+    Verifiable, Verified, WeightedTimestamp, local_settled_tx_hashes, settled_txs_root_from_hashes,
 };
 
 use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
@@ -504,10 +503,10 @@ where
         self.base.get_transactions_batch(hashes)
     }
 
-    /// Batched wave-certificate read by id. Pass-through to base storage —
-    /// pending entries don't carry `WaveCertificate`s, only the receipts
-    /// that contribute to them.
-    pub fn certificates_batch(&self, ids: &[TickId]) -> Vec<WaveCertificate> {
+    /// Batched attestation read by tick id. Pass-through to base storage —
+    /// pending entries don't carry attestations, only the receipts that
+    /// contribute to them.
+    pub fn certificates_batch(&self, ids: &[TickId]) -> Vec<FinalizedWave> {
         self.base.get_certificates_batch(ids)
     }
 
@@ -986,7 +985,7 @@ mod tests {
         Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader,
         ExecutionCertificate, ExecutionOutcome, FinalizedWave, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, LocalKey, Round, SignerBitfield, StateWrites, TickId, Transaction,
-        TxHash, TxOutcome, WaveCertificate, WitnessSources,
+        TxHash, TxOutcome, WitnessSources,
     };
 
     use super::*;
@@ -1121,7 +1120,7 @@ mod tests {
         fn get_transactions_batch(&self, _hashes: &[TxHash]) -> Vec<Verified<Transaction>> {
             Vec::new()
         }
-        fn get_certificates_batch(&self, _ids: &[TickId]) -> Vec<WaveCertificate> {
+        fn get_certificates_batch(&self, _ids: &[TickId]) -> Vec<FinalizedWave> {
             Vec::new()
         }
         fn get_consensus_receipt(&self, _tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
@@ -1658,13 +1657,11 @@ mod tests {
         };
         let certs = vec![Arc::new(
             FinalizedWave::new(
-                Arc::new(WaveCertificate::new(
-                    *settles,
-                    // A counterpart's certificate for the same transaction:
-                    // what makes it cross-shard, and so what puts it in the
-                    // settled set.
-                    vec![ec_for(settles), remote_ec_for(settles)],
-                )),
+                *settles,
+                // A counterpart's certificate for the same transaction:
+                // what makes it cross-shard, and so what puts it in the
+                // settled set.
+                vec![ec_for(settles), remote_ec_for(settles)],
                 vec![],
             )
             .into(),

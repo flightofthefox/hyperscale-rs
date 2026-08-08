@@ -1,7 +1,7 @@
 //! Shared test helpers for storage crate tests.
 //!
 //! Provides reusable builder functions for [`StateWrites`],
-//! `WaveCertificate`, `Block`, and `QuorumCertificate` so that
+//! `FinalizedWave`, `Block`, and `QuorumCertificate` so that
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
 use std::collections::BTreeMap;
@@ -19,8 +19,8 @@ use hyperscale_types::{
     RevealChain, Round, SettledWrites, ShardAnchor, ShardId, ShardLoad, ShardWitnessPayload,
     SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt,
     SubstateKey, SubstateLeaf, TickId, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
-    Verified, WaveCertificate, WeightedTimestamp, WitnessSources, WorkInFlight,
-    compute_global_receipt_root, compute_merkle_root,
+    Verified, WeightedTimestamp, WitnessSources, WorkInFlight, compute_global_receipt_root,
+    compute_merkle_root,
 };
 
 use crate::tree::Jmt;
@@ -97,13 +97,12 @@ pub const fn state_key(owner_seed: u8, local_seed: u8) -> SubstateKey {
     }
 }
 
-/// Build a test `WaveCertificate` at the given height.
+/// Build a test attestation at the given height.
 ///
-/// Includes a single placeholder local EC so the certificate satisfies the
-/// invariant enforced at decode time (one EC per wave whose `tick_id` matches
-/// `wc.tick_id`).
+/// Includes a single placeholder local EC so it satisfies the invariant
+/// enforced at decode time (one EC whose `tick_id` matches the wave's own).
 #[must_use]
-pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardId) -> WaveCertificate {
+pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardId) -> FinalizedWave {
     let tick_id = TickId::new(shard, height);
     let local_ec = Arc::new(ExecutionCertificate::new(
         tick_id,
@@ -113,7 +112,7 @@ pub fn make_test_wave_certificate(height: BlockHeight, shard: ShardId) -> WaveCe
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::empty(),
     ));
-    WaveCertificate::new(tick_id, vec![local_ec])
+    FinalizedWave::new(tick_id, vec![local_ec], vec![])
 }
 
 /// Build a minimal `Block` at the given height.
@@ -371,20 +370,17 @@ pub fn make_test_execution_certificate(
     )
 }
 
-/// Build a test block that carries ECs inside its wave certificates.
+/// Build a test block that carries ECs inside its finalized waves.
 ///
-/// The wave-certificate's `tick_id` is taken from the first EC's `tick_id` so
+/// The wave's `tick_id` is taken from the first EC's `tick_id` so
 /// the local-EC decode invariant is satisfied without injecting a placeholder.
 fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertificate>>) -> Block {
     let block = make_test_block(height);
     if ecs.is_empty() {
         return block;
     }
-    let certificate = Arc::new(WaveCertificate::new(*ecs[0].tick_id(), ecs));
-    push_certificate(
-        block,
-        Arc::new(FinalizedWave::new(certificate, vec![]).into()),
-    )
+    let certificate = FinalizedWave::new(*ecs[0].tick_id(), ecs, vec![]);
+    push_certificate(block, Arc::new(certificate.into()))
 }
 
 /// Append a finalized wave to `block`'s certificate list, preserving
@@ -457,11 +453,9 @@ pub fn commit_block_with_updates(
         }),
         metadata: None,
     };
-    let certificate = Arc::new(WaveCertificate::new(
-        TickId::new(ShardId::ROOT, height),
-        vec![],
-    ));
-    let finalized = Arc::new(FinalizedWave::new(certificate, vec![receipt]).into());
+    let finalized = Arc::new(
+        FinalizedWave::new(TickId::new(ShardId::ROOT, height), vec![], vec![receipt]).into(),
+    );
     let block = push_certificate(make_test_block(height), finalized);
     storage.commit_block(&make_test_certified(block), &empty_witness())
 }

@@ -10520,7 +10520,7 @@ mod tests {
     ) -> Arc<Verifiable<FinalizedWave>> {
         use hyperscale_types::{
             ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot,
-            SignerBitfield, TxOutcome, WaveCertificate,
+            SignerBitfield, TxOutcome,
         };
         let ec = |shard: ShardId| {
             let wave = TickId::new(shard, BlockHeight::new(height));
@@ -10539,8 +10539,11 @@ mod tests {
             )
         };
         let local_wave = TickId::new(local, BlockHeight::new(height));
-        let wc = WaveCertificate::new(local_wave, vec![Arc::new(ec(local)), Arc::new(ec(remote))]);
-        Arc::new(Verifiable::from(FinalizedWave::new(Arc::new(wc), vec![])))
+        Arc::new(Verifiable::from(FinalizedWave::new(
+            local_wave,
+            vec![Arc::new(ec(local)), Arc::new(ec(remote))],
+            vec![],
+        )))
     }
 
     fn block_with_certs(certs: Vec<Arc<Verifiable<FinalizedWave>>>) -> Block {

@@ -15,7 +15,7 @@ use hyperscale_types::{
     ChainOrigin, ConsensusReceipt, FinalizedWave, GlobalReceiptHash, Hash, LocalKey,
     ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId,
     StateRoot, StoredReceipt, SubstateKey, SyncHint, TickId, TxHash, ValidatorId, Verifiable,
-    Verified, WaveCertificate, WeightedTimestamp, WitnessSources,
+    Verified, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -40,7 +40,7 @@ impl SimShardStorage {
     #[allow(clippy::significant_drop_tightening)] // both reads need the lock
     pub fn commit_certificate_with_writes(
         &self,
-        certificate: &WaveCertificate,
+        certificate: &FinalizedWave,
         writes: &SettledWrites,
     ) {
         {
@@ -123,10 +123,8 @@ fn commit_with(
         };
         let new_fw: Arc<Verifiable<FinalizedWave>> = Arc::new(
             FinalizedWave::new(
-                Arc::new(WaveCertificate::new(
-                    TickId::new(ShardId::ROOT, block.height()),
-                    vec![],
-                )),
+                TickId::new(ShardId::ROOT, block.height()),
+                vec![],
                 vec![receipt],
             )
             .into(),

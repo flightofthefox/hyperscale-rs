@@ -21,7 +21,7 @@ use hyperscale_metrics::{record_storage_operation, record_storage_read};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, BlockMetadata, CertifiedBlock,
     FinalizedWave, Hash, ProvisionHash, QuorumCertificate, TickId, Transaction, TxHash, Verifiable,
-    Verified, WaveCertificate,
+    Verified,
 };
 use rocksdb::{ColumnFamily, WriteBatch};
 
@@ -148,12 +148,7 @@ impl RocksDbShardStorage {
             );
         }
         for fw in block.certificates().iter() {
-            batch_put::<CertificatesCf>(
-                batch,
-                certificates_cf,
-                fw.tick_id(),
-                fw.certificate().as_ref(),
-            );
+            batch_put::<CertificatesCf>(batch, certificates_cf, fw.tick_id(), &fw.attestation());
         }
     }
 
@@ -485,7 +480,7 @@ impl RocksDbShardStorage {
         &self,
         certificates_cf: &ColumnFamily,
         ids: &[TickId],
-    ) -> Vec<Arc<WaveCertificate>> {
+    ) -> Vec<FinalizedWave> {
         if ids.is_empty() {
             return vec![];
         }
@@ -496,13 +491,10 @@ impl RocksDbShardStorage {
             .into_iter()
             .zip(ids.iter())
             .filter_map(|(result, id)| {
-                result.map_or_else(
-                    || {
-                        tracing::trace!(?id, "Certificate not found in storage");
-                        None
-                    },
-                    |cert| Some(Arc::new(cert)),
-                )
+                result.or_else(|| {
+                    tracing::trace!(?id, "Certificate not found in storage");
+                    None
+                })
             })
             .collect()
     }
@@ -555,13 +547,13 @@ impl RocksDbShardStorage {
     // Certificate storage
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Store a wave certificate.
-    pub fn put_certificate(&self, id: &TickId, cert: &WaveCertificate) {
+    /// Store a wave's attestation.
+    pub fn put_certificate(&self, id: &TickId, cert: &FinalizedWave) {
         self.cf_put_sync::<CertificatesCf>(id, cert);
     }
 
-    /// Get a wave certificate by `TickId`.
-    pub fn get_certificate(&self, id: &TickId) -> Option<WaveCertificate> {
+    /// Get a wave's attestation by `TickId`.
+    pub fn get_certificate(&self, id: &TickId) -> Option<FinalizedWave> {
         self.cf_get::<CertificatesCf>(id)
     }
 
@@ -569,7 +561,7 @@ impl RocksDbShardStorage {
     ///
     /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
     /// Returns only certificates that were found (missing ids are skipped).
-    pub fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<WaveCertificate> {
+    pub fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<FinalizedWave> {
         if ids.is_empty() {
             return vec![];
         }
@@ -599,7 +591,7 @@ mod test_helpers {
         record_certificate_persisted, record_storage_batch_size, record_storage_operation,
         record_storage_write,
     };
-    use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, SettledWrites, WaveCertificate};
+    use hyperscale_types::{BlockHeight, FinalizedWave, Hash, QuorumCertificate, SettledWrites};
     use rocksdb::{WriteBatch, WriteOptions};
     use tracing::field::Empty;
     use tracing::{Level, Span, instrument};
@@ -654,7 +646,7 @@ mod test_helpers {
         ))]
         pub fn commit_certificate_with_writes(
             &self,
-            certificate: &WaveCertificate,
+            certificate: &FinalizedWave,
             writes: &SettledWrites,
         ) {
             let start = Instant::now();
