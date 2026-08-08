@@ -6,7 +6,7 @@ use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetFinalizationsRequest;
 use hyperscale_types::network::response::GetFinalizationsResponse;
-use hyperscale_types::{Finalization, TickId, Verifiable};
+use hyperscale_types::{Finalization, FinalizationHash, Verifiable};
 use quick_cache::sync::Cache as QuickCache;
 
 /// Serve an inbound finalization fetch request.
@@ -23,12 +23,12 @@ use quick_cache::sync::Cache as QuickCache;
 /// verification marker is process-local and doesn't cross the network.
 pub fn serve_finalizations_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
-    fw_cache: &QuickCache<TickId, Arc<Verifiable<Finalization>>>,
+    fw_cache: &QuickCache<FinalizationHash, Arc<Verifiable<Finalization>>>,
     req: &GetFinalizationsRequest,
 ) -> GetFinalizationsResponse {
     let mut finalizations: Vec<Arc<Finalization>> = Vec::new();
-    let mut missing: Vec<TickId> = Vec::new();
-    for id in &req.tick_ids {
+    let mut missing: Vec<FinalizationHash> = Vec::new();
+    for id in &req.finalization_hashes {
         if let Some(fw) = fw_cache.get(id) {
             finalizations.push(Arc::new(fw.as_unverified().clone()));
         } else {

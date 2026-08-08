@@ -21,7 +21,7 @@ use hyperscale_core::{Action, FeeDemand};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash, LocalTimestamp,
     ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
-    ShardId, TickId, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    ShardId, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified,
     WeightedTimestamp,
 };
 use tracing::debug;
@@ -223,7 +223,6 @@ pub fn select_transactions(
 /// leave a tick ahead of a predecessor it should follow.
 pub fn select_finalizations(
     finalizations: Vec<Arc<Verifiable<Finalization>>>,
-    qc_chain_cert_ids: &HashSet<TickId>,
     qc_chain_resolved_txs: &HashSet<TxHash>,
     dedup_index: &CommitDedupIndex,
     max_finalized_txs: usize,
@@ -233,9 +232,6 @@ pub fn select_finalizations(
     let ticks_to_propose: Vec<_> = finalizations
         .into_iter()
         .filter(|fw| {
-            if qc_chain_cert_ids.contains(fw.tick_id()) || dedup_index.contains_cert(fw.tick_id()) {
-                return false;
-            }
             let unresolved = fw.tx_hashes().all(|tx_hash| {
                 !resolved_here.contains(&tx_hash)
                     && !qc_chain_resolved_txs.contains(&tx_hash)
@@ -550,7 +546,6 @@ mod tests {
         let (selected, count) = select_finalizations(
             vec![Arc::clone(&settled), abandoned],
             &HashSet::new(),
-            &HashSet::new(),
             &CommitDedupIndex::new(),
             MAX_FINALIZED_TX_PER_BLOCK,
         );
@@ -576,7 +571,6 @@ mod tests {
         );
         let (selected, count) = select_finalizations(
             vec![abandoned],
-            &HashSet::new(),
             &HashSet::new(),
             &dedup_index,
             MAX_FINALIZED_TX_PER_BLOCK,

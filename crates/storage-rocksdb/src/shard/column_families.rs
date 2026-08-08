@@ -5,8 +5,8 @@
 
 use hyperscale_types::{
     BlockMetadata, ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionMetadata,
-    Finalization, Hash, Round, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, TickId,
-    Transaction, ValidatorId,
+    Finalization, FinalizationHash, Hash, Round, SafeVoteRegisters, ShardWitnessPayload,
+    SubstateKey, TickId, Transaction, ValidatorId,
 };
 use rocksdb::{ColumnFamily, DB};
 
@@ -258,9 +258,9 @@ impl TypedCf for TransactionsCf {
 pub struct CertificatesCf;
 impl TypedCf for CertificatesCf {
     const NAME: &'static str = CERTIFICATES_CF;
-    type Key = TickId;
+    type Key = FinalizationHash;
     type Value = Finalization;
-    type KeyCodec = HborCodec<TickId>;
+    type KeyCodec = HborCodec<FinalizationHash>;
     type ValueCodec = HborCodec<Finalization>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {

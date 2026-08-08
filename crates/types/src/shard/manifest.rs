@@ -4,9 +4,9 @@
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, TickId, TxHash,
-    Verifiable, WitnessSources,
+    BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, FinalizationHash,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    QuorumCertificate, TxHash, Verifiable, WitnessSources,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -22,7 +22,7 @@ pub struct BlockManifest {
     #[hbor(max = MAX_TXS_PER_BLOCK)]
     tx_hashes: Vec<TxHash>,
     #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-    cert_ids: Vec<TickId>,
+    cert_ids: Vec<FinalizationHash>,
     #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
     provision_hashes: Vec<ProvisionHash>,
     /// The block's beacon-witness inputs, mirrored verbatim — the
@@ -51,7 +51,7 @@ impl BlockManifest {
     #[must_use]
     pub const fn new(
         tx_hashes: Vec<TxHash>,
-        cert_ids: Vec<TickId>,
+        cert_ids: Vec<FinalizationHash>,
         provision_hashes: Vec<ProvisionHash>,
         witness_sources: WitnessSources,
     ) -> Self {
@@ -69,10 +69,13 @@ impl BlockManifest {
         &self.tx_hashes
     }
 
-    /// Tick identifiers in block order.
-    /// Validators use these to match against what they finalized locally.
+    /// Finalization identities in block order — each the leaf its
+    /// block's `certificate_root` commits, which is what a validator
+    /// matches against what it finalized locally and what it fetches a
+    /// missing body by. Identity is content rather than tick, so a tick
+    /// settling in more than one part names each part separately.
     #[must_use]
-    pub const fn cert_ids(&self) -> &Vec<TickId> {
+    pub const fn cert_ids(&self) -> &Vec<FinalizationHash> {
         &self.cert_ids
     }
 
@@ -111,7 +114,11 @@ impl BlockManifest {
         // `Block`'s own decode validator, so the manifest cannot outgrow
         // the caps its fields declare.
         let tx_hashes: Vec<_> = block.transactions().iter().map(|tx| tx.hash()).collect();
-        let cert_ids: Vec<_> = block.certificates().iter().map(|c| *c.tick_id()).collect();
+        let cert_ids: Vec<_> = block
+            .certificates()
+            .iter()
+            .map(|c| c.receipt_hash())
+            .collect();
         let provision_hashes = block.provision_hashes();
         Self::new(
             tx_hashes,
@@ -279,7 +286,7 @@ mod tests {
     #[test]
     fn decode_rejects_oversized_provision_hashes_count() {
         let mut buf = hbor_to_vec(&Vec::<TxHash>::new()).unwrap();
-        buf.extend_from_slice(&hbor_to_vec(&Vec::<TickId>::new()).unwrap());
+        buf.extend_from_slice(&hbor_to_vec(&Vec::<FinalizationHash>::new()).unwrap());
         // Oversized provision_hashes.
         varint::write(&mut buf, MAX_PROVISIONS_PER_BLOCK + 1).unwrap();
         buf.extend(std::iter::repeat_n(

@@ -40,7 +40,7 @@ impl ShardParticipation {
         // already carries. Proposal building drops them as duplicates, so
         // the budget has to be raised by what will be dropped or the
         // block comes out short.
-        let (_, ancestor_txs, _) = self.shard_coordinator.collect_qc_chain_hashes(parent);
+        let (ancestor_txs, _) = self.shard_coordinator.collect_qc_chain_hashes(parent);
         let max_txs = MAX_TXS_PER_BLOCK + ancestor_txs.len();
         // The budget reads the chain, not a local claim set: the parent
         // header carries what this shard still owes in work.

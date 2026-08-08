@@ -69,7 +69,7 @@ pub struct MemoryMetrics {
     /// Committed transaction hash lookup.
     pub shard_committed_tx_lookup: usize,
     /// Committed finalization lookup.
-    pub shard_committed_cert_lookup: usize,
+    pub shard_committed_resolution_lookup: usize,
     /// Committed provision batch lookup.
     pub shard_committed_provision_lookup: usize,
     /// Block headers pending QC verification.

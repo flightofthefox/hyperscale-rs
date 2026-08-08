@@ -18,8 +18,8 @@ use hyperscale_types::network::request::{
     GetProvisionsRequest,
 };
 use hyperscale_types::{
-    BlockHeight, ExecutionCertificate, Finalization, MessageClass, ProvisionHash, ShardId, TickId,
-    TxHash, ValidatorId, Verifiable,
+    BlockHeight, ExecutionCertificate, Finalization, FinalizationHash, MessageClass, ProvisionHash,
+    ShardId, TxHash, ValidatorId, Verifiable,
 };
 
 use crate::fetch::{Fetch, FetchBinding, partition_solicited};
@@ -29,7 +29,7 @@ use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, pu
 /// Local-provision fetch keyed by [`ProvisionHash`].
 pub type LocalProvisionFetch = Fetch<ProvisionHash>;
 /// Finalization fetch keyed by [`TickId`].
-pub type FinalizationFetch = Fetch<TickId>;
+pub type FinalizationFetch = Fetch<FinalizationHash>;
 /// Cross-shard execution-cert fetch keyed by [`TickId`].
 pub type ExecCertFetch = Fetch<(ShardId, TxHash)>;
 /// Cross-shard provision fetch keyed by
@@ -129,16 +129,16 @@ impl FetchBinding for LocalProvisionBinding {
 pub struct FinalizationBinding;
 
 impl FetchBinding for FinalizationBinding {
-    type Id = TickId;
+    type Id = FinalizationHash;
 
     const NAME: &'static str = "finalization";
 
-    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<TickId> {
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<FinalizationHash> {
         &mut shard.cross_shard.finalization
     }
 
     fn dispatch_chunk<N: Network>(
-        ids: Vec<TickId>,
+        ids: Vec<FinalizationHash>,
         local_shard: ShardId,
         shard: ShardId,
         preferred: Option<ValidatorId>,
@@ -155,8 +155,9 @@ impl FetchBinding for FinalizationBinding {
             class,
             Box::new(move |result| {
                 if let Ok(resp) = result {
-                    let split =
-                        partition_solicited(resp.finalizations, &requested_ids, |w| [*w.tick_id()]);
+                    let split = partition_solicited(resp.finalizations, &requested_ids, |w| {
+                        [w.receipt_hash()]
+                    });
                     if !split.kept.is_empty() {
                         // Refcount is 1 right after decode, so each unwrap moves.
                         let finalizations: Vec<Arc<Verifiable<Finalization>>> = split

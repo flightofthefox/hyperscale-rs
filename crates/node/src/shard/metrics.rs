@@ -289,7 +289,7 @@ where
             shard_pending_commits_awaiting_data: shard_mem.pending_commits_awaiting_data,
             shard_received_votes_by_height: shard_mem.received_votes_by_height,
             shard_committed_tx_lookup: shard_mem.committed_tx_lookup,
-            shard_committed_cert_lookup: shard_mem.committed_cert_lookup,
+            shard_committed_resolution_lookup: shard_mem.committed_resolution_lookup,
             shard_committed_provision_lookup: shard_mem.committed_provision_lookup,
             shard_pending_qc_verifications: shard_mem.pending_qc_verifications,
             shard_verified_qcs: shard_mem.verified_qcs,

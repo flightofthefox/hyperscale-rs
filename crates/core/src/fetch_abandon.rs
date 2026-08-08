@@ -11,7 +11,8 @@
 //! `FetchInput::Abandoned` on the corresponding binding.
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, LeafIndex, ProvisionHash, ShardId, TickId, TxHash, ValidatorId,
+    BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, ProvisionHash, ShardId, TxHash,
+    ValidatorId,
 };
 
 /// Fetch-cancel family — one variant per payload type. Variants are added
@@ -52,8 +53,9 @@ pub enum FetchAbandon {
     /// resolvable, signature invalid) so the FSM clears the in-flight
     /// slot it would otherwise pin on a tick that cannot be admitted.
     Finalizations {
-        /// Tick ids whose in-flight fetch should be cancelled.
-        ids: Vec<TickId>,
+        /// Finalization identities whose in-flight fetch should be
+        /// cancelled.
+        ids: Vec<FinalizationHash>,
     },
     /// Cross-shard execution-certificate fetch keyed by
     /// `(source_shard, tx_hash)`. Emitted when an EC's admission path

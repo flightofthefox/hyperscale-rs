@@ -118,7 +118,7 @@ where
                 });
             }
             ProtocolEvent::FinalizationsAdmitted { finalizations } => {
-                let ids: Vec<_> = finalizations.iter().map(|w| *w.tick_id()).collect();
+                let ids: Vec<_> = finalizations.iter().map(|w| w.receipt_hash()).collect();
                 self.drive_fetch::<FinalizationBinding>(FetchInput::Admitted { ids });
             }
             ProtocolEvent::ExecutionCertificateAdmitted { certificate } => {

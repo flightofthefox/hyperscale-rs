@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY,
-    MAX_TIMESTAMP_RUSH, ProvisionHash, QuorumCertificate, ShardId, ShardLoad, TickId,
-    TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, compute_cross_shard_txs,
+    MAX_TIMESTAMP_RUSH, ProvisionHash, QuorumCertificate, ShardId, ShardLoad, TopologySnapshot,
+    Transaction, TxHash, Verifiable, VoteCount, compute_cross_shard_txs,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -324,7 +324,6 @@ pub fn validate_no_duplicate_transactions(
 /// against this shared state is therefore safe under the on-qc-formed race.
 pub fn validate_no_duplicate_resolutions(
     block: &Block,
-    qc_chain_cert_ids: &HashSet<TickId>,
     qc_chain_resolved_txs: &HashSet<TxHash>,
     dedup_index: &CommitDedupIndex,
 ) -> Result<(), String> {
@@ -334,17 +333,6 @@ pub fn validate_no_duplicate_resolutions(
 
     let mut resolved_here: HashSet<TxHash> = HashSet::new();
     for fw in block.certificates().iter() {
-        let tick_id = fw.tick_id();
-        if qc_chain_cert_ids.contains(tick_id) {
-            return Err(format!(
-                "finalization {tick_id:?} already in QC chain ancestor"
-            ));
-        }
-        if dedup_index.contains_cert(tick_id) {
-            return Err(format!(
-                "finalization {tick_id:?} already committed within its retention window"
-            ));
-        }
         for tx_hash in fw.tx_hashes() {
             if !resolved_here.insert(tx_hash) {
                 return Err(format!(
@@ -509,7 +497,6 @@ pub fn validate_block_for_vote(
     local_shard: ShardId,
     block: &Block,
     qc_chain_tx_hashes: &HashSet<TxHash>,
-    qc_chain_cert_ids: &HashSet<TickId>,
     qc_chain_resolved_txs: &HashSet<TxHash>,
     qc_chain_provision_hashes: &HashSet<ProvisionHash>,
     dedup_index: &CommitDedupIndex,
@@ -524,12 +511,7 @@ pub fn validate_block_for_vote(
     validate_transaction_ordering(block)?;
     validate_cross_shard_txs(topology_snapshot, local_shard, block)?;
     validate_no_duplicate_transactions(block, qc_chain_tx_hashes, dedup_index)?;
-    validate_no_duplicate_resolutions(
-        block,
-        qc_chain_cert_ids,
-        qc_chain_resolved_txs,
-        dedup_index,
-    )?;
+    validate_no_duplicate_resolutions(block, qc_chain_resolved_txs, dedup_index)?;
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
     validate_provisions_not_fenced(topology_snapshot, block)?;
     validate_engagement(topology_snapshot, local_shard, block, dedup_index)?;
@@ -1256,34 +1238,20 @@ mod tests {
         ))
     }
 
-    fn no_resolutions(
-        block: &Block,
-        qc_chain: &HashSet<TickId>,
-        dedup_index: &CommitDedupIndex,
-    ) -> Result<(), String> {
-        validate_no_duplicate_resolutions(block, qc_chain, &HashSet::new(), dedup_index)
+    fn no_resolutions(block: &Block, dedup_index: &CommitDedupIndex) -> Result<(), String> {
+        validate_no_duplicate_resolutions(block, &HashSet::new(), dedup_index)
     }
 
     #[test]
     fn validate_no_duplicate_resolutions_accepts_empty_block() {
         let block = block_with_certificates(BlockHeight::new(5), vec![]);
-        assert!(no_resolutions(&block, &HashSet::new(), &CommitDedupIndex::new()).is_ok());
+        assert!(no_resolutions(&block, &CommitDedupIndex::new()).is_ok());
     }
 
     #[test]
     fn validate_no_duplicate_resolutions_accepts_unique() {
         let block = block_with_certificates(BlockHeight::new(5), vec![finalization_at(1)]);
-        assert!(no_resolutions(&block, &HashSet::new(), &CommitDedupIndex::new()).is_ok());
-    }
-
-    #[test]
-    fn validate_no_duplicate_resolutions_rejects_qc_chain_dup() {
-        let fw = finalization_at(1);
-        let dup_id = *fw.tick_id();
-        let block = block_with_certificates(BlockHeight::new(6), vec![fw]);
-        let qc_chain: HashSet<_> = std::iter::once(dup_id).collect();
-        let err = no_resolutions(&block, &qc_chain, &CommitDedupIndex::new()).unwrap_err();
-        assert!(err.contains("already in QC chain ancestor"));
+        assert!(no_resolutions(&block, &CommitDedupIndex::new()).is_ok());
     }
 
     #[test]
@@ -1292,8 +1260,8 @@ mod tests {
         let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_certs(&[Arc::new((*fw).clone().into())]);
-        let err = no_resolutions(&block, &HashSet::new(), &dedup_index).unwrap_err();
-        assert!(err.contains("already committed"));
+        let err = no_resolutions(&block, &dedup_index).unwrap_err();
+        assert!(err.contains("already resolved within its retention window"));
     }
 
     /// A second verdict for one transaction is refused however it is
@@ -1314,7 +1282,7 @@ mod tests {
         assert_ne!(abandoned.tick_id(), settled.tick_id());
         let block = block_with_certificates(BlockHeight::new(6), vec![abandoned]);
 
-        let err = no_resolutions(&block, &HashSet::new(), &dedup_index).unwrap_err();
+        let err = no_resolutions(&block, &dedup_index).unwrap_err();
         assert!(
             err.contains("already resolved within its retention window"),
             "{err}"
@@ -1334,13 +1302,9 @@ mod tests {
 
         let block =
             block_with_certificates(BlockHeight::new(6), vec![finalization_over(9, tx_hash)]);
-        let err = validate_no_duplicate_resolutions(
-            &block,
-            &HashSet::new(),
-            &ancestor_resolved,
-            &CommitDedupIndex::new(),
-        )
-        .unwrap_err();
+        let err =
+            validate_no_duplicate_resolutions(&block, &ancestor_resolved, &CommitDedupIndex::new())
+                .unwrap_err();
         assert!(
             err.contains("already resolved by a QC chain ancestor"),
             "{err}"
@@ -1360,7 +1324,7 @@ mod tests {
             BlockHeight::new(6),
             vec![settled, finalization_over(9, tx_hash)],
         );
-        let err = no_resolutions(&block, &HashSet::new(), &CommitDedupIndex::new()).unwrap_err();
+        let err = no_resolutions(&block, &CommitDedupIndex::new()).unwrap_err();
         assert!(
             err.contains("resolved twice within the same block"),
             "{err}"
@@ -1554,7 +1518,6 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
-            &HashSet::new(),
             &CommitDedupIndex::new(),
             false,
             Some(ShardLoad::ZERO),
@@ -1576,7 +1539,6 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
-            &HashSet::new(),
             &CommitDedupIndex::new(),
             true,
             Some(ShardLoad::ZERO),
@@ -1590,7 +1552,6 @@ mod tests {
                 &topo,
                 local_shard(),
                 &empty,
-                &HashSet::new(),
                 &HashSet::new(),
                 &HashSet::new(),
                 &HashSet::new(),

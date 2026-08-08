@@ -3,25 +3,28 @@
 use hyperscale_hbor::Hbor;
 
 use crate::network::response::GetFinalizationsResponse;
-use crate::{MessageClass, NetworkMessage, Request, TickId};
+use crate::{FinalizationHash, MessageClass, NetworkMessage, Request};
 
-/// Request to fetch finalizations by id.
+/// Request to fetch finalizations by identity.
 ///
 /// Used when a validator is missing finalizations referenced by a pending
-/// block. The responder resolves each id from the local finalization cache
-/// (and falls through to storage where supported) — no scope information is
-/// needed since `TickId` self-contains shard, height, and dependency set.
+/// block. The responder resolves each from the local finalization cache
+/// (and falls through to storage where supported) — no scope information
+/// is needed, since the identity is a hash of the finalization's own
+/// content and the block manifest names exactly these.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct GetFinalizationsRequest {
-    /// Tick IDs being requested.
-    pub tick_ids: Vec<TickId>,
+    /// Finalization identities being requested.
+    pub finalization_hashes: Vec<FinalizationHash>,
 }
 
 impl GetFinalizationsRequest {
-    /// Build a request for the listed `tick_ids`.
+    /// Build a request for the listed `finalization_hashes`.
     #[must_use]
-    pub const fn new(tick_ids: Vec<TickId>) -> Self {
-        Self { tick_ids }
+    pub const fn new(finalization_hashes: Vec<FinalizationHash>) -> Self {
+        Self {
+            finalization_hashes,
+        }
     }
 }
 
@@ -49,14 +52,14 @@ mod tests {
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
-    use crate::{BlockHeight, ShardId};
+    use crate::Hash;
 
     #[test]
     fn test_hbor_roundtrip() {
         let request = GetFinalizationsRequest {
-            tick_ids: vec![
-                TickId::new(ShardId::ROOT, BlockHeight::new(1)),
-                TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+            finalization_hashes: vec![
+                FinalizationHash::from_raw(Hash::from_bytes(b"one")),
+                FinalizationHash::from_raw(Hash::from_bytes(b"two")),
             ],
         };
         let encoded = hbor_to_vec(&request).unwrap();

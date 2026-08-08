@@ -25,8 +25,8 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock, Finalization,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    Provisions, QuorumCertificate, TickId, Transaction, TxHash, Verifiable, WitnessSources,
+    FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK,
+    ProvisionHash, Provisions, QuorumCertificate, Transaction, TxHash, Verifiable, WitnessSources,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -91,7 +91,7 @@ pub struct ElidedCertifiedBlock {
     #[hbor(max = MAX_TXS_PER_BLOCK)]
     transactions: Vec<(TxHash, Option<Arc<Verifiable<Transaction>>>)>,
     #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
-    certificates: Vec<(TickId, Option<Arc<Verifiable<Finalization>>>)>,
+    certificates: Vec<(FinalizationHash, Option<Arc<Verifiable<Finalization>>>)>,
     provisions: ElidedProvisions,
     /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
@@ -152,7 +152,9 @@ impl ElidedCertifiedBlock {
 
     /// Per-certificate `(tick id, optional body)` pairs; body is `None` when elided.
     #[must_use]
-    pub const fn certificates(&self) -> &Vec<(TickId, Option<Arc<Verifiable<Finalization>>>)> {
+    pub const fn certificates(
+        &self,
+    ) -> &Vec<(FinalizationHash, Option<Arc<Verifiable<Finalization>>>)> {
         &self.certificates
     }
 
@@ -199,7 +201,7 @@ impl ElidedCertifiedBlock {
             .certificates()
             .iter()
             .map(|fw| {
-                let id = *fw.tick_id();
+                let id = fw.receipt_hash();
                 let body = if finalization_is_held(inventory.cert_have.as_ref(), fw) {
                     None
                 } else {
@@ -262,7 +264,7 @@ impl ElidedCertifiedBlock {
     ) -> Result<CertifiedBlock, RehydrateError>
     where
         FTx: FnMut(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        FCert: FnMut(&TickId) -> Option<Arc<Verifiable<Finalization>>>,
+        FCert: FnMut(&FinalizationHash) -> Option<Arc<Verifiable<Finalization>>>,
         FProv: FnMut(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     {
         // Header + QC are always inline, so the pairing can be checked
@@ -364,7 +366,7 @@ pub struct RehydrationMiss {
     /// Transaction hashes whose bodies could not be resolved.
     pub missing_tx: Vec<TxHash>,
     /// Tick ids whose finalization bodies could not be resolved.
-    pub missing_cert: Vec<TickId>,
+    pub missing_cert: Vec<FinalizationHash>,
     /// Provision hashes whose bodies could not be resolved.
     pub missing_provision: Vec<ProvisionHash>,
 }
@@ -450,7 +452,7 @@ mod tests {
     use crate::{
         AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, BloomFilter, ChainOrigin,
         ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot, Hash,
-        ProposerTimestamp, ShardId, SignerBitfield, TxOutcome, WeightedTimestamp,
+        ProposerTimestamp, ShardId, SignerBitfield, TickId, TxOutcome, WeightedTimestamp,
     };
 
     fn create_test_block() -> Block {
@@ -756,7 +758,7 @@ mod tests {
             &hbor_to_vec(&Vec::<(TxHash, Option<Arc<Transaction>>)>::new()).unwrap(),
         );
         buf.extend_from_slice(
-            &hbor_to_vec(&Vec::<(TickId, Option<Arc<Finalization>>)>::new()).unwrap(),
+            &hbor_to_vec(&Vec::<(FinalizationHash, Option<Arc<Finalization>>)>::new()).unwrap(),
         );
         // ElidedProvisions::Live(oversized) — discriminant 0, then the claim.
         buf.push(0);

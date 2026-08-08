@@ -1237,8 +1237,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(m.shard_committed_tx_lookup as f64);
         self.metrics
             .memory_shard
-            .with_label_values(&["committed_cert_lookup"])
-            .set(m.shard_committed_cert_lookup as f64);
+            .with_label_values(&["committed_resolution_lookup"])
+            .set(m.shard_committed_resolution_lookup as f64);
         self.metrics
             .memory_shard
             .with_label_values(&["committed_provision_lookup"])

@@ -42,8 +42,8 @@ use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, DeclaredKey, ExecutionCertificate, ExecutionCertificateVerifyError,
-    ExecutionVote, Finalization, FinalizationVerifyError, GlobalReceiptRoot, Hash,
-    MAX_FINALIZATION_DELAY, Mode, Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup,
+    ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
+    Hash, MAX_FINALIZATION_DELAY, Mode, Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup,
     SettledSetVerdict, SettledTxSet, ShardId, TickId, TopologySchedule, TopologySnapshot,
     Transaction, TransactionDecision, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
     WeightedTimestamp, settled_set_verdict, tick_leader, tick_leader_at,
@@ -304,7 +304,7 @@ pub struct ExecutionCoordinator {
     /// In-flight `Finalization` verifications, keyed by `TickId`. The
     /// tick is content-addressed by id (one tick per `TickId`), so a second
     /// fetch arrival for the same tick can short-circuit the crypto pool.
-    pending_finalization_verifications: HashSet<TickId>,
+    pending_finalization_verifications: HashSet<FinalizationHash>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Beacon-sync-lag buffers
@@ -2595,10 +2595,14 @@ impl ExecutionCoordinator {
         tick: Arc<Verifiable<Finalization>>,
     ) -> Vec<Action> {
         let tick_id = *tick.tick_id();
+        // A tick can settle in more than one part, so identity is the
+        // finalization's own content — both here and in the fetch this
+        // may abandon.
+        let id = tick.receipt_hash();
 
         // Already-finalized short-circuit — a second fetch arrival for a
-        // tick we've already admitted is wasted verification work.
-        if self.finalized.contains(&tick_id) {
+        // finalization we've already admitted is wasted verification work.
+        if self.finalized.get(&id).is_some() {
             tracing::debug!(
                 tick = %tick_id,
                 "Finalization already in canonical store — skipping verification"
@@ -2606,9 +2610,9 @@ impl ExecutionCoordinator {
             return Vec::new();
         }
 
-        // In-flight dedup — guards against a peer flooding the same fetched
-        // tick while the first dispatch is still running.
-        if !self.pending_finalization_verifications.insert(tick_id) {
+        // In-flight dedup — guards against a peer flooding the same
+        // fetched finalization while the first dispatch is still running.
+        if !self.pending_finalization_verifications.insert(id) {
             tracing::debug!(
                 tick = %tick_id,
                 "Duplicate Finalization verification dispatch suppressed"
@@ -2634,9 +2638,9 @@ impl ExecutionCoordinator {
                     "Rejecting fetched Finalization: contained EC from a recovering \
                      shard past the freeze frontier"
                 );
-                self.pending_finalization_verifications.remove(&tick_id);
+                self.pending_finalization_verifications.remove(&id);
                 return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
-                    ids: vec![tick_id],
+                    ids: vec![id],
                 })];
             }
             // Each contained EC is verified against the committee seated at its
@@ -2658,9 +2662,9 @@ impl ExecutionCoordinator {
                         "Rejecting fetched Finalization: contained EC's committee epoch is \
                          below the schedule floor"
                     );
-                    self.pending_finalization_verifications.remove(&tick_id);
+                    self.pending_finalization_verifications.remove(&id);
                     return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
-                        ids: vec![tick_id],
+                        ids: vec![id],
                     })];
                 }
             };
@@ -2670,9 +2674,9 @@ impl ExecutionCoordinator {
                     shard = shard.inner(),
                     "Rejecting fetched Finalization: contained EC lacks quorum power"
                 );
-                self.pending_finalization_verifications.remove(&tick_id);
+                self.pending_finalization_verifications.remove(&id);
                 return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
-                    ids: vec![tick_id],
+                    ids: vec![id],
                 })];
             }
             let Some(public_keys) = committee_public_keys_for_shard(committee, shard) else {
@@ -2681,9 +2685,9 @@ impl ExecutionCoordinator {
                     shard = shard.inner(),
                     "Rejecting fetched Finalization: cannot resolve EC committee keys"
                 );
-                self.pending_finalization_verifications.remove(&tick_id);
+                self.pending_finalization_verifications.remove(&id);
                 return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
-                    ids: vec![tick_id],
+                    ids: vec![id],
                 })];
             };
             ec_public_keys.push(public_keys);
@@ -2691,7 +2695,7 @@ impl ExecutionCoordinator {
         if beacon_behind {
             // Buffer the whole tick; replayed on `BeaconBlockPersisted` once the
             // beacon reaches the deferred EC's epoch.
-            self.pending_finalization_verifications.remove(&tick_id);
+            self.pending_finalization_verifications.remove(&id);
             self.awaiting_finalizations
                 .push(tick.tick_id().shard_id(), tick);
             return Vec::new();
@@ -2732,19 +2736,19 @@ impl ExecutionCoordinator {
         let tick = match result {
             Ok(verified) => {
                 self.pending_finalization_verifications
-                    .remove(verified.tick_id());
+                    .remove(&verified.receipt_hash());
                 verified
             }
             Err((raw, err)) => {
                 self.pending_finalization_verifications
-                    .remove(raw.tick_id());
+                    .remove(&raw.receipt_hash());
                 tracing::warn!(
                     tick = %raw.tick_id(),
                     error = ?err,
                     "Dropping fetched Finalization: contained EC signature invalid"
                 );
                 return vec![Action::AbandonFetch(FetchAbandon::Finalizations {
-                    ids: vec![*raw.tick_id()],
+                    ids: vec![raw.receipt_hash()],
                 })];
             }
         };
@@ -2790,10 +2794,13 @@ impl ExecutionCoordinator {
         self.provisioning.has_received_from(tx_hash, shard)
     }
 
-    /// Get a finalization by its `TickId` (returns `Arc` for sharing).
+    /// Get a finalization by its identity (returns `Arc` for sharing).
     #[must_use]
-    pub fn get_finalization(&self, tick_id: &TickId) -> Option<Arc<Verifiable<Finalization>>> {
-        self.finalized.get(tick_id)
+    pub fn get_finalization(
+        &self,
+        hash: &FinalizationHash,
+    ) -> Option<Arc<Verifiable<Finalization>>> {
+        self.finalized.get(hash)
     }
 
     /// Bloom filter over every transaction in a tracked finalization.
@@ -2827,7 +2834,7 @@ impl ExecutionCoordinator {
     /// authoritative tx-set source.
     pub fn remove_finalization(&mut self, fw: &Finalization) {
         let tick_id = fw.tick_id();
-        self.finalized.remove(tick_id);
+        self.finalized.remove(&fw.receipt_hash());
         // The local-shard EC is now durable in storage via the committed
         // finalization; drop the in-memory copy so peers fetching after
         // this point fall through to storage.
@@ -3903,6 +3910,7 @@ mod tests {
         ));
         let tick: Arc<Verifiable<Finalization>> =
             Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
+        let _fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, tick);
         assert_eq!(actions.len(), 1);
@@ -3934,6 +3942,7 @@ mod tests {
             SignerBitfield::new(4),
         ));
         let tick = Arc::new(Finalization::new(tick_id, vec![ec], vec![]));
+        let fw_hash = tick.receipt_hash();
         let actions = state.on_finalization_verified(Err((
             tick,
             FinalizationVerifyError::ExecutionCertificate {
@@ -3944,7 +3953,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![tick_id]
+                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![fw_hash]
             )),
             "Signature-invalid drop must emit AbandonFetch::Finalizations, got: {actions:?}"
         );
@@ -3981,12 +3990,13 @@ mod tests {
         ));
         let tick: Arc<Verifiable<Finalization>> =
             Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
+        let fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, Arc::clone(&tick));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![tick_id]
+                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![fw_hash]
             )),
             "quorum-power drop must emit AbandonFetch::Finalizations, got: {actions:?}"
         );
@@ -4028,12 +4038,13 @@ mod tests {
         ));
         let tick: Arc<Verifiable<Finalization>> =
             Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
+        let fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, Arc::clone(&tick));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![tick_id]
+                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![fw_hash]
             )),
             "unknown-committee drop must emit AbandonFetch::Finalizations, got: {actions:?}"
         );
@@ -4416,6 +4427,7 @@ mod tests {
         ));
         let tick: Arc<Verifiable<Finalization>> =
             Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
+        let _fw_hash = tick.receipt_hash();
 
         let first = state.admit_finalization(&topo, Arc::clone(&tick));
         assert_eq!(first.len(), 1);
@@ -4478,6 +4490,7 @@ mod tests {
         ));
         let tick: Arc<Verifiable<Finalization>> =
             Arc::new(Finalization::new(tick_id, vec![bogus_ec], vec![]).into());
+        let fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, tick);
         // No admission continuation — the poisoning vector this gate
@@ -4493,7 +4506,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![tick_id]
+                Action::AbandonFetch(FetchAbandon::Finalizations { ids }) if ids == &vec![fw_hash]
             )),
             "sub-quorum drop must emit AbandonFetch::Finalizations, got: {actions:?}"
         );
@@ -4875,6 +4888,7 @@ mod tests {
         ));
         let tick: Arc<Verifiable<Finalization>> =
             Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
+        let _fw_hash = tick.receipt_hash();
 
         let actions = coord.admit_finalization(&behind, Arc::clone(&tick));
         assert!(
@@ -5739,10 +5753,10 @@ mod tests {
         let mut state = make_test_state();
         let (tick_id, tick) = make_ready_local_tick(&[7]);
         let tx_hash = tick.tx_hashes()[0];
-        state.finalized.insert(
-            tick_id,
-            Arc::new(Verified::<Finalization>::seal(tick.into_finalization()).into()),
-        );
+        let finalization: Arc<Verifiable<Finalization>> =
+            Arc::new(Verified::<Finalization>::seal(tick.into_finalization()).into());
+        let fw_hash = finalization.receipt_hash();
+        state.finalized.insert(tick_id, finalization);
 
         state.unresolved =
             UnresolvedTxs::restored(vec![(tx_hash, WeightedTimestamp::from_millis(1_000), 42)]);
@@ -5750,7 +5764,7 @@ mod tests {
 
         assert!(state.abandonable().is_empty());
 
-        state.finalized.remove(&tick_id);
+        state.finalized.remove(&fw_hash);
         assert_eq!(state.abandonable(), vec![(tx_hash, 42)]);
     }
 
@@ -5817,7 +5831,7 @@ mod tests {
         let _ = state.finalize(&make_test_topology(), &tick_id);
         let finalized = state
             .finalized
-            .get(&tick_id)
+            .get_for_tx(tx_hash)
             .expect("tick must be in the finalized store after finalize");
 
         // Sanity: state is populated across sub-machines.

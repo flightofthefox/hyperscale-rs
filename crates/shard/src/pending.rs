@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use hyperscale_core::{Action, FetchAbandon, FetchRequest};
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, Finalization, LocalTimestamp,
-    ProvisionHash, Provisions, Round, ShardId, TickId, Transaction, TxHash, ValidatorId,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, Finalization, FinalizationHash,
+    LocalTimestamp, ProvisionHash, Provisions, Round, ShardId, Transaction, TxHash, ValidatorId,
     Verifiable,
 };
 use tracing::{debug, warn};
@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 #[derive(Debug, Default)]
 pub struct OrphanedFetches {
     txs: Vec<TxHash>,
-    ticks: Vec<TickId>,
+    finalizations: Vec<FinalizationHash>,
     provisions: Vec<ProvisionHash>,
 }
 
@@ -38,9 +38,9 @@ impl OrphanedFetches {
                 ids: self.txs,
             }));
         }
-        if !self.ticks.is_empty() {
+        if !self.finalizations.is_empty() {
             actions.push(Action::AbandonFetch(FetchAbandon::Finalizations {
-                ids: self.ticks,
+                ids: self.finalizations,
             }));
         }
         if !self.provisions.is_empty() {
@@ -86,7 +86,7 @@ impl PendingBlocks {
         let pending = self.0.remove(&block_hash)?;
         Some(self.orphaned_among(
             pending.missing_transaction_hashes,
-            pending.missing_tick_ids,
+            pending.missing_finalization_hashes,
             pending.missing_provision_hashes,
         ))
     }
@@ -157,18 +157,18 @@ impl PendingBlocks {
     /// cancel the orphaned in-flight fetches and free the FSM's slots.
     pub fn prune_committed(&mut self, committed_height: BlockHeight) -> OrphanedFetches {
         let mut txs: HashSet<TxHash> = HashSet::new();
-        let mut ticks: HashSet<TickId> = HashSet::new();
+        let mut finalizations: HashSet<FinalizationHash> = HashSet::new();
         let mut provisions: HashSet<ProvisionHash> = HashSet::new();
         self.0.retain(|_, pending| {
             if pending.header().height() > committed_height {
                 return true;
             }
             txs.extend(pending.missing_transaction_hashes.iter().copied());
-            ticks.extend(pending.missing_tick_ids.iter().copied());
+            finalizations.extend(pending.missing_finalization_hashes.iter().copied());
             provisions.extend(pending.missing_provision_hashes.iter().copied());
             false
         });
-        self.orphaned_among(txs, ticks, provisions)
+        self.orphaned_among(txs, finalizations, provisions)
     }
 
     /// Narrow a set of missing ids to those no remaining pending block needs.
@@ -177,7 +177,7 @@ impl PendingBlocks {
     fn orphaned_among(
         &self,
         txs: HashSet<TxHash>,
-        ticks: HashSet<TickId>,
+        finalizations: HashSet<FinalizationHash>,
         provisions: HashSet<ProvisionHash>,
     ) -> OrphanedFetches {
         OrphanedFetches {
@@ -185,9 +185,9 @@ impl PendingBlocks {
                 .into_iter()
                 .filter(|h| !self.0.values().any(|p| p.needs_transaction(h)))
                 .collect(),
-            ticks: ticks
+            finalizations: finalizations
                 .into_iter()
-                .filter(|w| !self.0.values().any(|p| p.needs_finalization(w)))
+                .filter(|h| !self.0.values().any(|p| p.needs_finalization(h)))
                 .collect(),
             provisions: provisions
                 .into_iter()
@@ -264,7 +264,7 @@ impl PendingBlocks {
         manifest: BlockManifest,
         now: LocalTimestamp,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        lookup_finalization: impl Fn(&TickId) -> Option<Arc<Verifiable<Finalization>>>,
+        lookup_finalization: impl Fn(&FinalizationHash) -> Option<Arc<Verifiable<Finalization>>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     ) {
         let mut pending = PendingBlock::from_manifest(header, manifest, now);
@@ -281,13 +281,13 @@ impl PendingBlocks {
             pending.add_transaction(tx);
         }
 
-        let ticks: Vec<Arc<Verifiable<Finalization>>> = pending
+        let finalizations: Vec<Arc<Verifiable<Finalization>>> = pending
             .manifest()
             .cert_ids()
             .iter()
             .filter_map(&lookup_finalization)
             .collect();
-        for fw in ticks {
+        for fw in finalizations {
             pending.add_finalization(fw);
         }
 
@@ -363,9 +363,9 @@ impl PendingBlocks {
     /// Record an arrived finalization against any pending block that needs
     /// it. Returns the hashes of blocks that became complete as a result.
     pub fn receive_finalization(&mut self, fw: &Arc<Verifiable<Finalization>>) -> Vec<BlockHash> {
-        let tick_id = *fw.tick_id();
+        let hash = fw.receipt_hash();
         self.fold_arrival(
-            |pending| pending.needs_finalization(&tick_id),
+            |pending| pending.needs_finalization(&hash),
             |pending| {
                 pending.add_finalization(Arc::clone(fw));
             },
@@ -446,17 +446,17 @@ impl PendingBlocks {
                 }));
             }
 
-            let missing_ticks = pending.missing_ticks();
-            if !missing_ticks.is_empty() {
+            let missing_finalizations = pending.missing_finalizations();
+            if !missing_finalizations.is_empty() {
                 debug!(
                     validator = ?me,
                     block_hash = ?block_hash,
-                    missing_tick_count = missing_ticks.len(),
+                    missing_finalization_count = missing_finalizations.len(),
                     age_ms = age.as_millis(),
                     "Fetch timeout reached, requesting missing finalizations"
                 );
                 actions.push(Action::Fetch(FetchRequest::Finalizations {
-                    ids: missing_ticks,
+                    ids: missing_finalizations,
                     shard: local_shard,
                     preferred: Some(proposer),
                     class: None,
@@ -498,14 +498,14 @@ pub struct PendingBlock {
     /// Set of transaction hashes we're still waiting for (`HashSet` for O(1) lookup).
     missing_transaction_hashes: HashSet<TxHash>,
 
-    /// Map of `TickId` -> `Arc<Verifiable<Finalization>>` (carries cert + receipts + ECs).
+    /// Finalizations by identity (each carries certificates + receipts).
     ///
-    /// A block is complete once
-    /// all its ticks have been independently finalized by this validator.
-    received_finalizations: BTreeMap<TickId, Arc<Verifiable<Finalization>>>,
+    /// A block is complete once every finalization its manifest names has
+    /// been independently finalized by this validator or fetched.
+    received_finalizations: BTreeMap<FinalizationHash, Arc<Verifiable<Finalization>>>,
 
-    /// Set of `TickId`s we're still waiting for.
-    missing_tick_ids: HashSet<TickId>,
+    /// Identities we're still waiting for.
+    missing_finalization_hashes: HashSet<FinalizationHash>,
 
     /// Received provisions keyed by provisions hash. `BTreeMap` so
     /// `provisions()` iteration is deterministic across validators.
@@ -532,7 +532,8 @@ impl PendingBlock {
         let total_tx_count = manifest.transaction_count();
         let missing_transaction_hashes: HashSet<TxHash> =
             manifest.tx_hashes().iter().copied().collect();
-        let missing_tick_ids: HashSet<TickId> = manifest.cert_ids().iter().copied().collect();
+        let missing_finalization_hashes: HashSet<FinalizationHash> =
+            manifest.cert_ids().iter().copied().collect();
         let missing_provision_hashes: HashSet<ProvisionHash> =
             manifest.provision_hashes().iter().copied().collect();
 
@@ -541,7 +542,7 @@ impl PendingBlock {
             received_transactions: HashMap::with_capacity(total_tx_count),
             missing_transaction_hashes,
             received_finalizations: BTreeMap::new(),
-            missing_tick_ids,
+            missing_finalization_hashes,
             received_provisions: BTreeMap::new(),
             missing_provision_hashes,
             manifest,
@@ -571,7 +572,11 @@ impl PendingBlock {
             provisions.iter().map(|p| p.hash()).collect();
         provision_hashes.sort();
         let tx_hashes: Vec<TxHash> = block.transactions().iter().map(|tx| tx.hash()).collect();
-        let cert_ids: Vec<TickId> = block.certificates().iter().map(|c| *c.tick_id()).collect();
+        let cert_ids: Vec<FinalizationHash> = block
+            .certificates()
+            .iter()
+            .map(|c| c.receipt_hash())
+            .collect();
         let manifest = BlockManifest::new(
             tx_hashes,
             cert_ids,
@@ -588,7 +593,7 @@ impl PendingBlock {
             received_transactions: HashMap::new(),
             missing_transaction_hashes: HashSet::new(),
             received_finalizations: BTreeMap::new(),
-            missing_tick_ids: HashSet::new(),
+            missing_finalization_hashes: HashSet::new(),
             received_provisions,
             missing_provision_hashes: HashSet::new(),
             manifest,
@@ -603,7 +608,7 @@ impl PendingBlock {
         }
         // Fill in all finalizations
         for fw in finalizations {
-            pending.received_finalizations.insert(*fw.tick_id(), fw);
+            pending.received_finalizations.insert(fw.receipt_hash(), fw);
         }
         pending
     }
@@ -621,13 +626,14 @@ impl PendingBlock {
         }
     }
 
-    /// Add a finalization (carries certificate + receipts + ECs).
+    /// Add a finalization (carries certificates + receipts).
     ///
-    /// Returns true if this tick was needed, false if duplicate or not in this block.
+    /// Returns true if it was needed, false if duplicate or not in this
+    /// block.
     pub fn add_finalization(&mut self, fw: Arc<Verifiable<Finalization>>) -> bool {
-        let tick_id = *fw.tick_id();
-        if self.missing_tick_ids.remove(&tick_id) {
-            self.received_finalizations.insert(tick_id, fw);
+        let hash = fw.receipt_hash();
+        if self.missing_finalization_hashes.remove(&hash) {
+            self.received_finalizations.insert(hash, fw);
             true
         } else {
             false
@@ -637,7 +643,7 @@ impl PendingBlock {
     /// Check if all transactions, finalizations, and provisions have been received.
     pub fn is_complete(&self) -> bool {
         self.missing_transaction_hashes.is_empty()
-            && self.missing_tick_ids.is_empty()
+            && self.missing_finalization_hashes.is_empty()
             && self.missing_provision_hashes.is_empty()
     }
 
@@ -656,9 +662,9 @@ impl PendingBlock {
         self.missing_transaction_hashes.contains(tx_hash)
     }
 
-    /// Get the number of missing ticks.
-    pub fn missing_tick_count(&self) -> usize {
-        self.missing_tick_ids.len()
+    /// Get the number of missing finalizations.
+    pub fn missing_finalization_count(&self) -> usize {
+        self.missing_finalization_hashes.len()
     }
 
     /// Get the number of missing provision batches.
@@ -667,8 +673,8 @@ impl PendingBlock {
     }
 
     /// Check if this pending block needs a specific finalization.
-    pub fn needs_finalization(&self, tick_id: &TickId) -> bool {
-        self.missing_tick_ids.contains(tick_id)
+    pub fn needs_finalization(&self, hash: &FinalizationHash) -> bool {
+        self.missing_finalization_hashes.contains(hash)
     }
 
     /// Add a received provisions.
@@ -694,9 +700,9 @@ impl PendingBlock {
         self.missing_provision_hashes.contains(batch_hash)
     }
 
-    /// Get the missing tick ids as a Vec.
-    pub fn missing_ticks(&self) -> Vec<TickId> {
-        self.missing_tick_ids.iter().copied().collect()
+    /// Get the missing finalization identities as a Vec.
+    pub fn missing_finalizations(&self) -> Vec<FinalizationHash> {
+        self.missing_finalization_hashes.iter().copied().collect()
     }
 
     /// Get all received finalizations.
@@ -712,7 +718,7 @@ impl PendingBlock {
             return Err(format!(
                 "Cannot construct block: {} transactions, {} ticks still missing",
                 self.missing_transaction_hashes.len(),
-                self.missing_tick_ids.len()
+                self.missing_finalization_hashes.len()
             ));
         }
 
@@ -910,25 +916,20 @@ mod tests {
     #[test]
     fn test_pending_block_with_finalizations() {
         let tx1 = TxHash::from(Hash::from_bytes(b"tx1"));
-        let tick1 = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let tick2 = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let one = FinalizationHash::from_raw(Hash::from_bytes(b"one"));
+        let two = FinalizationHash::from_raw(Hash::from_bytes(b"two"));
         let header = make_header(BlockHeight::new(1));
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(
-                vec![tx1],
-                vec![tick1, tick2],
-                vec![],
-                WitnessSources::empty(),
-            ),
+            BlockManifest::new(vec![tx1], vec![one, two], vec![], WitnessSources::empty()),
             LocalTimestamp::ZERO,
         );
 
         assert_eq!(pb.missing_transaction_count(), 1);
-        assert_eq!(pb.missing_tick_count(), 2);
-        assert!(pb.needs_finalization(&tick1));
-        assert!(pb.needs_finalization(&tick2));
+        assert_eq!(pb.missing_finalization_count(), 2);
+        assert!(pb.needs_finalization(&one));
+        assert!(pb.needs_finalization(&two));
         assert!(!pb.is_complete());
     }
 
@@ -936,23 +937,27 @@ mod tests {
     fn test_add_finalization() {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let header = make_header(BlockHeight::new(1));
-
-        let mut pb = PendingBlock::from_manifest(
-            header,
-            BlockManifest::new(vec![], vec![tick_id], vec![], WitnessSources::empty()),
-            LocalTimestamp::ZERO,
-        );
-
-        assert_eq!(pb.missing_tick_count(), 1);
-        assert!(!pb.is_complete());
-
-        let fw = Arc::new(
+        let fw: Arc<Verifiable<Finalization>> = Arc::new(
             Verified::new_unchecked_for_test(Finalization::new(tick_id, vec![], vec![])).into(),
         );
 
+        let mut pb = PendingBlock::from_manifest(
+            header,
+            BlockManifest::new(
+                vec![],
+                vec![fw.receipt_hash()],
+                vec![],
+                WitnessSources::empty(),
+            ),
+            LocalTimestamp::ZERO,
+        );
+
+        assert_eq!(pb.missing_finalization_count(), 1);
+        assert!(!pb.is_complete());
+
         let added = pb.add_finalization(fw);
         assert!(added);
-        assert_eq!(pb.missing_tick_count(), 0);
+        assert_eq!(pb.missing_finalization_count(), 0);
         assert!(pb.is_complete());
     }
 
@@ -962,12 +967,15 @@ mod tests {
         let tx_hash = tx.hash();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let header = make_header(BlockHeight::new(1));
+        let fw: Arc<Verifiable<Finalization>> = Arc::new(
+            Verified::new_unchecked_for_test(Finalization::new(tick_id, vec![], vec![])).into(),
+        );
 
         let mut pb = PendingBlock::from_manifest(
             header,
             BlockManifest::new(
                 vec![tx_hash],
-                vec![tick_id],
+                vec![fw.receipt_hash()],
                 vec![],
                 WitnessSources::empty(),
             ),
@@ -979,12 +987,8 @@ mod tests {
         // Add transaction
         pb.add_transaction(tx);
         assert!(pb.has_all_transactions());
-        assert!(!pb.is_complete()); // Still missing tick
+        assert!(!pb.is_complete()); // Still missing the finalization
 
-        // Add finalization
-        let fw = Arc::new(
-            Verified::new_unchecked_for_test(Finalization::new(tick_id, vec![], vec![])).into(),
-        );
         pb.add_finalization(fw);
         assert!(pb.is_complete());
     }
@@ -1044,7 +1048,7 @@ mod tests {
         let orphaned = pending_blocks.prune_committed(BlockHeight::new(5));
         let orphaned_provisions: HashSet<_> = orphaned.provisions.into_iter().collect();
         assert_eq!(orphaned_provisions, HashSet::from([prov_a, prov_b]));
-        assert!(orphaned.txs.is_empty() && orphaned.ticks.is_empty());
+        assert!(orphaned.txs.is_empty() && orphaned.finalizations.is_empty());
         assert_eq!(pending_blocks.len(), 1, "live block must remain");
     }
 

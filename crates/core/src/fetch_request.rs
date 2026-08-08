@@ -18,8 +18,8 @@
 //! the fetch key (no id-set to enumerate).
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, LeafIndex, MessageClass, ProvisionHash, ShardId, TickId, TxHash,
-    ValidatorId,
+    BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, MessageClass, ProvisionHash,
+    ShardId, TxHash, ValidatorId,
 };
 
 /// Fetch family — one variant per payload type.
@@ -61,8 +61,8 @@ pub enum FetchRequest {
     },
     /// Intra-shard DA payload — `shard` is always local.
     Finalizations {
-        /// Tick ids whose finalizations are missing.
-        ids: Vec<TickId>,
+        /// Identities of the finalizations that are missing.
+        ids: Vec<FinalizationHash>,
         /// Always the local shard for this variant.
         shard: ShardId,
         /// Canonical-source hint, when one exists.

@@ -16,10 +16,10 @@ use hyperscale_storage::{
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
     BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate, Finalization,
-    GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, ProposerTimestamp, QuorumCertificate,
-    Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot, StoredReceipt,
-    SubstateKey, SyncHint, TickId, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    WitnessSources,
+    FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, ProposerTimestamp,
+    QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot,
+    StoredReceipt, SubstateKey, SyncHint, TickId, TxHash, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -211,7 +211,7 @@ fn test_commit_certificate_with_writes_persists_both() {
 
     storage.commit_certificate_with_writes(&cert, &writes);
 
-    let stored_cert = storage.get_certificate(&tick_id);
+    let stored_cert = storage.get_certificate(&cert.receipt_hash());
     assert!(stored_cert.is_some());
     assert_eq!(stored_cert.unwrap().tick_id(), &tick_id);
 
@@ -386,7 +386,7 @@ fn test_certificate_idempotency() {
     storage.commit_certificate_with_writes(&cert, &updates);
     storage.commit_certificate_with_writes(&cert, &updates);
 
-    let stored = storage.get_certificate(&tick_id);
+    let stored = storage.get_certificate(&cert.receipt_hash());
     assert!(stored.is_some());
     assert_eq!(stored.unwrap().tick_id(), &tick_id);
 }
@@ -639,7 +639,7 @@ fn test_commit_block_stores_certificates() {
 
     let shard = ShardId::ROOT;
     let cert = make_test_finalization(BlockHeight::new(1), shard);
-    let tick_id = *cert.tick_id();
+    let cert_hash = cert.receipt_hash();
 
     // Create a block that includes this certificate
     let block = make_test_block(BlockHeight::new(1));
@@ -672,7 +672,7 @@ fn test_commit_block_stores_certificates() {
     };
     let _ = storage.commit_block(&make_test_certified(block), &no_witness());
 
-    assert!(storage.get_certificate(&tick_id).is_some());
+    assert!(storage.get_certificate(&cert_hash).is_some());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -695,19 +695,19 @@ fn test_certificates_batch() {
 
     let cert1 = make_test_finalization(BlockHeight::new(1), ShardId::ROOT);
     let cert2 = make_test_finalization(BlockHeight::new(2), ShardId::ROOT);
-    let id1 = *cert1.tick_id();
-    let id2 = *cert2.tick_id();
+    let id1 = cert1.receipt_hash();
+    let id2 = cert2.receipt_hash();
 
-    storage.put_certificate(&id1, &cert1);
-    storage.put_certificate(&id2, &cert2);
+    storage.put_certificate(&cert1.receipt_hash(), &cert1);
+    storage.put_certificate(&cert2.receipt_hash(), &cert2);
 
     let result = storage.get_certificates_batch(&[id1, id2]);
     assert_eq!(result.len(), 2);
 
-    let missing = TickId::new(ShardId::leaf(8, 99), BlockHeight::new(99));
+    let missing = FinalizationHash::from_raw(Hash::from_bytes(b"absent"));
     let partial = storage.get_certificates_batch(&[id1, missing]);
     assert_eq!(partial.len(), 1);
-    assert_eq!(partial[0].tick_id(), &id1);
+    assert_eq!(partial[0].receipt_hash(), id1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -765,9 +765,9 @@ fn test_certificate_store_and_retrieve() {
     let cert = make_test_finalization(BlockHeight::new(1), ShardId::ROOT);
     let tick_id = *cert.tick_id();
 
-    storage.put_certificate(&tick_id, &cert);
+    storage.put_certificate(&cert.receipt_hash(), &cert);
 
-    let stored = storage.get_certificate(&tick_id).unwrap();
+    let stored = storage.get_certificate(&cert.receipt_hash()).unwrap();
     assert_eq!(stored.tick_id(), &tick_id);
 }
 
@@ -775,7 +775,7 @@ fn test_certificate_store_and_retrieve() {
 fn test_certificate_get_missing() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    let missing = TickId::new(ShardId::leaf(8, 99), BlockHeight::new(99));
+    let missing = FinalizationHash::from_raw(Hash::from_bytes(b"absent"));
     assert!(storage.get_certificate(&missing).is_none());
 }
 
@@ -807,7 +807,7 @@ fn test_commit_certificate_via_commit_store() {
 
     assert_eq!(storage.jmt_height(), BlockHeight::new(0));
     assert_eq!(storage.state_root(), StateRoot::ZERO);
-    assert!(storage.get_certificate(cert.tick_id()).is_some());
+    assert!(storage.get_certificate(&cert.receipt_hash()).is_some());
 }
 
 #[test]
@@ -835,7 +835,7 @@ fn test_substates_survive_reopen() {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
         let updates = make_settled_writes(1, 10, vec![42]);
         let cert = make_test_finalization(BlockHeight::new(1), ShardId::ROOT);
-        cert_id = *cert.tick_id();
+        cert_id = cert.receipt_hash();
         storage.commit_certificate_with_writes(&cert, &updates);
         root_after_write = storage.state_root();
         version_after_write = storage.jmt_height();
@@ -849,7 +849,7 @@ fn test_substates_survive_reopen() {
 
         let cert = storage.get_certificate(&cert_id);
         assert!(cert.is_some(), "certificate should survive reopen");
-        assert_eq!(cert.unwrap().tick_id(), &cert_id);
+        assert_eq!(cert.unwrap().receipt_hash(), cert_id);
 
         // Verify the substate was written via direct key lookup.
         let value = storage.substate(state_key(1, 10));

@@ -30,8 +30,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Finalization, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, TickId, Transaction,
-    TxHash, Verifiable, WeightedTimestamp,
+    Finalization, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, Transaction, TxHash,
+    Verifiable, WeightedTimestamp,
 };
 
 #[allow(clippy::struct_field_names)] // shared `_retention` postfix is the artifact-tier convention
@@ -39,15 +39,12 @@ pub struct CommitDedupIndex {
     /// `tx_hash → end_timestamp_exclusive`. Pruned when
     /// `end_timestamp_exclusive <= current_committed_ts`.
     tx_retention: HashMap<TxHash, WeightedTimestamp>,
-    /// `tick_id → vote_anchor_ts + RETENTION_HORIZON`. Pruned when
-    /// `deadline <= current_committed_ts`. Past the horizon, every tx the
-    /// tick covered has terminated everywhere, so no future block can
-    /// legitimately reference the same `tick_id`.
-    cert_retention: HashMap<TickId, WeightedTimestamp>,
-    /// `tx_hash → the same deadline as the finalization that resolved it`.
-    /// Every transaction a committed finalization reached a verdict for,
-    /// under whichever verdict — which is what makes settlement and
-    /// abandonment exclusive rather than two rules that have to agree.
+    /// `tx_hash → vote_anchor_ts + RETENTION_HORIZON` of the finalization
+    /// that resolved it. Every transaction a committed finalization
+    /// reached a verdict for, under whichever verdict — which is what
+    /// makes settlement and abandonment exclusive rather than two rules
+    /// that have to agree, and what a tick key could never express, since
+    /// a tick can settle in more than one part.
     resolved_tx_retention: HashMap<TxHash, WeightedTimestamp>,
     /// `provision_hash → local_committed_ts + RETENTION_HORIZON`. Pruned
     /// when `deadline <= current_committed_ts`. Past the horizon, every tx
@@ -71,7 +68,6 @@ impl CommitDedupIndex {
     pub fn new() -> Self {
         Self {
             tx_retention: HashMap::new(),
-            cert_retention: HashMap::new(),
             resolved_tx_retention: HashMap::new(),
             provision_retention: HashMap::new(),
             provision_tx_retention: HashMap::new(),
@@ -88,14 +84,12 @@ impl CommitDedupIndex {
         }
     }
 
-    /// Record a block's finalizations in the retention lookup, by tick and
-    /// by every transaction each one resolved. Each entry's deadline is
-    /// the tick's local EC `vote_anchor_ts + RETENTION_HORIZON`.
+    /// Record every transaction a block's finalizations resolved. Each
+    /// entry's deadline is the resolving tick's local EC
+    /// `vote_anchor_ts + RETENTION_HORIZON`.
     pub fn register_committed_certs(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
         for fw in finalizations {
-            let tick_id = *fw.tick_id();
             let deadline = fw.local_ec().deadline();
-            self.cert_retention.entry(tick_id).or_insert(deadline);
             for tx_hash in fw.tx_hashes() {
                 self.resolved_tx_retention
                     .entry(tx_hash)
@@ -146,7 +140,6 @@ impl CommitDedupIndex {
     /// re-inclusion, so the entry is no longer correctness-bearing.
     pub fn prune(&mut self, now: WeightedTimestamp) {
         self.tx_retention.retain(|_, end| *end > now);
-        self.cert_retention.retain(|_, deadline| *deadline > now);
         self.resolved_tx_retention
             .retain(|_, deadline| *deadline > now);
         self.provision_retention
@@ -157,10 +150,6 @@ impl CommitDedupIndex {
 
     pub fn contains_tx(&self, tx_hash: &TxHash) -> bool {
         self.tx_retention.contains_key(tx_hash)
-    }
-
-    pub fn contains_cert(&self, tick_id: &TickId) -> bool {
-        self.cert_retention.contains_key(tick_id)
     }
 
     /// Whether a committed finalization already reached a verdict for
@@ -183,8 +172,8 @@ impl CommitDedupIndex {
         self.tx_retention.len()
     }
 
-    pub fn cert_retention_len(&self) -> usize {
-        self.cert_retention.len()
+    pub fn resolved_tx_retention_len(&self) -> usize {
+        self.resolved_tx_retention.len()
     }
 
     pub fn provision_retention_len(&self) -> usize {
@@ -272,47 +261,28 @@ mod tests {
         assert!(idx.contains_tx(&later_hash));
     }
 
-    // ─── Certs ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn register_certs_populates_retention() {
-        let mut idx = CommitDedupIndex::new();
-        let fw = make_fw(1);
-        idx.register_committed_certs(std::slice::from_ref(&fw));
-        assert!(idx.contains_cert(fw.tick_id()));
-        assert_eq!(idx.cert_retention_len(), 1);
-    }
-
-    #[test]
-    fn prune_drops_certs_past_their_deadline() {
-        // make_finalization sets vote_anchor_ts = block_height + 1.
-        // Deadline = vote_anchor_ts + RETENTION_HORIZON.
-        let mut idx = CommitDedupIndex::new();
-        let fw = make_fw(1);
-        idx.register_committed_certs(&[Arc::clone(&fw)]);
-
-        idx.prune(WeightedTimestamp::ZERO);
-        assert!(idx.contains_cert(fw.tick_id()));
-
-        let past = fw
-            .local_ec()
-            .deadline()
-            .plus(std::time::Duration::from_millis(1));
-        idx.prune(past);
-        assert!(!idx.contains_cert(fw.tick_id()));
-    }
+    // ─── Resolutions ────────────────────────────────────────────────────
 
     /// A committed finalization records every transaction it reached a
     /// verdict for, so a later block naming one of them under a different
-    /// tick is refusable. Both keys expire together — the transactions
-    /// share the finalization's deadline.
+    /// tick is refusable. Identity is the transaction and only the
+    /// transaction: a tick can settle in more than one part, so its id
+    /// answers no question this index is asked.
     #[test]
     fn register_certs_records_what_they_resolved() {
+        // make_finalization sets vote_anchor_ts = block_height + 1, so the
+        // deadline is that plus RETENTION_HORIZON.
         let mut idx = CommitDedupIndex::new();
         let fw = make_fw(1);
         let tx_hash = fw.tx_hashes().next().expect("a tick names its members");
         idx.register_committed_certs(std::slice::from_ref(&fw));
         assert!(idx.contains_resolved_tx(&tx_hash));
+
+        idx.prune(WeightedTimestamp::ZERO);
+        assert!(
+            idx.contains_resolved_tx(&tx_hash),
+            "still within the window"
+        );
 
         idx.prune(
             fw.local_ec()
@@ -320,7 +290,6 @@ mod tests {
                 .plus(std::time::Duration::from_millis(1)),
         );
         assert!(!idx.contains_resolved_tx(&tx_hash));
-        assert!(!idx.contains_cert(fw.tick_id()));
     }
 
     // ─── Provisions ─────────────────────────────────────────────────────

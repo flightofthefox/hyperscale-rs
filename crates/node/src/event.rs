@@ -23,8 +23,8 @@ use hyperscale_network::RequestError;
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
-    HeaderFetchCount, LeafIndex, ProvisionHash, ShardForkProof, ShardId, ShardVoteEquivocation,
-    TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    FinalizationHash, HeaderFetchCount, LeafIndex, ProvisionHash, ShardForkProof, ShardId,
+    ShardVoteEquivocation, Transaction, TxHash, ValidatorId, Verifiable, Verified,
 };
 
 use crate::shard::commit::QcOnlyDivergence;
@@ -316,8 +316,8 @@ pub enum ShardScopedInput {
 
     /// A finalization fetch request failed.
     FinalizationsFetchFailed {
-        /// Tick ids that weren't returned.
-        ids: Vec<TickId>,
+        /// Finalization identities that weren't returned.
+        ids: Vec<FinalizationHash>,
     },
 
     /// Transaction validated by the validation pipeline. The `NodeHost`

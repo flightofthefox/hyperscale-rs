@@ -52,7 +52,7 @@ impl SimShardStorage {
             .write()
             .unwrap()
             .certificates
-            .insert(*certificate.tick_id(), certificate.clone());
+            .insert(certificate.receipt_hash(), certificate.clone());
     }
 
     /// Test helper: commits database updates with auto-incrementing JMT version.

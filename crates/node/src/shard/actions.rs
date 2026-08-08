@@ -284,7 +284,7 @@ where
                 self.io
                     .caches
                     .finalization
-                    .insert(*tick.tick_id(), Arc::clone(tick));
+                    .insert(tick.receipt_hash(), Arc::clone(tick));
             }
         }
 

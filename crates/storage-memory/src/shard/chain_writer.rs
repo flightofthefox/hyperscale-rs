@@ -187,7 +187,7 @@ fn build_prepared_commit(
             c.blocks.insert(block.height(), unwrapped);
             for fw in block.certificates().iter() {
                 let tick_id = *fw.tick_id();
-                c.certificates.insert(tick_id, fw.attestation());
+                c.certificates.insert(fw.receipt_hash(), fw.attestation());
                 c.finalizations_by_height
                     .entry(tick_id.block_height())
                     .or_default()
@@ -266,7 +266,7 @@ impl SimShardStorage {
             );
             for fw in block.certificates().iter() {
                 let tick_id = *fw.tick_id();
-                c.certificates.insert(tick_id, fw.attestation());
+                c.certificates.insert(fw.receipt_hash(), fw.attestation());
                 c.finalizations_by_height
                     .entry(tick_id.block_height())
                     .or_default()

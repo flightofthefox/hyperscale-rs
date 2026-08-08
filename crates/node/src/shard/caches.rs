@@ -17,7 +17,7 @@ use std::sync::Arc;
 use hyperscale_execution::{ExecCertStore, FinalizationStore};
 use hyperscale_mempool::TxStore;
 use hyperscale_provisions::{ProvisionStore, VerifiedHeaderBuffer};
-use hyperscale_types::{Finalization, TickId, Verifiable};
+use hyperscale_types::{Finalization, FinalizationHash, Verifiable};
 use quick_cache::sync::Cache as QuickCache;
 
 /// Default certificate cache capacity.
@@ -35,7 +35,7 @@ pub struct SharedCaches {
     /// Finalizations, keyed by `TickId`. Populated by `io_loop`'s
     /// `Continuation(FinalizationsAdmitted)` interception; queried by the
     /// inbound finalization handler.
-    pub finalization: Arc<QuickCache<TickId, Arc<Verifiable<Finalization>>>>,
+    pub finalization: Arc<QuickCache<FinalizationHash, Arc<Verifiable<Finalization>>>>,
     /// Outbound + local provision store, owned by the
     /// [`ProvisionCoordinator`]. Cloned here so handlers (block, block-topup,
     /// local-provision, cross-shard provision) can read it without going

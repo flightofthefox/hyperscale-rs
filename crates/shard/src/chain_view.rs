@@ -15,8 +15,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, ProvisionHash,
-    QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, TickId, TxHash, Verified,
-    WorkInFlight,
+    QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, TxHash, Verified, WorkInFlight,
 };
 use tracing::warn;
 
@@ -195,8 +194,7 @@ impl<'a> ChainView<'a> {
     pub fn collect_ancestor_hashes(
         &self,
         parent_block_hash: BlockHash,
-    ) -> (HashSet<TickId>, HashSet<TxHash>, HashSet<ProvisionHash>) {
-        let mut cert_ids: HashSet<TickId> = HashSet::new();
+    ) -> (HashSet<TxHash>, HashSet<ProvisionHash>) {
         let mut tx_hashes: HashSet<TxHash> = HashSet::new();
         let mut provision_hashes: HashSet<ProvisionHash> = HashSet::new();
 
@@ -209,16 +207,13 @@ impl<'a> ChainView<'a> {
             for tx_hash in manifest.tx_hashes() {
                 tx_hashes.insert(*tx_hash);
             }
-            for cert_id in manifest.cert_ids() {
-                cert_ids.insert(*cert_id);
-            }
             for batch_hash in manifest.provision_hashes() {
                 provision_hashes.insert(*batch_hash);
             }
             current_hash = pending.header().parent_block_hash();
         }
 
-        (cert_ids, tx_hashes, provision_hashes)
+        (tx_hashes, provision_hashes)
     }
 
     /// The transactions the QC chain's uncommitted ancestors have already
@@ -351,41 +346,6 @@ mod tests {
     }
 
     #[test]
-    fn collect_ancestor_hashes_includes_manifest_only_cert_ids() {
-        // A manifest-only ancestor (header known, body not yet assembled) still
-        // contributes its certificate tick-ids to dedup, matching the
-        // assembled-block walk; otherwise a descendant could re-include a
-        // finalization already present above the committed tip.
-        let header = make_header(3, BlockHash::ZERO);
-        let block_hash = header.hash();
-        let tick = TickId::new(ShardId::ROOT, BlockHeight::new(2));
-        let manifest = BlockManifest::new(vec![], vec![tick], vec![], WitnessSources::empty());
-        let pending_block = PendingBlock::from_manifest(header, manifest, LocalTimestamp::ZERO);
-        let mut pending = PendingBlocks::new();
-        pending.insert(pending_block);
-
-        run_view(
-            0,
-            BlockHash::ZERO,
-            StateRoot::ZERO,
-            &pending,
-            None,
-            |view| {
-                assert!(
-                    view.get_pending(block_hash)
-                        .is_some_and(|p| p.block().is_none()),
-                    "ancestor must stay manifest-only for this case",
-                );
-                let (cert_ids, _txs, _provisions) = view.collect_ancestor_hashes(block_hash);
-                assert!(
-                    cert_ids.contains(&tick),
-                    "manifest-only ancestor cert tick-id missing from dedup set",
-                );
-            },
-        );
-    }
-
-    #[test]
     fn collect_ancestor_hashes_covers_assembled_block_below_unassembled() {
         // Chain above the committed tip: walk start `middle` (manifest-only) ->
         // `low` (assembled, height 1) -> committed. `low`'s transaction must
@@ -433,7 +393,7 @@ mod tests {
                         .is_some_and(|p| p.block().is_none())
                 );
 
-                let (_certs, tx_hashes, _provisions) = view.collect_ancestor_hashes(middle_hash);
+                let (tx_hashes, _provisions) = view.collect_ancestor_hashes(middle_hash);
                 assert!(
                     tx_hashes.contains(&tx_hash),
                     "assembled ancestor below an unassembled one dropped from dedup set",

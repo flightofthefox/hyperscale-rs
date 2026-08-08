@@ -20,8 +20,8 @@ use std::time::Instant;
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, BlockMetadata, CertifiedBlock,
-    Finalization, Hash, ProvisionHash, QuorumCertificate, TickId, Transaction, TxHash, Verifiable,
-    Verified,
+    Finalization, FinalizationHash, Hash, ProvisionHash, QuorumCertificate, Transaction, TxHash,
+    Verifiable, Verified,
 };
 use rocksdb::{ColumnFamily, WriteBatch};
 
@@ -148,7 +148,12 @@ impl RocksDbShardStorage {
             );
         }
         for fw in block.certificates().iter() {
-            batch_put::<CertificatesCf>(batch, certificates_cf, fw.tick_id(), &fw.attestation());
+            batch_put::<CertificatesCf>(
+                batch,
+                certificates_cf,
+                &fw.receipt_hash(),
+                &fw.attestation(),
+            );
         }
     }
 
@@ -479,7 +484,7 @@ impl RocksDbShardStorage {
     fn get_certificates_batch_ordered(
         &self,
         certificates_cf: &ColumnFamily,
-        ids: &[TickId],
+        ids: &[FinalizationHash],
     ) -> Vec<Finalization> {
         if ids.is_empty() {
             return vec![];
@@ -547,21 +552,21 @@ impl RocksDbShardStorage {
     // Certificate storage
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Store a tick's attestation.
-    pub fn put_certificate(&self, id: &TickId, cert: &Finalization) {
+    /// Store a finalization's attestation.
+    pub fn put_certificate(&self, id: &FinalizationHash, cert: &Finalization) {
         self.cf_put_sync::<CertificatesCf>(id, cert);
     }
 
-    /// Get a tick's attestation by `TickId`.
-    pub fn get_certificate(&self, id: &TickId) -> Option<Finalization> {
+    /// Get a finalization's attestation by identity.
+    pub fn get_certificate(&self, id: &FinalizationHash) -> Option<Finalization> {
         self.cf_get::<CertificatesCf>(id)
     }
 
-    /// Get multiple certificates by `TickId` (batch read).
+    /// Get multiple attestations by identity (batch read).
     ///
     /// Uses `RocksDB`'s `multi_get_cf` for efficient batch retrieval.
     /// Returns only certificates that were found (missing ids are skipped).
-    pub fn get_certificates_batch(&self, ids: &[TickId]) -> Vec<Finalization> {
+    pub fn get_certificates_batch(&self, ids: &[FinalizationHash]) -> Vec<Finalization> {
         if ids.is_empty() {
             return vec![];
         }
@@ -653,7 +658,7 @@ mod test_helpers {
             let mut batch = WriteBatch::default();
             let mut write_count = 0usize;
 
-            self.cf_put::<CertificatesCf>(&mut batch, certificate.tick_id(), certificate);
+            self.cf_put::<CertificatesCf>(&mut batch, &certificate.receipt_hash(), certificate);
             write_count += 1;
 
             // Append substate writes to the cert batch at the current JMT

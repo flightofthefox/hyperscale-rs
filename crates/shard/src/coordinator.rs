@@ -16,11 +16,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
-    BlockHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROGRESS_WAIT,
-    MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionHash,
-    RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup,
-    SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt, SubstateKey, TickId,
-    WeightedTimestamp, WorkInFlight, derive_reshape_trigger, ready_signal_window,
+    BlockHash, FinalizationHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp,
+    ProvisionHash, RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger,
+    ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt,
+    SubstateKey, WeightedTimestamp, WorkInFlight, derive_reshape_trigger, ready_signal_window,
     settled_set_verdict,
 };
 
@@ -60,7 +60,7 @@ pub struct ShardMemoryStats {
     pub committed_tx_lookup: usize,
     /// Committed tick-id → deadline entries for proposal/validation dedup.
     /// Keyed by `vote_anchor_ts + RETENTION_HORIZON`.
-    pub committed_cert_lookup: usize,
+    pub committed_resolution_lookup: usize,
     /// Committed provision-hash → deadline entries for proposal/validation
     /// dedup. Keyed by `local_committed_ts + RETENTION_HORIZON`.
     pub committed_provision_lookup: usize,
@@ -1539,7 +1539,7 @@ impl ShardCoordinator {
         // height — the two-chain commit window leaves them visible and the
         // mempool doesn't clear its ready-set until commit, so we must dedup
         // here to avoid repeating items across consecutive blocks.
-        let (qc_chain_cert_hashes, qc_chain_tx_hashes, qc_chain_provision_hashes) =
+        let (qc_chain_tx_hashes, qc_chain_provision_hashes) =
             self.collect_qc_chain_hashes(parent_block_hash);
         let qc_chain_resolved_txs = self.chain_view().ancestor_resolved_txs(parent_block_hash);
 
@@ -1556,7 +1556,6 @@ impl ShardCoordinator {
         );
         let (finalizations, _finalized_tx_count) = select_finalizations(
             finalizations,
-            &qc_chain_cert_hashes,
             &qc_chain_resolved_txs,
             &self.dedup_index,
             MAX_FINALIZED_TX_PER_BLOCK,
@@ -2055,7 +2054,7 @@ impl ShardCoordinator {
         header: &BlockHeader,
         manifest: BlockManifest,
         lookup_tx: impl Fn(&TxHash) -> Option<Arc<Verifiable<Transaction>>>,
-        lookup_finalization: impl Fn(&TickId) -> Option<Arc<Verifiable<Finalization>>>,
+        lookup_finalization: impl Fn(&FinalizationHash) -> Option<Arc<Verifiable<Finalization>>>,
         lookup_provision: impl Fn(&ProvisionHash) -> Option<Arc<Verifiable<Provisions>>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
@@ -2604,7 +2603,7 @@ impl ShardCoordinator {
                 validator = ?self.me,
                 block_hash = ?block_hash,
                 missing_txs = pending.missing_transaction_count(),
-                missing_ticks = pending.missing_tick_count(),
+                missing_finalizations = pending.missing_finalization_count(),
                 missing_provisions = pending.missing_provision_count(),
                 "Block incomplete, will fetch after timeout if still missing"
             );
@@ -3115,15 +3114,13 @@ impl ShardCoordinator {
         coasting: bool,
     ) -> bool {
         let parent = block.header().parent_block_hash();
-        let (qc_chain_cert_ids, qc_chain_tx_hashes, qc_chain_provision_hashes) =
-            self.collect_qc_chain_hashes(parent);
+        let (qc_chain_tx_hashes, qc_chain_provision_hashes) = self.collect_qc_chain_hashes(parent);
         let qc_chain_resolved_txs = self.chain_view().ancestor_resolved_txs(parent);
         if let Err(e) = validate_block_for_vote(
             topology_snapshot,
             self.local_shard,
             block,
             &qc_chain_tx_hashes,
-            &qc_chain_cert_ids,
             &qc_chain_resolved_txs,
             &qc_chain_provision_hashes,
             &self.dedup_index,
@@ -5145,7 +5142,7 @@ impl ShardCoordinator {
                         block_hash = ?pending.header().hash(),
                         height = height.inner(),
                         missing_txs = pending.missing_transaction_count(),
-                        missing_ticks = pending.missing_tick_count(),
+                        missing_finalizations = pending.missing_finalization_count(),
                         missing_provisions = pending.missing_provision_count(),
                         "View change — block still incomplete (missing data)"
                     );
@@ -6036,7 +6033,7 @@ impl ShardCoordinator {
             pending_commits_awaiting_data: 0,
             received_votes_by_height: self.votes.received_votes_len(),
             committed_tx_lookup: self.dedup_index.tx_retention_len(),
-            committed_cert_lookup: self.dedup_index.cert_retention_len(),
+            committed_resolution_lookup: self.dedup_index.resolved_tx_retention_len(),
             committed_provision_lookup: self.dedup_index.provision_retention_len(),
             pending_qc_verifications: self.verification.pending_qc_verifications_len(),
             verified_qcs: self.verification.verified_qcs_len(),
@@ -6097,20 +6094,18 @@ impl ShardCoordinator {
     #[must_use]
     pub fn dedup_overhead(&self) -> usize {
         let parent_block_hash = self.proposal_parent_block_hash();
-        let (_, tx_hashes, _) = self.collect_qc_chain_hashes(parent_block_hash);
+        let (tx_hashes, _) = self.collect_qc_chain_hashes(parent_block_hash);
         tx_hashes.len()
     }
 
-    /// Walk the QC chain from `parent_block_hash` back to committed height,
-    /// collecting certificate, transaction, and provision hashes from
-    /// ancestor blocks. Thin wrapper over [`ChainView::collect_ancestor_hashes`]
-    /// that supplies the coordinator's `dedup_index`.
+    /// Walk the QC chain from `parent_block_hash` back to committed
+    /// height, collecting transaction and provision hashes from ancestor
+    /// blocks. Thin wrapper over [`ChainView::collect_ancestor_hashes`].
     #[must_use]
     pub fn collect_qc_chain_hashes(
         &self,
         parent_block_hash: BlockHash,
     ) -> (
-        std::collections::HashSet<TickId>,
         std::collections::HashSet<TxHash>,
         std::collections::HashSet<ProvisionHash>,
     ) {
@@ -10049,8 +10044,7 @@ mod tests {
         };
 
         let result = {
-            let (_, qc_chain, _) =
-                state.collect_qc_chain_hashes(block.header().parent_block_hash());
+            let (qc_chain, _) = state.collect_qc_chain_hashes(block.header().parent_block_hash());
             validate_no_duplicate_transactions(&block, &qc_chain, &state.dedup_index)
         };
         assert!(result.is_err());
@@ -10129,7 +10123,7 @@ mod tests {
         // Ancestor is at committed height, so walk stops before checking it
         assert!(
             {
-                let (_, qc_chain, _) =
+                let (qc_chain, _) =
                     state.collect_qc_chain_hashes(block.header().parent_block_hash());
                 validate_no_duplicate_transactions(&block, &qc_chain, &state.dedup_index)
             }
@@ -10295,7 +10289,7 @@ mod tests {
     ) -> Arc<Verifiable<Finalization>> {
         use hyperscale_types::{
             ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot,
-            SignerBitfield, TxOutcome,
+            SignerBitfield, TickId, TxOutcome,
         };
         let ec = |shard: ShardId| {
             let tick = TickId::new(shard, BlockHeight::new(height));

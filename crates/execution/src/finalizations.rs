@@ -12,13 +12,16 @@
 //! owns the mutable in-flight lifecycle (ticks, vote trackers, retries) and
 //! hands them off to this store at the moment of finalization.
 //!
-//! The underlying map is a `BTreeMap<TickId, Arc<Finalization>>` so
-//! iteration is deterministic — load-bearing for simulation determinism and
-//! for proposal building, which iterates the store to include finalized
-//! finalizations in block order. Beside it, a `TxHash → TickId` index answers the
-//! questions that are per transaction rather than per tick: whether a
-//! transaction has reached terminal state, which finalization carries it, and
-//! what a sync requester already holds.
+//! Entries are keyed by `(TickId, FinalizationHash)` so iteration is both
+//! deterministic and in tick order — load-bearing for simulation
+//! determinism and for proposal building, which iterates the store to
+//! include finalizations in block order. A tick can settle in more than
+//! one part, so the tick alone does not identify an entry; the hash is
+//! what a manifest names and a fetch asks by. Beside the map, a
+//! `TxHash → key` index answers the questions that are per transaction
+//! rather than per tick: whether a transaction has reached terminal
+//! state, which finalization carries it, and what a sync requester
+//! already holds.
 //!
 //! Held behind an `RwLock` so an `Arc<FinalizationStore>` can be shared
 //! across every same-shard vnode's `ExecutionCoordinator`. In practice
@@ -28,14 +31,22 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use hyperscale_types::{BloomFilter, DEFAULT_FPR, Finalization, TickId, TxHash, Verifiable};
+use hyperscale_types::{
+    BloomFilter, DEFAULT_FPR, Finalization, FinalizationHash, TickId, TxHash, Verifiable,
+};
+
+/// A tracked finalization's place in the store: its tick, which orders it
+/// against every other, and its identity, which distinguishes the parts a
+/// tick settles in.
+type Slot = (TickId, FinalizationHash);
 
 /// Ticks by id, plus the transaction index derived from them. Both live
 /// under one lock so a reader can never observe a transaction indexed
 /// against a finalization the map has already dropped.
 struct Inner {
-    finalizations: BTreeMap<TickId, Arc<Verifiable<Finalization>>>,
-    by_tx: HashMap<TxHash, TickId>,
+    finalizations: BTreeMap<Slot, Arc<Verifiable<Finalization>>>,
+    by_tx: HashMap<TxHash, Slot>,
+    by_hash: HashMap<FinalizationHash, Slot>,
 }
 
 /// Per-shard finalization store. See module docs for lifecycle.
@@ -63,6 +74,7 @@ impl FinalizationStore {
             inner: RwLock::new(Inner {
                 finalizations: BTreeMap::new(),
                 by_tx: HashMap::new(),
+                by_hash: HashMap::new(),
             }),
         }
     }
@@ -90,31 +102,37 @@ impl FinalizationStore {
             fw.verified().is_some(),
             "FinalizationStore invariant: only Verifiable::Verified entries are admitted"
         );
+        let slot = (tick_id, fw.receipt_hash());
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
         for tx_hash in fw.tx_hashes() {
-            inner.by_tx.insert(tx_hash, tick_id);
+            inner.by_tx.insert(tx_hash, slot);
         }
-        inner.finalizations.insert(tick_id, fw);
+        inner.by_hash.insert(slot.1, slot);
+        inner.finalizations.insert(slot, fw);
     }
 
-    /// Remove the entry for `tick_id`, if any. No-op when absent (sync
-    /// paths may remove a finalization the local node never aggregated).
-    pub fn remove(&self, tick_id: &TickId) {
+    /// Remove the entry with this identity, if any. No-op when absent
+    /// (sync paths may remove a finalization the local node never
+    /// aggregated).
+    pub fn remove(&self, hash: &FinalizationHash) {
         let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
-        let Some(fw) = inner.finalizations.remove(tick_id) else {
+        let Some(slot) = inner.by_hash.remove(hash) else {
+            return;
+        };
+        let Some(fw) = inner.finalizations.remove(&slot) else {
             return;
         };
         for tx_hash in fw.tx_hashes() {
             // A later finalization re-indexing the same transaction would
             // own the entry; only drop the one this one still holds.
-            if inner.by_tx.get(&tx_hash) == Some(tick_id) {
+            if inner.by_tx.get(&tx_hash) == Some(&slot) {
                 inner.by_tx.remove(&tx_hash);
             }
         }
     }
 
-    /// All finalizations in `TickId` order. Used by the proposer to
-    /// include finalizations in the next block.
+    /// All finalizations in tick order. Used by the proposer to include
+    /// finalizations in the next block.
     #[must_use]
     pub fn all(&self) -> Vec<Arc<Verifiable<Finalization>>> {
         self.inner
@@ -126,16 +144,14 @@ impl FinalizationStore {
             .collect()
     }
 
-    /// Lookup by `TickId`. Peers reference finalizations by tick in fetch requests,
-    /// so this is the primary ingress lookup for serving finalization data.
+    /// Lookup by identity. Peers reference finalizations by the hash a
+    /// manifest names, so this is the primary ingress lookup for serving
+    /// finalization data.
     #[must_use]
-    pub fn get(&self, tick_id: &TickId) -> Option<Arc<Verifiable<Finalization>>> {
-        self.inner
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .finalizations
-            .get(tick_id)
-            .map(Arc::clone)
+    pub fn get(&self, hash: &FinalizationHash) -> Option<Arc<Verifiable<Finalization>>> {
+        let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
+        let slot = inner.by_hash.get(hash)?;
+        inner.finalizations.get(slot).map(Arc::clone)
     }
 
     /// Tick containing `tx_hash`, if any. Used to answer terminal-state
@@ -145,8 +161,8 @@ impl FinalizationStore {
     #[must_use]
     pub fn get_for_tx(&self, tx_hash: TxHash) -> Option<Arc<Verifiable<Finalization>>> {
         let inner = self.inner.read().unwrap_or_else(PoisonError::into_inner);
-        let tick_id = inner.by_tx.get(&tx_hash)?;
-        inner.finalizations.get(tick_id).map(Arc::clone)
+        let slot = inner.by_tx.get(&tx_hash)?;
+        inner.finalizations.get(slot).map(Arc::clone)
     }
 
     /// Whether `tx_hash` is part of any currently-tracked finalization.
@@ -174,15 +190,18 @@ impl FinalizationStore {
             .collect()
     }
 
-    /// Whether a finalization for this `TickId` is tracked. Used by debug/query
-    /// paths to distinguish "tick is finalized" from "tick has no tracker".
+    /// Whether any part of `tick_id` is tracked. Used by debug/query
+    /// paths to distinguish "tick is finalized" from "tick has no
+    /// tracker".
     #[must_use]
     pub fn contains(&self, tick_id: &TickId) -> bool {
         self.inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .finalizations
-            .contains_key(tick_id)
+            .range((*tick_id, FinalizationHash::ZERO)..)
+            .next()
+            .is_some_and(|((tick, _), _)| tick == tick_id)
     }
 
     /// Number of finalizations currently tracked.
@@ -284,6 +303,7 @@ mod tests {
         let store = FinalizationStore::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx1"));
         let (wid, fw) = make_finalization(1, &[tx]);
+        let _id = fw.receipt_hash();
 
         store.insert(wid, fw);
 
@@ -299,14 +319,19 @@ mod tests {
         let store = FinalizationStore::new();
         let tx = TxHash::from(Hash::from_bytes(b"tx1"));
         let (wid, fw) = make_finalization(1, &[tx]);
+        let id = fw.receipt_hash();
 
         store.insert(wid, fw);
 
-        let looked_up = store.get(&wid).expect("finalization present by tick");
+        let looked_up = store.get(&id).expect("finalization present by identity");
         assert_eq!(looked_up.tick_id(), &wid);
 
         // Unknown id returns None.
-        assert!(store.get(&make_tick_id(99)).is_none());
+        assert!(
+            store
+                .get(&FinalizationHash::from_raw(Hash::from_bytes(b"absent")))
+                .is_none()
+        );
     }
 
     #[test]
@@ -316,7 +341,9 @@ mod tests {
         let b = TxHash::from(Hash::from_bytes(b"b"));
         let c = TxHash::from(Hash::from_bytes(b"c"));
         let (wid1, fw1) = make_finalization(1, &[a, b]);
+        let _id1 = fw1.receipt_hash();
         let (wid2, fw2) = make_finalization(2, &[c]);
+        let _id2 = fw2.receipt_hash();
 
         store.insert(wid1, fw1);
         store.insert(wid2, fw2);
@@ -334,12 +361,14 @@ mod tests {
         let tx1 = TxHash::from(Hash::from_bytes(b"tx1"));
         let tx2 = TxHash::from(Hash::from_bytes(b"tx2"));
         let (wid1, fw1) = make_finalization(1, &[tx1]);
+        let id1 = fw1.receipt_hash();
         let (wid2, fw2) = make_finalization(2, &[tx2]);
+        let _id2 = fw2.receipt_hash();
 
         store.insert(wid1, fw1);
         store.insert(wid2, fw2);
 
-        store.remove(&wid1);
+        store.remove(&id1);
 
         assert!(!store.contains(&wid1));
         assert!(store.contains(&wid2));
@@ -354,7 +383,9 @@ mod tests {
         let tx1 = TxHash::from(Hash::from_bytes(b"tx1"));
         let tx2 = TxHash::from(Hash::from_bytes(b"tx2"));
         let (wid1, fw1) = make_finalization(1, &[tx1]);
+        let _id1 = fw1.receipt_hash();
         let (wid2, fw2) = make_finalization(2, &[tx2]);
+        let _id2 = fw2.receipt_hash();
         store.insert(wid1, fw1);
         store.insert(wid2, fw2);
 
@@ -373,11 +404,13 @@ mod tests {
         let a = TxHash::from(Hash::from_bytes(b"a"));
         let b = TxHash::from(Hash::from_bytes(b"b"));
         let (wid1, fw1) = make_finalization(1, &[a]);
+        let id1 = fw1.receipt_hash();
         let (wid2, fw2) = make_finalization(2, &[b]);
+        let _id2 = fw2.receipt_hash();
         store.insert(wid1, fw1);
         store.insert(wid2, fw2);
 
-        store.remove(&wid1);
+        store.remove(&id1);
 
         assert!(!store.is_finalized(a));
         assert!(store.is_finalized(b));
@@ -389,9 +422,9 @@ mod tests {
     #[test]
     fn remove_absent_finalization_is_noop() {
         let store = FinalizationStore::new();
-        let missing = make_tick_id(42);
+        let _missing = make_tick_id(42);
         // No panic, no state change.
-        store.remove(&missing);
+        store.remove(&FinalizationHash::from_raw(Hash::from_bytes(b"absent")));
         assert!(store.is_empty());
     }
 

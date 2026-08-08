@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
-    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization,
+    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
     MerkleInclusionProof, PreparedCommit, QuorumCertificate, RETENTION_HORIZON, SettledTxsRoot,
     ShardId, ShardWitnessPayload, StateRoot, StateWrites, SubstateKey, TickId, Transaction, TxHash,
     Verifiable, Verified, WeightedTimestamp, local_settled_tx_hashes, settled_txs_root_from_hashes,
@@ -503,10 +503,10 @@ where
         self.base.get_transactions_batch(hashes)
     }
 
-    /// Batched attestation read by tick id. Pass-through to base storage —
+    /// Batched attestation read by identity. Pass-through to base storage —
     /// pending entries don't carry attestations, only the receipts that
     /// contribute to them.
-    pub fn certificates_batch(&self, ids: &[TickId]) -> Vec<Finalization> {
+    pub fn certificates_batch(&self, ids: &[FinalizationHash]) -> Vec<Finalization> {
         self.base.get_certificates_batch(ids)
     }
 
@@ -1120,7 +1120,7 @@ mod tests {
         fn get_transactions_batch(&self, _hashes: &[TxHash]) -> Vec<Verified<Transaction>> {
             Vec::new()
         }
-        fn get_certificates_batch(&self, _ids: &[TickId]) -> Vec<Finalization> {
+        fn get_certificates_batch(&self, _ids: &[FinalizationHash]) -> Vec<Finalization> {
             Vec::new()
         }
         fn get_consensus_receipt(&self, _tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
