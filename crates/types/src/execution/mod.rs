@@ -375,6 +375,7 @@ mod tests {
         let mut buf = hbor_to_vec(&tick_id).unwrap();
         buf.extend_from_slice(&hbor_to_vec(&WeightedTimestamp::ZERO).unwrap());
         buf.extend_from_slice(&hbor_to_vec(&GlobalReceiptRoot::ZERO).unwrap());
+        buf.extend_from_slice(&hbor_to_vec(&0u32).unwrap());
         varint::write(&mut buf, MAX_TXS_PER_BLOCK + 1).unwrap();
         buf.extend(std::iter::repeat_n(0u8, (MAX_TXS_PER_BLOCK + 1) * 128));
         let err = hbor_from_slice::<ExecutionCertificate>(&buf).unwrap_err();
@@ -399,7 +400,10 @@ mod tests {
             tick_id: TickId,
             vote_anchor_ts: WeightedTimestamp,
             global_receipt_root: GlobalReceiptRoot,
+            tx_count: u32,
             tx_outcomes: Vec<TxOutcome>,
+            leaf_indices: Vec<u8>,
+            proof: Vec<Hash>,
             aggregated_signature: AggregateSignature,
             signers: SignerBitfield,
         }
@@ -414,7 +418,10 @@ mod tests {
             tick_id,
             vote_anchor_ts: WeightedTimestamp::from_millis(1),
             global_receipt_root: GlobalReceiptRoot::ZERO,
+            tx_count: 2,
             tx_outcomes: outcomes,
+            leaf_indices: Vec::new(),
+            proof: Vec::new(),
             aggregated_signature: AggregateSignature::ZERO,
             signers: SignerBitfield::new(4),
         })

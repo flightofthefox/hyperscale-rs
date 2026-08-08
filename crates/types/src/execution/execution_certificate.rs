@@ -5,33 +5,59 @@
 //! `Verified<ExecutionCertificate>`; predicate at
 //! [`impl Verify<&ExecutionCertificateContext<'_>>`](Verify::verify) below.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Formatter};
 
 use hyperscale_crypto::{ConsensusSignature, Verifier};
 use hyperscale_hbor::error::{DecodeError as HborDecodeError, EncodeError as HborEncodeError};
 use hyperscale_hbor::{
     Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth,
-    bounded as hbor_bounded, to_vec as hbor_to_vec,
+    bounded as hbor_bounded, to_vec as hbor_to_vec, varint,
 };
 use thiserror::Error;
 
 use crate::{
     AggregateSignature, BlockHeight, ConsensusPublicKey, ExecutionVote, ExecutionVoteMessage,
     GlobalReceiptRoot, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition, RETENTION_HORIZON, ShardId,
-    SignerBitfield, TickId, TxOutcome, ValidatorId, Verified, Verify, WeightedTimestamp,
-    compute_global_receipt_root, signed_bytes,
+    SignerBitfield, TickId, TxHash, TxOutcome, ValidatorId, Verified, Verify, WeightedTimestamp,
+    compute_global_receipt_root, compute_sparse_proof, signed_bytes, tx_outcome_leaf,
+    verify_sparse_inclusion,
 };
 
 /// Aggregated certificate for an execution wave.
 ///
 /// Contains the signature aggregated signature from 2f+1 validators plus per-tx
 /// outcomes so remote shards can extract individual transaction results.
+///
+/// # Copies carry what their holder is party to
+///
+/// The signed value is `global_receipt_root`, a merkle root over the whole
+/// tick's outcome leaves, so a copy can carry any subset of them and still
+/// prove itself: the leaves it holds plus [`Self::proof`] rebuild the
+/// signed root. The producing shard is party to its entire tick, so its
+/// own copy carries every leaf and needs no proof; a copy sent to a
+/// participating shard carries the outcomes naming that shard, and its
+/// size follows that shard's stake in the tick rather than the tick's.
+///
+/// One rule covers both: `tx_count` is the tick's leaf count whatever the
+/// copy holds, and decoding rebuilds the root from the carried leaves at
+/// their stated indices. A complete copy is the case where those are all
+/// of them and the proof is empty, which is why it needs no marker.
 pub struct ExecutionCertificate {
     tick_id: TickId,
     vote_anchor_ts: WeightedTimestamp,
     global_receipt_root: GlobalReceiptRoot,
+    /// Leaf count of the receipt tree — the whole tick's outcome count,
+    /// not this copy's. Signed, so a copy cannot restate the tree it is
+    /// proving against.
+    tx_count: u32,
+    /// Receipt-tree leaf index of each carried outcome, ascending and
+    /// distinct. Parallel to `tx_outcomes`.
+    leaf_indices: Vec<u32>,
     tx_outcomes: Vec<TxOutcome>,
+    /// Sibling nodes covering the leaves this copy does not carry. Empty
+    /// on a complete copy.
+    proof: Vec<Hash>,
     aggregated_signature: AggregateSignature,
     signers: SignerBitfield,
     /// Cached HBOR-encoded bytes. Populated at construction or after
@@ -45,7 +71,10 @@ impl Debug for ExecutionCertificate {
             .field("tick_id", &self.tick_id)
             .field("vote_anchor_ts", &self.vote_anchor_ts)
             .field("global_receipt_root", &self.global_receipt_root)
+            .field("tx_count", &self.tx_count)
+            .field("leaf_indices", &self.leaf_indices)
             .field("tx_outcomes", &self.tx_outcomes)
+            .field("proof", &self.proof.len())
             .field("aggregated_signature", &self.aggregated_signature)
             .field("signers", &self.signers)
             .finish_non_exhaustive()
@@ -58,7 +87,10 @@ impl Clone for ExecutionCertificate {
             tick_id: self.tick_id,
             vote_anchor_ts: self.vote_anchor_ts,
             global_receipt_root: self.global_receipt_root,
+            tx_count: self.tx_count,
+            leaf_indices: self.leaf_indices.clone(),
             tx_outcomes: self.tx_outcomes.clone(),
+            proof: self.proof.clone(),
             aggregated_signature: self.aggregated_signature,
             signers: self.signers.clone(),
             cached_bytes: self.cached_bytes.clone(),
@@ -71,7 +103,10 @@ impl PartialEq for ExecutionCertificate {
         self.tick_id == other.tick_id
             && self.vote_anchor_ts == other.vote_anchor_ts
             && self.global_receipt_root == other.global_receipt_root
+            && self.tx_count == other.tx_count
+            && self.leaf_indices == other.leaf_indices
             && self.tx_outcomes == other.tx_outcomes
+            && self.proof == other.proof
             && self.aggregated_signature == other.aggregated_signature
             && self.signers == other.signers
     }
@@ -80,16 +115,67 @@ impl PartialEq for ExecutionCertificate {
 impl Eq for ExecutionCertificate {}
 
 // Manual codec: cached_bytes is derived, not serialized.
-// Manual codec — the decode side recomputes the receipt root over the
-// carried outcomes. The signature aggregate only commits to
-// (global_receipt_root, tx_count), not to tx_outcomes content; without
-// this check a Byzantine aggregator could ship a signature-valid EC whose
-// outcomes don't hash to the signed root, slipping bogus per-tx results
-// past every downstream consumer (gossip ingress, fetch ingress,
-// Finalization admission).
+//
+// The decode side rebuilds the receipt root from the leaves this copy
+// carries, at their stated indices, plus the proof. The signature
+// aggregate only commits to (global_receipt_root, tx_count), not to
+// tx_outcomes content; without this check a Byzantine aggregator could
+// ship a signature-valid EC whose outcomes don't belong under the signed
+// root, slipping bogus per-tx results past every downstream consumer
+// (gossip ingress, fetch ingress, Finalization admission).
+//
+// A complete copy carries no index list: its leaves are `0..tx_count` by
+// definition, which the two cases can never confuse because a partial
+// copy holds strictly fewer. Padding is derived on both sides, so a
+// complete copy also carries no proof — its wire form is today's plus the
+// leaf count.
 
 impl HborWidth for ExecutionCertificate {
     const MIN_ENCODED_LEN: usize = 1;
+}
+
+/// Encode ascending leaf indices as gaps: the first index, then each
+/// subsequent one less its predecessor and the step between them, so a
+/// run of consecutive leaves costs one byte apiece.
+fn encode_leaf_indices(indices: &[u32]) -> Result<Vec<u8>, HborEncodeError> {
+    let mut bytes = Vec::with_capacity(indices.len());
+    let mut previous: Option<u32> = None;
+    for &index in indices {
+        let gap = previous.map_or(index, |prior| index.saturating_sub(prior).saturating_sub(1));
+        varint::write(&mut bytes, gap as usize)?;
+        previous = Some(index);
+    }
+    Ok(bytes)
+}
+
+/// Inverse of [`encode_leaf_indices`]. Requires the blob to hold exactly
+/// `count` gaps and to be consumed exactly, so one index set has one
+/// encoding.
+fn decode_leaf_indices(mut bytes: &[u8], count: usize) -> Result<Vec<u32>, HborDecodeError> {
+    let mut indices = Vec::with_capacity(count);
+    let mut previous: Option<u32> = None;
+    for _ in 0..count {
+        let (gap, consumed) = varint::read(bytes)?;
+        bytes = &bytes[consumed..];
+        let gap = u32::try_from(gap)
+            .map_err(|_| HborDecodeError::FailedValidation("leaf index gap out of range"))?;
+        let index = match previous {
+            None => gap,
+            Some(prior) => prior
+                .checked_add(gap)
+                .and_then(|sum| sum.checked_add(1))
+                .ok_or(HborDecodeError::FailedValidation("leaf index out of range"))?,
+        };
+        indices.push(index);
+        previous = Some(index);
+    }
+    if bytes.is_empty() {
+        Ok(indices)
+    } else {
+        Err(HborDecodeError::FailedValidation(
+            "trailing bytes after the leaf index list",
+        ))
+    }
 }
 
 impl HborEncode for ExecutionCertificate {
@@ -97,8 +183,16 @@ impl HborEncode for ExecutionCertificate {
         encoder.nested(&self.tick_id)?;
         encoder.nested(&self.vote_anchor_ts)?;
         encoder.nested(&self.global_receipt_root)?;
+        encoder.nested(&self.tx_count)?;
         hbor_bounded::check_encoded_len("tx_outcomes", self.tx_outcomes.len(), MAX_TXS_PER_BLOCK)?;
         encoder.nested(&self.tx_outcomes)?;
+        if self.is_complete() {
+            encoder.write_sized(&[])?;
+        } else {
+            encoder.write_sized(&encode_leaf_indices(&self.leaf_indices)?)?;
+        }
+        hbor_bounded::check_encoded_len("proof", self.proof.len(), MAX_TXS_PER_BLOCK)?;
+        encoder.nested(&self.proof)?;
         encoder.nested(&self.aggregated_signature)?;
         encoder.nested(&self.signers)
     }
@@ -109,20 +203,57 @@ impl HborDecode for ExecutionCertificate {
         let tick_id: TickId = decoder.nested()?;
         let vote_anchor_ts: WeightedTimestamp = decoder.nested()?;
         let global_receipt_root: GlobalReceiptRoot = decoder.nested()?;
+        let tx_count: u32 = decoder.nested()?;
         let tx_outcomes: Vec<TxOutcome> = decoder
+            .descend(|decoder| hbor_bounded::decode_bounded_vec(decoder, MAX_TXS_PER_BLOCK))?;
+        let index_len = decoder.read_len(1)?;
+        let index_bytes = decoder.read_slice(index_len)?;
+        let proof: Vec<Hash> = decoder
             .descend(|decoder| hbor_bounded::decode_bounded_vec(decoder, MAX_TXS_PER_BLOCK))?;
         let aggregated_signature: AggregateSignature = decoder.nested()?;
         let signers: SignerBitfield = decoder.nested()?;
-        if compute_global_receipt_root(&tx_outcomes) != global_receipt_root {
+
+        if tx_count as usize > MAX_TXS_PER_BLOCK {
             return Err(HborDecodeError::FailedValidation(
-                "tx outcomes do not hash to the signed receipt root",
+                "tx count exceeds the per-block cap",
             ));
         }
+        let complete = tx_outcomes.len() == tx_count as usize;
+        let leaf_indices = if complete {
+            if !index_bytes.is_empty() {
+                return Err(HborDecodeError::FailedValidation(
+                    "a complete certificate carries no leaf index list",
+                ));
+            }
+            (0..tx_count).collect()
+        } else {
+            decode_leaf_indices(index_bytes, tx_outcomes.len())?
+        };
+
+        let claimed: Vec<(u32, Hash)> = leaf_indices
+            .iter()
+            .copied()
+            .zip(tx_outcomes.iter().map(tx_outcome_leaf))
+            .collect();
+        if !verify_sparse_inclusion(
+            global_receipt_root.into_raw(),
+            &claimed,
+            tx_count as usize,
+            &proof,
+        ) {
+            return Err(HborDecodeError::FailedValidation(
+                "tx outcomes do not prove against the signed receipt root",
+            ));
+        }
+
         let mut ec = Self {
             tick_id,
             vote_anchor_ts,
             global_receipt_root,
+            tx_count,
+            leaf_indices,
             tx_outcomes,
+            proof,
             aggregated_signature,
             signers,
             cached_bytes: None,
@@ -143,17 +274,95 @@ impl ExecutionCertificate {
         aggregated_signature: AggregateSignature,
         signers: SignerBitfield,
     ) -> Self {
+        let tx_count = u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX);
         let mut ec = Self {
             tick_id,
             vote_anchor_ts,
             global_receipt_root,
+            tx_count,
+            leaf_indices: (0..tx_count).collect(),
             tx_outcomes,
+            proof: Vec::new(),
             aggregated_signature,
             signers,
             cached_bytes: None,
         };
         ec.populate_cached_bytes();
         ec
+    }
+
+    /// The copy of this certificate a shard party to `keep` needs: the
+    /// outcomes naming those transactions, plus a proof binding them to
+    /// the same signed root.
+    ///
+    /// Neither the signed root nor the signature moves, so the projection
+    /// verifies under the same committee as the certificate it came from
+    /// — which is what lets a recipient be sent its own stake in a tick
+    /// rather than the whole of it.
+    ///
+    /// Returns `None` when this copy carries no outcome for any named
+    /// transaction: a certificate proving nothing about the recipient's
+    /// transactions is not worth sending, and an empty claim does not
+    /// verify.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a copy that is not itself complete. Building the proof
+    /// reads sibling nodes off the whole receipt tree, which only the
+    /// producing shard's copy carries.
+    #[must_use]
+    pub fn project_to(&self, keep: &HashSet<TxHash>) -> Option<Self> {
+        assert!(
+            self.is_complete(),
+            "only a complete certificate can be projected"
+        );
+        let (leaf_indices, tx_outcomes): (Vec<u32>, Vec<TxOutcome>) = self
+            .leaf_indices
+            .iter()
+            .zip(self.tx_outcomes.iter())
+            .filter(|(_, outcome)| keep.contains(&outcome.tx_hash()))
+            .map(|(&index, outcome)| (index, outcome.clone()))
+            .unzip();
+        if tx_outcomes.is_empty() {
+            return None;
+        }
+
+        let leaves: Vec<Hash> = self.tx_outcomes.iter().map(tx_outcome_leaf).collect();
+        let proof = compute_sparse_proof(&leaves, &leaf_indices);
+        let mut ec = Self {
+            tick_id: self.tick_id,
+            vote_anchor_ts: self.vote_anchor_ts,
+            global_receipt_root: self.global_receipt_root,
+            tx_count: self.tx_count,
+            leaf_indices,
+            tx_outcomes,
+            proof,
+            aggregated_signature: self.aggregated_signature,
+            signers: self.signers.clone(),
+            cached_bytes: None,
+        };
+        ec.populate_cached_bytes();
+        Some(ec)
+    }
+
+    /// Number of outcomes in the whole tick, however many this copy
+    /// carries. The receipt tree's leaf count.
+    #[must_use]
+    pub const fn tx_count(&self) -> u32 {
+        self.tx_count
+    }
+
+    /// Whether this copy carries every outcome of its tick.
+    #[must_use]
+    pub const fn is_complete(&self) -> bool {
+        self.tx_outcomes.len() == self.tx_count as usize
+    }
+
+    /// Receipt-tree leaf index of each carried outcome, parallel to
+    /// [`Self::tx_outcomes`].
+    #[must_use]
+    pub fn leaf_indices(&self) -> &[u32] {
+        &self.leaf_indices
     }
 
     /// Self-contained wave identifier (shard + height + remote dependencies).
@@ -261,7 +470,7 @@ impl ExecutionCertificate {
                 tick_id: self.tick_id,
                 shard_group: self.shard_id(),
                 global_receipt_root: self.global_receipt_root,
-                tx_count: u32::try_from(self.tx_outcomes.len()).unwrap_or(u32::MAX),
+                tx_count: self.tx_count,
             },
             network,
         )
@@ -387,8 +596,7 @@ impl Verified<ExecutionCertificate> {
             .map(|(idx, &vid)| (vid, idx))
             .collect();
 
-        let mut seen_validators: std::collections::HashSet<ValidatorId> =
-            std::collections::HashSet::new();
+        let mut seen_validators: HashSet<ValidatorId> = HashSet::new();
         let mut unique_votes: Vec<&Verified<ExecutionVote>> = votes
             .iter()
             .filter(|vote| seen_validators.insert(vote.validator()))
@@ -766,5 +974,228 @@ mod tests {
             cert.verify(&ctx),
             Err(ExecutionCertificateVerifyError::BadAggregatedSignature)
         );
+    }
+
+    /// A complete certificate round-trips and stays complete: its wire
+    /// form carries no index list and no proof, which is what keeps the
+    /// producing shard's own copy the cheap case.
+    #[test]
+    fn a_complete_certificate_carries_no_index_list_or_proof() {
+        let outcomes = vec![outcome(1), outcome(2), outcome(3)];
+        let root = compute_global_receipt_root(&outcomes);
+        let cert = ExecutionCertificate::new(
+            tick_id(),
+            WeightedTimestamp::from_millis(11),
+            root,
+            outcomes.clone(),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        assert!(cert.is_complete());
+        assert!(cert.proof.is_empty());
+
+        let decoded: ExecutionCertificate =
+            hbor_from_slice(&hbor_to_vec(&cert).expect("encode")).expect("decode");
+        assert_eq!(decoded, cert);
+        assert_eq!(decoded.tx_outcomes(), &outcomes);
+    }
+
+    /// A projection carries the recipient's outcomes and nothing else,
+    /// still proves against the same signed root, and still reports the
+    /// whole tick's leaf count.
+    #[test]
+    fn a_projection_carries_only_the_named_transactions() {
+        let outcomes: Vec<TxOutcome> = (1..=8).map(outcome).collect();
+        let root = compute_global_receipt_root(&outcomes);
+        let cert = ExecutionCertificate::new(
+            tick_id(),
+            WeightedTimestamp::from_millis(11),
+            root,
+            outcomes.clone(),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+
+        let keep: HashSet<TxHash> = [outcomes[2].tx_hash(), outcomes[5].tx_hash()]
+            .into_iter()
+            .collect();
+        let projected = cert.project_to(&keep).expect("two outcomes kept");
+
+        assert!(!projected.is_complete());
+        assert_eq!(projected.tx_count(), 8);
+        assert_eq!(projected.leaf_indices(), &[2, 5]);
+        assert_eq!(
+            projected.tx_outcomes(),
+            &vec![outcomes[2].clone(), outcomes[5].clone()]
+        );
+        assert_eq!(projected.global_receipt_root(), root);
+
+        let decoded: ExecutionCertificate =
+            hbor_from_slice(&hbor_to_vec(&projected).expect("encode")).expect("decode");
+        assert_eq!(decoded, projected);
+    }
+
+    /// A projection of the whole tick is the complete certificate again —
+    /// the two are one shape, not two.
+    #[test]
+    fn projecting_to_every_transaction_reproduces_the_complete_copy() {
+        let outcomes: Vec<TxOutcome> = (1..=5).map(outcome).collect();
+        let cert = ExecutionCertificate::new(
+            tick_id(),
+            WeightedTimestamp::from_millis(11),
+            compute_global_receipt_root(&outcomes),
+            outcomes.clone(),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        let keep: HashSet<TxHash> = outcomes.iter().map(TxOutcome::tx_hash).collect();
+        assert_eq!(cert.project_to(&keep).expect("all kept"), cert);
+    }
+
+    /// A recipient party to nothing in the tick gets no certificate: an
+    /// empty claim proves nothing and would not verify.
+    #[test]
+    fn projecting_to_nothing_yields_no_certificate() {
+        let outcomes = vec![outcome(1)];
+        let cert = ExecutionCertificate::new(
+            tick_id(),
+            WeightedTimestamp::from_millis(11),
+            compute_global_receipt_root(&outcomes),
+            outcomes,
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        assert!(cert.project_to(&HashSet::new()).is_none());
+    }
+
+    /// A projection is smaller than the certificate it came from once the
+    /// tick is bigger than the recipient's share of it — the whole point
+    /// of sending one.
+    #[test]
+    fn a_projection_is_smaller_than_the_tick_it_came_from() {
+        let outcomes: Vec<TxOutcome> = (0..64).map(outcome).collect();
+        let cert = ExecutionCertificate::new(
+            tick_id(),
+            WeightedTimestamp::from_millis(11),
+            compute_global_receipt_root(&outcomes),
+            outcomes.clone(),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        let keep: HashSet<TxHash> = std::iter::once(outcomes[9].tx_hash()).collect();
+        let projected = cert.project_to(&keep).expect("one outcome kept");
+
+        let whole = hbor_to_vec(&cert).expect("encode").len();
+        let part = hbor_to_vec(&projected).expect("encode").len();
+        assert!(
+            part * 4 < whole,
+            "a single-transaction projection of a 64-transaction tick must be far \
+             smaller: {part} against {whole}"
+        );
+    }
+
+    /// A forged outcome swapped into a projection fails the decode-side
+    /// rebuild: the leaf it hashes to does not sit under the signed root.
+    #[test]
+    fn decode_rejects_a_forged_outcome_in_a_projection() {
+        let outcomes: Vec<TxOutcome> = (1..=8).map(outcome).collect();
+        let cert = ExecutionCertificate::new(
+            tick_id(),
+            WeightedTimestamp::from_millis(11),
+            compute_global_receipt_root(&outcomes),
+            outcomes.clone(),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        let keep: HashSet<TxHash> = std::iter::once(outcomes[2].tx_hash()).collect();
+        let mut projected = cert.project_to(&keep).expect("one outcome kept");
+
+        projected.tx_outcomes[0] = outcome(200);
+        projected.populate_cached_bytes();
+        let bytes = hbor_to_vec(&projected).expect("encode");
+        let err = hbor_from_slice::<ExecutionCertificate>(&bytes)
+            .expect_err("a forged outcome must fail the rebuild");
+        assert!(matches!(err, HborDecodeError::FailedValidation(_)));
+    }
+
+    /// A projection whose outcome is moved to another leaf index fails
+    /// even though the outcome itself is honest — position is part of
+    /// what the root commits to.
+    #[test]
+    fn decode_rejects_an_outcome_claimed_at_the_wrong_leaf() {
+        let outcomes: Vec<TxOutcome> = (1..=8).map(outcome).collect();
+        let cert = ExecutionCertificate::new(
+            tick_id(),
+            WeightedTimestamp::from_millis(11),
+            compute_global_receipt_root(&outcomes),
+            outcomes.clone(),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        let keep: HashSet<TxHash> = std::iter::once(outcomes[2].tx_hash()).collect();
+        let mut projected = cert.project_to(&keep).expect("one outcome kept");
+
+        projected.leaf_indices[0] = 3;
+        projected.populate_cached_bytes();
+        let bytes = hbor_to_vec(&projected).expect("encode");
+        let err = hbor_from_slice::<ExecutionCertificate>(&bytes)
+            .expect_err("a relocated outcome must fail the rebuild");
+        assert!(matches!(err, HborDecodeError::FailedValidation(_)));
+    }
+
+    /// A copy that understates the tick's leaf count is refused: the
+    /// count is signed, and a copy free to restate it could prove its
+    /// outcomes against a tree the committee never attested.
+    #[test]
+    fn decode_rejects_a_restated_leaf_count() {
+        let outcomes: Vec<TxOutcome> = (1..=8).map(outcome).collect();
+        let cert = ExecutionCertificate::new(
+            tick_id(),
+            WeightedTimestamp::from_millis(11),
+            compute_global_receipt_root(&outcomes),
+            outcomes.clone(),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        let keep: HashSet<TxHash> = std::iter::once(outcomes[0].tx_hash()).collect();
+        let mut projected = cert.project_to(&keep).expect("one outcome kept");
+
+        projected.tx_count = 4;
+        projected.populate_cached_bytes();
+        let bytes = hbor_to_vec(&projected).expect("encode");
+        let err = hbor_from_slice::<ExecutionCertificate>(&bytes)
+            .expect_err("a restated leaf count must fail the rebuild");
+        assert!(matches!(err, HborDecodeError::FailedValidation(_)));
+    }
+
+    /// A complete copy may not also carry an index list: that would be a
+    /// second encoding of a claim that already has one.
+    #[test]
+    fn decode_rejects_a_complete_copy_carrying_indices() {
+        let outcomes: Vec<TxOutcome> = (1..=4).map(outcome).collect();
+        let cert = ExecutionCertificate::new(
+            tick_id(),
+            WeightedTimestamp::from_millis(11),
+            compute_global_receipt_root(&outcomes),
+            outcomes,
+            // Distinctive so the encoded signature can be located below.
+            AggregateSignature::new([0xAB; 96]),
+            SignerBitfield::new(4),
+        );
+        // Re-encode by hand with the index list a complete copy omits:
+        // the empty blob length and the empty proof length are the two
+        // bytes immediately before the signature.
+        let mut forged = hbor_to_vec(&cert).expect("encode");
+        let marker = hbor_to_vec(&cert.aggregated_signature).expect("encode");
+        let at = forged
+            .windows(marker.len())
+            .position(|window| window == marker.as_slice())
+            .expect("signature must appear in the encoding");
+        let blob_at = at - 2;
+        assert_eq!(forged[blob_at..at], [0, 0], "empty index blob, empty proof");
+        forged.splice(blob_at..=blob_at, [4u8, 0, 0, 0, 0]);
+        let err = hbor_from_slice::<ExecutionCertificate>(&forged)
+            .expect_err("a complete copy carrying indices must be refused");
+        assert!(matches!(err, HborDecodeError::FailedValidation(_)));
     }
 }
