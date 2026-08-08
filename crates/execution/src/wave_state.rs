@@ -31,9 +31,9 @@ use std::time::Duration;
 use hyperscale_core::{CrossShardExecutionRequest, TickExecutionGroup};
 use hyperscale_types::{
     BlockHash, BlockHeight, DeclaredKey, ExecutionCertificate, ExecutionOutcome, FinalizedWave,
-    GlobalReceiptRoot, Mode, RevealChain, ShardId, StoredReceipt, Transaction, TransactionDecision,
-    TxHash, TxOutcome, Verifiable, Verified, WAVE_TIMEOUT, WaveCertificate, WaveId,
-    WeightedTimestamp, compute_global_receipt_root,
+    GlobalReceiptRoot, Mode, RevealChain, Settles, ShardId, StoredReceipt, Transaction,
+    TransactionDecision, TxHash, TxOutcome, Verifiable, Verified, WAVE_TIMEOUT, WaveCertificate,
+    WaveId, WeightedTimestamp, compute_global_receipt_root, refused_transactions, settles,
 };
 
 use crate::provisional::ProvisionalCells;
@@ -798,10 +798,12 @@ impl WaveState {
                         .cloned()
                         .expect("execution result must be present under provisioned branch")
                 };
-                // An outcome that applies no effects still settles the
-                // payer's charge when the engine built one — an abort
-                // whose effects were discarded, or a failure that produced
-                // none.
+                // The charge this shard holds against the transaction, if
+                // the engine built one. Named whatever the local outcome
+                // was, because the local outcome is not what decides
+                // whether it is owed: a leg that completed here still
+                // owes the floor if a counterpart refuses the wave, and a
+                // charge nobody named is a charge nothing can settle.
                 let work = self.attested_work.get(tx_hash).copied().unwrap_or(0);
                 // What the transaction reserved when its block committed
                 // it, carried so the settling block can release exactly
@@ -809,16 +811,13 @@ impl WaveState {
                 // still holds; a member swept before it voted reserved
                 // nothing this wave can return.
                 let reserved = self.transactions.get(tx_hash).map_or(0, |tx| tx.work());
-                match (&outcome, self.fee_receipts.get(tx_hash)) {
-                    (ExecutionOutcome::Aborted | ExecutionOutcome::Failed, Some(fee)) => {
-                        TxOutcome::with_fee(
-                            *tx_hash,
-                            outcome.clone(),
-                            fee.consensus.receipt_hash(),
-                            work,
-                        )
-                    }
-                    _ => TxOutcome::attesting(*tx_hash, outcome.clone(), work),
+                let charge = self
+                    .fee_receipts
+                    .get(tx_hash)
+                    .map(|fee| fee.consensus.receipt_hash());
+                match charge {
+                    Some(fee) => TxOutcome::with_fee(*tx_hash, outcome, fee, work),
+                    None => TxOutcome::attesting(*tx_hash, outcome, work),
                 }
                 .reserving(reserved)
             })
@@ -1125,12 +1124,12 @@ impl WaveState {
 
     /// Consume the wave and produce its terminal [`FinalizedWave`].
     ///
-    /// Builds the [`WaveCertificate`] and drains a stored receipt for each
-    /// non-aborted outcome in the local EC, in canonical order. Aborted
-    /// outcomes contribute no receipt; stray receipts for aborted txs (e.g.
-    /// local execution finished before the aggregated EC attested
-    /// `Aborted`) drop with the wave. Mirrors `FinalizedWave::reconstruct`,
-    /// matching the invariant peers enforce via
+    /// Builds the [`WaveCertificate`] and drains one stored receipt per
+    /// outcome that settles anything, in canonical order. Which side of an
+    /// outcome settles is [`settles`]'s question, read against the whole
+    /// certificate rather than against this shard's own verdict: a leg
+    /// that completed here and was refused by a counterpart settles its
+    /// charge, not its effects. Peers re-derive the same rule through
     /// `validate_receipts_against_ec` at ingress.
     ///
     /// Should only be called when [`Self::is_complete`] is true; that gate
@@ -1154,36 +1153,29 @@ impl WaveState {
             .find(|ec| ec.wave_id() == wc.wave_id())
             .expect("WaveCertificate invariant: local EC must be present")
             .clone();
+        let refused = refused_transactions(&wc);
         let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
         for outcome in local_ec.tx_outcomes() {
-            if outcome.is_aborted() {
-                // The transaction's own effects are discarded; a fee it
-                // settles is not.
-                if outcome.fee_receipt().is_some()
-                    && let Some(fee) = self.fee_receipts.remove(&outcome.tx_hash())
-                {
-                    receipts.push(fee);
+            let drained = match settles(outcome, &refused) {
+                // The charge stands in for whatever the transaction did:
+                // a `Failed` receipt carries nothing, and a completed
+                // leg's effects are discarded by the refusal. Either way
+                // the pairing stays one receipt per outcome.
+                Settles::Charge(_) => {
+                    self.take_receipt(outcome.tx_hash());
+                    self.fee_receipts.remove(&outcome.tx_hash())
                 }
-                continue;
-            }
-            // A failure that settles a charge stores that receipt instead
-            // of its own — the `Failed` receipt carries nothing, and the
-            // pairing stays one receipt per outcome either way.
-            if outcome.fee_receipt().is_some()
-                && let Some(fee) = self.fee_receipts.remove(&outcome.tx_hash())
-            {
-                self.take_receipt(outcome.tx_hash());
-                receipts.push(fee);
-                continue;
-            }
-            if let Some(receipt) = self.take_receipt(outcome.tx_hash()) {
+                Settles::Effects(_) | Settles::Failure => self.take_receipt(outcome.tx_hash()),
+                Settles::Nothing => continue,
+            };
+            if let Some(receipt) = drained {
                 receipts.push(receipt);
             } else {
                 tracing::error!(
                     wave = %self.wave_id,
                     tx_hash = ?outcome.tx_hash(),
-                    "into_finalized: non-aborted tx is missing its stored receipt \
-                     (is_complete gate bypassed)"
+                    "into_finalized: an outcome that settles something is missing \
+                     its stored receipt (is_complete gate bypassed)"
                 );
             }
         }
@@ -2125,6 +2117,46 @@ mod tests {
         finalized
             .validate_receipts_against_ec()
             .expect("a settled fee receipt is what the EC named");
+    }
+
+    /// A leg that completed here and was refused by its counterpart owes
+    /// the floor its own outcome held in reserve.
+    ///
+    /// The local verdict is not what decides this. This shard executed the
+    /// leg and voted `Succeeded`; the wave still decided against it, so
+    /// the effects are discarded — and if the charge went with them, a
+    /// transaction whose counterpart aborts would be free, and the fold
+    /// the tick chain promoted for it would name a debit state never
+    /// takes.
+    #[test]
+    fn a_leg_refused_by_its_counterpart_still_settles_its_charge() {
+        let mut w = make_cross_shard_wave(1);
+        let tx = w.tx_hashes()[0];
+        w.mark_tx_provisioned(tx, ts_for(WAVE_START + 1));
+        record_executed(&mut w, tx, true);
+        let fee = fee_receipt_for(tx);
+        let fee_hash = fee.consensus.receipt_hash();
+        w.record_fee_receipt(fee);
+
+        let (_, _, outcomes) = w.build_vote_data(ts_for(WAVE_START + 2)).expect("vote");
+        assert_eq!(outcomes[0].outcome(), &executed(true), "the leg completed");
+        assert_eq!(
+            outcomes[0].fee_receipt(),
+            Some(fee_hash),
+            "a completed leg names what it owes if the wave refuses it"
+        );
+
+        let wave_id = w.wave_id().clone();
+        w.add_execution_certificate(make_ec_from(&wave_id, outcomes));
+        w.add_execution_certificate(make_ec(&wave_id, ShardId::leaf(1, 1), &[tx], false));
+
+        let finalized = w.into_finalized();
+        finalized
+            .validate_receipts_against_ec()
+            .expect("the receipt is the one the outcomes name");
+        let settling = finalized.settling_receipts();
+        assert_eq!(settling.len(), 1, "the charge settles, the effects do not");
+        assert_eq!(settling[0].consensus.receipt_hash(), fee_hash);
     }
 
     #[test]

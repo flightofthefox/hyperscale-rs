@@ -192,6 +192,9 @@ pub struct ExecutionSim {
     /// The receipts each wave's tick produced, so a test can settle a wave
     /// with what it actually executed rather than with a stand-in.
     receipts: BTreeMap<WaveId, Vec<StoredReceipt>>,
+    /// The charges each wave's tick held in reserve beside those
+    /// receipts — what settles instead of them when the wave refuses.
+    charges: BTreeMap<WaveId, Vec<StoredReceipt>>,
     /// The settled state every tick reads through, so the harness models
     /// the whole path: a committed certificate's receipts land here in
     /// commit order, exactly as `merge_writes_from_receipts` lands them in
@@ -228,6 +231,7 @@ impl ExecutionSim {
             height: BlockHeight::GENESIS,
             outputs: Vec::new(),
             receipts: BTreeMap::new(),
+            charges: BTreeMap::new(),
             base,
             local_shard,
         }
@@ -348,6 +352,7 @@ impl ExecutionSim {
                         self.local_shard,
                         request.tx_hash,
                         &request.transaction,
+                        !group.wave_id.is_zero(),
                     )
                 })
                 .collect();
@@ -362,6 +367,10 @@ impl ExecutionSim {
                 .entry(group.wave_id.clone())
                 .or_default()
                 .extend(results.iter().cloned());
+            self.charges
+                .entry(group.wave_id.clone())
+                .or_default()
+                .extend(fee_receipts.iter().cloned());
             waves.push(WaveExecutionResult {
                 wave_id: group.wave_id.clone(),
                 results,
@@ -414,6 +423,12 @@ impl ExecutionSim {
         self.receipts.get(wave_id).cloned().unwrap_or_default()
     }
 
+    /// The charges `wave_id`'s tick held in reserve.
+    #[must_use]
+    pub fn charges_for(&self, wave_id: &WaveId) -> Vec<StoredReceipt> {
+        self.charges.get(wave_id).cloned().unwrap_or_default()
+    }
+
     /// The wave a transaction was assigned to, if the coordinator still
     /// tracks it.
     #[must_use]
@@ -451,6 +466,24 @@ pub const fn vault_of(owner: [u8; 16]) -> SubstateKey {
 /// one per write, so the vault must always read exactly the counter.
 pub const CREDIT: u128 = 1;
 
+/// The cell a leg's abort charge reaches, and the amount it carries.
+///
+/// A cross-shard leg that completes here still owes a floor if the wave
+/// refuses it, and that charge rides its own receipt — held in reserve
+/// beside the effects, settled only if the effects are not. Separate
+/// from [`vault_of`] so a test can read what was charged without
+/// unpicking it from what was moved.
+#[must_use]
+pub const fn charge_of(owner: [u8; 16]) -> SubstateKey {
+    SubstateKey {
+        owner: Address(owner),
+        local: LocalKey([2; 16]),
+    }
+}
+
+/// What an abort charge carries.
+pub const FLOOR: u128 = 7;
+
 /// Decode a counter cell; an absent cell reads as zero.
 #[must_use]
 pub fn counter(bytes: Option<Vec<u8>>) -> u64 {
@@ -482,9 +515,12 @@ fn stub_execute(
     local_shard: ShardId,
     tx_hash: TxHash,
     tx: &Arc<Verified<Transaction>>,
+    abortable: bool,
 ) -> ExecutedTx {
     let mut cells = BTreeMap::new();
     let mut movements: BTreeMap<SubstateKey, Movement> = BTreeMap::new();
+    // The payer this shard would charge: the first owner it holds.
+    let mut charged: Option<[u8; 16]> = None;
     for key in tx.admission_write_keys() {
         // Only the owning shard applies a cell, exactly as `Locality`
         // scopes the engine's fold.
@@ -494,6 +530,7 @@ fn stub_execute(
         let cell = cell_of(key.owner().0);
         let next = counter(snapshot.substate(cell)) + 1;
         cells.insert(cell, Some(next.to_le_bytes().to_vec()));
+        charged.get_or_insert_with(|| key.owner().0);
         let credit = movements.entry(vault_of(key.owner().0)).or_default();
         *credit = credit.then(Movement {
             credit: CREDIT,
@@ -508,7 +545,7 @@ fn stub_execute(
         writes_root(&writes),
     )
     .receipt_hash();
-    ExecutedTx::new(
+    let mut executed = ExecutedTx::new(
         tx_hash,
         ConsensusReceipt::Succeeded {
             receipt_hash,
@@ -517,7 +554,40 @@ fn stub_execute(
             events: Vec::new(),
         },
         ExecutionMetadata::empty(),
+    );
+    // A leg a wave can still discard carries its charge beside its
+    // effects, exactly as the engine builds one for a cross-shard
+    // member. Which of the two settles is the wave's decision, not this
+    // shard's.
+    if abortable {
+        executed.fee_receipt = charged.map(stub_charge);
+    }
+    executed
+}
+
+/// The receipt a refused leg settles: the abort floor and nothing else.
+fn stub_charge(owner: [u8; 16]) -> ConsensusReceipt {
+    let mut writes = StateWrites::default();
+    writes.movements.insert(
+        charge_of(owner),
+        Movement {
+            credit: FLOOR,
+            debit: 0,
+        },
+    );
+    let receipt_hash = GlobalReceipt::new(
+        true,
+        EventRoot::ZERO,
+        BeaconWitnessRoot::ZERO,
+        writes_root(&writes),
     )
+    .receipt_hash();
+    ConsensusReceipt::Succeeded {
+        receipt_hash,
+        writes,
+        beacon_witness_events: Vec::new(),
+        events: Vec::new(),
+    }
 }
 
 /// A committed `FinalizedWave` settling `wave_id`, accepting every member.
@@ -561,8 +631,34 @@ pub fn settle_refused_by_counterpart(
     wave_id: &WaveId,
     counterpart: ShardId,
     receipts: &[StoredReceipt],
+    charges: &[StoredReceipt],
 ) -> FinalizedWave {
-    let local = settle(wave_id, receipts);
+    // The local certificate reports what this shard did and names the
+    // charge it holds against a refusal, which is what its own outcomes
+    // carry. The stored receipts are the charges, because that is the
+    // side of each outcome the wave's verdict selects.
+    let outcomes: Vec<TxOutcome> = receipts
+        .iter()
+        .zip(charges)
+        .map(|(receipt, charge)| {
+            TxOutcome::with_fee(
+                receipt.tx_hash,
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: receipt.consensus.receipt_hash(),
+                },
+                charge.consensus.receipt_hash(),
+                0,
+            )
+        })
+        .collect();
+    let local = ExecutionCertificate::new(
+        wave_id.clone(),
+        WeightedTimestamp::from_millis(wave_id.block_height().inner() * BLOCK_INTERVAL_MS),
+        compute_global_receipt_root(&outcomes),
+        outcomes,
+        AggregateSignature::new([0u8; 96]),
+        SignerBitfield::new(4),
+    );
     let refused: Vec<TxOutcome> = receipts
         .iter()
         .map(|receipt| TxOutcome::new(receipt.tx_hash, ExecutionOutcome::Failed))
@@ -580,12 +676,7 @@ pub fn settle_refused_by_counterpart(
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
-    let certificate = WaveCertificate::new(
-        wave_id.clone(),
-        vec![
-            Arc::new(local.execution_certificates()[0].as_unverified().clone()),
-            Arc::new(remote),
-        ],
-    );
-    FinalizedWave::new(Arc::new(certificate), receipts.to_vec())
+    let certificate =
+        WaveCertificate::new(wave_id.clone(), vec![Arc::new(local), Arc::new(remote)]);
+    FinalizedWave::new(Arc::new(certificate), charges.to_vec())
 }

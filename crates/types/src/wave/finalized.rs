@@ -4,7 +4,7 @@
 //! `Verified<FinalizedWave>`; predicate at
 //! [`impl Verify<&FinalizedWaveContext<'_>>`](Verify::verify) below.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_crypto::Verifier;
@@ -42,6 +42,62 @@ pub struct FinalizedWave {
     certificate: Arc<WaveCertificate>,
     #[hbor(max = MAX_TXS_PER_BLOCK)]
     receipts: Vec<StoredReceipt>,
+}
+
+/// What one outcome settles, given the verdict the whole wave reached.
+///
+/// A transaction settles its own effects only if every participant
+/// accepted it. Otherwise the effects are discarded — that is what makes
+/// a cross-shard abort atomic — and what is left is the charge the
+/// outcome named beside them, which is how an attempt nobody applied
+/// still costs its payer.
+///
+/// One rule with two readers: the wave's own shard builds its receipt
+/// list from it, and every peer re-derives it to check that list. They
+/// have to be the same rule, because a wave that stored the other side
+/// of a transaction would either move value one-sidedly or waive a
+/// charge, depending on which way it got it wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Settles {
+    /// The transaction's own effects, under this receipt hash.
+    Effects(GlobalReceiptHash),
+    /// The charge named beside the outcome, under this receipt hash.
+    Charge(GlobalReceiptHash),
+    /// The canonical failure record — a failure owing no charge.
+    Failure,
+    /// Nothing at all.
+    Nothing,
+}
+
+/// Every transaction some participant refused: aborted, or executed to a
+/// failure. Abort is dominant and success unanimous, so one refusal
+/// anywhere discards the transaction's effects everywhere.
+#[must_use]
+pub fn refused_transactions(certificate: &WaveCertificate) -> BTreeSet<TxHash> {
+    certificate
+        .execution_certificates()
+        .iter()
+        .flat_map(|ec| ec.tx_outcomes())
+        .filter(|outcome| !matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }))
+        .map(TxOutcome::tx_hash)
+        .collect()
+}
+
+/// What `outcome` settles, given the transactions `refused` names.
+#[must_use]
+pub fn settles(outcome: &TxOutcome, refused: &BTreeSet<TxHash>) -> Settles {
+    match outcome.outcome() {
+        ExecutionOutcome::Succeeded { receipt_hash } if !refused.contains(&outcome.tx_hash()) => {
+            Settles::Effects(*receipt_hash)
+        }
+        // Refused here, or completed here and refused by a counterpart.
+        // Either way the effects are gone and the charge is what is left.
+        _ => match (outcome.fee_receipt(), outcome.outcome()) {
+            (Some(charge), _) => Settles::Charge(charge),
+            (None, ExecutionOutcome::Failed) => Settles::Failure,
+            (None, _) => Settles::Nothing,
+        },
+    }
 }
 
 /// Reason a `FinalizedWave`'s receipts don't agree with its own EC.
@@ -273,22 +329,13 @@ impl FinalizedWave {
             .find(|ec| ec.wave_id() == self.certificate.wave_id())
             .ok_or(ReceiptValidationError::MissingLocalEc)?;
 
+        let refused = refused_transactions(&self.certificate);
         let mut receipt_iter = self.receipts.iter();
         for outcome in local_ec.tx_outcomes() {
-            // An aborted outcome carries no receipt of the transaction's
-            // own effects — that is what makes the abort atomic. It may
-            // still settle the payer's fee through a receipt carrying
-            // only that debit, named by hash on the outcome.
-            let ec_kind = match outcome.outcome() {
-                ExecutionOutcome::Aborted => match outcome.fee_receipt() {
-                    Some(fee_receipt) => Some(fee_receipt),
-                    None => continue,
-                },
-                ExecutionOutcome::Succeeded { receipt_hash } => Some(*receipt_hash),
-                // A failure produced no effects to apply, but its payer
-                // still owes for the attempt. When it settles that charge
-                // the fee receipt stands in for the `Failed` receipt.
-                ExecutionOutcome::Failed => outcome.fee_receipt(),
+            let ec_kind = match settles(outcome, &refused) {
+                Settles::Effects(hash) | Settles::Charge(hash) => Some(hash),
+                Settles::Failure => None,
+                Settles::Nothing => continue,
             };
 
             let receipt =
@@ -353,6 +400,18 @@ impl FinalizedWave {
     /// settles whatever the verdict, which is what makes a refused
     /// attempt cost its payer something.
     ///
+    /// The [`settles`] rule the receipts were built under, re-read
+    /// against the certificate rather than trusted: a wave arriving from
+    /// a peer is validated at ingress, and this is the backstop for
+    /// anything that reaches state by another road.
+    ///
+    /// It bites in one direction only. A refused transaction settles the
+    /// charge its outcome named and nothing else, because the failure to
+    /// stop there moves value one-sidedly. Anything the certificate does
+    /// not refuse passes as it stands — a receipt whose hash disagreed
+    /// with its outcome is caught at ingress, and dropping it here
+    /// instead would lose committed state with no diagnostic.
+    ///
     /// The attested roots are deliberately not filtered this way:
     /// `local_receipt_root` covers everything the wave carried, because
     /// it attests what execution produced. This attests what the wave
@@ -362,17 +421,17 @@ impl FinalizedWave {
         // Read off the certificates rather than through `tx_decisions`,
         // whose canonical order needs the local EC: a receipt names its
         // own transaction, so nothing here has to enumerate the wave, and
-        // a malformed certificate settles nothing instead of panicking on
-        // the commit path.
-        let mut refused: HashSet<TxHash> = HashSet::new();
-        let mut charges: HashSet<GlobalReceiptHash> = HashSet::new();
+        // a malformed certificate needs no special case on the commit
+        // path.
+        let refused = refused_transactions(&self.certificate);
+        // Per transaction, not a bare set of hashes: two legs of one payer
+        // owing the same floor produce byte-identical charges, and a set
+        // would let either stand in for the other.
+        let mut charges: HashMap<TxHash, GlobalReceiptHash> = HashMap::new();
         for ec in self.certificate.execution_certificates() {
             for outcome in ec.tx_outcomes() {
-                if !matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }) {
-                    refused.insert(outcome.tx_hash());
-                }
-                if let Some(charge) = outcome.fee_receipt() {
-                    charges.insert(charge);
+                if let Settles::Charge(hash) = settles(outcome, &refused) {
+                    charges.insert(outcome.tx_hash(), hash);
                 }
             }
         }
@@ -380,7 +439,7 @@ impl FinalizedWave {
             .iter()
             .filter(|receipt| {
                 !refused.contains(&receipt.tx_hash)
-                    || charges.contains(&receipt.consensus.receipt_hash())
+                    || charges.get(&receipt.tx_hash) == Some(&receipt.consensus.receipt_hash())
             })
             .cloned()
             .collect()

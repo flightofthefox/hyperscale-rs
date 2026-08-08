@@ -213,7 +213,8 @@ pub use wave::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
 };
 pub use wave::finalized::{
-    FinalizedWave, FinalizedWaveContext, FinalizedWaveVerifyError, ReceiptValidationError,
+    FinalizedWave, FinalizedWaveContext, FinalizedWaveVerifyError, ReceiptValidationError, Settles,
+    refused_transactions, settles,
 };
 pub use wave::id::{MAX_REMOTE_SHARDS_PER_WAVE, WaveId};
 pub use wave::outcome::{ExecutionOutcome, TxOutcome};

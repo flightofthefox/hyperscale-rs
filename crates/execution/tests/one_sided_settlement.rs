@@ -10,7 +10,8 @@
 mod common;
 
 use common::sim::{
-    ExecutionSim, LEFT, Schedule, cell_of, counter, settle, settle_refused_by_counterpart,
+    ExecutionSim, FLOOR, LEFT, Schedule, amount, cell_of, charge_of, counter, settle,
+    settle_refused_by_counterpart, vault_of,
 };
 use hyperscale_types::test_utils::{test_prefix, test_transaction_with_prefixes};
 use hyperscale_types::{ShardId, Transaction};
@@ -29,8 +30,10 @@ fn crossing(seed: u8) -> Transaction {
     )
 }
 
-/// Settle a crossing with `refused`, and report what reached state.
-fn settled_local_effect(refused: bool) -> u64 {
+/// Settle a crossing with `refused`, and report what reached state: the
+/// cell its effects would have written, the vault they would have
+/// credited, and the charge it owes for having been refused.
+fn settled_local_effect(refused: bool) -> (u64, u128, u128) {
     let mut sim = ExecutionSim::with_shards(Schedule::Eager, 2, LEFT);
 
     let leg = crossing(0);
@@ -43,27 +46,43 @@ fn settled_local_effect(refused: bool) -> u64 {
     assert!(!receipts.is_empty(), "the local half executed");
 
     let finalized = if refused {
-        settle_refused_by_counterpart(&wave, ShardId::leaf(1, 1), &receipts)
+        settle_refused_by_counterpart(
+            &wave,
+            ShardId::leaf(1, 1),
+            &receipts,
+            &sim.charges_for(&wave),
+        )
     } else {
         settle(&wave, &receipts)
     };
     sim.commit(Vec::new(), vec![finalized]);
     sim.drain();
-    counter(sim.settled(cell_of(test_prefix(LOCAL))))
+    (
+        counter(sim.settled(cell_of(test_prefix(LOCAL)))),
+        amount(sim.settled(vault_of(test_prefix(LOCAL)))),
+        amount(sim.settled(charge_of(test_prefix(LOCAL)))),
+    )
 }
 
-/// The control: with every participant accepting, the local half settles.
+/// The control: with every participant accepting, the local half settles
+/// and there is nothing to charge.
 #[test]
 fn an_accepted_crossing_settles_its_local_half() {
-    assert_eq!(settled_local_effect(false), 1);
+    assert_eq!(settled_local_effect(false), (1, 1, 0));
 }
 
-/// The refusal: nothing settles, because nothing happened.
+/// The refusal: none of the effects settle, because nothing happened —
+/// and the charge does, because the attempt did.
+///
+/// The two halves fail in opposite directions and both matter. Settling
+/// the effects moves value one-sidedly; dropping the charge with them
+/// makes a transaction whose counterpart refuses it free, and leaves the
+/// tick chain holding a debit state never takes.
 #[test]
-fn a_crossing_refused_by_its_counterpart_settles_nothing() {
+fn a_crossing_refused_by_its_counterpart_settles_only_its_charge() {
     assert_eq!(
         settled_local_effect(true),
-        0,
-        "a shard applied its own half of a transaction the wave refused"
+        (0, 0, FLOOR),
+        "a refused crossing must settle its charge and none of its effects"
     );
 }
