@@ -354,15 +354,15 @@ impl Finalization {
     /// back out of storage.
     ///
     /// Used on the storage/sync serving side to rebuild the in-memory shape
-    /// from committed state. Walks the local EC's `tx_outcomes` (canonical block
-    /// order) and fetches each receipt via `lookup`. Aborted txs are skipped —
-    /// they produce no receipt (matches the shape in `execution::finalize`).
+    /// from committed state. Walks the local EC's `tx_outcomes` in canonical
+    /// block order and fetches a receipt for each outcome that settles one.
     ///
     /// Returns `None` if:
     /// - The wave lacks a local EC (malformed — should not happen for a
     ///   committed wave per the `WaveState::attestation` invariant).
-    /// - Any non-aborted tx's receipt is missing from the lookup (peer/storage
-    ///   has incomplete state — syncing peer should try a different source).
+    /// - A receipt the wave settled is missing from the lookup
+    ///   (peer/storage has incomplete state — a syncing peer should try a
+    ///   different source).
     pub fn reconstruct<F>(attestation: Self, mut lookup: F) -> Option<Self>
     where
         F: FnMut(&TxHash) -> Option<Arc<ConsensusReceipt>>,
@@ -372,16 +372,20 @@ impl Finalization {
             .iter()
             .find(|ec| ec.tick_id() == &attestation.tick_id)?;
 
+        // Which outcomes owe a receipt is [`settles`]'s question, asked
+        // against the whole certificate — the same reading that built the
+        // list. An outcome that settles nothing was never stored, and an
+        // outcome that settles something was: anything else here would
+        // either demand a receipt that does not exist or admit one the
+        // wave never carried.
+        let refused = refused_transactions(&attestation.execution_certificates);
         let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
         for outcome in local_ec.tx_outcomes() {
-            match lookup(&outcome.tx_hash()) {
-                Some(receipt) => {
-                    receipts.push(StoredReceipt::synced(outcome.tx_hash(), receipt));
-                }
-                // An abort settling a fee still owes that receipt.
-                None if outcome.is_aborted() && outcome.fee_receipt().is_none() => {}
-                None => return None,
+            if matches!(settles(outcome, &refused), Settles::Nothing) {
+                continue;
             }
+            let receipt = lookup(&outcome.tx_hash())?;
+            receipts.push(StoredReceipt::synced(outcome.tx_hash(), receipt));
         }
 
         Some(attestation.with_receipts(receipts))

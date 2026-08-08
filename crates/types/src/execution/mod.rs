@@ -622,6 +622,50 @@ mod tests {
         );
     }
 
+    /// A leg that succeeded here and was refused by its counterpart
+    /// settles nothing when it owes no charge — so no receipt was ever
+    /// stored for it, and a rebuild must not demand one. This is the
+    /// ordinary shape on a non-payer shard: the payer settles the charge,
+    /// this side settles nothing at all.
+    #[test]
+    fn reconstruct_skips_a_leg_its_counterpart_refused() {
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
+        let remote_tick_id = make_tick_id(1, BlockHeight::new(42));
+        let settling = TxHash::from(Hash::from_bytes(b"settling"));
+        let refused = TxHash::from(Hash::from_bytes(b"refused_by_counterpart"));
+
+        // Locally both succeeded; the counterpart aborted the second.
+        let local_ec = make_local_ec(
+            &tick_id,
+            vec![
+                TxOutcome::new(
+                    settling,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                ),
+                TxOutcome::new(
+                    refused,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                ),
+            ],
+        );
+        let remote_ec = make_local_ec(
+            &remote_tick_id,
+            vec![TxOutcome::new(refused, ExecutionOutcome::Aborted)],
+        );
+        let attestation = Finalization::new(tick_id, vec![local_ec, remote_ec], vec![]);
+
+        let fw = Finalization::reconstruct(attestation, |tx_hash| {
+            (*tx_hash == settling).then(make_success_receipt)
+        })
+        .expect("a refused leg owing no charge stored no receipt to find");
+        assert_eq!(fw.receipts().len(), 1);
+        assert_eq!(fw.receipts()[0].tx_hash, settling);
+    }
+
     #[test]
     fn reconstruct_fails_when_local_ec_missing() {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
