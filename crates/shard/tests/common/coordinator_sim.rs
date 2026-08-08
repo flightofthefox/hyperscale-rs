@@ -31,7 +31,7 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
-    ChainEntry, PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter,
+    ChainEntry, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
@@ -1780,8 +1780,11 @@ impl ShardCoordinatorSim {
                     .view_at(parent_block_hash, parent_block_height);
                 let pending_snapshots = view.pending_snapshots().to_vec();
                 let (computed_root, jmt_snapshot, prepared) = view.prepare_block_commit(
-                    parent_state_root,
-                    parent_block_height,
+                    ParentAnchor {
+                        state_root: parent_state_root,
+                        height: parent_block_height,
+                        state: view.as_ref(),
+                    },
                     &finalized_waves,
                     block_height,
                     &pending_snapshots,

@@ -7,12 +7,12 @@ use hyperscale_storage::tree::{
     resolve_materialized_root,
 };
 use hyperscale_storage::{
-    BaseReadCache, JmtSnapshot, ShardChainWriter, SubstateDatabase, merge_state_writes,
+    BaseReadCache, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateDatabase,
     merge_writes_from_receipts,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, FinalizedWave, PreparedCommit,
-    QuorumCertificate, StateRoot, StateWrites, StoredReceipt, SyncHint, Verifiable, Verified,
+    QuorumCertificate, SettledWrites, StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 
@@ -26,8 +26,7 @@ use crate::typed_cf::TypedCf;
 impl ShardChainWriter for RocksDbShardStorage {
     fn prepare_block_commit(
         self: &Arc<Self>,
-        parent_state_root: StateRoot,
-        parent_block_height: BlockHeight,
+        parent: ParentAnchor<'_>,
         finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
@@ -52,8 +51,8 @@ impl ShardChainWriter for RocksDbShardStorage {
             let jmt_snapshot = Arc::new(noop_jmt_snapshot(
                 &SnapshotTreeStore::new(&self.db, self.root_path.clone()),
                 pending_snapshots,
-                parent_state_root,
-                parent_block_height,
+                parent.state_root,
+                parent.height,
                 block_height,
             ));
             let prepared = build_prepared_commit(
@@ -61,7 +60,7 @@ impl ShardChainWriter for RocksDbShardStorage {
                 WriteBatch::default(),
                 Arc::clone(&jmt_snapshot),
             );
-            return (parent_state_root, jmt_snapshot, prepared);
+            return (parent.state_root, jmt_snapshot, prepared);
         }
 
         let snapshot_store = SnapshotTreeStore::new(&self.db, self.root_path.clone());
@@ -69,7 +68,7 @@ impl ShardChainWriter for RocksDbShardStorage {
         // ancestor (a block prepared before its parent's tree existed,
         // across a recovery bridge) carries this same root without
         // holding its node, and the JMT applier needs a version that does.
-        let parent_version = jmt_parent_height(parent_block_height, parent_state_root)
+        let parent_version = jmt_parent_height(parent.height, parent.state_root)
             .map(BlockHeight::inner)
             .map(|pv| {
                 resolve_materialized_root(&snapshot_store, pending_snapshots, pv)
@@ -79,42 +78,36 @@ impl ShardChainWriter for RocksDbShardStorage {
         // Collect per-receipt writes references — no merge needed.
         // State locking guarantees no key conflicts between receipts, so
         // put_at_version can flatten them directly into JMT work items.
-        let per_receipt_writes: Vec<&StateWrites> = settling
-            .iter()
-            .filter_map(|r| r.consensus.writes())
-            .collect();
+        // One resolution, feeding both the tree and the substate batch —
+        // they commit the same values or they disagree about state. A
+        // receipt says what it moved, and two receipts moving one cell
+        // compose only once something has said what they moved from.
+        let settled = merge_writes_from_receipts(&settling, &mut |key| parent.state.substate(key));
 
         let (computed_root, collected) = if pending_snapshots.is_empty() {
             put_at_version(
                 &snapshot_store,
                 parent_version,
                 block_height.inner(),
-                &per_receipt_writes,
+                &settled,
             )
         } else {
             let overlay = OverlayTreeReader::new(&snapshot_store, pending_snapshots);
-            put_at_version(
-                &overlay,
-                parent_version,
-                block_height.inner(),
-                &per_receipt_writes,
-            )
+            put_at_version(&overlay, parent_version, block_height.inner(), &settled)
         };
 
         let jmt_snapshot = Arc::new(JmtSnapshot::from_collected_writes(
             collected,
-            parent_state_root,
-            parent_block_height,
+            parent.state_root,
+            parent.height,
             computed_root,
             block_height,
         ));
 
         // Merge writes for the substate WriteBatch (off the state_root critical path).
-        let merged_writes = merge_state_writes(&per_receipt_writes);
-
         // Pre-build substate + receipt writes into a WriteBatch for efficient commit.
         let mut write_batch = self.build_substate_write_batch(
-            &merged_writes,
+            &settled,
             block_height.inner(),
             /* write_history */ true,
             base_reads,
@@ -275,7 +268,7 @@ impl RocksDbShardStorage {
     /// the commit see the same `base_version`.
     pub(crate) fn commit_block_inner_locked(
         &self,
-        merged_writes: &StateWrites,
+        merged_writes: &SettledWrites,
         block: &Block,
         qc: &Verified<QuorumCertificate>,
         receipts: &[StoredReceipt],
@@ -319,12 +312,8 @@ impl RocksDbShardStorage {
         // Compute JMT update.
         let parent_version =
             jmt_parent_height(BlockHeight::new(base_version), base_root).map(BlockHeight::inner);
-        let (new_root, collected) = put_at_version(
-            &snapshot_store,
-            parent_version,
-            block_height,
-            &[merged_writes],
-        );
+        let (new_root, collected) =
+            put_at_version(&snapshot_store, parent_version, block_height, merged_writes);
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
             base_root,

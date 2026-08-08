@@ -9,7 +9,9 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
-use hyperscale_storage::{JmtSnapshot, ShardChainWriter, ShardStorage, SubstateStore};
+use hyperscale_storage::{
+    JmtSnapshot, ParentAnchor, ShardChainWriter, ShardStorage, SubstateDatabase, SubstateStore,
+};
 use hyperscale_types::network::gossip::{CertifiedBlockHeaderGossip, ShardForkProofGossip};
 use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, ReadySignalNotification, TimeoutNotification,
@@ -191,7 +193,7 @@ pub struct ProposalResult {
 /// 4. Return block, hash, prepared commit handle
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)] // one linear block-assembly pipeline
-pub fn build_proposal<S: ShardChainWriter>(
+pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
     storage: &Arc<S>,
     proposer: ValidatorId,
     height: BlockHeight,
@@ -223,8 +225,13 @@ pub fn build_proposal<S: ShardChainWriter>(
     pending_snapshots: &[Arc<JmtSnapshot>],
 ) -> ProposalResult {
     let (state_root, jmt_snapshot, prepared) = storage.prepare_block_commit(
-        parent_state_root,
-        parent_block_height,
+        ParentAnchor {
+            state_root: parent_state_root,
+            height: parent_block_height,
+            // The proposer builds on an anchored view of its parent —
+            // the state this block's settling movements land on.
+            state: storage.as_ref(),
+        },
         &certificates,
         height,
         pending_snapshots,
@@ -763,8 +770,11 @@ where
                 .view_at(parent_block_hash, parent_block_height);
             let pending_snapshots = view.pending_snapshots().to_vec();
             let (computed_root, jmt_snapshot, prepared) = view.prepare_block_commit(
-                parent_state_root,
-                parent_block_height,
+                ParentAnchor {
+                    state_root: parent_state_root,
+                    height: parent_block_height,
+                    state: view.as_ref(),
+                },
                 &finalized_waves,
                 block_height,
                 &pending_snapshots,

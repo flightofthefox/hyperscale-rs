@@ -12,7 +12,27 @@ use hyperscale_types::{
     Verifiable, Verified,
 };
 
-use crate::{BaseReadCache, JmtSnapshot};
+use crate::{BaseReadCache, JmtSnapshot, SubstateDatabase};
+
+/// The block a new one builds on: what it committed, and the state it
+/// left behind.
+///
+/// One value rather than three parameters because they answer one
+/// question and have to agree. A settling receipt says what it *moved*,
+/// and a movement is nothing without the value it moves from — so a
+/// `state` that did not come from the block at `height` would resolve
+/// movements against the wrong baseline and fork the state root against
+/// every replica that anchored correctly.
+pub struct ParentAnchor<'a> {
+    /// The parent's committed state root.
+    pub state_root: StateRoot,
+    /// The parent's height.
+    pub height: BlockHeight,
+    /// The state as the parent left it — what this block's writes land
+    /// on. Anchored at the parent, which is not always the committed
+    /// tip: a proposer builds on blocks that have not persisted yet.
+    pub state: &'a dyn SubstateDatabase,
+}
 
 /// Abstracts state commitment for both simulation and production storage.
 ///
@@ -61,8 +81,7 @@ pub trait ShardChainWriter: Send + Sync + 'static {
     /// Returns `(computed_state_root, jmt_snapshot, prepared)`.
     fn prepare_block_commit(
         self: &Arc<Self>,
-        parent_state_root: StateRoot,
-        parent_block_height: BlockHeight,
+        parent: ParentAnchor<'_>,
         finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],

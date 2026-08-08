@@ -35,12 +35,12 @@ pub use beacon::chain_writer::BeaconChainWriter;
 pub use beacon::ratify_registers::RatifyRegisterStore;
 pub use beacon::storage::BeaconStorage;
 use hyperscale_jmt::TreeReader;
-use hyperscale_types::{StateWrites, SubstateKey};
+use hyperscale_types::{SettledWrites, SubstateKey};
 pub use shard::boundary::{
     AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, WitnessSeed,
 };
 pub use shard::chain_reader::{BlockForSync, ShardChainReader};
-pub use shard::chain_writer::ShardChainWriter;
+pub use shard::chain_writer::{ParentAnchor, ShardChainWriter};
 pub use shard::genesis::GenesisCommit;
 pub use shard::pending_chain::{BaseReadCache, ChainEntry, PendingChain, SubstateView};
 pub use shard::recovered_state::RecoveredState;
@@ -100,6 +100,8 @@ pub trait SubstateDatabase {
 /// Write access to a substate store. Test and genesis paths commit
 /// through it directly; the live path goes through `ShardChainWriter`.
 pub trait CommittableSubstateDatabase {
-    /// Apply `writes` to the store.
-    fn commit(&mut self, writes: &StateWrites);
+    /// Apply `writes` to the store. Values only — a store holds values,
+    /// so whatever moved has already been resolved against what it moved
+    /// from.
+    fn commit(&mut self, writes: &SettledWrites);
 }

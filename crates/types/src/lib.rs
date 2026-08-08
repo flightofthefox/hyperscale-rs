@@ -83,7 +83,7 @@ pub use hyperscale_crypto::{
 pub use hyperscale_hbor::HborSigned;
 pub use hyperscale_vm_types::{
     AMOUNT_CELL_BYTES, Address, LocalKey, MAX_CELL_VALUE_LEN, Mode, ModeKind, Movement,
-    StateWrites, SubstateKey, amount_cell, compatible, encode_amount, read_amount,
+    SettledWrites, StateWrites, SubstateKey, amount_cell, compatible, encode_amount, read_amount,
 };
 pub use network::{
     GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,

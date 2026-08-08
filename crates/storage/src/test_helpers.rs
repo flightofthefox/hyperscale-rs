@@ -4,7 +4,7 @@
 //! `WaveCertificate`, `Block`, and `QuorumCertificate` so that
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_jmt::TreeReader;
@@ -16,10 +16,10 @@ use hyperscale_types::{
     FeeSummary, FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey,
     LocalReceiptRoot, LogLevel, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof,
     ProposerTimestamp, ProvisionsRoot, QuorumCertificate, Randomness, RatifyCert, RatifyRound,
-    RevealChain, Round, ShardAnchor, ShardId, ShardLoad, ShardWitnessPayload, SignerBitfield,
-    SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt, SubstateKey,
-    SubstateLeaf, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-    WaveCertificate, WaveId, WeightedTimestamp, WitnessSources, WorkInFlight,
+    RevealChain, Round, SettledWrites, ShardAnchor, ShardId, ShardLoad, ShardWitnessPayload,
+    SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt,
+    SubstateKey, SubstateLeaf, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
+    Verified, WaveCertificate, WaveId, WeightedTimestamp, WitnessSources, WorkInFlight,
     compute_global_receipt_root, compute_merkle_root,
 };
 
@@ -64,7 +64,7 @@ pub fn import_boundary_state<S: BoundaryStore>(
     storage.finalize_boundary_import(height, witnesses)
 }
 
-/// A [`StateWrites`] holding one cell: owner `[owner_seed; 16]`, local
+/// A receipt's writes holding one cell: owner `[owner_seed; 16]`, local
 /// zero-padded from `local_seed`.
 #[must_use]
 pub fn make_state_writes(owner_seed: u8, local_seed: u8, value: Vec<u8>) -> StateWrites {
@@ -73,6 +73,16 @@ pub fn make_state_writes(owner_seed: u8, local_seed: u8, value: Vec<u8>) -> Stat
         .cells
         .insert(state_key(owner_seed, local_seed), Some(value));
     writes
+}
+
+/// The same cell as a value a store can commit directly, for the tests
+/// that skip the receipt path.
+#[must_use]
+pub fn make_settled_writes(owner_seed: u8, local_seed: u8, value: Vec<u8>) -> SettledWrites {
+    SettledWrites::from_absolutes(BTreeMap::from([(
+        state_key(owner_seed, local_seed),
+        Some(value),
+    )]))
 }
 
 /// The substate key for owner `[owner_seed; 16]`, local zero-padded from
@@ -143,7 +153,7 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             Vec::new(),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             WorkInFlight::ZERO,
             BeaconWitnessRoot::ZERO,
             BeaconWitnessLeafCount::ZERO,
@@ -494,7 +504,7 @@ pub fn commit_block_with_witnesses(
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             Vec::new(),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             WorkInFlight::ZERO,
             root,
             count,
@@ -563,7 +573,7 @@ pub fn commit_block_with_witness_window(
             LocalReceiptRoot::ZERO,
             ProvisionsRoot::ZERO,
             Vec::new(),
-            std::collections::BTreeMap::new(),
+            BTreeMap::new(),
             WorkInFlight::ZERO,
             root,
             count,

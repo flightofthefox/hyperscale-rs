@@ -9,8 +9,8 @@ use hyperscale_storage::JmtSnapshot;
 use hyperscale_storage::tree::{carry_noop_root, jmt_parent_height, put_at_version};
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
-    ExecutionMetadata, QuorumCertificate, SafeVoteRegisters, ShardWitnessPayload, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, Transaction, TxHash, ValidatorId, WaveCertificate,
+    ExecutionMetadata, QuorumCertificate, SafeVoteRegisters, SettledWrites, ShardWitnessPayload,
+    StateRoot, StoredReceipt, SubstateKey, Transaction, TxHash, ValidatorId, WaveCertificate,
     WaveId,
 };
 
@@ -110,7 +110,7 @@ impl SharedState {
 /// split observer's follow path.
 pub fn apply_state_writes(
     s: &mut SharedState,
-    writes: &StateWrites,
+    writes: &SettledWrites,
     height: BlockHeight,
 ) -> StateRoot {
     apply_writes(s, writes, height.inner(), /* write_history */ true);
@@ -118,7 +118,7 @@ pub fn apply_state_writes(
     let parent_version =
         jmt_parent_height(s.current_block_height, s.current_root_hash).map(BlockHeight::inner);
     let (new_root, collected) =
-        put_at_version(&s.tree_store, parent_version, height.inner(), &[writes]);
+        put_at_version(&s.tree_store, parent_version, height.inner(), writes);
 
     for (key, node) in &collected.nodes {
         s.tree_store.insert(key.clone(), Arc::clone(node));
@@ -253,11 +253,11 @@ impl ConsensusState {
 /// no pre-state to preserve.
 pub fn apply_writes(
     state: &mut SharedState,
-    writes: &StateWrites,
+    writes: &SettledWrites,
     version: u64,
     write_history: bool,
 ) {
-    for (key, change) in &writes.cells {
+    for (key, change) in writes.cells() {
         let prior = state.current_state.get(key).cloned();
         if write_history {
             state.state_history.insert((*key, version), prior);

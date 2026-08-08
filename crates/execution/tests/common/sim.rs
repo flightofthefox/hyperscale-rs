@@ -42,10 +42,10 @@ use hyperscale_types::test_utils::{TestCommittee, certify, make_live_block};
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, EventRoot,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FinalizedWave, GlobalReceipt,
-    LocalKey, MerkleInclusionProof, ShardId, ShardTrie, SignerBitfield, StateRoot, StateWrites,
-    StoredReceipt, SubstateKey, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome,
-    ValidatorId, Verifiable, Verified, WaveCertificate, WaveId, WeightedTimestamp,
-    compute_global_receipt_root,
+    LocalKey, MerkleInclusionProof, SettledWrites, ShardId, ShardTrie, SignerBitfield, StateRoot,
+    StateWrites, StoredReceipt, SubstateKey, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
+    WeightedTimestamp, compute_global_receipt_root,
 };
 
 /// The shard a single-shard fixture runs on.
@@ -82,12 +82,12 @@ pub enum Schedule {
 struct StubBase {
     /// Settled writes in commit order, each with the height that applied
     /// them.
-    history: Mutex<Vec<(BlockHeight, StateWrites)>>,
+    history: Mutex<Vec<(BlockHeight, SettledWrites)>>,
 }
 
 impl StubBase {
     /// Land a settled write set at `height`.
-    fn apply(&self, height: BlockHeight, writes: &StateWrites) {
+    fn apply(&self, height: BlockHeight, writes: &SettledWrites) {
         self.history
             .lock()
             .expect("base lock")
@@ -102,7 +102,7 @@ impl StubBase {
             if *applied > height {
                 break;
             }
-            for (key, change) in &writes.cells {
+            for (key, change) in writes.cells() {
                 match change {
                     Some(value) => {
                         cells.insert(*key, value.clone());

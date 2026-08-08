@@ -242,10 +242,12 @@ impl RocksDbShardStorage {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use hyperscale_jmt::NibblePath;
     use hyperscale_storage::SubstateDatabase;
     use hyperscale_storage::test_helpers::state_key;
-    use hyperscale_types::StateWrites;
+    use hyperscale_types::SettledWrites;
     use tempfile::TempDir;
 
     use super::super::core::RocksDbShardStorage;
@@ -269,15 +271,16 @@ mod tests {
         let key_a = state_key(1, 10);
         let key_b = state_key(2, 20);
 
-        let mut writes = StateWrites::default();
-        writes.cells.insert(key_a, Some(vec![0xAA]));
-        writes.cells.insert(key_b, Some(vec![0xBB]));
+        let writes = SettledWrites::from_absolutes(BTreeMap::from([
+            (key_a, Some(vec![0xAA])),
+            (key_b, Some(vec![0xBB])),
+        ]));
         storage.commit(&writes).unwrap();
 
         // Advance JMT version past the retention window with empty
         // commits so the history cutoff is above version 1.
         for _ in 0..4 {
-            storage.commit(&StateWrites::default()).unwrap();
+            storage.commit(&SettledWrites::default()).unwrap();
         }
 
         storage.run_state_history_gc();

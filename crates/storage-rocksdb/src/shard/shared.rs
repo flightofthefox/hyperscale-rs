@@ -14,15 +14,15 @@ use std::sync::Arc;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::{
     AdoptSource, BaseReadCache, BlockForSync, BoundaryStore, GenesisCommit, ImportProgress,
-    JmtSnapshot, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateDatabase,
-    SubstateStore, VersionedStore, WitnessSeed,
+    JmtSnapshot, ParentAnchor, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
+    SubstateDatabase, SubstateStore, VersionedStore, WitnessSeed,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, ExecutionCertificate, FinalizedWave,
-    MerkleInclusionProof, PreparedCommit, QuorumCertificate, SafeVoteRegisters,
-    ShardWitnessPayload, StateRoot, StateWrites, StoredReceipt, SubstateKey, SubstateLeaf,
-    Transaction, TxHash, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
+    MerkleInclusionProof, PreparedCommit, QuorumCertificate, SafeVoteRegisters, SettledWrites,
+    ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf, Transaction, TxHash,
+    ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
 };
 
 use super::core::RocksDbShardStorage;
@@ -69,12 +69,12 @@ impl SubstateDatabase for SharedStorage {
 }
 
 impl GenesisCommit for SharedStorage {
-    fn install_genesis(&self, substates: &StateWrites, jmt_writes: &StateWrites) -> StateRoot {
+    fn install_genesis(&self, substates: &SettledWrites, jmt_writes: &SettledWrites) -> StateRoot {
         self.0.commit_substates_only(substates);
         self.0.finalize_genesis_jmt(jmt_writes)
     }
 
-    fn replicate_genesis_substates(&self, substates: &StateWrites) {
+    fn replicate_genesis_substates(&self, substates: &SettledWrites) {
         self.0.commit_substates_only(substates);
     }
 }
@@ -198,16 +198,14 @@ impl BoundaryStore for SharedStorage {
 impl ShardChainWriter for SharedStorage {
     fn prepare_block_commit(
         self: &Arc<Self>,
-        parent_state_root: StateRoot,
-        parent_block_height: BlockHeight,
+        parent: ParentAnchor<'_>,
         finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
         base_reads: Option<&BaseReadCache>,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit) {
         self.0.prepare_block_commit(
-            parent_state_root,
-            parent_block_height,
+            parent,
             finalized_waves,
             block_height,
             pending_snapshots,
@@ -305,7 +303,7 @@ mod test_helpers {
     use super::*;
 
     impl CommittableSubstateDatabase for SharedStorage {
-        fn commit(&mut self, writes: &StateWrites) {
+        fn commit(&mut self, writes: &SettledWrites) {
             RocksDbShardStorage::commit(&self.0, writes)
                 .expect("Storage commit failed - cannot maintain consistent state");
         }

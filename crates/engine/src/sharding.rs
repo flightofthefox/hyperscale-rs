@@ -7,7 +7,7 @@
 //! JMT must contain only its own subtree, so what a shard commits is
 //! filtered here first.
 
-use hyperscale_types::{Hash, ShardId, ShardTrie, StateWrites, WritesRoot};
+use hyperscale_types::{Hash, SettledWrites, ShardId, ShardTrie, StateWrites, WritesRoot};
 
 use crate::executor::protocol_hash;
 
@@ -22,11 +22,18 @@ use crate::executor::protocol_hash;
 /// the identity filter.
 #[must_use]
 pub fn filter_genesis_writes_for_shard(
-    merged: &StateWrites,
+    merged: &SettledWrites,
     local_shard: ShardId,
     shard_trie: &ShardTrie,
-) -> StateWrites {
-    filter_writes_for_shard(merged, local_shard, shard_trie)
+) -> SettledWrites {
+    SettledWrites::from_absolutes(
+        merged
+            .cells()
+            .iter()
+            .filter(|(key, _)| shard_trie.shard_for_prefix(key.owner) == local_shard)
+            .map(|(key, change)| (*key, change.clone()))
+            .collect(),
+    )
 }
 
 /// Filter [`StateWrites`] for a single shard.
@@ -43,6 +50,11 @@ pub fn filter_writes_for_shard(
     for (key, change) in &writes.cells {
         if shard_trie.shard_for_prefix(key.owner) == local_shard {
             filtered.cells.insert(*key, change.clone());
+        }
+    }
+    for (key, movement) in &writes.movements {
+        if shard_trie.shard_for_prefix(key.owner) == local_shard {
+            filtered.movements.insert(*key, *movement);
         }
     }
     filtered

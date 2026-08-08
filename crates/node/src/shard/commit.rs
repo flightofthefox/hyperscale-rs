@@ -23,7 +23,7 @@ use crossbeam::channel::Sender;
 use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
-use hyperscale_storage::{ChainEntry, PendingChain, ShardChainWriter, ShardStorage};
+use hyperscale_storage::{ChainEntry, ParentAnchor, PendingChain, ShardChainWriter, ShardStorage};
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, EpochWindows,
     FinalizedWave, LocalTimestamp, PreparedCommit, ShardId, StateRoot, SyncHint, Verifiable,
@@ -168,12 +168,14 @@ where
 
     let finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>> = block.certificates().to_vec();
     let (computed_root, jmt_snapshot, prepared) = view.prepare_block_commit(
-        pending.parent_state_root,
-        pending.parent_block_height,
+        ParentAnchor {
+            state_root: pending.parent_state_root,
+            height: pending.parent_block_height,
+            state: view.as_ref(),
+        },
         &finalized_waves,
         height,
         &pending_snapshots,
-        // `None` → the view drains its own base-read cache internally.
         None,
     );
 

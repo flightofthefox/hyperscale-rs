@@ -24,8 +24,8 @@ use hyperscale_storage::{
     BaseReadCache, GenesisCommit, JmtSnapshot, SubstateDatabase, SubstateStore, tree,
 };
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, QuorumCertificate, SafeVoteRegisters, StateRoot, StateWrites,
-    SubstateKey, ValidatorId, Verified,
+    Block, BlockHeight, ChainOrigin, QuorumCertificate, SafeVoteRegisters, SettledWrites,
+    StateRoot, SubstateKey, ValidatorId, Verified,
 };
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Options,
@@ -435,7 +435,7 @@ impl RocksDbShardStorage {
     /// history writes (no pre-state to preserve).
     pub(crate) fn build_substate_write_batch(
         &self,
-        writes: &StateWrites,
+        writes: &SettledWrites,
         version: u64,
         write_history: bool,
         base_reads: Option<&BaseReadCache>,
@@ -464,7 +464,7 @@ impl RocksDbShardStorage {
     pub(crate) fn append_substate_writes_to_batch(
         &self,
         batch: &mut WriteBatch,
-        writes: &StateWrites,
+        writes: &SettledWrites,
         version: u64,
         write_history: bool,
         base_reads: Option<&BaseReadCache>,
@@ -480,10 +480,10 @@ impl RocksDbShardStorage {
         // cache entry, batch-`multi_get_cf` them in one FFI call.
         // Priors aligned 1:1 with `writes.cells` iteration order;
         // `None` entry = cache miss, needs multi_get fallback.
-        let mut priors: Vec<Option<Option<Vec<u8>>>> = Vec::with_capacity(writes.cells.len());
+        let mut priors: Vec<Option<Option<Vec<u8>>>> = Vec::with_capacity(writes.cells().len());
         let mut miss_keys: Vec<SubstateKey> = Vec::new();
         let mut miss_indices: Vec<usize> = Vec::new();
-        for (index, key) in writes.cells.keys().enumerate() {
+        for (index, key) in writes.cells().keys().enumerate() {
             if let Some(cache) = base_reads
                 && let Some(cached) = cache.get(key)
             {
@@ -512,7 +512,7 @@ impl RocksDbShardStorage {
         // stale-set entry for this version in one shot.
         let history_key_codec = VersionedSubstateKeyCodec;
         let mut stale_history_keys: Vec<Vec<u8>> = Vec::new();
-        for ((key, change), prior_slot) in writes.cells.iter().zip(priors) {
+        for ((key, change), prior_slot) in writes.cells().iter().zip(priors) {
             let prior =
                 prior_slot.expect("every write must have a resolved prior (cache hit or fetched)");
             if let Some(new_value) = change {
@@ -570,7 +570,7 @@ impl RocksDbShardStorage {
     /// # Panics
     ///
     /// Panics if the underlying `RocksDB` write fails.
-    pub fn commit_substates_only(&self, writes: &StateWrites) {
+    pub fn commit_substates_only(&self, writes: &SettledWrites) {
         // Genesis writes at version 0. Repeat Sets to the same key
         // overwrite — idempotent by RocksDB write semantics. No history
         // entries: genesis has no pre-state to preserve.
@@ -596,7 +596,7 @@ impl RocksDbShardStorage {
     ///
     /// Panics if called after the JMT has already been initialized, or
     /// if the underlying `RocksDB` write fails.
-    pub fn finalize_genesis_jmt(&self, merged: &StateWrites) -> StateRoot {
+    pub fn finalize_genesis_jmt(&self, merged: &SettledWrites) -> StateRoot {
         let _commit_guard = self.commit_lock.lock().unwrap();
 
         // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JMT.
@@ -609,7 +609,7 @@ impl RocksDbShardStorage {
         let snapshot_store = SnapshotTreeStore::new(&self.db, self.root_path.clone());
 
         // parent=None, version=0: genesis is the first JMT state.
-        let (root, collected) = tree::put_at_version(&snapshot_store, None, 0, &[merged]);
+        let (root, collected) = tree::put_at_version(&snapshot_store, None, 0, merged);
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
             StateRoot::ZERO,
@@ -630,12 +630,12 @@ impl RocksDbShardStorage {
 }
 
 impl GenesisCommit for RocksDbShardStorage {
-    fn install_genesis(&self, substates: &StateWrites, jmt_writes: &StateWrites) -> StateRoot {
+    fn install_genesis(&self, substates: &SettledWrites, jmt_writes: &SettledWrites) -> StateRoot {
         Self::commit_substates_only(self, substates);
         Self::finalize_genesis_jmt(self, jmt_writes)
     }
 
-    fn replicate_genesis_substates(&self, substates: &StateWrites) {
+    fn replicate_genesis_substates(&self, substates: &SettledWrites) {
         Self::commit_substates_only(self, substates);
     }
 }
@@ -706,10 +706,10 @@ mod test_helpers {
         ///
         /// Panics if the commit lock is poisoned.
         #[instrument(level = Level::DEBUG, skip_all, fields(
-            cell_count = writes.cells.len(),
+            cell_count = writes.cells().len(),
             latency_us = Empty,
         ))]
-        pub fn commit(&self, writes: &StateWrites) -> Result<(), StorageError> {
+        pub fn commit(&self, writes: &SettledWrites) -> Result<(), StorageError> {
             let _commit_guard = self.commit_lock.lock().unwrap();
 
             let start = Instant::now();
@@ -732,7 +732,7 @@ mod test_helpers {
             );
 
             let (new_root, collected) =
-                tree::put_at_version(&snapshot_store, parent_version, new_version, &[writes]);
+                tree::put_at_version(&snapshot_store, parent_version, new_version, writes);
             let jmt_snapshot = JmtSnapshot::from_collected_writes(
                 collected,
                 base_root,
@@ -763,7 +763,7 @@ mod test_helpers {
     }
 
     impl CommittableSubstateDatabase for RocksDbShardStorage {
-        fn commit(&mut self, writes: &StateWrites) {
+        fn commit(&mut self, writes: &SettledWrites) {
             Self::commit(self, writes)
                 .expect("Storage commit failed - cannot maintain consistent state");
         }

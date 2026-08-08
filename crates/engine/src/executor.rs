@@ -28,16 +28,16 @@ use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::SubstateDatabase;
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Event, EventExt, EventRoot,
-    ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, ProvisionalHolds, RevealChain, Stake,
-    StakePoolSeat, StateWrites, SubstateEntry, Transaction, TxHash, Verified, compute_merkle_root,
-    install_vm_statics,
+    ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, ProvisionalHolds, RevealChain,
+    Stake, StakePoolSeat, StateWrites, SubstateEntry, Transaction, TxHash, Verified,
+    compute_merkle_root, install_vm_statics,
 };
 use hyperscale_vm_effects::{
     Address, Declaration, EffectTarget, InstanceRegistry, NodeCall, PackageHash,
     PrefixShardResolver, RoleId, SubstateKey, admit_tree, package_hash, route_tree,
 };
 use hyperscale_vm_kernel::{
-    Base, BatchTx, EnvInputs, ExecutionMode, Locality, ManifestWalk, Outcome, Receipt, amount_cell,
+    Base, BatchTx, EnvInputs, ExecutionMode, Locality, ManifestWalk, Outcome, Receipt,
     execute_batch,
 };
 
@@ -315,67 +315,28 @@ fn vm_metadata(fuel: u64, error: Option<String>) -> ExecutionMetadata {
         error,
     )
 }
-
-/// Assemble one kernel receipt into the projected [`ExecutedTx`]: fold
-/// its delta, root its writes, and run the shard projection. Aborts
-/// carry their reason and fuel in the node-local metadata.
-/// Apply the payer's fee burn on top of a transaction's kernel-mirroring
-/// fold. The burn is part of the receipt's writes — and so of its
-/// attested `writes_root` and the sync-replayable work items — while the
-/// pre-fee `running` map stays the kernel differential's source: the
-/// applied value of a fee-bearing cell is always
-/// `saturating_sub(pre-fee value, cumulative fees)`.
-fn apply_fee_burn(
-    writes: &mut BTreeMap<SubstateKey, Option<Vec<u8>>>,
-    running: &BTreeMap<SubstateKey, Option<Vec<u8>>>,
-    base: &VmBase,
-    fees_applied: &mut BTreeMap<SubstateKey, u128>,
-    fee: Option<PayerFee>,
-    fuel: u64,
-) {
-    // The transaction's own burn first: the attested actual — fuel, until
-    // real pricing lands — capped at the signed ceiling.
-    let mut own_vault = None;
-    if let Some(payer) = fee {
-        let burn = u128::from(fuel).min(payer.max_fee);
-        if burn > 0 {
-            *fees_applied.entry(payer.vault).or_insert(0) += burn;
-            own_vault = Some(payer.vault);
-        }
+/// Debit the payer's vault by what this transaction burned.
+///
+/// A movement, like every other debit, which is what makes the burn
+/// compose with whatever else reaches the vault instead of having to be
+/// re-derived into each sibling's absolute. There is nothing cumulative
+/// to track and nothing to re-stamp: two transactions burning against
+/// one vault each record their own debit and settlement adds them.
+fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>, fuel: u64) {
+    let Some(payer) = fee else {
+        return;
+    };
+    // The attested actual — fuel, until real pricing lands — capped at
+    // the signed ceiling.
+    let burn = u128::from(fuel).min(payer.max_fee);
+    if burn == 0 {
+        return;
     }
-    // Re-derive the fee-bearing cells this transaction itself carries —
-    // its own payer's vault, plus any earlier-debited vault its update
-    // set covers — from the pre-fee fold: a write of a debited cell must
-    // carry the cumulative burn, or its absolute update would revert
-    // earlier debits at commit. Cells only *other* transactions debited
-    // stay out: a receipt is one transaction's effect record, and
-    // stamping a sibling's vault into it would put a write in it the
-    // transaction never made.
-    let touched: Vec<SubstateKey> = writes
-        .keys()
-        .filter(|key| fees_applied.contains_key(*key))
-        .copied()
-        .chain(own_vault.filter(|vault| !writes.contains_key(vault)))
-        .collect();
-    for vault in touched {
-        let fees = fees_applied[&vault];
-        let prefee = writes
-            .get(&vault)
-            .cloned()
-            .or_else(|| running.get(&vault).cloned())
-            .unwrap_or_else(|| base.cells.get(&vault).cloned());
-        let Some(bytes) = prefee else {
-            continue;
-        };
-        let Ok(cell): Result<[u8; 16], _> = bytes.as_slice().try_into() else {
-            continue;
-        };
-        let debited = u128::from_le_bytes(cell).saturating_sub(fees);
-        // The burn folds outside the kernel store, so it applies the
-        // store's own rule itself: a zero balance is an absent cell, and
-        // the leaf goes with the bond it carried.
-        writes.insert(vault, amount_cell(debited).map(|cell| cell.to_vec()));
-    }
+    let entry = writes.movements.entry(payer.vault).or_default();
+    *entry = entry.then(Movement {
+        credit: 0,
+        debit: burn,
+    });
 }
 
 /// What this shard, as a transaction's fee payer, charges it.
@@ -442,41 +403,42 @@ pub const fn charge_for(outcome: &Outcome, payer: PayerFee) -> Option<u128> {
     }
 }
 
-/// The fold's mutable state across a batch: the pre-fee kernel-mirror
-/// map (the differential's source) and the cumulative fee burns layered
-/// on top of it.
+/// The fold's mutable state across a batch: the kernel-mirror map a
+/// later transaction reads what an earlier one left through, and the
+/// differential's source.
+///
+/// Fees do not appear here. A burn is a debit, a debit is a movement,
+/// and a movement needs no baseline — so nothing has to track what
+/// siblings have already burned in order to keep a later absolute from
+/// reverting it.
 struct FoldState {
     running: BTreeMap<SubstateKey, Option<Vec<u8>>>,
-    fees_applied: BTreeMap<SubstateKey, u128>,
 }
 
 /// Build the receipt an abort of this transaction settles: the payer's
 /// vault debited by the class floor, and nothing else.
 ///
-/// The value is read as of every canonically earlier transaction's
-/// applied effect and fee, but without this transaction's own — an abort
-/// discards those, so the burn must not be layered on top of them.
+/// A debit rather than a value, so it neither reads nor depends on what
+/// the vault held when the transaction ran. An abort discards this
+/// transaction's own effects, and the floor lands on whatever its
+/// siblings left — which is what a movement means and what an absolute
+/// computed here could not have expressed without re-deriving their
+/// burns.
 fn build_fee_receipt(
     ctx: &WaveBatchContext<'_>,
-    base: &VmBase,
-    fold: &FoldState,
     tx_hash: TxHash,
     vault: SubstateKey,
     floor: u128,
-) -> Option<ConsensusReceipt> {
-    let prefee = fold
-        .running
-        .get(&vault)
-        .cloned()
-        .unwrap_or_else(|| base.cells.get(&vault).cloned())?;
-    let cell: [u8; 16] = prefee.as_slice().try_into().ok()?;
-    let applied = u128::from_le_bytes(cell)
-        .saturating_sub(fold.fees_applied.get(&vault).copied().unwrap_or(0));
-    let debited = applied.saturating_sub(floor);
-
+) -> ConsensusReceipt {
     let writes = StateWrites {
-        cells: BTreeMap::from([(vault, Some(debited.to_le_bytes().to_vec()))]),
-        movements: BTreeMap::new(),
+        cells: BTreeMap::new(),
+        movements: BTreeMap::from([(
+            vault,
+            Movement {
+                credit: 0,
+                debit: floor,
+            },
+        )]),
     };
     let receipt_hash = GlobalReceipt::new(
         true,
@@ -498,7 +460,7 @@ fn build_fee_receipt(
         Vec::new(),
         Vec::new(),
     );
-    Some(project_to_shard(&cached, tx_hash, ctx.local_shard, ctx.shard_trie).consensus)
+    project_to_shard(&cached, tx_hash, ctx.local_shard, ctx.shard_trie).consensus
 }
 
 /// What judging and storing one artifact costs, whatever the verdict:
@@ -521,7 +483,6 @@ pub const fn publish_work(artifact: &[u8]) -> u64 {
 /// on and nothing for the kernel differential to check.
 fn assemble_published_tx(
     ctx: &WaveBatchContext<'_>,
-    base: &VmBase,
     vm_tx: TxHash,
     publisher: [u8; 16],
     artifact: &[u8],
@@ -536,14 +497,8 @@ fn assemble_published_tx(
     // condition `prepare` treats as a deterministic failure.
     let refusal = admit_package(artifact).err().map(|error| error.0);
 
-    let mut fold = FoldState {
-        running: BTreeMap::new(),
-        fees_applied: BTreeMap::new(),
-    };
-    let cached = if let Some(reason) = &refusal {
-        CachedOutput::failed(vm_metadata(work, Some(reason.clone())))
-    } else {
-        {
+    let cached = refusal.as_ref().map_or_else(
+        || {
             let mut writes = StateWrites::default();
             if locality.is_local(Address(publisher)) {
                 let package = package_hash(&ProtocolHasher, artifact);
@@ -554,14 +509,7 @@ fn assemble_published_tx(
                     .cells
                     .insert(package_key(publisher, package), Some(artifact.to_vec()));
             }
-            apply_fee_burn(
-                &mut writes.cells,
-                &fold.running,
-                base,
-                &mut fold.fees_applied,
-                fee,
-                work,
-            );
+            apply_fee_burn(&mut writes, fee, work);
             let receipt_hash = GlobalReceipt::new(
                 true,
                 EventRoot::ZERO,
@@ -577,15 +525,14 @@ fn assemble_published_tx(
                 Vec::new(),
                 Vec::new(),
             )
-        }
-    };
+        },
+        |reason| CachedOutput::failed(vm_metadata(work, Some(reason.clone()))),
+    );
     // A refused artifact is the sender's own defect — they chose what to
     // publish — so it pays the ceiling, exactly as a trap does. Charging
     // less would leave a rejected publish cheaper than an accepted one.
     let fee_receipt = match (&refusal, fee) {
-        (Some(_), Some(payer)) => {
-            build_fee_receipt(ctx, base, &fold, tx_hash, payer.vault, payer.max_fee)
-        }
+        (Some(_), Some(payer)) => Some(build_fee_receipt(ctx, tx_hash, payer.vault, payer.max_fee)),
         _ => None,
     };
 
@@ -631,44 +578,30 @@ fn assemble_executed_tx(
         work: attested_work,
     } = kernel;
     let tx_hash = vm_tx;
-    // Built before this transaction's own burn folds in: a charge settles
-    // over the state its siblings left, not over its own.
     let fee_receipt = fee.and_then(|payer| {
         let amount = charge_for(&receipt.outcome, payer)?;
-        let built = build_fee_receipt(ctx, base, fold, tx_hash, payer.vault, amount)?;
-        // A charge that settles unconditionally joins the cumulative
-        // burn: a sibling folded later that writes this vault must carry
-        // the debit, or its absolute update would revert the charge at
-        // commit. The floor a completed cross-shard leg holds in reserve
-        // stays out — whether it settles is the wave's verdict, unknown
-        // at fold time.
-        if !matches!(receipt.outcome, Outcome::Completed { .. }) {
-            *fold.fees_applied.entry(payer.vault).or_insert(0) += amount;
-        }
-        Some(built)
+        Some(build_fee_receipt(ctx, tx_hash, payer.vault, amount))
     });
     let cached = if matches!(receipt.outcome, Outcome::Completed { .. }) {
-        // The kernel's own flatten: this receipt's owned part folded to
-        // absolute cells, reading through the batch's running state to
-        // the pre-read base.
-        let mut writes = receipt.delta.flatten(locality, &mut |key| {
+        // What the receipt carries: exclusive writes as absolutes,
+        // everything commutative as the movement it was. Unresolved,
+        // because the state this lands on is not the state it ran
+        // against — that is settlement's question.
+        let mut writes = receipt.delta.project(locality);
+        // The batch's own fold is the one reader whose baseline really is
+        // this one: a later transaction in this tick must see what an
+        // earlier one left. It mirrors the kernel's store, so it takes
+        // the resolved form and takes it before the burn, which the
+        // kernel does not know about.
+        let resolved = writes.resolve(&mut |key| {
             fold.running
                 .get(&key)
                 .map_or_else(|| base.cells.get(&key).cloned(), Clone::clone)
         });
-        // The pre-fee fold is the kernel differential's source: update it
-        // before the burn layers on.
-        for (key, change) in &writes.cells {
+        for (key, change) in resolved.cells() {
             fold.running.insert(*key, change.clone());
         }
-        apply_fee_burn(
-            &mut writes.cells,
-            &fold.running,
-            base,
-            &mut fold.fees_applied,
-            fee,
-            receipt.fuel,
-        );
+        apply_fee_burn(&mut writes, fee, receipt.fuel);
         // Every participant derives the same events from the same
         // manifest, so the root covers the whole union while each shard's
         // receipt keeps only what its own instances emitted.
@@ -910,7 +843,6 @@ impl Executor {
 
         let mut fold = FoldState {
             running: BTreeMap::new(),
-            fees_applied: BTreeMap::new(),
         };
         let mut folded: BTreeMap<TxHash, ExecutedTx> = BTreeMap::new();
         for (vm_tx, receipt) in &outcome.receipts {
@@ -944,7 +876,6 @@ impl Executor {
                 *vm_tx,
                 assemble_published_tx(
                     ctx,
-                    &base,
                     *vm_tx,
                     *publisher,
                     artifact,

@@ -226,11 +226,11 @@ mod tests {
     use hyperscale_jmt::{Blake3Hasher, Tree};
     use hyperscale_storage::SubstateStore;
     use hyperscale_storage::test_helpers::{
-        make_state_writes, test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
-        test_boundary_unpinned_height_not_served,
+        make_settled_writes, make_state_writes, test_boundary_import_roundtrip,
+        test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
     };
     use hyperscale_types::{
-        ConsensusReceipt, GlobalReceiptHash, Hash, ShardId, SplitChildRoots, StateWrites,
+        ConsensusReceipt, GlobalReceiptHash, Hash, SettledWrites, ShardId, SplitChildRoots,
         SubstateKey, TxHash, shard_prefix_path,
     };
 
@@ -239,7 +239,7 @@ mod tests {
     type Jmt = Tree<Blake3Hasher, 1>;
 
     fn commit_one(storage: &SimShardStorage, seed: u8) {
-        storage.commit_shared(&make_state_writes(seed, seed, vec![seed, seed, seed]));
+        storage.commit_shared(&make_settled_writes(seed, seed, vec![seed, seed, seed]));
     }
 
     #[test]
@@ -297,12 +297,12 @@ mod tests {
     #[test]
     fn boundary_leaf_reads_resolve_at_pinned_version() {
         let storage = SimShardStorage::default();
-        let old = make_state_writes(7, 7, vec![1]);
+        let old = make_settled_writes(7, 7, vec![1]);
         storage.commit_shared(&old);
         storage.pin_boundary(BlockHeight::new(1)).unwrap();
 
         // Overwrite the same substate at height 2.
-        let new = make_state_writes(7, 7, vec![2]);
+        let new = make_settled_writes(7, 7, vec![2]);
         storage.commit_shared(&new);
 
         let boundary = storage.open_boundary(BlockHeight::new(1)).expect("pinned");
@@ -339,18 +339,20 @@ mod tests {
 
     /// One write under the owner prefix `[seed; 16]` wrapped as a synced
     /// receipt — the shape a followed parent block's writes arrive in.
-    fn follow_receipt(seed: u8) -> (StateWrites, StoredReceipt) {
+    /// The same one-cell write in both forms: what the receipt carries,
+    /// and what the store commits.
+    fn follow_receipt(seed: u8) -> (SettledWrites, StoredReceipt) {
         let writes = make_state_writes(seed, seed, vec![seed; 4]);
         let receipt = StoredReceipt::synced(
             TxHash::from(Hash::from_bytes(&[seed])),
             Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
-                writes: writes.clone(),
+                writes,
                 beacon_witness_events: Vec::new(),
                 events: Vec::new(),
             }),
         );
-        (writes, receipt)
+        (make_settled_writes(seed, seed, vec![seed; 4]), receipt)
     }
 
     /// Which child of the root the owner prefix `[seed; 16]` routes to —

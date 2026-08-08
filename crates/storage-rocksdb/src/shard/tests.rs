@@ -1,22 +1,23 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::test_helpers::{
-    make_state_writes, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
+    make_settled_writes, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
     make_test_execution_certificate, make_test_qc, make_test_receipt, make_test_wave_certificate,
     state_key, test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
     test_witness_payload_range_reads as helpers_test_witness_payload_range_reads,
 };
 use hyperscale_storage::{
-    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore,
-    VersionedStore, merge_state_writes,
+    ParentAnchor, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateDatabase,
+    SubstateStore, VersionedStore,
 };
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
     BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
     FinalizedWave, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, ProposerTimestamp,
-    QuorumCertificate, Round, SafeVoteRegisters, ShardId, SignerBitfield, StateRoot, StateWrites,
+    QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot,
     StoredReceipt, SubstateKey, SyncHint, TxHash, ValidatorId, Verifiable, Verified,
     WaveCertificate, WaveId, WeightedTimestamp, WitnessSources,
 };
@@ -48,7 +49,18 @@ use super::metadata::write_chain_origin;
 use crate::config::RocksDbConfig;
 
 /// Helper: wrap writes into a single `StoredReceipt` for test commit calls.
-fn updates_to_receipts(writes: &StateWrites) -> Vec<StoredReceipt> {
+/// The union of already-settled fixtures — values, so nothing to fold.
+fn union_of(parts: &[SettledWrites]) -> SettledWrites {
+    SettledWrites::from_absolutes(
+        parts
+            .iter()
+            .flat_map(SettledWrites::cells)
+            .map(|(key, change)| (*key, change.clone()))
+            .collect(),
+    )
+}
+
+fn updates_to_receipts(writes: &SettledWrites) -> Vec<StoredReceipt> {
     if writes.is_empty() {
         return vec![];
     }
@@ -56,7 +68,7 @@ fn updates_to_receipts(writes: &StateWrites) -> Vec<StoredReceipt> {
         tx_hash: TxHash::ZERO,
         consensus: Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
-            writes: writes.clone(),
+            writes: writes.clone().into(),
             beacon_witness_events: Vec::new(),
             events: Vec::new(),
         }),
@@ -74,11 +86,9 @@ fn commit_empty(storage: &RocksDbShardStorage, block: &Block, qc: &Verified<Quor
     storage.commit_block(&certified, &no_witness());
 }
 
-/// A [`StateWrites`] holding a single removal.
-fn make_state_delete(owner_seed: u8, local_seed: u8) -> StateWrites {
-    let mut writes = StateWrites::default();
-    writes.cells.insert(state_key(owner_seed, local_seed), None);
-    writes
+/// Writes holding a single removal.
+fn make_state_delete(owner_seed: u8, local_seed: u8) -> SettledWrites {
+    SettledWrites::from_absolutes(BTreeMap::from([(state_key(owner_seed, local_seed), None)]))
 }
 
 /// The per-version substate byte total tracks inserts, value updates and
@@ -89,15 +99,15 @@ fn substate_bytes_tracks_commits_and_survives_reopen() {
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
     // v1: two inserts.
-    let v1 = merge_state_writes(&[
-        &make_state_writes(3, 7, vec![1]),
-        &make_state_writes(4, 8, vec![2]),
+    let v1 = union_of(&[
+        make_settled_writes(3, 7, vec![1]),
+        make_settled_writes(4, 8, vec![2]),
     ]);
     storage.commit(&v1).unwrap();
     assert_eq!(storage.substate_bytes_at(BlockHeight::new(1)), Some(2));
 
     // v2: value update only — count unchanged.
-    storage.commit(&make_state_writes(3, 7, vec![9])).unwrap();
+    storage.commit(&make_settled_writes(3, 7, vec![9])).unwrap();
     assert_eq!(storage.substate_bytes_at(BlockHeight::new(2)), Some(2));
 
     // v3: delete one — count drops; the historical entry is untouched.
@@ -122,7 +132,7 @@ fn recovered_state_carries_substate_bytes() {
     for h in 1..=3u64 {
         let block = make_test_block(BlockHeight::new(h));
         let qc = make_test_qc(&block);
-        let updates = make_state_writes(u8::try_from(h).unwrap_or(u8::MAX), 1, vec![1]);
+        let updates = make_settled_writes(u8::try_from(h).unwrap_or(u8::MAX), 1, vec![1]);
         rocks_commit_with(&storage, &updates, &block, &qc);
     }
 
@@ -141,7 +151,7 @@ fn test_basic_substate_operations() {
 
     // Commit a value
     storage
-        .commit(&make_state_writes(3, 10, vec![99, 88, 77]))
+        .commit(&make_settled_writes(3, 10, vec![99, 88, 77]))
         .unwrap();
 
     // Now we can read it
@@ -156,7 +166,9 @@ fn test_snapshot() {
     let key = state_key(7, 10);
 
     // Write initial value
-    storage.commit(&make_state_writes(7, 10, vec![1])).unwrap();
+    storage
+        .commit(&make_settled_writes(7, 10, vec![1]))
+        .unwrap();
 
     // Take snapshot
     let snapshot = storage.snapshot();
@@ -193,7 +205,7 @@ fn test_commit_certificate_with_writes_persists_both() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
-    let writes = make_state_writes(1, 10, vec![99, 88, 77]);
+    let writes = make_settled_writes(1, 10, vec![99, 88, 77]);
     let cert = make_test_wave_certificate(BlockHeight::new(42), ShardId::ROOT);
     let wave_id = cert.wave_id().clone();
 
@@ -367,7 +379,7 @@ fn test_certificate_idempotency() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
-    let updates = make_state_writes(1, 10, vec![99, 88, 77]);
+    let updates = make_settled_writes(1, 10, vec![99, 88, 77]);
     let cert = make_test_wave_certificate(BlockHeight::new(42), ShardId::ROOT);
     let wave_id = cert.wave_id().clone();
 
@@ -402,10 +414,14 @@ fn test_block_height_increments_on_commit() {
 
     assert_eq!(storage.jmt_height(), BlockHeight::new(0));
 
-    storage.commit(&make_state_writes(1, 10, vec![1])).unwrap();
+    storage
+        .commit(&make_settled_writes(1, 10, vec![1]))
+        .unwrap();
     assert_eq!(storage.jmt_height(), BlockHeight::new(1));
 
-    storage.commit(&make_state_writes(4, 20, vec![2])).unwrap();
+    storage
+        .commit(&make_settled_writes(4, 20, vec![2]))
+        .unwrap();
     assert_eq!(storage.jmt_height(), BlockHeight::new(2));
 }
 
@@ -416,11 +432,15 @@ fn test_state_root_changes_on_commit() {
 
     let root0 = storage.state_root();
 
-    storage.commit(&make_state_writes(1, 10, vec![1])).unwrap();
+    storage
+        .commit(&make_settled_writes(1, 10, vec![1]))
+        .unwrap();
     let root1 = storage.state_root();
     assert_ne!(root0, root1, "root should change after first commit");
 
-    storage.commit(&make_state_writes(4, 20, vec![2])).unwrap();
+    storage
+        .commit(&make_settled_writes(4, 20, vec![2]))
+        .unwrap();
     let root2 = storage.state_root();
     assert_ne!(root1, root2, "root should change after second commit");
 }
@@ -552,7 +572,7 @@ fn test_commit_block_applies_writes() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
-    let updates = make_state_writes(1, 10, vec![42]);
+    let updates = make_settled_writes(1, 10, vec![42]);
     let mut block = make_test_block(BlockHeight::new(1));
     let receipts = updates_to_receipts(&updates);
     attach_receipts(&mut block, receipts);
@@ -565,9 +585,9 @@ fn test_commit_block_multiple_certs() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
-    let updates1 = make_state_writes(1, 10, vec![1]);
-    let updates2 = make_state_writes(2, 20, vec![2]);
-    let merged = merge_state_writes(&[&updates1, &updates2]);
+    let updates1 = make_settled_writes(1, 10, vec![1]);
+    let updates2 = make_settled_writes(2, 20, vec![2]);
+    let merged = union_of(&[updates1, updates2]);
     let mut block = make_test_block(BlockHeight::new(1));
     let receipts = updates_to_receipts(&merged);
     attach_receipts(&mut block, receipts);
@@ -592,8 +612,11 @@ fn test_prepare_then_commit_matches_direct() {
         Arc::new(RocksDbShardStorage::open(temp_dir1.path(), NibblePath::empty()).unwrap());
     let parent_root = s_prepared.state_root();
     let (spec_root, _jmt_snapshot, prepared) = s_prepared.prepare_block_commit(
-        parent_root,
-        BlockHeight::GENESIS,
+        ParentAnchor {
+            state_root: parent_root,
+            height: BlockHeight::GENESIS,
+            state: &*s_prepared,
+        },
         &[],
         BlockHeight::new(1),
         &[],
@@ -717,7 +740,7 @@ fn test_initial_state_root_is_zero() {
 
 #[test]
 fn test_state_root_deterministic() {
-    let updates = make_state_writes(1, 10, vec![42]);
+    let updates = make_settled_writes(1, 10, vec![42]);
 
     let td1 = TempDir::new().unwrap();
     let s1 = RocksDbShardStorage::open(td1.path(), NibblePath::empty()).unwrap();
@@ -735,11 +758,11 @@ fn test_state_root_deterministic() {
 fn test_state_root_differs_for_different_data() {
     let td1 = TempDir::new().unwrap();
     let s1 = RocksDbShardStorage::open(td1.path(), NibblePath::empty()).unwrap();
-    s1.commit(&make_state_writes(1, 10, vec![1])).unwrap();
+    s1.commit(&make_settled_writes(1, 10, vec![1])).unwrap();
 
     let td2 = TempDir::new().unwrap();
     let s2 = RocksDbShardStorage::open(td2.path(), NibblePath::empty()).unwrap();
-    s2.commit(&make_state_writes(1, 10, vec![2])).unwrap();
+    s2.commit(&make_settled_writes(1, 10, vec![2])).unwrap();
 
     assert_ne!(s1.state_root(), s2.state_root());
 }
@@ -791,7 +814,7 @@ fn test_commit_certificate_via_commit_store() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
-    let updates = make_state_writes(1, 10, vec![42]);
+    let updates = make_settled_writes(1, 10, vec![42]);
     let cert = make_test_wave_certificate(BlockHeight::new(1), ShardId::ROOT);
 
     storage.commit_certificate_with_writes(&cert, &updates);
@@ -806,7 +829,7 @@ fn test_empty_commit_still_advances_version() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
-    let updates = StateWrites::default();
+    let updates = SettledWrites::default();
     storage.commit(&updates).unwrap();
     assert_eq!(storage.jmt_height(), BlockHeight::new(1));
 }
@@ -824,7 +847,7 @@ fn test_substates_survive_reopen() {
     let cert_id;
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        let updates = make_state_writes(1, 10, vec![42]);
+        let updates = make_settled_writes(1, 10, vec![42]);
         let cert = make_test_wave_certificate(BlockHeight::new(1), ShardId::ROOT);
         cert_id = cert.wave_id().clone();
         storage.commit_certificate_with_writes(&cert, &updates);
@@ -996,7 +1019,7 @@ fn test_ec_atomic_with_block_commit() {
 /// as a single-tx `FinalizedWave` receipt inside a block and commits it.
 fn rocks_commit_with(
     storage: &RocksDbShardStorage,
-    writes: &StateWrites,
+    writes: &SettledWrites,
     block: &Block,
     qc: &Verified<QuorumCertificate>,
 ) {
@@ -1006,7 +1029,7 @@ fn rocks_commit_with(
             tx_hash: TxHash::ZERO,
             consensus: Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
-                writes: writes.clone(),
+                writes: writes.clone().into(),
                 beacon_witness_events: Vec::new(),
                 events: Vec::new(),
             }),
@@ -1050,10 +1073,10 @@ fn test_state_history_create_delete_create() {
     // Keep an anchor key alive throughout so the JMT never empties out —
     // deleting K alone at V2 would otherwise break the parent-version
     // chain. The state-history behavior under test is independent of this.
-    let anchor = make_state_writes(99, 0xFF, vec![0xFF]);
+    let anchor = make_settled_writes(99, 0xFF, vec![0xFF]);
 
     // V1: create K=A, plus anchor.
-    let v1 = merge_state_writes(&[&make_state_writes(7, 42, vec![0xAA]), &anchor]);
+    let v1 = union_of(&[make_settled_writes(7, 42, vec![0xAA]), anchor]);
     storage.commit(&v1).unwrap();
 
     // V2: delete K.
@@ -1061,7 +1084,7 @@ fn test_state_history_create_delete_create() {
 
     // V3: recreate K=B.
     storage
-        .commit(&make_state_writes(7, 42, vec![0xBB]))
+        .commit(&make_settled_writes(7, 42, vec![0xBB]))
         .unwrap();
 
     // See memory test for derivation:
@@ -1096,7 +1119,7 @@ fn substate_bytes_pruned_by_jmt_gc() {
             .unwrap();
 
     for h in 1..=10u64 {
-        let writes = make_state_writes(u8::try_from(h).unwrap_or(u8::MAX), 1, vec![1]);
+        let writes = make_settled_writes(u8::try_from(h).unwrap_or(u8::MAX), 1, vec![1]);
         storage.commit(&writes).unwrap();
     }
     storage.run_jmt_gc();
@@ -1150,10 +1173,10 @@ fn test_historical_substate_read_respects_retention() {
     for h in 1..=10u64 {
         let block = make_test_block(BlockHeight::new(h));
         let qc = make_test_qc(&block);
-        let mut writes = StateWrites::default();
-        writes
-            .cells
-            .insert(key, Some(vec![u8::try_from(h).unwrap_or(u8::MAX)]));
+        let writes = SettledWrites::from_absolutes(BTreeMap::from([(
+            key,
+            Some(vec![u8::try_from(h).unwrap_or(u8::MAX)]),
+        )]));
         rocks_commit_with(&storage, &writes, &block, &qc);
     }
     // current=10, floor=8.
@@ -1187,7 +1210,7 @@ fn test_genesis_skips_history_entries() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
 
-    let updates = make_state_writes(1, 1, vec![0xAA]);
+    let updates = make_settled_writes(1, 1, vec![0xAA]);
     storage.commit_substates_only(&updates);
 
     // StateHistoryCf must be empty after a genesis-style commit.

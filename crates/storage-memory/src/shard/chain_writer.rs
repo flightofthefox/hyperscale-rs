@@ -8,11 +8,12 @@ use hyperscale_storage::tree::{
     resolve_materialized_root,
 };
 use hyperscale_storage::{
-    BaseReadCache, JmtSnapshot, ShardChainWriter, SubstateDatabase, merge_writes_from_receipts,
+    BaseReadCache, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateDatabase,
+    merge_writes_from_receipts,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, FinalizedWave, PreparedCommit,
-    QuorumCertificate, StateRoot, StateWrites, StoredReceipt, SyncHint, Verifiable, Verified,
+    QuorumCertificate, SettledWrites, StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
@@ -21,8 +22,7 @@ use super::state::{apply_state_writes, apply_writes};
 impl ShardChainWriter for SimShardStorage {
     fn prepare_block_commit(
         self: &Arc<Self>,
-        parent_state_root: StateRoot,
-        parent_block_height: BlockHeight,
+        parent: ParentAnchor<'_>,
         finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
@@ -49,18 +49,18 @@ impl ShardChainWriter for SimShardStorage {
             let snapshot = Arc::new(noop_jmt_snapshot(
                 &s.tree_store,
                 pending_snapshots,
-                parent_state_root,
-                parent_block_height,
+                parent.state_root,
+                parent.height,
                 block_height,
             ));
             drop(s);
             let prepared = build_prepared_commit(
                 Arc::clone(self),
                 Arc::clone(&snapshot),
-                StateWrites::default(),
+                SettledWrites::default(),
                 Vec::new(),
             );
-            return (parent_state_root, snapshot, prepared);
+            return (parent.state_root, snapshot, prepared);
         }
 
         // Read lock: compute speculative JMT root.
@@ -70,60 +70,44 @@ impl ShardChainWriter for SimShardStorage {
         // ancestor (a block prepared before its parent's tree existed,
         // across a recovery bridge) carries this same root without
         // holding its node, and the JMT applier needs a version that does.
-        let parent_version = jmt_parent_height(parent_block_height, parent_state_root)
+        let parent_version = jmt_parent_height(parent.height, parent.state_root)
             .map(BlockHeight::inner)
             .map(|pv| {
                 resolve_materialized_root(&s.tree_store, pending_snapshots, pv)
                     .map_or(pv, |(v, _)| v)
             });
 
-        // Collect per-receipt writes references — no merge needed. State
-        // locking guarantees no key conflicts between receipts.
-        let per_receipt_writes: Vec<&StateWrites> = settling
-            .iter()
-            .filter_map(|r| r.consensus.writes())
-            .collect();
+        // One resolution, feeding both the tree and the substate store —
+        // they commit the same values or they disagree about state. It
+        // happens here rather than per receipt because a receipt says
+        // what it moved, and two receipts moving one cell compose only
+        // once something has said what they moved from.
+        let settled = merge_writes_from_receipts(&settling, &mut |key| parent.state.substate(key));
 
         let (result_root, collected) = if pending_snapshots.is_empty() {
             put_at_version(
                 &s.tree_store,
                 parent_version,
                 block_height.inner(),
-                &per_receipt_writes,
+                &settled,
             )
         } else {
             let overlay = OverlayTreeReader::new(&s.tree_store, pending_snapshots);
-            put_at_version(
-                &overlay,
-                parent_version,
-                block_height.inner(),
-                &per_receipt_writes,
-            )
+            put_at_version(&overlay, parent_version, block_height.inner(), &settled)
         };
 
         let snapshot = Arc::new(JmtSnapshot::from_collected_writes(
             collected,
-            parent_state_root,
-            parent_block_height,
+            parent.state_root,
+            parent.height,
             result_root,
             block_height,
         ));
 
         drop(s); // Release read lock
 
-        // Merge for commit-time substate writes (off the state_root
-        // critical path). Movements resolve against the committed tip:
-        // the read lock is already released, and what a receipt moved
-        // lands on whatever the cell holds when it settles.
-        let merged_writes =
-            merge_writes_from_receipts(&settling, &mut |key| self.as_ref().substate(key));
-
-        let prepared = build_prepared_commit(
-            Arc::clone(self),
-            Arc::clone(&snapshot),
-            merged_writes,
-            receipts,
-        );
+        let prepared =
+            build_prepared_commit(Arc::clone(self), Arc::clone(&snapshot), settled, receipts);
 
         (result_root, snapshot, prepared)
     }
@@ -163,7 +147,7 @@ impl ShardChainWriter for SimShardStorage {
 fn build_prepared_commit(
     storage: Arc<SimShardStorage>,
     snapshot: Arc<JmtSnapshot>,
-    merged_writes: StateWrites,
+    merged_writes: SettledWrites,
     receipts: Vec<StoredReceipt>,
 ) -> PreparedCommit {
     Box::new(
@@ -251,7 +235,7 @@ impl SimShardStorage {
     /// Internal commit path used by `commit_block` (sync blocks without a `PreparedCommit`).
     fn commit_block_inner(
         &self,
-        merged_writes: &StateWrites,
+        merged_writes: &SettledWrites,
         block: &Block,
         qc: &Verified<QuorumCertificate>,
         receipts: &[StoredReceipt],

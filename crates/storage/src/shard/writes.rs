@@ -1,7 +1,7 @@
 //! Merging and filtering [`StateWrites`].
 
 use hyperscale_jmt::NibblePath;
-use hyperscale_types::{StateWrites, StoredReceipt, SubstateKey};
+use hyperscale_types::{SettledWrites, StateWrites, StoredReceipt, SubstateKey};
 
 /// Extract and merge the writes from stored receipts, resolving what
 /// they moved against the state they land on.
@@ -25,7 +25,7 @@ use hyperscale_types::{StateWrites, StoredReceipt, SubstateKey};
 pub fn merge_writes_from_receipts(
     receipts: &[StoredReceipt],
     prior: &mut dyn FnMut(SubstateKey) -> Option<Vec<u8>>,
-) -> StateWrites {
+) -> SettledWrites {
     let mut merged = StateWrites::default();
     for receipt in receipts {
         if let Some(writes) = receipt.consensus.writes() {
@@ -49,12 +49,14 @@ pub fn merge_writes_from_receipts(
 pub fn merge_state_writes(list: &[&StateWrites]) -> StateWrites {
     let mut merged = StateWrites::default();
     for writes in list {
-        merged.cells.extend(
-            writes
-                .cells
-                .iter()
-                .map(|(key, change)| (*key, change.clone())),
-        );
+        for (key, change) in &writes.cells {
+            merged.cells.insert(*key, change.clone());
+            merged.movements.remove(key);
+        }
+        for (key, movement) in &writes.movements {
+            let entry = merged.movements.entry(*key).or_default();
+            *entry = entry.then(*movement);
+        }
     }
     merged
 }
@@ -67,14 +69,15 @@ pub fn merge_state_writes(list: &[&StateWrites]) -> StateWrites {
 /// leaf's routing half — so every cell of one owner shares the prefix
 /// decision.
 #[must_use]
-pub fn filter_writes_to_prefix(writes: &StateWrites, prefix: &NibblePath) -> StateWrites {
-    let mut filtered = StateWrites::default();
-    for (key, change) in &writes.cells {
-        if key_under_prefix(&key.to_bytes(), prefix) {
-            filtered.cells.insert(*key, change.clone());
-        }
-    }
-    filtered
+pub fn filter_writes_to_prefix(writes: &SettledWrites, prefix: &NibblePath) -> SettledWrites {
+    SettledWrites::from_absolutes(
+        writes
+            .cells()
+            .iter()
+            .filter(|(key, _)| key_under_prefix(&key.to_bytes(), prefix))
+            .map(|(key, change)| (*key, change.clone()))
+            .collect(),
+    )
 }
 
 /// Whether `key`'s leading bits equal `prefix` — the subtree-membership
@@ -88,12 +91,24 @@ fn key_under_prefix(key: &[u8; 32], prefix: &NibblePath) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use hyperscale_jmt::NibblePath;
     use hyperscale_types::{Address, LocalKey, SubstateKey};
 
     use super::*;
 
-    fn writes_for(owner: [u8; 16], value: u8) -> StateWrites {
+    fn writes_for(owner: [u8; 16], value: u8) -> SettledWrites {
+        SettledWrites::from_absolutes(BTreeMap::from([(
+            SubstateKey {
+                owner: Address(owner),
+                local: LocalKey([1; 16]),
+            },
+            Some(vec![value]),
+        )]))
+    }
+
+    fn relative(owner: [u8; 16], value: u8) -> StateWrites {
         let mut writes = StateWrites::default();
         writes.cells.insert(
             SubstateKey {
@@ -107,7 +122,7 @@ mod tests {
 
     #[test]
     fn later_writes_win_per_cell() {
-        let merged = merge_state_writes(&[&writes_for([1; 16], 1), &writes_for([1; 16], 2)]);
+        let merged = merge_state_writes(&[&relative([1; 16], 1), &relative([1; 16], 2)]);
         assert_eq!(merged.cells.len(), 1);
         assert_eq!(merged.cells.values().next().unwrap(), &Some(vec![2]));
     }
@@ -116,7 +131,13 @@ mod tests {
     fn prefix_filter_splits_on_the_leading_bit() {
         let low = writes_for([0x00; 16], 1);
         let high = writes_for([0xFF; 16], 2);
-        let merged = merge_state_writes(&[&low, &high]);
+        let merged = SettledWrites::from_absolutes(
+            low.cells()
+                .iter()
+                .chain(high.cells())
+                .map(|(key, change)| (*key, change.clone()))
+                .collect(),
+        );
 
         let mut left = NibblePath::empty();
         left.push_bits(0, 1);

@@ -17,15 +17,15 @@ use hyperscale_engine::{
 use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput, VersionedStore};
 use hyperscale_types::{
     BlockHash, BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
-    MerkleInclusionProof, NetworkId, ProvisionalHolds, RevealChain, ShardId, ShardTrie, StateRoot,
-    StateWrites, SubstateKey, Transaction, TransactionBody, TransactionEnvelope, Verified,
-    WeightedTimestamp, absorb_committed_cells,
+    MerkleInclusionProof, NetworkId, ProvisionalHolds, RevealChain, SettledWrites, ShardId,
+    ShardTrie, StateRoot, StateWrites, SubstateKey, Transaction, TransactionBody,
+    TransactionEnvelope, Verified, WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
     AbiParam, Address, Constraint, EdgeRef, EnvelopeTree, Expr, GraphArg, GraphNode, IntentDecl,
     ManifestGraph, Value, package_hash,
 };
-use hyperscale_vm_kernel::encode_amount;
+use hyperscale_vm_kernel::{amount_cell, encode_amount};
 use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_metadata};
 
 /// The two accounts the transfer cases move funds between, as signing
@@ -58,7 +58,7 @@ impl MapDb {
     fn genesis(accounts: &[([u8; 16], u128)]) -> Self {
         let writes = genesis_writes(accounts, &[]);
         let mut map = BTreeMap::new();
-        for (key, change) in &writes.cells {
+        for (key, change) in writes.cells() {
             let value = change.clone().expect("genesis writes are Set-only");
             map.insert(*key, value);
         }
@@ -67,9 +67,12 @@ impl MapDb {
 }
 
 impl MapDb {
-    /// Apply a receipt's committed writes, as the commit path would.
+    /// Apply a receipt's committed writes, as the commit path would —
+    /// resolving what it moved against what this map holds, which is
+    /// what settlement does.
     fn apply(&mut self, writes: &StateWrites) {
-        for (key, change) in &writes.cells {
+        let writes = writes.resolve(&mut |key| self.0.get(&key).cloned());
+        for (key, change) in writes.cells() {
             match change {
                 Some(value) => {
                     self.0.insert(*key, value.clone());
@@ -403,7 +406,7 @@ fn consecutive_payments_thread_through_the_tick_chain() {
             .consensus
             .writes()
             .expect("a completed payment commits updates");
-        threaded.push(vault_cell(updates, hot));
+        threaded.push(vault_cell(&settled_on(updates, &store), hot));
         store.apply(updates);
     }
     assert_eq!(
@@ -428,7 +431,8 @@ fn consecutive_payments_thread_through_the_tick_chain() {
             .consensus
             .writes()
             .expect("a completed payment commits updates");
-        chained.push(vault_cell(updates, hot));
+        // Against this tick's own baseline — the state it lands on.
+        chained.push(vault_cell(&settled_on(updates, &baseline.snapshot()), hot));
         chain.append(
             tick,
             TickOutput {
@@ -473,14 +477,46 @@ fn execute_batch_on(
     executor.execute_wave_batch(&ctx, snapshot_store, transactions)
 }
 
-fn vault_cell(writes: &StateWrites, owner: [u8; 16]) -> Option<Vec<u8>> {
-    writes.cells.get(&vault_key(owner, XRD)).cloned().flatten()
+/// A receipt's writes as they settle onto `accounts`.
+///
+/// A receipt says what it moved, not what the cell ends at, so an
+/// assertion about a balance has to name the state the movement lands
+/// on. These tests start from `accounts` and settle one batch onto it.
+/// A receipt's writes as they settle onto the state they land on.
+fn settled_on(writes: &StateWrites, state: &impl SubstateDatabase) -> SettledWrites {
+    writes.resolve(&mut |key| state.substate(key))
+}
+
+fn settled(writes: &StateWrites, accounts: &[([u8; 16], u128)]) -> SettledWrites {
+    eprintln!(
+        "SETTLEDBG cells={:?} movements={:?} accounts={:?}",
+        writes.cells.keys().collect::<Vec<_>>(),
+        writes.movements,
+        accounts
+            .iter()
+            .map(|(o, a)| (vault_key(*o, XRD), a))
+            .collect::<Vec<_>>()
+    );
+    writes.resolve(&mut |key| {
+        accounts
+            .iter()
+            .find(|(owner, _)| vault_key(*owner, XRD) == key)
+            .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
+    })
+}
+
+fn vault_cell(writes: &SettledWrites, owner: [u8; 16]) -> Option<Vec<u8>> {
+    writes
+        .cells()
+        .get(&vault_key(owner, XRD))
+        .cloned()
+        .flatten()
 }
 
 /// Whether the batch removed the vault cell outright — a drain, never a
 /// zero write.
-fn vault_removed(writes: &StateWrites, owner: [u8; 16]) -> bool {
-    writes.cells.get(&vault_key(owner, XRD)) == Some(&None)
+fn vault_removed(writes: &SettledWrites, owner: [u8; 16]) -> bool {
+    writes.cells().get(&vault_key(owner, XRD)) == Some(&None)
 }
 
 #[test]
@@ -507,11 +543,11 @@ fn a_transfer_folds_to_identity_keyed_absolute_updates() {
     // the sender signs, so the sender pays. Deposit credited the
     // recipient. Absolute values, identity-keyed.
     assert_eq!(
-        vault_cell(database_updates, alice()),
+        vault_cell(&settled(database_updates, &world_accounts()), alice()),
         Some(encode_amount(1_000 - 100 - TRANSFER_FEE).to_vec())
     );
     assert_eq!(
-        vault_cell(database_updates, bob()),
+        vault_cell(&settled(database_updates, &world_accounts()), bob()),
         Some(encode_amount(150).to_vec())
     );
 }
@@ -569,10 +605,13 @@ fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
     );
 }
 
-/// A charged failure's debit survives a sibling folded after it: the
-/// charge joins the batch's cumulative burn when the fee receipt is
-/// built, so a later credit to the same vault carries the debit in its
-/// own absolute write instead of reverting it at commit.
+/// A charged failure's debit survives a sibling folded after it.
+///
+/// Each records what it moved on the vault — the failure its floor, the
+/// credit its amount — so settling both leaves the vault holding the
+/// sum. Neither receipt has to know about the other, which is what a
+/// movement buys: an absolute would have had to carry the sibling's
+/// debit to avoid reverting it.
 #[test]
 fn a_failed_charge_survives_a_later_sibling_credit() {
     let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
@@ -604,11 +643,19 @@ fn a_failed_charge_survives_a_later_sibling_credit() {
     let ConsensusReceipt::Succeeded { writes, .. } = &executed[1].consensus else {
         panic!("the credit must succeed");
     };
-    // The credit's own absolute write carries the failure's floor debit.
+    // Settle both, in commit order, and the debit is still there.
+    let mut db = MapDb::genesis(&world_accounts());
+    let charge = executed[0]
+        .fee_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.writes())
+        .expect("a charged failure settles its floor");
+    db.apply(charge);
+    db.apply(writes);
     assert_eq!(
-        vault_cell(writes, bob()),
+        db.substate(vault_key(bob(), XRD)),
         Some(encode_amount(50 + amount - floor).to_vec()),
-        "a later sibling's write must layer the charged floor, not revert it"
+        "a later sibling's credit must compose with the charged floor, not revert it"
     );
 }
 
@@ -712,11 +759,11 @@ fn a_completed_transfer_burns_the_fee_ceiling_from_its_payer() {
         panic!("transfer must succeed: {:?}", executed[0].consensus);
     };
     assert_eq!(
-        vault_cell(database_updates, payer),
+        vault_cell(&settled(database_updates, &accounts), payer),
         Some(encode_amount(1_000 - 100 - 10).to_vec())
     );
     assert_eq!(
-        vault_cell(database_updates, bob()),
+        vault_cell(&settled(database_updates, &accounts), bob()),
         Some(encode_amount(150).to_vec())
     );
 }
@@ -747,7 +794,7 @@ fn a_call_that_never_touches_its_payers_vault_still_pays() {
         "the stamp wrote its entropy leaf"
     );
     assert_eq!(
-        vault_cell(database_updates, alice()),
+        vault_cell(&settled(database_updates, &world_accounts()), alice()),
         Some(encode_amount(1_000 - 10).to_vec()),
         "the payer's vault carries the burn even though the manifest never loaded it"
     );
@@ -781,7 +828,7 @@ fn a_receipt_carries_only_its_own_payers_burn() {
             panic!("both transfers must succeed: {:?}", tx.consensus);
         };
         assert_eq!(
-            vault_cell(writes, own),
+            vault_cell(&settled(writes, &accounts), own),
             Some(encode_amount(1_000 - 100 - 10).to_vec()),
             "a receipt carries its own payer's burn"
         );
@@ -862,12 +909,12 @@ fn a_missed_edge_bound_charges_its_payer_the_floor() {
         panic!("a charged abort settles a fee receipt");
     };
     assert_eq!(
-        vault_cell(database_updates, payer),
+        vault_cell(&settled(database_updates, &accounts), payer),
         Some(encode_amount(funded - floor).to_vec()),
         "the floor and nothing else"
     );
     assert_eq!(
-        vault_cell(database_updates, bob()),
+        vault_cell(&settled(database_updates, &accounts), bob()),
         None,
         "the transfer's own effects are discarded"
     );
@@ -896,12 +943,12 @@ fn a_payer_drained_by_its_own_fee_deletes_its_vault() {
     };
 
     assert!(
-        vault_removed(database_updates, payer),
+        vault_removed(&settled(database_updates, &accounts), payer),
         "a drained payer vault is deleted, not zeroed"
     );
     // The recipient is untouched by the rule.
     assert_eq!(
-        vault_cell(database_updates, bob()),
+        vault_cell(&settled(database_updates, &accounts), bob()),
         Some(encode_amount(150).to_vec())
     );
 }
@@ -1072,12 +1119,15 @@ fn a_two_recipient_fan_out_executes() {
         panic!("the fan-out must succeed: {:?}", executed[0].consensus);
     };
     assert_eq!(
-        vault_cell(writes, alice()),
+        vault_cell(&settled(writes, &world_accounts()), alice()),
         Some(encode_amount(1_000 - 5 - 6 - 10).to_vec())
     );
-    assert_eq!(vault_cell(writes, bob()), Some(encode_amount(55).to_vec()));
     assert_eq!(
-        vault_cell(writes, fee_payer(7)),
+        vault_cell(&settled(writes, &world_accounts()), bob()),
+        Some(encode_amount(55).to_vec())
+    );
+    assert_eq!(
+        vault_cell(&settled(writes, &world_accounts()), fee_payer(7)),
         Some(encode_amount(1_006).to_vec())
     );
 }
@@ -1136,7 +1186,8 @@ fn a_publish_writes_the_artifact_under_its_publisher() {
     );
     // The publisher paid: the vault carries the burn, and the fee is the
     // only other thing a publish writes.
-    let paid = vault_cell(database_updates, payer).expect("the payer's vault was written");
+    let paid = vault_cell(&settled(database_updates, &[(payer, 1_000_000)]), payer)
+        .expect("the payer's vault was written");
     assert_eq!(
         paid,
         encode_amount(1_000_000 - artifact.len() as u128).to_vec(),
@@ -1369,7 +1420,7 @@ fn a_preview_agrees_with_the_wave_that_would_commit_it() {
 
     for owner in [payer, bob()] {
         assert_eq!(
-            vault_cell(database_updates, owner),
+            vault_cell(&settled(database_updates, &world_accounts()), owner),
             Some(encode_amount(change_for(&report, owner).after).to_vec()),
             "the preview's figure for {owner:?} is what the wave commits"
         );

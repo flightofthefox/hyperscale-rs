@@ -23,14 +23,14 @@ use hyperscale_engine::{
 use hyperscale_storage::SubstateDatabase;
 use hyperscale_types::{
     BlockHash, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash, NetworkId, ProvisionalHolds,
-    RevealChain, ShardId, ShardTrie, StateWrites, SubstateKey, Transaction, TransactionBody,
-    TransactionEnvelope, Verified, WeightedTimestamp,
+    RevealChain, SettledWrites, ShardId, ShardTrie, StateWrites, SubstateKey, Transaction,
+    TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
     Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
     Value,
 };
-use hyperscale_vm_kernel::encode_amount;
+use hyperscale_vm_kernel::{amount_cell, encode_amount};
 
 /// A funded account whose key nothing in this binary holds — the address
 /// is all an attacker has, and the address is public.
@@ -47,7 +47,7 @@ impl MapDb {
     fn genesis(accounts: &[([u8; 16], u128)]) -> Self {
         let writes = genesis_writes(accounts, &[]);
         let mut map = BTreeMap::new();
-        for (key, change) in &writes.cells {
+        for (key, change) in writes.cells() {
             let value = change.clone().expect("genesis writes are Set-only");
             map.insert(*key, value);
         }
@@ -144,9 +144,26 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
     executor.execute_wave_batch(&ctx, &store, std::slice::from_ref(&verified))
 }
 
+/// A receipt's writes as they settle onto `accounts`.
+///
+/// A receipt says what it moved, not what the cell ends at, so a balance
+/// assertion has to name the state the movement lands on.
+fn settled(writes: &StateWrites, accounts: &[([u8; 16], u128)]) -> SettledWrites {
+    writes.resolve(&mut |key| {
+        accounts
+            .iter()
+            .find(|(owner, _)| vault_key(*owner, XRD) == key)
+            .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
+    })
+}
+
 /// An account's native vault as the batch left it.
-fn vault_cell(writes: &StateWrites, owner: [u8; 16]) -> Option<Vec<u8>> {
-    writes.cells.get(&vault_key(owner, XRD)).cloned().flatten()
+fn vault_cell(writes: &SettledWrites, owner: [u8; 16]) -> Option<Vec<u8>> {
+    writes
+        .cells()
+        .get(&vault_key(owner, XRD))
+        .cloned()
+        .flatten()
 }
 
 /// The defect, closed: an address is public, and knowing one buys nothing.
@@ -196,11 +213,11 @@ fn the_gated_node_is_the_one_that_moves_the_balance() {
     // Half the payer's balance in one node, less the fee they also pay,
     // and the recipient credited without having signed anything.
     assert_eq!(
-        vault_cell(database_updates, thief()),
+        vault_cell(&settled(database_updates, &world_accounts()), thief()),
         Some(encode_amount(4_000).to_vec())
     );
     assert_eq!(
-        vault_cell(database_updates, VICTIM),
+        vault_cell(&settled(database_updates, &world_accounts()), VICTIM),
         Some(encode_amount(15_000).to_vec())
     );
 }

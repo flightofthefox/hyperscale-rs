@@ -1,6 +1,6 @@
 //! Genesis install primitive.
 
-use hyperscale_types::{StateRoot, StateWrites};
+use hyperscale_types::{SettledWrites, StateRoot};
 
 /// Storage backends that can install a genesis snapshot in one shot.
 ///
@@ -19,7 +19,7 @@ pub trait GenesisCommit {
     /// prefix-rooted JMT, so the committed `state_root` is exactly the global
     /// tree's subtree at the shard prefix. For a single-shard (empty-prefix)
     /// store the two are identical.
-    fn install_genesis(&self, substates: &StateWrites, jmt_writes: &StateWrites) -> StateRoot;
+    fn install_genesis(&self, substates: &SettledWrites, jmt_writes: &SettledWrites) -> StateRoot;
 
     /// Write `substates` to the substate store without touching the JMT.
     ///
@@ -31,5 +31,5 @@ pub trait GenesisCommit {
     /// on a store with no substates yet — the imports that follow overwrite
     /// the replicated values for keys inside the store's prefix, never the
     /// other way around.
-    fn replicate_genesis_substates(&self, substates: &StateWrites);
+    fn replicate_genesis_substates(&self, substates: &SettledWrites);
 }

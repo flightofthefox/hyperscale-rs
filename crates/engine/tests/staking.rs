@@ -46,7 +46,7 @@ impl MapDb {
     fn genesis(accounts: &[([u8; 16], u128)], pools: &[StakePoolSeat]) -> Self {
         let writes = genesis_writes(accounts, pools);
         let mut map = BTreeMap::new();
-        for (key, change) in &writes.cells {
+        for (key, change) in writes.cells() {
             let value = change.clone().expect("genesis writes are Set-only");
             map.insert(*key, value);
         }

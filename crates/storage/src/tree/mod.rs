@@ -29,7 +29,7 @@ use hyperscale_jmt::{
     UpdateResult, ValueHash,
 };
 use hyperscale_types::state_key::jmt_value_hash;
-use hyperscale_types::{BlockHeight, Hash, StateRoot, StateWrites, SubstateKey, SubstateLeaf};
+use hyperscale_types::{BlockHeight, Hash, SettledWrites, StateRoot, SubstateKey, SubstateLeaf};
 use rayon::prelude::*;
 pub use snapshot::JmtSnapshot;
 
@@ -281,26 +281,17 @@ pub fn noop_jmt_snapshot<S: TreeReader>(
 /// Flatten writes into `(key, optional_value)` work items; `None`
 /// values are deletes.
 ///
-/// # Panics
-///
-/// Panics on writes that still carry movements. A movement is relative
-/// and the tree stores values, so one arriving here has skipped the
-/// resolution that turns it into a value — and since only `cells` is
-/// walked, the alternative to panicking is dropping the change silently
-/// and attesting a root that omits it.
-fn flatten_work_items<'a>(writes_list: &[&'a StateWrites]) -> Vec<(SubstateKey, Option<&'a [u8]>)> {
-    let mut work_items: Vec<(SubstateKey, Option<&[u8]>)> = Vec::new();
-    for writes in writes_list {
-        assert!(
-            writes.movements.is_empty(),
-            "state writes reach the tree resolved; {} movement(s) did not",
-            writes.movements.len(),
-        );
-        for (key, change) in &writes.cells {
-            work_items.push((*key, change.as_deref()));
-        }
-    }
-    work_items
+/// The tree stores values, so it takes the settled form and only the
+/// settled form — a movement is relative and has no place here. That is
+/// a type, not a check, because the failure it prevents is silent: this
+/// walk would simply not see a movement, and the root would be attested
+/// without the change in it.
+fn flatten_work_items(writes: &SettledWrites) -> Vec<(SubstateKey, Option<&[u8]>)> {
+    writes
+        .cells()
+        .iter()
+        .map(|(key, change)| (*key, change.as_deref()))
+        .collect()
 }
 
 /// Computes new state tree nodes for the given database updates, returning
@@ -323,14 +314,14 @@ pub fn put_at_version<S: TreeReader + Sync>(
     store: &S,
     parent_version: Option<u64>,
     new_version: u64,
-    writes_list: &[&StateWrites],
+    writes: &SettledWrites,
 ) -> (StateRoot, CollectedWrites) {
     assert!(
         parent_version.is_none_or(|pv| new_version > pv),
         "put_at_version: new_version ({new_version}) must be greater than parent_version ({parent_version:?})"
     );
 
-    let work_items = flatten_work_items(writes_list);
+    let work_items = flatten_work_items(writes);
 
     if work_items.is_empty() {
         // No updates — carry the existing root forward to the new version.
@@ -419,10 +410,9 @@ mod tests {
         let mut store = MemoryStore::new();
         let key = cell([0xA5u8; 16], [0x3Cu8; 16]);
 
-        let mut writes = StateWrites::default();
-        writes.cells.insert(key, Some(vec![42]));
+        let writes = SettledWrites::from_absolutes(BTreeMap::from([(key, Some(vec![42]))]));
 
-        let (root, collected) = put_at_version(&store, None, 1, &[&writes]);
+        let (root, collected) = put_at_version(&store, None, 1, &writes);
         assert_ne!(root, StateRoot::ZERO);
         for (node_key, node) in &collected.nodes {
             store.put_node(node_key.clone(), node.as_ref().clone());

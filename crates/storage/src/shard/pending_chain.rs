@@ -21,8 +21,8 @@ use hyperscale_types::{
 use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
 use crate::tree::proofs::generate_proof;
 use crate::{
-    BlockForSync, JmtSnapshot, ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore,
-    VersionedStore,
+    BlockForSync, JmtSnapshot, ParentAnchor, ShardChainReader, ShardChainWriter, SubstateDatabase,
+    SubstateStore, VersionedStore,
 };
 
 /// Cached base-storage reads observed through a [`SubstateView`].
@@ -676,43 +676,6 @@ impl<S> SubstateView<S> {
 }
 
 impl<S> SubstateView<S> {
-    /// Build a view from a chain of entries in commit order (earliest first).
-    /// Takes borrowed entries so the caller can hold a read lock over the
-    /// chain index for the duration of the walk without cloning.
-    ///
-    /// `anchor_height` is the height of the view's anchor — the chain's
-    /// tip (last entry) when non-empty, or the base's committed tip when
-    /// the walk produced nothing.
-    fn from_chain(base: Arc<S>, chain: &[&ChainEntry], anchor_height: BlockHeight) -> Self {
-        let mut overlay: OverlayEntries = HashMap::new();
-        let mut jmt_snapshots: Vec<Arc<JmtSnapshot>> = Vec::with_capacity(chain.len());
-        let mut jmt_nodes: JmtNodeIndex = HashMap::new();
-        let mut versioned_receipts: Vec<(BlockHeight, Arc<ConsensusReceipt>)> = Vec::new();
-
-        for entry in chain {
-            for receipt in &entry.receipts {
-                if let Some(writes) = receipt.writes() {
-                    apply_writes(&mut overlay, writes);
-                }
-                versioned_receipts.push((entry.height, Arc::clone(receipt)));
-            }
-            for (key, node) in &entry.jmt_snapshot.nodes {
-                jmt_nodes.insert(key.clone(), Arc::clone(node));
-            }
-            jmt_snapshots.push(Arc::clone(&entry.jmt_snapshot));
-        }
-
-        Self {
-            base,
-            anchor_height,
-            overlay,
-            jmt_snapshots,
-            jmt_nodes,
-            versioned_receipts,
-            base_reads: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
     /// Build a view with no pending entries (reads always go to base).
     fn base_only(base: Arc<S>, anchor_height: BlockHeight) -> Self {
         Self {
@@ -742,8 +705,20 @@ impl<S> SubstateView<S> {
 
 /// Flatten one receipt's writes into the overlay map. Later calls
 /// override earlier ones for the same key (commit order).
-fn apply_writes(overlay: &mut OverlayEntries, writes: &StateWrites) {
-    for (key, change) in &writes.cells {
+/// Fold one receipt's writes into the overlay.
+///
+/// Movements resolve against whatever stands here already — the overlay
+/// entry an earlier receipt in this walk left, or the base beneath it.
+/// The walk is in commit order, so that is exactly the state each
+/// receipt lands on.
+fn apply_writes(overlay: &mut OverlayEntries, base: &dyn SubstateDatabase, writes: &StateWrites) {
+    let resolved = writes.resolve(&mut |key| {
+        overlay
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| base.substate(key))
+    });
+    for (key, change) in resolved.cells() {
         overlay.insert(*key, change.clone());
     }
 }
@@ -771,6 +746,45 @@ fn overlay_get(
             .or_insert_with(|| value.clone());
     }
     value
+}
+
+impl<S: SubstateDatabase> SubstateView<S> {
+    /// Build a view from a chain of entries in commit order (earliest first).
+    /// Takes borrowed entries so the caller can hold a read lock over the
+    /// chain index for the duration of the walk without cloning.
+    ///
+    /// `anchor_height` is the height of the view's anchor — the chain's
+    /// tip (last entry) when non-empty, or the base's committed tip when
+    /// the walk produced nothing.
+    fn from_chain(base: Arc<S>, chain: &[&ChainEntry], anchor_height: BlockHeight) -> Self {
+        let mut overlay: OverlayEntries = HashMap::new();
+        let mut jmt_snapshots: Vec<Arc<JmtSnapshot>> = Vec::with_capacity(chain.len());
+        let mut jmt_nodes: JmtNodeIndex = HashMap::new();
+        let mut versioned_receipts: Vec<(BlockHeight, Arc<ConsensusReceipt>)> = Vec::new();
+
+        for entry in chain {
+            for receipt in &entry.receipts {
+                if let Some(writes) = receipt.writes() {
+                    apply_writes(&mut overlay, &*base, writes);
+                }
+                versioned_receipts.push((entry.height, Arc::clone(receipt)));
+            }
+            for (key, node) in &entry.jmt_snapshot.nodes {
+                jmt_nodes.insert(key.clone(), Arc::clone(node));
+            }
+            jmt_snapshots.push(Arc::clone(&entry.jmt_snapshot));
+        }
+
+        Self {
+            base,
+            anchor_height,
+            overlay,
+            jmt_snapshots,
+            jmt_nodes,
+            versioned_receipts,
+            base_reads: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 impl<S: SubstateDatabase> SubstateDatabase for SubstateView<S> {
@@ -916,8 +930,7 @@ impl<S: TreeReader + Send + Sync> TreeReader for SubstateView<S> {
 impl<S: ShardChainWriter> ShardChainWriter for SubstateView<S> {
     fn prepare_block_commit(
         self: &Arc<Self>,
-        parent_state_root: StateRoot,
-        parent_block_height: BlockHeight,
+        parent: ParentAnchor<'_>,
         finalized_waves: &[Arc<Verifiable<FinalizedWave>>],
         block_height: BlockHeight,
         pending_snapshots: &[Arc<JmtSnapshot>],
@@ -934,8 +947,7 @@ impl<S: ShardChainWriter> ShardChainWriter for SubstateView<S> {
         };
         let effective = base_reads.or(drained.as_ref());
         self.base.prepare_block_commit(
-            parent_state_root,
-            parent_block_height,
+            parent,
             finalized_waves,
             block_height,
             pending_snapshots,

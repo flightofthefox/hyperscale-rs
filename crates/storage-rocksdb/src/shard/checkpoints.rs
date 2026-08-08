@@ -560,12 +560,8 @@ impl BoundaryStore for RocksDbShardStorage {
         );
         let parent_version =
             jmt_parent_height(BlockHeight::new(base_version), base_root).map(BlockHeight::inner);
-        let (new_root, collected) = put_at_version(
-            &snapshot_store,
-            parent_version,
-            height.inner(),
-            &[&filtered],
-        );
+        let (new_root, collected) =
+            put_at_version(&snapshot_store, parent_version, height.inner(), &filtered);
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
             base_root,
@@ -610,7 +606,7 @@ mod tests {
     use blake3::hash as blake3_hash;
     use hyperscale_jmt::{Blake3Hasher, Tree};
     use hyperscale_storage::test_helpers::{
-        completed_import_progress, import_boundary_state, make_state_writes,
+        completed_import_progress, import_boundary_state, make_settled_writes,
         test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
         test_boundary_unpinned_height_not_served,
     };
@@ -628,7 +624,7 @@ mod tests {
     }
 
     fn commit_one(storage: &RocksDbShardStorage, seed: u8) {
-        let writes = make_state_writes(seed, seed, vec![seed, seed, seed]);
+        let writes = make_settled_writes(seed, seed, vec![seed, seed, seed]);
         storage.commit(&writes).unwrap();
     }
 

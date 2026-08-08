@@ -18,7 +18,7 @@ use hyperscale_storage::{
     GenesisCommit, ImportProgress, RecoveredState, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, StateRoot, StateWrites,
+    BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, SettledWrites, StateRoot,
     SubstateKey, Verified,
 };
 
@@ -262,7 +262,7 @@ impl SimShardStorage {
     /// # Panics
     ///
     /// Panics if the internal `RwLock` is poisoned.
-    pub fn commit_substates_only(&self, writes: &StateWrites) {
+    pub fn commit_substates_only(&self, writes: &SettledWrites) {
         let mut s = write_or_recover(&self.state);
         apply_writes(&mut s, writes, 0, /* write_history */ false);
     }
@@ -281,7 +281,7 @@ impl SimShardStorage {
     /// Panics if the internal `RwLock` is poisoned, or if the JMT has
     /// already been initialized.
     #[must_use]
-    pub fn finalize_genesis_jmt(&self, merged: &StateWrites) -> StateRoot {
+    pub fn finalize_genesis_jmt(&self, merged: &SettledWrites) -> StateRoot {
         let mut s = write_or_recover(&self.state);
 
         // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JMT.
@@ -292,7 +292,7 @@ impl SimShardStorage {
         );
 
         // parent=None, version=0: genesis is the first JMT state.
-        let (root, collected) = put_at_version(&s.tree_store, None, 0, &[merged]);
+        let (root, collected) = put_at_version(&s.tree_store, None, 0, merged);
 
         for (key, node) in &collected.nodes {
             s.tree_store.insert(key.clone(), Arc::clone(node));
@@ -314,12 +314,12 @@ impl SimShardStorage {
 }
 
 impl GenesisCommit for SimShardStorage {
-    fn install_genesis(&self, substates: &StateWrites, jmt_writes: &StateWrites) -> StateRoot {
+    fn install_genesis(&self, substates: &SettledWrites, jmt_writes: &SettledWrites) -> StateRoot {
         Self::commit_substates_only(self, substates);
         Self::finalize_genesis_jmt(self, jmt_writes)
     }
 
-    fn replicate_genesis_substates(&self, substates: &StateWrites) {
+    fn replicate_genesis_substates(&self, substates: &SettledWrites) {
         Self::commit_substates_only(self, substates);
     }
 }

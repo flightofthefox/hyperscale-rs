@@ -599,7 +599,7 @@ mod test_helpers {
         record_certificate_persisted, record_storage_batch_size, record_storage_operation,
         record_storage_write,
     };
-    use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, StateWrites, WaveCertificate};
+    use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, SettledWrites, WaveCertificate};
     use rocksdb::{WriteBatch, WriteOptions};
     use tracing::field::Empty;
     use tracing::{Level, Span, instrument};
@@ -655,7 +655,7 @@ mod test_helpers {
         pub fn commit_certificate_with_writes(
             &self,
             certificate: &WaveCertificate,
-            writes: &StateWrites,
+            writes: &SettledWrites,
         ) {
             let start = Instant::now();
             let mut batch = WriteBatch::default();
@@ -673,7 +673,7 @@ mod test_helpers {
                 &mut batch, writes, version, /* write_history */ true,
                 /* base_reads */ None,
             );
-            write_count += writes.cells.len();
+            write_count += writes.cells().len();
 
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(true);

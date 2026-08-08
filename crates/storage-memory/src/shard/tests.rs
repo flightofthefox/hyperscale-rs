@@ -1,20 +1,20 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_storage::test_helpers::{
-    make_state_writes, make_test_block, make_test_certified, make_test_qc, state_key,
+    make_settled_writes, make_test_block, make_test_certified, make_test_qc, state_key,
 };
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    CommittableSubstateDatabase, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
-    SubstateDatabase, SubstateStore, VersionedStore, merge_state_writes, test_helpers,
+    CommittableSubstateDatabase, ParentAnchor, SafeVoteRegisterStore, ShardChainReader,
+    ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
     Address, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock,
     ChainOrigin, ConsensusReceipt, FinalizedWave, GlobalReceiptHash, Hash, LocalKey,
-    ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, ShardId, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, SyncHint, TxHash, ValidatorId, Verifiable, Verified,
+    ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId,
+    StateRoot, StoredReceipt, SubstateKey, SyncHint, TxHash, ValidatorId, Verifiable, Verified,
     WaveCertificate, WaveId, WeightedTimestamp, WitnessSources,
 };
 
@@ -41,7 +41,7 @@ impl SimShardStorage {
     pub fn commit_certificate_with_writes(
         &self,
         certificate: &WaveCertificate,
-        writes: &StateWrites,
+        writes: &SettledWrites,
     ) {
         {
             let mut s = self.state.write().unwrap();
@@ -61,7 +61,7 @@ impl SimShardStorage {
     /// # Panics
     ///
     /// Panics if the internal `RwLock` is poisoned.
-    pub fn commit_shared(&self, writes: &StateWrites) {
+    pub fn commit_shared(&self, writes: &SettledWrites) {
         let mut s = self.state.write().unwrap();
 
         let new_version = s.current_block_height.inner() + 1;
@@ -71,7 +71,7 @@ impl SimShardStorage {
         let parent_version =
             jmt_parent_height(s.current_block_height, s.current_root_hash).map(BlockHeight::inner);
         let (new_root, collected) =
-            put_at_version(&s.tree_store, parent_version, new_version, &[writes]);
+            put_at_version(&s.tree_store, parent_version, new_version, writes);
 
         for (key, node) in &collected.nodes {
             s.tree_store.insert(key.clone(), Arc::clone(node));
@@ -83,16 +83,27 @@ impl SimShardStorage {
 }
 
 impl CommittableSubstateDatabase for SimShardStorage {
-    fn commit(&mut self, writes: &StateWrites) {
+    fn commit(&mut self, writes: &SettledWrites) {
         self.commit_shared(writes);
     }
 }
 
 /// Helper: commit a block with given updates by injecting them via a single-tx
 /// `FinalizedWave` inside `block.certificates`.
+/// The union of already-settled fixtures — values, so nothing to fold.
+fn union_of(parts: &[SettledWrites]) -> SettledWrites {
+    SettledWrites::from_absolutes(
+        parts
+            .iter()
+            .flat_map(SettledWrites::cells)
+            .map(|(key, change)| (*key, change.clone()))
+            .collect(),
+    )
+}
+
 fn commit_with(
     storage: &SimShardStorage,
-    writes: &StateWrites,
+    writes: &SettledWrites,
     block: &Block,
     qc: &Verified<QuorumCertificate>,
 ) -> StateRoot {
@@ -104,7 +115,7 @@ fn commit_with(
             tx_hash: TxHash::ZERO,
             consensus: Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
-                writes: writes.clone(),
+                writes: writes.clone().into(),
                 beacon_witness_events: Vec::new(),
                 events: Vec::new(),
             }),
@@ -171,7 +182,7 @@ fn commit_empty(
     block: &Block,
     qc: &Verified<QuorumCertificate>,
 ) -> StateRoot {
-    commit_with(storage, &StateWrites::default(), block, qc)
+    commit_with(storage, &SettledWrites::default(), block, qc)
 }
 
 #[test]
@@ -184,8 +195,7 @@ fn test_basic_substate_operations() {
     assert!(storage.substate(key).is_none());
 
     // Commit a value
-    let mut writes = StateWrites::default();
-    writes.cells.insert(key, Some(vec![99, 88, 77]));
+    let writes = SettledWrites::from_absolutes(BTreeMap::from([(key, Some(vec![99, 88, 77]))]));
     storage.commit(&writes);
 
     // Now we can read it
@@ -199,13 +209,13 @@ fn test_snapshot_isolation() {
     let key = state_key(1, 10);
 
     // Write initial value
-    storage.commit(&make_state_writes(1, 10, vec![1]));
+    storage.commit(&make_settled_writes(1, 10, vec![1]));
 
     // Take snapshot
     let snapshot = storage.snapshot();
 
     // Modify storage
-    storage.commit(&make_state_writes(1, 10, vec![2]));
+    storage.commit(&make_settled_writes(1, 10, vec![2]));
 
     // Snapshot has old value
     assert_eq!(snapshot.substate(key), Some(vec![1]));
@@ -224,14 +234,13 @@ fn test_snapshot_clone_performance() {
     for i in 0..10_000u32 {
         let mut owner = [0u8; 16];
         owner[..4].copy_from_slice(&i.to_be_bytes());
-        let mut writes = StateWrites::default();
-        writes.cells.insert(
+        let writes = SettledWrites::from_absolutes(BTreeMap::from([(
             SubstateKey {
                 owner: Address(owner),
                 local: LocalKey([0; 16]),
             },
             Some(vec![u8::try_from(i).unwrap_or(u8::MAX)]),
-        );
+        )]));
         storage.commit_substates_only(&writes);
     }
 
@@ -379,10 +388,10 @@ fn test_jmt_height_increments_on_commit() {
     let storage = SimShardStorage::default();
     assert_eq!(storage.jmt_height(), BlockHeight::new(0));
 
-    storage.commit_shared(&make_state_writes(1, 10, vec![1]));
+    storage.commit_shared(&make_settled_writes(1, 10, vec![1]));
     assert_eq!(storage.jmt_height(), BlockHeight::new(1));
 
-    storage.commit_shared(&make_state_writes(4, 20, vec![2]));
+    storage.commit_shared(&make_settled_writes(4, 20, vec![2]));
     assert_eq!(storage.jmt_height(), BlockHeight::new(2));
 }
 
@@ -391,11 +400,11 @@ fn test_state_root_changes_on_commit() {
     let storage = SimShardStorage::default();
     let root0 = storage.state_root();
 
-    storage.commit_shared(&make_state_writes(1, 10, vec![1]));
+    storage.commit_shared(&make_settled_writes(1, 10, vec![1]));
     let root1 = storage.state_root();
     assert_ne!(root0, root1, "root should change after first commit");
 
-    storage.commit_shared(&make_state_writes(4, 20, vec![2]));
+    storage.commit_shared(&make_settled_writes(4, 20, vec![2]));
     let root2 = storage.state_root();
     assert_ne!(root1, root2, "root should change after second commit");
 }
@@ -406,7 +415,7 @@ fn test_state_root_deterministic() {
     let s1 = SimShardStorage::default();
     let s2 = SimShardStorage::default();
 
-    let updates = make_state_writes(1, 10, vec![42]);
+    let updates = make_settled_writes(1, 10, vec![42]);
     s1.commit_shared(&updates);
     s2.commit_shared(&updates);
 
@@ -419,8 +428,8 @@ fn test_state_root_differs_for_different_data() {
     let s1 = SimShardStorage::default();
     let s2 = SimShardStorage::default();
 
-    s1.commit_shared(&make_state_writes(1, 10, vec![1]));
-    s2.commit_shared(&make_state_writes(1, 10, vec![2]));
+    s1.commit_shared(&make_settled_writes(1, 10, vec![1]));
+    s2.commit_shared(&make_settled_writes(1, 10, vec![2]));
 
     assert_ne!(s1.state_root(), s2.state_root());
 }
@@ -428,7 +437,7 @@ fn test_state_root_differs_for_different_data() {
 #[test]
 fn test_empty_commit_still_advances_version() {
     let storage = SimShardStorage::default();
-    let updates = StateWrites::default();
+    let updates = SettledWrites::default();
     storage.commit_shared(&updates);
     assert_eq!(storage.jmt_height(), BlockHeight::new(1));
 }
@@ -440,7 +449,7 @@ fn test_empty_commit_still_advances_version() {
 #[test]
 fn test_commit_block_single() {
     let storage = SimShardStorage::default();
-    let updates = make_state_writes(1, 10, vec![42]);
+    let updates = make_settled_writes(1, 10, vec![42]);
     let block = make_test_block(BlockHeight::new(1));
     let qc = make_test_qc(&block);
 
@@ -451,9 +460,16 @@ fn test_commit_block_single() {
 #[test]
 fn test_commit_block_multiple_updates() {
     let storage = SimShardStorage::default();
-    let updates1 = make_state_writes(1, 10, vec![1]);
-    let updates2 = make_state_writes(2, 20, vec![2]);
-    let merged = merge_state_writes(&[&updates1, &updates2]);
+    let updates1 = make_settled_writes(1, 10, vec![1]);
+    let updates2 = make_settled_writes(2, 20, vec![2]);
+    let merged = SettledWrites::from_absolutes(
+        updates1
+            .cells()
+            .iter()
+            .chain(updates2.cells())
+            .map(|(key, change)| (*key, change.clone()))
+            .collect(),
+    );
     let block = make_test_block(BlockHeight::new(1));
     let qc = make_test_qc(&block);
 
@@ -483,8 +499,11 @@ fn test_prepare_then_commit_fast_path() {
     // Prepare path
     let parent_root = s_prepared.state_root();
     let (spec_root, _jmt_snapshot, prepared) = s_prepared.prepare_block_commit(
-        parent_root,
-        BlockHeight::GENESIS,
+        ParentAnchor {
+            state_root: parent_root,
+            height: BlockHeight::GENESIS,
+            state: &*s_prepared,
+        },
         &[],
         BlockHeight::new(1),
         &[],
@@ -508,8 +527,11 @@ fn test_prepare_commit_state_root_matches() {
 
     let parent_root = storage.state_root();
     let (spec_root, _jmt_snapshot, prepared) = storage.prepare_block_commit(
-        parent_root,
-        BlockHeight::GENESIS,
+        ParentAnchor {
+            state_root: parent_root,
+            height: BlockHeight::GENESIS,
+            state: &*storage,
+        },
         &[],
         BlockHeight::new(1),
         &[],
@@ -533,7 +555,7 @@ fn test_clear() {
     let mut storage = SimShardStorage::default();
 
     // Add some data
-    storage.commit_shared(&make_state_writes(1, 10, vec![1]));
+    storage.commit_shared(&make_settled_writes(1, 10, vec![1]));
     assert!(storage.jmt_height() > BlockHeight::GENESIS);
     assert!(!storage.is_empty());
 
@@ -550,11 +572,11 @@ fn test_len_and_is_empty() {
     assert!(storage.is_empty());
     assert_eq!(storage.len(), 0);
 
-    storage.commit_shared(&make_state_writes(1, 10, vec![1]));
+    storage.commit_shared(&make_settled_writes(1, 10, vec![1]));
     assert!(!storage.is_empty());
     assert_eq!(storage.len(), 1);
 
-    storage.commit_shared(&make_state_writes(4, 20, vec![2]));
+    storage.commit_shared(&make_settled_writes(4, 20, vec![2]));
     assert_eq!(storage.len(), 2);
 }
 
@@ -566,9 +588,9 @@ fn substate_bytes_tracks_block_commits() {
     let storage = SimShardStorage::default();
 
     // h1: two inserts.
-    let v1 = merge_state_writes(&[
-        &make_state_writes(3, 7, vec![1]),
-        &make_state_writes(4, 8, vec![2]),
+    let v1 = union_of(&[
+        make_settled_writes(3, 7, vec![1]),
+        make_settled_writes(4, 8, vec![2]),
     ]);
     let block1 = make_test_block(BlockHeight::new(1));
     let qc1 = make_test_qc(&block1);
@@ -576,15 +598,14 @@ fn substate_bytes_tracks_block_commits() {
     assert_eq!(storage.substate_bytes_at(BlockHeight::new(1)), Some(2));
 
     // h2: value update only.
-    let v2 = make_state_writes(3, 7, vec![9]);
+    let v2 = make_settled_writes(3, 7, vec![9]);
     let block2 = make_test_block(BlockHeight::new(2));
     let qc2 = make_test_qc(&block2);
     commit_with(&storage, &v2, &block2, &qc2);
     assert_eq!(storage.substate_bytes_at(BlockHeight::new(2)), Some(2));
 
     // h3: delete one — count drops; history retained.
-    let mut v3 = StateWrites::default();
-    v3.cells.insert(state_key(3, 7), None);
+    let v3 = SettledWrites::from_absolutes(BTreeMap::from([(state_key(3, 7), None)]));
     let block3 = make_test_block(BlockHeight::new(3));
     let qc3 = make_test_qc(&block3);
     commit_with(&storage, &v3, &block3, &qc3);
@@ -599,13 +620,13 @@ fn historical_substate_reads_resolve_per_version() {
     let key = state_key(1, 10);
 
     // Block height 1: commit value [100].
-    let updates1 = make_state_writes(1, 10, vec![100]);
+    let updates1 = make_settled_writes(1, 10, vec![100]);
     let block1 = make_test_block(BlockHeight::new(1));
     let qc1 = make_test_qc(&block1);
     let root_v1 = commit_with(&storage, &updates1, &block1, &qc1);
 
     // Block height 2: overwrite with value [200].
-    let updates2 = make_state_writes(1, 10, vec![200]);
+    let updates2 = make_settled_writes(1, 10, vec![200]);
     let block2 = make_test_block(BlockHeight::new(2));
     let qc2 = make_test_qc(&block2);
     let root_v2 = commit_with(&storage, &updates2, &block2, &qc2);
@@ -674,7 +695,7 @@ fn test_snapshot_at_version_is_deterministic_across_persistence_lag() {
     let commit = |storage: &SimShardStorage, height: BlockHeight, value: Vec<u8>| {
         let block = make_test_block(height);
         let qc = make_test_qc(&block);
-        let writes = make_state_writes(node_seed, 1, value);
+        let writes = make_settled_writes(node_seed, 1, value);
         commit_with(storage, &writes, &block, &qc);
     };
 
@@ -730,7 +751,7 @@ fn test_snapshot_resolves_floor_among_many_versions() {
     for h in 1..=50u64 {
         let block = make_test_block(BlockHeight::new(h));
         let qc = make_test_qc(&block);
-        let writes = make_state_writes(node_seed, 1, vec![u8::try_from(h).unwrap_or(u8::MAX)]);
+        let writes = make_settled_writes(node_seed, 1, vec![u8::try_from(h).unwrap_or(u8::MAX)]);
         commit_with(&storage, &writes, &block, &qc);
     }
 
@@ -765,19 +786,18 @@ fn test_state_history_create_delete_create() {
     // — the JMT parent-version chain would otherwise break at V2 if
     // deleting K left the tree empty. The state-history behavior we're
     // actually testing is entirely independent of this.
-    let anchor = make_state_writes(99, 0xFF, vec![0xFF]);
+    let anchor = make_settled_writes(99, 0xFF, vec![0xFF]);
 
     // V1: create with value A (=0xAA). Also set the anchor key.
-    let v1 = merge_state_writes(&[&make_state_writes(7, 42, vec![0xAA]), &anchor]);
+    let v1 = union_of(&[make_settled_writes(7, 42, vec![0xAA]), anchor]);
     storage.commit_shared(&v1);
 
     // V2: delete K.
-    let mut v2 = StateWrites::default();
-    v2.cells.insert(key, None);
+    let v2 = SettledWrites::from_absolutes(BTreeMap::from([(key, None)]));
     storage.commit_shared(&v2);
 
     // V3: create again with value B (=0xBB).
-    let v3 = make_state_writes(7, 42, vec![0xBB]);
+    let v3 = make_settled_writes(7, 42, vec![0xBB]);
     storage.commit_shared(&v3);
 
     // Expected:
@@ -819,7 +839,7 @@ fn test_snapshot_at_below_retention_panics() {
     for h in 1..=10u64 {
         let block = make_test_block(BlockHeight::new(h));
         let qc = make_test_qc(&block);
-        commit_with(&storage, &StateWrites::default(), &block, &qc);
+        commit_with(&storage, &SettledWrites::default(), &block, &qc);
     }
     // current=10, floor=8. Asking for V=1 is well below floor.
     let _snap = <SimShardStorage as VersionedStore>::snapshot_at(&storage, BlockHeight::new(1));
@@ -839,10 +859,10 @@ fn test_historical_substate_read_respects_retention() {
     for h in 1..=10u64 {
         let block = make_test_block(BlockHeight::new(h));
         let qc = make_test_qc(&block);
-        let mut writes = StateWrites::default();
-        writes
-            .cells
-            .insert(key, Some(vec![u8::try_from(h).unwrap_or(u8::MAX)]));
+        let writes = SettledWrites::from_absolutes(BTreeMap::from([(
+            key,
+            Some(vec![u8::try_from(h).unwrap_or(u8::MAX)]),
+        )]));
         commit_with(&storage, &writes, &block, &qc);
     }
     // current=10, floor=8.
@@ -872,7 +892,7 @@ fn test_historical_substate_read_respects_retention() {
 fn test_genesis_skips_history_entries() {
     let storage = SimShardStorage::default();
 
-    let updates = make_state_writes(1, 1, vec![0xAA]);
+    let updates = make_settled_writes(1, 1, vec![0xAA]);
     storage.commit_substates_only(&updates);
 
     // History map must be empty after a genesis-style commit.

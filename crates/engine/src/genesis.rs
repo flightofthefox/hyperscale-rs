@@ -10,7 +10,7 @@
 use hyperscale_effects_bridge::vm_statics::PackageCache;
 use hyperscale_effects_bridge::{PoolRegistry, ProtocolHasher, admit_package, validator_key};
 pub use hyperscale_effects_bridge::{XRD, entropy_key, vault_key};
-use hyperscale_types::{StakePoolSeat, StateWrites};
+use hyperscale_types::{SettledWrites, StakePoolSeat};
 use hyperscale_vm_effects::{
     Address, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, Value, package_hash,
 };
@@ -153,7 +153,7 @@ pub fn stake_unit(pool: [u8; 16]) -> Address {
 /// a seated pool's validator records and one [`XRD`] vault cell per
 /// funded account, identity-keyed under the owner's prefix.
 #[must_use]
-pub fn genesis_writes(accounts: &[([u8; 16], u128)], pools: &[StakePoolSeat]) -> StateWrites {
+pub fn genesis_writes(accounts: &[([u8; 16], u128)], pools: &[StakePoolSeat]) -> SettledWrites {
     // The stdlib package as a committed cell, under the same content
     // address a publish would place it at. Genesis is then the cache's
     // cold start in the literal sense — the same projection of committed
@@ -179,7 +179,7 @@ pub fn genesis_writes(accounts: &[([u8; 16], u128)], pools: &[StakePoolSeat]) ->
             Some(encode_amount(*balance).to_vec()),
         );
     }
-    writes
+    SettledWrites::from_absolutes(writes.cells)
 }
 
 #[cfg(test)]
@@ -196,10 +196,10 @@ mod tests {
         let writes = genesis_writes(&[(alice, 500), (bob, 700)], &[]);
         // Two funded accounts' vault cells, plus the stdlib package under
         // the publisher no key derives.
-        assert_eq!(writes.cells.len(), 3);
+        assert_eq!(writes.cells().len(), 3);
         assert!(
             writes
-                .cells
+                .cells()
                 .keys()
                 .any(|key| key.owner == GENESIS_PUBLISHER)
         );
@@ -208,7 +208,7 @@ mod tests {
             let key = vault_key(owner, XRD);
             assert_eq!(key.owner.0, owner);
             assert_eq!(
-                writes.cells.get(&key),
+                writes.cells().get(&key),
                 Some(&Some(encode_amount(balance).to_vec()))
             );
         }
