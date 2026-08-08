@@ -2045,6 +2045,8 @@ impl ExecutionCoordinator {
 
         // One claim set for the whole commit: every composition below
         // sees the same cells held, whichever path produced the wave.
+        // The reservations behind those claims are read at the same
+        // instant and for the same reason.
         let blocked = self.provisional_cells();
 
         let now = self.committed_ts;

@@ -28,8 +28,8 @@ use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::SubstateDatabase;
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Event, EventExt, EventRoot,
-    ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, RevealChain, Stake, StakePoolSeat,
-    StateWrites, SubstateEntry, Transaction, TxHash, Verified, compute_merkle_root,
+    ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, ProvisionalHolds, RevealChain, Stake,
+    StakePoolSeat, StateWrites, SubstateEntry, Transaction, TxHash, Verified, compute_merkle_root,
     install_vm_statics,
 };
 use hyperscale_vm_effects::{
@@ -119,6 +119,10 @@ pub fn tx_randomness(anchor: RevealChain, tx: TxHash) -> [u8; 32] {
 #[derive(Debug, Default)]
 pub struct VmBase {
     pub cells: BTreeMap<SubstateKey, Vec<u8>>,
+    /// What legs of unresolved waves hold against these cells. Empty for
+    /// a baseline with nothing in flight over it — a preview, or a shard
+    /// with no cross-shard leg outstanding.
+    pub holds: ProvisionalHolds,
 }
 
 impl Base for VmBase {
@@ -141,8 +145,8 @@ impl Base for VmBase {
         false
     }
 
-    fn holds(&self, _key: SubstateKey) -> BTreeMap<TxHash, u128> {
-        BTreeMap::new()
+    fn holds(&self, key: SubstateKey) -> BTreeMap<TxHash, u128> {
+        self.holds.get(&key).cloned().unwrap_or_default()
     }
 
     fn into_any(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
@@ -825,7 +829,19 @@ impl Executor {
                 cells.insert(key, value);
             }
         }
-        let base = Arc::new(VmBase { cells });
+        // Trie-routed like the pre-read above, and for the same reason:
+        // a declaration spans every participating shard, so the holds it
+        // implies do too, and a shard that reported one against a cell it
+        // holds none of would judge a reservation as exceeding a balance
+        // it cannot see. A wave's own locality cannot decide this — the
+        // single-shard arm's `Locality::All` claims every owner.
+        let holds = ctx
+            .holds
+            .iter()
+            .filter(|(key, _)| ctx.shard_trie.shard_for_prefix(key.owner) == ctx.local_shard)
+            .map(|(key, held)| (*key, held.clone()))
+            .collect();
+        let base = Arc::new(VmBase { cells, holds });
 
         let batch: Vec<BatchTx> = prepared
             .iter()

@@ -1,0 +1,24 @@
+//! Reservations that legs no wave has resolved still hold.
+//!
+//! A cross-shard leg's reservation is engaged the moment its block
+//! commits and released only when its wave's fate does, and in between it
+//! is invisible: the settled state a later tick reads still shows the
+//! whole balance, because nothing a wave has not resolved may be read.
+//! Judging a second withdrawal against that balance is what lets one
+//! vault fund two.
+//!
+//! The amount is the declared one. A reservation says statically how much
+//! feasibility is judged against — that is the whole reason the mode
+//! carries a number — so the hold needs nothing from the leg's execution
+//! and is known from the moment it is dispatched.
+
+use std::collections::BTreeMap;
+
+use crate::{SubstateKey, TxHash};
+
+/// What each unresolved leg holds against each amount cell.
+///
+/// Shaped as the kernel's `Base::holds` reads it, keyed by transaction so
+/// a leg judging its own reservation finds the one it took rather than
+/// counting it twice.
+pub type ProvisionalHolds = BTreeMap<SubstateKey, BTreeMap<TxHash, u128>>;

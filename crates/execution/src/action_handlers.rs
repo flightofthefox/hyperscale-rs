@@ -8,6 +8,7 @@
 //! event plumbing — sharing the handlers between production and
 //! simulation keeps execution behavior identical across both backends.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_core::{
@@ -21,10 +22,10 @@ use hyperscale_types::network::notification::{
     ExecutionCertificatesNotification, ExecutionVotesNotification,
 };
 use hyperscale_types::{
-    BlockHeight, ExecutionCertificate, ExecutionCertificateContext,
+    BlockHeight, DeclaredKey, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificatesSenderMessage, ExecutionVote, ExecutionVotesSenderMessage,
-    FinalizedWaveContext, Stopwatch, StoredReceipt, TxHash, TxOutcome, Verifiable, Verified,
-    signed_bytes,
+    FinalizedWaveContext, Mode, Stopwatch, StoredReceipt, SubstateKey, TxHash, TxOutcome,
+    Verifiable, Verified, signed_bytes,
 };
 
 // ============================================================================
@@ -111,10 +112,51 @@ pub fn accumulate_tick_output(
                     .as_ref()
                     .and_then(|fee| fee.writes())
                     .cloned(),
+                reserved: granted_reservations(group, tx),
             })
             .collect();
         output.provisional.insert(group.wave_id.clone(), entries);
     }
+}
+
+/// What one member of `group` holds in reservations, by cell.
+///
+/// Only a leg that ran to completion holds anything. A reservation is
+/// granted or refused when the kernel judges it, and an attempt that
+/// aborted or failed took none — recording its declaration anyway would
+/// hold a vault against value nobody reserved, and would let the held
+/// total exceed the balance, which is a state the kernel reads as a
+/// corrupt ledger rather than as an infeasible request.
+///
+/// For a leg that did complete, declared and granted are the same
+/// number: the kernel grants a reservation at the amount the declaration
+/// named or refuses it outright.
+///
+/// A reservation targets an amount cell, which is a point, so an
+/// owner-granular declaration is never one. Cells this shard does not own
+/// ride along and are dropped where locality is known — a declaration
+/// spans every participating shard, and this one does not.
+fn granted_reservations(
+    group: &TickExecutionGroup,
+    executed: &ExecutedTx,
+) -> BTreeMap<SubstateKey, u128> {
+    let mut reserved = BTreeMap::new();
+    if executed.consensus.writes().is_none() {
+        return reserved;
+    }
+    let Some(request) = group
+        .requests
+        .iter()
+        .find(|r| r.tx_hash == executed.tx_hash)
+    else {
+        return reserved;
+    };
+    for (key, mode) in &request.transaction.routing().declared_modes {
+        if let (DeclaredKey::Cell(cell), Mode::Reserve { amount }) = (key, mode) {
+            *reserved.entry(*cell).or_default() += *amount;
+        }
+    }
+    reserved
 }
 
 /// Outcomes flow through `ctx.notify`. Variants owned by other coordinator
@@ -212,6 +254,9 @@ where
                 .tick_chain
                 .view_at(BlockHeight::new(tick.inner().saturating_sub(1)));
             let view_snap = view.snapshot();
+            // From the same view as the baseline, so a leg's debit and
+            // the hold standing for it are never both visible.
+            let holds = view.holds();
             let wave_ctx = WaveBatchContext {
                 par: ctx.par,
                 local_shard: ctx.shard,
@@ -219,6 +264,7 @@ where
                 block_hash,
                 wave_start_ts: tick_ts,
                 wave_start_reveal: tick_reveal,
+                holds: &holds,
             };
             let inputs: Vec<TickTxInput<'_>> = groups
                 .iter()

@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use hyperscale_dispatch::Parallelism;
 use hyperscale_types::{
-    BlockHash, RevealChain, ShardId, ShardTrie, SubstateEntry, Transaction, Verified,
-    WeightedTimestamp,
+    BlockHash, ProvisionalHolds, RevealChain, ShardId, ShardTrie, SubstateEntry, Transaction,
+    Verified, WeightedTimestamp,
 };
 
 /// Per-wave inputs an engine's batch execution reads besides the
@@ -40,6 +40,12 @@ pub struct WaveBatchContext<'a> {
     /// this is the randomness anchor of every member; cross-shard
     /// batches carry per-transaction anchors on their inputs.
     pub wave_start_reveal: RevealChain,
+    /// Reservations still held by legs of waves this batch's baseline
+    /// cannot see, because nothing an unresolved wave wrote is readable.
+    /// The kernel judges a reservation and a debit against committed
+    /// balance less what is held, so these are what keep one vault from
+    /// funding two withdrawals in successive ticks.
+    pub holds: &'a ProvisionalHolds,
 }
 
 /// One cross-shard transaction as an engine consumes it: the

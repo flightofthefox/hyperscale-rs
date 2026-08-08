@@ -26,7 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
-use hyperscale_types::{BlockHeight, StateWrites, SubstateKey, TxHash, WaveId};
+use hyperscale_types::{BlockHeight, ProvisionalHolds, StateWrites, SubstateKey, TxHash, WaveId};
 
 use crate::lock_recover::{read_or_recover, write_or_recover};
 use crate::{SubstateDatabase, VersionedStore};
@@ -46,6 +46,15 @@ pub struct ProvisionalTx {
     /// aborted (the substitute receipt), dropped with everything else if
     /// the wave never finalizes.
     pub reserve: Option<StateWrites>,
+    /// What this leg holds against each amount cell while its wave is
+    /// unresolved — its declared reservations.
+    ///
+    /// Recorded here rather than tracked beside the chain so the hold and
+    /// the writes it stands for share one lifetime: both are promoted or
+    /// dropped by the same resolution, and a reader can never see a
+    /// balance with the debit already in it while the hold still says the
+    /// value is spoken for.
+    pub reserved: BTreeMap<SubstateKey, u128>,
 }
 
 /// The execution output of one tick.
@@ -286,10 +295,31 @@ where
                 }
             }
         }
+        // The holds standing at this anchor: every retained entry's
+        // unresolved legs, whatever tick they joined. Read from the same
+        // entries the overlay is folded from, so a leg whose resolution
+        // put its debit into the overlay has had its hold dropped by that
+        // same resolution — the two can never disagree.
+        let mut holds = ProvisionalHolds::new();
+        {
+            let entries = read_or_recover(&self.entries);
+            for entry in entries.values() {
+                for leg in entry.pending.values().flatten() {
+                    for (cell, amount) in &leg.reserved {
+                        *holds
+                            .entry(*cell)
+                            .or_default()
+                            .entry(leg.tx_hash)
+                            .or_default() += *amount;
+                    }
+                }
+            }
+        }
         TickView {
             base: Arc::clone(&self.base),
             anchor: tick,
             overlay: Arc::new(overlay),
+            holds: Arc::new(holds),
         }
     }
 }
@@ -304,6 +334,7 @@ pub struct TickView<S> {
     base: Arc<S>,
     anchor: BlockHeight,
     overlay: Arc<HashMap<SubstateKey, Option<Vec<u8>>>>,
+    holds: Arc<ProvisionalHolds>,
 }
 
 impl<S: VersionedStore> TickView<S> {
@@ -315,6 +346,15 @@ impl<S: VersionedStore> TickView<S> {
             base_snapshot: self.base.snapshot_at(self.anchor),
             overlay: Arc::clone(&self.overlay),
         }
+    }
+
+    /// What unresolved legs hold against the cells this view reads.
+    ///
+    /// The companion to the overlay: the overlay is what a reader may
+    /// see, and this is what it may not spend of what it sees.
+    #[must_use]
+    pub fn holds(&self) -> Arc<ProvisionalHolds> {
+        Arc::clone(&self.holds)
     }
 }
 
@@ -506,6 +546,7 @@ mod tests {
                         tx_hash: tx(7),
                         writes: Some(writes(&[(key(1), Some(b"provisional"))])),
                         reserve: None,
+                        reserved: BTreeMap::new(),
                     }],
                 )]),
             },
@@ -549,6 +590,7 @@ mod tests {
                             tx_hash: tx(member),
                             writes: Some(writes(&[(cell, Some(b"promoted"))])),
                             reserve: None,
+                            reserved: BTreeMap::new(),
                         }],
                     )]),
                 },
@@ -585,6 +627,7 @@ mod tests {
                         tx_hash: tx(7),
                         writes: Some(writes(&[(key(1), Some(b"effects"))])),
                         reserve: Some(writes(&[(key(9), Some(b"floor"))])),
+                        reserved: BTreeMap::new(),
                     }],
                 )]),
             },
@@ -617,6 +660,7 @@ mod tests {
                         tx_hash: tx(7),
                         writes: Some(writes(&[(key(1), Some(b"effects"))])),
                         reserve: Some(writes(&[(key(9), Some(b"floor"))])),
+                        reserved: BTreeMap::new(),
                     }],
                 )]),
             },

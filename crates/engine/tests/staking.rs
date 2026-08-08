@@ -17,8 +17,9 @@ use hyperscale_engine::{
 use hyperscale_storage::SubstateDatabase;
 use hyperscale_types::{
     BeaconWitnessEvent, BlockHash, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
-    NetworkId, RevealChain, ShardId, ShardTrie, Stake, StakePoolId, StakePoolSeat, SubstateKey,
-    Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
+    NetworkId, ProvisionalHolds, RevealChain, ShardId, ShardTrie, Stake, StakePoolId,
+    StakePoolSeat, SubstateKey, Transaction, TransactionBody, TransactionEnvelope, Verified,
+    WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
     Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
@@ -166,6 +167,7 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
         wave_start_ts: WeightedTimestamp::from_millis(1_000),
         wave_start_reveal: RevealChain::ZERO,
+        holds: &ProvisionalHolds::new(),
     };
     let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
     executor.execute_wave_batch(&ctx, &store, std::slice::from_ref(&verified))

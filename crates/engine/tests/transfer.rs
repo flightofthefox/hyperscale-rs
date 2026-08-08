@@ -17,9 +17,9 @@ use hyperscale_engine::{
 use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput, VersionedStore};
 use hyperscale_types::{
     BlockHash, BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
-    MerkleInclusionProof, NetworkId, RevealChain, ShardId, ShardTrie, StateRoot, StateWrites,
-    SubstateKey, Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
-    absorb_committed_cells,
+    MerkleInclusionProof, NetworkId, ProvisionalHolds, RevealChain, ShardId, ShardTrie, StateRoot,
+    StateWrites, SubstateKey, Transaction, TransactionBody, TransactionEnvelope, Verified,
+    WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
     AbiParam, Address, Constraint, EdgeRef, EnvelopeTree, Expr, GraphArg, GraphNode, IntentDecl,
@@ -314,6 +314,7 @@ fn execute_anchored(
         block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
         wave_start_ts: WeightedTimestamp::from_millis(1_000),
         wave_start_reveal: reveal,
+        holds: &ProvisionalHolds::new(),
     };
     executor.execute_wave_batch(&ctx, &snapshot_store, transactions)
 }
@@ -467,6 +468,7 @@ fn execute_batch_on(
         block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
         wave_start_ts: WeightedTimestamp::from_millis(1_000),
         wave_start_reveal: RevealChain::ZERO,
+        holds: &ProvisionalHolds::new(),
     };
     executor.execute_wave_batch(&ctx, snapshot_store, transactions)
 }
@@ -928,6 +930,7 @@ fn execute_on_shard(
         block_hash: BlockHash::from_raw(Hash::from_bytes(b"block")),
         wave_start_ts: WeightedTimestamp::from_millis(1_000),
         wave_start_reveal: RevealChain::ZERO,
+        holds: &ProvisionalHolds::new(),
     };
     executor.execute_wave_batch(&ctx, &snapshot_store, transactions)
 }

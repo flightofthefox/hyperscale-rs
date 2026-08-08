@@ -22,6 +22,7 @@ pub mod network;
 mod primitives;
 mod provisioning;
 mod signing;
+pub mod state_holds;
 pub mod state_key;
 mod time;
 mod verifiable;
@@ -170,6 +171,7 @@ pub use signing::{
     shard_reveal_verify, signed_bytes, validator_possession_proof_sign,
     validator_possession_proof_verify, vrf_output_from_proof,
 };
+pub use state_holds::ProvisionalHolds;
 pub use time::epoch_windows::EpochWindows;
 pub use time::limits::{MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH};
 pub use time::range::{MAX_VALIDITY_RANGE, TimestampRange};

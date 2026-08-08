@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use hyperscale_effects_bridge::admit_package;
 use hyperscale_storage::SubstateDatabase;
-use hyperscale_types::{Event, RevealChain, Transaction, WeightedTimestamp};
+use hyperscale_types::{Event, ProvisionalHolds, RevealChain, Transaction, WeightedTimestamp};
 use hyperscale_vm_effects::{EffectTarget, SubstateKey};
 use hyperscale_vm_kernel::{
     Base, BatchTx, Locality, ManifestWalk, Outcome, Receipt, decode_amount, execute_batch,
@@ -284,7 +284,13 @@ impl Executor {
         if let Some(value) = snapshot.substate(payer.vault) {
             cells.insert(payer.vault, value);
         }
-        let base = Arc::new(VmBase { cells });
+        let base = Arc::new(VmBase {
+            cells,
+            // A preview judges against committed state alone: it is
+            // not in a tick, so no wave's reservation is in flight
+            // over the baseline it reads.
+            holds: ProvisionalHolds::new(),
+        });
 
         let vm_tx = tx.hash();
         let batch = [BatchTx::new(
