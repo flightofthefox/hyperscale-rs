@@ -40,19 +40,38 @@ pub const MAX_FINALIZED_TX_PER_BLOCK: usize = 8_192;
 /// revisiting.
 pub const MAX_PROVISIONS_PER_BLOCK: usize = 256;
 
+/// How far the drain's transaction *count* may run past the depth its
+/// work budget is sized for, when every transaction is as cheap as one
+/// can be.
+///
+/// One scalar has to bound two things: how much work the drain owes, and
+/// how many transactions owe it. Those stay within a factor of each other
+/// only while the fixed per-transaction charge is comparable to the
+/// largest gas limit a sender may declare — otherwise a flood of
+/// zero-gas transactions fits the same budget as a handful of heavy ones
+/// and the count runs free. Two is chosen rather than derived; what
+/// matters is that it is finite and that the charge below follows from
+/// it.
+const DRAIN_COUNT_SLACK: u64 = 2;
+
 /// What admitting and tracking any transaction costs a block, before
 /// anything it declares.
 ///
 /// Every committed transaction occupies a wave entry, a tick-chain
 /// entry, a receipt and mempool tracking whatever its manifest touches,
 /// and that cost is per transaction rather than per unit of declared
-/// work. Without this term a budget over declared work alone would
-/// bound weight and not number, and a flood of minimal zero-gas
-/// transactions would be close to free.
+/// work. Without this term a budget over declared work alone would bound
+/// weight and not number, and a flood of minimal zero-gas transactions
+/// would be close to free.
+///
+/// Derived from [`MAX_GAS_LIMIT`] and [`DRAIN_COUNT_SLACK`] rather than
+/// chosen beside them, because the three only do their job in
+/// combination: picking this independently is what lets a later change
+/// to the gas ceiling quietly unbound the count.
 ///
 /// A placeholder like every other quantity in the fee model: phase 6
-/// sets it against measured baselines.
-pub const TX_ADMISSION_WORK: u64 = 1_000;
+/// sets the pair against measured baselines.
+pub const TX_ADMISSION_WORK: u64 = MAX_GAS_LIMIT / (DRAIN_COUNT_SLACK - 1);
 
 /// How much unsettled work this shard's chain may owe at once.
 ///
@@ -69,6 +88,14 @@ pub const TX_ADMISSION_WORK: u64 = 1_000;
 /// placeholder; phase 6 calibrates them together against measured
 /// throughput.
 pub const MAX_DRAIN_WORK: u64 = 3 * MAX_TXS_PER_BLOCK as u64 * (TX_ADMISSION_WORK + MAX_GAS_LIMIT);
+
+/// The count bound the fixed charge exists to provide, asserted rather
+/// than assumed: the cheapest a transaction can be is the admission
+/// charge, so this is how many the drain could ever hold at once.
+const _: () = assert!(
+    MAX_DRAIN_WORK / TX_ADMISSION_WORK <= DRAIN_COUNT_SLACK * 3 * MAX_TXS_PER_BLOCK as u64,
+    "the work budget must bound the drain's transaction count, not only its weight",
+);
 
 /// The largest execution ceiling a transaction may sign for.
 ///
