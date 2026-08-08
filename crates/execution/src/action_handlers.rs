@@ -88,7 +88,6 @@ pub struct ExecutionOutputs {
 /// all for ordinary payment traffic.
 pub fn accumulate_tick_output(
     output: &mut TickOutput,
-    tick_id: TickId,
     requests: &[CrossShardExecutionRequest],
     executed: &[ExecutedTx],
 ) {
@@ -125,26 +124,21 @@ pub fn accumulate_tick_output(
             members.push((tx.tx_hash, writes));
         }
     }
-    if !members.is_empty() {
-        output.determined.insert(tick_id, members);
-    }
+    output.determined = members;
 
-    if !beyond.is_empty() {
-        let entries: Vec<ProvisionalTx> = beyond
-            .into_iter()
-            .map(|tx| ProvisionalTx {
-                tx_hash: tx.tx_hash,
-                writes: tx.consensus.writes().cloned(),
-                reserve: tx
-                    .fee_receipt
-                    .as_ref()
-                    .and_then(|fee| fee.writes())
-                    .cloned(),
-                reserved: granted_reservations(requests, tx),
-            })
-            .collect();
-        output.provisional.insert(tick_id, entries);
-    }
+    output.provisional = beyond
+        .into_iter()
+        .map(|tx| ProvisionalTx {
+            tx_hash: tx.tx_hash,
+            writes: tx.consensus.writes().cloned(),
+            reserve: tx
+                .fee_receipt
+                .as_ref()
+                .and_then(|fee| fee.writes())
+                .cloned(),
+            reserved: granted_reservations(requests, tx),
+        })
+        .collect();
 }
 
 /// What one member of `requests` holds in reservations, by cell.
@@ -307,7 +301,7 @@ where
 
             let tick_id = TickId::new(ctx.shard, tick);
             let mut output = TickOutput::default();
-            accumulate_tick_output(&mut output, tick_id, &requests, &executed);
+            accumulate_tick_output(&mut output, &requests, &executed);
             let ExecutionOutputs {
                 outcomes: tx_outcomes,
                 results,

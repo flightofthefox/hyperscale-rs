@@ -18,7 +18,7 @@ use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput,
 use hyperscale_types::{
     BlockHash, BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
     MerkleInclusionProof, NetworkId, ProvisionalHolds, RevealChain, SettledWrites, ShardId,
-    ShardTrie, StateRoot, StateWrites, SubstateKey, TickId, Transaction, TransactionBody,
+    ShardTrie, StateRoot, StateWrites, SubstateKey, Transaction, TransactionBody,
     TransactionEnvelope, Verified, WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
@@ -436,11 +436,8 @@ fn consecutive_payments_thread_through_the_tick_chain() {
         chain.append(
             tick,
             TickOutput {
-                determined: BTreeMap::from([(
-                    TickId::new(ShardId::ROOT, tick),
-                    vec![(executed[0].tx_hash, updates.clone())],
-                )]),
-                provisional: BTreeMap::new(),
+                determined: vec![(executed[0].tx_hash, updates.clone())],
+                provisional: Vec::new(),
             },
         );
     }

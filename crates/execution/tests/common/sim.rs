@@ -403,7 +403,7 @@ impl ExecutionSim {
             })
             .collect();
         let mut output = TickOutput::default();
-        accumulate_tick_output(&mut output, tick_id, &requests, &executed);
+        accumulate_tick_output(&mut output, &requests, &executed);
         let ExecutionOutputs {
             outcomes,
             results,

@@ -36,7 +36,7 @@
 //! implements none of the commit-pipeline surfaces (`ShardChainWriter`,
 //! `TreeReader`), so the two overlays cannot be cross-fed.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use hyperscale_types::{
@@ -77,26 +77,21 @@ pub struct ProvisionalTx {
 /// The execution output of one tick.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TickOutput {
-    /// What each single-shard member left, by the wave it belongs to and
-    /// in the canonical order the batch fold produced them in —
-    /// absolutes where an exclusive write stated the value, movements
-    /// where a commutative access said what it moved, unconditional fee
-    /// burns included. Readable by every subsequent tick immediately.
-    ///
-    /// Keyed by wave for the same reason the provisional side is: a tick
-    /// can carry more than one single-shard wave — its block's own, plus
-    /// any whose members an earlier tick deferred — and each reaches the
-    /// persisted base when its *own* settling block persists.
-    pub determined: BTreeMap<TickId, Vec<(TxHash, StateWrites)>>,
-    /// Per-wave provisional contributions, unreadable until the wave
-    /// resolves.
-    pub provisional: BTreeMap<TickId, Vec<ProvisionalTx>>,
+    /// What each member reaching no further than this shard left, in the
+    /// canonical order the batch fold produced them in — absolutes where
+    /// an exclusive write stated the value, movements where a commutative
+    /// access said what it moved, unconditional fee burns included.
+    /// Readable by every subsequent tick immediately.
+    pub determined: Vec<(TxHash, StateWrites)>,
+    /// What its cross-shard legs left, unreadable until the tick's
+    /// certificate commits and says which side of each survives.
+    pub provisional: Vec<ProvisionalTx>,
 }
 
-/// How a wave's fate became known from chain content.
+/// How a tick's fate became known from chain content.
 #[derive(Clone, Debug)]
 pub enum TickResolution {
-    /// The wave's certificate committed. Transactions in `aborted` settle
+    /// The tick's certificate committed. Transactions in `aborted` settle
     /// their reserve charge; every other member settles its execution
     /// writes.
     Settled {
@@ -105,8 +100,9 @@ pub enum TickResolution {
         /// Members whose verdict discards their execution effects.
         aborted: BTreeSet<TxHash>,
     },
-    /// The wave will never finalize (counterpart terminated, gate
-    /// rejection). Nothing settles; its provisional entries drop.
+    /// The tick will never finalize — it held a transaction abandoned at
+    /// its deadline, so it was discarded. Nothing settles; its
+    /// provisional entries drop.
     Aborted {
         /// Height at which the abort became known.
         height: BlockHeight,
@@ -115,9 +111,6 @@ pub enum TickResolution {
 
 /// One transaction's readable contribution to a tick.
 struct Contribution {
-    /// The wave whose verdict governs it, and so the wave whose
-    /// settlement puts these writes into the base.
-    wave: TickId,
     /// What the transaction left, in the form its receipt states it.
     writes: StateWrites,
     /// The height the settled base gains these writes at, known once the
@@ -133,48 +126,43 @@ struct Contribution {
 /// One tick's retained state.
 struct TickEntry {
     /// Readable contributions in canonical transaction order — the order
-    /// the batch fold that produced them ran in. The single-shard wave's
-    /// members are here from the append; a cross-shard wave's arrive when
-    /// its verdict promotes them.
+    /// the batch fold that produced them ran in. The members reaching no
+    /// further than this shard are here from the append; a cross-shard
+    /// leg's arrive when the tick's verdict promotes them.
     readable: BTreeMap<TxHash, Contribution>,
-    /// Waves whose fate is still unknown. Includes the single-shard wave
-    /// (with no provisional entries) so eviction waits for its
-    /// settlement.
-    pending: HashMap<TickId, Vec<ProvisionalTx>>,
+    /// The tick's provisional legs, until its certificate commits.
+    /// `None` once it has. Present-and-empty while a tick of purely
+    /// local members awaits its own settlement, so eviction waits for it.
+    pending: Option<Vec<ProvisionalTx>>,
 }
 
 impl TickEntry {
     /// The entry one tick's output produces.
     fn from_output(output: TickOutput) -> Self {
-        let mut entry = Self {
-            readable: BTreeMap::new(),
-            pending: HashMap::new(),
-        };
-        for (wave, txs) in output.determined {
-            for (tx_hash, writes) in txs {
-                entry.readable.insert(
-                    tx_hash,
-                    Contribution {
-                        wave,
-                        writes,
-                        in_base_from: None,
-                    },
-                );
-            }
-            entry.pending.insert(wave, Vec::new());
+        Self {
+            readable: output
+                .determined
+                .into_iter()
+                .map(|(tx_hash, writes)| {
+                    (
+                        tx_hash,
+                        Contribution {
+                            writes,
+                            in_base_from: None,
+                        },
+                    )
+                })
+                .collect(),
+            pending: Some(output.provisional),
         }
-        for (wave, txs) in output.provisional {
-            entry.pending.insert(wave, txs);
-        }
-        entry
     }
 
-    /// Apply one wave's verdict: promote each member's surviving side
-    /// into the readable fold, or drop the wave's entries outright, and
+    /// Apply the tick's verdict: promote each member's surviving side
+    /// into the readable fold, or drop the tick's entries outright, and
     /// record the height the base gains whatever survives at.
-    /// A no-op for a wave already resolved.
+    /// A no-op for a tick already resolved.
     fn resolve(&mut self, tick_id: &TickId, resolution: &TickResolution) {
-        let Some(txs) = self.pending.remove(tick_id) else {
+        let Some(txs) = self.pending.take() else {
             return;
         };
         match resolution {
@@ -189,19 +177,16 @@ impl TickEntry {
                         self.readable.insert(
                             tx.tx_hash,
                             Contribution {
-                                wave: *tick_id,
                                 writes,
                                 in_base_from: None,
                             },
                         );
                     }
                 }
-                // The base gains everything this wave settled, at the
+                // The base gains everything this tick settled, at the
                 // height that settled it.
                 for contribution in self.readable.values_mut() {
-                    if contribution.wave == *tick_id {
-                        contribution.in_base_from = Some(*height);
-                    }
+                    contribution.in_base_from = Some(*height);
                 }
             }
             // Nothing settles, so nothing enters the base and no height
@@ -218,7 +203,7 @@ impl TickEntry {
             // abandonment is a verdict about a cross-shard wave, and a
             // wave with determined output is not one.
             TickResolution::Aborted { .. } => {
-                if self.readable.values().any(|c| c.wave == *tick_id) {
+                if !self.readable.is_empty() {
                     // Left folded rather than dropped or stamped: every
                     // read keeps agreeing with the ones before it, and
                     // the cost is a tick this entry pins.
@@ -235,7 +220,7 @@ impl TickEntry {
     /// Whether the settled base at `floor` already carries everything
     /// this entry holds, so no future read can still need it.
     fn covered_by(&self, floor: BlockHeight) -> bool {
-        self.pending.is_empty()
+        self.pending.is_none()
             && self
                 .readable
                 .values()
@@ -300,22 +285,18 @@ where
         *executed = (*executed).max(height);
     }
 
-    /// Resolve a wave's fate: a settled verdict promotes each member's
-    /// surviving side into the readable fold, an abort drops the wave's
-    /// entries.
+    /// Resolve a tick's fate: a settled verdict promotes each member's
+    /// surviving side into the readable fold, an abort drops its entries.
     ///
-    /// Every retained tick is searched rather than the one at the wave's
-    /// own height. A wave joins whichever tick it became executable at —
-    /// later than its origin block when its provisions arrived late — and
-    /// contributes to more than one when a member waits on a cell another
-    /// wave holds provisionally. Resolving the wrong entry would leave the
-    /// promotion unapplied and the tick unevictable.
+    /// The entry is the one at the tick's own height, because a tick's
+    /// output is appended there and nowhere else — which it is because a
+    /// tick attests exactly what it ran.
     ///
-    /// Idempotent and tolerant of unknown waves: every entry may already
-    /// be evicted (every wave resolved and persisted) or torn down at a
-    /// reshape boundary.
+    /// Idempotent and tolerant of unknown ticks: the entry may already be
+    /// evicted (resolved and persisted) or torn down at a reshape
+    /// boundary.
     pub fn resolve(&self, tick_id: &TickId, resolution: &TickResolution) {
-        for entry in write_or_recover(&self.entries).values_mut() {
+        if let Some(entry) = write_or_recover(&self.entries).get_mut(&tick_id.block_height()) {
             entry.resolve(tick_id, resolution);
         }
     }
@@ -400,7 +381,7 @@ where
                 }
                 fold_state_writes(&mut overlay, &contribution.writes);
             }
-            for leg in entry.pending.values().flatten() {
+            for leg in entry.pending.iter().flatten() {
                 for (cell, amount) in &leg.reserved {
                     *holds
                         .entry(*cell)
@@ -482,6 +463,7 @@ impl<Snap: SubstateDatabase> SubstateDatabase for TickViewSnapshot<Snap> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use hyperscale_types::{
@@ -619,7 +601,7 @@ mod tests {
         read_amount(cell).expect("an amount cell")
     }
 
-    fn wave(height: u64, _remote: &[u64]) -> TickId {
+    fn tick(height: u64) -> TickId {
         TickId::new(ShardId::leaf(0, 0), BlockHeight::new(height))
     }
 
@@ -633,24 +615,18 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: BTreeMap::from([(
-                    wave(1, &[]),
-                    vec![(
-                        tx(1),
-                        writes(&[(key(1), Some(b"one")), (key(2), Some(b"two"))]),
-                    )],
-                )]),
-                provisional: BTreeMap::new(),
+                determined: vec![(
+                    tx(1),
+                    writes(&[(key(1), Some(b"one")), (key(2), Some(b"two"))]),
+                )],
+                provisional: Vec::new(),
             },
         );
         chain.append(
             BlockHeight::new(2),
             TickOutput {
-                determined: BTreeMap::from([(
-                    wave(2, &[]),
-                    vec![(tx(2), writes(&[(key(1), None)]))],
-                )]),
-                provisional: BTreeMap::new(),
+                determined: vec![(tx(2), writes(&[(key(1), None)]))],
+                provisional: Vec::new(),
             },
         );
 
@@ -677,8 +653,8 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: BTreeMap::from([(wave(1, &[]), vec![(tx(1), debit(key(1), 300))])]),
-                provisional: BTreeMap::new(),
+                determined: vec![(tx(1), debit(key(1), 300))],
+                provisional: Vec::new(),
             },
         );
 
@@ -717,20 +693,17 @@ mod tests {
     #[test]
     fn provisional_entries_unreadable_until_settled() {
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
-        let w = wave(1, &[2]);
+        let w = tick(1);
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: BTreeMap::new(),
-                provisional: BTreeMap::from([(
-                    w,
-                    vec![ProvisionalTx {
-                        tx_hash: tx(7),
-                        writes: Some(writes(&[(key(1), Some(b"provisional"))])),
-                        reserve: None,
-                        reserved: BTreeMap::new(),
-                    }],
-                )]),
+                determined: Vec::new(),
+                provisional: vec![ProvisionalTx {
+                    tx_hash: tx(7),
+                    writes: Some(writes(&[(key(1), Some(b"provisional"))])),
+                    reserve: None,
+                    reserved: BTreeMap::new(),
+                }],
             },
         );
 
@@ -751,35 +724,30 @@ mod tests {
         );
     }
 
-    /// A wave joins whichever tick it became executable at, which is not
-    /// its origin block when provisions arrived late, and it contributes
-    /// to two when a member waited on a provisional cell. Resolution has
-    /// to reach every entry holding it, or the promotion is dropped and
-    /// the tick never evicts.
+    /// A tick's output lives at its own height and nowhere else, because
+    /// a tick attests exactly what it ran. So a resolution reaches one
+    /// entry, and a second tick over the same cell is untouched by it —
+    /// which is what lets `resolve` be a lookup rather than a search.
     #[test]
-    fn resolution_reaches_every_tick_the_wave_contributed_to() {
+    fn a_resolution_reaches_the_tick_it_names_and_no_other() {
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
-        let w = wave(1, &[2]);
         for (height, cell, member) in [(4u64, key(1), 7u8), (6, key(2), 8)] {
             chain.append(
                 BlockHeight::new(height),
                 TickOutput {
-                    determined: BTreeMap::new(),
-                    provisional: BTreeMap::from([(
-                        w,
-                        vec![ProvisionalTx {
-                            tx_hash: tx(member),
-                            writes: Some(writes(&[(cell, Some(b"promoted"))])),
-                            reserve: None,
-                            reserved: BTreeMap::new(),
-                        }],
-                    )]),
+                    determined: Vec::new(),
+                    provisional: vec![ProvisionalTx {
+                        tx_hash: tx(member),
+                        writes: Some(writes(&[(cell, Some(b"promoted"))])),
+                        reserve: None,
+                        reserved: BTreeMap::new(),
+                    }],
                 },
             );
         }
 
         chain.resolve(
-            &w,
+            &tick(4),
             &TickResolution::Settled {
                 height: BlockHeight::new(6),
                 aborted: BTreeSet::new(),
@@ -788,28 +756,30 @@ mod tests {
 
         let view = chain.view_at(BlockHeight::new(6));
         assert_eq!(view.snapshot().substate(key(1)), Some(b"promoted".to_vec()));
-        assert_eq!(view.snapshot().substate(key(2)), Some(b"promoted".to_vec()));
+        assert_eq!(
+            view.snapshot().substate(key(2)),
+            None,
+            "the tick at 6 is unresolved, so nothing of it is readable"
+        );
+
         chain.prune_persisted(BlockHeight::new(6));
-        assert!(chain.is_empty(), "both entries must become evictable");
+        assert_eq!(chain.len(), 1, "only the resolved tick evicts");
     }
 
     #[test]
     fn aborted_member_settles_reserve_not_writes() {
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
-        let w = wave(1, &[2]);
+        let w = tick(1);
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: BTreeMap::new(),
-                provisional: BTreeMap::from([(
-                    w,
-                    vec![ProvisionalTx {
-                        tx_hash: tx(7),
-                        writes: Some(writes(&[(key(1), Some(b"effects"))])),
-                        reserve: Some(writes(&[(key(9), Some(b"floor"))])),
-                        reserved: BTreeMap::new(),
-                    }],
-                )]),
+                determined: Vec::new(),
+                provisional: vec![ProvisionalTx {
+                    tx_hash: tx(7),
+                    writes: Some(writes(&[(key(1), Some(b"effects"))])),
+                    reserve: Some(writes(&[(key(9), Some(b"floor"))])),
+                    reserved: BTreeMap::new(),
+                }],
             },
         );
 
@@ -828,20 +798,17 @@ mod tests {
     #[test]
     fn wholesale_abort_drops_everything() {
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
-        let w = wave(1, &[2]);
+        let w = tick(1);
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: BTreeMap::new(),
-                provisional: BTreeMap::from([(
-                    w,
-                    vec![ProvisionalTx {
-                        tx_hash: tx(7),
-                        writes: Some(writes(&[(key(1), Some(b"effects"))])),
-                        reserve: Some(writes(&[(key(9), Some(b"floor"))])),
-                        reserved: BTreeMap::new(),
-                    }],
-                )]),
+                determined: Vec::new(),
+                provisional: vec![ProvisionalTx {
+                    tx_hash: tx(7),
+                    writes: Some(writes(&[(key(1), Some(b"effects"))])),
+                    reserve: Some(writes(&[(key(9), Some(b"floor"))])),
+                    reserved: BTreeMap::new(),
+                }],
             },
         );
 
@@ -865,8 +832,8 @@ mod tests {
         let store = Arc::new(StubStore::with_cell(key(1), encode_amount(1_000).as_ref()));
         let chain = TickChain::new(store);
         let output = || TickOutput {
-            determined: BTreeMap::from([(wave(1, &[]), vec![(tx(1), debit(key(1), 100))])]),
-            provisional: BTreeMap::new(),
+            determined: vec![(tx(1), debit(key(1), 100))],
+            provisional: Vec::new(),
         };
         chain.append(BlockHeight::new(1), output());
         chain.append(BlockHeight::new(1), output());
@@ -890,20 +857,17 @@ mod tests {
         ));
         let chain = TickChain::new(Arc::clone(&store));
 
-        let w = wave(3, &[2]);
+        let w = tick(3);
         chain.append(
             BlockHeight::new(3),
             TickOutput {
-                determined: BTreeMap::new(),
-                provisional: BTreeMap::from([(
-                    w,
-                    vec![ProvisionalTx {
-                        tx_hash: tx(7),
-                        writes: Some(debit(key(1), 100)),
-                        reserve: None,
-                        reserved: BTreeMap::new(),
-                    }],
-                )]),
+                determined: Vec::new(),
+                provisional: vec![ProvisionalTx {
+                    tx_hash: tx(7),
+                    writes: Some(debit(key(1), 100)),
+                    reserve: None,
+                    reserved: BTreeMap::new(),
+                }],
             },
         );
         chain.resolve(
@@ -938,20 +902,14 @@ mod tests {
     #[test]
     fn eviction_waits_for_resolution_persistence_and_execution() {
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
-        let w = wave(1, &[]);
-        let append_at = |height: u64, wave: TickId| {
-            chain.append(
-                BlockHeight::new(height),
-                TickOutput {
-                    determined: BTreeMap::from([(
-                        wave,
-                        vec![(tx(1), writes(&[(key(1), Some(b"one"))]))],
-                    )]),
-                    provisional: BTreeMap::new(),
-                },
-            );
-        };
-        append_at(1, w);
+        let w = tick(1);
+        chain.append(
+            BlockHeight::new(1),
+            TickOutput {
+                determined: vec![(tx(1), writes(&[(key(1), Some(b"one"))]))],
+                provisional: Vec::new(),
+            },
+        );
 
         // Unresolved: survives any persistence progress.
         chain.prune_persisted(BlockHeight::new(10));
@@ -976,7 +934,13 @@ mod tests {
 
         // Execution reaches the settling height: nothing anchors below it
         // any more.
-        append_at(3, wave(3, &[]));
+        chain.append(
+            BlockHeight::new(3),
+            TickOutput {
+                determined: vec![(tx(3), writes(&[(key(1), Some(b"three"))]))],
+                provisional: Vec::new(),
+            },
+        );
         chain.prune_persisted(BlockHeight::new(2));
         assert_eq!(chain.len(), 2, "persistence has not caught up");
         chain.prune_persisted(BlockHeight::new(3));
@@ -984,21 +948,21 @@ mod tests {
     }
 
     #[test]
-    fn resolution_is_idempotent_and_tolerates_unknown_waves() {
+    fn resolution_is_idempotent_and_tolerates_unknown_ticks() {
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
         let settled = TickResolution::Settled {
             height: BlockHeight::new(1),
             aborted: BTreeSet::new(),
         };
-        // Unknown wave: no entry at its origin height.
-        chain.resolve(&wave(5, &[2]), &settled);
+        // Unknown tick: no entry at its height.
+        chain.resolve(&tick(5), &settled);
 
-        let w = wave(1, &[2]);
+        let w = tick(1);
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: BTreeMap::new(),
-                provisional: BTreeMap::from([(w, Vec::new())]),
+                determined: Vec::new(),
+                provisional: Vec::new(),
             },
         );
         chain.resolve(&w, &settled);

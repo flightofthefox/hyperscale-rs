@@ -679,13 +679,19 @@ impl ExecutionCoordinator {
         let members: Vec<TxHash> = state.tx_hashes().to_vec();
 
         self.ticks.insert_tick(tick_id, state);
-        self.ticked.insert(
-            tick_id,
-            TickedBatch {
-                claims,
-                provisional,
-            },
-        );
+        // Only a tick that runs a batch appends an output, and only an
+        // output has a fate to record. A tick that abandons and nothing
+        // else claims no cell and settles nothing, so the chain never
+        // hears of it.
+        if !requests.is_empty() {
+            self.ticked.insert(
+                tick_id,
+                TickedBatch {
+                    claims,
+                    provisional,
+                },
+            );
+        }
 
         // Only the tick leader creates a `VoteTracker` for aggregation.
         // Resolved under the committee seated at the tick's own block,
