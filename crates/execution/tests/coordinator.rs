@@ -5,6 +5,7 @@
 //! API is caught here rather than by inline tests that can reach into
 //! private fields.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_execution::{ExecutionCoordinator, ExecutionMemoryStats};
@@ -26,7 +27,7 @@ fn fresh_coordinator_reports_no_finalized_state() {
     let coord = fresh_coordinator();
     assert!(!coord.is_finalized(TxHash::from(Hash::from_bytes(b"anything"))));
     assert!(coord.finalized_tx_hashes().is_empty());
-    assert!(coord.get_finalized_waves().is_empty());
+    assert!(coord.get_finalized_waves(&HashSet::new()).is_empty());
 }
 
 /// Destructures every field of `ExecutionMemoryStats`, so adding a field

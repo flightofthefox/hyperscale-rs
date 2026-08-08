@@ -24,7 +24,7 @@
 //! (`BFT CRITICAL: VM fold diverged from the kernel apply`), so nothing here
 //! is standing in for that.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use hyperscale_core::{Action, TickExecutionGroup, WaveExecutionResult};
@@ -398,10 +398,12 @@ impl ExecutionSim {
 
     /// Whether a block carrying `certificates` in this order would settle
     /// two cell-sharing waves out of the order they executed in — the
-    /// pre-vote gate's question.
+    /// pre-vote gate's question. No ancestor blocks here: the harness
+    /// models one block at a time.
     #[must_use]
     pub fn settles_out_of_order(&self, certificates: &[WaveId]) -> Option<WaveId> {
-        self.coord.certificates_settle_out_of_order(certificates)
+        self.coord
+            .certificates_settle_out_of_order(certificates, &HashSet::new())
     }
 
     /// The receipts `wave_id`'s tick produced.

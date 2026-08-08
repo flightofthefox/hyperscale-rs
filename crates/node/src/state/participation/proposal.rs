@@ -35,7 +35,14 @@ impl ShardParticipation {
         // how many are actually offered is the work budget inside
         // `ready_transactions`. The overhead compensates for QC-chain
         // duplicates shard consensus filters during proposal building.
-        let max_txs = MAX_TXS_PER_BLOCK + self.shard_coordinator.dedup_overhead();
+        let parent = self.shard_coordinator.proposal_parent_block_hash();
+        // What the ancestor chain above the committed tip already carries.
+        // Proposal building drops these as duplicates, so the settlement
+        // order rule has to count them as placed or every successor is
+        // held back for a predecessor that is already ahead of it.
+        let (ancestor_certified, ancestor_txs, _) =
+            self.shard_coordinator.collect_qc_chain_hashes(parent);
+        let max_txs = MAX_TXS_PER_BLOCK + ancestor_txs.len();
         // Reshape-boundary quiesce: in a shard's final epoch before it
         // terminates at a split or merge, stop selecting transactions that
         // can't settle before the cut. `None` in steady state, so the
@@ -50,7 +57,9 @@ impl ShardParticipation {
             self.now,
             quiesce,
         );
-        let finalized_waves = self.execution_coordinator.get_finalized_waves();
+        let finalized_waves = self
+            .execution_coordinator
+            .get_finalized_waves(&ancestor_certified);
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard

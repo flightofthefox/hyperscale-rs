@@ -2856,8 +2856,18 @@ impl ExecutionCoordinator {
     /// The relation is a strict order on ticks, so the hold-back cannot
     /// cycle, and a predecessor that never settles is the same liveness
     /// question its own transactions already pose.
+    ///
+    /// `ancestor_certified` names the waves an uncommitted ancestor block
+    /// already carries. Those settle strictly before anything this block
+    /// can hold, so they satisfy the order exactly as a settled wave does
+    /// — and they have to be counted, because a wave's tick entry clears
+    /// on the certificate *committing*, not on its being proposed. The
+    /// emitted order is the block's order, so the caller must preserve it.
     #[must_use]
-    pub fn get_finalized_waves(&self) -> Vec<Arc<Verifiable<FinalizedWave>>> {
+    pub fn get_finalized_waves(
+        &self,
+        ancestor_certified: &HashSet<WaveId>,
+    ) -> Vec<Arc<Verifiable<FinalizedWave>>> {
         let ready = self.finalized.all_waves();
         let mut ordered: Vec<Arc<Verifiable<FinalizedWave>>> = ready;
         // Ties keep `WaveId` order, which `all_waves` already imposes, so
@@ -2867,7 +2877,7 @@ impl ExecutionCoordinator {
         let mut emitted: Vec<Arc<Verifiable<FinalizedWave>>> = Vec::with_capacity(ordered.len());
         let mut placed: BTreeSet<WaveId> = BTreeSet::new();
         for fw in ordered {
-            if self.predecessors_unsettled(fw.wave_id(), &placed) {
+            if self.predecessors_unsettled(fw.wave_id(), &placed, ancestor_certified) {
                 continue;
             }
             placed.insert(fw.wave_id().clone());
@@ -2886,18 +2896,28 @@ impl ExecutionCoordinator {
     }
 
     /// Whether some wave that executed before `wave_id` writes a cell it
-    /// writes and has neither settled nor been placed ahead of it.
+    /// writes and settles no earlier.
     ///
-    /// Absence from `ticked_waves` means settled: the entry is removed
-    /// when the fate commits.
-    fn predecessors_unsettled(&self, wave_id: &WaveId, placed: &BTreeSet<WaveId>) -> bool {
+    /// A predecessor is in order when it has resolved — absence from
+    /// `ticked_waves`, whose entry clears when the fate commits — when an
+    /// uncommitted ancestor block already carries its certificate, or when
+    /// it sits earlier in this same block's list.
+    fn predecessors_unsettled(
+        &self,
+        wave_id: &WaveId,
+        placed: &BTreeSet<WaveId>,
+        ancestor_certified: &HashSet<WaveId>,
+    ) -> bool {
         let Some(ticked) = self.ticked_waves.get(wave_id) else {
             return false;
         };
         let mut own = ProvisionalCells::default();
         own.claim(&ticked.claims);
         self.ticked_waves.iter().any(|(other_id, other)| {
-            other.tick < ticked.tick && !placed.contains(other_id) && own.blocks(&other.claims)
+            other.tick < ticked.tick
+                && !placed.contains(other_id)
+                && !ancestor_certified.contains(other_id)
+                && own.blocks(&other.claims)
         })
     }
 
@@ -2905,15 +2925,24 @@ impl ExecutionCoordinator {
     /// cell-sharing waves out of the order they executed in.
     ///
     /// The mirror of what [`Self::get_finalized_waves`] emits, read by the
-    /// pre-vote gate. A node that has not composed a wave's tick knows of
-    /// no predecessor for it and passes, which is the direction that
-    /// cannot reject a well-formed block: the rule needs a quorum of
-    /// enforcers, not every node.
+    /// pre-vote gate, and it has to read the same ancestor set: the
+    /// proposer's list is what survives the QC-chain duplicate filter, so
+    /// a predecessor riding an ancestor block is absent from the block
+    /// under test and present in neither `placed` nor a resolution.
+    ///
+    /// A node that has not composed a wave's tick knows of no predecessor
+    /// for it and passes, which is the direction that cannot reject a
+    /// well-formed block: the rule needs a quorum of enforcers, not every
+    /// node.
     #[must_use]
-    pub fn certificates_settle_out_of_order(&self, certificates: &[WaveId]) -> Option<WaveId> {
+    pub fn certificates_settle_out_of_order(
+        &self,
+        certificates: &[WaveId],
+        ancestor_certified: &HashSet<WaveId>,
+    ) -> Option<WaveId> {
         let mut placed: BTreeSet<WaveId> = BTreeSet::new();
         for wave_id in certificates {
-            if self.predecessors_unsettled(wave_id, &placed) {
+            if self.predecessors_unsettled(wave_id, &placed, ancestor_certified) {
                 return Some(wave_id.clone());
             }
             placed.insert(wave_id.clone());

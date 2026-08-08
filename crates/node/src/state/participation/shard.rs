@@ -386,13 +386,19 @@ impl ShardParticipation {
         // Settlement order. A receipt carries the absolute its tick's
         // baseline produced, so two waves writing one cell have to settle
         // in the order they executed — the reverse reverts a committed
-        // write. A node that has not composed a wave's tick knows of no
-        // predecessor for it and passes; the rule needs a quorum of
-        // enforcers, not every node, and that is the direction that
-        // cannot refuse a well-formed block.
+        // write. A predecessor riding an uncommitted ancestor block
+        // settles first and so satisfies the order without appearing
+        // here; the ancestor walk is what tells this apart from a
+        // genuinely skipped predecessor. A node that has not composed a
+        // wave's tick knows of no predecessor for it and passes; the rule
+        // needs a quorum of enforcers, not every node, and that is the
+        // direction that cannot refuse a well-formed block.
+        let (ancestor_certified, ..) = self
+            .shard_coordinator
+            .collect_qc_chain_hashes(header.parent_block_hash());
         if let Some(wave_id) = self
             .execution_coordinator
-            .certificates_settle_out_of_order(manifest.cert_ids())
+            .certificates_settle_out_of_order(manifest.cert_ids(), &ancestor_certified)
         {
             tracing::warn!(
                 block_hash = ?header.hash(),

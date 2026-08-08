@@ -198,31 +198,35 @@ pub fn select_transactions(
 }
 
 /// Select finalized waves for inclusion: drop those already in the QC
-/// chain or committed within the retention window, sort by kickoff height
-/// (tie-breaking by wave hash for canonical manifest order), and cap the
-/// total finalized-tx count at the `max_finalized_txs` limit. Returns
+/// chain or committed within the retention window, and cap the total
+/// finalized-tx count at the `max_finalized_txs` limit. Returns
 /// `(waves, total_tx_count)`.
 ///
-/// Canonical order matters: verifiers flatten receipts into JMT `work_items`
-/// in manifest order, and the `BTreeMap` collapse there is last-writer-wins,
-/// so the proposer must produce a deterministic order.
+/// Order is the caller's and is preserved. It arrives in the order the
+/// waves executed, which is the order their receipts have to settle in —
+/// two waves writing one cell each carry an absolute computed from their
+/// own baseline, and settlement is last writer per cell, so the later
+/// execution must land last. Re-sorting here by kickoff height would
+/// invert exactly the pairs that matter: a wave held back from its own
+/// block's tick executes after a later-numbered one it shares a cell
+/// with. Order stays deterministic because the caller's is, which is what
+/// verifiers flattening receipts into JMT `work_items` in manifest order
+/// need.
+///
+/// Truncation is a suffix for the same reason: dropping the tail cannot
+/// leave a wave ahead of a predecessor it should follow.
 pub fn select_finalized_waves(
     finalized_waves: Vec<Arc<Verifiable<FinalizedWave>>>,
     qc_chain_cert_ids: &HashSet<WaveId>,
     dedup_index: &CommitDedupIndex,
     max_finalized_txs: usize,
 ) -> (Vec<Arc<Verifiable<FinalizedWave>>>, usize) {
-    let mut candidate_waves: Vec<_> = finalized_waves
+    let mut finalized_tx_count = 0usize;
+    let waves_to_propose: Vec<_> = finalized_waves
         .into_iter()
         .filter(|fw| {
             !qc_chain_cert_ids.contains(fw.wave_id()) && !dedup_index.contains_cert(fw.wave_id())
         })
-        .collect();
-    candidate_waves.sort_by_key(|fw| (fw.wave_id().block_height(), fw.wave_id().clone()));
-
-    let mut finalized_tx_count = 0usize;
-    let waves_to_propose: Vec<_> = candidate_waves
-        .into_iter()
         .take_while(|fw| {
             let new_total = finalized_tx_count.saturating_add(fw.tx_count());
             if new_total <= max_finalized_txs {
