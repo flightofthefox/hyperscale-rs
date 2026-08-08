@@ -823,10 +823,15 @@ impl WaveState {
                 let work = self.attested_work.get(tx_hash).copied().unwrap_or(0);
                 // What the transaction reserved when its block committed
                 // it, carried so the settling block can release exactly
-                // that. Derived from the transaction, which this wave
-                // still holds; a member swept before it voted reserved
-                // nothing this wave can return.
-                let reserved = self.transactions.get(tx_hash).map_or(0, |tx| tx.work());
+                // that. A member the wave could not price would release
+                // less than its block took, and the drain keeps the
+                // difference for as long as the chain runs — so the
+                // transaction is required, not defaulted.
+                let reserved = self
+                    .transactions
+                    .get(tx_hash)
+                    .expect("a wave holds every member it names")
+                    .work();
                 let charge = self
                     .fee_receipts
                     .get(tx_hash)
