@@ -4,7 +4,7 @@
 //! plus an index from each attested transaction to the certificate
 //! carrying its outcome — the key a counterpart shard actually asks by.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{Block, ExecutionCertificate, Hash, TickId};
 use rocksdb::{ColumnFamily, WriteBatch};
@@ -42,16 +42,45 @@ pub fn append_block_certs_to_batch(
             widest
                 .entry(*ec.tick_id())
                 .and_modify(|held| {
-                    if ec.tx_outcomes().len() > held.tx_outcomes().len() {
+                    if supersedes(ec, held) {
                         *held = ec;
                     }
                 })
                 .or_insert(ec);
         }
     }
+    // The same comparison against what is already stored. A remote tick
+    // reaches this shard through whichever of its own finalizations needed
+    // it, so two blocks can each carry a copy of one tick — and the second
+    // is not always the wider. Writing it unconditionally would replace a
+    // complete copy with a projection and leave the transaction index
+    // pointing at outcomes the stored copy no longer carries.
     for cert in widest.into_values() {
+        let stored = storage.cf_get::<ExecutionCertsCf>(cert.tick_id());
+        if stored.is_some_and(|held| !supersedes(cert, &held)) {
+            continue;
+        }
         append_ec_to_batch(batch, primary_cf, index_cf, cert);
     }
+}
+
+/// Whether `candidate` carries everything `held` does and at least one
+/// outcome more.
+///
+/// Copies of one tick can be disjoint rather than nested, so a count
+/// comparison would sometimes replace coverage with different coverage
+/// and leave the transaction index pointing at outcomes the stored copy
+/// no longer carries. One tick has one slot here, so the rule is that the
+/// slot never loses ground: a copy that is not a strict superset is
+/// dropped, and the transactions only it covered are served from their
+/// own shard instead.
+fn supersedes(candidate: &ExecutionCertificate, held: &ExecutionCertificate) -> bool {
+    let candidate_leaves: BTreeSet<u32> = candidate.leaf_indices().iter().copied().collect();
+    candidate_leaves.len() > held.leaf_indices().len()
+        && held
+            .leaf_indices()
+            .iter()
+            .all(|index| candidate_leaves.contains(index))
 }
 
 fn append_ec_to_batch(
