@@ -2994,12 +2994,12 @@ impl ExecutionCoordinator {
         self.finalized.get(wave_id)
     }
 
-    /// Bloom filter over every tracked finalized-wave id hash. Attached to
-    /// outgoing `GetBlockRequest`s so the responder can elide wave
-    /// certificates the requester already has. Returns `None` when the
+    /// Bloom filter over every transaction in a tracked finalized wave.
+    /// Attached to outgoing `GetBlockRequest`s so the responder can elide
+    /// wave certificates the requester already has. Returns `None` when the
     /// cached set is too large to size a filter within the configured cap.
     #[must_use]
-    pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<WaveId>> {
+    pub fn cert_bloom_snapshot(&self) -> Option<BloomFilter<TxHash>> {
         self.finalized.cert_bloom_snapshot()
     }
 

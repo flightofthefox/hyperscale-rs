@@ -3,10 +3,9 @@
 use std::collections::BTreeSet;
 use std::fmt::{self, Display};
 
-use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
+use hyperscale_hbor::Hbor;
 
-use crate::primitives::bloom::BloomKey;
-use crate::{BlockHeight, Hash, ShardId};
+use crate::{BlockHeight, ShardId};
 
 /// Cap on `WaveId.remote_shards` length at decode time.
 ///
@@ -80,17 +79,6 @@ impl WaveId {
     #[must_use]
     pub fn dependency_count(&self) -> usize {
         self.remote_shards.len()
-    }
-}
-
-impl BloomKey for WaveId {
-    fn bloom_seed(&self) -> [u8; 16] {
-        let bytes = hbor_to_vec(self).expect("WaveId serialization should never fail");
-        let h = Hash::from_bytes(&bytes);
-        let raw = h.as_bytes();
-        let mut out = [0u8; 16];
-        out.copy_from_slice(&raw[0..16]);
-        out
     }
 }
 

@@ -43,9 +43,10 @@ pub struct Inventory {
     /// recently-evicted cache. Responder may omit the corresponding
     /// transaction body.
     pub tx_have: Option<BloomFilter<TxHash>>,
-    /// Finalized wave certificates the requester already has cached.
-    /// Responder may omit matching `FinalizedWave` bodies.
-    pub cert_have: Option<BloomFilter<WaveId>>,
+    /// Transactions the requester already holds a finalized wave for.
+    /// Responder may omit a `FinalizedWave` body once every one of its
+    /// transactions matches.
+    pub cert_have: Option<BloomFilter<TxHash>>,
     /// Provisions the requester already has in its provision store.
     /// Independent of the responder's own `Live → Sealed` downgrade.
     pub provision_have: Option<BloomFilter<ProvisionHash>>,
@@ -199,7 +200,7 @@ impl ElidedCertifiedBlock {
             .iter()
             .map(|fw| {
                 let id = fw.wave_id().clone();
-                let body = if matches_filter(inventory.cert_have.as_ref(), &id) {
+                let body = if wave_is_held(inventory.cert_have.as_ref(), fw) {
                     None
                 } else {
                     Some(Arc::clone(fw))
@@ -425,9 +426,21 @@ where
     filter.is_some_and(|bf| bf.contains(item))
 }
 
+/// Whether the requester's transaction filter covers every transaction of
+/// `fw`, which is what it takes to hold the wave itself. A wave with no
+/// transactions is never held — a vacuous match would elide a body the
+/// requester has no way to resolve.
+fn wave_is_held(filter: Option<&BloomFilter<TxHash>>, fw: &FinalizedWave) -> bool {
+    let Some(bf) = filter else {
+        return false;
+    };
+    let mut txs = fw.tx_hashes().peekable();
+    txs.peek().is_some() && txs.all(|tx| bf.contains(&tx))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use hyperscale_hbor::{
         DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
@@ -437,9 +450,10 @@ mod tests {
     use crate::test_utils::test_transaction;
     use crate::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
-        BloomFilter, CertificateRoot, ChainOrigin, Hash, LocalReceiptRoot, ProposerTimestamp,
+        BloomFilter, CertificateRoot, ChainOrigin, ExecutionCertificate, ExecutionOutcome,
+        GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
         ProvisionsRoot, RevealChain, Round, ShardId, ShardLoad, SignerBitfield, StateRoot,
-        TransactionRoot, ValidatorId, WeightedTimestamp, WorkInFlight,
+        TransactionRoot, TxOutcome, ValidatorId, WaveCertificate, WeightedTimestamp, WorkInFlight,
     };
 
     fn create_test_block() -> Block {
@@ -476,6 +490,93 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
+    }
+
+    /// Block carrying one two-transaction finalized wave and no
+    /// transactions of its own.
+    fn create_test_block_with_wave(tx_hashes: &[TxHash]) -> Block {
+        let wave_id = WaveId::new(ShardId::ROOT, BlockHeight::new(1), BTreeSet::new());
+        let outcomes: Vec<TxOutcome> = tx_hashes
+            .iter()
+            .map(|h| {
+                TxOutcome::new(
+                    *h,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+            })
+            .collect();
+        let ec = ExecutionCertificate::new(
+            wave_id.clone(),
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            outcomes,
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        let wc = WaveCertificate::new(wave_id, vec![Arc::new(ec)]);
+        let fw = Verifiable::from(FinalizedWave::new(Arc::new(wc), Vec::new()));
+
+        let Block::Live {
+            header,
+            transactions,
+            provisions,
+            witness_sources,
+            ..
+        } = create_test_block()
+        else {
+            unreachable!("create_test_block builds a Live block")
+        };
+        Block::Live {
+            header,
+            transactions,
+            certificates: Arc::new(vec![Arc::new(fw)]),
+            provisions,
+            witness_sources,
+        }
+    }
+
+    fn cert_filter(tx_hashes: &[TxHash]) -> Inventory {
+        let mut bf: BloomFilter<TxHash> = BloomFilter::with_capacity(16, 0.01).unwrap();
+        for h in tx_hashes {
+            bf.insert(h);
+        }
+        Inventory {
+            tx_have: None,
+            cert_have: Some(bf),
+            provision_have: None,
+        }
+    }
+
+    /// A wave is held only when the requester has every one of its
+    /// transactions — a partial match leaves the body inline, because a
+    /// requester holding half a wave holds no wave at all.
+    #[test]
+    fn cert_elision_requires_every_transaction_of_the_wave() {
+        let a = TxHash::from(Hash::from_bytes(b"wave tx a"));
+        let b = TxHash::from(Hash::from_bytes(b"wave tx b"));
+        let block = create_test_block_with_wave(&[a, b]);
+        let qc = create_test_qc(&block);
+
+        let partial = ElidedCertifiedBlock::elide(&block, qc.clone(), &cert_filter(&[a]));
+        assert!(
+            partial.certificates[0].1.is_some(),
+            "one of two transactions is not the wave"
+        );
+
+        let full = ElidedCertifiedBlock::elide(&block, qc, &cert_filter(&[a, b]));
+        assert!(full.certificates[0].1.is_none(), "requester has the wave");
+    }
+
+    /// An empty wave would match a filter vacuously; eliding it would
+    /// leave the requester unable to resolve a body it never had.
+    #[test]
+    fn cert_elision_never_elides_a_transactionless_wave() {
+        let block = create_test_block_with_wave(&[]);
+        let qc = create_test_qc(&block);
+        let elided = ElidedCertifiedBlock::elide(&block, qc, &cert_filter(&[]));
+        assert!(elided.certificates[0].1.is_some());
     }
 
     fn create_test_qc(block: &Block) -> QuorumCertificate {

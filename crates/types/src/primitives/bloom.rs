@@ -4,14 +4,15 @@
 //! transactions / certificates / provisions it already has locally, letting
 //! the responder elide those bodies from the response. Each item produces a
 //! 16-byte seed via the [`BloomKey`] trait — for [`TypedHash`] items the
-//! seed is the first 16 bytes of the hash (free); for structured ids like
-//! `WaveId` the seed is derived from the id's identity hash. Probes use
-//! Kirsch-Mitzenmacher double-hashing (same FPR as independent hashes; see
-//! Kirsch & Mitzenmacher, "Less Hashing, Same Performance", 2006).
+//! seed is the first 16 bytes of the hash (free); a structured id would
+//! derive one from its identity hash. Probes use Kirsch-Mitzenmacher
+//! double-hashing (same FPR as independent hashes; see Kirsch &
+//! Mitzenmacher, "Less Hashing, Same Performance", 2006).
 //!
 //! The phantom [`T`] tags the filter with the item kind so
-//! `BloomFilter<TxHash>` can't be confused with `BloomFilter<WaveId>`
-//! at a call site. The wire format is identical regardless of `T`.
+//! `BloomFilter<TxHash>` can't be confused with
+//! `BloomFilter<ProvisionHash>` at a call site. The wire format is
+//! identical regardless of `T`.
 //!
 //! Sizing: callers construct via [`BloomFilter::with_capacity`] supplying
 //! an item count and an FPR. The bit count is rounded up to a multiple of
@@ -43,8 +44,8 @@ use crate::TypedHash;
 ///
 /// For [`TypedHash`] items the seed is the first 16 bytes of the underlying
 /// 32-byte hash — free, since the bytes are already a cryptographic hash.
-/// For structured identifiers (e.g. [`WaveId`](crate::WaveId)) the impl
-/// derives the seed from the id's own identity hash.
+/// A structured identifier would implement this by hashing its own
+/// encoding down to a seed.
 pub trait BloomKey {
     /// Return the 16-byte seed used to derive the filter's bit probes.
     fn bloom_seed(&self) -> [u8; 16];
