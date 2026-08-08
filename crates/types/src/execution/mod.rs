@@ -292,12 +292,52 @@ mod tests {
 
     #[test]
     fn test_receipt_hash_changes_with_ec() {
-        // `receipt_hash` commits to `(shard_id, tick_id)` pairs, so two
-        // ECs with distinct tick_ids must produce distinct receipt hashes.
         let tick_id = make_tick_id(0, BlockHeight::new(42));
         let fw1 = Finalization::new(tick_id, vec![make_test_ec(0, 1)], vec![]);
         let fw2 = Finalization::new(tick_id, vec![make_test_ec(1, 2)], vec![]);
         assert_ne!(fw1.receipt_hash(), fw2.receipt_hash());
+    }
+
+    /// Narrowing a counterpart's certificate moves the leaf.
+    ///
+    /// A projected copy is as valid as the copy it came from — same
+    /// signed root, same signature — and anyone holding the wider one can
+    /// build it. What separates them is which outcomes they carry, and
+    /// that decides whether a leg settles its effects or its charge. The
+    /// finalization's own receipt check reads the same certificate set on
+    /// both sides and so cannot tell, which leaves this leaf as the thing
+    /// that does.
+    #[test]
+    fn a_narrowed_certificate_changes_the_leaf() {
+        let local = make_test_ec(0, 1);
+        let remote_outcomes = vec![make_outcome(2), make_outcome(3)];
+        let remote = Arc::new(ExecutionCertificate::new(
+            make_tick_id(1, BlockHeight::new(42)),
+            WeightedTimestamp::from_millis(43),
+            compute_global_receipt_root(&remote_outcomes),
+            remote_outcomes,
+            AggregateSignature::new([0u8; 96]),
+            SignerBitfield::new(4),
+        ));
+        let narrowed = Arc::new(
+            remote
+                .project_to(&std::iter::once(make_outcome(2).tx_hash()).collect())
+                .expect("a copy covering one of the two"),
+        );
+        assert_eq!(
+            narrowed.global_receipt_root(),
+            remote.global_receipt_root(),
+            "the narrower copy verifies under the same signed root",
+        );
+
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
+        let whole = Finalization::new(tick_id, vec![Arc::clone(&local), remote], vec![]);
+        let partial = Finalization::new(tick_id, vec![local, narrowed], vec![]);
+        assert_ne!(
+            whole.receipt_hash(),
+            partial.receipt_hash(),
+            "a block cannot carry the narrower copy under the wider one's root",
+        );
     }
 
     #[test]

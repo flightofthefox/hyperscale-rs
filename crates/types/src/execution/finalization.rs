@@ -246,26 +246,34 @@ impl Finalization {
             .expect("finalization invariant: local EC must be present")
     }
 
-    /// The leaf a block's `certificate_root` commits for this tick.
+    /// The leaf a block's `certificate_root` commits for this
+    /// finalization: its tick, then each constituent certificate's
+    /// content, in the order the vec was sorted into at construction.
     ///
-    /// Hashes sorted (`shard_id`, `tick_id`) pairs over the constituent
-    /// ECs; the vec is pre-sorted at construction for deterministic
-    /// ordering. At most one valid EC exists per `tick_id` (signature
-    /// verification upstream enforces this), so committing to `tick_id`
-    /// is content-equivalent. A verifier holding only the tick ids
-    /// reproduces the hash without the EC bodies.
+    /// **The certificates are committed by content, not by identity.** A
+    /// certificate carries the outcomes naming its holder, so many valid
+    /// copies of one exist and they differ in what they cover — and
+    /// anyone holding a copy can build a narrower one, since dropping a
+    /// leaf from a set you hold means supplying that leaf's hash as a
+    /// proof node. Naming the tick alone would leave every one of those
+    /// copies hashing alike, and the difference between them is what
+    /// decides a verdict: [`refused_transactions`] reads the carried
+    /// outcomes, so a copy with a counterpart's abort dropped turns
+    /// [`settles`] from the charge to the effects. A finalization built
+    /// consistently around the narrower copy passes its own receipt check
+    /// — the same certificate set feeds both sides of it — so this leaf
+    /// is what has to tell the two apart.
     ///
     /// # Panics
     ///
-    /// Panics if HBOR encoding of a `ShardId` or `TickId` fails — closed
-    /// wire types, infallible in practice.
+    /// Panics if HBOR encoding of a `TickId` fails — a closed wire type,
+    /// infallible in practice.
     #[must_use]
     pub fn receipt_hash(&self) -> FinalizationHash {
         let mut hasher = Hasher::new();
+        hasher.update(&hbor_to_vec(&self.tick_id).unwrap());
         for ec in &self.execution_certificates {
-            let tick_id = ec.tick_id();
-            hasher.update(&hbor_to_vec(&tick_id.shard_id()).unwrap());
-            hasher.update(&hbor_to_vec(tick_id).unwrap());
+            hasher.update(ec.wire_hash().as_bytes());
         }
         FinalizationHash::from_raw(Hash::from_hash_bytes(hasher.finalize().as_bytes()))
     }
