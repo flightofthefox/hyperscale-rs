@@ -134,11 +134,12 @@ pub struct ReadyStateRootVerification {
 /// Classification of the in-flight check outcome for the vote path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InFlightCheck {
-    /// In-flight count passes — proceed with voting.
+    /// The drain total checks out — proceed with voting.
     Proceed,
     /// Run verifications but do not vote (safe-vote rule declined, or parent pruned).
     SkipVote,
-    /// In-flight count exceeds the allowed tolerance — abort entirely.
+    /// The drain total is not the one the block's own content
+    /// produces — abort entirely.
     Abort,
 }
 
@@ -344,8 +345,8 @@ pub struct VerificationPipeline {
     /// `NOT_STARTED` forever and wedge the shard on a view-change loop.
     beacon_witness_awaiting_committee: HashSet<BlockHash>,
 
-    // === In-flight count verification ===
-    /// Blocks with verified in-flight counts (synchronous tolerance check).
+    // === Drain total verification ===
+    /// Blocks whose claimed drain total was re-derived and matched.
     verified_in_flight: HashSet<BlockHash>,
 
     // === Composite assembly ===
@@ -1961,10 +1962,10 @@ impl VerificationPipeline {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // In-flight count verification (synchronous)
+    // Drain total verification (synchronous)
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Classify a vote-path block against the in-flight count tolerance.
+    /// Classify a vote-path block against the drain total it claims.
     /// The caller pre-resolves `parent_in_flight` from its chain view
     /// (`None` = parent pruned) and the finalized-tx count from the pending
     /// block, then uses the returned [`InFlightCheck`] to decide between
@@ -2032,7 +2033,7 @@ impl VerificationPipeline {
                 expected = expected.inner(),
                 parent_in_flight = parent_in_flight.inner(),
                 new_txs = block.transaction_count(),
-                "In-flight count verification failed — proposed value does not match expected"
+                "Drain total verification failed — proposed value does not match expected"
             );
             false
         }
@@ -2513,7 +2514,7 @@ mod tests {
 
     #[test]
     fn classify_vote_in_flight_skips_vote_when_parent_pruned() {
-        // A pruned parent resolves no in-flight count: skip voting but
+        // A pruned parent resolves no drain total: skip voting but
         // still keep verifying.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = block_with(BlockHeight::new(5), bh(b"parent"), 0, vec![]);
@@ -2524,7 +2525,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_vote_in_flight_proceeds_when_genesis_parent_and_counts_match() {
+    fn classify_vote_in_flight_proceeds_when_genesis_parent_and_totals_match() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();

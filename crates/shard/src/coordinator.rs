@@ -253,7 +253,7 @@ pub struct ShardCoordinator {
     /// verification delta. Feeds reshape-trigger derivation.
     substate_bytes_frontier: (BlockHeight, u64),
 
-    /// In-flight count carried by the committed tip's header, retained so
+    /// Drain total carried by the committed tip's header, retained so
     /// the vote path can check a block extending the pruned tip. `None`
     /// when the tip's header was never observed (an ordinary restart);
     /// a snap-synced joiner seeds it from the boundary header so its

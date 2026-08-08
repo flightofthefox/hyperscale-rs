@@ -7,6 +7,11 @@
 //! dispatch reads through [`TickChain::view_at`] instead of the
 //! settlement-derived [`crate::PendingChain`] overlay.
 //!
+//! A tick is clocked by commits, never by time. It is one execution
+//! batch, and a block carrying no work produces none — so the ticks a
+//! chain holds are neither periodic nor one per height, and the timer the
+//! word suggests elsewhere in this workspace has nothing to do with it.
+//!
 //! A tick's output is a pure function of the committed chain prefix, so
 //! the chain is a deterministic cache: any replica rebuilds it by
 //! replaying committed blocks forward from the persisted tip.

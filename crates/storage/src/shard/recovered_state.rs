@@ -40,12 +40,12 @@ pub struct RecoveredState {
     /// storage directly.
     pub anchor_qc: Option<QuorumCertificate>,
 
-    /// In-flight count carried by the committed tip's header. `None` on
+    /// Drain total carried by the committed tip's header. `None` on
     /// an ordinary restart (peers' headers repopulate the window as the
     /// chain advances); a snap-synced bootstrap seeds it from the
     /// boundary header so the fresh committee's first block past the
-    /// anchor is votable — the vote path checks the claimed in-flight
-    /// count against the parent's.
+    /// anchor is votable — the vote path checks the claimed total
+    /// against the parent's.
     pub committed_in_flight: Option<WorkInFlight>,
 
     /// Reveal chain carried by the committed tip's header — the value the

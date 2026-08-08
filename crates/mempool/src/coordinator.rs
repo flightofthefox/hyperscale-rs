@@ -2,19 +2,25 @@
 //! transactions.
 //!
 //! Owns the per-validator transaction pool and the bookkeeping that surrounds
-//! it: a [`TxStore`] of pending transactions, a tombstone store that
-//! state locks (the in-flight set), a [`TombstoneStore`] for recently
-//! decided hashes, and an [`ExpectedTxs`] sub-machine that backfills
+//! it: a [`TxStore`] of pending transactions, a [`TombstoneStore`] for
+//! recently decided hashes, and an [`ExpectedTxs`] sub-machine that backfills
 //! cross-shard transactions referenced by remote provisions before their
 //! source-shard gossip arrives.
+//!
+//! Nothing here decides who conflicts with whom. Two transactions reaching
+//! one cell are both offered; execution composes them into a batch and
+//! sequences them there, under a compatibility rule the mempool cannot see
+//! and would only approximate.
 //!
 //! # Backpressure
 //!
 //! Two limits gate proposal and ingress:
-//! - [`MAX_DRAIN_WORK`] (a protocol constant in `hyperscale-types`) caps
-//!   simultaneous lock-holding transactions, preventing the execution
-//!   pipeline from being overrun. Not operator-tunable: the right value
-//!   is fully determined by block size × pipeline depth.
+//! - [`MAX_DRAIN_WORK`] (a protocol constant in `hyperscale-types`) caps the
+//!   work this shard's chain may owe unsettled at once, so a shard that is
+//!   not settling admits less until it does. Not operator-tunable: every
+//!   replica has to price the same headroom off the same chain content, and
+//!   the figure selection reads comes from the parent header rather than
+//!   from local state.
 //! - [`MempoolConfig::max_pending`] caps RPC-submitted pending transactions
 //!   so that arrival rate exceeding processing capacity translates to
 //!   rejected submissions rather than unbounded memory growth. Operator-
@@ -130,17 +136,14 @@ struct PoolEntry {
 /// Mempool state machine.
 ///
 /// Handles transaction lifecycle from submission to completion.
-/// Uses `BTreeMap` for the pool to maintain hash ordering, which allows
-/// `ready_transactions()` to iterate in sorted order without sorting.
 ///
-/// # Incremental Ready Set
-///
-/// To avoid O(n) scans on every `ready_transactions()` call, we maintain
-/// a pre-computed ready set that is updated incrementally.
-///
-/// Transactions are added to this set when they become ready (Pending status,
-/// no conflicts with locked nodes) and removed when they are no longer ready
-/// (status changes, conflicts arise, or evicted).
+/// The pool is a `BTreeMap` so hash order is the iteration order, which is
+/// also the order transactions are offered in: selection walks the pool
+/// once and filters, taking each entry the drain still has room for. There
+/// is no index beside it — eligibility is a property of the entry the walk
+/// is already holding, so a set maintained alongside would have to be
+/// invalidated by every commit, settlement and fence for a scan the pool's
+/// own bound already keeps small.
 pub struct MempoolCoordinator {
     /// Transaction pool sorted by hash (`BTreeMap` for ordered iteration).
     pool: BTreeMap<TxHash, PoolEntry>,
@@ -191,16 +194,16 @@ pub struct MempoolCoordinator {
     /// Configuration for mempool behavior.
     config: MempoolConfig,
 
-    /// This validator's home shard. Filters declared-node iterators to
-    /// local nodes only at lock-tracking time.
+    /// This validator's home shard — the projection target for the
+    /// declared keys admission reads off a transaction.
     local_shard: ShardId,
 
     /// Gossip-timed fork fences. While engaged, admission rejects any
     /// transaction touching a fenced shard — no point starting cross-shard
     /// work bound to a committee that is provably forked. A liveness
     /// quiesce only; safety rests on the provision fence. Held until the
-    /// shard's recovery completes, so mid-recovery txs can't flow back in,
-    /// take locks, and stall on fenced provisions.
+    /// shard's recovery completes, so mid-recovery txs can't flow back in
+    /// and stall on fenced provisions.
     fork_fence: ForkFence,
 
     /// The dispatch seam's clock reading, pushed by [`Self::set_time`]

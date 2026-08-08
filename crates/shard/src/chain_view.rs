@@ -110,7 +110,7 @@ impl<'a> ChainView<'a> {
         )
     }
 
-    /// In-flight count on the parent header, or `None` when the parent is
+    /// Drain total on the parent header, or `None` when the parent is
     /// unresolvable: pruned from `pending` and — when the parent is the
     /// committed tip itself — the committed-tip scalar wasn't recovered.
     /// A snap-synced joiner extending its boundary anchor resolves through
@@ -155,7 +155,7 @@ impl<'a> ChainView<'a> {
             .flatten()
     }
 
-    /// In-flight count on the parent header. Returns zero if the parent is
+    /// Drain total on the parent header. Returns zero if the parent is
     /// unresolvable (see [`Self::parent_in_flight_checked`]).
     pub fn parent_in_flight(&self, parent_block_hash: BlockHash) -> WorkInFlight {
         self.parent_in_flight_checked(parent_block_hash)

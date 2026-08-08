@@ -68,13 +68,17 @@ const DRAIN_COUNT_SLACK: u64 = 2;
 /// bounded the drain by how many transactions it held rather than by
 /// what they would cost to execute and settle.
 ///
-/// Enforced as a bound on *adding* to the drain rather than on the drain
-/// itself. The total advances on commit and retreats on settlement, and
-/// a wave that never certifies retreats nothing — abandonment leaves no
-/// chain artifact to release against — so the total is not something a
-/// chain can always get back under. A block that adds no transactions
-/// stays valid whatever the total reads, which keeps the blocks that
-/// bring it down from being the ones refused.
+/// A block carrying transactions is valid only if the total it leaves is
+/// under this, so a chain of valid blocks never owes more than the
+/// budget. A block carrying none is exempt whatever the total reads:
+/// those are the blocks that carry the certificates the drain retreats
+/// on, and refusing them would leave a chain that somehow sat above the
+/// budget no way back down.
+///
+/// The total is not self-clearing. It advances on commit and retreats on
+/// settlement, and a wave that never certifies retreats nothing —
+/// abandonment leaves no chain artifact to release against — so stranded
+/// work lowers what this shard can admit for as long as the chain runs.
 ///
 /// Sized like the count it replaces: a full pipeline of blocks
 /// (commit → execute → certify) at a representative gas limit, so a
@@ -99,16 +103,18 @@ const _: () = assert!(
 /// Whether a block carrying `tx_count` transactions, and leaving the
 /// drain owing `work_in_flight`, is one a validator may vote for.
 ///
-/// A block that adds nothing to the drain is always admissible, whatever
-/// the total reads. Those are the blocks that carry the certificates that
-/// bring it down, so refusing them is refusing the only way back under
-/// the budget — and the total is not always recoverable, because a wave
-/// that never certifies strands its reservation with nothing to release
-/// it against.
+/// `work_in_flight` is what the block leaves owing, not what it
+/// inherited, so the bound is on the level a block produces: one that
+/// would carry the drain past the budget is refused, and a chain whose
+/// blocks all pass this never exceeds it.
 ///
-/// The bound is therefore on growth, not on level, and it is still a real
-/// bound: an over-budget drain admits no new work at all, and an
-/// under-budget one can be pushed over by at most a single block.
+/// A block that adds nothing is exempt from the level entirely. Those are
+/// the blocks that carry the certificates the drain retreats on, so
+/// refusing them would be refusing the only way back under — which
+/// matters because the total is not always recoverable: a wave that never
+/// certifies strands its reservation with nothing to release it against,
+/// and what has to stay impossible is the chain stopping rather than the
+/// ceiling dropping.
 #[must_use]
 pub const fn drain_admits_block(work_in_flight: WorkInFlight, tx_count: usize) -> bool {
     tx_count == 0 || work_in_flight.inner() <= MAX_DRAIN_WORK
@@ -161,10 +167,11 @@ pub const MAX_ROUND_GAP: u64 = 100_000;
 mod tests {
     use super::{MAX_DRAIN_WORK, WorkInFlight, drain_admits_block};
 
-    /// The bound bites on growth: a block bringing new work while the
-    /// drain already owes more than the budget is refused.
+    /// The bound bites on the level a block leaves: one carrying
+    /// transactions is refused the moment its own total clears the
+    /// budget, and admitted right up to it.
     #[test]
-    fn an_over_budget_drain_admits_no_new_work() {
+    fn a_block_is_refused_for_the_total_it_leaves() {
         let over = WorkInFlight::new(MAX_DRAIN_WORK + 1);
         assert!(!drain_admits_block(over, 1));
         assert!(drain_admits_block(WorkInFlight::new(MAX_DRAIN_WORK), 1));
