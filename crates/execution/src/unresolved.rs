@@ -205,8 +205,15 @@ mod tests {
         ledger.register_committed(std::iter::once(&tx));
         ledger.register_committed(std::iter::once(&tx));
 
-        assert_eq!(ledger.len(), 1);
-        assert_eq!(ledger.len(), 1);
+        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
+        assert_eq!(ledger.len(), 1, "one entry, not two");
+        assert!(
+            ledger
+                .past_deadline(deadline.minus(Duration::from_millis(1)))
+                .is_empty(),
+            "and the deadline is still the one it was admitted under",
+        );
+        assert_eq!(ledger.past_deadline(deadline), vec![(tx.hash(), tx.work())]);
     }
 
     /// A transaction becomes abandonable at its own deadline and not
