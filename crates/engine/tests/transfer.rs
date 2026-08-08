@@ -436,8 +436,10 @@ fn consecutive_payments_thread_through_the_tick_chain() {
         chain.append(
             tick,
             TickOutput {
-                determined: vec![(executed[0].tx_hash, updates.clone())],
-                determined_wave: Some(WaveId::new(ShardId::ROOT, tick, BTreeSet::new())),
+                determined: BTreeMap::from([(
+                    WaveId::new(ShardId::ROOT, tick, BTreeSet::new()),
+                    vec![(executed[0].tx_hash, updates.clone())],
+                )]),
                 provisional: BTreeMap::new(),
             },
         );

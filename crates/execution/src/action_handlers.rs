@@ -94,7 +94,7 @@ pub fn accumulate_tick_output(
     let mut ordered: Vec<&ExecutedTx> = executed.iter().collect();
     ordered.sort_by_key(|tx| tx.tx_hash);
     if group.wave_id.is_zero() {
-        output.determined_wave = Some(group.wave_id.clone());
+        let mut members: Vec<(TxHash, StateWrites)> = Vec::new();
         for tx in ordered {
             let mut writes = StateWrites::default();
             for part in [
@@ -107,9 +107,10 @@ pub fn accumulate_tick_output(
                 fold_state_writes(&mut writes, part);
             }
             if !writes.is_empty() {
-                output.determined.push((tx.tx_hash, writes));
+                members.push((tx.tx_hash, writes));
             }
         }
+        output.determined.insert(group.wave_id.clone(), members);
     } else {
         let entries: Vec<ProvisionalTx> = ordered
             .into_iter()

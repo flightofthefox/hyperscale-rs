@@ -582,8 +582,7 @@ impl ExecutionCoordinator {
         classification: &TopologySnapshot,
         block: CommittingBlock,
         transactions: &[Arc<Verifiable<Transaction>>],
-        blocked: &ProvisionalCells,
-    ) -> (Vec<TickExecutionGroup>, Vec<Verifiable<ExecutionVote>>) {
+    ) -> (BTreeSet<WaveId>, Vec<Verifiable<ExecutionVote>>) {
         let CommittingBlock {
             hash: block_hash,
             height: block_height,
@@ -598,7 +597,7 @@ impl ExecutionCoordinator {
         // (beacon hasn't reached this epoch) just skips the optimization.
         let setup_committee = topology_schedule.at(block_ts);
         let local_shard = self.local_shard;
-        let mut tick_groups: Vec<TickExecutionGroup> = Vec::new();
+        let mut candidates: BTreeSet<WaveId> = BTreeSet::new();
         let mut votes_to_replay: Vec<Verifiable<ExecutionVote>> = Vec::new();
 
         for (wave_id, txs) in waves {
@@ -641,13 +640,8 @@ impl ExecutionCoordinator {
                 wave_state.absorb_engagement_evidence(&self.provisioning);
             }
 
-            // The wave joins this commit's tick if fully provisioned at
-            // creation.
-            if let Some(group) = wave_state.tick_group_if_ready(&self.provisioning, blocked) {
-                tick_groups.push(group);
-            }
-
             self.waves.insert_wave(wave_id.clone(), wave_state);
+            candidates.insert(wave_id.clone());
 
             // Only the wave leader creates a VoteTracker for aggregation.
             // Resolved under `setup_committee` (the wave-start guess); the
@@ -677,7 +671,7 @@ impl ExecutionCoordinator {
             }
         }
 
-        (tick_groups, votes_to_replay)
+        (candidates, votes_to_replay)
     }
 
     /// Scan all waves and return completion data for any that can emit a vote.
@@ -934,8 +928,7 @@ impl ExecutionCoordinator {
         &mut self,
         batches: &[Arc<Verifiable<Provisions>>],
         committed_ts: WeightedTimestamp,
-        blocked: &ProvisionalCells,
-    ) -> Vec<TickExecutionGroup> {
+    ) -> BTreeSet<WaveId> {
         // Sort for deterministic iteration (logs, action vector order).
         let mut ordered: Vec<&Arc<Verifiable<Provisions>>> = batches.iter().collect();
         ordered.sort_by_key(|b| b.hash());
@@ -960,12 +953,13 @@ impl ExecutionCoordinator {
         }
 
         // Then, for each affected wave, drain engagement coverage and
-        // mark newly-ready txs provisioned. If a wave transitions from
-        // partial → fully provisioned, it joins this commit's tick.
+        // mark newly-ready txs provisioned. A wave that transitions from
+        // partial → fully provisioned becomes a candidate for this
+        // commit's tick; whether it joins is composition's question.
         // Membership is one-shot, but engagement coverage keeps draining
         // past it: the payer's leg executes on its own requirement long
         // before the echoes its vote waits for arrive.
-        let mut tick_groups: Vec<TickExecutionGroup> = Vec::new();
+        let mut candidates: BTreeSet<WaveId> = BTreeSet::new();
         for wave_id in affected_waves {
             let Some(wave) = self.waves.get_wave_mut(&wave_id) else {
                 continue;
@@ -978,13 +972,10 @@ impl ExecutionCoordinator {
             }
 
             wave.absorb_ready_provisions(&self.provisioning, committed_ts);
-
-            if let Some(group) = wave.tick_group_if_ready(&self.provisioning, blocked) {
-                tick_groups.push(group);
-            }
+            candidates.insert(wave_id);
         }
 
-        tick_groups
+        candidates
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2043,20 +2034,20 @@ impl ExecutionCoordinator {
             }
         }
 
-        // One claim set for the whole commit: every composition below
-        // sees the same cells held, whichever path produced the wave.
-        // The reservations behind those claims are read at the same
-        // instant and for the same reason.
-        let blocked = self.provisional_cells();
+        // What earlier ticks hold, and the set this commit's own
+        // composition will add to.
+        let mut held = self.provisional_cells();
 
+        // The deadline reads the claims a member has actually been
+        // waiting on, which are the ones standing before this commit
+        // composes anything: a member this tick is about to defer has
+        // waited no time at all.
         let now = self.committed_ts;
         for (_, wave) in self.waves.waves_iter_mut() {
-            wave.abort_members_blocked_past_deadline(&blocked, now);
+            wave.abort_members_blocked_past_deadline(&held, now);
         }
 
-        // Members kept out of an earlier tick go first — they are older
-        // than anything this block carries.
-        let mut tick_groups: Vec<TickExecutionGroup> = self.redrive_deferred_members(&blocked);
+        let mut candidates: BTreeSet<WaveId> = self.waves_owing_members();
 
         if !transactions.is_empty() {
             tracing::debug!(
@@ -2065,7 +2056,7 @@ impl ExecutionCoordinator {
                 "Starting execution for new transactions"
             );
 
-            let (groups, early_votes) = self.setup_waves_and_dispatch(
+            let (created, early_votes) = self.setup_waves_and_dispatch(
                 topology_schedule,
                 anchored,
                 CommittingBlock {
@@ -2075,9 +2066,8 @@ impl ExecutionCoordinator {
                     reveal: header.reveal_chain(),
                 },
                 transactions,
-                &blocked,
             );
-            tick_groups.extend(groups);
+            candidates.extend(created);
             for vote in early_votes {
                 actions.extend(self.dispatch_execution_vote(topology_schedule, vote));
             }
@@ -2088,19 +2078,14 @@ impl ExecutionCoordinator {
         // Apply this block's provisions after wave setup so newly-created
         // waves can transition to provisioned from the same block's batches.
         if !provisions.is_empty() {
-            tick_groups.extend(self.apply_committed_provisions(
-                provisions,
-                self.committed_ts,
-                &blocked,
-            ));
+            candidates.extend(self.apply_committed_provisions(provisions, self.committed_ts));
         }
 
         // Compose this commit's tick: the single-shard wave plus every
-        // wave that became fully provisioned at this commit. Sorted so
-        // the batch is identical on every replica regardless of which
-        // path produced each group.
+        // wave that became fully provisioned at this commit, in the one
+        // order every replica derives from the candidate set.
+        let tick_groups = self.compose_tick(candidates, &mut held);
         if !tick_groups.is_empty() {
-            tick_groups.sort_by(|a, b| a.wave_id.cmp(&b.wave_id));
             for group in &tick_groups {
                 let claims = self
                     .waves
@@ -2198,25 +2183,54 @@ impl ExecutionCoordinator {
         cells
     }
 
-    /// Compose a tick group for every wave holding members that were kept
-    /// out of an earlier tick and are no longer blocked.
+    /// Every wave still holding a member that has not joined a tick.
     ///
-    /// Runs after the commit's resolutions are recorded, so a member
-    /// enters the first tick composed after the wave it waited on
-    /// resolved.
-    fn redrive_deferred_members(&mut self, blocked: &ProvisionalCells) -> Vec<TickExecutionGroup> {
-        let deferred: Vec<WaveId> = self
-            .waves
+    /// Candidates, not entrants: whether a member joins is composition's
+    /// question, and it is asked again on every commit. Read after the
+    /// commit's resolutions are recorded, so a member enters the first
+    /// tick composed after the wave it waited on resolved.
+    fn waves_owing_members(&self) -> BTreeSet<WaveId> {
+        self.waves
             .waves_iter()
             .filter(|(_, wave)| !wave.fully_dispatched())
             .map(|(wave_id, _)| wave_id.clone())
-            .collect();
-        let mut groups = Vec::new();
-        for wave_id in deferred {
+            .collect()
+    }
+
+    /// Compose this commit's tick from the waves that could join it.
+    ///
+    /// A cross-shard leg's writes are provisional, and the batch is one
+    /// overlay: a transaction sharing the tick reads what that leg left,
+    /// which an abort would retract. The claim that keeps a later tick
+    /// off a provisional cell has to hold inside the tick as well, so it
+    /// accumulates as the tick is built rather than being fixed before
+    /// it — `held` carries in what earlier ticks claimed and leaves with
+    /// what this one adds.
+    ///
+    /// Cross-shard waves compose first. Their writes are the provisional
+    /// ones, so they are what everything else has to be compatible with,
+    /// and a determined member is the cheaper of the two to defer — it
+    /// waits on latency where a leg waits on a deadline. Within each
+    /// half the order is `WaveId`, so the composition is a function of
+    /// the candidate set and nothing else.
+    ///
+    /// The claim itself is per transaction, not per wave — a wave settles
+    /// each member on its own verdict, so its own legs are no more able
+    /// to share a provisional cell than two waves' are.
+    fn compose_tick(
+        &mut self,
+        candidates: BTreeSet<WaveId>,
+        held: &mut ProvisionalCells,
+    ) -> Vec<TickExecutionGroup> {
+        let mut ordered: Vec<WaveId> = candidates.into_iter().collect();
+        ordered.sort_by_key(|wave_id| (wave_id.is_zero(), wave_id.clone()));
+
+        let mut groups = Vec::with_capacity(ordered.len());
+        for wave_id in ordered {
             let Some(wave) = self.waves.get_wave_mut(&wave_id) else {
                 continue;
             };
-            if let Some(group) = wave.tick_group_if_ready(&self.provisioning, blocked) {
+            if let Some(group) = wave.tick_group_if_ready(&self.provisioning, held) {
                 groups.push(group);
             }
         }

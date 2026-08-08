@@ -72,17 +72,17 @@ pub struct ProvisionalTx {
 /// The execution output of one tick.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TickOutput {
-    /// What each member of the single-shard wave left, in the canonical
-    /// order the batch fold produced them in — absolutes where an
-    /// exclusive write stated the value, movements where a commutative
-    /// access said what it moved, unconditional fee burns included.
-    /// Readable by every subsequent tick immediately.
-    pub determined: Vec<(TxHash, StateWrites)>,
-    /// The single-shard wave the determined members belong to, if the
-    /// tick had one. Their writes reach the persisted base when this
-    /// wave's settling block persists, which is what decides when a
-    /// reader stops folding them.
-    pub determined_wave: Option<WaveId>,
+    /// What each single-shard member left, by the wave it belongs to and
+    /// in the canonical order the batch fold produced them in —
+    /// absolutes where an exclusive write stated the value, movements
+    /// where a commutative access said what it moved, unconditional fee
+    /// burns included. Readable by every subsequent tick immediately.
+    ///
+    /// Keyed by wave for the same reason the provisional side is: a tick
+    /// can carry more than one single-shard wave — its block's own, plus
+    /// any whose members an earlier tick deferred — and each reaches the
+    /// persisted base when its *own* settling block persists.
+    pub determined: BTreeMap<WaveId, Vec<(TxHash, StateWrites)>>,
     /// Per-wave provisional contributions, unreadable until the wave
     /// resolves.
     pub provisional: BTreeMap<WaveId, Vec<ProvisionalTx>>,
@@ -145,8 +145,8 @@ impl TickEntry {
             readable: BTreeMap::new(),
             pending: HashMap::new(),
         };
-        if let Some(wave) = output.determined_wave {
-            for (tx_hash, writes) in output.determined {
+        for (wave, txs) in output.determined {
+            for (tx_hash, writes) in txs {
                 entry.readable.insert(
                     tx_hash,
                     Contribution {
@@ -611,19 +611,23 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: vec![(
-                    tx(1),
-                    writes(&[(key(1), Some(b"one")), (key(2), Some(b"two"))]),
-                )],
-                determined_wave: Some(wave(1, &[])),
+                determined: BTreeMap::from([(
+                    wave(1, &[]),
+                    vec![(
+                        tx(1),
+                        writes(&[(key(1), Some(b"one")), (key(2), Some(b"two"))]),
+                    )],
+                )]),
                 provisional: BTreeMap::new(),
             },
         );
         chain.append(
             BlockHeight::new(2),
             TickOutput {
-                determined: vec![(tx(2), writes(&[(key(1), None)]))],
-                determined_wave: Some(wave(2, &[])),
+                determined: BTreeMap::from([(
+                    wave(2, &[]),
+                    vec![(tx(2), writes(&[(key(1), None)]))],
+                )]),
                 provisional: BTreeMap::new(),
             },
         );
@@ -651,8 +655,7 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: vec![(tx(1), debit(key(1), 300))],
-                determined_wave: Some(wave(1, &[])),
+                determined: BTreeMap::from([(wave(1, &[]), vec![(tx(1), debit(key(1), 300))])]),
                 provisional: BTreeMap::new(),
             },
         );
@@ -696,8 +699,7 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: Vec::new(),
-                determined_wave: None,
+                determined: BTreeMap::new(),
                 provisional: BTreeMap::from([(
                     w.clone(),
                     vec![ProvisionalTx {
@@ -740,8 +742,7 @@ mod tests {
             chain.append(
                 BlockHeight::new(height),
                 TickOutput {
-                    determined: Vec::new(),
-                    determined_wave: None,
+                    determined: BTreeMap::new(),
                     provisional: BTreeMap::from([(
                         w.clone(),
                         vec![ProvisionalTx {
@@ -777,8 +778,7 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: Vec::new(),
-                determined_wave: None,
+                determined: BTreeMap::new(),
                 provisional: BTreeMap::from([(
                     w.clone(),
                     vec![ProvisionalTx {
@@ -810,8 +810,7 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: Vec::new(),
-                determined_wave: None,
+                determined: BTreeMap::new(),
                 provisional: BTreeMap::from([(
                     w.clone(),
                     vec![ProvisionalTx {
@@ -844,8 +843,7 @@ mod tests {
         let store = Arc::new(StubStore::with_cell(key(1), encode_amount(1_000).as_ref()));
         let chain = TickChain::new(store);
         let output = || TickOutput {
-            determined: vec![(tx(1), debit(key(1), 100))],
-            determined_wave: Some(wave(1, &[])),
+            determined: BTreeMap::from([(wave(1, &[]), vec![(tx(1), debit(key(1), 100))])]),
             provisional: BTreeMap::new(),
         };
         chain.append(BlockHeight::new(1), output());
@@ -874,8 +872,7 @@ mod tests {
         chain.append(
             BlockHeight::new(3),
             TickOutput {
-                determined: Vec::new(),
-                determined_wave: None,
+                determined: BTreeMap::new(),
                 provisional: BTreeMap::from([(
                     w.clone(),
                     vec![ProvisionalTx {
@@ -920,17 +917,19 @@ mod tests {
     fn eviction_waits_for_resolution_persistence_and_execution() {
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
         let w = wave(1, &[]);
-        let append_at = |height: u64, wave: Option<WaveId>| {
+        let append_at = |height: u64, wave: WaveId| {
             chain.append(
                 BlockHeight::new(height),
                 TickOutput {
-                    determined: vec![(tx(1), writes(&[(key(1), Some(b"one"))]))],
-                    determined_wave: wave,
+                    determined: BTreeMap::from([(
+                        wave,
+                        vec![(tx(1), writes(&[(key(1), Some(b"one"))]))],
+                    )]),
                     provisional: BTreeMap::new(),
                 },
             );
         };
-        append_at(1, Some(w.clone()));
+        append_at(1, w.clone());
 
         // Unresolved: survives any persistence progress.
         chain.prune_persisted(BlockHeight::new(10));
@@ -955,7 +954,7 @@ mod tests {
 
         // Execution reaches the settling height: nothing anchors below it
         // any more.
-        append_at(3, Some(wave(3, &[])));
+        append_at(3, wave(3, &[]));
         chain.prune_persisted(BlockHeight::new(2));
         assert_eq!(chain.len(), 2, "persistence has not caught up");
         chain.prune_persisted(BlockHeight::new(3));
@@ -976,8 +975,7 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: Vec::new(),
-                determined_wave: None,
+                determined: BTreeMap::new(),
                 provisional: BTreeMap::from([(w.clone(), Vec::new())]),
             },
         );
