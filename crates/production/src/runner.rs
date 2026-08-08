@@ -1570,7 +1570,6 @@ fn update_shard_rpc_state(shard_loop: &ProdShardLoop, config: &ShardLoopConfig) 
     // differ, so the backpressure check iterates every entry rather
     // than picking a per-shard representative.
     if let Some(ref mempool_snapshot) = config.publishers.mempool {
-        #[allow(clippy::cast_possible_truncation)] // pool size derived from a fixed const
         let remote_congestion_threshold = WorkInFlight::new(MAX_DRAIN_WORK * 4 / 5);
         mempool_snapshot.rcu(|current| {
             let mut updated = (**current).clone();

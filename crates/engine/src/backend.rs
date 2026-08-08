@@ -38,7 +38,7 @@ mod native {
         validate_component,
     };
     use wasmtime::component::{Component, InstancePre, Linker};
-    use wasmtime::{Engine, Store};
+    use wasmtime::{Engine, Store, Trap};
 
     use super::{FUEL, HostState};
     use crate::genesis::{account_artifact, staking_artifact};
@@ -112,11 +112,21 @@ mod native {
                 }
             };
             let args: Vec<HostArg<'_>> = call.args.iter().map(host_arg).collect();
-            let result = call_export(&mut store, &instance, call.export, &args, call.returns)
-                .map_err(|trap| format!("{trap:#}"));
+            let outcome = call_export(&mut store, &instance, call.export, &args, call.returns);
+            // The engine's own classification, not an inference from the
+            // fuel left: a trap that happens to land on an exhausted
+            // counter is a different outcome from one caused by it, and
+            // the reference interpreter reports the distinction exactly.
+            // Two runtimes disagreeing here is two nodes disagreeing on
+            // whether a transaction was its sender's own defect.
+            let exhausted = outcome
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<Trap>())
+                .is_some_and(|trap| matches!(trap, Trap::OutOfFuel));
+            let result = outcome.map_err(|trap| format!("{trap:#}"));
             let remaining = store.get_fuel().expect("fuel metering is enabled");
             let fuel = budget - remaining;
-            let exhausted = remaining == 0 && result.is_err();
             InvokeResult {
                 session: store.into_data().0,
                 fuel,

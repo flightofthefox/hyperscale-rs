@@ -924,34 +924,24 @@ impl MempoolCoordinator {
             .retain(|_, (_, deadline)| *deadline > now);
     }
 
-    /// Remove `key` from the blocker set of every deferred tx, re-adding
-    /// any tx whose last blocker was this key back through the store so it
-    /// gets re-checked against remaining locks and ready-set claims.
-    /// Get transactions ready for inclusion in a block with backpressure support.
+    /// The transactions this shard offers for the next block, in hash
+    /// order, under what the drain has room for.
     ///
-    /// Returns transactions sorted by hash (ascending) for determinism.
-    /// All transactions are subject to the same backpressure limit.
+    /// Availability decides who is eligible — admitted, past its dwell,
+    /// not parked on engagement evidence — and nothing here decides who
+    /// conflicts with whom. Two transactions touching one cell are both
+    /// offered; execution composes them into one batch and sequences
+    /// them there.
     ///
-    /// Backpressure rules:
-    /// - At hard limit, NO transactions are proposed
-    /// - Otherwise, transactions are returned up to `max_count`, capped by headroom
-    ///   to the hard limit
-    ///
-    /// The backpressure limit is based on how many transactions are currently holding
-    /// state locks (Committed or Executed status). This controls execution and crypto
-    /// verification pressure across the system.
-    ///
-    /// Parameters:
-    /// - `max_count`: Maximum total transactions
-    /// - `pending_commit_tx_count`: Transactions about to be committed (INCREASES in-flight)
-    /// - `pending_commit_cert_count`: Certificates about to be committed (DECREASES in-flight)
-    ///
-    /// The effective in-flight is: `current + pending_txs - pending_certs`
+    /// `in_flight` is what the chain says this shard still owes, read
+    /// off the parent header rather than from local state, so every
+    /// replica prices the same headroom. `max_count` is the wire cap on
+    /// a block's transaction list, not a packing bound.
     ///
     /// # Performance
     ///
-    /// This method is `O(min(ready_set_size, max_count))` instead of `O(pool_size)` because
-    /// it reads from a pre-computed ready set that is maintained incrementally.
+    /// `O(pool_size)` in the worst case: the pool is walked in key order
+    /// and filtered, stopping at `max_count` offers.
     #[must_use]
     pub fn ready_transactions(
         &self,

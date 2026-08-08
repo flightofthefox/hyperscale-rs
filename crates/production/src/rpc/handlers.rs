@@ -308,10 +308,9 @@ fn check_backpressure(state: &RpcState) -> Option<(StatusCode, Json<SubmitTransa
         ));
     }
 
-    // Threshold is 80% of `MAX_TX_IN_FLIGHT` (block/limits.rs). Each
-    // hosted vnode tracks its own remote-shard in-flight counts via
-    // verified block headers; reject if any of them flags a congested
-    // remote shard.
+    // Threshold is 80% of `MAX_DRAIN_WORK`. Each hosted vnode tracks the
+    // unsettled work of every remote shard it verifies headers from;
+    // reject if any of them flags a congested remote shard.
     for v in snapshot.vnodes.values() {
         let threshold = v.remote_congestion_threshold;
         if threshold <= WorkInFlight::ZERO {
