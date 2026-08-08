@@ -17,15 +17,15 @@ use hyperscale_core::{
 use hyperscale_engine::{ExecutedTx, TickTxInput, WaveBatchContext};
 use hyperscale_metrics::record_execution_latency;
 use hyperscale_network::Network;
-use hyperscale_storage::{ProvisionalTx, ShardStorage, TickOutput};
+use hyperscale_storage::{ProvisionalTx, ShardStorage, TickOutput, fold_state_writes};
 use hyperscale_types::network::notification::{
     ExecutionCertificatesNotification, ExecutionVotesNotification,
 };
 use hyperscale_types::{
-    BlockHeight, DeclaredKey, ExecutionCertificate, ExecutionCertificateContext,
+    BlockHeight, ConsensusReceipt, DeclaredKey, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificatesSenderMessage, ExecutionVote, ExecutionVotesSenderMessage,
-    FinalizedWaveContext, Mode, Stopwatch, StoredReceipt, SubstateKey, TxHash, TxOutcome,
-    Verifiable, Verified, signed_bytes,
+    FinalizedWaveContext, Mode, StateWrites, Stopwatch, StoredReceipt, SubstateKey, TxHash,
+    TxOutcome, Verifiable, Verified, signed_bytes,
 };
 
 // ============================================================================
@@ -73,13 +73,19 @@ pub struct ExecutionOutputs {
 
 /// Fold one wave group's executed records into the tick output.
 ///
-/// The single-shard wave's writes are determined at commit: execution
-/// receipts and their unconditional fee charges fold into the readable
-/// map, in canonical (tx-hash) order — the order the batch fold computed
-/// their absolutes in. A cross-shard wave's records sit beside the fold
-/// as per-tx provisional entries until the wave resolves: the execution
-/// writes on one side, the reserve fee charge on the other, whichever
-/// the wave's verdict picks.
+/// The single-shard wave's writes are determined at commit: each member
+/// contributes its execution receipt and its unconditional fee charge,
+/// in canonical (tx-hash) order — the order the batch fold ran in. A
+/// cross-shard wave's records sit beside them as per-tx provisional
+/// entries until the wave resolves: the execution writes on one side,
+/// the reserve fee charge on the other, whichever the wave's verdict
+/// picks.
+///
+/// Either way the receipt goes in whole. A receipt states absolutes
+/// where an exclusive write named the value and movements where a
+/// commutative access said what it moved, and a fee burn is always the
+/// second — so a fold that kept only the cells would carry nothing at
+/// all for ordinary payment traffic.
 pub fn accumulate_tick_output(
     output: &mut TickOutput,
     group: &TickExecutionGroup,
@@ -90,15 +96,18 @@ pub fn accumulate_tick_output(
     if group.wave_id.is_zero() {
         output.determined_wave = Some(group.wave_id.clone());
         for tx in ordered {
-            if let Some(writes) = tx.consensus.writes() {
-                for (key, change) in &writes.cells {
-                    output.determined.cells.insert(*key, change.clone());
-                }
+            let mut writes = StateWrites::default();
+            for part in [
+                tx.consensus.writes(),
+                tx.fee_receipt.as_ref().and_then(ConsensusReceipt::writes),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                fold_state_writes(&mut writes, part);
             }
-            if let Some(fee) = tx.fee_receipt.as_ref().and_then(|fee| fee.writes()) {
-                for (key, change) in &fee.cells {
-                    output.determined.cells.insert(*key, change.clone());
-                }
+            if !writes.is_empty() {
+                output.determined.push((tx.tx_hash, writes));
             }
         }
     } else {

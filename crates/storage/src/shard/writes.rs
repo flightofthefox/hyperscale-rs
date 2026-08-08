@@ -29,19 +29,32 @@ pub fn merge_writes_from_receipts(
     let mut merged = StateWrites::default();
     for receipt in receipts {
         if let Some(writes) = receipt.consensus.writes() {
-            for (key, change) in &writes.cells {
-                merged.cells.insert(*key, change.clone());
-                // An exclusive write supersedes what earlier receipts
-                // moved: the cell's value is now stated outright.
-                merged.movements.remove(key);
-            }
-            for (key, movement) in &writes.movements {
-                let entry = merged.movements.entry(*key).or_default();
-                *entry = entry.then(*movement);
-            }
+            fold_state_writes(&mut merged, writes);
         }
     }
     merged.resolve(prior)
+}
+
+/// Fold `writes` onto `merged`, in that order.
+///
+/// The one place the workspace composes two write sets. An exclusive
+/// write supersedes whatever stood before it, movements included — the
+/// cell's value is now stated outright. A movement composes onto what is
+/// already there, because that is what commutative means.
+///
+/// Everything that lays one write set over another goes through here:
+/// settlement, the tick chain's readable fold, and the batch fold's own
+/// merge. A second copy of this rule is a second chance to drop a
+/// movement silently.
+pub fn fold_state_writes(merged: &mut StateWrites, writes: &StateWrites) {
+    for (key, change) in &writes.cells {
+        merged.cells.insert(*key, change.clone());
+        merged.movements.remove(key);
+    }
+    for (key, movement) in &writes.movements {
+        let entry = merged.movements.entry(*key).or_default();
+        *entry = entry.then(*movement);
+    }
 }
 
 /// Merge writes in order; later entries win per cell.
@@ -49,14 +62,7 @@ pub fn merge_writes_from_receipts(
 pub fn merge_state_writes(list: &[&StateWrites]) -> StateWrites {
     let mut merged = StateWrites::default();
     for writes in list {
-        for (key, change) in &writes.cells {
-            merged.cells.insert(*key, change.clone());
-            merged.movements.remove(key);
-        }
-        for (key, movement) in &writes.movements {
-            let entry = merged.movements.entry(*key).or_default();
-            *entry = entry.then(*movement);
-        }
+        fold_state_writes(&mut merged, writes);
     }
     merged
 }

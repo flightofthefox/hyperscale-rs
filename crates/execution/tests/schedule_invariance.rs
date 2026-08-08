@@ -11,7 +11,9 @@
 
 mod common;
 
-use common::sim::{ExecutionSim, LEFT, Schedule, cell_of, counter, settle};
+use common::sim::{
+    CREDIT, ExecutionSim, LEFT, Schedule, amount, cell_of, counter, settle, vault_of,
+};
 use hyperscale_storage::TickOutput;
 use hyperscale_types::test_utils::{test_prefix, test_transaction_with_prefixes};
 use hyperscale_types::{BlockHeight, Transaction};
@@ -56,6 +58,14 @@ fn chained(schedule: Schedule) -> Vec<(BlockHeight, TickOutput)> {
         counter(sim.read(cell_of(test_prefix(LOCAL)))),
         3,
         "each transaction must have read what its predecessors wrote"
+    );
+    // The other half of what a receipt says. The counter is an absolute
+    // and re-applying one is harmless; the credit states what it moved,
+    // so a fold that drops it or applies it twice shows up only here.
+    assert_eq!(
+        amount(sim.read(vault_of(test_prefix(LOCAL)))),
+        3 * CREDIT,
+        "one credit per transaction must reach the baseline, exactly once"
     );
     sim.outputs().to_vec()
 }
@@ -112,6 +122,11 @@ fn with_a_crossing(schedule: Schedule) -> (Vec<(BlockHeight, TickOutput)>, u64) 
     sim.commit(Vec::new(), Vec::new());
     sim.drain();
 
+    assert_eq!(
+        amount(sim.settled(vault_of(test_prefix(LOCAL)))),
+        CREDIT,
+        "the crossing's credit must settle exactly once"
+    );
     let settled = counter(sim.settled(cell_of(test_prefix(LOCAL))));
     (sim.outputs().to_vec(), settled)
 }
@@ -136,7 +151,7 @@ fn tick_outputs_do_not_move_with_resolution_timing() {
 /// So a tick that runs before the eviction sees its predecessor's write in
 /// the fold, and one that runs after sees neither the fold nor a base old
 /// enough to hold it. Same committed chain, two answers.
-fn evicted_between(schedule: Schedule) -> u64 {
+fn evicted_between(schedule: Schedule) -> (u64, u128) {
     let mut sim = ExecutionSim::new(schedule);
 
     let first = local_tx(0, LOCAL);
@@ -154,7 +169,14 @@ fn evicted_between(schedule: Schedule) -> u64 {
     sim.commit(Vec::new(), vec![settle(&wave, &receipts)]);
 
     sim.drain();
-    counter(sim.read(cell_of(test_prefix(LOCAL))))
+    // Read together: the settled fold and the base both carry the
+    // predecessor's contribution for a window, and the reader has to take
+    // exactly one of them. An absolute cannot tell the difference; the
+    // credit can.
+    (
+        counter(sim.read(cell_of(test_prefix(LOCAL)))),
+        amount(sim.read(vault_of(test_prefix(LOCAL)))),
+    )
 }
 
 #[test]

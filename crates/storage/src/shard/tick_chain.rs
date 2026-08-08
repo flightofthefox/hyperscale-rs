@@ -18,6 +18,14 @@
 //! (aborted) without recomputing any tick output — no chained output ever
 //! depends on an entry that resolution changes.
 //!
+//! **A contribution is readable until the base carries it, and never
+//! both.** A receipt says what an exclusive write left and what a
+//! commutative access moved, and the second of those does not survive
+//! being applied twice. So each contribution records the height its
+//! wave's settlement reaches the base at, and a read folds it only while
+//! its anchor sits below that height. Overlap is not idempotent and is
+//! therefore not permitted.
+//!
 //! **This overlay never feeds state-root computation.** State roots stay
 //! settlement-derived through `PendingChain`; `TickChain` deliberately
 //! implements none of the commit-pipeline surfaces (`ShardChainWriter`,
@@ -27,11 +35,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
 use hyperscale_types::{
-    BlockHeight, Movement, ProvisionalHolds, StateWrites, SubstateKey, TxHash, WaveId, amount_cell,
+    BlockHeight, ProvisionalHolds, StateWrites, SubstateKey, TxHash, WaveId, amount_cell,
     read_amount,
 };
 
 use crate::lock_recover::{read_or_recover, write_or_recover};
+use crate::shard::writes::fold_state_writes;
 use crate::{SubstateDatabase, VersionedStore};
 
 /// One cross-shard transaction's provisional contribution to a tick.
@@ -63,13 +72,16 @@ pub struct ProvisionalTx {
 /// The execution output of one tick.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TickOutput {
-    /// Folded absolute cells determined at commit: the single-shard
-    /// wave's writes, including its unconditional fee burns. Readable by
-    /// every subsequent tick immediately.
-    pub determined: StateWrites,
-    /// The single-shard wave the determined fold came from, if the tick
-    /// had one. Tracked for eviction only: the fold reaches the persisted
-    /// base when this wave's settling block persists.
+    /// What each member of the single-shard wave left, in the canonical
+    /// order the batch fold produced them in — absolutes where an
+    /// exclusive write stated the value, movements where a commutative
+    /// access said what it moved, unconditional fee burns included.
+    /// Readable by every subsequent tick immediately.
+    pub determined: Vec<(TxHash, StateWrites)>,
+    /// The single-shard wave the determined members belong to, if the
+    /// tick had one. Their writes reach the persisted base when this
+    /// wave's settling block persists, which is what decides when a
+    /// reader stops folding them.
     pub determined_wave: Option<WaveId>,
     /// Per-wave provisional contributions, unreadable until the wave
     /// resolves.
@@ -96,95 +108,65 @@ pub enum TickResolution {
     },
 }
 
-/// What a fold knows about one cell.
-///
-/// A cell an exclusive write reached has a value. A cell only movements
-/// reached has no value until something says what it started from, so it
-/// stays relative until a reader supplies the base.
-#[derive(Clone, Debug)]
-enum CellState {
-    /// The value the cell holds, or `None` for a removal.
-    Absolute(Option<Vec<u8>>),
-    /// What the cell has moved by, against a base not yet read.
-    Moved(Movement),
-}
-
-impl CellState {
-    /// This state with `next` applied after it.
+/// One transaction's readable contribution to a tick.
+struct Contribution {
+    /// The wave whose verdict governs it, and so the wave whose
+    /// settlement puts these writes into the base.
+    wave: WaveId,
+    /// What the transaction left, in the form its receipt states it.
+    writes: StateWrites,
+    /// The height the settled base gains these writes at, known once the
+    /// wave's fate commits.
     ///
-    /// An absolute supersedes whatever stood before, because that is what
-    /// exclusive means. A movement composes: onto an absolute it resolves
-    /// on the spot, onto an earlier movement it accumulates, and onto
-    /// nothing it waits for the base.
-    fn then(current: Option<&Self>, next: &Self) -> Self {
-        match (current, next) {
-            (_, Self::Absolute(value)) => Self::Absolute(value.clone()),
-            (Some(Self::Absolute(value)), Self::Moved(movement)) => {
-                let before = value.as_deref().and_then(read_amount).unwrap_or(0);
-                let after = movement.apply(before).unwrap_or(0);
-                Self::Absolute(amount_cell(after).map(|cell| cell.to_vec()))
-            }
-            (Some(Self::Moved(held)), Self::Moved(movement)) => Self::Moved(held.then(*movement)),
-            (None, Self::Moved(movement)) => Self::Moved(*movement),
-        }
-    }
-
-    /// The value this state names, resolving against `base` if it is
-    /// still relative.
-    fn value(&self, base: impl FnOnce() -> Option<Vec<u8>>) -> Option<Vec<u8>> {
-        match self {
-            Self::Absolute(value) => value.clone(),
-            Self::Moved(movement) => {
-                let before = base().as_deref().and_then(read_amount).unwrap_or(0);
-                amount_cell(movement.apply(before).unwrap_or(0)).map(|cell| cell.to_vec())
-            }
-        }
-    }
+    /// A read anchored below it needs the fold; at or above it the base
+    /// already carries the same change. Folding both would leave an
+    /// exclusive write unchanged and a movement applied twice, which is
+    /// why this is a height rather than a flag.
+    in_base_from: Option<BlockHeight>,
 }
 
 /// One tick's retained state.
 struct TickEntry {
-    /// Folded readable cells: determined at append, plus entries promoted
-    /// by resolution. A cell only movements reached stays relative here
-    /// and resolves where the base is in reach.
-    readable: HashMap<SubstateKey, CellState>,
+    /// Readable contributions in canonical transaction order — the order
+    /// the batch fold that produced them ran in. The single-shard wave's
+    /// members are here from the append; a cross-shard wave's arrive when
+    /// its verdict promotes them.
+    readable: BTreeMap<TxHash, Contribution>,
     /// Waves whose fate is still unknown. Includes the single-shard wave
     /// (with no provisional entries) so eviction waits for its
     /// settlement.
     pending: HashMap<WaveId, Vec<ProvisionalTx>>,
-    /// Highest settling height seen among resolved waves, initially the
-    /// tick's own height. The tick's readable fold is fully covered by
-    /// the persisted base only once this height persists.
-    max_resolution: BlockHeight,
 }
 
 impl TickEntry {
-    /// An entry for the tick at `height`, before any output folds in.
-    fn empty(height: BlockHeight) -> Self {
-        Self {
-            readable: HashMap::new(),
+    /// The entry one tick's output produces.
+    fn from_output(output: TickOutput) -> Self {
+        let mut entry = Self {
+            readable: BTreeMap::new(),
             pending: HashMap::new(),
-            max_resolution: height,
-        }
-    }
-
-    /// Fold a tick output in. Waves already recorded keep the entries
-    /// they have, so a repeat append never duplicates one. A repeat that
-    /// re-adds a wave the chain has already resolved is transient: the
-    /// appending coordinator holds its own verdict for that wave until
-    /// its tick lands, and emits it immediately after.
-    fn absorb(&mut self, output: TickOutput) {
-        self.fold(&output.determined);
-        for (wave, txs) in output.provisional {
-            self.pending.entry(wave).or_insert(txs);
-        }
+        };
         if let Some(wave) = output.determined_wave {
-            self.pending.entry(wave).or_default();
+            for (tx_hash, writes) in output.determined {
+                entry.readable.insert(
+                    tx_hash,
+                    Contribution {
+                        wave: wave.clone(),
+                        writes,
+                        in_base_from: None,
+                    },
+                );
+            }
+            entry.pending.insert(wave, Vec::new());
         }
+        for (wave, txs) in output.provisional {
+            entry.pending.insert(wave, txs);
+        }
+        entry
     }
 
     /// Apply one wave's verdict: promote each member's surviving side
-    /// into the readable fold, or drop the wave's entries outright.
+    /// into the readable fold, or drop the wave's entries outright, and
+    /// record the height the base gains whatever survives at.
     /// A no-op for a wave already resolved.
     fn resolve(&mut self, wave_id: &WaveId, resolution: &TickResolution) {
         let Some(txs) = self.pending.remove(wave_id) else {
@@ -199,29 +181,39 @@ impl TickEntry {
                         tx.writes
                     };
                     if let Some(writes) = promoted {
-                        self.fold(&writes);
+                        self.readable.insert(
+                            tx.tx_hash,
+                            Contribution {
+                                wave: wave_id.clone(),
+                                writes,
+                                in_base_from: None,
+                            },
+                        );
                     }
                 }
                 *height
             }
+            // Nothing settles. A cross-shard wave's contributions never
+            // reached `readable`; the single-shard wave's stay, because
+            // later ticks have already read them, and become evictable so
+            // the chain does not pin a fold nothing will settle.
             TickResolution::Aborted { height } => *height,
         };
-        self.max_resolution = self.max_resolution.max(height);
+        for contribution in self.readable.values_mut() {
+            if contribution.wave == *wave_id {
+                contribution.in_base_from = Some(height);
+            }
+        }
     }
 
-    /// Fold one receipt's writes into this entry, absolutes overwriting
-    /// and movements composing.
-    fn fold(&mut self, writes: &StateWrites) {
-        for (key, change) in &writes.cells {
-            let next = CellState::Absolute(change.clone());
-            let folded = CellState::then(self.readable.get(key), &next);
-            self.readable.insert(*key, folded);
-        }
-        for (key, movement) in &writes.movements {
-            let next = CellState::Moved(*movement);
-            let folded = CellState::then(self.readable.get(key), &next);
-            self.readable.insert(*key, folded);
-        }
+    /// Whether the settled base at `floor` already carries everything
+    /// this entry holds, so no future read can still need it.
+    fn covered_by(&self, floor: BlockHeight) -> bool {
+        self.pending.is_empty()
+            && self
+                .readable
+                .values()
+                .all(|c| c.in_base_from.is_some_and(|height| height <= floor))
     }
 }
 
@@ -239,6 +231,10 @@ pub struct TickChain<S> {
     /// above this — which is what makes it the floor eviction may not
     /// outrun.
     executed: RwLock<BlockHeight>,
+    /// The highest height the settled base is known to carry. Read
+    /// beside the entries so a contribution is folded exactly while the
+    /// base is missing it, and evicted once the base is not.
+    persisted: RwLock<BlockHeight>,
 }
 
 impl<S> TickChain<S>
@@ -246,11 +242,17 @@ where
     S: VersionedStore,
 {
     /// Create an empty tick chain over the given base storage.
-    pub const fn new(base: Arc<S>) -> Self {
+    ///
+    /// Seeded from the store's committed tip, not from genesis: a
+    /// restarted node's base already carries everything up to it, and a
+    /// read anchored below the store's retention floor is a panic.
+    pub fn new(base: Arc<S>) -> Self {
+        let persisted = base.jmt_height();
         Self {
             base,
             entries: RwLock::new(BTreeMap::new()),
             executed: RwLock::new(BlockHeight::GENESIS),
+            persisted: RwLock::new(persisted),
         }
     }
 
@@ -259,14 +261,15 @@ where
     /// Same-shard vnodes share one chain and each executes the tick under
     /// its own validator identity, so a height can be appended more than
     /// once. A tick's output is a pure function of the committed chain
-    /// prefix, so the repeats carry the same content: folding them in is
-    /// value-preserving, and a wave already resolved out of the entry
-    /// stays resolved.
+    /// prefix, so every repeat carries byte-identical content and the
+    /// first append is the whole of it — which is why a repeat is
+    /// dropped rather than folded. Folding it would leave an exclusive
+    /// write unchanged and apply every movement it carries a second
+    /// time, and it would re-add waves the chain has since resolved.
     pub fn append(&self, height: BlockHeight, output: TickOutput) {
         write_or_recover(&self.entries)
             .entry(height)
-            .or_insert_with(|| TickEntry::empty(height))
-            .absorb(output);
+            .or_insert_with(|| TickEntry::from_output(output));
         let mut executed = write_or_recover(&self.executed);
         *executed = (*executed).max(height);
     }
@@ -291,23 +294,24 @@ where
         }
     }
 
-    /// Drop every tick a future read can no longer need: all waves
-    /// resolved, and both the tick and every settling height at or below
-    /// the eviction floor. Called on `BlockPersisted`.
+    /// Record what the base now carries and drop every tick a future read
+    /// can no longer need. Called on `BlockPersisted`.
     ///
-    /// The floor is the lower of what has persisted and what has
-    /// executed, and the second half is load-bearing. A fold's writes
-    /// enter the base at the height its wave *settled*, which can be
+    /// The eviction floor is the lower of what has persisted and what has
+    /// executed, and the second half is load-bearing. A contribution
+    /// enters the base at the height its wave *settled*, which can be
     /// above the anchor a still-queued tick will read from — so dropping
     /// on persistence alone lets eviction outrun a lagging tick queue,
     /// and that tick then finds neither the fold nor a base old enough to
     /// hold it. Two replicas at different execution positions would
     /// derive different receipts from one committed chain.
     pub fn prune_persisted(&self, persisted: BlockHeight) {
+        {
+            let mut recorded = write_or_recover(&self.persisted);
+            *recorded = (*recorded).max(persisted);
+        }
         let floor = persisted.min(*read_or_recover(&self.executed));
-        write_or_recover(&self.entries).retain(|height, entry| {
-            !(entry.pending.is_empty() && *height <= floor && entry.max_resolution <= floor)
-        });
+        write_or_recover(&self.entries).retain(|_, entry| !entry.covered_by(floor));
     }
 
     /// Tear the chain down. A reshape boundary terminates the shard's
@@ -330,59 +334,60 @@ where
     }
 
     /// Build the baseline view for the tick after `tick`: every retained
-    /// tick's readable fold at or below `tick`, in height order, over the
-    /// base as of `tick`.
+    /// contribution at or below `tick` the base does not already carry,
+    /// over the base as of the height it is read at.
     ///
-    /// The base read is anchored at `tick`, not at whatever this replica
-    /// has currently persisted. Execution runs behind consensus, so a
-    /// replica whose tick queue lags still commits and persists blocks —
-    /// including the settlement of a wave belonging to a *later* tick,
-    /// which 2f+1 other replicas certified without waiting for this one.
-    /// Reading the live base would fold that later tick's writes into
-    /// this tick's baseline, and the receipts would disagree with every
-    /// replica that was not lagging. Anchoring makes the baseline a
-    /// function of the tick alone.
+    /// The base is read at `min(tick, persisted)` rather than at the live
+    /// tip. Execution runs behind consensus, so a replica whose tick
+    /// queue lags has already persisted settlements belonging to *later*
+    /// ticks, which 2f+1 other replicas certified without waiting for it;
+    /// reading the live base would fold those into this tick's baseline
+    /// and split its receipts from the committee's.
     ///
-    /// Folds cover the window the anchor cannot: settlements between the
-    /// persisted tip and `tick` belong to ticks at or below `tick`, and a
-    /// tick is only evicted once the base has absorbed it.
+    /// Anchoring alone is not enough, because a read at or above the
+    /// persisted tip sees everything the base holds while the overlay may
+    /// still hold the same contribution — harmless for an absolute and
+    /// wrong for a movement. So the two are made disjoint instead: the
+    /// base covers every contribution settled at or below the read
+    /// height, the overlay covers the rest, and the answer is the same
+    /// whichever side of that line a replica's persistence happens to
+    /// sit.
     pub fn view_at(&self, tick: BlockHeight) -> TickView<S> {
+        let mut overlay = StateWrites::default();
+        let mut holds = ProvisionalHolds::new();
+        // One acquisition for the base height, the overlay and the holds.
+        // A resolution landing between two reads would drop a leg's hold
+        // without the debit it stood for reaching the overlay, and the
+        // reader would spend a balance twice.
+        let entries = read_or_recover(&self.entries);
+        let base_at = tick.min(*read_or_recover(&self.persisted));
         // Ascending, because an exclusive write supersedes what stood
         // before it and a movement composes onto it — an order the fold
         // has to respect even though movements commute among themselves.
-        let mut overlay: HashMap<SubstateKey, CellState> = HashMap::new();
-        {
-            let entries = read_or_recover(&self.entries);
-            for (_, entry) in entries.range(..=tick) {
-                for (key, change) in &entry.readable {
-                    let folded = CellState::then(overlay.get(key), change);
-                    overlay.insert(*key, folded);
+        for (_, entry) in entries.range(..=tick) {
+            for contribution in entry.readable.values() {
+                if contribution
+                    .in_base_from
+                    .is_some_and(|height| height <= base_at)
+                {
+                    continue;
+                }
+                fold_state_writes(&mut overlay, &contribution.writes);
+            }
+            for leg in entry.pending.values().flatten() {
+                for (cell, amount) in &leg.reserved {
+                    *holds
+                        .entry(*cell)
+                        .or_default()
+                        .entry(leg.tx_hash)
+                        .or_default() += *amount;
                 }
             }
         }
-        // The holds standing at this anchor: every retained entry's
-        // unresolved legs, whatever tick they joined. Read from the same
-        // entries the overlay is folded from, so a leg whose resolution
-        // put its debit into the overlay has had its hold dropped by that
-        // same resolution — the two can never disagree.
-        let mut holds = ProvisionalHolds::new();
-        {
-            let entries = read_or_recover(&self.entries);
-            for entry in entries.values() {
-                for leg in entry.pending.values().flatten() {
-                    for (cell, amount) in &leg.reserved {
-                        *holds
-                            .entry(*cell)
-                            .or_default()
-                            .entry(leg.tx_hash)
-                            .or_default() += *amount;
-                    }
-                }
-            }
-        }
+        drop(entries);
         TickView {
             base: Arc::clone(&self.base),
-            anchor: tick,
+            anchor: base_at,
             overlay: Arc::new(overlay),
             holds: Arc::new(holds),
         }
@@ -398,7 +403,7 @@ where
 pub struct TickView<S> {
     base: Arc<S>,
     anchor: BlockHeight,
-    overlay: Arc<HashMap<SubstateKey, CellState>>,
+    overlay: Arc<StateWrites>,
     holds: Arc<ProvisionalHolds>,
 }
 
@@ -427,17 +432,25 @@ impl<S: VersionedStore> TickView<S> {
 /// snapshot.
 pub struct TickViewSnapshot<Snap> {
     base_snapshot: Snap,
-    overlay: Arc<HashMap<SubstateKey, CellState>>,
+    overlay: Arc<StateWrites>,
 }
 
 impl<Snap: SubstateDatabase> SubstateDatabase for TickViewSnapshot<Snap> {
     fn substate(&self, key: SubstateKey) -> Option<Vec<u8>> {
+        let written = self.overlay.cells.get(&key);
+        let Some(movement) = self.overlay.movements.get(&key) else {
+            return written.map_or_else(|| self.base_snapshot.substate(key), Clone::clone);
+        };
         // A cell the folds only moved resolves here, where the base it
-        // moved from is finally in reach.
-        self.overlay.get(&key).map_or_else(
-            || self.base_snapshot.substate(key),
-            |change| change.value(|| self.base_snapshot.substate(key)),
-        )
+        // moved from is finally in reach; one an exclusive write also
+        // reached moves from that write instead.
+        let before = written
+            .cloned()
+            .unwrap_or_else(|| self.base_snapshot.substate(key))
+            .as_deref()
+            .and_then(read_amount)
+            .unwrap_or(0);
+        amount_cell(movement.apply(before).unwrap_or(0)).map(|cell| cell.to_vec())
     }
 }
 
@@ -445,33 +458,59 @@ impl<Snap: SubstateDatabase> SubstateDatabase for TickViewSnapshot<Snap> {
 mod tests {
     use std::sync::Mutex;
 
-    use hyperscale_types::{Address, Hash, LocalKey, MerkleInclusionProof, ShardId, StateRoot};
+    use hyperscale_types::{
+        Address, Hash, LocalKey, MerkleInclusionProof, Movement, ShardId, StateRoot, encode_amount,
+    };
 
     use super::*;
     use crate::SubstateStore;
     use crate::lock_recover::lock_or_recover;
 
-    /// A base whose every version reads the same — the anchor is
-    /// exercised by [`StubStore::anchors`], not by versioned values.
+    /// A base built from settled write sets at heights, readable as of
+    /// any anchor — the store's history without the JMT.
     struct StubStore {
-        cells: HashMap<SubstateKey, Vec<u8>>,
-        /// Anchor heights `snapshot_at` was asked for, so a test can
-        /// pin that a tick reads the base as of its own height.
+        history: BTreeMap<BlockHeight, HashMap<SubstateKey, Vec<u8>>>,
+        tip: BlockHeight,
+        /// Anchor heights `snapshot_at` was asked for, so a test can pin
+        /// which version a tick read the base at.
         anchors: Mutex<Vec<BlockHeight>>,
     }
 
     impl StubStore {
+        /// A base holding `value` at `key` from genesis, with nothing
+        /// settled since.
         fn with_cell(key: SubstateKey, value: &[u8]) -> Self {
+            Self::settling(key, value, BlockHeight::GENESIS, value)
+        }
+
+        /// A base holding `genesis` at `key`, which a settlement replaces
+        /// with `settled` at `height` — the store's tip.
+        fn settling(key: SubstateKey, genesis: &[u8], height: BlockHeight, settled: &[u8]) -> Self {
             Self {
-                cells: HashMap::from([(key, value.to_vec())]),
+                history: BTreeMap::from([
+                    (
+                        BlockHeight::GENESIS,
+                        HashMap::from([(key, genesis.to_vec())]),
+                    ),
+                    (height, HashMap::from([(key, settled.to_vec())])),
+                ]),
+                tip: height,
                 anchors: Mutex::new(Vec::new()),
             }
+        }
+
+        fn cells_at(&self, height: BlockHeight) -> HashMap<SubstateKey, Vec<u8>> {
+            let mut cells = HashMap::new();
+            for (_, settled) in self.history.range(..=height) {
+                cells.extend(settled.iter().map(|(k, v)| (*k, v.clone())));
+            }
+            cells
         }
     }
 
     impl SubstateDatabase for StubStore {
         fn substate(&self, key: SubstateKey) -> Option<Vec<u8>> {
-            self.cells.get(&key).cloned()
+            self.cells_at(self.tip).get(&key).cloned()
         }
     }
 
@@ -485,7 +524,7 @@ mod tests {
     impl VersionedStore for StubStore {
         fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
             lock_or_recover(&self.anchors).push(height);
-            StubSnapshot(self.cells.clone())
+            StubSnapshot(self.cells_at(height))
         }
         fn substate_bytes_at(&self, _height: BlockHeight) -> Option<u64> {
             None
@@ -495,10 +534,10 @@ mod tests {
     impl SubstateStore for StubStore {
         type Snapshot<'a> = StubSnapshot;
         fn snapshot(&self) -> Self::Snapshot<'_> {
-            StubSnapshot(self.cells.clone())
+            StubSnapshot(self.cells_at(self.tip))
         }
         fn jmt_height(&self) -> BlockHeight {
-            BlockHeight::GENESIS
+            self.tip
         }
         fn state_root(&self) -> StateRoot {
             StateRoot::ZERO
@@ -536,6 +575,24 @@ mod tests {
         }
     }
 
+    /// A receipt that debits `amount` from `cell` — what every fee burn
+    /// and every commutative balance change actually carries.
+    fn debit(cell: SubstateKey, amount: u128) -> StateWrites {
+        let mut moved = StateWrites::default();
+        moved.movements.insert(
+            cell,
+            Movement {
+                credit: 0,
+                debit: amount,
+            },
+        );
+        moved
+    }
+
+    fn amount(cell: &[u8]) -> u128 {
+        read_amount(cell).expect("an amount cell")
+    }
+
     fn wave(height: u64, remote: &[u64]) -> WaveId {
         WaveId::new(
             ShardId::leaf(0, 0),
@@ -554,7 +611,10 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: writes(&[(key(1), Some(b"one")), (key(2), Some(b"two"))]),
+                determined: vec![(
+                    tx(1),
+                    writes(&[(key(1), Some(b"one")), (key(2), Some(b"two"))]),
+                )],
                 determined_wave: Some(wave(1, &[])),
                 provisional: BTreeMap::new(),
             },
@@ -562,7 +622,7 @@ mod tests {
         chain.append(
             BlockHeight::new(2),
             TickOutput {
-                determined: writes(&[(key(1), None)]),
+                determined: vec![(tx(2), writes(&[(key(1), None)]))],
                 determined_wave: Some(wave(2, &[])),
                 provisional: BTreeMap::new(),
             },
@@ -579,23 +639,53 @@ mod tests {
         assert_eq!(view.snapshot().substate(key(2)), Some(b"two".to_vec()));
     }
 
-    /// A tick reads the base as of its own height, not as of whatever
-    /// this replica has persisted. Execution runs behind consensus, so a
-    /// lagging replica has already persisted settlements belonging to
-    /// ticks it has not run; an unanchored read would fold those into an
-    /// earlier tick's baseline and split its receipts from the
-    /// committee's.
+    /// A determined fold carries what its receipts carry, movements
+    /// included. A fee burn is a debit and every payment moves a balance,
+    /// so a fold that kept only the absolutes would hold nothing at all
+    /// for ordinary traffic — and the next tick would read a balance its
+    /// predecessor had already spent.
     #[test]
-    fn a_tick_reads_the_base_as_of_its_own_height() {
-        let store = Arc::new(StubStore::with_cell(key(1), b"base"));
+    fn a_determined_movement_reaches_the_next_tick() {
+        let store = Arc::new(StubStore::with_cell(key(1), encode_amount(1_000).as_ref()));
+        let chain = TickChain::new(store);
+        chain.append(
+            BlockHeight::new(1),
+            TickOutput {
+                determined: vec![(tx(1), debit(key(1), 300))],
+                determined_wave: Some(wave(1, &[])),
+                provisional: BTreeMap::new(),
+            },
+        );
+
+        let view = chain.view_at(BlockHeight::new(1));
+        assert_eq!(amount(&view.snapshot().substate(key(1)).unwrap()), 700);
+    }
+
+    /// A tick reads the base no later than its own height, and no later
+    /// than what has persisted. The first keeps a lagging replica — which
+    /// has already persisted settlements belonging to ticks it has not
+    /// run — from folding them into an earlier tick's baseline. The
+    /// second is what makes the base and the overlay disjoint: a read
+    /// above the persisted tip sees everything the base holds, so the
+    /// overlay has to know exactly where that line is.
+    #[test]
+    fn a_tick_reads_the_base_no_later_than_its_own_height() {
+        let store = Arc::new(StubStore::settling(
+            key(1),
+            b"base",
+            BlockHeight::new(9),
+            b"settled",
+        ));
         let chain = TickChain::new(Arc::clone(&store));
+        chain.prune_persisted(BlockHeight::new(9));
 
         let _ = chain.view_at(BlockHeight::new(4)).snapshot();
-        let _ = chain.view_at(BlockHeight::new(9)).snapshot();
+        let _ = chain.view_at(BlockHeight::new(12)).snapshot();
 
         assert_eq!(
             *lock_or_recover(&store.anchors),
-            vec![BlockHeight::new(4), BlockHeight::new(9)]
+            vec![BlockHeight::new(4), BlockHeight::new(9)],
+            "the anchor is the tick, clamped to what has persisted"
         );
     }
 
@@ -606,7 +696,7 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: StateWrites::default(),
+                determined: Vec::new(),
                 determined_wave: None,
                 provisional: BTreeMap::from([(
                     w.clone(),
@@ -650,7 +740,7 @@ mod tests {
             chain.append(
                 BlockHeight::new(height),
                 TickOutput {
-                    determined: StateWrites::default(),
+                    determined: Vec::new(),
                     determined_wave: None,
                     provisional: BTreeMap::from([(
                         w.clone(),
@@ -687,7 +777,7 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: StateWrites::default(),
+                determined: Vec::new(),
                 determined_wave: None,
                 provisional: BTreeMap::from([(
                     w.clone(),
@@ -720,7 +810,7 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: StateWrites::default(),
+                determined: Vec::new(),
                 determined_wave: None,
                 provisional: BTreeMap::from([(
                     w.clone(),
@@ -745,6 +835,82 @@ mod tests {
         assert_eq!(view.snapshot().substate(key(9)), None);
     }
 
+    /// Same-shard vnodes share one chain and each appends the tick it
+    /// executed. The outputs are byte-identical, so the second is
+    /// dropped: refolding it would leave an absolute unchanged and apply
+    /// every movement a second time.
+    #[test]
+    fn a_repeated_append_is_dropped_rather_than_refolded() {
+        let store = Arc::new(StubStore::with_cell(key(1), encode_amount(1_000).as_ref()));
+        let chain = TickChain::new(store);
+        let output = || TickOutput {
+            determined: vec![(tx(1), debit(key(1), 100))],
+            determined_wave: Some(wave(1, &[])),
+            provisional: BTreeMap::new(),
+        };
+        chain.append(BlockHeight::new(1), output());
+        chain.append(BlockHeight::new(1), output());
+
+        let view = chain.view_at(BlockHeight::new(1));
+        assert_eq!(amount(&view.snapshot().substate(key(1)).unwrap()), 900);
+    }
+
+    /// A fold and the base must never both carry one contribution. The
+    /// eviction floor holds a settled fold while execution lags, and the
+    /// base gains the same writes as soon as the settling block persists
+    /// — so the two windows overlap, and the reader has to pick exactly
+    /// one of them.
+    #[test]
+    fn a_retained_fold_stops_applying_once_the_base_carries_it() {
+        let store = Arc::new(StubStore::settling(
+            key(1),
+            encode_amount(1_000).as_ref(),
+            BlockHeight::new(8),
+            encode_amount(900).as_ref(),
+        ));
+        let chain = TickChain::new(Arc::clone(&store));
+
+        let w = wave(3, &[2]);
+        chain.append(
+            BlockHeight::new(3),
+            TickOutput {
+                determined: Vec::new(),
+                determined_wave: None,
+                provisional: BTreeMap::from([(
+                    w.clone(),
+                    vec![ProvisionalTx {
+                        tx_hash: tx(7),
+                        writes: Some(debit(key(1), 100)),
+                        reserve: None,
+                        reserved: BTreeMap::new(),
+                    }],
+                )]),
+            },
+        );
+        chain.resolve(
+            &w,
+            &TickResolution::Settled {
+                height: BlockHeight::new(8),
+                aborted: BTreeSet::new(),
+            },
+        );
+        chain.prune_persisted(BlockHeight::new(10));
+        assert_eq!(
+            chain.len(),
+            1,
+            "execution has only reached tick 3, so the fold is retained"
+        );
+
+        // A queued tick anchored below the settlement needs the fold.
+        let view = chain.view_at(BlockHeight::new(5));
+        assert_eq!(amount(&view.snapshot().substate(key(1)).unwrap()), 900);
+
+        // A later tick reads a base that already holds it, and must not
+        // apply the debit again.
+        let view = chain.view_at(BlockHeight::new(11));
+        assert_eq!(amount(&view.snapshot().substate(key(1)).unwrap()), 900);
+    }
+
     /// A fold survives until nothing can still need it: every wave in it
     /// resolved, the settlement persisted, and execution advanced past the
     /// settling height. The last is what keeps eviction from outrunning a
@@ -758,7 +924,7 @@ mod tests {
             chain.append(
                 BlockHeight::new(height),
                 TickOutput {
-                    determined: writes(&[(key(1), Some(b"one"))]),
+                    determined: vec![(tx(1), writes(&[(key(1), Some(b"one"))]))],
                     determined_wave: wave,
                     provisional: BTreeMap::new(),
                 },
@@ -810,7 +976,7 @@ mod tests {
         chain.append(
             BlockHeight::new(1),
             TickOutput {
-                determined: StateWrites::default(),
+                determined: Vec::new(),
                 determined_wave: None,
                 provisional: BTreeMap::from([(w.clone(), Vec::new())]),
             },

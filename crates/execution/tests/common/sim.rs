@@ -42,10 +42,10 @@ use hyperscale_types::test_utils::{TestCommittee, certify, make_live_block};
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, BlockHeight, ConsensusReceipt, EventRoot,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FinalizedWave, GlobalReceipt,
-    LocalKey, MerkleInclusionProof, SettledWrites, ShardId, ShardTrie, SignerBitfield, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, TopologySchedule, TopologySnapshot, Transaction,
-    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
-    WeightedTimestamp, compute_global_receipt_root,
+    LocalKey, MerkleInclusionProof, Movement, SettledWrites, ShardId, ShardTrie, SignerBitfield,
+    StateRoot, StateWrites, StoredReceipt, SubstateKey, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WaveCertificate, WaveId,
+    WeightedTimestamp, compute_global_receipt_root, read_amount,
 };
 
 /// The shard a single-shard fixture runs on.
@@ -431,6 +431,26 @@ pub const fn cell_of(owner: [u8; 16]) -> SubstateKey {
     }
 }
 
+/// The amount cell a declared owner prefix credits, beside the counter
+/// cell it writes.
+///
+/// A receipt says two kinds of thing and the pair has to be exercised
+/// together: an exclusive write states the value it left, and a
+/// commutative access states only what it moved. The second is what every
+/// fee burn and every payment actually carries, and it is the one that
+/// does not survive being dropped from a fold or applied twice.
+#[must_use]
+pub const fn vault_of(owner: [u8; 16]) -> SubstateKey {
+    SubstateKey {
+        owner: Address(owner),
+        local: LocalKey([1; 16]),
+    }
+}
+
+/// What each transaction credits to the vault of every cell it writes —
+/// one per write, so the vault must always read exactly the counter.
+pub const CREDIT: u128 = 1;
+
 /// Decode a counter cell; an absent cell reads as zero.
 #[must_use]
 pub fn counter(bytes: Option<Vec<u8>>) -> u64 {
@@ -441,11 +461,21 @@ pub fn counter(bytes: Option<Vec<u8>>) -> u64 {
     })
 }
 
-/// Execute one transaction: increment every cell it declares exclusively.
+/// Decode an amount cell; an absent cell reads as zero.
+#[must_use]
+pub fn amount(bytes: Option<Vec<u8>>) -> u128 {
+    bytes.map_or(0, |raw| read_amount(&raw).expect("an amount cell"))
+}
+
+/// Execute one transaction: increment every cell it declares exclusively,
+/// and credit the same owner's vault.
 ///
-/// Reads run through the tick view, so the receipt is a function of the
+/// Reads run through the tick view, so the counter is a function of the
 /// baseline — which is what makes a wrong baseline observable as a wrong
-/// count rather than as nothing at all.
+/// count rather than as nothing at all. The credit reads nothing, so it
+/// is the opposite probe: it states what it moved, and any fold that
+/// drops it or applies it twice shows up as a vault that disagrees with
+/// the counter beside it.
 fn stub_execute(
     snapshot: &impl SubstateDatabase,
     trie: &ShardTrie,
@@ -454,6 +484,7 @@ fn stub_execute(
     tx: &Arc<Verified<Transaction>>,
 ) -> ExecutedTx {
     let mut cells = BTreeMap::new();
+    let mut movements: BTreeMap<SubstateKey, Movement> = BTreeMap::new();
     for key in tx.admission_write_keys() {
         // Only the owning shard applies a cell, exactly as `Locality`
         // scopes the engine's fold.
@@ -463,11 +494,13 @@ fn stub_execute(
         let cell = cell_of(key.owner().0);
         let next = counter(snapshot.substate(cell)) + 1;
         cells.insert(cell, Some(next.to_le_bytes().to_vec()));
+        let credit = movements.entry(vault_of(key.owner().0)).or_default();
+        *credit = credit.then(Movement {
+            credit: CREDIT,
+            debit: 0,
+        });
     }
-    let writes = StateWrites {
-        cells,
-        movements: BTreeMap::new(),
-    };
+    let writes = StateWrites { cells, movements };
     let receipt_hash = GlobalReceipt::new(
         true,
         EventRoot::ZERO,

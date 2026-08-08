@@ -49,7 +49,9 @@ pub use shard::tick_chain::{
     ProvisionalTx, TickChain, TickOutput, TickResolution, TickView, TickViewSnapshot,
 };
 pub use shard::vote_registers::SafeVoteRegisterStore;
-pub use shard::writes::{filter_writes_to_prefix, merge_state_writes, merge_writes_from_receipts};
+pub use shard::writes::{
+    filter_writes_to_prefix, fold_state_writes, merge_state_writes, merge_writes_from_receipts,
+};
 pub use tree::{CollectedWrites, JmtSnapshot};
 
 /// Umbrella bound for storage backends threaded as a generic `S` through
