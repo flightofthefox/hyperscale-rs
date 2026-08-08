@@ -5,6 +5,8 @@
 //! inclusion proofs fixed-size and eliminates the odd-node-promotion
 //! second-preimage attractor.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::Hash;
 
 /// Compute a binary merkle root from a list of hashes.
@@ -243,6 +245,139 @@ fn take_flank(
     let node = proof.get(*cursor).copied()?;
     *cursor += 1;
     Some(node)
+}
+
+/// Compute a multiproof for an arbitrary set of leaves — the sibling
+/// nodes needed to rebuild the root from those leaves alone.
+///
+/// `present` holds the leaf indices in ascending order. Where two present
+/// leaves share a parent the parent needs no sibling at all, so a proof
+/// costs one node per boundary between the covered set and the rest of the
+/// tree rather than a full path per leaf: a set covering the whole tree
+/// produces an empty proof, and the cost of a scattered set grows with the
+/// set, not with the tree.
+///
+/// Padding nodes are never transmitted. Both sides seed the leaves past
+/// `hashes.len()` as `Hash::ZERO` and fold them upward, so any node whose
+/// span is wholly padding is derived rather than carried — the same rule
+/// [`compute_range_proof`] applies through [`zero_subtrees`].
+///
+/// Pairs with [`verify_sparse_inclusion`], which consumes the nodes in the
+/// order produced here: leaf level upward, ascending index within a level.
+#[must_use]
+pub fn compute_sparse_proof(hashes: &[Hash], present: &[u32]) -> Vec<Hash> {
+    if hashes.is_empty() {
+        return Vec::new();
+    }
+    let leaf_count = hashes.len();
+    let padded_len = leaf_count.next_power_of_two();
+
+    let mut level: Vec<Hash> = Vec::with_capacity(padded_len);
+    level.extend_from_slice(hashes);
+    level.resize(padded_len, Hash::ZERO);
+
+    let mut known: BTreeSet<usize> = present.iter().map(|&index| index as usize).collect();
+    known.extend(leaf_count..padded_len);
+
+    let mut proof = Vec::new();
+    while level.len() > 1 {
+        let mut parents_known: BTreeSet<usize> = BTreeSet::new();
+        for &index in &known {
+            let sibling = index ^ 1;
+            // A pair with both halves known is settled at its lower half.
+            if sibling < index && known.contains(&sibling) {
+                continue;
+            }
+            if !known.contains(&sibling) {
+                proof.push(level[sibling]);
+            }
+            parents_known.insert(index / 2);
+        }
+
+        let mut parents = Vec::with_capacity(level.len() / 2);
+        for pair in level.as_chunks::<2>().0 {
+            parents.push(Hash::from_parts(&[pair[0].as_bytes(), pair[1].as_bytes()]));
+        }
+        level = parents;
+        known = parents_known;
+    }
+    proof
+}
+
+/// Verify that `present` — `(leaf_index, leaf_hash)` pairs in strictly
+/// ascending index order — sit at those positions in a `leaf_count`-leaf
+/// tree with the given `root`.
+///
+/// Lifts the known set level by level, taking each missing sibling from
+/// `proof` in the order [`compute_sparse_proof`] emits them. Requires the
+/// proof to be consumed exactly, and the indices to be canonical — in
+/// range, ascending, distinct — so a reordered, gapped or padded claim is
+/// rejected rather than reinterpreted.
+///
+/// An empty `present` never verifies against a non-empty tree: a claim
+/// about no leaves proves nothing, and admitting it would let a copy
+/// carrying no outcomes pass for one that had been checked.
+#[must_use]
+pub fn verify_sparse_inclusion(
+    root: Hash,
+    present: &[(u32, Hash)],
+    leaf_count: usize,
+    proof: &[Hash],
+) -> bool {
+    if leaf_count == 0 {
+        return present.is_empty() && proof.is_empty() && root == Hash::ZERO;
+    }
+    if present.is_empty() {
+        return false;
+    }
+    let mut previous: Option<u32> = None;
+    for &(index, _) in present {
+        if index as usize >= leaf_count || previous.is_some_and(|prior| index <= prior) {
+            return false;
+        }
+        previous = Some(index);
+    }
+
+    let padded_len = leaf_count.next_power_of_two();
+    let mut known: BTreeMap<usize, Hash> = present
+        .iter()
+        .map(|&(index, hash)| (index as usize, hash))
+        .collect();
+    known.extend((leaf_count..padded_len).map(|index| (index, Hash::ZERO)));
+
+    let mut cursor = 0usize;
+    let mut width = padded_len;
+    while width > 1 {
+        let mut parents: BTreeMap<usize, Hash> = BTreeMap::new();
+        for (&index, &hash) in &known {
+            let sibling = index ^ 1;
+            if sibling < index && known.contains_key(&sibling) {
+                continue;
+            }
+            let sibling_hash = if let Some(&node) = known.get(&sibling) {
+                node
+            } else {
+                let Some(&node) = proof.get(cursor) else {
+                    return false;
+                };
+                cursor += 1;
+                node
+            };
+            let (left, right) = if index.is_multiple_of(2) {
+                (hash, sibling_hash)
+            } else {
+                (sibling_hash, hash)
+            };
+            parents.insert(
+                index / 2,
+                Hash::from_parts(&[left.as_bytes(), right.as_bytes()]),
+            );
+        }
+        known = parents;
+        width /= 2;
+    }
+
+    cursor == proof.len() && known.get(&0) == Some(&root)
 }
 
 /// Verify a merkle inclusion proof against a known root.
@@ -668,5 +803,180 @@ mod tests {
                 leaf_index
             ));
         }
+    }
+
+    /// Pair each index with its leaf hash, the shape the verifier takes.
+    fn claimed(hashes: &[Hash], present: &[u32]) -> Vec<(u32, Hash)> {
+        present
+            .iter()
+            .map(|&index| (index, hashes[index as usize]))
+            .collect()
+    }
+
+    /// Every non-empty subset of every tree up to eight leaves rebuilds
+    /// the same root the full tree computes. Exhaustive rather than
+    /// sampled: the interesting cases are the pairings — siblings both
+    /// present, one present, neither — and they only appear in
+    /// combination.
+    #[test]
+    fn every_subset_of_a_small_tree_rebuilds_the_root() {
+        for n in 1..=8usize {
+            let hashes = leaves(n);
+            let root = compute_merkle_root(&hashes);
+            for mask in 1u32..(1 << n) {
+                let present: Vec<u32> = (0..n)
+                    .filter(|i| mask & (1 << i) != 0)
+                    .map(|i| u32::try_from(i).unwrap())
+                    .collect();
+                let proof = compute_sparse_proof(&hashes, &present);
+                assert!(
+                    verify_sparse_inclusion(root, &claimed(&hashes, &present), n, &proof),
+                    "n={n} mask={mask:b} must rebuild the root"
+                );
+            }
+        }
+    }
+
+    /// A copy holding every leaf carries no proof at all: the tree is
+    /// entirely known, and the padding it doesn't hold is derived from
+    /// the leaf count.
+    #[test]
+    fn a_complete_set_needs_no_proof() {
+        for n in 1..=9usize {
+            let hashes = leaves(n);
+            let present: Vec<u32> = (0..u32::try_from(n).unwrap()).collect();
+            assert!(
+                compute_sparse_proof(&hashes, &present).is_empty(),
+                "n={n} complete set must need no proof"
+            );
+        }
+    }
+
+    /// The proof is bounded by the boundary between the covered set and
+    /// the rest of the tree, not by a path per leaf — which is the whole
+    /// reason a projection is cheaper than the tick it comes from.
+    #[test]
+    fn a_contiguous_run_costs_less_than_a_path_per_leaf() {
+        let hashes = leaves(64);
+        let present: Vec<u32> = (0..32).collect();
+        let proof = compute_sparse_proof(&hashes, &present);
+        assert_eq!(proof.len(), 1, "half the tree is one sibling subtree");
+    }
+
+    /// A single leaf out of a large tree costs one sibling per level —
+    /// the ceiling on what any one leaf can cost.
+    #[test]
+    fn a_lone_leaf_costs_one_sibling_per_level() {
+        let hashes = leaves(64);
+        let proof = compute_sparse_proof(&hashes, &[37]);
+        assert_eq!(proof.len(), 6);
+        assert!(verify_sparse_inclusion(
+            compute_merkle_root(&hashes),
+            &claimed(&hashes, &[37]),
+            64,
+            &proof
+        ));
+    }
+
+    /// A tampered leaf fails: the rebuilt root is not the signed one.
+    #[test]
+    fn a_tampered_leaf_fails() {
+        let hashes = leaves(16);
+        let root = compute_merkle_root(&hashes);
+        let present = [2u32, 9, 11];
+        let proof = compute_sparse_proof(&hashes, &present);
+        let mut forged = claimed(&hashes, &present);
+        forged[1].1 = Hash::from_bytes(b"forged");
+        assert!(!verify_sparse_inclusion(root, &forged, 16, &proof));
+    }
+
+    /// A leaf moved to another index fails even though the hash is real
+    /// — position is part of the claim.
+    #[test]
+    fn a_leaf_claimed_at_the_wrong_index_fails() {
+        let hashes = leaves(16);
+        let root = compute_merkle_root(&hashes);
+        let proof = compute_sparse_proof(&hashes, &[5]);
+        assert!(!verify_sparse_inclusion(
+            root,
+            &[(6, hashes[5])],
+            16,
+            &proof
+        ));
+    }
+
+    /// A proof with nodes appended or removed is rejected rather than
+    /// ignored, so the encoding admits exactly one proof per claim.
+    #[test]
+    fn a_padded_or_truncated_proof_fails() {
+        let hashes = leaves(16);
+        let root = compute_merkle_root(&hashes);
+        let present = [1u32, 4];
+        let proof = compute_sparse_proof(&hashes, &present);
+        let claim = claimed(&hashes, &present);
+
+        let mut padded = proof.clone();
+        padded.push(Hash::ZERO);
+        assert!(!verify_sparse_inclusion(root, &claim, 16, &padded));
+
+        let truncated = &proof[..proof.len() - 1];
+        assert!(!verify_sparse_inclusion(root, &claim, 16, truncated));
+    }
+
+    /// Indices must be in range, ascending and distinct — anything else
+    /// is a second encoding of a claim that already has one.
+    #[test]
+    fn non_canonical_indices_fail() {
+        let hashes = leaves(8);
+        let root = compute_merkle_root(&hashes);
+        let proof = compute_sparse_proof(&hashes, &[1, 5]);
+
+        assert!(
+            !verify_sparse_inclusion(root, &[(5, hashes[5]), (1, hashes[1])], 8, &proof),
+            "descending indices must fail"
+        );
+        assert!(
+            !verify_sparse_inclusion(root, &[(1, hashes[1]), (1, hashes[1])], 8, &proof),
+            "repeated indices must fail"
+        );
+        assert!(
+            !verify_sparse_inclusion(root, &[(1, hashes[1]), (8, Hash::ZERO)], 8, &proof),
+            "an index past the leaf count must fail"
+        );
+    }
+
+    /// A claim about no leaves proves nothing about a non-empty tree.
+    /// The empty tree is the one case where it holds.
+    #[test]
+    fn an_empty_claim_holds_only_for_an_empty_tree() {
+        let hashes = leaves(4);
+        assert!(!verify_sparse_inclusion(
+            compute_merkle_root(&hashes),
+            &[],
+            4,
+            &[]
+        ));
+        assert!(verify_sparse_inclusion(Hash::ZERO, &[], 0, &[]));
+        assert!(!verify_sparse_inclusion(
+            Hash::from_bytes(b"not-zero"),
+            &[],
+            0,
+            &[]
+        ));
+    }
+
+    /// A proof built over one tree does not verify against another's
+    /// root, even at the same shape.
+    #[test]
+    fn a_proof_from_another_tree_fails() {
+        let hashes = leaves(8);
+        let other: Vec<Hash> = (0..8u8).map(|i| Hash::from_bytes(&[i, 0xFF])).collect();
+        let proof = compute_sparse_proof(&other, &[3]);
+        assert!(!verify_sparse_inclusion(
+            compute_merkle_root(&hashes),
+            &claimed(&hashes, &[3]),
+            8,
+            &proof
+        ));
     }
 }

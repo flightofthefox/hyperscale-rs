@@ -119,8 +119,8 @@ pub use primitives::identifiers::{
     WorkInFlight,
 };
 pub use primitives::merkle::{
-    compute_merkle_root, compute_merkle_root_with_proof, compute_range_proof,
-    verify_merkle_inclusion, verify_range_inclusion,
+    compute_merkle_root, compute_merkle_root_with_proof, compute_range_proof, compute_sparse_proof,
+    verify_merkle_inclusion, verify_range_inclusion, verify_sparse_inclusion,
 };
 pub use primitives::positional_bundle::PositionalBundle;
 pub use primitives::randomness::{RANDOMNESS_BYTES, Randomness};
