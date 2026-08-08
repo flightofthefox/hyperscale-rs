@@ -24,7 +24,7 @@
 //! (`BFT CRITICAL: VM fold diverged from the kernel apply`), so nothing here
 //! is standing in for that.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, TickBatchOutcome};
@@ -453,14 +453,24 @@ impl ExecutionSim {
         self.base.substate(key)
     }
 
-    /// Whether a block carrying `certificates` in this order would settle
-    /// two cell-sharing ticks out of the order they executed in — the
-    /// pre-vote gate's question. No ancestor blocks here: the harness
-    /// models one block at a time.
+    /// Hand a finalization to the coordinator as ready for inclusion,
+    /// without committing a block for it — what local aggregation does.
+    pub fn admit(&self, finalization: Finalization) {
+        self.coord.finalization_store().insert(
+            *finalization.tick_id(),
+            Arc::new(Verifiable::from(finalization)),
+        );
+    }
+
+    /// The ticks a proposal would carry certificates for, in the order it
+    /// would carry them.
     #[must_use]
-    pub fn settles_out_of_order(&self, certificates: &[TickId]) -> Option<TickId> {
+    pub fn offered_finalizations(&self) -> Vec<TickId> {
         self.coord
-            .certificates_settle_out_of_order(certificates, &HashSet::new())
+            .get_finalizations()
+            .iter()
+            .map(|fw| *fw.tick_id())
+            .collect()
     }
 
     /// The receipts `tick_id`'s tick produced.

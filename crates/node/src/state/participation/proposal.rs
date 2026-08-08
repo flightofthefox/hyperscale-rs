@@ -36,12 +36,11 @@ impl ShardParticipation {
         // `ready_transactions`. The overhead compensates for QC-chain
         // duplicates shard consensus filters during proposal building.
         let parent = self.shard_coordinator.proposal_parent_block_hash();
-        // What the ancestor chain above the committed tip already carries.
-        // Proposal building drops these as duplicates, so the settlement
-        // order rule has to count them as placed or every successor is
-        // held back for a predecessor that is already ahead of it.
-        let (ancestor_certified, ancestor_txs, _) =
-            self.shard_coordinator.collect_qc_chain_hashes(parent);
+        // The transactions the ancestor chain above the committed tip
+        // already carries. Proposal building drops them as duplicates, so
+        // the budget has to be raised by what will be dropped or the
+        // block comes out short.
+        let (_, ancestor_txs, _) = self.shard_coordinator.collect_qc_chain_hashes(parent);
         let max_txs = MAX_TXS_PER_BLOCK + ancestor_txs.len();
         // The budget reads the chain, not a local claim set: the parent
         // header carries what this shard still owes in work.
@@ -49,9 +48,7 @@ impl ShardParticipation {
         let ready_txs =
             self.mempool_coordinator
                 .ready_transactions(max_txs, in_flight.inner(), self.now);
-        let finalizations = self
-            .execution_coordinator
-            .get_finalizations(&ancestor_certified);
+        let finalizations = self.execution_coordinator.get_finalizations();
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard

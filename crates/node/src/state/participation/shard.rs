@@ -400,32 +400,6 @@ impl ShardParticipation {
             return vec![];
         }
 
-        // Settlement order. A receipt carries the absolute its tick's
-        // baseline produced, so two ticks writing one cell have to settle
-        // in the order they executed — the reverse reverts a committed
-        // write. A predecessor riding an uncommitted ancestor block
-        // settles first and so satisfies the order without appearing
-        // here; the ancestor walk is what tells this apart from a
-        // genuinely skipped predecessor. A node that has not composed a
-        // tick's tick knows of no predecessor for it and passes; the rule
-        // needs a quorum of enforcers, not every node, and that is the
-        // direction that cannot refuse a well-formed block.
-        let (ancestor_certified, ..) = self
-            .shard_coordinator
-            .collect_qc_chain_hashes(header.parent_block_hash());
-        if let Some(tick_id) = self
-            .execution_coordinator
-            .certificates_settle_out_of_order(manifest.cert_ids(), &ancestor_certified)
-        {
-            tracing::warn!(
-                block_hash = ?header.hash(),
-                height = header.height().inner(),
-                tick = %tick_id,
-                "Rejecting block: a finalization settles ahead of one it shares a cell with"
-            );
-            return vec![];
-        }
-
         self.shard_coordinator.on_block_header(
             sched,
             header,

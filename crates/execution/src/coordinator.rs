@@ -86,14 +86,15 @@ struct CommittingBlock {
 
 /// A tick with entries on the tick chain and no committed fate yet.
 struct TickedBatch {
-    /// What its members declared they would mutate.
-    claims: Vec<(DeclaredKey, Mode)>,
-    /// Whether those claims are held *provisionally* — true when the tick
-    /// ran a leg reaching beyond this shard, whose writes nothing may read
-    /// until a counterpart resolves it. A tick of purely local members
-    /// leaves writes determined at once, and its claims exist only to
-    /// order its certificate against the ticks that read them.
-    provisional: bool,
+    /// What its cross-shard legs declared they would mutate — the cells
+    /// nothing may read until this tick's certificate says which side of
+    /// each survives.
+    ///
+    /// Its other members claim nothing: their writes are determined the
+    /// moment they execute and readable at once, so a later tick may
+    /// fold over them freely. Empty for a tick that ran no leg reaching
+    /// beyond this shard, which is then held only for its own fate.
+    provisional_claims: Vec<(DeclaredKey, Mode)>,
 }
 
 /// One composed-but-undispatched tick: the block's identity anchors plus
@@ -646,8 +647,7 @@ impl ExecutionCoordinator {
 
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
-        let mut claims: Vec<(DeclaredKey, Mode)> = Vec::new();
-        let mut provisional = false;
+        let mut provisional_claims: Vec<(DeclaredKey, Mode)> = Vec::new();
         for member in admitted {
             state.admit(
                 member.request.tx_hash,
@@ -656,8 +656,10 @@ impl ExecutionCoordinator {
                 member.forced_abort,
             );
             self.ticks.assign_tx(member.request.tx_hash, tick_id);
-            claims.extend(member.request.transaction.routing().declared_modes.clone());
-            provisional |= member.request.reaches_beyond;
+            if member.request.reaches_beyond {
+                provisional_claims
+                    .extend(member.request.transaction.routing().declared_modes.clone());
+            }
             requests.push(member.request);
         }
 
@@ -684,13 +686,8 @@ impl ExecutionCoordinator {
         // else claims no cell and settles nothing, so the chain never
         // hears of it.
         if !requests.is_empty() {
-            self.ticked.insert(
-                tick_id,
-                TickedBatch {
-                    claims,
-                    provisional,
-                },
-            );
+            self.ticked
+                .insert(tick_id, TickedBatch { provisional_claims });
         }
 
         // Only the tick leader creates a `VoteTracker` for aggregation.
@@ -2164,15 +2161,15 @@ impl ExecutionCoordinator {
         );
     }
 
-    /// The cells unresolved cross-shard ticks hold provisionally.
+    /// The cells unresolved cross-shard legs hold provisionally.
     ///
-    /// Rebuilt per commit from `ticked`, which is small: one entry
-    /// per tick that has joined a tick and whose fate has not committed,
-    /// and the in-flight cap bounds how many that can be.
+    /// Rebuilt per commit from `ticked`, which is small: one entry per
+    /// tick whose fate has not committed, and the drain budget bounds how
+    /// many that can be.
     fn provisional_cells(&self) -> ProvisionalCells {
         let mut cells = ProvisionalCells::default();
-        for ticked in self.ticked.values().filter(|t| t.provisional) {
-            cells.claim(&ticked.claims);
+        for ticked in self.ticked.values() {
+            cells.claim(&ticked.provisional_claims);
         }
         cells
     }
@@ -2770,123 +2767,18 @@ impl ExecutionCoordinator {
         self.ticks.tick_assignment(tx_hash)
     }
 
-    /// Finalizations ready for a block, in an order state can be
-    /// applied in. Returns the `Block::Live.certificates` transport shape
-    /// so the proposer can hand the result straight to the action without
-    /// a per-element conversion.
+    /// Every finalization ready for inclusion, in the order a block must
+    /// settle them.
     ///
-    /// A receipt carries the absolute its tick's baseline produced, and
-    /// settlement is last writer per cell, so two ticks that write one
-    /// cell have to settle in the order they executed — the later tick's
-    /// absolute already contains the earlier one's effect and may
-    /// overwrite it, while the reverse reverts a committed write. Ticks
-    /// ready together therefore go out in tick order, and one whose
-    /// earlier-tick predecessor is neither settled nor ahead of it here
-    /// waits for a later block.
-    ///
-    /// The relation is a strict order on ticks, so the hold-back cannot
-    /// cycle, and a predecessor that never settles is the same liveness
-    /// question its own transactions already pose.
-    ///
-    /// `ancestor_certified` names the ticks an uncommitted ancestor block
-    /// already carries. Those settle strictly before anything this block
-    /// can hold, so they satisfy the order exactly as a settled transaction does
-    /// — and they have to be counted, because a tick's tick entry clears
-    /// on the certificate *committing*, not on its being proposed. The
-    /// emitted order is the block's order, so the caller must preserve it.
+    /// That order is tick order, and it is the store's own: a tick's
+    /// certificate settles the writes that tick produced, and a later
+    /// tick executed against the earlier one's output. `TickId` sorts by
+    /// `(shard, height)`, so iterating the store is already the order
+    /// receipts have to be applied in — there is nothing to sort and
+    /// nothing to hold back.
     #[must_use]
-    pub fn get_finalizations(
-        &self,
-        ancestor_certified: &HashSet<TickId>,
-    ) -> Vec<Arc<Verifiable<Finalization>>> {
-        let ready = self.finalized.all();
-        let mut ordered: Vec<Arc<Verifiable<Finalization>>> = ready;
-        // Ties keep `TickId` order, which `all` already imposes, so
-        // the result is a pure function of the ready set.
-        ordered.sort_by_key(|fw| self.settlement_position(fw.tick_id()));
-
-        let mut emitted: Vec<Arc<Verifiable<Finalization>>> = Vec::with_capacity(ordered.len());
-        let mut placed: BTreeSet<TickId> = BTreeSet::new();
-        for fw in ordered {
-            if self.predecessors_unsettled(fw.tick_id(), &placed, ancestor_certified) {
-                continue;
-            }
-            placed.insert(*fw.tick_id());
-            emitted.push(fw);
-        }
-        emitted
-    }
-
-    /// The tick a certificate settles from. A tick the coordinator no
-    /// longer tracks has already resolved, so it sorts ahead of
-    /// everything still in flight.
-    fn settlement_position(&self, tick_id: &TickId) -> BlockHeight {
-        if self.ticked.contains_key(tick_id) {
-            tick_id.block_height()
-        } else {
-            BlockHeight::GENESIS
-        }
-    }
-
-    /// Whether some tick that executed before `tick_id` reaches a cell it
-    /// reaches incompatibly, and settles no earlier.
-    ///
-    /// Order matters only where composition does not. Two ticks that both
-    /// moved a cell each carry what they moved, so settlement adds them
-    /// and either sequence lands on the same value — nothing to order. It
-    /// is the exclusive writes that carry an absolute, and an absolute
-    /// applied after a change it does not contain reverts that change.
-    ///
-    /// A predecessor is in order when it has resolved — absence from
-    /// `ticked`, whose entry clears when the fate commits — when an
-    /// uncommitted ancestor block already carries its certificate, or when
-    /// it sits earlier in this same block's list.
-    fn predecessors_unsettled(
-        &self,
-        tick_id: &TickId,
-        placed: &BTreeSet<TickId>,
-        ancestor_certified: &HashSet<TickId>,
-    ) -> bool {
-        let Some(ticked) = self.ticked.get(tick_id) else {
-            return false;
-        };
-        let mut own = ProvisionalCells::default();
-        own.claim(&ticked.claims);
-        self.ticked.iter().any(|(other_id, other)| {
-            other_id.block_height() < tick_id.block_height()
-                && !placed.contains(other_id)
-                && !ancestor_certified.contains(other_id)
-                && own.blocks(&other.claims)
-        })
-    }
-
-    /// Whether `certificates` — a block's list, in order — settles two
-    /// cell-sharing ticks out of the order they executed in.
-    ///
-    /// The mirror of what [`Self::get_finalizations`] emits, read by the
-    /// pre-vote gate, and it has to read the same ancestor set: the
-    /// proposer's list is what survives the QC-chain duplicate filter, so
-    /// a predecessor riding an ancestor block is absent from the block
-    /// under test and present in neither `placed` nor a resolution.
-    ///
-    /// A node that has not composed a tick's tick knows of no predecessor
-    /// for it and passes, which is the direction that cannot reject a
-    /// well-formed block: the rule needs a quorum of enforcers, not every
-    /// node.
-    #[must_use]
-    pub fn certificates_settle_out_of_order(
-        &self,
-        certificates: &[TickId],
-        ancestor_certified: &HashSet<TickId>,
-    ) -> Option<TickId> {
-        let mut placed: BTreeSet<TickId> = BTreeSet::new();
-        for tick_id in certificates {
-            if self.predecessors_unsettled(tick_id, &placed, ancestor_certified) {
-                return Some(*tick_id);
-            }
-            placed.insert(*tick_id);
-        }
-        None
+    pub fn get_finalizations(&self) -> Vec<Arc<Verifiable<Finalization>>> {
+        self.finalized.all()
     }
 
     /// Whether provisions from `shard` have been absorbed for `tx_hash` —

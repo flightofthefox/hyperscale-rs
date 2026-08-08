@@ -7,10 +7,12 @@
 //! contains every earlier tick's effect and may overwrite them, while an
 //! earlier tick's contains none of the later ones and must not.
 //!
-//! Nothing about finalization enforces the agreement — two ticks whose
-//! leaders differ in speed can finalize either way round — so the ordering
-//! is imposed where certificates enter a block: the proposer offers them in
-//! tick order, and the pre-vote gate refuses a list that does not.
+//! Nothing about finalization establishes the agreement — two ticks whose
+//! leaders differ in speed finalize either way round — so it is the
+//! proposal that has to. It does so by construction rather than by a rule:
+//! a tick's certificate settles what that tick produced, ticks execute in
+//! height order, and `TickId` sorts by height, so the store's own order is
+//! settlement order and a proposer has no other list to offer.
 
 mod common;
 
@@ -61,28 +63,31 @@ fn settling_in_tick_order_keeps_both_writes() {
     assert_eq!(counter(sim.settled(cell_of(test_prefix(CELL)))), 2);
 }
 
-/// The reverse is refused before it can be voted on: the earlier receipt's
-/// absolute was computed before the later transaction existed, and landing
-/// it last would revert a committed write.
+/// The reverse is unconstructable rather than refused. Both
+/// finalizations are handed over later-first, so the ready set cannot be
+/// in tick order by arrival, and the proposal still comes out in it —
+/// there is no list a proposer could offer that settles the later tick's
+/// absolute ahead of the write it already contains.
 #[test]
-fn a_certificate_settling_ahead_of_its_predecessor_is_refused() {
+fn the_proposal_carries_certificates_in_tick_order() {
     let (sim, ticks) = two_over_one_cell();
+    for tick in ticks.iter().rev() {
+        let receipts = sim.receipts_for(tick);
+        sim.admit(settle(tick, &receipts));
+    }
     assert_eq!(
-        sim.settles_out_of_order(&[ticks[1], ticks[0]]),
-        Some(ticks[1]),
-        "the later tick's certificate may not settle first"
-    );
-    assert_eq!(
-        sim.settles_out_of_order(&[ticks[0], ticks[1]]),
-        None,
-        "tick order is what the rule asks for, not any order"
+        sim.offered_finalizations(),
+        ticks,
+        "the proposal is in tick order whatever order finalization reached it in"
     );
 }
 
-/// Ticks that share no cell are unordered — the rule is per cell, not a
-/// serialization of the settlement pipeline.
+/// Ticks that share no cell land on the same state whichever order
+/// settles them: each carries only what it touched, so there is no
+/// absolute for the other to revert. The order is unconditional, and this
+/// is why paying for it costs nothing.
 #[test]
-fn ticks_over_disjoint_cells_settle_in_any_order() {
+fn ticks_over_disjoint_cells_settle_to_the_same_state_in_any_order() {
     let mut sim = ExecutionSim::new(Schedule::Eager);
     let mut ticks = Vec::new();
     for (seed, cell) in [(0u8, CELL), (1, OTHER)] {
@@ -92,5 +97,14 @@ fn ticks_over_disjoint_cells_settle_in_any_order() {
         sim.drain();
         ticks.push(sim.tick_of(hash).expect("tick assigned"));
     }
-    assert_eq!(sim.settles_out_of_order(&[ticks[1], ticks[0]]), None);
+
+    // Committed in the reverse of tick order.
+    for tick in ticks.iter().rev() {
+        let receipts = sim.receipts_for(tick);
+        sim.commit(Vec::new(), vec![settle(tick, &receipts)]);
+    }
+    sim.drain();
+
+    assert_eq!(counter(sim.settled(cell_of(test_prefix(CELL)))), 1);
+    assert_eq!(counter(sim.settled(cell_of(test_prefix(OTHER)))), 1);
 }
