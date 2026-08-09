@@ -620,6 +620,20 @@ pub fn build_probe_transfer_tx(validity: TimestampRange) -> Transaction {
 /// several.
 pub const PROBE_PAYMENT: u128 = 100;
 
+/// Genesis funding for a scenario that submits a train of
+/// [`build_probe_transfer_tx`] probes rather than one.
+///
+/// Admission refuses an envelope whose payer cannot cover the fee it
+/// declares on top of its in-flight siblings', so a train of `count`
+/// probes needs the whole train's declared cost in the vault before
+/// solvency is what the scenario measures. Doubled for headroom, the way
+/// [`withdrawal_burst_genesis_accounts`] sizes its own burst.
+#[must_use]
+pub fn probe_train_genesis_accounts(count: u32) -> Vec<([u8; 16], u128)> {
+    let funded = u128::from(count) * (MAX_FEE + PROBE_PAYMENT) * 2;
+    vec![(sender(0).1, funded), (recipient(0), 10)]
+}
+
 /// `count` accounts routing to `shard` under a `num_shards`-wide trie,
 /// each drawing a fresh seed.
 #[must_use]

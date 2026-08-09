@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use hyperscale_types::ShardId;
+use hyperscale_types::{BlockHeight, ShardId, Transaction, WeightedTimestamp};
 
 use crate::support::query::{committee_size, live_shards};
 use crate::support::tx::{build_probe_transfer_tx, validity_around};
@@ -128,6 +128,121 @@ pub fn split_lifecycle(c: &mut impl Cluster) {
         "split child roots did not match the beacon anchor within budget"
     );
     assert_height_frozen(c, root, epochs(2));
+}
+
+/// How many probes the replay train submits per epoch of the parent's
+/// remaining life.
+///
+/// A probe is only a replay candidate while its own validity window still
+/// contains the moment it is resubmitted, and `MAX_VALIDITY_RANGE` is
+/// under an epoch, so one probe per epoch would leave gaps a cut can land
+/// in. Four spaces them at a quarter of a window's reach even when an
+/// epoch is the production five minutes.
+const PROBES_PER_EPOCH: u64 = 4;
+
+/// Upper bound on the train, and so on the funding
+/// [`probe_train_genesis_accounts`] has to cover.
+pub const MAX_REPLAY_PROBES: u32 = 48;
+
+/// Whether both split children are seated and committing.
+fn children_live<C: Cluster>(c: &C, left: ShardId, right: ShardId) -> bool {
+    [left, right].iter().all(|&child| {
+        c.serves_shard(child) && c.committed_height(child).is_some_and(|h| h.inner() >= 1)
+    })
+}
+
+/// A transaction the terminating parent committed cannot commit again on
+/// either child.
+///
+/// The parent's `CommitDedupIndex` dies with its chain and both children
+/// construct their own empty, so nothing a child holds refuses the
+/// resubmission: its QC chain is empty, its mempool holds no tombstone
+/// from the parent's sweep, and the transaction's own validity window
+/// still contains its anchor. The replay is refused only if a child
+/// inherits what its parent committed.
+///
+/// Requires [`probe_train_genesis_accounts`] funding and a config with
+/// `split_bytes = 0` and one cohort of pool surplus.
+///
+/// # Panics
+///
+/// Panics if any lifecycle stage misses its budget, if no probe survives
+/// to be a replay candidate (which would make the assertion vacuous), or
+/// if either child commits the replay.
+pub fn split_boundary_refuses_a_replay(c: &mut impl Cluster) {
+    let root = ShardId::ROOT;
+    let (left, right) = root.children();
+
+    // Block cadence is activity-driven and scales with neither the epoch
+    // nor the harness, so the train's spacing is measured rather than
+    // assumed. The probe supplies the activity; the measurement epoch is
+    // absorbed into the wait for admission that follows it.
+    c.submit(Arc::new(build_probe_transfer_tx(validity_around(c.now()))));
+    let before = committed_height(c, root);
+    c.run_until(epochs(1), |_| false);
+    let blocks_per_epoch = committed_height(c, root).saturating_sub(before);
+    let spacing = (blocks_per_epoch / PROBES_PER_EPOCH).max(1);
+
+    assert!(
+        await_split_admitted(c, root, epochs(8)),
+        "beacon did not admit the root split within budget"
+    );
+
+    // A train rather than one probe. The replay candidate has to be
+    // committed on the parent *and* still inside its validity window once
+    // the children accept blocks, while admission to cut runs one to two
+    // epochs — longer than any window a transaction is allowed to sign.
+    // A single probe submitted at admission is expired by the cut, and the
+    // resubmission would then be refused for expiry rather than for the
+    // duplicate this is about.
+    let mut probes: Vec<Arc<Transaction>> = Vec::new();
+    while probes.len() < MAX_REPLAY_PROBES as usize && !children_live(c, left, right) {
+        let probe = Arc::new(build_probe_transfer_tx(validity_around(c.now())));
+        probes.push(Arc::clone(&probe));
+        c.submit(probe);
+        let from = committed_height(c, root);
+        c.run_until(epochs(4), |c| {
+            children_live(c, left, right) || committed_height(c, root) >= from + spacing
+        });
+    }
+
+    assert!(
+        children_live(c, left, right),
+        "split children were not live within the train's budget",
+    );
+
+    // The candidate: committed on the parent, and still signed for the
+    // instant it is about to be resubmitted at. Read off the chain rather
+    // than inferred from when it was submitted, so the scenario does not
+    // depend on where the cut fell.
+    let anchor = WeightedTimestamp::ZERO.plus(c.now());
+    let replay = probes
+        .iter()
+        .rev()
+        .find(|probe| {
+            probe.validity_range().contains(anchor) && c.chain_fate(root, probe.hash()).0.is_some()
+        })
+        .cloned();
+    let replay = replay.expect(
+        "no probe both committed on the parent and outlived the cut — \
+         the train is mis-spaced and the replay assertion would be vacuous",
+    );
+    let replayed = replay.hash();
+
+    c.submit(replay);
+    c.run_until(epochs(4), |_| false);
+
+    for child in [left, right] {
+        assert!(
+            c.chain_fate(child, replayed).0.is_none(),
+            "child {child} committed {replayed}, which its parent had already committed",
+        );
+    }
+}
+
+/// `shard`'s committed height as a plain number, zero before it commits.
+fn committed_height<C: Cluster>(c: &C, shard: ShardId) -> u64 {
+    c.committed_height(shard).map_or(0, BlockHeight::inner)
 }
 
 /// Grow the root into two shards, then merge the two cold children back into it.

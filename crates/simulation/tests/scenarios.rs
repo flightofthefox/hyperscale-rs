@@ -15,17 +15,19 @@ use hyperscale_scenarios::tx::{
     cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
     insolvent_genesis_accounts, livelock_genesis_accounts, merge_straddler_setup,
     nullifier_race_genesis_accounts, overdraw_genesis_accounts, participant_sweep_genesis_accounts,
-    reshape_lifecycle_accounts, shared_recipient_genesis_accounts, split_straddler_setup,
-    staking_genesis_accounts, storm_genesis_accounts, withdrawal_burst_genesis_accounts,
+    probe_train_genesis_accounts, reshape_lifecycle_accounts, shared_recipient_genesis_accounts,
+    split_straddler_setup, staking_genesis_accounts, storm_genesis_accounts,
+    withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
-    Cluster, FaultableCluster, ScenarioConfig, a_failed_attempt_still_attests_work,
-    a_payer_cannot_spend_one_balance_twice, abort_converges, abort_floor_settles_on_deadline,
-    attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
-    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_fetch_fallback,
-    cross_shard_fraction, cross_shard_header_fetch_fallback,
-    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
+    Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig,
+    a_failed_attempt_still_attests_work, a_payer_cannot_spend_one_balance_twice, abort_converges,
+    abort_floor_settles_on_deadline, attested_load_reaches_the_beacon,
+    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
+    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
+    cross_shard_exec_cert_drop_fetch_fallback, cross_shard_fraction,
+    cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
+    cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
     delegation_folds_into_beacon_state, deploy_storm_rides_out, epochs,
@@ -42,8 +44,8 @@ use hyperscale_scenarios::{
     preview_reports_resource_changes, randomness_draw_agrees_across_shards,
     re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
     register_validator_pools_a_node, register_without_capacity_is_rejected,
-    registered_validator_activates_onto_a_shard, single_transfer, split_lifecycle,
-    split_straddler_atomic, split_straddler_ec_partition_atomic,
+    registered_validator_activates_onto_a_shard, single_transfer, split_boundary_refuses_a_replay,
+    split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_terminating_payer_releases_its_reservation, stake_withdraw_drops_effective_stake,
     surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates, withdrawals_compose_over_one_vault,
@@ -145,6 +147,21 @@ const fn split_config() -> ScenarioConfig {
 fn split_lifecycle_sim() {
     let mut cluster = SimCluster::with_accounts(&split_config(), 11, &genesis_accounts(1, 1));
     split_lifecycle(&mut cluster);
+}
+
+/// Red until a split child inherits the dedup window its parent committed
+/// under. Both children construct an empty `CommitDedupIndex`, so nothing
+/// refuses the replay this drives; the seeded constructor is what turns it
+/// green, and the `ignore` comes off with it.
+#[test]
+#[ignore = "reproduces the boundary replay hole; green once children inherit the dedup window"]
+fn split_boundary_refuses_a_replay_sim() {
+    let mut cluster = SimCluster::with_accounts(
+        &split_config(),
+        11,
+        &probe_train_genesis_accounts(MAX_REPLAY_PROBES),
+    );
+    split_boundary_refuses_a_replay(&mut cluster);
 }
 
 // ─── Engine scenarios ───────────────────────────────────────────────
