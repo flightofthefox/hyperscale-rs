@@ -4,7 +4,8 @@
 //! `Finalization`, `Block`, and `QuorumCertificate` so that
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::slice::from_ref;
 use std::sync::Arc;
 
 use hyperscale_jmt::TreeReader;
@@ -16,18 +17,18 @@ use hyperscale_types::{
     ConsensusReceipt, Epoch, Event, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
     FeeSummary, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel,
     MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp,
-    ProvisionEntry, Provisions, QuorumCertificate, Randomness, RatifyCert, RatifyRound,
-    RevealChain, Round, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield,
-    SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt, SubstateKey,
-    SubstateLeaf, TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome,
-    Verifiable, Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
-    compute_merkle_root,
+    ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, Randomness, RatifyCert,
+    RatifyRound, RevealChain, Round, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload,
+    SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt,
+    SubstateKey, SubstateLeaf, TickHalf, TickId, Transaction, TransactionDecision, TxHash,
+    TxOutcome, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    compute_global_receipt_root, compute_merkle_root,
 };
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, ShardChainReader,
+    BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, RecoveredState, ShardChainReader,
     ShardChainWriter, SubstateDatabase, SubstateStore, WitnessSeed,
 };
 
@@ -790,9 +791,97 @@ where
     );
 }
 
+/// A complete EC over `tx_hashes`, every transaction succeeding — the
+/// producing shard's copy, and the only one [`ExecutionCertificate::project_to`]
+/// can narrow.
+fn execution_certificate_over(
+    block_height: BlockHeight,
+    tx_hashes: &[TxHash],
+) -> ExecutionCertificate {
+    let outcomes: Vec<TxOutcome> = tx_hashes
+        .iter()
+        .enumerate()
+        .map(|(position, tx_hash)| {
+            let seed = u8::try_from(position).expect("small fixture") + 150;
+            TxOutcome::new(
+                *tx_hash,
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(&[seed; 32])),
+                },
+            )
+        })
+        .collect();
+    ExecutionCertificate::new(
+        TickId::new(ShardId::ROOT, block_height),
+        WeightedTimestamp::from_millis(block_height.inner() + 1),
+        compute_global_receipt_root(&outcomes),
+        outcomes,
+        AggregateSignature::new([0u8; 96]),
+        SignerBitfield::new(4),
+    )
+}
+
+/// Shared coverage test for the tick slot: a store keeps the widest copy
+/// of a tick it has seen, and answers a by-transaction lookup only for
+/// what that copy carries.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_widest_tick_copy_holds_the_slot(storage: &(impl ShardChainReader + ShardChainWriter)) {
+    let txs: Vec<TxHash> = (1u8..=3)
+        .map(|seed| TxHash::from(Hash::from_bytes(&[seed; 32])))
+        .collect();
+    let complete = execution_certificate_over(BlockHeight::new(1), &txs);
+    let leg = |tx: TxHash| {
+        complete
+            .project_to(&HashSet::from([tx]))
+            .expect("the copy carries it")
+    };
+
+    // One leg arrives, and answers for the transaction it carries.
+    commit_empty_blocks_up_to(storage, BlockHeight::new(1));
+    let first = make_test_block_with_ecs(BlockHeight::new(1), vec![Arc::new(leg(txs[0]))]);
+    storage.commit_block(&make_test_certified(first), &empty_witness());
+    let served = storage.get_execution_certificates_for_txs(&[txs[0]]);
+    assert_eq!(served.len(), 1, "the transaction its copy carries");
+    assert!(served[0].covers(&txs[0]));
+
+    // A disjoint leg does not take the slot from it — the transaction
+    // only that leg covered is served from its own shard instead.
+    let second = make_test_block_with_ecs(BlockHeight::new(2), vec![Arc::new(leg(txs[1]))]);
+    storage.commit_block(&make_test_certified(second), &empty_witness());
+    assert!(
+        storage.get_execution_certificates_for_txs(&[txs[0]])[0].covers(&txs[0]),
+        "the copy already held keeps the slot",
+    );
+    assert!(
+        storage
+            .get_execution_certificates_for_txs(&[txs[1]])
+            .is_empty(),
+        "and nothing points at a copy that lost",
+    );
+
+    // The complete copy carries everything the slot held and more, so it
+    // takes it, and the index reaches every transaction of the tick.
+    let third = make_test_block_with_ecs(BlockHeight::new(3), vec![Arc::new(complete.clone())]);
+    storage.commit_block(&make_test_certified(third), &empty_witness());
+    for tx in &txs {
+        let served = storage.get_execution_certificates_for_txs(from_ref(tx));
+        assert_eq!(served.len(), 1);
+        assert!(served[0].covers(tx), "the complete copy answers for it");
+    }
+    assert_eq!(
+        storage.get_execution_certificates_for_txs(&txs).len(),
+        1,
+        "transactions of one tick resolve to one certificate",
+    );
+}
+
 /// Attach a provisions bundle for `tx_hash` to a live block, preserving
 /// everything else.
-fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block {
+#[must_use]
+pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block {
     let bundle = Provisions::new(
         source,
         ShardId::ROOT,
@@ -838,6 +927,104 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
         },
         sealed @ Block::Sealed { .. } => sealed,
     }
+}
+
+/// Commit a block at `height` carrying one provision bundle, and return
+/// the bundle's hash. The bundle's transaction varies with the height, so
+/// each block's bundle has its own identity.
+fn commit_block_with_provisions(storage: &impl ShardChainWriter, height: u64) -> ProvisionHash {
+    let seed = u8::try_from(height).expect("small fixture");
+    let block = with_provisions(
+        make_test_block(BlockHeight::new(height)),
+        ShardId::leaf(1, 1),
+        TxHash::from(Hash::from_bytes(&[seed; 32])),
+    );
+    let hash = block
+        .provisions()
+        .first()
+        .expect("the block carries one")
+        .hash();
+    storage.commit_block(&make_test_certified(block), &empty_witness());
+    hash
+}
+
+/// Shared retention test: sealing a block keeps its bundles' hashes and
+/// drops their bodies, so the bodies live beside it and a restart reads
+/// them back.
+///
+/// `recovered` loads recovered state the way the backend does — the
+/// `RocksDB` caller reopens the store first, which is the crossing the
+/// bodies have to survive.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_committed_bundle_outlives_sealing(
+    storage: &(impl ShardChainReader + ShardChainWriter),
+    recovered: impl Fn() -> RecoveredState,
+) {
+    let hash = commit_block_with_provisions(storage, 1);
+
+    assert!(
+        storage
+            .get_block(BlockHeight::new(1))
+            .expect("the block committed")
+            .block()
+            .provisions()
+            .is_empty(),
+        "the stored block is sealed and carries no bodies",
+    );
+    assert_eq!(
+        recovered()
+            .retained_provisions
+            .iter()
+            .map(|bundle| bundle.hash())
+            .collect::<Vec<_>>(),
+        vec![hash],
+        "and the body it dropped is recovered from storage",
+    );
+}
+
+/// Shared sweep test: a body outlives the depth a replay could start
+/// from, and no longer.
+///
+/// The floor is the history retention floor — below it `snapshot_at`
+/// cannot serve the baseline a replayed tick reads, so a body kept there
+/// could never be replayed against. `storage` must be configured with
+/// `history_length` as its JMT history length; the walk is derived from
+/// it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_retained_bundle_drops_below_the_history_floor(
+    storage: &(impl ShardChainReader + ShardChainWriter),
+    history_length: u64,
+    recovered: impl Fn() -> RecoveredState,
+) {
+    let first = commit_block_with_provisions(storage, 1);
+    for height in 2..=history_length + 1 {
+        commit_block_with_provisions(storage, height);
+    }
+    assert!(
+        recovered()
+            .retained_provisions
+            .iter()
+            .any(|bundle| bundle.hash() == first),
+        "at the floor the body is still readable",
+    );
+
+    commit_block_with_provisions(storage, history_length + 2);
+    let retained = recovered().retained_provisions;
+    assert!(
+        !retained.iter().any(|bundle| bundle.hash() == first),
+        "past it the sweep drops it",
+    );
+    assert_eq!(
+        retained.len() as u64,
+        history_length + 1,
+        "and keeps the readable window, plus the block of slack at its floor",
+    );
 }
 
 /// Shared rebuild test: a replica that lost its execution state replays

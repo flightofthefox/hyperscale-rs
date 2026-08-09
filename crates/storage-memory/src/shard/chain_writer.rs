@@ -10,7 +10,7 @@ use hyperscale_storage::tree::{
 };
 use hyperscale_storage::{
     BaseReadCache, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateDatabase,
-    merge_writes_from_receipts,
+    covers_strictly_more, merge_writes_from_receipts, widest_tick_copies,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, Block, BlockHeight, CertifiedBlock, Finalization, PreparedCommit,
@@ -289,33 +289,29 @@ impl SimShardStorage {
     }
 }
 
-/// Fold a block's execution certificates into the consensus map: index
-/// every attested transaction, and keep the widest copy of each tick.
+/// Fold a block's execution certificates into the consensus map, keeping
+/// the widest copy of each tick and indexing the transactions that copy
+/// attests.
 ///
-/// A certificate carries the outcomes naming its holder, so one tick can
-/// reach a finalization as more than one copy — a broadcast and a
-/// narrower fetch answer for the same batch. The map is keyed by tick, so
-/// keeping the widest means a later request is answered from a copy
-/// covering more of the batch, never less.
+/// Only an accepted copy is indexed: a transaction the map cannot answer
+/// for with the certificate it kept is served from its own shard instead.
 fn record_execution_certs(consensus: &mut ConsensusState, block: &Block) {
-    for fw in block.certificates().iter() {
-        for ec in fw.execution_certificates() {
-            let ec = ec.as_unverified();
-            for outcome in ec.tx_outcomes() {
-                consensus
-                    .tx_cert_index
-                    .insert(outcome.tx_hash(), *ec.tick_id());
-            }
-            match consensus.execution_certs.entry(*ec.tick_id()) {
-                Entry::Occupied(mut held) => {
-                    if ec.tx_outcomes().len() > held.get().tx_outcomes().len() {
-                        held.insert(ec.clone());
-                    }
+    for cert in widest_tick_copies(block).into_values() {
+        match consensus.execution_certs.entry(*cert.tick_id()) {
+            Entry::Occupied(mut held) => {
+                if !covers_strictly_more(cert, held.get()) {
+                    continue;
                 }
-                Entry::Vacant(slot) => {
-                    slot.insert(ec.clone());
-                }
+                held.insert(cert.clone());
             }
+            Entry::Vacant(slot) => {
+                slot.insert(cert.clone());
+            }
+        }
+        for outcome in cert.tx_outcomes() {
+            consensus
+                .tx_cert_index
+                .insert(outcome.tx_hash(), *cert.tick_id());
         }
     }
 }

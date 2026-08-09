@@ -207,8 +207,10 @@ fn build_prepared_commit(
                 witness.leaf_count_at_block_end,
             );
             storage.append_beacon_witnesses_to_batch(&mut write_batch, witness);
-            append_block_certs_to_batch(&storage, &mut write_batch, block);
 
+            // The block's execution certificates append inside
+            // `try_apply_prepared_commit`, which holds `commit_lock`
+            // across the read their write depends on.
             let applied = storage.try_apply_prepared_commit(
                 write_batch,
                 &jmt_snapshot,

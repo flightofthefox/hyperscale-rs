@@ -13,6 +13,7 @@ use hyperscale_types::{
 use rocksdb::{WriteBatch, WriteOptions};
 
 use super::core::RocksDbShardStorage;
+use super::execution_certs::append_block_certs_to_batch;
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::metadata::read_jmt_metadata;
 use super::snapshot::RocksDbSnapshot;
@@ -182,6 +183,11 @@ impl RocksDbShardStorage {
         }
 
         self.append_jmt_to_batch(&mut write_batch, jmt_snapshot, new_version);
+
+        // Certificates append here rather than at prepare time: choosing
+        // which copy of a tick to keep reads the stored copy, and that
+        // read has to sit under `commit_lock` with the write it decides.
+        append_block_certs_to_batch(self, &mut write_batch, block);
 
         // Fold consensus metadata into the same batch for crash-safe atomicity.
         Self::append_consensus_to_batch(&mut write_batch, block, qc);

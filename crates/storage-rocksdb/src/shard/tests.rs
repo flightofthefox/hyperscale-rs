@@ -5,9 +5,12 @@ use hyperscale_jmt::NibblePath;
 use hyperscale_storage::test_helpers::{
     make_settled_writes, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
     make_test_execution_certificate, make_test_finalization, make_test_qc, make_test_receipt,
-    state_key, test_ec_storage_batch as helpers_test_ec_storage_batch,
-    test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip, test_unresolved_fold,
-    test_witness_payload_range_reads as helpers_test_witness_payload_range_reads,
+    state_key, test_committed_bundle_outlives_sealing,
+    test_ec_storage_batch as helpers_test_ec_storage_batch,
+    test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
+    test_retained_bundle_drops_below_the_history_floor, test_unresolved_fold,
+    test_widest_tick_copy_holds_the_slot,
+    test_witness_payload_range_reads as helpers_test_witness_payload_range_reads, with_provisions,
 };
 use hyperscale_storage::{
     ParentAnchor, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateDatabase,
@@ -16,11 +19,10 @@ use hyperscale_storage::{
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
     BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate, Finalization,
-    FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, MerkleInclusionProof,
-    ProposerTimestamp, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, RevealChain,
-    Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot, StoredReceipt,
-    SubstateKey, SyncHint, TickHalf, TickId, TxHash, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, WitnessSources,
+    FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, ProposerTimestamp,
+    QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot,
+    StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId, TxHash, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -1372,72 +1374,42 @@ fn safe_vote_registers_ignore_stale_chain_incarnation() {
     assert_eq!(storage.safe_vote_registers(v), Some(registers(1, 2)));
 }
 
-/// A bundle at `height` on a block that carries nothing else.
-fn block_with_provisions(height: BlockHeight, source: ShardId) -> (Block, ProvisionHash) {
-    let bundle = Provisions::new(
-        source,
-        ShardId::ROOT,
-        height,
-        WeightedTimestamp::from_millis(height.inner() * 1_000),
-        RevealChain::ZERO,
-        MerkleInclusionProof::dummy(),
-        vec![ProvisionEntry::new(TxHash::ZERO, Vec::new())],
-    );
-    let hash = bundle.hash();
-    let block = match make_test_block(height) {
-        Block::Live {
-            header,
-            transactions,
-            certificates,
-            witness_sources,
-            ..
-        } => Block::Live {
-            header,
-            transactions,
-            certificates,
-            provisions: Arc::new(vec![Arc::new(Verifiable::from(bundle))]),
-            witness_sources,
-        },
-        sealed @ Block::Sealed { .. } => sealed,
-    };
-    (block, hash)
-}
-
-/// Sealing a block keeps its bundles' hashes and drops their bodies, so
-/// the bodies are stored beside it — and stay readable across a reopen,
-/// which is the whole point of storing them.
 #[test]
 fn a_committed_bundle_outlives_its_block_s_sealing() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    let (block, hash) = block_with_provisions(BlockHeight::new(1), ShardId::leaf(1, 1));
+    test_committed_bundle_outlives_sealing(&storage, || storage.load_recovered_state());
+}
 
-    storage.commit_block(&make_test_certified(block), &no_witness());
+/// Storing the bodies is only worth anything if they outlive the process
+/// that committed them, which no in-memory backend can show.
+#[test]
+fn a_committed_bundle_survives_a_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let hash = {
+        let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+        let block = with_provisions(
+            make_test_block(BlockHeight::new(1)),
+            ShardId::leaf(1, 1),
+            TxHash::ZERO,
+        );
+        let hash = block.provisions()[0].hash();
+        storage.commit_block(&make_test_certified(block), &no_witness());
+        hash
+    };
 
-    let stored = storage
-        .get_block(BlockHeight::new(1))
-        .expect("the block committed");
-    assert!(
-        stored.block().provisions().is_empty(),
-        "the stored block is sealed and carries no bodies",
-    );
-
-    drop(stored);
-    drop(storage);
     let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-    let retained = reopened.load_recovered_state().retained_provisions;
     assert_eq!(
-        retained.iter().map(|p| p.hash()).collect::<Vec<_>>(),
+        reopened
+            .load_recovered_state()
+            .retained_provisions
+            .iter()
+            .map(|bundle| bundle.hash())
+            .collect::<Vec<_>>(),
         vec![hash],
-        "and the body it dropped is recovered from storage",
     );
 }
 
-/// A body outlives the depth a replay could start from, and no longer.
-///
-/// The floor is the history retention floor: below it `snapshot_at`
-/// cannot serve the baseline a replayed tick reads, so a body kept there
-/// could never be replayed against.
 #[test]
 fn a_retained_bundle_drops_below_the_history_floor() {
     let temp_dir = TempDir::new().unwrap();
@@ -1448,33 +1420,14 @@ fn a_retained_bundle_drops_below_the_history_floor() {
     let storage =
         RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
             .unwrap();
+    test_retained_bundle_drops_below_the_history_floor(&storage, 3, || {
+        storage.load_recovered_state()
+    });
+}
 
-    let (first, first_hash) = block_with_provisions(BlockHeight::new(1), ShardId::leaf(1, 1));
-    storage.commit_block(&make_test_certified(first), &no_witness());
-
-    for height in 2..=4 {
-        let (block, _) = block_with_provisions(BlockHeight::new(height), ShardId::leaf(1, 1));
-        storage.commit_block(&make_test_certified(block), &no_witness());
-    }
-    assert!(
-        storage
-            .load_recovered_state()
-            .retained_provisions
-            .iter()
-            .any(|p| p.hash() == first_hash),
-        "at the floor the body is still readable",
-    );
-
-    let (block, _) = block_with_provisions(BlockHeight::new(5), ShardId::leaf(1, 1));
-    storage.commit_block(&make_test_certified(block), &no_witness());
-    let retained = storage.load_recovered_state().retained_provisions;
-    assert!(
-        !retained.iter().any(|p| p.hash() == first_hash),
-        "past it the sweep drops it",
-    );
-    assert_eq!(
-        retained.len(),
-        4,
-        "and keeps the readable window, plus the block of slack at its floor",
-    );
+#[test]
+fn the_widest_copy_of_a_tick_holds_the_slot() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_widest_tick_copy_holds_the_slot(&storage);
 }
