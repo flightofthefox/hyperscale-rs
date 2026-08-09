@@ -498,10 +498,13 @@ impl ExecutionSim {
     /// Hand a finalization to the coordinator as ready for inclusion,
     /// without committing a block for it — what local aggregation does.
     pub fn admit(&self, finalization: Finalization) {
-        self.coord.finalization_store().insert(
-            *finalization.tick_id(),
-            Arc::new(Verifiable::from(finalization)),
-        );
+        let tick_id = *finalization.tick_id();
+        // The store admits verified entries only; local aggregation
+        // produces one, and the fixture stands in for that gate.
+        let verified = Verified::new_unchecked_for_test(finalization);
+        self.coord
+            .finalization_store()
+            .insert(tick_id, Arc::new(Verifiable::from(verified)));
     }
 
     /// The ticks a proposal would carry certificates for, in the order it
