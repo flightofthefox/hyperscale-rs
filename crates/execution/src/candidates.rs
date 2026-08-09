@@ -20,6 +20,7 @@ use hyperscale_types::{RevealChain, ShardId, Transaction, TxHash, Verified, Weig
 
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
+use crate::tick_state::Admission;
 
 /// One committed transaction awaiting a tick.
 #[derive(Debug)]
@@ -77,11 +78,10 @@ pub struct Admitted {
     pub request: CrossShardExecutionRequest,
     /// The shards whose certificates its settlement needs.
     pub participating: BTreeSet<ShardId>,
-    /// Whether the tick must attest it `Aborted` whatever its execution
-    /// says — the payer's leg whose counterparts never engaged. It still
-    /// executes, because the charge the abort settles is what that
-    /// execution builds.
-    pub forced_abort: bool,
+    /// The terms it joins on. Everything composition admits runs; the
+    /// payer's leg whose counterparts never engaged runs and is attested
+    /// `Aborted` regardless.
+    pub admission: Admission,
 }
 
 impl TickCandidates {
@@ -216,7 +216,11 @@ impl TickCandidates {
                     reaches_beyond,
                 },
                 participating: candidate.participating.clone(),
-                forced_abort: !candidate.engagement_pending.is_empty(),
+                admission: if candidate.engagement_pending.is_empty() {
+                    Admission::Executes
+                } else {
+                    Admission::ExecutesAborted
+                },
             });
             taken.push(tx_hash);
         }
@@ -387,8 +391,9 @@ mod tests {
         let admitted =
             candidates.compose(&provisioning, &mut ProvisionalCells::default(), ms(60_000));
         assert_eq!(admitted.len(), 1);
-        assert!(
-            admitted[0].forced_abort,
+        assert_eq!(
+            admitted[0].admission,
+            Admission::ExecutesAborted,
             "it executes to build the charge, and is attested aborted",
         );
     }

@@ -62,7 +62,7 @@ use crate::lookups::{
 use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
-use crate::tick_state::{Divergence, TickState};
+use crate::tick_state::{Admission, Divergence, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
 use crate::unresolved::UnresolvedTxs;
 use crate::vote_tracker::VoteTracker;
@@ -664,7 +664,7 @@ impl ExecutionCoordinator {
                 member.request.tx_hash,
                 member.participating,
                 member.request.transaction.work(),
-                member.forced_abort,
+                member.admission,
             );
             self.ticks.assign_tx(member.request.tx_hash, tick_id);
             if member.request.reaches_beyond {
@@ -675,14 +675,20 @@ impl ExecutionCoordinator {
             requests.push(member.request);
         }
 
-        // Read after admission, so a member that just joined this tick is
-        // not abandoned out from under it — the tick is about to attest
-        // it, which is what `will_attest` reports.
-        let composing: HashSet<TxHash> = state.tx_hashes().iter().copied().collect();
-        let abandoned = self.abandonable(&composing);
-        self.discard_ticks_holding(&abandoned);
-        for (tx_hash, declared_work) in abandoned {
-            state.abandon(tx_hash, declared_work);
+        // Read after the assignments above, so a member that just joined
+        // this tick is not taken from it: the tick that holds a
+        // transaction is the one that speaks for it.
+        //
+        // Each joins undispatched, on the shards its committing block
+        // named. Those are what routes this tick's certificate to the
+        // counterparts still waiting on a verdict for it — the abort is
+        // dominant, so their coverage closes on it. A ledger rebuilt by
+        // replay has no participants to give, and names this shard alone.
+        for (tx_hash, declared_work) in self.abandonable() {
+            let mut participating: BTreeSet<ShardId> =
+                self.unresolved.participants(tx_hash).collect();
+            participating.insert(local_shard);
+            state.admit(tx_hash, participating, declared_work, Admission::Aborted);
             self.candidates.remove(tx_hash);
             self.provisioning.remove_tx(tx_hash);
             self.ticks.assign_tx(tx_hash, tick_id);
@@ -2209,81 +2215,28 @@ impl ExecutionCoordinator {
     /// the deadline at a frontier where another has not — which is what
     /// lets a committee sign a verdict about it.
     ///
-    /// Past it, only the transactions this shard has no outcome for and
-    /// none coming: the tick being composed has not just admitted them,
-    /// and no live tick is still going to attest them. The second is
-    /// what stops the commits between a tick's composition and its
-    /// certificate from abandoning a member that tick is about to speak
-    /// for — a payer's leg, admitted at its engagement deadline, whose
-    /// abort carries a charge an abandonment cannot.
+    /// Past it, only the transactions no tick has taken. The tick that
+    /// holds a transaction is the one that answers for it, and its
+    /// verdict can carry a charge an abandonment cannot — a payer's leg,
+    /// admitted at its engagement deadline, is exactly that. A second
+    /// tick speaking for the same transaction would be contradicting the
+    /// first. The assignment is what says which tick holds it, and it
+    /// lasts as long as the ledger entry does: both release when the
+    /// finalization resolving the transaction commits.
     ///
-    /// Two narrowings that used to sit here are answered elsewhere now.
-    /// An assembled settlement needs none: its tick is lower, so the
-    /// store offers it first and the duplicate-resolution rule refuses
-    /// the abort, after which the ledger releases the transaction. And a
+    /// Two narrowings that used to sit here are answered elsewhere. An
+    /// assembled settlement needs none: its tick is lower, so the store
+    /// offers it first and the duplicate-resolution rule refuses the
+    /// abort, after which the ledger releases the transaction. And a
     /// transaction a terminating counterpart may have settled is the
     /// fence's question, which [`Self::fence_pairs`] is what lets the
     /// fence ask about an abandonment at all.
-    ///
-    /// **What remains is local, and that is why tick membership is not
-    /// yet a fold over committed content.** Whether a tick has attested
-    /// turns on when this node saw its certificate.
-    fn abandonable(&self, composing: &HashSet<TxHash>) -> Vec<(TxHash, u64)> {
+    fn abandonable(&self) -> Vec<(TxHash, u64)> {
         self.unresolved
             .past_deadline(self.committed_ts)
             .into_iter()
-            .filter(|(tx_hash, _)| {
-                !composing.contains(tx_hash) && !self.already_abandoning(*tx_hash)
-            })
+            .filter(|(tx_hash, _)| self.ticks.tick_assignment(*tx_hash).is_none())
             .collect()
-    }
-
-    /// Whether a live tick is still going to attest `tx_hash`.
-    ///
-    /// The ledger holds an entry until the certificate resolving it
-    /// commits, so every commit in between asks again — and without this
-    /// the answer would be yes, abandoning a member the tick that holds
-    /// it is about to speak for and discarding that tick with it.
-    fn already_abandoning(&self, tx_hash: TxHash) -> bool {
-        self.ticks
-            .tick_assignment(tx_hash)
-            .and_then(|tick_id| self.ticks.get_tick(&tick_id))
-            .is_some_and(|tick| tick.will_attest(tx_hash))
-    }
-
-    /// Drop every tick still holding a transaction this tick abandons.
-    ///
-    /// A tick that outlived an abandoned member would go on to attest a
-    /// second verdict for it, and the abort is the one the chain has.
-    /// Its remaining members are not aborted here — each waits for its own
-    /// deadline — but they lose the tick, which by this point has failed
-    /// to resolve them for the whole width of a deadline.
-    fn discard_ticks_holding(&mut self, abandoned: &[(TxHash, u64)]) {
-        let doomed: BTreeSet<TickId> = abandoned
-            .iter()
-            .filter_map(|(tx_hash, _)| self.ticks.tick_assignment(*tx_hash))
-            .collect();
-        for tick_id in doomed {
-            let Some(tick) = self.ticks.remove_tick(&tick_id) else {
-                continue;
-            };
-            tracing::info!(
-                tick = %tick_id,
-                txs = tick.tx_hashes().len(),
-                "Discarding a tick that held a transaction past its deadline"
-            );
-            self.outbound_certs.on_tick_finalized(&tick_id);
-            self.record_tick_resolution(
-                &tick_id,
-                TickResolution::Abandoned {
-                    members: tick.tx_hashes().iter().copied().collect(),
-                },
-            );
-            for &tx_hash in tick.tx_hashes() {
-                self.ticks.remove_assignment(tx_hash);
-                self.provisioning.remove_tx(tx_hash);
-            }
-        }
     }
 
     /// Record a tick's fate for the tick chain.
@@ -2597,10 +2550,15 @@ impl ExecutionCoordinator {
                 vec![]
             }
             SettledSetVerdict::Reject => {
-                // The partner never settled this tick, so it must never be
-                // produced. `finalize` already removed it from the registry
-                // and nothing here resolves its transactions, so they stay
-                // owed and the tick at their deadline abandons them.
+                // The partner never settled this half, so it must never be
+                // produced. Taking it was one-shot, so the tick will not
+                // offer it again — and the members it named are left with
+                // a tick that has stopped speaking for them. Releasing
+                // their assignments hands them back to the deadline path,
+                // which is the only thing that can still resolve them.
+                for tx_hash in finalized_arc.tx_hashes() {
+                    self.ticks.remove_assignment(tx_hash);
+                }
                 vec![]
             }
         }
@@ -3213,7 +3171,7 @@ mod tests {
             tick_ts,
         );
         for (tx, participating) in txs {
-            state.admit(tx.hash(), participating, tx.work(), false);
+            state.admit(tx.hash(), participating, tx.work(), Admission::Executes);
         }
         state
     }
@@ -5695,6 +5653,49 @@ mod tests {
         );
     }
 
+    /// A member that never ran joins on the shards its committing block
+    /// named, not on this one alone.
+    ///
+    /// That is what routes the tick's certificate to the counterparts
+    /// still owed a verdict for it: an abort is dominant, so their
+    /// coverage closes on ours and neither side is left waiting on a
+    /// transaction the other has already given up on.
+    #[test]
+    fn an_undispatched_member_joins_on_its_committing_block_s_participants() {
+        let schedule = make_test_topology();
+        let counterpart = ShardId::leaf(1, 1);
+        let mut state = make_test_state();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
+
+        state.unresolved.register_committed(std::iter::once((
+            &transaction,
+            BTreeSet::from([ShardId::ROOT, counterpart]),
+        )));
+
+        let outcomes = abandonment_vote(&mut state, &schedule, 1, deadline_ms);
+        assert_eq!(outcomes.len(), 1, "the tick speaks for it");
+        assert!(outcomes[0].is_aborted());
+
+        let tick = state
+            .ticks
+            .get_tick(&TickId::new(ShardId::ROOT, BlockHeight::new(1)))
+            .expect("the commit past the deadline composed a tick for it");
+        assert_eq!(
+            tick.counterpart_shards(),
+            vec![counterpart],
+            "so the certificate reaches the shard still waiting on it",
+        );
+        assert_eq!(
+            tick.cross_shard_tx_hashes().collect::<Vec<_>>(),
+            vec![tx_hash],
+            "and it settles as the leg it is, not as a determined member",
+        );
+    }
+
     /// Before its deadline a transaction is merely slow, and nothing
     /// abandons it — that is what stops a proposer discarding work.
     #[test]
@@ -5761,18 +5762,19 @@ mod tests {
         state.committed_ts = WeightedTimestamp::from_millis(deadline_ms);
 
         assert!(
-            state.abandonable(&HashSet::new()).is_empty(),
+            state.abandonable().is_empty(),
             "a tick still to vote is an outcome on its way",
         );
         let _ = tx_hash;
     }
 
     /// A tick whose own certificate exists and which waits on a
-    /// counterpart's is stranded: it speaks no further, so the tick at
-    /// the deadline abandons its transaction and discards the tick —
-    /// which would otherwise go on to attest a second verdict.
+    /// counterpart's keeps its member anyway. The tick that holds a
+    /// transaction is the one that answers for it, and its certificate
+    /// already carries a verdict a later abort would contradict — so the
+    /// deadline passes and nothing takes the member from it.
     #[test]
-    fn a_stranded_tick_is_discarded_by_the_tick_that_abandons_it() {
+    fn a_stranded_tick_keeps_the_member_it_holds() {
         let mut state = make_test_state();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let tx = test_transaction(1);
@@ -5804,16 +5806,13 @@ mod tests {
             UnresolvedTxs::restored(vec![(tx_hash, WeightedTimestamp::from_millis(1_000), 42)]);
         state.committed_ts = WeightedTimestamp::from_millis(1_000).plus(MAX_FINALIZATION_DELAY);
 
-        let abandoned = state.abandonable(&HashSet::new());
-        assert_eq!(
-            abandoned,
-            vec![(tx_hash, 42)],
-            "a tick that has attested and waits on a counterpart is stranded",
-        );
-        state.discard_ticks_holding(&abandoned);
         assert!(
-            !state.ticks.contains_tick(&tick_id),
-            "and the stranded tick is discarded with it",
+            state.abandonable().is_empty(),
+            "the tick holding it is the one that speaks for it",
+        );
+        assert!(
+            state.ticks.contains_tick(&tick_id),
+            "so the tick survives its own deadline, waiting on the verdict it needs",
         );
     }
 
@@ -5925,7 +5924,7 @@ mod tests {
         let outcomes = abandonment_vote(&mut state, &schedule, 2, deadline_ms);
         assert_eq!(outcomes.len(), 1, "the tick at the deadline abandons it");
         assert!(
-            state.abandonable(&HashSet::new()).is_empty(),
+            state.abandonable().is_empty(),
             "and the next commit leaves that tick alone",
         );
         assert!(

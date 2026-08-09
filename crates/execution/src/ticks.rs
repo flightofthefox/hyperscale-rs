@@ -407,6 +407,7 @@ mod tests {
     use proptest::collection::vec as prop_vec;
 
     use super::*;
+    use crate::tick_state::Admission;
 
     fn shard() -> ShardId {
         ShardId::ROOT
@@ -426,7 +427,7 @@ mod tests {
             test_transaction(tx_seed).hash(),
             BTreeSet::from([shard()]),
             1,
-            false,
+            Admission::Executes,
         );
         state
     }

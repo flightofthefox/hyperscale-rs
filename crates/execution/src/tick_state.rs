@@ -8,9 +8,14 @@
 //!
 //! ## What a tick holds
 //!
-//! Exactly the transactions that executed in it, plus the ones it
-//! abandons. Both are decided at composition — a member that could not
-//! reach its outcome in this tick is not in it, it is still waiting in
+//! A tick's *membership* is what it answers for; its *batch* is the
+//! subset the VM runs. The two differ by one case: a member past the
+//! deadline that bounds it joins undispatched and is attested `Aborted`
+//! without executing, because a certificate is execution's statement
+//! about its members rather than about its batch.
+//!
+//! Membership is decided at composition — a member that could not reach
+//! its outcome in this tick is not in it, it is still waiting in
 //! [`TickCandidates`](crate::candidates::TickCandidates) — so a tick has
 //! an outcome for every member the moment its batch returns, and no
 //! member of it waits on another.
@@ -57,6 +62,39 @@ pub struct Divergence {
     pub ec_root: GlobalReceiptRoot,
 }
 
+/// How a member joins its tick.
+///
+/// The three cases are the whole of it: what the tick answers for is its
+/// membership, and what the VM runs is its batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// In the batch, attested with whatever execution returns.
+    Executes,
+    /// In the batch and attested `Aborted` whatever it returns — the
+    /// payer's leg whose counterparts never engaged. It still executes,
+    /// because the charge that abort settles is what the execution
+    /// builds.
+    ExecutesAborted,
+    /// Not in the batch. Past the deadline that bounds it, so no
+    /// execution here can reach an outcome, and the tick attests
+    /// `Aborted` on nothing but the hash and the reservation its
+    /// committing block took.
+    Aborted,
+}
+
+impl Admission {
+    /// Whether the member goes to the engine, and so whether the tick
+    /// waits for a result before it can vote.
+    const fn dispatched(self) -> bool {
+        matches!(self, Self::Executes | Self::ExecutesAborted)
+    }
+
+    /// Whether the tick attests `Aborted` whatever execution says.
+    const fn aborts(self) -> bool {
+        matches!(self, Self::ExecutesAborted | Self::Aborted)
+    }
+}
+
 /// Age at which a still-unresolved tick emits a single diagnostic warning.
 ///
 /// Every committed transaction is supposed to reach a certificate — its
@@ -94,13 +132,9 @@ pub struct TickState {
     /// is what makes the tick votable.
     awaiting_results: HashSet<TxHash>,
     /// Members this tick attests `Aborted` whatever their execution said:
-    /// a payer's leg whose counterparts never engaged, and the ones
-    /// abandoned past their own deadline.
+    /// a payer's leg whose counterparts never engaged, and the ones past
+    /// their own deadline that never ran.
     aborted: HashSet<TxHash>,
-    /// Members abandoned rather than executed. A subset of `aborted`,
-    /// kept apart because it is what tells a later commit this tick is
-    /// already speaking for them.
-    abandoned: HashSet<TxHash>,
 
     // ── Local execution outputs ─────────────────────────────────────────
     /// Execution results from the engine, per member.
@@ -173,8 +207,8 @@ pub struct TickState {
 
 impl TickState {
     /// An empty tick at `tick_id`, anchored on the block whose commit
-    /// composed it. Members are admitted by
-    /// [`admit`](Self::admit) and [`abandon`](Self::abandon).
+    /// composed it. Members join through [`admit`](Self::admit), which is
+    /// the only way in.
     #[must_use]
     pub fn new(tick_id: TickId, block_hash: BlockHash, tick_ts: WeightedTimestamp) -> Self {
         Self {
@@ -187,7 +221,6 @@ impl TickState {
             reserved_work: HashMap::new(),
             awaiting_results: HashSet::new(),
             aborted: HashSet::new(),
-            abandoned: HashSet::new(),
             execution_results: HashMap::new(),
             execution_receipts: HashMap::new(),
             fee_receipts: HashMap::new(),
@@ -209,43 +242,30 @@ impl TickState {
         }
     }
 
-    /// Admit a member this tick's batch executes.
+    /// Admit a member, on the terms `admission` names.
     ///
-    /// `forced_abort` marks the one whose verdict is decided before the
-    /// result comes back — the payer's leg whose counterparts never
-    /// engaged. It still executes, because the charge its abort settles
-    /// is what that execution builds.
+    /// One entry point for all three, because they differ only in what
+    /// the tick waits for and what it will say. An
+    /// [`Aborted`](Admission::Aborted) member joins with no body at all:
+    /// the ledger names it by hash, by the shards party to it, and by the
+    /// work its committing block reserved, which is everything an abort
+    /// has to state.
     pub fn admit(
         &mut self,
         tx_hash: TxHash,
         participating: BTreeSet<ShardId>,
         reserved_work: u64,
-        forced_abort: bool,
+        admission: Admission,
     ) {
         if !self.enrol(tx_hash, participating, reserved_work) {
             return;
         }
-        self.awaiting_results.insert(tx_hash);
-        if forced_abort {
+        if admission.dispatched() {
+            self.awaiting_results.insert(tx_hash);
+        }
+        if admission.aborts() {
             self.aborted.insert(tx_hash);
         }
-    }
-
-    /// Admit a transaction this shard can no longer finalize, to be
-    /// attested `Aborted` without executing.
-    ///
-    /// It joins with its outcome already decided and no body: the ledger
-    /// names it by hash and by the work its committing block reserved,
-    /// which is all an abort has to state. The only shard whose
-    /// certificate it waits for is this one — an abort is dominant, so no
-    /// counterpart can contradict it.
-    pub fn abandon(&mut self, tx_hash: TxHash, reserved_work: u64) {
-        let participating = BTreeSet::from([self.tick_id.shard_id()]);
-        if !self.enrol(tx_hash, participating, reserved_work) {
-            return;
-        }
-        self.aborted.insert(tx_hash);
-        self.abandoned.insert(tx_hash);
     }
 
     /// Shared membership bookkeeping. Returns whether the hash was new —
@@ -264,31 +284,6 @@ impl TickState {
         self.reserved_work.insert(tx_hash, reserved_work);
         self.covered_shards.insert(tx_hash, BTreeSet::new());
         true
-    }
-
-    /// Whether this tick already attests `tx_hash` as abandoned.
-    ///
-    /// Composition is deterministic, so this is too: every replica's tick
-    /// at a given height abandons the same members. The ledger keeps the
-    /// entry until that certificate commits, so without this the next
-    /// commit would abandon it again and discard the tick carrying the
-    /// verdict.
-    #[must_use]
-    pub fn is_abandoning(&self, tx_hash: TxHash) -> bool {
-        self.abandoned.contains(&tx_hash)
-    }
-
-    /// Whether this tick is still going to attest `tx_hash`: its own
-    /// certificate has not formed yet, or the verdict that certificate
-    /// carries is the abandonment.
-    ///
-    /// The negative case is the one that matters — a tick whose local
-    /// certificate exists has said everything it will say, so a member of
-    /// it still awaiting a counterpart is stranded rather than in hand.
-    #[must_use]
-    pub fn will_attest(&self, tx_hash: TxHash) -> bool {
-        self.tx_hash_set.contains(&tx_hash)
-            && (!self.local_ec_emitted || self.abandoned.contains(&tx_hash))
     }
 
     // ── Identity getters ────────────────────────────────────────────────
@@ -1055,8 +1050,13 @@ mod tests {
             BlockHash::ZERO,
             WeightedTimestamp::from_millis(1_000),
         );
-        tick.admit(determined, BTreeSet::from([local]), 10, false);
-        tick.admit(leg, BTreeSet::from([local, shard(1)]), 20, false);
+        tick.admit(determined, BTreeSet::from([local]), 10, Admission::Executes);
+        tick.admit(
+            leg,
+            BTreeSet::from([local, shard(1)]),
+            20,
+            Admission::Executes,
+        );
         for tx_hash in [determined, leg] {
             tick.record_execution_result(
                 tx_hash,
@@ -1153,7 +1153,7 @@ mod tests {
             BlockHash::ZERO,
             WeightedTimestamp::from_millis(1_000),
         );
-        tick.admit(tx(1), BTreeSet::from([local]), 10, false);
+        tick.admit(tx(1), BTreeSet::from([local]), 10, Admission::Executes);
         tick.record_execution_result(
             tx(1),
             ExecutionOutcome::Succeeded {
