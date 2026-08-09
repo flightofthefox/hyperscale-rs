@@ -68,11 +68,9 @@ pub fn serve_settled_txs_request<S: ShardStorage>(
     // shipping a response the receiver would reject at decode. The set is
     // the cross-shard settled transactions only — one entry each, across a
     // window spanning the retention horizon — so the headroom is that many
-    // cross-shard transactions per horizon, not per block. An overflow
-    // means cross-shard throughput outran the single-shot transfer and the
-    // design must escalate to paged or JMT-absence-proof delivery (c2).
-    // Log it loudly rather than letting the requester read the overflow
-    // `not_found` as a plain "block not held" and rotate peers forever.
+    // cross-shard transactions per horizon, not per block. Log it loudly
+    // rather than letting the requester read the overflow `not_found` as a
+    // plain "block not held" and rotate peers forever.
     let window = set.len();
     if window > MAX_FINALIZED_TX_PER_BLOCK {
         tracing::warn!(
@@ -81,7 +79,7 @@ pub fn serve_settled_txs_request<S: ShardStorage>(
             window,
             cap = MAX_FINALIZED_TX_PER_BLOCK,
             "settled-transaction window exceeds the wire cap; serving not_found — \
-             cross-shard load outran the one-shot transfer (escalate to c2)"
+             cross-shard load outran the one-shot transfer"
         );
         record_fetch_response_sent("settled_txs", 0);
         return GetSettledTxsResponse::not_found();
