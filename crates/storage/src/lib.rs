@@ -48,7 +48,7 @@ pub use shard::store::{SubstateStore, VersionedStore};
 pub use shard::tick_chain::{
     ProvisionalTx, TickChain, TickOutput, TickResolution, TickView, TickViewSnapshot,
 };
-pub use shard::unresolved::fold_unresolved_txs;
+pub use shard::unresolved::{RecoveredTx, fold_unresolved_txs};
 pub use shard::vote_registers::SafeVoteRegisterStore;
 pub use shard::writes::{
     filter_writes_to_prefix, fold_state_writes, merge_state_writes, merge_writes_from_receipts,

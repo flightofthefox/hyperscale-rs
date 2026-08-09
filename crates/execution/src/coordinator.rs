@@ -38,7 +38,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_storage::{RecoveredState, TickResolution};
+use hyperscale_storage::{RecoveredState, RecoveredTx, TickResolution};
 use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, DeclaredKey, ExecutionCertificate, ExecutionCertificateVerifyError,
@@ -235,6 +235,13 @@ pub struct ExecutionCoordinator {
     /// that state.
     unresolved: UnresolvedTxs,
 
+    /// What a restart recovered from the committed chain, held until a
+    /// topology can classify it. Construction has no schedule to resolve
+    /// participants against, so the replay waits for
+    /// [`on_committed_state_restored`](Self::on_committed_state_restored)
+    /// and is empty from then on.
+    recovered_txs: Vec<RecoveredTx>,
+
     /// Tick fates known but not yet emittable, each with the tick that
     /// carries its entries. Drained whenever a tick completes or a block
     /// commits.
@@ -423,7 +430,8 @@ impl ExecutionCoordinator {
             tick_in_flight: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
-            unresolved: UnresolvedTxs::restored(recovered.unresolved_txs.clone()),
+            unresolved: UnresolvedTxs::default(),
+            recovered_txs: recovered.unresolved_txs.clone(),
             pending_tick_resolutions: Vec::new(),
             candidates: TickCandidates::new(local_shard),
             ticks: TickRegistry::new(),
@@ -577,12 +585,18 @@ impl ExecutionCoordinator {
     /// owes an outcome for, the provisions and engagement echoes its
     /// cross-shard members wait on, and the candidate itself.
     ///
+    /// `ts` and `reveal` are the committing block's, which is what a
+    /// member executes under however many ticks later it runs — so a
+    /// replay of the chain passes the anchors each transaction's own
+    /// block carried rather than the tip's.
+    ///
     /// Nothing executes here. Whether a transaction can reach its outcome
     /// at this commit is composition's question, asked again at every one.
     fn register_committed_txs(
         &mut self,
         classification: &TopologySnapshot,
-        block: CommittingBlock,
+        ts: WeightedTimestamp,
+        reveal: RevealChain,
         transactions: &[Arc<Verifiable<Transaction>>],
     ) {
         let local_shard = self.local_shard;
@@ -617,7 +631,7 @@ impl ExecutionCoordinator {
                 Err(raw) => Arc::new(Verified::<Transaction>::from_persisted(raw)),
             };
             self.candidates
-                .register(verified, participating, block.ts, block.reveal);
+                .register(verified, participating, ts, reveal);
         }
 
         for (tx_hash, counterparts, validity_end) in engagement_waits {
@@ -627,6 +641,62 @@ impl ExecutionCoordinator {
                 validity_end.plus(MAX_FINALIZATION_DELAY),
             );
         }
+    }
+
+    /// Rejoin what the chain says is still in flight, after a restart
+    /// lost the state that was tracking it.
+    ///
+    /// Tick state does not survive a restart and the chain does, so a
+    /// replica that comes back is holding transactions it committed and
+    /// has no record of working on. Replaying them through the same
+    /// registration a commit performs puts them back on the ordinary
+    /// path: they wait in the candidate pool exactly as they would have,
+    /// and the first tick that can run them does.
+    ///
+    /// A leg's provisions do not come back with it. They were absorbed
+    /// into memory when they committed and the block kept only their
+    /// hashes, so a recovered leg waits for the fetch path to supply
+    /// them again and reaches its deadline if it never does — where a
+    /// transaction reaching no further than this shard runs at once.
+    ///
+    /// Deferred to here rather than done at construction because
+    /// participants need a topology, and there is none until the
+    /// schedule is up. Idempotent: the payload is taken, and the
+    /// registration is keyed by transaction and already idempotent
+    /// against a live commit that beat this call.
+    pub fn on_committed_state_restored(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+    ) -> Vec<Action> {
+        let recovered = std::mem::take(&mut self.recovered_txs);
+        if recovered.is_empty() {
+            return Vec::new();
+        }
+        // Provision deadlines stamp against this clock, which a commit
+        // would have advanced before any of this ran.
+        self.provisioning.advance_clock(self.committed_ts);
+
+        tracing::info!(
+            shard = %self.local_shard,
+            txs = recovered.len(),
+            "Rejoining transactions the chain still owes an outcome for"
+        );
+
+        for entry in recovered {
+            // Each under the committee its own block resolved, not the
+            // tip's: a reshape inside the recovery window moves the shard
+            // set, and participants assigned against the wrong one would
+            // name shards the transaction's block never did.
+            let classification =
+                self.classification_committee(topology_schedule, entry.committee_anchor_ts);
+            self.register_committed_txs(
+                classification,
+                entry.committed_ts,
+                entry.committed_reveal,
+                std::slice::from_ref(&entry.transaction),
+            );
+        }
+        Vec::new()
     }
 
     /// Compose this commit's tick and set it up to be attested.
@@ -2107,7 +2177,7 @@ impl ExecutionCoordinator {
         // anything is composed from it: the block's own transactions, and
         // the provisions and engagement echoes its batches carry.
         if !transactions.is_empty() {
-            self.register_committed_txs(anchored, block, transactions);
+            self.register_committed_txs(anchored, block.ts, block.reveal, transactions);
         }
         if !provisions.is_empty() {
             self.apply_committed_provisions(provisions);
@@ -3094,6 +3164,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_storage::RecoveredTx;
     use hyperscale_types::test_utils::{
         certify as test_certify, make_live_block as helpers_make_live_block, test_transaction,
     };
@@ -5355,6 +5426,7 @@ mod tests {
         local: ShardId,
         remote: ShardId,
         height: u64,
+        tx_hash: TxHash,
     ) -> Arc<Verifiable<Finalization>> {
         let ec = |shard: ShardId| {
             let tick = TickId::new(shard, BlockHeight::new(height));
@@ -5363,7 +5435,7 @@ mod tests {
                 WeightedTimestamp::from_millis(height),
                 GlobalReceiptRoot::ZERO,
                 vec![TxOutcome::new(
-                    TxHash::from(Hash::from_bytes(b"tx")),
+                    tx_hash,
                     ExecutionOutcome::Succeeded {
                         receipt_hash: GlobalReceiptHash::ZERO,
                     },
@@ -5390,7 +5462,12 @@ mod tests {
         // Past ROOT's terminal window — the gate's anchor is the committed ts.
         state.committed_ts = WeightedTimestamp::from_millis(1500);
         let sched = terminating_schedule();
-        let tick = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let tick = cross_shard_finalization(
+            ShardId::leaf(1, 0),
+            ShardId::ROOT,
+            1,
+            TxHash::from(Hash::from_bytes(b"tx")),
+        );
         let tick_id = *tick.tick_id();
 
         let deferred = state.emit_or_gate_finalized(&sched, tick);
@@ -5424,10 +5501,11 @@ mod tests {
 
     /// A tick a past-terminal shard never settled is dropped, not produced
     /// and not buffered for retry. Nothing here resolves its transaction:
-    /// it stays owed, and the tick at its deadline abandons it.
+    /// it stays owed, and it goes back to the deadline path that can.
     #[test]
     fn finalize_gate_drops_an_unsettled_tick() {
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
+        let local = ShardId::leaf(1, 0);
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
         state.committed_ts = WeightedTimestamp::from_millis(1500);
         let sched = terminating_schedule();
         state.record_settled_txs(
@@ -5437,15 +5515,16 @@ mod tests {
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
         );
-        let tick = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(9)),
+        ));
+        let tx_hash = transaction.hash();
+        let tick = cross_shard_finalization(local, ShardId::ROOT, 1, tx_hash);
         let tick_id = *tick.tick_id();
-        // The rejection must resolve nothing: the transaction stays owed,
-        // and the tick at its deadline is what abandons it.
-        state.unresolved = UnresolvedTxs::restored(
-            tick.tx_hashes()
-                .map(|tx_hash| (tx_hash, WeightedTimestamp::from_millis(60_000), 1))
-                .collect(),
-        );
+        state
+            .unresolved
+            .register_committed(std::iter::once((&transaction, BTreeSet::from([local]))));
+        state.ticks.assign_tx(tx_hash, tick_id);
 
         let dropped = state.emit_or_gate_finalized(&sched, tick);
         assert!(
@@ -5461,6 +5540,10 @@ mod tests {
             state.unresolved.len(),
             1,
             "a gate rejection is not a verdict — the transaction stays owed",
+        );
+        assert!(
+            state.ticks.tick_assignment(tx_hash).is_none(),
+            "and its tick has stopped speaking for it, so the deadline path can",
         );
     }
 
@@ -5478,7 +5561,12 @@ mod tests {
         // Post-cut: any epoch-1 timestamp is past ROOT's terminal window.
         state.committed_ts = WeightedTimestamp::from_millis(1500);
         let sched = terminating_schedule();
-        let tick = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let tick = cross_shard_finalization(
+            ShardId::leaf(1, 0),
+            ShardId::ROOT,
+            1,
+            TxHash::from(Hash::from_bytes(b"tx")),
+        );
         let tick_id = *tick.tick_id();
 
         // The late certificate completes the tick before the settled set is
@@ -5551,7 +5639,12 @@ mod tests {
 
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
         state.committed_ts = WeightedTimestamp::from_millis(1500);
-        let tick = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let tick = cross_shard_finalization(
+            ShardId::leaf(1, 0),
+            ShardId::ROOT,
+            1,
+            TxHash::from(Hash::from_bytes(b"tx")),
+        );
         let tick_id = *tick.tick_id();
 
         // ROOT is live in epoch 0 but leaves the trie at its boundary: the
@@ -5650,6 +5743,69 @@ mod tests {
             outcomes[0].declared_work(),
             reserved,
             "releasing exactly what the committing block reserved",
+        );
+    }
+
+    /// A restart puts what the chain still owes an outcome for back on
+    /// the ordinary path: waiting in the candidate pool, and executing at
+    /// the first tick that can run it.
+    ///
+    /// Without this the transaction has no candidate and no assignment,
+    /// so nothing composes it and the deadline is the only thing left
+    /// that can speak for it — a restart would abandon everything it was
+    /// carrying.
+    #[test]
+    fn a_restart_rejoins_what_the_chain_still_owes_an_outcome_for() {
+        let schedule = make_test_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let recovered = RecoveredState {
+            committed_height: BlockHeight::new(1),
+            committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
+            unresolved_txs: vec![RecoveredTx {
+                transaction,
+                committed_ts: WeightedTimestamp::from_millis(1_000),
+                committed_reveal: RevealChain::ZERO,
+                committee_anchor_ts: WeightedTimestamp::from_millis(1_000),
+            }],
+            ..RecoveredState::default()
+        };
+        let mut state = ExecutionCoordinator::with_shared_stores(
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            &recovered,
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizationStore::new()),
+        );
+
+        assert!(
+            state.candidates.is_empty(),
+            "construction has no topology to classify with, so it holds",
+        );
+        state.on_committed_state_restored(&schedule);
+        assert!(
+            state.candidates.contains(tx_hash),
+            "and the restore puts it back in the pool",
+        );
+        assert_eq!(state.unresolved.len(), 1, "still owed, as the chain says");
+
+        // The proof it rejoined the ordinary path rather than a synthetic
+        // one: the next commit composes it, and it executes.
+        let actions = state.on_block_committed(
+            &schedule,
+            &test_certify(
+                make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![]),
+                2_000,
+            ),
+        );
+        assert!(
+            actions.iter().any(
+                |action| matches!(action, Action::ExecuteTransactions { requests, .. }
+                    if requests.iter().any(|r| r.tx_hash == tx_hash))
+            ),
+            "the first tick that can run it does",
         );
     }
 
@@ -5777,16 +5933,18 @@ mod tests {
     fn a_stranded_tick_keeps_the_member_it_holds() {
         let mut state = make_test_state();
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let tx = test_transaction(1);
-        let tx_hash = tx.hash();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
         let participating: BTreeSet<ShardId> =
             [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect();
         let mut tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             vec![(
-                Arc::new(Verified::new_unchecked_for_test(tx)),
-                participating,
+                Arc::new(Verified::new_unchecked_for_test(test_transaction(1))),
+                participating.clone(),
             )],
         );
         tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
@@ -5802,9 +5960,10 @@ mod tests {
         state.ticks.insert_tick(tick_id, tick);
         state.ticks.assign_tx(tx_hash, tick_id);
 
-        state.unresolved =
-            UnresolvedTxs::restored(vec![(tx_hash, WeightedTimestamp::from_millis(1_000), 42)]);
-        state.committed_ts = WeightedTimestamp::from_millis(1_000).plus(MAX_FINALIZATION_DELAY);
+        state
+            .unresolved
+            .register_committed(std::iter::once((&transaction, participating)));
+        state.committed_ts = WeightedTimestamp::from_millis(60_000).plus(MAX_FINALIZATION_DELAY);
 
         assert!(
             state.abandonable().is_empty(),

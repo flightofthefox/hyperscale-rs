@@ -15,12 +15,12 @@ use hyperscale_types::{
     BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin,
     ConsensusReceipt, Epoch, Event, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
     FeeSummary, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel,
-    PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, QuorumCertificate,
-    Randomness, RatifyCert, RatifyRound, Round, SettledWrites, ShardAnchor, ShardId,
-    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, SubstateLeaf, TickId, Transaction,
-    TransactionDecision, TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp,
-    WitnessSources, compute_global_receipt_root, compute_merkle_root,
+    MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp,
+    ProvisionEntry, Provisions, QuorumCertificate, Randomness, RatifyCert, RatifyRound,
+    RevealChain, Round, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield,
+    SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt, SubstateKey,
+    SubstateLeaf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, Verifiable,
+    Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root, compute_merkle_root,
 };
 
 use crate::shard::unresolved::fold_unresolved_txs;
@@ -783,6 +783,36 @@ where
     );
 }
 
+/// Attach a provisions bundle for `tx_hash` to a live block, preserving
+/// everything else.
+fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block {
+    let bundle = Provisions::new(
+        source,
+        ShardId::ROOT,
+        BlockHeight::new(1),
+        WeightedTimestamp::ZERO,
+        RevealChain::ZERO,
+        MerkleInclusionProof::dummy(),
+        vec![ProvisionEntry::new(tx_hash, vec![])],
+    );
+    match block {
+        Block::Live {
+            header,
+            transactions,
+            certificates,
+            witness_sources,
+            ..
+        } => Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions: Arc::new(vec![Arc::new(Verifiable::from(bundle))]),
+            witness_sources,
+        },
+        sealed @ Block::Sealed { .. } => sealed,
+    }
+}
+
 /// Attach `txs` to a live block, preserving everything else.
 fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Block {
     match block {
@@ -813,6 +843,7 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
 pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)) {
     let resolved = test_transaction(1);
     let open = test_transaction(2);
+    let source = ShardId::leaf(1, 1);
 
     commit_empty_blocks_up_to(storage, BlockHeight::new(1));
     let committing = with_transactions(
@@ -824,34 +855,48 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)
     );
     storage.commit_block(&make_test_certified(committing), &empty_witness());
 
+    // A counterpart's bundle for the one that stays open. A block is
+    // stored sealed and sealing keeps only provision hashes, so it is
+    // committed here to pin what the replay does *not* get back.
+    let provisioning = with_provisions(make_test_block(BlockHeight::new(2)), source, open.hash());
+    storage.commit_block(&make_test_certified(provisioning), &empty_witness());
+
     // Only one of them gets an outcome. An abort resolves a transaction
     // exactly as a settlement does, and owes no receipt — which is what
     // lets the rebuilt block carry it on every backend.
     let resolving = push_certificate(
-        make_test_block(BlockHeight::new(2)),
+        make_test_block(BlockHeight::new(3)),
         Arc::new(Verifiable::from(make_finalization(
-            BlockHeight::new(2),
+            BlockHeight::new(3),
             resolved.hash(),
             TransactionDecision::Aborted,
         ))),
     );
     storage.commit_block(&make_test_certified(resolving), &empty_witness());
 
-    let rebuilt = fold_unresolved_txs(storage, BlockHeight::new(2), WeightedTimestamp::ZERO);
-    let names: Vec<TxHash> = rebuilt.iter().map(|(tx_hash, ..)| *tx_hash).collect();
+    let rebuilt = fold_unresolved_txs(storage, BlockHeight::new(3), WeightedTimestamp::ZERO);
+    let names: Vec<TxHash> = rebuilt
+        .iter()
+        .map(|entry| entry.transaction.hash())
+        .collect();
     assert_eq!(
         names,
         vec![open.hash()],
         "the replay must name what committed and never resolved, and only that"
     );
     assert_eq!(
-        rebuilt[0].1,
-        open.validity_range().end_timestamp_exclusive,
-        "carrying the validity end the abort deadline derives from"
+        rebuilt[0].transaction.validity_range(),
+        open.validity_range(),
+        "carrying the body the deadline and the reservation both read",
     );
-    assert_eq!(
-        rebuilt[0].2,
-        open.work(),
-        "and the reservation an abandonment has to release"
+    assert!(
+        storage
+            .get_block(BlockHeight::new(2))
+            .expect("committed")
+            .block()
+            .provisions()
+            .is_empty(),
+        "and no provisions: a stored block keeps their hashes, not their contents, \
+         so a recovered leg has to be sent them again",
     );
 }

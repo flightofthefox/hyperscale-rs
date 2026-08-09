@@ -40,9 +40,19 @@ impl ShardParticipation {
                 actions.extend(self.provisions_coordinator.flush_expected_provisions());
                 actions
             }
-            ProtocolEvent::CommittedStateRestored { height, hash, qc } => self
-                .shard_coordinator
-                .on_committed_state_restored(height, hash, qc),
+            // Both halves resume from the same recovered tip: consensus
+            // from the frontier it stored, execution from the
+            // transactions that frontier still owes an outcome for.
+            ProtocolEvent::CommittedStateRestored { height, hash, qc } => {
+                let mut actions = self
+                    .shard_coordinator
+                    .on_committed_state_restored(height, hash, qc);
+                actions.extend(
+                    self.execution_coordinator
+                        .on_committed_state_restored(topology_schedule),
+                );
+                actions
+            }
             // Remote-header catch-up finished. The coordinator keeps no
             // sync-mode state to reconcile on completion, so the event is
             // an acknowledged no-op.

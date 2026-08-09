@@ -61,33 +61,12 @@ pub struct UnresolvedTxs {
 }
 
 impl UnresolvedTxs {
-    /// Rebuild from a replay of the committed chain: each transaction
-    /// still owed an outcome, against the validity end its deadline
-    /// derives from and the work its block reserved for it.
-    ///
-    /// The deadline rule lives here and only here, so a rebuilt ledger
-    /// and a live one cannot disagree about when a transaction stops
-    /// being able to finalize.
-    #[must_use]
-    pub fn restored(entries: Vec<(TxHash, WeightedTimestamp, u64)>) -> Self {
-        Self {
-            owed: entries
-                .into_iter()
-                .map(|(tx_hash, validity_end, declared_work)| {
-                    (
-                        tx_hash,
-                        Owed {
-                            deadline: validity_end.plus(MAX_FINALIZATION_DELAY),
-                            declared_work,
-                            participants: BTreeSet::new(),
-                        },
-                    )
-                })
-                .collect(),
-        }
-    }
-
     /// Record what a committed block puts in flight.
+    ///
+    /// One entry point for a live commit and for a replay of the chain
+    /// alike, so the deadline rule and the participant set are each
+    /// written once and a rebuilt ledger cannot disagree with the one it
+    /// rebuilds.
     ///
     /// Idempotent per transaction: a hash cannot commit twice within its
     /// own validity window, and re-registering one must not move the
