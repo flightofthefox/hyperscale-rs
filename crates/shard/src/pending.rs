@@ -814,7 +814,7 @@ mod tests {
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
         Block, BlockHeaderParts, BlockHeight, ChainOrigin, Hash, ProposerTimestamp,
-        QuorumCertificate, Round, ShardId, TickId, Verified, WitnessSources,
+        QuorumCertificate, Round, ShardId, TickHalf, TickId, Verified, WitnessSources,
     };
 
     use super::*;
@@ -938,7 +938,13 @@ mod tests {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let header = make_header(BlockHeight::new(1));
         let fw: Arc<Verifiable<Finalization>> = Arc::new(
-            Verified::new_unchecked_for_test(Finalization::new(tick_id, vec![], vec![])).into(),
+            Verified::new_unchecked_for_test(Finalization::new(
+                tick_id,
+                TickHalf::Determined,
+                vec![],
+                vec![],
+            ))
+            .into(),
         );
 
         let mut pb = PendingBlock::from_manifest(
@@ -968,7 +974,13 @@ mod tests {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let header = make_header(BlockHeight::new(1));
         let fw: Arc<Verifiable<Finalization>> = Arc::new(
-            Verified::new_unchecked_for_test(Finalization::new(tick_id, vec![], vec![])).into(),
+            Verified::new_unchecked_for_test(Finalization::new(
+                tick_id,
+                TickHalf::Determined,
+                vec![],
+                vec![],
+            ))
+            .into(),
         );
 
         let mut pb = PendingBlock::from_manifest(
@@ -996,7 +1008,12 @@ mod tests {
     #[test]
     fn test_from_complete_block_is_complete() {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
-        let fw = Arc::new(Finalization::new(tick_id, vec![], vec![]));
+        let fw = Arc::new(Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![],
+            vec![],
+        ));
         let verified_fw = Arc::new(Verified::new_unchecked_for_test((*fw).clone()).into());
         let wire_fw = Arc::new((*fw).clone().into());
 

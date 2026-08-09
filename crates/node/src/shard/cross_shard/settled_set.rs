@@ -238,8 +238,9 @@ mod tests {
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
         BlockHeader, BlockHeaderParts, CertificateRoot, ExecutionCertificate, ExecutionOutcome,
         Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, ProposerTimestamp,
-        QuorumCertificate, Round, ShardId, SignerBitfield, TickId, TxHash, TxOutcome, ValidatorId,
-        Verifiable, Verified, WeightedTimestamp, WitnessSources, settled_txs_root_from_hashes,
+        QuorumCertificate, Round, ShardId, SignerBitfield, TickHalf, TickId, TxHash, TxOutcome,
+        ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+        settled_txs_root_from_hashes,
     };
 
     use super::*;
@@ -285,6 +286,7 @@ mod tests {
         );
         Arc::new(Verifiable::from(Finalization::new(
             tick,
+            TickHalf::Determined,
             vec![Arc::new(ec), Arc::new(remote)],
             vec![],
         )))

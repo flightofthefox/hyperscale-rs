@@ -10289,7 +10289,7 @@ mod tests {
     ) -> Arc<Verifiable<Finalization>> {
         use hyperscale_types::{
             ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot,
-            SignerBitfield, TickId, TxOutcome,
+            SignerBitfield, TickHalf, TickId, TxOutcome,
         };
         let ec = |shard: ShardId| {
             let tick = TickId::new(shard, BlockHeight::new(height));
@@ -10310,6 +10310,7 @@ mod tests {
         let local_tick = TickId::new(local, BlockHeight::new(height));
         Arc::new(Verifiable::from(Finalization::new(
             local_tick,
+            TickHalf::Determined,
             vec![Arc::new(ec(local)), Arc::new(ec(remote))],
             vec![],
         )))

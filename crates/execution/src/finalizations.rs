@@ -243,7 +243,7 @@ mod tests {
 
     use hyperscale_types::{
         AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, ShardId, SignerBitfield, TxHash, TxOutcome, Verified,
+        GlobalReceiptRoot, Hash, ShardId, SignerBitfield, TickHalf, TxHash, TxOutcome, Verified,
         WeightedTimestamp,
     };
 
@@ -281,6 +281,7 @@ mod tests {
         // empty receipts vector is fine for the store's contract.
         let verified = Verified::new_unchecked_for_test(Finalization::new(
             tick_id,
+            TickHalf::Determined,
             vec![Arc::new(ec)],
             vec![],
         ));

@@ -68,8 +68,8 @@ mod tests {
         AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot,
         ChainOrigin, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, ProposerTimestamp, QuorumCertificate, ShardId, SignerBitfield,
-        StateRoot, TickId, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-        WeightedTimestamp,
+        StateRoot, TickHalf, TickId, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
+        Verified, WeightedTimestamp,
     };
 
     #[test]
@@ -157,6 +157,7 @@ mod tests {
             Arc::new(
                 Finalization::new(
                     TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
+                    TickHalf::Determined,
                     vec![ec],
                     vec![],
                 )
@@ -188,6 +189,7 @@ mod tests {
         ));
         let cert = Finalization::new(
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10)),
+            TickHalf::Determined,
             vec![ec],
             vec![],
         );

@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use hyperscale_types::{
     BlockHash, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
-    GlobalReceiptRoot, MAX_FINALIZATION_DELAY, Settles, ShardId, StoredReceipt, TickId,
+    GlobalReceiptRoot, MAX_FINALIZATION_DELAY, Settles, ShardId, StoredReceipt, TickHalf, TickId,
     TransactionDecision, TxHash, TxOutcome, Verified, WeightedTimestamp,
     compute_global_receipt_root, refused_transactions, settles,
 };
@@ -875,7 +875,7 @@ impl TickState {
     /// Returns `None` when this half has no members, or when the local
     /// certificate has not landed yet.
     #[must_use]
-    fn attestation_for(&self, members: &HashSet<TxHash>) -> Option<Finalization> {
+    fn attestation_for(&self, half: TickHalf, members: &HashSet<TxHash>) -> Option<Finalization> {
         let local = self.local_certificate()?;
         // What the local certificate says on its own. A member it already
         // reports as aborted needs no remote to corroborate it.
@@ -917,7 +917,7 @@ impl TickState {
             .collect();
         ecs.sort_by(|a, b| (&a.shard_id(), a.tick_id()).cmp(&(&b.shard_id(), b.tick_id())));
 
-        Some(Finalization::from_verified_ecs(self.tick_id, ecs))
+        Some(Finalization::from_verified_ecs(self.tick_id, half, ecs))
     }
 
     /// Drain one stored receipt per outcome of `attestation` that settles
@@ -974,7 +974,7 @@ impl TickState {
             return None;
         }
         let members: HashSet<TxHash> = self.determined_members().into_iter().collect();
-        let attestation = self.attestation_for(&members)?;
+        let attestation = self.attestation_for(TickHalf::Determined, &members)?;
         self.determined_emitted = true;
         Some(self.with_drained_receipts(attestation))
     }
@@ -985,7 +985,7 @@ impl TickState {
             return None;
         }
         let members: HashSet<TxHash> = self.leg_members().into_iter().collect();
-        let attestation = self.attestation_for(&members)?;
+        let attestation = self.attestation_for(TickHalf::Legs, &members)?;
         self.legs_emitted = true;
         Some(self.with_drained_receipts(attestation))
     }

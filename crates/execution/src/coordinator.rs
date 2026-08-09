@@ -3172,7 +3172,7 @@ mod tests {
         AggregateSignature, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Epoch,
         ExecutionOutcome, GlobalReceiptHash, Hash, MAX_FINALIZATION_DELAY, NetworkDefinition,
         QuorumCertificate, RecoveryCause, ShardRecovery, Signer, SignerBitfield, StoredReceipt,
-        ValidatorInfo, ValidatorSet,
+        TickHalf, ValidatorInfo, ValidatorSet,
     };
 
     use super::*;
@@ -4038,7 +4038,7 @@ mod tests {
             signers,
         ));
         let tick: Arc<Verifiable<Finalization>> =
-            Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
+            Arc::new(Finalization::new(tick_id, TickHalf::Determined, vec![ec], vec![]).into());
         let _fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, tick);
@@ -4070,7 +4070,12 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         ));
-        let tick = Arc::new(Finalization::new(tick_id, vec![ec], vec![]));
+        let tick = Arc::new(Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![ec],
+            vec![],
+        ));
         let fw_hash = tick.receipt_hash();
         let actions = state.on_finalization_verified(Err((
             tick,
@@ -4118,7 +4123,7 @@ mod tests {
             signers,
         ));
         let tick: Arc<Verifiable<Finalization>> =
-            Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
+            Arc::new(Finalization::new(tick_id, TickHalf::Determined, vec![ec], vec![]).into());
         let fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, Arc::clone(&tick));
@@ -4166,7 +4171,7 @@ mod tests {
             signers,
         ));
         let tick: Arc<Verifiable<Finalization>> =
-            Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
+            Arc::new(Finalization::new(tick_id, TickHalf::Determined, vec![ec], vec![]).into());
         let fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, Arc::clone(&tick));
@@ -4204,6 +4209,7 @@ mod tests {
         ));
         let tick = Arc::new(Verified::new_unchecked_for_test(Finalization::new(
             tick_id,
+            TickHalf::Determined,
             vec![ec],
             vec![],
         )));
@@ -4555,7 +4561,7 @@ mod tests {
             signers,
         ));
         let tick: Arc<Verifiable<Finalization>> =
-            Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
+            Arc::new(Finalization::new(tick_id, TickHalf::Determined, vec![ec], vec![]).into());
         let _fw_hash = tick.receipt_hash();
 
         let first = state.admit_finalization(&topo, Arc::clone(&tick));
@@ -4586,7 +4592,7 @@ mod tests {
             AggregateSignature::ZERO,
             signers,
         ));
-        let raw_finalization = Finalization::new(tick_id, vec![ec], vec![]);
+        let raw_finalization = Finalization::new(tick_id, TickHalf::Determined, vec![ec], vec![]);
         let verifiable_finalization =
             Arc::new(Verified::new_unchecked_for_test(raw_finalization.clone()).into());
         // Seed the canonical store directly (mirrors what `finalize`
@@ -4617,8 +4623,9 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::empty(), // no signers — far below 2f+1
         ));
-        let tick: Arc<Verifiable<Finalization>> =
-            Arc::new(Finalization::new(tick_id, vec![bogus_ec], vec![]).into());
+        let tick: Arc<Verifiable<Finalization>> = Arc::new(
+            Finalization::new(tick_id, TickHalf::Determined, vec![bogus_ec], vec![]).into(),
+        );
         let fw_hash = tick.receipt_hash();
 
         let actions = state.admit_finalization(&topo, tick);
@@ -5016,7 +5023,7 @@ mod tests {
             signers,
         ));
         let tick: Arc<Verifiable<Finalization>> =
-            Arc::new(Finalization::new(tick_id, vec![ec], vec![]).into());
+            Arc::new(Finalization::new(tick_id, TickHalf::Determined, vec![ec], vec![]).into());
         let _fw_hash = tick.receipt_hash();
 
         let actions = coord.admit_finalization(&behind, Arc::clone(&tick));
@@ -5447,6 +5454,7 @@ mod tests {
         let local_tick = TickId::new(local, BlockHeight::new(height));
         let tick = Finalization::new(
             local_tick,
+            TickHalf::Determined,
             vec![Arc::new(ec(local)), Arc::new(ec(remote))],
             vec![],
         );
@@ -6003,6 +6011,7 @@ mod tests {
         let tick_id = TickId::new(local, BlockHeight::new(1));
         let abort = Finalization::new(
             tick_id,
+            TickHalf::Determined,
             vec![Arc::new(ExecutionCertificate::new(
                 tick_id,
                 WeightedTimestamp::from_millis(1),

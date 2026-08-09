@@ -18,8 +18,8 @@ use hyperscale_types::{
     BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate, Finalization,
     FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, ProposerTimestamp,
     QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot,
-    StoredReceipt, SubstateKey, SyncHint, TickId, TxHash, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, WitnessSources,
+    StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId, TxHash, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -507,6 +507,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
     let new_fw: Arc<Verifiable<Finalization>> = Arc::new(
         Finalization::new(
             TickId::new(ShardId::ROOT, block.height()),
+            TickHalf::Determined,
             vec![placeholder_local_ec(ShardId::ROOT, block.height())],
             receipts,
         )
@@ -949,7 +950,9 @@ fn test_ec_survives_reopen() {
         let mut block = make_test_block(BlockHeight::new(1));
         push_finalization(
             &mut block,
-            Arc::new(Finalization::new(tick_id, vec![Arc::new(ec)], vec![]).into()),
+            Arc::new(
+                Finalization::new(tick_id, TickHalf::Determined, vec![Arc::new(ec)], vec![]).into(),
+            ),
         );
         storage.commit_block(&make_test_certified(block), &no_witness());
     }
@@ -973,7 +976,9 @@ fn test_ec_atomic_with_block_commit() {
     let mut block = make_test_block(BlockHeight::new(1));
     push_finalization(
         &mut block,
-        Arc::new(Finalization::new(tick_id, vec![Arc::new(ec)], vec![]).into()),
+        Arc::new(
+            Finalization::new(tick_id, TickHalf::Determined, vec![Arc::new(ec)], vec![]).into(),
+        ),
     );
     // Commit block with EC atomically
     storage.commit_block(&make_test_certified(block), &no_witness());
@@ -1019,6 +1024,7 @@ fn rocks_commit_with(
         let tick = Arc::new(
             Finalization::new(
                 TickId::new(ShardId::ROOT, block.height()),
+                TickHalf::Determined,
                 vec![placeholder_local_ec(ShardId::ROOT, block.height())],
                 vec![receipt],
             )

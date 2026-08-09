@@ -13,9 +13,9 @@ use crate::{
     ConsensusPublicKey, ConsensusSignature, DeclaredKey, Derived, EnvelopeExt,
     ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
     NetworkDefinition, NetworkId, ProposerTimestamp, QuorumCertificate, Round, Routing,
-    ShardForkProof, ShardId, SignerBitfield, TickId, TimestampRange, TopologySnapshot, Transaction,
-    TransactionBody, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, ValidatorId,
-    ValidatorInfo, ValidatorSet, Verifiable, Verified, VmStatics, VmStaticsError,
+    ShardForkProof, ShardId, SignerBitfield, TickHalf, TickId, TimestampRange, TopologySnapshot,
+    Transaction, TransactionBody, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome,
+    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, VmStatics, VmStaticsError,
     WeightedTimestamp, WitnessSources, compute_global_receipt_root, declared_work,
     install_vm_statics, signed_bytes, vm_statics_installed,
 };
@@ -814,7 +814,7 @@ pub fn make_finalization(
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
-    Finalization::new(tick_id, vec![Arc::new(ec)], vec![])
+    Finalization::new(tick_id, TickHalf::Determined, vec![Arc::new(ec)], vec![])
 }
 
 /// A deterministic [`VmStatics`](crate::VmStatics) stub for consensus-crate

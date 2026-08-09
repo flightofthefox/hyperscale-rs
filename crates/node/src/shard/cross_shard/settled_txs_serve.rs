@@ -103,8 +103,8 @@ mod tests {
         BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ExecutionCertificate,
         ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash,
         ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, ShardId, SignerBitfield,
-        TickId, TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp, WitnessSources,
-        settled_txs_root_from_hashes,
+        TickHalf, TickId, TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp,
+        WitnessSources, settled_txs_root_from_hashes,
     };
 
     use super::*;
@@ -152,6 +152,7 @@ mod tests {
         );
         Arc::new(Verifiable::from(Finalization::new(
             tick,
+            TickHalf::Determined,
             vec![Arc::new(ec), Arc::new(remote)],
             vec![],
         )))

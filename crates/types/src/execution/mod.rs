@@ -50,8 +50,8 @@ mod tests {
         ExecutionOutcome, Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot,
         Hash, MAX_EXECUTION_CERTIFICATES_PER_TICK, NetworkDefinition, ProvisionTxRoot,
         ProvisionTxRootsMap, RETENTION_HORIZON, ReceiptValidationError, ShardId, SignerBitfield,
-        StateWrites, StoredReceipt, TickId, TopologySnapshot, TxHash, TxOutcome, ValidatorId,
-        ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
+        StateWrites, StoredReceipt, TickHalf, TickId, TopologySnapshot, TxHash, TxOutcome,
+        ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
         compute_global_receipt_root, compute_global_receipt_root_with_proof, compute_merkle_root,
         tick_leader, tick_leader_at, tx_outcome_leaf, verify_merkle_inclusion,
     };
@@ -283,6 +283,7 @@ mod tests {
     fn test_receipt_hash_deterministic() {
         let fw = Finalization::new(
             make_tick_id(0, BlockHeight::new(42)),
+            TickHalf::Determined,
             vec![make_test_ec(0, 1), make_test_ec(1, 2)],
             vec![],
         );
@@ -293,8 +294,18 @@ mod tests {
     #[test]
     fn test_receipt_hash_changes_with_ec() {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
-        let fw1 = Finalization::new(tick_id, vec![make_test_ec(0, 1)], vec![]);
-        let fw2 = Finalization::new(tick_id, vec![make_test_ec(1, 2)], vec![]);
+        let fw1 = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![make_test_ec(0, 1)],
+            vec![],
+        );
+        let fw2 = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![make_test_ec(1, 2)],
+            vec![],
+        );
         assert_ne!(fw1.receipt_hash(), fw2.receipt_hash());
     }
 
@@ -331,8 +342,14 @@ mod tests {
         );
 
         let tick_id = make_tick_id(0, BlockHeight::new(42));
-        let whole = Finalization::new(tick_id, vec![Arc::clone(&local), remote], vec![]);
-        let partial = Finalization::new(tick_id, vec![local, narrowed], vec![]);
+        let whole = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![Arc::clone(&local), remote],
+            vec![],
+        );
+        let partial =
+            Finalization::new(tick_id, TickHalf::Determined, vec![local, narrowed], vec![]);
         assert_ne!(
             whole.receipt_hash(),
             partial.receipt_hash(),
@@ -344,6 +361,7 @@ mod tests {
     fn test_finalization_hbor_roundtrip() {
         let fw = Finalization::new(
             make_tick_id(0, BlockHeight::new(42)),
+            TickHalf::Determined,
             vec![make_test_ec(0, 1), make_test_ec(1, 2)],
             vec![],
         );
@@ -359,6 +377,7 @@ mod tests {
         // and then panicked the IO loop on first call to local_ec().
         let fw = Finalization::new(
             make_tick_id(0, BlockHeight::new(42)),
+            TickHalf::Determined,
             vec![make_test_ec(1, 1)],
             vec![],
         );
@@ -380,7 +399,7 @@ mod tests {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
         let ec_a = make_local_ec(&tick_id, vec![make_outcome(1)]);
         let ec_b = make_local_ec(&tick_id, vec![make_outcome(2)]);
-        let fw = Finalization::new(tick_id, vec![ec_a, ec_b], vec![]);
+        let fw = Finalization::new(tick_id, TickHalf::Determined, vec![ec_a, ec_b], vec![]);
         let bytes = hbor_to_vec(&fw).unwrap();
         let err = hbor_from_slice::<Finalization>(&bytes).unwrap_err();
         assert!(matches!(err, DecodeError::FailedValidation(_)));
@@ -393,6 +412,7 @@ mod tests {
         // what fires, before any per-EC decode work happens.
         let tick_id = make_tick_id(0, BlockHeight::new(42));
         let mut buf = hbor_to_vec(&tick_id).unwrap();
+        buf.extend(hbor_to_vec(&TickHalf::Determined).unwrap());
         varint::write(&mut buf, MAX_EXECUTION_CERTIFICATES_PER_TICK + 1).unwrap();
         buf.extend(std::iter::repeat_n(
             0u8,
@@ -478,7 +498,12 @@ mod tests {
         use crate::MAX_TXS_PER_BLOCK;
 
         let tick_id = make_tick_id(0, BlockHeight::new(42));
-        let attestation = Finalization::new(tick_id, vec![make_local_ec(&tick_id, vec![])], vec![]);
+        let attestation = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![make_local_ec(&tick_id, vec![])],
+            vec![],
+        );
 
         // Everything up to the receipt count, then a forged count.
         let mut buf = hbor_to_vec(&attestation).unwrap();
@@ -595,8 +620,12 @@ mod tests {
                 },
             ),
         ];
-        let attestation =
-            Finalization::new(tick_id, vec![make_local_ec(&tick_id, outcomes)], vec![]);
+        let attestation = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![make_local_ec(&tick_id, outcomes)],
+            vec![],
+        );
 
         let fw = Finalization::reconstruct(attestation, |_| Some(make_success_receipt()))
             .expect("reconstruction should succeed");
@@ -623,8 +652,12 @@ mod tests {
             ),
             TxOutcome::new(tx_b, ExecutionOutcome::Aborted),
         ];
-        let attestation =
-            Finalization::new(tick_id, vec![make_local_ec(&tick_id, outcomes)], vec![]);
+        let attestation = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![make_local_ec(&tick_id, outcomes)],
+            vec![],
+        );
 
         // Lookup returns Some for tx_a, None for tx_b (never persisted — pure abort).
         let fw = Finalization::reconstruct(attestation, |h| {
@@ -652,8 +685,12 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::from_raw(Hash::from_bytes(b"r_a")),
             },
         )];
-        let attestation =
-            Finalization::new(tick_id, vec![make_local_ec(&tick_id, outcomes)], vec![]);
+        let attestation = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![make_local_ec(&tick_id, outcomes)],
+            vec![],
+        );
 
         let fw = Finalization::reconstruct(attestation, |_| None);
         assert!(
@@ -696,7 +733,12 @@ mod tests {
             &remote_tick_id,
             vec![TxOutcome::new(refused, ExecutionOutcome::Aborted)],
         );
-        let attestation = Finalization::new(tick_id, vec![local_ec, remote_ec], vec![]);
+        let attestation = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![local_ec, remote_ec],
+            vec![],
+        );
 
         let fw = Finalization::reconstruct(attestation, |tx_hash| {
             (*tx_hash == settling).then(make_success_receipt)
@@ -717,7 +759,7 @@ mod tests {
                 ExecutionOutcome::Aborted,
             )],
         );
-        let attestation = Finalization::new(tick_id, vec![remote_ec], vec![]);
+        let attestation = Finalization::new(tick_id, TickHalf::Determined, vec![remote_ec], vec![]);
 
         let fw = Finalization::reconstruct(attestation, |_| Some(make_success_receipt()));
         assert!(fw.is_none(), "reconstruction requires the local EC");
@@ -742,6 +784,7 @@ mod tests {
         ];
         let fw = Finalization::new(
             tick_id,
+            TickHalf::Determined,
             vec![make_local_ec(&tick_id, outcomes)],
             vec![
                 StoredReceipt {
@@ -777,6 +820,7 @@ mod tests {
         )];
         let fw = Finalization::new(
             tick_id,
+            TickHalf::Determined,
             vec![make_local_ec(&tick_id, outcomes)],
             vec![StoredReceipt {
                 tx_hash: tx_a,
@@ -798,6 +842,7 @@ mod tests {
         let outcomes = vec![TxOutcome::new(tx_a, ExecutionOutcome::Failed)];
         let fw = Finalization::new(
             tick_id,
+            TickHalf::Determined,
             vec![make_local_ec(&tick_id, outcomes)],
             vec![StoredReceipt {
                 tx_hash: tx_a,
@@ -831,6 +876,7 @@ mod tests {
         )];
         let fw = Finalization::new(
             tick_id,
+            TickHalf::Determined,
             vec![make_local_ec(&tick_id, outcomes)],
             vec![StoredReceipt {
                 tx_hash: tx_a,
@@ -860,7 +906,12 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
         )];
-        let fw = Finalization::new(tick_id, vec![make_local_ec(&tick_id, outcomes)], vec![]);
+        let fw = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![make_local_ec(&tick_id, outcomes)],
+            vec![],
+        );
         assert!(matches!(
             fw.validate_receipts_against_ec(),
             Err(ReceiptValidationError::MissingReceipt { .. })
@@ -874,6 +925,7 @@ mod tests {
         let outcomes = vec![TxOutcome::new(tx_a, ExecutionOutcome::Aborted)];
         let fw = Finalization::new(
             tick_id,
+            TickHalf::Determined,
             vec![make_local_ec(&tick_id, outcomes)],
             vec![StoredReceipt {
                 tx_hash: tx_a,
@@ -905,6 +957,7 @@ mod tests {
         )];
         let fw = Finalization::new(
             tick_id,
+            TickHalf::Determined,
             vec![make_local_ec(&tick_id, outcomes)],
             vec![StoredReceipt {
                 tx_hash: tx_b,
@@ -928,7 +981,7 @@ mod tests {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
         let remote_tick_id = make_tick_id(1, BlockHeight::new(42));
         let remote_ec = make_local_ec(&remote_tick_id, vec![]);
-        let fw = Finalization::new(tick_id, vec![remote_ec], vec![]);
+        let fw = Finalization::new(tick_id, TickHalf::Determined, vec![remote_ec], vec![]);
         assert_eq!(
             fw.validate_receipts_against_ec(),
             Err(ReceiptValidationError::MissingLocalEc)
@@ -942,7 +995,12 @@ mod tests {
             TxHash::from(Hash::from_bytes(b"aborted")),
             ExecutionOutcome::Aborted,
         )];
-        let fw = Finalization::new(tick_id, vec![make_local_ec(&tick_id, outcomes)], vec![]);
+        let fw = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![make_local_ec(&tick_id, outcomes)],
+            vec![],
+        );
         assert_eq!(fw.validate_receipts_against_ec(), Ok(()));
     }
 }

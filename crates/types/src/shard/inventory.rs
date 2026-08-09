@@ -452,7 +452,7 @@ mod tests {
     use crate::{
         AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, BloomFilter, ChainOrigin,
         ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot, Hash,
-        ProposerTimestamp, ShardId, SignerBitfield, TickId, TxOutcome, WeightedTimestamp,
+        ProposerTimestamp, ShardId, SignerBitfield, TickHalf, TickId, TxOutcome, WeightedTimestamp,
     };
 
     fn create_test_block() -> Block {
@@ -496,7 +496,12 @@ mod tests {
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
         );
-        let fw = Verifiable::from(Finalization::new(tick_id, vec![Arc::new(ec)], Vec::new()));
+        let fw = Verifiable::from(Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![Arc::new(ec)],
+            Vec::new(),
+        ));
 
         let Block::Live {
             header,

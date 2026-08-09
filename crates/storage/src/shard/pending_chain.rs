@@ -984,8 +984,8 @@ mod tests {
     use hyperscale_types::{
         Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
-        Hash, LocalKey, Round, SignerBitfield, StateWrites, TickId, Transaction, TxHash, TxOutcome,
-        WitnessSources,
+        Hash, LocalKey, Round, SignerBitfield, StateWrites, TickHalf, TickId, Transaction, TxHash,
+        TxOutcome, WitnessSources,
     };
 
     use super::*;
@@ -1658,6 +1658,7 @@ mod tests {
         let certs = vec![Arc::new(
             Finalization::new(
                 *settles,
+                TickHalf::Determined,
                 // A counterpart's certificate for the same transaction:
                 // what makes it cross-shard, and so what puts it in the
                 // settled set.

@@ -19,8 +19,9 @@ use hyperscale_types::{
     ProvisionEntry, Provisions, QuorumCertificate, Randomness, RatifyCert, RatifyRound,
     RevealChain, Round, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield,
     SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt, SubstateKey,
-    SubstateLeaf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome, Verifiable,
-    Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root, compute_merkle_root,
+    SubstateLeaf, TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome,
+    Verifiable, Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
+    compute_merkle_root,
 };
 
 use crate::shard::unresolved::fold_unresolved_txs;
@@ -113,7 +114,7 @@ pub fn make_test_finalization(height: BlockHeight, shard: ShardId) -> Finalizati
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::empty(),
     ));
-    Finalization::new(tick_id, vec![local_ec], vec![])
+    Finalization::new(tick_id, TickHalf::Determined, vec![local_ec], vec![])
 }
 
 /// Build a minimal `Block` at the given height.
@@ -362,7 +363,7 @@ fn make_test_block_with_ecs(height: BlockHeight, ecs: Vec<Arc<ExecutionCertifica
     if ecs.is_empty() {
         return block;
     }
-    let certificate = Finalization::new(*ecs[0].tick_id(), ecs, vec![]);
+    let certificate = Finalization::new(*ecs[0].tick_id(), TickHalf::Determined, ecs, vec![]);
     push_certificate(block, Arc::new(certificate.into()))
 }
 
@@ -437,7 +438,13 @@ pub fn commit_block_with_updates(
         metadata: None,
     };
     let finalized = Arc::new(
-        Finalization::new(TickId::new(ShardId::ROOT, height), vec![], vec![receipt]).into(),
+        Finalization::new(
+            TickId::new(ShardId::ROOT, height),
+            TickHalf::Determined,
+            vec![],
+            vec![receipt],
+        )
+        .into(),
     );
     let block = push_certificate(make_test_block(height), finalized);
     storage.commit_block(&make_test_certified(block), &empty_witness())

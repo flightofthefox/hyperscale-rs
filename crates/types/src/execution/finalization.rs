@@ -31,6 +31,27 @@ use crate::{
 /// validator at decode time.
 pub const MAX_EXECUTION_CERTIFICATES_PER_TICK: usize = 1024;
 
+/// Which half of its tick a finalization settles.
+///
+/// A tick settles in two halves and they are not interchangeable: the
+/// determined half carries writes every later tick can already read, so
+/// it is what settlement order is measured over, while the legs half
+/// waits on counterparts and may land arbitrarily late. Nothing else on
+/// a finalization tells them apart — the certificates are the same shape
+/// either way, and which members reach beyond the shard is a fact about
+/// transactions committed in earlier blocks. So the half travels with
+/// the finalization, and is covered by its hash: a flipped marker would
+/// otherwise advance the settlement frontier past a half that never
+/// settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+pub enum TickHalf {
+    /// The members whose settlement needs no shard but this one, settling
+    /// on the tick's own certificate.
+    Determined,
+    /// The members whose settlement waits on a counterpart's verdict.
+    Legs,
+}
+
 /// A finalization — every participating shard has attested the tick's
 /// transactions, and the local receipts stand beside the proof.
 ///
@@ -67,6 +88,9 @@ pub const MAX_EXECUTION_CERTIFICATES_PER_TICK: usize = 1024;
 #[hbor(validate = check_finalization)]
 pub struct Finalization {
     tick_id: TickId,
+    /// Which half of `tick_id` this settles. Ordering is per half, so
+    /// the identity that orders is too.
+    half: TickHalf,
     #[hbor(max = MAX_EXECUTION_CERTIFICATES_PER_TICK)]
     execution_certificates: Vec<Arc<Verifiable<ExecutionCertificate>>>,
     #[hbor(max = MAX_TXS_PER_BLOCK)]
@@ -212,6 +236,20 @@ impl Finalization {
         &self.tick_id
     }
 
+    /// Which half of its tick this settles — what settlement order is
+    /// measured over.
+    #[must_use]
+    pub const fn half(&self) -> TickHalf {
+        self.half
+    }
+
+    /// Whether this settles the half that carries writes later ticks can
+    /// already read, and so the half the settlement frontier tracks.
+    #[must_use]
+    pub const fn is_determined(&self) -> bool {
+        matches!(self.half, TickHalf::Determined)
+    }
+
     /// Execution certificates from all participating shards.
     /// Always includes the local EC (see invariant above).
     /// May contain multiple ECs from the same remote shard — this happens when
@@ -272,6 +310,7 @@ impl Finalization {
     pub fn receipt_hash(&self) -> FinalizationHash {
         let mut hasher = Hasher::new();
         hasher.update(&hbor_to_vec(&self.tick_id).unwrap());
+        hasher.update(&hbor_to_vec(&self.half).unwrap());
         for ec in &self.execution_certificates {
             hasher.update(ec.wire_hash().as_bytes());
         }
@@ -353,6 +392,7 @@ impl Finalization {
     pub fn attestation(&self) -> Self {
         Self {
             tick_id: self.tick_id,
+            half: self.half,
             execution_certificates: self.execution_certificates.clone(),
             receipts: Vec::new(),
         }
@@ -413,11 +453,13 @@ impl Finalization {
     #[must_use]
     pub fn new(
         tick_id: TickId,
+        half: TickHalf,
         execution_certificates: Vec<Arc<ExecutionCertificate>>,
         receipts: Vec<StoredReceipt>,
     ) -> Self {
         Self {
             tick_id,
+            half,
             execution_certificates: execution_certificates
                 .into_iter()
                 .map(|ec| Arc::new(Verifiable::from(Arc::unwrap_or_clone(ec))))
@@ -441,10 +483,12 @@ impl Finalization {
     #[must_use]
     pub fn from_verified_ecs(
         tick_id: TickId,
+        half: TickHalf,
         execution_certificates: Vec<Verified<ExecutionCertificate>>,
     ) -> Self {
         Self {
             tick_id,
+            half,
             execution_certificates: execution_certificates
                 .into_iter()
                 .map(|ec| Arc::new(Verifiable::from(ec)))
@@ -775,9 +819,44 @@ mod tests {
 
     use super::*;
     use crate::{
-        AggregateSignature, BlockHash, BlockHeight, ExecutionVote, Hash, ShardId, ValidatorId,
-        WeightedTimestamp, compute_global_receipt_root,
+        AggregateSignature, BlockHash, BlockHeight, ExecutionVote, Hash, ShardId, SignerBitfield,
+        ValidatorId, WeightedTimestamp, compute_global_receipt_root,
     };
+
+    /// The half is part of what a finalization is, so it is part of its
+    /// identity.
+    ///
+    /// The settlement frontier reads the half off the block and advances
+    /// on it. If two finalizations differing only in their half shared a
+    /// hash, a proposer could present the legs half as the determined one
+    /// under a hash the certificate root already commits to — advancing
+    /// the frontier past a determined half that never settled, and
+    /// barring it forever.
+    #[test]
+    fn the_half_a_finalization_settles_is_part_of_its_identity() {
+        let local_wid = tick_id(0, 7, &[]);
+        let ec = Arc::new(ExecutionCertificate::new(
+            local_wid,
+            WeightedTimestamp::from_millis(1),
+            compute_global_receipt_root(&[make_outcome(1)]),
+            vec![make_outcome(1)],
+            AggregateSignature::ZERO,
+            SignerBitfield::new(2),
+        ));
+        let determined = Finalization::new(
+            local_wid,
+            TickHalf::Determined,
+            vec![Arc::clone(&ec)],
+            vec![],
+        );
+        let legs = Finalization::new(local_wid, TickHalf::Legs, vec![ec], vec![]);
+
+        assert_ne!(
+            determined.receipt_hash(),
+            legs.receipt_hash(),
+            "a flipped half must not pass under the hash the block commits to",
+        );
+    }
 
     fn make_outcome(seed: u8) -> TxOutcome {
         TxOutcome::new(
@@ -849,6 +928,7 @@ mod tests {
 
         let tick = Finalization::new(
             local_wid,
+            TickHalf::Determined,
             vec![Arc::new(local_ec), Arc::new(remote_ec)],
             vec![],
         );
@@ -896,6 +976,7 @@ mod tests {
 
         let tick = Finalization::new(
             local_wid,
+            TickHalf::Determined,
             vec![Arc::new(local_ec), Arc::new(tampered_remote)],
             vec![],
         );
@@ -927,7 +1008,7 @@ mod tests {
         let outcomes = vec![make_outcome(1)];
         let ec = make_verified_ec(&net, &local_wid, &outcomes, &sks).into_inner();
 
-        let tick = Finalization::new(local_wid, vec![Arc::new(ec)], vec![]);
+        let tick = Finalization::new(local_wid, TickHalf::Determined, vec![Arc::new(ec)], vec![]);
 
         let verified = Verified::<Finalization>::from_committed_block(tick.clone());
         assert_eq!(verified.into_inner(), tick);
@@ -943,7 +1024,7 @@ mod tests {
         let outcomes = vec![make_outcome(1)];
         let ec = make_verified_ec(&net, &local_wid, &outcomes, &sks).into_inner();
 
-        let tick = Finalization::new(local_wid, vec![Arc::new(ec)], vec![]);
+        let tick = Finalization::new(local_wid, TickHalf::Determined, vec![Arc::new(ec)], vec![]);
 
         // Supply two public-key vectors for a single-EC tick.
         let ec_pks: Vec<Vec<ConsensusPublicKey>> = vec![vec![], vec![]];

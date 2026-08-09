@@ -44,9 +44,9 @@ use hyperscale_types::{
     EventRoot, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, Finalization,
     GlobalReceipt, LocalKey, MerkleInclusionProof, Movement, ProvisionEntry, Provisions,
     RevealChain, SettledWrites, ShardId, ShardTrie, SignerBitfield, StateRoot, StateWrites,
-    StoredReceipt, SubstateKey, TickId, TopologySchedule, TopologySnapshot, Transaction, TxHash,
-    TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp, compute_global_receipt_root,
-    read_amount,
+    StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    compute_global_receipt_root, read_amount,
 };
 
 /// The shard a single-shard fixture runs on.
@@ -671,7 +671,12 @@ pub fn settle(tick_id: &TickId, receipts: &[StoredReceipt]) -> Finalization {
         AggregateSignature::new([0u8; 96]),
         SignerBitfield::new(4),
     );
-    Finalization::new(*tick_id, vec![Arc::new(ec)], receipts.to_vec())
+    Finalization::new(
+        *tick_id,
+        TickHalf::Determined,
+        vec![Arc::new(ec)],
+        receipts.to_vec(),
+    )
 }
 
 /// A committed `Finalization` whose counterpart refused every member.
@@ -729,6 +734,7 @@ pub fn settle_refused_by_counterpart(
     );
     Finalization::new(
         *tick_id,
+        TickHalf::Legs,
         vec![Arc::new(local), Arc::new(remote)],
         charges.to_vec(),
     )

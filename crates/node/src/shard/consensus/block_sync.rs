@@ -427,8 +427,8 @@ mod tests {
         AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, CertificateRoot,
         ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, Finalization,
         GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProposerTimestamp,
-        QuorumCertificate, Round, ShardId, SignerBitfield, TickId, TransactionRoot, TxHash,
-        TxOutcome, Verifiable, WeightedTimestamp, WitnessSources,
+        QuorumCertificate, Round, ShardId, SignerBitfield, TickHalf, TickId, TransactionRoot,
+        TxHash, TxOutcome, Verifiable, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -533,8 +533,15 @@ mod tests {
             }),
             metadata: None,
         };
-        let fw =
-            Arc::new(Finalization::new(tick_id, vec![Arc::new(ec)], vec![receipt.clone()]).into());
+        let fw = Arc::new(
+            Finalization::new(
+                tick_id,
+                TickHalf::Determined,
+                vec![Arc::new(ec)],
+                vec![receipt.clone()],
+            )
+            .into(),
+        );
         let lrr = Verified::<LocalReceiptRoot>::compute(&[receipt]).into_inner();
         let cr = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
         (fw, lrr, cr)
@@ -711,8 +718,15 @@ mod tests {
             consensus: Arc::new(ConsensusReceipt::Failed),
             metadata: None,
         };
-        let fw =
-            Arc::new(Finalization::new(tick_id, vec![Arc::new(ec)], vec![receipt.clone()]).into());
+        let fw = Arc::new(
+            Finalization::new(
+                tick_id,
+                TickHalf::Determined,
+                vec![Arc::new(ec)],
+                vec![receipt.clone()],
+            )
+            .into(),
+        );
         let h = header_with_roots(
             &header(),
             None,

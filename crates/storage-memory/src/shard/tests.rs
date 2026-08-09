@@ -14,8 +14,8 @@ use hyperscale_types::{
     Address, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock,
     ChainOrigin, ConsensusReceipt, Finalization, GlobalReceiptHash, Hash, LocalKey,
     ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId,
-    StateRoot, StoredReceipt, SubstateKey, SyncHint, TickId, TxHash, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, WitnessSources,
+    StateRoot, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId, TxHash, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -124,6 +124,7 @@ fn commit_with(
         let new_fw: Arc<Verifiable<Finalization>> = Arc::new(
             Finalization::new(
                 TickId::new(ShardId::ROOT, block.height()),
+                TickHalf::Determined,
                 vec![],
                 vec![receipt],
             )
