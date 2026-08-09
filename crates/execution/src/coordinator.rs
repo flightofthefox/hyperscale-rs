@@ -38,7 +38,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_storage::{RecoveredState, RecoveredTx, TickResolution};
+use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, DeclaredKey, ExecutionCertificate, ExecutionCertificateVerifyError,
@@ -235,12 +235,12 @@ pub struct ExecutionCoordinator {
     /// that state.
     unresolved: UnresolvedTxs,
 
-    /// What a restart recovered from the committed chain, held until a
-    /// topology can classify it. Construction has no schedule to resolve
-    /// participants against, so the replay waits for
+    /// The blocks a restart has to replay before this coordinator's
+    /// account of what is in flight matches its peers'. Construction has
+    /// no schedule to compose against, so they wait for
     /// [`on_committed_state_restored`](Self::on_committed_state_restored)
-    /// and is empty from then on.
-    recovered_txs: Vec<RecoveredTx>,
+    /// and are empty from then on.
+    replay_blocks: Vec<Verified<CertifiedBlock>>,
 
     /// Tick fates known but not yet emittable, each with the tick that
     /// carries its entries. Drained whenever a tick completes or a block
@@ -399,17 +399,21 @@ impl ExecutionCoordinator {
     /// sync-inventory bloom read from a single canonical view per shard
     /// rather than vnode-0's incidentally-convergent copy.
     ///
-    /// The three commit-frontier scalars seed from the recovered tip
-    /// (`RecoveredState`'s height, `block_anchor_wt()`, and
-    /// `committee_anchor_wt()`; genesis/`ZERO` for a fresh chain). Seeding
-    /// them keeps the first post-restart commit on the exact carry path —
-    /// height-contiguous with the recovered tip, its committee anchor is the
-    /// tip's own anchor — where a zero frontier would take the gap fallback
-    /// and classify that block's ticks under the window it opens: a replica
-    /// restarted just below an epoch cut that a reshape moves would group
-    /// ticks differently from its peers and split execution votes. A seeded
-    /// frontier also gives pre-first-commit bookkeeping (expected-cert ages,
-    /// conflict detection) a real clock instead of a zero one.
+    /// The commit-frontier scalars seed from where execution's own
+    /// account resumes, which is not where consensus's does: a restart
+    /// replays from the block committing the oldest transaction still
+    /// owed an outcome, so the frontier seeds at the block below that one
+    /// and the replay carries it up to the tip. With nothing owed there
+    /// is nothing to replay and the recovered tip is the frontier.
+    ///
+    /// Either way the seed keeps the next commit on the exact carry path —
+    /// height-contiguous, its committee anchor the previous block's — where
+    /// a zero frontier would take the gap fallback and classify that
+    /// block's ticks under the window it opens: a replica restarted just
+    /// below an epoch cut that a reshape moves would group ticks
+    /// differently from its peers and split execution votes. A seeded
+    /// frontier also gives pre-first-commit bookkeeping (expected-cert
+    /// ages, conflict detection) a real clock instead of a zero one.
     #[must_use]
     pub fn with_shared_stores(
         me: ValidatorId,
@@ -418,9 +422,29 @@ impl ExecutionCoordinator {
         exec_certs: Arc<ExecCertStore>,
         finalized: Arc<FinalizationStore>,
     ) -> Self {
-        let committed_height = recovered.committed_height;
-        let committed_block_anchor_wt = recovered.block_anchor_wt();
-        let committed_committee_anchor_wt = recovered.committee_anchor_wt();
+        // Execution resumes below the first block it replays, so the
+        // replay carries the frontier up to the tip rather than starting
+        // from it. Without the block under the floor there is no clock to
+        // carry, and the first block replayed classifies under its own
+        // anchor — the same fallback a chain with no history takes, which
+        // a genesis frontier is what selects.
+        let resume = recovered
+            .replay
+            .blocks
+            .first()
+            .map(|certified| (certified.block().height(), recovered.replay.anchor_wt));
+        let (committed_height, committed_block_anchor_wt) = match resume {
+            Some((first, Some(anchor))) => (first.saturating_sub(1), anchor),
+            Some((_, None)) => (BlockHeight::GENESIS, WeightedTimestamp::ZERO),
+            None => (recovered.committed_height, recovered.block_anchor_wt()),
+        };
+        // Whatever seeds the height seeds this too: the block above is
+        // contiguous, so it carries `committed_ts` into the slot before
+        // anything classifies against it.
+        let committed_committee_anchor_wt = match resume {
+            Some(_) => committed_block_anchor_wt,
+            None => recovered.committee_anchor_wt(),
+        };
         Self {
             finalized,
             committed_height,
@@ -431,7 +455,7 @@ impl ExecutionCoordinator {
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
             unresolved: UnresolvedTxs::default(),
-            recovered_txs: recovered.unresolved_txs.clone(),
+            replay_blocks: recovered.replay.blocks.clone(),
             pending_tick_resolutions: Vec::new(),
             candidates: TickCandidates::new(local_shard),
             ticks: TickRegistry::new(),
@@ -643,33 +667,32 @@ impl ExecutionCoordinator {
         }
     }
 
-    /// Rejoin what the chain says is still in flight, after a restart
-    /// lost the state that was tracking it.
+    /// Replay the committed chain from where this coordinator's account
+    /// of what is in flight has to resume.
     ///
-    /// Tick state does not survive a restart and the chain does, so a
-    /// replica that comes back is holding transactions it committed and
-    /// has no record of working on. Replaying them through the same
-    /// registration a commit performs puts them back on the ordinary
-    /// path: they wait in the candidate pool exactly as they would have,
-    /// and the first tick that can run them does.
+    /// Tick state does not survive a restart and the chain does. Both
+    /// halves of what was lost — which tick holds which transaction, and
+    /// what each tick's baseline was — are functions of committed content
+    /// alone, so re-driving the ordinary commit path over the stored
+    /// blocks reproduces them exactly. A replica that skipped this would
+    /// compose those transactions into a tick of its own, and its peers'
+    /// certificate for that height would come back under a root it never
+    /// computed.
     ///
-    /// A leg's provisions do not come back with it. They were absorbed
-    /// into memory when they committed and the block kept only their
-    /// hashes, so a recovered leg waits for the fetch path to supply
-    /// them again and reaches its deadline if it never does — where a
-    /// transaction reaching no further than this shard runs at once.
+    /// The blocks arrive with the provision bundles they carried already
+    /// reattached, so a leg composes here on the evidence it composed on
+    /// the first time rather than waiting for a fetch nobody will answer.
     ///
     /// Deferred to here rather than done at construction because
-    /// participants need a topology, and there is none until the
-    /// schedule is up. Idempotent: the payload is taken, and the
-    /// registration is keyed by transaction and already idempotent
-    /// against a live commit that beat this call.
+    /// composition needs a topology, and there is none until the schedule
+    /// is up. Idempotent: the payload is taken, and a live commit that
+    /// beat this call has already advanced the frontier past it.
     pub fn on_committed_state_restored(
         &mut self,
         topology_schedule: &TopologySchedule,
     ) -> Vec<Action> {
-        let recovered = std::mem::take(&mut self.recovered_txs);
-        if recovered.is_empty() {
+        let blocks = std::mem::take(&mut self.replay_blocks);
+        if blocks.is_empty() {
             return Vec::new();
         }
         // Provision deadlines stamp against this clock, which a commit
@@ -678,25 +701,16 @@ impl ExecutionCoordinator {
 
         tracing::info!(
             shard = %self.local_shard,
-            txs = recovered.len(),
-            "Rejoining transactions the chain still owes an outcome for"
+            blocks = blocks.len(),
+            from = %self.committed_height.next(),
+            "Replaying the chain the restart lost execution state for"
         );
 
-        for entry in recovered {
-            // Each under the committee its own block resolved, not the
-            // tip's: a reshape inside the recovery window moves the shard
-            // set, and participants assigned against the wrong one would
-            // name shards the transaction's block never did.
-            let classification =
-                self.classification_committee(topology_schedule, entry.committee_anchor_ts);
-            self.register_committed_txs(
-                classification,
-                entry.committed_ts,
-                entry.committed_reveal,
-                std::slice::from_ref(&entry.transaction),
-            );
+        let mut actions = Vec::new();
+        for certified in &blocks {
+            actions.extend(self.on_block_committed(topology_schedule, certified));
         }
-        Vec::new()
+        actions
     }
 
     /// Compose this commit's tick and set it up to be attested.
@@ -3164,7 +3178,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_crypto_bls::BlsSigner;
-    use hyperscale_storage::RecoveredTx;
+    use hyperscale_storage::ReplayWindow;
     use hyperscale_types::test_utils::{
         certify as test_certify, make_live_block as helpers_make_live_block, test_transaction,
     };
@@ -5754,67 +5768,179 @@ mod tests {
         );
     }
 
-    /// A restart puts what the chain still owes an outcome for back on
-    /// the ordinary path: waiting in the candidate pool, and executing at
-    /// the first tick that can run it.
+    /// A block a replay feeds back in, as storage hands it over.
+    fn replayable(block: Block, now_ms: u64) -> Verified<CertifiedBlock> {
+        Verified::<CertifiedBlock>::from_persisted(test_certify(block, now_ms))
+    }
+
+    /// The transactions a coordinator's tick at `height` holds.
+    fn tick_members(state: &ExecutionCoordinator, height: u64) -> Vec<TxHash> {
+        state
+            .ticks
+            .get_tick(&TickId::new(ShardId::ROOT, BlockHeight::new(height)))
+            .map(|tick| tick.tx_hashes().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// A restart replays the chain it lost execution state for, so it
+    /// ends up holding what a replica that never went down holds.
     ///
-    /// Without this the transaction has no candidate and no assignment,
-    /// so nothing composes it and the deadline is the only thing left
-    /// that can speak for it — a restart would abandon everything it was
-    /// carrying.
+    /// Which tick holds a transaction is a function of committed content,
+    /// but not one anything on the chain records directly — it is
+    /// composition's own output. Re-driving composition over the same
+    /// blocks is what reproduces it.
     #[test]
-    fn a_restart_rejoins_what_the_chain_still_owes_an_outcome_for() {
+    fn a_restart_replays_the_chain_it_lost_execution_state_for() {
         let schedule = make_test_topology();
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(1)),
-        ));
-        let tx_hash = transaction.hash();
+        let held = test_transaction(1);
+        let held_hash = held.hash();
+        let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
+        let committing = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(held)],
+        );
+
+        // A replica that never went down: its tick at height 2 takes the
+        // transaction and holds it until a finalization resolves it.
+        let mut live = make_test_state();
+        live.on_block_committed(&schedule, &test_certify(seed, 1_000));
+        live.on_block_committed(&schedule, &test_certify(committing.clone(), 2_000));
+        assert_eq!(
+            live.ticks.tick_assignment(held_hash),
+            Some(TickId::new(ShardId::ROOT, BlockHeight::new(2))),
+            "fixture precondition: the live replica's tick holds it",
+        );
+
+        // A restarted one recovers the same chain: the block that
+        // committed the transaction, under the clock of the block below
+        // it so the replay stays on the carry path.
         let recovered = RecoveredState {
-            committed_height: BlockHeight::new(1),
-            committed_block_anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
-            unresolved_txs: vec![RecoveredTx {
-                transaction,
-                committed_ts: WeightedTimestamp::from_millis(1_000),
-                committed_reveal: RevealChain::ZERO,
-                committee_anchor_ts: WeightedTimestamp::from_millis(1_000),
-            }],
+            committed_height: BlockHeight::new(2),
+            replay: ReplayWindow {
+                blocks: vec![replayable(committing, 2_000)],
+                anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
+            },
             ..RecoveredState::default()
         };
-        let mut state = ExecutionCoordinator::with_shared_stores(
+        let mut restarted = ExecutionCoordinator::with_shared_stores(
             ValidatorId::new(0),
             ShardId::ROOT,
             &recovered,
             Arc::new(ExecCertStore::new()),
             Arc::new(FinalizationStore::new()),
         );
-
         assert!(
-            state.candidates.is_empty(),
-            "construction has no topology to classify with, so it holds",
+            restarted.candidates.is_empty(),
+            "construction has no topology to compose against, so it holds",
         );
-        state.on_committed_state_restored(&schedule);
-        assert!(
-            state.candidates.contains(tx_hash),
-            "and the restore puts it back in the pool",
-        );
-        assert_eq!(state.unresolved.len(), 1, "still owed, as the chain says");
 
-        // The proof it rejoined the ordinary path rather than a synthetic
-        // one: the next commit composes it, and it executes.
-        let actions = state.on_block_committed(
-            &schedule,
-            &test_certify(
-                make_live_block(BlockHeight::new(2), 2_000, ValidatorId::new(0), vec![]),
-                2_000,
-            ),
+        let actions = restarted.on_committed_state_restored(&schedule);
+        assert_eq!(
+            restarted.ticks.tick_assignment(held_hash),
+            live.ticks.tick_assignment(held_hash),
+            "the replay puts it back on the tick that already held it",
         );
         assert!(
             actions.iter().any(
                 |action| matches!(action, Action::ExecuteTransactions { requests, .. }
-                    if requests.iter().any(|r| r.tx_hash == tx_hash))
+                    if requests.iter().any(|r| r.tx_hash == held_hash))
             ),
-            "the first tick that can run it does",
+            "and runs it, because the tick that holds it is the tick that ran it",
         );
+        assert_eq!(
+            restarted.unresolved.len(),
+            1,
+            "still owed, as the chain says"
+        );
+
+        // The consequence: the next block composes one tick, not two
+        // different ones. A membership disagreement here is a fail-stop —
+        // the quorum's certificate comes back under this tick's own id,
+        // carrying a root the odd replica never computed.
+        let next = make_live_block(
+            BlockHeight::new(3),
+            3_000,
+            ValidatorId::new(0),
+            vec![Arc::new(test_transaction(2))],
+        );
+        live.on_block_committed(&schedule, &test_certify(next.clone(), 3_000));
+        restarted.on_block_committed(&schedule, &test_certify(next, 3_000));
+        assert_eq!(
+            tick_members(&restarted, 3),
+            tick_members(&live, 3),
+            "a tick's membership decides what its certificate says",
+        );
+    }
+
+    /// A tick whose receipts disagree with the quorum's still fail-stops.
+    ///
+    /// The replay closes the disagreement that a restart used to cause,
+    /// upstream of this check rather than by loosening it — so the check
+    /// has to still bite on the thing it exists for: a replica computing
+    /// state nobody else can reproduce.
+    #[test]
+    #[should_panic(expected = "BFT CRITICAL")]
+    fn a_divergent_fold_fail_stops() {
+        let schedule = make_test_topology();
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+        let mut state = make_test_state();
+        state.on_block_committed(
+            &schedule,
+            &test_certify(
+                make_live_block(
+                    BlockHeight::new(1),
+                    1_000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(tx)],
+                ),
+                1_000,
+            ),
+        );
+
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        state.on_execution_batch_completed(
+            &schedule,
+            BlockHeight::new(1),
+            TickBatchOutcome {
+                tick_id,
+                results: Vec::new(),
+                tx_outcomes: vec![TxOutcome::new(
+                    tx_hash,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )],
+                fee_receipts: Vec::new(),
+                attested_work: Vec::new(),
+            },
+        );
+        state.emit_vote_actions(&schedule);
+
+        // The committee certified a different root for the tick this
+        // replica voted on.
+        state
+            .ticks
+            .get_tick_mut(&tick_id)
+            .expect("the tick is still tracked")
+            .add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+                ExecutionCertificate::new(
+                    tick_id,
+                    WeightedTimestamp::from_millis(1_000),
+                    GlobalReceiptRoot::from_raw(Hash::from_bytes(b"quorum")),
+                    vec![TxOutcome::new(
+                        tx_hash,
+                        ExecutionOutcome::Succeeded {
+                            receipt_hash: GlobalReceiptHash::ZERO,
+                        },
+                    )],
+                    AggregateSignature::ZERO,
+                    SignerBitfield::new(4),
+                ),
+            )));
+        state.scan_votable_ticks(&schedule);
     }
 
     /// A member that never ran joins on the shards its committing block

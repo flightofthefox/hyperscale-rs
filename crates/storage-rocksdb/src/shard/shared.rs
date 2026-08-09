@@ -20,9 +20,9 @@ use hyperscale_storage::{
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, ExecutionCertificate, Finalization,
-    FinalizationHash, MerkleInclusionProof, PreparedCommit, QuorumCertificate, SafeVoteRegisters,
-    SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf,
-    TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    FinalizationHash, MerkleInclusionProof, PreparedCommit, Provisions, QuorumCertificate,
+    SafeVoteRegisters, SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey,
+    SubstateLeaf, TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
 };
 
 use super::core::RocksDbShardStorage;
@@ -239,6 +239,10 @@ impl SafeVoteRegisterStore for SharedStorage {
 impl ShardChainReader for SharedStorage {
     fn get_block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
         self.0.get_block(height)
+    }
+
+    fn provisions_at(&self, height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
+        ShardChainReader::provisions_at(&*self.0, height)
     }
 
     fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {

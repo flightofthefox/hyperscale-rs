@@ -10,7 +10,7 @@ use hyperscale_types::{
     ValidatorId, Verified, WeightedTimestamp, WorkInFlight,
 };
 
-use super::unresolved::RecoveredTx;
+use super::unresolved::ReplayWindow;
 
 /// State recovered from storage on startup.
 ///
@@ -22,14 +22,15 @@ pub struct RecoveredState {
     /// Last committed height; the resume point for proposal/voting after restart.
     pub committed_height: BlockHeight,
 
-    /// The transactions this shard committed and has no outcome for, each
-    /// as its committing block recorded it. Replayed from the committed
-    /// chain by
-    /// [`fold_unresolved_txs`](super::unresolved::fold_unresolved_txs),
-    /// because execution's own account of what is in flight does not
-    /// survive the restart this state exists to recover from. The
-    /// coordinator drains it once a topology is available to classify it.
-    pub unresolved_txs: Vec<RecoveredTx>,
+    /// Where execution resumes: the blocks it replays to rebuild
+    /// everything it was tracking, and the clock the first of them
+    /// carries forward.
+    ///
+    /// Composition and execution both read only committed content, so
+    /// replaying it reproduces the tick membership and the tick outputs a
+    /// replica had before it went down — neither of which survives the
+    /// restart this state exists to recover from.
+    pub replay: ReplayWindow,
 
     /// The provision bodies still held for the blocks that carried them.
     /// A stored block keeps only their hashes, so this is what puts them
@@ -179,9 +180,9 @@ impl RecoveredState {
         Self {
             committed_height: anchor.height,
             // Nothing below the anchor is imported, so a snap-synced
-            // replica knows of nothing in flight beneath it, and has no
-            // block that carried a bundle.
-            unresolved_txs: Vec::new(),
+            // replica knows of nothing in flight beneath it: no block to
+            // replay, and none that carried a bundle.
+            replay: ReplayWindow::default(),
             retained_provisions: Vec::new(),
             committed_hash: Some(anchor.block_hash),
             latest_qc: None,

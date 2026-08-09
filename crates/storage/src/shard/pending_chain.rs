@@ -984,8 +984,8 @@ mod tests {
     use hyperscale_types::{
         Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
-        Hash, LocalKey, Round, SignerBitfield, StateWrites, TickHalf, TickId, Transaction, TxHash,
-        TxOutcome, WitnessSources,
+        Hash, LocalKey, Provisions, Round, SignerBitfield, StateWrites, TickHalf, TickId,
+        Transaction, TxHash, TxOutcome, WitnessSources,
     };
 
     use super::*;
@@ -1088,6 +1088,10 @@ mod tests {
     }
 
     impl ShardChainReader for StubStore {
+        fn provisions_at(&self, _height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
+            Vec::new()
+        }
+
         fn get_block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
             self.blocks
                 .get(&height)

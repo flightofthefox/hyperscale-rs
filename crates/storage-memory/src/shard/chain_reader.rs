@@ -8,7 +8,8 @@ use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockManifest, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    QuorumCertificate, ShardWitnessPayload, TickId, Transaction, TxHash, Verified,
+    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardWitnessPayload, TickId, Transaction,
+    TxHash, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
@@ -20,6 +21,15 @@ impl ShardChainReader for SimShardStorage {
             .get(&height)
             .cloned()
             .map(Verified::<CertifiedBlock>::from_persisted)
+    }
+
+    fn provisions_at(&self, height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
+        read_or_recover(&self.consensus)
+            .provisions
+            .range((height, ProvisionHash::from_raw(Hash::ZERO))..)
+            .take_while(|((at, _), _)| *at == height)
+            .map(|(_, provisions)| Arc::new(Verifiable::from((**provisions).clone())))
+            .collect()
     }
 
     fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {

@@ -24,7 +24,7 @@ use hyperscale_types::{
     compute_merkle_root,
 };
 
-use crate::shard::unresolved::fold_unresolved_txs;
+use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
     BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, ShardChainReader,
@@ -880,20 +880,13 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)
     );
     storage.commit_block(&make_test_certified(resolving), &empty_witness());
 
-    let rebuilt = fold_unresolved_txs(storage, BlockHeight::new(3), WeightedTimestamp::ZERO);
-    let names: Vec<TxHash> = rebuilt
-        .iter()
-        .map(|entry| entry.transaction.hash())
-        .collect();
+    // The floor is the height that committed the one still open. The
+    // one resolved at height 3 committed there too, and does not hold
+    // the floor down: an outcome is what releases it.
     assert_eq!(
-        names,
-        vec![open.hash()],
-        "the replay must name what committed and never resolved, and only that"
-    );
-    assert_eq!(
-        rebuilt[0].transaction.validity_range(),
-        open.validity_range(),
-        "carrying the body the deadline and the reservation both read",
+        unresolved_replay_floor(storage, BlockHeight::new(3), WeightedTimestamp::ZERO),
+        Some(BlockHeight::new(1)),
+        "the replay starts at the block committing what is still owed",
     );
     assert!(
         storage
@@ -902,7 +895,43 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)
             .block()
             .provisions()
             .is_empty(),
-        "and no provisions: a stored block keeps their hashes, not their contents, \
-         so the bodies are recovered from where they are stored beside it",
+        "a stored block keeps its bundles' hashes, not their contents",
+    );
+
+    // And the window puts them back, so replaying it composes the leg
+    // rather than waiting on evidence nothing will send again.
+    let window = replay_window(storage, BlockHeight::new(3), WeightedTimestamp::ZERO);
+    let heights: Vec<BlockHeight> = window
+        .blocks
+        .iter()
+        .map(|certified| certified.block().height())
+        .collect();
+    assert_eq!(
+        heights,
+        vec![
+            BlockHeight::new(1),
+            BlockHeight::new(2),
+            BlockHeight::new(3)
+        ],
+        "opening at the floor and running to the tip",
+    );
+    assert_eq!(
+        window.anchor_wt,
+        Some(WeightedTimestamp::ZERO),
+        "carrying the clock of the block below it, so the first block replayed keeps the carry",
+    );
+    assert_eq!(
+        window.blocks[1]
+            .block()
+            .provisions()
+            .iter()
+            .map(|p| p.hash())
+            .collect::<Vec<_>>(),
+        storage
+            .provisions_at(BlockHeight::new(2))
+            .iter()
+            .map(|p| p.hash())
+            .collect::<Vec<_>>(),
+        "with the bodies sealing dropped reattached",
     );
 }

@@ -8,7 +8,8 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash, ProvisionHash,
-    QuorumCertificate, ShardWitnessPayload, TickId, Transaction, TxHash, Verified,
+    Provisions, QuorumCertificate, ShardWitnessPayload, TickId, Transaction, TxHash, Verifiable,
+    Verified,
 };
 
 /// A sync-ready block retrieved from storage.
@@ -39,6 +40,13 @@ pub struct BlockForSync {
 pub trait ShardChainReader: Send + Sync + 'static {
     /// Get a committed block by height.
     fn get_block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>>;
+
+    /// The provision bundles the block at `height` carried.
+    ///
+    /// A stored block keeps only their hashes, so this is the other half
+    /// of reading one back whole. Empty when the block carried none, or
+    /// when the bodies have dropped below the retention floor.
+    fn provisions_at(&self, height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>>;
 
     /// Get a committed block header (header + committing QC) by height.
     ///

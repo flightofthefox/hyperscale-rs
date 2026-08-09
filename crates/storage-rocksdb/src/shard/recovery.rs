@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_metrics::record_storage_operation;
-use hyperscale_storage::{RecoveredState, SubstateStore, fold_unresolved_txs};
+use hyperscale_storage::{RecoveredState, SubstateStore, replay_window};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, Hash, Provisions,
     RevealChain, SafeVoteRegisters, ShardLoad, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
@@ -70,7 +70,7 @@ impl RocksDbShardStorage {
         let committed_block_anchor_wt = self.anchor_ts_at(committed_height);
         RecoveredState {
             committed_height,
-            unresolved_txs: fold_unresolved_txs(
+            replay: replay_window(
                 self,
                 committed_height,
                 committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),

@@ -6,11 +6,12 @@ use std::sync::Arc;
 use hyperscale_storage::{BlockForSync, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-    ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash, Hash,
-    QuorumCertificate, ShardWitnessPayload, TickId, Transaction, TxHash, Verified,
+    ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash, Hash, ProvisionHash,
+    Provisions, QuorumCertificate, ShardWitnessPayload, TickId, Transaction, TxHash, Verifiable,
+    Verified,
 };
 
-use super::column_families::{BeaconWitnessesCf, ExecutionCertsCf, TxCertIndexCf};
+use super::column_families::{BeaconWitnessesCf, ExecutionCertsCf, ProvisionsCf, TxCertIndexCf};
 use super::core::RocksDbShardStorage;
 use crate::typed_cf::{TypedCf, get, iter_all, iter_from};
 
@@ -18,6 +19,19 @@ impl ShardChainReader for RocksDbShardStorage {
     fn get_block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
         self.get_block_denormalized(height)
             .map(Verified::<CertifiedBlock>::from_persisted)
+    }
+
+    fn provisions_at(&self, height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
+        let cf = self.cf();
+        let provisions_cf = ProvisionsCf::handle(&cf);
+        iter_from::<ProvisionsCf>(
+            &self.db,
+            provisions_cf,
+            &(height, ProvisionHash::from_raw(Hash::ZERO)),
+        )
+        .take_while(|((at, _), _)| *at == height)
+        .map(|(_, provisions)| Arc::new(Verifiable::from(provisions)))
+        .collect()
     }
 
     fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {

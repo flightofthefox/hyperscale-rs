@@ -30,22 +30,22 @@ use std::sync::{Arc, Mutex};
 use hyperscale_core::{Action, CrossShardExecutionRequest, TickBatchOutcome};
 use hyperscale_engine::ExecutedTx;
 use hyperscale_engine::sharding::writes_root;
-use hyperscale_execution::ExecutionCoordinator;
 use hyperscale_execution::action_handlers::{
     ExecutionOutputs, accumulate_tick_output, split_execution_outputs,
 };
+use hyperscale_execution::{ExecCertStore, ExecutionCoordinator, FinalizationStore};
 use hyperscale_storage::{
-    SubstateDatabase, SubstateStore, TickChain, TickOutput, VersionedStore,
-    merge_writes_from_receipts,
+    RecoveredState, ReplayWindow, SubstateDatabase, SubstateStore, TickChain, TickOutput,
+    VersionedStore, merge_writes_from_receipts,
 };
 use hyperscale_types::test_utils::{TestCommittee, certify, make_live_block};
 use hyperscale_types::{
-    Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, ConsensusReceipt,
-    EventRoot, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, Finalization,
-    GlobalReceipt, LocalKey, MerkleInclusionProof, Movement, ProvisionEntry, Provisions,
-    RevealChain, SettledWrites, ShardId, ShardTrie, SignerBitfield, StateRoot, StateWrites,
-    StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot, Transaction,
-    TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
+    ConsensusReceipt, EventRoot, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
+    Finalization, GlobalReceipt, LocalKey, MerkleInclusionProof, Movement, ProvisionEntry,
+    Provisions, RevealChain, SettledWrites, ShardId, ShardTrie, SignerBitfield, StateRoot,
+    StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
     compute_global_receipt_root, read_amount,
 };
 
@@ -196,6 +196,9 @@ pub struct ExecutionSim {
     /// The charges each tick's tick held in reserve beside those
     /// receipts — what settles instead of them when the tick refuses.
     charges: BTreeMap<TickId, Vec<StoredReceipt>>,
+    /// Every block committed, as storage would hand it back — the input
+    /// a restart replays.
+    committed: Vec<Verified<CertifiedBlock>>,
     /// The settled state every tick reads through, so the harness models
     /// the whole path: a committed certificate's receipts land here in
     /// commit order, exactly as `merge_writes_from_receipts` lands them in
@@ -233,6 +236,7 @@ impl ExecutionSim {
             outputs: Vec::new(),
             receipts: BTreeMap::new(),
             charges: BTreeMap::new(),
+            committed: Vec::new(),
             base,
             local_shard,
         }
@@ -265,6 +269,10 @@ impl ExecutionSim {
                 .collect(),
         );
         let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
+        self.committed
+            .push(Verified::<CertifiedBlock>::from_persisted(
+                certified.clone(),
+            ));
         let actions = self.coord.on_block_committed(&self.topology, &certified);
         self.absorb(actions);
         // Persistence follows the commit, which is when the chain evicts
@@ -315,6 +323,10 @@ impl ExecutionSim {
             sealed @ Block::Sealed { .. } => sealed,
         };
         let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
+        self.committed
+            .push(Verified::<CertifiedBlock>::from_persisted(
+                certified.clone(),
+            ));
         let actions = self.coord.on_block_committed(&self.topology, &certified);
         self.absorb(actions);
         self.chain.prune_persisted(self.height);
@@ -451,6 +463,36 @@ impl ExecutionSim {
     #[must_use]
     pub fn settled(&self, key: SubstateKey) -> Option<Vec<u8>> {
         self.base.substate(key)
+    }
+
+    /// Restart this replica: the settled base survives, and everything
+    /// execution was holding does not — the coordinator and the tick
+    /// chain both come back empty, exactly as they do at startup.
+    ///
+    /// The whole committed chain is handed over as the replay window.
+    /// Where that window's floor actually sits is storage's question,
+    /// and this harness holds no retention window to answer it with.
+    pub fn restart(&mut self) {
+        let recovered = RecoveredState {
+            committed_height: self.height,
+            replay: ReplayWindow {
+                blocks: self.committed.clone(),
+                anchor_wt: None,
+            },
+            ..RecoveredState::default()
+        };
+        self.coord = ExecutionCoordinator::with_shared_stores(
+            ValidatorId::new(0),
+            self.local_shard,
+            &recovered,
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizationStore::new()),
+        );
+        self.chain = Arc::new(TickChain::new(Arc::clone(&self.base)));
+        self.pending.clear();
+        let actions = self.coord.on_committed_state_restored(&self.topology);
+        self.absorb(actions);
+        self.drain();
     }
 
     /// Hand a finalization to the coordinator as ready for inclusion,
