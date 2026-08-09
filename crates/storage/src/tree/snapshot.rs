@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use hyperscale_jmt::{Child, EMPTY_HASH, Node, NodeKey};
-use hyperscale_types::{BlockHeight, StateRoot};
+use hyperscale_types::{BlockHeight, SettledWrites, StateRoot};
 
 use super::{CollectedWrites, state_root_from_jmt};
 
@@ -31,12 +31,22 @@ pub struct JmtSnapshot {
     pub stale_node_keys: Vec<NodeKey>,
     /// Net change to the tree's total substate value bytes in this block.
     pub bytes_delta: i64,
+    /// The cell values these nodes hash — the block's writes as absolutes,
+    /// resolved once against the state its parent left behind.
+    ///
+    /// A reader of unpersisted state lays these down as they stand rather
+    /// than resolving the block's movements a second time. Two resolutions
+    /// mean two baselines, and a validator that picks the second from how
+    /// far it happens to have persisted computes a state root no one else
+    /// does.
+    pub settled: SettledWrites,
 }
 
 impl JmtSnapshot {
     /// Create a snapshot from collected writes.
     pub fn from_collected_writes(
         collected: CollectedWrites,
+        settled: SettledWrites,
         base_root: StateRoot,
         base_height: BlockHeight,
         result_root: StateRoot,
@@ -50,6 +60,7 @@ impl JmtSnapshot {
             nodes: collected.nodes,
             stale_node_keys: collected.stale_node_keys,
             bytes_delta: collected.bytes_delta,
+            settled,
         }
     }
 
@@ -131,6 +142,7 @@ mod tests {
                 .collect(),
             stale_node_keys: Vec::new(),
             bytes_delta: 0,
+            settled: SettledWrites::default(),
         };
         (store, snapshot)
     }
@@ -198,6 +210,7 @@ mod tests {
             nodes: Vec::new(),
             stale_node_keys: Vec::new(),
             bytes_delta: 0,
+            settled: SettledWrites::default(),
         }
     }
 

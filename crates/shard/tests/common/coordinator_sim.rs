@@ -1539,7 +1539,6 @@ impl ShardCoordinatorSim {
                     ChainEntry {
                         parent_block_hash,
                         height,
-                        receipts: collect_finalized_receipts(&finalizations),
                         settled_txs: local_settled_tx_hashes(&finalizations, shard_id),
                         jmt_snapshot: result.jmt_snapshot,
                         certified_block: None,
@@ -1811,7 +1810,6 @@ impl ShardCoordinatorSim {
                         ChainEntry {
                             parent_block_hash,
                             height: block_height,
-                            receipts: collect_finalized_receipts(&finalizations),
                             settled_txs: local_settled_tx_hashes(&finalizations, self.shard),
                             jmt_snapshot,
                             certified_block: None,
@@ -1943,15 +1941,6 @@ impl ShardCoordinatorSim {
             height: ancestor.height().next(),
         })
     }
-}
-
-fn collect_finalized_receipts(
-    ticks: &[Arc<Verifiable<Finalization>>],
-) -> Vec<Arc<ConsensusReceipt>> {
-    ticks
-        .iter()
-        .flat_map(|fw| fw.consensus_receipts())
-        .collect()
 }
 
 /// Clone `h` with `timestamp` bumped by 1ms. Mints the

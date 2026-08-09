@@ -612,6 +612,7 @@ impl RocksDbShardStorage {
         let (root, collected) = tree::put_at_version(&snapshot_store, None, 0, merged);
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
+            merged.clone(),
             StateRoot::ZERO,
             BlockHeight::GENESIS,
             root,
@@ -735,6 +736,7 @@ mod test_helpers {
                 tree::put_at_version(&snapshot_store, parent_version, new_version, writes);
             let jmt_snapshot = JmtSnapshot::from_collected_writes(
                 collected,
+                writes.clone(),
                 base_root,
                 BlockHeight::new(base_version),
                 new_root,

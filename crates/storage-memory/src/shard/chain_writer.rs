@@ -99,6 +99,7 @@ impl ShardChainWriter for SimShardStorage {
 
         let snapshot = Arc::new(JmtSnapshot::from_collected_writes(
             collected,
+            settled.clone(),
             parent.state_root,
             parent.height,
             result_root,

@@ -98,6 +98,7 @@ impl ShardChainWriter for RocksDbShardStorage {
 
         let jmt_snapshot = Arc::new(JmtSnapshot::from_collected_writes(
             collected,
+            settled.clone(),
             parent.state_root,
             parent.height,
             computed_root,
@@ -316,6 +317,7 @@ impl RocksDbShardStorage {
             put_at_version(&snapshot_store, parent_version, block_height, merged_writes);
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
+            merged_writes.clone(),
             base_root,
             BlockHeight::new(base_version),
             new_root,

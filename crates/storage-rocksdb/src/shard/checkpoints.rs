@@ -564,6 +564,7 @@ impl BoundaryStore for RocksDbShardStorage {
             put_at_version(&snapshot_store, parent_version, height.inner(), &filtered);
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
+            filtered,
             base_root,
             BlockHeight::new(base_version),
             new_root,

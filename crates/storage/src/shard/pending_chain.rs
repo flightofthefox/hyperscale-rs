@@ -13,8 +13,8 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
     MerkleInclusionProof, PreparedCommit, QuorumCertificate, RETENTION_HORIZON, SettledTxsRoot,
-    ShardId, ShardWitnessPayload, StateRoot, StateWrites, SubstateKey, TickId, Transaction, TxHash,
-    Verifiable, Verified, WeightedTimestamp, local_settled_tx_hashes, settled_txs_root_from_hashes,
+    ShardId, ShardWitnessPayload, StateRoot, SubstateKey, TickId, Transaction, TxHash, Verifiable,
+    Verified, WeightedTimestamp, local_settled_tx_hashes, settled_txs_root_from_hashes,
 };
 
 use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
@@ -40,8 +40,6 @@ pub struct ChainEntry {
     pub parent_block_hash: BlockHash,
     /// Block height. Used for pruning and version-aware reads.
     pub height: BlockHeight,
-    /// Per-tx receipts produced by this block.
-    pub receipts: Vec<Arc<ConsensusReceipt>>,
     /// Tick-ids this shard settled in this block — the local execution
     /// certificate of each committed tick. Carried from insert (the
     /// certificates exist before the QC attaches `certified_block`), so a
@@ -660,10 +658,10 @@ pub struct SubstateView<S> {
     /// JMT node index built from `jmt_snapshots` for O(1) lookup
     /// (see [`jmt::TreeReader`] impl).
     jmt_nodes: JmtNodeIndex,
-    /// Per-receipt references for versioned queries
+    /// Per-block settled writes for versioned queries
     /// ([`SubstateStore::get_substate_at_height`]).
     /// Sorted by height ascending.
-    versioned_receipts: Vec<(BlockHeight, Arc<ConsensusReceipt>)>,
+    versioned_settled: Vec<(BlockHeight, Arc<JmtSnapshot>)>,
     /// Lazy cache of base-storage reads observed through this view.
     /// Populated on every overlay-miss `get_raw_substate_by_db_key` call.
     /// Consumed at commit time by `take_base_reads` so `capture_history`
@@ -692,7 +690,7 @@ impl<S> SubstateView<S> {
             overlay: HashMap::new(),
             jmt_snapshots: Vec::new(),
             jmt_nodes: HashMap::new(),
-            versioned_receipts: Vec::new(),
+            versioned_settled: Vec::new(),
             base_reads: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -708,26 +706,6 @@ impl<S> SubstateView<S> {
     #[must_use]
     pub fn take_base_reads(&self) -> BaseReadCache {
         std::mem::take(&mut *lock_or_recover(&self.base_reads))
-    }
-}
-
-/// Flatten one receipt's writes into the overlay map. Later calls
-/// override earlier ones for the same key (commit order).
-/// Fold one receipt's writes into the overlay.
-///
-/// Movements resolve against whatever stands here already — the overlay
-/// entry an earlier receipt in this walk left, or the base beneath it.
-/// The walk is in commit order, so that is exactly the state each
-/// receipt lands on.
-fn apply_writes(overlay: &mut OverlayEntries, base: &dyn SubstateDatabase, writes: &StateWrites) {
-    let resolved = writes.resolve(&mut |key| {
-        overlay
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| base.substate(key))
-    });
-    for (key, change) in resolved.cells() {
-        overlay.insert(*key, change.clone());
     }
 }
 
@@ -768,18 +746,25 @@ impl<S: SubstateDatabase> SubstateView<S> {
         let mut overlay: OverlayEntries = HashMap::new();
         let mut jmt_snapshots: Vec<Arc<JmtSnapshot>> = Vec::with_capacity(chain.len());
         let mut jmt_nodes: JmtNodeIndex = HashMap::new();
-        let mut versioned_receipts: Vec<(BlockHeight, Arc<ConsensusReceipt>)> = Vec::new();
+        let mut versioned_settled: Vec<(BlockHeight, Arc<JmtSnapshot>)> =
+            Vec::with_capacity(chain.len());
 
+        // The walk is in commit order and every entry states its cells
+        // outright, so a later block's value replaces an earlier one's.
+        // Nothing resolves here, and nothing may: a movement resolves
+        // against the state its own block's parent left, which the
+        // committing block already did. A second resolution would have
+        // to pick a baseline, and the only one on hand is however far
+        // this validator has persisted — which is not a quantity
+        // consensus agrees on.
         for entry in chain {
-            for receipt in &entry.receipts {
-                if let Some(writes) = receipt.writes() {
-                    apply_writes(&mut overlay, &*base, writes);
-                }
-                versioned_receipts.push((entry.height, Arc::clone(receipt)));
+            for (key, change) in entry.jmt_snapshot.settled.cells() {
+                overlay.insert(*key, change.clone());
             }
             for (key, node) in &entry.jmt_snapshot.nodes {
                 jmt_nodes.insert(key.clone(), Arc::clone(node));
             }
+            versioned_settled.push((entry.height, Arc::clone(&entry.jmt_snapshot)));
             jmt_snapshots.push(Arc::clone(&entry.jmt_snapshot));
         }
 
@@ -789,7 +774,7 @@ impl<S: SubstateDatabase> SubstateView<S> {
             overlay,
             jmt_snapshots,
             jmt_nodes,
-            versioned_receipts,
+            versioned_settled,
             base_reads: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -864,15 +849,15 @@ impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
             return (*self.base).get_substate_at_height(key, block_height);
         }
 
-        // Base value at the persisted tip, then pending receipts in
-        // commit order up to `block_height` — the view's overlay walk,
-        // narrowed to one key.
+        // Base value at the persisted tip, then each pending block's
+        // settled cells in commit order up to `block_height` — the
+        // view's overlay walk, narrowed to one key.
         let mut value = (*self.base).get_substate_at_height(key, persisted_version)?;
-        for (h, receipt) in &self.versioned_receipts {
+        for (h, snapshot) in &self.versioned_settled {
             if *h > block_height {
                 break;
             }
-            if let Some(change) = receipt.writes().and_then(|writes| writes.cells.get(&key)) {
+            if let Some(change) = snapshot.settled.cells().get(&key) {
                 value.clone_from(change);
             }
         }
@@ -984,8 +969,8 @@ mod tests {
     use hyperscale_types::{
         Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
-        Hash, LocalKey, Provisions, Round, SignerBitfield, StateWrites, TickHalf, TickId,
-        Transaction, TxHash, TxOutcome, WitnessSources,
+        Hash, LocalKey, Provisions, Round, SettledWrites, SignerBitfield, StateWrites, TickHalf,
+        TickId, Transaction, TxHash, TxOutcome, WitnessSources,
     };
 
     use super::*;
@@ -1182,16 +1167,7 @@ mod tests {
         writes
     }
 
-    fn make_receipt(writes: StateWrites) -> Arc<ConsensusReceipt> {
-        Arc::new(ConsensusReceipt::Succeeded {
-            receipt_hash: GlobalReceiptHash::ZERO,
-            writes,
-            beacon_witness_events: Vec::new(),
-            events: Vec::new(),
-        })
-    }
-
-    fn empty_snapshot() -> Arc<JmtSnapshot> {
+    fn snapshot_of(settled: SettledWrites) -> Arc<JmtSnapshot> {
         Arc::new(JmtSnapshot {
             base_root: StateRoot::ZERO,
             base_height: BlockHeight::GENESIS,
@@ -1200,16 +1176,22 @@ mod tests {
             nodes: vec![],
             stale_node_keys: vec![],
             bytes_delta: 0,
+            settled,
         })
     }
 
-    fn entry_at(parent: BlockHash, height: BlockHeight, writes: StateWrites) -> ChainEntry {
+    fn empty_snapshot() -> Arc<JmtSnapshot> {
+        snapshot_of(SettledWrites::default())
+    }
+
+    /// A block that settled `writes`. Resolved against an empty prior,
+    /// as a block whose parent left the cells untouched would be.
+    fn entry_at(parent: BlockHash, height: BlockHeight, writes: &StateWrites) -> ChainEntry {
         ChainEntry {
             parent_block_hash: parent,
             height,
-            receipts: vec![make_receipt(writes)],
             settled_txs: Vec::new(),
-            jmt_snapshot: empty_snapshot(),
+            jmt_snapshot: snapshot_of(writes.resolve(&mut |_| None)),
             certified_block: None,
             certified_uncommitted: None,
         }
@@ -1239,15 +1221,19 @@ mod tests {
         let h3 = bh(b"h3");
         chain.insert(
             h1,
-            entry_at(BlockHash::ZERO, BlockHeight::new(1), StateWrites::default()),
+            entry_at(
+                BlockHash::ZERO,
+                BlockHeight::new(1),
+                &StateWrites::default(),
+            ),
         );
         chain.insert(
             h2,
-            entry_at(h1, BlockHeight::new(2), StateWrites::default()),
+            entry_at(h1, BlockHeight::new(2), &StateWrites::default()),
         );
         chain.insert(
             h3,
-            entry_at(h2, BlockHeight::new(3), StateWrites::default()),
+            entry_at(h2, BlockHeight::new(3), &StateWrites::default()),
         );
 
         chain.prune(BlockHeight::new(2));
@@ -1268,7 +1254,7 @@ mod tests {
             entry_at(
                 BlockHash::ZERO,
                 BlockHeight::new(1),
-                make_writes(owner, [1; 16], vec![10]),
+                &make_writes(owner, [1; 16], vec![10]),
             ),
         );
         chain.insert(
@@ -1276,7 +1262,7 @@ mod tests {
             entry_at(
                 h1,
                 BlockHeight::new(2),
-                make_writes(owner, [2; 16], vec![20]),
+                &make_writes(owner, [2; 16], vec![20]),
             ),
         );
 
@@ -1299,7 +1285,7 @@ mod tests {
             entry_at(
                 BlockHash::ZERO,
                 BlockHeight::new(1),
-                make_writes(owner, [1; 16], vec![10]),
+                &make_writes(owner, [1; 16], vec![10]),
             ),
         );
         // Orphan: same height as h1, different parent (forks off ZERO).
@@ -1308,7 +1294,7 @@ mod tests {
             entry_at(
                 BlockHash::ZERO,
                 BlockHeight::new(1),
-                make_writes(owner, [1; 16], vec![99]),
+                &make_writes(owner, [1; 16], vec![99]),
             ),
         );
 
@@ -1333,7 +1319,7 @@ mod tests {
 
         chain.insert(
             h1,
-            entry_at(BlockHash::ZERO, target_height, StateWrites::default()),
+            entry_at(BlockHash::ZERO, target_height, &StateWrites::default()),
         );
         // Simulate persistence: prune the pending entry while leaving the
         // base store at its default `jmt_height = GENESIS`. The two
@@ -1373,7 +1359,11 @@ mod tests {
         let h1 = bh(b"h1");
         chain.insert(
             h1,
-            entry_at(BlockHash::ZERO, BlockHeight::new(5), StateWrites::default()),
+            entry_at(
+                BlockHash::ZERO,
+                BlockHeight::new(5),
+                &StateWrites::default(),
+            ),
         );
         let _view = chain.view_at(h1, BlockHeight::new(7));
     }
@@ -1410,7 +1400,6 @@ mod tests {
             ChainEntry {
                 parent_block_hash: BlockHash::ZERO,
                 height,
-                receipts: Vec::new(),
                 settled_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
@@ -1502,7 +1491,6 @@ mod tests {
             ChainEntry {
                 parent_block_hash: BlockHash::ZERO,
                 height: BlockHeight::new(5),
-                receipts: Vec::new(),
                 settled_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
@@ -1714,7 +1702,6 @@ mod tests {
             ChainEntry {
                 parent_block_hash: BlockHash::ZERO,
                 height: BlockHeight::new(4),
-                receipts: Vec::new(),
                 settled_txs: vec![settled_tx(&wa)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
@@ -1726,7 +1713,6 @@ mod tests {
             ChainEntry {
                 parent_block_hash: ancestor,
                 height: BlockHeight::new(5),
-                receipts: Vec::new(),
                 settled_txs: vec![settled_tx(&wb)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
@@ -1774,7 +1760,6 @@ mod tests {
             ChainEntry {
                 parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"committed-tip")),
                 height: BlockHeight::new(4),
-                receipts: Vec::new(),
                 settled_txs: vec![settled_tx(&parent_tick)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,

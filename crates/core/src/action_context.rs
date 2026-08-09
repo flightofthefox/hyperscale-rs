@@ -14,8 +14,8 @@ use hyperscale_storage::{
     JmtSnapshot, PendingChain, RatifyRegisterStore, SafeVoteRegisterStore, ShardStorage, TickChain,
 };
 use hyperscale_types::{
-    BeaconProposal, BlockHash, BlockHeight, ConsensusReceipt, Epoch, PreparedCommit, ShardId,
-    Signer, TopologySnapshot, TxHash, ValidatorId, Verified, Verifier,
+    BeaconProposal, BlockHash, BlockHeight, Epoch, PreparedCommit, ShardId, Signer,
+    TopologySnapshot, TxHash, ValidatorId, Verified, Verifier,
 };
 
 use crate::ProtocolEvent;
@@ -157,6 +157,5 @@ pub struct PreparedBlock {
     pub block_height: BlockHeight,
     pub prepared: PreparedCommit,
     pub jmt_snapshot: Arc<JmtSnapshot>,
-    pub receipts: Vec<Arc<ConsensusReceipt>>,
     pub settled_txs: Vec<TxHash>,
 }

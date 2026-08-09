@@ -199,12 +199,12 @@ where
         }));
     }
 
+    // The synced replica reaches the same cache as the one that
+    // executed: both read it out of the same block content.
     let receipts: Vec<Arc<ConsensusReceipt>> = finalizations
         .iter()
         .flat_map(|fw| fw.consensus_receipts())
         .collect();
-    // The synced replica reaches the same cache as the one that
-    // executed: both read it out of the same block content.
     absorb_committed_cells(receipts.iter().map(AsRef::as_ref));
     let parent_block_hash = block.header().parent_block_hash();
     let settled_txs = local_settled_tx_hashes(finalizations.iter(), block.header().shard_id());
@@ -213,7 +213,6 @@ where
         ChainEntry {
             parent_block_hash,
             height,
-            receipts,
             settled_txs,
             jmt_snapshot,
             certified_block: None,
@@ -258,7 +257,6 @@ where
             block_height,
             prepared,
             jmt_snapshot,
-            receipts,
             settled_txs,
         } = prep;
         pending_chain.insert(
@@ -266,7 +264,6 @@ where
             ChainEntry {
                 parent_block_hash,
                 height: block_height,
-                receipts,
                 settled_txs,
                 jmt_snapshot,
                 certified_block: None,

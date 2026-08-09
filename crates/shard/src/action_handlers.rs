@@ -412,17 +412,14 @@ fn split_child_roots_for_header(
     pair
 }
 
-fn collect_finalized_receipts(
-    ticks: &[Arc<Verifiable<Finalization>>],
-) -> Vec<Arc<ConsensusReceipt>> {
+/// A package published in this block is usable by transactions admitted
+/// after it commits, and this is where that becomes true.
+fn absorb_finalized_cells(ticks: &[Arc<Verifiable<Finalization>>]) {
     let receipts: Vec<Arc<ConsensusReceipt>> = ticks
         .iter()
         .flat_map(|fw| fw.consensus_receipts())
         .collect();
-    // A package published in this block is usable by transactions
-    // admitted after it commits, and this is where that becomes true.
     absorb_committed_cells(receipts.iter().map(AsRef::as_ref));
-    receipts
 }
 
 /// Handle the shard-owned delegated [`Action`] variants.
@@ -819,6 +816,7 @@ where
             record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
             let bytes_delta = jmt_snapshot.bytes_delta;
             if verify_result.is_ok() {
+                absorb_finalized_cells(&finalizations);
                 // SAFETY: `prepared` belongs to the same JMT replay that just
                 // produced the matching `computed_root` — only routed when
                 // verification succeeds.
@@ -828,7 +826,6 @@ where
                     block_height,
                     prepared,
                     jmt_snapshot,
-                    receipts: collect_finalized_receipts(&finalizations),
                     settled_txs: local_settled_tx_hashes(&finalizations, ctx.shard),
                 });
             } else if let Err(e) = &verify_result {
@@ -998,13 +995,13 @@ where
             );
             let block_hash = result.block_hash;
             let bytes_delta = result.jmt_snapshot.bytes_delta;
+            absorb_finalized_cells(&finalizations);
             (ctx.commit_prepared)(PreparedBlock {
                 block_hash,
                 parent_block_hash,
                 block_height: height,
                 prepared: result.prepared_commit,
                 jmt_snapshot: result.jmt_snapshot,
-                receipts: collect_finalized_receipts(&finalizations),
                 settled_txs: local_settled_tx_hashes(&finalizations, shard_id),
             });
             ctx.notify_protocol(ProtocolEvent::ProposalBuilt {

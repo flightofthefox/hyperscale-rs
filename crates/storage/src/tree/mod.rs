@@ -275,6 +275,7 @@ pub fn noop_jmt_snapshot<S: TreeReader>(
         nodes,
         stale_node_keys: Vec::new(),
         bytes_delta: 0,
+        settled: SettledWrites::default(),
     }
 }
 
