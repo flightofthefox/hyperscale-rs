@@ -788,8 +788,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     use std::sync::Arc;
 
     use hyperscale_types::network::request::{
-        GetBlockRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetSettledTxsRequest,
-        GetStateRangeRequest, GetTransactionsRequest, GetWitnessHistoryRequest,
+        GetBlockRequest, GetCommittedTxsRequest, GetProvisionsRequest, GetRemoteHeadersRequest,
+        GetSettledTxsRequest, GetStateRangeRequest, GetTransactionsRequest,
+        GetWitnessHistoryRequest,
     };
 
     use crate::beacon::serve::serve_beacon_block_request;
@@ -798,8 +799,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::bootstrap::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        serve_execution_certs_request, serve_finalizations_request, serve_local_provisions_request,
-        serve_provision_request, serve_remote_headers_request, serve_settled_txs_request,
+        serve_committed_txs_request, serve_execution_certs_request, serve_finalizations_request,
+        serve_local_provisions_request, serve_provision_request, serve_remote_headers_request,
+        serve_settled_txs_request,
     };
     use crate::shard::mempool::serve_transaction_request;
 
@@ -1101,6 +1103,21 @@ pub fn register_shard_request_handlers<S, N, D>(
         .register_request_handler::<GetSettledTxsRequest>(shard, move |req| {
             let window_floor = topology_snapshot.load().settled_window_floor(shard);
             serve_settled_txs_request(&pending_chain, window_floor, &req)
+        });
+
+    // ── committed_txs.request → terminated-shard membership answers ──
+    //
+    // A reshape successor resolving a transaction whose validity window
+    // opened before its own origin names our terminal block and the
+    // hashes it wants decided. Absence is proven against the terminal's
+    // `committed_txs_root`, which the successor already commit-proved, so
+    // nothing here is trusted. No window floor: the committed window is
+    // anchor-relative only.
+    let pending_chain = Arc::clone(&io.pending_chain);
+    process
+        .network
+        .register_request_handler::<GetCommittedTxsRequest>(shard, move |req| {
+            serve_committed_txs_request(&pending_chain, &req)
         });
 
     // ── beacon.proposal.request → process-level serve cache ──────

@@ -9,6 +9,7 @@
 //! subsystem-specific FSM instances, bindings, serves, and glue live here
 //! beside it.
 
+mod committed_txs_serve;
 mod exec_cert_serve;
 mod fetch;
 mod finalization_serve;
@@ -21,6 +22,7 @@ mod settled_set;
 mod settled_set_sync;
 mod settled_txs_serve;
 
+pub use committed_txs_serve::serve_committed_txs_request;
 pub use exec_cert_serve::serve_execution_certs_request;
 pub use fetch::{
     ExecCertBinding, ExecCertFetch, FinalizationBinding, FinalizationFetch, LocalProvisionBinding,

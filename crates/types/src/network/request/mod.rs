@@ -5,6 +5,7 @@
 pub mod beacon;
 
 mod block;
+mod committed_txs;
 mod execution_cert;
 mod finalization;
 mod local_provision;
@@ -17,6 +18,7 @@ mod transaction;
 mod witness_history;
 
 pub use block::GetBlockRequest;
+pub use committed_txs::GetCommittedTxsRequest;
 pub use execution_cert::GetExecutionCertsRequest;
 pub use finalization::GetFinalizationsRequest;
 pub use local_provision::GetLocalProvisionsRequest;

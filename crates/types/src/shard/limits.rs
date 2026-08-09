@@ -45,6 +45,17 @@ pub const MAX_PROVISION_TARGET_SHARDS: usize = 1_024;
 /// same cap.
 pub const MAX_FINALIZED_TX_PER_BLOCK: usize = 8_192;
 
+/// Cap on the transactions a successor asks about in one
+/// committed-transaction query.
+///
+/// Bounds the response, whose per-entry cost is an absence proof rather
+/// than a hash. The population it draws from is small by construction:
+/// only transactions submitted to the successor whose validity window
+/// opened before its origin, and only until the chain outlives that
+/// origin by `MAX_VALIDITY_RANGE`. A successor with more than this
+/// outstanding asks across several requests.
+pub const MAX_COMMITTED_TX_QUERY: usize = 256;
+
 /// Hard cap on the number of provision batches any single block can carry.
 ///
 /// A [`Provisions`](crate::Provisions) batch is keyed on `(source_shard,
