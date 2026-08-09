@@ -733,21 +733,22 @@ impl TickState {
     }
 
     /// Whether the legs half can settle now: every leg has its verdict,
-    /// and the determined half has already gone.
+    /// and this validator holds the receipts they settle.
     ///
-    /// The ordering is not bookkeeping. A determined member and a leg of
-    /// one tick are scheduled sequentially inside a single batch, so each
-    /// receipt states an absolute computed at its own point in the fold;
-    /// settling them out of that order reverts one. The provisional-cell
-    /// rule does not cover the pair — it governs across ticks, and these
-    /// are one tick.
+    /// It does not wait on the determined half. The two cannot produce
+    /// conflicting absolutes, because composition claims a leg's declared
+    /// access before testing any determined member: the pair is admitted
+    /// together only where both reach the cell commutatively, and
+    /// movements compose in any order. Waiting would only mean a
+    /// determined member missing a receipt could hold legs that are ready
+    /// — the same hostage-taking the halves exist to end, pointing the
+    /// other way.
     #[must_use]
     pub fn legs_ready(&self) -> bool {
         let legs = self.leg_members();
         !self.legs_emitted
             && self.attestable()
             && !legs.is_empty()
-            && self.determined_emitted_or_absent()
             && self.has_local_receipts_for(&legs)
             && legs.iter().all(|&tx_hash| self.is_covered(tx_hash))
     }
@@ -1078,6 +1079,79 @@ mod tests {
             ),
         )));
         (tick, determined, leg)
+    }
+
+    /// The hostage-taking runs both ways, and neither is allowed.
+    ///
+    /// A determined member this validator holds no receipt for cannot
+    /// settle, and must not hold the legs beside it. Nothing is lost by
+    /// letting them go first: composition claims a leg's declared access
+    /// before testing any determined member, so the two are admitted
+    /// together only where both reach the cell commutatively, and
+    /// movements compose in any order.
+    #[test]
+    fn a_determined_member_without_its_receipt_does_not_hold_the_legs() {
+        let local = shard(0);
+        let (determined, leg) = (tx(1), tx(2));
+        let mut tick = TickState::new(
+            TickId::new(local, BlockHeight::new(1)),
+            BlockHash::ZERO,
+            WeightedTimestamp::from_millis(1_000),
+        );
+        tick.admit(determined, BTreeSet::from([local]), 10, Admission::Executes);
+        tick.admit(
+            leg,
+            BTreeSet::from([local, shard(1)]),
+            20,
+            Admission::Executes,
+        );
+        for tx_hash in [determined, leg] {
+            tick.record_execution_result(
+                tx_hash,
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            );
+        }
+        // Only the leg's receipt lands.
+        tick.record_receipt(receipt(leg));
+        let (_, root, outcomes) = tick.build_vote_data().expect("every member came back");
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                *tick.tick_id(),
+                tick.vote_anchor_ts(),
+                root,
+                outcomes,
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                TickId::new(shard(1), BlockHeight::new(4)),
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::ZERO,
+                vec![TxOutcome::new(
+                    leg,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )],
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+
+        assert!(
+            !tick.determined_ready(),
+            "the determined half is missing the receipt it would settle",
+        );
+        assert!(tick.legs_ready(), "and the legs are ready regardless");
+        let half = tick
+            .take_legs_finalization()
+            .expect("covered and receipted");
+        assert_eq!(half.tx_hashes().collect::<Vec<_>>(), vec![leg]);
+        assert_eq!(half.half(), TickHalf::Legs);
     }
 
     /// The milestone's whole point: a leg whose counterpart never
