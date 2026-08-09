@@ -27,7 +27,7 @@ use hyperscale_types::{
     QuorumCertificate, ReadySignal, ReshapeTrigger, RevealChain, Round, SettledTxsRoot, ShardId,
     ShardLoad, SplitChildRoots, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateKey,
     Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
-    TransactionRootContext, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
+    TransactionRootContext, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
     VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, absorb_committed_cells,
     commit_witness_window, compute_cross_shard_txs, derive_leaves, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
@@ -734,6 +734,7 @@ where
             expected_root,
             expected_local_receipt_root,
             finalizations,
+            block_tx_hashes,
             block_height,
             claimed_split_child_roots,
             split_child_roots_required,
@@ -827,6 +828,7 @@ where
                     prepared,
                     jmt_snapshot,
                     settled_txs: local_settled_tx_hashes(&finalizations, ctx.shard),
+                    committed_txs: block_tx_hashes,
                 });
             } else if let Err(e) = &verify_result {
                 tracing::warn!(
@@ -961,6 +963,7 @@ where
                     &finalizations,
                 )
             });
+            let block_tx_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
             let result = build_proposal(
                 &view,
                 proposer,
@@ -1003,6 +1006,7 @@ where
                 prepared: result.prepared_commit,
                 jmt_snapshot: result.jmt_snapshot,
                 settled_txs: local_settled_tx_hashes(&finalizations, shard_id),
+                committed_txs: block_tx_hashes,
             });
             ctx.notify_protocol(ProtocolEvent::ProposalBuilt {
                 height,

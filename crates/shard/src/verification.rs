@@ -16,8 +16,8 @@ use hyperscale_types::{
     BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
     CertifiedBlock, ChainOrigin, Finalization, LinkageError, LocalReceiptRoot, ProvisionTxRootsMap,
     ProvisionsRoot, QuorumCertificate, ReshapeThresholds, RevealChain, SettledTxsRoot, ShardId,
-    SplitChildRoots, StateRoot, TopologySchedule, TopologySnapshot, TransactionRoot, Verifiable,
-    Verified, VerifiedBlockAssembleError, WeightedTimestamp, WorkInFlight,
+    SplitChildRoots, StateRoot, TopologySchedule, TopologySnapshot, TransactionRoot, TxHash,
+    Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp, WorkInFlight,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -107,6 +107,9 @@ pub struct ReadyStateRootVerification {
     /// Finalizations from the `PendingBlock` — these carry the proposer's receipts,
     /// ensuring all validators verify against the same execution outputs.
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    /// Hashes of the block's own transactions — its contribution to the
+    /// committed-transaction window a terminating boundary header roots.
+    pub block_tx_hashes: Vec<TxHash>,
     /// Height of the block being verified.
     pub block_height: BlockHeight,
     /// The header's `split_child_roots` claim, verified beside the
@@ -2145,6 +2148,8 @@ impl VerificationPipeline {
         let parent_state_root = chain.parent_state_root(pending.parent_block_hash);
         let finalizations: Vec<Arc<Verifiable<Finalization>>> =
             block.certificates().iter().cloned().collect();
+        let block_tx_hashes: Vec<TxHash> =
+            block.transactions().iter().map(|tx| tx.hash()).collect();
         Some(ReadyStateRootVerification {
             block_hash: pending.block_hash,
             parent_block_hash: pending.parent_block_hash,
@@ -2153,6 +2158,7 @@ impl VerificationPipeline {
             expected_root: pending.expected_root,
             expected_local_receipt_root: pending.expected_local_receipt_root,
             finalizations,
+            block_tx_hashes,
             block_height: pending.block_height,
             claimed_split_child_roots: pending.claimed_split_child_roots,
             split_child_roots_required: pending.split_child_roots_required,

@@ -1088,6 +1088,7 @@ impl ShardCoordinatorSim {
                 expected_root: ready.expected_root,
                 expected_local_receipt_root: ready.expected_local_receipt_root,
                 finalizations: ready.finalizations,
+                block_tx_hashes: ready.block_tx_hashes,
                 block_height: ready.block_height,
                 claimed_split_child_roots: ready.claimed_split_child_roots,
                 split_child_roots_required: ready.split_child_roots_required,
@@ -1540,6 +1541,12 @@ impl ShardCoordinatorSim {
                         parent_block_hash,
                         height,
                         settled_txs: local_settled_tx_hashes(&finalizations, shard_id),
+                        committed_txs: result
+                            .block
+                            .transactions()
+                            .iter()
+                            .map(|tx| tx.hash())
+                            .collect(),
                         jmt_snapshot: result.jmt_snapshot,
                         certified_block: None,
                         certified_uncommitted: None,
@@ -1742,6 +1749,7 @@ impl ShardCoordinatorSim {
                 expected_root,
                 expected_local_receipt_root,
                 finalizations,
+                block_tx_hashes,
                 block_height,
                 claimed_split_child_roots,
                 split_child_roots_required,
@@ -1811,6 +1819,7 @@ impl ShardCoordinatorSim {
                             parent_block_hash,
                             height: block_height,
                             settled_txs: local_settled_tx_hashes(&finalizations, self.shard),
+                            committed_txs: block_tx_hashes,
                             jmt_snapshot,
                             certified_block: None,
                             certified_uncommitted: None,

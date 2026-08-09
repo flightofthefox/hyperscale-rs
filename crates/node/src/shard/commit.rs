@@ -208,12 +208,14 @@ where
     absorb_committed_cells(receipts.iter().map(AsRef::as_ref));
     let parent_block_hash = block.header().parent_block_hash();
     let settled_txs = local_settled_tx_hashes(finalizations.iter(), block.header().shard_id());
+    let committed_txs = block.transactions().iter().map(|tx| tx.hash()).collect();
     pending_chain.insert(
         block_hash,
         ChainEntry {
             parent_block_hash,
             height,
             settled_txs,
+            committed_txs,
             jmt_snapshot,
             certified_block: None,
             certified_uncommitted: None,
@@ -258,6 +260,7 @@ where
             prepared,
             jmt_snapshot,
             settled_txs,
+            committed_txs,
         } = prep;
         pending_chain.insert(
             block_hash,
@@ -265,6 +268,7 @@ where
                 parent_block_hash,
                 height: block_height,
                 settled_txs,
+                committed_txs,
                 jmt_snapshot,
                 certified_block: None,
                 certified_uncommitted: None,

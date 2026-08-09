@@ -108,10 +108,10 @@ pub use network::{
 pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
-    BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot, EventRoot, FinalizationHash,
-    GenesisConfigHash, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash,
-    ProvisionTxRoot, ProvisionsRoot, RevealChain, SettledTxsRoot, StateRoot, TransactionRoot,
-    TxHash, WritesRoot,
+    BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot, CommittedTxsRoot, EventRoot,
+    FinalizationHash, GenesisConfigHash, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
+    ProvisionHash, ProvisionTxRoot, ProvisionsRoot, RevealChain, SettledTxsRoot, StateRoot,
+    TransactionRoot, TxHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex, RatifyRound,
@@ -162,14 +162,15 @@ pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate}
 pub use shard::reshape::{ReshapeThresholds, ReshapeTrigger};
 pub use shard::roots::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CertRootVerifyError,
-    CertificateRootContext, LocalReceiptRootContext, LocalReceiptRootVerifyError,
-    ProvisionRootVerifyError, ProvisionTxRootsContext, ProvisionTxRootsMap,
-    ProvisionTxRootsVerifyError, ProvisionsRootContext, REVEAL_CHAIN_DOMAIN_TAG, SplitChildRoots,
-    StateRootContext, StateRootVerifyError, TransactionRootContext, TxRootVerifyError,
-    certificate_root_from_receipt_hashes, commit_witness_window, derive_leaves,
+    CertificateRootContext, CommittedTxAbsence, LocalReceiptRootContext,
+    LocalReceiptRootVerifyError, ProvisionRootVerifyError, ProvisionTxRootsContext,
+    ProvisionTxRootsMap, ProvisionTxRootsVerifyError, ProvisionsRootContext,
+    REVEAL_CHAIN_DOMAIN_TAG, SplitChildRoots, StateRootContext, StateRootVerifyError,
+    TransactionRootContext, TxRootVerifyError, certificate_root_from_receipt_hashes,
+    commit_witness_window, committed_tx_leaf, committed_txs_root_from_hashes, derive_leaves,
     derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
-    settled_txs_root_from_hashes,
+    missed_proposals_since_prev_commit, next_reveal_chain, prove_committed_tx_absent,
+    ready_leaf_payload, settled_txs_root_from_hashes,
 };
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};

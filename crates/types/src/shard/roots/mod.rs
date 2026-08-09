@@ -21,6 +21,7 @@
 
 pub mod beacon_witness;
 pub mod certificate;
+pub mod committed_txs;
 pub mod local_receipt;
 pub mod provision_tx;
 pub mod provisions;
@@ -35,6 +36,10 @@ pub use beacon_witness::{
 };
 pub use certificate::{
     CertRootVerifyError, CertificateRootContext, certificate_root_from_receipt_hashes,
+};
+pub use committed_txs::{
+    CommittedTxAbsence, committed_tx_leaf, committed_txs_root_from_hashes,
+    prove_committed_tx_absent,
 };
 pub use local_receipt::{LocalReceiptRootContext, LocalReceiptRootVerifyError};
 pub use provision_tx::{ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError};

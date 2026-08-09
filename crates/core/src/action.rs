@@ -659,6 +659,10 @@ pub enum Action {
         /// root and the state root. The thread pool merges the receipts' writes
         /// from these.
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
+        /// Hashes of the block's own transactions — its contribution to
+        /// the committed-transaction window a terminating boundary header
+        /// roots. Carried as hashes because that is all the root needs.
+        block_tx_hashes: Vec<TxHash>,
         /// Block height being verified.
         block_height: BlockHeight,
         /// The header's `split_child_roots` claim, verified beside the
