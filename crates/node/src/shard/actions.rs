@@ -1,5 +1,6 @@
 //! Action processing and dispatch.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_beacon::action_handlers::handle_action as handle_beacon_action;
@@ -14,22 +15,24 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    BeaconProposal, BeaconWitnessCommit, BlockHeight, CertifiedBlock, Epoch, RoutingCommittees,
-    StateRoot, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, Verified,
+    BeaconProposal, BeaconWitnessCommit, BlockHeight, CertifiedBlock, Epoch, PredecessorTerminal,
+    RoutingCommittees, StateRoot, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
+    Verified,
 };
 use tracing::{debug, error, trace, warn};
 
 use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shard_input};
 use crate::beacon;
 use crate::beacon::{BeaconProposalBinding, ShardWitnessBinding};
-use crate::fetch::FetchInput;
+use crate::fetch::{FetchBinding, FetchInput};
 use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind, QcOnlyPending,
     make_commit_prepared, run_qc_only_prep,
 };
 use crate::shard::consensus::BlockSyncInput;
 use crate::shard::cross_shard::{
-    ExecCertBinding, FinalizationBinding, LocalProvisionBinding, ProvisionBinding,
+    CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
+    ProvisionBinding,
 };
 use crate::shard::mempool::TransactionBinding;
 
@@ -635,6 +638,38 @@ where
                     class,
                 });
             }
+            FetchRequest::CommittedTxs {
+                predecessor,
+                tx_hashes,
+                preferred,
+                class,
+            } => {
+                let wanted: BTreeSet<(PredecessorTerminal, TxHash)> = tx_hashes
+                    .into_iter()
+                    .map(|tx_hash| (predecessor, tx_hash))
+                    .collect();
+                // The scan re-derives the whole wanted set for this
+                // predecessor each pass, so anything the FSM still holds
+                // and the scan no longer names is an answer nobody is
+                // waiting for — a transaction that expired out of the
+                // pool, or the rule retiring as the chain outlives its
+                // origin. Nothing else retires these ids: a terminated
+                // committee that never answers would pin them for good.
+                let stale: Vec<_> = CommittedTxBinding::fetch_mut(&mut self.io)
+                    .pending_ids()
+                    .filter(|id| id.0.shard == predecessor.shard && !wanted.contains(id))
+                    .copied()
+                    .collect();
+                if !stale.is_empty() {
+                    self.drive_fetch::<CommittedTxBinding>(FetchInput::Abandoned { ids: stale });
+                }
+                self.drive_fetch::<CommittedTxBinding>(FetchInput::Request {
+                    ids: wanted.into_iter().collect(),
+                    shard: predecessor.shard,
+                    preferred,
+                    class,
+                });
+            }
             FetchRequest::ShardWitnesses {
                 source_shard,
                 block_height,
@@ -700,6 +735,9 @@ where
             }
             FetchAbandon::ExecutionCerts { ids } => {
                 self.drive_fetch::<ExecCertBinding>(FetchInput::Abandoned { ids });
+            }
+            FetchAbandon::CommittedTxs { ids } => {
+                self.drive_fetch::<CommittedTxBinding>(FetchInput::Abandoned { ids });
             }
             FetchAbandon::BeaconProposal { ids } => {
                 self.drive_fetch::<BeaconProposalBinding>(FetchInput::Abandoned { ids });

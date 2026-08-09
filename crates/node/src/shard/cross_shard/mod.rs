@@ -25,8 +25,9 @@ mod settled_txs_serve;
 pub use committed_txs_serve::serve_committed_txs_request;
 pub use exec_cert_serve::serve_execution_certs_request;
 pub use fetch::{
-    ExecCertBinding, ExecCertFetch, FinalizationBinding, FinalizationFetch, LocalProvisionBinding,
-    LocalProvisionFetch, ProvisionBinding, ProvisionFetch,
+    CommittedTxBinding, CommittedTxFetch, ExecCertBinding, ExecCertFetch, FinalizationBinding,
+    FinalizationFetch, LocalProvisionBinding, LocalProvisionFetch, ProvisionBinding,
+    ProvisionFetch,
 };
 pub use finalization_serve::serve_finalizations_request;
 use hyperscale_types::{BlockHeight, LocalTimestamp, ShardId};
@@ -56,6 +57,9 @@ pub struct CrossShardState {
     pub finalization: FinalizationFetch,
     /// Local-provision fetch (pinned to proposer).
     pub local_provision: LocalProvisionFetch,
+    /// Committed-transaction membership fetch against the chains this
+    /// one succeeds (rotates through the predecessor's committee).
+    pub committed_tx: CommittedTxFetch,
 
     /// Settled-ticks acquisition drivers — one per past-terminal remote
     /// shard whose `S_P` this node is acquiring for the split-boundary fence.
@@ -86,6 +90,14 @@ impl CrossShardState {
                     parallel_chunks_per_tick: 2,
                 },
             ),
+            committed_tx: CommittedTxFetch::new(
+                "committed_tx",
+                FetchConfig {
+                    max_in_flight: 256,
+                    max_ids_per_request: 64,
+                    parallel_chunks_per_tick: 2,
+                },
+            ),
             settled_set_sync: SettledTxsAcquisition::new(),
         }
     }
@@ -101,6 +113,7 @@ impl CrossShardState {
             || self.exec_cert.has_pending()
             || self.finalization.has_pending()
             || self.local_provision.has_pending()
+            || self.committed_tx.has_pending()
             || self.settled_set_sync.has_pending()
     }
 

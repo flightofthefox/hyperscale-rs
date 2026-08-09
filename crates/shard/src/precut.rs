@@ -85,18 +85,22 @@ impl PrecutResolutions {
 
     /// The `(predecessor, transaction)` pairs still owed an answer — what
     /// a driver turns into queries.
+    ///
+    /// The predecessor rides out whole rather than as its shard id: a
+    /// query names the terminal block it resolves against, and the
+    /// absence proof that comes back is checked against that terminal's
+    /// root.
     #[must_use]
     pub fn outstanding(
         &self,
         predecessors: &[PredecessorTerminal],
         tx_hashes: impl IntoIterator<Item = TxHash>,
-    ) -> Vec<(ShardId, TxHash)> {
+    ) -> Vec<(PredecessorTerminal, TxHash)> {
         let mut out = Vec::new();
         for tx_hash in tx_hashes {
             for predecessor in predecessors {
-                let key = (predecessor.shard, tx_hash);
-                if !self.answers.contains_key(&key) {
-                    out.push(key);
+                if !self.answers.contains_key(&(predecessor.shard, tx_hash)) {
+                    out.push((*predecessor, tx_hash));
                 }
             }
         }
@@ -236,7 +240,11 @@ mod tests {
         let mut resolutions = PrecutResolutions::default();
         resolutions.record(left, tx(1), true);
 
-        let outstanding = resolutions.outstanding(&predecessors, [tx(1), tx(2)]);
+        let outstanding: Vec<(ShardId, TxHash)> = resolutions
+            .outstanding(&predecessors, [tx(1), tx(2)])
+            .into_iter()
+            .map(|(predecessor, tx_hash)| (predecessor.shard, tx_hash))
+            .collect();
         assert_eq!(
             outstanding,
             vec![(right, tx(1)), (left, tx(2)), (right, tx(2))]

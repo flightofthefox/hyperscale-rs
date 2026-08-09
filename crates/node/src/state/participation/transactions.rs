@@ -33,7 +33,13 @@ impl ShardParticipation {
                 self.on_transactions_fetched(sched, transactions)
             }
             ProtocolEvent::TransactionsAdmitted { txs } => {
-                let actions = self.shard_coordinator.on_transactions_admitted(sched, &txs);
+                let mut actions = self.shard_coordinator.on_transactions_admitted(sched, &txs);
+                // A newly-admitted transaction that opened before this
+                // chain did is refused until a predecessor answers for
+                // it. Asking here rather than waiting for the cleanup
+                // tick is what keeps the refusal from costing a full
+                // tick of latency per arrival.
+                actions.extend(self.scan_precut_queries());
                 self.shard_coordinator.queue_ready_proposal();
                 actions
             }

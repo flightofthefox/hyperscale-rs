@@ -92,13 +92,13 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError,
     CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Finalization,
-    LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, PredecessorTerminal,
-    ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
-    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round,
-    SafeVoteRegisters, ShardLoad, StateRoot, StateRootVerifyError, Timeout, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId,
-    Verifiable, Verified, Verifier, Verify, VoteCount, derive_leaves,
-    missed_proposals_since_prev_commit, ready_leaf_payload,
+    LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, MAX_VALIDITY_RANGE,
+    PredecessorTerminal, ProvisionRootVerifyError, ProvisionTxRootsMap,
+    ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
+    QuorumCertificate, RecoveryCause, RevealChain, Round, SafeVoteRegisters, ShardLoad, StateRoot,
+    StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier,
+    Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -1091,6 +1091,22 @@ impl ShardCoordinator {
         deferred.map_or(PrecutVerdict::Pass, PrecutVerdict::Defer)
     }
 
+    /// Whether anything can still be offered to this chain from before
+    /// it began.
+    ///
+    /// False on a chain with no predecessors — one born at network
+    /// genesis has nothing before it, and one that missed the flip has
+    /// no terminal to ask about. False again once the chain's certified
+    /// clock has run `MAX_VALIDITY_RANGE` past its origin: that is the
+    /// widest a validity window gets, so nothing signed since can open
+    /// before the cut and nothing signed before it is still valid.
+    #[must_use]
+    pub fn precut_rule_live(&self) -> bool {
+        !self.predecessors.is_empty()
+            && self.high_qc().weighted_timestamp()
+                < self.chain_origin.anchor_wt.plus(MAX_VALIDITY_RANGE)
+    }
+
     /// Record one predecessor's answer about a transaction that predates
     /// this chain.
     ///
@@ -1107,14 +1123,42 @@ impl ShardCoordinator {
         self.resolutions.record(predecessor, tx_hash, absent);
     }
 
-    /// The `(predecessor, transaction)` pairs still owed an answer for
-    /// `tx_hashes` — what an acquisition driver turns into queries.
+    /// The `(predecessor, transaction)` pairs still owed an answer — what
+    /// an acquisition driver turns into queries.
+    ///
+    /// `tx_hashes` is the caller's candidate set — the mempool's pending
+    /// transactions that open before the cut. Blocks awaiting a vote
+    /// contribute their own pre-cut transactions on top: a vote deferred
+    /// by [`Self::precut_verdict`] resolves only once the query it waits
+    /// on is issued, and nothing guarantees the block's transactions are
+    /// also sitting in this node's pool.
+    ///
+    /// Empty on a chain with no predecessors, and empty again once the
+    /// chain has outlived its origin by `MAX_VALIDITY_RANGE`, where
+    /// nothing offered to it opens before the cut.
     #[must_use]
     pub fn outstanding_precut_queries(
         &self,
         tx_hashes: impl IntoIterator<Item = TxHash>,
-    ) -> Vec<(ShardId, TxHash)> {
-        self.resolutions.outstanding(&self.predecessors, tx_hashes)
+    ) -> Vec<(PredecessorTerminal, TxHash)> {
+        if !self.precut_rule_live() {
+            return Vec::new();
+        }
+        let cut = self.chain_origin.anchor_wt;
+        let awaiting_vote = self
+            .pending_blocks
+            .values()
+            .filter_map(|pending| pending.block())
+            .flat_map(|block| {
+                block
+                    .transactions()
+                    .iter()
+                    .filter(|tx| tx.validity_range().start_timestamp_inclusive < cut)
+                    .map(|tx| tx.hash())
+                    .collect::<Vec<_>>()
+            });
+        let candidates: BTreeSet<TxHash> = tx_hashes.into_iter().chain(awaiting_vote).collect();
+        self.resolutions.outstanding(&self.predecessors, candidates)
     }
 
     /// Whether `tx_hash` may be proposed despite opening before this
@@ -6442,12 +6486,13 @@ mod tests {
 
     use hyperscale_core::Action;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_types::test_utils::make_live_block;
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessRoot, BlockHeaderParts, ConsensusSignature, Epoch, Hash,
-        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, NetworkParams,
-        RETENTION_HORIZON, ShardId, Signer, SignerBitfield, TopologySchedule, TopologySnapshot,
-        Transaction, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
-        WitnessSources, test_utils,
+        AggregateSignature, BeaconWitnessRoot, BlockHeaderParts, CommittedTxsRoot,
+        ConsensusSignature, Epoch, Hash, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
+        NetworkDefinition, NetworkParams, RETENTION_HORIZON, ShardId, Signer, SignerBitfield,
+        TimestampRange, TopologySchedule, TopologySnapshot, Transaction, ValidatorId,
+        ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources, test_utils,
     };
 
     use super::*;
@@ -6496,6 +6541,149 @@ mod tests {
             RecoveredState::default(),
         );
         (state, TopologySchedule::single(Arc::new(topology_snapshot)))
+    }
+
+    // ─── Pre-cut queries ───────────────────────────────────────────────
+
+    /// A successor of one chain, cut at `cut`, with its certified clock
+    /// sitting at `now`.
+    fn make_successor(cut: WeightedTimestamp, now: WeightedTimestamp) -> ShardCoordinator {
+        let mut recovered = RecoveredState {
+            chain_origin: ChainOrigin {
+                genesis_height: BlockHeight::new(10),
+                anchor_wt: cut,
+            },
+            predecessors: vec![PredecessorTerminal {
+                shard: ShardId::leaf(1, 0),
+                height: BlockHeight::new(9),
+                block_hash: BlockHash::ZERO,
+                committed_txs_root: CommittedTxsRoot::ZERO,
+            }],
+            ..RecoveredState::default()
+        };
+        recovered.latest_qc = Some(Verified::new_unchecked_for_test(QuorumCertificate::new(
+            BlockHash::ZERO,
+            ShardId::ROOT,
+            BlockHeight::new(10),
+            BlockHash::ZERO,
+            Round::new(1),
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            now,
+        )));
+        ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            recovered,
+        )
+    }
+
+    fn precut_tx(seed: u8, opens_ms: u64) -> Arc<Transaction> {
+        test_utils::install_stub_vm_statics();
+        Arc::new(test_utils::stub_transaction(
+            test_utils::test_prefix(seed),
+            &[test_utils::test_prefix(seed)],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::from_millis(opens_ms),
+                WeightedTimestamp::from_millis(opens_ms + 100_000),
+            ),
+        ))
+    }
+
+    /// A chain born at network genesis anchors at zero, so nothing can
+    /// open before it and nothing is ever asked.
+    #[test]
+    fn a_genesis_chain_asks_nothing() {
+        let (state, _) = make_test_state();
+        assert!(!state.precut_rule_live());
+        assert!(
+            state
+                .outstanding_precut_queries([TxHash::from(Hash::from_bytes(b"probe"))])
+                .is_empty()
+        );
+    }
+
+    /// A candidate that opened before the cut is owed an answer by the
+    /// predecessor; one that opened after is this chain's own business.
+    #[test]
+    fn a_successor_asks_its_predecessor_about_pre_cut_candidates() {
+        let state = make_successor(
+            WeightedTimestamp::from_millis(10_000),
+            WeightedTimestamp::from_millis(10_500),
+        );
+        let predecessor = state.predecessors()[0];
+        let probe = TxHash::from(Hash::from_bytes(b"probe"));
+
+        assert_eq!(
+            state.outstanding_precut_queries([probe]),
+            vec![(predecessor, probe)]
+        );
+    }
+
+    /// A transaction carried by a block awaiting a vote is asked about
+    /// even though nothing handed it to the scan. The vote deferred on
+    /// it, and nothing else would issue the query that releases it.
+    #[test]
+    fn a_block_awaiting_a_vote_contributes_its_own_pre_cut_transactions() {
+        let mut state = make_successor(
+            WeightedTimestamp::from_millis(10_000),
+            WeightedTimestamp::from_millis(10_500),
+        );
+        let predecessor = state.predecessors()[0];
+        // One opens before the cut, one after; only the first is the
+        // predecessor's business.
+        let before = precut_tx(1, 9_000);
+        let after = precut_tx(2, 10_500);
+        let block = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(11),
+            10_600,
+            ValidatorId::new(1),
+            vec![Arc::clone(&before), Arc::clone(&after)],
+            vec![],
+        );
+        install_complete_block(&mut state, &block);
+
+        assert_eq!(
+            state.outstanding_precut_queries(std::iter::empty()),
+            vec![(predecessor, before.hash())]
+        );
+    }
+
+    /// Once the chain's clock has run `MAX_VALIDITY_RANGE` past its
+    /// origin the rule retires: nothing still valid can have opened
+    /// before the cut, so the queries stop even with candidates on hand.
+    #[test]
+    fn the_queries_retire_with_the_rule() {
+        let cut = WeightedTimestamp::from_millis(10_000);
+        let state = make_successor(cut, cut.plus(MAX_VALIDITY_RANGE));
+        assert!(!state.precut_rule_live());
+        assert!(
+            state
+                .outstanding_precut_queries([TxHash::from(Hash::from_bytes(b"probe"))])
+                .is_empty()
+        );
+    }
+
+    /// An answered pair drops out; its sibling stays owed.
+    #[test]
+    fn an_answered_pair_is_no_longer_outstanding() {
+        let mut state = make_successor(
+            WeightedTimestamp::from_millis(10_000),
+            WeightedTimestamp::from_millis(10_500),
+        );
+        let predecessor = state.predecessors()[0];
+        let answered = TxHash::from(Hash::from_bytes(b"answered"));
+        let owed = TxHash::from(Hash::from_bytes(b"owed"));
+
+        state.record_precut_resolution(predecessor.shard, answered, true);
+        assert_eq!(
+            state.outstanding_precut_queries([answered, owed]),
+            vec![(predecessor, owed)]
+        );
     }
 
     #[test]

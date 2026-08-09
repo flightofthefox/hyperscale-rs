@@ -16,7 +16,8 @@ use crate::beacon;
 use crate::fetch::FetchInput;
 use crate::shard::ShardLoop;
 use crate::shard::cross_shard::{
-    ExecCertBinding, FinalizationBinding, LocalProvisionBinding, ProvisionBinding,
+    CommittedTxBinding, ExecCertBinding, FinalizationBinding, LocalProvisionBinding,
+    ProvisionBinding,
 };
 use crate::shard::mempool::TransactionBinding;
 
@@ -43,5 +44,6 @@ where
         self.drive_fetch::<FinalizationBinding>(FetchInput::Tick);
         self.drive_fetch::<ProvisionBinding>(FetchInput::Tick);
         self.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
+        self.drive_fetch::<CommittedTxBinding>(FetchInput::Tick);
     }
 }

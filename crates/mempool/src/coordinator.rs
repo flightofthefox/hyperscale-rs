@@ -979,6 +979,23 @@ impl MempoolCoordinator {
             .count()
     }
 
+    /// Transactions still awaiting inclusion whose validity window opened
+    /// before `wt`. Parked ones included: a reshape successor refuses
+    /// them all until it can prove them absent from what its predecessor
+    /// committed, so being unselectable for another reason doesn't make
+    /// the question moot.
+    #[must_use]
+    pub fn pending_opening_before(&self, wt: WeightedTimestamp) -> Vec<TxHash> {
+        self.pool
+            .iter()
+            .filter(|(_, entry)| {
+                matches!(entry.status, TransactionStatus::Pending)
+                    && entry.tx.validity_range().start_timestamp_inclusive < wt
+            })
+            .map(|(hash, _)| *hash)
+            .collect()
+    }
+
     /// Check if we're at the pending transaction limit for RPC backpressure.
     ///
     /// When at this limit, new RPC transaction submissions are rejected to

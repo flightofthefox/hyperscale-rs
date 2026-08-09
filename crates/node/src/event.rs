@@ -23,8 +23,9 @@ use hyperscale_network::RequestError;
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
-    FinalizationHash, HeaderFetchCount, LeafIndex, ProvisionHash, ShardForkProof, ShardId,
-    ShardVoteEquivocation, Transaction, TxHash, ValidatorId, Verifiable, Verified,
+    FinalizationHash, HeaderFetchCount, LeafIndex, PredecessorTerminal, ProvisionHash,
+    ShardForkProof, ShardId, ShardVoteEquivocation, Transaction, TxHash, ValidatorId, Verifiable,
+    Verified,
 };
 
 use crate::shard::commit::QcOnlyDivergence;
@@ -382,6 +383,24 @@ pub enum ShardScopedInput {
         hashes: Vec<(ShardId, TxHash)>,
     },
 
+    /// A committed-transaction query went unanswered — a transport
+    /// failure, a peer that doesn't hold the named terminal, or a
+    /// response this node can't lift to the attested root. Whole-batch,
+    /// because a response is usable or it isn't.
+    CommittedTxsFetchFailed {
+        /// `(predecessor, transaction)` pairs still owed an answer.
+        ids: Vec<(PredecessorTerminal, TxHash)>,
+    },
+
+    /// A committed-transaction query was answered and verified: release
+    /// the fetch slots. Keyed by the *request* ids, so a peer's payload
+    /// can't leave a slot pinned. The answers themselves ride the
+    /// accompanying `ProtocolEvent::PrecutResolutionsReceived`.
+    CommittedTxsFetchFulfilled {
+        /// `(predecessor, transaction)` pairs the response answered.
+        ids: Vec<(PredecessorTerminal, TxHash)>,
+    },
+
     /// A shard-witness chunk fetch failed (network error, empty response,
     /// or the peer's window was pruned). Per-id so multiple in-flight
     /// runs can fail independently.
@@ -507,6 +526,8 @@ impl ShardScopedInput {
             | Self::ExecCertFetchFailed { .. }
             | Self::LocalProvisionsFetchFailed { .. }
             | Self::FinalizationsFetchFailed { .. }
+            | Self::CommittedTxsFetchFailed { .. }
+            | Self::CommittedTxsFetchFulfilled { .. }
             | Self::ShardWitnessesFetchFailed { .. }
             | Self::ShardWitnessesFetchFulfilled { .. }
             | Self::BeaconProposalFetchFailed { .. }

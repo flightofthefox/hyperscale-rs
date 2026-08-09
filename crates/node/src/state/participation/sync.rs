@@ -6,9 +6,11 @@
 //! provisions flush their expected sets so we can immediately
 //! participate in execution for blocks within the `MAX_FINALIZATION_DELAY` window.
 
-use hyperscale_core::{Action, ProtocolEvent};
+use std::collections::BTreeMap;
+
+use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_shard::SettledTxSet;
-use hyperscale_types::TopologySchedule;
+use hyperscale_types::{PredecessorTerminal, TopologySchedule, TxHash};
 
 use super::ShardParticipation;
 
@@ -78,6 +80,24 @@ impl ShardParticipation {
                 );
                 actions
             }
+            // A predecessor answered which of the queried transactions it
+            // committed. Record the answers, then re-drive the votes that
+            // deferred for want of them and the proposal that was
+            // filtering them out.
+            ProtocolEvent::PrecutResolutionsReceived {
+                predecessor,
+                answers,
+            } => {
+                for (tx_hash, absent) in answers {
+                    self.shard_coordinator
+                        .record_precut_resolution(predecessor, tx_hash, absent);
+                }
+                let actions = self
+                    .shard_coordinator
+                    .redrive_pending_votes(topology_schedule);
+                self.shard_coordinator.queue_ready_proposal();
+                actions
+            }
             _ => unreachable!("non-sync event routed to handle_sync"),
         }
     }
@@ -145,6 +165,50 @@ impl ShardParticipation {
             });
         }
         actions
+    }
+
+    /// Ask each predecessor about the pre-cut transactions this node is
+    /// still holding a refusal over.
+    ///
+    /// One request per predecessor, carrying that predecessor's complete
+    /// outstanding set — the io side diffs it against what the fetch
+    /// already holds, so a pair that drops out of the set here is what
+    /// releases its slot. That is why a predecessor with nothing
+    /// outstanding still gets a request: an empty set is how the last
+    /// query retires.
+    ///
+    /// Silent on a chain the rule no longer applies to, which is where
+    /// the mempool walk would otherwise cost the most for nothing.
+    pub(in crate::state) fn scan_precut_queries(&self) -> Vec<Action> {
+        if !self.shard_coordinator.precut_rule_live() {
+            return Vec::new();
+        }
+        let cut = self.shard_coordinator.chain_origin().anchor_wt;
+        let candidates = self.mempool_coordinator.pending_opening_before(cut);
+        let outstanding = self
+            .shard_coordinator
+            .outstanding_precut_queries(candidates);
+
+        let mut by_predecessor: BTreeMap<PredecessorTerminal, Vec<TxHash>> = self
+            .shard_coordinator
+            .predecessors()
+            .iter()
+            .map(|predecessor| (*predecessor, Vec::new()))
+            .collect();
+        for (predecessor, tx_hash) in outstanding {
+            by_predecessor.entry(predecessor).or_default().push(tx_hash);
+        }
+        by_predecessor
+            .into_iter()
+            .map(|(predecessor, tx_hashes)| {
+                Action::Fetch(FetchRequest::CommittedTxs {
+                    predecessor,
+                    tx_hashes,
+                    preferred: None,
+                    class: None,
+                })
+            })
+            .collect()
     }
 }
 

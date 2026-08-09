@@ -18,8 +18,8 @@
 //! the fetch key (no id-set to enumerate).
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, MessageClass, ProvisionHash,
-    ShardId, TxHash, ValidatorId,
+    BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, MessageClass, PredecessorTerminal,
+    ProvisionHash, ShardId, TxHash, ValidatorId,
 };
 
 /// Fetch family — one variant per payload type.
@@ -117,6 +117,28 @@ pub enum FetchRequest {
         /// End of the run, exclusive.
         hi: LeafIndex,
         /// Canonical-source hint, when one exists.
+        preferred: Option<ValidatorId>,
+        /// Optional class override; see enum-level doc.
+        class: Option<MessageClass>,
+    },
+    /// Committed-transaction membership query against a chain this one
+    /// succeeds. Routing shard is `predecessor.shard`, whose committee
+    /// still answers while any retained window carries it. `preferred`
+    /// is `None`: every member of the terminal committee holds the same
+    /// answer, so health-weighted rotation is what moves off a peer that
+    /// serves `not_found` or an unusable proof.
+    ///
+    /// The predecessor rides whole rather than as a shard id. Its
+    /// terminal names the window the server reconstructs, and its
+    /// `committed_txs_root` is what an absence proof is checked against
+    /// before any answer reaches the coordinator.
+    CommittedTxs {
+        /// The chain being queried and the terminal to resolve against.
+        predecessor: PredecessorTerminal,
+        /// Transactions whose membership in that chain's committed set
+        /// is outstanding.
+        tx_hashes: Vec<TxHash>,
+        /// Always `None` for this variant; see variant-level doc.
         preferred: Option<ValidatorId>,
         /// Optional class override; see enum-level doc.
         class: Option<MessageClass>,

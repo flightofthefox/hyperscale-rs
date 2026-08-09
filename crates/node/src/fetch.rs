@@ -197,6 +197,14 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
         self.pending.len()
     }
 
+    /// Every id currently tracked, in sorted order. A driver whose
+    /// consumer re-derives its wanted set each tick diffs against this to
+    /// abandon what the consumer no longer asks for — without it an id
+    /// nobody answers stays in the pending set for the process's life.
+    pub fn pending_ids(&self) -> impl Iterator<Item = &Id> {
+        self.pending.keys()
+    }
+
     /// Age in milliseconds of the longest-running in-flight entry, or
     /// `0` if nothing is in flight. Surfaced through `ShardIo::fetch_metrics`
     /// so an alert on `> N` catches admission paths that silently dropped

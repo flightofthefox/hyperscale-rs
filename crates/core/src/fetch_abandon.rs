@@ -11,8 +11,8 @@
 //! `FetchInput::Abandoned` on the corresponding binding.
 
 use hyperscale_types::{
-    BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, ProvisionHash, ShardId, TxHash,
-    ValidatorId,
+    BlockHash, BlockHeight, Epoch, FinalizationHash, LeafIndex, PredecessorTerminal, ProvisionHash,
+    ShardId, TxHash, ValidatorId,
 };
 
 /// Fetch-cancel family — one variant per payload type. Variants are added
@@ -69,6 +69,18 @@ pub enum FetchAbandon {
     ExecutionCerts {
         /// Transactions whose in-flight EC fetch should be cancelled.
         ids: Vec<(ShardId, TxHash)>,
+    },
+    /// Committed-transaction membership query keyed by
+    /// `(predecessor, tx_hash)`. Emitted by the acquisition scan when a
+    /// pair it previously asked about drops out of the outstanding set
+    /// without an answer — the transaction expired out of the mempool,
+    /// or the chain outlived its origin and the rule that wanted the
+    /// answer no longer applies. Nothing else retires these ids: a
+    /// terminated committee that never answers would otherwise pin them
+    /// for the process's life.
+    CommittedTxs {
+        /// `(predecessor, transaction)` pairs whose query should stop.
+        ids: Vec<(PredecessorTerminal, TxHash)>,
     },
     /// Missing-proposal fetch keyed by `(epoch, validator)`. Emitted by
     /// the beacon coordinator when a pending commit-assembly stash is

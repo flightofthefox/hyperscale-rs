@@ -455,7 +455,8 @@ impl StateMachine for NodeStateMachine {
             evt @ (ProtocolEvent::BlockSyncReadyToApply { .. }
             | ProtocolEvent::BlockSyncComplete { .. }
             | ProtocolEvent::RemoteHeaderSyncComplete { .. }
-            | ProtocolEvent::SettledTxsReconstructed { .. }) => {
+            | ProtocolEvent::SettledTxsReconstructed { .. }
+            | ProtocolEvent::PrecutResolutionsReceived { .. }) => {
                 self.with_shard(move |s, sched| s.handle_sync(sched, evt))
             }
 

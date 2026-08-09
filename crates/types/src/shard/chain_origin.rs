@@ -50,7 +50,7 @@ impl Default for ChainOrigin {
 /// A split child has one. A merged parent has two, and a transaction is
 /// only safe to admit when it is absent from both: a proof from one child
 /// says nothing about what the other committed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PredecessorTerminal {
     /// The shard that terminated — whose committee answers the query.
     pub shard: ShardId,

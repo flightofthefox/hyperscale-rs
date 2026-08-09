@@ -36,6 +36,12 @@ impl ShardParticipation {
 
         actions.extend(self.recover_stalled_fallback_fetches(sched));
 
+        // Ask the predecessors about anything still refused for opening
+        // before this chain did. Also the only pass that runs when the
+        // outstanding set has emptied, which is what releases the last
+        // query's slot.
+        actions.extend(self.scan_precut_queries());
+
         // Drop tombstones whose `end_timestamp_exclusive` has passed — past
         // expiry, validator-side validity check rejects re-submission anyway.
         self.mempool_coordinator.cleanup_expired_tombstones();
