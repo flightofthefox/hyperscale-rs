@@ -800,14 +800,15 @@ impl ExecutionCoordinator {
 
         // Only the tick leader creates a `VoteTracker` for aggregation.
         // Resolved under the committee seated at the tick's own block,
-        // which is the one that will verify the certificate.
+        // which is the one that will verify the certificate. A window this
+        // shard has already left seats nobody, and there is no leader to
+        // be: the tick composes, but no vote it could carry would reach a
+        // quorum.
         let mut votes_to_replay: Vec<Verifiable<ExecutionVote>> = Vec::new();
         if let Some(committee) = topology_schedule.at(block.ts)
-            && self.me
-                == tick_leader(
-                    &tick_id,
-                    committee.consensus_committee_for_shard(local_shard),
-                )
+            && let seated = committee.consensus_committee_for_shard(local_shard)
+            && !seated.is_empty()
+            && self.me == tick_leader(&tick_id, seated)
         {
             let quorum = committee.quorum_threshold_for_shard(local_shard);
             self.ticks
@@ -1931,11 +1932,16 @@ impl ExecutionCoordinator {
         } in effects
         {
             // The rotated leader is drawn from the committee seated at the
-            // tick's anchor — the one that will verify the EC. `None` (beacon
-            // behind) defers this retry to a later commit.
+            // tick's anchor — the one that will verify the EC. Two ways
+            // there is nobody to rotate to, and both defer the retry to a
+            // later commit rather than resolving a leader: the beacon is
+            // behind the anchor, or the anchor resolves a window this
+            // shard has already left, where its committee is empty and no
+            // vote can reach a quorum anyway.
             let Some(committee) = topology_schedule
                 .at(vote_anchor_ts)
                 .map(|s| s.consensus_committee_for_shard(self.local_shard).to_vec())
+                .filter(|committee| !committee.is_empty())
             else {
                 continue;
             };
@@ -3020,8 +3026,16 @@ impl ExecutionCoordinator {
             trackers = counts.trackers,
             assignments = counts.assignments,
             expected_certs = expected.len(),
+            unresolved = self.unresolved.len(),
             "Chain terminated — dropped pending execution state"
         );
+        // What the chain owes an outcome for goes with the rest. The
+        // ledger's entries are abandonable at their deadlines, and a
+        // deadline falling after the terminal would have this chain
+        // compose a tick to abandon them in — on a coast block, under a
+        // committee it no longer has. Nothing here can reach a verdict
+        // either way, which is the same reason the ticks above go.
+        self.unresolved = UnresolvedTxs::default();
         // The terminated chain's tick outputs die with it: successors seed
         // from settled state, and pending resolutions have nothing left to
         // resolve against. A tick still in flight lands on a cleared
