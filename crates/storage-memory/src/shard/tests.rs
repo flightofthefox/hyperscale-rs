@@ -2,20 +2,24 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_storage::test_helpers::{
-    make_settled_writes, make_test_block, make_test_certified, make_test_qc, state_key,
+    make_settled_writes, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
+    make_test_qc, state_key,
 };
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    CommittableSubstateDatabase, ParentAnchor, SafeVoteRegisterStore, ShardChainReader,
-    ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore, test_helpers,
+    CommittableSubstateDatabase, DedupWindow, ParentAnchor, SafeVoteRegisterStore,
+    ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore, VersionedStore,
+    test_helpers,
 };
-use hyperscale_types::test_utils::test_transaction;
+use hyperscale_types::test_utils::{
+    install_stub_vm_statics, stub_transaction, test_prefix, test_transaction,
+};
 use hyperscale_types::{
     Address, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock,
     ChainOrigin, ConsensusReceipt, Finalization, GlobalReceiptHash, Hash, LocalKey,
     ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId,
-    StateRoot, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId, TxHash, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    StateRoot, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId, TimestampRange, Transaction,
+    TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -1049,4 +1053,141 @@ fn safe_vote_registers_ignore_stale_chain_incarnation() {
 
     storage.persist_safe_vote_registers(v, registers(1, 2));
     assert_eq!(storage.safe_vote_registers(v), Some(registers(1, 2)));
+}
+
+// ─── Dedup window ───────────────────────────────────────────────────
+//
+// The window a coordinator rebuilds when it resumes a chain it did not
+// commit itself. An empty index refuses no duplicate, so what these pin
+// is that the fold reaches back far enough and reports honestly when it
+// cannot.
+
+/// A block at `height` anchored at `anchor_wt_ms`, carrying `txs`.
+fn block_with_txs(
+    height: BlockHeight,
+    anchor_wt_ms: u64,
+    txs: Vec<Arc<Verifiable<Transaction>>>,
+) -> Block {
+    match make_test_block_with_anchor_wt(height, anchor_wt_ms) {
+        Block::Live {
+            header,
+            certificates,
+            provisions,
+            witness_sources,
+            ..
+        } => Block::Live {
+            header,
+            transactions: Arc::new(txs),
+            certificates,
+            provisions,
+            witness_sources,
+        },
+        sealed @ Block::Sealed { .. } => sealed,
+    }
+}
+
+/// A transaction whose signed window ends at `end_ms` — the deadline the
+/// fold has to recover for it.
+fn dedup_tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
+    install_stub_vm_statics();
+    let validity = TimestampRange::new(
+        WeightedTimestamp::ZERO,
+        WeightedTimestamp::from_millis(end_ms),
+    );
+    Arc::new(Verifiable::from(stub_transaction(
+        test_prefix(seed),
+        &[test_prefix(seed)],
+        1_000,
+        validity,
+    )))
+}
+
+/// The fold recovers each committed transaction against its own signed
+/// deadline, not against when the block carrying it committed.
+#[test]
+fn dedup_window_recovers_committed_txs_with_their_own_deadlines() {
+    let storage = SimShardStorage::default();
+    let tx = dedup_tx(1, 90_000);
+    let tx_hash = tx.hash();
+    let block = block_with_txs(BlockHeight::new(1), 1_000, vec![tx]);
+    let qc = make_test_qc(&block);
+    commit_empty(&storage, &block, &qc);
+
+    let window = DedupWindow::from_reader(
+        &storage,
+        BlockHeight::new(1),
+        WeightedTimestamp::from_millis(1_000),
+        BlockHeight::new(1),
+    );
+
+    assert_eq!(
+        window.committed,
+        vec![(tx_hash, WeightedTimestamp::from_millis(90_000))],
+    );
+}
+
+/// A walk that reaches the chain's first block is whole however short its
+/// span: nothing below it was ever committed to have been missed.
+#[test]
+fn dedup_window_reaching_the_chain_origin_is_whole() {
+    let storage = SimShardStorage::default();
+    let block = block_with_txs(BlockHeight::new(1), 1_000, vec![dedup_tx(2, 90_000)]);
+    let qc = make_test_qc(&block);
+    commit_empty(&storage, &block, &qc);
+
+    let window = DedupWindow::from_reader(
+        &storage,
+        BlockHeight::new(1),
+        WeightedTimestamp::from_millis(1_000),
+        BlockHeight::new(1),
+    );
+
+    assert!(window.reached_origin, "the walk bottomed out at height 1");
+}
+
+/// A chain holding nothing below the height it starts at leaves the window
+/// short rather than empty — the shape a snap-synced store has, whose
+/// origin sits far below the anchor it imported at.
+///
+/// Empty is the safe answer for a replay window and the unsafe one here:
+/// an index covering nothing refuses nothing, so the shortfall has to be
+/// reported instead of erasing the window.
+#[test]
+fn dedup_window_stops_short_without_claiming_the_origin() {
+    let storage = SimShardStorage::default();
+    // Three blocks, all inside the window, none of them the chain's
+    // claimed origin — so the walk runs out beneath them.
+    let tx = dedup_tx(3, 900_000);
+    let tx_hash = tx.hash();
+    for height in 1..=3u64 {
+        let txs = if height == 3 {
+            vec![tx.clone()]
+        } else {
+            vec![]
+        };
+        let block = block_with_txs(BlockHeight::new(height), 400_000 + height, txs);
+        let qc = make_test_qc(&block);
+        commit_empty(&storage, &block, &qc);
+    }
+
+    let window = DedupWindow::from_reader(
+        &storage,
+        BlockHeight::new(3),
+        WeightedTimestamp::from_millis(400_003),
+        BlockHeight::GENESIS,
+    );
+
+    assert_eq!(
+        window.committed,
+        vec![(tx_hash, WeightedTimestamp::from_millis(900_000))],
+    );
+    assert!(
+        !window.reached_origin,
+        "a walk that ran out of blocks above its origin has not reached it",
+    );
+    assert_eq!(
+        window.covered_from,
+        Some(WeightedTimestamp::from_millis(400_001)),
+        "coverage reaches as deep as the oldest block it read",
+    );
 }

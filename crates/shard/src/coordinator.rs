@@ -58,6 +58,11 @@ pub struct ShardMemoryStats {
     /// Committed tx-hash → `end_timestamp_exclusive` entries used for fast
     /// dedup lookup.
     pub committed_tx_lookup: usize,
+    /// Whether the dedup lookups above cover the whole retention window.
+    /// False while a coordinator that resumed or joined mid-chain is still
+    /// folding forward to it, during which it refuses fewer duplicates
+    /// than a peer that committed the window itself.
+    pub dedup_window_complete: bool,
     /// Committed tick-id → deadline entries for proposal/validation dedup.
     /// Keyed by `vote_anchor_ts + RETENTION_HORIZON`.
     pub committed_resolution_lookup: usize,
@@ -471,6 +476,16 @@ impl ShardCoordinator {
             .get(&me)
             .copied()
             .unwrap_or_default();
+        // Seeded from the chain the store kept, not constructed empty: an
+        // empty index refuses no duplicate, so a coordinator resuming a
+        // chain without it re-admits everything the window still covers.
+        // A chain with no committed tip has nothing beneath it to have
+        // missed, which is known rather than guessed — the same reading
+        // the reveal chain and load take from an absent tip.
+        let mut dedup_index = CommitDedupIndex::seeded(&recovered.dedup);
+        if recovered.committed_hash.is_none() {
+            dedup_index.cover_to_origin();
+        }
         Self {
             verifier,
             view_change: ViewChangeController::new(initial_view),
@@ -524,7 +539,7 @@ impl ShardCoordinator {
             ),
             block_sync: BlockSyncManager::new(),
             proposal: ProposalTracker::new(),
-            dedup_index: CommitDedupIndex::new(),
+            dedup_index,
             ready_signal_pool: ReadySignalPool::new(),
             detected_equivocators: BTreeSet::new(),
             beacon_witness_accumulator: BeaconWitnessAccumulator::from_leaves(
@@ -4500,6 +4515,12 @@ impl ShardCoordinator {
             || BlockManifest::from_block(block),
             |pending| pending.manifest().clone(),
         );
+        // Committing a block is also what deepens the index's own
+        // coverage: a coordinator seeded short of the horizon reaches it
+        // by folding forward, and these are the blocks a backward walk
+        // would otherwise have had to read.
+        self.dedup_index
+            .cover(block.header().parent_qc().weighted_timestamp());
         self.dedup_index
             .register_committed_txs(block.transactions());
         self.dedup_index
@@ -6059,6 +6080,7 @@ impl ShardCoordinator {
             pending_commits_awaiting_data: 0,
             received_votes_by_height: self.votes.received_votes_len(),
             committed_tx_lookup: self.dedup_index.tx_retention_len(),
+            dedup_window_complete: self.dedup_index.is_complete(self.committed_ts),
             committed_resolution_lookup: self.dedup_index.resolved_tx_retention_len(),
             committed_provision_lookup: self.dedup_index.provision_retention_len(),
             pending_qc_verifications: self.verification.pending_qc_verifications_len(),

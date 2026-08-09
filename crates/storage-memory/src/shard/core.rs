@@ -15,7 +15,8 @@ use hyperscale_jmt::NibblePath;
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::put_at_version;
 use hyperscale_storage::{
-    GenesisCommit, ImportProgress, RecoveredState, SubstateDatabase, SubstateStore, replay_window,
+    DedupWindow, GenesisCommit, ImportProgress, RecoveredState, SubstateDatabase, SubstateStore,
+    replay_window,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, SettledWrites, StateRoot,
@@ -204,6 +205,12 @@ impl SimShardStorage {
                 self,
                 committed_height,
                 committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
+            ),
+            dedup: DedupWindow::from_reader(
+                self,
+                committed_height,
+                committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
+                chain_origin.genesis_height,
             ),
             retained_provisions,
             committed_hash,

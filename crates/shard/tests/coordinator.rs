@@ -65,6 +65,7 @@ fn memory_stats_reports_all_zeros_for_fresh_coordinator() {
         pending_commits_awaiting_data,
         received_votes_by_height,
         committed_tx_lookup,
+        dedup_window_complete,
         committed_resolution_lookup,
         committed_provision_lookup,
         pending_qc_verifications,
@@ -81,6 +82,10 @@ fn memory_stats_reports_all_zeros_for_fresh_coordinator() {
     assert_eq!(pending_commits_awaiting_data, 0);
     assert_eq!(received_votes_by_height, 0);
     assert_eq!(committed_tx_lookup, 0);
+    assert!(
+        dedup_window_complete,
+        "a chain with no committed tip has nothing beneath it to have missed",
+    );
     assert_eq!(committed_resolution_lookup, 0);
     assert_eq!(committed_provision_lookup, 0);
     assert_eq!(pending_qc_verifications, 0);

@@ -10,6 +10,7 @@ use hyperscale_types::{
     ValidatorId, Verified, WeightedTimestamp, WorkInFlight,
 };
 
+use super::dedup_window::DedupWindow;
 use super::unresolved::ReplayWindow;
 
 /// State recovered from storage on startup.
@@ -31,6 +32,19 @@ pub struct RecoveredState {
     /// replica had before it went down — neither of which survives the
     /// restart this state exists to recover from.
     pub replay: ReplayWindow,
+
+    /// The committed artifacts a coordinator has to refuse a second
+    /// inclusion of, rebuilt from the chain the restart kept.
+    ///
+    /// A different and wider question from [`replay`](Self::replay), which
+    /// is bounded by what is still owed an outcome and is empty when
+    /// nothing is: a chain that resolved everything it committed has no
+    /// replay window and a full dedup window. So this walks its own range
+    /// — every block within [`RETENTION_HORIZON`] of the tip — rather than
+    /// reusing that floor.
+    ///
+    /// [`RETENTION_HORIZON`]: hyperscale_types::RETENTION_HORIZON
+    pub dedup: DedupWindow,
 
     /// The provision bodies still held for the blocks that carried them.
     /// A stored block keeps only their hashes, so this is what puts them
@@ -183,6 +197,10 @@ impl RecoveredState {
             // replica knows of nothing in flight beneath it: no block to
             // replay, and none that carried a bundle.
             replay: ReplayWindow::default(),
+            // Nothing below the anchor is imported, so there is no chain
+            // to fold a dedup window out of yet. The tail sync above the
+            // anchor supplies it as it commits.
+            dedup: DedupWindow::covering_nothing(),
             retained_provisions: Vec::new(),
             committed_hash: Some(anchor.block_hash),
             latest_qc: None,

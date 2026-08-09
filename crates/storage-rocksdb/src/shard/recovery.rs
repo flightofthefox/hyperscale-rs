@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_metrics::record_storage_operation;
-use hyperscale_storage::{RecoveredState, SubstateStore, replay_window};
+use hyperscale_storage::{DedupWindow, RecoveredState, SubstateStore, replay_window};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, Hash, Provisions,
     RevealChain, SafeVoteRegisters, ShardLoad, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
@@ -74,6 +74,12 @@ impl RocksDbShardStorage {
                 self,
                 committed_height,
                 committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
+            ),
+            dedup: DedupWindow::from_reader(
+                self,
+                committed_height,
+                committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
+                chain_origin.genesis_height,
             ),
             retained_provisions: self.load_retained_provisions(),
             committed_hash: committed_hash.map(BlockHash::from_raw),

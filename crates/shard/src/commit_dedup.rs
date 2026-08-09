@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use hyperscale_storage::DedupWindow;
 use hyperscale_types::{
     Finalization, ProvisionHash, Provisions, RETENTION_HORIZON, ShardId, Transaction, TxHash,
     Verifiable, WeightedTimestamp,
@@ -62,16 +63,94 @@ pub struct CommitDedupIndex {
     /// bundle in the same block as its transactions, so the
     /// committed-earlier arm is the rare mis-pairing remnant.
     provision_tx_retention: HashMap<(ShardId, TxHash), WeightedTimestamp>,
+    /// The oldest block anchor this index has folded, or `None` before it
+    /// has folded any.
+    ///
+    /// The maps cannot express what this does: "nothing was committed"
+    /// and "what was committed is unknown" are both an empty map, and
+    /// they call for opposite treatment. Depth is what separates them.
+    covered_from: Option<WeightedTimestamp>,
+    /// Whether the coverage bottoms out at the chain's own origin, below
+    /// which there is nothing to have missed.
+    reached_origin: bool,
 }
 
 impl CommitDedupIndex {
+    /// An index covering nothing and knowing it.
+    ///
+    /// Only for a coordinator that has no chain to fold — a genuinely new
+    /// chain. Anything resuming one seeds from [`Self::seeded`] instead,
+    /// because an unseeded index refuses no duplicate at all.
     pub fn new() -> Self {
         Self {
             tx_retention: HashMap::new(),
             resolved_tx_retention: HashMap::new(),
             provision_retention: HashMap::new(),
             provision_tx_retention: HashMap::new(),
+            covered_from: None,
+            reached_origin: false,
         }
+    }
+
+    /// An index rebuilt from a window folded off committed blocks.
+    ///
+    /// The transaction and resolution tiers reproduce what the live path
+    /// registered, because neither deadline depends on when the fold ran.
+    /// `provision_tx_retention` stays empty: it is fed from bundle
+    /// *content*, which sealing drops, so a rebuilt index votes
+    /// conservatively on the engagement mirror across the window — the
+    /// same position a freshly synced validator already holds.
+    #[must_use]
+    pub fn seeded(window: &DedupWindow) -> Self {
+        let mut index = Self::new();
+        index.tx_retention.extend(window.committed.iter().copied());
+        index
+            .resolved_tx_retention
+            .extend(window.resolved.iter().copied());
+        index
+            .provision_retention
+            .extend(window.provisions.iter().copied());
+        index.covered_from = window.covered_from;
+        index.reached_origin = window.reached_origin;
+        index
+    }
+
+    /// Whether the index covers the whole window a chain at `now` has to
+    /// refuse duplicates across.
+    ///
+    /// True once the coverage runs a full [`RETENTION_HORIZON`] behind
+    /// `now`, or bottoms out at the chain's own origin — below which
+    /// nothing was ever committed to be missed.
+    ///
+    /// A false answer means the index under-refuses by an unknown amount.
+    /// The lookups stay honest about what they hold either way — they
+    /// just hold less — so this is what separates "nothing was committed"
+    /// from "what was committed is not all known".
+    #[must_use]
+    pub fn is_complete(&self, now: WeightedTimestamp) -> bool {
+        self.reached_origin
+            || self
+                .covered_from
+                .is_some_and(|from| now.elapsed_since(from) >= RETENTION_HORIZON)
+    }
+
+    /// Record that the coverage bottoms out at the chain's origin.
+    ///
+    /// For a chain with no committed tip: nothing beneath it was ever
+    /// committed, so there is nothing to have missed and no span to wait
+    /// out.
+    pub const fn cover_to_origin(&mut self) {
+        self.reached_origin = true;
+    }
+
+    /// Deepen the coverage to include a block anchored at `anchor`.
+    ///
+    /// Coverage only ever extends backwards to the oldest block folded,
+    /// so a chain that starts short of the horizon reaches it by
+    /// committing across it — the blocks it commits are the same evidence
+    /// a walk would have read.
+    pub fn cover(&mut self, anchor: WeightedTimestamp) {
+        self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
     }
 
     /// Record a block's transactions in the retention lookup. Each entry's
