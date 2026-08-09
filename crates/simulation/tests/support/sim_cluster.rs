@@ -21,12 +21,12 @@ use hyperscale_scenarios::tx::{staking_genesis_accounts, world_accounts, world_p
 use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
 };
-use hyperscale_simulation::{EPOCH_MS, ExecutionMode, SimConfig, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, ExecutionMode, JoinKind, SimConfig, SimulationRunner};
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_types::{
-    Address, BeaconChainConfig, BeaconState, BlockHeight, ConsensusReceipt, Event, LocalKey,
-    ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, ValidatorId,
+    Address, BeaconChainConfig, BeaconState, BlockHeight, CertifiedBlock, ConsensusReceipt, Event,
+    LocalKey, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, ValidatorId, Verified,
 };
 
 /// The clock slice `run_until` advances per poll, matching the runner's own
@@ -282,6 +282,56 @@ impl SimCluster {
                     .is_some_and(|vnode| committee.contains(&vnode.validator_id()))
             })
             .collect()
+    }
+
+    /// The block `host` committed at `height` on `shard`, if it holds
+    /// one there.
+    ///
+    /// Per-host rather than per-shard: comparing two replicas is the
+    /// point, and comparing them at one height is what makes the answer
+    /// mean anything.
+    #[must_use]
+    pub fn host_block(
+        &self,
+        host: usize,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> Option<Verified<CertifiedBlock>> {
+        self.runner
+            .hosts_shard(host_index(host), shard)
+            .and_then(|storage| storage.get_block(height))
+    }
+
+    /// Restart `host`'s replica of `shard`: tear the vnode down and seat
+    /// it again on the storage it kept.
+    ///
+    /// What a process restart leaves behind. The committed chain
+    /// survives on disk; everything consensus and execution held in
+    /// memory — tick assignments, tick outputs, absorbed provisions —
+    /// does not, and has to come back out of committed content.
+    ///
+    /// Sim-only, and deliberately not on [`FaultableCluster`]: that trait
+    /// is the intersection of what both harnesses can do, and bouncing a
+    /// real node process is a larger commitment than this needs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `host` does not serve `shard`, or if the rejoin does not
+    /// take the retained-storage path — a snap-sync there would be a
+    /// different test entirely.
+    pub fn restart_host(&mut self, host: usize, shard: ShardId) {
+        let host = host_index(host);
+        let validator = self
+            .runner
+            .vnode_state_in(host, shard)
+            .expect("restart of a shard this host does not serve")
+            .validator_id();
+        let storage = self.runner.leave_shard(host, shard);
+        let kind = self.runner.join_shard(host, validator, shard, storage);
+        assert!(
+            matches!(kind, JoinKind::Retained { .. }),
+            "a restart resumes the store it kept, not a fresh sync; got {kind:?}",
+        );
     }
 
     /// A host serving any shard `tx` touches, for submission routing. Single
