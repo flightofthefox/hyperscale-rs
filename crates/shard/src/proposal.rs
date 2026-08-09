@@ -153,11 +153,12 @@ impl ProposalTracker {
 ///    survive past mempool eviction — critical after sync).
 /// 2. Txs whose `validity_range` is malformed against `validity_anchor`, or
 ///    whose half-open range does not contain `validity_anchor`.
-/// 3. Txs whose window opened before `chain_origin_wt` — the predecessor's,
-///    on a reshape successor, and refusable on validity alone. This is the
-///    same expression voters apply during block verification, anchored on
-///    the parent QC's `weighted_timestamp`; filtering here saves us from
-///    proposing blocks that will be rejected.
+/// 3. Txs whose window opened before `chain_origin_wt` — the
+///    predecessor's, on a reshape successor — unless `precut_admissible`
+///    says every predecessor proved it absent from its committed set.
+///    This is the same question voters ask during block verification, so
+///    filtering here keeps a proposer from offering what its own voters
+///    would defer on or refuse.
 ///
 /// Logs the dedup and expiry counts when non-zero.
 pub fn select_transactions(
@@ -166,6 +167,7 @@ pub fn select_transactions(
     dedup_index: &CommitDedupIndex,
     validity_anchor: WeightedTimestamp,
     chain_origin_wt: WeightedTimestamp,
+    precut_admissible: &dyn Fn(&TxHash) -> bool,
 ) -> Vec<Arc<Verified<Transaction>>> {
     let before = ready_txs.len();
     let mut deduped = 0;
@@ -186,9 +188,13 @@ pub fn select_transactions(
                 return false;
             }
             // Opened before this chain did, so it belongs to the
-            // predecessor that ran before the cut and the voters will
-            // refuse it. Zero for a chain born at network genesis.
-            if tx.validity_range().start_timestamp_inclusive < chain_origin_wt {
+            // predecessor that ran before the cut. Offerable only where
+            // every predecessor proved it absent from its committed set;
+            // anything else a voter defers on or refuses. Zero for a
+            // chain born at network genesis.
+            if tx.validity_range().start_timestamp_inclusive < chain_origin_wt
+                && !precut_admissible(&h)
+            {
                 predates += 1;
                 return false;
             }
@@ -737,6 +743,61 @@ mod tests {
         CommitDedupIndex::new()
     }
 
+    /// The predicate a chain with no resolved predecessors carries: no
+    /// pre-cut transaction is admissible. Cases anchored at
+    /// `WeightedTimestamp::ZERO` never reach it, since nothing opens
+    /// before an origin of zero.
+    fn refuses_precut(_: &TxHash) -> bool {
+        false
+    }
+
+    /// The predicate for a chain whose predecessors proved everything
+    /// asked about absent from their committed sets.
+    fn admits_precut(_: &TxHash) -> bool {
+        true
+    }
+
+    /// A transaction opening before the chain's origin is dropped while
+    /// unresolved, and offered once every predecessor has proven it
+    /// absent — the whole point of the committed set, seen from the
+    /// proposer's side.
+    #[test]
+    fn select_transactions_offers_a_precut_tx_only_once_resolved_absent() {
+        let cut = ts(10_000);
+        let anchor = ts(10_500);
+        // Opens before the cut, still valid at the anchor: exactly the
+        // population the successor cannot judge on its own.
+        let precut = tx_with_range(9, TimestampRange::new(ts(9_000), ts(40_000)));
+        let txs = vec![precut];
+
+        let refused = select_transactions(
+            &txs,
+            &HashSet::new(),
+            &empty_dedup_index(),
+            anchor,
+            cut,
+            &refuses_precut,
+        );
+        assert!(
+            refused.is_empty(),
+            "an unresolved pre-cut transaction is not offered"
+        );
+
+        let admitted = select_transactions(
+            &txs,
+            &HashSet::new(),
+            &empty_dedup_index(),
+            anchor,
+            cut,
+            &admits_precut,
+        );
+        assert_eq!(
+            admitted.len(),
+            1,
+            "proven absent from every predecessor, so this is its first commit"
+        );
+    }
+
     #[test]
     fn select_transactions_drops_expired_txs() {
         // Anchor in the future of the tx's range.
@@ -755,6 +816,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             WeightedTimestamp::ZERO,
+            &refuses_precut,
         );
 
         assert_eq!(selected.len(), 1, "only the in-range tx should survive");
@@ -774,6 +836,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             WeightedTimestamp::ZERO,
+            &refuses_precut,
         );
 
         assert!(
@@ -798,6 +861,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             WeightedTimestamp::ZERO,
+            &refuses_precut,
         );
 
         assert!(selected.is_empty(), "malformed range should be filtered");
@@ -816,6 +880,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             WeightedTimestamp::ZERO,
+            &refuses_precut,
         );
 
         assert!(
@@ -837,6 +902,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             WeightedTimestamp::ZERO,
+            &refuses_precut,
         );
 
         assert_eq!(selected.len(), 1, "anchor == start_inclusive must be kept");
@@ -858,6 +924,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             WeightedTimestamp::ZERO,
+            &refuses_precut,
         );
         assert!(selected.is_empty());
     }

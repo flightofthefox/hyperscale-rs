@@ -115,6 +115,7 @@ use crate::deferred_qc::DeferredQc;
 use crate::fee_ledger::FeeReservationLedger;
 use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
+use crate::precut::{PrecutResolutions, PrecutStatus, PrecutVerdict};
 use crate::proposal::{
     ProposalKind, ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
     filter_engaged_transactions, select_finalizations, select_provisions, select_transactions,
@@ -426,6 +427,13 @@ pub struct ShardCoordinator {
     /// strict rule stands, which is always safe.
     predecessors: Vec<PredecessorTerminal>,
 
+    /// Per-predecessor answers about transactions that predate this
+    /// chain — what narrows the blanket pre-cut refusal to the
+    /// transactions a predecessor actually committed. Empty until a
+    /// driver resolves them, and unconsulted on a chain older than
+    /// `MAX_VALIDITY_RANGE`, where nothing on offer predates the origin.
+    resolutions: PrecutResolutions,
+
     /// Settled-tick sets for shards that have terminated at a split,
     /// keyed by the terminated shard. The split-boundary fence consults
     /// this when voting on a block whose finalizations carry a
@@ -567,6 +575,7 @@ impl ShardCoordinator {
             local_shard,
             chain_origin: recovered.chain_origin,
             predecessors: recovered.predecessors,
+            resolutions: PrecutResolutions::default(),
             settled_sets: HashMap::new(),
         }
     }
@@ -1014,15 +1023,25 @@ impl ShardCoordinator {
     /// anything: a transaction whose validity window opened before the
     /// cut, or a certificate anchored before it.
     ///
-    /// Both classes are refused for the same reason. This chain holds no
-    /// record of what its predecessor committed, so it cannot tell a
-    /// first inclusion from a second across that span — and it does not
-    /// have to, because nothing from before the cut has any business
-    /// here. A transaction was admissible there and is not here; a
-    /// certificate resolves transactions this chain never committed, and
-    /// letting one in would allow a second verdict on a transaction that
-    /// already had one, which is the exclusivity `resolved_tx_retention`
-    /// exists to hold.
+    /// The two classes part company here. A **certificate** anchored
+    /// before the cut is refused outright and always: it names a tick on
+    /// the predecessor, resolves transactions this chain never committed,
+    /// and carries receipts computed against a state this genesis never
+    /// held. There is no harmless subset to separate out.
+    ///
+    /// A **transaction** is different. The hazard is only what the
+    /// predecessor actually *committed*; one submitted before the cut and
+    /// never committed is harmless, and landing it here is its first
+    /// inclusion. Refusing the whole class is the safe default a
+    /// successor runs under until it can ask the finer question, and
+    /// [`PrecutResolutions`] is the answer: per-predecessor, each
+    /// absence proven against a `committed_txs_root` this chain
+    /// commit-proved.
+    ///
+    /// Unresolved defers rather than refuses. Every honest validator
+    /// reaches the same verdict once the answer lands, so a slow answer
+    /// costs a wait; refusing would spend a round on it instead and make
+    /// the block look bad rather than early.
     ///
     /// Provisions are left out, for want of a clock to judge them by. A
     /// batch carries its *source* shard's weighted timestamp, and this
@@ -1038,25 +1057,71 @@ impl ShardCoordinator {
     /// retained, and nothing ever consumes it.
     ///
     /// `ChainOrigin::ROOT` anchors at zero, so a chain born at network
-    /// genesis never matches and pays nothing for the check. The rule
-    /// retires itself everywhere else: a validity window is at most
-    /// `MAX_VALIDITY_RANGE` wide and a certificate anchors no earlier than
-    /// the transactions it resolves, so once a chain has outlived its own
-    /// origin by the retention horizon nothing can still predate it.
-    fn predates_this_chain(&self, block: &Block) -> Option<String> {
+    /// genesis matches nothing here and pays nothing for the check. Nor
+    /// does a chain older than the retention horizon: a validity window
+    /// spans at most `MAX_VALIDITY_RANGE`, and a certificate anchors no
+    /// earlier than the transactions it resolves, so neither reaches back
+    /// past an origin that far behind.
+    fn precut_verdict(&self, block: &Block) -> PrecutVerdict {
         let cut = self.chain_origin.anchor_wt;
-        if let Some(tx) = block
-            .transactions()
-            .iter()
-            .find(|tx| tx.validity_range().start_timestamp_inclusive < cut)
-        {
-            return Some(format!("transaction {}", tx.hash()));
-        }
-        block
+        if let Some(fw) = block
             .certificates()
             .iter()
             .find(|fw| fw.local_ec().vote_anchor_ts() < cut)
-            .map(|fw| format!("certificate for tick {:?}", fw.tick_id()))
+        {
+            return PrecutVerdict::Reject(format!("certificate for tick {:?}", fw.tick_id()));
+        }
+        // A proven replay refuses the block whatever else is outstanding,
+        // so the scan runs to the end rather than deferring on the first
+        // unresolved transaction it meets.
+        let mut deferred = None;
+        for tx in block
+            .transactions()
+            .iter()
+            .filter(|tx| tx.validity_range().start_timestamp_inclusive < cut)
+        {
+            match self.resolutions.status(&self.predecessors, &tx.hash()) {
+                PrecutStatus::Absent => {}
+                PrecutStatus::Committed => {
+                    return PrecutVerdict::Reject(format!("transaction {}", tx.hash()));
+                }
+                PrecutStatus::Unresolved => deferred = Some(tx.hash()),
+            }
+        }
+        deferred.map_or(PrecutVerdict::Pass, PrecutVerdict::Defer)
+    }
+
+    /// Record one predecessor's answer about a transaction that predates
+    /// this chain.
+    ///
+    /// `absent` must already have been verified against that
+    /// predecessor's attested `committed_txs_root`; a `committed` answer
+    /// carries no proof and needs none, since it leaves the standing
+    /// refusal in place.
+    pub fn record_precut_resolution(
+        &mut self,
+        predecessor: ShardId,
+        tx_hash: TxHash,
+        absent: bool,
+    ) {
+        self.resolutions.record(predecessor, tx_hash, absent);
+    }
+
+    /// The `(predecessor, transaction)` pairs still owed an answer for
+    /// `tx_hashes` — what an acquisition driver turns into queries.
+    #[must_use]
+    pub fn outstanding_precut_queries(
+        &self,
+        tx_hashes: impl IntoIterator<Item = TxHash>,
+    ) -> Vec<(ShardId, TxHash)> {
+        self.resolutions.outstanding(&self.predecessors, tx_hashes)
+    }
+
+    /// Whether `tx_hash` may be proposed despite opening before this
+    /// chain did — proven absent from every predecessor's committed set.
+    #[must_use]
+    pub fn precut_tx_admissible(&self, tx_hash: &TxHash) -> bool {
+        self.resolutions.status(&self.predecessors, tx_hash) == PrecutStatus::Absent
     }
 
     /// Whether a header keyed at `wt` carries `split_child_roots` — the
@@ -1651,6 +1716,7 @@ impl ShardCoordinator {
             &self.dedup_index,
             validity_anchor,
             self.chain_origin.anchor_wt,
+            &|tx_hash| self.precut_tx_admissible(tx_hash),
         );
         let (finalizations, _finalized_tx_count) = select_finalizations(
             finalizations,
@@ -3052,23 +3118,30 @@ impl ShardCoordinator {
                 return vec![];
             }
 
-            // A transaction whose validity window opened before this chain
-            // did belongs to the predecessor that ran before the cut, and
-            // no index here covers what that chain committed. Refuse it on
-            // its window instead: admission on the predecessor required
-            // `start <= anchor <= cut`, so every transaction it could have
-            // committed opens before the cut, while anything signed since
-            // opens after it. The rule retires itself — a window is at most
-            // `MAX_VALIDITY_RANGE` wide, so nothing can still open before a
-            // cut the chain has already outlived by that much.
-            if let Some(what) = self.predates_this_chain(block) {
-                warn!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    %what,
-                    "Block carries content predating this chain's origin; not voting"
-                );
-                return vec![];
+            // Content from before this chain's origin. A certificate is
+            // refused outright; a transaction only once a predecessor is
+            // known to have committed it. Unresolved waits for the
+            // answer rather than spending a round refusing the block.
+            match self.precut_verdict(block) {
+                PrecutVerdict::Pass => {}
+                PrecutVerdict::Reject(what) => {
+                    warn!(
+                        validator = ?self.me,
+                        block_hash = ?block_hash,
+                        %what,
+                        "Block carries content predating this chain's origin; not voting"
+                    );
+                    return vec![];
+                }
+                PrecutVerdict::Defer(tx_hash) => {
+                    trace!(
+                        validator = ?self.me,
+                        block_hash = ?block_hash,
+                        ?tx_hash,
+                        "Pre-cut transaction unresolved against the predecessors; deferring"
+                    );
+                    return vec![];
+                }
             }
             let block_fees = self.local_payer_fees(
                 committee,
