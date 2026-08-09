@@ -998,17 +998,53 @@ impl ShardCoordinator {
         self.quiescent(topology_schedule) && topology_schedule.successors_live(self.local_shard)
     }
 
-    /// The first transaction in `block` whose validity window opened
-    /// before this chain did, if any.
+    /// What in `block` belongs to the chain that ran before this one, if
+    /// anything: a transaction whose validity window opened before the
+    /// cut, or a certificate anchored before it.
+    ///
+    /// Both classes are refused for the same reason. This chain holds no
+    /// record of what its predecessor committed, so it cannot tell a
+    /// first inclusion from a second across that span — and it does not
+    /// have to, because nothing from before the cut has any business
+    /// here. A transaction was admissible there and is not here; a
+    /// certificate resolves transactions this chain never committed, and
+    /// letting one in would allow a second verdict on a transaction that
+    /// already had one, which is the exclusivity `resolved_tx_retention`
+    /// exists to hold.
+    ///
+    /// Provisions are left out, for want of a clock to judge them by. A
+    /// batch carries its *source* shard's weighted timestamp, and this
+    /// cut is in this chain's — two different clocks, comparable only to
+    /// within whatever skew stands between them, so a rule written on
+    /// that comparison would refuse honest batches near the boundary.
+    /// The batch names transaction hashes rather than bodies, so there is
+    /// no local window to read instead.
+    ///
+    /// Leaving them costs little. A batch provisions transactions, and a
+    /// batch from before the cut can only provision transactions the rule
+    /// above already refuses, so it is inert here: it is verified and
+    /// retained, and nothing ever consumes it.
     ///
     /// `ChainOrigin::ROOT` anchors at zero, so a chain born at network
-    /// genesis never matches and pays nothing for the check.
-    fn pre_origin_transaction(&self, block: &Block) -> Option<TxHash> {
-        block
+    /// genesis never matches and pays nothing for the check. The rule
+    /// retires itself everywhere else: a validity window is at most
+    /// `MAX_VALIDITY_RANGE` wide and a certificate anchors no earlier than
+    /// the transactions it resolves, so once a chain has outlived its own
+    /// origin by the retention horizon nothing can still predate it.
+    fn predates_this_chain(&self, block: &Block) -> Option<String> {
+        let cut = self.chain_origin.anchor_wt;
+        if let Some(tx) = block
             .transactions()
             .iter()
-            .find(|tx| tx.validity_range().start_timestamp_inclusive < self.chain_origin.anchor_wt)
-            .map(|tx| tx.hash())
+            .find(|tx| tx.validity_range().start_timestamp_inclusive < cut)
+        {
+            return Some(format!("transaction {}", tx.hash()));
+        }
+        block
+            .certificates()
+            .iter()
+            .find(|fw| fw.local_ec().vote_anchor_ts() < cut)
+            .map(|fw| format!("certificate for tick {:?}", fw.tick_id()))
     }
 
     /// Whether a header keyed at `wt` carries `split_child_roots` — the
@@ -1606,6 +1642,7 @@ impl ShardCoordinator {
             &self.dedup_index,
             self.chain_view().parent_settled_frontier(parent_block_hash),
             MAX_FINALIZED_TX_PER_BLOCK,
+            self.chain_origin.anchor_wt,
         );
         let provisions = select_provisions(
             provisions,
@@ -3008,12 +3045,12 @@ impl ShardCoordinator {
             // opens after it. The rule retires itself — a window is at most
             // `MAX_VALIDITY_RANGE` wide, so nothing can still open before a
             // cut the chain has already outlived by that much.
-            if let Some(tx_hash) = self.pre_origin_transaction(block) {
+            if let Some(what) = self.predates_this_chain(block) {
                 warn!(
                     validator = ?self.me,
                     block_hash = ?block_hash,
-                    ?tx_hash,
-                    "Transaction predates this chain's origin; not voting"
+                    %what,
+                    "Block carries content predating this chain's origin; not voting"
                 );
                 return vec![];
             }

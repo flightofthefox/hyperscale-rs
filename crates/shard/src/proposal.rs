@@ -239,6 +239,7 @@ pub fn select_finalizations(
     dedup_index: &CommitDedupIndex,
     parent_settled_frontier: BlockHeight,
     max_finalized_txs: usize,
+    chain_origin_wt: WeightedTimestamp,
 ) -> (Vec<Arc<Verifiable<Finalization>>>, usize) {
     let mut finalized_tx_count = 0usize;
     let mut resolved_here: HashSet<TxHash> = HashSet::new();
@@ -246,6 +247,12 @@ pub fn select_finalizations(
     let ticks_to_propose: Vec<_> = finalizations
         .into_iter()
         .filter(|fw| {
+            // Anchored before this chain began, so it resolves
+            // transactions this chain never committed and every voter
+            // refuses it. Zero for a chain born at network genesis.
+            if fw.local_ec().vote_anchor_ts() < chain_origin_wt {
+                return false;
+            }
             // The settlement frontier, proposer-side: a determined half
             // at or below it would be refused by every voter, and one
             // offered out of order would settle an older absolute over a
@@ -584,6 +591,7 @@ mod tests {
             &CommitDedupIndex::new(),
             BlockHeight::GENESIS,
             MAX_FINALIZED_TX_PER_BLOCK,
+            WeightedTimestamp::ZERO,
         );
         assert_eq!(selected.len(), 1, "the second verdict is dropped");
         assert_eq!(selected[0].tick_id(), settled.tick_id());
@@ -611,6 +619,7 @@ mod tests {
             &dedup_index,
             BlockHeight::GENESIS,
             MAX_FINALIZED_TX_PER_BLOCK,
+            WeightedTimestamp::ZERO,
         );
         assert!(selected.is_empty());
         assert_eq!(count, 0);
