@@ -9,7 +9,7 @@ use hyperscale_storage::TickResolution;
 use hyperscale_types::{
     BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
     BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
-    CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader,
+    CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, CommittedTxsRoot,
     ConsensusPublicKey, Epoch, ExecutionCertificate, ExecutionVote, Finalization,
     GlobalReceiptRoot, Hash, HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1,
     PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
@@ -675,11 +675,14 @@ pub enum Action {
         /// Whether the block's window requires a `settled_txs_root` — set
         /// on any terminating boundary header (a split parent's or a merge
         /// child's final epoch), broader than `split_child_roots_required`.
-        settled_txs_root_required: bool,
+        terminal_roots_required: bool,
         /// The header's `settled_txs_root` claim, recomputed beside the
         /// state root over the committed retention window when the block
         /// terminates the shard at a boundary.
         claimed_settled_txs_root: Option<SettledTxsRoot>,
+        /// The header's `committed_txs_root` claim, recomputed beside the
+        /// state root over the same committed retention window.
+        claimed_committed_txs_root: Option<CommittedTxsRoot>,
         /// The block's parent-QC weighted timestamp — the anchor the
         /// settled-transaction window walk floors at (`anchor − RETENTION_HORIZON`),
         /// resolved identically by the proposer and every verifier.
@@ -960,9 +963,9 @@ pub enum Action {
         /// child, broader than `carry_split_child_roots`. When set, the
         /// handler computes the `settled_txs_root` over the committed
         /// retention window and stamps it into the header.
-        carry_settled_txs_root: bool,
+        carry_terminal_roots: bool,
         /// The schedule's settled-window floor for the shard at the block's
-        /// anchor, paired with `carry_settled_txs_root` — extends the
+        /// anchor, paired with `carry_terminal_roots` — extends the
         /// committed window walk back to the reshape's admission.
         settled_txs_window_floor: Option<WeightedTimestamp>,
         /// The block's **anchored** committee snapshot, resolved by the

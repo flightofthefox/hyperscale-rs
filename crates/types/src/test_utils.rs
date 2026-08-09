@@ -712,6 +712,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             reveal_chain,
             split_child_roots,
             settled_txs_root,
+            committed_txs_root,
             load,
         ) = header.into_parts();
         let pqc = parent_qc.as_unverified();
@@ -749,6 +750,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             reveal_chain,
             split_child_roots,
             settled_txs_root,
+            committed_txs_root,
             load,
         })
     };

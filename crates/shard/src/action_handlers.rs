@@ -20,18 +20,18 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRootContext, Block, BlockHash, BlockHeader,
     BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote, BlockVoteMessage,
     CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
-    CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError, ConsensusPublicKey,
-    ConsensusReceipt, Epoch, Finalization, Hash, LocalReceiptRoot, LocalReceiptRootContext,
-    NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
-    QuorumCertificate, ReadySignal, ReshapeTrigger, RevealChain, Round, SettledTxsRoot, ShardId,
-    ShardLoad, SplitChildRoots, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateKey,
-    Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
-    TransactionRootContext, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
-    VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, absorb_committed_cells,
-    commit_witness_window, compute_cross_shard_txs, derive_leaves, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
-    vrf_output_from_proof, work_over_certificates,
+    CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError, CommittedTxsRoot,
+    ConsensusPublicKey, ConsensusReceipt, Epoch, Finalization, Hash, LocalReceiptRoot,
+    LocalReceiptRootContext, NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, RevealChain,
+    Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot, StateRootContext,
+    Stopwatch, StoredReceipt, SubstateKey, Timeout, TimeoutContext, TopologySnapshot, Transaction,
+    TransactionRoot, TransactionRootContext, TxHash, ValidatorId, Verifiable, Verified, Verifier,
+    Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight,
+    absorb_committed_cells, commit_witness_window, compute_cross_shard_txs, derive_leaves,
+    local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
+    shard_reveal_sign, signed_bytes, vrf_output_from_proof, work_over_certificates,
 };
 
 /// Result of QC verification and assembly.
@@ -224,6 +224,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
     committee_anchor_epoch: Epoch,
     carry_split_child_roots: bool,
     settled_txs_root: Option<SettledTxsRoot>,
+    committed_txs_root: Option<CommittedTxsRoot>,
     pending_snapshots: &[Arc<JmtSnapshot>],
 ) -> ProposalResult {
     let (state_root, jmt_snapshot, prepared) = storage.prepare_block_commit(
@@ -368,6 +369,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
         reveal_chain,
         split_child_roots,
         settled_txs_root,
+        committed_txs_root,
         load,
     });
 
@@ -738,8 +740,9 @@ where
             block_height,
             claimed_split_child_roots,
             split_child_roots_required,
-            settled_txs_root_required,
+            terminal_roots_required,
             claimed_settled_txs_root,
+            claimed_committed_txs_root,
             parent_weighted_timestamp,
             settled_txs_window_floor,
         } => {
@@ -796,7 +799,7 @@ where
             // the tick-ids it settled within the retention window; recompute
             // it from the committed chain whenever the shard terminates at
             // the next boundary, split or merge.
-            let computed_settled_txs_root = settled_txs_root_required.then(|| {
+            let computed_settled_txs_root = terminal_roots_required.then(|| {
                 ctx.pending_chain.settled_txs_root_in_window(
                     ctx.shard,
                     parent_block_hash,
@@ -806,13 +809,26 @@ where
                     &finalizations,
                 )
             });
+            // Its sibling over the same window: every transaction the
+            // chain committed, which a successor reads to tell a replay
+            // from a first inclusion.
+            let computed_committed_txs_root = terminal_roots_required.then(|| {
+                ctx.pending_chain.committed_txs_root_in_window(
+                    parent_block_hash,
+                    parent_block_height,
+                    parent_weighted_timestamp,
+                    block_tx_hashes.clone(),
+                )
+            });
             let verify_result = expected_root.verify(&StateRootContext {
                 computed_root: &computed_root,
                 claimed_split_child_roots,
                 split_child_roots_required,
                 claimed_settled_txs_root,
                 computed_settled_txs_root,
-                settled_txs_root_required,
+                claimed_committed_txs_root,
+                computed_committed_txs_root,
+                terminal_roots_required,
             });
             record_signature_verification_latency("state_root", start.elapsed().as_secs_f64());
             let bytes_delta = jmt_snapshot.bytes_delta;
@@ -874,7 +890,7 @@ where
             parent_committee_anchor_epoch,
             committee_anchor_epoch,
             carry_split_child_roots,
-            carry_settled_txs_root,
+            carry_terminal_roots,
             settled_txs_window_floor,
             classification_topology_snapshot: classification_topology,
         } => {
@@ -953,7 +969,7 @@ where
             // the tick-ids it settled within the retention window —
             // whenever the shard terminates at the next boundary, split or
             // merge.
-            let settled_txs_root = carry_settled_txs_root.then(|| {
+            let settled_txs_root = carry_terminal_roots.then(|| {
                 ctx.pending_chain.settled_txs_root_in_window(
                     shard_id,
                     parent_block_hash,
@@ -964,6 +980,17 @@ where
                 )
             });
             let block_tx_hashes: Vec<TxHash> = transactions.iter().map(|tx| tx.hash()).collect();
+            // Its sibling over the same window: every transaction the
+            // chain committed, which a successor reads to tell a replay
+            // from a first inclusion.
+            let committed_txs_root = carry_terminal_roots.then(|| {
+                ctx.pending_chain.committed_txs_root_in_window(
+                    parent_block_hash,
+                    parent_block_height,
+                    parent_qc.weighted_timestamp(),
+                    block_tx_hashes.clone(),
+                )
+            });
             let result = build_proposal(
                 &view,
                 proposer,
@@ -994,6 +1021,7 @@ where
                 committee_anchor_epoch,
                 carry_split_child_roots,
                 settled_txs_root,
+                committed_txs_root,
                 &pending_snapshots,
             );
             let block_hash = result.block_hash;

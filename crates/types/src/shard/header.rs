@@ -11,10 +11,11 @@ use thiserror::Error;
 
 use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
-    ChainOrigin, Hash, LocalReceiptRoot, MAX_PROVISION_TARGET_SHARDS, MAX_TXS_PER_BLOCK,
-    ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate, RevealChain, Round,
-    SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot, TransactionRoot, TxHash,
-    ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, WorkInFlight,
+    ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot, MAX_PROVISION_TARGET_SHARDS,
+    MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
+    RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot,
+    TransactionRoot, TxHash, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
+    WorkInFlight,
 };
 
 /// Block header containing consensus metadata.
@@ -92,6 +93,16 @@ pub struct BlockHeader {
     /// resolves split-straddling ticks against the terminated shard's
     /// settled set without walking its chain.
     settled_txs_root: Option<SettledTxsRoot>,
+    /// Merkle root over every transaction this shard committed within its
+    /// retention window, carried on the same terminating boundary headers
+    /// as `settled_txs_root` (`None` everywhere else). A reshape successor
+    /// reads it off the terminal it commit-proved to tell a replay of
+    /// something the predecessor committed from a first inclusion the
+    /// predecessor never made. Sibling to `settled_txs_root` rather than
+    /// part of it: that one is bounded by cross-shard traffic and read by
+    /// a surviving counterpart, this one by total throughput and read by a
+    /// successor.
+    committed_txs_root: Option<CommittedTxsRoot>,
     /// The shard's attested load through this block — attested work as a
     /// running total, and the byte total behind the parent state. The
     /// beacon reads it off the boundary header it already sources and
@@ -140,6 +151,7 @@ pub struct BlockHeaderParts {
     pub reveal_chain: RevealChain,
     pub split_child_roots: Option<SplitChildRoots>,
     pub settled_txs_root: Option<SettledTxsRoot>,
+    pub committed_txs_root: Option<CommittedTxsRoot>,
     pub load: ShardLoad,
 }
 
@@ -170,6 +182,7 @@ impl Default for BlockHeaderParts {
             reveal_chain: RevealChain::ZERO,
             split_child_roots: None,
             settled_txs_root: None,
+            committed_txs_root: None,
             load: ShardLoad::ZERO,
         }
     }
@@ -209,6 +222,7 @@ impl BlockHeader {
             reveal_chain,
             split_child_roots,
             settled_txs_root,
+            committed_txs_root,
             load,
         } = parts;
         Self {
@@ -235,6 +249,7 @@ impl BlockHeader {
             reveal_chain,
             split_child_roots,
             settled_txs_root,
+            committed_txs_root,
             load,
         }
     }
@@ -280,6 +295,7 @@ impl BlockHeader {
             reveal_chain: RevealChain::ZERO,
             split_child_roots: None,
             settled_txs_root: None,
+            committed_txs_root: None,
             load: ShardLoad::ZERO,
         }
     }
@@ -333,6 +349,7 @@ impl BlockHeader {
             reveal_chain: RevealChain::ZERO,
             split_child_roots: None,
             settled_txs_root: None,
+            committed_txs_root: None,
             load: ShardLoad::ZERO,
         }
     }
@@ -400,6 +417,7 @@ impl BlockHeader {
             reveal_chain: RevealChain::ZERO,
             split_child_roots: None,
             settled_txs_root: None,
+            committed_txs_root: None,
             load: ShardLoad::ZERO,
         }
     }
@@ -641,6 +659,14 @@ impl BlockHeader {
         self.settled_txs_root
     }
 
+    /// Merkle root over every transaction this shard committed within its
+    /// retention window — present on the same terminating boundary
+    /// headers as [`Self::settled_txs_root`], `None` everywhere else.
+    #[must_use]
+    pub const fn committed_txs_root(&self) -> Option<CommittedTxsRoot> {
+        self.committed_txs_root
+    }
+
     /// The shard's attested load through this block: attested work as a
     /// running total over the chain's history, and the byte total behind
     /// the parent state. Both recomputed at verification.
@@ -678,6 +704,7 @@ impl BlockHeader {
         RevealChain,
         Option<SplitChildRoots>,
         Option<SettledTxsRoot>,
+        Option<CommittedTxsRoot>,
         ShardLoad,
     ) {
         (
@@ -704,6 +731,7 @@ impl BlockHeader {
             self.reveal_chain,
             self.split_child_roots,
             self.settled_txs_root,
+            self.committed_txs_root,
             self.load,
         )
     }
@@ -963,6 +991,7 @@ mod tests {
             _,
             _,
             _,
+            _,
         ) = bare.clone().into_parts();
         let carrying = BlockHeader::new(BlockHeaderParts {
             shard_id,
@@ -1027,6 +1056,7 @@ mod tests {
             split_child_roots,
             _,
             _,
+            _,
         ) = bare.clone().into_parts();
         let carrying = BlockHeader::new(BlockHeaderParts {
             shard_id,
@@ -1058,6 +1088,36 @@ mod tests {
         let decoded: BlockHeader = hbor_from_slice(&hbor_to_vec(&carrying).unwrap()).unwrap();
         assert_eq!(decoded.settled_txs_root(), Some(root));
         assert_ne!(carrying.hash(), bare.hash());
+    }
+
+    /// `committed_txs_root` is hash-affecting header content in its own
+    /// right: it survives the round-trip, changes the block hash, and does
+    /// so independently of `settled_txs_root` — the two are siblings, so
+    /// neither can stand in for the other.
+    #[test]
+    fn committed_txs_root_round_trip_and_hash() {
+        let bare = BlockHeader::new(BlockHeaderParts::default());
+        let committed = CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed window"));
+        let settled = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled window"));
+
+        let carrying = BlockHeader::new(BlockHeaderParts {
+            committed_txs_root: Some(committed),
+            ..Default::default()
+        });
+        let decoded: BlockHeader = hbor_from_slice(&hbor_to_vec(&carrying).unwrap()).unwrap();
+        assert_eq!(decoded.committed_txs_root(), Some(committed));
+        assert_eq!(decoded.settled_txs_root(), None);
+        assert_ne!(carrying.hash(), bare.hash());
+
+        let settled_only = BlockHeader::new(BlockHeaderParts {
+            settled_txs_root: Some(settled),
+            ..Default::default()
+        });
+        assert_ne!(
+            carrying.hash(),
+            settled_only.hash(),
+            "the two roots occupy distinct header positions"
+        );
     }
 
     /// Forge a `BlockHeader` whose `cross_shard_txs` length claims one past the cap,

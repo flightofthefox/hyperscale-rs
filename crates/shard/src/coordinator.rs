@@ -1070,13 +1070,17 @@ impl ShardCoordinator {
         }
     }
 
-    /// Whether a header keyed at `wt` carries `settled_txs_root` — set on
-    /// any terminating boundary header (a split parent's *or* a merge
-    /// child's final epoch), identical on the build side (carry) and the
-    /// vote side (required). Broader than [`Self::split_child_roots_bit`]: a
-    /// merge child terminates without carrying `split_child_roots`. `None`
-    /// under that helper's retention condition, and only that one.
-    fn settled_txs_root_bit(
+    /// Whether a header keyed at `wt` carries the two terminal-boundary
+    /// roots — `settled_txs_root` and `committed_txs_root` — set on any
+    /// terminating boundary header (a split parent's *or* a merge child's
+    /// final epoch), identical on the build side (carry) and the vote side
+    /// (required). One bit for both: they answer different readers but are
+    /// carried by the same headers, so nothing distinguishes when to emit
+    /// one from when to emit the other. Broader than
+    /// [`Self::split_child_roots_bit`]: a merge child terminates without
+    /// carrying `split_child_roots`. `None` under that helper's retention
+    /// condition, and only that one.
+    fn terminal_roots_bit(
         &self,
         topology_schedule: &TopologySchedule,
         wt: WeightedTimestamp,
@@ -1973,8 +1977,8 @@ impl ShardCoordinator {
             );
             return vec![];
         };
-        let Some(carry_settled_txs_root) =
-            self.settled_txs_root_bit(topology_schedule, parent_qc.weighted_timestamp())
+        let Some(carry_terminal_roots) =
+            self.terminal_roots_bit(topology_schedule, parent_qc.weighted_timestamp())
         else {
             trace!(
                 validator = ?self.me,
@@ -2077,7 +2081,7 @@ impl ShardCoordinator {
             parent_committee_anchor_epoch,
             committee_anchor_epoch,
             carry_split_child_roots,
-            carry_settled_txs_root,
+            carry_terminal_roots,
             topology_schedule
                 .settled_window_floor(self.local_shard, parent_qc.weighted_timestamp()),
             Arc::clone(committee),
@@ -3019,7 +3023,7 @@ impl ShardCoordinator {
                 );
                 return vec![];
             };
-            let Some(settled_txs_root_required) = self.settled_txs_root_bit(
+            let Some(terminal_roots_required) = self.terminal_roots_bit(
                 topology_schedule,
                 block.header().parent_qc().weighted_timestamp(),
             ) else {
@@ -3091,7 +3095,7 @@ impl ShardCoordinator {
                     deltas: &self.pending_bytes_deltas,
                 },
                 split_child_roots_required,
-                settled_txs_root_required,
+                terminal_roots_required,
                 fee_demands,
                 fee_read_height,
                 fee_read_ready,

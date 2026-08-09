@@ -1480,6 +1480,7 @@ mod tests {
             reveal_chain,
             split_child_roots,
             settled_txs_root,
+            committed_txs_root,
             _,
         ) = header.into_parts();
         BlockHeader::new(BlockHeaderParts {
@@ -1506,6 +1507,7 @@ mod tests {
             reveal_chain,
             split_child_roots,
             settled_txs_root,
+            committed_txs_root,
             load,
         })
     }
