@@ -139,6 +139,15 @@ pub struct TickState {
     locally_divergent: bool,
     /// The mismatch behind the latch, until the coordinator reports it.
     divergence: Option<Divergence>,
+    /// Whether the determined half's finalization has been handed off.
+    determined_emitted: bool,
+    /// Whether the legs half's finalization has been handed off.
+    legs_emitted: bool,
+    /// Members a committed finalization has resolved. The tick's
+    /// certificate and tracking state drop once every member is here —
+    /// which is later than the halves being emitted, since a handed-off
+    /// finalization still has to reach a block.
+    settled: HashSet<TxHash>,
     /// Whether the local certificate has been added to
     /// `execution_certificates`. Gates completion. Independent of the
     /// canonical-root reconciliation — `locally_divergent` carries the
@@ -188,6 +197,9 @@ impl TickState {
             admitted_local_ec_root: None,
             locally_divergent: false,
             divergence: None,
+            determined_emitted: false,
+            legs_emitted: false,
+            settled: HashSet::new(),
             local_ec_emitted: false,
             overdue_warned: false,
             covered_shards: HashMap::new(),
@@ -407,12 +419,11 @@ impl TickState {
         self.execution_receipts.remove(&tx_hash)
     }
 
-    /// True if, for every non-aborted outcome in the local certificate,
-    /// this validator has produced a matching local receipt. Aborted
+    /// Whether this validator holds a local receipt for every member of
+    /// `members` the local certificate attests as executed. Aborted
     /// outcomes need no receipt.
     ///
-    /// Gates [`Self::is_complete`] so `finalize` can't produce a
-    /// [`Finalization`] that fails
+    /// Gates each half so it can't produce a [`Finalization`] that fails
     /// [`Finalization::validate_receipts_against_ec`]. The check mirrors
     /// that invariant: a receipt is needed exactly for the outcomes the
     /// certificate attests as `Executed`. When this validator's local
@@ -420,24 +431,44 @@ impl TickState {
     /// than synthesizing a `Finalization` with missing receipts. Recovery
     /// flows through the existing peer-fetch path.
     ///
+    /// **Scoped to one half, because each half drains its own receipts.**
+    /// A tick-wide check would pass before the first half settles and
+    /// fail afterwards, wedging the second on receipts the first
+    /// legitimately consumed.
+    ///
     /// Returns false if the local certificate hasn't arrived yet;
-    /// `local_ec_emitted` is checked separately by [`Self::is_complete`]
-    /// for the same reason.
+    /// `local_ec_emitted` is checked separately for the same reason.
     ///
     /// [`Finalization`]: hyperscale_types::Finalization
     /// [`Finalization::validate_receipts_against_ec`]:
     ///     hyperscale_types::Finalization::validate_receipts_against_ec
-    fn has_local_receipts_for_non_aborted(&self) -> bool {
-        let Some(local_ec) = self
-            .execution_certificates
-            .iter()
-            .find(|ec| ec.tick_id() == &self.tick_id)
-        else {
+    fn has_local_receipts_for(&self, members: &[TxHash]) -> bool {
+        let Some(local_ec) = self.local_certificate() else {
             return false;
         };
-        local_ec.tx_outcomes().iter().all(|outcome| {
-            outcome.is_aborted() || self.execution_receipts.contains_key(&outcome.tx_hash())
-        })
+        local_ec
+            .tx_outcomes()
+            .iter()
+            .filter(|outcome| members.contains(&outcome.tx_hash()))
+            .all(|outcome| {
+                outcome.is_aborted() || self.execution_receipts.contains_key(&outcome.tx_hash())
+            })
+    }
+
+    /// This tick's own certificate, in the copy that carries the whole
+    /// batch.
+    ///
+    /// The store can hold more than one copy of a tick — a broadcast and
+    /// a narrower fetch answer both land, and the retention rule keeps
+    /// whichever covers something new — so the first match is not
+    /// necessarily the complete one. Projecting a half needs sibling
+    /// nodes from the whole receipt tree, which only the complete copy
+    /// carries, and a shard sends its own peers exactly that.
+    fn local_certificate(&self) -> Option<&Arc<Verified<ExecutionCertificate>>> {
+        self.execution_certificates
+            .iter()
+            .filter(|ec| ec.tick_id() == &self.tick_id)
+            .find(|ec| ec.is_complete())
     }
 
     // ── Vote emission ───────────────────────────────────────────────────
@@ -564,8 +595,9 @@ impl TickState {
     /// would be unbounded; keeping only those that cover something new
     /// caps the collection at one certificate per transaction.
     ///
-    /// Returns `true` if the tick is now complete (ready for `finalize`).
-    pub fn add_execution_certificate(&mut self, ec: Arc<Verified<ExecutionCertificate>>) -> bool {
+    /// Readiness is the caller's next question — a certificate can make
+    /// either half settleable, or neither.
+    pub fn add_execution_certificate(&mut self, ec: Arc<Verified<ExecutionCertificate>>) {
         let shard = ec.shard_id();
         let is_local = ec.tick_id() == &self.tick_id;
 
@@ -575,10 +607,10 @@ impl TickState {
                 .is_some_and(|covered| !covered.contains(&shard))
         });
         // An empty tick's own certificate covers nothing yet still has to
-        // land: `is_complete` gates on having emitted it.
+        // land: both halves gate on having emitted it.
         let first_local = is_local && !self.local_ec_emitted;
         if !covers_something_new && !first_local {
-            return self.is_complete();
+            return;
         }
 
         for outcome in ec.tx_outcomes() {
@@ -600,8 +632,6 @@ impl TickState {
         }
 
         self.execution_certificates.push(ec);
-
-        self.is_complete()
     }
 
     /// Compare `local_vote_global_receipt_root` against
@@ -638,42 +668,107 @@ impl TickState {
         self.locally_divergent
     }
 
-    /// Whether the tick is complete: local certificate present, every
-    /// non-aborted member has a local receipt on this validator, and
-    /// every member either aborted (terminal) or is covered by every
-    /// participating shard.
-    ///
-    /// The local-receipt gate prevents the race where the local
-    /// certificate arrives (aggregated from other validators' votes)
-    /// before this validator's engine finishes — without it, `finalize`
-    /// silently drops the pending receipt slots and produces a divergent
-    /// `Finalization`.
+    /// The members whose settlement needs no shard but this one — the
+    /// single-shard transactions plus the ones this tick abandons. Their
+    /// outcome is decided by the tick's own certificate, so nothing a
+    /// counterpart does can hold them.
     #[must_use]
-    pub fn is_complete(&self) -> bool {
-        if !self.local_ec_emitted {
-            return false;
+    pub fn determined_members(&self) -> Vec<TxHash> {
+        self.tx_hashes
+            .iter()
+            .copied()
+            .filter(|&tx_hash| !self.reaches_beyond(tx_hash))
+            .collect()
+    }
+
+    /// The members whose settlement waits on a counterpart.
+    #[must_use]
+    pub fn leg_members(&self) -> Vec<TxHash> {
+        self.cross_shard_tx_hashes().collect()
+    }
+
+    /// Conditions both halves share: the certificate exists and this
+    /// validator agreed with it. Receipts are checked per half, since
+    /// each drains its own.
+    const fn attestable(&self) -> bool {
+        self.local_ec_emitted && !self.locally_divergent
+    }
+
+    /// Whether `tx_hash` has the verdict its settlement needs: an abort
+    /// anywhere is terminal, and anything else waits for every
+    /// participating shard to have certified it.
+    fn is_covered(&self, tx_hash: TxHash) -> bool {
+        if self.tracker_aborted.contains(&tx_hash) {
+            return true;
         }
-        if self.locally_divergent {
-            return false;
+        match (
+            self.participating_shards.get(&tx_hash),
+            self.covered_shards.get(&tx_hash),
+        ) {
+            (Some(expected), Some(covered)) => expected.is_subset(covered),
+            _ => false,
         }
-        if !self.has_local_receipts_for_non_aborted() {
-            return false;
-        }
-        for tx_hash in &self.tx_hashes {
-            if self.tracker_aborted.contains(tx_hash) {
-                continue;
+    }
+
+    /// Whether the determined half can settle now.
+    ///
+    /// It needs no coverage beyond the tick's own certificate, which is
+    /// the whole point: a leg waiting on a counterpart that never comes
+    /// cannot hold these members, and the settlement frontier they
+    /// advance therefore cannot wedge.
+    #[must_use]
+    pub fn determined_ready(&self) -> bool {
+        let members = self.determined_members();
+        !self.determined_emitted
+            && self.attestable()
+            && !members.is_empty()
+            && self.has_local_receipts_for(&members)
+    }
+
+    /// Whether the legs half can settle now: every leg has its verdict,
+    /// and the determined half has already gone.
+    ///
+    /// The ordering is not bookkeeping. A determined member and a leg of
+    /// one tick are scheduled sequentially inside a single batch, so each
+    /// receipt states an absolute computed at its own point in the fold;
+    /// settling them out of that order reverts one. The provisional-cell
+    /// rule does not cover the pair — it governs across ticks, and these
+    /// are one tick.
+    #[must_use]
+    pub fn legs_ready(&self) -> bool {
+        let legs = self.leg_members();
+        !self.legs_emitted
+            && self.attestable()
+            && !legs.is_empty()
+            && self.determined_emitted_or_absent()
+            && self.has_local_receipts_for(&legs)
+            && legs.iter().all(|&tx_hash| self.is_covered(tx_hash))
+    }
+
+    /// Whether the determined half is out of the way — emitted, or never
+    /// existed because the tick ran nothing but legs.
+    fn determined_emitted_or_absent(&self) -> bool {
+        self.determined_emitted || self.determined_members().is_empty()
+    }
+
+    /// Whether this tick has said everything it will say.
+    #[must_use]
+    pub fn has_spoken(&self) -> bool {
+        self.determined_emitted_or_absent() && (self.legs_emitted || self.leg_members().is_empty())
+    }
+
+    /// Record that a committed finalization resolved these members.
+    /// Returns whether every member of the tick is now settled, which is
+    /// when its certificate and tracking state can be dropped.
+    pub fn record_settled(&mut self, tx_hashes: impl IntoIterator<Item = TxHash>) -> bool {
+        for tx_hash in tx_hashes {
+            if self.tx_hash_set.contains(&tx_hash) {
+                self.settled.insert(tx_hash);
             }
-            let Some(expected) = self.participating_shards.get(tx_hash) else {
-                return false;
-            };
-            let Some(covered) = self.covered_shards.get(tx_hash) else {
-                return false;
-            };
-            if !expected.is_subset(covered) {
-                return false;
-            }
         }
-        true
+        self.tx_hashes
+            .iter()
+            .all(|tx_hash| self.settled.contains(tx_hash))
     }
 
     /// Emit a `warn!` log exactly once, when the tick reaches
@@ -718,7 +813,7 @@ impl TickState {
             }
         }
 
-        let local_receipts_ready = self.has_local_receipts_for_non_aborted();
+        let local_receipts_ready = self.has_local_receipts_for(&self.tx_hashes);
 
         tracing::warn!(
             tick = %self.tick_id,
@@ -736,49 +831,55 @@ impl TickState {
             aborted = self.aborted.len(),
             tracker_aborted = self.tracker_aborted.len(),
             ecs_collected = self.execution_certificates.len(),
-            is_complete = self.is_complete(),
+            determined_ready = self.determined_ready(),
+            legs_ready = self.legs_ready(),
+            determined_emitted = self.determined_emitted,
+            legs_emitted = self.legs_emitted,
             missing_coverage = missing_coverage.join(" "),
             "Tick overdue: unresolved past the deadline that bounds every member"
         );
     }
 
-    /// Build the tick's attestation — its identity and the execution
-    /// certificates proving its members. The local certificate is always
-    /// included; a remote one is included when it covers a member this
-    /// tick still needs a verdict on, or when it is the certificate
-    /// carrying that member's abort. Deterministic order:
-    /// `(shard_id, tick_id)`.
+    /// Build one half's attestation: the tick's own certificate
+    /// projected to `members`, plus the counterpart certificates those
+    /// members still need a verdict from.
     ///
-    /// The second clause is what keeps the two sides of a settlement in
-    /// agreement. `tracker_aborted` is fed by the very certificates being
-    /// filtered here — a remote abort lands as coverage *and* as an entry
-    /// in that set — so pruning on `tracker_aborted` alone discards the
-    /// only artifact carrying that verdict. Every downstream reader
-    /// derives the outcome from the certificate and nothing else
-    /// ([`Finalization::tx_decisions`]), so what that drops is not merely
-    /// redundant: the local certificate's success stands unopposed and
-    /// this shard commits an accept against the counterparty's abort. An
-    /// abort the local certificate reports itself needs no such
-    /// corroboration, which is why a transaction both sides aborted still
-    /// keeps only the one certificate.
+    /// **The projection is what makes each half account for itself.**
+    /// `tx_hashes`, `tx_count` and `declared_work` all read the local
+    /// certificate, so projecting it to this half's members is what makes
+    /// the half name exactly its own transactions and release exactly
+    /// their reservations — no new field, and the drain term stays
+    /// readable off the block. Both projections verify under the same
+    /// signed root and signature as the copy they came from.
     ///
-    /// Callers should invoke only when `is_complete()` is true.
+    /// A remote certificate is included when it covers a member this half
+    /// still needs a verdict on, or when it is the certificate carrying
+    /// that member's abort. That second clause is what keeps the two
+    /// sides of a settlement in agreement. `tracker_aborted` is fed by
+    /// the very certificates being filtered here — a remote abort lands
+    /// as coverage *and* as an entry in that set — so pruning on
+    /// `tracker_aborted` alone discards the only artifact carrying that
+    /// verdict. Every downstream reader derives the outcome from the
+    /// certificate and nothing else ([`Finalization::tx_decisions`]), so
+    /// what that drops is not merely redundant: the local certificate's
+    /// success stands unopposed and this shard commits an accept against
+    /// the counterparty's abort.
+    ///
+    /// Returns `None` when this half has no members, or when the local
+    /// certificate has not landed yet.
     #[must_use]
-    pub fn attestation(&self) -> Finalization {
+    fn attestation_for(&self, members: &HashSet<TxHash>) -> Option<Finalization> {
+        let local = self.local_certificate()?;
         // What the local certificate says on its own. A member it already
         // reports as aborted needs no remote to corroborate it.
-        let locally_aborted: HashSet<TxHash> = self
-            .execution_certificates
+        let locally_aborted: HashSet<TxHash> = local
+            .tx_outcomes()
             .iter()
-            .find(|ec| ec.tick_id() == &self.tick_id)
-            .map(|ec| {
-                ec.tx_outcomes()
-                    .iter()
-                    .filter(|outcome| outcome.is_aborted())
-                    .map(TxOutcome::tx_hash)
-                    .collect()
-            })
-            .unwrap_or_default();
+            .filter(|outcome| outcome.is_aborted())
+            .map(TxOutcome::tx_hash)
+            .collect();
+
+        let projected = local.project_to(members)?;
 
         let required_remote_tick_ids: HashSet<TickId> = self
             .execution_certificates
@@ -787,7 +888,7 @@ impl TickState {
             .filter(|ec| {
                 ec.tx_outcomes().iter().any(|outcome| {
                     let tx_hash = outcome.tx_hash();
-                    if !self.participating_shards.contains_key(&tx_hash) {
+                    if !members.contains(&tx_hash) {
                         return false;
                     }
                     // Still awaiting a verdict, or holding the only one that
@@ -799,49 +900,33 @@ impl TickState {
             .map(|ec| *ec.tick_id())
             .collect();
 
-        let mut ecs: Vec<Verified<ExecutionCertificate>> = self
-            .execution_certificates
-            .iter()
-            .filter(|ec| {
-                ec.tick_id() == &self.tick_id || required_remote_tick_ids.contains(ec.tick_id())
-            })
-            .map(|verified| (**verified).clone())
+        let mut ecs: Vec<Verified<ExecutionCertificate>> = std::iter::once(projected)
+            .chain(
+                self.execution_certificates
+                    .iter()
+                    .filter(|ec| required_remote_tick_ids.contains(ec.tick_id()))
+                    .map(|verified| (**verified).clone()),
+            )
             .collect();
-
         ecs.sort_by(|a, b| (&a.shard_id(), a.tick_id()).cmp(&(&b.shard_id(), b.tick_id())));
 
-        Finalization::from_verified_ecs(self.tick_id, ecs)
+        Some(Finalization::from_verified_ecs(self.tick_id, ecs))
     }
 
-    /// Consume the tick and produce its terminal [`Finalization`].
+    /// Drain one stored receipt per outcome of `attestation` that settles
+    /// anything, in the certificate's canonical order.
     ///
-    /// Builds the [`attestation`](Self::attestation) and drains one stored
-    /// receipt per outcome that settles anything, in canonical order.
     /// Which side of an outcome settles is [`settles`]'s question, read
     /// against the whole certificate rather than against this shard's own
     /// verdict: a leg that completed here and was refused by a counterpart
     /// settles its charge, not its effects. Peers re-derive the same rule
     /// through `validate_receipts_against_ec` at ingress.
-    ///
-    /// Should only be called when [`Self::is_complete`] is true; that gate
-    /// guarantees both the local certificate's presence and a receipt for
-    /// every non-aborted outcome. A missing receipt under those conditions
-    /// is an invariant violation, logged but not fatal so the canonical
-    /// `Finalization` admitted via block sync can still recover the node.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the constructed attestation doesn't carry the local
-    /// certificate. `is_complete` requires `local_ec_emitted`, so its
-    /// presence is guaranteed at the legitimate call site.
-    #[must_use]
-    pub fn into_finalization(mut self) -> Finalization {
-        let attestation = self.attestation();
+    fn with_drained_receipts(&mut self, attestation: Finalization) -> Finalization {
         let local_ec = attestation
             .execution_certificates()
             .iter()
             .find(|ec| ec.tick_id() == attestation.tick_id())
-            .expect("finalization invariant: local certificate must be present")
+            .expect("a half carries the projection of its own tick's certificate")
             .clone();
         let refused = refused_transactions(attestation.execution_certificates());
         let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
@@ -864,12 +949,38 @@ impl TickState {
                 tracing::error!(
                     tick = %self.tick_id,
                     tx_hash = ?outcome.tx_hash(),
-                    "into_finalization: an outcome that settles something is missing \
-                     its stored receipt (is_complete gate bypassed)"
+                    "an outcome that settles something is missing its stored receipt \
+                     (readiness gate bypassed)"
                 );
             }
         }
         attestation.with_receipts(receipts)
+    }
+
+    /// Take the determined half's finalization, if it is ready.
+    ///
+    /// Settles on the tick's own certificate alone, so a leg waiting on a
+    /// counterpart cannot hold it — which is what keeps the settlement
+    /// frontier advancing whatever a counterpart does.
+    pub fn take_determined_finalization(&mut self) -> Option<Finalization> {
+        if !self.determined_ready() {
+            return None;
+        }
+        let members: HashSet<TxHash> = self.determined_members().into_iter().collect();
+        let attestation = self.attestation_for(&members)?;
+        self.determined_emitted = true;
+        Some(self.with_drained_receipts(attestation))
+    }
+
+    /// Take the legs half's finalization, if it is ready.
+    pub fn take_legs_finalization(&mut self) -> Option<Finalization> {
+        if !self.legs_ready() {
+            return None;
+        }
+        let members: HashSet<TxHash> = self.leg_members().into_iter().collect();
+        let attestation = self.attestation_for(&members)?;
+        self.legs_emitted = true;
+        Some(self.with_drained_receipts(attestation))
     }
 
     /// Per-member terminal decisions derived from collected certificates.
@@ -889,5 +1000,169 @@ impl TickState {
                 (*tx_hash, decision)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::{
+        AggregateSignature, ConsensusReceipt, GlobalReceiptHash, Hash, SignerBitfield,
+    };
+
+    use super::*;
+
+    fn tx(seed: u8) -> TxHash {
+        TxHash::from(Hash::from_bytes(&[seed; 32]))
+    }
+
+    fn receipt(tx_hash: TxHash) -> StoredReceipt {
+        StoredReceipt {
+            tx_hash,
+            consensus: Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                #[allow(clippy::default_trait_access)]
+                writes: Default::default(),
+                beacon_witness_events: Vec::new(),
+                events: Vec::new(),
+            }),
+            metadata: None,
+        }
+    }
+
+    fn shard(index: u64) -> ShardId {
+        ShardId::leaf(1, index)
+    }
+
+    /// A tick at `shard(0)` running one single-shard member and one leg
+    /// bound to `shard(1)`, both executed and both holding a receipt.
+    fn mixed_tick() -> (TickState, TxHash, TxHash) {
+        let local = shard(0);
+        let (determined, leg) = (tx(1), tx(2));
+        let mut tick = TickState::new(
+            TickId::new(local, BlockHeight::new(1)),
+            BlockHash::ZERO,
+            WeightedTimestamp::from_millis(1_000),
+        );
+        tick.admit(determined, BTreeSet::from([local]), 10, false);
+        tick.admit(leg, BTreeSet::from([local, shard(1)]), 20, false);
+        for tx_hash in [determined, leg] {
+            tick.record_execution_result(
+                tx_hash,
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            );
+            tick.record_receipt(receipt(tx_hash));
+        }
+        let (_, root, outcomes) = tick.build_vote_data().expect("every member came back");
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                *tick.tick_id(),
+                tick.vote_anchor_ts(),
+                root,
+                outcomes,
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        (tick, determined, leg)
+    }
+
+    /// The milestone's whole point: a leg whose counterpart never
+    /// certifies does not hold its tick-mates. The determined half
+    /// settles on the tick's own certificate, names only its own member,
+    /// and releases only that member's reservation.
+    #[test]
+    fn a_stranded_leg_does_not_hold_its_tick_mates() {
+        let (mut tick, determined, leg) = mixed_tick();
+
+        assert!(tick.determined_ready());
+        assert!(!tick.legs_ready(), "the counterpart has not certified");
+
+        let half = tick
+            .take_determined_finalization()
+            .expect("settles on the tick's own certificate");
+        assert_eq!(
+            half.tx_hashes().collect::<Vec<_>>(),
+            vec![determined],
+            "the half names its own members and no others",
+        );
+        assert_eq!(
+            half.declared_work(),
+            10,
+            "and releases only what those members reserved",
+        );
+        assert!(!tick.has_spoken(), "the leg is still owed a verdict");
+
+        // The counterpart still never certifies.
+        assert!(!tick.legs_ready());
+        assert!(tick.take_legs_finalization().is_none());
+        assert!(!tick.determined_ready(), "the determined half is one-shot");
+        let _ = leg;
+    }
+
+    /// Once the counterpart certifies, the legs half follows and the tick
+    /// has said everything it will say.
+    #[test]
+    fn the_legs_half_follows_its_counterpart() {
+        let (mut tick, _determined, leg) = mixed_tick();
+        tick.take_determined_finalization().expect("ready");
+
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                TickId::new(shard(1), BlockHeight::new(4)),
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::ZERO,
+                vec![TxOutcome::new(
+                    leg,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )],
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+
+        assert!(tick.legs_ready());
+        let half = tick.take_legs_finalization().expect("covered");
+        assert_eq!(half.tx_hashes().collect::<Vec<_>>(), vec![leg]);
+        assert_eq!(half.declared_work(), 20);
+        assert!(tick.has_spoken());
+    }
+
+    /// A tick with nothing but single-shard members has no legs half at
+    /// all, so it is done the moment its own certificate lands.
+    #[test]
+    fn a_purely_local_tick_has_one_half() {
+        let local = shard(0);
+        let mut tick = TickState::new(
+            TickId::new(local, BlockHeight::new(1)),
+            BlockHash::ZERO,
+            WeightedTimestamp::from_millis(1_000),
+        );
+        tick.admit(tx(1), BTreeSet::from([local]), 10, false);
+        tick.record_execution_result(
+            tx(1),
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        );
+        tick.record_receipt(receipt(tx(1)));
+        let (_, root, outcomes) = tick.build_vote_data().expect("came back");
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                *tick.tick_id(),
+                tick.vote_anchor_ts(),
+                root,
+                outcomes,
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+
+        assert!(tick.take_determined_finalization().is_some());
+        assert!(tick.leg_members().is_empty());
+        assert!(tick.has_spoken());
     }
 }

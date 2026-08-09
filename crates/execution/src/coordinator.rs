@@ -842,9 +842,7 @@ impl ExecutionCoordinator {
                 let (tx_hash, outcome) = wr.into_parts();
                 state.record_execution_result(tx_hash, outcome);
             }
-            if state.is_complete() {
-                actions.extend(self.finalize(topology_schedule, &tick_id));
-            }
+            actions.extend(self.finalize(topology_schedule, &tick_id));
         } else {
             // The coordinator stopped tracking the tick between its
             // dispatch and its batch returning. That says where this
@@ -2417,9 +2415,8 @@ impl ExecutionCoordinator {
             let Some(tick) = self.ticks.get_tick_mut(tick_id) else {
                 continue;
             };
-            if tick.add_execution_certificate(Arc::clone(ec)) && tick.is_complete() {
-                actions.extend(self.finalize(topology_schedule, tick_id));
-            }
+            tick.add_execution_certificate(Arc::clone(ec));
+            actions.extend(self.finalize(topology_schedule, tick_id));
         }
         // The other: an admitted local EC that contradicts the vote this
         // validator already cast.
@@ -2433,23 +2430,40 @@ impl ExecutionCoordinator {
     /// Called when the tick's local EC is present and every non-aborted tx is
     /// covered by all participating shards.
     fn finalize(&mut self, topology_schedule: &TopologySchedule, tick_id: &TickId) -> Vec<Action> {
-        let Some(tick) = self.ticks.remove_tick(tick_id) else {
+        let mut halves: Vec<Finalization> = Vec::new();
+        let Some(tick) = self.ticks.get_tick_mut(tick_id) else {
             return vec![];
         };
+        // Determined first, and the order matters: the two halves of one
+        // tick came out of a single batch fold, so a receipt in the second
+        // states an absolute computed on top of the first.
+        halves.extend(tick.take_determined_finalization());
+        halves.extend(tick.take_legs_finalization());
+        if halves.is_empty() {
+            return vec![];
+        }
+        let spoken = tick.has_spoken();
 
-        // Tick finalization requires every participating shard's EC, which
-        // means each remote shard executed this tick — strong evidence they
-        // also received our outbound EC (or are about to). Drop the
-        // re-broadcast tracker entry to stop wasting bandwidth.
-        self.outbound_certs.on_tick_finalized(tick_id);
+        if spoken {
+            // Every leg's settlement needed every participating shard's
+            // certificate, which means each of them executed this tick —
+            // strong evidence they also received our outbound EC (or are
+            // about to). Drop the re-broadcast tracker entry to stop
+            // wasting bandwidth. The tick itself stays until a committed
+            // block resolves its members.
+            self.outbound_certs.on_tick_finalized(tick_id);
+        }
 
         // Local-finalization gate produces `Verified<Finalization>`; lift
         // into the `Block::Live.certificates` transport shape once so the
         // store, the admission event, and any downstream `PendingBlock`
         // entry share the same `Arc` without further per-consumer cloning.
-        let finalized_arc =
-            Arc::new(Verified::<Finalization>::seal(tick.into_finalization()).into());
-        self.emit_or_gate_finalized(topology_schedule, finalized_arc)
+        let mut actions = Vec::new();
+        for half in halves {
+            let finalized_arc = Arc::new(Verified::<Finalization>::seal(half).into());
+            actions.extend(self.emit_or_gate_finalized(topology_schedule, finalized_arc));
+        }
+        actions
     }
 
     /// Admit a freshly built finalization downstream, or withhold it at
@@ -2835,16 +2849,25 @@ impl ExecutionCoordinator {
     pub fn remove_finalization(&mut self, fw: &Finalization) {
         let tick_id = fw.tick_id();
         self.finalized.remove(&fw.receipt_hash());
-        // The local-shard EC is now durable in storage via the committed
-        // finalization; drop the in-memory copy so peers fetching after
-        // this point fall through to storage.
-        self.exec_certs.evict(tick_id);
-        // The tick may already have been removed by `finalize` (local
-        // aggregation path) or be absent entirely (sync path: the block was
-        // received as committed without local tracking). Either case is fine.
-        self.ticks.remove_tick(tick_id);
 
         let tx_hashes: Vec<TxHash> = fw.tx_hashes().collect();
+        // A tick settles in two halves, so the first one committing says
+        // nothing about the second. Drop the tick and its certificate
+        // only once every member it holds has been resolved — otherwise
+        // the legs half loses the state it is still owed from.
+        let fully_resolved = self
+            .ticks
+            .get_tick_mut(tick_id)
+            .is_none_or(|tick| tick.record_settled(tx_hashes.iter().copied()));
+        if fully_resolved {
+            // The local-shard EC is now durable in storage via the
+            // committed finalization; drop the in-memory copy so peers
+            // fetching after this point fall through to storage.
+            self.exec_certs.evict(tick_id);
+            // The tick may be absent entirely (sync path: the block was
+            // received as committed without local tracking), which is fine.
+            self.ticks.remove_tick(tick_id);
+        }
         for &tx_hash in &tx_hashes {
             self.ticks.remove_assignment(tx_hash);
             self.provisioning.remove_tx(tx_hash);
@@ -2969,8 +2992,9 @@ impl ExecutionCoordinator {
                         }
                     },
                     |tick| {
-                        let complete = tick.is_complete();
-                        format!("tick={tick_id}, complete={complete}")
+                        let determined = tick.determined_ready();
+                        let legs = tick.legs_ready();
+                        format!("tick={tick_id}, determined_ready={determined}, legs_ready={legs}")
                     },
                 )
             },
@@ -5046,8 +5070,8 @@ mod tests {
         )));
         tick.add_execution_certificate(local_ec);
         assert!(
-            tick.is_complete(),
-            "fixture precondition: tick must be ready to finalize"
+            tick.determined_ready(),
+            "fixture precondition: a purely local tick settles on its own certificate"
         );
 
         (tick_id, tick)
@@ -5061,12 +5085,21 @@ mod tests {
 
         let _actions = state.finalize(&make_test_topology(), &tick_id);
 
-        assert!(!state.ticks.contains_tick(&tick_id), "tick handed off");
         assert!(
             state.finalized.contains(&tick_id),
             "finalized store populated"
         );
         assert_eq!(state.finalized.len(), 1);
+        // The tick outlives its handoff: it is what tells a committing
+        // block whether the members it resolved were all of them.
+        assert!(state.ticks.contains_tick(&tick_id));
+        assert!(
+            state
+                .ticks
+                .get_tick(&tick_id)
+                .is_some_and(TickState::has_spoken),
+            "a purely local tick has nothing left to say",
+        );
     }
 
     #[test]
@@ -5751,10 +5784,15 @@ mod tests {
     #[test]
     fn an_assembled_finalization_withholds_the_abort() {
         let mut state = make_test_state();
-        let (tick_id, tick) = make_ready_local_tick(&[7]);
+        let (tick_id, mut tick) = make_ready_local_tick(&[7]);
         let tx_hash = tick.tx_hashes()[0];
-        let finalization: Arc<Verifiable<Finalization>> =
-            Arc::new(Verified::<Finalization>::seal(tick.into_finalization()).into());
+        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+            Verified::<Finalization>::seal(
+                tick.take_determined_finalization()
+                    .expect("a purely local tick settles on its own certificate"),
+            )
+            .into(),
+        );
         let fw_hash = finalization.receipt_hash();
         state.finalized.insert(tick_id, finalization);
 
