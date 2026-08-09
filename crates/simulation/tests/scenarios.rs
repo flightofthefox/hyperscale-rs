@@ -45,7 +45,8 @@ use hyperscale_scenarios::{
     re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
     register_validator_pools_a_node, register_without_capacity_is_rejected,
     registered_validator_activates_onto_a_shard, single_transfer,
-    split_boundary_admits_an_uncommitted_precut_tx, split_boundary_refuses_a_replay,
+    split_boundary_admits_an_uncommitted_precut_tx,
+    split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
     split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_terminating_payer_releases_its_reservation, stake_withdraw_drops_effective_stake,
     surviving_sibling_split_seats_full_committees,
@@ -158,6 +159,13 @@ fn split_boundary_refuses_a_replay_sim() {
         &probe_train_genesis_accounts(MAX_REPLAY_PROBES),
     );
     split_boundary_refuses_a_replay(&mut cluster);
+}
+
+#[test]
+fn split_boundary_hands_back_what_it_never_included_sim() {
+    let mut cluster =
+        SimCluster::with_accounts(&split_config(), 11, &probe_train_genesis_accounts(4));
+    split_boundary_hands_back_what_it_never_included(&mut cluster);
 }
 
 #[test]

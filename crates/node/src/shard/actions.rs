@@ -157,6 +157,16 @@ where
                 attested_root,
                 peers,
             ),
+            Action::ReofferTransactions { txs } => {
+                // Through the client submit rail, not this shard's gossip
+                // topic: the fan-out resolves each transaction against
+                // the current topology, so it reaches the successor that
+                // holds its keys now rather than the committee this
+                // chain is leaving.
+                for tx in &txs {
+                    self.process.submit_transaction(tx);
+                }
+            }
             Action::Fetch(req) => self.process_fetch_request(req),
             Action::AbandonFetch(req) => self.process_fetch_abandon(req),
 

@@ -8,7 +8,9 @@ use hyperscale_types::{
     BlockHeight, MAX_VALIDITY_RANGE, ShardId, TimestampRange, Transaction, WeightedTimestamp,
 };
 
-use crate::support::query::{committee_size, live_shards};
+use crate::support::query::{
+    committee_size, epoch_duration_ms, live_shards, scheduled_terminal_epoch,
+};
 use crate::support::tx::{build_probe_transfer_tx, validity_around};
 use crate::support::wait::{
     assert_height_frozen, await_beacon_epoch, await_height, await_merge_keeper_count,
@@ -441,6 +443,103 @@ pub fn merge_lifecycle(c: &mut impl Cluster) {
         "the merged root did not match the beacon anchor within budget"
     );
 }
+
+/// A transaction a terminating shard admitted and never included still
+/// reaches an outcome, without the client resubmitting it.
+///
+/// The terminal sweep drives every *committed* transaction to its abort,
+/// because no later block on that chain can decide one. It leaves the
+/// `Pending` entries alone, and those have nowhere left to go: the chain
+/// proposes only empty coast blocks from there, its mempool dies with it,
+/// and its successors construct empty ones. Their client's last word is
+/// the `Pending` it got on submission.
+///
+/// The probe's window opens after the cut, so the parent admits it and
+/// can never include it — its terminal precedes the window. That is a
+/// `Pending` entry in a pool about to die, arrived at by construction
+/// rather than by racing the terminal. Nothing here resubmits it, so the
+/// only path from the parent's pool to a child's is the handback.
+///
+/// Deliberately *not* pre-cut: this isolates the handback from the
+/// committed-set query, which resolves a different population.
+///
+/// Requires a config with `split_bytes = 0` and one cohort of pool
+/// surplus, plus funding for one probe.
+///
+/// # Panics
+///
+/// Panics if the split misses its budget, if the parent included the
+/// probe after all (which would make the assertion vacuous), or if the
+/// probe reaches no outcome on either child.
+pub fn split_boundary_hands_back_what_it_never_included(c: &mut impl Cluster) {
+    let root = ShardId::ROOT;
+    let (left, right) = root.children();
+
+    assert!(
+        await_split_admitted(c, root, epochs(8)),
+        "beacon did not admit the root split within budget"
+    );
+    // Admission is not the cut. The readiness gate stamps which epoch the
+    // parent terminates on, and only then can a window be built that the
+    // parent provably cannot reach.
+    assert!(
+        c.run_until(epochs(12), |c| scheduled_terminal_epoch(c, root).is_some()),
+        "the split's cut was not scheduled within budget",
+    );
+
+    let probe = build_post_cut_probe(c, root);
+    let hash = probe.hash();
+    c.submit(probe);
+
+    assert!(
+        c.run_until(epochs(28), |c| [left, right]
+            .iter()
+            .all(|&child| shard_live(c, child))),
+        "split children were not live within budget",
+    );
+    assert!(
+        c.chain_fate(root, hash).0.is_none(),
+        "the parent included {hash}, so it never sat unincluded in the dying pool \
+         and the handback assertion would be vacuous",
+    );
+
+    assert!(
+        c.run_until(epochs(12), |c| [left, right]
+            .iter()
+            .any(|&child| c.chain_fate(child, hash).1.is_some())),
+        "{hash} was admitted to the parent's pool and never included, so the handback \
+         must carry it to a successor — nothing else can, and nothing resubmitted it",
+    );
+}
+
+/// A probe whose validity window opens after `parent`'s scheduled cut, so
+/// the parent admits it and can never include it.
+///
+/// Built from the cut the beacon has stamped rather than from a lead
+/// guessed off the admitting epoch: a reshape runs however many epochs
+/// its readiness gate takes, so no fixed lead clears the cut on every
+/// topology.
+///
+/// # Panics
+///
+/// Panics if the beacon has not scheduled `parent`'s cut yet.
+fn build_post_cut_probe(c: &impl Cluster, parent: ShardId) -> Arc<Transaction> {
+    let terminal = scheduled_terminal_epoch(c, parent).expect("the cut is scheduled");
+    let epoch_ms = epoch_duration_ms(c).expect("a scheduled cut implies a committed beacon");
+    // The epoch after the parent's last: its chain has ended by then, and
+    // its successors are the only thing that can include this.
+    let opens = terminal.inner().saturating_add(1).saturating_mul(epoch_ms);
+    let range = TimestampRange::new(
+        WeightedTimestamp::from_millis(opens),
+        WeightedTimestamp::from_millis(opens).plus(POST_CUT_PROBE_LIFE),
+    );
+    Arc::new(build_probe_transfer_tx(range))
+}
+
+/// How long [`build_post_cut_probe`]'s window stays open — the validity
+/// budget less the slack a window needs to stay well formed against an
+/// anchor trailing the clock it was built on.
+const POST_CUT_PROBE_LIFE: Duration = MAX_VALIDITY_RANGE.saturating_sub(Duration::from_secs(15));
 
 /// The same separation across a merge, where the successor has two
 /// predecessors instead of one.

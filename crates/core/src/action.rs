@@ -1274,6 +1274,26 @@ pub enum Action {
     /// succeeded, retention-horizon orphan cleanup, deadline eviction).
     AbandonFetch(FetchAbandon),
 
+    /// Offer transactions this chain never included to whatever holds
+    /// their keys now.
+    ///
+    /// Emitted once, by a chain that has dissolved at a reshape boundary,
+    /// for the pool entries its terminal sweep does not reach. The runner
+    /// routes each through the same fan-out a client submission takes, so
+    /// they resolve against the *current* topology and land on the
+    /// successor that now owns the payer rather than on the committee
+    /// that is shutting down.
+    ///
+    /// Best effort in both directions and safe in both. A seat that
+    /// hosts no successor drops its copy, and the seats that continue
+    /// cover it; a duplicate is deduplicated at admission; and a
+    /// transaction the terminating chain did commit is refused by the
+    /// successor's pre-cut rule against the predecessor's committed set.
+    ReofferTransactions {
+        /// Transactions to put back in front of the network.
+        txs: Vec<Arc<Transaction>>,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Beacon consensus
     // ═══════════════════════════════════════════════════════════════════════
@@ -1707,6 +1727,7 @@ impl Action {
             | Self::SetTimer { .. }
             | Self::CancelTimer { .. }
             | Self::Continuation(_)
+            | Self::ReofferTransactions { .. }
             | Self::VerifyAndBuildQuorumCertificate { .. }
             | Self::VerifyProvisions { .. }
             | Self::AggregateExecutionCertificate { .. }

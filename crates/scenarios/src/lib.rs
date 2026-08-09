@@ -56,7 +56,8 @@ pub use reshape::{
     MAX_REPLAY_PROBES, grow_reaches_four_shard_topology, grow_reaches_two_shard_topology,
     merge_boundary_admits_an_uncommitted_precut_tx, merge_lifecycle,
     merge_seats_full_keeper_committee, split_boundary_admits_an_uncommitted_precut_tx,
-    split_boundary_refuses_a_replay, split_lifecycle,
+    split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
+    split_lifecycle,
 };
 pub use straddler::{
     isolate_ec_intake, merge_straddler_atomic, split_straddler_atomic,

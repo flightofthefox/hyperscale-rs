@@ -17,6 +17,13 @@ use super::ShardParticipation;
 /// fires only on a genuine stall, not a transient gap between commits.
 pub(in crate::state) const STALL_RECOVERY_TICKS: u32 = 5;
 
+/// Cleanup ticks a coasting chain offers its unincluded pool back over
+/// before falling silent until dissolution. At the default one-second
+/// interval this covers the seating of successors that flip from the
+/// terminal cut, which is the common case; the dissolution offer is what
+/// covers a successor that takes longer.
+const HANDBACK_ATTEMPTS: u32 = 5;
+
 impl ShardParticipation {
     #[instrument(skip(self, sched))]
     pub(in crate::state) fn on_cleanup_timer(&mut self, sched: &TopologySchedule) -> Vec<Action> {
@@ -42,6 +49,8 @@ impl ShardParticipation {
         // query's slot.
         actions.extend(self.scan_precut_queries());
 
+        actions.extend(self.hand_back_pending_pool(sched));
+
         // Drop tombstones whose `end_timestamp_exclusive` has passed — past
         // expiry, validator-side validity check rejects re-submission anyway.
         self.mempool_coordinator.cleanup_expired_tombstones();
@@ -52,6 +61,57 @@ impl ShardParticipation {
         self.mempool_coordinator.cleanup_expired_pending();
 
         actions
+    }
+
+    /// Offer back what this chain admitted and never included, once its
+    /// successors are live.
+    ///
+    /// The terminal sweep drives every *committed* transaction to its
+    /// abort, because no later block on this chain can decide one. It
+    /// leaves the `Pending` entries alone, and those have nowhere to go:
+    /// this chain proposes only empty coast blocks from here, its mempool
+    /// dies with it, and a successor constructs an empty one. Without this
+    /// the client's last word on such a transaction is the `Pending` it
+    /// was given on submission.
+    ///
+    /// Gated on dissolution rather than quiescence, which is where the
+    /// sweep runs. Quiescence is the last block that can decide anything,
+    /// but the successors do not exist yet at that point and an offer made
+    /// then reaches nothing. Dissolution is the beacon showing them live.
+    ///
+    /// Driven from the cleanup timer rather than from block commit,
+    /// because a dissolved chain has stopped proposing and may commit
+    /// nothing further to hang the edge on.
+    fn hand_back_pending_pool(&mut self, sched: &TopologySchedule) -> Vec<Action> {
+        if self.pending_pool_handed_back || !self.shard_coordinator.quiescent(sched) {
+            return Vec::new();
+        }
+        // Offered from quiescence rather than once at dissolution. The
+        // successors seat from the terminal cut, well ahead of the fold
+        // that shows them live, so an early offer usually lands — and
+        // waiting for that fold leaves a client watching `Pending` for
+        // the epoch or two it takes.
+        //
+        // An offer made before they seat reaches nothing, so a few go out
+        // while the chain coasts, and one more when the beacon shows them
+        // live, which is the point an offer is certain to have somewhere
+        // to go. The repeats cost a duplicate the receiving pool drops.
+        let dissolved = self.shard_coordinator.dissolved(sched);
+        self.handback_attempts = self.handback_attempts.saturating_add(1);
+        self.pending_pool_handed_back = dissolved;
+        if !dissolved && self.handback_attempts > HANDBACK_ATTEMPTS {
+            return Vec::new();
+        }
+        let txs = self.mempool_coordinator.pending_for_handback();
+        if txs.is_empty() {
+            return Vec::new();
+        }
+        tracing::info!(
+            shard = ?self.local_shard,
+            count = txs.len(),
+            "Chain dissolved; offering back what it never included"
+        );
+        vec![Action::ReofferTransactions { txs }]
     }
 
     /// Flush the cross-shard fallback fetches when the shard has stalled.

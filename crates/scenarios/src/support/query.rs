@@ -82,6 +82,27 @@ pub fn split_admitted<C: Cluster>(c: &C, parent: ShardId) -> bool {
     })
 }
 
+/// The final epoch window the beacon has scheduled `parent`'s reshape to
+/// terminate on — the cut its chain ends at and its successors take over
+/// at.
+///
+/// `None` while the reshape is admitted but its readiness gate has yet to
+/// stamp a cut. A `Some` answer is irrevocable, so a scenario may build
+/// against it.
+#[must_use]
+pub fn scheduled_terminal_epoch<C: Cluster>(c: &C, parent: ShardId) -> Option<Epoch> {
+    c.beacon_state()
+        .and_then(|state| state.pending_reshapes.get(&parent)?.scheduled_terminal())
+}
+
+/// Milliseconds of weighted time per epoch, off the beacon's own chain
+/// config — what turns an epoch number into the boundary it starts at.
+#[must_use]
+pub fn epoch_duration_ms<C: Cluster>(c: &C) -> Option<u64> {
+    c.beacon_state()
+        .map(|state| state.chain_config.epoch_duration_ms)
+}
+
 /// The beacon-composed anchor root for `shard` — the `boundaries` `state_root`
 /// a flip must reproduce.
 #[must_use]

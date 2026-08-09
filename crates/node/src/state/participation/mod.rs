@@ -73,6 +73,15 @@ pub(in crate::state) struct ShardParticipation {
     /// them.
     pub(in crate::state) terminal_chain_swept: bool,
 
+    /// Latches the pending-pool handback, and counts the offers made
+    /// before it latched. Whatever the local chain admitted and never
+    /// included is offered back to the network as it coasts to its
+    /// dissolution; the sweep above cannot reach those entries, because
+    /// an aborted transaction is a decided one and these were never
+    /// decided by anything.
+    pub(in crate::state) pending_pool_handed_back: bool,
+    pub(in crate::state) handback_attempts: u32,
+
     /// Committed height observed at the previous cleanup tick, and how many
     /// consecutive cleanup ticks it has gone unchanged. The cross-shard fallback
     /// fetches are otherwise only swept on block commit; once the shard has
@@ -142,6 +151,8 @@ impl ShardParticipation {
             remote_headers_coordinator: RemoteHeaderCoordinator::new(local_shard),
             now: LocalTimestamp::ZERO,
             terminal_chain_swept: false,
+            pending_pool_handed_back: false,
+            handback_attempts: 0,
             last_cleanup_height: None,
             cleanup_stall_ticks: 0,
             fork_fence: ForkFence::new(),

@@ -1117,6 +1117,31 @@ impl MempoolCoordinator {
         expired.len()
     }
 
+    /// Everything still awaiting inclusion that a successor could still
+    /// include: the pool's `Pending` entries whose validity window has
+    /// not closed.
+    ///
+    /// [`Self::abort_in_flight`] terminalises what the chain committed;
+    /// this is the rest. A `Pending` entry holds no locks, no tick and no
+    /// certificate — it was never included — so it carries none of the
+    /// state that makes an in-flight transaction impossible to move, and
+    /// re-offering it costs a client the resubmission it would otherwise
+    /// have to make itself.
+    ///
+    /// Read rather than drained: the pool dies with the chain either way,
+    /// and leaving it intact keeps the engagement bookkeeping the entries
+    /// participate in untouched.
+    #[must_use]
+    pub fn pending_for_handback(&self) -> Vec<Arc<Transaction>> {
+        let now = self.current_ts;
+        self.pool
+            .values()
+            .filter(|entry| matches!(entry.status, TransactionStatus::Pending))
+            .filter(|entry| entry.tx.validity_range().end_timestamp_exclusive > now)
+            .map(|entry| Arc::new((**entry.tx).clone()))
+            .collect()
+    }
+
     /// Get the number of tombstones currently tracked.
     #[must_use]
     pub fn tombstone_count(&self) -> usize {
@@ -2175,6 +2200,65 @@ mod tests {
             mempool.status(&tx.hash()),
             Some(TransactionStatus::Pending)
         ));
+    }
+
+    /// The handback carries what the terminal sweep cannot reach: pool
+    /// entries that were never included, and only while a successor could
+    /// still include them.
+    #[test]
+    fn pending_for_handback_offers_only_live_uncommitted_entries() {
+        let topology_snapshot = make_test_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+        set_current_ts(&mut mempool, WeightedTimestamp::from_millis(500));
+
+        let alive = tx_with_end(1, 60_000);
+        let expiring = tx_with_end(2, 1_000);
+        for tx in [&alive, &expiring] {
+            mempool.on_submit_transaction(&topology_snapshot, Arc::clone(tx), LocalTimestamp::ZERO);
+        }
+
+        let mut offered: Vec<TxHash> = mempool
+            .pending_for_handback()
+            .iter()
+            .map(|tx| tx.hash())
+            .collect();
+        offered.sort_unstable();
+        let mut expected = vec![alive.hash(), expiring.hash()];
+        expected.sort_unstable();
+        assert_eq!(offered, expected);
+
+        // Past `expiring`'s window a successor could not include it either,
+        // so offering it back would only cost the successor an admission
+        // it immediately drops.
+        set_current_ts(&mut mempool, WeightedTimestamp::from_millis(1_500));
+        assert_eq!(
+            mempool
+                .pending_for_handback()
+                .iter()
+                .map(|tx| tx.hash())
+                .collect::<Vec<_>>(),
+            vec![alive.hash()],
+        );
+    }
+
+    /// A committed entry is the sweep's business, not the handback's — it
+    /// has a decision coming, or an abort standing in for one.
+    #[test]
+    fn pending_for_handback_leaves_committed_entries_to_the_sweep() {
+        let topology_snapshot = make_test_topology();
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+        set_current_ts(&mut mempool, WeightedTimestamp::from_millis(500));
+
+        let tx = tx_with_end(1, 60_000);
+        mempool.on_submit_transaction(&topology_snapshot, Arc::clone(&tx), LocalTimestamp::ZERO);
+        mempool
+            .pool
+            .get_mut(&tx.hash())
+            .expect("just admitted")
+            .status = TransactionStatus::Committed(BlockHeight::new(1));
+
+        assert!(mempool.pending_for_handback().is_empty());
+        assert_eq!(mempool.abort_in_flight().len(), 1);
     }
 
     #[test]
