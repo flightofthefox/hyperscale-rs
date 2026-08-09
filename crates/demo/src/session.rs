@@ -9,8 +9,8 @@ use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{CryptoScheme, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, Ed25519PrivateKey, NetworkDefinition, NetworkId,
-    ReshapeThresholds, ShardId, SharedCertificates, TimestampRange, Transaction,
+    BeaconChainConfig, BlockHeight, Ed25519PrivateKey, MAX_VALIDITY_RANGE, NetworkDefinition,
+    NetworkId, ReshapeThresholds, ShardId, SharedCertificates, TimestampRange, Transaction,
     TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
 };
 
@@ -27,12 +27,25 @@ fn account_from_seed(seed: u8) -> [u8; 16] {
     account_address(&signer_from_seed(seed).public_key().0)
 }
 
+/// How far back of `now` a validity window opens, absorbing the chain's
+/// anchor trailing the session clock.
+const VALIDITY_BACK: Duration = Duration::from_secs(5);
+
+/// Slack held under [`MAX_VALIDITY_RANGE`] so a window built against the
+/// session clock is still well formed at an anchor trailing it.
+const VALIDITY_SLACK: Duration = Duration::from_secs(15);
+
+/// How far past `now` a validity window runs — the rest of the budget
+/// once the backward opening and the anchor slack are taken.
+const VALIDITY_FORWARD: Duration =
+    MAX_VALIDITY_RANGE.saturating_sub(VALIDITY_BACK.saturating_add(VALIDITY_SLACK));
+
 /// A validity window bracketing `now`, wide enough that a transaction stays
 /// valid while it waits out ordering and settlement.
 fn validity_around(now: Duration) -> TimestampRange {
     TimestampRange::new(
-        WeightedTimestamp::ZERO.plus(now.saturating_sub(Duration::from_secs(5))),
-        WeightedTimestamp::ZERO.plus(now + Duration::from_secs(150)),
+        WeightedTimestamp::ZERO.plus(now.saturating_sub(VALIDITY_BACK)),
+        WeightedTimestamp::ZERO.plus(now + VALIDITY_FORWARD),
     )
 }
 

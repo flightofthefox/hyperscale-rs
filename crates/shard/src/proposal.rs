@@ -544,7 +544,9 @@ mod tests {
     use hyperscale_types::test_utils::{
         install_stub_vm_statics, make_finalization, stub_transaction, test_prefix,
     };
-    use hyperscale_types::{Hash, MAX_FINALIZED_TX_PER_BLOCK, TimestampRange, TransactionDecision};
+    use hyperscale_types::{
+        Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_VALIDITY_RANGE, TimestampRange, TransactionDecision,
+    };
 
     use super::*;
 
@@ -750,8 +752,11 @@ mod tests {
     #[test]
     fn select_transactions_drops_malformed_ranges() {
         let anchor = ts(1_000);
-        // Length over MAX_VALIDITY_RANGE (5 min).
-        let too_wide = TimestampRange::new(ts(0), anchor.plus(Duration::from_mins(10)));
+        // Length over MAX_VALIDITY_RANGE.
+        let too_wide = TimestampRange::new(
+            ts(0),
+            anchor.plus(MAX_VALIDITY_RANGE + Duration::from_secs(1)),
+        );
         let txs = vec![tx_with_range(4, too_wide)];
 
         let selected = select_transactions(&txs, &HashSet::new(), &empty_dedup_index(), anchor);

@@ -28,10 +28,24 @@ use crate::WeightedTimestamp;
 /// Hard upper bound on validity range length and forward edge from the
 /// anchoring `weighted_timestamp`.
 ///
-/// Equal to the EC retention horizon from Plan A by design — past this
-/// point, every artefact derived from the tx is provably unreferenceable
-/// on every shard.
-pub const MAX_VALIDITY_RANGE: Duration = Duration::from_mins(5);
+/// The longest a signed transaction can be anyone's business, and so the
+/// term every tx-derived retention window is sized from: a transaction
+/// included at the last instant of its window gets
+/// [`MAX_FINALIZATION_DELAY`] beyond it to terminate, and the sum is
+/// [`RETENTION_HORIZON`].
+///
+/// Bounded on both sides. Above by [`EPOCH_DURATION`]: an artifact that
+/// outlives the committee epoch that produced it forces every successor
+/// of a reshape to reach back further than the reshape itself spans.
+/// Below by [`SKIP_TIMEOUT`] — a beacon skip and its recovery must not
+/// expire every transaction a shard is holding — for which a small
+/// multiple is the margin.
+///
+/// [`MAX_FINALIZATION_DELAY`]: crate::MAX_FINALIZATION_DELAY
+/// [`RETENTION_HORIZON`]: crate::RETENTION_HORIZON
+/// [`EPOCH_DURATION`]: crate::EPOCH_DURATION
+/// [`SKIP_TIMEOUT`]: crate::SKIP_TIMEOUT
+pub const MAX_VALIDITY_RANGE: Duration = Duration::from_secs(120);
 
 /// Half-open `[start, end)` range of [`WeightedTimestamp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Hbor)]

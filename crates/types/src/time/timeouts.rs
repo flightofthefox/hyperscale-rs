@@ -58,6 +58,22 @@ pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);
 pub const RETENTION_HORIZON: Duration =
     Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() + MAX_FINALIZATION_DELAY.as_secs());
 
+/// The horizon must not outlive the epoch that produced what it retains.
+///
+/// A reshape's cut is scheduled one window ahead, so a successor
+/// inheriting a predecessor's tx-derived state has one epoch of chain to
+/// read it from. A horizon past that reaches back further than the
+/// reshape spans, and the successor has to fetch below what it already
+/// walks. Half an epoch is the working margin, not the hard bound.
+const _: () = assert!(RETENTION_HORIZON.as_secs() < EPOCH_DURATION.as_secs());
+
+/// A skipped epoch and its recovery must not expire the transactions a
+/// shard is holding. `SKIP_TIMEOUT` bounds the wait before the pool
+/// prevotes a skip, and ratification rounds follow it; a validity window
+/// under a small multiple of that turns one stalled epoch into a
+/// cleared mempool.
+const _: () = assert!(MAX_VALIDITY_RANGE.as_secs() >= 2 * SKIP_TIMEOUT.as_secs());
+
 /// Base view-change timeout for the first round at any height.
 ///
 /// Combined with `VIEW_CHANGE_TIMEOUT_INCREMENT` and capped by

@@ -14,10 +14,10 @@ use hyperscale_effects_bridge::{
 use hyperscale_engine::genesis::stake_unit;
 use hyperscale_engine::{XRD, account_address};
 use hyperscale_types::{
-    ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey, EnvelopeExt, Epoch, MIN_STAKE_FLOOR,
-    NetworkId, NetworkParams, ShardId, ShardTrie, StakePoolId, StakePoolSeat, SubintentSig,
-    TimestampRange, Transaction, TransactionBody, TransactionEnvelope, ValidatorId,
-    WeightedTimestamp, ed25519_keypair_from_seed,
+    ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey, EnvelopeExt, Epoch,
+    MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, NetworkId, NetworkParams, ShardId, ShardTrie, StakePoolId,
+    StakePoolSeat, SubintentSig, TimestampRange, Transaction, TransactionBody, TransactionEnvelope,
+    ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
     Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
@@ -426,23 +426,31 @@ pub fn merge_straddler_setup() -> MergeStraddlerSetup {
 
 /// A validity window bracketing `now`.
 ///
-/// Opens 5 s before and closes 150 s after, so a transaction built with
-/// this window stays valid across a reshape that shuffles placement
-/// meanwhile.
+/// Opens [`VALIDITY_BACK`] before `now` to absorb the chain's anchor
+/// trailing the cluster clock, and runs [`VALIDITY_FORWARD`] past it.
 #[must_use]
 pub fn validity_around(now: Duration) -> TimestampRange {
     TimestampRange::new(
-        WeightedTimestamp::ZERO.plus(now.saturating_sub(Duration::from_secs(5))),
+        WeightedTimestamp::ZERO.plus(now.saturating_sub(VALIDITY_BACK)),
         WeightedTimestamp::ZERO.plus(now + VALIDITY_FORWARD),
     )
 }
 
-/// How far forward [`validity_around`] opens a window.
+/// How far back of `now` [`validity_around`] opens a window.
+const VALIDITY_BACK: Duration = Duration::from_secs(5);
+
+/// Slack held under [`MAX_VALIDITY_RANGE`] so a window built against the
+/// cluster clock is still well formed at an anchor trailing it.
+const VALIDITY_SLACK: Duration = Duration::from_secs(15);
+
+/// How far forward [`validity_around`] opens a window — the rest of the
+/// budget once the backward opening and the anchor slack are taken.
 ///
 /// Wall-clock rather than epoch-shaped, and both a transaction's
 /// inclusion deadline and — for a cross-shard VM payer — the point past
 /// which it gives up waiting for engagement echoes.
-const VALIDITY_FORWARD: Duration = Duration::from_secs(150);
+const VALIDITY_FORWARD: Duration =
+    MAX_VALIDITY_RANGE.saturating_sub(VALIDITY_BACK.saturating_add(VALIDITY_SLACK));
 
 /// The account owned by [`signer_from_seed`]'s key for `seed`.
 #[must_use]

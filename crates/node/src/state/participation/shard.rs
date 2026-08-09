@@ -745,7 +745,7 @@ mod tests {
         let TestNode { mut node, .. } = TestNode::builder().build();
 
         // Register an outbound batch (local root shard → remote leaf shard).
-        // Deadline = self.now (ZERO) + RETENTION_HORIZON ≈ 5m24s.
+        // Deadline = self.now (ZERO) + RETENTION_HORIZON.
         let provisions = Arc::new(Verified::new_unchecked_for_test(Provisions::new(
             ShardId::ROOT,
             ShardId::leaf(1, 1),

@@ -2645,7 +2645,7 @@ mod tests {
         assert_eq!(coordinator.pipeline.verified_len(), 1);
 
         // Advance local commits until past `source_block_ts + RETENTION_HORIZON`.
-        // Source ts = 10 * 500ms = 5_000ms. Deadline = 5_000ms + 324_000ms.
+        // Source ts is height 10 at `TEST_BLOCK_INTERVAL_MS` apiece.
         let deadline_height = (u64::try_from(RETENTION_HORIZON.as_millis()).unwrap_or(u64::MAX)
             / TEST_BLOCK_INTERVAL_MS)
             + 11;

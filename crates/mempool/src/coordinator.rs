@@ -1462,8 +1462,8 @@ mod tests {
 
     #[test]
     fn entry_dropped_past_retention_horizon_emits_metric() {
-        // RETENTION_HORIZON ≈ 5min + 24s. Sighting at H=1 (ts=500ms); commit
-        // far past horizon at H=700 (ts=350_000ms) — well over 324_000ms.
+        // Sighting at H=1 (ts=500ms); commit at H=700 (ts=350_000ms), far
+        // past `RETENTION_HORIZON` behind it.
         let topology_snapshot = make_test_topology();
         let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
 
@@ -1495,8 +1495,8 @@ mod tests {
     #[test]
     fn entry_retained_within_retention_horizon() {
         // H=100 (ts=50_000ms) is well past grace (2_000ms) but well under
-        // RETENTION_HORIZON (~324_000ms). Entry should still be tracked, and
-        // a fetch is emitted but no drop.
+        // `RETENTION_HORIZON`. Entry should still be tracked, and a fetch is
+        // emitted but no drop.
         let topology_snapshot = make_test_topology();
         let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
 
