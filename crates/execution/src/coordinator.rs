@@ -360,7 +360,7 @@ pub struct ExecutionCoordinator {
     /// commit and when a set is recorded; a tick leaves only on evidence —
     /// settled-set membership, the scheduled termination clearing, or the
     /// schedule evicting the shard — never on a clock. Keyed by `TickId`.
-    gated_finalized: BTreeMap<TickId, Arc<Verifiable<Finalization>>>,
+    gated_finalized: BTreeMap<FinalizationHash, Arc<Verifiable<Finalization>>>,
 
     /// This validator's identity.
     me: ValidatorId,
@@ -586,9 +586,15 @@ impl ExecutionCoordinator {
         transactions: &[Arc<Verifiable<Transaction>>],
     ) {
         let local_shard = self.local_shard;
-        self.unresolved.register_committed(transactions.iter());
-
         let members = assign_participants(classification, transactions);
+        // The ledger takes the participants the same assignment produced:
+        // an abandonment has no counterpart certificate to read them off,
+        // and the fence needs them.
+        self.unresolved.register_committed(
+            transactions
+                .iter()
+                .zip(members.iter().map(|(_, shards)| shards.clone())),
+        );
         let reaches_beyond: Vec<_> = members
             .iter()
             .filter(|(_, shards)| shards.iter().any(|&s| s != local_shard))
@@ -672,7 +678,8 @@ impl ExecutionCoordinator {
         // Read after admission, so a member that just joined this tick is
         // not abandoned out from under it — the tick is about to attest
         // it, which is what `will_attest` reports.
-        let abandoned = self.abandonable();
+        let composing: HashSet<TxHash> = state.tx_hashes().iter().copied().collect();
+        let abandoned = self.abandonable(&composing);
         self.discard_ticks_holding(&abandoned);
         for (tx_hash, declared_work) in abandoned {
             state.abandon(tx_hash, declared_work);
@@ -2203,36 +2210,45 @@ impl ExecutionCoordinator {
     /// lets a committee sign a verdict about it.
     ///
     /// Past it, only the transactions this shard has no outcome for and
-    /// none coming. A finalization already assembled, one the
-    /// split-boundary gate is holding, and a tick that has yet to speak
-    /// are each an outcome on its way, and an abort beside one would be a
-    /// second verdict. What is left is stranded: a tick that attested and
-    /// waits on a counterpart's certificate, or — after a restart — no
-    /// tick at all.
+    /// none coming: the tick being composed has not just admitted them,
+    /// and no live tick is still going to attest them. The second is
+    /// what stops the commits between a tick's composition and its
+    /// certificate from abandoning a member that tick is about to speak
+    /// for — a payer's leg, admitted at its engagement deadline, whose
+    /// abort carries a charge an abandonment cannot.
     ///
-    /// That narrowing is local, and it is safe for it to be: it only ever
-    /// withholds. Every wait it defers to ends — a block carries the
-    /// finalization, the schedule evicts a gate-held partner, a tick votes
-    /// at its own deadline — and the next commit asks again, so a
-    /// withheld abort is late rather than lost.
-    fn abandonable(&self) -> Vec<(TxHash, u64)> {
-        let outcome_coming = |tx_hash: TxHash| {
-            self.finalized.is_finalized(tx_hash)
-                || self
-                    .gated_finalized
-                    .values()
-                    .any(|fw| fw.contains_tx(&tx_hash))
-                || self
-                    .ticks
-                    .tick_assignment(tx_hash)
-                    .and_then(|tick_id| self.ticks.get_tick(&tick_id))
-                    .is_some_and(|tick| tick.will_attest(tx_hash))
-        };
+    /// Two narrowings that used to sit here are answered elsewhere now.
+    /// An assembled settlement needs none: its tick is lower, so the
+    /// store offers it first and the duplicate-resolution rule refuses
+    /// the abort, after which the ledger releases the transaction. And a
+    /// transaction a terminating counterpart may have settled is the
+    /// fence's question, which [`Self::fence_pairs`] is what lets the
+    /// fence ask about an abandonment at all.
+    ///
+    /// **What remains is local, and that is why tick membership is not
+    /// yet a fold over committed content.** Whether a tick has attested
+    /// turns on when this node saw its certificate.
+    fn abandonable(&self, composing: &HashSet<TxHash>) -> Vec<(TxHash, u64)> {
         self.unresolved
             .past_deadline(self.committed_ts)
             .into_iter()
-            .filter(|(tx_hash, _)| !outcome_coming(*tx_hash))
+            .filter(|(tx_hash, _)| {
+                !composing.contains(tx_hash) && !self.already_abandoning(*tx_hash)
+            })
             .collect()
+    }
+
+    /// Whether a live tick is still going to attest `tx_hash`.
+    ///
+    /// The ledger holds an entry until the certificate resolving it
+    /// commits, so every commit in between asks again — and without this
+    /// the answer would be yes, abandoning a member the tick that holds
+    /// it is about to speak for and discarding that tick with it.
+    fn already_abandoning(&self, tx_hash: TxHash) -> bool {
+        self.ticks
+            .tick_assignment(tx_hash)
+            .and_then(|tick_id| self.ticks.get_tick(&tick_id))
+            .is_some_and(|tick| tick.will_attest(tx_hash))
     }
 
     /// Drop every tick still holding a transaction this tick abandons.
@@ -2501,6 +2517,38 @@ impl ExecutionCoordinator {
         actions
     }
 
+    /// The `(shard, tx_hash)` pairs the split-boundary fence asks about.
+    ///
+    /// A settlement carries its participants in the certificates it
+    /// collected, so reading them off is enough. An abandonment does not:
+    /// it names only this shard, because an abort is dominant and needs
+    /// no counterpart's verdict — which is the right answer to coverage
+    /// and the wrong one to the fence, whose question is whether a
+    /// terminating shard settled the transaction before it went. So a
+    /// transaction no remote certificate attests takes its participants
+    /// from the ledger instead, and the fence defers or rejects the
+    /// abandonment exactly as it would a settlement.
+    fn fence_pairs(&self, fw: &Finalization) -> Vec<(ShardId, TxHash)> {
+        let mut pairs: Vec<(ShardId, TxHash)> = Vec::new();
+        let mut attested_remotely: HashSet<TxHash> = HashSet::new();
+        for ec in fw.execution_certificates() {
+            let shard = ec.shard_id();
+            for outcome in ec.tx_outcomes() {
+                if shard != self.local_shard {
+                    attested_remotely.insert(outcome.tx_hash());
+                }
+                pairs.push((shard, outcome.tx_hash()));
+            }
+        }
+        for tx_hash in fw.tx_hashes() {
+            if attested_remotely.contains(&tx_hash) {
+                continue;
+            }
+            pairs.extend(self.unresolved.participants(tx_hash).map(|s| (s, tx_hash)));
+        }
+        pairs
+    }
+
     /// Admit a freshly built finalization downstream, or withhold it at
     /// the split-boundary gate so we never produce a tick the vote fence
     /// would reject.
@@ -2521,15 +2569,7 @@ impl ExecutionCoordinator {
     ) -> Vec<Action> {
         let tick_id = *finalized_arc.tick_id();
         let verdict = {
-            let outcomes = finalized_arc
-                .execution_certificates()
-                .iter()
-                .flat_map(|ec| {
-                    let shard = ec.shard_id();
-                    ec.tx_outcomes()
-                        .iter()
-                        .map(move |outcome| (shard, outcome.tx_hash()))
-                });
+            let outcomes = self.fence_pairs(finalized_arc.as_unverified());
             settled_set_verdict(
                 &self.settled_sets,
                 topology_schedule,
@@ -2552,7 +2592,8 @@ impl ExecutionCoordinator {
                 // evicts it from every retained window (reject). Never
                 // dropped on a clock — a deadline verdict here can
                 // contradict a settlement the partner already committed.
-                self.gated_finalized.insert(tick_id, finalized_arc);
+                self.gated_finalized
+                    .insert(finalized_arc.receipt_hash(), finalized_arc);
                 vec![]
             }
             SettledSetVerdict::Reject => {
@@ -5399,7 +5440,7 @@ mod tests {
             deferred.is_empty(),
             "the gate withholds the tick while the settled set is unknown",
         );
-        assert!(state.gated_finalized.contains_key(&tick_id));
+        assert_eq!(state.gated_finalized.len(), 1, "held at the gate");
         assert!(!state.finalized.contains(&tick_id));
 
         state.record_settled_txs(
@@ -5489,7 +5530,7 @@ mod tests {
             deferred.is_empty(),
             "no one-sided finalize while the partner's settled set is unknown",
         );
-        assert!(state.gated_finalized.contains_key(&tick_id));
+        assert_eq!(state.gated_finalized.len(), 1, "held at the gate");
 
         // ROOT terminated having settled nothing → the held tick rejects on
         // redrive, is never finalized, and its tx aborts (not wedged).
@@ -5562,7 +5603,7 @@ mod tests {
             deferred.is_empty(),
             "held while the partner is scheduled to terminate",
         );
-        assert!(state.gated_finalized.contains_key(&tick_id));
+        assert_eq!(state.gated_finalized.len(), 1, "held at the gate");
 
         // The settled set doesn't exist yet; the commit clock sails past
         // the tick's anchor (1ms) plus the horizon with epoch 0 still
@@ -5571,7 +5612,7 @@ mod tests {
         let released = state.redrive_gated_finalizations(&sched);
         assert!(released.is_empty(), "an unresolved tick is never finalized");
         assert!(
-            state.gated_finalized.contains_key(&tick_id),
+            !state.gated_finalized.is_empty(),
             "a gate-held tick is never dropped on a clock",
         );
 
@@ -5688,13 +5729,21 @@ mod tests {
     }
 
     /// A tick that has not yet spoken withholds the abort — it is about
-    /// to attest the transaction itself, at its own deadline, and that
-    /// verdict can carry a charge an abandonment cannot.
+    /// to attest the transaction itself, and that verdict can carry a
+    /// charge an abandonment cannot.
+    ///
+    /// The window is ordinary rather than pathological: a payer's leg
+    /// joins a tick at its engagement deadline, which *is* its
+    /// abandonment deadline, and the commits between that tick's
+    /// composition and its certificate would otherwise abandon the member
+    /// it is about to speak for — discarding the tick that carries the
+    /// charge. `abort_floor_settles_on_deadline` is the scenario.
     #[test]
     fn a_tick_that_has_not_attested_withholds_the_abort() {
         let schedule = make_test_topology();
         let mut state = make_test_state();
         let tx = test_transaction(1);
+        let tx_hash = tx.hash();
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
         state.on_block_committed(
@@ -5712,9 +5761,10 @@ mod tests {
         state.committed_ts = WeightedTimestamp::from_millis(deadline_ms);
 
         assert!(
-            state.abandonable().is_empty(),
+            state.abandonable(&HashSet::new()).is_empty(),
             "a tick still to vote is an outcome on its way",
         );
+        let _ = tx_hash;
     }
 
     /// A tick whose own certificate exists and which waits on a
@@ -5754,7 +5804,7 @@ mod tests {
             UnresolvedTxs::restored(vec![(tx_hash, WeightedTimestamp::from_millis(1_000), 42)]);
         state.committed_ts = WeightedTimestamp::from_millis(1_000).plus(MAX_FINALIZATION_DELAY);
 
-        let abandoned = state.abandonable();
+        let abandoned = state.abandonable(&HashSet::new());
         assert_eq!(
             abandoned,
             vec![(tx_hash, 42)],
@@ -5767,78 +5817,83 @@ mod tests {
         );
     }
 
-    /// A gate-held finalization withholds the abort. The gate defers
-    /// while it cannot tell whether a terminating counterpart settled the
-    /// transaction, and aborting under it would contradict a settlement
-    /// the partner may already have committed. The hold ends when the
-    /// schedule evicts the partner, so the abort is delayed, not lost.
+    /// The abort a terminating counterpart might have settled is held at
+    /// the fence, not at composition.
+    ///
+    /// An abandonment names only this shard, because an abort needs no
+    /// counterpart's verdict — so `settled_set_verdict`, which skips the
+    /// local shard, would wave it through. The ledger's participants are
+    /// what let the fence see it, and it then defers exactly as it does a
+    /// settlement: the partner may already have committed one, and
+    /// aborting under that is the one-sided settlement the fence exists
+    /// to prevent.
     #[test]
-    fn a_gate_held_finalization_withholds_the_abort() {
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
+    fn the_fence_holds_an_abort_a_terminating_partner_might_have_settled() {
+        let local = ShardId::leaf(1, 0);
+        let partner = ShardId::ROOT;
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
         let sched = terminating_schedule();
         state.committed_ts = WeightedTimestamp::from_millis(1500);
 
-        let tick = cross_shard_finalization(ShardId::leaf(1, 0), ShardId::ROOT, 1);
-        let tick_id = *tick.tick_id();
-        let tx_hashes: Vec<TxHash> = tick.tx_hashes().collect();
+        // A finalization whose only certificate is this shard's,
+        // attesting the abandonment — the shape composition produces past
+        // a deadline.
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(7)),
+        ));
+        let tx_hash = transaction.hash();
+        let tick_id = TickId::new(local, BlockHeight::new(1));
+        let abort = Finalization::new(
+            tick_id,
+            vec![Arc::new(ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::from_millis(1),
+                GlobalReceiptRoot::ZERO,
+                vec![TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)],
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ))],
+            vec![],
+        );
         assert!(
-            state.emit_or_gate_finalized(&sched, tick).is_empty(),
+            abort
+                .execution_certificates()
+                .iter()
+                .all(|ec| ec.shard_id() == local),
+            "an abandonment carries no counterpart certificate",
+        );
+
+        // Without the ledger's participants the fence sees nothing to ask
+        // about, which is what let an abandonment past it.
+        assert!(
+            state
+                .fence_pairs(&abort)
+                .iter()
+                .all(|(shard, _)| *shard == local),
+            "the certificates alone name no counterpart",
+        );
+
+        // With them, the terminating partner is named and the gate holds.
+        state.unresolved = UnresolvedTxs::default();
+        state.unresolved.register_committed(std::iter::once((
+            &transaction,
+            BTreeSet::from([local, partner]),
+        )));
+        assert!(
+            state
+                .fence_pairs(&abort)
+                .iter()
+                .any(|(shard, _)| *shard == partner),
+            "the ledger is where an abandonment's participants come from",
+        );
+
+        let held: Arc<Verifiable<Finalization>> =
+            Arc::new(Verified::<Finalization>::seal(abort).into());
+        assert!(
+            state.emit_or_gate_finalized(&sched, held).is_empty(),
             "held while the partner's settled set is unknown",
         );
-        assert!(state.gated_finalized.contains_key(&tick_id));
-
-        state.unresolved = UnresolvedTxs::restored(
-            tx_hashes
-                .iter()
-                .map(|tx_hash| (*tx_hash, WeightedTimestamp::from_millis(1500), 42))
-                .collect(),
-        );
-        state.committed_ts = WeightedTimestamp::from_millis(1500).plus(MAX_FINALIZATION_DELAY);
-
-        assert!(
-            state.abandonable().is_empty(),
-            "an outcome the gate is holding is not abandoned under it",
-        );
-
-        // Once the partner leaves every retained window the gate rejects
-        // the finalization, and the transaction is abandonable.
-        state.gated_finalized.clear();
-        assert_eq!(
-            state
-                .abandonable()
-                .iter()
-                .map(|(h, _)| *h)
-                .collect::<Vec<_>>(),
-            tx_hashes,
-        );
-    }
-
-    /// A finalization this node has already assembled withholds the abort
-    /// too: the outcome exists and is waiting on a block to carry it, and
-    /// an abort beside it would be a second verdict.
-    #[test]
-    fn an_assembled_finalization_withholds_the_abort() {
-        let mut state = make_test_state();
-        let (tick_id, mut tick) = make_ready_local_tick(&[7]);
-        let tx_hash = tick.tx_hashes()[0];
-        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
-            Verified::<Finalization>::seal(
-                tick.take_determined_finalization()
-                    .expect("a purely local tick settles on its own certificate"),
-            )
-            .into(),
-        );
-        let fw_hash = finalization.receipt_hash();
-        state.finalized.insert(tick_id, finalization);
-
-        state.unresolved =
-            UnresolvedTxs::restored(vec![(tx_hash, WeightedTimestamp::from_millis(1_000), 42)]);
-        state.committed_ts = WeightedTimestamp::from_millis(1_000).plus(MAX_FINALIZATION_DELAY);
-
-        assert!(state.abandonable().is_empty());
-
-        state.finalized.remove(&fw_hash);
-        assert_eq!(state.abandonable(), vec![(tx_hash, 42)]);
+        assert_eq!(state.gated_finalized.len(), 1, "held at the gate");
     }
 
     /// A tick already attesting the abandonment withholds the next one:
@@ -5870,7 +5925,7 @@ mod tests {
         let outcomes = abandonment_vote(&mut state, &schedule, 2, deadline_ms);
         assert_eq!(outcomes.len(), 1, "the tick at the deadline abandons it");
         assert!(
-            state.abandonable().is_empty(),
+            state.abandonable(&HashSet::new()).is_empty(),
             "and the next commit leaves that tick alone",
         );
         assert!(

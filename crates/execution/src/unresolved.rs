@@ -18,16 +18,16 @@
 //!
 //! [`TickRegistry`]: crate::ticks::TickRegistry
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Finalization, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, Transaction, TxHash, Verifiable,
-    WeightedTimestamp,
+    Finalization, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, ShardId, Transaction, TxHash,
+    Verifiable, WeightedTimestamp,
 };
 
 /// One committed transaction's outstanding account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Owed {
     /// The moment past which the transaction can no longer finalize
     /// anywhere: the last block that could have included it, plus the
@@ -37,6 +37,20 @@ struct Owed {
     /// here because an abandonment has no execution to read it from and
     /// must release exactly what was taken.
     declared_work: u64,
+    /// The shards party to it, as its committing block's topology
+    /// assigned them.
+    ///
+    /// Held for the split-boundary fence, which asks a different question
+    /// from coverage: not "whose verdict does this need" — an abort is
+    /// dominant and needs nobody's — but "could a terminating shard have
+    /// settled this before it went". An abandonment carries no
+    /// counterpart certificate to read that off, so it reads it here.
+    ///
+    /// Empty on a rebuilt entry: the replay runs inside storage, with no
+    /// topology to resolve participants against. A restarted replica's
+    /// abandonments are therefore unfenced, which is what happens today
+    /// as well, since no gated finalization survives a restart either.
+    participants: BTreeSet<ShardId>,
 }
 
 /// Committed-but-unresolved transactions, each against its deadline and
@@ -65,6 +79,7 @@ impl UnresolvedTxs {
                         Owed {
                             deadline: validity_end.plus(MAX_FINALIZATION_DELAY),
                             declared_work,
+                            participants: BTreeSet::new(),
                         },
                     )
                 })
@@ -79,18 +94,29 @@ impl UnresolvedTxs {
     /// deadline it was admitted under.
     pub fn register_committed<'a>(
         &mut self,
-        txs: impl IntoIterator<Item = &'a Arc<Verifiable<Transaction>>>,
+        txs: impl IntoIterator<Item = (&'a Arc<Verifiable<Transaction>>, BTreeSet<ShardId>)>,
     ) {
-        for tx in txs {
+        for (tx, participants) in txs {
             let owed = Owed {
                 deadline: tx
                     .validity_range()
                     .end_timestamp_exclusive
                     .plus(MAX_FINALIZATION_DELAY),
                 declared_work: tx.work(),
+                participants,
             };
             self.owed.entry(tx.hash()).or_insert(owed);
         }
+    }
+
+    /// The shards party to `tx_hash`, for the fence to ask its question
+    /// about. Empty for a transaction this ledger does not hold, and for
+    /// one recovered by replay.
+    pub fn participants(&self, tx_hash: TxHash) -> impl Iterator<Item = ShardId> + '_ {
+        self.owed
+            .get(&tx_hash)
+            .into_iter()
+            .flat_map(|owed| owed.participants.iter().copied())
     }
 
     /// Drop what a committed block's finalizations resolve. Every verdict
@@ -171,7 +197,7 @@ mod tests {
     fn a_committed_transaction_is_owed_an_outcome_until_one_commits() {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(1, 60_000);
-        ledger.register_committed(std::iter::once(&tx));
+        ledger.register_committed(std::iter::once((&tx, BTreeSet::new())));
         assert_eq!(ledger.len(), 1);
 
         let resolved =
@@ -187,7 +213,7 @@ mod tests {
     fn an_abort_releases_as_a_settlement_does() {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(2, 60_000);
-        ledger.register_committed(std::iter::once(&tx));
+        ledger.register_committed(std::iter::once((&tx, BTreeSet::new())));
 
         let aborted =
             make_finalization(BlockHeight::new(1), tx.hash(), TransactionDecision::Aborted);
@@ -202,8 +228,8 @@ mod tests {
     fn re_registering_does_not_move_the_deadline() {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(3, 60_000);
-        ledger.register_committed(std::iter::once(&tx));
-        ledger.register_committed(std::iter::once(&tx));
+        ledger.register_committed(std::iter::once((&tx, BTreeSet::new())));
+        ledger.register_committed(std::iter::once((&tx, BTreeSet::new())));
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         assert_eq!(ledger.len(), 1, "one entry, not two");
@@ -222,7 +248,7 @@ mod tests {
     fn a_transaction_is_abandonable_at_its_deadline_and_not_before() {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(4, 60_000);
-        ledger.register_committed(std::iter::once(&tx));
+        ledger.register_committed(std::iter::once((&tx, BTreeSet::new())));
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         assert!(
@@ -245,7 +271,7 @@ mod tests {
     fn an_entry_outlives_its_deadline_and_not_the_retention_window() {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(7, 60_000);
-        ledger.register_committed(std::iter::once(&tx));
+        ledger.register_committed(std::iter::once((&tx, BTreeSet::new())));
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         ledger.prune(deadline);

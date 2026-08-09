@@ -266,6 +266,18 @@ impl TickState {
         true
     }
 
+    /// Whether this tick already attests `tx_hash` as abandoned.
+    ///
+    /// Composition is deterministic, so this is too: every replica's tick
+    /// at a given height abandons the same members. The ledger keeps the
+    /// entry until that certificate commits, so without this the next
+    /// commit would abandon it again and discard the tick carrying the
+    /// verdict.
+    #[must_use]
+    pub fn is_abandoning(&self, tx_hash: TxHash) -> bool {
+        self.abandoned.contains(&tx_hash)
+    }
+
     /// Whether this tick is still going to attest `tx_hash`: its own
     /// certificate has not formed yet, or the verdict that certificate
     /// carries is the abandonment.

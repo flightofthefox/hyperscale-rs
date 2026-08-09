@@ -227,24 +227,27 @@ impl TickEntry {
             TickResolution::Abandoned { members } => {
                 for tx_hash in members {
                     self.pending.remove(tx_hash);
-                    if self
-                        .readable
-                        .get(tx_hash)
-                        .is_some_and(|c| c.in_base_from.is_none())
-                    {
-                        // Left folded rather than dropped or stamped:
-                        // every read keeps agreeing with the ones before
-                        // it, and the cost is an entry this pins.
-                        tracing::error!(
-                            tick = %tick_id,
-                            tx_hash = ?tx_hash,
-                            "abandoned a member whose fold later ticks have read"
-                        );
-                        debug_assert!(
-                            false,
-                            "a member with an unsettled readable fold cannot be abandoned"
-                        );
-                    }
+                    // Fail-stop rather than fold on. Leaving the
+                    // contribution in place keeps *this* node's reads
+                    // agreeing with each other while the base never gains
+                    // the writes, so a replica that snap-syncs the base
+                    // computes different state from the same chain — a
+                    // silent fork, and an entry that never evicts. A node
+                    // that reaches this is already producing state no
+                    // fresh node can reproduce.
+                    //
+                    // Unreachable on a healthy replica: a determined
+                    // member settles on its own tick's certificate, and a
+                    // tick on a shard still committing blocks always
+                    // certifies. What is left is a replica whose own
+                    // execution diverged, which never settles anything
+                    // and is unrecoverable by design.
+                    assert!(
+                        self.readable
+                            .get(tx_hash)
+                            .is_none_or(|c| c.in_base_from.is_some()),
+                        "tick {tick_id}: abandoned {tx_hash:?}, whose fold later ticks have read"
+                    );
                 }
             }
         }
