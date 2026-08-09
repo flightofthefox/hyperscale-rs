@@ -207,7 +207,7 @@ pub use topology::network::{NetworkDefinition, UnknownNetwork};
 pub use topology::schedule::{
     RoutingCommittees, ScheduleLookup, SplitAtBoundary, TopologySchedule,
 };
-pub use topology::settled_set::{SettledSetVerdict, SettledTxSet, settled_set_verdict};
+pub use topology::settled_set::{SettledSetVerdict, SettledTxSet, TxClaim, settled_set_verdict};
 pub use topology::shard_prefix::shard_prefix_path;
 pub use topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 pub use topology::trie::ShardTrie;

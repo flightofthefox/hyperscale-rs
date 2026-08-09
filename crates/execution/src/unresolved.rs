@@ -42,14 +42,14 @@ struct Owed {
     ///
     /// Held for the split-boundary fence, which asks a different question
     /// from coverage: not "whose verdict does this need" — an abort is
-    /// dominant and needs nobody's — but "could a terminating shard have
-    /// settled this before it went". An abandonment carries no
-    /// counterpart certificate to read that off, so it reads it here.
+    /// dominant and needs nobody's — but "did a terminating shard settle
+    /// this before it went". An abandonment carries no counterpart
+    /// certificate to read that off, so it reads it here.
     ///
-    /// Empty on a rebuilt entry: the replay runs inside storage, with no
-    /// topology to resolve participants against. A restarted replica's
-    /// abandonments are therefore unfenced, which is what happens today
-    /// as well, since no gated finalization survives a restart either.
+    /// A rebuilt entry carries them too: the replay re-drives the
+    /// ordinary commit path over the stored blocks, so each transaction's
+    /// participants resolve against the topology its own block anchored
+    /// in, exactly as they did the first time.
     participants: BTreeSet<ShardId>,
 }
 

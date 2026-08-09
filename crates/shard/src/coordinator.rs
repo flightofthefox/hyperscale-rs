@@ -20,8 +20,8 @@ use hyperscale_types::{
     MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp,
     ProvisionHash, RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger,
     ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt,
-    SubstateKey, WeightedTimestamp, WorkInFlight, derive_reshape_trigger, ready_signal_window,
-    settled_set_verdict,
+    SubstateKey, TxClaim, WeightedTimestamp, WorkInFlight, derive_reshape_trigger,
+    ready_signal_window, settled_set_verdict,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -877,12 +877,16 @@ impl ShardCoordinator {
         block: &Block,
         anchored_wt: WeightedTimestamp,
     ) -> SettledSetVerdict {
+        // Every pair a block's certificates yield is a settlement claim.
+        // An abandonment names no counterpart certificate, so it reaches
+        // this fence carrying only the local shard and is skipped —
+        // the finalize gate is where its participants are known.
         let outcomes = block.certificates().iter().flat_map(|fw| {
             fw.execution_certificates().iter().flat_map(|ec| {
                 let shard = ec.shard_id();
                 ec.tx_outcomes()
                     .iter()
-                    .map(move |outcome| (shard, outcome.tx_hash()))
+                    .map(move |outcome| (shard, outcome.tx_hash(), TxClaim::Settled))
             })
         });
         settled_set_verdict(

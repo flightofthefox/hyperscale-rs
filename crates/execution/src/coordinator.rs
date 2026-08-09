@@ -45,8 +45,8 @@ use hyperscale_types::{
     ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
     Hash, MAX_FINALIZATION_DELAY, Mode, Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup,
     SettledSetVerdict, SettledTxSet, ShardId, TickId, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionDecision, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, settled_set_verdict, tick_leader, tick_leader_at,
+    Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -766,8 +766,8 @@ impl ExecutionCoordinator {
         // Each joins undispatched, on the shards its committing block
         // named. Those are what routes this tick's certificate to the
         // counterparts still waiting on a verdict for it — the abort is
-        // dominant, so their coverage closes on it. A ledger rebuilt by
-        // replay has no participants to give, and names this shard alone.
+        // dominant, so their coverage closes on it — and what the fence
+        // asks its question about.
         for (tx_hash, declared_work) in self.abandonable() {
             let mut participating: BTreeSet<ShardId> =
                 self.unresolved.participants(tx_hash).collect();
@@ -2553,19 +2553,24 @@ impl ExecutionCoordinator {
         actions
     }
 
-    /// The `(shard, tx_hash)` pairs the split-boundary fence asks about.
+    /// The `(shard, tx_hash, claim)` triples the split-boundary fence asks
+    /// about.
     ///
     /// A settlement carries its participants in the certificates it
     /// collected, so reading them off is enough. An abandonment does not:
     /// it names only this shard, because an abort is dominant and needs
     /// no counterpart's verdict — which is the right answer to coverage
-    /// and the wrong one to the fence, whose question is whether a
-    /// terminating shard settled the transaction before it went. So a
-    /// transaction no remote certificate attests takes its participants
-    /// from the ledger instead, and the fence defers or rejects the
-    /// abandonment exactly as it would a settlement.
-    fn fence_pairs(&self, fw: &Finalization) -> Vec<(ShardId, TxHash)> {
-        let mut pairs: Vec<(ShardId, TxHash)> = Vec::new();
+    /// and the wrong one to the fence. So a transaction no remote
+    /// certificate attests takes its participants from the ledger
+    /// instead.
+    ///
+    /// The two ask opposite questions of the same set, which is what
+    /// [`TxClaim`] carries: a settlement needs the terminating partner to
+    /// have settled its own half, an abandonment needs it not to have.
+    /// One tick can hold both, so the claim is per transaction rather
+    /// than per finalization.
+    fn fence_pairs(&self, fw: &Finalization) -> Vec<(ShardId, TxHash, TxClaim)> {
+        let mut pairs: Vec<(ShardId, TxHash, TxClaim)> = Vec::new();
         let mut attested_remotely: HashSet<TxHash> = HashSet::new();
         for ec in fw.execution_certificates() {
             let shard = ec.shard_id();
@@ -2573,14 +2578,18 @@ impl ExecutionCoordinator {
                 if shard != self.local_shard {
                     attested_remotely.insert(outcome.tx_hash());
                 }
-                pairs.push((shard, outcome.tx_hash()));
+                pairs.push((shard, outcome.tx_hash(), TxClaim::Settled));
             }
         }
         for tx_hash in fw.tx_hashes() {
             if attested_remotely.contains(&tx_hash) {
                 continue;
             }
-            pairs.extend(self.unresolved.participants(tx_hash).map(|s| (s, tx_hash)));
+            pairs.extend(
+                self.unresolved
+                    .participants(tx_hash)
+                    .map(|s| (s, tx_hash, TxClaim::Abandoned)),
+            );
         }
         pairs
     }
@@ -6108,33 +6117,11 @@ mod tests {
         );
     }
 
-    /// The abort a terminating counterpart might have settled is held at
-    /// the fence, not at composition.
-    ///
-    /// An abandonment names only this shard, because an abort needs no
-    /// counterpart's verdict — so `settled_set_verdict`, which skips the
-    /// local shard, would wave it through. The ledger's participants are
-    /// what let the fence see it, and it then defers exactly as it does a
-    /// settlement: the partner may already have committed one, and
-    /// aborting under that is the one-sided settlement the fence exists
-    /// to prevent.
-    #[test]
-    fn the_fence_holds_an_abort_a_terminating_partner_might_have_settled() {
-        let local = ShardId::leaf(1, 0);
-        let partner = ShardId::ROOT;
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
-        let sched = terminating_schedule();
-        state.committed_ts = WeightedTimestamp::from_millis(1500);
-
-        // A finalization whose only certificate is this shard's,
-        // attesting the abandonment — the shape composition produces past
-        // a deadline.
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(7)),
-        ));
-        let tx_hash = transaction.hash();
+    /// A finalization whose only certificate is this shard's, attesting
+    /// `tx_hash` aborted — the shape composition produces past a deadline.
+    fn abandonment_of(local: ShardId, tx_hash: TxHash) -> Finalization {
         let tick_id = TickId::new(local, BlockHeight::new(1));
-        let abort = Finalization::new(
+        Finalization::new(
             tick_id,
             TickHalf::Determined,
             vec![Arc::new(ExecutionCertificate::new(
@@ -6146,7 +6133,45 @@ mod tests {
                 SignerBitfield::new(4),
             ))],
             vec![],
-        );
+        )
+    }
+
+    /// A state whose ledger names `partner` party to `tx_hash`, on the
+    /// schedule that has `partner` past-terminal at 1500ms.
+    fn state_abandoning(
+        local: ShardId,
+        partner: ShardId,
+        transaction: &Arc<Verifiable<Transaction>>,
+    ) -> ExecutionCoordinator {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
+        state.committed_ts = WeightedTimestamp::from_millis(1500);
+        state.unresolved.register_committed(std::iter::once((
+            transaction,
+            BTreeSet::from([local, partner]),
+        )));
+        state
+    }
+
+    /// The abort a terminating counterpart might have settled is held at
+    /// the fence, not at composition.
+    ///
+    /// An abandonment names only this shard, because an abort needs no
+    /// counterpart's verdict — so `settled_set_verdict`, which skips the
+    /// local shard, would wave it through. The ledger's participants are
+    /// what let the fence see it, and while the partner's settled set is
+    /// unknown it holds: the partner may already have committed a
+    /// settlement, and aborting under that is the one-sided settlement the
+    /// fence exists to prevent.
+    #[test]
+    fn the_fence_holds_an_abort_a_terminating_partner_might_have_settled() {
+        let local = ShardId::leaf(1, 0);
+        let partner = ShardId::ROOT;
+        let sched = terminating_schedule();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(7)),
+        ));
+        let tx_hash = transaction.hash();
+        let abort = abandonment_of(local, tx_hash);
         assert!(
             abort
                 .execution_certificates()
@@ -6157,25 +6182,21 @@ mod tests {
 
         // Without the ledger's participants the fence sees nothing to ask
         // about, which is what let an abandonment past it.
+        let bare = make_test_state_for_shard(ValidatorId::new(0), local);
         assert!(
-            state
-                .fence_pairs(&abort)
+            bare.fence_pairs(&abort)
                 .iter()
-                .all(|(shard, _)| *shard == local),
+                .all(|(shard, _, _)| *shard == local),
             "the certificates alone name no counterpart",
         );
 
         // With them, the terminating partner is named and the gate holds.
-        state.unresolved = UnresolvedTxs::default();
-        state.unresolved.register_committed(std::iter::once((
-            &transaction,
-            BTreeSet::from([local, partner]),
-        )));
+        let mut state = state_abandoning(local, partner, &transaction);
         assert!(
             state
                 .fence_pairs(&abort)
                 .iter()
-                .any(|(shard, _)| *shard == partner),
+                .any(|(shard, _, claim)| *shard == partner && *claim == TxClaim::Abandoned),
             "the ledger is where an abandonment's participants come from",
         );
 
@@ -6186,6 +6207,78 @@ mod tests {
             "held while the partner's settled set is unknown",
         );
         assert_eq!(state.gated_finalized.len(), 1, "held at the gate");
+    }
+
+    /// The abort of a transaction the terminated partner never settled is
+    /// admitted — the stranded case the deadline path exists for.
+    ///
+    /// The partner's settled set answers the opposite question from the
+    /// one a settlement asks of it: a settlement needs the partner to have
+    /// settled its half, an abandonment needs it not to have. Reading the
+    /// set the settlement way here would reject the only outcome the
+    /// transaction can still reach, and the work it reserved would never
+    /// return to the drain.
+    #[test]
+    fn a_partner_that_never_settled_it_is_what_makes_the_abort_admissible() {
+        let local = ShardId::leaf(1, 0);
+        let partner = ShardId::ROOT;
+        let sched = terminating_schedule();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(7)),
+        ));
+        let tx_hash = transaction.hash();
+        let mut state = state_abandoning(local, partner, &transaction);
+
+        state.record_settled_txs(
+            partner,
+            SettledTxSet {
+                txs: BTreeSet::new(),
+                terminal_wt: WeightedTimestamp::from_millis(1000),
+            },
+        );
+
+        let abort: Arc<Verifiable<Finalization>> =
+            Arc::new(Verified::<Finalization>::seal(abandonment_of(local, tx_hash)).into());
+        assert!(
+            !state.emit_or_gate_finalized(&sched, abort).is_empty(),
+            "the partner terminated without settling it, so the abort is the outcome",
+        );
+        assert!(state.gated_finalized.is_empty(), "and nothing is held back");
+    }
+
+    /// The abort of a transaction the terminated partner *did* settle is
+    /// refused: its half applied, and aborting here would tear the
+    /// transaction in two. The settlement path is what resolves it, on the
+    /// certificate `record_settled_txs` arms the fetch for.
+    #[test]
+    fn a_partner_that_settled_it_refuses_the_abort() {
+        let local = ShardId::leaf(1, 0);
+        let partner = ShardId::ROOT;
+        let sched = terminating_schedule();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(7)),
+        ));
+        let tx_hash = transaction.hash();
+        let mut state = state_abandoning(local, partner, &transaction);
+
+        state.record_settled_txs(
+            partner,
+            SettledTxSet {
+                txs: BTreeSet::from([tx_hash]),
+                terminal_wt: WeightedTimestamp::from_millis(1000),
+            },
+        );
+
+        let abort: Arc<Verifiable<Finalization>> =
+            Arc::new(Verified::<Finalization>::seal(abandonment_of(local, tx_hash)).into());
+        assert!(
+            state.emit_or_gate_finalized(&sched, abort).is_empty(),
+            "the partner settled its half, so this shard may not abort",
+        );
+        assert!(
+            state.gated_finalized.is_empty(),
+            "and it is refused rather than held: the set already answered",
+        );
     }
 
     /// A tick already attesting the abandonment withholds the next one:

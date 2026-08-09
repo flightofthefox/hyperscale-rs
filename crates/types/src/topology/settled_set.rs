@@ -55,64 +55,112 @@ pub enum SettledSetVerdict {
     Defer,
 }
 
-/// Resolve cross-shard outcomes against the known settled sets at
-/// `anchored_wt`.
+/// What a finalization claims about one transaction, which decides which
+/// way the terminated partner's settled set has to read.
 ///
-/// `outcomes` yields `(shard, tx_hash)` for each transaction a constituent
-/// execution certificate attests — the question the fence actually asks,
-/// which is whether that shard settled that transaction. Past-terminal-ness
-/// is read off the **anchored** snapshot at `anchored_wt`, so callers that
-/// must agree across replicas (the vote fence) pass the voted block's
-/// `parent_qc` weighted timestamp; node-local callers (the finalize gate)
-/// pass their committed timestamp.
+/// The two are opposite questions about the same evidence. A settlement
+/// applies this shard's half, so it needs the partner to have settled its
+/// own half too. An abandonment states the transaction reaches no outcome
+/// anywhere, so it needs the partner *not* to have settled — a partner
+/// that did settle is the one case where aborting would tear a
+/// cross-shard transaction in half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxClaim {
+    /// This shard settles the transaction, on coverage the finalization
+    /// carries.
+    Settled,
+    /// This shard abandons the transaction: it committed it, no
+    /// certificate resolved it, and its deadline has passed.
+    Abandoned,
+}
+
+/// Resolve a finalization's per-transaction claims against the known
+/// settled sets at `anchored_wt`.
+///
+/// `claims` yields `(shard, tx_hash, claim)` for each participating shard
+/// of each transaction the finalization reaches a verdict for. A
+/// [`Settled`](TxClaim::Settled) claim's shards are the ones whose
+/// certificates the finalization carries; an
+/// [`Abandoned`](TxClaim::Abandoned) claim has no counterpart certificate
+/// to read them off, so its caller supplies the participants the
+/// committing block assigned.
+///
+/// Past-terminal-ness is read off the **anchored** snapshot at
+/// `anchored_wt`, so callers that must agree across replicas (the vote
+/// fence) pass the voted block's `parent_qc` weighted timestamp;
+/// node-local callers (the finalize gate) pass their committed timestamp.
 ///
 /// A shard that is not yet past-terminal but is scheduled to terminate (an
 /// admitted split/merge or a coast toward its terminal block) is fenced the
-/// same way: `Defer` until it terminates and its settled set resolves the
-/// transaction. This closes the pre-boundary window in which a survivor
-/// could finalize a straddler the terminating side never settled.
+/// same way whichever claim names it: `Defer` until it terminates and its
+/// settled set answers. This closes the pre-boundary window in which a
+/// survivor could finalize a straddler the terminating side never settled,
+/// and the matching one in which it could abandon one the terminating side
+/// did settle.
 pub fn settled_set_verdict<S, I>(
     settled_sets: &HashMap<ShardId, SettledTxSet, S>,
     topology_schedule: &TopologySchedule,
     local_shard: ShardId,
     anchored_wt: WeightedTimestamp,
-    outcomes: I,
+    claims: I,
 ) -> SettledSetVerdict
 where
     S: BuildHasher,
-    I: IntoIterator<Item = (ShardId, TxHash)>,
+    I: IntoIterator<Item = (ShardId, TxHash, TxClaim)>,
 {
     let mut defer = false;
-    for (shard, tx_hash) in outcomes {
+    for (shard, tx_hash, claim) in claims {
         if shard == local_shard {
             continue;
         }
+        // A partner whose settled set can never be read splits the two
+        // claims, and both branches below take this fork. A settlement
+        // needs the set and is categorically unreachable without it. An
+        // abandonment does not: coverage is what a settlement needs from
+        // the partner, so a partner can only have settled a transaction
+        // this shard certified, and an abandonment is composed only for
+        // transactions no tick of ours holds. Rejecting one would strand
+        // the work against a partner that could never have settled it.
+        let settlement = matches!(claim, TxClaim::Settled);
+
         // Evicted from every retained window — terminated so long ago its
-        // transactions can never resolve.
+        // settled set can never be acquired.
         let Some((_, past_terminal)) = topology_schedule.at_for_shard(shard, anchored_wt) else {
-            return SettledSetVerdict::Reject;
+            if settlement {
+                return SettledSetVerdict::Reject;
+            }
+            continue;
         };
         if !past_terminal {
             // `shard` is live now, but if it is scheduled to terminate it may
-            // leave the trie before it settles this transaction — and once it
-            // does, only its settled set is authoritative. Finalizing on
+            // leave the trie before it resolves this transaction — and once it
+            // does, only its settled set is authoritative. Deciding on
             // coverage alone would then risk applying a transaction the
             // terminating side never settled (it can produce its outcome yet
-            // still fail to receive ours before its terminal block). Defer to
-            // its settled set, exactly as for an already-terminated shard.
+            // still fail to receive ours before its terminal block), or
+            // abandoning one it did. Defer to its settled set, exactly as for
+            // an already-terminated shard.
             if topology_schedule.termination_scheduled(shard, anchored_wt) {
                 defer = true;
             }
             continue;
         }
         match settled_sets.get(&shard) {
+            // Past the horizon the set stops being readable at all, which
+            // splits the same way eviction does.
             Some(settled) if anchored_wt > settled.terminal_wt.plus(RETENTION_HORIZON) => {
-                return SettledSetVerdict::Reject;
+                if settlement {
+                    return SettledSetVerdict::Reject;
+                }
             }
-            Some(settled) if !settled.txs.contains(&tx_hash) => {
-                return SettledSetVerdict::Reject;
+            // The partner's verdict, read the way the claim needs it: a
+            // settlement needs the partner to have settled, an
+            // abandonment needs it not to have.
+            Some(settled) => {
+                if settled.txs.contains(&tx_hash) != settlement {
+                    return SettledSetVerdict::Reject;
+                }
             }
-            Some(_) => {}
             None => defer = true,
         }
     }
