@@ -210,7 +210,7 @@ impl SimShardStorage {
                 self,
                 committed_height,
                 committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
-                chain_origin.genesis_height,
+                chain_origin,
             ),
             retained_provisions,
             committed_hash,

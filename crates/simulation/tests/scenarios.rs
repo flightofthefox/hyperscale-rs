@@ -149,12 +149,7 @@ fn split_lifecycle_sim() {
     split_lifecycle(&mut cluster);
 }
 
-/// Red until a split child inherits the dedup window its parent committed
-/// under. Both children construct an empty `CommitDedupIndex`, so nothing
-/// refuses the replay this drives; the seeded constructor is what turns it
-/// green, and the `ignore` comes off with it.
 #[test]
-#[ignore = "reproduces the boundary replay hole; green once children inherit the dedup window"]
 fn split_boundary_refuses_a_replay_sim() {
     let mut cluster = SimCluster::with_accounts(
         &split_config(),

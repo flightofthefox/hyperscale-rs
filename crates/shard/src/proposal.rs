@@ -152,7 +152,9 @@ impl ProposalTracker {
 ///    retention-backed committed-tx cache (historically-committed hashes that
 ///    survive past mempool eviction — critical after sync).
 /// 2. Txs whose `validity_range` is malformed against `validity_anchor`, or
-///    whose half-open range does not contain `validity_anchor`. This is the
+///    whose half-open range does not contain `validity_anchor`.
+/// 3. Txs whose window opened before `chain_origin_wt` — the predecessor's,
+///    on a reshape successor, and refusable on validity alone. This is the
 ///    same expression voters apply during block verification, anchored on
 ///    the parent QC's `weighted_timestamp`; filtering here saves us from
 ///    proposing blocks that will be rejected.
@@ -163,10 +165,12 @@ pub fn select_transactions(
     qc_chain_tx_hashes: &HashSet<TxHash>,
     dedup_index: &CommitDedupIndex,
     validity_anchor: WeightedTimestamp,
+    chain_origin_wt: WeightedTimestamp,
 ) -> Vec<Arc<Verified<Transaction>>> {
     let before = ready_txs.len();
     let mut deduped = 0;
     let mut expired = 0;
+    let mut predates = 0;
     let filtered: Vec<_> = ready_txs
         .iter()
         .filter(|tx| {
@@ -181,14 +185,22 @@ pub fn select_transactions(
                 expired += 1;
                 return false;
             }
+            // Opened before this chain did, so it belongs to the
+            // predecessor that ran before the cut and the voters will
+            // refuse it. Zero for a chain born at network genesis.
+            if tx.validity_range().start_timestamp_inclusive < chain_origin_wt {
+                predates += 1;
+                return false;
+            }
             true
         })
         .cloned()
         .collect();
-    if deduped > 0 || expired > 0 {
+    if deduped > 0 || expired > 0 || predates > 0 {
         debug!(
             deduped,
             expired,
+            predates,
             before,
             after = filtered.len(),
             "Filtered proposal candidates"
@@ -728,7 +740,13 @@ mod tests {
             tx_with_range(2, valid_range),
         ];
 
-        let selected = select_transactions(&txs, &HashSet::new(), &empty_dedup_index(), anchor);
+        let selected = select_transactions(
+            &txs,
+            &HashSet::new(),
+            &empty_dedup_index(),
+            anchor,
+            WeightedTimestamp::ZERO,
+        );
 
         assert_eq!(selected.len(), 1, "only the in-range tx should survive");
         assert_eq!(selected[0].hash(), txs[1].hash());
@@ -741,7 +759,13 @@ mod tests {
         let future_range = TimestampRange::new(ts(1_000), ts(60_000));
         let txs = vec![tx_with_range(3, future_range)];
 
-        let selected = select_transactions(&txs, &HashSet::new(), &empty_dedup_index(), anchor);
+        let selected = select_transactions(
+            &txs,
+            &HashSet::new(),
+            &empty_dedup_index(),
+            anchor,
+            WeightedTimestamp::ZERO,
+        );
 
         assert!(
             selected.is_empty(),
@@ -759,7 +783,13 @@ mod tests {
         );
         let txs = vec![tx_with_range(4, too_wide)];
 
-        let selected = select_transactions(&txs, &HashSet::new(), &empty_dedup_index(), anchor);
+        let selected = select_transactions(
+            &txs,
+            &HashSet::new(),
+            &empty_dedup_index(),
+            anchor,
+            WeightedTimestamp::ZERO,
+        );
 
         assert!(selected.is_empty(), "malformed range should be filtered");
     }
@@ -771,7 +801,13 @@ mod tests {
         let range = TimestampRange::new(ts(500), anchor); // [500, 1000)
         let txs = vec![tx_with_range(5, range)];
 
-        let selected = select_transactions(&txs, &HashSet::new(), &empty_dedup_index(), anchor);
+        let selected = select_transactions(
+            &txs,
+            &HashSet::new(),
+            &empty_dedup_index(),
+            anchor,
+            WeightedTimestamp::ZERO,
+        );
 
         assert!(
             selected.is_empty(),
@@ -786,7 +822,13 @@ mod tests {
         let range = TimestampRange::new(anchor, anchor.plus(Duration::from_mins(1)));
         let txs = vec![tx_with_range(6, range)];
 
-        let selected = select_transactions(&txs, &HashSet::new(), &empty_dedup_index(), anchor);
+        let selected = select_transactions(
+            &txs,
+            &HashSet::new(),
+            &empty_dedup_index(),
+            anchor,
+            WeightedTimestamp::ZERO,
+        );
 
         assert_eq!(selected.len(), 1, "anchor == start_inclusive must be kept");
     }
@@ -801,7 +843,13 @@ mod tests {
         let mut chain = HashSet::new();
         chain.insert(tx.hash());
 
-        let selected = select_transactions(&[tx], &chain, &empty_dedup_index(), anchor);
+        let selected = select_transactions(
+            &[tx],
+            &chain,
+            &empty_dedup_index(),
+            anchor,
+            WeightedTimestamp::ZERO,
+        );
         assert!(selected.is_empty());
     }
 }

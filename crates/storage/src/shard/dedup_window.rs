@@ -22,7 +22,9 @@
 
 use std::time::Duration;
 
-use hyperscale_types::{BlockHeight, ProvisionHash, RETENTION_HORIZON, TxHash, WeightedTimestamp};
+use hyperscale_types::{
+    Block, BlockHeight, ChainOrigin, ProvisionHash, RETENTION_HORIZON, TxHash, WeightedTimestamp,
+};
 
 use super::chain_reader::ShardChainReader;
 
@@ -80,17 +82,16 @@ impl DedupWindow {
     /// cannot see below it and so can only stamp a batch earlier than the
     /// live path did. That runs in the conservative direction — a batch
     /// whose entry expired early is re-requested, not wrongly admitted.
-    /// `origin_height` is the chain's own first height, which is not
-    /// generally zero: a reshape successor continues its predecessor's
-    /// height line, so its chain bottoms out well above genesis and a
-    /// walk that ran past it would read the absence of the predecessor's
-    /// blocks as a hole.
+    /// `origin` is where this chain begins, which is not generally height
+    /// zero: a reshape successor continues its predecessor's height line.
+    /// Reaching it makes the window whole, because what lies below is the
+    /// predecessor's and is refused on validity rather than on dedup.
     #[must_use]
     pub fn from_reader<R: ShardChainReader + ?Sized>(
         reader: &R,
         committed_height: BlockHeight,
         committed_ts: WeightedTimestamp,
-        origin_height: BlockHeight,
+        origin: ChainOrigin,
     ) -> Self {
         let floor = committed_ts.minus(RETENTION_HORIZON);
         let mut window = Self::default();
@@ -98,9 +99,13 @@ impl DedupWindow {
         let mut clock = WeightedTimestamp::ZERO;
 
         loop {
-            if height < origin_height {
-                // Below the chain's own first block. Nothing was ever
-                // committed here to have been missed.
+            if height < origin.genesis_height {
+                // The bottom of this chain. Nothing beneath it was ever
+                // committed *here*, and for a reshape successor what its
+                // predecessor committed beneath it is refused by a
+                // different rule — a transaction whose validity window
+                // opened before the chain did cannot be admitted at all,
+                // so there is nothing down there for this window to hold.
                 window.reached_origin = true;
                 return window;
             }
@@ -118,23 +123,7 @@ impl DedupWindow {
                 return window;
             }
             clock = clock.max(anchor);
-            window.covered_from = Some(anchor);
-
-            for tx in block.transactions().iter() {
-                window
-                    .committed
-                    .push((tx.hash(), tx.validity_range().end_timestamp_exclusive));
-            }
-            for finalization in block.certificates().iter() {
-                let deadline = finalization.local_ec().deadline();
-                for tx_hash in finalization.tx_hashes() {
-                    window.resolved.push((tx_hash, deadline));
-                }
-            }
-            let provision_deadline = clock.plus(RETENTION_HORIZON);
-            for hash in block.provision_hashes() {
-                window.provisions.push((hash, provision_deadline));
-            }
+            window.fold_block(block, clock);
 
             let Some(previous) = height.prev() else {
                 // Height zero: there is no block beneath it anywhere.
@@ -142,6 +131,35 @@ impl DedupWindow {
                 return window;
             };
             height = previous;
+        }
+    }
+
+    /// Fold one committed block's artifacts in, and record that coverage
+    /// now reaches its anchor.
+    ///
+    /// The one place a block becomes window entries, so a walk over local
+    /// storage and a walk over blocks fetched from a predecessor's
+    /// committee cannot disagree about what a block contributes.
+    ///
+    /// `clock` is the committing clock the provision tier keys on — the
+    /// running maximum of the anchors folded so far, mirroring the
+    /// monotonic clamp the live commit path applies.
+    pub fn fold_block(&mut self, block: &Block, clock: WeightedTimestamp) {
+        let anchor = block.header().parent_qc().weighted_timestamp();
+        self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
+        for tx in block.transactions().iter() {
+            self.committed
+                .push((tx.hash(), tx.validity_range().end_timestamp_exclusive));
+        }
+        for finalization in block.certificates().iter() {
+            let deadline = finalization.local_ec().deadline();
+            for tx_hash in finalization.tx_hashes() {
+                self.resolved.push((tx_hash, deadline));
+            }
+        }
+        let provision_deadline = clock.plus(RETENTION_HORIZON);
+        for hash in block.provision_hashes() {
+            self.provisions.push((hash, provision_deadline));
         }
     }
 

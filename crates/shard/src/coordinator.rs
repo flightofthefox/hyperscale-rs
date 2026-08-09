@@ -479,9 +479,13 @@ impl ShardCoordinator {
         // Seeded from the chain the store kept, not constructed empty: an
         // empty index refuses no duplicate, so a coordinator resuming a
         // chain without it re-admits everything the window still covers.
-        // A chain with no committed tip has nothing beneath it to have
-        // missed, which is known rather than guessed — the same reading
-        // the reveal chain and load take from an absent tip.
+        //
+        // A chain with no committed tip has folded nothing, and there is
+        // nothing beneath it to have missed: the network's first chain
+        // has no predecessor at all, and a reshape successor's
+        // predecessor is refused on validity rather than on dedup — a
+        // transaction whose window opened before this chain did cannot be
+        // admitted here however the index reads.
         let mut dedup_index = CommitDedupIndex::seeded(&recovered.dedup);
         if recovered.committed_hash.is_none() {
             dedup_index.cover_to_origin();
@@ -992,6 +996,19 @@ impl ShardCoordinator {
     #[must_use]
     pub fn dissolved(&self, topology_schedule: &TopologySchedule) -> bool {
         self.quiescent(topology_schedule) && topology_schedule.successors_live(self.local_shard)
+    }
+
+    /// The first transaction in `block` whose validity window opened
+    /// before this chain did, if any.
+    ///
+    /// `ChainOrigin::ROOT` anchors at zero, so a chain born at network
+    /// genesis never matches and pays nothing for the check.
+    fn pre_origin_transaction(&self, block: &Block) -> Option<TxHash> {
+        block
+            .transactions()
+            .iter()
+            .find(|tx| tx.validity_range().start_timestamp_inclusive < self.chain_origin.anchor_wt)
+            .map(|tx| tx.hash())
     }
 
     /// Whether a header keyed at `wt` carries `split_child_roots` — the
@@ -1581,6 +1598,7 @@ impl ShardCoordinator {
             &qc_chain_tx_hashes,
             &self.dedup_index,
             validity_anchor,
+            self.chain_origin.anchor_wt,
         );
         let (finalizations, _finalized_tx_count) = select_finalizations(
             finalizations,
@@ -2978,6 +2996,25 @@ impl ShardCoordinator {
 
             // Split-boundary fence over the block's finalizations.
             if self.fence_blocks_vote(topology_schedule, block, block_hash) {
+                return vec![];
+            }
+
+            // A transaction whose validity window opened before this chain
+            // did belongs to the predecessor that ran before the cut, and
+            // no index here covers what that chain committed. Refuse it on
+            // its window instead: admission on the predecessor required
+            // `start <= anchor <= cut`, so every transaction it could have
+            // committed opens before the cut, while anything signed since
+            // opens after it. The rule retires itself — a window is at most
+            // `MAX_VALIDITY_RANGE` wide, so nothing can still open before a
+            // cut the chain has already outlived by that much.
+            if let Some(tx_hash) = self.pre_origin_transaction(block) {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    ?tx_hash,
+                    "Transaction predates this chain's origin; not voting"
+                );
                 return vec![];
             }
             let block_fees = self.local_payer_fees(
@@ -4452,6 +4489,9 @@ impl ShardCoordinator {
         commit_ts: WeightedTimestamp,
     ) -> (Vec<Action>, BeaconWitnessCommit) {
         let height = block.height();
+        // Read against the pre-commit clock, so the comparison at the end
+        // catches the commit that carried the coverage over its horizon.
+        let was_complete = self.dedup_index.is_complete(self.committed_ts);
 
         // The committed chain is linear: every block extends the prior
         // committed tip. The safe-vote + round-contiguous commit rules
@@ -4515,23 +4555,7 @@ impl ShardCoordinator {
             || BlockManifest::from_block(block),
             |pending| pending.manifest().clone(),
         );
-        // Committing a block is also what deepens the index's own
-        // coverage: a coordinator seeded short of the horizon reaches it
-        // by folding forward, and these are the blocks a backward walk
-        // would otherwise have had to read.
-        self.dedup_index
-            .cover(block.header().parent_qc().weighted_timestamp());
-        self.dedup_index
-            .register_committed_txs(block.transactions());
-        self.dedup_index
-            .register_committed_certs(block.certificates());
-        self.dedup_index
-            .register_committed_provisions(manifest.provision_hashes(), commit_ts);
-        // Bundle content feeds the engagement mirror — live bodies only;
-        // a sealed manifest has no content and the mirror votes
-        // conservatively across that gap.
-        self.dedup_index
-            .register_committed_provision_txs(block.provisions(), commit_ts);
+        self.register_dedup_artifacts(block, &manifest, commit_ts);
         self.register_fee_holds(topology_schedule, block, commit_ts);
 
         // Derive this block's beacon-witness leaves from the same
@@ -4619,7 +4643,41 @@ impl ShardCoordinator {
 
         let mut actions = self.cleanup_old_state(height);
         self.drain_deferred_reservation_checks(height, &mut actions);
+        // This commit may be the one that finally covered the window. Any
+        // block held back for carrying transactions is votable now, and
+        // nothing else will come along to re-drive it.
+        if !was_complete && self.dedup_index.is_complete(self.committed_ts) {
+            actions.extend(self.redrive_pending_votes(topology_schedule));
+        }
         (actions, witness)
+    }
+
+    /// Fold a committed block into the dedup index: what it committed, what
+    /// its finalizations resolved, and the batches it carried.
+    ///
+    /// Committing is also what deepens the index's own coverage — a
+    /// coordinator seeded short of the horizon reaches it by folding
+    /// forward, and these are the blocks a backward walk would otherwise
+    /// have had to read.
+    fn register_dedup_artifacts(
+        &mut self,
+        block: &Block,
+        manifest: &BlockManifest,
+        commit_ts: WeightedTimestamp,
+    ) {
+        self.dedup_index
+            .cover(block.header().parent_qc().weighted_timestamp());
+        self.dedup_index
+            .register_committed_txs(block.transactions());
+        self.dedup_index
+            .register_committed_certs(block.certificates());
+        self.dedup_index
+            .register_committed_provisions(manifest.provision_hashes(), commit_ts);
+        // Bundle content feeds the engagement mirror — live bodies only;
+        // a sealed manifest has no content and the mirror votes
+        // conservatively across that gap.
+        self.dedup_index
+            .register_committed_provision_txs(block.provisions(), commit_ts);
     }
 
     /// Commit-time fee-ledger bookkeeping: engage reservations for the

@@ -1117,7 +1117,10 @@ fn dedup_window_recovers_committed_txs_with_their_own_deadlines() {
         &storage,
         BlockHeight::new(1),
         WeightedTimestamp::from_millis(1_000),
-        BlockHeight::new(1),
+        ChainOrigin {
+            genesis_height: BlockHeight::new(1),
+            anchor_wt: WeightedTimestamp::ZERO,
+        },
     );
 
     assert_eq!(
@@ -1126,10 +1129,16 @@ fn dedup_window_recovers_committed_txs_with_their_own_deadlines() {
     );
 }
 
-/// A walk that reaches the chain's first block is whole however short its
-/// span: nothing below it was ever committed to have been missed.
+/// A walk that reaches the height its chain starts at is whole, whatever
+/// its span.
+///
+/// For the network's first chain nothing was ever committed beneath it.
+/// For a reshape successor its predecessor's blocks do sit below, but what
+/// they carried is refused on validity — a transaction whose window opened
+/// before the chain did cannot be admitted here — so this window has
+/// nothing left to hold.
 #[test]
-fn dedup_window_reaching_the_chain_origin_is_whole() {
+fn dedup_window_reaching_the_height_its_chain_starts_at_is_whole() {
     let storage = SimShardStorage::default();
     let block = block_with_txs(BlockHeight::new(1), 1_000, vec![dedup_tx(2, 90_000)]);
     let qc = make_test_qc(&block);
@@ -1139,10 +1148,16 @@ fn dedup_window_reaching_the_chain_origin_is_whole() {
         &storage,
         BlockHeight::new(1),
         WeightedTimestamp::from_millis(1_000),
-        BlockHeight::new(1),
+        ChainOrigin {
+            genesis_height: BlockHeight::new(1),
+            anchor_wt: WeightedTimestamp::from_millis(900),
+        },
     );
 
-    assert!(window.reached_origin, "the walk bottomed out at height 1");
+    assert!(
+        window.reached_origin,
+        "the walk bottomed out at the height its chain begins",
+    );
 }
 
 /// A chain holding nothing below the height it starts at leaves the window
@@ -1174,7 +1189,7 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
         &storage,
         BlockHeight::new(3),
         WeightedTimestamp::from_millis(400_003),
-        BlockHeight::GENESIS,
+        ChainOrigin::ROOT,
     );
 
     assert_eq!(
