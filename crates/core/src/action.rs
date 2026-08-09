@@ -902,6 +902,11 @@ pub enum Action {
         fee_read_height: BlockHeight,
         /// Parent block's in-flight count (for deterministic computation).
         parent_in_flight: WorkInFlight,
+        /// Parent block's settlement frontier — the highest tick whose
+        /// determined half has settled at or below it. The block advances
+        /// it by the determined halves it carries, and may carry none
+        /// below it.
+        parent_settled_frontier: BlockHeight,
         /// Attested load on the parent's header — the running gas total
         /// this block advances by the gas its own certificates report.
         parent_load: Option<ShardLoad>,

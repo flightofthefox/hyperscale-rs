@@ -259,6 +259,12 @@ pub struct ShardCoordinator {
     /// a snap-synced joiner seeds it from the boundary header so its
     /// fresh committee's first block is votable.
     committed_in_flight: Option<WorkInFlight>,
+    /// Settlement frontier carried by the committed tip's header — the
+    /// value the next block advances. Seeded from the recovered tip so a
+    /// restart's first block checks against the same frontier its peers
+    /// do; `None` when no tip header was recovered, which skips the
+    /// frontier check rather than guessing at it.
+    committed_settled_frontier: Option<BlockHeight>,
 
     /// Reveal chain on the committed tip's header — what the next block
     /// extends. `None` under the same conditions as
@@ -479,6 +485,7 @@ impl ShardCoordinator {
             deferred_reservation_checks: HashMap::new(),
             committed_rounds: BTreeMap::new(),
             committed_in_flight: recovered.committed_in_flight,
+            committed_settled_frontier: recovered.committed_settled_frontier,
             // A fresh start's tip is the chain's genesis, whose header
             // carries `ZERO` — known, not guessed. A restart with a real
             // tip and no recovered scalar stays `None` and defers the
@@ -552,6 +559,7 @@ impl ShardCoordinator {
             self.committed_hash,
             self.committed_state_root,
             self.committed_in_flight,
+            self.committed_settled_frontier,
             self.committed_load,
             self.committed_reveal_chain,
             self.latest_qc.as_ref(),
@@ -1308,6 +1316,7 @@ impl ShardCoordinator {
         self.committed_hash = hash;
         self.committed_state_root = genesis.header().state_root();
         self.committed_in_flight = Some(genesis.header().work_in_flight());
+        self.committed_settled_frontier = Some(genesis.header().settled_tick_frontier());
         self.committed_reveal_chain = Some(genesis.header().reveal_chain());
         self.committed_load = Some(genesis.header().load());
         // A chain's genesis height and clock are per-chain properties: a
@@ -1558,6 +1567,7 @@ impl ShardCoordinator {
             finalizations,
             &qc_chain_resolved_txs,
             &self.dedup_index,
+            self.chain_view().parent_settled_frontier(parent_block_hash),
             MAX_FINALIZED_TX_PER_BLOCK,
         );
         let provisions = select_provisions(
@@ -2881,12 +2891,18 @@ impl ShardCoordinator {
             // Blocks the safe-vote rule declines must still run verification to
             // produce PreparedCommit. Parent-pruned blocks likewise run
             // verification but can't contribute in-flight accounting.
-            let (parent_in_flight, _finalized_tx_count) = {
+            let (parent_in_flight, parent_settled_frontier, _finalized_tx_count) = {
                 let chain = self.chain_view();
-                let parent_in_flight = if block.header().parent_qc().is_genesis() {
+                let genesis_parent = block.header().parent_qc().is_genesis();
+                let parent_in_flight = if genesis_parent {
                     Some(WorkInFlight::ZERO)
                 } else {
                     chain.parent_in_flight_checked(block.header().parent_block_hash())
+                };
+                let parent_settled_frontier = if genesis_parent {
+                    Some(BlockHeight::GENESIS)
+                } else {
+                    chain.parent_settled_frontier_checked(block.header().parent_block_hash())
                 };
                 let finalized_tx_count: u32 = chain.get_pending(block_hash).map_or(0, |p| {
                     p.finalizations()
@@ -2894,10 +2910,15 @@ impl ShardCoordinator {
                         .map(|fw| u32::try_from(fw.tx_count()).unwrap_or(u32::MAX))
                         .sum()
                 });
-                (parent_in_flight, finalized_tx_count)
+                (
+                    parent_in_flight,
+                    parent_settled_frontier,
+                    finalized_tx_count,
+                )
             };
-            let skip_vote = match self.verification.classify_vote_in_flight(
+            let skip_vote = match self.verification.classify_vote_terms(
                 parent_in_flight,
+                parent_settled_frontier,
                 block_hash,
                 block,
                 !safe,
@@ -4443,6 +4464,7 @@ impl ShardCoordinator {
         self.committed_block_anchor_wt = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
         self.committed_in_flight = Some(block.header().work_in_flight());
+        self.committed_settled_frontier = Some(block.header().settled_tick_frontier());
         self.committed_reveal_chain = Some(block.header().reveal_chain());
         self.committed_load = Some(block.header().load());
         self.gc_settled_sets();
@@ -10308,9 +10330,11 @@ mod tests {
             )
         };
         let local_tick = TickId::new(local, BlockHeight::new(height));
+        // A counterpart's certificate rides beside this shard's, which is
+        // the legs half by construction.
         Arc::new(Verifiable::from(Finalization::new(
             local_tick,
-            TickHalf::Determined,
+            TickHalf::Legs,
             vec![Arc::new(ec(local)), Arc::new(ec(remote))],
             vec![],
         )))

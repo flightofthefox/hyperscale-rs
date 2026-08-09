@@ -211,6 +211,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
     topology_snapshot: &TopologySnapshot,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
     parent_in_flight: WorkInFlight,
+    parent_settled_frontier: BlockHeight,
     parent_load: Option<ShardLoad>,
     substate_bytes: Option<u64>,
     ready_signals: Vec<ReadySignal>,
@@ -324,6 +325,17 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
             total.saturating_add(fw.as_unverified().declared_work())
         }));
 
+    // Settlement order, folded the same way and read off the same list.
+    // The certificates arrive in the order the ticks executed and the
+    // selection keeps it, so the frontier lands on the last determined
+    // half the block carries; a proposal that ordered them otherwise, or
+    // reached below the parent's frontier, is what verification refuses.
+    let settled_tick_frontier = certificates
+        .iter()
+        .filter(|fw| fw.as_unverified().is_determined())
+        .map(|fw| fw.as_unverified().tick_id().block_height())
+        .fold(parent_settled_frontier, BlockHeight::max);
+
     // The running gas total: the parent's advanced by what this block's
     // certificates report. An unresolvable parent load falls back to a
     // zero baseline; a voter that cannot resolve the parent abstains
@@ -349,6 +361,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
         cross_shard_txs,
         provision_tx_roots,
         work_in_flight,
+        settled_tick_frontier,
         beacon_witness_root,
         beacon_witness_leaf_count,
         beacon_witness_base,
@@ -851,6 +864,7 @@ where
             fee_checks,
             fee_read_height,
             parent_in_flight,
+            parent_settled_frontier,
             parent_load,
             substate_bytes,
             ready_signals,
@@ -967,6 +981,7 @@ where
                 &classification_topology,
                 provisions.clone(),
                 parent_in_flight,
+                parent_settled_frontier,
                 parent_load,
                 substate_bytes,
                 ready_signals,

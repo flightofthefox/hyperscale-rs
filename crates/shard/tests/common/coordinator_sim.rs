@@ -98,6 +98,7 @@ struct StaleReparent {
     parent_state_root: StateRoot,
     parent_block_height: BlockHeight,
     parent_in_flight: WorkInFlight,
+    parent_settled_frontier: BlockHeight,
     parent_load: ShardLoad,
     height: BlockHeight,
 }
@@ -1413,6 +1414,7 @@ impl ShardCoordinatorSim {
                 fee_checks: _,
                 fee_read_height: _,
                 parent_in_flight,
+                parent_settled_frontier,
                 parent_load,
                 substate_bytes,
                 ready_signals,
@@ -1444,6 +1446,7 @@ impl ShardCoordinatorSim {
                     parent_state_root,
                     parent_block_height,
                     parent_in_flight,
+                    parent_settled_frontier,
                     parent_load,
                     height,
                 ) = if let Some(reparent) = stale {
@@ -1455,6 +1458,7 @@ impl ShardCoordinatorSim {
                         reparent.parent_state_root,
                         reparent.parent_block_height,
                         reparent.parent_in_flight,
+                        reparent.parent_settled_frontier,
                         Some(reparent.parent_load),
                         reparent.height,
                     )
@@ -1465,6 +1469,7 @@ impl ShardCoordinatorSim {
                         parent_state_root,
                         parent_block_height,
                         parent_in_flight,
+                        parent_settled_frontier,
                         parent_load,
                         height,
                     )
@@ -1499,6 +1504,7 @@ impl ShardCoordinatorSim {
                     &classification_topology,
                     provisions.clone(),
                     parent_in_flight,
+                    parent_settled_frontier,
                     parent_load,
                     substate_bytes,
                     ready_signals,
@@ -1932,6 +1938,7 @@ impl ShardCoordinatorSim {
             parent_state_root: ancestor.state_root(),
             parent_block_height: ancestor.height(),
             parent_in_flight: ancestor.work_in_flight(),
+            parent_settled_frontier: ancestor.settled_tick_frontier(),
             parent_load: ancestor.load(),
             height: ancestor.height().next(),
         })
@@ -1966,6 +1973,7 @@ pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
         proposer: h.proposer(),
         timestamp: ProposerTimestamp::from_millis(h.timestamp().as_millis().saturating_add(1)),
         round: h.round(),
+        settled_tick_frontier: h.settled_tick_frontier(),
         is_fallback: h.is_fallback(),
         state_root: h.state_root(),
         transaction_root: h.transaction_root(),

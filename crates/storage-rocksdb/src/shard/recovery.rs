@@ -80,6 +80,7 @@ impl RocksDbShardStorage {
             committed_in_flight: None,
             committed_reveal_chain: self.committed_reveal_chain(committed_height),
             committed_load: self.committed_load(committed_height),
+            committed_settled_frontier: self.committed_settled_frontier(committed_height),
             committed_block_anchor_wt,
             committed_committee_anchor_wt: committed_height
                 .prev()
@@ -138,6 +139,16 @@ impl RocksDbShardStorage {
 
     /// Attested load carried by the committed tip's header. `None` under
     /// the same condition as [`Self::committed_reveal_chain`].
+    /// The committed tip's settlement frontier, read from its stored
+    /// header. `None` when no block is stored at `committed_height`.
+    fn committed_settled_frontier(&self, committed_height: BlockHeight) -> Option<BlockHeight> {
+        let cf = self.cf();
+        let blocks_cf = BlocksCf::handle(&cf);
+        let metadata: BlockMetadata =
+            get::<BlocksCf>(&*self.db, blocks_cf, &committed_height.inner())?;
+        Some(metadata.header().settled_tick_frontier())
+    }
+
     fn committed_load(&self, committed_height: BlockHeight) -> Option<ShardLoad> {
         let cf = self.cf();
         let blocks_cf = BlocksCf::handle(&cf);

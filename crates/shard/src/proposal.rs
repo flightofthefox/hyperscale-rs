@@ -225,12 +225,31 @@ pub fn select_finalizations(
     finalizations: Vec<Arc<Verifiable<Finalization>>>,
     qc_chain_resolved_txs: &HashSet<TxHash>,
     dedup_index: &CommitDedupIndex,
+    parent_settled_frontier: BlockHeight,
     max_finalized_txs: usize,
 ) -> (Vec<Arc<Verifiable<Finalization>>>, usize) {
     let mut finalized_tx_count = 0usize;
     let mut resolved_here: HashSet<TxHash> = HashSet::new();
+    let mut frontier = parent_settled_frontier;
     let ticks_to_propose: Vec<_> = finalizations
         .into_iter()
+        .filter(|fw| {
+            // The settlement frontier, proposer-side: a determined half
+            // at or below it would be refused by every voter, and one
+            // offered out of order would settle an older absolute over a
+            // newer one. The store hands them over in tick order, so this
+            // drops only what a gap in that order would have made
+            // unofferable anyway.
+            let fw_ref = fw.as_unverified();
+            if fw_ref.is_determined() {
+                let tick = fw_ref.tick_id().block_height();
+                if tick <= frontier {
+                    return false;
+                }
+                frontier = tick;
+            }
+            true
+        })
         .filter(|fw| {
             let unresolved = fw.tx_hashes().all(|tx_hash| {
                 !resolved_here.contains(&tx_hash)
@@ -385,6 +404,7 @@ pub fn assemble_build_action(
     let parent_block_height = parent_qc.height();
     let parent_state_root = chain.parent_state_root(parent_block_hash);
     let parent_in_flight = chain.parent_in_flight(parent_block_hash);
+    let parent_settled_frontier = chain.parent_settled_frontier(parent_block_hash);
     let parent_load = chain.parent_load_checked(parent_block_hash);
 
     let (
@@ -450,6 +470,7 @@ pub fn assemble_build_action(
         fee_checks,
         fee_read_height,
         parent_in_flight,
+        parent_settled_frontier,
         parent_load,
         substate_bytes,
         ready_signals,
@@ -547,6 +568,7 @@ mod tests {
             vec![Arc::clone(&settled), abandoned],
             &HashSet::new(),
             &CommitDedupIndex::new(),
+            BlockHeight::GENESIS,
             MAX_FINALIZED_TX_PER_BLOCK,
         );
         assert_eq!(selected.len(), 1, "the second verdict is dropped");
@@ -573,6 +595,7 @@ mod tests {
             vec![abandoned],
             &HashSet::new(),
             &dedup_index,
+            BlockHeight::GENESIS,
             MAX_FINALIZED_TX_PER_BLOCK,
         );
         assert!(selected.is_empty());

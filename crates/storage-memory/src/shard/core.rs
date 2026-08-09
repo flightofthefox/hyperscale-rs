@@ -169,6 +169,10 @@ impl SimShardStorage {
             .blocks
             .get(&committed_height)
             .map(|block| block.block().header().load());
+        let committed_settled_frontier = c
+            .blocks
+            .get(&committed_height)
+            .map(|block| block.block().header().settled_tick_frontier());
         // The accumulator window starts at the tip's witness base;
         // retained entries below it are the persistence layer's
         // hysteresis stock — serving data, not accumulator state.
@@ -207,6 +211,7 @@ impl SimShardStorage {
             committed_in_flight: None,
             committed_reveal_chain,
             committed_load,
+            committed_settled_frontier,
             committed_block_anchor_wt,
             committed_committee_anchor_wt,
             jmt_root: Some(self.state_root()),

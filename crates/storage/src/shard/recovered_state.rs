@@ -59,6 +59,13 @@ pub struct RecoveredState {
     /// against the parent's.
     pub committed_in_flight: Option<WorkInFlight>,
 
+    /// Settlement frontier carried by the committed tip's header — the
+    /// highest tick whose determined half has settled at or below it, and
+    /// the value the next block advances. `None` when no block is stored
+    /// at the committed height; the coordinator then skips the frontier
+    /// check on its first block rather than checking against a guess.
+    pub committed_settled_frontier: Option<BlockHeight>,
+
     /// Reveal chain carried by the committed tip's header — the value the
     /// next block extends (or reseeds past, when it anchors in a later
     /// epoch). Read back from the tip's stored header, so an ordinary
@@ -172,6 +179,7 @@ impl RecoveredState {
             latest_qc: None,
             anchor_qc: Some(anchor_qc),
             committed_in_flight: Some(boundary_header.work_in_flight()),
+            committed_settled_frontier: Some(boundary_header.settled_tick_frontier()),
             committed_reveal_chain: Some(boundary_header.reveal_chain()),
             committed_load: Some(boundary_header.load()),
             committed_block_anchor_wt: Some(boundary_header.parent_qc().weighted_timestamp()),

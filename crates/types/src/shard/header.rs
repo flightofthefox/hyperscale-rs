@@ -45,6 +45,19 @@ pub struct BlockHeader {
     #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
     provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
     work_in_flight: WorkInFlight,
+    /// The highest tick whose determined half has settled at or below
+    /// this block: the parent's, raised to the last determined half this
+    /// block carries. Folded like `work_in_flight` and read off the block
+    /// the same way — the certificates name their tick and their half, so
+    /// a validator checks the claim with no history behind it.
+    ///
+    /// It is what makes settlement order a validity rule rather than a
+    /// proposer convention. A receipt states an absolute computed from
+    /// its tick's baseline and settlement is last writer per cell, so an
+    /// earlier tick's determined half landing after a later one's reverts
+    /// a write later ticks have already read — and every replica would
+    /// agree on the wrong state, leaving nothing to detect afterwards.
+    settled_tick_frontier: BlockHeight,
     beacon_witness_root: BeaconWitnessRoot,
     beacon_witness_leaf_count: BeaconWitnessLeafCount,
     /// The beacon-witness window base of the window this block belongs
@@ -120,6 +133,7 @@ pub struct BlockHeaderParts {
     pub cross_shard_txs: Vec<TxHash>,
     pub provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
     pub work_in_flight: WorkInFlight,
+    pub settled_tick_frontier: BlockHeight,
     pub beacon_witness_root: BeaconWitnessRoot,
     pub beacon_witness_leaf_count: BeaconWitnessLeafCount,
     pub beacon_witness_base: BeaconWitnessLeafCount,
@@ -149,6 +163,7 @@ impl Default for BlockHeaderParts {
             cross_shard_txs: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             work_in_flight: WorkInFlight::ZERO,
+            settled_tick_frontier: BlockHeight::GENESIS,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
@@ -187,6 +202,7 @@ impl BlockHeader {
             cross_shard_txs,
             provision_tx_roots,
             work_in_flight,
+            settled_tick_frontier,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
@@ -212,6 +228,7 @@ impl BlockHeader {
             cross_shard_txs,
             provision_tx_roots,
             work_in_flight,
+            settled_tick_frontier,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
@@ -256,6 +273,7 @@ impl BlockHeader {
             cross_shard_txs: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             work_in_flight: WorkInFlight::ZERO,
+            settled_tick_frontier: BlockHeight::GENESIS,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
@@ -308,6 +326,7 @@ impl BlockHeader {
             cross_shard_txs: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             work_in_flight: WorkInFlight::ZERO,
+            settled_tick_frontier: BlockHeight::GENESIS,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
@@ -374,6 +393,7 @@ impl BlockHeader {
             cross_shard_txs: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             work_in_flight: WorkInFlight::ZERO,
+            settled_tick_frontier: BlockHeight::GENESIS,
             beacon_witness_root: BeaconWitnessRoot::ZERO,
             beacon_witness_leaf_count: BeaconWitnessLeafCount::ZERO,
             beacon_witness_base: BeaconWitnessLeafCount::ZERO,
@@ -550,6 +570,15 @@ impl BlockHeader {
         self.work_in_flight
     }
 
+    /// The highest tick whose determined half has settled at or below
+    /// this block. A block may carry determined halves only in strictly
+    /// ascending tick order above its parent's frontier, and this is
+    /// where that order ends up.
+    #[must_use]
+    pub const fn settled_tick_frontier(&self) -> BlockHeight {
+        self.settled_tick_frontier
+    }
+
     /// Root of this shard's monotonic beacon-witness accumulator at
     /// this block.
     ///
@@ -642,6 +671,7 @@ impl BlockHeader {
         Vec<TxHash>,
         BTreeMap<ShardId, ProvisionTxRoot>,
         WorkInFlight,
+        BlockHeight,
         BeaconWitnessRoot,
         BeaconWitnessLeafCount,
         BeaconWitnessLeafCount,
@@ -667,6 +697,7 @@ impl BlockHeader {
             self.cross_shard_txs,
             self.provision_tx_roots,
             self.work_in_flight,
+            self.settled_tick_frontier,
             self.beacon_witness_root,
             self.beacon_witness_leaf_count,
             self.beacon_witness_base,
@@ -924,6 +955,7 @@ mod tests {
             cross_shard_txs,
             provision_tx_roots,
             in_flight,
+            settled_tick_frontier,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
@@ -949,6 +981,7 @@ mod tests {
             cross_shard_txs,
             provision_tx_roots: provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
             work_in_flight: in_flight,
+            settled_tick_frontier,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
@@ -986,6 +1019,7 @@ mod tests {
             cross_shard_txs,
             provision_tx_roots,
             in_flight,
+            settled_tick_frontier,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,
@@ -1011,6 +1045,7 @@ mod tests {
             cross_shard_txs,
             provision_tx_roots: provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
             work_in_flight: in_flight,
+            settled_tick_frontier,
             beacon_witness_root,
             beacon_witness_leaf_count,
             beacon_witness_base,

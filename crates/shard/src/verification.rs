@@ -1969,9 +1969,10 @@ impl VerificationPipeline {
     /// (`None` = parent pruned) and the finalized-tx count from the pending
     /// block, then uses the returned [`InFlightCheck`] to decide between
     /// voting, running verifications only, or aborting.
-    pub(crate) fn classify_vote_in_flight(
+    pub(crate) fn classify_vote_terms(
         &mut self,
         parent_in_flight: Option<WorkInFlight>,
+        parent_settled_frontier: Option<BlockHeight>,
         block_hash: BlockHash,
         block: &Block,
         safe_vote_declined: bool,
@@ -1980,7 +1981,9 @@ impl VerificationPipeline {
             return InFlightCheck::SkipVote;
         }
 
-        let Some(parent_in_flight) = parent_in_flight else {
+        let (Some(parent_in_flight), Some(parent_settled_frontier)) =
+            (parent_in_flight, parent_settled_frontier)
+        else {
             trace!(
                 block_hash = ?block_hash,
                 "Skipping vote — parent pruned, still verifying for PreparedCommit"
@@ -1988,10 +1991,71 @@ impl VerificationPipeline {
             return InFlightCheck::SkipVote;
         };
 
-        if self.verify_in_flight(block_hash, block, parent_in_flight) {
+        if self.verify_in_flight(block_hash, block, parent_in_flight)
+            && Self::verify_settled_order(block_hash, block, parent_settled_frontier)
+        {
             InFlightCheck::Proceed
         } else {
             InFlightCheck::Abort
+        }
+    }
+
+    /// Verify the block settles determined halves in order, and claims
+    /// the frontier that leaves.
+    ///
+    /// A receipt states an absolute computed from its tick's baseline and
+    /// settlement is last writer per cell, so an earlier tick's
+    /// determined half landing after a later one's reverts a write later
+    /// ticks have already read. Every replica would then agree on the
+    /// wrong state — there is no divergence to notice afterwards, which
+    /// is why the order has to be refused up front rather than detected.
+    ///
+    /// Two conditions, both read off the block: the determined halves it
+    /// carries rise strictly, starting above the parent's frontier, and
+    /// the claimed frontier is where they end. Legs halves are not
+    /// constrained — a leg's declared cells are claimed against every
+    /// later tick from the moment it executes, so it has nothing to
+    /// invert against, and it may settle arbitrarily late without
+    /// wedging the ticks above it.
+    pub fn verify_settled_order(
+        block_hash: BlockHash,
+        block: &Block,
+        parent_settled_frontier: BlockHeight,
+    ) -> bool {
+        let mut frontier = parent_settled_frontier;
+        for fw in block.certificates().iter() {
+            let fw = fw.as_unverified();
+            if !fw.is_determined() {
+                continue;
+            }
+            let tick = fw.tick_id().block_height();
+            if tick <= frontier {
+                warn!(
+                    block_hash = ?block_hash,
+                    height = block.height().inner(),
+                    tick = tick.inner(),
+                    frontier = frontier.inner(),
+                    "Settlement order verification failed — a determined half at or below \
+                     the frontier it would settle under"
+                );
+                return false;
+            }
+            frontier = tick;
+        }
+
+        let proposed = block.header().settled_tick_frontier();
+        if proposed == frontier {
+            true
+        } else {
+            warn!(
+                block_hash = ?block_hash,
+                height = block.height().inner(),
+                proposed = proposed.inner(),
+                expected = frontier.inner(),
+                parent_settled_frontier = parent_settled_frontier.inner(),
+                "Settlement frontier verification failed — proposed value does not match expected"
+            );
+            false
         }
     }
 
@@ -2393,9 +2457,9 @@ mod tests {
         }
     }
     use hyperscale_types::{
-        BlockHeaderParts, Epoch, Hash, LocalTimestamp, ProposerTimestamp, QuorumCertificate, Round,
-        ShardId, ShardLoad, SignerBitfield, Transaction, TransactionRoot, ValidatorId,
-        WeightedTimestamp,
+        BlockHeaderParts, Epoch, ExecutionCertificate, GlobalReceiptRoot, Hash, LocalTimestamp,
+        ProposerTimestamp, QuorumCertificate, Round, ShardId, ShardLoad, SignerBitfield, TickHalf,
+        TickId, Transaction, TransactionRoot, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -2453,6 +2517,145 @@ mod tests {
         }
     }
 
+    /// A block settling `determined` (as determined halves) and `legs`
+    /// (as legs halves), claiming `frontier`.
+    fn block_settling(determined: &[u64], legs: &[u64], frontier: u64) -> Block {
+        let half = |height: u64, half: TickHalf| {
+            let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(height));
+            let ec = ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::from_millis(height),
+                GlobalReceiptRoot::ZERO,
+                Vec::new(),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            );
+            Arc::new(Verifiable::from(Finalization::new(
+                tick_id,
+                half,
+                vec![Arc::new(ec)],
+                Vec::new(),
+            )))
+        };
+        let certificates: Vec<_> = determined
+            .iter()
+            .map(|h| half(*h, TickHalf::Determined))
+            .chain(legs.iter().map(|h| half(*h, TickHalf::Legs)))
+            .collect();
+        let header = BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(100),
+            parent_block_hash: BlockHash::ZERO,
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            settled_tick_frontier: BlockHeight::new(frontier),
+            ..Default::default()
+        });
+        Block::Live {
+            header,
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(certificates),
+            provisions: Arc::new(Vec::new()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    /// The reproduced corruption, refused. Two ticks over one cell
+    /// settled in reverse across two blocks lose the later write; the
+    /// second block is the one carrying the lower tick, and its
+    /// determined half sits at or below the frontier its parent already
+    /// reached.
+    #[test]
+    fn a_determined_half_below_the_parent_frontier_is_refused() {
+        // The parent settled tick 2. This block offers tick 1.
+        let block = block_settling(&[1], &[], 2);
+        assert!(!VerificationPipeline::verify_settled_order(
+            block.hash(),
+            &block,
+            BlockHeight::new(2)
+        ));
+    }
+
+    /// Determined halves within one block must rise, or the receipts
+    /// apply in the order the block lists them and invert inside it.
+    #[test]
+    fn determined_halves_must_rise_within_a_block() {
+        let descending = block_settling(&[6, 4], &[], 6);
+        assert!(!VerificationPipeline::verify_settled_order(
+            descending.hash(),
+            &descending,
+            BlockHeight::new(3)
+        ));
+
+        let ascending = block_settling(&[4, 6], &[], 6);
+        assert!(VerificationPipeline::verify_settled_order(
+            ascending.hash(),
+            &ascending,
+            BlockHeight::new(3)
+        ));
+    }
+
+    /// The claimed frontier is where the determined halves end, and a
+    /// block claiming otherwise is refused — including one that settles
+    /// nothing and claims an advance.
+    #[test]
+    fn the_claimed_frontier_must_be_where_the_determined_halves_end() {
+        let overclaimed = block_settling(&[4], &[], 9);
+        assert!(!VerificationPipeline::verify_settled_order(
+            overclaimed.hash(),
+            &overclaimed,
+            BlockHeight::new(3)
+        ));
+
+        let idle = block_settling(&[], &[], 5);
+        assert!(
+            !VerificationPipeline::verify_settled_order(idle.hash(), &idle, BlockHeight::new(3)),
+            "a block settling no determined half carries its parent's frontier",
+        );
+
+        let carried = block_settling(&[], &[], 3);
+        assert!(VerificationPipeline::verify_settled_order(
+            carried.hash(),
+            &carried,
+            BlockHeight::new(3)
+        ));
+    }
+
+    /// Gaps are ordinary: a commit that admits nothing composes no tick,
+    /// so the heights that produce determined halves are sparse and the
+    /// frontier jumps over the rest.
+    #[test]
+    fn the_frontier_jumps_over_heights_that_composed_no_tick() {
+        let block = block_settling(&[9], &[], 9);
+        assert!(VerificationPipeline::verify_settled_order(
+            block.hash(),
+            &block,
+            BlockHeight::new(2)
+        ));
+    }
+
+    /// A legs half is unconstrained. It waits on a counterpart and may
+    /// land arbitrarily late; its declared cells are claimed against
+    /// every later tick from the moment it executes, so it has nothing
+    /// to invert against — and holding it to the frontier would wedge a
+    /// tick composed entirely of legs, which never advances one.
+    #[test]
+    fn a_legs_half_settles_whatever_the_frontier_says() {
+        let stale_leg = block_settling(&[], &[1], 7);
+        assert!(VerificationPipeline::verify_settled_order(
+            stale_leg.hash(),
+            &stale_leg,
+            BlockHeight::new(7)
+        ));
+
+        let with_determined = block_settling(&[8], &[1], 8);
+        assert!(VerificationPipeline::verify_settled_order(
+            with_determined.hash(),
+            &with_determined,
+            BlockHeight::new(7)
+        ));
+    }
+
     fn empty_certified() -> &'static HashMap<BlockHash, Arc<Verified<CertifiedBlock>>> {
         static EMPTY: std::sync::OnceLock<HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>> =
             std::sync::OnceLock::new();
@@ -2474,6 +2677,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             latest_qc,
             pending,
             empty_certified(),
@@ -2484,49 +2688,67 @@ mod tests {
         BlockHash::from_raw(Hash::from_bytes(tag))
     }
 
-    // ─── classify_vote_in_flight ────────────────────────────────────────
+    // ─── classify_vote_terms ────────────────────────────────────────
 
     #[test]
-    fn classify_vote_in_flight_skips_vote_when_locked() {
+    fn classify_vote_terms_skips_vote_when_locked() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
 
-        let out = vp.classify_vote_in_flight(Some(WorkInFlight::ZERO), block_hash, &block, true);
+        let out = vp.classify_vote_terms(
+            Some(WorkInFlight::ZERO),
+            Some(BlockHeight::GENESIS),
+            block_hash,
+            &block,
+            true,
+        );
         assert!(matches!(out, InFlightCheck::SkipVote));
     }
 
     #[test]
-    fn classify_vote_in_flight_skips_vote_when_parent_pruned() {
+    fn classify_vote_terms_skips_vote_when_parent_pruned() {
         // A pruned parent resolves no drain total: skip voting but
         // still keep verifying.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = block_with(BlockHeight::new(5), bh(b"parent"), 0, vec![]);
         let block_hash = block.hash();
 
-        let out = vp.classify_vote_in_flight(None, block_hash, &block, false);
+        let out = vp.classify_vote_terms(None, None, block_hash, &block, false);
         assert!(matches!(out, InFlightCheck::SkipVote));
     }
 
     #[test]
-    fn classify_vote_in_flight_proceeds_when_genesis_parent_and_totals_match() {
+    fn classify_vote_terms_proceeds_when_genesis_parent_and_totals_match() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
 
-        let out = vp.classify_vote_in_flight(Some(WorkInFlight::ZERO), block_hash, &block, false);
+        let out = vp.classify_vote_terms(
+            Some(WorkInFlight::ZERO),
+            Some(BlockHeight::GENESIS),
+            block_hash,
+            &block,
+            false,
+        );
         assert!(matches!(out, InFlightCheck::Proceed));
     }
 
     #[test]
-    fn classify_vote_in_flight_aborts_on_in_flight_mismatch() {
+    fn classify_vote_terms_aborts_on_in_flight_mismatch() {
         // Genesis parent → parent_in_flight = 0. Block claims in_flight = 5
         // with 0 transactions: proposed doesn't match expected → Abort.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 5, vec![]);
         let block_hash = block.hash();
 
-        let out = vp.classify_vote_in_flight(Some(WorkInFlight::ZERO), block_hash, &block, false);
+        let out = vp.classify_vote_terms(
+            Some(WorkInFlight::ZERO),
+            Some(BlockHeight::GENESIS),
+            block_hash,
+            &block,
+            false,
+        );
         assert!(matches!(out, InFlightCheck::Abort));
     }
 
@@ -2552,7 +2774,13 @@ mod tests {
         );
         let hash = honest.hash();
         assert!(matches!(
-            vp.classify_vote_in_flight(Some(WorkInFlight::ZERO), hash, &honest, false),
+            vp.classify_vote_terms(
+                Some(WorkInFlight::ZERO),
+                Some(BlockHeight::GENESIS),
+                hash,
+                &honest,
+                false
+            ),
             InFlightCheck::Proceed
         ));
 
@@ -2561,7 +2789,13 @@ mod tests {
         let understated = block_with(BlockHeight::new(1), BlockHash::ZERO, 1, vec![tx]);
         let hash = understated.hash();
         assert!(matches!(
-            vp.classify_vote_in_flight(Some(WorkInFlight::ZERO), hash, &understated, false),
+            vp.classify_vote_terms(
+                Some(WorkInFlight::ZERO),
+                Some(BlockHeight::GENESIS),
+                hash,
+                &understated,
+                false
+            ),
             InFlightCheck::Abort
         ));
     }

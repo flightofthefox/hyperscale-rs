@@ -28,6 +28,7 @@ pub struct ChainView<'a> {
     committed_hash: BlockHash,
     committed_state_root: StateRoot,
     committed_in_flight: Option<WorkInFlight>,
+    committed_settled_frontier: Option<BlockHeight>,
     committed_load: Option<ShardLoad>,
     committed_reveal_chain: Option<RevealChain>,
     latest_qc: Option<&'a Verified<QuorumCertificate>>,
@@ -44,6 +45,7 @@ impl<'a> ChainView<'a> {
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
         committed_in_flight: Option<WorkInFlight>,
+        committed_settled_frontier: Option<BlockHeight>,
         committed_load: Option<ShardLoad>,
         committed_reveal_chain: Option<RevealChain>,
         latest_qc: Option<&'a Verified<QuorumCertificate>>,
@@ -57,6 +59,7 @@ impl<'a> ChainView<'a> {
             committed_hash,
             committed_state_root,
             committed_in_flight,
+            committed_settled_frontier,
             committed_load,
             committed_reveal_chain,
             latest_qc,
@@ -122,6 +125,33 @@ impl<'a> ChainView<'a> {
         (parent_block_hash == self.committed_hash)
             .then_some(self.committed_in_flight)
             .flatten()
+    }
+
+    /// Settlement frontier on the parent header — the highest tick whose
+    /// determined half has settled at or below it. `None` when the parent
+    /// is unresolvable, under the same conditions as
+    /// [`Self::parent_in_flight_checked`]; a `None` skips the vote, since
+    /// the claimed frontier can't be checked.
+    #[must_use]
+    pub fn parent_settled_frontier_checked(
+        &self,
+        parent_block_hash: BlockHash,
+    ) -> Option<BlockHeight> {
+        if let Some(header) = self.get_header(parent_block_hash) {
+            return Some(header.settled_tick_frontier());
+        }
+        (parent_block_hash == self.committed_hash)
+            .then_some(self.committed_settled_frontier)
+            .flatten()
+    }
+
+    /// The parent's settlement frontier, or genesis when unresolvable —
+    /// the proposer-side read, where an unresolvable parent means the
+    /// block being built settles from the bottom rather than skipping.
+    #[must_use]
+    pub fn parent_settled_frontier(&self, parent_block_hash: BlockHash) -> BlockHeight {
+        self.parent_settled_frontier_checked(parent_block_hash)
+            .unwrap_or(BlockHeight::GENESIS)
     }
 
     /// Attested load on the parent header — the running gas total the next
@@ -296,6 +326,7 @@ mod tests {
             committed_hash,
             committed_state_root,
             committed_in_flight: None,
+            committed_settled_frontier: None,
             committed_load: None,
             committed_reveal_chain: None,
             latest_qc,
