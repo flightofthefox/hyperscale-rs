@@ -4,9 +4,9 @@
 //! what they store, and how their keys/values are encoded.
 
 use hyperscale_types::{
-    BlockMetadata, ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionMetadata,
-    Finalization, FinalizationHash, Hash, Round, SafeVoteRegisters, ShardWitnessPayload,
-    SubstateKey, TickId, Transaction, ValidatorId,
+    BlockHeight, BlockMetadata, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
+    ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash, Provisions, Round,
+    SafeVoteRegisters, ShardWitnessPayload, SubstateKey, TickId, Transaction, ValidatorId,
 };
 use rocksdb::{ColumnFamily, DB};
 
@@ -139,6 +139,19 @@ pub const SAFE_VOTE_REGISTERS_CF: &str = "safe_vote_registers";
 /// and clears this CF.
 pub const IMPORT_STAGING_CF: &str = "import_staging";
 
+/// Column family for the provision bundles a committed block carried.
+///
+/// Key: `(committing_height_BE_8B, provision_hash_32B)`; value:
+/// HBOR-encoded [`Provisions`]. A stored block keeps only its bundles'
+/// hashes, so this is where the bodies live between the block that
+/// carried them and the finalization that resolves what they provisioned
+/// — the window a restart has to replay across.
+///
+/// The committing height leads the key so the retention sweep is one
+/// range delete. It is the height of *our* block that carried the
+/// bundle, not `Provisions::block_height`, which is the source shard's.
+pub const PROVISIONS_CF: &str = "provisions";
+
 // Default-CF metadata keys are defined as MetadataEntry types in typed_cf.rs.
 // See CommittedHeightEntry, CommittedHashEntry, CommittedQcEntry, JmtMetadataEntry.
 
@@ -165,6 +178,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     SUBSTATE_BYTES_CF,
     SAFE_VOTE_REGISTERS_CF,
     IMPORT_STAGING_CF,
+    PROVISIONS_CF,
 ];
 
 // ─── CfHandles ───────────────────────────────────────────────────────────────
@@ -192,6 +206,7 @@ pub struct CfHandles<'a> {
     substate_bytes: &'a ColumnFamily,
     safe_vote_registers: &'a ColumnFamily,
     import_staging: &'a ColumnFamily,
+    provisions: &'a ColumnFamily,
 }
 
 impl<'a> CfHandles<'a> {
@@ -221,6 +236,7 @@ impl<'a> CfHandles<'a> {
             substate_bytes: resolve(SUBSTATE_BYTES_CF),
             safe_vote_registers: resolve(SAFE_VOTE_REGISTERS_CF),
             import_staging: resolve(IMPORT_STAGING_CF),
+            provisions: resolve(PROVISIONS_CF),
         }
     }
 }
@@ -321,6 +337,48 @@ impl TypedCf for ImportStagingCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.import_staging
+    }
+}
+
+/// Key codec for [`ProvisionsCf`]: the committing height big-endian,
+/// then the bundle's hash. BE first so the bytewise comparator groups a
+/// block's bundles together and orders the groups by height, which is
+/// what makes the retention sweep a single range delete.
+#[derive(Default)]
+pub struct ProvisionKeyCodec;
+
+impl DbEncode<(BlockHeight, ProvisionHash)> for ProvisionKeyCodec {
+    fn encode_to(&self, value: &(BlockHeight, ProvisionHash), buf: &mut Vec<u8>) {
+        let (height, hash) = value;
+        buf.extend_from_slice(&height.inner().to_be_bytes());
+        buf.extend_from_slice(Hash::from(*hash).as_bytes());
+    }
+}
+
+impl DbCodec<(BlockHeight, ProvisionHash)> for ProvisionKeyCodec {
+    fn decode(&self, bytes: &[u8]) -> (BlockHeight, ProvisionHash) {
+        assert_eq!(bytes.len(), 40, "provision key must be 8 + 32 bytes");
+        let (height, hash) = bytes.split_at(8);
+        (
+            BlockHeight::new(u64::from_be_bytes(
+                height.try_into().expect("length checked above"),
+            )),
+            ProvisionHash::from_raw(Hash::from_hash_bytes(hash)),
+        )
+    }
+}
+
+/// Provision bodies a committed block carried; see [`PROVISIONS_CF`].
+pub struct ProvisionsCf;
+impl TypedCf for ProvisionsCf {
+    const NAME: &'static str = PROVISIONS_CF;
+    type Key = (BlockHeight, ProvisionHash);
+    type Value = Provisions;
+    type KeyCodec = ProvisionKeyCodec;
+    type ValueCodec = HborCodec<Provisions>;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.provisions
     }
 }
 

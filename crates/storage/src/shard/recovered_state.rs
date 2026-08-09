@@ -2,9 +2,10 @@
 //! state machine after a crash or restart.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash,
+    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash, Provisions,
     QuorumCertificate, RevealChain, SafeVoteRegisters, ShardAnchor, ShardLoad, StateRoot,
     ValidatorId, Verified, WeightedTimestamp, WorkInFlight,
 };
@@ -29,6 +30,11 @@ pub struct RecoveredState {
     /// survive the restart this state exists to recover from. The
     /// coordinator drains it once a topology is available to classify it.
     pub unresolved_txs: Vec<RecoveredTx>,
+
+    /// The provision bodies still held for the blocks that carried them.
+    /// A stored block keeps only their hashes, so this is what puts them
+    /// back in the shared store a restarted node reads them from.
+    pub retained_provisions: Vec<Arc<Provisions>>,
 
     /// Last committed block hash (None for fresh start).
     pub committed_hash: Option<BlockHash>,
@@ -173,8 +179,10 @@ impl RecoveredState {
         Self {
             committed_height: anchor.height,
             // Nothing below the anchor is imported, so a snap-synced
-            // replica knows of nothing in flight beneath it.
+            // replica knows of nothing in flight beneath it, and has no
+            // block that carried a bundle.
             unresolved_txs: Vec::new(),
+            retained_provisions: Vec::new(),
             committed_hash: Some(anchor.block_hash),
             latest_qc: None,
             anchor_qc: Some(anchor_qc),

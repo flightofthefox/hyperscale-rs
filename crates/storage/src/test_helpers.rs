@@ -862,9 +862,8 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)
     );
     storage.commit_block(&make_test_certified(committing), &empty_witness());
 
-    // A counterpart's bundle for the one that stays open. A block is
-    // stored sealed and sealing keeps only provision hashes, so it is
-    // committed here to pin what the replay does *not* get back.
+    // A counterpart's bundle for the one that stays open, so the sealed
+    // block below is read against a height that actually carried one.
     let provisioning = with_provisions(make_test_block(BlockHeight::new(2)), source, open.hash());
     storage.commit_block(&make_test_certified(provisioning), &empty_witness());
 
@@ -904,6 +903,6 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)
             .provisions()
             .is_empty(),
         "and no provisions: a stored block keeps their hashes, not their contents, \
-         so a recovered leg has to be sent them again",
+         so the bodies are recovered from where they are stored beside it",
     );
 }

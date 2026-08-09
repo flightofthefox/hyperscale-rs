@@ -196,6 +196,7 @@ impl SimShardStorage {
             .filter(|(_, (origin, _))| *origin == chain_origin)
             .map(|(validator, (_, registers))| (*validator, *registers))
             .collect();
+        let retained_provisions = c.provisions.values().map(Arc::clone).collect();
         drop(c);
 
         RecoveredState {
@@ -205,6 +206,7 @@ impl SimShardStorage {
                 committed_height,
                 committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
             ),
+            retained_provisions,
             committed_hash,
             latest_qc,
             anchor_qc: None,

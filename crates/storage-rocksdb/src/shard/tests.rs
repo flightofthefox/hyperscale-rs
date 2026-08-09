@@ -16,10 +16,11 @@ use hyperscale_storage::{
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
     BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate, Finalization,
-    FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, ProposerTimestamp,
-    QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot,
-    StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId, TxHash, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, WitnessSources,
+    FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, MerkleInclusionProof,
+    ProposerTimestamp, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, RevealChain,
+    Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot, StoredReceipt,
+    SubstateKey, SyncHint, TickHalf, TickId, TxHash, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -1369,4 +1370,111 @@ fn safe_vote_registers_ignore_stale_chain_incarnation() {
 
     storage.persist_safe_vote_registers(v, registers(1, 2));
     assert_eq!(storage.safe_vote_registers(v), Some(registers(1, 2)));
+}
+
+/// A bundle at `height` on a block that carries nothing else.
+fn block_with_provisions(height: BlockHeight, source: ShardId) -> (Block, ProvisionHash) {
+    let bundle = Provisions::new(
+        source,
+        ShardId::ROOT,
+        height,
+        WeightedTimestamp::from_millis(height.inner() * 1_000),
+        RevealChain::ZERO,
+        MerkleInclusionProof::dummy(),
+        vec![ProvisionEntry::new(TxHash::ZERO, Vec::new())],
+    );
+    let hash = bundle.hash();
+    let block = match make_test_block(height) {
+        Block::Live {
+            header,
+            transactions,
+            certificates,
+            witness_sources,
+            ..
+        } => Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions: Arc::new(vec![Arc::new(Verifiable::from(bundle))]),
+            witness_sources,
+        },
+        sealed @ Block::Sealed { .. } => sealed,
+    };
+    (block, hash)
+}
+
+/// Sealing a block keeps its bundles' hashes and drops their bodies, so
+/// the bodies are stored beside it — and stay readable across a reopen,
+/// which is the whole point of storing them.
+#[test]
+fn a_committed_bundle_outlives_its_block_s_sealing() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    let (block, hash) = block_with_provisions(BlockHeight::new(1), ShardId::leaf(1, 1));
+
+    storage.commit_block(&make_test_certified(block), &no_witness());
+
+    let stored = storage
+        .get_block(BlockHeight::new(1))
+        .expect("the block committed");
+    assert!(
+        stored.block().provisions().is_empty(),
+        "the stored block is sealed and carries no bodies",
+    );
+
+    drop(stored);
+    drop(storage);
+    let reopened = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    let retained = reopened.load_recovered_state().retained_provisions;
+    assert_eq!(
+        retained.iter().map(|p| p.hash()).collect::<Vec<_>>(),
+        vec![hash],
+        "and the body it dropped is recovered from storage",
+    );
+}
+
+/// A body outlives the depth a replay could start from, and no longer.
+///
+/// The floor is the history retention floor: below it `snapshot_at`
+/// cannot serve the baseline a replayed tick reads, so a body kept there
+/// could never be replayed against.
+#[test]
+fn a_retained_bundle_drops_below_the_history_floor() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = RocksDbConfig {
+        jmt_history_length: 3,
+        ..RocksDbConfig::default()
+    };
+    let storage =
+        RocksDbShardStorage::open_with_config(temp_dir.path(), &config, NibblePath::empty())
+            .unwrap();
+
+    let (first, first_hash) = block_with_provisions(BlockHeight::new(1), ShardId::leaf(1, 1));
+    storage.commit_block(&make_test_certified(first), &no_witness());
+
+    for height in 2..=4 {
+        let (block, _) = block_with_provisions(BlockHeight::new(height), ShardId::leaf(1, 1));
+        storage.commit_block(&make_test_certified(block), &no_witness());
+    }
+    assert!(
+        storage
+            .load_recovered_state()
+            .retained_provisions
+            .iter()
+            .any(|p| p.hash() == first_hash),
+        "at the floor the body is still readable",
+    );
+
+    let (block, _) = block_with_provisions(BlockHeight::new(5), ShardId::leaf(1, 1));
+    storage.commit_block(&make_test_certified(block), &no_witness());
+    let retained = storage.load_recovered_state().retained_provisions;
+    assert!(
+        !retained.iter().any(|p| p.hash() == first_hash),
+        "past it the sweep drops it",
+    );
+    assert_eq!(
+        retained.len(),
+        4,
+        "and keeps the readable window, plus the block of slack at its floor",
+    );
 }

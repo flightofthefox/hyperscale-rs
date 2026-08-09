@@ -8,10 +8,10 @@ use std::sync::Arc;
 use hyperscale_storage::JmtSnapshot;
 use hyperscale_storage::tree::{carry_noop_root, jmt_parent_height, put_at_version};
 use hyperscale_types::{
-    BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
-    ExecutionMetadata, Finalization, FinalizationHash, QuorumCertificate, SafeVoteRegisters,
-    SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, TickId, Transaction,
-    TxHash, ValidatorId,
+    Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt,
+    ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, ProvisionHash,
+    Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites, ShardWitnessPayload,
+    StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash, ValidatorId,
 };
 
 use super::tree_store::SimTreeStore;
@@ -183,6 +183,10 @@ pub struct ConsensusState {
     /// can serve fetches and replay the accumulator on restart. Shard
     /// is implicit — storage is scoped per-shard.
     pub beacon_witnesses: BTreeMap<u64, ShardWitnessPayload>,
+    /// Provision bodies keyed by their committing height and hash.
+    /// Mirrors the production `provisions` CF: a stored block keeps only
+    /// the hashes, so this is what a replay reads the bodies back from.
+    pub provisions: BTreeMap<(BlockHeight, ProvisionHash), Arc<Provisions>>,
     /// The chain's origin — `ChainOrigin::ROOT` except for a split
     /// child's adopted store, where recovery must reconstruct the
     /// continued height line and clock.
@@ -213,8 +217,27 @@ impl ConsensusState {
             tx_cert_index: HashMap::new(),
             finalizations_by_height: HashMap::new(),
             beacon_witnesses: BTreeMap::new(),
+            provisions: BTreeMap::new(),
             chain_origin: ChainOrigin::ROOT,
             safe_vote_registers: HashMap::new(),
+        }
+    }
+
+    /// Record the provision bodies a committing block carried, and drop
+    /// every body below `jmt_history_length` blocks back — the depth a
+    /// replay can still read state at, and so the depth one can start
+    /// from. Mirrors `RocksDbShardStorage::append_provisions_to_batch`.
+    pub(crate) fn record_provisions(&mut self, block: &Block, jmt_history_length: u64) {
+        let height = block.height();
+        let floor = height.saturating_sub(jmt_history_length);
+        if floor > BlockHeight::GENESIS {
+            self.provisions.retain(|(at, _), _| *at >= floor);
+        }
+        for bundle in block.provisions() {
+            self.provisions.insert(
+                (height, bundle.hash()),
+                Arc::new(bundle.as_unverified().clone()),
+            );
         }
     }
 

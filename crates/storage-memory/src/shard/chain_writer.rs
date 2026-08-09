@@ -193,6 +193,7 @@ fn build_prepared_commit(
                     .or_default()
                     .push(tick_id);
             }
+            c.record_provisions(block, storage.jmt_history_length);
             c.insert_receipts(&receipts);
             record_execution_certs(&mut c, block);
             c.committed_height = block.height();
@@ -272,6 +273,7 @@ impl SimShardStorage {
                     .or_default()
                     .push(tick_id);
             }
+            c.record_provisions(block, self.jmt_history_length);
             // Store receipts atomically with block commit.
             c.insert_receipts(receipts);
             // Store execution certificates (extracted from finalizations) atomically.

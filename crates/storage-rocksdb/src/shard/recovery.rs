@@ -1,15 +1,16 @@
 //! Crash recovery for `RocksDB` storage.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{RecoveredState, SubstateStore, fold_unresolved_txs};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, Hash, RevealChain,
-    SafeVoteRegisters, ShardLoad, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, Hash, Provisions,
+    RevealChain, SafeVoteRegisters, ShardLoad, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
 };
 
-use super::column_families::{BeaconWitnessesCf, BlocksCf, SafeVoteRegistersCf};
+use super::column_families::{BeaconWitnessesCf, BlocksCf, ProvisionsCf, SafeVoteRegistersCf};
 use super::core::RocksDbShardStorage;
 use super::metadata::read_chain_origin;
 use crate::typed_cf::{TypedCf, get, iter_all, iter_from};
@@ -74,6 +75,7 @@ impl RocksDbShardStorage {
                 committed_height,
                 committed_block_anchor_wt.unwrap_or(WeightedTimestamp::ZERO),
             ),
+            retained_provisions: self.load_retained_provisions(),
             committed_hash: committed_hash.map(BlockHash::from_raw),
             latest_qc,
             anchor_qc: None,
@@ -182,6 +184,19 @@ impl RocksDbShardStorage {
         let beacon_witnesses_cf = BeaconWitnessesCf::handle(&cf);
         iter_from::<BeaconWitnessesCf>(&self.db, beacon_witnesses_cf, &start.inner())
             .map(|(_leaf_index, payload): (_, ShardWitnessPayload)| payload.leaf_hash())
+            .collect()
+    }
+
+    /// Every provision body still retained, for the shared store a
+    /// restarted node reads them back from.
+    ///
+    /// A full scan rather than a seek: the commit-path sweep is what
+    /// bounds the CF, so everything present is everything wanted.
+    fn load_retained_provisions(&self) -> Vec<Arc<Provisions>> {
+        let cf = self.cf();
+        let provisions_cf = ProvisionsCf::handle(&cf);
+        iter_all::<ProvisionsCf>(&self.db, provisions_cf)
+            .map(|(_key, provisions)| Arc::new(provisions))
             .collect()
     }
 }

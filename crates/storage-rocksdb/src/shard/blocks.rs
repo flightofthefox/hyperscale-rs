@@ -26,11 +26,12 @@ use hyperscale_types::{
 use rocksdb::{ColumnFamily, WriteBatch};
 
 use super::column_families::{
-    BeaconWitnessesCf, BlocksCf, CertificatesCf, ConsensusReceiptsCf, TransactionsCf,
+    BeaconWitnessesCf, BlocksCf, CertificatesCf, ConsensusReceiptsCf, ProvisionKeyCodec,
+    ProvisionsCf, TransactionsCf,
 };
 use super::core::RocksDbShardStorage;
 use super::metadata::{read_committed_hash, read_committed_height, read_committed_qc};
-use crate::typed_cf::{TypedCf, batch_put, batch_put_raw, get, multi_get};
+use crate::typed_cf::{DbEncode, TypedCf, batch_put, batch_put_raw, get, multi_get};
 
 impl RocksDbShardStorage {
     /// Get a range of committed blocks [from, to).
@@ -153,6 +154,51 @@ impl RocksDbShardStorage {
                 certificates_cf,
                 &fw.receipt_hash(),
                 &fw.attestation(),
+            );
+        }
+        self.append_provisions_to_batch(batch, block);
+    }
+
+    /// Fold a block's provision bodies into the same batch, and drop
+    /// every body a replay could no longer read.
+    ///
+    /// The block is still `Live` here — `into_sealed` runs on the way
+    /// into the blocks CF in this same call — so this is the last point
+    /// the bundles exist to be written.
+    ///
+    /// The floor is the history retention floor rather than the
+    /// unresolved set's: a replay reads state as of the block below the
+    /// one it starts at, and `snapshot_at` cannot serve that below
+    /// `height - jmt_history_length`. Nothing kept under that line could
+    /// be replayed against, so nothing under it is worth keeping.
+    ///
+    /// Cut at the floor rather than one above it, which is where the
+    /// lowest startable replay actually sits. The extra block costs one
+    /// commit's bundles and keeps the boundary from depending on the
+    /// commit's version matching its height, which a genesis commit
+    /// re-recording its own height does not.
+    fn append_provisions_to_batch(&self, batch: &mut WriteBatch, block: &Block) {
+        let provisions = block.provisions();
+        let height = block.height();
+        let cf = self.cf();
+        let provisions_cf = ProvisionsCf::handle(&cf);
+
+        let floor = height.inner().saturating_sub(self.jmt_history_length);
+        if floor > 0 {
+            let codec = ProvisionKeyCodec;
+            batch.delete_range_cf(
+                provisions_cf,
+                codec.encode(&(BlockHeight::GENESIS, ProvisionHash::from_raw(Hash::ZERO))),
+                codec.encode(&(BlockHeight::new(floor), ProvisionHash::from_raw(Hash::ZERO))),
+            );
+        }
+
+        for bundle in provisions {
+            batch_put::<ProvisionsCf>(
+                batch,
+                provisions_cf,
+                &(height, bundle.hash()),
+                bundle.as_unverified(),
             );
         }
     }

@@ -13,9 +13,10 @@ use hyperscale_types::test_utils::test_transaction;
 use hyperscale_types::{
     Address, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock,
     ChainOrigin, ConsensusReceipt, Finalization, GlobalReceiptHash, Hash, LocalKey,
-    ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId,
-    StateRoot, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId, TxHash, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    MerkleInclusionProof, ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate,
+    RevealChain, Round, SafeVoteRegisters, SettledWrites, ShardId, StateRoot, StoredReceipt,
+    SubstateKey, SyncHint, TickHalf, TickId, TxHash, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -665,6 +666,60 @@ fn historical_substate_reads_resolve_per_version() {
 fn a_replay_names_what_committed_and_never_resolved() {
     let storage = SimShardStorage::default();
     test_helpers::test_unresolved_fold(&storage);
+}
+
+/// Sealing a block keeps its bundles' hashes and drops their bodies, so
+/// the bodies are recovered from where they are stored beside it.
+#[test]
+fn a_committed_bundle_outlives_its_block_s_sealing() {
+    let storage = SimShardStorage::default();
+    let bundle = Provisions::new(
+        ShardId::leaf(1, 1),
+        ShardId::ROOT,
+        BlockHeight::new(1),
+        WeightedTimestamp::ZERO,
+        RevealChain::ZERO,
+        MerkleInclusionProof::dummy(),
+        vec![ProvisionEntry::new(TxHash::ZERO, Vec::new())],
+    );
+    let hash = bundle.hash();
+    let block = match make_test_block(BlockHeight::new(1)) {
+        Block::Live {
+            header,
+            transactions,
+            certificates,
+            witness_sources,
+            ..
+        } => Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions: Arc::new(vec![Arc::new(Verifiable::from(bundle))]),
+            witness_sources,
+        },
+        sealed @ Block::Sealed { .. } => sealed,
+    };
+    storage.commit_block(&make_test_certified(block), &no_witness());
+
+    assert!(
+        storage
+            .get_block(BlockHeight::new(1))
+            .expect("the block committed")
+            .block()
+            .provisions()
+            .is_empty(),
+        "the stored block is sealed and carries no bodies",
+    );
+    assert_eq!(
+        storage
+            .load_recovered_state()
+            .retained_provisions
+            .iter()
+            .map(|p| p.hash())
+            .collect::<Vec<_>>(),
+        vec![hash],
+        "and the body it dropped is recovered from storage",
+    );
 }
 
 #[test]

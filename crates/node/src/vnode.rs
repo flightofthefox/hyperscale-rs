@@ -127,7 +127,14 @@ pub fn seat_vnode_group(args: SeatVnodeGroup<'_>) -> Vec<VnodeInit> {
         .map(|state| state.as_ref().clone())
         .collect();
 
+    // The bodies our own committed blocks carried, back in the store
+    // everything reads them from. A stored block keeps only their
+    // hashes, so without this a restarted host holds blocks it cannot
+    // serve and legs it cannot replay.
     let provision_store = Arc::new(ProvisionStore::new());
+    for provisions in &args.recovered.retained_provisions {
+        provision_store.insert(Arc::clone(provisions));
+    }
     let tx_store = Arc::new(TxStore::new());
     let exec_cert_store = Arc::new(ExecCertStore::new());
     let finalization_store = Arc::new(FinalizationStore::new());
