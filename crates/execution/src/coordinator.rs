@@ -95,6 +95,10 @@ struct TickedBatch {
     /// fold over them freely. Empty for a tick that ran no leg reaching
     /// beyond this shard, which is then held only for its own fate.
     provisional_claims: Vec<(DeclaredKey, Mode)>,
+    /// The legs those claims belong to. A tick's fate arrives in halves,
+    /// and only the half carrying the legs releases their cells — so the
+    /// entry has to know which members that is.
+    legs: BTreeSet<TxHash>,
 }
 
 /// One composed-but-undispatched tick: the block's identity anchors plus
@@ -648,6 +652,7 @@ impl ExecutionCoordinator {
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
         let mut provisional_claims: Vec<(DeclaredKey, Mode)> = Vec::new();
+        let mut legs: BTreeSet<TxHash> = BTreeSet::new();
         for member in admitted {
             state.admit(
                 member.request.tx_hash,
@@ -657,6 +662,7 @@ impl ExecutionCoordinator {
             );
             self.ticks.assign_tx(member.request.tx_hash, tick_id);
             if member.request.reaches_beyond {
+                legs.insert(member.request.tx_hash);
                 provisional_claims
                     .extend(member.request.transaction.routing().declared_modes.clone());
             }
@@ -686,8 +692,13 @@ impl ExecutionCoordinator {
         // else claims no cell and settles nothing, so the chain never
         // hears of it.
         if !requests.is_empty() {
-            self.ticked
-                .insert(tick_id, TickedBatch { provisional_claims });
+            self.ticked.insert(
+                tick_id,
+                TickedBatch {
+                    provisional_claims,
+                    legs,
+                },
+            );
         }
 
         // Only the tick leader creates a `VoteTracker` for aggregation.
@@ -1992,7 +2003,17 @@ impl ExecutionCoordinator {
                 .filter(|(_, decision)| !matches!(decision, TransactionDecision::Accept))
                 .map(|(tx_hash, _)| tx_hash)
                 .collect();
-            self.record_tick_resolution(fw.tick_id(), TickResolution::Settled { height, aborted });
+            // The members this finalization speaks for, which is one
+            // half of its tick rather than the whole of it.
+            let members: BTreeSet<TxHash> = fw.tx_hashes().collect();
+            self.record_tick_resolution(
+                fw.tick_id(),
+                TickResolution::Settled {
+                    height,
+                    members,
+                    aborted,
+                },
+            );
         }
         actions.extend(self.drain_ready_tick_resolutions());
 
@@ -2238,8 +2259,8 @@ impl ExecutionCoordinator {
             self.outbound_certs.on_tick_finalized(&tick_id);
             self.record_tick_resolution(
                 &tick_id,
-                TickResolution::Aborted {
-                    height: self.committed_height,
+                TickResolution::Abandoned {
+                    members: tick.tx_hashes().iter().copied().collect(),
                 },
             );
             for &tx_hash in tick.tx_hashes() {
@@ -2258,14 +2279,28 @@ impl ExecutionCoordinator {
     /// still queued, and resolving against a chain that has never seen
     /// the tick would drop the promotion.
     fn record_tick_resolution(&mut self, tick_id: &TickId, resolution: TickResolution) {
+        let Some(ticked) = self.ticked.get(tick_id) else {
+            return;
+        };
         // The claims clear with the fate rather than with the promotion:
         // both the commit path and the tick-completion pump emit pending
         // resolutions before dispatching, so the chain is always at least
         // as resolved as the claim set says by the time a later tick runs.
-        if self.ticked.remove(tick_id).is_some() {
-            self.pending_tick_resolutions
-                .push((*tick_id, tick_id.block_height(), resolution));
+        //
+        // Only the half carrying the legs clears them. A determined
+        // member holds no cell — its writes are readable from the append
+        // — so its own half settling releases nothing.
+        let releases_claims = match &resolution {
+            TickResolution::Settled { members, .. } => {
+                ticked.legs.iter().all(|leg| members.contains(leg))
+            }
+            TickResolution::Abandoned { .. } => true,
+        };
+        if releases_claims {
+            self.ticked.remove(tick_id);
         }
+        self.pending_tick_resolutions
+            .push((*tick_id, tick_id.block_height(), resolution));
     }
 
     /// Emit every buffered resolution whose tick is now on the chain.

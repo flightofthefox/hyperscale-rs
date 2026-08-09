@@ -88,24 +88,30 @@ pub struct TickOutput {
     pub provisional: Vec<ProvisionalTx>,
 }
 
-/// How a tick's fate became known from chain content.
+/// How some of a tick's members became resolved from chain content.
+///
+/// A tick settles in halves — its determined members on its own
+/// certificate, its cross-shard legs once a counterpart certifies — so a
+/// resolution names the members it speaks for rather than the whole tick.
 #[derive(Clone, Debug)]
 pub enum TickResolution {
-    /// The tick's certificate committed. Transactions in `aborted` settle
-    /// their reserve charge; every other member settles its execution
+    /// A committed finalization resolved `members`. Those in `aborted`
+    /// settle their reserve charge; the rest settle their execution
     /// writes.
     Settled {
-        /// Height of the block that committed the certificate.
+        /// Height of the block that committed the finalization.
         height: BlockHeight,
-        /// Members whose verdict discards their execution effects.
+        /// The members it reached a verdict for.
+        members: BTreeSet<TxHash>,
+        /// Which of them had their execution effects discarded.
         aborted: BTreeSet<TxHash>,
     },
-    /// The tick will never finalize — it held a transaction abandoned at
-    /// its deadline, so it was discarded. Nothing settles; its
-    /// provisional entries drop.
-    Aborted {
-        /// Height at which the abort became known.
-        height: BlockHeight,
+    /// These members will never finalize — the tick holding them was
+    /// discarded after one of them was abandoned at its deadline.
+    /// Nothing settles; their provisional entries drop.
+    Abandoned {
+        /// The members that will never reach a verdict.
+        members: BTreeSet<TxHash>,
     },
 }
 
@@ -130,10 +136,11 @@ struct TickEntry {
     /// further than this shard are here from the append; a cross-shard
     /// leg's arrive when the tick's verdict promotes them.
     readable: BTreeMap<TxHash, Contribution>,
-    /// The tick's provisional legs, until its certificate commits.
-    /// `None` once it has. Present-and-empty while a tick of purely
-    /// local members awaits its own settlement, so eviction waits for it.
-    pending: Option<Vec<ProvisionalTx>>,
+    /// The tick's provisional legs, by member, until a verdict promotes
+    /// or drops each one. Keyed rather than listed because a tick's legs
+    /// resolve independently of its determined members and, at a
+    /// terminal, of each other.
+    pending: BTreeMap<TxHash, ProvisionalTx>,
 }
 
 impl TickEntry {
@@ -153,65 +160,91 @@ impl TickEntry {
                     )
                 })
                 .collect(),
-            pending: Some(output.provisional),
+            pending: output
+                .provisional
+                .into_iter()
+                .map(|tx| (tx.tx_hash, tx))
+                .collect(),
         }
     }
 
-    /// Apply the tick's verdict: promote each member's surviving side
-    /// into the readable fold, or drop the tick's entries outright, and
+    /// Apply a verdict for the members it names: promote each one's
+    /// surviving side into the readable fold, or drop it outright, and
     /// record the height the base gains whatever survives at.
-    /// A no-op for a tick already resolved.
+    ///
+    /// Scoped to the named members because a tick settles in halves. Its
+    /// determined members are readable from the append and are stamped
+    /// when their own half commits; its legs are unreadable until a
+    /// verdict promotes them, which is a later block and sometimes never.
+    /// Idempotent per member — a member already resolved is not in
+    /// `pending` and its contribution is already stamped.
     fn resolve(&mut self, tick_id: &TickId, resolution: &TickResolution) {
-        let Some(txs) = self.pending.take() else {
-            return;
-        };
         match resolution {
-            TickResolution::Settled { height, aborted } => {
-                for tx in txs {
-                    let promoted = if aborted.contains(&tx.tx_hash) {
-                        tx.reserve
-                    } else {
-                        tx.writes
-                    };
-                    if let Some(writes) = promoted {
-                        self.readable.insert(
-                            tx.tx_hash,
-                            Contribution {
-                                writes,
-                                in_base_from: None,
-                            },
-                        );
+            TickResolution::Settled {
+                height,
+                members,
+                aborted,
+            } => {
+                for tx_hash in members {
+                    // A leg's surviving side becomes readable here; a
+                    // determined member has been readable since the
+                    // append and only needs its height.
+                    if let Some(tx) = self.pending.remove(tx_hash) {
+                        let promoted = if aborted.contains(tx_hash) {
+                            tx.reserve
+                        } else {
+                            tx.writes
+                        };
+                        if let Some(writes) = promoted {
+                            self.readable.insert(
+                                *tx_hash,
+                                Contribution {
+                                    writes,
+                                    in_base_from: None,
+                                },
+                            );
+                        }
                     }
-                }
-                // The base gains everything this tick settled, at the
-                // height that settled it.
-                for contribution in self.readable.values_mut() {
-                    contribution.in_base_from = Some(*height);
+                    if let Some(contribution) = self.readable.get_mut(tx_hash) {
+                        contribution.in_base_from = Some(*height);
+                    }
                 }
             }
             // Nothing settles, so nothing enters the base and no height
-            // is recorded. Only a tick whose whole contribution is
-            // provisional can take this path: its entries were never
-            // readable, so dropping them changes no baseline any tick has
-            // already read.
+            // is recorded. Only a provisional contribution can take this
+            // path: it was never readable, so dropping it changes no
+            // baseline any tick has already read.
             //
-            // A readable fold here would have no correct handling. Later
-            // ticks have read those writes and no base will ever carry
-            // them, so stamping a height would drop them from a later
-            // baseline while an earlier one kept them, and leaving them
-            // unstamped would pin the tick forever. The rule is upstream:
-            // abandonment is a verdict about a cross-shard tick, and a
-            // tick with determined output is not one.
-            TickResolution::Aborted { .. } => {
-                if !self.readable.is_empty() {
-                    // Left folded rather than dropped or stamped: every
-                    // read keeps agreeing with the ones before it, and
-                    // the cost is a tick this entry pins.
-                    tracing::error!(
-                        tick = %tick_id,
-                        "abandoned a tick whose fold later ticks have read"
-                    );
-                    debug_assert!(false, "a tick with a readable fold cannot be abandoned");
+            // A readable contribution here would have no correct
+            // handling. Later ticks have read those writes and no base
+            // will ever carry them, so stamping a height would drop them
+            // from a later baseline while an earlier one kept them, and
+            // leaving them unstamped would pin the entry forever. The
+            // rule is upstream, and it is what the halves are for: a
+            // determined member settles on its tick's own certificate, so
+            // it is never waiting on the counterpart whose absence
+            // abandons its tick-mates.
+            TickResolution::Abandoned { members } => {
+                for tx_hash in members {
+                    self.pending.remove(tx_hash);
+                    if self
+                        .readable
+                        .get(tx_hash)
+                        .is_some_and(|c| c.in_base_from.is_none())
+                    {
+                        // Left folded rather than dropped or stamped:
+                        // every read keeps agreeing with the ones before
+                        // it, and the cost is an entry this pins.
+                        tracing::error!(
+                            tick = %tick_id,
+                            tx_hash = ?tx_hash,
+                            "abandoned a member whose fold later ticks have read"
+                        );
+                        debug_assert!(
+                            false,
+                            "a member with an unsettled readable fold cannot be abandoned"
+                        );
+                    }
                 }
             }
         }
@@ -220,7 +253,7 @@ impl TickEntry {
     /// Whether the settled base at `floor` already carries everything
     /// this entry holds, so no future read can still need it.
     fn covered_by(&self, floor: BlockHeight) -> bool {
-        self.pending.is_none()
+        self.pending.is_empty()
             && self
                 .readable
                 .values()
@@ -381,7 +414,7 @@ where
                 }
                 fold_state_writes(&mut overlay, &contribution.writes);
             }
-            for leg in entry.pending.iter().flatten() {
+            for leg in entry.pending.values() {
                 for (cell, amount) in &leg.reserved {
                     *holds
                         .entry(*cell)
@@ -714,6 +747,7 @@ mod tests {
             &w,
             &TickResolution::Settled {
                 height: BlockHeight::new(3),
+                members: BTreeSet::from([tx(7)]),
                 aborted: BTreeSet::new(),
             },
         );
@@ -750,6 +784,7 @@ mod tests {
             &tick(4),
             &TickResolution::Settled {
                 height: BlockHeight::new(6),
+                members: BTreeSet::from([tx(7)]),
                 aborted: BTreeSet::new(),
             },
         );
@@ -787,6 +822,7 @@ mod tests {
             &w,
             &TickResolution::Settled {
                 height: BlockHeight::new(3),
+                members: BTreeSet::from([tx(7)]),
                 aborted: BTreeSet::from([tx(7)]),
             },
         );
@@ -814,13 +850,77 @@ mod tests {
 
         chain.resolve(
             &w,
-            &TickResolution::Aborted {
-                height: BlockHeight::new(3),
+            &TickResolution::Abandoned {
+                members: BTreeSet::from([tx(7)]),
             },
         );
         let view = chain.view_at(BlockHeight::new(1));
         assert_eq!(view.snapshot().substate(key(1)), Some(b"base".to_vec()));
         assert_eq!(view.snapshot().substate(key(9)), None);
+    }
+
+    /// A tick that mixes a determined member with a leg is the shape the
+    /// halves exist for. Its determined member settles on the tick's own
+    /// certificate; when the leg is later abandoned, the abandonment
+    /// meets a fold that is already stamped and drops only the leg.
+    ///
+    /// Before the split this was the corruption case: one resolution
+    /// covered the whole tick, so abandoning the leg left the determined
+    /// member's writes folded forever and never in the base — visible to
+    /// a long-running replica and absent from one that snap-synced.
+    #[test]
+    fn abandoning_a_leg_leaves_its_settled_tick_mate_alone() {
+        let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
+        let w = tick(1);
+        chain.append(
+            BlockHeight::new(1),
+            TickOutput {
+                determined: vec![(tx(1), writes(&[(key(1), Some(b"determined"))]))],
+                provisional: vec![ProvisionalTx {
+                    tx_hash: tx(7),
+                    writes: Some(writes(&[(key(2), Some(b"leg"))])),
+                    reserve: Some(writes(&[(key(9), Some(b"floor"))])),
+                    reserved: BTreeMap::new(),
+                }],
+            },
+        );
+
+        // The determined half settles on its own; the leg is untouched.
+        chain.resolve(
+            &w,
+            &TickResolution::Settled {
+                height: BlockHeight::new(1),
+                members: BTreeSet::from([tx(1)]),
+                aborted: BTreeSet::new(),
+            },
+        );
+        let view = chain.view_at(BlockHeight::new(1));
+        assert_eq!(
+            view.snapshot().substate(key(1)),
+            Some(b"determined".to_vec()),
+        );
+        assert_eq!(view.snapshot().substate(key(2)), None, "the leg is unread");
+
+        // The counterpart never certifies, so the leg is abandoned.
+        chain.resolve(
+            &w,
+            &TickResolution::Abandoned {
+                members: BTreeSet::from([tx(7)]),
+            },
+        );
+        let view = chain.view_at(BlockHeight::new(1));
+        assert_eq!(
+            view.snapshot().substate(key(1)),
+            Some(b"determined".to_vec()),
+            "the settled tick-mate is untouched by its leg's abandonment",
+        );
+        assert_eq!(view.snapshot().substate(key(2)), None);
+        assert_eq!(view.snapshot().substate(key(9)), None);
+
+        // And the entry can now evict rather than pin: nothing pends and
+        // the fold is stamped, so the base carries everything it held.
+        chain.prune_persisted(BlockHeight::new(1));
+        assert_eq!(chain.len(), 0);
     }
 
     /// Same-shard vnodes share one chain and each appends the tick it
@@ -874,6 +974,7 @@ mod tests {
             &w,
             &TickResolution::Settled {
                 height: BlockHeight::new(8),
+                members: BTreeSet::from([tx(7)]),
                 aborted: BTreeSet::new(),
             },
         );
@@ -919,6 +1020,7 @@ mod tests {
             &w,
             &TickResolution::Settled {
                 height: BlockHeight::new(3),
+                members: BTreeSet::from([tx(1)]),
                 aborted: BTreeSet::new(),
             },
         );
@@ -952,6 +1054,7 @@ mod tests {
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
         let settled = TickResolution::Settled {
             height: BlockHeight::new(1),
+            members: BTreeSet::from([tx(7), tx(1)]),
             aborted: BTreeSet::new(),
         };
         // Unknown tick: no entry at its height.
