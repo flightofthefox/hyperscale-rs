@@ -984,9 +984,8 @@ impl ExecutionCoordinator {
     /// This is the SINGLE path to execution voting. Call after conflicts
     /// have been processed so tick state is deterministic at this height.
     /// Each vote is sent to the tick leader (unicast). The `vote_anchor_ts`
-    /// is the shard consensus-authenticated weighted timestamp determined by the tick
-    /// (either `all_provisioned_at`, or `tick_ts + MAX_FINALIZATION_DELAY`
-    /// for timeout-abort).
+    /// is the tick's own block's shard consensus-authenticated weighted
+    /// timestamp, which is what resolves the committee that attests.
     pub fn emit_vote_actions(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let local_vid = self.me;
         let completions = self.scan_votable_ticks(topology_schedule);
