@@ -36,15 +36,16 @@ use hyperscale_scenarios::{
     grow_reaches_two_shard_topology, halted_shard_recovers_by_committee_redraw,
     halted_shard_straddler_atomic, hot_recipient, insolvent_payer_engages_nothing,
     inter_shard_partition_strands_ticks_until_it_heals, isolated_validator_still_settles,
-    livelock_resolves_promptly, liveness_baseline, merge_lifecycle,
-    merge_seats_full_keeper_committee, merge_straddler_atomic,
+    livelock_resolves_promptly, liveness_baseline, merge_boundary_admits_an_uncommitted_precut_tx,
+    merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
     minority_fragment_rejoins_after_partition, multi_vnode_progress,
     nullifier_race_admits_exactly_one, participant_count_sweep, partition_halts_and_heals,
     partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
     preview_reports_resource_changes, randomness_draw_agrees_across_shards,
     re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
     register_validator_pools_a_node, register_without_capacity_is_rejected,
-    registered_validator_activates_onto_a_shard, single_transfer, split_boundary_refuses_a_replay,
+    registered_validator_activates_onto_a_shard, single_transfer,
+    split_boundary_admits_an_uncommitted_precut_tx, split_boundary_refuses_a_replay,
     split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_terminating_payer_releases_its_reservation, stake_withdraw_drops_effective_stake,
     surviving_sibling_split_seats_full_committees,
@@ -157,6 +158,16 @@ fn split_boundary_refuses_a_replay_sim() {
         &probe_train_genesis_accounts(MAX_REPLAY_PROBES),
     );
     split_boundary_refuses_a_replay(&mut cluster);
+}
+
+#[test]
+fn split_boundary_admits_an_uncommitted_precut_tx_sim() {
+    let mut cluster = SimCluster::with_accounts(
+        &split_config(),
+        11,
+        &probe_train_genesis_accounts(MAX_REPLAY_PROBES),
+    );
+    split_boundary_admits_an_uncommitted_precut_tx(&mut cluster);
 }
 
 // ─── Engine scenarios ───────────────────────────────────────────────
@@ -884,6 +895,16 @@ fn livelock_resolves_promptly_sim() {
 fn merge_lifecycle_sim() {
     let mut cluster = SimCluster::with_accounts(&split_config(), 11, &reshape_lifecycle_accounts());
     merge_lifecycle(&mut cluster);
+}
+
+#[test]
+fn merge_boundary_admits_an_uncommitted_precut_tx_sim() {
+    // The merge's own ballast plus the probe train's funding: the
+    // scenario needs both the reshape to fire and the train to pay.
+    let mut accounts = reshape_lifecycle_accounts();
+    accounts.extend(probe_train_genesis_accounts(MAX_REPLAY_PROBES));
+    let mut cluster = SimCluster::with_accounts(&split_config(), 11, &accounts);
+    merge_boundary_admits_an_uncommitted_precut_tx(&mut cluster);
 }
 
 /// Single-shard genesis with the grow trigger armed — `split_bytes` above

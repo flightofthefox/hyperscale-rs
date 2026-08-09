@@ -7,7 +7,7 @@ use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_types::{
     BeaconState, BlockHeight, Event, ShardId, Signer, StateRoot, Transaction, TransactionDecision,
-    TransactionStatus, TxHash,
+    TransactionStatus, TxHash, WeightedTimestamp,
 };
 
 use super::Budget;
@@ -114,6 +114,18 @@ pub trait Cluster {
         let _ = (shard, tx);
         None
     }
+
+    /// The weighted-time anchor `shard`'s chain starts at — the cut a
+    /// reshape successor judges pre-cut content against.
+    ///
+    /// `WeightedTimestamp::ZERO` for a chain born at network genesis, so a
+    /// scenario reading it before a reshape sees "nothing predates this".
+    /// `None` when no host serves `shard`.
+    ///
+    /// An observation seam: a scenario asserting on the pre-cut rule needs
+    /// the rule's own input to know its candidate really is pre-cut, and
+    /// nothing on the chain carries it.
+    fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp>;
 
     /// The status of `tx`, if any hosted mempool or execution still tracks it.
     fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus>;

@@ -31,7 +31,8 @@ use hyperscale_storage::{BeaconChainReader, BeaconStorage, SubstateStore};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, GenesisValidators, ShardId, StateRoot,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, shard_prefix_path,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
+    shard_prefix_path,
 };
 use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
@@ -353,6 +354,14 @@ impl Harness {
             .expect("store registry")
             .get(&shard)
             .and_then(Weak::upgrade)
+    }
+
+    /// The weighted-time anchor `shard`'s chain starts at, read off the
+    /// live store's recovered consensus state. `None` if no host serves
+    /// `shard`.
+    pub fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
+        let store = self.store_for(shard)?;
+        Some(store.load_recovered_state().chain_origin.anchor_wt)
     }
 
     /// [`chain_fate`] over the live store the runner writes to — the shared

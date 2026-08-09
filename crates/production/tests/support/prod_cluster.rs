@@ -23,6 +23,7 @@ use hyperscale_scenarios::{
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, NetworkDefinition, ReshapeThresholds, ShardId,
     StateRoot, Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    WeightedTimestamp,
 };
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
@@ -268,6 +269,10 @@ impl Cluster for ProdCluster {
         (0..self.inner.host_count())
             .filter_map(|idx| self.inner.tx_status(idx, &tx))
             .max_by_key(status_rank)
+    }
+
+    fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
+        self.inner.chain_origin_anchor(shard)
     }
 
     fn chain_fate(

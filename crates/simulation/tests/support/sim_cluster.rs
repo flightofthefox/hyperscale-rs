@@ -26,7 +26,7 @@ use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeight, CertifiedBlock, ConsensusReceipt, Event,
     LocalKey, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, ValidatorId, Verified,
+    TransactionDecision, TransactionStatus, TxHash, ValidatorId, Verified, WeightedTimestamp,
 };
 
 /// The clock slice `run_until` advances per poll, matching the runner's own
@@ -474,6 +474,17 @@ impl Cluster for SimCluster {
         (0..self.runner.num_hosts())
             .filter_map(|host| self.runner.tx_status(host, &tx))
             .max_by_key(status_rank)
+    }
+
+    fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
+        // By tallest chain, not by first host: a terminated predecessor's
+        // store can still answer for a shard id its successor has since
+        // reclaimed, and that store's origin is the one the successor
+        // replaced.
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .max_by_key(|store| ShardChainReader::committed_height(*store))
+            .map(|store| store.load_recovered_state().chain_origin.anchor_wt)
     }
 
     fn chain_fate(
