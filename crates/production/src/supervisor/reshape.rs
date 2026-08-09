@@ -29,8 +29,8 @@ use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetRemoteHeadersRequest, GetStateRangeRequest};
 use hyperscale_types::{
-    Block, BlockHeight, ChainOrigin, ReshapeSeat, ShardAnchor, ShardId, StateRoot, StoredReceipt,
-    SubstateLeaf, ValidatorId,
+    Block, BlockHeight, ChainOrigin, PredecessorTerminal, ReshapeSeat, ShardAnchor, ShardId,
+    StateRoot, StoredReceipt, SubstateLeaf, ValidatorId,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -233,7 +233,8 @@ impl ShardSupervisor {
                 kind,
                 origin,
                 genesis,
-            } => self.reshape_adopt(shard, kind, origin, *genesis),
+                predecessors,
+            } => self.reshape_adopt(shard, kind, origin, *genesis, predecessors),
             ReshapeRequest::Seat { shard } => self.reshape_seat(shard),
         }
     }
@@ -642,6 +643,7 @@ impl ShardSupervisor {
         kind: AdoptKind,
         origin: ChainOrigin,
         genesis: Block,
+        predecessors: Vec<PredecessorTerminal>,
     ) {
         let Some(storage) = self.reshape_stores.get_mut(&shard).map(|entry| {
             entry.genesis = Some(genesis.clone());
@@ -652,7 +654,7 @@ impl ShardSupervisor {
         };
         let events = self.events_tx.clone();
         self.tokio_handle.spawn_blocking(move || {
-            match adopt_prepared_store(storage.as_ref(), kind, origin, &genesis) {
+            match adopt_prepared_store(storage.as_ref(), kind, origin, &genesis, predecessors) {
                 Ok(recovered) => {
                     let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::Adopted {
                         shard,

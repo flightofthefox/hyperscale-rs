@@ -39,8 +39,8 @@ use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetBlockRequest, GetRemoteHeadersRequest};
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
-    Block, BlockHeight, CertifiedBlock, ChainOrigin, LocalTimestamp, ShardId, ValidatorId,
-    Verified, shard_prefix_path,
+    Block, BlockHeight, CertifiedBlock, ChainOrigin, LocalTimestamp, PredecessorTerminal, ShardId,
+    ValidatorId, Verified, shard_prefix_path,
 };
 use tracing::error;
 
@@ -204,7 +204,8 @@ impl SimulationRunner {
                 kind,
                 origin,
                 genesis,
-            } => self.reshape_adopt(host, shard, kind, origin, *genesis),
+                predecessors,
+            } => self.reshape_adopt(host, shard, kind, origin, *genesis, predecessors),
             ReshapeRequest::Seat { shard } => {
                 self.reshape_seat(host, view, shard);
                 None
@@ -416,9 +417,10 @@ impl SimulationRunner {
         kind: AdoptKind,
         origin: ChainOrigin,
         genesis: Block,
+        predecessors: Vec<PredecessorTerminal>,
     ) -> Option<ReshapeEvent> {
         let storage = self.reshape_stores.get(&(host, shard))?.storage.clone();
-        let recovered = adopt_prepared_store(&storage, kind, origin, &genesis)
+        let recovered = adopt_prepared_store(&storage, kind, origin, &genesis, predecessors)
             .expect("adopted reshape root must match the genesis it derived");
         let entry = self.reshape_stores.get_mut(&(host, shard))?;
         entry.genesis = Some(genesis);

@@ -243,6 +243,7 @@ mod tests {
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
             settled_txs_root: None,
+            committed_txs_root: None,
         };
         (PendingChain::new(Arc::new(storage)), anchor)
     }
@@ -330,6 +331,7 @@ mod tests {
             weighted_timestamp: WeightedTimestamp::ZERO,
             witness_base: BeaconWitnessLeafCount::ZERO,
             settled_txs_root: None,
+            committed_txs_root: None,
         };
         let peer = PendingChain::new(Arc::new(storage));
 

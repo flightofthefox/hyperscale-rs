@@ -35,9 +35,9 @@ use hyperscale_types::network::request::{
 use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeResponse};
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin, CommitProof,
-    MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, QuorumCertificate, ReadySignal,
-    ResolvedCommittee, ShardAnchor, ShardId, SignError, Signer, StateRoot, StoredReceipt,
-    ValidatorId, WeightedTimestamp, ready_signal_window, shard_prefix_path,
+    MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, PredecessorTerminal, QuorumCertificate,
+    ReadySignal, ResolvedCommittee, ShardAnchor, ShardId, SignError, Signer, StateRoot,
+    StoredReceipt, ValidatorId, WeightedTimestamp, ready_signal_window, shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
@@ -297,6 +297,10 @@ pub struct DerivedGenesis {
     pub block: Block,
     /// The chain origin it starts from.
     pub origin: ChainOrigin,
+    /// The parent terminal this child succeeds, carried off the same
+    /// header the genesis derives from. `None` when that header carries
+    /// no committed-transaction commitment.
+    pub predecessor: Option<PredecessorTerminal>,
 }
 
 /// Derive `child`'s genesis from the parent's terminal header.
@@ -309,7 +313,11 @@ fn derive_child_genesis(
     canonical_wt: WeightedTimestamp,
 ) -> Option<DerivedGenesis> {
     let (block, origin) = Block::split_child_genesis_from_terminal(child, terminal, canonical_wt)?;
-    Some(DerivedGenesis { block, origin })
+    Some(DerivedGenesis {
+        block,
+        origin,
+        predecessor: terminal.as_predecessor_terminal(),
+    })
 }
 
 /// Sans-io tail-follower keeping an observer's synced child store
@@ -1015,6 +1023,7 @@ mod tests {
             weighted_timestamp: WeightedTimestamp::from_millis(4_000),
             witness_base: BeaconWitnessLeafCount::ZERO,
             settled_txs_root: None,
+            committed_txs_root: None,
         };
         // The terminal's own parent QC sits at the cut exactly — the
         // boundary instant counts as not yet crossed.

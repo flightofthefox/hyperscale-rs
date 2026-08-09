@@ -12,10 +12,10 @@ use thiserror::Error;
 use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
     ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot, MAX_PROVISION_TARGET_SHARDS,
-    MAX_TXS_PER_BLOCK, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
-    RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot,
-    TransactionRoot, TxHash, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
-    WorkInFlight,
+    MAX_TXS_PER_BLOCK, PredecessorTerminal, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot,
+    QuorumCertificate, RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots,
+    StateRoot, TransactionRoot, TxHash, ValidatorId, Verifiable, Verified, Verify,
+    WeightedTimestamp, WorkInFlight,
 };
 
 /// Block header containing consensus metadata.
@@ -667,6 +667,22 @@ impl BlockHeader {
         self.committed_txs_root
     }
 
+    /// This header as the terminal a successor succeeds.
+    ///
+    /// `None` on any header that carries no `committed_txs_root`, which
+    /// is every header but a terminating boundary's. A successor handed
+    /// nothing here keeps refusing everything from before its origin,
+    /// which is the rule it would relax rather than a fallback.
+    #[must_use]
+    pub fn as_predecessor_terminal(&self) -> Option<PredecessorTerminal> {
+        Some(PredecessorTerminal {
+            shard: self.shard_id(),
+            height: self.height(),
+            block_hash: self.hash(),
+            committed_txs_root: self.committed_txs_root()?,
+        })
+    }
+
     /// The shard's attested load through this block: attested work as a
     /// running total over the chain's history, and the byte total behind
     /// the parent state. Both recomputed at verification.
@@ -1088,6 +1104,31 @@ mod tests {
         let decoded: BlockHeader = hbor_from_slice(&hbor_to_vec(&carrying).unwrap()).unwrap();
         assert_eq!(decoded.settled_txs_root(), Some(root));
         assert_ne!(carrying.hash(), bare.hash());
+    }
+
+    /// A terminating header describes itself as a predecessor terminal;
+    /// an ordinary one has nothing to offer a successor and says so,
+    /// which is what keeps the successor on its strict rule rather than
+    /// handing it a root it could not have committed to.
+    #[test]
+    fn only_a_terminating_header_is_a_predecessor_terminal() {
+        let bare = BlockHeader::new(BlockHeaderParts::default());
+        assert!(bare.as_predecessor_terminal().is_none());
+
+        let root = CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed window"));
+        let terminal = BlockHeader::new(BlockHeaderParts {
+            shard_id: ShardId::leaf(1, 0),
+            height: BlockHeight::new(41),
+            committed_txs_root: Some(root),
+            ..Default::default()
+        });
+        let predecessor = terminal
+            .as_predecessor_terminal()
+            .expect("a terminating header carries the commitment");
+        assert_eq!(predecessor.shard, ShardId::leaf(1, 0));
+        assert_eq!(predecessor.height, BlockHeight::new(41));
+        assert_eq!(predecessor.block_hash, terminal.hash());
+        assert_eq!(predecessor.committed_txs_root, root);
     }
 
     /// `committed_txs_root` is hash-affecting header content in its own

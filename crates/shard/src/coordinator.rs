@@ -92,13 +92,13 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError,
     CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Finalization,
-    LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, ProvisionRootVerifyError,
-    ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
-    QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round, SafeVoteRegisters,
-    ShardLoad, StateRoot, StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified,
-    Verifier, Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit,
-    ready_leaf_payload,
+    LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, PredecessorTerminal,
+    ProvisionRootVerifyError, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
+    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round,
+    SafeVoteRegisters, ShardLoad, StateRoot, StateRootVerifyError, Timeout, TopologySchedule,
+    TopologySnapshot, Transaction, TransactionRoot, TxHash, TxRootVerifyError, ValidatorId,
+    Verifiable, Verified, Verifier, Verify, VoteCount, derive_leaves,
+    missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -415,6 +415,17 @@ pub struct ShardCoordinator {
     /// the chain's real genesis QC.
     chain_origin: ChainOrigin,
 
+    /// The chains this one succeeds, and the commitments they left — one
+    /// for a split child, two for a merged parent, empty for a chain born
+    /// at network genesis.
+    ///
+    /// Seeded from the reshape flip, which is the delivery that lands
+    /// inside the window the pre-cut rule is live for. A seat that missed
+    /// the flip — a restart, or a validator rotated on afterwards — picks
+    /// them up from its topology projection instead; empty means the
+    /// strict rule stands, which is always safe.
+    predecessors: Vec<PredecessorTerminal>,
+
     /// Settled-tick sets for shards that have terminated at a split,
     /// keyed by the terminated shard. The split-boundary fence consults
     /// this when voting on a block whose finalizations carry a
@@ -555,6 +566,7 @@ impl ShardCoordinator {
             me,
             local_shard,
             chain_origin: recovered.chain_origin,
+            predecessors: recovered.predecessors,
             settled_sets: HashMap::new(),
         }
     }
@@ -6082,6 +6094,16 @@ impl ShardCoordinator {
     #[must_use]
     pub const fn chain_origin(&self) -> ChainOrigin {
         self.chain_origin
+    }
+
+    /// The chains this one succeeds, and the commitments they left.
+    ///
+    /// Empty on a chain born at network genesis, and on any seat that
+    /// missed the reshape flip — a restart, or a validator rotated on
+    /// afterwards — until its topology projection supplies them.
+    #[must_use]
+    pub fn predecessors(&self) -> &[PredecessorTerminal] {
+        &self.predecessors
     }
 
     /// Number of distinct validators for which this coordinator holds

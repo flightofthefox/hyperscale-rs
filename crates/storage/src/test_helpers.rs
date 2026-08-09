@@ -611,6 +611,7 @@ pub fn pin_snap_sync_replica(
         weighted_timestamp: WeightedTimestamp::from_millis(anchor_height.inner()),
         witness_base: BeaconWitnessLeafCount::ZERO,
         settled_txs_root: None,
+        committed_txs_root: None,
     }
 }
 

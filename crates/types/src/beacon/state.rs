@@ -37,9 +37,9 @@ use crate::beacon::params::{NetworkParams, ParamProposal};
 use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, NetworkDefinition,
-    RETENTION_HORIZON, Randomness, SettledTxsRoot, ShardId, Stake, StakePoolId, StateRoot,
-    ValidatorId, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, CommittedTxsRoot, ConsensusPublicKey, Epoch,
+    NetworkDefinition, RETENTION_HORIZON, Randomness, SettledTxsRoot, ShardId, Stake, StakePoolId,
+    StateRoot, ValidatorId, WeightedTimestamp,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -337,6 +337,19 @@ pub struct ShardBoundary {
     /// [`ShardAnchor`](crate::ShardAnchor) and resolves split-straddling
     /// ticks against it. `None` for a live shard.
     pub settled_txs_root: Option<SettledTxsRoot>,
+    /// The terminal header's `committed_txs_root` — the beacon-attested
+    /// commitment over every transaction this shard committed in its
+    /// retention window up to its terminal block. `Some` only on a
+    /// terminated shard's boundary record.
+    ///
+    /// A reshape successor reads it off the terminal header at the cut,
+    /// which is the only delivery fast enough to matter while the rule it
+    /// relaxes is live. This projection is the durable one: a successor
+    /// derives its `RecoveredState` afresh on every boot and cannot
+    /// reconstruct the root from its own chain, so a restart inside the
+    /// window — or a validator rotated onto the successor committee after
+    /// the flip — reads it here or not at all.
+    pub committed_txs_root: Option<CommittedTxsRoot>,
     /// Epoch the reshape that terminates this shard was admitted (split)
     /// or paired (merge), stamped at the reshape's execution alongside
     /// [`terminal_epoch`](Self::terminal_epoch). Floors the shard's
@@ -1697,6 +1710,7 @@ impl BeaconState {
                         weighted_timestamp: b.weighted_timestamp,
                         witness_base: b.witness_base,
                         settled_txs_root: b.settled_txs_root,
+                        committed_txs_root: b.committed_txs_root,
                     },
                 )
             })
@@ -1979,6 +1993,7 @@ mod tests {
             terminal_epoch: None,
             terminal_delivered: false,
             settled_txs_root: None,
+            committed_txs_root: None,
             reshape_admitted_epoch: None,
         };
         state.boundaries.insert(child, pending(Epoch::new(4)));
@@ -2047,6 +2062,7 @@ mod tests {
             terminal_epoch: None,
             terminal_delivered: false,
             settled_txs_root: None,
+            committed_txs_root: None,
             reshape_admitted_epoch: None,
         };
 
@@ -2347,6 +2363,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_delivered: false,
                 settled_txs_root: None,
+                committed_txs_root: None,
                 reshape_admitted_epoch: None,
             })
             .witness_leaf_count = BeaconWitnessLeafCount::new(7);

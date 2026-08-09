@@ -31,8 +31,8 @@ use hyperscale_types::network::response::{
 };
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, LocalTimestamp, NetworkDefinition,
-    QuorumCertificate, ShardAnchor, ShardId, StateRoot, StoredReceipt, SubstateLeaf, ValidatorId,
-    Verifier, WeightedTimestamp,
+    PredecessorTerminal, QuorumCertificate, ShardAnchor, ShardId, StateRoot, StoredReceipt,
+    SubstateLeaf, ValidatorId, Verifier, WeightedTimestamp,
 };
 
 use crate::bootstrap::{BootstrapRequest, ShardBootstrap, StateRangeOutcome};
@@ -174,6 +174,10 @@ pub enum ReshapeRequest {
         origin: ChainOrigin,
         /// The derived genesis block.
         genesis: Box<Block>,
+        /// The terminals this duty succeeds, read off the same headers
+        /// the genesis derives from — one for a split child, two for a
+        /// merged parent.
+        predecessors: Vec<PredecessorTerminal>,
     },
     /// Seat the prepared `shard` — install its genesis and run consensus. No
     /// response (terminal).
@@ -297,6 +301,8 @@ enum ObserverPhase {
         origin: ChainOrigin,
         /// The derived genesis block.
         genesis: Box<Block>,
+        /// The terminals this duty succeeds.
+        predecessors: Vec<PredecessorTerminal>,
     },
     /// Adopt emitted; awaiting the verified adopted root.
     AwaitingAdopt,
@@ -482,6 +488,7 @@ fn terminal_anchor(header: &BlockHeader) -> ShardAnchor {
         weighted_timestamp: header.parent_qc().weighted_timestamp(),
         witness_base: header.beacon_witness_base(),
         settled_txs_root: header.settled_txs_root(),
+        committed_txs_root: header.committed_txs_root(),
     }
 }
 
@@ -509,13 +516,14 @@ enum KeeperPhase {
         anchor: Option<ShardAnchor>,
         left: Box<KeeperHalf>,
         right: Box<KeeperHalf>,
-        derived: Option<(ChainOrigin, Box<Block>)>,
+        derived: Option<(ChainOrigin, Box<Block>, Vec<PredecessorTerminal>)>,
         finalize_requested: bool,
     },
     /// Union imported; awaiting the next advance to emit the adopt.
     Adopting {
         origin: ChainOrigin,
         genesis: Box<Block>,
+        predecessors: Vec<PredecessorTerminal>,
     },
     /// Adopt emitted; awaiting the verified adopted root.
     AwaitingAdopt,
@@ -560,6 +568,8 @@ enum ParentHalfPhase {
         origin: ChainOrigin,
         /// The derived genesis block.
         genesis: Box<Block>,
+        /// The terminals this duty succeeds.
+        predecessors: Vec<PredecessorTerminal>,
         /// Whether the seed request is already in flight.
         requested: bool,
     },
@@ -578,6 +588,8 @@ enum ParentHalfPhase {
         origin: ChainOrigin,
         /// The derived genesis block.
         genesis: Box<Block>,
+        /// The terminals this duty succeeds.
+        predecessors: Vec<PredecessorTerminal>,
     },
     /// Adopt emitted; awaiting the verified adopted root.
     AwaitingAdopt,
@@ -850,8 +862,12 @@ impl ReshapeOrchestrator {
                 KeeperPhase::Building { derived, .. } => derived.take(),
                 _ => None,
             };
-            if let Some((origin, genesis)) = derived {
-                keeper.phase = KeeperPhase::Adopting { origin, genesis };
+            if let Some((origin, genesis, predecessors)) = derived {
+                keeper.phase = KeeperPhase::Adopting {
+                    origin,
+                    genesis,
+                    predecessors,
+                };
             }
         }
     }
@@ -929,12 +945,13 @@ impl ReshapeOrchestrator {
                 *requested = false;
                 let anchor = *anchor;
                 if let Some(elided) = &response.certified
-                    && let Some((genesis, origin)) =
+                    && let Some((genesis, origin, predecessor)) =
                         anchored_split_genesis(child, elided.header(), elided.qc(), &anchor)
                 {
                     next = Some(ObserverPhase::Adopting {
                         origin,
                         genesis: Box::new(genesis),
+                        predecessors: predecessor.into_iter().collect(),
                     });
                 }
             }
@@ -963,12 +980,13 @@ impl ReshapeOrchestrator {
             *requested = false;
             let anchor = *anchor;
             if let Some(elided) = &response.certified
-                && let Some((genesis, origin)) =
+                && let Some((genesis, origin, predecessor)) =
                     anchored_split_genesis(child, elided.header(), elided.qc(), &anchor)
             {
                 next = Some(ParentHalfPhase::Adopting {
                     origin,
                     genesis: Box::new(genesis),
+                    predecessors: predecessor.into_iter().collect(),
                 });
             }
         }
@@ -1141,6 +1159,7 @@ impl ReshapeOrchestrator {
                     duty.phase = ObserverPhase::Adopting {
                         origin: derived.origin,
                         genesis: Box::new(derived.block.clone()),
+                        predecessors: derived.predecessor.into_iter().collect(),
                     };
                     return;
                 }
@@ -1226,14 +1245,18 @@ impl ReshapeOrchestrator {
                 }
             }
             ObserverPhase::Adopting { .. } => {
-                if let ObserverPhase::Adopting { origin, genesis } =
-                    std::mem::replace(&mut duty.phase, ObserverPhase::AwaitingAdopt)
+                if let ObserverPhase::Adopting {
+                    origin,
+                    genesis,
+                    predecessors,
+                } = std::mem::replace(&mut duty.phase, ObserverPhase::AwaitingAdopt)
                 {
                     out.push(ReshapeRequest::Adopt {
                         shard: child,
                         kind: AdoptKind::Split,
                         origin,
                         genesis,
+                        predecessors,
                     });
                 }
             }
@@ -1464,7 +1487,7 @@ impl ReshapeOrchestrator {
                 if derived.is_none()
                     && let (Some((left_h, left_qc)), Some((right_h, right_qc))) =
                         (&left.terminal, &right.terminal)
-                    && let Ok((genesis, origin)) = merge_genesis_from_terminals(
+                    && let Ok((genesis, origin, predecessors)) = merge_genesis_from_terminals(
                         parent,
                         (left_h, left_qc),
                         (right_h, right_qc),
@@ -1489,13 +1512,13 @@ impl ReshapeOrchestrator {
                         matches
                     })
                 {
-                    *derived = Some((origin, Box::new(genesis)));
+                    *derived = Some((origin, Box::new(genesis), predecessors));
                 }
                 if !*finalize_requested
                     && duty.stages_unacked == 0
                     && left.bootstrap.is_staged()
                     && right.bootstrap.is_staged()
-                    && let Some((origin, _)) = derived.as_ref()
+                    && let Some((origin, _, _)) = derived.as_ref()
                 {
                     out.push(ReshapeRequest::FinalizeImport {
                         shard: parent,
@@ -1505,14 +1528,18 @@ impl ReshapeOrchestrator {
                 }
             }
             KeeperPhase::Adopting { .. } => {
-                if let KeeperPhase::Adopting { origin, genesis } =
-                    std::mem::replace(&mut duty.phase, KeeperPhase::AwaitingAdopt)
+                if let KeeperPhase::Adopting {
+                    origin,
+                    genesis,
+                    predecessors,
+                } = std::mem::replace(&mut duty.phase, KeeperPhase::AwaitingAdopt)
                 {
                     out.push(ReshapeRequest::Adopt {
                         shard: parent,
                         kind: AdoptKind::Merge,
                         origin,
                         genesis,
+                        predecessors,
                     });
                 }
             }
@@ -1626,6 +1653,7 @@ impl ReshapeOrchestrator {
                     next = Some(ParentHalfPhase::SeedingAt {
                         origin: derived.origin,
                         genesis: Box::new(derived.block.clone()),
+                        predecessors: derived.predecessor.into_iter().collect(),
                         requested: false,
                     });
                 } else if view.boundary(child).is_some() {
@@ -1651,12 +1679,14 @@ impl ReshapeOrchestrator {
             ParentHalfPhase::SeedingAt {
                 origin,
                 genesis,
+                predecessors,
                 requested,
             } => {
                 if store_seeded {
                     next = Some(ParentHalfPhase::Adopting {
                         origin: *origin,
                         genesis: genesis.clone(),
+                        predecessors: predecessors.clone(),
                     });
                 } else if !*requested {
                     out.push(ReshapeRequest::SeedFromParent {
@@ -1683,14 +1713,18 @@ impl ReshapeOrchestrator {
                 }
             }
             ParentHalfPhase::Adopting { .. } => {
-                if let ParentHalfPhase::Adopting { origin, genesis } =
-                    std::mem::replace(&mut duty.phase, ParentHalfPhase::AwaitingAdopt)
+                if let ParentHalfPhase::Adopting {
+                    origin,
+                    genesis,
+                    predecessors,
+                } = std::mem::replace(&mut duty.phase, ParentHalfPhase::AwaitingAdopt)
                 {
                     out.push(ReshapeRequest::Adopt {
                         shard: child,
                         kind: AdoptKind::ParentHalf,
                         origin,
                         genesis,
+                        predecessors,
                     });
                 }
             }
@@ -1725,7 +1759,7 @@ fn anchored_split_genesis(
     terminal: &BlockHeader,
     qc: &QuorumCertificate,
     anchor: &ShardAnchor,
-) -> Option<(Block, ChainOrigin)> {
+) -> Option<(Block, ChainOrigin, Option<PredecessorTerminal>)> {
     let (genesis, origin) =
         split_genesis_from_terminal(child, terminal, qc, anchor.weighted_timestamp)
             .inspect_err(|error| {
@@ -1741,7 +1775,7 @@ fn anchored_split_genesis(
         );
         return None;
     }
-    Some((genesis, origin))
+    Some((genesis, origin, terminal.as_predecessor_terminal()))
 }
 
 /// Whether the parent's terminal is commit-proven — the gate the flip
@@ -1888,6 +1922,7 @@ mod tests {
             weighted_timestamp: wt,
             witness_base: BeaconWitnessLeafCount::ZERO,
             settled_txs_root: None,
+            committed_txs_root: None,
         }
     }
 

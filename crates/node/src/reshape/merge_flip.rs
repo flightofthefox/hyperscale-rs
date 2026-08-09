@@ -8,7 +8,8 @@
 //! when the beacon composes the same value.
 
 use hyperscale_types::{
-    Block, BlockHeader, ChainOrigin, QuorumCertificate, ShardId, TerminalRef, WeightedTimestamp,
+    Block, BlockHeader, ChainOrigin, PredecessorTerminal, QuorumCertificate, ShardId, TerminalRef,
+    WeightedTimestamp,
 };
 
 /// Derive a merged parent's genesis block and chain origin from its two
@@ -30,6 +31,11 @@ use hyperscale_types::{
 /// whichever QC `canonical_boundary_qcs` ranked highest across the
 /// committed proposal set, so no keeper could reproduce that choice.
 ///
+/// Both children are predecessors of the reformed parent, so the third
+/// element carries both: a transaction proven absent from one child's
+/// committed set says nothing about what the other committed, and the
+/// successor may only admit one absent from both.
+///
 /// # Errors
 ///
 /// Fails when a quorum certificate does not certify its terminal block.
@@ -38,7 +44,7 @@ pub fn merge_genesis_from_terminals(
     left: (&BlockHeader, &QuorumCertificate),
     right: (&BlockHeader, &QuorumCertificate),
     cut_wt: WeightedTimestamp,
-) -> Result<(Block, ChainOrigin), String> {
+) -> Result<(Block, ChainOrigin, Vec<PredecessorTerminal>), String> {
     let (left_terminal, left_qc) = left;
     let (right_terminal, right_qc) = right;
     if left_qc.block_hash() != left_terminal.hash() {
@@ -63,16 +69,20 @@ pub fn merge_genesis_from_terminals(
         },
         cut_wt,
     );
-    Ok((genesis, origin))
+    let predecessors = [left_terminal, right_terminal]
+        .into_iter()
+        .filter_map(BlockHeader::as_predecessor_terminal)
+        .collect();
+    Ok((genesis, origin, predecessors))
 }
 
 #[cfg(test)]
 mod tests {
 
     use hyperscale_types::{
-        AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, ChainOrigin, Hash,
-        QuorumCertificate, Round, ShardId, SignerBitfield, SplitChildRoots, StateRoot, ValidatorId,
-        WeightedTimestamp,
+        AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, ChainOrigin,
+        CommittedTxsRoot, Hash, QuorumCertificate, Round, ShardId, SignerBitfield, SplitChildRoots,
+        StateRoot, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -135,7 +145,7 @@ mod tests {
             cut_wt,
         );
 
-        let (genesis, origin) = merge_genesis_from_terminals(
+        let (genesis, origin, predecessors) = merge_genesis_from_terminals(
             parent,
             (&left_terminal, &left_qc),
             (&right_terminal, &right_qc),
@@ -146,6 +156,56 @@ mod tests {
         assert_eq!(genesis.header().state_root(), composed);
         assert_eq!(origin.genesis_height, BlockHeight::new(10));
         assert_eq!(origin.anchor_wt, cut_wt);
+        // Neither terminal carries a committed-transaction commitment
+        // here, so the merged parent succeeds them with nothing to ask
+        // against and keeps its strict rule.
+        assert!(predecessors.is_empty());
+    }
+
+    /// A merged parent succeeds *both* children, so both terminals become
+    /// predecessors. One absence proof settles nothing on its own: the
+    /// transaction has to be absent from each child's committed set.
+    #[test]
+    fn both_children_become_predecessors() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let cut_wt = WeightedTimestamp::from_millis(2_000);
+
+        let with_root = |shard: ShardId, height: u64, tag: &[u8]| {
+            BlockHeader::new(BlockHeaderParts {
+                shard_id: shard,
+                height: BlockHeight::new(height),
+                parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+                parent_qc: QuorumCertificate::genesis(shard, ChainOrigin::ROOT).into(),
+                proposer: ValidatorId::new(2),
+                round: Round::new(7),
+                state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
+                committed_txs_root: Some(CommittedTxsRoot::from_raw(Hash::from_bytes(tag))),
+                ..Default::default()
+            })
+        };
+        let left_terminal = with_root(left, 8, b"left committed");
+        let right_terminal = with_root(right, 9, b"right committed");
+        let left_qc = certifying_qc(&left_terminal, 2_400);
+        let right_qc = certifying_qc(&right_terminal, 2_600);
+
+        let (_, _, predecessors) = merge_genesis_from_terminals(
+            parent,
+            (&left_terminal, &left_qc),
+            (&right_terminal, &right_qc),
+            cut_wt,
+        )
+        .expect("derives");
+
+        assert_eq!(predecessors.len(), 2, "both children are predecessors");
+        assert_eq!(predecessors[0].shard, left);
+        assert_eq!(predecessors[0].block_hash, left_terminal.hash());
+        assert_eq!(predecessors[1].shard, right);
+        assert_eq!(predecessors[1].block_hash, right_terminal.hash());
+        assert_ne!(
+            predecessors[0].committed_txs_root, predecessors[1].committed_txs_root,
+            "each child commits its own set"
+        );
     }
 
     /// The merged root is composed from the terminals themselves, so a

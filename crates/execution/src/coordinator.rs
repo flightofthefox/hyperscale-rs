@@ -4845,6 +4845,7 @@ mod tests {
                 weighted_timestamp: WeightedTimestamp::from_millis(1),
                 witness_base: BeaconWitnessLeafCount::ZERO,
                 settled_txs_root: None,
+                committed_txs_root: None,
             },
         );
         TopologySchedule::single(Arc::new(TopologySnapshot::from_explicit_committees(

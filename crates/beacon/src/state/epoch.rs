@@ -916,6 +916,7 @@ fn record_boundaries(
                 terminal_epoch: marks.terminal_epoch,
                 terminal_delivered: marks.terminal_delivered,
                 settled_txs_root: header.settled_txs_root(),
+                committed_txs_root: header.committed_txs_root(),
                 reshape_admitted_epoch: marks.reshape_admitted_epoch,
             },
         );
@@ -1140,6 +1141,7 @@ fn seed_split_children(
                 terminal_epoch: None,
                 terminal_delivered: false,
                 settled_txs_root: None,
+                committed_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -1250,6 +1252,7 @@ fn compose_merge_parent(
             terminal_epoch: None,
             terminal_delivered: false,
             settled_txs_root: None,
+            committed_txs_root: None,
             reshape_admitted_epoch: None,
         },
     );
@@ -1825,6 +1828,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_delivered: false,
                 settled_txs_root: None,
+                committed_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -1882,6 +1886,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_delivered: false,
                 settled_txs_root: None,
+                committed_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2276,6 +2281,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_delivered: false,
                 settled_txs_root: None,
+                committed_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2372,6 +2378,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_delivered: false,
                 settled_txs_root: None,
+                committed_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -2447,6 +2454,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_delivered: false,
                 settled_txs_root: None,
+                committed_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3043,6 +3051,7 @@ mod tests {
                 terminal_epoch: Some(Epoch::new(1)),
                 terminal_delivered: false,
                 settled_txs_root: None,
+                committed_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3063,6 +3072,7 @@ mod tests {
                     terminal_epoch: None,
                     terminal_delivered: false,
                     settled_txs_root: None,
+                    committed_txs_root: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -3492,6 +3502,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_delivered: false,
                 settled_txs_root: None,
+                committed_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -3514,6 +3525,7 @@ mod tests {
                     terminal_epoch: Some(Epoch::new(1)),
                     terminal_delivered: true,
                     settled_txs_root: None,
+                    committed_txs_root: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -3661,6 +3673,7 @@ mod tests {
                     terminal_epoch: Some(Epoch::new(1)),
                     terminal_delivered: false,
                     settled_txs_root: None,
+                    committed_txs_root: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -3681,6 +3694,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_delivered: false,
                 settled_txs_root: None,
+                committed_txs_root: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -4076,6 +4090,7 @@ mod tests {
                 terminal_epoch: None,
                 terminal_delivered: false,
                 settled_txs_root: None,
+                committed_txs_root: None,
                 reshape_admitted_epoch: None,
             }
         }
@@ -4299,6 +4314,7 @@ mod tests {
                     terminal_epoch: None,
                     terminal_delivered: false,
                     settled_txs_root: None,
+                    committed_txs_root: None,
                     reshape_admitted_epoch: None,
                 },
             );

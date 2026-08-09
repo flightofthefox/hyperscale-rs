@@ -131,7 +131,7 @@ enum Phase {
     Witness(Box<WitnessHistorySync>),
     /// Assembling the shard's committed state; every verified chunk is
     /// staged by the driver as it arrives.
-    State(SnapSync),
+    State(Box<SnapSync>),
     /// Every sub-range staged, waiting for the driver to take the
     /// finalize (with the witness window).
     FinalizeReady,
@@ -231,12 +231,12 @@ impl ShardBootstrap {
         Self {
             shard,
             anchor,
-            phase: Phase::State(SnapSync::new(
+            phase: Phase::State(Box::new(SnapSync::new(
                 anchor,
                 shard_prefix_path(shard),
                 SPLIT_BITS,
                 STATE_CHUNK_LIMIT,
-            )),
+            ))),
             witness: None,
             resume: None,
             imported_substate_bytes: 0,
@@ -390,7 +390,7 @@ impl ShardBootstrap {
                 self.imported_substate_bytes = snap.staged_bytes();
                 self.phase = Phase::FinalizeReady;
             } else {
-                self.phase = Phase::State(snap);
+                self.phase = Phase::State(Box::new(snap));
             }
         }
         outcome

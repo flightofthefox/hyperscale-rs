@@ -1905,6 +1905,7 @@ mod tests {
             terminal_epoch: None,
             terminal_delivered: false,
             settled_txs_root: None,
+            committed_txs_root: None,
             reshape_admitted_epoch: None,
         }
     }
@@ -1930,6 +1931,7 @@ mod tests {
             terminal_epoch: None,
             terminal_delivered: false,
             settled_txs_root: None,
+            committed_txs_root: None,
             reshape_admitted_epoch: None,
         }
     }

@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash, Provisions,
-    QuorumCertificate, RevealChain, SafeVoteRegisters, ShardAnchor, ShardLoad, StateRoot,
-    ValidatorId, Verified, WeightedTimestamp, WorkInFlight,
+    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash,
+    PredecessorTerminal, Provisions, QuorumCertificate, RevealChain, SafeVoteRegisters,
+    ShardAnchor, ShardLoad, StateRoot, ValidatorId, Verified, WeightedTimestamp, WorkInFlight,
 };
 
 use super::dedup_window::DedupWindow;
@@ -45,6 +45,17 @@ pub struct RecoveredState {
     ///
     /// [`RETENTION_HORIZON`]: hyperscale_types::RETENTION_HORIZON
     pub dedup: DedupWindow,
+
+    /// The chains this one succeeds, and the commitments they left — one
+    /// for a split child, two for a merged parent, empty for a chain born
+    /// at network genesis or recovered by any path but a reshape flip.
+    ///
+    /// Set only on the flip, which is the delivery fast enough to matter:
+    /// the rule these relax retires `MAX_VALIDITY_RANGE` past the origin,
+    /// well before the beacon folds the same roots. Empty here is not a
+    /// gap — a seat that missed the flip reads them off its topology
+    /// projection instead, and until either lands the strict rule stands.
+    pub predecessors: Vec<PredecessorTerminal>,
 
     /// The provision bodies still held for the blocks that carried them.
     /// A stored block keeps only their hashes, so this is what puts them
@@ -201,6 +212,9 @@ impl RecoveredState {
             // to fold a dedup window out of yet. The tail sync above the
             // anchor supplies it as it commits.
             dedup: DedupWindow::covering_nothing(),
+            // A snap-synced joiner reaches no reshape flip, so it reads
+            // its predecessors off the topology projection or not at all.
+            predecessors: Vec::new(),
             retained_provisions: Vec::new(),
             committed_hash: Some(anchor.block_hash),
             latest_qc: None,

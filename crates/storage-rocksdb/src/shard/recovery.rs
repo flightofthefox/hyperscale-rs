@@ -70,6 +70,11 @@ impl RocksDbShardStorage {
         let committed_block_anchor_wt = self.anchor_ts_at(committed_height);
         RecoveredState {
             committed_height,
+            // A restart reaches no reshape flip: the flip-time delivery is
+            // gone with the process, and the roots come back off the
+            // topology projection instead. Empty means the strict pre-cut
+            // rule stands until that lands.
+            predecessors: Vec::new(),
             replay: replay_window(
                 self,
                 committed_height,

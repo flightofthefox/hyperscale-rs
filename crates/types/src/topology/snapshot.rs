@@ -11,10 +11,10 @@ use std::sync::Arc;
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
-    DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds, Round, SettledTxsRoot,
-    ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId, ValidatorSet,
-    VoteCount, WeightedTimestamp,
+    Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CommittedTxsRoot, CompletedRecovery,
+    ConsensusPublicKey, DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds,
+    Round, SettledTxsRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId,
+    ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -60,6 +60,18 @@ pub struct ShardAnchor {
     /// to resolve split-straddling ticks against the terminated shard's
     /// settled set; `None` for a live shard's anchor.
     pub settled_txs_root: Option<SettledTxsRoot>,
+    /// The terminated shard's beacon-attested committed-transaction
+    /// commitment, set only on a terminal boundary record. A reshape
+    /// successor reads it to tell a replay of something the predecessor
+    /// committed from a first inclusion the predecessor never made;
+    /// `None` for a live shard.
+    ///
+    /// The durable half of that delivery. The successor also reads the
+    /// root straight off the terminal header at the cut, which is the
+    /// only path fast enough while the rule it relaxes is still live —
+    /// this one is what a restart, or a validator seated after the flip,
+    /// recovers it from.
+    pub committed_txs_root: Option<CommittedTxsRoot>,
 }
 
 /// One reshape cohort seat as the topology projects it.
@@ -1437,6 +1449,7 @@ mod tests {
             weighted_timestamp: WeightedTimestamp::from_millis(42),
             witness_base: BeaconWitnessLeafCount::ZERO,
             settled_txs_root: None,
+            committed_txs_root: None,
         };
         let mut boundaries = HashMap::new();
         boundaries.insert(ShardId::leaf(1, 0), anchor);
