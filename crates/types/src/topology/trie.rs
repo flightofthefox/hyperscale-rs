@@ -71,6 +71,30 @@ impl ShardTrie {
         ))
     }
 
+    /// Whether `shard` owns `prefix`'s key space, asked without a trie.
+    ///
+    /// [`Self::shard_for_prefix`] descends by the prefix's own bits, so a
+    /// leaf at depth `d` owns exactly the prefixes whose first `d` bits
+    /// are its path. Answering it this way holds for any shard *while it
+    /// was a leaf*, which is what lets a consumer ask about one no live
+    /// trie carries — a shard that has since split or merged away, whose
+    /// keyspace a walk can only attribute to its successor.
+    ///
+    /// A caller asking about a departed shard is therefore asking a
+    /// question about a span of time as much as about a prefix, and owes
+    /// itself the check that the span is one the shard was live for.
+    ///
+    /// # Panics
+    /// As [`Self::shard_for_prefix`].
+    #[must_use]
+    pub fn shard_owns_prefix(shard: ShardId, prefix: Address) -> bool {
+        let depth = shard.depth();
+        depth == 0
+            || (u64::from_be_bytes(prefix.0[..8].try_into().expect("prefix is 16 bytes"))
+                >> (64 - depth))
+                == shard.path()
+    }
+
     fn walk(&self, bits: u64) -> ShardId {
         let mut id = ShardId::ROOT;
         loop {
@@ -189,6 +213,53 @@ mod tests {
             let bits = u64::from_be_bytes(prefix[..8].try_into().unwrap());
             assert_eq!(shard.path(), bits >> (64 - 3));
         }
+    }
+
+    /// The trie-free predicate answers exactly what the walk answers, on
+    /// every partition and every prefix: the owner owns it, and no other
+    /// leaf does. It feeds the split-boundary fence, so agreement with
+    /// the walk is not something to take on the derivation's word.
+    #[test]
+    fn ownership_without_a_trie_agrees_with_the_walk() {
+        use proptest::prelude::*;
+
+        proptest!(|(splits in prop::collection::vec(0usize..8, 0..8), raw in any::<[u8; 16]>())| {
+            // Splitting an arbitrary leaf each round reaches partitions
+            // at mixed depths, not only the uniform ones.
+            let mut trie = ShardTrie::single();
+            for pick in splits {
+                let leaf = trie.leaves().nth(pick % trie.len()).expect("non-empty");
+                trie.split(leaf);
+            }
+
+            let prefix = Address(raw);
+            let owner = trie.shard_for_prefix(prefix);
+            prop_assert!(ShardTrie::shard_owns_prefix(owner, prefix));
+            for leaf in trie.leaves() {
+                prop_assert_eq!(
+                    ShardTrie::shard_owns_prefix(leaf, prefix),
+                    leaf == owner,
+                    "only the owning leaf owns the prefix",
+                );
+            }
+        });
+    }
+
+    /// A departed shard still owns what it owned: the predicate answers
+    /// about the ancestor a split replaced, which is the case the walk
+    /// cannot reach because the trie no longer carries it.
+    #[test]
+    fn ownership_outlives_the_shard_in_the_trie() {
+        let mut trie = ShardTrie::single();
+        let prefix = Address([0x5A; 16]);
+        let departed = trie.shard_for_prefix(prefix);
+
+        trie.split(departed);
+        let successor = trie.shard_for_prefix(prefix);
+
+        assert_ne!(successor, departed, "the split replaced the owner");
+        assert!(ShardTrie::shard_owns_prefix(departed, prefix));
+        assert!(ShardTrie::shard_owns_prefix(successor, prefix));
     }
 
     #[test]

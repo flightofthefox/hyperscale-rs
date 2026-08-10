@@ -44,9 +44,9 @@ use hyperscale_types::{
     CertifiedBlock, DeclaredKey, ExecutionCertificate, ExecutionCertificateVerifyError,
     ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
     Hash, MAX_FINALIZATION_DELAY, Mode, Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup,
-    SettledSetVerdict, SettledTxSet, ShardId, TickId, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, settled_set_verdict, tick_leader, tick_leader_at,
+    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, TickId, TopologySchedule,
+    TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -625,14 +625,12 @@ impl ExecutionCoordinator {
     ) {
         let local_shard = self.local_shard;
         let members = assign_participants(classification, transactions);
-        // The ledger takes the participants the same assignment produced:
-        // an abandonment has no counterpart certificate to read them off,
-        // and the fence needs them.
-        self.unresolved.register_committed(
-            transactions
-                .iter()
-                .zip(members.iter().map(|(_, shards)| shards.clone())),
-        );
+        // The ledger takes the transactions themselves. What it needs of
+        // them — when they expire, what they reserved, what they reach
+        // outside this shard — is theirs and this shard's, so a rebuild
+        // reads the same account off the same blocks however long after.
+        self.unresolved
+            .register_committed(local_shard, ts, transactions.iter());
         let reaches_beyond: Vec<_> = members
             .iter()
             .filter(|(_, shards)| shards.iter().any(|&s| s != local_shard))
@@ -751,6 +749,7 @@ impl ExecutionCoordinator {
                 member.admission,
             );
             self.ticks.assign_tx(member.request.tx_hash, tick_id);
+            self.unresolved.certify(member.request.tx_hash);
             if member.request.reaches_beyond {
                 legs.insert(member.request.tx_hash);
                 provisional_claims
@@ -768,7 +767,7 @@ impl ExecutionCoordinator {
         // counterparts still waiting on a verdict for it — the abort is
         // dominant, so their coverage closes on it — and what the fence
         // asks its question about.
-        for (tx_hash, declared_work) in self.abandonable(topology_schedule, tick_id) {
+        for (tx_hash, declared_work) in self.abandonable(tick_id) {
             // A tick that held the member can never speak for it — its
             // coverage will not close — and its other legs would wait on
             // that coverage forever. It goes with the member; the rest of
@@ -776,13 +775,20 @@ impl ExecutionCoordinator {
             if let Some(held_by) = self.ticks.tick_assignment(tx_hash) {
                 self.discard_tick(held_by);
             }
-            let mut participating: BTreeSet<ShardId> =
-                self.unresolved.participants(tx_hash).collect();
+            let mut participating = self.unresolved.counterparts(
+                tx_hash,
+                self.classification_committee(
+                    topology_schedule,
+                    self.committed_committee_anchor_wt,
+                )
+                .shard_trie(),
+            );
             participating.insert(local_shard);
             state.admit(tx_hash, participating, declared_work, Admission::Aborted);
             self.candidates.remove(tx_hash);
             self.provisioning.remove_tx(tx_hash);
             self.ticks.assign_tx(tx_hash, tick_id);
+            self.unresolved.certify(tx_hash);
         }
 
         if state.is_empty() {
@@ -2042,6 +2048,7 @@ impl ExecutionCoordinator {
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
         self.unresolved.release_resolved(block.certificates());
+        self.stamp_departures(topology_schedule);
         self.unresolved.prune(self.committed_ts);
 
         let mut actions = Vec::new();
@@ -2301,15 +2308,11 @@ impl ExecutionCoordinator {
     /// transaction a terminating counterpart may have settled is the
     /// fence's question, which [`Self::fence_pairs`] is what lets the
     /// fence ask about an abandonment at all.
-    fn abandonable(
-        &self,
-        topology_schedule: &TopologySchedule,
-        composing: TickId,
-    ) -> Vec<(TxHash, u64)> {
+    fn abandonable(&self, composing: TickId) -> Vec<(TxHash, u64)> {
         self.unresolved
             .past_deadline(self.committed_ts)
             .into_iter()
-            .filter(|(tx_hash, _)| self.beyond_every_shard(topology_schedule, composing, *tx_hash))
+            .filter(|(tx_hash, _)| self.beyond_every_shard(composing, *tx_hash))
             .collect()
     }
 
@@ -2329,12 +2332,23 @@ impl ExecutionCoordinator {
     ///
     /// A settlement needs a certificate from every shard party to the
     /// transaction, so it takes two things to put one out of reach: no
-    /// certificate of ours for a counterpart to combine with its own, or a
-    /// participant that has left and will produce no more. The tick
-    /// composing now is the exception to both — it is about to speak for
-    /// the transaction itself, and its verdict can carry a charge an
-    /// abandonment cannot, a payer's leg admitted at its engagement
-    /// deadline being exactly that.
+    /// certificate of ours for a counterpart to combine with its own, or
+    /// no counterpart in a position to combine one.
+    ///
+    /// A tick holding the transaction is speaking for it and is left to.
+    /// The one composing now is about to attest it, and its verdict can
+    /// carry a charge an abandonment cannot — a payer's leg admitted at
+    /// its engagement deadline being exactly that. An earlier one can
+    /// still close its coverage, unless a counterpart it waits on has
+    /// left, in which case it never will.
+    ///
+    /// With no tick speaking for it, what decides is whether a certificate
+    /// of ours is out where a counterpart could settle against it. The
+    /// account answers that, not the tick registry: the certificate
+    /// outlives the tick that produced it — a discard drops the tick, a
+    /// restart loses it — and a shard reading the registry would take the
+    /// tick's absence for the certificate's and abandon a transaction its
+    /// counterpart can still settle.
     ///
     /// A participant that left having *already* settled the transaction is
     /// the one case this admits and must not: it is why the fence puts the
@@ -2346,25 +2360,35 @@ impl ExecutionCoordinator {
     /// the committed frontier — so replicas at one frontier compose the
     /// same tick. Nothing here consults a tick's certificate or its
     /// coverage, both of which arrive by local fetch.
-    fn beyond_every_shard(
-        &self,
-        topology_schedule: &TopologySchedule,
-        composing: TickId,
-        tx_hash: TxHash,
-    ) -> bool {
+    fn beyond_every_shard(&self, composing: TickId, tx_hash: TxHash) -> bool {
         match self.ticks.tick_assignment(tx_hash) {
-            None => true,
             Some(tick_id) if tick_id == composing => false,
-            Some(_) => self
-                .unresolved
-                .participants(tx_hash)
-                .filter(|shard| *shard != self.local_shard)
-                .any(|shard| {
-                    matches!(
-                        topology_schedule.at_for_shard(shard, self.committed_ts),
-                        Some((_, true))
-                    )
-                }),
+            Some(_) => self.unresolved.a_counterpart_has_left(tx_hash),
+            None => {
+                !self.unresolved.is_certified(tx_hash) || self.no_counterpart_can_settle(tx_hash)
+            }
+        }
+    }
+
+    /// Whether no counterpart is in a position to settle `tx_hash` against
+    /// a certificate of ours: none is party to it, so there is no
+    /// certificate but ours to combine with, or one that is has left.
+    fn no_counterpart_can_settle(&self, tx_hash: TxHash) -> bool {
+        !self.unresolved.reaches_beyond(tx_hash) || self.unresolved.a_counterpart_has_left(tx_hash)
+    }
+
+    /// Record where each departed shard's chain ended, for the entries
+    /// whose fate only that shard's settled set can decide.
+    ///
+    /// Read on every commit, while the schedule still carries the window
+    /// that proves the terminal — the account outlives that window, and a
+    /// departure it never recorded reads afterwards as a counterpart that
+    /// never left.
+    fn stamp_departures(&mut self, topology_schedule: &TopologySchedule) {
+        for (shard, cut) in topology_schedule.departures_at(self.committed_ts) {
+            if shard != self.local_shard && !self.unresolved.knows_terminal(shard) {
+                self.unresolved.record_terminal(shard, cut);
+            }
         }
     }
 
@@ -2507,6 +2531,7 @@ impl ExecutionCoordinator {
         let tick_id = TickId::new(self.local_shard, block_height);
         for tx in transactions {
             self.ticks.assign_tx(tx.hash(), tick_id);
+            self.unresolved.certify(tx.hash());
         }
     }
 
@@ -2615,7 +2640,7 @@ impl ExecutionCoordinator {
     /// have settled its own half, an abandonment needs it not to have.
     /// One tick can hold both, so the claim is per transaction rather
     /// than per finalization.
-    fn fence_pairs(&self, fw: &Finalization) -> Vec<(ShardId, TxHash, TxClaim)> {
+    fn fence_pairs(&self, trie: &ShardTrie, fw: &Finalization) -> Vec<(ShardId, TxHash, TxClaim)> {
         let mut pairs: Vec<(ShardId, TxHash, TxClaim)> = Vec::new();
         let mut attested_remotely: HashSet<TxHash> = HashSet::new();
         for ec in fw.execution_certificates() {
@@ -2633,7 +2658,8 @@ impl ExecutionCoordinator {
             }
             pairs.extend(
                 self.unresolved
-                    .participants(tx_hash)
+                    .counterparts(tx_hash, trie)
+                    .into_iter()
                     .map(|s| (s, tx_hash, TxClaim::Abandoned)),
             );
         }
@@ -2660,7 +2686,11 @@ impl ExecutionCoordinator {
     ) -> Vec<Action> {
         let tick_id = *finalized_arc.tick_id();
         let verdict = {
-            let outcomes = self.fence_pairs(finalized_arc.as_unverified());
+            let outcomes = self.fence_pairs(
+                self.classification_committee(topology_schedule, self.committed_ts)
+                    .shard_trie(),
+                finalized_arc.as_unverified(),
+            );
             settled_set_verdict(
                 &self.settled_sets,
                 topology_schedule,
@@ -3242,7 +3272,8 @@ mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_storage::ReplayWindow;
     use hyperscale_types::test_utils::{
-        certify as test_certify, make_live_block as helpers_make_live_block, test_transaction,
+        certify as test_certify, make_live_block as helpers_make_live_block, test_prefix,
+        test_transaction, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AggregateSignature, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Epoch,
@@ -5618,9 +5649,11 @@ mod tests {
         let tx_hash = transaction.hash();
         let tick = cross_shard_finalization(local, ShardId::ROOT, 1, tx_hash);
         let tick_id = *tick.tick_id();
-        state
-            .unresolved
-            .register_committed(std::iter::once((&transaction, BTreeSet::from([local]))));
+        state.unresolved.register_committed(
+            local,
+            WeightedTimestamp::ZERO,
+            std::iter::once(&transaction),
+        );
         state.ticks.assign_tx(tx_hash, tick_id);
 
         let dropped = state.emit_or_gate_finalized(&sched, tick);
@@ -6018,40 +6051,52 @@ mod tests {
         state.scan_votable_ticks(&schedule);
     }
 
-    /// A member that never ran joins on the shards its committing block
-    /// named, not on this one alone.
+    /// A member that never ran joins on the shards holding the keyspace
+    /// it reaches, not on this one alone.
     ///
     /// That is what routes the tick's certificate to the counterparts
     /// still owed a verdict for it: an abort is dominant, so their
     /// coverage closes on ours and neither side is left waiting on a
     /// transaction the other has already given up on.
     #[test]
-    fn an_undispatched_member_joins_on_its_committing_block_s_participants() {
-        let schedule = make_test_topology();
-        let counterpart = ShardId::leaf(1, 1);
-        let mut state = make_test_state();
+    fn an_undispatched_member_joins_on_the_shards_holding_its_keyspace() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(1)),
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
         let deadline_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
 
-        state.unresolved.register_committed(std::iter::once((
-            &transaction,
-            BTreeSet::from([ShardId::ROOT, counterpart]),
-        )));
+        state.unresolved.register_committed(
+            HOME,
+            WeightedTimestamp::ZERO,
+            std::iter::once(&transaction),
+        );
 
-        let outcomes = abandonment_vote(&mut state, &schedule, 1, deadline_ms);
+        let block = make_live_block_on_shard(
+            HOME,
+            BlockHeight::new(1),
+            deadline_ms,
+            ValidatorId::new(0),
+            vec![],
+        );
+        state.on_block_committed(&schedule, &test_certify(block, deadline_ms));
+        let outcomes: Vec<TxOutcome> = state
+            .scan_votable_ticks(&schedule)
+            .into_iter()
+            .flat_map(|completion| completion.tx_outcomes)
+            .collect();
         assert_eq!(outcomes.len(), 1, "the tick speaks for it");
         assert!(outcomes[0].is_aborted());
 
         let tick = state
             .ticks
-            .get_tick(&TickId::new(ShardId::ROOT, BlockHeight::new(1)))
+            .get_tick(&TickId::new(HOME, BlockHeight::new(1)))
             .expect("the commit past the deadline composed a tick for it");
         assert_eq!(
             tick.counterpart_shards(),
-            vec![counterpart],
+            vec![PEER],
             "so the certificate reaches the shard still waiting on it",
         );
         assert_eq!(
@@ -6128,39 +6173,113 @@ mod tests {
 
         assert!(
             state
-                .abandonable(&schedule, TickId::new(ShardId::ROOT, BlockHeight::new(1)))
+                .abandonable(TickId::new(ShardId::ROOT, BlockHeight::new(1)))
                 .is_empty(),
             "a tick still to vote is an outcome on its way",
         );
         let _ = tx_hash;
     }
 
+    /// A snapshot over an explicit leaf set, with `cut` naming the shards
+    /// scheduled to terminate at the epochs given.
+    fn leaves_snap(leaves: &[ShardId], cut: &[(ShardId, u64)]) -> Arc<TopologySnapshot> {
+        Arc::new(
+            TopologySnapshot::from_explicit_committees(
+                NetworkDefinition::simulator(),
+                &ValidatorSet::new(Vec::new()),
+                leaves.iter().map(|s| (*s, Vec::new())).collect(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+            )
+            .with_scheduled_terminals(cut.iter().map(|(s, e)| (*s, Epoch::new(*e))).collect()),
+        )
+    }
+
+    /// This shard, and the peer holding the other half of a straddler.
+    const HOME: ShardId = ShardId::leaf(1, 0);
+    const PEER: ShardId = ShardId::leaf(1, 1);
+
+    /// [`HOME`] and [`PEER`] both live, both crewed — the topology a
+    /// straddler between them composes and votes under.
+    fn two_shard_topology() -> TopologySchedule {
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId::new(i as u64),
+                public_key: k.public_key(),
+            })
+            .collect();
+        TopologySchedule::single(Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(validators),
+        )))
+    }
+
+    /// A schedule in which [`PEER`] splits at the end of epoch 0 while
+    /// [`HOME`] runs on, so the peer is past-terminal anywhere in epoch 1
+    /// and its keyspace passes to its two children.
+    ///
+    /// A counterpart is a peer rather than an ancestor: a shard's own
+    /// predecessor never held a transaction the shard committed, so a
+    /// fixture that used one would be asking about a settlement that
+    /// could not have happened.
+    fn peer_terminating_schedule(epoch_duration_ms: u64) -> TopologySchedule {
+        let (left, right) = PEER.children();
+        let mut sched = TopologySchedule::new(
+            epoch_duration_ms,
+            Epoch::new(0),
+            leaves_snap(&[HOME, PEER], &[(PEER, 0)]),
+        );
+        sched.insert(Epoch::new(1), leaves_snap(&[HOME, left, right], &[]));
+        sched
+    }
+
     /// The weighted timestamp at which a transaction admitted under
     /// [`state_stranded_on`] can no longer finalize anywhere.
     const STRANDED_DEADLINE_MS: u64 = 60_000 + MAX_FINALIZATION_DELAY.as_secs() * 1000;
 
+    /// A transaction paid for on the `0b0…` side of the keyspace and
+    /// writing to the `0b1…` side, so it reaches beyond a shard holding
+    /// the first however the trie is cut.
+    fn straddling_transaction(seed: u8) -> Transaction {
+        test_transaction_with_prefixes(
+            &[seed & 0x7F],
+            &[test_prefix(seed & 0x7F)],
+            &[test_prefix(seed | 0x80)],
+        )
+    }
+
     /// A state past `tx`'s deadline whose tick at height 1 holds it with
     /// this shard's own certificate in hand and no counterpart coverage —
-    /// the shape a counterpart's silence produces — with the ledger naming
-    /// `local` and `partner` party to it.
+    /// the shape a counterpart's silence produces. The transaction
+    /// straddles, so `partner` owns the half of it this shard does not.
     fn state_stranded_on(
-        local: ShardId,
-        partner: ShardId,
+        topology_schedule: &TopologySchedule,
         seed: u8,
     ) -> (ExecutionCoordinator, TickId, TxHash) {
+        let (local, partner) = (HOME, PEER);
         let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
         let tick_id = TickId::new(local, BlockHeight::new(1));
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(seed)),
+            Verified::new_unchecked_for_test(straddling_transaction(seed)),
         ));
         let tx_hash = transaction.hash();
-        let participating: BTreeSet<ShardId> = [local, partner].into_iter().collect();
         let mut tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             vec![(
-                Arc::new(Verified::new_unchecked_for_test(test_transaction(seed))),
-                participating.clone(),
+                Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
+                    seed,
+                ))),
+                [local, partner].into_iter().collect(),
             )],
         );
         tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
@@ -6175,10 +6294,14 @@ mod tests {
         )));
         state.ticks.insert_tick(tick_id, tick);
         state.ticks.assign_tx(tx_hash, tick_id);
-        state
-            .unresolved
-            .register_committed(std::iter::once((&transaction, participating)));
+        state.unresolved.register_committed(
+            local,
+            WeightedTimestamp::ZERO,
+            std::iter::once(&transaction),
+        );
+        state.unresolved.certify(tx_hash);
         state.committed_ts = WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS);
+        state.stamp_departures(topology_schedule);
         (state, tick_id, tx_hash)
     }
 
@@ -6188,15 +6311,14 @@ mod tests {
     /// contradict the one it is about to carry.
     #[test]
     fn a_stranded_tick_keeps_its_member_while_its_counterpart_lives() {
-        let sched = terminating_schedule_over(60_000);
-        let (state, tick_id, _) = state_stranded_on(ShardId::leaf(1, 0), ShardId::leaf(1, 1), 1);
+        // Windows wide enough that the frontier the fixture sits at is
+        // still inside the peer's own epoch.
+        let sched = peer_terminating_schedule(600_000);
+        let (state, tick_id, _) = state_stranded_on(&sched, 1);
 
         assert!(
             state
-                .abandonable(
-                    &sched,
-                    TickId::new(ShardId::leaf(1, 0), BlockHeight::new(9))
-                )
+                .abandonable(TickId::new(HOME, BlockHeight::new(9)))
                 .is_empty(),
             "a live counterpart can still deliver the verdict this tick waits on",
         );
@@ -6206,19 +6328,38 @@ mod tests {
         );
     }
 
+    /// The certificate outlives the tick that produced it, so losing the
+    /// tick does not make the member this shard's to abandon: the
+    /// counterpart holds a certificate of ours it can still settle
+    /// against, and the account is what remembers that.
+    #[test]
+    fn a_lost_tick_does_not_release_a_member_a_counterpart_can_settle() {
+        let sched = peer_terminating_schedule(600_000);
+        let (mut state, tick_id, _) = state_stranded_on(&sched, 1);
+
+        state.ticks.remove_tick(&tick_id);
+        state.ticks.discard_tick(&tick_id);
+
+        assert!(
+            state
+                .abandonable(TickId::new(HOME, BlockHeight::new(9)))
+                .is_empty(),
+            "the certificate is out there whether or not the tick still is",
+        );
+    }
+
     /// Once the counterpart is past-terminal the member is released. A
     /// settlement needs every participant's certificate and the departed
     /// shard will produce no more, so nothing can settle the transaction
     /// and abandoning it is this shard's decision alone.
     #[test]
     fn a_terminated_counterpart_releases_the_member_its_tick_strands() {
-        let sched = terminating_schedule_over(60_000);
-        let (state, _, tx_hash) = state_stranded_on(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        // Windows placed so the frontier the fixture sits at is past the
+        // peer's cut.
+        let sched = peer_terminating_schedule(60_000);
+        let (state, _, tx_hash) = state_stranded_on(&sched, 1);
 
-        let abandonable = state.abandonable(
-            &sched,
-            TickId::new(ShardId::leaf(1, 0), BlockHeight::new(9)),
-        );
+        let abandonable = state.abandonable(TickId::new(HOME, BlockHeight::new(9)));
         assert_eq!(
             abandonable
                 .iter()
@@ -6237,11 +6378,11 @@ mod tests {
     /// scenario.
     #[test]
     fn the_tick_composing_now_keeps_the_member_it_just_took() {
-        let sched = terminating_schedule_over(60_000);
-        let (state, tick_id, _) = state_stranded_on(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+        let sched = peer_terminating_schedule(60_000);
+        let (state, tick_id, _) = state_stranded_on(&sched, 1);
 
         assert!(
-            state.abandonable(&sched, tick_id).is_empty(),
+            state.abandonable(tick_id).is_empty(),
             "the tick composing now is the one that speaks for its own member",
         );
     }
@@ -6252,23 +6393,26 @@ mod tests {
     /// close.
     #[test]
     fn the_tick_that_stranded_a_member_is_discarded_with_it() {
-        let local = ShardId::leaf(1, 0);
-        let sched = terminating_schedule_over(60_000);
-        let (mut state, tick_id, tx_hash) = state_stranded_on(local, ShardId::ROOT, 1);
+        let local = HOME;
+        let sched = peer_terminating_schedule(60_000);
+        let (mut state, tick_id, tx_hash) = state_stranded_on(&sched, 1);
 
-        // A second member of the same tick, its own counterpart still live.
+        // A second member of the same tick, reaching only into keyspace
+        // nobody has left — so its own counterpart is still live.
         let sibling: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(test_transaction(2)),
         ));
         let sibling_hash = sibling.hash();
         state.ticks.assign_tx(sibling_hash, tick_id);
-        state.unresolved.register_committed(std::iter::once((
-            &sibling,
-            BTreeSet::from([local, ShardId::leaf(1, 1)]),
-        )));
+        state.unresolved.register_committed(
+            local,
+            WeightedTimestamp::ZERO,
+            std::iter::once(&sibling),
+        );
+        state.unresolved.certify(sibling_hash);
 
         // The commit that composes the abandonment, on the shard that
-        // stranded the member rather than through the ROOT-only helper.
+        // stranded the member.
         let block = make_live_block_on_shard(
             local,
             BlockHeight::new(9),
@@ -6317,16 +6461,18 @@ mod tests {
     /// A state whose ledger names `partner` party to `tx_hash`, on the
     /// schedule that has `partner` past-terminal at 1500ms.
     fn state_abandoning(
+        topology_schedule: &TopologySchedule,
         local: ShardId,
-        partner: ShardId,
         transaction: &Arc<Verifiable<Transaction>>,
     ) -> ExecutionCoordinator {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
         state.committed_ts = WeightedTimestamp::from_millis(1500);
-        state.unresolved.register_committed(std::iter::once((
-            transaction,
-            BTreeSet::from([local, partner]),
-        )));
+        state.unresolved.register_committed(
+            local,
+            WeightedTimestamp::ZERO,
+            std::iter::once(transaction),
+        );
+        state.stamp_departures(topology_schedule);
         state
     }
 
@@ -6342,11 +6488,10 @@ mod tests {
     /// fence exists to prevent.
     #[test]
     fn the_fence_holds_an_abort_a_terminating_partner_might_have_settled() {
-        let local = ShardId::leaf(1, 0);
-        let partner = ShardId::ROOT;
-        let sched = terminating_schedule();
+        let (local, partner) = (HOME, PEER);
+        let sched = peer_terminating_schedule(1_000);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(7)),
+            Verified::new_unchecked_for_test(straddling_transaction(7)),
         ));
         let tx_hash = transaction.hash();
         let abort = abandonment_of(local, tx_hash);
@@ -6358,24 +6503,26 @@ mod tests {
             "an abandonment carries no counterpart certificate",
         );
 
-        // Without the ledger's participants the fence sees nothing to ask
-        // about, which is what let an abandonment past it.
+        // Without the ledger's account of the transaction the fence sees
+        // nothing to ask about, which is what let an abandonment past it.
+        let (left, right) = PEER.children();
+        let trie = ShardTrie::from_leaves([HOME, left, right]);
         let bare = make_test_state_for_shard(ValidatorId::new(0), local);
         assert!(
-            bare.fence_pairs(&abort)
+            bare.fence_pairs(&trie, &abort)
                 .iter()
                 .all(|(shard, _, _)| *shard == local),
             "the certificates alone name no counterpart",
         );
 
-        // With them, the terminating partner is named and the gate holds.
-        let mut state = state_abandoning(local, partner, &transaction);
+        // With it, the terminating partner is named and the gate holds.
+        let mut state = state_abandoning(&sched, local, &transaction);
         assert!(
             state
-                .fence_pairs(&abort)
+                .fence_pairs(&trie, &abort)
                 .iter()
                 .any(|(shard, _, claim)| *shard == partner && *claim == TxClaim::Abandoned),
-            "the ledger is where an abandonment's participants come from",
+            "the ledger is where an abandonment's counterparts come from",
         );
 
         let held: Arc<Verifiable<Finalization>> =
@@ -6398,14 +6545,13 @@ mod tests {
     /// return to the drain.
     #[test]
     fn a_partner_that_never_settled_it_is_what_makes_the_abort_admissible() {
-        let local = ShardId::leaf(1, 0);
-        let partner = ShardId::ROOT;
-        let sched = terminating_schedule();
+        let (local, partner) = (HOME, PEER);
+        let sched = peer_terminating_schedule(1_000);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(7)),
+            Verified::new_unchecked_for_test(straddling_transaction(7)),
         ));
         let tx_hash = transaction.hash();
-        let mut state = state_abandoning(local, partner, &transaction);
+        let mut state = state_abandoning(&sched, local, &transaction);
 
         state.record_settled_txs(
             partner,
@@ -6430,14 +6576,13 @@ mod tests {
     /// certificate `record_settled_txs` arms the fetch for.
     #[test]
     fn a_partner_that_settled_it_refuses_the_abort() {
-        let local = ShardId::leaf(1, 0);
-        let partner = ShardId::ROOT;
-        let sched = terminating_schedule();
+        let (local, partner) = (HOME, PEER);
+        let sched = peer_terminating_schedule(1_000);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(7)),
+            Verified::new_unchecked_for_test(straddling_transaction(7)),
         ));
         let tx_hash = transaction.hash();
-        let mut state = state_abandoning(local, partner, &transaction);
+        let mut state = state_abandoning(&sched, local, &transaction);
 
         state.record_settled_txs(
             partner,
@@ -6471,14 +6616,13 @@ mod tests {
     /// reads a set that is still there. Only a late one arrives here.
     #[test]
     fn a_partner_past_its_horizon_refuses_the_abort() {
-        let local = ShardId::leaf(1, 0);
-        let partner = ShardId::ROOT;
-        let sched = terminating_schedule();
+        let (local, partner) = (HOME, PEER);
+        let sched = peer_terminating_schedule(1_000);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(7)),
+            Verified::new_unchecked_for_test(straddling_transaction(7)),
         ));
         let tx_hash = transaction.hash();
-        let mut state = state_abandoning(local, partner, &transaction);
+        let mut state = state_abandoning(&sched, local, &transaction);
 
         // Terminated far enough back that the set has stopped answering.
         state.record_settled_txs(
@@ -6508,17 +6652,22 @@ mod tests {
     /// to have settled against.
     #[test]
     fn a_partner_evicted_from_every_window_refuses_the_abort() {
-        let local = ShardId::ROOT;
-        let partner = ShardId::leaf(1, 1);
-        let sched = make_test_topology();
+        // The peer's own window is gone; only the successors of its split
+        // are carried. The account outlives the window, so the ledger
+        // still names the peer as what held the keyspace then.
+        let (left, right) = PEER.children();
+        let sched = TopologySchedule::single(leaves_snap(&[HOME, left, right], &[]));
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(7)),
+            Verified::new_unchecked_for_test(straddling_transaction(7)),
         ));
         let tx_hash = transaction.hash();
-        let mut state = state_abandoning(local, partner, &transaction);
+        let mut state = state_abandoning(&sched, HOME, &transaction);
+        state
+            .unresolved
+            .record_terminal(PEER, WeightedTimestamp::from_millis(1000));
 
         let abort: Arc<Verifiable<Finalization>> =
-            Arc::new(Verified::<Finalization>::seal(abandonment_of(local, tx_hash)).into());
+            Arc::new(Verified::<Finalization>::seal(abandonment_of(HOME, tx_hash)).into());
         assert!(
             state.emit_or_gate_finalized(&sched, abort).is_empty(),
             "a shard no retained window carries answers neither question",
@@ -6556,7 +6705,7 @@ mod tests {
         assert_eq!(outcomes.len(), 1, "the tick at the deadline abandons it");
         assert!(
             state
-                .abandonable(&schedule, TickId::new(ShardId::ROOT, BlockHeight::new(3)))
+                .abandonable(TickId::new(ShardId::ROOT, BlockHeight::new(3)))
                 .is_empty(),
             "and the next commit leaves that tick alone",
         );
