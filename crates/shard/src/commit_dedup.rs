@@ -122,10 +122,12 @@ impl CommitDedupIndex {
     /// `now`, or bottoms out at the chain's own origin — below which
     /// nothing was ever committed to be missed.
     ///
-    /// A false answer means the index under-refuses by an unknown amount.
-    /// The lookups stay honest about what they hold either way — they
-    /// just hold less — so this is what separates "nothing was committed"
-    /// from "what was committed is not all known".
+    /// Diagnostic, not a gate. A false answer means the index under-refuses
+    /// by an unknown amount, and nothing here holds a vote back over it: the
+    /// pre-cut rule is what covers the categorical case, and a shallow node
+    /// among a committee that holds the window costs a round rather than a
+    /// commit. What this separates is "nothing was committed" from "what was
+    /// committed is not all known", which the lookups cannot say apart.
     #[must_use]
     pub fn is_complete(&self, now: WeightedTimestamp) -> bool {
         self.reached_origin

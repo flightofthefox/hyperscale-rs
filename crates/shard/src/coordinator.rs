@@ -4701,9 +4701,6 @@ impl ShardCoordinator {
         commit_ts: WeightedTimestamp,
     ) -> (Vec<Action>, BeaconWitnessCommit) {
         let height = block.height();
-        // Read against the pre-commit clock, so the comparison at the end
-        // catches the commit that carried the coverage over its horizon.
-        let was_complete = self.dedup_index.is_complete(self.committed_ts);
 
         // The committed chain is linear: every block extends the prior
         // committed tip. The safe-vote + round-contiguous commit rules
@@ -4855,12 +4852,6 @@ impl ShardCoordinator {
 
         let mut actions = self.cleanup_old_state(height);
         self.drain_deferred_reservation_checks(height, &mut actions);
-        // This commit may be the one that finally covered the window. Any
-        // block held back for carrying transactions is votable now, and
-        // nothing else will come along to re-drive it.
-        if !was_complete && self.dedup_index.is_complete(self.committed_ts) {
-            actions.extend(self.redrive_pending_votes(topology_schedule));
-        }
         (actions, witness)
     }
 

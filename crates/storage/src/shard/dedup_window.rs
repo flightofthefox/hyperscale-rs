@@ -20,8 +20,6 @@
 //! refuses nothing at all. Empty is the safe answer there and the unsafe
 //! one here, so the gap is reported instead of erasing the window.
 
-use std::time::Duration;
-
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, ProvisionHash, RETENTION_HORIZON, TxHash, WeightedTimestamp,
 };
@@ -53,8 +51,8 @@ pub struct DedupWindow {
     /// construction: a coordinator that starts short of the horizon
     /// reaches it by committing across it, and the blocks it commits are
     /// the same evidence a walk would have read. So the depth travels and
-    /// the reader decides, against its own clock, whether the depth is
-    /// yet enough.
+    /// is measured against the reader's own clock, which is what makes a
+    /// short window legible as short rather than as an empty one.
     pub covered_from: Option<WeightedTimestamp>,
     /// Whether the walk bottomed out at the chain's own origin.
     ///
@@ -176,7 +174,3 @@ impl DedupWindow {
         Self::default()
     }
 }
-
-/// How far back a rebuild reads. Exposed so callers sizing a fetch against
-/// a remote chain ask for the same span the local walk would.
-pub const DEDUP_FOLD_WINDOW: Duration = RETENTION_HORIZON;
