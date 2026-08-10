@@ -17,9 +17,10 @@ use hyperscale_types::test_utils::{
 use hyperscale_types::{
     Address, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock,
     ChainOrigin, ConsensusReceipt, Finalization, GlobalReceiptHash, Hash, LocalKey,
-    ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId,
-    StateRoot, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId, TimestampRange, Transaction,
-    TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SafeVoteRegisters,
+    SettledWrites, ShardId, StateRoot, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId,
+    TimestampRange, Transaction, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -1204,5 +1205,56 @@ fn dedup_window_stops_short_without_claiming_the_origin() {
         window.covered_from,
         Some(WeightedTimestamp::from_millis(400_001)),
         "coverage reaches as deep as the oldest block it read",
+    );
+}
+
+/// Each batch is stamped against the anchor of the block that carried it,
+/// not against the tip the walk started from.
+///
+/// The live path keys the provision tier on the committing clock. A walk
+/// starting inside the window cannot see below it to reproduce that
+/// clock's monotonic clamp, so it takes each block's own anchor — landing
+/// at or before where the live path put the entry. Early expiry costs a
+/// re-request; the tip's clock would hold every entry in the window for an
+/// extra window's width.
+#[test]
+fn dedup_window_stamps_each_batch_against_its_own_block() {
+    let storage = SimShardStorage::default();
+    let (older_ms, newer_ms) = (10_000u64, 40_000u64);
+    let (older_tx, newer_tx) = (test_transaction(4).hash(), test_transaction(5).hash());
+
+    for (height, anchor_ms, tx_hash) in [(1u64, older_ms, older_tx), (2, newer_ms, newer_tx)] {
+        let block = test_helpers::with_provisions(
+            block_with_txs(BlockHeight::new(height), anchor_ms, vec![]),
+            ShardId::ROOT,
+            tx_hash,
+        );
+        let qc = make_test_qc(&block);
+        commit_empty(&storage, &block, &qc);
+    }
+
+    let window = DedupWindow::from_reader(
+        &storage,
+        BlockHeight::new(2),
+        WeightedTimestamp::from_millis(newer_ms),
+        ChainOrigin {
+            genesis_height: BlockHeight::new(1),
+            anchor_wt: WeightedTimestamp::ZERO,
+        },
+    );
+
+    let deadlines: Vec<WeightedTimestamp> = {
+        let mut stamped: Vec<WeightedTimestamp> =
+            window.provisions.iter().map(|(_, at)| *at).collect();
+        stamped.sort_unstable();
+        stamped
+    };
+    assert_eq!(
+        deadlines,
+        vec![
+            WeightedTimestamp::from_millis(older_ms).plus(RETENTION_HORIZON),
+            WeightedTimestamp::from_millis(newer_ms).plus(RETENTION_HORIZON),
+        ],
+        "two blocks at different anchors must not share one deadline",
     );
 }

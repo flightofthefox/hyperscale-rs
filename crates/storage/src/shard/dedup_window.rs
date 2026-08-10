@@ -76,10 +76,11 @@ impl DedupWindow {
     /// committed, only of the transaction's own signed window and the
     /// resolving certificate's anchor. The provision tier is keyed to the
     /// committing clock, which the live path clamps monotonically against
-    /// everything it had committed before; a fold seeded inside the window
-    /// cannot see below it and so can only stamp a batch earlier than the
-    /// live path did. That runs in the conservative direction — a batch
-    /// whose entry expired early is re-requested, not wrongly admitted.
+    /// everything it had committed before; a walk that starts inside the
+    /// window cannot see below it to reproduce that clamp, so a batch takes
+    /// its own block's anchor and lands at or before where the live path put
+    /// it. Early is the conservative direction — a batch whose entry expired
+    /// early is re-requested, not wrongly admitted.
     /// `origin` is where this chain begins, which is not generally height
     /// zero: a reshape successor continues its predecessor's height line.
     /// Reaching it makes the window whole, because what lies below is the
@@ -94,7 +95,6 @@ impl DedupWindow {
         let floor = committed_ts.minus(RETENTION_HORIZON);
         let mut window = Self::default();
         let mut height = committed_height;
-        let mut clock = WeightedTimestamp::ZERO;
 
         loop {
             if height < origin.genesis_height {
@@ -120,8 +120,7 @@ impl DedupWindow {
                 window.covered_from = Some(anchor);
                 return window;
             }
-            clock = clock.max(anchor);
-            window.fold_block(block, clock);
+            window.fold_block(block, anchor);
 
             let Some(previous) = height.prev() else {
                 // Height zero: there is no block beneath it anywhere.
@@ -135,15 +134,9 @@ impl DedupWindow {
     /// Fold one committed block's artifacts in, and record that coverage
     /// now reaches its anchor.
     ///
-    /// The one place a block becomes window entries, so a walk over local
-    /// storage and a walk over blocks fetched from a predecessor's
-    /// committee cannot disagree about what a block contributes.
-    ///
-    /// `clock` is the committing clock the provision tier keys on — the
-    /// running maximum of the anchors folded so far, mirroring the
-    /// monotonic clamp the live commit path applies.
-    pub fn fold_block(&mut self, block: &Block, clock: WeightedTimestamp) {
-        let anchor = block.header().parent_qc().weighted_timestamp();
+    /// `anchor` is the block's own `parent_qc` weighted timestamp, which
+    /// the provision tier keys its deadline on.
+    fn fold_block(&mut self, block: &Block, anchor: WeightedTimestamp) {
         self.covered_from = Some(self.covered_from.map_or(anchor, |from| from.min(anchor)));
         for tx in block.transactions().iter() {
             self.committed
@@ -155,7 +148,7 @@ impl DedupWindow {
                 self.resolved.push((tx_hash, deadline));
             }
         }
-        let provision_deadline = clock.plus(RETENTION_HORIZON);
+        let provision_deadline = anchor.plus(RETENTION_HORIZON);
         for hash in block.provision_hashes() {
             self.provisions.push((hash, provision_deadline));
         }
