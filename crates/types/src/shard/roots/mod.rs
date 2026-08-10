@@ -29,6 +29,7 @@ pub mod reveal_chain;
 pub mod settled_txs;
 pub mod state;
 pub mod terminal;
+pub mod terminal_verdict;
 pub mod transaction;
 
 pub use beacon_witness::{
@@ -49,4 +50,7 @@ pub use reveal_chain::{REVEAL_CHAIN_DOMAIN_TAG, extend_reveal_chain, next_reveal
 pub use settled_txs::{local_settled_tx_hashes, settled_txs_root_from_hashes};
 pub use state::{SplitChildRoots, StateRootContext, StateRootVerifyError};
 pub use terminal::TerminalRoots;
+pub use terminal_verdict::{
+    TerminalVerdictRootContext, TerminalVerdictRootVerifyError, terminal_verdict_root_from_records,
+};
 pub use transaction::{TransactionRootContext, TxRootVerifyError};

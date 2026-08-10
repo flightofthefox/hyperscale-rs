@@ -24,6 +24,24 @@ use crate::WorkInFlight;
 /// block.
 pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 
+/// Hard cap on the transactions one
+/// [`TerminalVerdict`](crate::TerminalVerdict) may name.
+///
+/// A record answers for the transactions this chain still owes an outcome
+/// for that a departed shard did not settle, and how many that can be is
+/// what [`MAX_DRAIN_WORK`] already bounds — a transaction is only owed
+/// while its reservation stands. So the ceiling is the drain's own count
+/// bound rather than a figure of its own, and a departure with more
+/// outstanding than one block will carry is answered over several, each
+/// record standing alone.
+pub const MAX_UNSETTLED_PER_VERDICT: usize = (MAX_DRAIN_WORK / TX_UNITS) as usize;
+
+/// Hard cap on the departed shards one block may answer for.
+///
+/// A shard leaves at a reshape cut, so a block carrying more of these
+/// than the trie has leaves is describing a topology that never existed.
+pub const MAX_TERMINAL_VERDICTS_PER_BLOCK: usize = MAX_PROVISION_TARGET_SHARDS;
+
 /// Cap on the number of shards a block can name as provision targets, at
 /// decode time.
 ///

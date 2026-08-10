@@ -111,7 +111,7 @@ pub use primitives::hash_kinds::{
     BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot, CommittedTxsRoot, EventRoot,
     FinalizationHash, GenesisConfigHash, GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot,
     ProvisionHash, ProvisionTxRoot, ProvisionsRoot, RevealChain, SettledTxsRoot, StateRoot,
-    TransactionRoot, TxHash, WritesRoot,
+    TerminalVerdictRoot, TransactionRoot, TxHash, WritesRoot,
 };
 pub use primitives::identifiers::{
     Attempt, BeaconWitnessLeafCount, BlockHeight, Epoch, HeaderFetchCount, LeafIndex, RatifyRound,
@@ -154,7 +154,8 @@ pub use shard::header::{
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{
     MAX_COMMITTED_TX_QUERY, MAX_DRAIN_WORK, MAX_FINALIZED_TX_PER_BLOCK, MAX_GAS_LIMIT,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP, MAX_TXS_PER_BLOCK,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_ROUND_GAP,
+    MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_VERDICT,
     drain_admits_block,
 };
 pub use shard::load::ShardLoad;
@@ -167,13 +168,15 @@ pub use shard::roots::{
     LocalReceiptRootVerifyError, ProvisionRootVerifyError, ProvisionTxRootsContext,
     ProvisionTxRootsMap, ProvisionTxRootsVerifyError, ProvisionsRootContext,
     REVEAL_CHAIN_DOMAIN_TAG, SplitChildRoots, StateRootContext, StateRootVerifyError,
-    TerminalRoots, TransactionRootContext, TxRootVerifyError, certificate_root_from_receipt_hashes,
+    TerminalRoots, TerminalVerdictRootContext, TerminalVerdictRootVerifyError,
+    TransactionRootContext, TxRootVerifyError, certificate_root_from_receipt_hashes,
     commit_witness_window, committed_tx_leaf, committed_txs_root_from_hashes, derive_leaves,
     derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, prove_committed_tx_absent,
-    ready_leaf_payload, settled_txs_root_from_hashes,
+    ready_leaf_payload, settled_txs_root_from_hashes, terminal_verdict_root_from_records,
 };
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
+pub use shard::terminal_verdict::TerminalVerdict;
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::SafeVoteRegisters;
