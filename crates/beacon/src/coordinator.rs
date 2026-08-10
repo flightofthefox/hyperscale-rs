@@ -125,14 +125,22 @@ pub fn retention_floor(
         // own committee. Its schedule window must outlive the record, or the
         // floor rises the instant the successors advance — a beat before the
         // predecessor observes successor-live and stops coasting — and evicts
-        // the window mid-handoff. Folding terminal records in holds the window
-        // exactly as long as the record lives.
+        // the window mid-handoff.
+        //
+        // A terminal record pins the cut's own window rather than the fold's:
+        // the shard leaves the trie at its cut, so the window that closes it
+        // is the newest one whose trie carries the shard at all, while the
+        // contribution delivering the record folds two windows later. Keying
+        // on the fold would evict the window the record exists to be read
+        // through — the shard would stop resolving a terminal cut, and with
+        // it a settled set, while its roots sat in a record still held. The
+        // window below absorbs the same signing slack as a live boundary's.
         .chain(
             state
                 .boundaries
                 .values()
-                .filter(|b| b.terminal_epoch.is_some())
-                .map(|b| Epoch::new(b.last_live_epoch.inner().saturating_sub(1))),
+                .filter_map(|b| b.terminal_epoch)
+                .map(|terminal| Epoch::new(terminal.inner().saturating_sub(1))),
         )
         .min()
         .unwrap_or(Epoch::GENESIS);
@@ -5665,11 +5673,47 @@ mod tests {
         assert!(floor < Epoch::new(1000), "horizon trails the head");
     }
 
+    /// The window a terminal record exists to project must outlive the
+    /// record.
+    ///
+    /// A terminal contribution folds two epochs after the cut it closes, so
+    /// the record's `last_live_epoch` sits above the last window whose trie
+    /// carried the shard. Pinning the floor to `last_live - 1` therefore
+    /// evicts exactly that window, and the shard stops resolving through
+    /// `terminal_cut_wt` and `at_for_shard` — while the record itself is
+    /// still held, carrying the `settled_txs_root` a survivor came for.
+    #[test]
+    fn a_terminal_records_window_outlives_the_fold_that_delivered_it() {
+        let mut state = state_at(1000, 4);
+        state
+            .boundaries
+            .insert(ShardId::ROOT, boundary_live_at(1000));
+        let ed = state.chain_config.epoch_duration_ms;
+        let head = WeightedTimestamp::from_millis(1000 * ed);
+        let now = LocalTimestamp::from_millis(1000 * ed);
+
+        // The cut closed epoch 100; the contribution carrying its roots
+        // folded at 102, which is what the record's last live epoch reads.
+        let predecessor = ShardId::leaf(2, 0);
+        state.boundaries.insert(
+            predecessor,
+            ShardBoundary {
+                terminal_epoch: Some(Epoch::new(100)),
+                ..boundary_live_at(102)
+            },
+        );
+
+        assert!(
+            retention_floor(&state, head, now) <= Epoch::new(100),
+            "the floor must retain the window whose trie last carried the shard",
+        );
+    }
+
     /// A reshape predecessor's terminal boundary record holds the floor at its
-    /// last live epoch even after it leaves the live committees — its schedule
-    /// window must outlive the record so straggling observers can snap-sync its
-    /// anchor and the coasting predecessor can resolve its own committee through
-    /// the beacon-fold lag before it observes its successors live.
+    /// cut even after it leaves the live committees — its schedule window must
+    /// outlive the record so straggling observers can snap-sync its anchor and
+    /// the coasting predecessor can resolve its own committee through the
+    /// beacon-fold lag before it observes its successors live.
     #[test]
     fn retention_floor_holds_a_terminal_predecessors_window() {
         let mut state = state_at(1000, 4);
@@ -5682,9 +5726,9 @@ mod tests {
 
         let without = retention_floor(&state, head, now);
 
-        // A dropped predecessor — not in the live committees — with a terminal
-        // record last live at epoch 100 pins the floor to 99, below the
-        // artifact horizon that would otherwise bind.
+        // A dropped predecessor — not in the live committees — terminating at
+        // epoch 100 pins the floor to 99, below the artifact horizon that
+        // would otherwise bind.
         let predecessor = ShardId::leaf(2, 0);
         assert!(!state.shard_committees.contains_key(&predecessor));
         state
@@ -5693,11 +5737,7 @@ mod tests {
         let with = retention_floor(&state, head, now);
 
         assert!(with < without, "the terminal record lowers the floor");
-        assert_eq!(
-            with,
-            Epoch::new(99),
-            "to its last live epoch minus a window"
-        );
+        assert_eq!(with, Epoch::new(99), "to its terminal cut minus a window");
     }
 
     #[test]
