@@ -492,6 +492,117 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
     );
 }
 
+/// Verify a survivor whose counterpart terminates mid-flight releases what
+/// it reserved.
+///
+/// The mirror of [`split_terminating_payer_releases_its_reservation`], which
+/// asserts only about the shard that dies. There the release is by
+/// construction — a terminated shard's ledger dies with its chain. Here the
+/// shard lives, so nothing tears the reservation down for it: the survivor
+/// holds a tick that executed its own leg, speaks its own verdict, and waits
+/// on a certificate the counterpart will never send.
+///
+/// [`isolate_ec_intake`] runs in *both* directions, which is what makes the
+/// straddler stranded rather than merely fenced. Cutting only the survivor's
+/// intake leaves the splitter holding both certificates, so it settles and
+/// its settled set names the straddler — and the survivor must then not abort
+/// it, which is a different scenario. With neither side holding the other's,
+/// neither settles, the splitter reaches its terminal having settled nothing,
+/// and abandoning is the only outcome the straddler can reach.
+///
+/// The drain is what this measures. A verdict alone would pass without it:
+/// the reservation releases on a *committed finalization* carrying the work
+/// figure, so a shard that reported an outcome and never certified one still
+/// holds the level. Baseline is read before submission and compared after,
+/// rather than against zero, because the choreography's own traffic — the
+/// threshold vote and the grow — is in flight on the same shard.
+///
+/// # Panics
+///
+/// Panics if the choreography misses its budget, either shard fails to commit
+/// the straddler while both are live, the reservation never engages, the
+/// survivor applies the straddler one-sided, it reaches no terminal outcome,
+/// or the survivor's drain never returns to its baseline.
+pub fn split_surviving_counterpart_releases_its_reservation(c: &mut impl FaultableCluster) {
+    let splitter = STRADDLER_SPLITTER;
+    let survivor = STRADDLER_SURVIVOR;
+    let setup = split_straddler_setup();
+
+    arm_splitter_termination(c);
+
+    // Neither side may hold the other's certificate. Provisions and headers
+    // still flow, so each shard commits the straddler and executes its own
+    // leg — which is the state under test, and the reason this cannot be
+    // read off a shard that never composed a tick for it.
+    let _ = isolate_ec_intake(c, survivor, splitter);
+    let _ = isolate_ec_intake(c, splitter, survivor);
+
+    let baseline = c
+        .committed_work_in_flight(survivor)
+        .expect("the survivor must serve a committed tip before the straddler");
+
+    let (key, from, to) = &setup.straddlers[0];
+    let hash = submit_straddler(c, key, *from, *to);
+
+    // Both while both are live: the splitter's coast blocks commit nothing,
+    // so a straddler landing later would leave the survivor with no tick at
+    // all — released by the deadline path without the counterpart's terminal
+    // mattering, which is the vacuous version of this scenario.
+    assert!(
+        c.run_until(epochs(12), |c| c.chain_fate(survivor, hash).0.is_some()
+            && c.chain_fate(splitter, hash).0.is_some()),
+        "both shards must commit the straddler while both are live",
+    );
+    let engaged = c
+        .committed_work_in_flight(survivor)
+        .expect("the survivor must serve a committed tip once it holds the straddler");
+    assert!(
+        engaged > baseline,
+        "the straddler must engage a reservation against the survivor's drain, \
+         or its release below proves nothing; baseline = {baseline}, engaged = {engaged}",
+    );
+
+    // The splitter terminates and its children seat.
+    let (child_left, child_right) = splitter.children();
+    assert!(
+        await_serves(c, child_left, epochs(28)) && await_serves(c, child_right, epochs(28)),
+        "both splitter children must be served within budget",
+    );
+    assert!(
+        await_anchor_seeded(c, child_left, epochs(6)),
+        "the beacon must compose the split children's anchor",
+    );
+
+    // Nothing applied on the survivor: the splitter settled no straddler, so
+    // applying this one would be the one-sided settlement the fence exists to
+    // prevent, and it is what the release below must not have cost.
+    assert!(
+        !chain_settled(c, survivor, hash),
+        "the survivor applied a straddler the splitter never settled",
+    );
+
+    let status = await_tx_terminal(c, hash, epochs(12));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Aborted))
+        ),
+        "a straddler no shard can settle must abort rather than hang; status = {status:?}",
+    );
+
+    // The release. It rides a committed finalization, which lands a block or
+    // more after the outcome is reported, so it is waited for rather than
+    // read at the instant the status flips.
+    assert!(
+        c.run_until(epochs(12), |c| c
+            .committed_work_in_flight(survivor)
+            .is_some_and(|level| level <= baseline)),
+        "the survivor's drain must return to its baseline once the straddler is \
+         abandoned; baseline = {baseline}, still owing = {:?}",
+        c.committed_work_in_flight(survivor),
+    );
+}
+
 /// The committed native-vault balance `owner` holds on `shard`.
 fn vault_balance<C: Cluster>(c: &C, shard: ShardId, owner: [u8; 16]) -> u128 {
     let vault = vault_key(owner, XRD);

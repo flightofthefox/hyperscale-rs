@@ -7,7 +7,7 @@ use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_types::{
     BeaconState, BlockHeight, Event, ShardId, Signer, StateRoot, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, WeightedTimestamp,
+    TransactionStatus, TxHash, WeightedTimestamp, WorkInFlight,
 };
 
 use super::Budget;
@@ -126,6 +126,16 @@ pub trait Cluster {
     /// the rule's own input to know its candidate really is pre-cut, and
     /// nothing on the chain carries it.
     fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp>;
+
+    /// The work `shard`'s committed tip leaves owing against the drain.
+    ///
+    /// `None` when no host serves `shard`, or when its tip carries no
+    /// header a hosted store can answer for.
+    ///
+    /// An observation seam, like [`Self::chain_origin_anchor`]: a scenario
+    /// asserting that stranded work returns to the drain has to read the
+    /// level itself, and no transaction status reports it.
+    fn committed_work_in_flight(&self, shard: ShardId) -> Option<WorkInFlight>;
 
     /// The status of `tx`, if any hosted mempool or execution still tracks it.
     fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus>;

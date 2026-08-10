@@ -27,11 +27,11 @@ use hyperscale_production::{
 use hyperscale_scenarios::query::chain_fate;
 use hyperscale_scenarios::tx::{world_accounts, world_pools};
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BeaconChainReader, BeaconStorage, SubstateStore};
+use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, GenesisValidators, ShardId, StateRoot,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, WorkInFlight,
     shard_prefix_path,
 };
 use libp2p::{Multiaddr, PeerId};
@@ -362,6 +362,16 @@ impl Harness {
     pub fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
         let store = self.store_for(shard)?;
         Some(store.load_recovered_state().chain_origin.anchor_wt)
+    }
+
+    /// The work `shard`'s committed tip leaves owing against the drain,
+    /// read off the tip header the live store holds. `None` if no host
+    /// serves `shard` or the tip carries no header.
+    pub fn committed_work_in_flight(&self, shard: ShardId) -> Option<WorkInFlight> {
+        let store = self.store_for(shard)?;
+        store
+            .get_certified_header(store.committed_height())
+            .map(|header| header.header().work_in_flight())
     }
 
     /// [`chain_fate`] over the live store the runner writes to — the shared

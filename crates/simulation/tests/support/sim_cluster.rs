@@ -27,6 +27,7 @@ use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeight, CertifiedBlock, ConsensusReceipt, Event,
     LocalKey, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey, Transaction,
     TransactionDecision, TransactionStatus, TxHash, ValidatorId, Verified, WeightedTimestamp,
+    WorkInFlight,
 };
 
 /// The clock slice `run_until` advances per poll, matching the runner's own
@@ -485,6 +486,16 @@ impl Cluster for SimCluster {
             .filter_map(|host| self.runner.hosts_shard(host, shard))
             .max_by_key(|store| ShardChainReader::committed_height(*store))
             .map(|store| store.load_recovered_state().chain_origin.anchor_wt)
+    }
+
+    fn committed_work_in_flight(&self, shard: ShardId) -> Option<WorkInFlight> {
+        // Tallest chain, for the same reason the origin above reads it:
+        // a terminated predecessor's store still answers for the shard id.
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .max_by_key(|store| ShardChainReader::committed_height(*store))
+            .and_then(|store| store.get_certified_header(store.committed_height()))
+            .map(|header| header.header().work_in_flight())
     }
 
     fn chain_fate(

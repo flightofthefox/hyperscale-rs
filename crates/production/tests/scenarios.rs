@@ -35,6 +35,7 @@ use hyperscale_scenarios::{
     re_registration_of_a_live_validator_is_a_no_op, register_validator_pools_a_node,
     register_without_capacity_is_rejected, registered_validator_activates_onto_a_shard,
     single_transfer, split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
+    split_surviving_counterpart_releases_its_reservation,
     split_terminating_payer_releases_its_reservation, stake_withdraw_drops_effective_stake,
     surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates, zipf_payments,
@@ -435,6 +436,16 @@ fn split_terminating_payer_releases_its_reservation_prod() {
     let mut cluster =
         ProdCluster::start_with_accounts(&straddler_config(), 11, EPOCH_MS, setup.accounts);
     cluster.run_faultable(split_terminating_payer_releases_its_reservation);
+}
+
+#[test]
+#[serial]
+#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+fn split_surviving_counterpart_releases_its_reservation_prod() {
+    let setup = split_straddler_setup();
+    let mut cluster =
+        ProdCluster::start_with_accounts(&straddler_config(), 11, EPOCH_MS, setup.accounts);
+    cluster.run_faultable(split_surviving_counterpart_releases_its_reservation);
 }
 
 #[test]

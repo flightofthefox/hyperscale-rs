@@ -48,6 +48,7 @@ use hyperscale_scenarios::{
     split_boundary_admits_an_uncommitted_precut_tx,
     split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
     split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
+    split_surviving_counterpart_releases_its_reservation,
     split_terminating_payer_releases_its_reservation, stake_withdraw_drops_effective_stake,
     surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates, withdrawals_compose_over_one_vault,
@@ -970,6 +971,17 @@ fn split_terminating_payer_releases_its_reservation_sim() {
         &setup.accounts,
     );
     cluster.run_faultable(split_terminating_payer_releases_its_reservation);
+}
+
+#[test]
+fn split_surviving_counterpart_releases_its_reservation_sim() {
+    let setup = split_straddler_setup();
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
+        &straddler_config(),
+        11,
+        &setup.accounts,
+    );
+    cluster.run_faultable(split_surviving_counterpart_releases_its_reservation);
 }
 
 #[test]
