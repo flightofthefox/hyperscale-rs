@@ -49,6 +49,7 @@ use hyperscale_scenarios::{
     split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
     split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_surviving_counterpart_releases_its_reservation,
+    split_survivor_recovers_a_settlement_it_never_received,
     split_terminating_payer_releases_its_reservation, stake_withdraw_drops_effective_stake,
     surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates, withdrawals_compose_over_one_vault,
@@ -982,6 +983,20 @@ fn split_surviving_counterpart_releases_its_reservation_sim() {
         &setup.accounts,
     );
     cluster.run_faultable(split_surviving_counterpart_releases_its_reservation);
+}
+
+#[test]
+#[ignore = "known gap: a settlement the departing side certified never reaches the \
+            survivor, which applies it on one side only — see the residual in \
+            .plans/stranded-drain-reservation.md"]
+fn split_survivor_recovers_a_settlement_it_never_received_sim() {
+    let setup = split_straddler_setup();
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
+        &straddler_config(),
+        11,
+        &setup.accounts,
+    );
+    cluster.run_faultable(split_survivor_recovers_a_settlement_it_never_received);
 }
 
 #[test]

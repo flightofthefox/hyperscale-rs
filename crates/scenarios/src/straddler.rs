@@ -613,6 +613,111 @@ fn vault_balance<C: Cluster>(c: &C, shard: ShardId, owner: [u8; 16]) -> u128 {
         })
 }
 
+/// Verify a straddler the departing splitter settled applies on both sides,
+/// when the survivor never receives the certificate that settled it.
+///
+/// The mirror of [`split_surviving_counterpart_releases_its_reservation`],
+/// which cuts [`isolate_ec_intake`] in both directions so neither shard
+/// settles and abandoning is the only reachable outcome. Cutting only the
+/// survivor's intake inverts that: the splitter holds both certificates and
+/// settles, applying its half, while the survivor holds only its own and
+/// cannot apply until the splitter's reaches it.
+///
+/// What that leaves the survivor is a transaction its counterpart's settled
+/// set names as settled — so no record covers it, the fence refuses any
+/// abandonment of it, and the only resolution left is the certificate
+/// itself. The certificate is committed on the splitter's tail chain, which
+/// is the same chain the settled set is reconstructed from; whether the
+/// survivor recovers it from there is what this measures. If it does not,
+/// the transaction is applied on the splitter and never on the survivor,
+/// and the survivor's reservation is held for the life of its chain.
+///
+/// The cut lifts once the splitter's children seat, so what is measured is
+/// a retention limit and not a partition: the survivor missed the
+/// certificate during the window it was pushed, and asks for it on a whole
+/// network afterwards. A survivor that could never reach the shard holding
+/// the certificate would fail this for a reason the residual is not
+/// about.
+///
+/// Requires disjoint splitter/survivor committees (no shared host), or a
+/// co-hosted vnode bridges the certificate across in-process, which no
+/// network rule intercepts.
+///
+/// # Panics
+///
+/// Panics if the choreography misses its budget, either shard fails to
+/// commit the straddler while both are live, the splitter fails to settle
+/// it, the survivor never applies what the splitter settled, or the
+/// survivor's drain never returns to its baseline.
+pub fn split_survivor_recovers_a_settlement_it_never_received(c: &mut impl FaultableCluster) {
+    let splitter = STRADDLER_SPLITTER;
+    let survivor = STRADDLER_SURVIVOR;
+    let setup = split_straddler_setup();
+
+    arm_splitter_termination(c);
+
+    // One direction only. The splitter still receives the survivor's
+    // certificate and so can settle; the survivor never receives the
+    // splitter's and so cannot.
+    let _ = isolate_ec_intake(c, survivor, splitter);
+
+    let baseline = c
+        .committed_work_in_flight(survivor)
+        .expect("the survivor must serve a committed tip before the straddler");
+
+    let (key, from, to) = &setup.straddlers[0];
+    let hash = submit_straddler(c, key, *from, *to);
+
+    assert!(
+        c.run_until(epochs(12), |c| c.chain_fate(survivor, hash).0.is_some()
+            && c.chain_fate(splitter, hash).0.is_some()),
+        "both shards must commit the straddler while both are live",
+    );
+
+    // The premise. Without it this is the stranded scenario wearing a
+    // different name, and what follows would prove nothing.
+    assert!(
+        c.run_until(epochs(10), |c| chain_settled(c, splitter, hash)),
+        "the splitter holds both certificates and must settle the straddler,          or nothing here is one-sided to begin with",
+    );
+
+    // The splitter terminates and its children seat.
+    let (child_left, child_right) = splitter.children();
+    assert!(
+        await_serves(c, child_left, epochs(28)) && await_serves(c, child_right, epochs(28)),
+        "both splitter children must be served within budget",
+    );
+    assert!(
+        await_anchor_seeded(c, child_left, epochs(6)),
+        "the beacon must compose the split children's anchor",
+    );
+
+    // Whole network from here. Anything the survivor still cannot obtain is
+    // something no longer being kept, rather than something it cannot reach.
+    c.clear_drops();
+
+    // The measurement. The splitter applied its half before it went; a
+    // transaction applied on one side and not the other is torn, whatever
+    // the survivor's reason for never holding the certificate.
+    assert!(
+        c.run_until(epochs(16), |c| chain_settled(c, survivor, hash)),
+        "the splitter settled the straddler and the survivor never did — applied \
+         on one side only; survivor fate = {:?}",
+        c.chain_fate(survivor, hash).1,
+    );
+
+    // And the reservation goes with the resolution, on the same mechanism
+    // every other verdict returns it by.
+    assert!(
+        c.run_until(epochs(12), |c| c
+            .committed_work_in_flight(survivor)
+            .is_some_and(|level| level <= baseline)),
+        "the survivor's drain must return to its baseline once the straddler \
+         resolves; baseline = {baseline}, still owing = {:?}",
+        c.committed_work_in_flight(survivor),
+    );
+}
+
 /// Verify a surviving sibling's second-generation split seats correctly.
 ///
 /// Composes [`split_straddler_atomic`] (grow → vote the threshold down so only
