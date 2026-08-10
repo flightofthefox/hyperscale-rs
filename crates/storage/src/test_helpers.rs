@@ -1121,4 +1121,16 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)
             .collect::<Vec<_>>(),
         "with the bodies sealing dropped reattached",
     );
+
+    // Every one of them live, including the floor — which carried no
+    // bundles at all. A sealed block owes nothing and composes nothing,
+    // so a window handing one back would skip the very transaction that
+    // put the block in the window.
+    assert!(
+        window
+            .blocks
+            .iter()
+            .all(|certified| certified.block().is_live()),
+        "a replayed block arrives in the shape a commit runs on, bundles or not",
+    );
 }

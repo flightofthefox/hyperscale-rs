@@ -153,14 +153,22 @@ pub fn replay_window<R: ShardChainReader + ?Sized>(
     ReplayWindow { blocks, anchor_wt }
 }
 
-/// Put a stored block's provision bundles back on it.
+/// Put a stored block back in the shape a commit runs on, with whatever
+/// provision bundles it carried reattached.
+///
+/// Live whether or not any came back, because the variant is what decides
+/// whether the commit path registers the block's transactions at all: a
+/// sealed block is one past its execution window, owing nothing and
+/// carrying nothing to compose. A block in this window is there precisely
+/// because it committed a transaction the chain still owes an outcome
+/// for, so handing it back sealed would skip the registration the replay
+/// exists to redo. Blocks that carried no bundles, and blocks whose
+/// bundles have aged out from under them, both arrive here empty and both
+/// still owe their transactions an outcome.
 fn rehydrate(
     certified: Verified<CertifiedBlock>,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
 ) -> Verified<CertifiedBlock> {
-    if provisions.is_empty() {
-        return certified;
-    }
     let (block, qc) = certified.into_inner().into_parts();
     // Sealing keeps the header, and the header is what the hash and the
     // QC pairing are over, so reattaching the bodies cannot break it.
