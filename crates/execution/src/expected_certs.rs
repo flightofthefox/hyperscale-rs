@@ -77,7 +77,8 @@ struct ExpectedEntry {
 #[derive(Debug, Clone)]
 struct FulfilledEntry {
     /// Shards whose certificate for this transaction we have ingested.
-    /// Suppresses re-registration from a duplicate header.
+    /// Suppresses re-registration by a later tick composing the same
+    /// member.
     shards: BTreeSet<ShardId>,
     /// The latest `vote_anchor_ts + RETENTION_HORIZON` across the
     /// certificates recorded here. Backstop for the late-re-registration
@@ -106,8 +107,8 @@ impl ExpectedCertTracker {
     ///
     /// Idempotent: re-registering an active expectation does not reset the
     /// discovery timestamp. Skipped entirely when that shard's outcome has
-    /// already been ingested — guards against late-arriving duplicate
-    /// headers re-opening a closed expectation.
+    /// already been ingested — a later tick composing the same member must
+    /// not re-open an expectation the certificate already closed.
     pub fn register(&mut self, source_shard: ShardId, tx_hash: TxHash, now_ts: WeightedTimestamp) {
         if self.is_fulfilled(source_shard, tx_hash) {
             return;
@@ -171,12 +172,11 @@ impl ExpectedCertTracker {
     /// Records `last_requested_at = now_ts` on each returned entry so the
     /// retry cooldown starts ticking.
     ///
-    /// A source header names every cross-shard transaction in its block,
-    /// including ones bound for other shards, so `txs_needed` is what keeps
-    /// this from fetching other shards' business. The cadence is only
-    /// stamped on entries actually returned: an expectation held back
-    /// because our own block committing the transaction hasn't landed yet
-    /// still gets its full initial window once it does.
+    /// `txs_needed` is the tick set's own view of what it is still waiting
+    /// on, so an expectation whose tick has since let its member go is
+    /// passed over rather than chased. The cadence is only stamped on
+    /// entries actually returned, so one held back that way still gets its
+    /// full initial window if the wait resumes.
     pub fn check_timeouts(
         &mut self,
         txs_needed: &HashSet<TxHash>,
@@ -572,8 +572,8 @@ mod tests {
 
     #[test]
     fn register_succeeds_after_fulfilled_record_drains() {
-        // Once on_txs_terminated drops a record, a duplicate header
-        // arriving later is allowed to re-register the expectation. The
+        // Once on_txs_terminated drops a record, a later tick composing
+        // the same member may re-register the expectation. The
         // deadline backstop on `prune_fulfilled` exists precisely because
         // this re-registration path can recreate a record that no future
         // termination will drain.
