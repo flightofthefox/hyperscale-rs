@@ -15,12 +15,12 @@ use hyperscale_types::{
     PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
     Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
     ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round,
-    RoutingCommittees, SafeVoteRegisters, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad,
+    RoutingCommittees, SafeVoteRegisters, ShardForkProof, ShardId, ShardLoad,
     ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
     SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
-    StateRoot, SubstateEntry, SubstateKey, TerminalRoots, TerminalVerdict, TickId, Timeout,
-    TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
-    ValidatorId, Verifiable, Verified, VoteCount, WeightedTimestamp, WorkInFlight,
+    StateRoot, SubstateEntry, SubstateKey, TerminalEvidence, TerminalRoots, TerminalVerdict,
+    TickId, Timeout, TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash,
+    TxOutcome, ValidatorId, Verifiable, Verified, VoteCount, WeightedTimestamp, WorkInFlight,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -1241,17 +1241,10 @@ pub enum Action {
     StartSettledTxsAcquisition {
         /// The terminated shard whose settled set to acquire.
         shard: ShardId,
-        /// Height of the terminal block `B`.
-        terminal_height: BlockHeight,
-        /// Hash of the terminal block `B` — the beacon-attested terminal
-        /// the window list ends at.
-        terminal_block_hash: BlockHash,
-        /// `B`'s weighted timestamp — bounds the fence's retention cutoff
-        /// once the set is recorded, and the host's self-expiry.
-        terminal_wt: WeightedTimestamp,
-        /// The beacon-attested `settled_txs_root` the fetched list is
-        /// checked against; a mismatch rotates the peer.
-        attested_root: SettledTxsRoot,
+        /// The terminal to fetch against, the root to check the list
+        /// against, and how long the answer stays good — all read off the
+        /// emitting node's own beacon fold.
+        evidence: TerminalEvidence,
         /// The terminated shard's terminal committee, asked in rotation.
         peers: Vec<ValidatorId>,
     },

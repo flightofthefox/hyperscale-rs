@@ -20,7 +20,7 @@
 use std::ops::Range;
 
 use super::timestamp::WeightedTimestamp;
-use crate::Epoch;
+use crate::{Epoch, TERMINAL_EVIDENCE_EPOCHS};
 
 /// The chain's epoch-window grid: weighted time partitioned into fixed
 /// `epoch_duration_ms` windows, one per [`Epoch`].
@@ -67,6 +67,28 @@ impl EpochWindows {
             .saturating_add(1)
             .saturating_mul(self.epoch_duration_ms);
         WeightedTimestamp::from_millis(start)..WeightedTimestamp::from_millis(end)
+    }
+
+    /// The instant a shard terminating at `terminal_cut` stops being
+    /// answerable: [`TERMINAL_EVIDENCE_EPOCHS`] windows past the cut.
+    ///
+    /// A cut always falls on a window boundary, so this is the close of the
+    /// window that many later. Every consumer of a departed shard's settled
+    /// set derives its bound here — the beacon retaining the terminal
+    /// boundary record, the acquisition driving the fetch, and the
+    /// split-boundary fence judging a claim — so none of them stops reading
+    /// while another still expects an answer.
+    #[must_use]
+    pub const fn terminal_evidence_expiry(
+        self,
+        terminal_cut: WeightedTimestamp,
+    ) -> WeightedTimestamp {
+        WeightedTimestamp::from_millis(
+            terminal_cut.as_millis().saturating_add(
+                self.epoch_duration_ms
+                    .saturating_mul(TERMINAL_EVIDENCE_EPOCHS),
+            ),
+        )
     }
 
     /// The largest epoch boundary strictly below `wt`, as `(epoch, cut)` where

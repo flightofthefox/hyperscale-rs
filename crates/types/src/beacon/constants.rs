@@ -243,6 +243,26 @@ pub const RESHAPE_READY_TTL_EPOCHS: u64 = 8;
 /// transition before the successors' first crossing can fold.
 pub const RESHAPE_HANDOFF_TTL_EPOCHS: u64 = 12;
 
+/// How long a departed shard's terminal evidence stays readable, measured
+/// in epochs from its terminal cut.
+///
+/// A terminated shard's `settled_txs_root` is what a surviving counterpart
+/// resolves its straddlers against, and it only becomes beacon-attested two
+/// folds after the cut: the terminal block satisfies `parent ≤ cut < qc`, so
+/// it cannot exist until the window after the one it closes, and the beacon
+/// block for that window is composed while the crossing is still being
+/// produced — so the crossing folds one window later again. The survivor
+/// then has to fetch the set and commit its own record of it.
+///
+/// Two epochs are therefore spent before any survivor can read the
+/// evidence, one more covers the fetch and the commit, and the remaining
+/// two absorb a skipped beacon epoch or a committee slow to contribute.
+/// Every bound on the evidence — the beacon's retention of the terminal
+/// boundary record, the acquisition's self-expiry, and the split-boundary
+/// fence's cutoff — is this same span, so no consumer stops reading while
+/// another still expects an answer.
+pub const TERMINAL_EVIDENCE_EPOCHS: u64 = 5;
+
 /// How long a stake-pool withdrawal request remains pending before its
 /// amount is released and any resulting auto-deactivations apply.
 ///

@@ -18,15 +18,42 @@
 use std::collections::{BTreeSet, HashMap};
 use std::hash::BuildHasher;
 
-use crate::{RETENTION_HORIZON, ShardId, TopologySchedule, TxHash, WeightedTimestamp};
+use crate::{
+    BlockHash, BlockHeight, SettledTxsRoot, ShardId, TopologySchedule, TxHash, WeightedTimestamp,
+};
+
+/// What a survivor needs to acquire a departed shard's settled set and to
+/// know how long the answer is good for.
+///
+/// Every field is read off the node's own beacon fold — the terminal
+/// anchor's height, hash and attested root from the boundary record, the
+/// cut and its expiry from the schedule's window grid — so nothing here is
+/// fetched and nothing here is trusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalEvidence {
+    /// Height of the departed shard's terminal block, naming the window
+    /// end the serve reconstructs from.
+    pub height: BlockHeight,
+    /// Hash of the terminal block — which terminal this targets, so a
+    /// revised one replaces rather than duplicates.
+    pub block_hash: BlockHash,
+    /// The terminal cut's weighted timestamp.
+    pub terminal_wt: WeightedTimestamp,
+    /// The cut's
+    /// [terminal-evidence expiry](crate::EpochWindows::terminal_evidence_expiry).
+    pub readable_until: WeightedTimestamp,
+    /// The beacon-attested `settled_txs_root` a fetched list must
+    /// recompute to.
+    pub attested_root: SettledTxsRoot,
+}
 
 /// A terminated shard's settled-transaction set.
 ///
 /// `txs` are the **cross-shard** transactions whose certificate committed
 /// in its chain at or before its terminal block — the only ones a
 /// counterpart fence ever queries. `terminal_wt` is the weighted timestamp
-/// at which the shard terminated, bounding how long the set stays relevant
-/// — [`RETENTION_HORIZON`] past it, any outcome naming the shard is
+/// at which the shard terminated; `readable_until` is how long the set
+/// stays relevant, past which any outcome naming the shard is
 /// categorically unreachable everywhere.
 #[derive(Clone, Debug)]
 pub struct SettledTxSet {
@@ -35,6 +62,12 @@ pub struct SettledTxSet {
     pub txs: BTreeSet<TxHash>,
     /// The terminal block's weighted timestamp.
     pub terminal_wt: WeightedTimestamp,
+    /// The shard's
+    /// [terminal-evidence expiry](crate::EpochWindows::terminal_evidence_expiry),
+    /// derived from the schedule's window grid when the set is recorded.
+    /// Carried on the set so every consumer — the fence, and the caches
+    /// holding it — reads one value rather than deriving its own.
+    pub readable_until: WeightedTimestamp,
 }
 
 /// The verdict on a set of cross-shard execution certificates against the
@@ -147,9 +180,9 @@ where
             continue;
         }
         match settled_sets.get(&shard) {
-            // Past the horizon the set stops being readable at all, which
-            // rejects for the same reason eviction does.
-            Some(settled) if anchored_wt > settled.terminal_wt.plus(RETENTION_HORIZON) => {
+            // Past the evidence window the set stops being readable at all,
+            // which rejects for the same reason eviction does.
+            Some(settled) if anchored_wt > settled.readable_until => {
                 return SettledSetVerdict::Reject;
             }
             // The partner's verdict, read the way the claim needs it: a

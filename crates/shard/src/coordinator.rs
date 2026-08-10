@@ -18,10 +18,10 @@ use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, FinalizationHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp,
-    ProvisionHash, RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger,
-    ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt,
-    SubstateKey, TerminalVerdict, TxClaim, TxOutcome, WeightedTimestamp, WorkInFlight,
-    derive_reshape_trigger, ready_signal_window, settled_set_verdict,
+    ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup,
+    SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt, SubstateKey,
+    TerminalVerdict, TxClaim, TxOutcome, WeightedTimestamp, WorkInFlight, derive_reshape_trigger,
+    ready_signal_window, settled_set_verdict,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -849,14 +849,14 @@ impl ShardCoordinator {
         self.settled_sets.insert(shard, settled);
     }
 
-    /// Drop settled-transaction sets past their retention horizon. Once the
-    /// committed chain advances beyond `terminal_wt + RETENTION_HORIZON`,
-    /// the fence rejects any tick naming the shard regardless of the set,
-    /// so retaining it only leaks memory.
+    /// Drop settled-transaction sets past their evidence window. Once the
+    /// committed chain advances beyond it, the fence rejects any tick
+    /// naming the shard regardless of the set, so retaining it only leaks
+    /// memory.
     fn gc_settled_sets(&mut self) {
         let now = self.committed_block_anchor_wt;
         self.settled_sets
-            .retain(|_, settled| now <= settled.terminal_wt.plus(RETENTION_HORIZON));
+            .retain(|_, settled| now <= settled.readable_until);
     }
 
     /// The settled-transaction set this validator has acquired for a terminated
@@ -904,8 +904,8 @@ impl ShardCoordinator {
     /// verdict. A shard evicted from every retained window is so far past
     /// its terminal that any tick naming it is unreachable everywhere —
     /// reject. A past-terminal shard whose settled set isn't known yet
-    /// defers the vote; past `terminal_wt + RETENTION_HORIZON` the tick
-    /// is categorically unreachable and rejects.
+    /// defers the vote; past the set's evidence window the tick is
+    /// categorically unreachable and rejects.
     ///
     /// An abandonment carries no counterpart certificate, so it yields no
     /// settlement claim and [`Self::abandons_a_settled_tx`] is what judges
@@ -6662,13 +6662,17 @@ mod tests {
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeaderParts,
         CommittedTxsRoot, ConsensusSignature, Epoch, Hash, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-        NetworkDefinition, NetworkParams, RETENTION_HORIZON, SettledTxsRoot, ShardAnchor, ShardId,
-        Signer, SignerBitfield, TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot,
+        NetworkDefinition, NetworkParams, SettledTxsRoot, ShardAnchor, ShardId, Signer,
+        SignerBitfield, TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot,
         Transaction, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
         WitnessSources, test_utils,
     };
 
     use super::*;
+
+    /// A window far enough out that these tests never trip it: what they
+    /// assert is how a set reads, not how long it stays readable.
+    const STILL_READABLE: WeightedTimestamp = WeightedTimestamp::from_millis(u64::MAX);
     use crate::validation::validate_no_duplicate_transactions;
 
     fn install_complete_block(state: &mut ShardCoordinator, block: &Block) {
@@ -11103,6 +11107,7 @@ mod tests {
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
+                readable_until: STILL_READABLE,
             },
         );
         let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
@@ -11125,6 +11130,7 @@ mod tests {
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"other"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
+                readable_until: STILL_READABLE,
             },
         );
         let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
@@ -11147,6 +11153,7 @@ mod tests {
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
+                readable_until: STILL_READABLE,
             },
         );
         let block = block_with_certs(vec![cross_shard_tick(
@@ -11188,6 +11195,7 @@ mod tests {
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
+                readable_until: STILL_READABLE,
             },
         );
         let block = block_with_certs(vec![cross_shard_tick(
@@ -11211,6 +11219,7 @@ mod tests {
             SettledTxSet {
                 txs: BTreeSet::new(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
+                readable_until: STILL_READABLE,
             },
         );
         let block = block_with_certs(vec![cross_shard_tick(
@@ -11224,11 +11233,11 @@ mod tests {
         );
     }
 
-    /// Past `terminal_wt + RETENTION_HORIZON`, a tick naming the
-    /// terminated shard is categorically unreachable and rejects, even if
-    /// the (stale) settled set happens to contain it.
+    /// Past its evidence window, a tick naming the terminated shard is
+    /// categorically unreachable and rejects, even if the (stale) settled
+    /// set happens to contain it.
     #[test]
-    fn fence_rejects_past_retention_horizon() {
+    fn fence_rejects_past_the_evidence_window() {
         let mut coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         coord.record_settled_txs(
@@ -11236,6 +11245,7 @@ mod tests {
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
+                readable_until: WeightedTimestamp::from_millis(6_000),
             },
         );
         let block = block_with_certs(vec![cross_shard_tick(
@@ -11243,9 +11253,7 @@ mod tests {
             ShardId::ROOT,
             1,
         )]);
-        let beyond = WeightedTimestamp::from_millis(1000)
-            .plus(RETENTION_HORIZON)
-            .plus(Duration::from_millis(1));
+        let beyond = WeightedTimestamp::from_millis(6_001);
         assert_eq!(
             coord.fence_finalizations(&sched, &block, beyond),
             SettledSetVerdict::Reject,
@@ -11363,6 +11371,7 @@ mod tests {
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
+                readable_until: STILL_READABLE,
             },
         );
         let released = coord.redrive_pending_votes(&sched);

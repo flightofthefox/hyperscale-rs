@@ -144,19 +144,9 @@ where
             } => self.process_fetch_commit_proof(source_shard, from_height, count),
             Action::StartSettledTxsAcquisition {
                 shard,
-                terminal_height,
-                terminal_block_hash,
-                terminal_wt,
-                attested_root,
+                evidence,
                 peers,
-            } => self.process_start_settled_txs_acquisition(
-                shard,
-                terminal_height,
-                terminal_block_hash,
-                terminal_wt,
-                attested_root,
-                peers,
-            ),
+            } => self.process_start_settled_txs_acquisition(shard, evidence, peers),
             Action::ReofferTransactions { txs } => {
                 // Through the client submit rail, not this shard's gossip
                 // topic: the fan-out resolves each transaction against

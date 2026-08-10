@@ -13,9 +13,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::response::GetSettledTxsResponse;
-use hyperscale_types::{
-    BlockHash, BlockHeight, SettledTxsRoot, ShardId, TxHash, ValidatorId, WeightedTimestamp,
-};
+use hyperscale_types::{ShardId, TerminalEvidence, TxHash, ValidatorId};
 
 use super::settled_set::SettledTxsAcquisitionOutput;
 use crate::shard::{ShardLoop, ShardScopedInput, push_shard_input};
@@ -34,20 +32,14 @@ where
     pub(crate) fn process_start_settled_txs_acquisition(
         &mut self,
         shard: ShardId,
-        terminal_height: BlockHeight,
-        terminal_block_hash: BlockHash,
-        terminal_wt: WeightedTimestamp,
-        attested_root: SettledTxsRoot,
+        evidence: TerminalEvidence,
         peers: Vec<ValidatorId>,
     ) {
-        let outputs = self.io.cross_shard.settled_set_sync.start(
-            shard,
-            terminal_height,
-            terminal_block_hash,
-            terminal_wt,
-            attested_root,
-            peers,
-        );
+        let outputs = self
+            .io
+            .cross_shard
+            .settled_set_sync
+            .start(shard, evidence, peers);
         self.process_settled_txs_acquisition_outputs(outputs);
     }
 

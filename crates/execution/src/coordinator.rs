@@ -2387,10 +2387,11 @@ impl ExecutionCoordinator {
     /// down — what each departed counterpart left of its business here.
     ///
     /// Composed from the settled sets, which is what bounds when this can
-    /// speak at all: a set is acquired at a shard's terminal and dropped
-    /// a `RETENTION_HORIZON` later, so a record is only ever offered
-    /// while the evidence for it is readable, which is the same window
-    /// every voter can check it in. Absence from a set is proof rather
+    /// speak at all: a set is acquired once the departed shard's terminal
+    /// roots are attested and dropped at its evidence expiry, so a record
+    /// is only ever offered while the evidence for it is readable, which
+    /// is the same window every voter can check it in. Absence from a set
+    /// is proof rather
     /// than ignorance — the set is complete and beacon-attested — so a
     /// transaction of ours it does not name is one that shard never
     /// settled and now never will.
@@ -2833,14 +2834,13 @@ impl ExecutionCoordinator {
         self.settled_sets.insert(shard, settled);
     }
 
-    /// Drop settled sets past their retention horizon. Past
-    /// `terminal_wt + RETENTION_HORIZON` the gate rejects any outcome
-    /// naming the shard regardless of the set, so retaining it only leaks
-    /// memory.
+    /// Drop settled sets past their evidence window. Past it the gate
+    /// rejects any outcome naming the shard regardless of the set, so
+    /// retaining it only leaks memory.
     fn gc_settled_sets(&mut self) {
         let now = self.committed_ts;
         self.settled_sets
-            .retain(|_, settled| now <= settled.terminal_wt.plus(RETENTION_HORIZON));
+            .retain(|_, settled| now <= settled.readable_until);
     }
 
     /// Re-check every gate-held finalization against the current settled
@@ -3360,6 +3360,10 @@ mod tests {
     };
 
     use super::*;
+
+    /// A window far enough out that these tests never trip it: what they
+    /// assert is how a set reads, not how long it stays readable.
+    const STILL_READABLE: WeightedTimestamp = WeightedTimestamp::from_millis(u64::MAX);
 
     fn make_test_topology() -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
@@ -5688,6 +5692,7 @@ mod tests {
             SettledTxSet {
                 txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
+                readable_until: STILL_READABLE,
             },
         );
         let released = state.redrive_gated_finalizations(&sched);
@@ -5718,6 +5723,7 @@ mod tests {
             SettledTxSet {
                 txs: BTreeSet::new(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
+                readable_until: STILL_READABLE,
             },
         );
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
@@ -5792,6 +5798,7 @@ mod tests {
             SettledTxSet {
                 txs: BTreeSet::new(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
+                readable_until: STILL_READABLE,
             },
         );
         let released = state.redrive_gated_finalizations(&sched);
@@ -6405,6 +6412,55 @@ mod tests {
         );
     }
 
+    /// The whole round trip in one place: a counterpart leaves without
+    /// settling, its set says so, this shard writes that down, and the
+    /// record is what lets the abort be composed afterwards.
+    #[test]
+    fn a_departed_counterpart_s_silence_is_written_down_and_licenses_the_abort() {
+        let sched = peer_terminating_schedule(60_000);
+        let (mut state, _, tx_hash) = state_stranded_on(&sched, 1);
+
+        // The peer's settled set arrives, naming nothing: it settled none
+        // of what it was party to before it went.
+        state.record_settled_txs(
+            PEER,
+            SettledTxSet {
+                txs: BTreeSet::new(),
+                terminal_wt: WeightedTimestamp::from_millis(60_000),
+                readable_until: STILL_READABLE,
+            },
+        );
+
+        let records = state.pending_terminal_verdicts();
+        assert_eq!(records.len(), 1, "the peer's departure is answerable");
+        assert_eq!(records[0].shard(), PEER);
+        assert_eq!(
+            records[0].unsettled(),
+            &[tx_hash],
+            "the straddler is what it left unresolved of our business",
+        );
+
+        // Committed, the record is what the account reads afterwards.
+        state.unresolved.record_terminal_verdicts(&records);
+        assert!(state.unresolved.is_unsettled_by_departed(tx_hash));
+
+        // And what it does not offer twice.
+        assert!(
+            state.pending_terminal_verdicts().is_empty(),
+            "a departure is answered once",
+        );
+
+        assert_eq!(
+            state
+                .abandonable(TickId::new(HOME, BlockHeight::new(9)))
+                .iter()
+                .map(|(hash, _)| *hash)
+                .collect::<Vec<_>>(),
+            vec![tx_hash],
+            "and the record is what makes the abort this shard's to compose",
+        );
+    }
+
     /// The certificate outlives the tick that produced it, so losing the
     /// tick does not make the member this shard's to abandon: the
     /// counterpart holds a certificate of ours it can still settle
@@ -6635,6 +6691,7 @@ mod tests {
             SettledTxSet {
                 txs: BTreeSet::new(),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
+                readable_until: STILL_READABLE,
             },
         );
 
@@ -6666,6 +6723,7 @@ mod tests {
             SettledTxSet {
                 txs: BTreeSet::from([tx_hash]),
                 terminal_wt: WeightedTimestamp::from_millis(1000),
+                readable_until: STILL_READABLE,
             },
         );
 
@@ -6688,11 +6746,11 @@ mod tests {
     /// a settlement unreachable.
     ///
     /// Refusing costs nothing a readable set would have given: a
-    /// transaction's deadline falls at or before its partner's terminal
-    /// plus the retention horizon, so an abort composed at the deadline
-    /// reads a set that is still there. Only a late one arrives here.
+    /// transaction's deadline falls well inside its partner's evidence
+    /// window, so an abort composed at the deadline reads a set that is
+    /// still there. Only a late one arrives here.
     #[test]
-    fn a_partner_past_its_horizon_refuses_the_abort() {
+    fn a_partner_past_its_evidence_window_refuses_the_abort() {
         let (local, partner) = (HOME, PEER);
         let sched = peer_terminating_schedule(1_000);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
@@ -6707,15 +6765,16 @@ mod tests {
             SettledTxSet {
                 txs: BTreeSet::new(),
                 terminal_wt: WeightedTimestamp::ZERO,
+                readable_until: WeightedTimestamp::from_millis(5_000),
             },
         );
-        state.committed_ts = WeightedTimestamp::from_millis(1).plus(RETENTION_HORIZON);
+        state.committed_ts = WeightedTimestamp::from_millis(5_001);
 
         let abort: Arc<Verifiable<Finalization>> =
             Arc::new(Verified::<Finalization>::seal(abandonment_of(local, tx_hash)).into());
         assert!(
             state.emit_or_gate_finalized(&sched, abort).is_empty(),
-            "past the horizon the set cannot establish that the partner did not settle",
+            "past the window the set cannot establish that the partner did not settle",
         );
         assert!(
             state.gated_finalized.is_empty(),

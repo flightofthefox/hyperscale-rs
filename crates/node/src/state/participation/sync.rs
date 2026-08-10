@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use hyperscale_core::{Action, FetchRequest, ProtocolEvent};
 use hyperscale_shard::SettledTxSet;
-use hyperscale_types::{PredecessorTerminal, TopologySchedule, TxHash};
+use hyperscale_types::{PredecessorTerminal, TerminalEvidence, TopologySchedule, TxHash};
 
 use super::ShardParticipation;
 
@@ -67,7 +67,13 @@ impl ShardParticipation {
                 txs,
                 terminal_wt,
             } => {
-                let set = SettledTxSet { txs, terminal_wt };
+                let set = SettledTxSet {
+                    txs,
+                    terminal_wt,
+                    readable_until: topology_schedule
+                        .windows()
+                        .terminal_evidence_expiry(terminal_wt),
+                };
                 self.execution_coordinator
                     .record_settled_txs(shard, set.clone());
                 self.shard_coordinator.record_settled_txs(shard, set);
@@ -157,10 +163,13 @@ impl ShardParticipation {
             };
             actions.push(Action::StartSettledTxsAcquisition {
                 shard,
-                terminal_height: anchor.height,
-                terminal_block_hash: anchor.block_hash,
-                terminal_wt,
-                attested_root,
+                evidence: TerminalEvidence {
+                    height: anchor.height,
+                    block_hash: anchor.block_hash,
+                    terminal_wt,
+                    readable_until: sched.windows().terminal_evidence_expiry(terminal_wt),
+                    attested_root,
+                },
                 peers,
             });
         }

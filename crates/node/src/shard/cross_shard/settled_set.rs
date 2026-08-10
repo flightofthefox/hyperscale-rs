@@ -16,7 +16,7 @@
 //! terminal committee satisfies the root check on the first fetch; a
 //! `not_found` or a list that doesn't recompute to the attested root
 //! rotates the peer and retries on the next tick. Each driver self-expires
-//! once the node's chain advances past `terminal_wt + RETENTION_HORIZON`,
+//! once the node's chain advances past `P`'s terminal-evidence expiry,
 //! beyond which the fence rejects any outcome naming `P` regardless.
 
 use std::collections::{BTreeSet, HashMap};
@@ -24,24 +24,14 @@ use std::collections::{BTreeSet, HashMap};
 use hyperscale_types::network::request::GetSettledTxsRequest;
 use hyperscale_types::network::response::GetSettledTxsResponse;
 use hyperscale_types::{
-    BlockHash, BlockHeight, RETENTION_HORIZON, SettledTxsRoot, ShardId, TxHash, ValidatorId,
-    WeightedTimestamp, settled_txs_root_from_hashes,
+    ShardId, TerminalEvidence, TxHash, ValidatorId, WeightedTimestamp, settled_txs_root_from_hashes,
 };
 
 /// One in-flight acquisition of a terminated shard's settled set.
 struct AcquisitionDriver {
-    /// Height of `P`'s terminal block — names the window end the serve
-    /// reconstructs from.
-    terminal_height: BlockHeight,
-    /// `P`'s terminal block hash — identifies which terminal this driver
-    /// targets, so a duplicate start for the same terminal is a no-op.
-    terminal_block_hash: BlockHash,
-    /// `P`'s terminal weighted timestamp — carried into the completion
-    /// event to bound the fence's retention cutoff, and the driver's
-    /// self-expiry.
-    terminal_wt: WeightedTimestamp,
-    /// The beacon-attested root the fetched list must recompute to.
-    attested_root: SettledTxsRoot,
+    /// `P`'s terminal, the root its list must recompute to, and when the
+    /// answer stops being readable.
+    evidence: TerminalEvidence,
     /// `P`'s terminal committee, asked in rotation. Empty falls back to
     /// shard-routed peer selection.
     peers: Vec<ValidatorId>,
@@ -53,7 +43,7 @@ struct AcquisitionDriver {
 
 impl AcquisitionDriver {
     const fn request(&self) -> GetSettledTxsRequest {
-        GetSettledTxsRequest::new(self.terminal_height, self.terminal_block_hash)
+        GetSettledTxsRequest::new(self.evidence.height, self.evidence.block_hash)
     }
 
     fn peer(&self) -> Option<ValidatorId> {
@@ -122,14 +112,11 @@ impl SettledTxsAcquisition {
     pub fn start(
         &mut self,
         shard: ShardId,
-        terminal_height: BlockHeight,
-        terminal_block_hash: BlockHash,
-        terminal_wt: WeightedTimestamp,
-        attested_root: SettledTxsRoot,
+        evidence: TerminalEvidence,
         peers: Vec<ValidatorId>,
     ) -> Vec<SettledTxsAcquisitionOutput> {
         if let Some(driver) = self.drivers.get_mut(&shard)
-            && driver.terminal_block_hash == terminal_block_hash
+            && driver.evidence.block_hash == evidence.block_hash
         {
             if driver.in_flight {
                 return vec![];
@@ -142,10 +129,7 @@ impl SettledTxsAcquisition {
             }];
         }
         let driver = AcquisitionDriver {
-            terminal_height,
-            terminal_block_hash,
-            terminal_wt,
-            attested_root,
+            evidence,
             peers,
             cursor: 0,
             in_flight: true,
@@ -175,7 +159,7 @@ impl SettledTxsAcquisition {
             driver.cursor = driver.cursor.wrapping_add(1);
             return vec![];
         };
-        if settled_txs_root_from_hashes(txs.iter()) != driver.attested_root {
+        if settled_txs_root_from_hashes(txs.iter()) != driver.evidence.attested_root {
             driver.cursor = driver.cursor.wrapping_add(1);
             return vec![];
         }
@@ -187,7 +171,7 @@ impl SettledTxsAcquisition {
         vec![SettledTxsAcquisitionOutput::Complete {
             shard,
             txs: set,
-            terminal_wt: driver.terminal_wt,
+            terminal_wt: driver.evidence.terminal_wt,
         }]
     }
 
@@ -200,7 +184,7 @@ impl SettledTxsAcquisition {
         }
     }
 
-    /// Drop acquisitions whose retention window has passed (the fence
+    /// Drop acquisitions whose evidence window has passed (the fence
     /// rejects naming the shard regardless), then re-issue every parked
     /// acquisition's fetch. `now_wt` is the node's current chain weighted
     /// timestamp, or `None` before the first commit.
@@ -209,8 +193,7 @@ impl SettledTxsAcquisition {
         now_wt: Option<WeightedTimestamp>,
     ) -> Vec<SettledTxsAcquisitionOutput> {
         if let Some(now) = now_wt {
-            self.drivers
-                .retain(|_, d| now <= d.terminal_wt.plus(RETENTION_HORIZON));
+            self.drivers.retain(|_, d| now <= d.evidence.readable_until);
         }
         let mut outputs = Vec::new();
         for (&shard, driver) in &mut self.drivers {
@@ -236,11 +219,11 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, CertificateRoot, ExecutionCertificate, ExecutionOutcome,
-        Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, ProposerTimestamp,
-        QuorumCertificate, Round, ShardId, SignerBitfield, TickHalf, TickId, TxHash, TxOutcome,
-        ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
-        settled_txs_root_from_hashes,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ExecutionCertificate,
+        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash,
+        ProposerTimestamp, QuorumCertificate, Round, SettledTxsRoot, ShardId, SignerBitfield,
+        TickHalf, TickId, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+        WitnessSources, settled_txs_root_from_hashes,
     };
 
     use super::*;
@@ -358,10 +341,13 @@ mod tests {
         let mut host = SettledTxsAcquisition::new();
         let mut outputs = host.start(
             SHARD,
-            BlockHeight::new(3),
-            terminal,
-            WeightedTimestamp::from_millis(9_000),
-            root,
+            TerminalEvidence {
+                height: BlockHeight::new(3),
+                block_hash: terminal,
+                terminal_wt: WeightedTimestamp::from_millis(9_000),
+                readable_until: WeightedTimestamp::from_millis(19_000),
+                attested_root: root,
+            },
             vec![ValidatorId::new(7)],
         );
 
@@ -405,10 +391,13 @@ mod tests {
         let wrong_root = settled_txs_root_from_hashes([&settled_tx(99)]);
         let _ = host.start(
             SHARD,
-            BlockHeight::new(3),
-            terminal,
-            WeightedTimestamp::from_millis(9_000),
-            wrong_root,
+            TerminalEvidence {
+                height: BlockHeight::new(3),
+                block_hash: terminal,
+                terminal_wt: WeightedTimestamp::from_millis(9_000),
+                readable_until: WeightedTimestamp::from_millis(19_000),
+                attested_root: wrong_root,
+            },
             vec![ValidatorId::new(0), ValidatorId::new(1)],
         );
         let request = GetSettledTxsRequest::new(BlockHeight::new(3), terminal);
@@ -425,24 +414,24 @@ mod tests {
         ));
     }
 
-    /// A driver whose retention window has passed drops on tick.
+    /// A driver whose evidence window has passed drops on tick.
     #[test]
-    fn expires_past_the_retention_horizon() {
+    fn expires_past_the_evidence_window() {
         let mut host = SettledTxsAcquisition::new();
         let _ = host.start(
             SHARD,
-            BlockHeight::new(2),
-            BlockHash::ZERO,
-            WeightedTimestamp::from_millis(1_000),
-            settled_txs_root_from_hashes(std::iter::empty()),
+            TerminalEvidence {
+                height: BlockHeight::new(2),
+                block_hash: BlockHash::ZERO,
+                terminal_wt: WeightedTimestamp::from_millis(1_000),
+                readable_until: WeightedTimestamp::from_millis(6_000),
+                attested_root: settled_txs_root_from_hashes(std::iter::empty()),
+            },
             vec![],
         );
         assert!(host.has_pending());
 
-        let past = WeightedTimestamp::from_millis(1_000)
-            .plus(RETENTION_HORIZON)
-            .plus(RETENTION_HORIZON);
-        let outputs = host.on_tick(Some(past));
+        let outputs = host.on_tick(Some(WeightedTimestamp::from_millis(6_001)));
         assert!(outputs.is_empty());
         assert!(!host.has_pending(), "the expired driver drops");
     }
@@ -455,28 +444,37 @@ mod tests {
         let root = settled_txs_root_from_hashes(std::iter::empty());
         let _ = host.start(
             SHARD,
-            BlockHeight::new(2),
-            BlockHash::from_raw(Hash::from_bytes(b"terminal-a")),
-            WeightedTimestamp::from_millis(1),
-            root,
+            TerminalEvidence {
+                height: BlockHeight::new(2),
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"terminal-a")),
+                terminal_wt: WeightedTimestamp::from_millis(1),
+                readable_until: WeightedTimestamp::from_millis(5_001),
+                attested_root: root,
+            },
             vec![],
         );
         let dup = host.start(
             SHARD,
-            BlockHeight::new(2),
-            BlockHash::from_raw(Hash::from_bytes(b"terminal-a")),
-            WeightedTimestamp::from_millis(1),
-            root,
+            TerminalEvidence {
+                height: BlockHeight::new(2),
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"terminal-a")),
+                terminal_wt: WeightedTimestamp::from_millis(1),
+                readable_until: WeightedTimestamp::from_millis(5_001),
+                attested_root: root,
+            },
             vec![],
         );
         assert!(dup.is_empty(), "same terminal in flight does not re-fetch");
 
         let replaced = host.start(
             SHARD,
-            BlockHeight::new(3),
-            BlockHash::from_raw(Hash::from_bytes(b"terminal-b")),
-            WeightedTimestamp::from_millis(1),
-            root,
+            TerminalEvidence {
+                height: BlockHeight::new(3),
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"terminal-b")),
+                terminal_wt: WeightedTimestamp::from_millis(1),
+                readable_until: WeightedTimestamp::from_millis(5_001),
+                attested_root: root,
+            },
             vec![],
         );
         assert!(

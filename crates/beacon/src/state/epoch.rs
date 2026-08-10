@@ -9,9 +9,8 @@ use hyperscale_types::{
     BeaconCert, BeaconProposal, BeaconState, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader,
     CertifiedBeaconBlock, CompletedRecovery, Epoch, EpochWindows, KeptSeat, NetworkDefinition,
     ObserverSeat, PendingReshape, QcContext, QuorumCertificate, RESHAPE_HANDOFF_TTL_EPOCHS,
-    RETENTION_HORIZON, RecoveryCause, RevealChain, ShardBoundary, ShardEpochContribution, ShardId,
-    SlotEffects, TerminalRef, TopologySnapshot, TransitionCause, ValidatorId, ValidatorStatus,
-    Verifier, Verify,
+    RecoveryCause, RevealChain, ShardBoundary, ShardEpochContribution, ShardId, SlotEffects,
+    TerminalRef, TopologySnapshot, TransitionCause, ValidatorId, ValidatorStatus, Verifier, Verify,
 };
 
 use crate::rules::{
@@ -983,26 +982,30 @@ fn record_boundaries(
     (outcome, reveals)
 }
 
-/// Drop terminal records past their retention horizon. A terminated
-/// shard's record lingers only to project its `settled_txs_root` to
-/// surviving counterparts; past `terminal_wt + RETENTION_HORIZON` the
+/// Drop terminal records past their evidence window. A terminated shard's
+/// record lingers only to project its `settled_txs_root` to surviving
+/// counterparts; past its
+/// [terminal-evidence expiry](EpochWindows::terminal_evidence_expiry) the
 /// split-boundary fence rejects any tick naming it regardless, so the
-/// record is dead weight. Bounded so a terminated shard can't
-/// accumulate forever.
+/// record is dead weight. The window is the same one the fence and the
+/// acquisition read, and it spans the two folds a terminal contribution
+/// takes to reach a record at all — a record dropped before then would
+/// never once have carried the roots it exists to project. Bounded so a
+/// terminated shard can't accumulate forever.
 ///
 /// A terminal record whose reshape successors aren't live yet is exempt: it
 /// is what `seed_split_children` folds the children from (or what a merge
 /// parent composes from), and that fold can only land on an epoch the beacon
 /// commits a proposal carrying the terminal QC. The beacon can commit empty
 /// for several epochs across the reshape's committee transition, so the
-/// horizon alone would drop the record first — stranding the children on
+/// window alone would drop the record first — stranding the children on
 /// their placeholders, or the merge parent uncomposed. It is also the anchor
 /// a coasting predecessor's observers snap-sync against while they finish
 /// adopting; under make-before-break the predecessor keeps coasting until its
-/// successors are live, so the record must outlive the horizon until then,
+/// successors are live, so the record must outlive the window until then,
 /// not merely until they seed. Holding it until the successors have produced
 /// past genesis (`BeaconState.advanced`) covers both, and frees the record
-/// for the next horizon sweep once the handoff has demonstrably completed.
+/// for the next sweep once the handoff has demonstrably completed.
 fn gc_terminal_boundaries(state: &mut BeaconState, epoch: Epoch, windows: EpochWindows) {
     let now = windows.window_of(epoch).start;
     let pending_fold: BTreeMap<ShardId, Epoch> = state
@@ -1030,7 +1033,7 @@ fn gc_terminal_boundaries(state: &mut BeaconState, epoch: Epoch, windows: EpochW
     state.boundaries.retain(|shard, b| {
         b.terminal_epoch.is_none_or(|t| {
             pending_fold.contains_key(shard)
-                || now <= windows.window_of(t).end.plus(RETENTION_HORIZON)
+                || now <= windows.terminal_evidence_expiry(windows.window_of(t).end)
         })
     });
     // A shard that left `boundaries` is gone; drop its produced mark and
@@ -1271,8 +1274,8 @@ mod tests {
         MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, QuorumCertificate, Round, SettledTxsRoot,
         ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardLoad, ShardRecovery,
         ShardWitnessPayload, SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId,
-        StateRoot, TerminalRoots, TransitionCause, ValidatorId, VrfProof, WeightedTimestamp,
-        compute_merkle_root, compute_range_proof,
+        StateRoot, TERMINAL_EVIDENCE_EPOCHS, TerminalRoots, TransitionCause, ValidatorId, VrfProof,
+        WeightedTimestamp, compute_merkle_root, compute_range_proof,
     };
 
     use super::*;
@@ -1862,7 +1865,7 @@ mod tests {
         state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
         // A prior boundary at height 3 backs the pending recovery (so the
-        // horizon GC keeps it) and lets us assert the crossing didn't advance
+        // the retention sweep keeps it) and lets us assert the crossing didn't advance
         // it.
         state.boundaries.insert(
             shard,
@@ -3301,11 +3304,11 @@ mod tests {
         );
     }
 
-    /// A terminal record drops once the chain advances past its retention
-    /// horizon — it lingers only to project the settled-transaction root, dead
+    /// A terminal record drops once the chain advances past its evidence
+    /// window — it lingers only to project the settled-transaction root, dead
     /// weight once the fence rejects naming the shard regardless.
     #[test]
-    fn terminal_record_drops_past_the_retention_horizon() {
+    fn terminal_record_drops_past_the_evidence_window() {
         let (mut state, parent, pair, composed) = terminating_state();
         let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
@@ -3327,13 +3330,13 @@ mod tests {
 
         // The children seat and produce past their genesis — the handoff is
         // done, so the parent's record is dead weight, free to drop on the next
-        // horizon sweep.
+        // sweep.
         for child in <[ShardId; 2]>::from(parent.children()) {
             state.advanced.insert(child);
         }
         // Advance to an epoch whose window opens past the terminal cut
-        // (2000ms at epoch_duration 1000) plus `RETENTION_HORIZON`.
-        let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
+        // (2000ms at epoch_duration 1000) plus the evidence window.
+        let past = Epoch::new(TERMINAL_EVIDENCE_EPOCHS + 5);
         record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -3345,7 +3348,59 @@ mod tests {
         );
         assert!(
             !state.boundaries.contains_key(&parent),
-            "terminal record drops past the retention horizon once its children are live",
+            "terminal record drops past the evidence window once its children are live",
+        );
+    }
+
+    /// The evidence window outlives the fold that first carries the roots.
+    ///
+    /// A terminal block satisfies `parent ≤ cut < qc`, so it cannot exist
+    /// until the window after the one it closes, and the beacon block for
+    /// that window is composed while the crossing is still being produced —
+    /// the contribution folds one window later again. At a production
+    /// 300s epoch that is 600s past the cut, so a window measured in
+    /// transaction-artifact retention (144s) would drop the record on the
+    /// very fold that first gave it roots to project, and no counterpart
+    /// would ever read a departed shard's settled set.
+    ///
+    /// The successors are live here, so nothing but the window itself is
+    /// holding the record.
+    #[test]
+    fn terminal_roots_land_inside_the_evidence_window() {
+        let (mut state, parent, pair, composed) = terminating_state();
+        // Production epochs: the cut moves to 600_000ms, and the fold that
+        // carries the roots opens at 900_000ms.
+        state.chain_config.epoch_duration_ms = 300_000;
+        for child in <[ShardId; 2]>::from(parent.children()) {
+            state.advanced.insert(child);
+        }
+
+        let roots = TerminalRoots {
+            settled_txs: SettledTxsRoot::from_raw(Hash::from_bytes(b"settled")),
+            committed_txs: CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed")),
+        };
+        let (header, payloads, range_proof) =
+            terminal_block_with_witnesses(parent, 9, 599_000, pair, composed, 3, Some(roots));
+        let (committed, contributions) =
+            contribution_for(parent, header, (payloads, range_proof), 601_000);
+        record_boundaries(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            Epoch::new(3),
+            &committed,
+            &contributions,
+            &BTreeSet::new(),
+        );
+
+        let record = state
+            .boundaries
+            .get(&parent)
+            .expect("the record survives the fold that first carries its roots");
+        assert_eq!(
+            record.terminal_roots,
+            Some(roots),
+            "and it carries them, for a surviving counterpart to read",
         );
     }
 
@@ -3374,18 +3429,18 @@ mod tests {
     }
 
     /// A split parent whose children are still placeholders outlives the
-    /// retention horizon. The children seed only from the parent's terminal
+    /// evidence window. The children seed only from the parent's terminal
     /// fold, and the beacon can commit empty for several epochs across the
     /// reshape's committee transition before any non-empty commit carries
-    /// that fold — dropping the record on the horizon alone would strand
+    /// that fold — dropping the record on the window alone would strand
     /// both children on their placeholders forever.
     #[test]
-    fn unseeded_split_parent_outlives_the_retention_horizon() {
+    fn unseeded_split_parent_outlives_the_evidence_window() {
         let (mut state, parent, pair, composed) = terminating_state();
 
-        // The beacon commits empty well past the horizon: no terminal fold
+        // The beacon commits empty well past the window: no terminal fold
         // yet, so both children stay on their placeholder anchors.
-        let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
+        let past = Epoch::new(TERMINAL_EVIDENCE_EPOCHS + 5);
         record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -3397,7 +3452,7 @@ mod tests {
         );
         assert!(
             state.boundaries.contains_key(&parent),
-            "an unseeded split parent is held past the horizon",
+            "an unseeded split parent is held past the window",
         );
         for child in <[ShardId; 2]>::from(parent.children()) {
             assert_eq!(
@@ -3412,7 +3467,7 @@ mod tests {
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
         let (committed, contributions) =
             contribution_for(parent, header, (payloads, range_proof), 2_500);
-        let later = Epoch::new(RETENTION_HORIZON.as_secs() + 6);
+        let later = Epoch::new(TERMINAL_EVIDENCE_EPOCHS + 6);
         record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -3439,11 +3494,11 @@ mod tests {
         );
 
         // The children produce past their genesis — the handoff is complete, so
-        // the parent drops on the next horizon sweep.
+        // the parent drops on the next sweep.
         for child in <[ShardId; 2]>::from(parent.children()) {
             state.advanced.insert(child);
         }
-        let even_later = Epoch::new(RETENTION_HORIZON.as_secs() + 7);
+        let even_later = Epoch::new(TERMINAL_EVIDENCE_EPOCHS + 7);
         record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -3460,14 +3515,14 @@ mod tests {
     }
 
     /// A merge child whose parent is still an uncomposed placeholder outlives
-    /// the retention horizon. The parent composes only from both children's
+    /// the evidence window. The parent composes only from both children's
     /// terminal folds, and the beacon can commit empty for several epochs
     /// across the reshape's committee transition before either fold lands —
-    /// dropping a child on the horizon alone would strand the parent on its
+    /// dropping a child on the window alone would strand the parent on its
     /// placeholder forever.
     #[test]
     #[allow(clippy::too_many_lines)] // walks three epochs of merge lifecycle in one scenario
-    fn merge_child_outlives_horizon_until_parent_composes() {
+    fn merge_child_outlives_the_window_until_parent_composes() {
         let mut state = single_pool_state(4);
         state.chain_config.epoch_duration_ms = 1_000;
         let parent = ShardId::ROOT;
@@ -3526,9 +3581,9 @@ mod tests {
             },
         );
 
-        // The beacon commits empty well past the horizon: the parent hasn't
+        // The beacon commits empty well past the window: the parent hasn't
         // composed, so both children's terminal records must be held.
-        let past = Epoch::new(RETENTION_HORIZON.as_secs() + 5);
+        let past = Epoch::new(TERMINAL_EVIDENCE_EPOCHS + 5);
         record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -3541,7 +3596,7 @@ mod tests {
         for child in [left, right] {
             assert!(
                 state.boundaries.contains_key(&child),
-                "a merge child is held past the horizon while its parent is uncomposed",
+                "a merge child is held past the window while its parent is uncomposed",
             );
         }
 
@@ -3553,7 +3608,7 @@ mod tests {
             .get_mut(&parent)
             .expect("parent placeholder")
             .block_hash = BlockHash::from_raw(Hash::from_bytes(b"composed parent"));
-        let later = Epoch::new(RETENTION_HORIZON.as_secs() + 6);
+        let later = Epoch::new(TERMINAL_EVIDENCE_EPOCHS + 6);
         record_boundaries(
             &BlsVerifier,
             &mut state,
@@ -3571,9 +3626,9 @@ mod tests {
         }
 
         // The reformed parent produces past its genesis — the handoff completes,
-        // so the children drop on the next horizon sweep.
+        // so the children drop on the next sweep.
         state.advanced.insert(parent);
-        let even_later = Epoch::new(RETENTION_HORIZON.as_secs() + 7);
+        let even_later = Epoch::new(TERMINAL_EVIDENCE_EPOCHS + 7);
         record_boundaries(
             &BlsVerifier,
             &mut state,
