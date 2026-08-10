@@ -177,17 +177,22 @@ impl ShardParticipation {
     /// outstanding still gets a request: an empty set is how the last
     /// query retires.
     ///
-    /// Silent on a chain the rule no longer applies to, which is where
-    /// the mempool walk would otherwise cost the most for nothing.
-    pub(in crate::state) fn scan_precut_queries(&self) -> Vec<Action> {
-        if !self.shard_coordinator.precut_rule_live() {
+    /// Once the rule retires the outstanding set is empty rather than
+    /// unasked, so the last release still goes out; the predecessors are
+    /// dropped immediately after, which is what makes this the final pass.
+    pub(in crate::state) fn scan_precut_queries(&mut self) -> Vec<Action> {
+        if !self.shard_coordinator.has_precut_predecessors() {
             return Vec::new();
         }
-        let cut = self.shard_coordinator.chain_origin().anchor_wt;
-        let candidates = self.mempool_coordinator.pending_opening_before(cut);
-        let outstanding = self
-            .shard_coordinator
-            .outstanding_precut_queries(candidates);
+        let live = self.shard_coordinator.precut_rule_live();
+        let outstanding = if live {
+            let cut = self.shard_coordinator.chain_origin().anchor_wt;
+            let candidates = self.mempool_coordinator.pending_opening_before(cut);
+            self.shard_coordinator
+                .outstanding_precut_queries(candidates)
+        } else {
+            Vec::new()
+        };
 
         let mut by_predecessor: BTreeMap<PredecessorTerminal, Vec<TxHash>> = self
             .shard_coordinator
@@ -198,7 +203,7 @@ impl ShardParticipation {
         for (predecessor, tx_hash) in outstanding {
             by_predecessor.entry(predecessor).or_default().push(tx_hash);
         }
-        by_predecessor
+        let actions: Vec<Action> = by_predecessor
             .into_iter()
             .map(|(predecessor, tx_hashes)| {
                 Action::Fetch(FetchRequest::CommittedTxs {
@@ -208,7 +213,11 @@ impl ShardParticipation {
                     class: None,
                 })
             })
-            .collect()
+            .collect();
+        if !live {
+            self.shard_coordinator.retire_precut();
+        }
+        actions
     }
 }
 

@@ -115,7 +115,7 @@ use crate::deferred_qc::DeferredQc;
 use crate::fee_ledger::FeeReservationLedger;
 use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
-use crate::precut::{PrecutResolutions, PrecutStatus, PrecutVerdict};
+use crate::precut::{Precut, PrecutStatus, PrecutVerdict};
 use crate::proposal::{
     ProposalKind, ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
     filter_engaged_transactions, select_finalizations, select_provisions, select_transactions,
@@ -416,23 +416,18 @@ pub struct ShardCoordinator {
     /// the chain's real genesis QC.
     chain_origin: ChainOrigin,
 
-    /// The chains this one succeeds, and the commitments they left — one
-    /// for a split child, two for a merged parent, empty for a chain born
-    /// at network genesis.
+    /// The chains this one succeeds, and what they have answered about
+    /// transactions that predate it — what narrows the blanket pre-cut
+    /// refusal to the transactions a predecessor actually committed.
     ///
     /// Seeded from the reshape flip, which is the delivery that lands
     /// inside the window the pre-cut rule is live for. A seat that missed
     /// the flip — a restart, or a validator rotated on afterwards — picks
-    /// them up from its topology projection instead; empty means the
-    /// strict rule stands, which is always safe.
-    predecessors: Vec<PredecessorTerminal>,
-
-    /// Per-predecessor answers about transactions that predate this
-    /// chain — what narrows the blanket pre-cut refusal to the
-    /// transactions a predecessor actually committed. Empty until a
-    /// driver resolves them, and unconsulted on a chain older than
-    /// `MAX_VALIDITY_RANGE`, where nothing on offer predates the origin.
-    resolutions: PrecutResolutions,
+    /// the predecessors up from its topology projection instead; holding
+    /// none means the strict rule stands, which is always safe. Retired
+    /// once the chain has outlived its origin by `MAX_VALIDITY_RANGE`,
+    /// past which nothing on offer predates the cut.
+    precut: Precut,
 
     /// Settled-tick sets for shards that have terminated at a split,
     /// keyed by the terminated shard. The split-boundary fence consults
@@ -574,8 +569,7 @@ impl ShardCoordinator {
             me,
             local_shard,
             chain_origin: recovered.chain_origin,
-            predecessors: recovered.predecessors,
-            resolutions: PrecutResolutions::default(),
+            precut: Precut::succeeding(recovered.predecessors),
             settled_sets: HashMap::new(),
         }
     }
@@ -1122,7 +1116,7 @@ impl ShardCoordinator {
             .iter()
             .filter(|tx| tx.validity_range().start_timestamp_inclusive < cut)
         {
-            match self.resolutions.status(&self.predecessors, &tx.hash()) {
+            match self.precut.status(&tx.hash()) {
                 PrecutStatus::Absent => {}
                 PrecutStatus::Committed => {
                     return PrecutVerdict::Reject(format!("transaction {}", tx.hash()));
@@ -1144,7 +1138,7 @@ impl ShardCoordinator {
     /// before the cut and nothing signed before it is still valid.
     #[must_use]
     pub fn precut_rule_live(&self) -> bool {
-        !self.predecessors.is_empty()
+        self.precut.has_predecessors()
             && self.high_qc().weighted_timestamp()
                 < self.chain_origin.anchor_wt.plus(MAX_VALIDITY_RANGE)
     }
@@ -1162,7 +1156,7 @@ impl ShardCoordinator {
         tx_hash: TxHash,
         absent: bool,
     ) {
-        self.resolutions.record(predecessor, tx_hash, absent);
+        self.precut.record(predecessor, tx_hash, absent);
     }
 
     /// The `(predecessor, transaction)` pairs still owed an answer — what
@@ -1200,14 +1194,37 @@ impl ShardCoordinator {
                     .collect::<Vec<_>>()
             });
         let candidates: BTreeSet<TxHash> = tx_hashes.into_iter().chain(awaiting_vote).collect();
-        self.resolutions.outstanding(&self.predecessors, candidates)
+        self.precut.outstanding(candidates)
     }
 
     /// Whether `tx_hash` may be proposed despite opening before this
     /// chain did — proven absent from every predecessor's committed set.
     #[must_use]
     pub fn precut_tx_admissible(&self, tx_hash: &TxHash) -> bool {
-        self.resolutions.status(&self.predecessors, tx_hash) == PrecutStatus::Absent
+        self.precut.admissible(tx_hash)
+    }
+
+    /// Whether any predecessor is on hand to be asked at all — false on a
+    /// chain born at network genesis, on a seat that missed the flip, and
+    /// on one whose pre-cut rule has already retired.
+    #[must_use]
+    pub const fn has_precut_predecessors(&self) -> bool {
+        self.precut.has_predecessors()
+    }
+
+    /// Drop the predecessors and their answers once the pre-cut rule has
+    /// retired, so neither is held for this coordinator's life.
+    ///
+    /// The caller drives it, because forgetting the predecessors is also
+    /// what stops it releasing the query slots they hold: the release is a
+    /// request naming an empty set, and there is nothing to name it against
+    /// afterwards. Returns whether anything was dropped.
+    pub fn retire_precut(&mut self) -> bool {
+        if self.precut.is_empty() || self.precut_rule_live() {
+            return false;
+        }
+        self.precut.retire();
+        true
     }
 
     /// Whether a header keyed at `wt` carries `split_child_roots` — the
@@ -1802,7 +1819,7 @@ impl ShardCoordinator {
             &self.dedup_index,
             validity_anchor,
             self.chain_origin.anchor_wt,
-            &|tx_hash| self.precut_tx_admissible(tx_hash),
+            &self.precut,
         );
         let (finalizations, _finalized_tx_count) = select_finalizations(
             finalizations,
@@ -6253,7 +6270,7 @@ impl ShardCoordinator {
     /// afterwards — until its topology projection supplies them.
     #[must_use]
     pub fn predecessors(&self) -> &[PredecessorTerminal] {
-        &self.predecessors
+        self.precut.predecessors()
     }
 
     /// Number of distinct validators for which this coordinator holds

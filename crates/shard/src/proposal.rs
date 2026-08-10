@@ -28,6 +28,7 @@ use tracing::debug;
 
 use crate::chain_view::ChainView;
 use crate::commit_dedup::CommitDedupIndex;
+use crate::precut::Precut;
 use crate::verification::VerificationPipeline;
 
 /// Variant-specific content for a proposal build.
@@ -154,8 +155,8 @@ impl ProposalTracker {
 /// 2. Txs whose `validity_range` is malformed against `validity_anchor`, or
 ///    whose half-open range does not contain `validity_anchor`.
 /// 3. Txs whose window opened before `chain_origin_wt` — the
-///    predecessor's, on a reshape successor — unless `precut_admissible`
-///    says every predecessor proved it absent from its committed set.
+///    predecessor's, on a reshape successor — unless `precut` holds an
+///    absence proof for it against every predecessor's committed set.
 ///    This is the same question voters ask during block verification, so
 ///    filtering here keeps a proposer from offering what its own voters
 ///    would defer on or refuse.
@@ -167,7 +168,7 @@ pub fn select_transactions(
     dedup_index: &CommitDedupIndex,
     validity_anchor: WeightedTimestamp,
     chain_origin_wt: WeightedTimestamp,
-    precut_admissible: &dyn Fn(&TxHash) -> bool,
+    precut: &Precut,
 ) -> Vec<Arc<Verified<Transaction>>> {
     let before = ready_txs.len();
     let mut deduped = 0;
@@ -193,7 +194,7 @@ pub fn select_transactions(
             // anything else a voter defers on or refuses. Zero for a
             // chain born at network genesis.
             if tx.validity_range().start_timestamp_inclusive < chain_origin_wt
-                && !precut_admissible(&h)
+                && !precut.admissible(&h)
             {
                 predates += 1;
                 return false;
@@ -570,7 +571,8 @@ mod tests {
         install_stub_vm_statics, make_finalization, stub_transaction, test_prefix,
     };
     use hyperscale_types::{
-        Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_VALIDITY_RANGE, TimestampRange, TransactionDecision,
+        CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_VALIDITY_RANGE,
+        PredecessorTerminal, TimestampRange, TransactionDecision,
     };
 
     use super::*;
@@ -743,18 +745,25 @@ mod tests {
         CommitDedupIndex::new()
     }
 
-    /// The predicate a chain with no resolved predecessors carries: no
-    /// pre-cut transaction is admissible. Cases anchored at
-    /// `WeightedTimestamp::ZERO` never reach it, since nothing opens
+    /// A successor of one chain that has answered nothing, so no pre-cut
+    /// transaction is admissible. Cases anchored at
+    /// `WeightedTimestamp::ZERO` never consult it, since nothing opens
     /// before an origin of zero.
-    fn refuses_precut(_: &TxHash) -> bool {
-        false
+    fn refuses_precut() -> Precut {
+        Precut::succeeding(vec![PredecessorTerminal {
+            shard: ShardId::leaf(1, 0),
+            height: BlockHeight::new(9),
+            block_hash: BlockHash::ZERO,
+            committed_txs_root: CommittedTxsRoot::ZERO,
+        }])
     }
 
-    /// The predicate for a chain whose predecessors proved everything
-    /// asked about absent from their committed sets.
-    fn admits_precut(_: &TxHash) -> bool {
-        true
+    /// The same successor, with `tx_hash` proven absent from its
+    /// predecessor's committed set.
+    fn admits_precut(tx_hash: TxHash) -> Precut {
+        let mut precut = refuses_precut();
+        precut.record(precut.predecessors()[0].shard, tx_hash, true);
+        precut
     }
 
     /// A transaction opening before the chain's origin is dropped while
@@ -767,8 +776,9 @@ mod tests {
         let anchor = ts(10_500);
         // Opens before the cut, still valid at the anchor: exactly the
         // population the successor cannot judge on its own.
-        let precut = tx_with_range(9, TimestampRange::new(ts(9_000), ts(40_000)));
-        let txs = vec![precut];
+        let candidate = tx_with_range(9, TimestampRange::new(ts(9_000), ts(40_000)));
+        let hash = candidate.hash();
+        let txs = vec![candidate];
 
         let refused = select_transactions(
             &txs,
@@ -776,7 +786,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             cut,
-            &refuses_precut,
+            &refuses_precut(),
         );
         assert!(
             refused.is_empty(),
@@ -789,7 +799,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             cut,
-            &admits_precut,
+            &admits_precut(hash),
         );
         assert_eq!(
             admitted.len(),
@@ -816,7 +826,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             WeightedTimestamp::ZERO,
-            &refuses_precut,
+            &refuses_precut(),
         );
 
         assert_eq!(selected.len(), 1, "only the in-range tx should survive");
@@ -836,7 +846,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             WeightedTimestamp::ZERO,
-            &refuses_precut,
+            &refuses_precut(),
         );
 
         assert!(
@@ -861,7 +871,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             WeightedTimestamp::ZERO,
-            &refuses_precut,
+            &refuses_precut(),
         );
 
         assert!(selected.is_empty(), "malformed range should be filtered");
@@ -880,7 +890,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             WeightedTimestamp::ZERO,
-            &refuses_precut,
+            &refuses_precut(),
         );
 
         assert!(
@@ -902,7 +912,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             WeightedTimestamp::ZERO,
-            &refuses_precut,
+            &refuses_precut(),
         );
 
         assert_eq!(selected.len(), 1, "anchor == start_inclusive must be kept");
@@ -924,7 +934,7 @@ mod tests {
             &empty_dedup_index(),
             anchor,
             WeightedTimestamp::ZERO,
-            &refuses_precut,
+            &refuses_precut(),
         );
         assert!(selected.is_empty());
     }
