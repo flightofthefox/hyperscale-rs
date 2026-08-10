@@ -274,18 +274,6 @@ impl UnresolvedTxs {
         shards
     }
 
-    /// Whether some shard that could hold a certificate of ours for
-    /// `tx_hash` has left, which is what puts a settlement of it out of
-    /// reach: the rest of its coverage will never arrive.
-    #[must_use]
-    pub fn a_counterpart_has_left(&self, tx_hash: TxHash) -> bool {
-        self.owed.get(&tx_hash).is_some_and(|owed| {
-            owed.remote_prefixes
-                .iter()
-                .any(|prefix| self.departure_over(owed, *prefix).is_some())
-        })
-    }
-
     /// Whether `tx_hash` reaches beyond this shard at all. A transaction
     /// that does not has no counterpart to hold a certificate of ours,
     /// whatever this shard has said about it.
@@ -801,7 +789,6 @@ mod tests {
             BTreeSet::from([PARTNER]),
             "one shard owns the whole remote side",
         );
-        assert!(!ledger.a_counterpart_has_left(tx.hash()));
 
         // The partner splits. Its keyspace passes to a child, and both
         // answer for the transaction — the child owns it now, the parent
@@ -811,23 +798,27 @@ mod tests {
         let after = ledger.counterparts(tx.hash(), &split);
         assert!(after.contains(&PARTNER), "the shard that held it then");
         assert_eq!(after.len(), 2, "and the one that holds it now");
-        assert!(ledger.a_counterpart_has_left(tx.hash()));
     }
 
     /// A shard that left before the transaction committed never held it,
     /// whatever its keyspace covers now — so its terminal says nothing
-    /// about this transaction's fate.
+    /// about this transaction's fate, and cannot be the silence that
+    /// strands it.
     #[test]
     fn a_terminal_older_than_the_transaction_is_not_its_counterpart_leaving() {
         let mut ledger = UnresolvedTxs::default();
         let tx = tx(14, 60_000);
         ledger.register_committed(LOCAL, ms(600_000), std::iter::once(&tx));
         ledger.certify(tx.hash());
-        ledger.record_terminal(PARTNER, ms(500_000), expiry(ms(500_000)));
+        let stale = ms(500_000);
+        ledger.record_terminal(PARTNER, stale, expiry(stale));
 
         assert!(
-            !ledger.a_counterpart_has_left(tx.hash()),
+            ledger
+                .prune(expiry(stale).plus(MAX_VALIDITY_RANGE))
+                .is_empty(),
             "the shard owning the prefix at commit is the successor, still running",
         );
+        assert_eq!(ledger.len(), 1, "so nothing has fallen silent on it");
     }
 }

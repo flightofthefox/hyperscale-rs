@@ -2345,8 +2345,9 @@ impl ExecutionCoordinator {
     /// The one composing now is about to attest it, and its verdict can
     /// carry a charge an abandonment cannot — a payer's leg admitted at
     /// its engagement deadline being exactly that. An earlier one can
-    /// still close its coverage, unless a counterpart it waits on has
-    /// left, in which case it never will.
+    /// still close its coverage, unless a record says the counterpart it
+    /// waits on left the transaction unsettled, in which case it never
+    /// will.
     ///
     /// With no tick speaking for it, what decides is whether a certificate
     /// of ours is out where a counterpart could settle against it. The
@@ -2356,10 +2357,19 @@ impl ExecutionCoordinator {
     /// tick's absence for the certificate's and abandon a transaction its
     /// counterpart can still settle.
     ///
-    /// A participant that left having *already* settled the transaction is
-    /// the one case this admits and must not: it is why the fence puts the
-    /// same question to that shard's settled set before the abandonment is
-    /// offered, and why an unreadable set refuses it.
+    /// That a counterpart has left is not that answer. A shard can settle
+    /// its half and then depart, so its departure and its silence are
+    /// different facts, and only the second puts a settlement out of
+    /// reach. The committed record is what establishes the second, so it
+    /// is what licenses spending a tick here — composing on the departure
+    /// alone would discard a tick whose settlement had already closed, and
+    /// the fence would then refuse the abort that replaced it, tearing the
+    /// transaction across the two shards.
+    ///
+    /// Committed evidence is also the only kind the fence cannot
+    /// contradict: [`Self::fence_pairs`] asks nothing about a transaction
+    /// a record covers, so what composition spends here is never refused
+    /// downstream.
     ///
     /// Every term reads off committed content — the ledger is a fold over
     /// committed blocks, the schedule is attested, and `committed_ts` is
@@ -2369,7 +2379,7 @@ impl ExecutionCoordinator {
     fn beyond_every_shard(&self, composing: TickId, tx_hash: TxHash) -> bool {
         match self.ticks.tick_assignment(tx_hash) {
             Some(tick_id) if tick_id == composing => false,
-            Some(_) => self.unresolved.a_counterpart_has_left(tx_hash),
+            Some(_) => self.unresolved.is_unsettled_by_departed(tx_hash),
             None => {
                 !self.unresolved.is_certified(tx_hash) || self.no_counterpart_can_settle(tx_hash)
             }
@@ -2378,9 +2388,11 @@ impl ExecutionCoordinator {
 
     /// Whether no counterpart is in a position to settle `tx_hash` against
     /// a certificate of ours: none is party to it, so there is no
-    /// certificate but ours to combine with, or one that is has left.
+    /// certificate but ours to combine with, or a committed record says
+    /// the one that was left it unsettled.
     fn no_counterpart_can_settle(&self, tx_hash: TxHash) -> bool {
-        !self.unresolved.reaches_beyond(tx_hash) || self.unresolved.a_counterpart_has_left(tx_hash)
+        !self.unresolved.reaches_beyond(tx_hash)
+            || self.unresolved.is_unsettled_by_departed(tx_hash)
     }
 
     /// The records this shard has evidence for and has not yet written
@@ -6347,6 +6359,19 @@ mod tests {
     /// this shard's own certificate in hand and no counterpart coverage —
     /// the shape a counterpart's silence produces. The transaction
     /// straddles, so `partner` owns the half of it this shard does not.
+    /// Commit the record naming `tx_hash` as what the departed peer left
+    /// unsettled — the evidence composition requires before it will spend
+    /// a tick on an abort.
+    fn record_peer_left_unsettled(state: &mut ExecutionCoordinator, tx_hash: TxHash) {
+        state
+            .unresolved
+            .record_terminal_verdicts(&[TerminalVerdict::new(
+                PEER,
+                WeightedTimestamp::from_millis(60_000),
+                vec![tx_hash],
+            )]);
+    }
+
     fn state_stranded_on(
         topology_schedule: &TopologySchedule,
         seed: u8,
@@ -6483,25 +6508,24 @@ mod tests {
         );
     }
 
-    /// Once the counterpart is past-terminal the member is released. A
-    /// settlement needs every participant's certificate and the departed
-    /// shard will produce no more, so nothing can settle the transaction
-    /// and abandoning it is this shard's decision alone.
+    /// A counterpart's departure is not by itself what releases the
+    /// member. A shard can settle its half and then leave, so its going
+    /// says nothing about whether the transaction is still reachable —
+    /// and spending the tick on the departure alone would discard the one
+    /// settlement that had already closed. Only a committed record
+    /// licenses the abort; until one lands the tick keeps speaking.
     #[test]
-    fn a_terminated_counterpart_releases_the_member_its_tick_strands() {
+    fn a_departure_alone_does_not_release_the_member_its_tick_strands() {
         // Windows placed so the frontier the fixture sits at is past the
         // peer's cut.
         let sched = peer_terminating_schedule(60_000);
-        let (state, _, tx_hash) = state_stranded_on(&sched, 1);
+        let (state, _, _) = state_stranded_on(&sched, 1);
 
-        let abandonable = state.abandonable(TickId::new(HOME, BlockHeight::new(9)));
-        assert_eq!(
-            abandonable
-                .iter()
-                .map(|(hash, _)| *hash)
-                .collect::<Vec<_>>(),
-            vec![tx_hash],
-            "the departed counterpart is what puts the transaction beyond every shard",
+        assert!(
+            state
+                .abandonable(TickId::new(HOME, BlockHeight::new(9)))
+                .is_empty(),
+            "the peer may have settled before it went, and nothing committed says otherwise",
         );
     }
 
@@ -6531,6 +6555,7 @@ mod tests {
         let local = HOME;
         let sched = peer_terminating_schedule(60_000);
         let (mut state, tick_id, tx_hash) = state_stranded_on(&sched, 1);
+        record_peer_left_unsettled(&mut state, tx_hash);
 
         // A second member of the same tick, reaching only into keyspace
         // nobody has left — so its own counterpart is still live.
