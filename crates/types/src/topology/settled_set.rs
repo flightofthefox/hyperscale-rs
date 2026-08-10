@@ -64,6 +64,10 @@ pub enum SettledSetVerdict {
 /// anywhere, so it needs the partner *not* to have settled — a partner
 /// that did settle is the one case where aborting would tear a
 /// cross-shard transaction in half.
+///
+/// Both read the same set and both need it readable. Opposite questions
+/// about the partner's set are still questions about the partner's set,
+/// so a set nobody can read leaves either claim unproven and rejects it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxClaim {
     /// This shard settles the transaction, on coverage the finalization
@@ -113,23 +117,20 @@ where
         if shard == local_shard {
             continue;
         }
-        // A partner whose settled set can never be read splits the two
-        // claims, and both branches below take this fork. A settlement
-        // needs the set and is categorically unreachable without it. An
-        // abandonment does not: coverage is what a settlement needs from
-        // the partner, so a partner can only have settled a transaction
-        // this shard certified, and an abandonment is composed only for
-        // transactions no tick of ours holds. Rejecting one would strand
-        // the work against a partner that could never have settled it.
         let settlement = matches!(claim, TxClaim::Settled);
 
         // Evicted from every retained window — terminated so long ago its
-        // settled set can never be acquired.
+        // settled set can never be acquired. Both claims need the set. A
+        // settlement is categorically unreachable without the partner's
+        // coverage. And an abandonment turns on the partner *not* having
+        // settled, which a set nobody can read cannot establish: a
+        // certificate of this shard's covering the transaction is enough
+        // for the partner to have settled against, and whether one exists
+        // is not something a replica can answer about itself — a restart
+        // loses the tick that produced it while the certificate itself
+        // outlives the restart.
         let Some((_, past_terminal)) = topology_schedule.at_for_shard(shard, anchored_wt) else {
-            if settlement {
-                return SettledSetVerdict::Reject;
-            }
-            continue;
+            return SettledSetVerdict::Reject;
         };
         if !past_terminal {
             // `shard` is live now, but if it is scheduled to terminate it may
@@ -147,11 +148,9 @@ where
         }
         match settled_sets.get(&shard) {
             // Past the horizon the set stops being readable at all, which
-            // splits the same way eviction does.
+            // rejects for the same reason eviction does.
             Some(settled) if anchored_wt > settled.terminal_wt.plus(RETENTION_HORIZON) => {
-                if settlement {
-                    return SettledSetVerdict::Reject;
-                }
+                return SettledSetVerdict::Reject;
             }
             // The partner's verdict, read the way the claim needs it: a
             // settlement needs the partner to have settled, an

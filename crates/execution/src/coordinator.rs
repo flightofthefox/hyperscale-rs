@@ -768,7 +768,14 @@ impl ExecutionCoordinator {
         // counterparts still waiting on a verdict for it — the abort is
         // dominant, so their coverage closes on it — and what the fence
         // asks its question about.
-        for (tx_hash, declared_work) in self.abandonable() {
+        for (tx_hash, declared_work) in self.abandonable(topology_schedule, tick_id) {
+            // A tick that held the member can never speak for it — its
+            // coverage will not close — and its other legs would wait on
+            // that coverage forever. It goes with the member; the rest of
+            // its members reach their own deadlines instead.
+            if let Some(held_by) = self.ticks.tick_assignment(tx_hash) {
+                self.discard_tick(held_by);
+            }
             let mut participating: BTreeSet<ShardId> =
                 self.unresolved.participants(tx_hash).collect();
             participating.insert(local_shard);
@@ -2304,14 +2311,8 @@ impl ExecutionCoordinator {
     /// the deadline at a frontier where another has not — which is what
     /// lets a committee sign a verdict about it.
     ///
-    /// Past it, only the transactions no tick has taken. The tick that
-    /// holds a transaction is the one that answers for it, and its
-    /// verdict can carry a charge an abandonment cannot — a payer's leg,
-    /// admitted at its engagement deadline, is exactly that. A second
-    /// tick speaking for the same transaction would be contradicting the
-    /// first. The assignment is what says which tick holds it, and it
-    /// lasts as long as the ledger entry does: both release when the
-    /// finalization resolving the transaction commits.
+    /// Past it, only the transactions no shard can still settle, which is
+    /// what makes abandoning one this shard's decision alone to take.
     ///
     /// Two narrowings that used to sit here are answered elsewhere. An
     /// assembled settlement needs none: its tick is lower, so the store
@@ -2320,12 +2321,71 @@ impl ExecutionCoordinator {
     /// transaction a terminating counterpart may have settled is the
     /// fence's question, which [`Self::fence_pairs`] is what lets the
     /// fence ask about an abandonment at all.
-    fn abandonable(&self) -> Vec<(TxHash, u64)> {
+    fn abandonable(
+        &self,
+        topology_schedule: &TopologySchedule,
+        composing: TickId,
+    ) -> Vec<(TxHash, u64)> {
         self.unresolved
             .past_deadline(self.committed_ts)
             .into_iter()
-            .filter(|(tx_hash, _)| self.ticks.tick_assignment(*tx_hash).is_none())
+            .filter(|(tx_hash, _)| self.beyond_every_shard(topology_schedule, composing, *tx_hash))
             .collect()
+    }
+
+    /// Drop a tick that can no longer speak for a member being abandoned,
+    /// releasing the transactions it holds to their own deadlines.
+    fn discard_tick(&mut self, tick_id: TickId) {
+        let counts = self.ticks.discard_tick(&tick_id);
+        self.ticked.remove(&tick_id);
+        tracing::info!(
+            tick = %tick_id,
+            released = counts.assignments,
+            "Discarded a tick holding an abandoned member"
+        );
+    }
+
+    /// Whether no shard can still settle `tx_hash`.
+    ///
+    /// A settlement needs a certificate from every shard party to the
+    /// transaction, so it takes two things to put one out of reach: no
+    /// certificate of ours for a counterpart to combine with its own, or a
+    /// participant that has left and will produce no more. The tick
+    /// composing now is the exception to both — it is about to speak for
+    /// the transaction itself, and its verdict can carry a charge an
+    /// abandonment cannot, a payer's leg admitted at its engagement
+    /// deadline being exactly that.
+    ///
+    /// A participant that left having *already* settled the transaction is
+    /// the one case this admits and must not: it is why the fence puts the
+    /// same question to that shard's settled set before the abandonment is
+    /// offered, and why an unreadable set refuses it.
+    ///
+    /// Every term reads off committed content — the ledger is a fold over
+    /// committed blocks, the schedule is attested, and `committed_ts` is
+    /// the committed frontier — so replicas at one frontier compose the
+    /// same tick. Nothing here consults a tick's certificate or its
+    /// coverage, both of which arrive by local fetch.
+    fn beyond_every_shard(
+        &self,
+        topology_schedule: &TopologySchedule,
+        composing: TickId,
+        tx_hash: TxHash,
+    ) -> bool {
+        match self.ticks.tick_assignment(tx_hash) {
+            None => true,
+            Some(tick_id) if tick_id == composing => false,
+            Some(_) => self
+                .unresolved
+                .participants(tx_hash)
+                .filter(|shard| *shard != self.local_shard)
+                .any(|shard| {
+                    matches!(
+                        topology_schedule.at_for_shard(shard, self.committed_ts),
+                        Some((_, true))
+                    )
+                }),
+        }
     }
 
     /// Record a tick's fate for the tick chain.
@@ -5279,6 +5339,15 @@ mod tests {
     /// whose next window (epoch 1) splits it into two children — so any
     /// weighted timestamp in epoch 1 is past `ROOT`'s terminal window.
     fn terminating_schedule() -> TopologySchedule {
+        terminating_schedule_over(1000)
+    }
+
+    /// A schedule in which `ShardId::ROOT` splits at the end of epoch 0, so
+    /// it is past-terminal anywhere in epoch 1 and its two children are
+    /// live there. `epoch_duration_ms` places the cut on the weighted-time
+    /// grid: a caller reaching past a transaction deadline needs windows
+    /// wide enough to still resolve there.
+    fn terminating_schedule_over(epoch_duration_ms: u64) -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
@@ -5304,7 +5373,7 @@ mod tests {
             2,
             ValidatorSet::new(validators),
         ));
-        let mut sched = TopologySchedule::new(1000, Epoch::new(0), final_window);
+        let mut sched = TopologySchedule::new(epoch_duration_ms, Epoch::new(0), final_window);
         sched.insert(Epoch::new(1), post_split);
         sched
     }
@@ -6075,32 +6144,39 @@ mod tests {
         state.committed_ts = WeightedTimestamp::from_millis(deadline_ms);
 
         assert!(
-            state.abandonable().is_empty(),
+            state
+                .abandonable(&schedule, TickId::new(ShardId::ROOT, BlockHeight::new(1)))
+                .is_empty(),
             "a tick still to vote is an outcome on its way",
         );
         let _ = tx_hash;
     }
 
-    /// A tick whose own certificate exists and which waits on a
-    /// counterpart's keeps its member anyway. The tick that holds a
-    /// transaction is the one that answers for it, and its certificate
-    /// already carries a verdict a later abort would contradict — so the
-    /// deadline passes and nothing takes the member from it.
-    #[test]
-    fn a_stranded_tick_keeps_the_member_it_holds() {
-        let mut state = make_test_state();
-        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+    /// The weighted timestamp at which a transaction admitted under
+    /// [`state_stranded_on`] can no longer finalize anywhere.
+    const STRANDED_DEADLINE_MS: u64 = 60_000 + MAX_FINALIZATION_DELAY.as_secs() * 1000;
+
+    /// A state past `tx`'s deadline whose tick at height 1 holds it with
+    /// this shard's own certificate in hand and no counterpart coverage —
+    /// the shape a counterpart's silence produces — with the ledger naming
+    /// `local` and `partner` party to it.
+    fn state_stranded_on(
+        local: ShardId,
+        partner: ShardId,
+        seed: u8,
+    ) -> (ExecutionCoordinator, TickId, TxHash) {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
+        let tick_id = TickId::new(local, BlockHeight::new(1));
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(1)),
+            Verified::new_unchecked_for_test(test_transaction(seed)),
         ));
         let tx_hash = transaction.hash();
-        let participating: BTreeSet<ShardId> =
-            [ShardId::ROOT, ShardId::leaf(1, 1)].into_iter().collect();
+        let participating: BTreeSet<ShardId> = [local, partner].into_iter().collect();
         let mut tick = tick_holding(
             tick_id,
             WeightedTimestamp::from_millis(1_000),
             vec![(
-                Arc::new(Verified::new_unchecked_for_test(test_transaction(1))),
+                Arc::new(Verified::new_unchecked_for_test(test_transaction(seed))),
                 participating.clone(),
             )],
         );
@@ -6116,19 +6192,123 @@ mod tests {
         )));
         state.ticks.insert_tick(tick_id, tick);
         state.ticks.assign_tx(tx_hash, tick_id);
-
         state
             .unresolved
             .register_committed(std::iter::once((&transaction, participating)));
-        state.committed_ts = WeightedTimestamp::from_millis(60_000).plus(MAX_FINALIZATION_DELAY);
+        state.committed_ts = WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS);
+        (state, tick_id, tx_hash)
+    }
+
+    /// While the counterpart is live the member stays with the tick that
+    /// holds it. The counterpart's certificate is still to come, so the
+    /// tick can yet speak for the member and a second verdict would
+    /// contradict the one it is about to carry.
+    #[test]
+    fn a_stranded_tick_keeps_its_member_while_its_counterpart_lives() {
+        let sched = terminating_schedule_over(60_000);
+        let (state, tick_id, _) = state_stranded_on(ShardId::leaf(1, 0), ShardId::leaf(1, 1), 1);
 
         assert!(
-            state.abandonable().is_empty(),
-            "the tick holding it is the one that speaks for it",
+            state
+                .abandonable(
+                    &sched,
+                    TickId::new(ShardId::leaf(1, 0), BlockHeight::new(9))
+                )
+                .is_empty(),
+            "a live counterpart can still deliver the verdict this tick waits on",
         );
         assert!(
             state.ticks.contains_tick(&tick_id),
-            "so the tick survives its own deadline, waiting on the verdict it needs",
+            "so the tick survives its own deadline",
+        );
+    }
+
+    /// Once the counterpart is past-terminal the member is released. A
+    /// settlement needs every participant's certificate and the departed
+    /// shard will produce no more, so nothing can settle the transaction
+    /// and abandoning it is this shard's decision alone.
+    #[test]
+    fn a_terminated_counterpart_releases_the_member_its_tick_strands() {
+        let sched = terminating_schedule_over(60_000);
+        let (state, _, tx_hash) = state_stranded_on(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+
+        let abandonable = state.abandonable(
+            &sched,
+            TickId::new(ShardId::leaf(1, 0), BlockHeight::new(9)),
+        );
+        assert_eq!(
+            abandonable
+                .iter()
+                .map(|(hash, _)| *hash)
+                .collect::<Vec<_>>(),
+            vec![tx_hash],
+            "the departed counterpart is what puts the transaction beyond every shard",
+        );
+    }
+
+    /// The tick composing now keeps the member it just took, whatever the
+    /// counterpart's fate. It is about to attest the transaction itself,
+    /// and that verdict can carry a charge an abandonment cannot — a
+    /// payer's leg joins a tick at its engagement deadline, which *is* its
+    /// abandonment deadline. `abort_floor_settles_on_deadline` is the
+    /// scenario.
+    #[test]
+    fn the_tick_composing_now_keeps_the_member_it_just_took() {
+        let sched = terminating_schedule_over(60_000);
+        let (state, tick_id, _) = state_stranded_on(ShardId::leaf(1, 0), ShardId::ROOT, 1);
+
+        assert!(
+            state.abandonable(&sched, tick_id).is_empty(),
+            "the tick composing now is the one that speaks for its own member",
+        );
+    }
+
+    /// A tick that stranded a member is discarded when that member is
+    /// abandoned, and the transactions it held alongside are released to
+    /// their own deadlines rather than waiting on coverage that will never
+    /// close.
+    #[test]
+    fn the_tick_that_stranded_a_member_is_discarded_with_it() {
+        let local = ShardId::leaf(1, 0);
+        let sched = terminating_schedule_over(60_000);
+        let (mut state, tick_id, tx_hash) = state_stranded_on(local, ShardId::ROOT, 1);
+
+        // A second member of the same tick, its own counterpart still live.
+        let sibling: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(2)),
+        ));
+        let sibling_hash = sibling.hash();
+        state.ticks.assign_tx(sibling_hash, tick_id);
+        state.unresolved.register_committed(std::iter::once((
+            &sibling,
+            BTreeSet::from([local, ShardId::leaf(1, 1)]),
+        )));
+
+        // The commit that composes the abandonment, on the shard that
+        // stranded the member rather than through the ROOT-only helper.
+        let block = make_live_block_on_shard(
+            local,
+            BlockHeight::new(9),
+            STRANDED_DEADLINE_MS,
+            ValidatorId::new(0),
+            vec![],
+        );
+        state.on_block_committed(&sched, &test_certify(block, STRANDED_DEADLINE_MS));
+
+        let composed = TickId::new(local, BlockHeight::new(9));
+        assert_eq!(
+            state.ticks.tick_assignment(tx_hash),
+            Some(composed),
+            "the abandonment is composed into this commit's tick",
+        );
+        assert!(
+            !state.ticks.contains_tick(&tick_id),
+            "the tick that can never speak for the abandoned member goes with it",
+        );
+        assert_eq!(
+            state.ticks.tick_assignment(sibling_hash),
+            None,
+            "and its other members are released to their own deadlines",
         );
     }
 
@@ -6296,6 +6476,73 @@ mod tests {
         );
     }
 
+    /// An abort naming a partner whose settled set can never be read is
+    /// refused. The set is what says whether the partner settled, and
+    /// opposite questions of it are still questions of it — so a set
+    /// nobody can acquire leaves the abort unproven, exactly as it leaves
+    /// a settlement unreachable.
+    ///
+    /// Refusing costs nothing a readable set would have given: a
+    /// transaction's deadline falls at or before its partner's terminal
+    /// plus the retention horizon, so an abort composed at the deadline
+    /// reads a set that is still there. Only a late one arrives here.
+    #[test]
+    fn a_partner_past_its_horizon_refuses_the_abort() {
+        let local = ShardId::leaf(1, 0);
+        let partner = ShardId::ROOT;
+        let sched = terminating_schedule();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(7)),
+        ));
+        let tx_hash = transaction.hash();
+        let mut state = state_abandoning(local, partner, &transaction);
+
+        // Terminated far enough back that the set has stopped answering.
+        state.record_settled_txs(
+            partner,
+            SettledTxSet {
+                txs: BTreeSet::new(),
+                terminal_wt: WeightedTimestamp::ZERO,
+            },
+        );
+        state.committed_ts = WeightedTimestamp::from_millis(1).plus(RETENTION_HORIZON);
+
+        let abort: Arc<Verifiable<Finalization>> =
+            Arc::new(Verified::<Finalization>::seal(abandonment_of(local, tx_hash)).into());
+        assert!(
+            state.emit_or_gate_finalized(&sched, abort).is_empty(),
+            "past the horizon the set cannot establish that the partner did not settle",
+        );
+        assert!(
+            state.gated_finalized.is_empty(),
+            "and it is refused rather than held: no later set will answer",
+        );
+    }
+
+    /// An abort naming a partner evicted from every retained window is
+    /// refused for the same reason: there is no set to read, and the
+    /// certificate this shard already produced is enough for the partner
+    /// to have settled against.
+    #[test]
+    fn a_partner_evicted_from_every_window_refuses_the_abort() {
+        let local = ShardId::ROOT;
+        let partner = ShardId::leaf(1, 1);
+        let sched = make_test_topology();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(7)),
+        ));
+        let tx_hash = transaction.hash();
+        let mut state = state_abandoning(local, partner, &transaction);
+
+        let abort: Arc<Verifiable<Finalization>> =
+            Arc::new(Verified::<Finalization>::seal(abandonment_of(local, tx_hash)).into());
+        assert!(
+            state.emit_or_gate_finalized(&sched, abort).is_empty(),
+            "a shard no retained window carries answers neither question",
+        );
+        assert!(state.gated_finalized.is_empty(), "and is refused, not held");
+    }
+
     /// A tick already attesting the abandonment withholds the next one:
     /// the ledger releases when that certificate commits, so re-composing
     /// it every commit in between would discard the tick carrying it.
@@ -6325,7 +6572,9 @@ mod tests {
         let outcomes = abandonment_vote(&mut state, &schedule, 2, deadline_ms);
         assert_eq!(outcomes.len(), 1, "the tick at the deadline abandons it");
         assert!(
-            state.abandonable().is_empty(),
+            state
+                .abandonable(&schedule, TickId::new(ShardId::ROOT, BlockHeight::new(3)))
+                .is_empty(),
             "and the next commit leaves that tick alone",
         );
         assert!(

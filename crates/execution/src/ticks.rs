@@ -316,6 +316,27 @@ impl TickRegistry {
         counts
     }
 
+    /// Drop one tick and everything keyed against it, including the
+    /// assignments of every member it holds.
+    ///
+    /// The members are released rather than resolved: each is owed an
+    /// outcome still, and with no tick holding it the deadline path is
+    /// what reaches one.
+    pub fn discard_tick(&mut self, tick_id: &TickId) -> PruneCounts {
+        let ticks = usize::from(self.states.remove(tick_id).is_some());
+        let trackers = usize::from(self.trackers.remove(tick_id).is_some());
+        self.ec_dispatched.remove(tick_id);
+        self.retries.remove(tick_id);
+
+        let before_assignments = self.assignments.len();
+        self.assignments.retain(|_, held_by| held_by != tick_id);
+        PruneCounts {
+            ticks,
+            trackers,
+            assignments: before_assignments - self.assignments.len(),
+        }
+    }
+
     /// Drop resolved ticks and everything keyed against them.
     ///
     /// Ticks whose `tick_id` no longer appears in `assignments.values()`
@@ -614,6 +635,34 @@ mod tests {
         assert_eq!(counts.ticks, 1);
         assert!(r.contains_tick(&wid1));
         assert!(!r.contains_tick(&wid2));
+    }
+
+    /// Discarding a tick releases every member it held, leaving each owed
+    /// an outcome with nothing holding it — and touches no other tick.
+    #[test]
+    fn discard_tick_releases_every_member_it_held() {
+        let mut r = TickRegistry::new();
+        let discarded = tick(1);
+        let survivor = tick(2);
+        let held = TxHash::from(Hash::from_bytes(b"held"));
+        let sibling = TxHash::from(Hash::from_bytes(b"sibling"));
+        let elsewhere = TxHash::from(Hash::from_bytes(b"elsewhere"));
+        r.insert_tick(discarded, make_tick_state(discarded, BlockHash::ZERO, 1));
+        r.insert_tick(survivor, make_tick_state(survivor, BlockHash::ZERO, 2));
+        r.mark_ec_dispatched(discarded);
+        r.assign_tx(held, discarded);
+        r.assign_tx(sibling, discarded);
+        r.assign_tx(elsewhere, survivor);
+
+        let counts = r.discard_tick(&discarded);
+        assert_eq!(counts.ticks, 1);
+        assert_eq!(counts.assignments, 2);
+        assert!(!r.contains_tick(&discarded));
+        assert!(!r.is_ec_dispatched(&discarded));
+        assert!(r.tick_assignment(held).is_none());
+        assert!(r.tick_assignment(sibling).is_none());
+        assert_eq!(r.tick_assignment(elsewhere), Some(survivor));
+        assert!(r.contains_tick(&survivor));
     }
 
     #[test]

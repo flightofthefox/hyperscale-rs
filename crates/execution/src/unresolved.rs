@@ -89,8 +89,10 @@ impl UnresolvedTxs {
     }
 
     /// The shards party to `tx_hash`, for the fence to ask its question
-    /// about. Empty for a transaction this ledger does not hold, and for
-    /// one recovered by replay.
+    /// about and for the abandonment path to ask whether any of them has
+    /// left. Empty only for a transaction this ledger does not hold: a
+    /// rebuilt entry carries its participants, since the replay re-drives
+    /// the ordinary commit path.
     pub fn participants(&self, tx_hash: TxHash) -> impl Iterator<Item = ShardId> + '_ {
         self.owed
             .get(&tx_hash)
