@@ -270,16 +270,33 @@ impl UnresolvedTxs {
     /// within that window. A clock of this transaction's own has nothing
     /// to say about when its counterpart leaves, which is why one cannot
     /// be what ends the entry.
-    pub fn prune(&mut self, now: WeightedTimestamp) {
+    ///
+    /// Returns the transactions dropped because every counterpart has
+    /// fallen silent — the ones whose fate is settled by nobody rather
+    /// than decided by anybody. Their reservations are owed to a
+    /// settlement that provably cannot arrive, and whatever this shard
+    /// still holds against them is holding it for nothing.
+    pub fn prune(&mut self, now: WeightedTimestamp) -> Vec<TxHash> {
+        let mut unanswerable = Vec::new();
         let kept: BTreeMap<TxHash, Owed> = std::mem::take(&mut self.owed)
             .into_iter()
-            .filter(|(_, owed)| {
+            .filter(|(tx_hash, owed)| {
                 let answerable = owed.remote_prefixes.iter().any(|prefix| {
                     self.departure_over(owed, *prefix)
                         .is_none_or(|cut| now <= cut.plus(RETENTION_HORIZON))
                 });
-                if owed.certified && answerable {
-                    return true;
+                // Having counterparts at all is what makes silence mean
+                // something: a transaction that never left this shard has
+                // nobody to fall silent, and its own deadline decides it
+                // as it decides any other.
+                if owed.certified && !owed.remote_prefixes.is_empty() {
+                    if answerable {
+                        return true;
+                    }
+                    // Our certificate is out there and no shard is left to
+                    // combine it with.
+                    unanswerable.push(*tx_hash);
+                    return false;
                 }
                 owed.deadline.plus(MAX_VALIDITY_RANGE) > now
             })
@@ -301,6 +318,8 @@ impl UnresolvedTxs {
                         .any(|prefix| ShardTrie::shard_owns_prefix(*shard, *prefix))
             })
         });
+
+        unanswerable
     }
 
     #[must_use]
@@ -522,6 +541,50 @@ mod tests {
 
         ledger.prune(cut.plus(RETENTION_HORIZON).plus(Duration::from_millis(1)));
         assert_eq!(ledger.len(), 0, "and never again past it");
+    }
+
+    /// The entry names itself on the way out, so its holder can let go of
+    /// what it was keeping for a settlement that cannot arrive.
+    #[test]
+    fn a_strand_whose_counterparts_all_fell_silent_names_itself() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(16, 60_000);
+        commit(&mut ledger, &tx);
+        ledger.certify(tx.hash());
+
+        let cut = ms(500_000);
+        ledger.record_terminal(PARTNER, cut);
+        assert!(
+            ledger.prune(cut.plus(RETENTION_HORIZON)).is_empty(),
+            "while the set still reads, the strand is nobody's to release",
+        );
+        assert_eq!(
+            ledger.prune(cut.plus(RETENTION_HORIZON).plus(Duration::from_millis(1))),
+            vec![tx.hash()],
+            "past it, nothing can settle it and the strand is named",
+        );
+    }
+
+    /// A transaction that never left this shard has no counterpart to
+    /// fall silent, so it is never named as a strand however long this
+    /// shard has spoken for it — its own deadline ends it, as ever.
+    #[test]
+    fn a_local_transaction_is_never_a_silenced_strand() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx_over(HERE, HERE.wrapping_add(1), 60_000);
+        commit(&mut ledger, &tx);
+        ledger.certify(tx.hash());
+
+        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
+        assert!(
+            ledger.prune(deadline).is_empty(),
+            "not yet past its own window",
+        );
+        assert!(
+            ledger.prune(deadline.plus(MAX_VALIDITY_RANGE)).is_empty(),
+            "and gone at that window's end without ever being a strand",
+        );
+        assert_eq!(ledger.len(), 0);
     }
 
     /// One counterpart falling silent is not enough while another can

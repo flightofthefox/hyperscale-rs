@@ -2049,7 +2049,8 @@ impl ExecutionCoordinator {
         // could still carry one is nobody's to resolve.
         self.unresolved.release_resolved(block.certificates());
         self.stamp_departures(topology_schedule);
-        self.unresolved.prune(self.committed_ts);
+        let unanswerable = self.unresolved.prune(self.committed_ts);
+        self.release_unanswerable(&unanswerable);
 
         let mut actions = Vec::new();
 
@@ -2375,6 +2376,35 @@ impl ExecutionCoordinator {
     /// certificate but ours to combine with, or one that is has left.
     fn no_counterpart_can_settle(&self, tx_hash: TxHash) -> bool {
         !self.unresolved.reaches_beyond(tx_hash) || self.unresolved.a_counterpart_has_left(tx_hash)
+    }
+
+    /// Let go of what this shard holds against transactions no shard can
+    /// settle any more.
+    ///
+    /// Every counterpart has left and every settled set that could have
+    /// spoken for them has stopped reading, so the tick holding one will
+    /// never close its coverage — no certificate is coming to close it
+    /// with. Its provisional claims are held against writes that will
+    /// never apply, and a later transaction reaching those cells is
+    /// waiting on nothing.
+    ///
+    /// Discarding here is not the discard a verdict makes. A verdict is
+    /// composed while counterparts are live and spends a tick that might
+    /// still have settled; this runs only once none of them can answer,
+    /// which is the same condition that makes the transaction's own fate
+    /// unreachable. Nothing that could still settle is destroyed, because
+    /// by then nothing can.
+    fn release_unanswerable(&mut self, tx_hashes: &[TxHash]) {
+        for tx_hash in tx_hashes {
+            if let Some(tick_id) = self.ticks.tick_assignment(*tx_hash) {
+                tracing::info!(
+                    tx = %tx_hash,
+                    tick = %tick_id,
+                    "Releasing a strand whose counterparts have all fallen silent"
+                );
+                self.discard_tick(tick_id);
+            }
+        }
     }
 
     /// Record where each departed shard's chain ended, for the entries
