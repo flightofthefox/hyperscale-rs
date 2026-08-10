@@ -18,9 +18,9 @@ use hyperscale_types::{
     RoutingCommittees, SafeVoteRegisters, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad,
     ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
     SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
-    StateRoot, SubstateEntry, SubstateKey, TerminalRoots, TickId, Timeout, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable,
-    Verified, VoteCount, WeightedTimestamp, WorkInFlight,
+    StateRoot, SubstateEntry, SubstateKey, TerminalRoots, TerminalVerdict, TickId, Timeout,
+    TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
+    ValidatorId, Verifiable, Verified, VoteCount, WeightedTimestamp, WorkInFlight,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -893,6 +893,10 @@ pub enum Action {
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         /// Provisions from remote shards, included in this block.
         provisions: Vec<Arc<Verifiable<Provisions>>>,
+        /// What departed shards left unresolved of this chain's business
+        /// — written down here while the settled sets they were read
+        /// from can still be checked against.
+        terminal_verdicts: Vec<TerminalVerdict>,
         /// Prior fee-reservation demand per local payer among the
         /// candidate transactions — in-flight holds plus the uncommitted
         /// window, excluding the candidates themselves. The builder

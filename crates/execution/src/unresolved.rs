@@ -156,6 +156,30 @@ impl UnresolvedTxs {
         }
     }
 
+    /// The transactions this ledger still owes an outcome for that
+    /// `shard` was party to, for a shard that left at `cut`.
+    ///
+    /// Only certified ones: a transaction no certificate of ours covers
+    /// is decided by its own deadline and needs no record to speak for
+    /// it. Only ones committed before the cut, since a shard that had
+    /// already gone was never party to what came after. And only ones no
+    /// record covers yet, so a departure is answered once.
+    #[must_use]
+    pub fn outstanding_with(&self, shard: ShardId, cut: WeightedTimestamp) -> Vec<TxHash> {
+        self.owed
+            .iter()
+            .filter(|(_, owed)| {
+                owed.certified && !owed.unsettled_by_departed && cut > owed.committed_ts
+            })
+            .filter(|(_, owed)| {
+                owed.remote_prefixes
+                    .iter()
+                    .any(|prefix| ShardTrie::shard_owns_prefix(shard, *prefix))
+            })
+            .map(|(tx_hash, _)| *tx_hash)
+            .collect()
+    }
+
     /// Whether a committed record has established that `tx_hash` can
     /// never settle — the question the split-boundary fence otherwise
     /// puts to a settled set that expires.

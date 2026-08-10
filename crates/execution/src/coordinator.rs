@@ -43,10 +43,11 @@ use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, DeclaredKey, ExecutionCertificate, ExecutionCertificateVerifyError,
     ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
-    Hash, MAX_FINALIZATION_DELAY, Mode, Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup,
-    SettledSetVerdict, SettledTxSet, ShardId, ShardTrie, TickId, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionDecision, TxClaim, TxHash, TxOutcome, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, settled_set_verdict, tick_leader, tick_leader_at,
+    Hash, MAX_FINALIZATION_DELAY, MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_UNSETTLED_PER_VERDICT, Mode,
+    Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledTxSet,
+    ShardId, ShardTrie, TerminalVerdict, TickId, TopologySchedule, TopologySnapshot, Transaction,
+    TransactionDecision, TxClaim, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, settled_set_verdict, tick_leader, tick_leader_at,
 };
 use tracing::instrument;
 
@@ -2380,6 +2381,41 @@ impl ExecutionCoordinator {
     /// certificate but ours to combine with, or one that is has left.
     fn no_counterpart_can_settle(&self, tx_hash: TxHash) -> bool {
         !self.unresolved.reaches_beyond(tx_hash) || self.unresolved.a_counterpart_has_left(tx_hash)
+    }
+
+    /// The records this shard has evidence for and has not yet written
+    /// down — what each departed counterpart left of its business here.
+    ///
+    /// Composed from the settled sets, which is what bounds when this can
+    /// speak at all: a set is acquired at a shard's terminal and dropped
+    /// a `RETENTION_HORIZON` later, so a record is only ever offered
+    /// while the evidence for it is readable, which is the same window
+    /// every voter can check it in. Absence from a set is proof rather
+    /// than ignorance — the set is complete and beacon-attested — so a
+    /// transaction of ours it does not name is one that shard never
+    /// settled and now never will.
+    ///
+    /// Bounded per record, with the remainder left for the next block:
+    /// each record stands alone, so a departure with more outstanding
+    /// than one block will carry is answered over several.
+    #[must_use]
+    pub fn pending_terminal_verdicts(&self) -> Vec<TerminalVerdict> {
+        let mut records: Vec<TerminalVerdict> = self
+            .settled_sets
+            .iter()
+            .filter_map(|(shard, settled)| {
+                let mut unsettled = self
+                    .unresolved
+                    .outstanding_with(*shard, settled.terminal_wt);
+                unsettled.retain(|tx_hash| !settled.txs.contains(tx_hash));
+                unsettled.truncate(MAX_UNSETTLED_PER_VERDICT);
+                (!unsettled.is_empty())
+                    .then(|| TerminalVerdict::new(*shard, settled.terminal_wt, unsettled))
+            })
+            .collect();
+        records.sort_by_key(TerminalVerdict::shard);
+        records.truncate(MAX_TERMINAL_VERDICTS_PER_BLOCK);
+        records
     }
 
     /// Let go of what this shard holds against transactions no shard can

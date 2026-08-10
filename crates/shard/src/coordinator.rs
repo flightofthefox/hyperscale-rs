@@ -20,8 +20,8 @@ use hyperscale_types::{
     MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp,
     ProvisionHash, RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger,
     ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt,
-    SubstateKey, TxClaim, TxOutcome, WeightedTimestamp, WorkInFlight, derive_reshape_trigger,
-    ready_signal_window, settled_set_verdict,
+    SubstateKey, TerminalVerdict, TxClaim, TxOutcome, WeightedTimestamp, WorkInFlight,
+    derive_reshape_trigger, ready_signal_window, settled_set_verdict,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -1819,6 +1819,7 @@ impl ShardCoordinator {
         ready_txs: &[Arc<Verified<Transaction>>],
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
+        terminal_verdicts: Vec<TerminalVerdict>,
     ) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
@@ -1871,6 +1872,7 @@ impl ShardCoordinator {
                     transactions: Vec::new(),
                     finalizations: Vec::new(),
                     provisions: Vec::new(),
+                    terminal_verdicts: Vec::new(),
                 },
             );
         }
@@ -1895,6 +1897,7 @@ impl ShardCoordinator {
                     transactions: Vec::new(),
                     finalizations: Vec::new(),
                     provisions: Vec::new(),
+                    terminal_verdicts: Vec::new(),
                 },
             );
         }
@@ -1954,6 +1957,7 @@ impl ShardCoordinator {
                 transactions,
                 finalizations,
                 provisions,
+                terminal_verdicts,
             },
         )
     }
@@ -4581,6 +4585,7 @@ impl ShardCoordinator {
         ready_txs: &[Arc<Verified<Transaction>>],
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
+        terminal_verdicts: Vec<TerminalVerdict>,
     ) -> Vec<Action> {
         let height = qc.height();
 
@@ -4654,7 +4659,13 @@ impl ShardCoordinator {
         // block N+1 is what certifies block N, so any gap in proposing N+1
         // stalls the finalization of N and everything pending behind it.
         // `try_propose` handles the proposer-rotation / backpressure checks.
-        actions.extend(self.try_propose(topology_schedule, ready_txs, finalizations, provisions));
+        actions.extend(self.try_propose(
+            topology_schedule,
+            ready_txs,
+            finalizations,
+            provisions,
+            terminal_verdicts,
+        ));
 
         actions
     }
@@ -9135,8 +9146,15 @@ mod tests {
             ))
         };
 
-        let actions =
-            state.on_qc_formed(&topology_schedule, block_3_hash, &qc, &[], vec![], vec![]);
+        let actions = state.on_qc_formed(
+            &topology_schedule,
+            block_3_hash,
+            &qc,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+        );
 
         // Should emit BuildProposal for height 4 even with empty content.
         let has_build_proposal = actions.iter().any(
@@ -9191,6 +9209,7 @@ mod tests {
             &[],
             vec![],
             vec![],
+            vec![],
         );
         assert!(
             actions.is_empty(),
@@ -9205,6 +9224,7 @@ mod tests {
             block_3_hash,
             &honest,
             &[],
+            vec![],
             vec![],
             vec![],
         );
@@ -9272,7 +9292,7 @@ mod tests {
         // Intentionally do NOT call on_block_persisted — parent tree
         // unavailable forces the defer branch.
 
-        let first = state.try_propose(&topology_schedule, &[], vec![], vec![]);
+        let first = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
         assert!(
             first
                 .iter()
@@ -9284,7 +9304,7 @@ mod tests {
             "defer slot should be recorded"
         );
 
-        let second = state.try_propose(&topology_schedule, &[], vec![], vec![]);
+        let second = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
         assert!(
             second.is_empty(),
             "second try_propose for same (height, round) must be suppressed"
@@ -9302,7 +9322,7 @@ mod tests {
             "deferred slot should be cleared"
         );
 
-        let third = state.try_propose(&topology_schedule, &[], vec![], vec![]);
+        let third = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
         assert!(
             third.iter().any(
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
@@ -9346,7 +9366,7 @@ mod tests {
         // the sync-commit shape, whose commits carry no byte delta.
         assert_ne!(state.substate_bytes_frontier.0, state.committed_height);
 
-        let first = state.try_propose(&snapshot, &[], vec![], vec![]);
+        let first = state.try_propose(&snapshot, &[], vec![], vec![], vec![]);
         assert!(
             first
                 .iter()
@@ -9365,7 +9385,7 @@ mod tests {
             "the reconcile must latch a proposal retry"
         );
 
-        let second = state.try_propose(&snapshot, &[], vec![], vec![]);
+        let second = state.try_propose(&snapshot, &[], vec![], vec![], vec![]);
         assert!(
             second.iter().any(
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
@@ -9647,7 +9667,7 @@ mod tests {
 
         // Ready txs must be dropped — sync blocks are always empty.
         let ready_txs = vec![Arc::new(test_utils::verified_test_transaction(1))];
-        let actions = state.try_propose(&topology_schedule, &ready_txs, vec![], vec![]);
+        let actions = state.try_propose(&topology_schedule, &ready_txs, vec![], vec![], vec![]);
 
         let proposal = actions
             .iter()
@@ -9702,7 +9722,7 @@ mod tests {
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
-        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![]);
+        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
         let Some(Action::BuildProposal { timestamp, .. }) = actions
             .iter()
             .find(|a| matches!(a, Action::BuildProposal { .. }))
@@ -9735,7 +9755,7 @@ mod tests {
 
         let height = BlockHeight::new(4);
         let round = Round::new(4);
-        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![]);
+        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
         assert!(
             actions
                 .iter()
@@ -9758,7 +9778,7 @@ mod tests {
         assert_eq!(state.last_voted_round(), round);
 
         // The retry at the same view must be a no-op, not a sibling build.
-        let retry = state.try_propose(&topology_schedule, &[], vec![], vec![]);
+        let retry = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
         assert!(retry.is_empty(), "retry built a sibling: {retry:?}");
     }
 
@@ -9819,7 +9839,7 @@ mod tests {
         sched.insert(Epoch::new(1), Arc::clone(&post_split));
         sched.set_head(post_split);
 
-        let actions = state.try_propose(&sched, &[], vec![], vec![]);
+        let actions = state.try_propose(&sched, &[], vec![], vec![], vec![]);
         let classification = actions
             .iter()
             .find_map(|a| match a {
@@ -10568,7 +10588,7 @@ mod tests {
         // Height 4 proposes at round 4 (rounds increase per block).
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
-        let _ = state.try_propose(&topology_schedule, &[], vec![], vec![]);
+        let _ = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
 
         assert_eq!(
             state.view_change.last_leader_activity,
@@ -10679,7 +10699,7 @@ mod tests {
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
-        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![]);
+        let actions = state.try_propose(&topology_schedule, &[], vec![], vec![], vec![]);
         assert!(
             actions
                 .iter()

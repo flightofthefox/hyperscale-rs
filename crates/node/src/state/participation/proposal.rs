@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_types::{
-    Finalization, MAX_TXS_PER_BLOCK, Provisions, TopologySchedule, TopologySnapshot, Transaction,
-    Verifiable, Verified,
+    Finalization, MAX_TXS_PER_BLOCK, Provisions, TerminalVerdict, TopologySchedule,
+    TopologySnapshot, Transaction, Verifiable, Verified,
 };
 
 use super::ShardParticipation;
@@ -19,6 +19,7 @@ pub(in crate::state) struct ProposalInputs {
     pub ready_txs: Vec<Arc<Verified<Transaction>>>,
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
     pub provisions: Vec<Arc<Verifiable<Provisions>>>,
+    pub terminal_verdicts: Vec<TerminalVerdict>,
 }
 
 impl ShardParticipation {
@@ -49,6 +50,9 @@ impl ShardParticipation {
             self.mempool_coordinator
                 .ready_transactions(max_txs, in_flight.inner(), self.now);
         let finalizations = self.execution_coordinator.get_finalizations();
+        // What departed counterparts left of this chain's business, while
+        // the settled sets that say so can still be read.
+        let terminal_verdicts = self.execution_coordinator.pending_terminal_verdicts();
         let queued = self.provisions_coordinator.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard
@@ -76,6 +80,7 @@ impl ShardParticipation {
             ready_txs,
             finalizations,
             provisions,
+            terminal_verdicts,
         }
     }
 
@@ -120,6 +125,7 @@ impl ShardParticipation {
             &inputs.ready_txs,
             inputs.finalizations,
             inputs.provisions,
+            inputs.terminal_verdicts,
         )
     }
 }

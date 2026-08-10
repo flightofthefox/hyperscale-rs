@@ -21,8 +21,8 @@ use hyperscale_core::{Action, FeeDemand};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash, LocalTimestamp,
     ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
-    ShardId, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp,
+    ShardId, TerminalVerdict, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp,
 };
 use tracing::debug;
 
@@ -43,6 +43,7 @@ pub enum ProposalKind {
         transactions: Vec<Arc<Verified<Transaction>>>,
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         provisions: Vec<Arc<Verifiable<Provisions>>>,
+        terminal_verdicts: Vec<TerminalVerdict>,
     },
     /// View-change fallback: empty payload, parent's weighted timestamp
     /// (prevents Byzantine proposers from manipulating consensus time on
@@ -439,6 +440,7 @@ pub fn assemble_build_action(
         transactions,
         finalizations,
         provisions,
+        terminal_verdicts,
         log_label,
         record_leader_activity,
     ) = match kind {
@@ -446,12 +448,14 @@ pub fn assemble_build_action(
             transactions,
             finalizations,
             provisions,
+            terminal_verdicts,
         } => (
             ProposerTimestamp::from_local(now),
             false,
             transactions,
             finalizations,
             provisions,
+            terminal_verdicts,
             "Requesting block build for proposal",
             false,
         ),
@@ -461,12 +465,14 @@ pub fn assemble_build_action(
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             "Building fallback block (leader timeout)",
             true,
         ),
         ProposalKind::Sync => (
             ProposerTimestamp::from_local(now),
             false,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -493,6 +499,7 @@ pub fn assemble_build_action(
         transactions,
         finalizations,
         provisions,
+        terminal_verdicts,
         fee_checks,
         fee_read_height,
         parent_in_flight,

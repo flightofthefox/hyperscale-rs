@@ -434,6 +434,7 @@ impl ShardParticipation {
             &inputs.ready_txs,
             inputs.finalizations,
             inputs.provisions,
+            inputs.terminal_verdicts,
         )
     }
 

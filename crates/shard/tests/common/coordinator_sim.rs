@@ -863,7 +863,13 @@ impl ShardCoordinatorSim {
     fn try_propose_for(&mut self, idx: usize) -> Vec<Action> {
         let ready_txs: Vec<Arc<Verified<Transaction>>> =
             self.tx_pools[idx].values().cloned().collect();
-        self.coordinators[idx].try_propose(&self.topology_schedule, &ready_txs, vec![], vec![])
+        self.coordinators[idx].try_propose(
+            &self.topology_schedule,
+            &ready_txs,
+            vec![],
+            vec![],
+            vec![],
+        )
     }
 
     /// Drain one envelope through its addressee. Network-priority
@@ -1196,9 +1202,15 @@ impl ShardCoordinatorSim {
             SimEvent::BlockReadyToCommit { certified, source } => {
                 coord.on_block_ready_to_commit(topology_schedule, certified, source)
             }
-            SimEvent::QuorumCertificateFormed { block_hash, qc } => {
-                coord.on_qc_formed(topology_schedule, block_hash, &qc, &[], vec![], vec![])
-            }
+            SimEvent::QuorumCertificateFormed { block_hash, qc } => coord.on_qc_formed(
+                topology_schedule,
+                block_hash,
+                &qc,
+                &[],
+                vec![],
+                vec![],
+                vec![],
+            ),
         }
     }
 
@@ -1412,6 +1424,7 @@ impl ShardCoordinatorSim {
                 parent_block_height,
                 transactions,
                 finalizations,
+                terminal_verdicts,
                 provisions,
                 fee_checks: _,
                 fee_read_height: _,
@@ -1508,7 +1521,7 @@ impl ShardCoordinatorSim {
                     shard_id,
                     &classification_topology,
                     provisions.clone(),
-                    Vec::new(),
+                    terminal_verdicts,
                     parent_in_flight,
                     parent_settled_frontier,
                     parent_load,
