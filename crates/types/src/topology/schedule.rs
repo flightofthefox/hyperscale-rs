@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
-    BlockHeight, Epoch, EpochWindows, ReshapeThresholds, ShardId, TopologySnapshot, ValidatorId,
-    WeightedTimestamp,
+    BlockHeight, Epoch, EpochWindows, PredecessorTerminal, ReshapeThresholds, ShardId,
+    TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
 
 /// Per-shard committees for request **routing**, terminal-clamped.
@@ -621,6 +621,60 @@ impl TopologySchedule {
             .map(|(epoch, _)| windows.window_of(*epoch).end)
     }
 
+    /// The chains `shard` succeeds, read off the beacon's own boundary
+    /// records — one terminal for a split child, two for a merged parent,
+    /// none for a chain born at network genesis.
+    ///
+    /// The reshape flip hands these to a seat present at the cut. This is
+    /// where every other seat gets them: a restart, a validator rotated on
+    /// afterwards, a snap-synced joiner. Nothing here is fetched, so
+    /// nothing here is trusted — the records are the node's own commit-
+    /// proved fold.
+    ///
+    /// A candidate is a predecessor when its terminal cut is exactly
+    /// `origin_wt`. That binding is what makes shard-id reuse harmless: a
+    /// merge reclaims an id its own ancestor once held, and the reclaimed
+    /// chain's origin is the merge cut, which only the two children
+    /// terminated at. Structure alone would not separate them — the same
+    /// id can be a split parent in one era and a merged parent in the
+    /// next.
+    ///
+    /// A candidate carrying no [`TerminalRoots`] is left out rather than
+    /// guessed at: a successor handed nothing keeps refusing everything
+    /// from before its origin, which is the rule it would have relaxed.
+    #[must_use]
+    pub fn predecessor_terminals(
+        &self,
+        shard: ShardId,
+        origin_wt: WeightedTimestamp,
+    ) -> Vec<PredecessorTerminal> {
+        if origin_wt == WeightedTimestamp::ZERO {
+            // The network's first chain. Nothing ran before it, so nothing
+            // offered to it can open before it began.
+            return Vec::new();
+        }
+        let (left, right) = shard.children();
+        // A split child succeeds its parent; a merged parent succeeds its
+        // two children. Both are offered because a chain does not record
+        // which reshape produced it, and the cut binding admits at most
+        // one of the two shapes: a shard born at a cut has no children
+        // that could have terminated at it.
+        [shard.parent(), Some(left), Some(right)]
+            .into_iter()
+            .flatten()
+            .filter(|candidate| self.terminal_cut_wt(*candidate) == Some(origin_wt))
+            .filter_map(|candidate| {
+                let anchor = self.head.boundary(candidate)?;
+                Some(PredecessorTerminal {
+                    shard: candidate,
+                    height: anchor.height,
+                    block_hash: anchor.block_hash,
+                    committed_txs_root: anchor.terminal_roots?.committed_txs,
+                })
+            })
+            .collect()
+    }
+
     /// The epoch window a *parent-anchor* timestamp resolves: an anchor
     /// exactly on a window boundary belongs to the closing window,
     /// mirroring [`EpochWindows::is_crossing`]'s parent-inclusive cut
@@ -811,15 +865,16 @@ impl TopologySchedule {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use hyperscale_crypto::Signer;
     use hyperscale_crypto_bls::BlsSigner;
 
     use super::*;
     use crate::{
-        BlockHeight, CompletedRecovery, NetworkDefinition, RecoveryCause, ReshapeSeat,
-        ShardRecovery, ValidatorSet,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, CommittedTxsRoot, CompletedRecovery, Hash,
+        NetworkDefinition, RecoveryCause, ReshapeSeat, SettledTxsRoot, ShardAnchor, ShardRecovery,
+        StateRoot, TerminalRoots, ValidatorSet,
     };
 
     fn snapshot() -> Arc<TopologySnapshot> {
@@ -845,6 +900,182 @@ mod tests {
             retained: retained.to_vec(),
             attested_frontier,
         }
+    }
+
+    /// A snapshot whose head trie holds `live` and whose boundary map
+    /// records `terminated` with the given committed-transaction root.
+    fn topology_with(
+        live: &[ShardId],
+        terminated: &[(ShardId, Option<CommittedTxsRoot>)],
+    ) -> Arc<TopologySnapshot> {
+        let committees: HashMap<ShardId, Vec<ValidatorId>> =
+            live.iter().map(|shard| (*shard, Vec::new())).collect();
+        let boundaries: HashMap<ShardId, ShardAnchor> = terminated
+            .iter()
+            .map(|(shard, committed)| {
+                (
+                    *shard,
+                    ShardAnchor {
+                        state_root: StateRoot::ZERO,
+                        block_hash: BlockHash::from_raw(Hash::from_bytes(
+                            format!("{shard:?}").as_bytes(),
+                        )),
+                        height: BlockHeight::new(41),
+                        weighted_timestamp: WeightedTimestamp::ZERO,
+                        witness_base: BeaconWitnessLeafCount::ZERO,
+                        terminal_roots: committed.map(|committed_txs| TerminalRoots {
+                            settled_txs: SettledTxsRoot::ZERO,
+                            committed_txs,
+                        }),
+                    },
+                )
+            })
+            .collect();
+        Arc::new(TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &ValidatorSet::new(Vec::new()),
+            committees,
+            HashMap::new(),
+            boundaries,
+            HashMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        ))
+    }
+
+    fn root_committed() -> CommittedTxsRoot {
+        CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed window"))
+    }
+
+    /// A two-window schedule cut at 1000ms: `before` governs epoch 0,
+    /// `after` governs epoch 1 and is the head. The head is what
+    /// `terminal_cut_wt` reads to decide a shard has left, so a fixture
+    /// that only inserts the later window leaves every shard live and
+    /// every assertion here vacuous.
+    fn cut_at_1000(
+        before: &[ShardId],
+        after: &[ShardId],
+        terminated: &[(ShardId, Option<CommittedTxsRoot>)],
+    ) -> TopologySchedule {
+        let head = topology_with(after, terminated);
+        let mut sched = TopologySchedule::new(1000, Epoch::new(0), topology_with(before, &[]));
+        sched.insert(Epoch::new(1), Arc::clone(&head));
+        sched.set_head(head);
+        sched
+    }
+
+    /// A split child succeeds the parent that terminated at its origin,
+    /// and reads the parent's commitment off the boundary record.
+    #[test]
+    fn a_split_child_succeeds_the_parent_that_terminated_at_its_cut() {
+        let (left, right) = ShardId::ROOT.children();
+        // ROOT is live in epoch 0 and gone from epoch 1, so its terminal
+        // cut is the end of epoch 0 — 1000ms.
+        let sched = cut_at_1000(
+            &[ShardId::ROOT],
+            &[left, right],
+            &[(ShardId::ROOT, Some(root_committed()))],
+        );
+        let cut = WeightedTimestamp::from_millis(1000);
+
+        let predecessors = sched.predecessor_terminals(left, cut);
+        assert_eq!(predecessors.len(), 1);
+        assert_eq!(predecessors[0].shard, ShardId::ROOT);
+        assert_eq!(predecessors[0].height, BlockHeight::new(41));
+        assert_eq!(predecessors[0].committed_txs_root, root_committed());
+    }
+
+    /// A merged parent succeeds both children — one absence proof settles
+    /// nothing, so both terminals have to be found.
+    #[test]
+    fn a_merged_parent_succeeds_both_children() {
+        let (left, right) = ShardId::ROOT.children();
+        let sched = cut_at_1000(
+            &[left, right],
+            &[ShardId::ROOT],
+            &[
+                (left, Some(root_committed())),
+                (right, Some(root_committed())),
+            ],
+        );
+
+        let predecessors =
+            sched.predecessor_terminals(ShardId::ROOT, WeightedTimestamp::from_millis(1000));
+        assert_eq!(
+            predecessors.iter().map(|p| p.shard).collect::<Vec<_>>(),
+            vec![left, right],
+        );
+    }
+
+    /// The cut is what binds a terminal to a chain, not the shard tree. A
+    /// candidate that terminated at some *other* instant is not this
+    /// chain's predecessor, which is what keeps a reclaimed shard id from
+    /// inheriting an ancestor's terminal.
+    #[test]
+    fn a_terminal_at_another_cut_is_not_a_predecessor() {
+        let (left, right) = ShardId::ROOT.children();
+        let sched = cut_at_1000(
+            &[ShardId::ROOT],
+            &[left, right],
+            &[(ShardId::ROOT, Some(root_committed()))],
+        );
+
+        // The fixture is the one the positive case uses, so this asserts
+        // the binding rather than a mis-built schedule.
+        assert_eq!(
+            sched
+                .predecessor_terminals(left, WeightedTimestamp::from_millis(1000))
+                .len(),
+            1,
+        );
+        // ROOT's terminal cut is 1000ms; a chain claiming to have begun at
+        // 2000ms did not succeed it.
+        assert!(
+            sched
+                .predecessor_terminals(left, WeightedTimestamp::from_millis(2000))
+                .is_empty()
+        );
+    }
+
+    /// A candidate whose boundary record carries no terminal roots is left
+    /// out: the successor keeps refusing everything from before its
+    /// origin, which is the rule the roots would have relaxed.
+    #[test]
+    fn a_terminal_without_roots_is_not_adopted() {
+        let (left, right) = ShardId::ROOT.children();
+        let cut = WeightedTimestamp::from_millis(1000);
+
+        // Same cut, same structure — only the roots are missing, so this
+        // isolates the one condition it is about.
+        assert_eq!(
+            cut_at_1000(
+                &[ShardId::ROOT],
+                &[left, right],
+                &[(ShardId::ROOT, Some(root_committed()))],
+            )
+            .predecessor_terminals(left, cut)
+            .len(),
+            1,
+        );
+        assert!(
+            cut_at_1000(&[ShardId::ROOT], &[left, right], &[(ShardId::ROOT, None)])
+                .predecessor_terminals(left, cut)
+                .is_empty()
+        );
+    }
+
+    /// A chain born at network genesis anchors at zero and succeeds
+    /// nothing, so it never asks.
+    #[test]
+    fn a_genesis_chain_has_no_predecessors() {
+        let sched = TopologySchedule::single(topology_with(&[ShardId::ROOT], &[]));
+        assert!(
+            sched
+                .predecessor_terminals(ShardId::ROOT, WeightedTimestamp::ZERO)
+                .is_empty()
+        );
     }
 
     #[test]

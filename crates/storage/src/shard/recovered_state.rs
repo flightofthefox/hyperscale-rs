@@ -54,7 +54,9 @@ pub struct RecoveredState {
     /// the rule these relax retires `MAX_VALIDITY_RANGE` past the origin,
     /// well before the beacon folds the same roots. Empty here is not a
     /// gap — a seat that missed the flip reads them off its topology
-    /// projection instead, and until either lands the strict rule stands.
+    /// projection instead, via
+    /// `TopologySchedule::predecessor_terminals`, and until either lands
+    /// the strict rule stands.
     pub predecessors: Vec<PredecessorTerminal>,
 
     /// The provision bodies still held for the blocks that carried them.
@@ -212,8 +214,9 @@ impl RecoveredState {
             // to fold a dedup window out of yet. The tail sync above the
             // anchor supplies it as it commits.
             dedup: DedupWindow::covering_nothing(),
-            // A snap-synced joiner reaches no reshape flip, so it reads
-            // its predecessors off the topology projection or not at all.
+            // A snap-synced joiner reaches no reshape flip, so it reads its
+            // predecessors off the topology projection at its first beacon
+            // block instead.
             predecessors: Vec::new(),
             retained_provisions: Vec::new(),
             committed_hash: Some(anchor.block_hash),

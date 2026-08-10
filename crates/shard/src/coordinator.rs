@@ -423,10 +423,11 @@ pub struct ShardCoordinator {
     /// Seeded from the reshape flip, which is the delivery that lands
     /// inside the window the pre-cut rule is live for. A seat that missed
     /// the flip — a restart, or a validator rotated on afterwards — picks
-    /// the predecessors up from its topology projection instead; holding
-    /// none means the strict rule stands, which is always safe. Retired
-    /// once the chain has outlived its origin by `MAX_VALIDITY_RANGE`,
-    /// past which nothing on offer predates the cut.
+    /// the predecessors up from its topology projection instead, at the
+    /// first beacon block it commits; holding none means the strict rule
+    /// stands, which is always safe. Retired once the chain has outlived
+    /// its origin by `MAX_VALIDITY_RANGE`, past which nothing on offer
+    /// predates the cut.
     precut: Precut,
 
     /// Settled-tick sets for shards that have terminated at a split,
@@ -1127,20 +1128,63 @@ impl ShardCoordinator {
         deferred.map_or(PrecutVerdict::Pass, PrecutVerdict::Defer)
     }
 
-    /// Whether anything can still be offered to this chain from before
-    /// it began.
+    /// Whether content from before this chain began can still be offered
+    /// to it.
     ///
-    /// False on a chain with no predecessors — one born at network
-    /// genesis has nothing before it, and one that missed the flip has
-    /// no terminal to ask about. False again once the chain's certified
-    /// clock has run `MAX_VALIDITY_RANGE` past its origin: that is the
-    /// widest a validity window gets, so nothing signed since can open
-    /// before the cut and nothing signed before it is still valid.
+    /// False on a chain born at network genesis, which has nothing before
+    /// it. False again once the chain's certified clock has run
+    /// `MAX_VALIDITY_RANGE` past its origin: that is the widest a validity
+    /// window gets, so nothing signed since can open before the cut and
+    /// nothing signed before it is still valid.
+    ///
+    /// A property of the chain rather than of what this node holds — which
+    /// is what makes it the right gate for *acquiring* the predecessors,
+    /// where [`Self::precut_rule_live`] would be circular.
     #[must_use]
-    pub fn precut_rule_live(&self) -> bool {
-        self.precut.has_predecessors()
+    pub fn precut_window_open(&self) -> bool {
+        self.chain_origin.anchor_wt > WeightedTimestamp::ZERO
             && self.high_qc().weighted_timestamp()
                 < self.chain_origin.anchor_wt.plus(MAX_VALIDITY_RANGE)
+    }
+
+    /// Whether the relaxation is live: the window is open *and* this node
+    /// holds predecessors to resolve against. A seat that missed the flip
+    /// and has not yet read them off its topology projection holds none,
+    /// and keeps the strict refusal until it does.
+    #[must_use]
+    pub fn precut_rule_live(&self) -> bool {
+        self.precut.has_predecessors() && self.precut_window_open()
+    }
+
+    /// Read the chains this one succeeds off the beacon's own boundary
+    /// records, for a seat the reshape flip never reached.
+    ///
+    /// The flip is the fast delivery and covers the seats present at the
+    /// cut. This is the durable one, and the only path for a restart, a
+    /// validator rotated onto the successor committee afterwards, or a
+    /// snap-synced joiner — none of which run a reshape duty, and none of
+    /// which can re-derive the roots from their own chain.
+    ///
+    /// Runs only while the window is open and only when nothing is held,
+    /// so it neither displaces what the flip delivered nor undoes a
+    /// retirement. Returns whether anything was adopted.
+    pub fn adopt_precut_predecessors(&mut self, topology_schedule: &TopologySchedule) -> bool {
+        if self.precut.has_predecessors() || !self.precut_window_open() {
+            return false;
+        }
+        let predecessors =
+            topology_schedule.predecessor_terminals(self.local_shard, self.chain_origin.anchor_wt);
+        if predecessors.is_empty() {
+            return false;
+        }
+        info!(
+            validator = ?self.me,
+            shard = ?self.local_shard,
+            count = predecessors.len(),
+            "Adopted this chain's predecessors from the topology projection"
+        );
+        self.precut = Precut::succeeding(predecessors);
+        true
     }
 
     /// Record one predecessor's answer about a transaction that predates
@@ -5281,6 +5325,12 @@ impl ShardCoordinator {
         // now seat a block's committee — retry any beacon-witness verification
         // that was parked on that lag before it strands the shard.
         actions.extend(self.retry_beacon_witness_awaiting_committee(topology_schedule));
+        // The same fold is what carries this chain's predecessors to a seat
+        // the flip never reached, so a boot that lands mid-window picks
+        // them up at the first beacon block it commits.
+        if self.adopt_precut_predecessors(topology_schedule) {
+            actions.extend(self.redrive_pending_votes(topology_schedule));
+        }
         if !self.is_block_syncing() {
             actions.extend(self.maybe_emit_ready_signal(topology_schedule));
         }
@@ -6267,7 +6317,9 @@ impl ShardCoordinator {
     ///
     /// Empty on a chain born at network genesis, and on any seat that
     /// missed the reshape flip — a restart, or a validator rotated on
-    /// afterwards — until its topology projection supplies them.
+    /// afterwards — until
+    /// [`adopt_precut_predecessors`](Self::adopt_precut_predecessors)
+    /// reads them off its topology projection.
     #[must_use]
     pub fn predecessors(&self) -> &[PredecessorTerminal] {
         self.precut.predecessors()
@@ -6535,11 +6587,12 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_types::test_utils::make_live_block;
     use hyperscale_types::{
-        AggregateSignature, BeaconWitnessRoot, BlockHeaderParts, CommittedTxsRoot,
-        ConsensusSignature, Epoch, Hash, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-        NetworkDefinition, NetworkParams, RETENTION_HORIZON, ShardId, Signer, SignerBitfield,
-        TimestampRange, TopologySchedule, TopologySnapshot, Transaction, ValidatorId,
-        ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp, WitnessSources, test_utils,
+        AggregateSignature, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHeaderParts,
+        CommittedTxsRoot, ConsensusSignature, Epoch, Hash, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
+        NetworkDefinition, NetworkParams, RETENTION_HORIZON, SettledTxsRoot, ShardAnchor, ShardId,
+        Signer, SignerBitfield, TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot,
+        Transaction, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
+        WitnessSources, test_utils,
     };
 
     use super::*;
@@ -6595,17 +6648,31 @@ mod tests {
     /// A successor of one chain, cut at `cut`, with its certified clock
     /// sitting at `now`.
     fn make_successor(cut: WeightedTimestamp, now: WeightedTimestamp) -> ShardCoordinator {
-        let mut recovered = RecoveredState {
-            chain_origin: ChainOrigin {
-                genesis_height: BlockHeight::new(10),
-                anchor_wt: cut,
-            },
-            predecessors: vec![PredecessorTerminal {
+        successor_holding(
+            cut,
+            now,
+            vec![PredecessorTerminal {
                 shard: ShardId::leaf(1, 0),
                 height: BlockHeight::new(9),
                 block_hash: BlockHash::ZERO,
                 committed_txs_root: CommittedTxsRoot::ZERO,
             }],
+        )
+    }
+
+    /// A successor cut at `cut`, clock at `now`, holding `predecessors` —
+    /// empty for the seat the reshape flip never reached.
+    fn successor_holding(
+        cut: WeightedTimestamp,
+        now: WeightedTimestamp,
+        predecessors: Vec<PredecessorTerminal>,
+    ) -> ShardCoordinator {
+        let mut recovered = RecoveredState {
+            chain_origin: ChainOrigin {
+                genesis_height: BlockHeight::new(10),
+                anchor_wt: cut,
+            },
+            predecessors,
             ..RecoveredState::default()
         };
         recovered.latest_qc = Some(Verified::new_unchecked_for_test(QuorumCertificate::new(
@@ -6731,6 +6798,120 @@ mod tests {
             state.outstanding_precut_queries([answered, owed]),
             vec![(predecessor, owed)]
         );
+    }
+
+    /// A schedule in which `ShardId::ROOT` terminated at `10_000ms`, leaving
+    /// its two children live and its boundary record carrying the
+    /// commitments a successor reads.
+    fn post_split_schedule(committed: CommittedTxsRoot) -> TopologySchedule {
+        let children: [ShardId; 2] = ShardId::ROOT.children().into();
+        let anchor = ShardAnchor {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"root terminal")),
+            height: BlockHeight::new(9),
+            weighted_timestamp: WeightedTimestamp::from_millis(10_000),
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            terminal_roots: Some(TerminalRoots {
+                settled_txs: SettledTxsRoot::ZERO,
+                committed_txs: committed,
+            }),
+        };
+        let live = |shards: &[ShardId], boundaries: HashMap<ShardId, ShardAnchor>| {
+            Arc::new(TopologySnapshot::from_explicit_committees(
+                NetworkDefinition::simulator(),
+                &ValidatorSet::new(Vec::new()),
+                shards.iter().map(|shard| (*shard, Vec::new())).collect(),
+                HashMap::new(),
+                boundaries,
+                HashMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+            ))
+        };
+        let mut boundaries = HashMap::new();
+        boundaries.insert(ShardId::ROOT, anchor);
+        let head = live(&children, boundaries);
+        let mut sched = TopologySchedule::new(
+            10_000,
+            Epoch::new(0),
+            live(&[ShardId::ROOT], HashMap::new()),
+        );
+        sched.insert(Epoch::new(1), Arc::clone(&head));
+        sched.set_head(head);
+        sched
+    }
+
+    /// A seat the reshape flip never reached — a restart, or a validator
+    /// rotated on afterwards — reads its predecessors off the beacon's own
+    /// boundary records instead, and the pre-cut relaxation comes alive
+    /// with them.
+    #[test]
+    fn a_seat_that_missed_the_flip_adopts_its_predecessors_from_the_projection() {
+        let committed = CommittedTxsRoot::from_raw(Hash::from_bytes(b"parent window"));
+        let sched = post_split_schedule(committed);
+        let (left, _) = ShardId::ROOT.children();
+        let mut state = successor_holding(
+            WeightedTimestamp::from_millis(10_000),
+            WeightedTimestamp::from_millis(10_500),
+            Vec::new(),
+        );
+        state.local_shard = left;
+
+        assert!(
+            !state.precut_rule_live(),
+            "holding no predecessors, the strict refusal stands",
+        );
+        assert!(
+            state.precut_window_open(),
+            "but the window it would relax is still open",
+        );
+
+        assert!(state.adopt_precut_predecessors(&sched));
+        assert_eq!(
+            state.predecessors(),
+            &[PredecessorTerminal {
+                shard: ShardId::ROOT,
+                height: BlockHeight::new(9),
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"root terminal")),
+                committed_txs_root: committed,
+            }],
+        );
+        assert!(state.precut_rule_live());
+    }
+
+    /// Adoption never displaces what the flip delivered: the flip is the
+    /// authority for the seats it reached, and re-reading the projection
+    /// over it would churn the answers already recorded against it.
+    #[test]
+    fn adoption_leaves_flip_delivered_predecessors_alone() {
+        let sched = post_split_schedule(CommittedTxsRoot::from_raw(Hash::from_bytes(b"other")));
+        let (left, _) = ShardId::ROOT.children();
+        let mut state = make_successor(
+            WeightedTimestamp::from_millis(10_000),
+            WeightedTimestamp::from_millis(10_500),
+        );
+        state.local_shard = left;
+        let delivered = state.predecessors().to_vec();
+
+        assert!(!state.adopt_precut_predecessors(&sched));
+        assert_eq!(state.predecessors(), delivered.as_slice());
+    }
+
+    /// Past the window there is nothing left to relax, so a late boot
+    /// adopts nothing rather than taking on state it will only retire.
+    #[test]
+    fn adoption_stops_once_the_window_has_closed() {
+        let sched = post_split_schedule(CommittedTxsRoot::ZERO);
+        let (left, _) = ShardId::ROOT.children();
+        let cut = WeightedTimestamp::from_millis(10_000);
+        let mut state = successor_holding(cut, cut.plus(MAX_VALIDITY_RANGE), Vec::new());
+        state.local_shard = left;
+
+        assert!(!state.precut_window_open());
+        assert!(!state.adopt_precut_predecessors(&sched));
+        assert!(state.predecessors().is_empty());
     }
 
     #[test]
