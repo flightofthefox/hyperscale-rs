@@ -12,7 +12,7 @@
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
 //! the complete block data, making it recoverable from any honest validator in that set.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
@@ -20,7 +20,7 @@ use hyperscale_types::{
     MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp,
     ProvisionHash, RETENTION_HORIZON, ReadySignal, ReshapeThresholds, ReshapeTrigger,
     ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt,
-    SubstateKey, TxClaim, WeightedTimestamp, WorkInFlight, derive_reshape_trigger,
+    SubstateKey, TxClaim, TxOutcome, WeightedTimestamp, WorkInFlight, derive_reshape_trigger,
     ready_signal_window, settled_set_verdict,
 };
 
@@ -911,16 +911,19 @@ impl ShardCoordinator {
     /// reject. A past-terminal shard whose settled set isn't known yet
     /// defers the vote; past `terminal_wt + RETENTION_HORIZON` the tick
     /// is categorically unreachable and rejects.
+    ///
+    /// An abandonment carries no counterpart certificate, so it yields no
+    /// settlement claim and [`Self::abandons_a_settled_tx`] is what judges
+    /// it instead.
     fn fence_finalizations(
         &self,
         topology_schedule: &TopologySchedule,
         block: &Block,
         anchored_wt: WeightedTimestamp,
     ) -> SettledSetVerdict {
-        // Every pair a block's certificates yield is a settlement claim.
-        // An abandonment names no counterpart certificate, so it reaches
-        // this fence carrying only the local shard and is skipped —
-        // the finalize gate is where its participants are known.
+        if self.abandons_a_settled_tx(block) {
+            return SettledSetVerdict::Reject;
+        }
         let outcomes = block.certificates().iter().flat_map(|fw| {
             fw.execution_certificates().iter().flat_map(|ec| {
                 let shard = ec.shard_id();
@@ -936,6 +939,45 @@ impl ShardCoordinator {
             anchored_wt,
             outcomes,
         )
+    }
+
+    /// Whether the block abandons a transaction some terminated shard
+    /// settled — a verdict that would tear a cross-shard transaction in
+    /// half, and the one thing about an abandonment a voter can check.
+    ///
+    /// The question is put to the sets rather than to the transaction. A
+    /// settled set names only what its shard settled, so a hit is proof
+    /// the transaction reached an outcome there and this shard may not
+    /// abort it, while a shard that was never party to it cannot produce
+    /// one. That is what makes the participants unnecessary here: they are
+    /// derived at commit from the transaction body, which the block
+    /// carrying the abandonment does not hold.
+    ///
+    /// A miss is not proof of the opposite — a set this node has not
+    /// acquired could still name the transaction. So enforcement is by the
+    /// replicas holding the terminated shard's set, and a block reaches no
+    /// quorum once f+1 of them do. The composing side is stricter: its
+    /// gate defers until the set answers, so an honest proposer offers no
+    /// abandonment this scan has yet to see the evidence for.
+    fn abandons_a_settled_tx(&self, block: &Block) -> bool {
+        if self.settled_sets.is_empty() {
+            return false;
+        }
+        block.certificates().iter().any(|fw| {
+            let attested_remotely: HashSet<TxHash> = fw
+                .execution_certificates()
+                .iter()
+                .filter(|ec| ec.shard_id() != self.local_shard)
+                .flat_map(|ec| ec.tx_outcomes().iter().map(TxOutcome::tx_hash))
+                .collect();
+            fw.tx_hashes()
+                .filter(|tx_hash| !attested_remotely.contains(tx_hash))
+                .any(|tx_hash| {
+                    self.settled_sets
+                        .values()
+                        .any(|settled| settled.txs.contains(&tx_hash))
+                })
+        })
     }
 
     /// Apply the split-boundary fence at vote time; returns `true` (and
@@ -6391,10 +6433,7 @@ impl ShardCoordinator {
     pub fn collect_qc_chain_hashes(
         &self,
         parent_block_hash: BlockHash,
-    ) -> (
-        std::collections::HashSet<TxHash>,
-        std::collections::HashSet<ProvisionHash>,
-    ) {
+    ) -> (HashSet<TxHash>, HashSet<ProvisionHash>) {
         self.chain_view().collect_ancestor_hashes(parent_block_hash)
     }
 
@@ -10756,6 +10795,102 @@ mod tests {
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
+    }
+
+    /// An abandonment: this shard's certificate alone, attesting the
+    /// transaction aborted, with no counterpart certificate beside it.
+    fn abandonment_tick(local: ShardId, height: u64) -> Arc<Verifiable<Finalization>> {
+        use hyperscale_types::{
+            ExecutionCertificate, ExecutionOutcome, GlobalReceiptRoot, SignerBitfield, TickHalf,
+            TickId, TxOutcome,
+        };
+        let tick = TickId::new(local, BlockHeight::new(height));
+        Arc::new(Verifiable::from(Finalization::new(
+            tick,
+            TickHalf::Determined,
+            vec![Arc::new(ExecutionCertificate::new(
+                tick,
+                WeightedTimestamp::from_millis(height),
+                GlobalReceiptRoot::ZERO,
+                vec![TxOutcome::new(
+                    TxHash::from(Hash::from_bytes(b"tx")),
+                    ExecutionOutcome::Aborted,
+                )],
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ))],
+            vec![],
+        )))
+    }
+
+    /// A block abandoning a transaction a terminated shard settled is
+    /// refused. The abort would tear the transaction in half, and the
+    /// settled set is the evidence a voter can check without holding the
+    /// transaction or knowing which shards were party to it.
+    #[test]
+    fn fence_rejects_an_abandonment_a_terminated_shard_settled() {
+        let mut coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord.record_settled_txs(
+            ShardId::ROOT,
+            SettledTxSet {
+                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
+                terminal_wt: WeightedTimestamp::from_millis(1000),
+            },
+        );
+        let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
+        assert_eq!(
+            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            SettledSetVerdict::Reject,
+        );
+    }
+
+    /// The same abandonment passes when no set names the transaction. A
+    /// miss is not proof — an unacquired set could still name it — so this
+    /// is the vote landing on the evidence the node has, which is why the
+    /// composing side defers rather than relying on this scan.
+    #[test]
+    fn fence_admits_an_abandonment_no_settled_set_names() {
+        let mut coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord.record_settled_txs(
+            ShardId::ROOT,
+            SettledTxSet {
+                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"other"))).collect(),
+                terminal_wt: WeightedTimestamp::from_millis(1000),
+            },
+        );
+        let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
+        assert_eq!(
+            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            SettledSetVerdict::Pass,
+        );
+    }
+
+    /// A settlement is judged on the certificates it carries, not by this
+    /// scan: the transaction appearing in the partner's settled set is
+    /// exactly what a settlement needs, and reading it as an abandonment
+    /// would refuse the outcome the fence exists to admit.
+    #[test]
+    fn the_abandonment_scan_leaves_a_settlement_alone() {
+        let mut coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord.record_settled_txs(
+            ShardId::ROOT,
+            SettledTxSet {
+                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
+                terminal_wt: WeightedTimestamp::from_millis(1000),
+            },
+        );
+        let block = block_with_certs(vec![cross_shard_tick(
+            ShardId::leaf(1, 0),
+            ShardId::ROOT,
+            1,
+        )]);
+        assert_eq!(
+            coord.fence_finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
+            SettledSetVerdict::Pass,
+        );
     }
 
     /// A finalization naming a past-terminal shard whose settled set is
