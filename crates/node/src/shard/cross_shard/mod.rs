@@ -22,7 +22,7 @@ mod settled_set;
 mod settled_set_sync;
 mod settled_txs_serve;
 
-pub use committed_txs_serve::serve_committed_txs_request;
+pub use committed_txs_serve::{CommittedTxsCache, serve_committed_txs_request};
 pub use exec_cert_serve::serve_execution_certs_request;
 pub use fetch::{
     CommittedTxBinding, CommittedTxFetch, ExecCertBinding, ExecCertFetch, FinalizationBinding,

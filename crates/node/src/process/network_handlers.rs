@@ -799,9 +799,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::bootstrap::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        serve_committed_txs_request, serve_execution_certs_request, serve_finalizations_request,
-        serve_local_provisions_request, serve_provision_request, serve_remote_headers_request,
-        serve_settled_txs_request,
+        CommittedTxsCache, serve_committed_txs_request, serve_execution_certs_request,
+        serve_finalizations_request, serve_local_provisions_request, serve_provision_request,
+        serve_remote_headers_request, serve_settled_txs_request,
     };
     use crate::shard::mempool::serve_transaction_request;
 
@@ -1114,10 +1114,15 @@ pub fn register_shard_request_handlers<S, N, D>(
     // nothing here is trusted. No window floor: the committed window is
     // anchor-relative only.
     let pending_chain = Arc::clone(&io.pending_chain);
+    // The walk behind an answer is the committed window in full, and the
+    // set it produces cannot change once the terminal is committed. One
+    // reconstruction serves every query about that terminal, from every
+    // peer, for as long as anyone is still asking.
+    let committed_txs_cache = Arc::new(CommittedTxsCache::default());
     process
         .network
         .register_request_handler::<GetCommittedTxsRequest>(shard, move |req| {
-            serve_committed_txs_request(&pending_chain, &req)
+            serve_committed_txs_request(&pending_chain, &committed_txs_cache, &req)
         });
 
     // ── beacon.proposal.request → process-level serve cache ──────

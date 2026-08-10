@@ -11,20 +11,80 @@
 //! the terminal's proposer rooted, so the proofs verify against the
 //! attested root without this server being trusted for any of it.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::{BlockForSync, PendingChain, ShardStorage};
 use hyperscale_types::network::request::GetCommittedTxsRequest;
 use hyperscale_types::network::response::{CommittedTxVerdict, GetCommittedTxsResponse};
-use hyperscale_types::{TxHash, prove_committed_tx_absent};
+use hyperscale_types::{BlockHash, BlockHeight, TxHash, prove_committed_tx_absent};
+
+/// How many terminals' reconstructed sets are held at once.
+///
+/// A shard terminates once per reshape and a successor only asks within a
+/// validity range of the cut, so one entry answers the live case. The rest
+/// is slack for a node hosting several vnodes through overlapping
+/// reshapes.
+const CACHED_TERMINALS: usize = 4;
+
+/// Reconstructed committed sets, keyed by the terminal they end at.
+///
+/// The walk this memoizes folds every transaction in every block within a
+/// retention horizon of the terminal — the cost is throughput times the
+/// horizon, and it lands on every request. The set it produces is
+/// immutable: the terminal is committed, and no later block extends the
+/// chain it ends.
+///
+/// A miss under concurrency walks twice rather than blocking, which is the
+/// trade this weight of cache exists to make. Two walks over the same
+/// committed ancestry produce the same set, so the loser's work is
+/// redundant rather than wrong.
+#[derive(Default)]
+pub struct CommittedTxsCache {
+    /// Most recently reconstructed first, truncated at
+    /// [`CACHED_TERMINALS`]. A queue rather than a map because the
+    /// capacity is smaller than a hash.
+    entries: Mutex<VecDeque<CachedTerminal>>,
+}
+
+/// One terminal's reconstructed set: the block it ends at, and the
+/// members that block's window rooted.
+type CachedTerminal = (BlockHeight, BlockHash, Arc<Vec<TxHash>>);
+
+impl CommittedTxsCache {
+    /// The set for `terminal`, reconstructed by `walk` on a miss.
+    fn get_or_insert(
+        &self,
+        height: BlockHeight,
+        hash: BlockHash,
+        walk: impl FnOnce() -> Vec<TxHash>,
+    ) -> Arc<Vec<TxHash>> {
+        if let Ok(entries) = self.entries.lock()
+            && let Some((_, _, members)) =
+                entries.iter().find(|(h, b, _)| *h == height && *b == hash)
+        {
+            return Arc::clone(members);
+        }
+        let members = Arc::new(walk());
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.push_front((height, hash, Arc::clone(&members)));
+            entries.truncate(CACHED_TERMINALS);
+        }
+        members
+    }
+}
 
 /// Serve an inbound committed-transaction query from the local chain.
 ///
 /// Returns `not_found` when the terminal block isn't held or the stored
 /// block's hash doesn't match the requested terminal — the requester
-/// rotates peers.
+/// rotates peers. The hash is checked before the walk, so an unheld
+/// terminal costs a lookup rather than a reconstruction.
 #[must_use]
 pub fn serve_committed_txs_request<S: ShardStorage>(
     pending_chain: &PendingChain<S>,
+    cache: &CommittedTxsCache,
     req: &GetCommittedTxsRequest,
 ) -> GetCommittedTxsResponse {
     let Some(BlockForSync { block, .. }) = pending_chain.block_for_sync(req.terminal_height) else {
@@ -41,18 +101,20 @@ pub fn serve_committed_txs_request<S: ShardStorage>(
         return GetCommittedTxsResponse::not_found();
     };
 
-    let own: Vec<TxHash> = block.transactions().iter().map(|tx| tx.hash()).collect();
-    // Sorted and deduplicated by the walk's `BTreeSet`, which is what the
-    // absence proofs' leaf indices are relative to.
-    let members: Vec<TxHash> = pending_chain
-        .committed_txs_in_window(
-            block.header().parent_block_hash(),
-            parent_height,
-            block.header().parent_qc().weighted_timestamp(),
-            own,
-        )
-        .into_iter()
-        .collect();
+    let members = cache.get_or_insert(req.terminal_height, req.terminal_block_hash, || {
+        let own: Vec<TxHash> = block.transactions().iter().map(|tx| tx.hash()).collect();
+        // Sorted and deduplicated by the walk's `BTreeSet`, which is what
+        // the absence proofs' leaf indices are relative to.
+        pending_chain
+            .committed_txs_in_window(
+                block.header().parent_block_hash(),
+                parent_height,
+                block.header().parent_qc().weighted_timestamp(),
+                own,
+            )
+            .into_iter()
+            .collect()
+    });
 
     let verdicts = req
         .tx_hashes
@@ -159,9 +221,10 @@ mod tests {
             terminal,
             vec![tx_hash(1), tx_hash(5), absent],
         );
-        let verdicts = serve_committed_txs_request(&pending_chain, &req)
-            .verdicts
-            .expect("terminal block is held");
+        let verdicts =
+            serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
+                .verdicts
+                .expect("terminal block is held");
         assert_eq!(verdicts.len(), 3);
 
         assert_eq!(
@@ -197,9 +260,10 @@ mod tests {
         let (pending_chain, terminal) = chain();
         let committed: Vec<TxHash> = (1..=6u8).map(tx_hash).collect();
         let req = GetCommittedTxsRequest::new(BlockHeight::new(3), terminal, committed.clone());
-        let verdicts = serve_committed_txs_request(&pending_chain, &req)
-            .verdicts
-            .expect("terminal block is held");
+        let verdicts =
+            serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
+                .verdicts
+                .expect("terminal block is held");
         for (verdict, tx) in verdicts.iter().zip(&committed) {
             assert_eq!(
                 verdict,
@@ -224,9 +288,10 @@ mod tests {
 
         let below_floor = tx_hash(10);
         let req = GetCommittedTxsRequest::new(BlockHeight::new(3), terminal, vec![below_floor]);
-        let verdicts = serve_committed_txs_request(&pending_chain, &req)
-            .verdicts
-            .expect("terminal block is held");
+        let verdicts =
+            serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
+                .verdicts
+                .expect("terminal block is held");
 
         let root = committed_txs_root_from_hashes([tx_hash(11), tx_hash(12)].iter());
         let CommittedTxVerdict::Absent(proof) = &verdicts[0] else {
@@ -243,7 +308,8 @@ mod tests {
         let (pending_chain, terminal) = chain();
         let req = GetCommittedTxsRequest::new(BlockHeight::new(3), terminal, Vec::new());
         assert_eq!(
-            serve_committed_txs_request(&pending_chain, &req).verdicts,
+            serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
+                .verdicts,
             Some(Vec::new())
         );
     }
@@ -258,7 +324,76 @@ mod tests {
             vec![tx_hash(1)],
         );
         assert!(
-            serve_committed_txs_request(&pending_chain, &req)
+            serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
+                .verdicts
+                .is_none()
+        );
+    }
+
+    /// One reconstruction answers every later query about the same
+    /// terminal. Checked by mutating the store out from under the cache:
+    /// a fourth block lands after the first answer, and the cached set
+    /// still reflects the chain as it stood at the terminal — which a
+    /// re-walk would not.
+    #[test]
+    fn the_set_is_reconstructed_once_per_terminal() {
+        let storage = SimShardStorage::default();
+        let mut parent = BlockHash::ZERO;
+        for (h, seeds) in [(1u64, &[1u8, 2][..]), (2, &[3, 4]), (3, &[5, 6])] {
+            parent = commit_block(&storage, h, parent, 1_000 * h, seeds);
+        }
+        let storage = Arc::new(storage);
+        let pending_chain = PendingChain::new(Arc::clone(&storage));
+        let cache = CommittedTxsCache::default();
+
+        let ask = |probe: TxHash| {
+            let req = GetCommittedTxsRequest::new(BlockHeight::new(3), parent, vec![probe]);
+            serve_committed_txs_request(&pending_chain, &cache, &req)
+                .verdicts
+                .expect("terminal block is held")
+                .remove(0)
+        };
+        assert_eq!(ask(tx_hash(1)), CommittedTxVerdict::Committed);
+
+        // A block the terminal does not extend. Nothing in it belongs to
+        // the set the terminal rooted, and the memo is what guarantees a
+        // later answer says so.
+        commit_block(&storage, 4, parent, 4_000, &[7]);
+        let CommittedTxVerdict::Absent(proof) = ask(tx_hash(7)) else {
+            panic!("a transaction committed past the terminal is outside its set");
+        };
+        let root = committed_txs_root_from_hashes(
+            [1u8, 2, 3, 4, 5, 6]
+                .iter()
+                .map(|&s| tx_hash(s))
+                .collect::<Vec<_>>()
+                .iter(),
+        );
+        assert!(proof.proves_absent(&tx_hash(7), root));
+    }
+
+    /// The memo is keyed by the terminal, so a query naming a different
+    /// one is not answered from another's set.
+    #[test]
+    fn a_second_terminal_does_not_read_the_first_ones_set() {
+        let (pending_chain, terminal) = chain();
+        let cache = CommittedTxsCache::default();
+
+        let first = GetCommittedTxsRequest::new(BlockHeight::new(3), terminal, vec![tx_hash(1)]);
+        assert_eq!(
+            serve_committed_txs_request(&pending_chain, &cache, &first).verdicts,
+            Some(vec![CommittedTxVerdict::Committed]),
+        );
+
+        // Same height, different terminal: the cache must miss and the
+        // hash check must refuse, rather than the entry answering for it.
+        let forged = GetCommittedTxsRequest::new(
+            BlockHeight::new(3),
+            BlockHash::from_raw(Hash::from_bytes(b"other-chain")),
+            vec![tx_hash(1)],
+        );
+        assert!(
+            serve_committed_txs_request(&pending_chain, &cache, &forged)
                 .verdicts
                 .is_none()
         );
@@ -271,7 +406,7 @@ mod tests {
         let req =
             GetCommittedTxsRequest::new(BlockHeight::new(7), BlockHash::ZERO, vec![tx_hash(1)]);
         assert!(
-            serve_committed_txs_request(&pending_chain, &req)
+            serve_committed_txs_request(&pending_chain, &CommittedTxsCache::default(), &req)
                 .verdicts
                 .is_none()
         );
