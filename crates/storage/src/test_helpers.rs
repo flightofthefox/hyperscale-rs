@@ -150,6 +150,7 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
         transactions: Arc::new(Vec::new()),
         certificates: Arc::new(Vec::new()),
         provisions: Arc::new(Vec::new()),
+        terminal_verdicts: Arc::new(Vec::new()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -377,6 +378,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
             transactions,
             certificates,
             provisions,
+            terminal_verdicts,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -386,6 +388,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
                 transactions,
                 certificates: Arc::new(certificates),
                 provisions,
+                terminal_verdicts,
                 witness_sources,
             }
         }
@@ -394,6 +397,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
             transactions,
             certificates,
             provision_hashes,
+            terminal_verdicts,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -403,6 +407,7 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
                 transactions,
                 certificates: Arc::new(certificates),
                 provision_hashes,
+                terminal_verdicts,
                 witness_sources,
             }
         }
@@ -484,6 +489,7 @@ pub fn commit_block_with_witnesses(
         transactions: Arc::new(Vec::new()),
         certificates: Arc::new(Vec::new()),
         provisions: Arc::new(Vec::new()),
+        terminal_verdicts: Arc::new(Vec::new()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -538,6 +544,7 @@ pub fn commit_block_with_witness_window(
         transactions: Arc::new(Vec::new()),
         certificates: Arc::new(Vec::new()),
         provisions: Arc::new(Vec::new()),
+        terminal_verdicts: Arc::new(Vec::new()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -896,6 +903,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
             header,
             transactions,
             certificates,
+            terminal_verdicts,
             witness_sources,
             ..
         } => Block::Live {
@@ -903,6 +911,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
             transactions,
             certificates,
             provisions: Arc::new(vec![Arc::new(Verifiable::from(bundle))]),
+            terminal_verdicts,
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,
@@ -916,6 +925,7 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
             header,
             certificates,
             provisions,
+            terminal_verdicts,
             witness_sources,
             ..
         } => Block::Live {
@@ -923,6 +933,7 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
             transactions: Arc::new(txs),
             certificates,
             provisions,
+            terminal_verdicts,
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,

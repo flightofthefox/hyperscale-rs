@@ -1026,6 +1026,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         }
     }
 
@@ -1150,6 +1151,7 @@ mod tests {
             certificates: Arc::new(wrapped),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         }
     }
 
@@ -1281,6 +1283,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(wrapped),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         }
     }
 
@@ -1525,6 +1528,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(provisions),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         }
     }
 

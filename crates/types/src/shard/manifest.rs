@@ -5,8 +5,9 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight, FinalizationHash,
-    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    QuorumCertificate, TxHash, Verifiable, WitnessSources,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TERMINAL_VERDICTS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, ProvisionHash, QuorumCertificate, TerminalVerdict, TxHash, Verifiable,
+    WitnessSources,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -25,6 +26,12 @@ pub struct BlockManifest {
     cert_ids: Vec<FinalizationHash>,
     #[hbor(max = MAX_PROVISIONS_PER_BLOCK)]
     provision_hashes: Vec<ProvisionHash>,
+    /// What departed shards left unresolved of this chain's business,
+    /// mirrored verbatim rather than by hash: a verdict is composed on
+    /// the records themselves however long after the terminal they came
+    /// from, and there is no later source to fetch them from.
+    #[hbor(max = MAX_TERMINAL_VERDICTS_PER_BLOCK)]
+    terminal_verdicts: Vec<TerminalVerdict>,
     /// The block's beacon-witness inputs, mirrored verbatim — the
     /// sync/reload path replays leaf derivation from the manifest under
     /// QC trust. See [`WitnessSources`].
@@ -40,6 +47,7 @@ impl Default for BlockManifest {
             tx_hashes: Vec::new(),
             cert_ids: Vec::new(),
             provision_hashes: Vec::new(),
+            terminal_verdicts: Vec::new(),
             witness_sources: WitnessSources::empty(),
         }
     }
@@ -53,12 +61,14 @@ impl BlockManifest {
         tx_hashes: Vec<TxHash>,
         cert_ids: Vec<FinalizationHash>,
         provision_hashes: Vec<ProvisionHash>,
+        terminal_verdicts: Vec<TerminalVerdict>,
         witness_sources: WitnessSources,
     ) -> Self {
         Self {
             tx_hashes,
             cert_ids,
             provision_hashes,
+            terminal_verdicts,
             witness_sources,
         }
     }
@@ -84,6 +94,12 @@ impl BlockManifest {
     #[must_use]
     pub const fn provision_hashes(&self) -> &Vec<ProvisionHash> {
         &self.provision_hashes
+    }
+
+    /// What departed shards left unresolved of this chain's business.
+    #[must_use]
+    pub const fn terminal_verdicts(&self) -> &Vec<TerminalVerdict> {
+        &self.terminal_verdicts
     }
 
     /// The block's beacon-witness inputs.
@@ -124,6 +140,7 @@ impl BlockManifest {
             tx_hashes,
             cert_ids,
             provision_hashes,
+            block.terminal_verdicts().to_vec(),
             block.witness_sources().as_ref().clone(),
         )
     }

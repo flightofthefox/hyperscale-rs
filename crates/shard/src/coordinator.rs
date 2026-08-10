@@ -7044,6 +7044,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
+            terminal_verdicts: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -7504,6 +7505,7 @@ mod tests {
                 vec![TxHash::from(Hash::from_bytes(b"absent-tx"))],
                 vec![],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -7584,6 +7586,7 @@ mod tests {
                 transactions: Arc::new(Vec::new()),
                 certificates: Arc::new(Vec::new()),
                 provisions: Arc::new(Vec::new()),
+                terminal_verdicts: Arc::new(Vec::new()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             }
         };
@@ -7787,6 +7790,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
+            terminal_verdicts: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -8227,6 +8231,7 @@ mod tests {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
+            terminal_verdicts: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let parent_block_hash = parent_block.hash();
@@ -10331,6 +10336,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         };
         let mut sub_quorum_signers = SignerBitfield::new(4);
         sub_quorum_signers.set(0); // single signer — far below 2f+1 = 3
@@ -10399,6 +10405,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         };
         let block_hash = block.hash();
         // The linkage assert fires before the committee resolves, so a
@@ -10446,6 +10453,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         };
         let qc = {
             let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
@@ -10651,6 +10659,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         };
         let ancestor_hash = ancestor_block.hash();
         install_complete_block(&mut state, &ancestor_block);
@@ -10684,6 +10693,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         };
 
         let result = {
@@ -10728,6 +10738,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         };
         let ancestor_hash = ancestor_block.hash();
 
@@ -10759,6 +10770,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         };
 
         // Ancestor is at committed height, so walk stops before checking it
@@ -10966,6 +10978,7 @@ mod tests {
             certificates: Arc::new(certs),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         }
     }
 
@@ -11211,6 +11224,7 @@ mod tests {
             )]),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         }
     }
 
@@ -11303,6 +11317,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         }
     }
 
@@ -11323,6 +11338,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         }
     }
 

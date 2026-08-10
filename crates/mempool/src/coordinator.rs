@@ -1238,6 +1238,7 @@ mod tests {
                 transactions,
                 certificates,
                 provisions: Arc::new(vec![Arc::new(provision.into())]),
+                terminal_verdicts: Arc::new(Vec::new()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             },
             sealed @ Block::Sealed { .. } => sealed,

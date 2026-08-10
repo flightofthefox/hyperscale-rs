@@ -462,6 +462,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provision_hashes: Arc::new(Vec::new()),
+            terminal_verdicts: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     );
@@ -471,6 +472,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             transactions,
             certificates,
             provisions,
+            terminal_verdicts,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -480,6 +482,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
                 transactions,
                 certificates: Arc::new(certificates),
                 provisions,
+                terminal_verdicts,
                 witness_sources,
             }
         }
@@ -488,6 +491,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             transactions,
             certificates,
             provision_hashes,
+            terminal_verdicts,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -497,6 +501,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
                 transactions,
                 certificates: Arc::new(certificates),
                 provision_hashes,
+                terminal_verdicts,
                 witness_sources,
             }
         }
@@ -524,6 +529,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             transactions: Arc::new(Vec::new()),
             certificates: Arc::new(Vec::new()),
             provision_hashes: Arc::new(Vec::new()),
+            terminal_verdicts: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     );
@@ -533,6 +539,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             transactions,
             certificates,
             provisions,
+            terminal_verdicts,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -542,6 +549,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
                 transactions,
                 certificates: Arc::new(certificates),
                 provisions,
+                terminal_verdicts,
                 witness_sources,
             }
         }
@@ -550,6 +558,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
             transactions,
             certificates,
             provision_hashes,
+            terminal_verdicts,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -559,6 +568,7 @@ fn attach_receipts(block: &mut Block, receipts: Vec<StoredReceipt>) {
                 transactions,
                 certificates: Arc::new(certificates),
                 provision_hashes,
+                terminal_verdicts,
                 witness_sources,
             }
         }
@@ -659,6 +669,7 @@ fn test_commit_block_stores_certificates() {
             transactions,
             certificates: fw_certificates,
             provisions,
+            terminal_verdicts: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
@@ -671,6 +682,7 @@ fn test_commit_block_stores_certificates() {
             transactions,
             certificates: fw_certificates,
             provision_hashes,
+            terminal_verdicts: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };

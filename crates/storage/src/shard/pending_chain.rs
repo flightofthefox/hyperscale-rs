@@ -1780,6 +1780,7 @@ mod tests {
             transactions,
             certificates: Arc::new(certs),
             provisions,
+            terminal_verdicts: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         // The certifying QC carries a deliberately divergent timestamp (a
@@ -1920,6 +1921,7 @@ mod tests {
             transactions: Arc::new(txs),
             certificates,
             provisions,
+            terminal_verdicts: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         // A deliberately divergent certifying timestamp, as in

@@ -141,6 +141,7 @@ fn commit_with(
                 transactions,
                 certificates,
                 provisions,
+                terminal_verdicts,
                 witness_sources,
             } => {
                 let mut certificates = (*certificates).clone();
@@ -150,6 +151,7 @@ fn commit_with(
                     transactions,
                     certificates: Arc::new(certificates),
                     provisions,
+                    terminal_verdicts,
                     witness_sources,
                 }
             }
@@ -158,6 +160,7 @@ fn commit_with(
                 transactions,
                 certificates,
                 provision_hashes,
+                terminal_verdicts,
                 witness_sources,
             } => {
                 let mut certificates = (*certificates).clone();
@@ -167,6 +170,7 @@ fn commit_with(
                     transactions,
                     certificates: Arc::new(certificates),
                     provision_hashes,
+                    terminal_verdicts,
                     witness_sources,
                 }
             }
@@ -342,6 +346,7 @@ fn test_transactions_batch_with_indexed_block() {
             transactions: Arc::new(vec![tx]),
             certificates,
             provisions,
+            terminal_verdicts: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
@@ -354,6 +359,7 @@ fn test_transactions_batch_with_indexed_block() {
             transactions: Arc::new(vec![tx]),
             certificates,
             provision_hashes,
+            terminal_verdicts: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
@@ -1074,6 +1080,7 @@ fn block_with_txs(
             header,
             certificates,
             provisions,
+            terminal_verdicts,
             witness_sources,
             ..
         } => Block::Live {
@@ -1081,6 +1088,7 @@ fn block_with_txs(
             transactions: Arc::new(txs),
             certificates,
             provisions,
+            terminal_verdicts,
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,

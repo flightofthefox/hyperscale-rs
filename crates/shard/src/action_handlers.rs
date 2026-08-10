@@ -27,12 +27,12 @@ use hyperscale_types::{
     ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
     QuorumCertificate, ReadySignal, ReshapeTrigger, RevealChain, Round, ShardId, ShardLoad,
     SplitChildRoots, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateKey,
-    TerminalRoots, Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
-    TransactionRootContext, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
-    VrfProof, WeightedTimestamp, WitnessSources, WorkInFlight, absorb_committed_cells,
-    commit_witness_window, derive_leaves, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
-    vrf_output_from_proof, work_over_certificates,
+    TerminalRoots, TerminalVerdict, TerminalVerdictRoot, Timeout, TimeoutContext, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionRootContext, TxHash, ValidatorId, Verifiable,
+    Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
+    WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves,
+    local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
+    shard_reveal_sign, signed_bytes, vrf_output_from_proof, work_over_certificates,
 };
 
 /// Result of QC verification and assembly.
@@ -211,6 +211,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
     local_shard: ShardId,
     topology_snapshot: &TopologySnapshot,
     provisions: Vec<Arc<Verifiable<Provisions>>>,
+    terminal_verdicts: Vec<TerminalVerdict>,
     parent_in_flight: WorkInFlight,
     parent_settled_frontier: BlockHeight,
     parent_load: Option<ShardLoad>,
@@ -344,6 +345,11 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
         .unwrap_or(ShardLoad::ZERO)
         .advance(work_over_certificates(&certificates), substate_bytes);
 
+    // What departed shards left unresolved, committed so a verdict on it
+    // outlives the settled set the records were read from.
+    let terminal_verdict_root =
+        Verified::<TerminalVerdictRoot>::compute(&terminal_verdicts).into_inner();
+
     let header = BlockHeader::new(BlockHeaderParts {
         shard_id: local_shard,
         height,
@@ -359,6 +365,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
         local_receipt_root,
         provision_root,
         provision_tx_roots,
+        terminal_verdict_root,
         work_in_flight,
         settled_tick_frontier,
         beacon_witness_root,
@@ -375,6 +382,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateDatabase>(
         transactions: Arc::new(transactions),
         certificates: Arc::new(certificates),
         provisions: Arc::new(provisions),
+        terminal_verdicts: Arc::new(terminal_verdicts),
         witness_sources,
     };
 
@@ -984,6 +992,7 @@ where
                 shard_id,
                 &classification_topology,
                 provisions.clone(),
+                Vec::new(),
                 parent_in_flight,
                 parent_settled_frontier,
                 parent_load,

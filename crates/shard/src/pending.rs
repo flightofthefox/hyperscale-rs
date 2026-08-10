@@ -581,6 +581,7 @@ impl PendingBlock {
             tx_hashes,
             cert_ids,
             provision_hashes,
+            block.terminal_verdicts().to_vec(),
             block.witness_sources().as_ref().clone(),
         );
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>> =
@@ -762,6 +763,7 @@ impl PendingBlock {
             transactions: Arc::new(transactions),
             certificates: Arc::new(certificates),
             provisions: Arc::new(provisions),
+            terminal_verdicts: Arc::new(self.manifest.terminal_verdicts().clone()),
             witness_sources: Arc::new(self.manifest.witness_sources().clone()),
         });
 
@@ -893,7 +895,13 @@ mod tests {
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(vec![tx1, tx2], vec![], vec![], WitnessSources::empty()),
+            BlockManifest::new(
+                vec![tx1, tx2],
+                vec![],
+                vec![],
+                vec![],
+                WitnessSources::empty(),
+            ),
             LocalTimestamp::ZERO,
         );
 
@@ -922,7 +930,13 @@ mod tests {
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(vec![tx1], vec![one, two], vec![], WitnessSources::empty()),
+            BlockManifest::new(
+                vec![tx1],
+                vec![one, two],
+                vec![],
+                vec![],
+                WitnessSources::empty(),
+            ),
             LocalTimestamp::ZERO,
         );
 
@@ -952,6 +966,7 @@ mod tests {
             BlockManifest::new(
                 vec![],
                 vec![fw.receipt_hash()],
+                vec![],
                 vec![],
                 WitnessSources::empty(),
             ),
@@ -989,6 +1004,7 @@ mod tests {
                 vec![tx_hash],
                 vec![fw.receipt_hash()],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1023,6 +1039,7 @@ mod tests {
             certificates: Arc::new(vec![wire_fw]),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         };
 
         let pending = PendingBlock::from_complete_block(
@@ -1050,6 +1067,7 @@ mod tests {
                 vec![],
                 vec![],
                 vec![prov_a, prov_b],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1098,13 +1116,20 @@ mod tests {
                 vec![],
                 vec![],
                 vec![shared, only_stale],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
         );
         let live = PendingBlock::from_manifest(
             make_header(BlockHeight::new(10)),
-            BlockManifest::new(vec![], vec![], vec![shared], WitnessSources::empty()),
+            BlockManifest::new(
+                vec![],
+                vec![],
+                vec![shared],
+                vec![],
+                WitnessSources::empty(),
+            ),
             LocalTimestamp::ZERO,
         );
         pending_blocks.insert(stale);
@@ -1130,6 +1155,7 @@ mod tests {
                 vec![shared, only_dropped],
                 vec![],
                 vec![],
+                vec![],
                 WitnessSources::empty(),
             ),
             LocalTimestamp::ZERO,
@@ -1137,7 +1163,13 @@ mod tests {
         let dropped_hash = dropped.header().hash();
         let other = PendingBlock::from_manifest(
             make_header(BlockHeight::new(8)),
-            BlockManifest::new(vec![shared], vec![], vec![], WitnessSources::empty()),
+            BlockManifest::new(
+                vec![shared],
+                vec![],
+                vec![],
+                vec![],
+                WitnessSources::empty(),
+            ),
             LocalTimestamp::ZERO,
         );
         pending_blocks.insert(dropped);

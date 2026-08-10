@@ -25,8 +25,9 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock, Finalization,
-    FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK,
-    ProvisionHash, Provisions, QuorumCertificate, Transaction, TxHash, Verifiable, WitnessSources,
+    FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISIONS_PER_BLOCK,
+    MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash, Provisions,
+    QuorumCertificate, TerminalVerdict, Transaction, TxHash, Verifiable, WitnessSources,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -93,6 +94,12 @@ pub struct ElidedCertifiedBlock {
     #[hbor(max = MAX_FINALIZED_TX_PER_BLOCK)]
     certificates: Vec<(FinalizationHash, Option<Arc<Verifiable<Finalization>>>)>,
     provisions: ElidedProvisions,
+    /// What departed shards left unresolved of the serving chain's
+    /// business, always inline: the records are small, rare, and are what
+    /// a verdict is composed on, so a hop that dropped them would hand
+    /// back a block that cannot answer for itself.
+    #[hbor(max = MAX_TERMINAL_VERDICTS_PER_BLOCK)]
+    terminal_verdicts: Vec<TerminalVerdict>,
     /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
     /// block's beacon-witness leaves at commit.
@@ -236,6 +243,7 @@ impl ElidedCertifiedBlock {
             transactions,
             certificates,
             provisions,
+            terminal_verdicts: block.terminal_verdicts().to_vec(),
             witness_sources: block.witness_sources().as_ref().clone(),
         }
     }
@@ -338,6 +346,7 @@ impl ElidedCertifiedBlock {
                     transactions: txs,
                     certificates: certs,
                     provisions: Arc::new(provisions),
+                    terminal_verdicts: Arc::new(self.terminal_verdicts.clone()),
                     witness_sources: Arc::new(self.witness_sources.clone()),
                 }
             }
@@ -346,6 +355,7 @@ impl ElidedCertifiedBlock {
                 transactions: txs,
                 certificates: certs,
                 provision_hashes: Arc::new(hashes.clone()),
+                terminal_verdicts: Arc::new(self.terminal_verdicts.clone()),
                 witness_sources: Arc::new(self.witness_sources.clone()),
             },
             (None, ElidedProvisions::Live(_)) => {
@@ -469,6 +479,7 @@ mod tests {
             transactions: Arc::new(vec![Arc::new(Verifiable::from(tx))]),
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
+            terminal_verdicts: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -507,6 +518,7 @@ mod tests {
             header,
             transactions,
             provisions,
+            terminal_verdicts,
             witness_sources,
             ..
         } = create_test_block()
@@ -518,6 +530,7 @@ mod tests {
             transactions,
             certificates: Arc::new(vec![Arc::new(fw)]),
             provisions,
+            terminal_verdicts,
             witness_sources,
         }
     }

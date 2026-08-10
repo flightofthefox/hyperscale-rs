@@ -2520,6 +2520,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         }
     }
 
@@ -2563,6 +2564,7 @@ mod tests {
             certificates: Arc::new(certificates),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         }
     }
 
@@ -3275,6 +3277,7 @@ mod tests {
             certificates: Arc::new(Vec::new()),
             provisions: Arc::new(Vec::new()),
             witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(Vec::new()),
         };
         let block_hash = block.hash();
         vp.track_pending_assembly(Arc::new(block));

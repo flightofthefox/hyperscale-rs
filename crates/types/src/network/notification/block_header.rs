@@ -119,6 +119,7 @@ mod tests {
             ],
             vec![],
             vec![],
+            vec![],
             WitnessSources::empty(),
         );
 
@@ -133,6 +134,7 @@ mod tests {
         let header = make_header(BlockHeight::new(5));
         let manifest = BlockManifest::new(
             vec![TxHash::from(Hash::from_bytes(b"tx1"))],
+            vec![],
             vec![],
             vec![],
             WitnessSources::empty(),
@@ -152,7 +154,13 @@ mod tests {
 
         let gossip = BlockHeaderNotification::new(
             make_header(BlockHeight::new(1)),
-            BlockManifest::new(vec![tx1, tx2, tx3], vec![], vec![], WitnessSources::empty()),
+            BlockManifest::new(
+                vec![tx1, tx2, tx3],
+                vec![],
+                vec![],
+                vec![],
+                WitnessSources::empty(),
+            ),
             zero_sig(),
         );
 
