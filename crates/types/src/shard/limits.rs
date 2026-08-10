@@ -96,13 +96,9 @@ const DRAIN_COUNT_SLACK: u64 = 2;
 /// budget no way back down.
 ///
 /// The total advances on commit and retreats when a certificate resolves
-/// the transaction, whichever verdict it carries. One still unresolved at
+/// the transaction, whichever verdict it carries: one still unresolved at
 /// its own deadline is certified aborted at the reservation its block
-/// took — unless a certificate of the shard's own already covers it, in
-/// which case a counterpart could have settled against that certificate,
-/// and only that counterpart's departure makes the abort admissible. A
-/// straddler waiting on a counterpart that never leaves holds its
-/// reservation for as long as it waits.
+/// took, so a shard that stops receiving traffic returns to zero.
 ///
 /// Sized like the count it replaces: a full pipeline of blocks
 /// (commit → execute → certify) at a representative gas limit, so a

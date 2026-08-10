@@ -751,7 +751,6 @@ impl ExecutionCoordinator {
                 member.admission,
             );
             self.ticks.assign_tx(member.request.tx_hash, tick_id);
-            self.unresolved.certify(member.request.tx_hash);
             if member.request.reaches_beyond {
                 legs.insert(member.request.tx_hash);
                 provisional_claims
@@ -784,7 +783,6 @@ impl ExecutionCoordinator {
             self.candidates.remove(tx_hash);
             self.provisioning.remove_tx(tx_hash);
             self.ticks.assign_tx(tx_hash, tick_id);
-            self.unresolved.certify(tx_hash);
         }
 
         if state.is_empty() {
@@ -2044,8 +2042,7 @@ impl ExecutionCoordinator {
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
         self.unresolved.release_resolved(block.certificates());
-        self.stamp_departed_participants(topology_schedule);
-        self.unresolved.prune(self.committed_ts, self.local_shard);
+        self.unresolved.prune(self.committed_ts);
 
         let mut actions = Vec::new();
 
@@ -2332,23 +2329,12 @@ impl ExecutionCoordinator {
     ///
     /// A settlement needs a certificate from every shard party to the
     /// transaction, so it takes two things to put one out of reach: no
-    /// certificate of ours for a counterpart to combine with its own, or
-    /// no counterpart in a position to combine one.
-    ///
-    /// A tick holding the transaction is speaking for it and is left to.
-    /// The one composing now is about to attest it, and its verdict can
-    /// carry a charge an abandonment cannot — a payer's leg admitted at
-    /// its engagement deadline being exactly that. An earlier one can
-    /// still close its coverage, unless a counterpart it waits on has
-    /// left, in which case it never will.
-    ///
-    /// With no tick speaking for it, what decides is whether a certificate
-    /// of ours is out where a counterpart could settle against it. The
-    /// account answers that, not the tick registry: the certificate
-    /// outlives the tick that produced it — a discard drops the tick, a
-    /// restart loses it — and a shard reading the registry would take the
-    /// tick's absence for the certificate's and abandon a transaction its
-    /// counterpart can still settle.
+    /// certificate of ours for a counterpart to combine with its own, or a
+    /// participant that has left and will produce no more. The tick
+    /// composing now is the exception to both — it is about to speak for
+    /// the transaction itself, and its verdict can carry a charge an
+    /// abandonment cannot, a payer's leg admitted at its engagement
+    /// deadline being exactly that.
     ///
     /// A participant that left having *already* settled the transaction is
     /// the one case this admits and must not: it is why the fence puts the
@@ -2367,63 +2353,18 @@ impl ExecutionCoordinator {
         tx_hash: TxHash,
     ) -> bool {
         match self.ticks.tick_assignment(tx_hash) {
+            None => true,
             Some(tick_id) if tick_id == composing => false,
-            Some(_) => self.a_counterpart_has_left(topology_schedule, tx_hash),
-            None => {
-                !self.unresolved.is_certified(tx_hash)
-                    || self.no_counterpart_can_settle(topology_schedule, tx_hash)
-            }
-        }
-    }
-
-    /// The shards other than this one party to `tx_hash` — the ones whose
-    /// certificates a settlement of it needs.
-    fn counterparts(&self, tx_hash: TxHash) -> impl Iterator<Item = ShardId> + '_ {
-        self.unresolved
-            .participants(tx_hash)
-            .filter(move |shard| *shard != self.local_shard)
-    }
-
-    /// Whether some counterpart of `tx_hash`'s has left and will produce
-    /// no more, which is what stops the tick holding it from ever closing
-    /// its coverage.
-    fn a_counterpart_has_left(
-        &self,
-        topology_schedule: &TopologySchedule,
-        tx_hash: TxHash,
-    ) -> bool {
-        self.counterparts(tx_hash).any(|shard| {
-            matches!(
-                topology_schedule.at_for_shard(shard, self.committed_ts),
-                Some((_, true))
-            )
-        })
-    }
-
-    /// Whether no counterpart is in a position to settle `tx_hash` against
-    /// a certificate of ours: none is party to it, so there is no
-    /// certificate but ours to combine with, or one that is has left.
-    fn no_counterpart_can_settle(
-        &self,
-        topology_schedule: &TopologySchedule,
-        tx_hash: TxHash,
-    ) -> bool {
-        self.counterparts(tx_hash).next().is_none()
-            || self.a_counterpart_has_left(topology_schedule, tx_hash)
-    }
-
-    /// Record where each departed participant's chain ended, for the
-    /// entries whose fate only that shard's settled set can decide.
-    ///
-    /// Read on every commit, while the schedule still carries the window
-    /// that proves the terminal: that window is retained against the
-    /// beacon's own consumers, and a straddler waits on its counterpart
-    /// for as long as the counterpart takes.
-    fn stamp_departed_participants(&mut self, topology_schedule: &TopologySchedule) {
-        for shard in self.unresolved.unstamped_participants(self.local_shard) {
-            if let Some(cut) = topology_schedule.terminal_cut_for_shard(shard, self.committed_ts) {
-                self.unresolved.record_terminal(shard, cut);
-            }
+            Some(_) => self
+                .unresolved
+                .participants(tx_hash)
+                .filter(|shard| *shard != self.local_shard)
+                .any(|shard| {
+                    matches!(
+                        topology_schedule.at_for_shard(shard, self.committed_ts),
+                        Some((_, true))
+                    )
+                }),
         }
     }
 
@@ -2566,7 +2507,6 @@ impl ExecutionCoordinator {
         let tick_id = TickId::new(self.local_shard, block_height);
         for tx in transactions {
             self.ticks.assign_tx(tx.hash(), tick_id);
-            self.unresolved.certify(tx.hash());
         }
     }
 
@@ -6238,7 +6178,6 @@ mod tests {
         state
             .unresolved
             .register_committed(std::iter::once((&transaction, participating)));
-        state.unresolved.certify(tx_hash);
         state.committed_ts = WeightedTimestamp::from_millis(STRANDED_DEADLINE_MS);
         (state, tick_id, tx_hash)
     }
@@ -6264,27 +6203,6 @@ mod tests {
         assert!(
             state.ticks.contains_tick(&tick_id),
             "so the tick survives its own deadline",
-        );
-    }
-
-    /// The certificate outlives the tick that produced it, so losing the
-    /// tick does not make the member this shard's to abandon: the
-    /// counterpart holds a certificate of ours it can still settle
-    /// against, and the account is what remembers that.
-    #[test]
-    fn a_lost_tick_does_not_release_a_member_a_counterpart_can_settle() {
-        let local = ShardId::leaf(1, 0);
-        let sched = terminating_schedule_over(60_000);
-        let (mut state, tick_id, _) = state_stranded_on(local, ShardId::leaf(1, 1), 1);
-
-        state.ticks.remove_tick(&tick_id);
-        state.ticks.discard_tick(&tick_id);
-
-        assert!(
-            state
-                .abandonable(&sched, TickId::new(local, BlockHeight::new(9)))
-                .is_empty(),
-            "the certificate is out there whether or not the tick still is",
         );
     }
 
@@ -6348,7 +6266,6 @@ mod tests {
             &sibling,
             BTreeSet::from([local, ShardId::leaf(1, 1)]),
         )));
-        state.unresolved.certify(sibling_hash);
 
         // The commit that composes the abandonment, on the shard that
         // stranded the member rather than through the ROOT-only helper.
