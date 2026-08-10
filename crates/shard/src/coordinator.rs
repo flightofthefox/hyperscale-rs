@@ -1011,6 +1011,62 @@ impl ShardCoordinator {
         }
     }
 
+    /// Whether the block's terminal-verdict records are ones this voter
+    /// can attest to, and so whether voting on it must be withheld.
+    ///
+    /// A record claims a departed shard did not settle the transactions it
+    /// names, which is the same question the split-boundary fence puts to
+    /// that shard's settled set — so it is asked through the same
+    /// predicate, and the record's validity cannot drift from the verdict
+    /// it will later license. The set is complete and beacon-attested, so
+    /// absence from it is proof rather than ignorance.
+    ///
+    /// A voter that has not acquired the set defers rather than guessing:
+    /// the record is only proposable inside the window where the set can
+    /// be read, so a voter inside it either has the set or is about to.
+    /// After that window the record is history and nothing re-asks this.
+    fn fence_terminal_verdicts(
+        &self,
+        topology_schedule: &TopologySchedule,
+        block: &Block,
+        block_hash: BlockHash,
+    ) -> bool {
+        if block.terminal_verdicts().is_empty() {
+            return false;
+        }
+        let claims = block.terminal_verdicts().iter().flat_map(|verdict| {
+            verdict
+                .unsettled()
+                .iter()
+                .map(move |tx_hash| (verdict.shard(), *tx_hash, TxClaim::Abandoned))
+        });
+        match settled_set_verdict(
+            &self.settled_sets,
+            topology_schedule,
+            self.local_shard,
+            block.header().parent_qc().weighted_timestamp(),
+            claims,
+        ) {
+            SettledSetVerdict::Pass => false,
+            SettledSetVerdict::Reject => {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    "Terminal-verdict record names a transaction its shard settled — not voting"
+                );
+                true
+            }
+            SettledSetVerdict::Defer => {
+                trace!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    "Settled set for a terminal-verdict record unknown at vote; deferring"
+                );
+                true
+            }
+        }
+    }
+
     /// Whether `wt` lands past this shard's terminal window — the coast
     /// region after a split's cut. A block whose parent QC carries such a
     /// timestamp must be empty (it exists only to certify the crossing),
@@ -3262,6 +3318,12 @@ impl ShardCoordinator {
 
             // Split-boundary fence over the block's finalizations.
             if self.fence_blocks_vote(topology_schedule, block, block_hash) {
+                return vec![];
+            }
+
+            // And over the records it writes down about departed shards,
+            // which the same sets answer for.
+            if self.fence_terminal_verdicts(topology_schedule, block, block_hash) {
                 return vec![];
             }
 

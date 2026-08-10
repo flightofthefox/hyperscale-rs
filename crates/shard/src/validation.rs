@@ -19,7 +19,7 @@ use std::sync::Arc;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY,
     MAX_TIMESTAMP_RUSH, ProvisionHash, QuorumCertificate, ShardId, ShardLoad, TopologySnapshot,
-    Transaction, TxHash, Verifiable, VoteCount,
+    Transaction, TxHash, Verifiable, VoteCount, terminal_verdict_root_from_records,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -491,6 +491,44 @@ pub fn validate_block_for_vote(
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
     validate_provisions_not_fenced(topology_snapshot, block)?;
     validate_engagement(topology_snapshot, local_shard, block, dedup_index)?;
+    validate_terminal_verdicts_well_formed(block)?;
+    Ok(())
+}
+
+/// Validate the block's terminal-verdict records against the header that
+/// commits them, and against the one form a record may take.
+///
+/// Structural only — whether the records tell the truth is a question for
+/// the departed shards' settled sets, which this cannot see. What it
+/// establishes is that every replica reads the same claim: the root binds
+/// the records to the header, and the canonical order means one claim has
+/// one encoding, so two proposers naming the same transactions cannot
+/// produce blocks that differ.
+pub fn validate_terminal_verdicts_well_formed(block: &Block) -> Result<(), String> {
+    let verdicts = block.terminal_verdicts();
+    let computed = terminal_verdict_root_from_records(verdicts);
+    let claimed = block.header().terminal_verdict_root();
+    if computed != claimed {
+        return Err(format!(
+            "terminal-verdict root {claimed:?} does not commit the block's records {computed:?}"
+        ));
+    }
+
+    let mut seen: HashSet<ShardId> = HashSet::new();
+    for verdict in verdicts {
+        if !verdict.is_well_formed() {
+            return Err(format!(
+                "terminal-verdict record for {:?} is empty, over its cap, or out of order",
+                verdict.shard(),
+            ));
+        }
+        if !seen.insert(verdict.shard()) {
+            return Err(format!(
+                "block carries two terminal-verdict records for {:?}",
+                verdict.shard(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -562,9 +600,9 @@ mod tests {
         AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Finalization,
         Hash, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
         Provisions, QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, Signer,
-        SignerBitfield, TimestampRange, Transaction, TransactionDecision, ValidatorId,
-        ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources,
-        test_utils,
+        SignerBitfield, TerminalVerdict, TerminalVerdictRoot, TimestampRange, Transaction,
+        TransactionDecision, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
+        WeightedTimestamp, WitnessSources, test_utils,
     };
 
     use super::*;
@@ -1028,6 +1066,87 @@ mod tests {
             witness_sources: Arc::new(WitnessSources::empty()),
             terminal_verdicts: Arc::new(Vec::new()),
         }
+    }
+
+    /// A block carrying records, rooted the way the header claims.
+    fn block_with_verdicts(verdicts: Vec<TerminalVerdict>, root: TerminalVerdictRoot) -> Block {
+        let base = header_at_height(BlockHeight::new(6), 100_000);
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: base.height(),
+                parent_block_hash: base.parent_block_hash(),
+                parent_qc: base.parent_qc().clone().into(),
+                proposer: base.proposer(),
+                timestamp: base.timestamp(),
+                round: base.round(),
+                provision_tx_roots: std::collections::BTreeMap::new(),
+                terminal_verdict_root: root,
+                ..Default::default()
+            }),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(Vec::new()),
+            provisions: Arc::new(Vec::new()),
+            terminal_verdicts: Arc::new(verdicts),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    fn verdict(shard: ShardId, seeds: &[u8]) -> TerminalVerdict {
+        TerminalVerdict::new(
+            shard,
+            WeightedTimestamp::from_millis(1_000),
+            seeds
+                .iter()
+                .map(|&seed| TxHash::from(Hash::from_bytes(&[seed; 32]))),
+        )
+    }
+
+    /// The header commits the records, so a block whose root does not
+    /// cover what it carries is refused before anyone asks whether the
+    /// records are true.
+    #[test]
+    fn a_block_whose_root_does_not_commit_its_records_is_refused() {
+        let records = vec![verdict(ShardId::ROOT, &[1, 2])];
+        let honest = terminal_verdict_root_from_records(&records);
+        assert!(
+            validate_terminal_verdicts_well_formed(&block_with_verdicts(records.clone(), honest))
+                .is_ok()
+        );
+
+        let err = validate_terminal_verdicts_well_formed(&block_with_verdicts(
+            records,
+            TerminalVerdictRoot::ZERO,
+        ))
+        .unwrap_err();
+        assert!(err.contains("does not commit"), "{err}");
+    }
+
+    /// One claim has one encoding. A record out of its canonical order is
+    /// a second form of the same claim and is refused, so two proposers
+    /// naming the same transactions cannot build differing blocks.
+    #[test]
+    fn a_record_out_of_its_canonical_form_is_refused() {
+        let malformed =
+            TerminalVerdict::new(ShardId::ROOT, WeightedTimestamp::from_millis(1_000), []);
+        let root = terminal_verdict_root_from_records(std::slice::from_ref(&malformed));
+        let err =
+            validate_terminal_verdicts_well_formed(&block_with_verdicts(vec![malformed], root))
+                .unwrap_err();
+        assert!(
+            err.contains("empty, over its cap, or out of order"),
+            "{err}"
+        );
+    }
+
+    /// One record per departed shard: two would let a block answer for
+    /// the same shard twice and leave which answer counts to the reader.
+    #[test]
+    fn two_records_for_one_shard_are_refused() {
+        let records = vec![verdict(ShardId::ROOT, &[1]), verdict(ShardId::ROOT, &[2])];
+        let root = terminal_verdict_root_from_records(&records);
+        let err = validate_terminal_verdicts_well_formed(&block_with_verdicts(records, root))
+            .unwrap_err();
+        assert!(err.contains("two terminal-verdict records"), "{err}");
     }
 
     /// The running work total is a validity condition, not a hint: a header
