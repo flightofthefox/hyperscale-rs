@@ -311,14 +311,52 @@ impl TopologySchedule {
     ) -> (ScheduleLookup<'_>, bool) {
         match self.lookup(wt) {
             ScheduleLookup::Committee(snapshot) if !snapshot.shard_trie().contains(shard) => self
-                .by_epoch
-                .range(..self.epoch_for(wt))
-                .rev()
-                .find(|(_, s)| s.shard_trie().contains(shard))
+                .terminal_window(shard, wt)
                 .map_or((ScheduleLookup::Evicted, true), |(_, s)| {
                     (ScheduleLookup::Committee(s), true)
                 }),
             other => (other, false),
+        }
+    }
+
+    /// The newest retained window below `wt`'s that carries `shard` — the
+    /// last one its chain ran under, for a `wt` whose own window has
+    /// dropped it. `None` once no retained window carries it at all.
+    fn terminal_window(
+        &self,
+        shard: ShardId,
+        wt: WeightedTimestamp,
+    ) -> Option<(Epoch, &Arc<TopologySnapshot>)> {
+        self.by_epoch
+            .range(..self.epoch_for(wt))
+            .rev()
+            .find(|(_, s)| s.shard_trie().contains(shard))
+            .map(|(epoch, snapshot)| (*epoch, snapshot))
+    }
+
+    /// Where `shard`'s chain ended, as an upper bound: the end of the last
+    /// window that carried it.
+    ///
+    /// The figure a consumer records when it needs the terminal to outlive
+    /// the window that proves it. Read off the attested schedule and the
+    /// epoch geometry alone, so two replicas that observe the departure on
+    /// different blocks — a lagging beacon fold moves *when* this resolves,
+    /// never *what* it resolves to — still record the same instant.
+    ///
+    /// `None` while `shard` is alive in `wt`'s window, and `None` once no
+    /// retained window carries it: a terminal this cannot read is not one
+    /// it invents.
+    #[must_use]
+    pub fn terminal_cut_for_shard(
+        &self,
+        shard: ShardId,
+        wt: WeightedTimestamp,
+    ) -> Option<WeightedTimestamp> {
+        match self.lookup(wt) {
+            ScheduleLookup::Committee(snapshot) if !snapshot.shard_trie().contains(shard) => self
+                .terminal_window(shard, wt)
+                .map(|(epoch, _)| self.windows().window_of(epoch).end),
+            _ => None,
         }
     }
 
@@ -1352,6 +1390,48 @@ mod tests {
         assert_eq!(
             sched.split_at_next_boundary(p, WeightedTimestamp::from_millis(2500)),
             SplitAtBoundary::Unresolved
+        );
+    }
+
+    /// The cut a departed shard's chain ended at is the end of the last
+    /// window that carried it, and it reads the same from anywhere past
+    /// it — which is what lets a consumer record it once and stop
+    /// depending on the window that proves it.
+    #[test]
+    fn terminal_cut_is_the_end_of_the_last_window_carrying_the_shard() {
+        let p = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let (left, right) = p.children();
+        let mut sched = TopologySchedule::new(
+            1000,
+            Epoch::new(6),
+            reshape_snap(&[p, sibling], &[], &[], &[]),
+        );
+        sched.insert(
+            Epoch::new(7),
+            reshape_snap(&[left, right, sibling], &[], &[], &[]),
+        );
+
+        let cut = sched.windows().window_of(Epoch::new(6)).end;
+        assert_eq!(
+            sched.terminal_cut_for_shard(p, WeightedTimestamp::from_millis(7500)),
+            Some(cut),
+        );
+        assert_eq!(
+            sched.terminal_cut_for_shard(p, WeightedTimestamp::from_millis(7999)),
+            Some(cut),
+            "and does not move with where it is read from",
+        );
+
+        assert_eq!(
+            sched.terminal_cut_for_shard(p, WeightedTimestamp::from_millis(6500)),
+            None,
+            "a shard still in its own window has no terminal to read",
+        );
+        assert_eq!(
+            sched.terminal_cut_for_shard(sibling, WeightedTimestamp::from_millis(7500)),
+            None,
+            "nor does one that outlived the window under test",
         );
     }
 
