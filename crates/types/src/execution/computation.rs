@@ -1,47 +1,8 @@
-//! Block-derived helpers: the block's cross-shard transactions, per-target
-//! provision merkle roots, and tick-leader selection.
-
-use std::sync::Arc;
+//! Tick-leader selection.
 
 use hyperscale_hbor::to_vec as hbor_to_vec;
 
-use crate::{
-    Attempt, Hash, ShardId, TickId, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable,
-};
-
-/// The block's transactions that reach beyond this shard, in block order.
-///
-/// This is what a remote shard reads a committed header for: which of the
-/// block's transactions it might be party to, and so which outcomes it
-/// should expect. Whether it *is* party is a question about its own state,
-/// which it answers more precisely than any shard set carried here could.
-///
-/// Used in both block proposal (to populate `BlockHeader::cross_shard_txs`)
-/// and validation (to verify the header's field).
-pub fn compute_cross_shard_txs(
-    local_shard: ShardId,
-    topology_snapshot: &TopologySnapshot,
-    transactions: &[Arc<Verifiable<Transaction>>],
-) -> Vec<TxHash> {
-    transactions
-        .iter()
-        .filter(|tx| reaches_beyond(local_shard, topology_snapshot, tx))
-        .map(|tx| tx.hash())
-        .collect()
-}
-
-/// Whether `tx` touches any shard other than `local_shard`.
-fn reaches_beyond(
-    local_shard: ShardId,
-    topology_snapshot: &TopologySnapshot,
-    tx: &Arc<Verifiable<Transaction>>,
-) -> bool {
-    !topology_snapshot.is_single_shard_transaction(tx)
-        && topology_snapshot
-            .all_shards_for_transaction(tx)
-            .into_iter()
-            .any(|s| s != local_shard)
-}
+use crate::{Attempt, Hash, TickId, ValidatorId};
 
 /// Deterministically select the tick leader for a tick (attempt 0).
 ///

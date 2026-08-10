@@ -7498,7 +7498,6 @@ mod tests {
                 certificate_root: __h.certificate_root(),
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
-                cross_shard_txs: __h.cross_shard_txs().clone(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 work_in_flight: __h.work_in_flight(),
                 ..Default::default()
@@ -7926,7 +7925,6 @@ mod tests {
                 certificate_root: __h.certificate_root(),
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
-                cross_shard_txs: __h.cross_shard_txs().clone(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 work_in_flight: __h.work_in_flight(),
                 ..Default::default()
@@ -7996,7 +7994,6 @@ mod tests {
                 certificate_root: __h.certificate_root(),
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
-                cross_shard_txs: __h.cross_shard_txs().clone(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 work_in_flight: __h.work_in_flight(),
                 ..Default::default()
@@ -8081,7 +8078,6 @@ mod tests {
                 certificate_root: __h.certificate_root(),
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
-                cross_shard_txs: __h.cross_shard_txs().clone(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 work_in_flight: __h.work_in_flight(),
                 ..Default::default()
@@ -8184,7 +8180,6 @@ mod tests {
                 certificate_root: __h.certificate_root(),
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
-                cross_shard_txs: __h.cross_shard_txs().clone(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 work_in_flight: __h.work_in_flight(),
                 ..Default::default()
@@ -8234,7 +8229,6 @@ mod tests {
                 certificate_root: __h.certificate_root(),
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
-                cross_shard_txs: __h.cross_shard_txs().clone(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 work_in_flight: __h.work_in_flight(),
                 ..Default::default()
@@ -8826,7 +8820,6 @@ mod tests {
                 certificate_root: __h.certificate_root(),
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
-                cross_shard_txs: __h.cross_shard_txs().clone(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 work_in_flight: __h.work_in_flight(),
                 ..Default::default()
@@ -9172,7 +9165,6 @@ mod tests {
                 certificate_root: __h.certificate_root(),
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
-                cross_shard_txs: __h.cross_shard_txs().clone(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 work_in_flight: __h.work_in_flight(),
                 ..Default::default()
@@ -9216,7 +9208,6 @@ mod tests {
                 certificate_root: __h.certificate_root(),
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
-                cross_shard_txs: __h.cross_shard_txs().clone(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 work_in_flight: __h.work_in_flight(),
                 ..Default::default()
@@ -9312,7 +9303,6 @@ mod tests {
                 certificate_root: __h.certificate_root(),
                 local_receipt_root: __h.local_receipt_root(),
                 provision_root: __h.provision_root(),
-                cross_shard_txs: __h.cross_shard_txs().clone(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 work_in_flight: __h.work_in_flight(),
                 ..Default::default()
@@ -10143,7 +10133,6 @@ mod tests {
                     certificate_root: __h.certificate_root(),
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
-                    cross_shard_txs: __h.cross_shard_txs().clone(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     work_in_flight: __h.work_in_flight(),
                     ..Default::default()
@@ -10212,7 +10201,6 @@ mod tests {
                     certificate_root: __h.certificate_root(),
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
-                    cross_shard_txs: __h.cross_shard_txs().clone(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     work_in_flight: __h.work_in_flight(),
                     ..Default::default()
@@ -10260,7 +10248,6 @@ mod tests {
                     certificate_root: __h.certificate_root(),
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
-                    cross_shard_txs: __h.cross_shard_txs().clone(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     work_in_flight: __h.work_in_flight(),
                     ..Default::default()
@@ -10466,7 +10453,6 @@ mod tests {
                     certificate_root: __h.certificate_root(),
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
-                    cross_shard_txs: __h.cross_shard_txs().clone(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     work_in_flight: __h.work_in_flight(),
                     ..Default::default()
@@ -10500,7 +10486,6 @@ mod tests {
                     certificate_root: __h.certificate_root(),
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
-                    cross_shard_txs: __h.cross_shard_txs().clone(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     work_in_flight: __h.work_in_flight(),
                     ..Default::default()
@@ -10545,7 +10530,6 @@ mod tests {
                     certificate_root: __h.certificate_root(),
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
-                    cross_shard_txs: __h.cross_shard_txs().clone(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     work_in_flight: __h.work_in_flight(),
                     ..Default::default()
@@ -10577,7 +10561,6 @@ mod tests {
                     certificate_root: __h.certificate_root(),
                     local_receipt_root: __h.local_receipt_root(),
                     provision_root: __h.provision_root(),
-                    cross_shard_txs: __h.cross_shard_txs().clone(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     work_in_flight: __h.work_in_flight(),
                     ..Default::default()

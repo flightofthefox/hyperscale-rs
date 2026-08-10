@@ -1,19 +1,19 @@
 //! Timeout-driven fallback detection for expected execution certificates.
 //!
-//! A remote shard's committed block header lists the cross-shard
-//! transactions in that block. For each one we are party to we expect an
-//! aggregated execution certificate carrying that shard's outcome within a
-//! bounded window. If it doesn't land in time, we fall back to explicitly
-//! fetching it from the source shard's committee.
+//! A composed tick names, per member, the shards party to it. Each of
+//! those owes an aggregated execution certificate carrying its outcome,
+//! and the tick's coverage does not close without one. If a certificate
+//! doesn't land within a bounded window, we fall back to explicitly
+//! fetching it from that shard's committee.
 //!
 //! ## Key type
 //!
 //! Expectations and fulfilments are both keyed by `(source_shard, tx_hash)`
 //! — the question actually being asked, which is per transaction. The
-//! certificate's own identity is not what a requester holds: a header names
-//! transactions, and which certificate the source shard puts each one in is
-//! the source shard's business. One arriving certificate therefore fulfils
-//! every expectation for the transactions it covers.
+//! certificate's own identity is not what a requester holds: which
+//! certificate a source shard puts a transaction in is the source shard's
+//! business. One arriving certificate therefore fulfils every expectation
+//! for the transactions it covers.
 //!
 //! ## Deadlines
 //!
@@ -35,13 +35,10 @@
 //!
 //! **Backstop — time-based**: each entry also carries a deadline
 //! (`vote_anchor_ts + RETENTION_HORIZON`), pruned by
-//! [`prune_fulfilled`](ExpectedCertTracker::prune_fulfilled). This
-//! catches a specific late-arrival race: state-based drain runs at
-//! `remove_finalization`, after which the tick is gone. If a
-//! duplicate header then arrives within the gossip window, `register`
-//! re-creates an expectation, the fallback fetch returns the EC,
-//! `mark_fulfilled` re-creates the tombstone — but no future
-//! `remove_finalization` will fire for those txs. The deadline evicts it.
+//! [`prune_fulfilled`](ExpectedCertTracker::prune_fulfilled). A
+//! certificate that lands once no tick holds its transactions still
+//! records a tombstone, and no `remove_finalization` will ever fire for
+//! those transactions. The deadline evicts it.
 //!
 //! Retention pruning against the transactions still awaiting coverage is
 //! orchestrated by the coordinator via
@@ -51,7 +48,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
-use hyperscale_types::{MAX_FINALIZATION_DELAY, ShardId, TxHash, WeightedTimestamp};
+use hyperscale_types::{ShardId, TxHash, WeightedTimestamp};
 
 /// How long to wait before the first fallback request. Anchored on the
 /// committing QC's `weighted_timestamp_ms`, so the window stays meaningful
@@ -62,15 +59,6 @@ const EXEC_CERT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Interval between repeated fallback requests for the same cert.
 const EXEC_CERT_RETRY_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Grace window during which a freshly-registered expectation is retained
-/// even when no local tick holds its transaction yet. Remote committed-block
-/// headers can arrive ahead of the local block that commits the same
-/// transaction; without this window, the registration is silently pruned by
-/// `retain_if_tx_needed` and the EC never gets fetched. Sized to comfortably
-/// exceed the worst-case lag between receiving the remote header and
-/// committing the local block referencing the same cross-shard tx.
-const EXPECTED_RETENTION_GRACE: Duration = MAX_FINALIZATION_DELAY;
 
 /// One shard's outcome for one transaction — what an expectation is for.
 type ExpectedCertKey = (ShardId, TxHash);
@@ -238,17 +226,9 @@ impl ExpectedCertTracker {
     /// Drop expectations for transactions no outstanding local tick is
     /// waiting on. The coordinator computes the set from `TickRegistry` and
     /// passes it in — the tracker has no view of ticks.
-    pub fn retain_if_tx_needed(&mut self, txs_needed: &HashSet<TxHash>, now_ts: WeightedTimestamp) {
-        // Retain expectations whose transaction is still held by a local
-        // tick OR whose registration is recent enough that the local block
-        // committing it may not have landed yet. Without the grace window,
-        // a remote header arriving slightly ahead of our own commit of the
-        // same transaction is silently pruned and the EC never gets
-        // fetched.
-        self.expected.retain(|(_, tx_hash), entry| {
-            txs_needed.contains(tx_hash)
-                || now_ts.elapsed_since(entry.discovered_at) < EXPECTED_RETENTION_GRACE
-        });
+    pub fn retain_if_tx_needed(&mut self, txs_needed: &HashSet<TxHash>) {
+        self.expected
+            .retain(|(_, tx_hash), _| txs_needed.contains(tx_hash));
     }
 
     /// Drop every active expectation, returning its keys so the caller can
@@ -258,18 +238,6 @@ impl ExpectedCertTracker {
     /// re-registration.
     pub fn drain_expected(&mut self) -> Vec<ExpectedCertKey> {
         self.expected.drain().map(|(key, _)| key).collect()
-    }
-
-    /// Retro-stamp `discovered_at == ZERO` entries with `now_ts`.
-    /// Remote headers can register expectations before our first local
-    /// commit; without this, every such entry would report a ~57-year age
-    /// on the next commit and trigger a fallback fetch storm.
-    pub fn retro_stamp_zero_timestamps(&mut self, now_ts: WeightedTimestamp) {
-        for entry in self.expected.values_mut() {
-            if entry.discovered_at == WeightedTimestamp::ZERO {
-                entry.discovered_at = now_ts;
-            }
-        }
     }
 
     /// Whether `source_shard`'s outcome for `tx_hash` has already been
@@ -545,14 +513,27 @@ mod tests {
         assert_eq!(fetches, expected);
     }
 
+    /// The commit-independent flush asks the same question the timeout
+    /// path does: an expectation whose transaction no local tick holds is
+    /// not ours to chase.
+    #[test]
+    fn flush_all_skips_a_tx_no_local_tick_holds() {
+        let mut t = ExpectedCertTracker::new();
+        t.register(shard(1), tx(5), ms(0));
+
+        assert!(t.flush_all(&HashSet::new(), ms(1_000)).is_empty());
+        assert_eq!(
+            t.flush_all(&HashSet::from([tx(5)]), ms(1_000)),
+            vec![(shard(1), tx(5))]
+        );
+    }
+
     #[test]
     fn retain_if_tx_needed_drops_expectations_whose_tx_is_no_longer_tracked() {
         let mut t = ExpectedCertTracker::new();
         t.register(shard(1), tx(5), ms(0));
 
-        // Past the grace window with the tx absent from every local tick.
-        let past_grace = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap() + 1);
-        t.retain_if_tx_needed(&HashSet::new(), past_grace);
+        t.retain_if_tx_needed(&HashSet::new());
 
         assert_eq!(t.expected_len(), 0);
     }
@@ -562,32 +543,9 @@ mod tests {
         let mut t = ExpectedCertTracker::new();
         t.register(shard(1), tx(5), ms(0));
 
-        let past_grace = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap() + 1);
-        t.retain_if_tx_needed(&HashSet::from([tx(5)]), past_grace);
+        t.retain_if_tx_needed(&HashSet::from([tx(5)]));
 
         assert!(t.is_expected(shard(1), tx(5)));
-    }
-
-    /// The grace window covers a remote header arriving ahead of our own
-    /// commit of the same transaction: it is not in any local tick yet, and
-    /// pruning it would leave the certificate unfetched.
-    #[test]
-    fn retain_if_tx_needed_keeps_recent_unneeded_expectation() {
-        let mut t = ExpectedCertTracker::new();
-        t.register(shard(1), tx(5), ms(0));
-
-        t.retain_if_tx_needed(&HashSet::new(), ms(1_000));
-
-        assert!(t.is_expected(shard(1), tx(5)));
-    }
-
-    #[test]
-    fn retain_if_tx_needed_prunes_at_exactly_grace_boundary() {
-        let mut t = ExpectedCertTracker::new();
-        t.register(shard(1), tx(5), ms(0));
-        let boundary = ms(u64::try_from(EXPECTED_RETENTION_GRACE.as_millis()).unwrap());
-        t.retain_if_tx_needed(&HashSet::new(), boundary);
-        assert_eq!(t.expected_len(), 0);
     }
 
     #[test]
@@ -626,27 +584,6 @@ mod tests {
         t.register(shard(1), tx(5), ms(70_000));
 
         assert!(t.is_expected(shard(1), tx(5)));
-    }
-
-    #[test]
-    fn retro_stamp_updates_zero_entries_and_leaves_others_intact() {
-        let mut t = ExpectedCertTracker::new();
-        let zero_anchored = tx(1);
-        let stamped = tx(2);
-        t.register(shard(1), zero_anchored, WeightedTimestamp::ZERO);
-        t.register(shard(1), stamped, ms(9_000));
-
-        t.retro_stamp_zero_timestamps(ms(10_000));
-
-        // Cross the stamped entry's deadline first (registered at 9_000,
-        // deadline at 14_000) while the retro-stamped entry is still fresh
-        // (its new anchor is 10_000, deadline 15_000).
-        let fetches = t.check_timeouts(&all(), ms(14_000));
-        assert_eq!(fetches, vec![(shard(1), stamped, false)]);
-
-        // And finally cross the retro-stamped entry's deadline.
-        let fetches = t.check_timeouts(&all(), ms(15_000));
-        assert_eq!(fetches, vec![(shard(1), zero_anchored, false)]);
     }
 
     // ─── Property test ──────────────────────────────────────────────────

@@ -489,19 +489,13 @@ mod tests {
 
     use crate::state::test_support::TestNode;
 
-    /// `RemoteHeaderAdmitted` must fan out to **both** execution and
-    /// provisions: each registers its expectations from the header's tick
-    /// list (only for ticks whose `remote_shards` includes local). The
-    /// header opens for provision verification only on
-    /// `RemoteHeaderCommitted`, once its commit proof is held. Dropping
-    /// either fan-out side leaves the shard blind to one half of
-    /// cross-shard work.
+    /// `RemoteHeaderAdmitted` registers the provisions the header's
+    /// `provision_tx_roots` promise this shard. The header opens for
+    /// provision verification only on `RemoteHeaderCommitted`, once its
+    /// commit proof is held.
     #[test]
-    fn remote_header_admitted_fans_to_execution_and_provisions() {
+    fn remote_header_admitted_registers_expected_provisions() {
         let TestNode { mut node, .. } = TestNode::builder().build();
-
-        // Tick on a remote leaf shard listing the local root shard as a dependency.
-        let cross_shard_tx = TxHash::from(Hash::from_bytes(b"cross-shard tx"));
 
         let mut block = make_live_block(
             ShardId::leaf(1, 1),
@@ -526,7 +520,6 @@ mod tests {
                 certificate_root: header.certificate_root(),
                 local_receipt_root: header.local_receipt_root(),
                 provision_root: header.provision_root(),
-                cross_shard_txs: vec![cross_shard_tx],
                 provision_tx_roots: std::collections::BTreeMap::from([(
                     ShardId::ROOT,
                     ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),
@@ -541,10 +534,6 @@ mod tests {
                 QuorumCertificate::genesis(ShardId::leaf(1, 1), ChainOrigin::ROOT),
             )));
 
-        let pre_exec = node
-            .execution_coordinator()
-            .memory_stats()
-            .expected_exec_certs;
         let pre_prov = node
             .provisions_coordinator()
             .memory_stats()
@@ -557,13 +546,6 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            node.execution_coordinator()
-                .memory_stats()
-                .expected_exec_certs,
-            pre_exec + 1,
-            "execution must register the tick from the verified header as an expected EC",
-        );
         assert_eq!(
             node.provisions_coordinator()
                 .memory_stats()

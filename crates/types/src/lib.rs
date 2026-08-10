@@ -75,7 +75,7 @@ pub use beacon::{
 };
 pub use crypto::Ed25519PrivateKey;
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
-pub use execution::computation::{compute_cross_shard_txs, tick_leader, tick_leader_at};
+pub use execution::computation::{tick_leader, tick_leader_at};
 pub use execution::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
 };

@@ -140,45 +140,12 @@ fn certificate_tracking_debug_reports_no_assignment_for_unknown_tx() {
     );
 }
 
+/// A coordinator holding no tick expects no counterpart's outcome, so
+/// there is nothing for the commit-independent flush to request.
 #[test]
-fn on_verified_remote_header_registers_an_expectation_per_named_transaction() {
-    let (mut coord, topology_schedule) = fresh_coordinator_with_topology();
-    let _ = &topology_schedule;
-    // Every cross-shard transaction a remote header names gets an
-    // expectation against that shard. With committed_ts still ZERO the
-    // initial-deadline gate is silenced, but the count must reflect the
-    // header.
-    let remote_shard = ShardId::leaf(8, 99);
-    coord.on_verified_remote_header(
-        remote_shard,
-        &[
-            TxHash::from(Hash::from_bytes(b"tx one")),
-            TxHash::from(Hash::from_bytes(b"tx two")),
-        ],
-    );
-
-    assert_eq!(
-        coord.memory_stats().expected_exec_certs,
-        2,
-        "one expectation per transaction the header names"
-    );
-}
-
-/// A header names every cross-shard transaction in its block, including
-/// ones bound for other shards — it has no way to say which are ours. Those
-/// register, but our own tick set gates the fetch, so nothing is requested
-/// for a transaction we hold no tick for.
-#[test]
-fn a_transaction_no_local_tick_holds_is_never_fetched() {
+fn a_coordinator_holding_no_tick_fetches_nothing() {
     let (mut coord, _topology) = fresh_coordinator_with_topology();
-    coord.on_verified_remote_header(
-        ShardId::leaf(8, 99),
-        &[TxHash::from(Hash::from_bytes(b"someone else's business"))],
-    );
 
-    assert_eq!(coord.memory_stats().expected_exec_certs, 1);
-    assert!(
-        coord.flush_expected_certs().is_empty(),
-        "a transaction we are not party to must never be fetched"
-    );
+    assert_eq!(coord.memory_stats().expected_exec_certs, 0);
+    assert!(coord.flush_expected_certs().is_empty());
 }

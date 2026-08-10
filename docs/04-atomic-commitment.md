@@ -33,7 +33,7 @@ An empty bundle is still emitted, and that is a second job the same wire edge do
 
 Verification at the destination is two-stage and entirely artifact-based. The source block's header is already held and QC-verified via remote-header sync ([03-state-and-sync.md](03-state-and-sync.md) §6), so verifying a provision bundle means one QC check per source block plus merkle verification of every entry against the attested state root. A provision is a *proof about a committed remote block* — no node in the source shard is trusted, only its quorum (INV-EXEC-10). Verified provisions are persisted and flow into tick composition.
 
-**The header also pre-announces.** Source block headers carry `provision_targets` (which shards this block provisions) and per-destination `provision_tx_roots`, so destinations know what to expect and can detect absence — absence of data, unlike presence, needs an announcement to be actionable.
+**The header also pre-announces.** Source block headers carry per-destination `provision_tx_roots`, so a destination knows what to expect and can detect absence — absence of data, unlike presence, needs an announcement to be actionable. Execution certificates need no such announcement: a shard's own tick names the participants party to each of its members, so the certificates it is owed are a question about its own state.
 
 ## 3. Execute and certify: outcome agreement by determinism
 

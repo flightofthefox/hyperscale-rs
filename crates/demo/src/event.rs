@@ -77,10 +77,9 @@ pub enum TraceKind {
         /// why the timeline draws it differently from a normal block.
         fallback: bool,
         proposer: u64,
-        /// Cross-shard execution ticks this block opens. Single-shard
-        /// transactions never appear here — the header field exists so
-        /// remote shards know which certificates to expect — so this stays
-        /// zero until the topology has more than one shard.
+        /// The block's transactions that touch more than one shard, and so
+        /// open cross-shard execution. Stays zero until the topology has
+        /// more than one shard.
         cross_shard_ticks: u32,
     },
     /// The beacon committed an epoch. One block per epoch, wall-clock paced,

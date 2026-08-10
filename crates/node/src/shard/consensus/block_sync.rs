@@ -467,7 +467,6 @@ mod tests {
             certificate_root: certificate_root.unwrap_or_else(|| h.certificate_root()),
             local_receipt_root: local_receipt_root.unwrap_or_else(|| h.local_receipt_root()),
             provision_root: h.provision_root(),
-            cross_shard_txs: h.cross_shard_txs().clone(),
             provision_tx_roots: h.provision_tx_roots().clone(),
             work_in_flight: h.work_in_flight(),
             ..Default::default()

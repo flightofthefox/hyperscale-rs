@@ -788,6 +788,16 @@ impl ExecutionCoordinator {
         if state.is_empty() {
             return (None, Vec::new(), Vec::new());
         }
+
+        // What the tick waits on is what a counterpart owes us, so the
+        // wait-set is the expectation set: an entry arms the fallback
+        // fetch that recovers a certificate the broadcast lost, and
+        // retires when the tick lets the member go.
+        for (tx_hash, shard) in state.awaited_counterparts() {
+            self.expected_certs
+                .register(shard, tx_hash, self.committed_ts);
+        }
+
         let members: Vec<TxHash> = state.tx_hashes().to_vec();
 
         self.ticks.insert_tick(tick_id, state);
@@ -1794,21 +1804,6 @@ impl ExecutionCoordinator {
     // Expected Execution Certificate Tracking
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Register expected outcomes from a remote block header.
-    ///
-    /// Called when a remote shard's committed block header is received. Every
-    /// cross-shard transaction the header names gets an expectation against
-    /// that shard; the header cannot say which of them we are party to, so
-    /// the ones that turn out not to be ours are dropped by
-    /// [`Self::check_exec_cert_timeouts`]'s retention pass and never fetched
-    /// — the fetch gate is our own tick set, not the header's claim.
-    pub fn on_verified_remote_header(&mut self, source_shard: ShardId, cross_shard_txs: &[TxHash]) {
-        for &tx_hash in cross_shard_txs {
-            self.expected_certs
-                .register(source_shard, tx_hash, self.committed_ts);
-        }
-    }
-
     /// Handle a commit-proven remote header from the `RemoteHeaderCoordinator`.
     ///
     /// Marks the source block proven — opening the commit-proof gate for
@@ -1865,10 +1860,6 @@ impl ExecutionCoordinator {
     fn check_exec_cert_timeouts(&mut self) -> Vec<Action> {
         let now_ts = self.committed_ts;
 
-        // Our own tick set is the authority on which transactions we are
-        // party to, so it gates both the fetch and the retention pass — a
-        // source header names every cross-shard transaction in its block,
-        // including ones bound for other shards.
         let awaited = self.awaited_txs();
         let fetches = self.expected_certs.check_timeouts(&awaited, now_ts);
 
@@ -1888,7 +1879,7 @@ impl ExecutionCoordinator {
             }));
         }
 
-        self.expected_certs.retain_if_tx_needed(&awaited, now_ts);
+        self.expected_certs.retain_if_tx_needed(&awaited);
         self.expected_certs.prune_fulfilled(now_ts);
 
         actions
@@ -2052,17 +2043,6 @@ impl ExecutionCoordinator {
         // could still carry one is nobody's to resolve.
         self.unresolved.release_resolved(block.certificates());
         self.unresolved.prune(self.committed_ts);
-
-        // Retro-stamp entries recorded before the first local commit. Remote
-        // headers can register expected exec certs while `committed_ts` is
-        // still zero; without this, every such entry would report a
-        // ~57-year age on the next commit and trigger a fallback fetch
-        // storm. Buffered ECs anchor on their own BFT-attested
-        // `vote_anchor_ts` so they don't need this treatment.
-        if first_commit && self.committed_ts != WeightedTimestamp::ZERO {
-            let now_ts = self.committed_ts;
-            self.expected_certs.retro_stamp_zero_timestamps(now_ts);
-        }
 
         let mut actions = Vec::new();
 
@@ -4758,7 +4738,9 @@ mod tests {
         let remote_shard = ShardId::leaf(1, 1);
         let tick_id = TickId::new(remote_shard, BlockHeight::new(5));
         let cross_shard_tx = TxHash::from(Hash::from_bytes(b"cross-shard tx"));
-        state.on_verified_remote_header(remote_shard, std::slice::from_ref(&cross_shard_tx));
+        state
+            .expected_certs
+            .register(remote_shard, cross_shard_tx, state.committed_ts);
         assert_eq!(state.expected_certs.expected_len(), 1);
         assert_eq!(state.expected_certs.fulfilled_len(), 0);
 
@@ -5157,7 +5139,9 @@ mod tests {
         let remote_shard = ShardId::leaf(1, 1);
         let tx = Arc::new(test_transaction(7));
         let tx_hash = tx.hash();
-        state.on_verified_remote_header(remote_shard, std::slice::from_ref(&tx_hash));
+        state
+            .expected_certs
+            .register(remote_shard, tx_hash, state.committed_ts);
         assert_eq!(
             state.expected_certs.expected_len(),
             1,
@@ -6628,28 +6612,19 @@ mod tests {
         assert_eq!(after.received_provision_shards, 0);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // First-commit retro-stamp — remote headers can register expected ECs
-    // while committed_ts is still ZERO. Without retro-stamp, the first
-    // commit triggers a fallback-fetch storm because elapsed_since(ZERO)
-    // dwarfs the fallback timeout.
-    // ═══════════════════════════════════════════════════════════════════════════
-
+    /// An expectation is stamped with the weighted timestamp of the
+    /// commit that composed the tick holding it, so the fallback window
+    /// is measured from a real clock reading and the first commit after a
+    /// restart cannot read as decades overdue.
     #[test]
-    fn test_first_commit_retro_stamps_expected_certs_and_suppresses_fallback() {
+    fn a_composed_tick_stamps_its_expectations_with_the_commit_clock() {
         let topo = make_two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), ShardId::leaf(1, 0));
 
-        // Pre-first-commit: register an expectation. discovered_at is ZERO.
         let remote_shard = ShardId::leaf(1, 1);
         let tx = Arc::new(test_transaction(1));
-        state.on_verified_remote_header(remote_shard, &[tx.hash()]);
-        // Also seed a local tick holding that transaction, so the retention
-        // check in `check_exec_cert_timeouts` keeps the expectation alive.
         let local_tick = TickId::new(ShardId::leaf(1, 0), BlockHeight::new(10));
-        let mut participating = BTreeSet::new();
-        participating.insert(ShardId::leaf(1, 0));
-        participating.insert(remote_shard);
+        let participating = BTreeSet::from([ShardId::leaf(1, 0), remote_shard]);
         state.ticks.insert_tick(
             local_tick,
             tick_holding(
@@ -6658,9 +6633,12 @@ mod tests {
                 vec![(verified_arc(&tx), participating)],
             ),
         );
+        state.expected_certs.register(
+            remote_shard,
+            tx.hash(),
+            WeightedTimestamp::from_millis(30_000),
+        );
 
-        // Commit the first block with a QC weighted_timestamp that, without
-        // retro-stamping, would imply an elapsed_since of ~billions of ms.
         let block = make_live_block_on_shard(
             ShardId::leaf(1, 0),
             BlockHeight::new(1),
@@ -6688,7 +6666,7 @@ mod tests {
             .any(|a| matches!(a, Action::Fetch(FetchRequest::ExecutionCerts { .. })));
         assert!(
             !fallback_fired,
-            "retro-stamp must suppress the first-commit fallback storm"
+            "an expectation stamped at the commit clock is not already overdue at that commit"
         );
     }
 }

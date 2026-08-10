@@ -1028,7 +1028,6 @@ mod tests {
             certificate_root: header.certificate_root(),
             local_receipt_root: header.local_receipt_root(),
             provision_root: header.provision_root(),
-            cross_shard_txs: header.cross_shard_txs().clone(),
             provision_tx_roots: roots,
             work_in_flight: header.work_in_flight(),
             ..Default::default()

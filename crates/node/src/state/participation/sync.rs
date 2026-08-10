@@ -220,7 +220,7 @@ mod tests {
     use hyperscale_types::test_utils::make_live_block;
     use hyperscale_types::{
         Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlockHeader,
-        ChainOrigin, Hash, LocalTimestamp, ProvisionTxRoot, QuorumCertificate, ShardId, TxHash,
+        ChainOrigin, Hash, LocalTimestamp, ProvisionTxRoot, QuorumCertificate, ShardId,
         ValidatorId, Verified,
     };
 
@@ -240,7 +240,6 @@ mod tests {
 
         // Seed provisions.expected via a verified remote header whose
         // tick depends on local.
-        let cross_shard_tx = TxHash::from(Hash::from_bytes(b"cross-shard tx"));
         let mut block = make_live_block(
             ShardId::leaf(1, 1),
             BlockHeight::new(5),
@@ -264,7 +263,6 @@ mod tests {
                 certificate_root: header.certificate_root(),
                 local_receipt_root: header.local_receipt_root(),
                 provision_root: header.provision_root(),
-                cross_shard_txs: vec![cross_shard_tx],
                 provision_tx_roots: std::collections::BTreeMap::from([(
                     ShardId::ROOT,
                     ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),

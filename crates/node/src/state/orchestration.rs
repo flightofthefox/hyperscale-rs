@@ -129,8 +129,8 @@ impl NodeStateMachine {
         actions
     }
 
-    /// Fan a verified remote header to execution and provisions, then feed it to
-    /// the beacon coordinator. Shard consensus already received the header in
+    /// Fan a verified remote header to provisions, then feed it to the
+    /// beacon coordinator. Shard consensus already received the header in
     /// `RemoteHeaderQcVerified` (early insertion for deferral proof validation).
     ///
     /// Admission arms expectations only — the header's exports (provisions,
@@ -140,13 +140,9 @@ impl NodeStateMachine {
         &mut self,
         certified_header: &Arc<Verified<CertifiedBlockHeader>>,
     ) -> Vec<Action> {
-        let shard = certified_header.shard_id();
         let Some(s) = self.shard.as_mut() else {
             return Vec::new();
         };
-
-        s.execution_coordinator
-            .on_verified_remote_header(shard, certified_header.header().cross_shard_txs());
 
         let mut actions = s
             .provisions_coordinator

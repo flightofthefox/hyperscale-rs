@@ -19,7 +19,7 @@ use std::sync::Arc;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY,
     MAX_TIMESTAMP_RUSH, ProvisionHash, QuorumCertificate, ShardId, ShardLoad, TopologySnapshot,
-    Transaction, TxHash, Verifiable, VoteCount, compute_cross_shard_txs,
+    Transaction, TxHash, Verifiable, VoteCount,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -242,29 +242,6 @@ pub fn validate_timestamp(header: &BlockHeader, now: LocalTimestamp) -> Result<(
 /// out of the same check.
 pub fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
     verify_hash_sorted(block.transactions(), "transactions")
-}
-
-/// Validate that a block's `cross_shard_txs` field matches the value
-/// recomputed from its transactions. Prevents a Byzantine proposer from
-/// lying to remote shards about which of its transactions reach them —
-/// either hiding one so no counterpart ever expects an outcome, or naming
-/// one that does not exist.
-pub fn validate_cross_shard_txs(
-    topology_snapshot: &TopologySnapshot,
-    local_shard: ShardId,
-    block: &Block,
-) -> Result<(), String> {
-    let expected = compute_cross_shard_txs(local_shard, topology_snapshot, block.transactions());
-
-    if block.header().cross_shard_txs() != &expected {
-        return Err(format!(
-            "cross-shard transactions mismatch: header={:?}, computed={:?}",
-            block.header().cross_shard_txs(),
-            expected
-        ));
-    }
-
-    Ok(())
 }
 
 /// Validate that no transaction in the block has already been committed or
@@ -509,7 +486,6 @@ pub fn validate_block_for_vote(
     validate_block_work(block, parent_load)?;
     validate_transactions_verified(block)?;
     validate_transaction_ordering(block)?;
-    validate_cross_shard_txs(topology_snapshot, local_shard, block)?;
     validate_no_duplicate_transactions(block, qc_chain_tx_hashes, dedup_index)?;
     validate_no_duplicate_resolutions(block, qc_chain_resolved_txs, dedup_index)?;
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
@@ -646,51 +622,10 @@ mod tests {
             certificate_root: base.certificate_root(),
             local_receipt_root: base.local_receipt_root(),
             provision_root: base.provision_root(),
-            cross_shard_txs: base.cross_shard_txs().clone(),
             provision_tx_roots: base.provision_tx_roots().clone(),
             work_in_flight: base.work_in_flight(),
             ..Default::default()
         })
-    }
-
-    fn block_with_cross_shard_txs(height: BlockHeight, cross_shard_txs: Vec<TxHash>) -> Block {
-        let header = BlockHeader::new(BlockHeaderParts {
-            height,
-            parent_block_hash: BlockHash::ZERO,
-            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
-            timestamp: ProposerTimestamp::from_millis(0),
-            cross_shard_txs,
-            provision_tx_roots: std::collections::BTreeMap::new(),
-            ..Default::default()
-        });
-        Block::Live {
-            header,
-            transactions: Arc::new(Vec::new()),
-            certificates: Arc::new(Vec::new()),
-            provisions: Arc::new(Vec::new()),
-            witness_sources: Arc::new(WitnessSources::empty()),
-        }
-    }
-
-    #[test]
-    fn validate_cross_shard_txs_accepts_recomputed_list() {
-        let topo = topology_snapshot();
-        let height = BlockHeight::new(1);
-        let expected = compute_cross_shard_txs(local_shard(), &topo, &[]);
-        let block = block_with_cross_shard_txs(height, expected);
-        assert!(validate_cross_shard_txs(&topo, local_shard(), &block).is_ok());
-    }
-
-    /// A proposer naming a transaction the block does not contain is
-    /// refused: a counterpart would arm an expectation nothing can fulfil.
-    #[test]
-    fn validate_cross_shard_txs_rejects_a_fabricated_transaction() {
-        let topo = topology_snapshot();
-        let block = block_with_cross_shard_txs(
-            BlockHeight::new(1),
-            vec![TxHash::from(Hash::from_bytes(b"never in this block"))],
-        );
-        assert!(validate_cross_shard_txs(&topo, local_shard(), &block).is_err());
     }
 
     // ═══════════════════════════════════════════════════════════════════════

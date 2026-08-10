@@ -12,10 +12,9 @@ use thiserror::Error;
 use crate::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, CertificateRoot,
     ChainOrigin, CommittedTxsRoot, Hash, LocalReceiptRoot, MAX_PROVISION_TARGET_SHARDS,
-    MAX_TXS_PER_BLOCK, PredecessorTerminal, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot,
-    QuorumCertificate, RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots,
-    StateRoot, TransactionRoot, TxHash, ValidatorId, Verifiable, Verified, Verify,
-    WeightedTimestamp, WorkInFlight,
+    PredecessorTerminal, ProposerTimestamp, ProvisionTxRoot, ProvisionsRoot, QuorumCertificate,
+    RevealChain, Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot,
+    TransactionRoot, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp, WorkInFlight,
 };
 
 /// Block header containing consensus metadata.
@@ -41,8 +40,6 @@ pub struct BlockHeader {
     certificate_root: CertificateRoot,
     local_receipt_root: LocalReceiptRoot,
     provision_root: ProvisionsRoot,
-    #[hbor(max = MAX_TXS_PER_BLOCK)]
-    cross_shard_txs: Vec<TxHash>,
     #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
     provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
     work_in_flight: WorkInFlight,
@@ -141,7 +138,6 @@ pub struct BlockHeaderParts {
     pub certificate_root: CertificateRoot,
     pub local_receipt_root: LocalReceiptRoot,
     pub provision_root: ProvisionsRoot,
-    pub cross_shard_txs: Vec<TxHash>,
     pub provision_tx_roots: BTreeMap<ShardId, ProvisionTxRoot>,
     pub work_in_flight: WorkInFlight,
     pub settled_tick_frontier: BlockHeight,
@@ -172,7 +168,6 @@ impl Default for BlockHeaderParts {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            cross_shard_txs: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
@@ -193,8 +188,7 @@ impl BlockHeader {
     ///
     /// # Panics
     ///
-    /// Panics if `cross_shard_txs.len() > MAX_TXS_PER_BLOCK` or
-    /// `provision_tx_roots.len() > MAX_PROVISION_TARGET_SHARDS`.
+    /// Panics if `provision_tx_roots.len() > MAX_PROVISION_TARGET_SHARDS`.
     #[allow(clippy::too_many_arguments)] // mirrors the 23 stored fields
     #[must_use]
     pub fn new(parts: BlockHeaderParts) -> Self {
@@ -212,7 +206,6 @@ impl BlockHeader {
             certificate_root,
             local_receipt_root,
             provision_root,
-            cross_shard_txs,
             provision_tx_roots,
             work_in_flight,
             settled_tick_frontier,
@@ -239,7 +232,6 @@ impl BlockHeader {
             certificate_root,
             local_receipt_root,
             provision_root,
-            cross_shard_txs,
             provision_tx_roots,
             work_in_flight,
             settled_tick_frontier,
@@ -285,7 +277,6 @@ impl BlockHeader {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            cross_shard_txs: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
@@ -339,7 +330,6 @@ impl BlockHeader {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            cross_shard_txs: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
@@ -407,7 +397,6 @@ impl BlockHeader {
             certificate_root: CertificateRoot::ZERO,
             local_receipt_root: LocalReceiptRoot::ZERO,
             provision_root: ProvisionsRoot::ZERO,
-            cross_shard_txs: Vec::new(),
             provision_tx_roots: BTreeMap::new(),
             work_in_flight: WorkInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
@@ -537,26 +526,6 @@ impl BlockHeader {
     #[must_use]
     pub const fn provision_root(&self) -> ProvisionsRoot {
         self.provision_root
-    }
-
-    /// The block's transactions that reach beyond this shard, in block
-    /// order. Single-shard transactions are excluded.
-    ///
-    /// QC-attested (covered by the block hash), so a byzantine proposer
-    /// cannot forge it without the block being rejected by honest validators —
-    /// `validate_cross_shard_txs` recomputes this from `transactions` and
-    /// compares.
-    ///
-    /// This is what a remote shard reads to know which outcomes to expect
-    /// from us. It does not say which shards are party to each transaction:
-    /// a reader answers that from its own state, which is both more precise
-    /// than a carried shard set and the only view that can be trusted about
-    /// itself. Provisions completeness is handled separately via
-    /// [`BlockHeader::provision_tx_roots`]. Empty for genesis, fallback, and
-    /// sync blocks.
-    #[must_use]
-    pub const fn cross_shard_txs(&self) -> &Vec<TxHash> {
-        &self.cross_shard_txs
     }
 
     /// Per-target-shard merkle commitment over the tx hashes a target shard
@@ -710,7 +679,6 @@ impl BlockHeader {
         CertificateRoot,
         LocalReceiptRoot,
         ProvisionsRoot,
-        Vec<TxHash>,
         BTreeMap<ShardId, ProvisionTxRoot>,
         WorkInFlight,
         BlockHeight,
@@ -737,7 +705,6 @@ impl BlockHeader {
             self.certificate_root,
             self.local_receipt_root,
             self.provision_root,
-            self.cross_shard_txs,
             self.provision_tx_roots,
             self.work_in_flight,
             self.settled_tick_frontier,
@@ -996,7 +963,6 @@ mod tests {
             certificate_root,
             local_receipt_root,
             provision_root,
-            cross_shard_txs,
             provision_tx_roots,
             in_flight,
             settled_tick_frontier,
@@ -1023,7 +989,6 @@ mod tests {
             certificate_root,
             local_receipt_root,
             provision_root,
-            cross_shard_txs,
             provision_tx_roots: provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
             work_in_flight: in_flight,
             settled_tick_frontier,
@@ -1061,7 +1026,6 @@ mod tests {
             certificate_root,
             local_receipt_root,
             provision_root,
-            cross_shard_txs,
             provision_tx_roots,
             in_flight,
             settled_tick_frontier,
@@ -1088,7 +1052,6 @@ mod tests {
             certificate_root,
             local_receipt_root,
             provision_root,
-            cross_shard_txs,
             provision_tx_roots: provision_tx_roots.iter().map(|(k, v)| (*k, *v)).collect(),
             work_in_flight: in_flight,
             settled_tick_frontier,
@@ -1161,42 +1124,10 @@ mod tests {
         );
     }
 
-    /// Forge a `BlockHeader` whose `cross_shard_txs` length claims one past the cap,
-    /// padded so the claim is input-satisfiable — the protocol cap, not the
-    /// wire-level length bound, is what must fire, before any per-element
-    /// work happens.
-    #[test]
-    fn decode_rejects_oversized_cross_shard_txs_count() {
-        let h = sample_header();
-        let mut buf = Vec::new();
-        for part in [
-            hbor_to_vec(&h.shard_id).unwrap(),
-            hbor_to_vec(&h.height).unwrap(),
-            hbor_to_vec(&h.parent_block_hash).unwrap(),
-            hbor_to_vec(&h.parent_qc).unwrap(),
-            hbor_to_vec(&h.proposer).unwrap(),
-            hbor_to_vec(&h.timestamp).unwrap(),
-            hbor_to_vec(&h.round).unwrap(),
-            hbor_to_vec(&h.is_fallback).unwrap(),
-            hbor_to_vec(&h.state_root).unwrap(),
-            hbor_to_vec(&h.transaction_root).unwrap(),
-            hbor_to_vec(&h.certificate_root).unwrap(),
-            hbor_to_vec(&h.local_receipt_root).unwrap(),
-            hbor_to_vec(&h.provision_root).unwrap(),
-        ] {
-            buf.extend_from_slice(&part);
-        }
-        varint::write(&mut buf, MAX_TXS_PER_BLOCK + 1).unwrap();
-        buf.extend(std::iter::repeat_n(0u8, (MAX_TXS_PER_BLOCK + 1) * 32));
-        let err = hbor_from_slice::<BlockHeader>(&buf).unwrap_err();
-        assert!(matches!(
-            err,
-            DecodeError::BoundExceeded { max, actual }
-                if max == MAX_TXS_PER_BLOCK && actual == MAX_TXS_PER_BLOCK + 1
-        ));
-    }
-
-    /// The same forgery against the `provision_tx_roots` map cap.
+    /// Forge a `BlockHeader` whose `provision_tx_roots` length claims one
+    /// past the cap, padded so the claim is input-satisfiable — the
+    /// protocol cap, not the wire-level length bound, is what must fire,
+    /// before any per-element work happens.
     #[test]
     fn decode_rejects_oversized_provision_tx_roots_count() {
         let h = sample_header();
@@ -1218,8 +1149,6 @@ mod tests {
         ] {
             buf.extend_from_slice(&part);
         }
-        // No cross-shard transactions.
-        buf.extend_from_slice(&hbor_to_vec(&Vec::<TxHash>::new()).unwrap());
         // Oversized provision_tx_roots claim, padded to satisfiability.
         varint::write(&mut buf, MAX_PROVISION_TARGET_SHARDS + 1).unwrap();
         buf.extend(std::iter::repeat_n(

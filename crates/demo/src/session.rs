@@ -716,6 +716,8 @@ impl Session {
         let mut watermarks: Vec<(ShardId, BlockHeight)> = Vec::new();
         let mut handoffs: BTreeMap<ShardId, BlockHeight> = BTreeMap::new();
         let mut frontier = self.attested_wt;
+        let topology =
+            (0..self.runner.num_hosts()).find_map(|host| self.runner.host_topology(host));
 
         for shard in self.live_shards() {
             // Hosts of one shard agree on committed content, so the furthest
@@ -753,6 +755,13 @@ impl Session {
                 };
                 let block = block.as_ref().block();
                 let header = block.header();
+                let crossing = topology.as_ref().map_or(0, |topology| {
+                    block
+                        .transactions()
+                        .iter()
+                        .filter(|tx| topology.is_cross_shard_transaction(tx))
+                        .count()
+                });
                 let wt = child
                     .as_ref()
                     .header()
@@ -767,7 +776,7 @@ impl Session {
                     header.round(),
                     header.is_fallback(),
                     header.proposer().inner(),
-                    u32::try_from(header.cross_shard_txs().len()).unwrap_or(u32::MAX),
+                    u32::try_from(crossing).unwrap_or(u32::MAX),
                 ));
                 // A settled-transaction root rides every header of a terminating
                 // shard's final epoch, so the first one seen opens the

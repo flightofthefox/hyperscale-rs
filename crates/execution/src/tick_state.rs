@@ -361,6 +361,29 @@ impl TickState {
             .collect()
     }
 
+    /// Every counterpart certificate this tick's members wait on, as
+    /// `(member, shard)` pairs — the coverage [`Self::is_covered`] asks
+    /// for, stated as the certificates that would supply it.
+    ///
+    /// A member admitted as an abort names none: the tick's own
+    /// certificate carries its verdict, and no counterpart owes one for a
+    /// transaction that reached no outcome anywhere.
+    pub fn awaited_counterparts(&self) -> impl Iterator<Item = (TxHash, ShardId)> + '_ {
+        let local = self.tick_id.shard_id();
+        self.tx_hashes
+            .iter()
+            .copied()
+            .filter(|tx_hash| !self.aborted.contains(tx_hash))
+            .flat_map(move |tx_hash| {
+                self.participating_shards
+                    .get(&tx_hash)
+                    .into_iter()
+                    .flatten()
+                    .filter(move |&&shard| shard != local)
+                    .map(move |&shard| (tx_hash, shard))
+            })
+    }
+
     /// The tick's members `shard` is a participant in — what this tick is
     /// waiting on that shard for.
     pub fn txs_awaiting(&self, shard: ShardId) -> impl Iterator<Item = TxHash> + '_ {

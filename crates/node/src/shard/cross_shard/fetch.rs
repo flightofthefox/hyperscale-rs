@@ -214,9 +214,8 @@ pub struct ExecCertBinding;
 impl FetchBinding for ExecCertBinding {
     /// `(source_shard, tx_hash)` — the shard whose outcome is missing and
     /// the transaction it is missing for. The certificate's own identity
-    /// is not a key here: the requester learned of the transaction from
-    /// the source shard's header and cannot know which certificate will
-    /// carry it.
+    /// is not a key here: the requester knows which shards its tick waits
+    /// on, not which certificate each will put the transaction in.
     type Id = (ShardId, TxHash);
 
     const NAME: &'static str = "exec_cert";
