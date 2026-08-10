@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Address, Finalization, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, RETENTION_HORIZON, ShardId,
-    ShardTrie, Transaction, TxHash, Verifiable, WeightedTimestamp,
+    ShardTrie, TerminalVerdict, Transaction, TxHash, Verifiable, WeightedTimestamp,
 };
 
 /// One committed transaction's outstanding account.
@@ -59,6 +59,15 @@ struct Owed {
     /// certificate outlives the tick, and a shard that could not say
     /// whether it had issued one would have to assume it had.
     certified: bool,
+    /// Whether a committed record says a departed shard left this
+    /// transaction unsettled.
+    ///
+    /// The evidence that nothing can settle it, in the one form that
+    /// outlives the settled set it was read from. Where the deadline
+    /// window says how long this shard may speak for a transaction on its
+    /// own clock, this says it may speak whatever the clock reads: no
+    /// counterpart is left to contradict it, and the chain says so.
+    unsettled_by_departed: bool,
 }
 
 /// Committed-but-unresolved transactions, each against its deadline and
@@ -106,6 +115,7 @@ impl UnresolvedTxs {
                     .filter(|prefix| !ShardTrie::shard_owns_prefix(local_shard, *prefix))
                     .collect(),
                 certified: false,
+                unsettled_by_departed: false,
             };
             self.owed.entry(tx.hash()).or_insert(owed);
         }
@@ -127,6 +137,33 @@ impl UnresolvedTxs {
     #[must_use]
     pub fn is_certified(&self, tx_hash: TxHash) -> bool {
         self.owed.get(&tx_hash).is_some_and(|owed| owed.certified)
+    }
+
+    /// Take what a committed block says departed shards left unsettled.
+    ///
+    /// A record names transactions its shard did not settle before it
+    /// went, which is what puts a settlement of them out of reach for
+    /// good. Records naming transactions this ledger no longer holds are
+    /// ignored: an entry already resolved needs no verdict, and one
+    /// already dropped is nobody's to speak for.
+    pub fn record_terminal_verdicts(&mut self, verdicts: &[TerminalVerdict]) {
+        for verdict in verdicts {
+            for tx_hash in verdict.unsettled() {
+                if let Some(owed) = self.owed.get_mut(tx_hash) {
+                    owed.unsettled_by_departed = true;
+                }
+            }
+        }
+    }
+
+    /// Whether a committed record has established that `tx_hash` can
+    /// never settle — the question the split-boundary fence otherwise
+    /// puts to a settled set that expires.
+    #[must_use]
+    pub fn is_unsettled_by_departed(&self, tx_hash: TxHash) -> bool {
+        self.owed
+            .get(&tx_hash)
+            .is_some_and(|owed| owed.unsettled_by_departed)
     }
 
     /// Record where a departed participant's chain ended.
@@ -247,7 +284,8 @@ impl UnresolvedTxs {
         self.owed
             .iter()
             .filter(|(_, owed)| {
-                now >= owed.deadline && now < owed.deadline.plus(MAX_VALIDITY_RANGE)
+                now >= owed.deadline
+                    && (owed.unsettled_by_departed || now < owed.deadline.plus(MAX_VALIDITY_RANGE))
             })
             .map(|(tx_hash, owed)| (*tx_hash, owed.declared_work))
             .collect()
@@ -563,6 +601,64 @@ mod tests {
             vec![tx.hash()],
             "past it, nothing can settle it and the strand is named",
         );
+    }
+
+    /// A committed record is what lets a verdict outlive the deadline
+    /// window. Past that window the shard stops speaking for a
+    /// transaction on its own clock; a record says no counterpart is left
+    /// to contradict it, and the chain is where that is written.
+    #[test]
+    fn a_record_reopens_the_window_a_deadline_closed() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(17, 60_000);
+        commit(&mut ledger, &tx);
+        ledger.certify(tx.hash());
+
+        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
+        let past = deadline.plus(MAX_VALIDITY_RANGE);
+        assert!(
+            ledger.past_deadline(past).is_empty(),
+            "on its own clock the shard has stopped speaking for it",
+        );
+
+        ledger.record_terminal_verdicts(&[TerminalVerdict::new(PARTNER, ms(500_000), [tx.hash()])]);
+        assert_eq!(
+            ledger.past_deadline(past),
+            vec![(tx.hash(), tx.work())],
+            "the record says nothing can settle it, so the shard may",
+        );
+        assert!(ledger.is_unsettled_by_departed(tx.hash()));
+    }
+
+    /// A record still opens nothing before the transaction's own
+    /// deadline: until then it may yet finalize somewhere, and the record
+    /// speaks only to what a departed shard did.
+    #[test]
+    fn a_record_does_not_reach_back_before_the_deadline() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(18, 60_000);
+        commit(&mut ledger, &tx);
+        ledger.certify(tx.hash());
+        ledger.record_terminal_verdicts(&[TerminalVerdict::new(PARTNER, ms(500_000), [tx.hash()])]);
+
+        let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
+        assert!(
+            ledger
+                .past_deadline(deadline.minus(Duration::from_millis(1)))
+                .is_empty(),
+            "merely covered is not yet abandonable",
+        );
+    }
+
+    /// A record naming a transaction the ledger no longer holds changes
+    /// nothing: one already resolved needs no verdict.
+    #[test]
+    fn a_record_for_a_transaction_we_no_longer_hold_is_ignored() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(19, 60_000);
+        ledger.record_terminal_verdicts(&[TerminalVerdict::new(PARTNER, ms(500_000), [tx.hash()])]);
+        assert!(!ledger.is_unsettled_by_departed(tx.hash()));
+        assert_eq!(ledger.len(), 0);
     }
 
     /// A transaction that never left this shard has no counterpart to

@@ -2048,6 +2048,10 @@ impl ExecutionCoordinator {
         // whichever way it went; what is left past every window that
         // could still carry one is nobody's to resolve.
         self.unresolved.release_resolved(block.certificates());
+        // What the block writes down about departed shards, before the
+        // prune below reads what is still answerable.
+        self.unresolved
+            .record_terminal_verdicts(block.terminal_verdicts());
         self.stamp_departures(topology_schedule);
         let unanswerable = self.unresolved.prune(self.committed_ts);
         self.release_unanswerable(&unanswerable);
@@ -2684,6 +2688,13 @@ impl ExecutionCoordinator {
         }
         for tx_hash in fw.tx_hashes() {
             if attested_remotely.contains(&tx_hash) {
+                continue;
+            }
+            // A committed record already answered for this one, in a form
+            // that does not expire with the set it was read from. Putting
+            // the question again would let the set's own horizon refuse a
+            // verdict the chain has already established is safe.
+            if self.unresolved.is_unsettled_by_departed(tx_hash) {
                 continue;
             }
             pairs.extend(
