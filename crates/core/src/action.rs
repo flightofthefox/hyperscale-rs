@@ -9,7 +9,7 @@ use hyperscale_storage::TickResolution;
 use hyperscale_types::{
     BeaconBlockHash, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
     BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockVote, CandidateBeaconBlock,
-    CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader, CommittedTxsRoot,
+    CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader,
     ConsensusPublicKey, Epoch, ExecutionCertificate, ExecutionVote, Finalization,
     GlobalReceiptRoot, Hash, HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1,
     PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
@@ -18,9 +18,9 @@ use hyperscale_types::{
     RoutingCommittees, SafeVoteRegisters, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad,
     ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
     SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
-    StateRoot, SubstateEntry, SubstateKey, TickId, Timeout, TopologySnapshot, Transaction,
-    TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-    VoteCount, WeightedTimestamp, WorkInFlight,
+    StateRoot, SubstateEntry, SubstateKey, TerminalRoots, TickId, Timeout, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, ValidatorId, Verifiable,
+    Verified, VoteCount, WeightedTimestamp, WorkInFlight,
 };
 
 use crate::{CommitSource, FetchAbandon, FetchRequest, ProtocolEvent, TimerId};
@@ -672,17 +672,14 @@ pub enum Action {
         /// final epoch before a split), resolved by the coordinator from
         /// the schedule.
         split_child_roots_required: bool,
-        /// Whether the block's window requires a `settled_txs_root` — set
-        /// on any terminating boundary header (a split parent's or a merge
+        /// Whether the block's window requires terminal roots — set on any
+        /// terminating boundary header (a split parent's or a merge
         /// child's final epoch), broader than `split_child_roots_required`.
         terminal_roots_required: bool,
-        /// The header's `settled_txs_root` claim, recomputed beside the
-        /// state root over the committed retention window when the block
+        /// The header's `terminal_roots` claim, recomputed beside the state
+        /// root over the committed retention window when the block
         /// terminates the shard at a boundary.
-        claimed_settled_txs_root: Option<SettledTxsRoot>,
-        /// The header's `committed_txs_root` claim, recomputed beside the
-        /// state root over the same committed retention window.
-        claimed_committed_txs_root: Option<CommittedTxsRoot>,
+        claimed_terminal_roots: Option<TerminalRoots>,
         /// The block's parent-QC weighted timestamp — the anchor the
         /// settled-transaction window walk floors at (`anchor − RETENTION_HORIZON`),
         /// resolved identically by the proposer and every verifier.

@@ -11,10 +11,10 @@ use std::sync::Arc;
 use hyperscale_hbor::Hbor;
 
 use crate::{
-    Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CommittedTxsRoot, CompletedRecovery,
-    ConsensusPublicKey, DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds,
-    Round, SettledTxsRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId,
-    ValidatorSet, VoteCount, WeightedTimestamp,
+    Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
+    DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds, Round, ShardId,
+    ShardRecovery, ShardTrie, StateRoot, TerminalRoots, Transaction, ValidatorId, ValidatorSet,
+    VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -55,23 +55,16 @@ pub struct ShardAnchor {
     /// header's `beacon_witness_root`. Serving shards retain persisted
     /// witness payloads down to this index.
     pub witness_base: BeaconWitnessLeafCount,
-    /// The terminated shard's beacon-attested settled-transaction commitment, set
-    /// only on a terminal boundary record. A surviving counterpart reads it
-    /// to resolve split-straddling ticks against the terminated shard's
-    /// settled set; `None` for a live shard's anchor.
-    pub settled_txs_root: Option<SettledTxsRoot>,
-    /// The terminated shard's beacon-attested committed-transaction
-    /// commitment, set only on a terminal boundary record. A reshape
-    /// successor reads it to tell a replay of something the predecessor
-    /// committed from a first inclusion the predecessor never made;
-    /// `None` for a live shard.
+    /// The terminated shard's beacon-attested [`TerminalRoots`], set only
+    /// on a terminal boundary record and `None` for a live shard's anchor.
     ///
-    /// The durable half of that delivery. The successor also reads the
-    /// root straight off the terminal header at the cut, which is the
-    /// only path fast enough while the rule it relaxes is still live —
-    /// this one is what a restart, or a validator seated after the flip,
-    /// recovers it from.
-    pub committed_txs_root: Option<CommittedTxsRoot>,
+    /// A surviving counterpart reads the settled half to resolve
+    /// split-straddling ticks; a reshape successor reads the committed
+    /// half to tell a replay of something the predecessor committed from a
+    /// first inclusion it never made. Both also take them off the terminal
+    /// header directly — this is the durable copy a restart, or a
+    /// validator seated after the flip, recovers them from.
+    pub terminal_roots: Option<TerminalRoots>,
 }
 
 /// One reshape cohort seat as the topology projects it.
@@ -1448,8 +1441,7 @@ mod tests {
             height: BlockHeight::new(42),
             weighted_timestamp: WeightedTimestamp::from_millis(42),
             witness_base: BeaconWitnessLeafCount::ZERO,
-            settled_txs_root: None,
-            committed_txs_root: None,
+            terminal_roots: None,
         };
         let mut boundaries = HashMap::new();
         boundaries.insert(ShardId::leaf(1, 0), anchor);

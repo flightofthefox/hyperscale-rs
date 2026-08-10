@@ -19,7 +19,7 @@ use hyperscale_hbor::Hbor;
 use hyperscale_jmt::{Blake3Hasher, Hasher};
 use thiserror::Error;
 
-use crate::{CommittedTxsRoot, Hash, SettledTxsRoot, StateRoot, Verified, Verify};
+use crate::{Hash, StateRoot, TerminalRoots, Verified, Verify};
 
 /// The two child hashes of the JMT root node behind a header's
 /// `state_root` — `r_p0` / `r_p1` for a shard whose split executes at the
@@ -75,20 +75,13 @@ pub struct StateRootContext<'a> {
     /// the next epoch's trie replaces the shard with its two children
     /// (the split-pending shard's final epoch).
     pub split_child_roots_required: bool,
-    /// The header's `settled_txs_root` claim.
-    pub claimed_settled_txs_root: Option<SettledTxsRoot>,
-    /// Root recomputed by walking the committed retention window, present
-    /// exactly when [`Self::terminal_roots_required`] is set.
-    pub computed_settled_txs_root: Option<SettledTxsRoot>,
-    /// The header's `committed_txs_root` claim.
-    pub claimed_committed_txs_root: Option<CommittedTxsRoot>,
-    /// Root recomputed by walking the committed retention window, present
-    /// exactly when [`Self::terminal_roots_required`] is set.
-    pub computed_committed_txs_root: Option<CommittedTxsRoot>,
-    /// Whether the block's window requires both terminal-boundary claims —
-    /// set on a terminating shard's boundary header. One predicate for
-    /// both roots: they are carried by the same headers, so a header
-    /// carrying one and not the other is malformed either way.
+    /// The header's [`TerminalRoots`] claim.
+    pub claimed_terminal_roots: Option<TerminalRoots>,
+    /// The pair recomputed by walking the committed retention window,
+    /// present exactly when [`Self::terminal_roots_required`] is set.
+    pub computed_terminal_roots: Option<TerminalRoots>,
+    /// Whether the block's window requires the claim — set on a
+    /// terminating shard's boundary header.
     pub terminal_roots_required: bool,
 }
 
@@ -134,43 +127,24 @@ pub enum StateRootVerifyError {
     },
 
     /// The block terminates the shard at a boundary but the header carries
-    /// no `settled_txs_root`.
-    #[error("settled transaction root required at a terminating boundary but absent")]
-    MissingSettledTxsRoot,
+    /// no terminal roots.
+    #[error("terminal roots required at a terminating boundary but absent")]
+    MissingTerminalRoots,
 
-    /// The header carries `settled_txs_root` outside a terminating
-    /// boundary header.
-    #[error("settled transaction root carried outside a terminating boundary")]
-    UnexpectedSettledTxsRoot,
+    /// The header carries terminal roots outside a terminating boundary
+    /// header.
+    #[error("terminal roots carried outside a terminating boundary")]
+    UnexpectedTerminalRoots,
 
-    /// The claimed settled-transaction root differs from the root recomputed
-    /// over the committed retention window.
-    #[error("settled transaction root {claimed:?} ≠ recomputed {computed:?}")]
-    SettledTxsRootMismatch {
-        /// Header's claimed settled-transaction root.
-        claimed: SettledTxsRoot,
-        /// Root recomputed by walking the committed retention window.
-        computed: Option<SettledTxsRoot>,
-    },
-
-    /// The block terminates the shard at a boundary but the header carries
-    /// no `committed_txs_root`.
-    #[error("committed transaction root required at a terminating boundary but absent")]
-    MissingCommittedTxsRoot,
-
-    /// The header carries `committed_txs_root` outside a terminating
-    /// boundary header.
-    #[error("committed transaction root carried outside a terminating boundary")]
-    UnexpectedCommittedTxsRoot,
-
-    /// The claimed committed-transaction root differs from the root
-    /// recomputed over the committed retention window.
-    #[error("committed transaction root {claimed:?} ≠ recomputed {computed:?}")]
-    CommittedTxsRootMismatch {
-        /// Header's claimed committed-transaction root.
-        claimed: CommittedTxsRoot,
-        /// Root recomputed by walking the committed retention window.
-        computed: Option<CommittedTxsRoot>,
+    /// A claimed terminal root differs from the pair recomputed over the
+    /// committed retention window. Both roots are reported, so which half
+    /// diverged is read off the pair rather than named by the variant.
+    #[error("terminal roots {claimed:?} ≠ recomputed {computed:?}")]
+    TerminalRootsMismatch {
+        /// Header's claimed pair.
+        claimed: TerminalRoots,
+        /// Pair recomputed by walking the committed retention window.
+        computed: Option<TerminalRoots>,
     },
 }
 
@@ -215,24 +189,13 @@ impl Verify<&StateRootContext<'_>> for StateRoot {
             }
             _ => {}
         }
-        match (ctx.terminal_roots_required, ctx.claimed_settled_txs_root) {
-            (true, None) => return Err(StateRootVerifyError::MissingSettledTxsRoot),
-            (false, Some(_)) => return Err(StateRootVerifyError::UnexpectedSettledTxsRoot),
-            (true, Some(claimed)) if Some(claimed) != ctx.computed_settled_txs_root => {
-                return Err(StateRootVerifyError::SettledTxsRootMismatch {
+        match (ctx.terminal_roots_required, ctx.claimed_terminal_roots) {
+            (true, None) => return Err(StateRootVerifyError::MissingTerminalRoots),
+            (false, Some(_)) => return Err(StateRootVerifyError::UnexpectedTerminalRoots),
+            (true, Some(claimed)) if Some(claimed) != ctx.computed_terminal_roots => {
+                return Err(StateRootVerifyError::TerminalRootsMismatch {
                     claimed,
-                    computed: ctx.computed_settled_txs_root,
-                });
-            }
-            _ => {}
-        }
-        match (ctx.terminal_roots_required, ctx.claimed_committed_txs_root) {
-            (true, None) => return Err(StateRootVerifyError::MissingCommittedTxsRoot),
-            (false, Some(_)) => return Err(StateRootVerifyError::UnexpectedCommittedTxsRoot),
-            (true, Some(claimed)) if Some(claimed) != ctx.computed_committed_txs_root => {
-                return Err(StateRootVerifyError::CommittedTxsRootMismatch {
-                    claimed,
-                    computed: ctx.computed_committed_txs_root,
+                    computed: ctx.computed_terminal_roots,
                 });
             }
             _ => {}
@@ -244,7 +207,7 @@ impl Verify<&StateRootContext<'_>> for StateRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Hash;
+    use crate::{CommittedTxsRoot, Hash, SettledTxsRoot};
 
     fn composing_pair() -> (SplitChildRoots, StateRoot) {
         let left = StateRoot::from_raw(Hash::from_bytes(b"left subtree"));
@@ -264,10 +227,8 @@ mod tests {
                 computed_root: &root,
                 claimed_split_child_roots: Some(pair),
                 split_child_roots_required: true,
-                claimed_settled_txs_root: None,
-                computed_settled_txs_root: None,
-                claimed_committed_txs_root: None,
-                computed_committed_txs_root: None,
+                claimed_terminal_roots: None,
+                computed_terminal_roots: None,
                 terminal_roots_required: false,
             })
             .is_ok()
@@ -282,10 +243,8 @@ mod tests {
                 computed_root: &root,
                 claimed_split_child_roots: None,
                 split_child_roots_required: true,
-                claimed_settled_txs_root: None,
-                computed_settled_txs_root: None,
-                claimed_committed_txs_root: None,
-                computed_committed_txs_root: None,
+                claimed_terminal_roots: None,
+                computed_terminal_roots: None,
                 terminal_roots_required: false,
             })
             .unwrap_err(),
@@ -301,10 +260,8 @@ mod tests {
                 computed_root: &root,
                 claimed_split_child_roots: Some(pair),
                 split_child_roots_required: false,
-                claimed_settled_txs_root: None,
-                computed_settled_txs_root: None,
-                claimed_committed_txs_root: None,
-                computed_committed_txs_root: None,
+                claimed_terminal_roots: None,
+                computed_terminal_roots: None,
                 terminal_roots_required: false,
             })
             .unwrap_err(),
@@ -324,10 +281,8 @@ mod tests {
                 computed_root: &root,
                 claimed_split_child_roots: Some(forged),
                 split_child_roots_required: true,
-                claimed_settled_txs_root: None,
-                computed_settled_txs_root: None,
-                claimed_committed_txs_root: None,
-                computed_committed_txs_root: None,
+                claimed_terminal_roots: None,
+                computed_terminal_roots: None,
                 terminal_roots_required: false,
             })
             .unwrap_err(),
@@ -349,10 +304,8 @@ mod tests {
                     computed_root: &root,
                     claimed_split_child_roots: Some(pair),
                     split_child_roots_required: true,
-                    claimed_settled_txs_root: None,
-                    computed_settled_txs_root: None,
-                    claimed_committed_txs_root: None,
-                    computed_committed_txs_root: None,
+                    claimed_terminal_roots: None,
+                    computed_terminal_roots: None,
                     terminal_roots_required: false,
                 })
                 .unwrap_err(),
@@ -360,197 +313,86 @@ mod tests {
         ));
     }
 
-    /// A satisfied committed-transaction claim, so a settled-side test
-    /// fails only on the check it is about.
-    fn satisfied_committed(required: bool) -> Option<CommittedTxsRoot> {
-        required.then(|| CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed")))
-    }
-
-    /// A satisfied settled-transaction claim, the mirror of
-    /// [`satisfied_committed`].
-    fn satisfied_settled(required: bool) -> Option<SettledTxsRoot> {
-        required.then(|| SettledTxsRoot::from_raw(Hash::from_bytes(b"settled")))
-    }
-
-    /// A context isolating the settled-transaction checks: the state root
-    /// matches, no split-child-roots claim is in play, and the committed
-    /// root is supplied consistently.
-    fn settled_ctx(
+    /// A context isolating the terminal-roots checks: the state root
+    /// matches and no split-child-roots claim is in play.
+    fn terminal_ctx(
         root: &StateRoot,
-        claimed: Option<SettledTxsRoot>,
-        computed: Option<SettledTxsRoot>,
+        claimed: Option<TerminalRoots>,
+        computed: Option<TerminalRoots>,
         required: bool,
     ) -> StateRootContext<'_> {
-        let committed = satisfied_committed(required);
         StateRootContext {
             computed_root: root,
             claimed_split_child_roots: None,
             split_child_roots_required: false,
-            claimed_settled_txs_root: claimed,
-            computed_settled_txs_root: computed,
-            claimed_committed_txs_root: committed,
-            computed_committed_txs_root: committed,
+            claimed_terminal_roots: claimed,
+            computed_terminal_roots: computed,
             terminal_roots_required: required,
         }
     }
 
-    /// The mirror of [`settled_ctx`], isolating the committed-transaction
-    /// checks with the settled root supplied consistently.
-    fn committed_ctx(
-        root: &StateRoot,
-        claimed: Option<CommittedTxsRoot>,
-        computed: Option<CommittedTxsRoot>,
-        required: bool,
-    ) -> StateRootContext<'_> {
-        let settled = satisfied_settled(required);
-        StateRootContext {
-            computed_root: root,
-            claimed_split_child_roots: None,
-            split_child_roots_required: false,
-            claimed_settled_txs_root: settled,
-            computed_settled_txs_root: settled,
-            claimed_committed_txs_root: claimed,
-            computed_committed_txs_root: computed,
-            terminal_roots_required: required,
+    fn roots(settled: &[u8], committed: &[u8]) -> TerminalRoots {
+        TerminalRoots {
+            settled_txs: SettledTxsRoot::from_raw(Hash::from_bytes(settled)),
+            committed_txs: CommittedTxsRoot::from_raw(Hash::from_bytes(committed)),
         }
     }
 
     #[test]
-    fn settled_txs_root_matching_the_recompute_verifies() {
+    fn terminal_roots_matching_the_recompute_verify() {
         let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let settled = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled"));
+        let pair = roots(b"settled", b"committed");
         assert!(
-            root.verify(&settled_ctx(&root, Some(settled), Some(settled), true))
+            root.verify(&terminal_ctx(&root, Some(pair), Some(pair), true))
                 .is_ok()
         );
     }
 
     #[test]
-    fn missing_settled_txs_root_at_a_boundary_is_rejected() {
+    fn missing_terminal_roots_at_a_boundary_is_rejected() {
         let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let recomputed = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled"));
+        let recomputed = roots(b"settled", b"committed");
         assert_eq!(
-            root.verify(&settled_ctx(&root, None, Some(recomputed), true))
+            root.verify(&terminal_ctx(&root, None, Some(recomputed), true))
                 .unwrap_err(),
-            StateRootVerifyError::MissingSettledTxsRoot,
+            StateRootVerifyError::MissingTerminalRoots,
         );
     }
 
     #[test]
-    fn settled_txs_root_outside_a_boundary_is_rejected() {
+    fn terminal_roots_outside_a_boundary_are_rejected() {
         let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let settled = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled"));
         assert_eq!(
-            root.verify(&settled_ctx(&root, Some(settled), None, false))
-                .unwrap_err(),
-            StateRootVerifyError::UnexpectedSettledTxsRoot,
-        );
-    }
-
-    #[test]
-    fn settled_txs_root_diverging_from_the_recompute_is_rejected() {
-        let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let claimed = SettledTxsRoot::from_raw(Hash::from_bytes(b"claimed"));
-        let computed = SettledTxsRoot::from_raw(Hash::from_bytes(b"computed"));
-        assert_eq!(
-            root.verify(&settled_ctx(&root, Some(claimed), Some(computed), true))
-                .unwrap_err(),
-            StateRootVerifyError::SettledTxsRootMismatch {
-                claimed,
-                computed: Some(computed),
-            },
-        );
-    }
-
-    #[test]
-    fn committed_txs_root_matching_the_recompute_verifies() {
-        let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let committed = CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed window"));
-        assert!(
-            root.verify(&committed_ctx(
+            root.verify(&terminal_ctx(
                 &root,
-                Some(committed),
-                Some(committed),
-                true
+                Some(roots(b"settled", b"committed")),
+                None,
+                false
             ))
-            .is_ok()
+            .unwrap_err(),
+            StateRootVerifyError::UnexpectedTerminalRoots,
         );
     }
 
+    /// Either half diverging fails the pair, so neither is carried along
+    /// unchecked by the other matching.
     #[test]
-    fn missing_committed_txs_root_at_a_boundary_is_rejected() {
+    fn each_half_diverging_from_the_recompute_is_rejected() {
         let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let recomputed = CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed"));
-        assert_eq!(
-            root.verify(&committed_ctx(&root, None, Some(recomputed), true))
-                .unwrap_err(),
-            StateRootVerifyError::MissingCommittedTxsRoot,
-        );
-    }
+        let computed = roots(b"settled", b"committed");
 
-    #[test]
-    fn committed_txs_root_outside_a_boundary_is_rejected() {
-        let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let committed = CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed"));
-        assert_eq!(
-            root.verify(&committed_ctx(&root, Some(committed), None, false))
-                .unwrap_err(),
-            StateRootVerifyError::UnexpectedCommittedTxsRoot,
-        );
-    }
-
-    #[test]
-    fn committed_txs_root_diverging_from_the_recompute_is_rejected() {
-        let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let claimed = CommittedTxsRoot::from_raw(Hash::from_bytes(b"claimed"));
-        let computed = CommittedTxsRoot::from_raw(Hash::from_bytes(b"computed"));
-        assert_eq!(
-            root.verify(&committed_ctx(&root, Some(claimed), Some(computed), true))
-                .unwrap_err(),
-            StateRootVerifyError::CommittedTxsRootMismatch {
-                claimed,
-                computed: Some(computed),
-            },
-        );
-    }
-
-    /// Both roots ride the one predicate, so a header carrying only the
-    /// settled half at a terminating boundary is refused just as a header
-    /// carrying neither is.
-    #[test]
-    fn one_predicate_governs_both_terminal_roots() {
-        let root = StateRoot::from_raw(Hash::from_bytes(b"state"));
-        let settled = SettledTxsRoot::from_raw(Hash::from_bytes(b"settled"));
-        let committed = CommittedTxsRoot::from_raw(Hash::from_bytes(b"committed"));
-
-        let settled_only = StateRootContext {
-            computed_root: &root,
-            claimed_split_child_roots: None,
-            split_child_roots_required: false,
-            claimed_settled_txs_root: Some(settled),
-            computed_settled_txs_root: Some(settled),
-            claimed_committed_txs_root: None,
-            computed_committed_txs_root: Some(committed),
-            terminal_roots_required: true,
-        };
-        assert_eq!(
-            root.verify(&settled_only).unwrap_err(),
-            StateRootVerifyError::MissingCommittedTxsRoot,
-        );
-
-        let committed_only = StateRootContext {
-            computed_root: &root,
-            claimed_split_child_roots: None,
-            split_child_roots_required: false,
-            claimed_settled_txs_root: None,
-            computed_settled_txs_root: Some(settled),
-            claimed_committed_txs_root: Some(committed),
-            computed_committed_txs_root: Some(committed),
-            terminal_roots_required: true,
-        };
-        assert_eq!(
-            root.verify(&committed_only).unwrap_err(),
-            StateRootVerifyError::MissingSettledTxsRoot,
-        );
+        for claimed in [
+            roots(b"other settled", b"committed"),
+            roots(b"settled", b"other committed"),
+        ] {
+            assert_eq!(
+                root.verify(&terminal_ctx(&root, Some(claimed), Some(computed), true))
+                    .unwrap_err(),
+                StateRootVerifyError::TerminalRootsMismatch {
+                    claimed,
+                    computed: Some(computed),
+                },
+            );
+        }
     }
 }

@@ -524,8 +524,7 @@ impl StateMachine for NodeStateMachine {
                     claimed_split_child_roots: ready.claimed_split_child_roots,
                     split_child_roots_required: ready.split_child_roots_required,
                     terminal_roots_required: ready.terminal_roots_required,
-                    claimed_settled_txs_root: ready.claimed_settled_txs_root,
-                    claimed_committed_txs_root: ready.claimed_committed_txs_root,
+                    claimed_terminal_roots: ready.claimed_terminal_roots,
                     parent_weighted_timestamp: ready.parent_weighted_timestamp,
                     settled_txs_window_floor: ready.settled_txs_window_floor,
                 });

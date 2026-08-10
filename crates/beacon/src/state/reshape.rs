@@ -300,8 +300,7 @@ const fn pending_placeholder_boundary(epoch: Epoch) -> ShardBoundary {
         consecutive_misses: 0,
         terminal_epoch: None,
         terminal_delivered: false,
-        settled_txs_root: None,
-        committed_txs_root: None,
+        terminal_roots: None,
         reshape_admitted_epoch: None,
     }
 }
@@ -907,8 +906,7 @@ mod tests {
                 consecutive_misses: 0,
                 terminal_epoch: None,
                 terminal_delivered: false,
-                settled_txs_root: None,
-                committed_txs_root: None,
+                terminal_roots: None,
                 reshape_admitted_epoch: None,
             },
         );
@@ -1264,8 +1262,7 @@ mod tests {
                     consecutive_misses: 0,
                     terminal_epoch: None,
                     terminal_delivered: false,
-                    settled_txs_root: None,
-                    committed_txs_root: None,
+                    terminal_roots: None,
                     reshape_admitted_epoch: None,
                 },
             );
@@ -1835,8 +1832,7 @@ mod tests {
             consecutive_misses: 0,
             terminal_epoch: None,
             terminal_delivered: false,
-            settled_txs_root: None,
-            committed_txs_root: None,
+            terminal_roots: None,
             reshape_admitted_epoch: None,
         }
     }

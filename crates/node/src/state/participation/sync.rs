@@ -146,7 +146,7 @@ impl ShardParticipation {
             let Some(anchor) = head.boundary(shard) else {
                 continue;
             };
-            let Some(attested_root) = anchor.settled_txs_root else {
+            let Some(attested_root) = anchor.terminal_roots.map(|roots| roots.settled_txs) else {
                 continue;
             };
             if self.shard_coordinator.settled_set(shard).is_some() {

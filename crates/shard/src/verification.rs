@@ -14,11 +14,10 @@ use std::sync::Arc;
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_types::{
     BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertificateRoot,
-    CertifiedBlock, ChainOrigin, CommittedTxsRoot, Finalization, LinkageError, LocalReceiptRoot,
-    ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, ReshapeThresholds, RevealChain,
-    SettledTxsRoot, ShardId, SplitChildRoots, StateRoot, TopologySchedule, TopologySnapshot,
-    TransactionRoot, TxHash, Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp,
-    WorkInFlight,
+    CertifiedBlock, ChainOrigin, Finalization, LinkageError, LocalReceiptRoot, ProvisionTxRootsMap,
+    ProvisionsRoot, QuorumCertificate, ReshapeThresholds, RevealChain, ShardId, SplitChildRoots,
+    StateRoot, TerminalRoots, TopologySchedule, TopologySnapshot, TransactionRoot, TxHash,
+    Verifiable, Verified, VerifiedBlockAssembleError, WeightedTimestamp, WorkInFlight,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -119,16 +118,13 @@ pub struct ReadyStateRootVerification {
     /// Whether the block's window requires the claim (the shard's final
     /// epoch before a split).
     pub split_child_roots_required: bool,
-    /// Whether the block's window requires a `settled_txs_root` — set on
-    /// any terminating boundary header (a split parent's or a merge
-    /// child's final epoch), broader than [`Self::split_child_roots_required`].
+    /// Whether the block's window requires terminal roots — set on any
+    /// terminating boundary header (a split parent's or a merge child's
+    /// final epoch), broader than [`Self::split_child_roots_required`].
     pub terminal_roots_required: bool,
-    /// The header's `settled_txs_root` claim, verified beside the state
-    /// root over the committed retention window.
-    pub claimed_settled_txs_root: Option<SettledTxsRoot>,
-    /// The header's `committed_txs_root` claim, verified beside it over
-    /// the same window.
-    pub claimed_committed_txs_root: Option<CommittedTxsRoot>,
+    /// The header's `terminal_roots` claim, verified beside the state root
+    /// over the committed retention window.
+    pub claimed_terminal_roots: Option<TerminalRoots>,
     /// The block's parent-QC weighted timestamp — the settled-transaction window
     /// anchor.
     pub parent_weighted_timestamp: WeightedTimestamp,
@@ -163,8 +159,7 @@ pub struct PendingStateRootVerification {
     pub claimed_split_child_roots: Option<SplitChildRoots>,
     pub split_child_roots_required: bool,
     pub terminal_roots_required: bool,
-    pub claimed_settled_txs_root: Option<SettledTxsRoot>,
-    pub claimed_committed_txs_root: Option<CommittedTxsRoot>,
+    pub claimed_terminal_roots: Option<TerminalRoots>,
     pub parent_weighted_timestamp: WeightedTimestamp,
     pub settled_txs_window_floor: Option<WeightedTimestamp>,
 }
@@ -1053,8 +1048,7 @@ impl VerificationPipeline {
             claimed_split_child_roots: block.header().split_child_roots(),
             split_child_roots_required,
             terminal_roots_required,
-            claimed_settled_txs_root: block.header().settled_txs_root(),
-            claimed_committed_txs_root: block.header().committed_txs_root(),
+            claimed_terminal_roots: block.header().terminal_roots(),
             parent_weighted_timestamp: block.header().parent_qc().weighted_timestamp(),
             settled_txs_window_floor,
         };
@@ -2169,8 +2163,7 @@ impl VerificationPipeline {
             claimed_split_child_roots: pending.claimed_split_child_roots,
             split_child_roots_required: pending.split_child_roots_required,
             terminal_roots_required: pending.terminal_roots_required,
-            claimed_settled_txs_root: pending.claimed_settled_txs_root,
-            claimed_committed_txs_root: pending.claimed_committed_txs_root,
+            claimed_terminal_roots: pending.claimed_terminal_roots,
             parent_weighted_timestamp: pending.parent_weighted_timestamp,
             settled_txs_window_floor: pending.settled_txs_window_floor,
         })

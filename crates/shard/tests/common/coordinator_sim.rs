@@ -31,7 +31,8 @@ use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_shard::action_handlers::{build_proposal, verify_and_build_qc};
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
-    ChainEntry, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter,
+    ChainEntry, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
+    ShardChainWriter, TerminalWindow,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::test_utils::TestCommittee;
@@ -1093,8 +1094,7 @@ impl ShardCoordinatorSim {
                 claimed_split_child_roots: ready.claimed_split_child_roots,
                 split_child_roots_required: ready.split_child_roots_required,
                 terminal_roots_required: ready.terminal_roots_required,
-                claimed_settled_txs_root: ready.claimed_settled_txs_root,
-                claimed_committed_txs_root: ready.claimed_committed_txs_root,
+                claimed_terminal_roots: ready.claimed_terminal_roots,
                 parent_weighted_timestamp: ready.parent_weighted_timestamp,
                 settled_txs_window_floor: ready.settled_txs_window_floor,
             });
@@ -1479,21 +1479,16 @@ impl ShardCoordinatorSim {
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
                 let pending_snapshots = view.pending_snapshots().to_vec();
-                let settled_txs_root = carry_terminal_roots.then(|| {
-                    self.pending_chains[emitter_idx].settled_txs_root_in_window(
-                        shard_id,
-                        parent_block_hash,
-                        parent_block_height,
-                        parent_qc.weighted_timestamp(),
-                        settled_txs_window_floor,
+                let terminal_roots = carry_terminal_roots.then(|| {
+                    self.pending_chains[emitter_idx].terminal_roots_in_window(
+                        &TerminalWindow {
+                            local_shard: shard_id,
+                            parent_block_hash,
+                            parent_block_height,
+                            anchor_wt: parent_qc.weighted_timestamp(),
+                            settled_window_floor: settled_txs_window_floor,
+                        },
                         &finalizations,
-                    )
-                });
-                let committed_txs_root = carry_terminal_roots.then(|| {
-                    self.pending_chains[emitter_idx].committed_txs_root_in_window(
-                        parent_block_hash,
-                        parent_block_height,
-                        parent_qc.weighted_timestamp(),
                         transactions.iter().map(|tx| tx.hash()).collect(),
                     )
                 });
@@ -1536,8 +1531,7 @@ impl ShardCoordinatorSim {
                     parent_committee_anchor_epoch,
                     committee_anchor_epoch,
                     carry_split_child_roots,
-                    settled_txs_root,
-                    committed_txs_root,
+                    terminal_roots,
                     &pending_snapshots,
                 );
                 let block_hash = result.block_hash;
@@ -1764,8 +1758,7 @@ impl ShardCoordinatorSim {
                 claimed_split_child_roots,
                 split_child_roots_required,
                 terminal_roots_required,
-                claimed_settled_txs_root,
-                claimed_committed_txs_root,
+                claimed_terminal_roots,
                 parent_weighted_timestamp,
                 settled_txs_window_floor,
             } => {
@@ -1790,14 +1783,17 @@ impl ShardCoordinatorSim {
                 if !receipt_ok {
                     return;
                 }
-                let computed_settled_txs_root = terminal_roots_required.then(|| {
-                    self.pending_chains[emitter_idx].settled_txs_root_in_window(
-                        self.shard,
-                        parent_block_hash,
-                        parent_block_height,
-                        parent_weighted_timestamp,
-                        settled_txs_window_floor,
+                let computed_terminal_roots = terminal_roots_required.then(|| {
+                    self.pending_chains[emitter_idx].terminal_roots_in_window(
+                        &TerminalWindow {
+                            local_shard: self.shard,
+                            parent_block_hash,
+                            parent_block_height,
+                            anchor_wt: parent_weighted_timestamp,
+                            settled_window_floor: settled_txs_window_floor,
+                        },
                         &finalizations,
+                        block_tx_hashes.clone(),
                     )
                 });
                 let view = self.pending_chains[emitter_idx]
@@ -1814,22 +1810,12 @@ impl ShardCoordinatorSim {
                     &pending_snapshots,
                     None,
                 );
-                let computed_committed_txs_root = terminal_roots_required.then(|| {
-                    self.pending_chains[emitter_idx].committed_txs_root_in_window(
-                        parent_block_hash,
-                        parent_block_height,
-                        parent_weighted_timestamp,
-                        block_tx_hashes.clone(),
-                    )
-                });
                 let verify_result = expected_root.verify(&StateRootContext {
                     computed_root: &computed_root,
                     claimed_split_child_roots,
                     split_child_roots_required,
-                    claimed_settled_txs_root,
-                    computed_settled_txs_root,
-                    claimed_committed_txs_root,
-                    computed_committed_txs_root,
+                    claimed_terminal_roots,
+                    computed_terminal_roots,
                     terminal_roots_required,
                 });
                 let bytes_delta = jmt_snapshot.bytes_delta;
@@ -2005,8 +1991,7 @@ pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
         beacon_witness_base: h.beacon_witness_base(),
         reveal_chain: h.reveal_chain(),
         split_child_roots: h.split_child_roots(),
-        settled_txs_root: h.settled_txs_root(),
-        committed_txs_root: h.committed_txs_root(),
+        terminal_roots: h.terminal_roots(),
         load: h.load(),
     })
 }

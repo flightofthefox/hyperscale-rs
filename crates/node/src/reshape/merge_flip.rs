@@ -81,8 +81,8 @@ mod tests {
 
     use hyperscale_types::{
         AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, ChainOrigin,
-        CommittedTxsRoot, Hash, QuorumCertificate, Round, ShardId, SignerBitfield, SplitChildRoots,
-        StateRoot, ValidatorId, WeightedTimestamp,
+        CommittedTxsRoot, Hash, QuorumCertificate, Round, SettledTxsRoot, ShardId, SignerBitfield,
+        SplitChildRoots, StateRoot, TerminalRoots, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
@@ -180,7 +180,10 @@ mod tests {
                 proposer: ValidatorId::new(2),
                 round: Round::new(7),
                 state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
-                committed_txs_root: Some(CommittedTxsRoot::from_raw(Hash::from_bytes(tag))),
+                terminal_roots: Some(TerminalRoots {
+                    settled_txs: SettledTxsRoot::ZERO,
+                    committed_txs: CommittedTxsRoot::from_raw(Hash::from_bytes(tag)),
+                }),
                 ..Default::default()
             })
         };

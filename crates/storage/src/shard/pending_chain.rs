@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeight, CertifiedBlock,
-    CertifiedBlockHeader, CommittedTxsRoot, ConsensusReceipt, ExecutionCertificate, Finalization,
-    FinalizationHash, MerkleInclusionProof, PreparedCommit, QuorumCertificate, RETENTION_HORIZON,
-    SettledTxsRoot, ShardId, ShardWitnessPayload, StateRoot, SubstateKey, TickId, Transaction,
-    TxHash, Verifiable, Verified, WeightedTimestamp, committed_txs_root_from_hashes,
+    CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
+    MerkleInclusionProof, PreparedCommit, QuorumCertificate, RETENTION_HORIZON, ShardId,
+    ShardWitnessPayload, StateRoot, SubstateKey, TerminalRoots, TickId, Transaction, TxHash,
+    Verifiable, Verified, WeightedTimestamp, committed_txs_root_from_hashes,
     local_settled_tx_hashes, settled_txs_root_from_hashes,
 };
 
@@ -32,6 +32,29 @@ use crate::{
 /// can source priors without a fresh `multi_get_cf` on `StateCf`. Entries
 /// are `SubstateKey → value-at-anchor`.
 pub type BaseReadCache = HashMap<SubstateKey, Option<Vec<u8>>>;
+/// Where a terminal-roots walk starts and stops.
+///
+/// Every field must resolve identically on the proposer and on each
+/// verifier, or the attested roots diverge and the block reaches no
+/// quorum: the parent pins the ancestry both walk, `anchor_wt` is the
+/// block's parent-QC weighted timestamp, and `settled_window_floor` is the
+/// schedule's settled-window floor. They travel as one value because they
+/// are one agreement, not five arguments that happen to be passed together.
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalWindow {
+    /// The shard whose settlements the settled walk keys on.
+    pub local_shard: ShardId,
+    /// Hash of the block being built or verified over.
+    pub parent_block_hash: BlockHash,
+    /// Height of that parent.
+    pub parent_block_height: BlockHeight,
+    /// The block's parent-QC weighted timestamp.
+    pub anchor_wt: WeightedTimestamp,
+    /// The schedule's settled-window floor, which reaches the settled walk
+    /// back to the reshape's admission. The committed walk has no
+    /// equivalent — it floors at `anchor_wt − RETENTION_HORIZON` alone.
+    pub settled_window_floor: Option<WeightedTimestamp>,
+}
 
 /// One block's worth of pending state, indexed by block hash in
 /// [`PendingChain::entries`].
@@ -311,48 +334,46 @@ where
         self.base.get_block_for_sync(height)
     }
 
-    /// A terminating shard's settled-transaction root over `[min(anchor_wt,
-    /// window_floor) − RETENTION_HORIZON, parent]`, including
-    /// `own_certificates` (the block being built or verified). `anchor_wt`
-    /// is the block's parent-QC weighted timestamp and `window_floor` the
-    /// schedule's settled-window floor — both the same value on the
-    /// proposer and every verifier — so the floored window, and thus the
-    /// root, agree.
+    /// The commitments a terminating boundary header carries, both walked
+    /// over the block being built or verified and the committed window
+    /// behind it.
+    ///
+    /// One call because one predicate governs both: a header carries the
+    /// pair or neither, so computing one without the other has no caller.
+    /// The two walks differ in reach and in what they fold. The settled
+    /// side runs over `[min(anchor_wt, settled_window_floor) −
+    /// RETENTION_HORIZON, parent]`, because a counterpart's fence can hold
+    /// a straddler admitted as far back as the reshape; the committed side
+    /// floors at `anchor_wt − RETENTION_HORIZON`, because a successor only
+    /// asks about transactions whose validity window is still open.
+    ///
+    /// `window` is where both walks start and stop; `own_certificates` and
+    /// `own_txs` are what the block under construction contributes.
     #[must_use]
-    pub fn settled_txs_root_in_window(
+    pub fn terminal_roots_in_window(
         &self,
-        local_shard: ShardId,
-        parent_block_hash: BlockHash,
-        parent_block_height: BlockHeight,
-        anchor_wt: WeightedTimestamp,
-        window_floor: Option<WeightedTimestamp>,
+        window: &TerminalWindow,
         own_certificates: &[Arc<Verifiable<Finalization>>],
-    ) -> SettledTxsRoot {
-        let set = self.settled_txs_in_window(
-            local_shard,
-            parent_block_hash,
-            parent_block_height,
-            anchor_wt,
-            window_floor,
-            local_settled_tx_hashes(own_certificates, local_shard),
+        own_txs: Vec<TxHash>,
+    ) -> TerminalRoots {
+        let settled = self.settled_txs_in_window(
+            window.local_shard,
+            window.parent_block_hash,
+            window.parent_block_height,
+            window.anchor_wt,
+            window.settled_window_floor,
+            local_settled_tx_hashes(own_certificates, window.local_shard),
         );
-        settled_txs_root_from_hashes(set.iter())
-    }
-
-    /// A terminating shard's committed-transaction root over `[anchor_wt −
-    /// RETENTION_HORIZON, parent]`, including `own` (the transactions of
-    /// the block being built or verified).
-    #[must_use]
-    pub fn committed_txs_root_in_window(
-        &self,
-        parent_block_hash: BlockHash,
-        parent_block_height: BlockHeight,
-        anchor_wt: WeightedTimestamp,
-        own: Vec<TxHash>,
-    ) -> CommittedTxsRoot {
-        let set =
-            self.committed_txs_in_window(parent_block_hash, parent_block_height, anchor_wt, own);
-        committed_txs_root_from_hashes(set.iter())
+        let committed = self.committed_txs_in_window(
+            window.parent_block_hash,
+            window.parent_block_height,
+            window.anchor_wt,
+            own_txs,
+        );
+        TerminalRoots {
+            settled_txs: settled_txs_root_from_hashes(settled.iter()),
+            committed_txs: committed_txs_root_from_hashes(committed.iter()),
+        }
     }
 
     /// Every transaction committed across the window, unioned with `own`
@@ -2028,12 +2049,19 @@ mod tests {
             },
         );
         let anchor = WeightedTimestamp::from_millis(10_000);
-        let root = chain.committed_txs_root_in_window(
-            parent,
-            BlockHeight::new(2),
-            anchor,
-            vec![tx_hash(21)],
-        );
+        let root = chain
+            .terminal_roots_in_window(
+                &TerminalWindow {
+                    local_shard: ShardId::ROOT,
+                    parent_block_hash: parent,
+                    parent_block_height: BlockHeight::new(2),
+                    anchor_wt: anchor,
+                    settled_window_floor: None,
+                },
+                &[],
+                vec![tx_hash(21)],
+            )
+            .committed_txs;
         assert_eq!(
             root,
             committed_txs_root_from_hashes([tx_hash(20), tx_hash(21)].iter())
