@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Address, Finalization, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, RETENTION_HORIZON, ShardId,
-    ShardTrie, TerminalVerdict, Transaction, TxHash, Verifiable, WeightedTimestamp,
+    Address, Finalization, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, ShardId, ShardTrie,
+    TerminalVerdict, Transaction, TxHash, Verifiable, WeightedTimestamp,
 };
 
 /// One committed transaction's outstanding account.
@@ -70,6 +70,21 @@ struct Owed {
     unsettled_by_departed: bool,
 }
 
+/// Where a departed participant's chain ended, and how long what it left
+/// behind can still be read.
+#[derive(Debug, Clone, Copy)]
+struct Departure {
+    /// The terminal cut — what dates the departure against a
+    /// transaction's own commit frontier.
+    cut: WeightedTimestamp,
+    /// The cut's terminal-evidence expiry. The entries this shard holds
+    /// against the departed shard live to exactly here, because this is
+    /// when its settled set stops answering: a shorter life would strand
+    /// them before the evidence that decides them is even attested, and a
+    /// longer one would hold them past any answer.
+    readable_until: WeightedTimestamp,
+}
+
 /// Committed-but-unresolved transactions, each against its deadline and
 /// the reservation it holds.
 #[derive(Debug, Default)]
@@ -79,7 +94,7 @@ pub struct UnresolvedTxs {
     /// whose fate only that shard's settled set can decide. Held against
     /// the schedule window that proves the terminal, which is retained on
     /// a frontier of its own.
-    departed: BTreeMap<ShardId, WeightedTimestamp>,
+    departed: BTreeMap<ShardId, Departure>,
 }
 
 impl UnresolvedTxs {
@@ -190,12 +205,21 @@ impl UnresolvedTxs {
             .is_some_and(|owed| owed.unsettled_by_departed)
     }
 
-    /// Record where a departed participant's chain ended.
+    /// Record where a departed participant's chain ended, and when what it
+    /// left stops being readable.
     ///
-    /// Idempotent on the figure, which is a property of the schedule
+    /// Idempotent on both figures, which are properties of the schedule
     /// rather than of when this shard got around to reading it.
-    pub fn record_terminal(&mut self, shard: ShardId, cut: WeightedTimestamp) {
-        self.departed.entry(shard).or_insert(cut);
+    pub fn record_terminal(
+        &mut self,
+        shard: ShardId,
+        cut: WeightedTimestamp,
+        readable_until: WeightedTimestamp,
+    ) {
+        self.departed.entry(shard).or_insert(Departure {
+            cut,
+            readable_until,
+        });
     }
 
     /// Whether a terminal is already recorded for `shard`.
@@ -211,13 +235,13 @@ impl UnresolvedTxs {
     /// earlier ones belong to shards that were already gone and so never
     /// held it, and later ones to successors that never did either. `None`
     /// while the prefix is still owned by the shard that owned it then.
-    fn departure_over(&self, owed: &Owed, prefix: Address) -> Option<WeightedTimestamp> {
+    fn departure_over(&self, owed: &Owed, prefix: Address) -> Option<Departure> {
         self.departed
             .iter()
             .filter(|(shard, _)| ShardTrie::shard_owns_prefix(**shard, prefix))
-            .filter(|(_, cut)| **cut > owed.committed_ts)
-            .map(|(_, cut)| *cut)
-            .min()
+            .filter(|(_, departure)| departure.cut > owed.committed_ts)
+            .map(|(_, departure)| *departure)
+            .min_by_key(|departure| departure.cut)
     }
 
     /// The shards that could hold a certificate of ours for `tx_hash` —
@@ -240,8 +264,9 @@ impl UnresolvedTxs {
             shards.extend(
                 self.departed
                     .iter()
-                    .filter(|(shard, cut)| {
-                        ShardTrie::shard_owns_prefix(**shard, *prefix) && **cut > owed.committed_ts
+                    .filter(|(shard, departure)| {
+                        ShardTrie::shard_owns_prefix(**shard, *prefix)
+                            && departure.cut > owed.committed_ts
                     })
                     .map(|(shard, _)| *shard),
             );
@@ -325,8 +350,8 @@ impl UnresolvedTxs {
     /// get that abandonment committed.
     ///
     /// One a certificate of ours does cover is decided by a participant's
-    /// settled set, which reads for `RETENTION_HORIZON` past that shard's
-    /// terminal and never again. So it lives while some participant can
+    /// settled set, which reads to that shard's terminal-evidence expiry
+    /// and never again. So it lives while some participant can
     /// still answer — one still running, whose certificate can yet arrive
     /// or whose own terminal can yet let the set speak, or one departed
     /// within that window. A clock of this transaction's own has nothing
@@ -345,7 +370,7 @@ impl UnresolvedTxs {
             .filter(|(tx_hash, owed)| {
                 let answerable = owed.remote_prefixes.iter().any(|prefix| {
                     self.departure_over(owed, *prefix)
-                        .is_none_or(|cut| now <= cut.plus(RETENTION_HORIZON))
+                        .is_none_or(|departure| now <= departure.readable_until)
                 });
                 // Having counterparts at all is what makes silence mean
                 // something: a transaction that never left this shard has
@@ -371,9 +396,9 @@ impl UnresolvedTxs {
         // the keyspace now, and hold the entry open against a shard that
         // was never party to it.
         let owed = &self.owed;
-        self.departed.retain(|shard, cut| {
+        self.departed.retain(|shard, departure| {
             owed.values().any(|entry| {
-                *cut > entry.committed_ts
+                departure.cut > entry.committed_ts
                     && entry
                         .remote_prefixes
                         .iter()
@@ -396,7 +421,8 @@ mod tests {
 
     use hyperscale_types::test_utils::{make_finalization, stub_transaction};
     use hyperscale_types::{
-        BlockHeight, TimestampRange, TransactionDecision, Verified, WeightedTimestamp,
+        BlockHeight, EPOCH_DURATION, EpochWindows, TimestampRange, TransactionDecision, Verified,
+        WeightedTimestamp,
     };
 
     use super::*;
@@ -429,6 +455,12 @@ mod tests {
 
     fn ms(v: u64) -> WeightedTimestamp {
         WeightedTimestamp::from_millis(v)
+    }
+
+    /// When a departure at `cut` stops answering, on the production epoch
+    /// grid — the same derivation the commit path stamps departures with.
+    fn expiry(cut: WeightedTimestamp) -> WeightedTimestamp {
+        EpochWindows::new(EPOCH_DURATION.as_secs() * 1000).terminal_evidence_expiry(cut)
     }
 
     fn commit(ledger: &mut UnresolvedTxs, tx: &Arc<Verifiable<Transaction>>) {
@@ -585,9 +617,8 @@ mod tests {
     }
 
     /// It goes when the last counterpart that could have answered stops
-    /// being able to: a departed shard's settled set reads for
-    /// `RETENTION_HORIZON` past its terminal, and nothing decides the
-    /// transaction after that.
+    /// being able to: a departed shard's settled set reads to its
+    /// evidence expiry, and nothing decides the transaction after that.
     #[test]
     fn a_certified_straddler_goes_when_its_last_counterpart_falls_silent() {
         let mut ledger = UnresolvedTxs::default();
@@ -596,12 +627,12 @@ mod tests {
         ledger.certify(tx.hash());
 
         let cut = ms(500_000);
-        ledger.record_terminal(PARTNER, cut);
+        ledger.record_terminal(PARTNER, cut, expiry(cut));
 
-        ledger.prune(cut.plus(RETENTION_HORIZON));
-        assert_eq!(ledger.len(), 1, "the set still reads at the horizon");
+        ledger.prune(expiry(cut));
+        assert_eq!(ledger.len(), 1, "the set still reads at the expiry");
 
-        ledger.prune(cut.plus(RETENTION_HORIZON).plus(Duration::from_millis(1)));
+        ledger.prune(expiry(cut).plus(Duration::from_millis(1)));
         assert_eq!(ledger.len(), 0, "and never again past it");
     }
 
@@ -615,13 +646,13 @@ mod tests {
         ledger.certify(tx.hash());
 
         let cut = ms(500_000);
-        ledger.record_terminal(PARTNER, cut);
+        ledger.record_terminal(PARTNER, cut, expiry(cut));
         assert!(
-            ledger.prune(cut.plus(RETENTION_HORIZON)).is_empty(),
+            ledger.prune(expiry(cut)).is_empty(),
             "while the set still reads, the strand is nobody's to release",
         );
         assert_eq!(
-            ledger.prune(cut.plus(RETENTION_HORIZON).plus(Duration::from_millis(1))),
+            ledger.prune(expiry(cut).plus(Duration::from_millis(1))),
             vec![tx.hash()],
             "past it, nothing can settle it and the strand is named",
         );
@@ -719,8 +750,8 @@ mod tests {
         ledger.certify(tx.hash());
 
         let cut = ms(500_000);
-        ledger.record_terminal(ShardId::leaf(2, 2), cut);
-        ledger.prune(cut.plus(RETENTION_HORIZON).plus(MAX_VALIDITY_RANGE));
+        ledger.record_terminal(ShardId::leaf(2, 2), cut, expiry(cut));
+        ledger.prune(expiry(cut).plus(MAX_VALIDITY_RANGE));
         assert_eq!(ledger.len(), 1, "the other shard is still running");
     }
 
@@ -775,7 +806,7 @@ mod tests {
         // The partner splits. Its keyspace passes to a child, and both
         // answer for the transaction — the child owns it now, the parent
         // held it when our certificate went out.
-        ledger.record_terminal(PARTNER, ms(500_000));
+        ledger.record_terminal(PARTNER, ms(500_000), expiry(ms(500_000)));
         let split = ShardTrie::from_leaves([LOCAL, ShardId::leaf(2, 2), ShardId::leaf(2, 3)]);
         let after = ledger.counterparts(tx.hash(), &split);
         assert!(after.contains(&PARTNER), "the shard that held it then");
@@ -792,7 +823,7 @@ mod tests {
         let tx = tx(14, 60_000);
         ledger.register_committed(LOCAL, ms(600_000), std::iter::once(&tx));
         ledger.certify(tx.hash());
-        ledger.record_terminal(PARTNER, ms(500_000));
+        ledger.record_terminal(PARTNER, ms(500_000), expiry(ms(500_000)));
 
         assert!(
             !ledger.a_counterpart_has_left(tx.hash()),

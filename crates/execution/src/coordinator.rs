@@ -2456,9 +2456,11 @@ impl ExecutionCoordinator {
     /// departure it never recorded reads afterwards as a counterpart that
     /// never left.
     fn stamp_departures(&mut self, topology_schedule: &TopologySchedule) {
+        let windows = topology_schedule.windows();
         for (shard, cut) in topology_schedule.departures_at(self.committed_ts) {
             if shard != self.local_shard && !self.unresolved.knows_terminal(shard) {
-                self.unresolved.record_terminal(shard, cut);
+                self.unresolved
+                    .record_terminal(shard, cut, windows.terminal_evidence_expiry(cut));
             }
         }
     }
@@ -3353,10 +3355,10 @@ mod tests {
         test_transaction, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
-        AggregateSignature, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Epoch,
-        ExecutionOutcome, GlobalReceiptHash, Hash, MAX_FINALIZATION_DELAY, NetworkDefinition,
-        QuorumCertificate, RecoveryCause, ShardRecovery, Signer, SignerBitfield, StoredReceipt,
-        TickHalf, ValidatorInfo, ValidatorSet,
+        AggregateSignature, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
+        EPOCH_DURATION, Epoch, ExecutionOutcome, GlobalReceiptHash, Hash, MAX_FINALIZATION_DELAY,
+        NetworkDefinition, QuorumCertificate, RecoveryCause, ShardRecovery, Signer, SignerBitfield,
+        StoredReceipt, TickHalf, ValidatorInfo, ValidatorSet,
     };
 
     use super::*;
@@ -6798,9 +6800,11 @@ mod tests {
         ));
         let tx_hash = transaction.hash();
         let mut state = state_abandoning(&sched, HOME, &transaction);
-        state
-            .unresolved
-            .record_terminal(PEER, WeightedTimestamp::from_millis(1000));
+        state.unresolved.record_terminal(
+            PEER,
+            WeightedTimestamp::from_millis(1000),
+            WeightedTimestamp::from_millis(1000).plus(EPOCH_DURATION * 5),
+        );
 
         let abort: Arc<Verifiable<Finalization>> =
             Arc::new(Verified::<Finalization>::seal(abandonment_of(HOME, tx_hash)).into());
