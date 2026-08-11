@@ -1015,12 +1015,27 @@ impl ShardCoordinator {
     /// Whether the block's terminal-verdict records are ones this voter
     /// can attest to, and so whether voting on it must be withheld.
     ///
-    /// A record claims a departed shard did not settle the transactions it
-    /// names, which is the same question the split-boundary fence puts to
-    /// that shard's settled set — so it is asked through the same
-    /// predicate, and the record's validity cannot drift from the verdict
-    /// it will later license. The set is complete and beacon-attested, so
-    /// absence from it is proof rather than ignorance.
+    /// A record makes two claims, and both have to be checked or neither
+    /// is. The first is that a shard departed, at a stated cut; the second
+    /// is that it left the named transactions unsettled when it went.
+    ///
+    /// The departure is the schedule's to answer, and it is asked first
+    /// because the second question is only meaningful once it holds. A
+    /// shard still live in the anchored window has no settled set and can
+    /// settle any of the transactions named at any time, so a record
+    /// against it is not a claim a voter could ever check — and
+    /// [`settled_set_verdict`] passes over such a shard rather than
+    /// judging it, which is right for the question it exists to ask and
+    /// would leave this one unasked. The stated cut is held to the
+    /// schedule's own for the same reason: it is what dates the record
+    /// against the transactions it speaks for, and nothing downstream
+    /// re-derives it.
+    ///
+    /// What the departed shard actually settled is then the same question
+    /// the split-boundary fence puts to its settled set, so it is asked
+    /// through the same predicate and the record's validity cannot drift
+    /// from the verdict it will later license. The set is complete and
+    /// beacon-attested, so absence from it is proof rather than ignorance.
     ///
     /// A voter that has not acquired the set defers rather than guessing:
     /// the record is only proposable inside the window where the set can
@@ -1035,6 +1050,22 @@ impl ShardCoordinator {
         if block.terminal_verdicts().is_empty() {
             return false;
         }
+        let anchored_wt = block.header().parent_qc().weighted_timestamp();
+        for verdict in block.terminal_verdicts() {
+            let scheduled = topology_schedule.terminal_cut_for_shard(verdict.shard(), anchored_wt);
+            if scheduled != Some(verdict.terminal_wt()) {
+                warn!(
+                    validator = ?self.me,
+                    block_hash = ?block_hash,
+                    shard = ?verdict.shard(),
+                    claimed = ?verdict.terminal_wt(),
+                    ?scheduled,
+                    "Terminal-verdict record names a departure the schedule does not attest — \
+                     not voting"
+                );
+                return true;
+            }
+        }
         let claims = block.terminal_verdicts().iter().flat_map(|verdict| {
             verdict
                 .tx_hashes()
@@ -1044,7 +1075,7 @@ impl ShardCoordinator {
             &self.settled_sets,
             topology_schedule,
             self.local_shard,
-            block.header().parent_qc().weighted_timestamp(),
+            anchored_wt,
             claims,
         ) {
             SettledSetVerdict::Pass => false,
@@ -6658,8 +6689,8 @@ mod tests {
         CommittedTxsRoot, ConsensusSignature, Epoch, Hash, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
         NetworkDefinition, NetworkParams, SettledTxsRoot, ShardAnchor, ShardId, Signer,
         SignerBitfield, TerminalRoots, TimestampRange, TopologySchedule, TopologySnapshot,
-        Transaction, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, WeightedTimestamp,
-        WitnessSources, test_utils,
+        Transaction, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount,
+        WeightedTimestamp, WitnessSources, terminal_verdict_root_from_records, test_utils,
     };
 
     use super::*;
@@ -11049,6 +11080,172 @@ mod tests {
             vec![Arc::new(ec(local)), Arc::new(ec(remote))],
             vec![],
         )))
+    }
+
+    /// A block carrying boundary records, anchored at `anchor_ms` — the
+    /// clock the fence reads each named departure against.
+    fn block_with_records(anchor_ms: u64, records: Vec<TerminalVerdict>) -> Block {
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"parent"));
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(1),
+                parent_block_hash: parent,
+                parent_qc: QuorumCertificate::new(
+                    parent,
+                    ShardId::ROOT,
+                    BlockHeight::new(0),
+                    BlockHash::ZERO,
+                    Round::new(0),
+                    SignerBitfield::empty(),
+                    AggregateSignature::ZERO,
+                    WeightedTimestamp::from_millis(anchor_ms),
+                )
+                .into(),
+                terminal_verdict_root: terminal_verdict_root_from_records(&records),
+                ..Default::default()
+            }),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(Vec::new()),
+            provisions: Arc::new(Vec::new()),
+            terminal_verdicts: Arc::new(records),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    /// A record claiming `shard` left `tx` unsettled when it terminated at
+    /// `terminal_wt`.
+    fn record_naming(shard: ShardId, terminal_wt: u64, tx: &[u8]) -> TerminalVerdict {
+        TerminalVerdict::new(
+            shard,
+            WeightedTimestamp::from_millis(terminal_wt),
+            [UnsettledTx {
+                tx_hash: TxHash::from(Hash::from_bytes(tx)),
+                deadline: WeightedTimestamp::from_millis(1_200),
+                declared_work: 5,
+            }],
+        )
+    }
+
+    /// `ROOT` terminates at the close of window 0, so a record against it
+    /// states that cut and nothing else. The schedule is the authority on
+    /// both figures, and a voter checks them before asking what the
+    /// departed shard settled.
+    const ROOT_CUT_MS: u64 = 1_000;
+    /// An anchor in window 1, after `ROOT` has left the trie.
+    const AFTER_CUT_MS: u64 = 1_500;
+
+    /// A record against a shard that has not left is refused. Its settled
+    /// set does not exist and it can still settle anything the record
+    /// names, so the claim is one no voter could ever check — and the
+    /// verdict the record would license is the one that tears a
+    /// cross-shard transaction in half.
+    ///
+    /// The delegate cannot catch this: a live shard is exactly what
+    /// `settled_set_verdict` passes over, which is right for the question
+    /// it asks and leaves this one unasked.
+    #[test]
+    fn a_record_against_a_live_shard_is_refused() {
+        let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        let live = ShardId::leaf(1, 1);
+        let records = vec![record_naming(live, ROOT_CUT_MS, b"tx")];
+
+        assert_eq!(
+            settled_set_verdict(
+                &coord.settled_sets,
+                &sched,
+                coord.local_shard,
+                WeightedTimestamp::from_millis(AFTER_CUT_MS),
+                records.iter().flat_map(|r| r.tx_hashes().map(move |tx| (
+                    r.shard(),
+                    tx,
+                    TxClaim::Abandoned
+                ))),
+            ),
+            SettledSetVerdict::Pass,
+            "the delegate passes over a live shard, so the fence must ask first",
+        );
+        assert!(coord.fence_terminal_verdicts(
+            &sched,
+            &block_with_records(AFTER_CUT_MS, records),
+            BlockHash::ZERO,
+        ));
+    }
+
+    /// And one against this shard itself, which the delegate skips for the
+    /// same reason: the fence asks only what a *counterpart* did.
+    #[test]
+    fn a_record_against_the_local_shard_is_refused() {
+        let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        let records = vec![record_naming(coord.local_shard, ROOT_CUT_MS, b"tx")];
+        assert!(coord.fence_terminal_verdicts(
+            &sched,
+            &block_with_records(AFTER_CUT_MS, records),
+            BlockHash::ZERO,
+        ));
+    }
+
+    /// The stated cut is held to the schedule's own. It dates the record
+    /// against the transactions it speaks for and nothing downstream
+    /// re-derives it, so a restatement is the proposer's word alone.
+    #[test]
+    fn a_record_restating_the_wrong_cut_is_refused() {
+        let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS + 1, b"tx")];
+        assert!(coord.fence_terminal_verdicts(
+            &sched,
+            &block_with_records(AFTER_CUT_MS, records),
+            BlockHash::ZERO,
+        ));
+    }
+
+    /// The honest record still passes: a departure the schedule attests,
+    /// at the cut it attests, naming a transaction the departed shard's
+    /// own settled set does not.
+    #[test]
+    fn a_record_the_schedule_attests_is_voted_on() {
+        let mut coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord.record_settled_txs(
+            ShardId::ROOT,
+            SettledTxSet {
+                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"other"))).collect(),
+                terminal_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
+                readable_until: STILL_READABLE,
+            },
+        );
+        let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
+        assert!(!coord.fence_terminal_verdicts(
+            &sched,
+            &block_with_records(AFTER_CUT_MS, records),
+            BlockHash::ZERO,
+        ));
+    }
+
+    /// Past the departure the record's own claim still stands or falls on
+    /// the settled set: one naming a transaction `ROOT` did settle is
+    /// refused by the delegate, which is the check the departure gate
+    /// exists to let run.
+    #[test]
+    fn a_record_naming_what_the_departed_shard_settled_is_refused() {
+        let mut coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord.record_settled_txs(
+            ShardId::ROOT,
+            SettledTxSet {
+                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
+                terminal_wt: WeightedTimestamp::from_millis(ROOT_CUT_MS),
+                readable_until: STILL_READABLE,
+            },
+        );
+        let records = vec![record_naming(ShardId::ROOT, ROOT_CUT_MS, b"tx")];
+        assert!(coord.fence_terminal_verdicts(
+            &sched,
+            &block_with_records(AFTER_CUT_MS, records),
+            BlockHash::ZERO,
+        ));
     }
 
     fn block_with_certs(certs: Vec<Arc<Verifiable<Finalization>>>) -> Block {
