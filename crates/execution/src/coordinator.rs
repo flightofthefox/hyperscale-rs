@@ -43,7 +43,7 @@ use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
     CertifiedBlock, DeclaredKey, ExecutionCertificate, ExecutionCertificateVerifyError,
     ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
-    Hash, MAX_FINALIZATION_DELAY, MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_UNSETTLED_PER_VERDICT, Mode,
+    Hash, MAX_FINALIZATION_DELAY, MAX_TERMINAL_VERDICTS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, Mode,
     Provisions, RETENTION_HORIZON, RevealChain, ScheduleLookup, SettledSetVerdict, SettledTxSet,
     ShardId, ShardTrie, TerminalVerdict, TickId, TopologySchedule, TopologySnapshot, Transaction,
     TransactionDecision, TxClaim, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
@@ -2408,26 +2408,39 @@ impl ExecutionCoordinator {
     /// transaction of ours it does not name is one that shard never
     /// settled and now never will.
     ///
-    /// Bounded per record, with the remainder left for the next block:
-    /// each record stands alone, so a departure with more outstanding
-    /// than one block will carry is answered over several.
+    /// Bounded by one budget across every departure, with the remainder
+    /// left for the next block: each record stands alone, so a departure
+    /// with more outstanding than a block will carry is answered over
+    /// several. The budget is the block's rather than each record's
+    /// because a transaction straddling two departed shards is named by
+    /// both, so the records can name more between them than the drain
+    /// holds — and a block over that bound is one every voter refuses.
+    ///
+    /// Ascending by shard, which is the one order a block may carry them
+    /// in.
     #[must_use]
     pub fn pending_terminal_verdicts(&self) -> Vec<TerminalVerdict> {
-        let mut records: Vec<TerminalVerdict> = self
-            .settled_sets
-            .iter()
-            .filter_map(|(shard, settled)| {
-                let mut unsettled = self
-                    .unresolved
-                    .outstanding_with(*shard, settled.terminal_wt);
-                unsettled.retain(|tx_hash| !settled.txs.contains(tx_hash));
-                unsettled.truncate(MAX_UNSETTLED_PER_VERDICT);
-                (!unsettled.is_empty())
-                    .then(|| TerminalVerdict::new(*shard, settled.terminal_wt, unsettled))
-            })
-            .collect();
-        records.sort_by_key(TerminalVerdict::shard);
-        records.truncate(MAX_TERMINAL_VERDICTS_PER_BLOCK);
+        let mut budget = MAX_UNSETTLED_PER_BLOCK;
+        let mut records: Vec<TerminalVerdict> = Vec::new();
+        // `settled_sets` is a hash map, so the shards are walked in sorted
+        // order rather than its own: which departures the budget reaches
+        // must not turn on a per-process iteration order.
+        let mut shards: Vec<ShardId> = self.settled_sets.keys().copied().collect();
+        shards.sort_unstable();
+        for shard in shards {
+            if budget == 0 || records.len() == MAX_TERMINAL_VERDICTS_PER_BLOCK {
+                break;
+            }
+            let settled = &self.settled_sets[&shard];
+            let mut unsettled = self.unresolved.outstanding_with(shard, settled.terminal_wt);
+            unsettled.retain(|tx_hash| !settled.txs.contains(tx_hash));
+            unsettled.truncate(budget);
+            if unsettled.is_empty() {
+                continue;
+            }
+            budget -= unsettled.len();
+            records.push(TerminalVerdict::new(shard, settled.terminal_wt, unsettled));
+        }
         records
     }
 
@@ -2447,6 +2460,7 @@ impl ExecutionCoordinator {
     /// which is the same condition that makes the transaction's own fate
     /// unreachable. Nothing that could still settle is destroyed, because
     /// by then nothing can.
+    ///
     fn release_unanswerable(&mut self, tx_hashes: &[TxHash]) {
         for tx_hash in tx_hashes {
             if let Some(tick_id) = self.ticks.tick_assignment(*tx_hash) {
@@ -6486,6 +6500,54 @@ mod tests {
             vec![tx_hash],
             "and the record is what makes the abort this shard's to compose",
         );
+    }
+
+    /// One transaction can be named by two records, which is why the
+    /// budget the composer spends is the block's and not each record's: a
+    /// straddler reaching a departed shard reaches its departed successor
+    /// too, so the records name more between them than the drain holds,
+    /// and a block over that bound is one every voter refuses.
+    ///
+    /// Also pins the order: ascending by shard is the one form a block may
+    /// carry them in, and `settled_sets` is a hash map, so the walk cannot
+    /// take its iteration order.
+    #[test]
+    fn two_departures_over_one_transaction_share_the_block_s_budget() {
+        let sched = peer_terminating_schedule(60_000);
+        let (mut state, _, tx_hash) = state_stranded_on(&sched, 1);
+        let (peer_left, _) = PEER.children();
+
+        // Both cover the straddler's remote prefix — the bit test a shard
+        // and its descendant both pass — so both are party to it.
+        let set = |cut_ms: u64| SettledTxSet {
+            txs: BTreeSet::new(),
+            terminal_wt: WeightedTimestamp::from_millis(cut_ms),
+            readable_until: STILL_READABLE,
+        };
+        state.record_settled_txs(peer_left, set(120_000));
+        state.record_settled_txs(PEER, set(60_000));
+
+        let records = state.pending_terminal_verdicts();
+        assert_eq!(
+            records
+                .iter()
+                .map(TerminalVerdict::shard)
+                .collect::<Vec<_>>(),
+            vec![PEER, peer_left],
+            "ascending by shard, whatever order the sets are held in",
+        );
+        let named: usize = records.iter().map(|r| r.unsettled().len()).sum();
+        assert_eq!(
+            named, 2,
+            "one outstanding transaction, named twice — the sum is not the drain's count",
+        );
+        assert!(
+            named <= MAX_UNSETTLED_PER_BLOCK,
+            "and inside the block's own bound"
+        );
+        for record in &records {
+            assert_eq!(record.unsettled(), &[tx_hash]);
+        }
     }
 
     /// The certificate outlives the tick that produced it, so losing the

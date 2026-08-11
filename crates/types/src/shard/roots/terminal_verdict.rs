@@ -20,10 +20,15 @@ pub fn terminal_verdict_root_from_records(verdicts: &[TerminalVerdict]) -> Termi
     TerminalVerdictRoot::from_raw(compute_merkle_root(&leaves))
 }
 
+/// Domain tag separating a boundary record's merkle leaf from every other
+/// leaf preimage the codebase hashes.
+const TERMINAL_VERDICT_LEAF_TAG: &[u8] = b"hyperscale.terminal_verdict_leaf.v1";
+
 /// One record's leaf: its shard, its terminal, and the transactions it
 /// names, in the canonical order the record is built in.
 fn record_leaf(verdict: &TerminalVerdict) -> Hash {
-    let mut bytes = Vec::with_capacity(16 + verdict.unsettled().len() * 32);
+    let mut bytes = TERMINAL_VERDICT_LEAF_TAG.to_vec();
+    bytes.reserve(16 + verdict.unsettled().len() * 32);
     bytes.extend_from_slice(&verdict.shard().to_le_bytes());
     bytes.extend_from_slice(&verdict.terminal_wt().as_millis().to_le_bytes());
     for tx_hash in verdict.unsettled() {

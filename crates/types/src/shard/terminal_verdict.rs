@@ -22,7 +22,7 @@
 
 use hyperscale_hbor::Hbor;
 
-use crate::{MAX_UNSETTLED_PER_VERDICT, ShardId, TxHash, WeightedTimestamp};
+use crate::{MAX_UNSETTLED_PER_BLOCK, ShardId, TxHash, WeightedTimestamp};
 
 /// One departed shard's unsettled remainder, as this chain sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
@@ -38,7 +38,7 @@ pub struct TerminalVerdict {
     ///
     /// Sorted and duplicate-free, so the record has one form and a
     /// validator checking it walks the same order it would build.
-    #[hbor(max = MAX_UNSETTLED_PER_VERDICT)]
+    #[hbor(max = MAX_UNSETTLED_PER_BLOCK)]
     unsettled: Vec<TxHash>,
 }
 
@@ -82,11 +82,14 @@ impl TerminalVerdict {
     /// repeats, and naming something.
     ///
     /// An empty record asserts nothing and would cost a block a leaf for
-    /// it, so it is not well-formed rather than merely pointless.
+    /// it, so it is not well-formed rather than merely pointless. The
+    /// upper bound is the block's, which a single record may spend the
+    /// whole of; what stops several records spending it each is the sum
+    /// the block's own check applies.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         !self.unsettled.is_empty()
-            && self.unsettled.len() <= MAX_UNSETTLED_PER_VERDICT
+            && self.unsettled.len() <= MAX_UNSETTLED_PER_BLOCK
             && self.unsettled.windows(2).all(|pair| pair[0] < pair[1])
     }
 }

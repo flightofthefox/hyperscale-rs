@@ -24,8 +24,9 @@ use crate::WorkInFlight;
 /// block.
 pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 
-/// Hard cap on the transactions one
-/// [`TerminalVerdict`](crate::TerminalVerdict) may name.
+/// Hard cap on the transactions a block's
+/// [`TerminalVerdict`](crate::TerminalVerdict) records may name between
+/// them.
 ///
 /// A record answers for the transactions this chain still owes an outcome
 /// for that a departed shard did not settle, and how many that can be is
@@ -34,7 +35,14 @@ pub const MAX_TXS_PER_BLOCK: usize = 4_096;
 /// bound rather than a figure of its own, and a departure with more
 /// outstanding than one block will carry is answered over several, each
 /// record standing alone.
-pub const MAX_UNSETTLED_PER_VERDICT: usize = (MAX_DRAIN_WORK / TX_UNITS) as usize;
+///
+/// The bound is on the block rather than on any one record, because the
+/// drain is one budget shared across every departure the block answers
+/// for. It doubles as each record's own decode cap, since a single
+/// departure can hold the whole of it — but that cap alone would let a
+/// block carry the budget once per record, which is why the sum is
+/// checked as well.
+pub const MAX_UNSETTLED_PER_BLOCK: usize = (MAX_DRAIN_WORK / TX_UNITS) as usize;
 
 /// Hard cap on the departed shards one block may answer for.
 ///

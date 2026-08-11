@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY,
-    MAX_TIMESTAMP_RUSH, ProvisionHash, QuorumCertificate, ShardId, ShardLoad, TopologySnapshot,
-    Transaction, TxHash, Verifiable, VoteCount, terminal_verdict_root_from_records,
+    MAX_TIMESTAMP_RUSH, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, QuorumCertificate, ShardId,
+    ShardLoad, TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount,
+    terminal_verdict_root_from_records,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -496,14 +497,23 @@ pub fn validate_block_for_vote(
 }
 
 /// Validate the block's terminal-verdict records against the header that
-/// commits them, and against the one form a record may take.
+/// commits them, against the one form a record may take, and against the
+/// budget they share.
 ///
 /// Structural only — whether the records tell the truth is a question for
 /// the departed shards' settled sets, which this cannot see. What it
 /// establishes is that every replica reads the same claim: the root binds
-/// the records to the header, and the canonical order means one claim has
-/// one encoding, so two proposers naming the same transactions cannot
-/// produce blocks that differ.
+/// the records to the header, and the canonical order — within each
+/// record and across them — means one claim has one encoding, so two
+/// proposers naming the same transactions cannot produce blocks that
+/// differ.
+///
+/// The budget is the drain's, and it is one budget for the block rather
+/// than one per record: a transaction is named only while it is owed an
+/// outcome, so the records between them can name no more than the drain
+/// can hold. Each record's own decode cap is the same figure, since one
+/// departure may hold the whole of it, which is why the sum is what
+/// stops a block spending it once per record.
 pub fn validate_terminal_verdicts_well_formed(block: &Block) -> Result<(), String> {
     let verdicts = block.terminal_verdicts();
     let computed = terminal_verdict_root_from_records(verdicts);
@@ -514,7 +524,8 @@ pub fn validate_terminal_verdicts_well_formed(block: &Block) -> Result<(), Strin
         ));
     }
 
-    let mut seen: HashSet<ShardId> = HashSet::new();
+    let mut named = 0usize;
+    let mut previous: Option<ShardId> = None;
     for verdict in verdicts {
         if !verdict.is_well_formed() {
             return Err(format!(
@@ -522,20 +533,34 @@ pub fn validate_terminal_verdicts_well_formed(block: &Block) -> Result<(), Strin
                 verdict.shard(),
             ));
         }
-        if !seen.insert(verdict.shard()) {
+        // Ascending by shard, which gives uniqueness and one encoding per
+        // claim set together — two records for one shard would leave which
+        // answer counts to the reader, and a reordering would be a second
+        // form of the same block.
+        if previous.is_some_and(|previous| previous >= verdict.shard()) {
             return Err(format!(
-                "block carries two terminal-verdict records for {:?}",
+                "terminal-verdict record for {:?} repeats or precedes the one before it",
                 verdict.shard(),
             ));
         }
+        previous = Some(verdict.shard());
+        named = named.saturating_add(verdict.unsettled().len());
+    }
+    if named > MAX_UNSETTLED_PER_BLOCK {
+        return Err(format!(
+            "terminal-verdict records name {named} transactions, over the drain's own bound of \
+             {MAX_UNSETTLED_PER_BLOCK}",
+        ));
     }
     Ok(())
 }
 
 /// A coast block — one whose parent QC's weighted timestamp lands past
-/// the shard's terminal window — exists only to certify the crossing.
-/// It must carry no transactions, no certificates, and no provisions, so
-/// state stays frozen at the crossing's root.
+/// the shard's terminal window — exists only to certify the crossing. It
+/// must carry no content of any kind, so state stays frozen at the
+/// crossing's root: no transactions, no certificates, no provisions, and
+/// no boundary records, which a chain whose own capacity to resolve
+/// anything ended at its cut has nothing left to write down.
 fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
     if !block.transactions().is_empty() {
         return Err(format!(
@@ -553,6 +578,12 @@ fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
         return Err(format!(
             "coast block past the terminal window carries {} provisions",
             block.provisions().len()
+        ));
+    }
+    if !block.terminal_verdicts().is_empty() {
+        return Err(format!(
+            "coast block past the terminal window carries {} terminal-verdict records",
+            block.terminal_verdicts().len()
         ));
     }
     Ok(())
@@ -1138,15 +1169,58 @@ mod tests {
         );
     }
 
-    /// One record per departed shard: two would let a block answer for
-    /// the same shard twice and leave which answer counts to the reader.
+    /// Ascending by shard, which is what gives uniqueness and one encoding
+    /// per claim set at once: two records for one shard would leave which
+    /// answer counts to the reader, and a reordering would be a second
+    /// form of the same block.
     #[test]
-    fn two_records_for_one_shard_are_refused() {
-        let records = vec![verdict(ShardId::ROOT, &[1]), verdict(ShardId::ROOT, &[2])];
+    fn records_out_of_shard_order_or_repeating_a_shard_are_refused() {
+        let (left, right) = ShardId::ROOT.children();
+        assert!(left < right, "the fixture relies on the child ordering");
+
+        let ordered = vec![verdict(left, &[1]), verdict(right, &[2])];
+        let root = terminal_verdict_root_from_records(&ordered);
+        assert!(
+            validate_terminal_verdicts_well_formed(&block_with_verdicts(ordered, root)).is_ok()
+        );
+
+        for records in [
+            vec![verdict(right, &[2]), verdict(left, &[1])],
+            vec![verdict(left, &[1]), verdict(left, &[2])],
+        ] {
+            let root = terminal_verdict_root_from_records(&records);
+            let err = validate_terminal_verdicts_well_formed(&block_with_verdicts(records, root))
+                .unwrap_err();
+            assert!(err.contains("repeats or precedes"), "{err}");
+        }
+    }
+
+    /// The drain is one budget across every departure a block answers
+    /// for. Each record's own cap is the same figure, because one
+    /// departure may hold the whole of it — so without the sum a block
+    /// could spend the budget once per record.
+    #[test]
+    fn records_naming_more_than_the_drain_can_hold_are_refused() {
+        // Two records, each half the budget plus one, so neither trips its
+        // own cap and together they clear the block's.
+        let half = MAX_UNSETTLED_PER_BLOCK / 2 + 1;
+        let (left, right) = ShardId::ROOT.children();
+        let span = |shard: ShardId, from: usize| {
+            TerminalVerdict::new(
+                shard,
+                WeightedTimestamp::from_millis(1_000),
+                (from..from + half).map(|i| TxHash::from(Hash::from_bytes(&i.to_le_bytes()))),
+            )
+        };
+        let records = vec![span(left, 0), span(right, half)];
+        for record in &records {
+            assert!(record.is_well_formed(), "each record is within its own cap");
+        }
+
         let root = terminal_verdict_root_from_records(&records);
         let err = validate_terminal_verdicts_well_formed(&block_with_verdicts(records, root))
             .unwrap_err();
-        assert!(err.contains("two terminal-verdict records"), "{err}");
+        assert!(err.contains("over the drain's own bound"), "{err}");
     }
 
     /// The running work total is a validity condition, not a hint: a header
@@ -1602,6 +1676,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("coast block"), "{err}");
+
+        // A boundary record is content too. A chain whose capacity to
+        // resolve anything ended at its cut has nothing left to write
+        // down, so the rule covers every body list rather than three of
+        // four.
+        let records = vec![verdict(ShardId::ROOT, &[1])];
+        let with_record = block_with_verdicts(
+            records.clone(),
+            terminal_verdict_root_from_records(&records),
+        );
+        let err = validate_block_for_vote(
+            &topo,
+            local_shard(),
+            &with_record,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &CommitDedupIndex::new(),
+            true,
+            Some(ShardLoad::ZERO),
+        )
+        .unwrap_err();
+        assert!(err.contains("terminal-verdict records"), "{err}");
 
         let empty = block_with_transactions(BlockHeight::new(1), Vec::new());
         assert!(
