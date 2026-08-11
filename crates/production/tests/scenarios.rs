@@ -439,9 +439,15 @@ fn split_terminating_payer_releases_its_reservation_prod() {
     cluster.run_faultable(split_terminating_payer_releases_its_reservation);
 }
 
+/// The sibling of the sim scenario, which carries the same gap. Only one
+/// `#[ignore]` reason reaches a runner, and the whole production suite is
+/// already gated on `--ignored`, so the reason has to say both things or an
+/// `--ignored` run reads a known gap as a regression.
 #[test]
 #[serial]
-#[ignore = "real-QUIC production scenario; run with -- --ignored"]
+#[ignore = "real-QUIC production scenario; run with -- --ignored. Expected to FAIL on the \
+            known gap: a settlement the departing side certified never reaches the survivor, \
+            which applies it on one side only"]
 fn split_survivor_recovers_a_settlement_it_never_received_prod() {
     let setup = split_straddler_setup();
     let mut cluster =

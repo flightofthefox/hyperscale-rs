@@ -38,6 +38,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
+use hyperscale_metrics::{record_unheld_verdict_name, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
@@ -65,7 +66,7 @@ use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
 use crate::tick_state::{Admission, Divergence, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
-use crate::unresolved::UnresolvedTxs;
+use crate::unresolved::{Unanswerable, UnresolvedTxs};
 use crate::vote_tracker::VoteTracker;
 
 /// One payer-side engagement wait: the transaction, the counterpart
@@ -2051,8 +2052,12 @@ impl ExecutionCoordinator {
         self.unresolved.release_resolved(block.certificates());
         // What the block writes down about departed shards, before the
         // prune below reads what is still answerable.
-        self.unresolved
+        let unheld = self
+            .unresolved
             .record_terminal_verdicts(block.terminal_verdicts());
+        for _ in 0..unheld {
+            record_unheld_verdict_name();
+        }
         self.stamp_departures(topology_schedule);
         let unanswerable = self.unresolved.prune(self.committed_ts);
         self.release_unanswerable(&unanswerable);
@@ -2461,12 +2466,22 @@ impl ExecutionCoordinator {
     /// unreachable. Nothing that could still settle is destroyed, because
     /// by then nothing can.
     ///
-    fn release_unanswerable(&mut self, tx_hashes: &[TxHash]) {
-        for tx_hash in tx_hashes {
-            if let Some(tick_id) = self.ticks.tick_assignment(*tx_hash) {
+    /// Each of these is also a reservation the drain never gets back —
+    /// only a committed certificate returns one, and by here none is
+    /// coming. Counted by cause, because the drain's baseline rises with
+    /// them and a shard that accumulates enough admits nothing at all.
+    fn release_unanswerable(&mut self, unanswerable: &[Unanswerable]) {
+        for entry in unanswerable {
+            record_unresolvable_tx(if entry.covered_by_record {
+                "record_covered"
+            } else {
+                "no_record"
+            });
+            if let Some(tick_id) = self.ticks.tick_assignment(entry.tx_hash) {
                 tracing::info!(
-                    tx = %tx_hash,
+                    tx = %entry.tx_hash,
                     tick = %tick_id,
+                    covered_by_record = entry.covered_by_record,
                     "Releasing a strand whose counterparts have all fallen silent"
                 );
                 self.discard_tick(tick_id);

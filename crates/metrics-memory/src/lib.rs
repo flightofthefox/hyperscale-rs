@@ -254,6 +254,14 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("early_arrival_evictions", None, 1);
     }
 
+    fn record_unresolvable_tx(&self, cause: &str) {
+        self.inc("unresolvable_txs", Some(cause), 1);
+    }
+
+    fn record_unheld_verdict_name(&self) {
+        self.inc("unheld_verdict_names", None, 1);
+    }
+
     // ── Sync ─────────────────────────────────────────────────────────
 
     fn set_sync_blocks_behind(&self, kind: &str, shard: u64, blocks_behind: u64) {

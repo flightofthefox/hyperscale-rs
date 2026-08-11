@@ -24,12 +24,20 @@ use hyperscale_types::{
 
 use super::chain_reader::ShardChainReader;
 
-/// How far back a rebuild has to read.
+/// How far back a rebuild reads.
 ///
 /// A transaction committed at time `T` states a validity end at most
-/// `MAX_VALIDITY_RANGE` beyond it, and stops being anyone's business a
-/// `RETENTION_HORIZON` past that. Blocks older than this contribute
-/// nothing a rebuild would keep.
+/// `MAX_VALIDITY_RANGE` beyond it, and its own clock stops deciding it a
+/// `RETENTION_HORIZON` past that. So this spans every entry whose fate is
+/// its deadline's to settle.
+///
+/// It does **not** span every entry the ledger holds. One a certificate of
+/// this shard's covers lives while some counterpart can still answer,
+/// which is the counterpart's clock rather than the transaction's: a
+/// counterpart may run for hours past the commit and only then depart, and
+/// the entry survives to that departure's terminal-evidence expiry. No span
+/// measured back from the tip reaches such a commit, which is why widening
+/// this is not the answer.
 const FOLD_WINDOW: Duration = MAX_VALIDITY_RANGE.saturating_add(RETENTION_HORIZON);
 
 /// The lowest height committing a transaction the chain still owes an

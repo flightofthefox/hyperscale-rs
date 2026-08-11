@@ -147,6 +147,13 @@ pub struct Metrics {
     pub network_request_retries: CounterVec,
     pub early_arrival_evictions: Counter,
     pub backpressure_events: CounterVec,
+    /// Committed transactions whose outcome the shard can no longer
+    /// produce, by cause — their drain reservations never return.
+    pub unresolvable_txs: CounterVec,
+    /// Committed boundary records naming a transaction this replica's
+    /// ledger does not hold. Read across a shard's replicas: an outlier is
+    /// one whose rebuild missed the transaction's own block.
+    pub unheld_verdict_names: Counter,
 
     // === Network class accounting ===
     /// Per-class in-flight request slot count.
@@ -726,6 +733,21 @@ impl Metrics {
             )
             .unwrap(),
 
+            unresolvable_txs: register_counter_vec!(
+                "hyperscale_unresolvable_txs_total",
+                "Committed transactions the shard can no longer produce an outcome for, \
+                 by cause; their drain reservations never return",
+                &["cause"]
+            )
+            .unwrap(),
+
+            unheld_verdict_names: register_counter!(
+                "hyperscale_unheld_verdict_names_total",
+                "Committed boundary records naming a transaction this replica's ledger \
+                 does not hold"
+            )
+            .unwrap(),
+
             request_slots_in_flight: register_gauge_vec!(
                 "hyperscale_request_slots_in_flight",
                 "In-flight request slots, broken down by message class",
@@ -1015,6 +1037,17 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_early_arrival_eviction(&self) {
         self.metrics.early_arrival_evictions.inc();
+    }
+
+    fn record_unresolvable_tx(&self, cause: &str) {
+        self.metrics
+            .unresolvable_txs
+            .with_label_values(&[cause])
+            .inc();
+    }
+
+    fn record_unheld_verdict_name(&self) {
+        self.metrics.unheld_verdict_names.inc();
     }
 
     fn set_request_slots_in_flight(&self, class: &str, count: usize) {

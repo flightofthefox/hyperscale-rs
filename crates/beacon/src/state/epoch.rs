@@ -1865,8 +1865,8 @@ mod tests {
         state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
         // A prior boundary at height 3 backs the pending recovery (so the
-        // the retention sweep keeps it) and lets us assert the crossing didn't advance
-        // it.
+        // retention sweep keeps it) and lets us assert the crossing didn't
+        // advance it.
         state.boundaries.insert(
             shard,
             ShardBoundary {

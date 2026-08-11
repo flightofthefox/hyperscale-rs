@@ -85,6 +85,26 @@ struct Departure {
     readable_until: WeightedTimestamp,
 }
 
+/// A transaction the ledger let go of without an outcome, because no
+/// counterpart is left to reach one with.
+///
+/// The reservation it took against the drain is not returned — only a
+/// committed certificate does that, and none is coming — so this is the
+/// leak, and `covered_by_record` is what says which kind. Covered means a
+/// record had established the abort was safe and the chain did not get one
+/// committed before the entry ran out of counterparts. Uncovered means no
+/// record ever named it: either the departed counterpart settled it before
+/// it left, in which case its certificate was the only resolution there
+/// was, or the evidence never arrived to write a record from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unanswerable {
+    /// The transaction dropped.
+    pub tx_hash: TxHash,
+    /// Whether a committed record had named it unsettled by a departed
+    /// counterpart.
+    pub covered_by_record: bool,
+}
+
 /// Committed-but-unresolved transactions, each against its deadline and
 /// the reservation it holds.
 #[derive(Debug, Default)]
@@ -158,17 +178,31 @@ impl UnresolvedTxs {
     ///
     /// A record names transactions its shard did not settle before it
     /// went, which is what puts a settlement of them out of reach for
-    /// good. Records naming transactions this ledger no longer holds are
-    /// ignored: an entry already resolved needs no verdict, and one
-    /// already dropped is nobody's to speak for.
-    pub fn record_terminal_verdicts(&mut self, verdicts: &[TerminalVerdict]) {
+    /// good. Returns how many it named that this ledger does not hold,
+    /// which is how many verdicts this replica will not compose that a
+    /// replica holding them will.
+    ///
+    /// Most such names are ordinary: a record is offered until it commits,
+    /// so a later block repeats what an earlier one already discharged,
+    /// and one the same block resolves is released before this runs. The
+    /// one that is not ordinary is a rebuild that never reached the
+    /// transaction's own block — the entry's life is its counterpart's
+    /// clock while the replay window is measured in the transaction's, so
+    /// a restart can come back holding the record and not the entry. That
+    /// replica names a smaller abandonable set than its peers at the same
+    /// frontier, and the tick they compose is one it cannot sign. Counted
+    /// rather than silent because nothing else distinguishes it.
+    pub fn record_terminal_verdicts(&mut self, verdicts: &[TerminalVerdict]) -> usize {
+        let mut unheld = 0usize;
         for verdict in verdicts {
             for tx_hash in verdict.unsettled() {
-                if let Some(owed) = self.owed.get_mut(tx_hash) {
-                    owed.unsettled_by_departed = true;
+                match self.owed.get_mut(tx_hash) {
+                    Some(owed) => owed.unsettled_by_departed = true,
+                    None => unheld = unheld.saturating_add(1),
                 }
             }
         }
+        unheld
     }
 
     /// The transactions this ledger still owes an outcome for that
@@ -350,8 +384,11 @@ impl UnresolvedTxs {
     /// fallen silent — the ones whose fate is settled by nobody rather
     /// than decided by anybody. Their reservations are owed to a
     /// settlement that provably cannot arrive, and whatever this shard
-    /// still holds against them is holding it for nothing.
-    pub fn prune(&mut self, now: WeightedTimestamp) -> Vec<TxHash> {
+    /// still holds against them is holding it for nothing. Each carries
+    /// whether a committed record had covered it, which separates a chain
+    /// that ran out of room to commit the abort from one that never had
+    /// the evidence to compose it.
+    pub fn prune(&mut self, now: WeightedTimestamp) -> Vec<Unanswerable> {
         let mut unanswerable = Vec::new();
         let kept: BTreeMap<TxHash, Owed> = std::mem::take(&mut self.owed)
             .into_iter()
@@ -370,7 +407,10 @@ impl UnresolvedTxs {
                     }
                     // Our certificate is out there and no shard is left to
                     // combine it with.
-                    unanswerable.push(*tx_hash);
+                    unanswerable.push(Unanswerable {
+                        tx_hash: *tx_hash,
+                        covered_by_record: owed.unsettled_by_departed,
+                    });
                     return false;
                 }
                 owed.deadline.plus(MAX_VALIDITY_RANGE) > now
@@ -625,7 +665,10 @@ mod tests {
     }
 
     /// The entry names itself on the way out, so its holder can let go of
-    /// what it was keeping for a settlement that cannot arrive.
+    /// what it was keeping for a settlement that cannot arrive — and says
+    /// whether a record had covered it, which separates a chain that ran
+    /// out of room to commit the abort from one that never had the
+    /// evidence to compose it.
     #[test]
     fn a_strand_whose_counterparts_all_fell_silent_names_itself() {
         let mut ledger = UnresolvedTxs::default();
@@ -641,8 +684,58 @@ mod tests {
         );
         assert_eq!(
             ledger.prune(expiry(cut).plus(Duration::from_millis(1))),
-            vec![tx.hash()],
+            vec![Unanswerable {
+                tx_hash: tx.hash(),
+                covered_by_record: false,
+            }],
             "past it, nothing can settle it and the strand is named",
+        );
+    }
+
+    /// A strand a record had covered is dropped for the same reason but is
+    /// a different failure: the abort was licensed and the chain never got
+    /// one committed. Only one of the two says the evidence path is
+    /// working, so the holder has to be able to tell them apart.
+    #[test]
+    fn a_covered_strand_names_the_record_that_licensed_its_abort() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(18, 60_000);
+        commit(&mut ledger, &tx);
+        ledger.certify(tx.hash());
+
+        let cut = ms(500_000);
+        ledger.record_terminal(PARTNER, cut, expiry(cut));
+        assert_eq!(
+            ledger.record_terminal_verdicts(&[TerminalVerdict::new(PARTNER, cut, [tx.hash()])]),
+            0,
+            "the ledger holds the transaction the record names",
+        );
+
+        assert_eq!(
+            ledger.prune(expiry(cut).plus(Duration::from_millis(1))),
+            vec![Unanswerable {
+                tx_hash: tx.hash(),
+                covered_by_record: true,
+            }],
+        );
+    }
+
+    /// A record naming what the ledger does not hold is counted rather
+    /// than ignored. Usually ordinary — a record is offered until it
+    /// commits, so a later block repeats a discharged one — but it is also
+    /// the one signal that a rebuild came back holding the record and not
+    /// the entry, which is a replica that will not compose the verdict its
+    /// peers do.
+    #[test]
+    fn a_record_naming_an_unheld_transaction_is_counted() {
+        let mut ledger = UnresolvedTxs::default();
+        assert_eq!(
+            ledger.record_terminal_verdicts(&[TerminalVerdict::new(
+                PARTNER,
+                ms(500_000),
+                [tx(19, 60_000).hash(), tx(20, 60_000).hash()],
+            )]),
+            2,
         );
     }
 

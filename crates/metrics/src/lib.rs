@@ -337,6 +337,28 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record an early arrival eviction.
     fn record_early_arrival_eviction(&self) {}
 
+    /// Record a committed transaction this shard can no longer produce an
+    /// outcome for, so its reservation against the drain never comes back.
+    /// `cause` says whether a committed boundary record had covered it — a
+    /// chain that ran out of room to get the abort committed — or whether
+    /// none ever did, which is a counterpart that settled the transaction
+    /// before it left, or evidence that never arrived.
+    ///
+    /// The drain's baseline rises with each of these, so a nonzero rate is
+    /// a shard walking towards a budget it cannot admit against.
+    fn record_unresolvable_tx(&self, cause: &str) {}
+
+    /// Record a committed boundary record naming a transaction this
+    /// replica's ledger does not hold.
+    ///
+    /// Ordinary in the common case — a record is offered until it commits,
+    /// so a later block repeats what an earlier one discharged. Read it
+    /// across the replicas of one shard rather than on its own: a replica
+    /// counting these where its peers count none is one whose rebuild did
+    /// not reach the transaction's own block, and it will not compose the
+    /// verdict its peers do.
+    fn record_unheld_verdict_name(&self) {}
+
     /// Set the in-flight request slot count for a `MessageClass`.
     ///
     /// Sampled by the request manager whenever a slot is acquired or
@@ -777,6 +799,20 @@ pub fn record_backpressure_event(source: &str) {
 #[inline]
 pub fn record_early_arrival_eviction() {
     recorder().record_early_arrival_eviction();
+}
+
+/// Record a committed transaction whose outcome this shard can no longer
+/// produce, so its drain reservation never returns.
+#[inline]
+pub fn record_unresolvable_tx(cause: &str) {
+    recorder().record_unresolvable_tx(cause);
+}
+
+/// Record a committed boundary record naming a transaction this replica's
+/// ledger does not hold.
+#[inline]
+pub fn record_unheld_verdict_name() {
+    recorder().record_unheld_verdict_name();
 }
 
 /// Set the in-flight request slot count for a class.

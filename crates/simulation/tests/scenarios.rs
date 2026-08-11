@@ -987,8 +987,7 @@ fn split_surviving_counterpart_releases_its_reservation_sim() {
 
 #[test]
 #[ignore = "known gap: a settlement the departing side certified never reaches the \
-            survivor, which applies it on one side only — see the residual in \
-            .plans/stranded-drain-reservation.md"]
+            survivor, which applies it on one side only"]
 fn split_survivor_recovers_a_settlement_it_never_received_sim() {
     let setup = split_straddler_setup();
     let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
