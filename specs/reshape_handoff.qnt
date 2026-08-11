@@ -214,8 +214,8 @@
 //     (the twin drops the hash tiebreak; expect a counterexample)
 
 module split_handoff {
-  // Retention horizon in whole epochs (model scale of RETENTION_HORIZON
-  // over the terminal window's end).
+  // Terminal-evidence window in whole epochs (model scale of
+  // TERMINAL_EVIDENCE_EPOCHS over the terminal window's end).
   const HORIZON: int
   // Epoch band (Apalache: constant ranges only).
   const MAX_EPOCH: int

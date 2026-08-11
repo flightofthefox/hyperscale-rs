@@ -202,3 +202,220 @@ where
         SettledSetVerdict::Pass
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        Epoch, EpochWindows, Hash, NetworkDefinition, TERMINAL_EVIDENCE_EPOCHS, TopologySnapshot,
+        ValidatorSet,
+    };
+
+    const LOCAL: ShardId = ShardId::leaf(1, 0);
+    const PEER: ShardId = ShardId::leaf(1, 1);
+
+    const EPOCH_MS: u64 = 300_000;
+    /// The cut PEER terminates at: the close of the window it last lives in.
+    const CUT_MS: u64 = EPOCH_MS;
+
+    fn wt(ms: u64) -> WeightedTimestamp {
+        WeightedTimestamp::from_millis(ms)
+    }
+
+    fn tx(seed: u8) -> TxHash {
+        TxHash::from(Hash::from_bytes(&[seed]))
+    }
+
+    fn snap(leaves: &[ShardId], cut: &[(ShardId, u64)]) -> Arc<TopologySnapshot> {
+        Arc::new(
+            TopologySnapshot::from_explicit_committees(
+                NetworkDefinition::simulator(),
+                &ValidatorSet::new(Vec::new()),
+                leaves.iter().map(|s| (*s, Vec::new())).collect(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+            )
+            .with_scheduled_terminals(cut.iter().map(|(s, e)| (*s, Epoch::new(*e))).collect()),
+        )
+    }
+
+    /// PEER lives in window 0 and terminates at its close; its children hold
+    /// the keyspace from window 1 on.
+    fn peer_terminated() -> TopologySchedule {
+        let (left, right) = PEER.children();
+        let mut sched =
+            TopologySchedule::new(EPOCH_MS, Epoch::new(0), snap(&[LOCAL, PEER], &[(PEER, 0)]));
+        // Retained through the whole evidence window, so an anchor inside it
+        // resolves a window rather than falling off the head.
+        for epoch in 1..=TERMINAL_EVIDENCE_EPOCHS + 1 {
+            sched.insert(Epoch::new(epoch), snap(&[LOCAL, left, right], &[]));
+        }
+        sched
+    }
+
+    /// A set for PEER carrying `txs`, readable for the terminal-evidence
+    /// window past the cut — what the acquisition stamps on it.
+    fn set_of(txs: &[TxHash]) -> HashMap<ShardId, SettledTxSet> {
+        let windows = EpochWindows::new(EPOCH_MS);
+        let mut sets = HashMap::new();
+        sets.insert(
+            PEER,
+            SettledTxSet {
+                txs: txs.iter().copied().collect(),
+                terminal_wt: wt(CUT_MS),
+                readable_until: windows.terminal_evidence_expiry(wt(CUT_MS)),
+            },
+        );
+        sets
+    }
+
+    fn verdict(
+        sets: &HashMap<ShardId, SettledTxSet>,
+        anchored_ms: u64,
+        claims: &[(ShardId, TxHash, TxClaim)],
+    ) -> SettledSetVerdict {
+        settled_set_verdict(
+            sets,
+            &peer_terminated(),
+            LOCAL,
+            wt(anchored_ms),
+            claims.iter().copied(),
+        )
+    }
+
+    /// The set is the authority, and the two claims read it opposite ways: a
+    /// settlement needs the departed shard to have settled, an abandonment
+    /// needs it not to have.
+    #[test]
+    fn the_two_claims_read_the_same_set_in_opposite_directions() {
+        let inside = CUT_MS + EPOCH_MS;
+        let settled = set_of(&[tx(1)]);
+
+        assert_eq!(
+            verdict(&settled, inside, &[(PEER, tx(1), TxClaim::Settled)]),
+            SettledSetVerdict::Pass,
+        );
+        assert_eq!(
+            verdict(&settled, inside, &[(PEER, tx(1), TxClaim::Abandoned)]),
+            SettledSetVerdict::Reject,
+            "the partner settled it, so abandoning would tear it in half",
+        );
+        assert_eq!(
+            verdict(&settled, inside, &[(PEER, tx(2), TxClaim::Abandoned)]),
+            SettledSetVerdict::Pass,
+            "one the set does not name is one the partner never settled",
+        );
+        assert_eq!(
+            verdict(&settled, inside, &[(PEER, tx(2), TxClaim::Settled)]),
+            SettledSetVerdict::Reject,
+            "and settling it would need coverage that never existed",
+        );
+    }
+
+    /// A past-terminal shard whose set is not held yet defers rather than
+    /// deciding — the evidence exists, this replica has not read it.
+    #[test]
+    fn an_unheld_set_defers_both_claims() {
+        let none = HashMap::new();
+        let inside = CUT_MS + EPOCH_MS;
+        for claim in [TxClaim::Settled, TxClaim::Abandoned] {
+            assert_eq!(
+                verdict(&none, inside, &[(PEER, tx(1), claim)]),
+                SettledSetVerdict::Defer,
+            );
+        }
+    }
+
+    /// The window that decides is the set's own `readable_until`, which the
+    /// acquisition derives from the schedule's epoch grid. It spans the two
+    /// folds a terminal contribution takes to be attested at all, so a block
+    /// anchored two epochs past the cut — the first that can carry the
+    /// evidence — still reads the set rather than rejecting on age.
+    #[test]
+    fn the_evidence_window_outlives_the_fold_that_delivers_it() {
+        let settled = set_of(&[tx(1)]);
+        let delivered = CUT_MS + 2 * EPOCH_MS;
+
+        assert_eq!(
+            verdict(&settled, delivered, &[(PEER, tx(1), TxClaim::Settled)]),
+            SettledSetVerdict::Pass,
+            "the roots reach a boundary record two folds past the cut",
+        );
+
+        let expiry = EpochWindows::new(EPOCH_MS).terminal_evidence_expiry(wt(CUT_MS));
+        assert_eq!(
+            verdict(
+                &settled,
+                expiry.as_millis(),
+                &[(PEER, tx(1), TxClaim::Settled)]
+            ),
+            SettledSetVerdict::Pass,
+            "readable to the last instant of the window",
+        );
+        assert_eq!(
+            verdict(
+                &settled,
+                expiry.as_millis() + 1,
+                &[(PEER, tx(1), TxClaim::Settled)],
+            ),
+            SettledSetVerdict::Reject,
+            "and unreadable past it, which refuses both claims alike",
+        );
+    }
+
+    /// Claims about this shard are not the fence's business — it asks only
+    /// what a *counterpart* did.
+    #[test]
+    fn a_claim_about_the_local_shard_is_not_asked() {
+        let none = HashMap::new();
+        assert_eq!(
+            verdict(
+                &none,
+                CUT_MS + EPOCH_MS,
+                &[(LOCAL, tx(1), TxClaim::Abandoned)],
+            ),
+            SettledSetVerdict::Pass,
+        );
+    }
+
+    /// A shard still live in the anchored window is decided by its own
+    /// certificates, not by a set that cannot exist yet — unless it is
+    /// scheduled to terminate, which defers instead. The pre-boundary hold
+    /// is what keeps a survivor from applying a straddler the terminating
+    /// side never settles.
+    #[test]
+    fn a_shard_scheduled_to_terminate_defers_before_its_cut() {
+        let none = HashMap::new();
+        assert_eq!(
+            verdict(&none, 0, &[(PEER, tx(1), TxClaim::Settled)]),
+            SettledSetVerdict::Defer,
+            "PEER is live in window 0 and carries an admitted terminal",
+        );
+    }
+
+    /// One deferral does not soften a rejection elsewhere: a torn claim is
+    /// refused whatever else the same finalization asks about.
+    #[test]
+    fn a_rejection_dominates_a_deferral() {
+        let settled = set_of(&[tx(1)]);
+        assert_eq!(
+            verdict(
+                &settled,
+                CUT_MS + EPOCH_MS,
+                &[
+                    (PEER, tx(1), TxClaim::Abandoned),
+                    (ShardId::leaf(2, 2), tx(3), TxClaim::Settled),
+                ],
+            ),
+            SettledSetVerdict::Reject,
+        );
+    }
+}
