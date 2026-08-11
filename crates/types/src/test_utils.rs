@@ -64,6 +64,13 @@ pub const fn test_prefix(seed: u8) -> Address {
     Address::new([seed; 31], AddressClass::Component)
 }
 
+/// A principal prefix from a seed byte — an account, whose class is what
+/// resolves it to the protocol's blueprint.
+#[must_use]
+pub const fn test_principal(seed: u8) -> Address {
+    Address::new([seed; 31], AddressClass::Principal)
+}
+
 /// A substate key seeded by one byte: the owner prefix and the local half
 /// both filled with it.
 #[must_use]

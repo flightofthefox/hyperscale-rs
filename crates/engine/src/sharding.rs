@@ -76,7 +76,7 @@ pub fn writes_root(writes: &StateWrites) -> WritesRoot {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::test_utils::test_prefix;
+    use hyperscale_types::test_utils::test_principal;
     use hyperscale_types::{ShardId, ShardTrie, StateWrites, SubstateKey, WritesRoot};
     use hyperscale_vm_effects::{Address, LocalKey};
 
@@ -105,8 +105,8 @@ mod tests {
 
     #[test]
     fn writes_root_distinguishes_inputs() {
-        let a = writes(&[(test_prefix(1), [0; 16], vec![1])]);
-        let b = writes(&[(test_prefix(2), [0; 16], vec![1])]);
+        let a = writes(&[(test_principal(1), [0; 16], vec![1])]);
+        let b = writes(&[(test_principal(2), [0; 16], vec![1])]);
         assert_ne!(writes_root(&a), writes_root(&b));
         assert_eq!(writes_root(&a), writes_root(&a.clone()));
     }
@@ -116,8 +116,8 @@ mod tests {
     #[test]
     fn filter_for_shard_keeps_only_this_shard_prefixes() {
         let trie = ShardTrie::uniform_from_count(2);
-        let left = test_prefix(0x00);
-        let right = test_prefix(0xFF);
+        let left = test_principal(0x00);
+        let right = test_principal(0xFF);
         assert_ne!(trie.shard_for_prefix(left), trie.shard_for_prefix(right));
         let all = writes(&[(left, [1; 16], vec![1]), (right, [1; 16], vec![2])]);
 
@@ -129,8 +129,8 @@ mod tests {
     #[test]
     fn filter_for_single_shard_is_the_identity() {
         let all = writes(&[
-            (test_prefix(1), [1; 16], vec![1]),
-            (test_prefix(9), [2; 16], vec![2]),
+            (test_principal(1), [1; 16], vec![1]),
+            (test_principal(9), [2; 16], vec![2]),
         ]);
         let filtered =
             filter_writes_for_shard(&all, ShardId::ROOT, &ShardTrie::uniform_from_count(1));

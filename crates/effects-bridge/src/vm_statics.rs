@@ -528,9 +528,8 @@ mod tests {
     use hyperscale_types::{Ed25519PrivateKey, NetworkId, SubintentSig, TX_UNITS, TransactionBody};
     use hyperscale_vm_effects::stdlib::{VAULT, account_metadata};
     use hyperscale_vm_effects::{
-        AddressClass, Constraint, EdgeRef, GraphArg, GraphNode, Hasher, InstanceMeta, IntentDecl,
-        ManifestGraph, PackageHash, Subintent, SubintentHash, YieldBinding, YieldParam, child_key,
-        nullifier_key,
+        AddressClass, Constraint, EdgeRef, GraphArg, GraphNode, Hasher, IntentDecl, ManifestGraph,
+        PackageHash, Subintent, SubintentHash, YieldBinding, YieldParam, child_key, nullifier_key,
     };
 
     use super::*;
@@ -555,15 +554,10 @@ mod tests {
         let mut cache = MetadataCache::new();
         cache.publish(package, account_metadata());
         let mut instances = InstanceRegistry::new();
-        for address in [composer_addr(), bob_addr()] {
-            instances.register(
-                address,
-                InstanceMeta {
-                    package,
-                    config: vec![],
-                },
-            );
-        }
+        // The composer and its counterparty are principals: their
+        // addresses derive from their keys, so nothing is registered for
+        // them.
+        instances.serve_principals(package);
         BridgeStatics {
             cache: PackageCache::new(cache),
             instances,

@@ -25,8 +25,8 @@ use crate::support::query::{
     pool_effective_stake, pool_total_stake, validator_pubkey, validator_status,
 };
 use crate::support::tx::{
-    GENESIS_POOL, SECOND_POOL, SECOND_POOL_ID, STAKE_POOL, STAKE_POOL_ID, build_deactivate_tx,
-    build_register_tx, build_stake_tx, build_unstake_tx, delegator, pool_operator, validity_around,
+    GENESIS_POOL_ID, SECOND_POOL_ID, STAKE_POOL_ID, build_deactivate_tx, build_register_tx,
+    build_stake_tx, build_unstake_tx, delegator, pool_at, pool_operator, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -127,7 +127,7 @@ pub fn delegation_folds_into_beacon_state(c: &mut impl Cluster) {
     let tx = build_stake_tx(
         &key,
         delegator,
-        STAKE_POOL,
+        pool_at(STAKE_POOL_ID),
         DELEGATION,
         validity_around(c.now()),
     );
@@ -168,8 +168,13 @@ pub fn register_validator_pools_a_node(c: &mut impl Cluster) {
     warm_up(c);
 
     let newcomer = ValidatorId::new(1000);
-    delegate(c, STAKE_POOL, STAKE_POOL_ID, MIN_STAKE_FLOOR.attos() * 10);
-    register(c, STAKE_POOL, 9, newcomer);
+    delegate(
+        c,
+        pool_at(STAKE_POOL_ID),
+        STAKE_POOL_ID,
+        MIN_STAKE_FLOOR.attos() * 10,
+    );
+    register(c, pool_at(STAKE_POOL_ID), 9, newcomer);
     assert!(
         c.run_until(epochs(8), |c| validator_status(c, newcomer)
             == Some(ValidatorStatus::Pooled)),
@@ -190,12 +195,17 @@ pub fn register_without_capacity_is_rejected(c: &mut impl Cluster) {
     // The pool exists but holds less than one min_stake, so it can support no
     // validator — the registration must be rejected on the capacity gate.
     let newcomer = ValidatorId::new(2000);
-    delegate(c, STAKE_POOL, STAKE_POOL_ID, MIN_STAKE_FLOOR.attos() / 2);
+    delegate(
+        c,
+        pool_at(STAKE_POOL_ID),
+        STAKE_POOL_ID,
+        MIN_STAKE_FLOOR.attos() / 2,
+    );
 
     // The registration itself commits — it is a well-formed action by the
     // pool's own operator, and what refuses it is the beacon's capacity
     // gate rather than anything the transaction did wrong.
-    register(c, STAKE_POOL, 11, newcomer);
+    register(c, pool_at(STAKE_POOL_ID), 11, newcomer);
     // Run long enough that the registration has folded; an accepted one
     // would surface within a couple of epochs.
     c.run_until(epochs(5), |_| false);
@@ -211,8 +221,13 @@ pub fn register_without_capacity_is_rejected(c: &mut impl Cluster) {
     // the refused one is not spent — nothing recorded it — but a pool
     // that already holds a record for an id refuses to ask again.
     let funded = ValidatorId::new(2001);
-    delegate(c, STAKE_POOL, STAKE_POOL_ID, MIN_STAKE_FLOOR.attos() * 2);
-    register(c, STAKE_POOL, 12, funded);
+    delegate(
+        c,
+        pool_at(STAKE_POOL_ID),
+        STAKE_POOL_ID,
+        MIN_STAKE_FLOOR.attos() * 2,
+    );
+    register(c, pool_at(STAKE_POOL_ID), 12, funded);
     assert!(
         c.run_until(epochs(8), |c| validator_status(c, funded)
             == Some(ValidatorStatus::Pooled)),
@@ -246,7 +261,7 @@ pub fn stake_withdraw_drops_effective_stake(c: &mut impl Cluster) {
         build_stake_tx(
             &key,
             delegator,
-            STAKE_POOL,
+            pool_at(STAKE_POOL_ID),
             delegated,
             validity_around(c.now()),
         ),
@@ -263,7 +278,7 @@ pub fn stake_withdraw_drops_effective_stake(c: &mut impl Cluster) {
         build_unstake_tx(
             &key,
             delegator,
-            STAKE_POOL,
+            pool_at(STAKE_POOL_ID),
             returned,
             validity_around(c.now()),
         ),
@@ -301,8 +316,8 @@ pub fn withdrawal_ejects_a_validator_that_a_deposit_reactivates(c: &mut impl Clu
 
     let member = ValidatorId::new(3000);
     let funded = MIN_STAKE_FLOOR.attos() * 10;
-    delegate(c, STAKE_POOL, STAKE_POOL_ID, funded);
-    register(c, STAKE_POOL, 13, member);
+    delegate(c, pool_at(STAKE_POOL_ID), STAKE_POOL_ID, funded);
+    register(c, pool_at(STAKE_POOL_ID), 13, member);
     assert!(
         c.run_until(epochs(8), |c| validator_status(c, member)
             == Some(ValidatorStatus::Pooled)),
@@ -319,7 +334,7 @@ pub fn withdrawal_ejects_a_validator_that_a_deposit_reactivates(c: &mut impl Clu
         build_unstake_tx(
             &key,
             delegator,
-            STAKE_POOL,
+            pool_at(STAKE_POOL_ID),
             returned,
             validity_around(c.now()),
         ),
@@ -334,7 +349,7 @@ pub fn withdrawal_ejects_a_validator_that_a_deposit_reactivates(c: &mut impl Clu
 
     // Buy the capacity back; the beacon's reactivation pass promotes
     // the ejected validator once the pool supports it again.
-    delegate(c, STAKE_POOL, STAKE_POOL_ID, funded);
+    delegate(c, pool_at(STAKE_POOL_ID), STAKE_POOL_ID, funded);
     assert!(
         c.run_until(epochs(8), |c| matches!(
             validator_status(c, member),
@@ -375,8 +390,13 @@ pub fn registered_validator_activates_onto_a_shard(c: &mut impl Cluster) {
     // full it parks in the pool. Which pool it joins does not matter to
     // the draw — the committee fills from the pooled set network-wide.
     let newcomer = ValidatorId::new(1000);
-    delegate(c, STAKE_POOL, STAKE_POOL_ID, MIN_STAKE_FLOOR.attos() * 10);
-    register(c, STAKE_POOL, 9, newcomer);
+    delegate(
+        c,
+        pool_at(STAKE_POOL_ID),
+        STAKE_POOL_ID,
+        MIN_STAKE_FLOOR.attos() * 10,
+    );
+    register(c, pool_at(STAKE_POOL_ID), 9, newcomer);
     assert!(
         c.run_until(epochs(8), |c| validator_status(c, newcomer)
             == Some(ValidatorStatus::Pooled)),
@@ -394,7 +414,7 @@ pub fn registered_validator_activates_onto_a_shard(c: &mut impl Cluster) {
         c,
         build_deactivate_tx(
             &operator,
-            GENESIS_POOL,
+            pool_at(GENESIS_POOL_ID),
             ValidatorId::new(0),
             validity_around(c.now()),
         ),
@@ -427,10 +447,10 @@ pub fn re_registration_of_a_live_validator_is_a_no_op(c: &mut impl Cluster) {
     let id = ValidatorId::new(1000);
     let first = dummy_pubkey(c, 9);
     let capacity = MIN_STAKE_FLOOR.attos() * 10;
-    delegate(c, STAKE_POOL, STAKE_POOL_ID, capacity);
-    delegate(c, SECOND_POOL, SECOND_POOL_ID, capacity);
+    delegate(c, pool_at(STAKE_POOL_ID), STAKE_POOL_ID, capacity);
+    delegate(c, pool_at(SECOND_POOL_ID), SECOND_POOL_ID, capacity);
 
-    register(c, STAKE_POOL, 9, id);
+    register(c, pool_at(STAKE_POOL_ID), 9, id);
     assert!(
         c.run_until(epochs(8), |c| validator_pubkey(c, id) == Some(first)),
         "validator never registered",
@@ -438,7 +458,7 @@ pub fn re_registration_of_a_live_validator_is_a_no_op(c: &mut impl Cluster) {
 
     // A second pool, funded and with capacity to spare, claims the same
     // id under a different key. The id is dead, so the record stands.
-    register(c, SECOND_POOL, 99, id);
+    register(c, pool_at(SECOND_POOL_ID), 99, id);
     c.run_until(epochs(5), |_| false);
     assert_eq!(
         validator_pubkey(c, id),
@@ -464,13 +484,18 @@ pub fn pool_capacity_caps_registrations(c: &mut impl Cluster) {
         ValidatorId::new(1002),
         ValidatorId::new(1003),
     ];
-    delegate(c, STAKE_POOL, STAKE_POOL_ID, MIN_STAKE_FLOOR.attos() * 3);
+    delegate(
+        c,
+        pool_at(STAKE_POOL_ID),
+        STAKE_POOL_ID,
+        MIN_STAKE_FLOOR.attos() * 3,
+    );
 
     // Four registrations against capacity three: every one is a valid
     // action by the pool's own operator, and exactly three take.
     for (i, id) in candidates.iter().enumerate() {
         let offset = u8::try_from(i).expect("candidate index fits u8");
-        register(c, STAKE_POOL, 20 + offset, *id);
+        register(c, pool_at(STAKE_POOL_ID), 20 + offset, *id);
     }
     assert!(
         c.run_until(epochs(8), |c| candidates

@@ -9,8 +9,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hyperscale_effects_bridge::{account_address, encode_tree};
-use hyperscale_engine::genesis::stake_unit;
+use hyperscale_effects_bridge::{ProtocolHasher, account_address, encode_tree};
+use hyperscale_engine::genesis::{pool_address, stake_unit, staking_artifact};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, Parallelism, TickBatchContext, XRD, genesis_writes,
 };
@@ -22,19 +22,15 @@ use hyperscale_types::{
     WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
-    Address, AddressClass, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl,
-    ManifestGraph, Value,
+    Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
+    Value, package_hash,
 };
 
-/// The pool instance the beacon is told about.
-const POOL: Address = Address::new([0x50; 31], AddressClass::Component);
-/// An instance of the very same package that nobody was told about.
-const IMPOSTOR: Address = Address::new([0x51; 31], AddressClass::Component);
-/// The identifier the beacon folds `POOL` under.
+/// The identifier the beacon folds the seated pool under.
 const POOL_ID: u32 = 7;
 /// The delegator's signing seed.
 const DELEGATOR: u8 = 7;
-/// The signing seed of the principal `POOL`'s operator surface admits.
+/// The signing seed of the principal the pool's operator surface admits.
 const OPERATOR: u8 = 8;
 /// The signing seed of a funded account that operates nothing.
 const OUTSIDER: u8 = 9;
@@ -82,13 +78,18 @@ fn world_accounts() -> Vec<(Address, u128)> {
 }
 
 /// A pool seat and the principal its operator surface admits.
-fn seat(address: Address, id: u32) -> StakePoolSeat {
+fn seat(id: u32) -> StakePoolSeat {
     StakePoolSeat {
-        address,
         id: StakePoolId::new(id),
         operator: account_of(OPERATOR),
         founding: Vec::new(),
     }
+}
+
+/// Where genesis seats the pool with this identifier — derived from the
+/// record, so a test names it the way genesis places it.
+fn pool_at(id: u32) -> Address {
+    pool_address(package_hash(&ProtocolHasher, staking_artifact()), &seat(id))
 }
 
 fn withdraw(target: Address, resource: Address, amount: u128) -> GraphNode {
@@ -192,10 +193,10 @@ fn witnesses(executed: &ExecutedTx) -> Vec<BeaconWitnessEvent> {
 fn a_delegation_to_a_seated_pool_reaches_the_witness_channel() {
     let executor = Executor::with_pools(
         &world_accounts(),
-        &[seat(POOL, POOL_ID), seat(IMPOSTOR, 99)],
+        &[seat(POOL_ID), seat(99)],
         ExecutionMode::Serial,
     );
-    let executed = execute(&executor, signed_stake(POOL, 500));
+    let executed = execute(&executor, signed_stake(pool_at(POOL_ID), 500));
     assert_eq!(
         witnesses(&executed[0]),
         vec![BeaconWitnessEvent::StakeDeposit {
@@ -210,16 +211,12 @@ fn a_delegation_to_a_seated_pool_reaches_the_witness_channel() {
 /// decision the network makes, not one a transaction can make for it.
 #[test]
 fn an_unseated_instance_of_the_same_package_reaches_nobody() {
-    let executor = Executor::with_pools(
-        &world_accounts(),
-        &[seat(POOL, POOL_ID)],
-        ExecutionMode::Serial,
-    );
-    // `IMPOSTOR` is not in the pool set, so it was never registered as an
+    let executor = Executor::with_pools(&world_accounts(), &[seat(POOL_ID)], ExecutionMode::Serial);
+    // `pool_at(99)` is not in the pool set, so it was never registered as an
     // instance either and the delegation cannot even be routed to it —
     // which is the outer of the two guards. The inner one is covered by
     // the codec's own tests, where an instance exists and is unrecognised.
-    let executed = execute(&executor, signed_stake(POOL, 500));
+    let executed = execute(&executor, signed_stake(pool_at(POOL_ID), 500));
     assert_eq!(
         witnesses(&executed[0]).len(),
         1,
@@ -231,11 +228,7 @@ fn an_unseated_instance_of_the_same_package_reaches_nobody() {
 /// channel carries what a stake pool says and nothing else.
 #[test]
 fn an_ordinary_transfer_is_not_a_beacon_fact() {
-    let executor = Executor::with_pools(
-        &world_accounts(),
-        &[seat(POOL, POOL_ID)],
-        ExecutionMode::Serial,
-    );
+    let executor = Executor::with_pools(&world_accounts(), &[seat(POOL_ID)], ExecutionMode::Serial);
     let key = Ed25519PrivateKey::from_bytes(&[DELEGATOR; 32]).unwrap();
     let from = account_address(&key.public_key().0);
     let graph = ManifestGraph {
@@ -325,13 +318,9 @@ fn signed_registration(pool: Address, seed: u8) -> Transaction {
 /// principal's signature reaches it.
 #[test]
 fn only_the_configured_operator_may_register_a_validator() {
-    let _ = Executor::with_pools(
-        &world_accounts(),
-        &[seat(POOL, POOL_ID)],
-        ExecutionMode::Serial,
-    );
+    let _ = Executor::with_pools(&world_accounts(), &[seat(POOL_ID)], ExecutionMode::Serial);
 
-    let outsider = signed_registration(POOL, OUTSIDER);
+    let outsider = signed_registration(pool_at(POOL_ID), OUTSIDER);
     assert!(outsider.body().signature_is_valid());
     let refused = outsider
         .try_derived()
@@ -346,7 +335,9 @@ fn only_the_configured_operator_may_register_a_validator() {
     // The control: the same manifest, the same fee, one signature
     // different. What bites is whose key signed it and not the shape.
     assert!(
-        signed_registration(POOL, OPERATOR).try_derived().is_ok(),
+        signed_registration(pool_at(POOL_ID), OPERATOR)
+            .try_derived()
+            .is_ok(),
         "the configured operator's own registration admits",
     );
 }
@@ -355,10 +346,6 @@ fn only_the_configured_operator_may_register_a_validator() {
 /// in the funds it carries, so anyone may delegate to any seated pool.
 #[test]
 fn a_delegation_needs_no_operator() {
-    let _ = Executor::with_pools(
-        &world_accounts(),
-        &[seat(POOL, POOL_ID)],
-        ExecutionMode::Serial,
-    );
-    assert!(signed_stake(POOL, 500).try_derived().is_ok());
+    let _ = Executor::with_pools(&world_accounts(), &[seat(POOL_ID)], ExecutionMode::Serial);
+    assert!(signed_stake(pool_at(POOL_ID), 500).try_derived().is_ok());
 }

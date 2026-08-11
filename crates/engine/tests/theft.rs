@@ -34,7 +34,7 @@ use hyperscale_vm_kernel::{amount_cell, encode_amount};
 
 /// A funded account whose key nothing in this binary holds — the address
 /// is all an attacker has, and the address is public.
-const VICTIM: Address = Address::new([0x99; 31], AddressClass::Component);
+const VICTIM: Address = Address::new([0x99; 31], AddressClass::Principal);
 /// The signing seed of the account that pays for the theft.
 const THIEF: u8 = 3;
 /// What both accounts hold at genesis.

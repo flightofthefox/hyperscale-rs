@@ -516,9 +516,11 @@ impl Display for StakePoolId {
 /// only the contract creates memberships, so they never drift again.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub struct StakePoolSeat {
-    /// The pool instance's address.
-    pub address: Address,
-    /// The identifier the beacon folds this pool's facts under.
+    /// The identifier the beacon folds this pool's facts under, and the
+    /// salt separating this pool's instance from any other seated
+    /// identically. The instance's address derives from the record
+    /// genesis builds out of this seat, so there is nothing here to
+    /// declare it with.
     pub id: StakePoolId,
     /// The principal whose signature the pool's operator methods admit.
     pub operator: Address,

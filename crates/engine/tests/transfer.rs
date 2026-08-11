@@ -15,7 +15,7 @@ use hyperscale_engine::{
     PreviewReport, ResourceChange, TickBatchContext, XRD, genesis_writes,
 };
 use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput, VersionedStore};
-use hyperscale_types::test_utils::test_prefix;
+use hyperscale_types::test_utils::test_principal;
 use hyperscale_types::{
     BlockHash, BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
     MerkleInclusionProof, NetworkId, ProvisionalHolds, RevealChain, SettledWrites, ShardId,
@@ -1494,7 +1494,7 @@ fn a_preview_prices_an_abort_at_its_class_floor() {
 /// nothing: it could never enter a block, so nobody would pay for it.
 #[test]
 fn a_preview_refuses_what_admission_would_refuse() {
-    let stranger = test_prefix(0xAB);
+    let stranger = test_principal(0xAB);
     assert!(
         !world_accounts().iter().any(|(a, _)| *a == stranger),
         "the address must be outside the world"

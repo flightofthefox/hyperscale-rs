@@ -535,7 +535,6 @@ mod tests {
     fn config_hash_covers_the_seated_pools() {
         let config = sample_config();
         let seat = StakePoolSeat {
-            address: test_prefix(0x50),
             id: StakePoolId::new(7777),
             operator: test_prefix(0x51),
             founding: Vec::new(),

@@ -11,7 +11,7 @@ use std::time::Duration;
 use hyperscale_effects_bridge::{
     ProtocolHasher, attach_metadata, encode_tree, sign_call, transfer_graph,
 };
-use hyperscale_engine::genesis::stake_unit;
+use hyperscale_engine::genesis::{pool_address, stake_unit, staking_artifact};
 use hyperscale_engine::{XRD, account_address};
 use hyperscale_types::{
     ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey, EnvelopeExt, Epoch,
@@ -20,8 +20,8 @@ use hyperscale_types::{
     ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
-    Address, AddressClass, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl,
-    ManifestGraph, Subintent, Value, YieldBinding, YieldParam,
+    Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
+    Subintent, Value, YieldBinding, YieldParam, package_hash,
 };
 use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_metadata};
 
@@ -1138,13 +1138,7 @@ pub fn build_publish_tx(
     )
 }
 
-/// The stake pool the VM staking scenario delegates to.
-///
-/// An address no key derives, like the genesis publisher's: a pool is
-/// seated by the network rather than created by a signer.
-pub const STAKE_POOL: Address = Address::new([0x50; 31], AddressClass::Component);
-
-/// The identifier the beacon folds [`STAKE_POOL`] under.
+/// The identifier the beacon folds the VM staking scenario's pool under.
 ///
 /// Distinct from the genesis pool every seated validator belongs to, so a
 /// delegation through the VM is the only source of this pool's stake and
@@ -1181,23 +1175,28 @@ pub fn staking_genesis_accounts() -> Vec<(Address, u128)> {
     ]
 }
 
-/// A second seated pool, for the scenarios whose claim needs two pools
-/// that disagree.
-pub const SECOND_POOL: Address = Address::new([0x51; 31], AddressClass::Component);
-
-/// The identifier the beacon folds [`SECOND_POOL`] under.
+/// The identifier the beacon folds the second staking pool under.
 pub const SECOND_POOL_ID: StakePoolId = StakePoolId::new(7778);
 
-/// The contract for the pool every genesis validator belongs to.
+/// The identifier beacon genesis creates the founding pool under.
 ///
 /// Beacon genesis creates that pool and its members; seating an instance
 /// for it is what gives it an operator, which is how a deployment retires
 /// a founding validator. Nothing else about the pool changes — its stake
 /// and its membership are still genesis's.
-pub const GENESIS_POOL: Address = Address::new([0x52; 31], AddressClass::Component);
-
-/// The identifier beacon genesis creates the founding pool under.
 pub const GENESIS_POOL_ID: StakePoolId = StakePoolId::new(0);
+
+/// Where genesis seats the pool with `id` — derived from the record, so
+/// a scenario names a pool the way genesis places it.
+#[must_use]
+pub fn pool_at(id: StakePoolId) -> Address {
+    let seat = StakePoolSeat {
+        id,
+        operator: pool_operator().1,
+        founding: Vec::new(),
+    };
+    pool_address(package_hash(&ProtocolHasher, staking_artifact()), &seat)
+}
 
 /// The pools a staking cluster seats.
 ///
@@ -1210,13 +1209,11 @@ pub fn staking_pools() -> Vec<StakePoolSeat> {
     let operator = pool_operator().1;
     vec![
         StakePoolSeat {
-            address: STAKE_POOL,
             id: STAKE_POOL_ID,
             operator,
             founding: Vec::new(),
         },
         StakePoolSeat {
-            address: SECOND_POOL,
             id: SECOND_POOL_ID,
             operator,
             founding: Vec::new(),
@@ -1224,7 +1221,6 @@ pub fn staking_pools() -> Vec<StakePoolSeat> {
         // The founding pool's members are the beacon's to name, and
         // genesis fills them in from its own folded state.
         StakePoolSeat {
-            address: GENESIS_POOL,
             id: GENESIS_POOL_ID,
             operator,
             founding: Vec::new(),
@@ -1543,7 +1539,7 @@ pub fn build_reshape_threshold_vote_tx(
 ) -> Transaction {
     build_operator_tx(
         operator,
-        GENESIS_POOL,
+        pool_at(GENESIS_POOL_ID),
         "cast-param-vote",
         vec![
             GraphArg::Literal(Value::U64(split_bytes)),

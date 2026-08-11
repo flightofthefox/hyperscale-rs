@@ -232,32 +232,35 @@ fn registration_of(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_vm_effects::{Address, AddressClass, Hash32, InstanceMeta};
+    use hyperscale_vm_effects::{Address, Hash32, InstanceMeta};
 
     use super::*;
+    use crate::ProtocolHasher;
 
-    const POOL: Address = Address::new([0x50; 31], AddressClass::Component);
-    const IMPOSTOR: Address = Address::new([0x51; 31], AddressClass::Component);
     const POOL_ID: u32 = 7;
 
     fn package(tag: u8) -> PackageHash {
         PackageHash(Hash32([tag; 32]))
     }
 
-    fn world() -> (PoolRegistry, InstanceRegistry) {
-        let mut pools = PoolRegistry::new();
-        pools.register(POOL, StakePoolId::new(POOL_ID));
+    fn instance(instances: &mut InstanceRegistry, salt: u8) -> Address {
+        instances.create(
+            &ProtocolHasher,
+            InstanceMeta {
+                package: package(1),
+                config: Vec::new(),
+                salt: Hash32([salt; 32]),
+            },
+        )
+    }
+
+    fn world() -> (PoolRegistry, InstanceRegistry, Address, Address) {
         let mut instances = InstanceRegistry::new();
-        for address in [POOL, IMPOSTOR] {
-            instances.register(
-                address,
-                InstanceMeta {
-                    package: package(1),
-                    config: Vec::new(),
-                },
-            );
-        }
-        (pools, instances)
+        let pool = instance(&mut instances, 1);
+        let impostor = instance(&mut instances, 2);
+        let mut pools = PoolRegistry::new();
+        pools.register(pool, StakePoolId::new(POOL_ID));
+        (pools, instances, pool, impostor)
     }
 
     fn event(emitter: Address, event_type: u32, amount: u128) -> Event {
@@ -270,16 +273,16 @@ mod tests {
 
     #[test]
     fn a_recognised_pools_events_read_as_beacon_facts() {
-        let (pools, instances) = world();
+        let (pools, instances, pool, _impostor) = world();
         assert_eq!(
-            witness_from_event(&event(POOL, STAKED, 500), &pools, &instances, package(1)),
+            witness_from_event(&event(pool, STAKED, 500), &pools, &instances, package(1)),
             Some(BeaconWitnessEvent::StakeDeposit {
                 pool_id: StakePoolId::new(POOL_ID),
                 amount: Stake::from_attos(500),
             }),
         );
         assert_eq!(
-            witness_from_event(&event(POOL, UNSTAKED, 40), &pools, &instances, package(1)),
+            witness_from_event(&event(pool, UNSTAKED, 40), &pools, &instances, package(1)),
             Some(BeaconWitnessEvent::StakeWithdraw {
                 pool_id: StakePoolId::new(POOL_ID),
                 amount: Stake::from_attos(40),
@@ -292,10 +295,10 @@ mod tests {
     /// anyone may create — speaks to nobody.
     #[test]
     fn an_unrecognised_instance_of_the_same_package_is_not_a_pool() {
-        let (pools, instances) = world();
+        let (pools, instances, _pool, impostor) = world();
         assert_eq!(
             witness_from_event(
-                &event(IMPOSTOR, STAKED, 1_000_000),
+                &event(impostor, STAKED, 1_000_000),
                 &pools,
                 &instances,
                 package(1)
@@ -309,9 +312,9 @@ mod tests {
     /// carry the other's claim.
     #[test]
     fn a_recognised_address_running_other_code_is_not_a_pool() {
-        let (pools, instances) = world();
+        let (pools, instances, pool, _impostor) = world();
         assert_eq!(
-            witness_from_event(&event(POOL, STAKED, 500), &pools, &instances, package(2)),
+            witness_from_event(&event(pool, STAKED, 500), &pools, &instances, package(2)),
             None,
         );
     }
@@ -338,11 +341,11 @@ mod tests {
 
     #[test]
     fn a_recognised_pools_operator_actions_read_as_beacon_facts() {
-        let (pools, instances) = world();
+        let (pools, instances, pool, _impostor) = world();
         let pool_id = StakePoolId::new(POOL_ID);
         assert_eq!(
             witness_from_event(
-                &raw(POOL, VALIDATOR_REGISTERED, registration_payload()),
+                &raw(pool, VALIDATOR_REGISTERED, registration_payload()),
                 &pools,
                 &instances,
                 package(1)
@@ -357,7 +360,7 @@ mod tests {
         let named = VALIDATOR.to_le_bytes().to_vec();
         assert_eq!(
             witness_from_event(
-                &raw(POOL, VALIDATOR_DEACTIVATED, named.clone()),
+                &raw(pool, VALIDATOR_DEACTIVATED, named.clone()),
                 &pools,
                 &instances,
                 package(1)
@@ -369,7 +372,7 @@ mod tests {
         );
         assert_eq!(
             witness_from_event(
-                &raw(POOL, VALIDATOR_UNJAILED, named),
+                &raw(pool, VALIDATOR_UNJAILED, named),
                 &pools,
                 &instances,
                 package(1)
@@ -387,9 +390,9 @@ mod tests {
     /// could have said which pool spoke.
     #[test]
     fn an_operator_action_is_folded_under_its_emitter() {
-        let (mut pools, instances) = world();
-        pools.register(IMPOSTOR, StakePoolId::new(POOL_ID + 1));
-        let event = raw(IMPOSTOR, VALIDATOR_REGISTERED, registration_payload());
+        let (mut pools, instances, _pool, impostor) = world();
+        pools.register(impostor, StakePoolId::new(POOL_ID + 1));
+        let event = raw(impostor, VALIDATOR_REGISTERED, registration_payload());
         let Some(BeaconWitnessEvent::RegisterValidator { pool_id, .. }) =
             witness_from_event(&event, &pools, &instances, package(1))
         else {
@@ -402,7 +405,7 @@ mod tests {
     /// per index, so a payload that is nearly right is not a fact.
     #[test]
     fn an_operator_payload_of_the_wrong_width_is_not_a_fact() {
-        let (pools, instances) = world();
+        let (pools, instances, pool, _impostor) = world();
         let mut long = registration_payload();
         long.push(0);
         let mut short = registration_payload();
@@ -410,7 +413,7 @@ mod tests {
         for payload in [long, short, Vec::new(), VALIDATOR.to_le_bytes().to_vec()] {
             assert_eq!(
                 witness_from_event(
-                    &raw(POOL, VALIDATOR_REGISTERED, payload),
+                    &raw(pool, VALIDATOR_REGISTERED, payload),
                     &pools,
                     &instances,
                     package(1)
@@ -422,7 +425,7 @@ mod tests {
             for event_type in [VALIDATOR_DEACTIVATED, VALIDATOR_UNJAILED] {
                 assert_eq!(
                     witness_from_event(
-                        &raw(POOL, event_type, payload.clone()),
+                        &raw(pool, event_type, payload.clone()),
                         &pools,
                         &instances,
                         package(1)
@@ -447,10 +450,10 @@ mod tests {
 
     #[test]
     fn a_cast_vote_reads_as_the_proposal_it_backs() {
-        let (pools, instances) = world();
+        let (pools, instances, pool, _impostor) = world();
         assert_eq!(
             witness_from_event(
-                &raw(POOL, PARAM_VOTE_CAST, cast_payload()),
+                &raw(pool, PARAM_VOTE_CAST, cast_payload()),
                 &pools,
                 &instances,
                 package(1)
@@ -475,10 +478,10 @@ mod tests {
     /// fact at all.
     #[test]
     fn a_cleared_vote_carries_no_proposal_and_no_bytes() {
-        let (pools, instances) = world();
+        let (pools, instances, pool, _impostor) = world();
         assert_eq!(
             witness_from_event(
-                &raw(POOL, PARAM_VOTE_CLEARED, Vec::new()),
+                &raw(pool, PARAM_VOTE_CLEARED, Vec::new()),
                 &pools,
                 &instances,
                 package(1)
@@ -490,7 +493,7 @@ mod tests {
         );
         assert_eq!(
             witness_from_event(
-                &raw(POOL, PARAM_VOTE_CLEARED, cast_payload()),
+                &raw(pool, PARAM_VOTE_CLEARED, cast_payload()),
                 &pools,
                 &instances,
                 package(1)
@@ -504,12 +507,12 @@ mod tests {
     /// state this side cannot see; reading is not admitting.
     #[test]
     fn a_vote_the_fold_will_reject_still_reads_as_a_vote() {
-        let (pools, instances) = world();
+        let (pools, instances, pool, _impostor) = world();
         let mut payload = 0u64.to_le_bytes().to_vec();
         payload.extend_from_slice(&0u64.to_le_bytes());
         payload.extend_from_slice(&0u64.to_le_bytes());
         let Some(BeaconWitnessEvent::ParamVote(vote)) = witness_from_event(
-            &raw(POOL, PARAM_VOTE_CAST, payload),
+            &raw(pool, PARAM_VOTE_CAST, payload),
             &pools,
             &instances,
             package(1),
@@ -527,7 +530,7 @@ mod tests {
 
     #[test]
     fn a_vote_payload_of_the_wrong_width_is_not_a_fact() {
-        let (pools, instances) = world();
+        let (pools, instances, pool, _impostor) = world();
         let mut long = cast_payload();
         long.push(0);
         let mut short = cast_payload();
@@ -535,7 +538,7 @@ mod tests {
         for payload in [long, short, Vec::new(), vec![0; 16]] {
             assert_eq!(
                 witness_from_event(
-                    &raw(POOL, PARAM_VOTE_CAST, payload),
+                    &raw(pool, PARAM_VOTE_CAST, payload),
                     &pools,
                     &instances,
                     package(1)
@@ -547,19 +550,19 @@ mod tests {
 
     #[test]
     fn an_event_the_table_does_not_declare_is_not_a_fact() {
-        let (pools, instances) = world();
+        let (pools, instances, pool, _impostor) = world();
         assert_eq!(
-            witness_from_event(&event(POOL, 7, 500), &pools, &instances, package(1)),
+            witness_from_event(&event(pool, 7, 500), &pools, &instances, package(1)),
             None,
         );
     }
 
     #[test]
     fn a_payload_that_is_not_an_amount_cell_is_not_a_fact() {
-        let (pools, instances) = world();
+        let (pools, instances, pool, _impostor) = world();
         for payload in [Vec::new(), vec![1; 8], vec![1; 17]] {
             let event = Event {
-                emitter: POOL,
+                emitter: pool,
                 event_type: STAKED,
                 payload,
             };
@@ -574,11 +577,11 @@ mod tests {
     /// a network without staking stays in: nothing is a fact.
     #[test]
     fn an_empty_registry_recognises_nothing() {
-        let (_, instances) = world();
+        let (_, instances, pool, _impostor) = world();
         let pools = PoolRegistry::new();
         assert!(pools.is_empty());
         assert_eq!(
-            witness_from_event(&event(POOL, STAKED, 500), &pools, &instances, package(1)),
+            witness_from_event(&event(pool, STAKED, 500), &pools, &instances, package(1)),
             None,
         );
     }

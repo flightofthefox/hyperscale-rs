@@ -12,8 +12,8 @@ use hyperscale_effects_bridge::{PoolRegistry, ProtocolHasher, admit_package, val
 pub use hyperscale_effects_bridge::{XRD, entropy_key, vault_key};
 use hyperscale_types::{SettledWrites, StakePoolSeat};
 use hyperscale_vm_effects::{
-    Address, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, Value, package_hash,
-    resource_address,
+    Address, Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, Value,
+    package_hash, resource_address,
 };
 use hyperscale_vm_kernel::encode_amount;
 use hyperscale_vm_stdlib::genesis_writes as stdlib_genesis_writes;
@@ -84,7 +84,7 @@ pub fn genesis_world(accounts: &[(Address, u128)]) -> World {
 /// Panics if a stdlib artifact would not be admissible as a published
 /// package — a build defect, not a runtime condition.
 #[must_use]
-pub fn genesis_world_with_pools(accounts: &[(Address, u128)], pools: &[StakePoolSeat]) -> World {
+pub fn genesis_world_with_pools(_accounts: &[(Address, u128)], pools: &[StakePoolSeat]) -> World {
     let artifact = account_artifact();
     let account_package = package_hash(&ProtocolHasher, artifact);
     let metadata =
@@ -101,30 +101,14 @@ pub fn genesis_world_with_pools(accounts: &[(Address, u128)], pools: &[StakePool
 
     let cache = PackageCache::new(seed);
     let mut instances = InstanceRegistry::new();
-    for (address, _) in accounts {
-        instances.register(
-            *address,
-            InstanceMeta {
-                package: account_package,
-                config: vec![],
-            },
-        );
-    }
+    // Funded accounts need nothing registered: a principal address
+    // commits its own auth material, and the blueprint serving every
+    // principal is protocol-defined.
+    instances.serve_principals(account_package);
     let mut registry = PoolRegistry::new();
     for seat in pools {
-        instances.register(
-            seat.address,
-            InstanceMeta {
-                package: staking_package,
-                // The resource a delegation is denominated in, and the
-                // principal its operator surface admits. The resource the
-                // pool *issues* is derived from the pool, not configured,
-                // and the pool's own identity is its address — so neither
-                // is named here.
-                config: vec![Value::Address(*XRD), Value::Address(seat.operator)],
-            },
-        );
-        registry.register(seat.address, seat.id);
+        let address = instances.create(&ProtocolHasher, pool_meta(staking_package, seat));
+        registry.register(address, seat.id);
     }
     World {
         cache,
@@ -134,6 +118,33 @@ pub fn genesis_world_with_pools(accounts: &[(Address, u128)], pools: &[StakePool
         pools: registry,
     }
 }
+
+/// A genesis-seated pool's creation-fixed record.
+///
+/// Its configuration is the resource a delegation is denominated in and
+/// the principal its operator surface admits. The resource the pool
+/// *issues* is derived from the pool rather than configured, and the
+/// pool's own identity is its address — so neither is named here.
+///
+/// The salt stands in for a creating transaction's fresh id, which
+/// genesis has none of: the pool's own beacon identifier separates two
+/// pools that would otherwise be seated identically.
+#[must_use]
+pub fn pool_meta(staking_package: PackageHash, seat: &StakePoolSeat) -> InstanceMeta {
+    InstanceMeta {
+        package: staking_package,
+        config: vec![Value::Address(*XRD), Value::Address(seat.operator)],
+        salt: ProtocolHasher.hash(DOMAIN_GENESIS_SALT, &[&seat.id.inner().to_le_bytes()]),
+    }
+}
+
+/// The address genesis seats `seat` at.
+#[must_use]
+pub fn pool_address(staking_package: PackageHash, seat: &StakePoolSeat) -> Address {
+    pool_meta(staking_package, seat).address(&ProtocolHasher)
+}
+
+const DOMAIN_GENESIS_SALT: &[u8] = b"hyperscale/engine/genesis-instance";
 
 /// The resource a pool issues against delegations.
 ///
@@ -160,6 +171,7 @@ pub fn genesis_writes(accounts: &[(Address, u128)], pools: &[StakePoolSeat]) -> 
     // state every later block extends, rather than a second source the
     // cache would have to be told about separately.
     let mut writes = stdlib_genesis_writes(&ProtocolHasher);
+    let staking_package = package_hash(&ProtocolHasher, staking_artifact());
     // A seated pool's record of the validators it already operates.
     // Beacon genesis creates those memberships directly in beacon state,
     // so without this the contract would hold no record of validators it
@@ -168,7 +180,7 @@ pub fn genesis_writes(accounts: &[(Address, u128)], pools: &[StakePoolSeat]) -> 
     for seat in pools {
         for (validator, pubkey) in &seat.founding {
             writes.cells.insert(
-                validator_key(seat.address, validator.inner()),
+                validator_key(pool_address(staking_package, seat), validator.inner()),
                 Some(pubkey.as_bytes().to_vec()),
             );
         }
@@ -184,7 +196,7 @@ pub fn genesis_writes(accounts: &[(Address, u128)], pools: &[StakePoolSeat]) -> 
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::test_utils::test_prefix;
+    use hyperscale_types::test_utils::test_principal;
     use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_metadata};
 
     use super::*;
@@ -192,8 +204,8 @@ mod tests {
 
     #[test]
     fn genesis_writes_are_identity_keyed_vault_cells() {
-        let alice = test_prefix(0x11);
-        let bob = test_prefix(0x22);
+        let alice = test_principal(0x11);
+        let bob = test_principal(0x22);
         let writes = genesis_writes(&[(alice, 500), (bob, 700)], &[]);
         // Two funded accounts' vault cells, plus the stdlib package under
         // the publisher no key derives.
@@ -259,9 +271,9 @@ mod tests {
 
     #[test]
     fn the_world_binds_every_funded_account_to_the_stdlib_package() {
-        let world = genesis_world(&[(test_prefix(0x11), 1), (test_prefix(0x22), 2)]);
+        let world = genesis_world(&[(test_principal(0x11), 1), (test_principal(0x22), 2)]);
         assert!(world.cache.load().get(world.account_package).is_some());
-        for address in [test_prefix(0x11), test_prefix(0x22)] {
+        for address in [test_principal(0x11), test_principal(0x22)] {
             assert_eq!(
                 world.instances.get(address).map(|m| m.package),
                 Some(world.account_package)
