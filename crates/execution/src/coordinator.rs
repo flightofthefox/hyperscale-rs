@@ -529,6 +529,25 @@ impl ExecutionCoordinator {
             )
     }
 
+    /// The trie that says who was party to a transaction.
+    ///
+    /// One accessor rather than an anchor chosen per call site, because
+    /// the two sites that ask it have to agree: composition derives an
+    /// abandonment's participants from it, and the finalize gate
+    /// re-derives the same set to put the fence's question to. A window
+    /// later resolves a departed counterpart's *successor*, so a gate
+    /// reading a different anchor than composition would ask about a
+    /// shard that was never party — and pass, because a live successor is
+    /// what [`settled_set_verdict`] steps over.
+    ///
+    /// The anchor is the block's committee anchor, not its own timestamp:
+    /// the two straddle an epoch cut once per window, and it is the
+    /// former that classified the block's content.
+    fn counterpart_trie<'t>(&self, topology_schedule: &'t TopologySchedule) -> &'t ShardTrie {
+        self.classification_committee(topology_schedule, self.committed_committee_anchor_wt)
+            .shard_trie()
+    }
+
     /// Set up per-tick execution state for a newly committed block.
     ///
     /// For each distinct tick, creates a [`TickState`], records tx → tick
@@ -777,14 +796,9 @@ impl ExecutionCoordinator {
             if let Some(held_by) = self.ticks.tick_assignment(tx_hash) {
                 self.discard_tick(held_by);
             }
-            let mut participating = self.unresolved.counterparts(
-                tx_hash,
-                self.classification_committee(
-                    topology_schedule,
-                    self.committed_committee_anchor_wt,
-                )
-                .shard_trie(),
-            );
+            let mut participating = self
+                .unresolved
+                .counterparts(tx_hash, self.counterpart_trie(topology_schedule));
             participating.insert(local_shard);
             state.admit(tx_hash, participating, declared_work, Admission::Aborted);
             self.candidates.remove(tx_hash);
@@ -2790,9 +2804,13 @@ impl ExecutionCoordinator {
     ) -> Vec<Action> {
         let tick_id = *finalized_arc.tick_id();
         let verdict = {
+            // Two anchors, deliberately, because they date two different
+            // questions. Who was party to a transaction is the trie's to
+            // answer, at the anchor the abandonment was composed against.
+            // Whether a shard is past-terminal is asked at the committed
+            // frontier, which is what a node-local caller reads it at.
             let outcomes = self.fence_pairs(
-                self.classification_committee(topology_schedule, self.committed_ts)
-                    .shard_trie(),
+                self.counterpart_trie(topology_schedule),
                 finalized_arc.as_unverified(),
             );
             settled_set_verdict(

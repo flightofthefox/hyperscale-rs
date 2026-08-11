@@ -1271,12 +1271,16 @@ pub enum Action {
     /// Offer transactions this chain never included to whatever holds
     /// their keys now.
     ///
-    /// Emitted once, by a chain that has dissolved at a reshape boundary,
-    /// for the pool entries its terminal sweep does not reach. The runner
-    /// routes each through the same fan-out a client submission takes, so
-    /// they resolve against the *current* topology and land on the
-    /// successor that now owns the payer rather than on the committee
-    /// that is shutting down.
+    /// Emitted by a chain quiescing at a reshape boundary, for the pool
+    /// entries its terminal sweep does not reach. Repeated a few times
+    /// while it coasts and once more when its successors are live: the
+    /// successors seat from the terminal cut, well ahead of the fold that
+    /// shows them live, so an early offer usually lands and waiting for
+    /// that fold would leave a client watching `Pending` for an epoch or
+    /// two. The runner routes each through the same fan-out a client
+    /// submission takes, so they resolve against the *current* topology
+    /// and land on the successor that now owns the payer rather than on
+    /// the committee that is shutting down.
     ///
     /// Best effort in both directions and safe in both. A seat that
     /// hosts no successor drops its copy, and the seats that continue

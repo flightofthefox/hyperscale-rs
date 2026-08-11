@@ -109,7 +109,8 @@ impl ShardParticipation {
         tracing::info!(
             shard = ?self.local_shard,
             count = txs.len(),
-            "Chain dissolved; offering back what it never included"
+            dissolved,
+            "Offering back what this chain never included"
         );
         vec![Action::ReofferTransactions { txs }]
     }

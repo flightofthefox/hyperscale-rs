@@ -541,7 +541,7 @@ pub fn split_surviving_counterpart_releases_its_reservation(c: &mut impl Faultab
         .expect("the survivor must serve a committed tip before the straddler");
 
     let (key, from, to) = &setup.straddlers[0];
-    let hash = submit_straddler(c, key, *from, *to);
+    let (hash, reserved) = submit_straddler_reserving(c, key, *from, *to);
 
     // Both while both are live: the splitter's coast blocks commit nothing,
     // so a straddler landing later would leave the survivor with no tick at
@@ -592,12 +592,24 @@ pub fn split_surviving_counterpart_releases_its_reservation(c: &mut impl Faultab
     // The release. It rides a committed finalization, which lands a block or
     // more after the outcome is reported, so it is waited for rather than
     // read at the instant the status flips.
+    //
+    // Two conditions, because either alone can be satisfied by something
+    // other than the release. Returning to the baseline is the property
+    // `MAX_DRAIN_WORK` documents, but the choreography's own traffic is
+    // in flight at the moment the baseline is read, and its later
+    // settlement lowers the level whatever the straddler does. So the
+    // straddler's own reservation is named as well: the level has to fall
+    // by at least what this transaction declared, which no other
+    // transaction settling can supply.
     assert!(
         c.run_until(epochs(12), |c| c
             .committed_work_in_flight(survivor)
-            .is_some_and(|level| level <= baseline)),
+            .is_some_and(
+                |level| level <= baseline && level.saturating_add(reserved) <= engaged
+            )),
         "the survivor's drain must return to its baseline once the straddler is \
-         abandoned; baseline = {baseline}, still owing = {:?}",
+         abandoned, and must fall by the {reserved} the straddler reserved; \
+         baseline = {baseline}, engaged = {engaged}, still owing = {:?}",
         c.committed_work_in_flight(survivor),
     );
 }
@@ -935,10 +947,25 @@ pub fn submit_straddler<C: Cluster>(
     from: [u8; 16],
     to: [u8; 16],
 ) -> TxHash {
+    submit_straddler_reserving(c, key, from, to).0
+}
+
+/// [`submit_straddler`], also reporting what the transaction reserves
+/// against its shards' drains.
+///
+/// The figure a committed abandonment returns exactly, so a scenario
+/// measuring the release can name the straddler's own contribution rather
+/// than inferring it from a level other traffic also moves.
+fn submit_straddler_reserving<C: Cluster>(
+    c: &mut C,
+    key: &Ed25519PrivateKey,
+    from: [u8; 16],
+    to: [u8; 16],
+) -> (TxHash, u64) {
     let tx = build_transfer_tx(key, from, to, STRADDLER_PAYMENT, validity_around(c.now()));
-    let hash = tx.hash();
+    let (hash, work) = (tx.hash(), tx.work());
     c.submit(Arc::new(tx));
-    hash
+    (hash, work)
 }
 
 /// Assert the settled-transaction fence held for `probes`: every straddler the
