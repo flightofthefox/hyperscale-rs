@@ -533,12 +533,9 @@ pub fn validate_block_for_vote(
 /// proposers naming the same transactions cannot produce blocks that
 /// differ.
 ///
-/// The budget is the drain's, and it is one budget for the block rather
-/// than one per record: a transaction is named only while it is owed an
-/// outcome, so the records between them can name no more than the drain
-/// can hold. Each record's own decode cap is the same figure, since one
-/// departure may hold the whole of it, which is why the sum is what
-/// stops a block spending it once per record.
+/// The budget checked is the sum across every record, because
+/// [`MAX_UNSETTLED_PER_BLOCK`] doubles as each record's own decode cap and
+/// that cap alone would let a block spend it once per record.
 pub fn validate_terminal_verdicts_well_formed(block: &Block) -> Result<(), String> {
     let verdicts = block.terminal_verdicts();
     let computed = terminal_verdict_root_from_records(verdicts);

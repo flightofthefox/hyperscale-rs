@@ -2370,17 +2370,6 @@ impl ExecutionCoordinator {
     /// alone would discard a tick whose settlement had already closed, and
     /// the fence would then refuse the abort that replaced it, tearing the
     /// transaction across the two shards.
-    ///
-    /// Committed evidence is also the only kind the fence cannot
-    /// contradict: [`Self::fence_pairs`] asks nothing about a transaction
-    /// a record covers, so what composition spends here is never refused
-    /// downstream.
-    ///
-    /// Every term reads off committed content — the ledger is a fold over
-    /// committed blocks, the schedule is attested, and `committed_ts` is
-    /// the committed frontier — so replicas at one frontier compose the
-    /// same tick. Nothing here consults a tick's certificate or its
-    /// coverage, both of which arrive by local fetch.
     fn beyond_every_shard(&self, composing: TickId, tx_hash: TxHash) -> bool {
         match self.ticks.tick_assignment(tx_hash) {
             Some(tick_id) if tick_id == composing => false,
@@ -2408,18 +2397,12 @@ impl ExecutionCoordinator {
     /// roots are attested and dropped at its evidence expiry, so a record
     /// is only ever offered while the evidence for it is readable, which
     /// is the same window every voter can check it in. Absence from a set
-    /// is proof rather
-    /// than ignorance — the set is complete and beacon-attested — so a
-    /// transaction of ours it does not name is one that shard never
-    /// settled and now never will.
+    /// is proof rather than ignorance — the set is complete and
+    /// beacon-attested — so a transaction of ours it does not name is one
+    /// that shard never settled and now never will.
     ///
-    /// Bounded by one budget across every departure, with the remainder
-    /// left for the next block: each record stands alone, so a departure
-    /// with more outstanding than a block will carry is answered over
-    /// several. The budget is the block's rather than each record's
-    /// because a transaction straddling two departed shards is named by
-    /// both, so the records can name more between them than the drain
-    /// holds — and a block over that bound is one every voter refuses.
+    /// Bounded by [`MAX_UNSETTLED_PER_BLOCK`], one budget across every
+    /// departure, with the remainder left for the next block.
     ///
     /// Ascending by shard, which is the one order a block may carry them
     /// in.

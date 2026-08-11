@@ -420,13 +420,9 @@ impl UnresolvedTxs {
     /// every record still owed a verdict.
     ///
     /// Returns the transactions dropped because every counterpart has
-    /// fallen silent — the ones whose fate is settled by nobody rather
-    /// than decided by anybody. Their reservations are owed to a
-    /// settlement that provably cannot arrive, and whatever this shard
-    /// still holds against them is holding it for nothing. Each carries
-    /// whether a committed record had covered it, which separates a chain
-    /// that ran out of room to commit the abort from one that never had
-    /// the evidence to compose it.
+    /// fallen silent. Each carries whether a committed record had covered
+    /// it, which separates a chain that ran out of room to commit the abort
+    /// from one that never had the evidence to compose it.
     pub fn prune(&mut self, now: WeightedTimestamp) -> Vec<Unanswerable> {
         let mut unanswerable = Vec::new();
         let kept: BTreeMap<TxHash, Owed> = std::mem::take(&mut self.owed)

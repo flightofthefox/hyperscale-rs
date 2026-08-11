@@ -447,11 +447,8 @@ pub fn merge_lifecycle(c: &mut impl Cluster) {
 /// A transaction a terminating shard admitted and never included still
 /// reaches an outcome, without the client resubmitting it.
 ///
-/// The terminal sweep drives every *committed* transaction to its abort,
-/// because no later block on that chain can decide one. It leaves the
-/// `Pending` entries alone, and those have nowhere left to go: the chain
-/// proposes only empty coast blocks from there, its mempool dies with it,
-/// and its successors construct empty ones. Their client's last word is
+/// The terminal sweep reaches only what the chain *committed*, so a
+/// `Pending` entry has nowhere left to go and its client's last word is
 /// the `Pending` it got on submission.
 ///
 /// The probe's window opens after the cut, so the parent admits it and

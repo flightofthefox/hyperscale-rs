@@ -81,6 +81,7 @@ impl DedupWindow {
     /// its own block's anchor and lands at or before where the live path put
     /// it. Early is the conservative direction — a batch whose entry expired
     /// early is re-requested, not wrongly admitted.
+    ///
     /// `origin` is where this chain begins, which is not generally height
     /// zero: a reshape successor continues its predecessor's height line.
     /// Reaching it makes the window whole, because what lies below is the

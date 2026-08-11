@@ -1136,25 +1136,14 @@ impl ShardCoordinator {
     /// costs a wait; refusing would spend a round on it instead and make
     /// the block look bad rather than early.
     ///
-    /// Provisions are left out, for want of a clock to judge them by. A
-    /// batch carries its *source* shard's weighted timestamp, and this
-    /// cut is in this chain's — two different clocks, comparable only to
-    /// within whatever skew stands between them, so a rule written on
-    /// that comparison would refuse honest batches near the boundary.
-    /// The batch names transaction hashes rather than bodies, so there is
-    /// no local window to read instead.
+    /// Provisions are left out. A batch carries its *source* shard's
+    /// weighted timestamp where the cut is in this chain's, so a rule
+    /// written on that comparison would refuse honest batches near the
+    /// boundary — and a pre-cut batch can only provision transactions the
+    /// rule above already refuses, so it is inert here.
     ///
-    /// Leaving them costs little. A batch provisions transactions, and a
-    /// batch from before the cut can only provision transactions the rule
-    /// above already refuses, so it is inert here: it is verified and
-    /// retained, and nothing ever consumes it.
-    ///
-    /// `ChainOrigin::ROOT` anchors at zero, so a chain born at network
-    /// genesis matches nothing here and pays nothing for the check. Nor
-    /// does a chain older than the retention horizon: a validity window
-    /// spans at most `MAX_VALIDITY_RANGE`, and a certificate anchors no
-    /// earlier than the transactions it resolves, so neither reaches back
-    /// past an origin that far behind.
+    /// The chains this can match at all are bounded by
+    /// [`Self::precut_window_open`].
     fn precut_verdict(&self, block: &Block) -> PrecutVerdict {
         let cut = self.chain_origin.anchor_wt;
         if let Some(fw) = block

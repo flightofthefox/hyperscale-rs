@@ -503,12 +503,11 @@ pub fn split_terminating_payer_releases_its_reservation(c: &mut impl FaultableCl
 /// on a certificate the counterpart will never send.
 ///
 /// [`isolate_ec_intake`] runs in *both* directions, which is what makes the
-/// straddler stranded rather than merely fenced. Cutting only the survivor's
-/// intake leaves the splitter holding both certificates, so it settles and
-/// its settled set names the straddler — and the survivor must then not abort
-/// it, which is a different scenario. With neither side holding the other's,
-/// neither settles, the splitter reaches its terminal having settled nothing,
-/// and abandoning is the only outcome the straddler can reach.
+/// straddler stranded rather than merely fenced: neither side holds the
+/// other's certificate, the splitter reaches its terminal having settled
+/// nothing, and abandoning is the only outcome the straddler can reach.
+/// Cutting one direction only is
+/// [`split_survivor_recovers_a_settlement_it_never_received`].
 ///
 /// The drain is what this measures. A verdict alone would pass without it:
 /// the reservation releases on a *committed finalization* carrying the work
@@ -616,28 +615,22 @@ fn vault_balance<C: Cluster>(c: &C, shard: ShardId, owner: [u8; 16]) -> u128 {
 /// Verify a straddler the departing splitter settled applies on both sides,
 /// when the survivor never receives the certificate that settled it.
 ///
-/// The mirror of [`split_surviving_counterpart_releases_its_reservation`],
-/// which cuts [`isolate_ec_intake`] in both directions so neither shard
-/// settles and abandoning is the only reachable outcome. Cutting only the
-/// survivor's intake inverts that: the splitter holds both certificates and
-/// settles, applying its half, while the survivor holds only its own and
-/// cannot apply until the splitter's reaches it.
+/// The mirror of [`split_surviving_counterpart_releases_its_reservation`]:
+/// [`isolate_ec_intake`] cuts only the survivor's intake, so the splitter
+/// holds both certificates and settles, applying its half, while the
+/// survivor holds only its own and cannot apply until the splitter's
+/// reaches it.
 ///
 /// What that leaves the survivor is a transaction its counterpart's settled
 /// set names as settled — so no record covers it, the fence refuses any
 /// abandonment of it, and the only resolution left is the certificate
 /// itself. The certificate is committed on the splitter's tail chain, which
 /// is the same chain the settled set is reconstructed from; whether the
-/// survivor recovers it from there is what this measures. If it does not,
-/// the transaction is applied on the splitter and never on the survivor,
-/// and the survivor's reservation is held for the life of its chain.
+/// survivor recovers it from there is what this measures.
 ///
 /// The cut lifts once the splitter's children seat, so what is measured is
-/// a retention limit and not a partition: the survivor missed the
-/// certificate during the window it was pushed, and asks for it on a whole
-/// network afterwards. A survivor that could never reach the shard holding
-/// the certificate would fail this for a reason the residual is not
-/// about.
+/// a retention limit and not a partition: the survivor asks for the
+/// certificate on a whole network, having missed it while the cut was up.
 ///
 /// Requires disjoint splitter/survivor committees (no shared host), or a
 /// co-hosted vnode bridges the certificate across in-process, which no
