@@ -6,8 +6,13 @@ use crate::{MAX_FINALIZED_TX_PER_BLOCK, MessageClass, NetworkMessage, TxHash};
 
 /// The complete settled-transaction window list of a terminated shard.
 ///
-/// `txs` is `S_P` in full: every **cross-shard** transaction `P` settled in
-/// `[B − RETENTION_HORIZON, B]`. Single-shard transactions are excluded —
+/// `txs` is `S_P` in full: every **cross-shard** transaction `P` settled
+/// over the window ending at `B` and reaching back to its terminating
+/// reshape's admission. The floor is the schedule's, not a fixed span
+/// behind the terminal: a counterpart's fence holds straddlers from the
+/// moment the reshape is admitted, so a terminal-relative span would drop
+/// settlements made early in it and read their absence as "never settled".
+/// Single-shard transactions are excluded —
 /// they are never the subject of a counterpart's fence query — so the list
 /// is proportional to cross-shard traffic, not total throughput. Verified,
 /// not trusted bare — the requester recomputes

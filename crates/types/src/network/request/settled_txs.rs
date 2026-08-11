@@ -6,8 +6,9 @@
 //! `B`. It reads `P`'s beacon-attested `settled_txs_root` from its own
 //! fold and fetches the whole window settled-transaction list in one shot: the
 //! complete set `S_P` of the **cross-shard** transactions `P` settled over
-//! `[B − RETENTION_HORIZON, B]` (single-shard transactions are never queried, so
-//! they are excluded). The requester accepts the list iff its recomputed
+//! the window ending at `B` and reaching back to its terminating reshape's
+//! admission (single-shard transactions are never queried, so they are
+//! excluded). The requester accepts the list iff its recomputed
 //! root equals the attested one, so a withheld transaction changes the root and the
 //! absence of any transaction from the verified-complete set is sound (see
 //! [`GetSettledTxsResponse`]).
