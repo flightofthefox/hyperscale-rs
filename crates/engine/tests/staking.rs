@@ -22,14 +22,14 @@ use hyperscale_types::{
     WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
-    Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
-    Value,
+    Address, AddressClass, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl,
+    ManifestGraph, Value,
 };
 
 /// The pool instance the beacon is told about.
-const POOL: [u8; 16] = [0x50; 16];
+const POOL: Address = Address::new([0x50; 31], AddressClass::Component);
 /// An instance of the very same package that nobody was told about.
-const IMPOSTOR: [u8; 16] = [0x51; 16];
+const IMPOSTOR: Address = Address::new([0x51; 31], AddressClass::Component);
 /// The identifier the beacon folds `POOL` under.
 const POOL_ID: u32 = 7;
 /// The delegator's signing seed.
@@ -43,7 +43,7 @@ const OUTSIDER: u8 = 9;
 struct MapDb(BTreeMap<SubstateKey, Vec<u8>>);
 
 impl MapDb {
-    fn genesis(accounts: &[([u8; 16], u128)], pools: &[StakePoolSeat]) -> Self {
+    fn genesis(accounts: &[(Address, u128)], pools: &[StakePoolSeat]) -> Self {
         let writes = genesis_writes(accounts, pools);
         let mut map = BTreeMap::new();
         for (key, change) in writes.cells() {
@@ -64,16 +64,16 @@ fn key_of(seed: u8) -> Ed25519PrivateKey {
     Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap()
 }
 
-fn account_of(seed: u8) -> [u8; 16] {
+fn account_of(seed: u8) -> Address {
     account_address(&key_of(seed).public_key().0)
 }
 
-fn delegator() -> [u8; 16] {
+fn delegator() -> Address {
     account_of(DELEGATOR)
 }
 
 /// Every address any test in this binary transacts with, pools included.
-fn world_accounts() -> Vec<([u8; 16], u128)> {
+fn world_accounts() -> Vec<(Address, u128)> {
     vec![
         (delegator(), 10_000),
         (account_of(OPERATOR), 10_000),
@@ -82,7 +82,7 @@ fn world_accounts() -> Vec<([u8; 16], u128)> {
 }
 
 /// A pool seat and the principal its operator surface admits.
-fn seat(address: [u8; 16], id: u32) -> StakePoolSeat {
+fn seat(address: Address, id: u32) -> StakePoolSeat {
     StakePoolSeat {
         address,
         id: StakePoolId::new(id),
@@ -91,9 +91,9 @@ fn seat(address: [u8; 16], id: u32) -> StakePoolSeat {
     }
 }
 
-fn withdraw(target: [u8; 16], resource: Address, amount: u128) -> GraphNode {
+fn withdraw(target: Address, resource: Address, amount: u128) -> GraphNode {
     GraphNode {
-        target: Address(target),
+        target,
         method: "withdraw".into(),
         args: vec![
             GraphArg::Literal(Value::Address(resource)),
@@ -112,20 +112,20 @@ fn from_edge(producer: u32, resource: Address) -> GraphArg {
     }
 }
 
-/// `delegator.withdraw(XRD) -> pool.stake -> delegator.deposit(units)`.
-fn signed_stake(pool: [u8; 16], amount: u128) -> Transaction {
+/// `delegator.withdraw(*XRD) -> pool.stake -> delegator.deposit(units)`.
+fn signed_stake(pool: Address, amount: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[DELEGATOR; 32]).unwrap();
     let from = account_address(&key.public_key().0);
     let graph = ManifestGraph {
         nodes: vec![
-            withdraw(from, XRD, amount),
+            withdraw(from, *XRD, amount),
             GraphNode {
-                target: Address(pool),
+                target: pool,
                 method: "stake".into(),
-                args: vec![from_edge(0, XRD)],
+                args: vec![from_edge(0, *XRD)],
             },
             GraphNode {
-                target: Address(from),
+                target: from,
                 method: "deposit".into(),
                 args: vec![from_edge(1, stake_unit(pool))],
             },
@@ -143,7 +143,7 @@ fn signed_stake(pool: [u8; 16], amount: u128) -> Transaction {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(&tree)),
             subintent_sigs: Vec::new(),
-            fee_payer: Address(from),
+            fee_payer: from,
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,
@@ -240,11 +240,11 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
     let from = account_address(&key.public_key().0);
     let graph = ManifestGraph {
         nodes: vec![
-            withdraw(from, XRD, 100),
+            withdraw(from, *XRD, 100),
             GraphNode {
-                target: Address(from),
+                target: from,
                 method: "deposit".into(),
-                args: vec![from_edge(0, XRD)],
+                args: vec![from_edge(0, *XRD)],
             },
         ],
     };
@@ -260,7 +260,7 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(&tree)),
             subintent_sigs: Vec::new(),
-            fee_payer: Address(from),
+            fee_payer: from,
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,
@@ -281,13 +281,13 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
 
 /// `pool.register-validator(id, pubkey, proof)`, signed and paid for by
 /// `seed` whatever the pool's configuration says.
-fn signed_registration(pool: [u8; 16], seed: u8) -> Transaction {
+fn signed_registration(pool: Address, seed: u8) -> Transaction {
     let key = key_of(seed);
     let tree = EnvelopeTree {
         root: IntentDecl {
             graph: ManifestGraph {
                 nodes: vec![GraphNode {
-                    target: Address(pool),
+                    target: pool,
                     method: "register-validator".into(),
                     args: vec![
                         GraphArg::Literal(Value::U64(11)),
@@ -305,7 +305,7 @@ fn signed_registration(pool: [u8; 16], seed: u8) -> Transaction {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(&tree)),
             subintent_sigs: Vec::new(),
-            fee_payer: Address(account_of(seed)),
+            fee_payer: account_of(seed),
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,

@@ -17,12 +17,12 @@ use hyperscale_storage::{
     SubstateStore, VersionedStore,
 };
 use hyperscale_types::{
-    Address, AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-    BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate, Finalization,
-    FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, ProposerTimestamp,
-    QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId, SignerBitfield, StateRoot,
-    StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId, TxHash, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, WitnessSources,
+    Address, AddressClass, AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block,
+    BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
+    Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey,
+    ProposerTimestamp, QuorumCertificate, Round, SafeVoteRegisters, SettledWrites, ShardId,
+    SignerBitfield, StateRoot, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId, TxHash,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -1169,7 +1169,7 @@ fn test_historical_substate_read_respects_retention() {
             .unwrap();
 
     let key = SubstateKey {
-        owner: Address([9u8; 16]),
+        owner: Address::new([9u8; 31], AddressClass::Component),
         local: LocalKey([1u8; 16]),
     };
 

@@ -1920,11 +1920,11 @@ mod tests {
         use hyperscale_types::test_utils::test_prefix;
 
         let trie = ShardTrie::uniform_from_count(2);
-        let shard1 = trie.shard_for_prefix(Address(test_prefix(seed)));
+        let shard1 = trie.shard_for_prefix(test_prefix(seed));
 
         let mut other_seed = seed.wrapping_add(1);
         loop {
-            if trie.shard_for_prefix(Address(test_prefix(other_seed))) != shard1 {
+            if trie.shard_for_prefix(test_prefix(other_seed)) != shard1 {
                 break;
             }
             other_seed = other_seed.wrapping_add(1);
@@ -2320,7 +2320,7 @@ mod tests {
 
         // A tx writing to a node, and that node's shard.
         let prefix = test_prefix(7);
-        let fenced_shard = topology_snapshot.shard_for_prefix(Address(prefix));
+        let fenced_shard = topology_snapshot.shard_for_prefix(prefix);
         let tx = test_transaction_with_prefixes(&[7], &[], &[prefix]);
         let hash = tx.hash();
 
@@ -2341,7 +2341,7 @@ mod tests {
         let mut seed = 8u8;
         let other = loop {
             let p = test_prefix(seed);
-            if topology_snapshot.shard_for_prefix(Address(p)) != fenced_shard {
+            if topology_snapshot.shard_for_prefix(p) != fenced_shard {
                 break p;
             }
             seed = seed.wrapping_add(1);
@@ -2368,7 +2368,7 @@ mod tests {
         let mut mempool = MempoolCoordinator::new(ShardId::leaf(1, 0));
 
         let prefix = test_prefix(7);
-        let fenced_shard = topology_snapshot.shard_for_prefix(Address(prefix));
+        let fenced_shard = topology_snapshot.shard_for_prefix(prefix);
         mempool.engage_fork_fence(fenced_shard, BlockHeight::new(5), &BTreeMap::new());
 
         let submit = |mempool: &mut MempoolCoordinator, seed: u8| {
@@ -2443,7 +2443,7 @@ mod tests {
 
     /// A signed stub transaction whose derived owners are exactly
     /// `owners`, paying from `payer`.
-    fn stub_vm(payer: [u8; 16], owners: &[[u8; 16]]) -> Arc<Verified<Transaction>> {
+    fn stub_vm(payer: Address, owners: &[Address]) -> Arc<Verified<Transaction>> {
         install_stub_vm_statics();
         Arc::new(verified(stub_transaction(
             payer,
@@ -2463,7 +2463,7 @@ mod tests {
         let topology = TestCommittee::new(4, 42).topology_snapshot(1);
         let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
 
-        let owners: Vec<[u8; 16]> = (0..8u8).map(|i| [0x40 + i; 16]).collect();
+        let owners: Vec<Address> = (0..8u8).map(|i| test_prefix(0x40 + i)).collect();
         for owner in &owners {
             let tx = stub_vm(*owner, std::slice::from_ref(owner));
             mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
@@ -2503,7 +2503,7 @@ mod tests {
         let topology = TestCommittee::new(4, 42).topology_snapshot(1);
         let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
 
-        let owners: Vec<[u8; 16]> = (0..6u8).map(|i| [0x60 + i; 16]).collect();
+        let owners: Vec<Address> = (0..6u8).map(|i| test_prefix(0x60 + i)).collect();
         for owner in &owners {
             let tx = stub_vm(*owner, std::slice::from_ref(owner));
             mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
@@ -2531,8 +2531,8 @@ mod tests {
         let mut mempool = MempoolCoordinator::new(local);
 
         // A clear top bit routes to leaf(1, 0); a set one to leaf(1, 1).
-        let local_owner = [0x01; 16];
-        let payer_owner = [0x81; 16];
+        let local_owner = test_prefix(0x01);
+        let payer_owner = test_prefix(0x81);
         let parked = stub_vm(payer_owner, &[local_owner, payer_owner]);
         let parked_hash = parked.hash();
         mempool.on_transaction_gossip(&topology, Arc::clone(&parked), false, LocalTimestamp::ZERO);
@@ -2589,8 +2589,8 @@ mod tests {
         let payer_shard = ShardId::leaf(1, 1);
         let mut mempool = MempoolCoordinator::new(local);
 
-        let local_owner = [0x02; 16];
-        let payer_owner = [0x91; 16];
+        let local_owner = test_prefix(0x02);
+        let payer_owner = test_prefix(0x91);
         let tx = stub_vm(payer_owner, &[local_owner, payer_owner]);
         let hash = tx.hash();
 

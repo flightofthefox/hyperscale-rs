@@ -8,20 +8,21 @@ use std::collections::{BTreeMap, HashSet};
 use std::slice::from_ref;
 use std::sync::Arc;
 
-use hyperscale_jmt::TreeReader;
+use hyperscale_jmt::{KEY_BYTES, TreeReader};
 use hyperscale_types::test_utils::{make_finalization, test_transaction};
 use hyperscale_types::{
-    Address, AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconCert, BeaconChainConfig,
-    BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash,
-    BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin,
-    ConsensusReceipt, Epoch, Event, ExecutionCertificate, ExecutionMetadata, ExecutionOutcome,
-    FeeSummary, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalKey, LogLevel,
-    MerkleInclusionProof, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp,
-    ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, Randomness, RatifyCert,
-    RatifyRound, RevealChain, Round, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload,
-    SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt,
-    SubstateKey, SubstateLeaf, TerminalVerdict, TickHalf, TickId, Transaction, TransactionDecision,
-    TxHash, TxOutcome, UnsettledTx, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    Address, AddressClass, AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconCert,
+    BeaconChainConfig, BeaconState, BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot,
+    Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBeaconBlock,
+    CertifiedBlock, ChainOrigin, ConsensusReceipt, Epoch, Event, ExecutionCertificate,
+    ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization, GlobalReceiptHash,
+    GlobalReceiptRoot, Hash, LocalKey, LogLevel, MerkleInclusionProof, PcQc2, PcQc3,
+    PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProvisionEntry, ProvisionHash,
+    Provisions, QuorumCertificate, Randomness, RatifyCert, RatifyRound, RevealChain, Round,
+    SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView,
+    Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt, SubstateKey, SubstateLeaf,
+    TerminalVerdict, TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome,
+    UnsettledTx, Verifiable, Verified, WeightedTimestamp, WitnessSources,
     compute_global_receipt_root, compute_merkle_root,
 };
 
@@ -43,8 +44,8 @@ pub fn completed_import_progress(height: BlockHeight, staged_bytes: u64) -> Impo
         chunk_limit: 0,
         staged_bytes,
         cursors: vec![ImportCursor {
-            next: [0u8; 32],
-            end: [0xFF; 32],
+            next: [0u8; KEY_BYTES],
+            end: [0xFF; KEY_BYTES],
             done: true,
         }],
     }
@@ -95,7 +96,7 @@ pub const fn state_key(owner_seed: u8, local_seed: u8) -> SubstateKey {
     let mut local = [0u8; 16];
     local[0] = local_seed;
     SubstateKey {
-        owner: Address([owner_seed; 16]),
+        owner: Address::new([owner_seed; 31], AddressClass::Component),
         local: LocalKey(local),
     }
 }
@@ -302,7 +303,7 @@ pub fn make_test_receipt(seed: u8) -> StoredReceipt {
         writes: StateWrites::default(),
         beacon_witness_events: Vec::new(),
         events: vec![Event {
-            emitter: Address([seed; 16]),
+            emitter: Address::new([seed; 31], AddressClass::Component),
             event_type: u32::from(seed),
             payload: vec![seed, seed + 1],
         }],
@@ -797,16 +798,26 @@ where
 
     let boundary = serving.open_boundary(BlockHeight::new(6)).expect("pinned");
     let root_key = boundary.get_root_key(6).expect("root resolves");
-    let chunk = Jmt::collect_range(&boundary, &root_key, &[0u8; 32], &[0xFF; 32], 1_000).unwrap();
+    let chunk = Jmt::collect_range(
+        &boundary,
+        &root_key,
+        &[0u8; KEY_BYTES],
+        &[0xFF; KEY_BYTES],
+        1_000,
+    )
+    .unwrap();
     let leaves: Vec<SubstateLeaf> = chunk
         .leaves
         .iter()
         .map(|(leaf_key, _)| {
             let value = boundary
-                .substate(SubstateKey::from_bytes(*leaf_key))
+                .substate(
+                    SubstateKey::from_bytes(*leaf_key).expect("a stored leaf key names an address"),
+                )
                 .expect("resolves");
             SubstateLeaf {
-                key: SubstateKey::from_bytes(*leaf_key),
+                key: SubstateKey::from_bytes(*leaf_key)
+                    .expect("a stored leaf key names an address"),
                 value,
             }
         })

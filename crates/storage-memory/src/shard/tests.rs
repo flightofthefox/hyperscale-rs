@@ -15,8 +15,8 @@ use hyperscale_types::test_utils::{
     install_stub_vm_statics, stub_transaction, test_prefix, test_transaction,
 };
 use hyperscale_types::{
-    Address, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight, CertifiedBlock,
-    ChainOrigin, ConsensusReceipt, Finalization, GlobalReceiptHash, Hash, LocalKey,
+    Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
+    CertifiedBlock, ChainOrigin, ConsensusReceipt, Finalization, GlobalReceiptHash, Hash, LocalKey,
     ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SafeVoteRegisters,
     SettledWrites, ShardId, StateRoot, StoredReceipt, SubstateKey, SyncHint, TickHalf, TickId,
     TimestampRange, Transaction, TxHash, ValidatorId, Verifiable, Verified, WeightedTimestamp,
@@ -240,11 +240,12 @@ fn test_snapshot_clone_performance() {
     // This test bounds the cost of a single BTreeMap-clone snapshot at
     // simulation scale, not tree commit speed.
     for i in 0..10_000u32 {
-        let mut owner = [0u8; 16];
-        owner[..4].copy_from_slice(&i.to_be_bytes());
+        let mut body = [0u8; 31];
+        body[..4].copy_from_slice(&i.to_be_bytes());
+        let owner = Address::new(body, AddressClass::Component);
         let writes = SettledWrites::from_absolutes(BTreeMap::from([(
             SubstateKey {
-                owner: Address(owner),
+                owner,
                 local: LocalKey([0; 16]),
             },
             Some(vec![u8::try_from(i).unwrap_or(u8::MAX)]),
@@ -895,8 +896,8 @@ fn test_snapshot_at_below_retention_panics() {
 #[test]
 fn test_historical_substate_read_respects_retention() {
     let key = SubstateKey {
-        owner: Address([9u8; 16]),
-        local: LocalKey([1u8; 16]),
+        owner: Address::new([9u8; 31], AddressClass::Component),
+        local: LocalKey([1; 16]),
     };
 
     let storage = SimShardStorage::with_jmt_history_length(2);

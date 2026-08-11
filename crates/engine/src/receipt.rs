@@ -51,7 +51,7 @@ enum CachedOutputBody {
         /// substate prefix: which shard keeps the fact is the same
         /// question — and the same answer — as which shard keeps the
         /// event it was read from.
-        witnesses: Vec<([u8; 16], BeaconWitnessEvent)>,
+        witnesses: Vec<(Address, BeaconWitnessEvent)>,
         /// Fuel the engine consumed. Shard-invariant here and filtered to
         /// nothing by projection: every participant that ran this batch
         /// consumed the same amount, and locality scoping shows up as a
@@ -72,7 +72,7 @@ impl CachedOutput {
         metadata: ExecutionMetadata,
         gas_consumed: u64,
         events: Vec<Event>,
-        witnesses: Vec<([u8; 16], BeaconWitnessEvent)>,
+        witnesses: Vec<(Address, BeaconWitnessEvent)>,
     ) -> Self {
         Self {
             metadata,
@@ -131,9 +131,7 @@ pub fn project_to_shard(
             // shard owns its emitter.
             let beacon_witness_events: Vec<BeaconWitnessEvent> = witnesses
                 .iter()
-                .filter(|(emitter, _)| {
-                    shard_trie.shard_for_prefix(Address(*emitter)) == local_shard
-                })
+                .filter(|(emitter, _)| shard_trie.shard_for_prefix(*emitter) == local_shard)
                 .map(|(_, event)| event.clone())
                 .collect();
             // An event is stored where its emitter lives, so each shard

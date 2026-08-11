@@ -42,10 +42,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::Hash;
+    use crate::test_utils::test_prefix;
+    use crate::{Hash, LEAF_KEY_BYTES};
 
     fn sample_entry(seed: u8) -> SubstateEntry {
-        SubstateEntry::test_entry([seed; 16], b"sort", Some(vec![seed]))
+        SubstateEntry::test_entry(test_prefix(seed), b"sort", Some(vec![seed]))
     }
 
     #[test]
@@ -79,11 +80,11 @@ mod tests {
         let mut buf = hbor_to_vec(&TxHash::from(Hash::from_bytes(b"tx"))).unwrap();
         varint::write(&mut buf, MAX_STATE_ENTRIES_PER_TX + 1).unwrap();
         // Enough input to pay for the claimed count at an entry's minimum
-        // width (32-byte key + the value's None tag), so the entry cap is
-        // the check that refuses.
+        // width (the leaf key plus the value's None tag), so the entry cap
+        // is the check that refuses.
         buf.extend(std::iter::repeat_n(
             0u8,
-            (MAX_STATE_ENTRIES_PER_TX + 1) * 33,
+            (MAX_STATE_ENTRIES_PER_TX + 1) * (LEAF_KEY_BYTES + 1),
         ));
         let err = hbor_from_slice::<ProvisionEntry>(&buf).unwrap_err();
         assert!(matches!(

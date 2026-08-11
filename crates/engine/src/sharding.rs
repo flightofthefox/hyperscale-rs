@@ -76,17 +76,18 @@ pub fn writes_root(writes: &StateWrites) -> WritesRoot {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::test_utils::test_prefix;
     use hyperscale_types::{ShardId, ShardTrie, StateWrites, SubstateKey, WritesRoot};
     use hyperscale_vm_effects::{Address, LocalKey};
 
     use super::*;
 
-    fn writes(cells: &[([u8; 16], [u8; 16], Vec<u8>)]) -> StateWrites {
+    fn writes(cells: &[(Address, [u8; 16], Vec<u8>)]) -> StateWrites {
         let mut writes = StateWrites::default();
         for (owner, local, value) in cells {
             writes.cells.insert(
                 SubstateKey {
-                    owner: Address(*owner),
+                    owner: *owner,
                     local: LocalKey(*local),
                 },
                 Some(value.clone()),
@@ -104,8 +105,8 @@ mod tests {
 
     #[test]
     fn writes_root_distinguishes_inputs() {
-        let a = writes(&[([1; 16], [0; 16], vec![1])]);
-        let b = writes(&[([2; 16], [0; 16], vec![1])]);
+        let a = writes(&[(test_prefix(1), [0; 16], vec![1])]);
+        let b = writes(&[(test_prefix(2), [0; 16], vec![1])]);
         assert_ne!(writes_root(&a), writes_root(&b));
         assert_eq!(writes_root(&a), writes_root(&a.clone()));
     }
@@ -115,22 +116,22 @@ mod tests {
     #[test]
     fn filter_for_shard_keeps_only_this_shard_prefixes() {
         let trie = ShardTrie::uniform_from_count(2);
-        let left = [0x00; 16];
-        let right = [0xFF; 16];
-        assert_ne!(
-            trie.shard_for_prefix(Address(left)),
-            trie.shard_for_prefix(Address(right))
-        );
+        let left = test_prefix(0x00);
+        let right = test_prefix(0xFF);
+        assert_ne!(trie.shard_for_prefix(left), trie.shard_for_prefix(right));
         let all = writes(&[(left, [1; 16], vec![1]), (right, [1; 16], vec![2])]);
 
-        let filtered = filter_writes_for_shard(&all, trie.shard_for_prefix(Address(left)), &trie);
+        let filtered = filter_writes_for_shard(&all, trie.shard_for_prefix(left), &trie);
         assert_eq!(filtered.cells.len(), 1);
-        assert_eq!(filtered.cells.keys().next().unwrap().owner, Address(left));
+        assert_eq!(filtered.cells.keys().next().unwrap().owner, left);
     }
 
     #[test]
     fn filter_for_single_shard_is_the_identity() {
-        let all = writes(&[([1; 16], [1; 16], vec![1]), ([9; 16], [2; 16], vec![2])]);
+        let all = writes(&[
+            (test_prefix(1), [1; 16], vec![1]),
+            (test_prefix(9), [2; 16], vec![2]),
+        ]);
         let filtered =
             filter_writes_for_shard(&all, ShardId::ROOT, &ShardTrie::uniform_from_count(1));
         assert_eq!(filtered, all);

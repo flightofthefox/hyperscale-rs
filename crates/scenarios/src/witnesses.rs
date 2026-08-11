@@ -16,9 +16,9 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    ConsensusPublicKey, MIN_STAKE_FLOOR, NetworkDefinition, Stake, StakePoolId, Transaction,
-    TransactionDecision, TransactionStatus, UNBONDING_WINDOW_EPOCHS, ValidatorId, ValidatorStatus,
-    validator_possession_proof_sign,
+    Address, ConsensusPublicKey, MIN_STAKE_FLOOR, NetworkDefinition, Stake, StakePoolId,
+    Transaction, TransactionDecision, TransactionStatus, UNBONDING_WINDOW_EPOCHS, ValidatorId,
+    ValidatorStatus, validator_possession_proof_sign,
 };
 
 use crate::support::query::{
@@ -52,7 +52,7 @@ fn dummy_pubkey(c: &impl Cluster, seed: u8) -> ConsensusPublicKey {
 ///
 /// A pool's capacity is its stake, so most operator scenarios open by
 /// buying the capacity they are about to spend.
-fn delegate<C: Cluster>(c: &mut C, pool: [u8; 16], id: StakePoolId, amount: u128) {
+fn delegate<C: Cluster>(c: &mut C, pool: Address, id: StakePoolId, amount: u128) {
     let (key, delegator) = delegator();
     let before = pool_total_stake(c, id).unwrap_or(Stake::ZERO);
     submit_committed(
@@ -71,7 +71,7 @@ fn delegate<C: Cluster>(c: &mut C, pool: [u8; 16], id: StakePoolId, amount: u128
 /// with a genuine proof-of-possession — the fold rejects a registration
 /// whose proof does not verify, so the signing scheme must be the
 /// cluster's own.
-fn register<C: Cluster>(c: &mut C, pool: [u8; 16], seed: u8, validator: ValidatorId) {
+fn register<C: Cluster>(c: &mut C, pool: Address, seed: u8, validator: ValidatorId) {
     let keypair = c.signer_from_seed(&[seed; 32]);
     let proof = validator_possession_proof_sign(
         keypair.as_ref(),

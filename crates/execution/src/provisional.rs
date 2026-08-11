@@ -94,19 +94,19 @@ impl ProvisionalCells {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::LocalKey;
+    use hyperscale_types::{AddressClass, LocalKey};
 
     use super::*;
 
     fn cell(owner: u8, local: u8) -> DeclaredKey {
         DeclaredKey::Cell(SubstateKey {
-            owner: Address([owner; 16]),
+            owner: Address::new([owner; 31], AddressClass::Component),
             local: LocalKey([local; 16]),
         })
     }
 
     fn prefix(owner: u8) -> DeclaredKey {
-        DeclaredKey::Prefix(Address([owner; 16]))
+        DeclaredKey::Prefix(Address::new([owner; 31], AddressClass::Component))
     }
 
     const RESERVE: Mode = Mode::Reserve { amount: 5 };

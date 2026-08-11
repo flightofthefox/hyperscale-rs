@@ -8,7 +8,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::OnceLock;
 
 use hyperscale_hbor::{Hbor, to_vec as hbor_to_vec};
-use hyperscale_jmt::{Blake3Hasher, MultiProof, Tree};
+use hyperscale_jmt::{Blake3Hasher, Key as JmtKey, MultiProof, Tree};
 use thiserror::Error;
 
 use crate::state_key::jmt_value_hash;
@@ -368,7 +368,7 @@ impl Verify<&ProvisionsContext<'_>> for Provisions {
         let multi_proof =
             MultiProof::decode(proof_bytes).map_err(|_| ProvisionsVerifyError::MalformedProof)?;
 
-        let mut expected: Vec<([u8; 32], Option<[u8; 32]>)> = Vec::with_capacity(entries.len());
+        let mut expected: Vec<(JmtKey, Option<[u8; 32]>)> = Vec::with_capacity(entries.len());
         for e in &entries {
             let value_hash = e.value.as_ref().map(|v| jmt_value_hash(v));
             expected.push((e.key.to_bytes(), value_hash));
@@ -415,14 +415,14 @@ mod tests {
     use hyperscale_hbor::{
         DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
-    use hyperscale_vm_types::{Address, LocalKey};
+    use hyperscale_vm_types::{LocalKey, SubstateKey};
 
     use super::*;
-    use crate::SubstateKey;
+    use crate::test_utils::test_prefix;
 
     fn cell(owner: u8, local: u8) -> SubstateKey {
         SubstateKey {
-            owner: Address([owner; 16]),
+            owner: test_prefix(owner),
             local: LocalKey([local; 16]),
         }
     }
@@ -538,7 +538,7 @@ mod tests {
 
         fn build_jmt(entries: &[(SubstateKey, Vec<u8>)]) -> (StateRoot, MerkleInclusionProof) {
             let mut store = MemoryStore::new();
-            let updates: BTreeMap<[u8; 32], Option<LeafValue>> = entries
+            let updates: BTreeMap<JmtKey, Option<LeafValue>> = entries
                 .iter()
                 .map(|(k, v)| {
                     let val = LeafValue::new(jmt_value_hash(v), v.len() as u64);
@@ -549,7 +549,7 @@ mod tests {
             let root_hash = result.root_hash;
             store.apply(&result);
             let root_key = NodeKey::root(1);
-            let jmt_keys: Vec<[u8; 32]> = entries.iter().map(|(k, _)| k.to_bytes()).collect();
+            let jmt_keys: Vec<JmtKey> = entries.iter().map(|(k, _)| k.to_bytes()).collect();
             let proof = Jmt::prove(&store, &root_key, &jmt_keys).unwrap();
             let state_root = StateRoot::from_raw(Hash::from_hash_bytes(&root_hash));
             (state_root, MerkleInclusionProof::new(proof.encode()))

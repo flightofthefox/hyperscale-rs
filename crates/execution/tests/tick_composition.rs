@@ -127,15 +127,20 @@ fn one_leg_claims_against_its_own_sibling() {
     sim.commit(vec![first, second], Vec::new());
     sim.drain();
 
-    let tick = sim.tick_of(first_hash).expect("the crossing joined a tick");
+    // Which of the two claims the cell is canonical order's to decide,
+    // not this test's: what has to hold is that exactly one does.
+    let first_tick = sim.tick_of(first_hash);
+    let second_tick = sim.tick_of(second_hash);
+    let tick = first_tick
+        .or(second_tick)
+        .expect("one crossing joined a tick");
     assert_eq!(
         sim.receipts_for(&tick).len(),
         1,
         "one leg claims the cell; its sibling waits for the verdict"
     );
     assert_ne!(
-        sim.tick_of(second_hash).as_ref(),
-        Some(&tick),
+        first_tick, second_tick,
         "so the sibling is attested by whichever tick does run it",
     );
 }

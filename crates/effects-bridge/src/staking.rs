@@ -43,7 +43,7 @@ use hyperscale_types::{
     Event, NetworkParams, ParamProposal, ParamVote, ReshapeThresholds, Stake, StakePoolId,
     ValidatorId,
 };
-use hyperscale_vm_effects::{InstanceRegistry, PackageHash};
+use hyperscale_vm_effects::{Address, InstanceRegistry, PackageHash};
 
 /// The stake pool's event table, by the index its guest emits.
 ///
@@ -67,7 +67,7 @@ const PARAM_VOTE_CLEARED: u32 = 6;
 /// should be able to do on its own.
 #[derive(Clone, Debug, Default)]
 pub struct PoolRegistry {
-    pools: BTreeMap<[u8; 16], StakePoolId>,
+    pools: BTreeMap<Address, StakePoolId>,
 }
 
 impl PoolRegistry {
@@ -80,13 +80,13 @@ impl PoolRegistry {
     }
 
     /// Recognise `address` as the pool the beacon folds under `id`.
-    pub fn register(&mut self, address: [u8; 16], id: StakePoolId) {
+    pub fn register(&mut self, address: Address, id: StakePoolId) {
         self.pools.insert(address, id);
     }
 
     /// The pool `address` is recognised as, if any.
     #[must_use]
-    pub fn pool_of(&self, address: [u8; 16]) -> Option<StakePoolId> {
+    pub fn pool_of(&self, address: Address) -> Option<StakePoolId> {
         self.pools.get(&address).copied()
     }
 
@@ -112,7 +112,7 @@ pub fn witness_from_event(
     instances: &InstanceRegistry,
     staking_package: PackageHash,
 ) -> Option<BeaconWitnessEvent> {
-    let pool_id = pools.pool_of(event.emitter.0)?;
+    let pool_id = pools.pool_of(event.emitter)?;
     // The registry says this instance counts; the instance registry says
     // what code it runs. A recognised address running someone else's code
     // is a genesis defect rather than a runtime condition, and it stays a
@@ -232,12 +232,12 @@ fn registration_of(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_vm_effects::{Address, Hash32, InstanceMeta};
+    use hyperscale_vm_effects::{Address, AddressClass, Hash32, InstanceMeta};
 
     use super::*;
 
-    const POOL: [u8; 16] = [0x50; 16];
-    const IMPOSTOR: [u8; 16] = [0x51; 16];
+    const POOL: Address = Address::new([0x50; 31], AddressClass::Component);
+    const IMPOSTOR: Address = Address::new([0x51; 31], AddressClass::Component);
     const POOL_ID: u32 = 7;
 
     fn package(tag: u8) -> PackageHash {
@@ -250,7 +250,7 @@ mod tests {
         let mut instances = InstanceRegistry::new();
         for address in [POOL, IMPOSTOR] {
             instances.register(
-                Address(address),
+                address,
                 InstanceMeta {
                     package: package(1),
                     config: Vec::new(),
@@ -260,9 +260,9 @@ mod tests {
         (pools, instances)
     }
 
-    fn event(emitter: [u8; 16], event_type: u32, amount: u128) -> Event {
+    fn event(emitter: Address, event_type: u32, amount: u128) -> Event {
         Event {
-            emitter: Address(emitter),
+            emitter,
             event_type,
             payload: amount.to_le_bytes().to_vec(),
         }
@@ -328,9 +328,9 @@ mod tests {
         payload
     }
 
-    fn raw(emitter: [u8; 16], event_type: u32, payload: Vec<u8>) -> Event {
+    fn raw(emitter: Address, event_type: u32, payload: Vec<u8>) -> Event {
         Event {
-            emitter: Address(emitter),
+            emitter,
             event_type,
             payload,
         }
@@ -559,7 +559,7 @@ mod tests {
         let (pools, instances) = world();
         for payload in [Vec::new(), vec![1; 8], vec![1; 17]] {
             let event = Event {
-                emitter: Address(POOL),
+                emitter: POOL,
                 event_type: STAKED,
                 payload,
             };

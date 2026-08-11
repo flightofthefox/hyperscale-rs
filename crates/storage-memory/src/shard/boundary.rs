@@ -223,12 +223,13 @@ impl BoundaryStore for SimShardStorage {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_jmt::{Blake3Hasher, Tree};
+    use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::SubstateStore;
     use hyperscale_storage::test_helpers::{
         make_settled_writes, make_state_writes, test_boundary_import_roundtrip,
         test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
     };
+    use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
         ConsensusReceipt, GlobalReceiptHash, Hash, SettledWrites, ShardId, SplitChildRoots,
         SubstateKey, TxHash, shard_prefix_path,
@@ -250,7 +251,7 @@ mod tests {
         let mut progress = completed_import_progress(BlockHeight::new(3), 1);
         progress.cursors[0].done = false;
         let leaf = SubstateLeaf {
-            key: SubstateKey::from_bytes([0x42; 32]),
+            key: test_key(0x42),
             value: vec![1],
         };
         storage.stage_import_chunk(&progress, &[leaf]).unwrap();
@@ -278,8 +279,8 @@ mod tests {
         let boundary = storage.open_boundary(BlockHeight::new(1)).expect("pinned");
         let root_key = boundary.get_root_key(1).expect("pinned root resolves");
 
-        let start = [0u8; 32];
-        let end = [0xFFu8; 32];
+        let start = [0u8; KEY_BYTES];
+        let end = [0xFFu8; KEY_BYTES];
         let chunk = Jmt::collect_range(&boundary, &root_key, &start, &end, 1_000).unwrap();
         assert!(!chunk.leaves.is_empty());
         let proof = Jmt::prove_range(&boundary, &root_key, &start, &end, &chunk).unwrap();
@@ -307,10 +308,17 @@ mod tests {
 
         let boundary = storage.open_boundary(BlockHeight::new(1)).expect("pinned");
         let root_key = boundary.get_root_key(1).expect("pinned root resolves");
-        let chunk = Jmt::collect_range(&boundary, &root_key, &[0u8; 32], &[0xFF; 32], 10).unwrap();
+        let chunk = Jmt::collect_range(
+            &boundary,
+            &root_key,
+            &[0u8; KEY_BYTES],
+            &[0xFF; KEY_BYTES],
+            10,
+        )
+        .unwrap();
         let (leaf, _) = chunk.leaves.first().expect("one substate committed");
         let value = boundary
-            .substate(SubstateKey::from_bytes(*leaf))
+            .substate(SubstateKey::from_bytes(*leaf).expect("a stored leaf key names an address"))
             .expect("leaf resolves");
         assert_eq!(value, vec![1]);
     }

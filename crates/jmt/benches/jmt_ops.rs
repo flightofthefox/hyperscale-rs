@@ -6,16 +6,24 @@ use std::hint::black_box;
 
 use blake3::hash as blake3_hash;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use hyperscale_jmt::{Blake3Hasher, Key, LeafValue, MemoryStore, MultiProof, Tree, ValueHash};
+use hyperscale_jmt::{
+    Blake3Hasher, KEY_BYTES, Key, LeafValue, MemoryStore, MultiProof, Tree, ValueHash,
+};
 
 type Jmt = Tree<Blake3Hasher>;
 
 fn make_key(i: u32) -> Key {
-    let mut k = [0u8; 32];
-    k[0..4].copy_from_slice(&i.to_be_bytes());
+    let mut seed = [0u8; 4];
+    seed.copy_from_slice(&i.to_be_bytes());
     // Spread entropy across the path so buckets actually branch.
-    let h = blake3_hash(&k);
-    k.copy_from_slice(h.as_bytes());
+    let mut k = [0u8; KEY_BYTES];
+    for (chunk, slot) in k.chunks_mut(32).enumerate() {
+        let mut input = seed.to_vec();
+        input.push(u8::try_from(chunk).expect("a key is a few chunks"));
+        let h = blake3_hash(&input);
+        let len = slot.len();
+        slot.copy_from_slice(&h.as_bytes()[..len]);
+    }
     k
 }
 

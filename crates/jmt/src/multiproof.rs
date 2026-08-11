@@ -68,7 +68,7 @@
 //! decoded proof against a root or key set. Use [`Tree::verify`] for that.
 
 use crate::hasher::{EMPTY_HASH, Hash, Hasher};
-use crate::node::{Key, MAX_DEPTH_BITS, Node, NodeKey, ValueHash, bits_at};
+use crate::node::{KEY_BYTES, Key, MAX_DEPTH_BITS, Node, NodeKey, ValueHash, bits_at};
 use crate::storage::TreeReader;
 use crate::tree::Tree;
 
@@ -785,7 +785,7 @@ fn encode_claim(claim: &ProofClaim, buf: &mut Vec<u8>) {
 }
 
 fn decode_claim(r: &mut ByteReader) -> Result<ProofClaim, DecodeError> {
-    let key = r.bytes32()?;
+    let key = r.key()?;
     let depth_bits = r.u16_be()?;
     if depth_bits > MAX_DEPTH_BITS {
         return Err(DecodeError::DepthOutOfRange {
@@ -801,7 +801,7 @@ fn decode_claim(r: &mut ByteReader) -> Result<ProofClaim, DecodeError> {
         }
         TERM_EMPTY => (ClaimTermination::EmptySubtree, None),
         TERM_LEAF_MISMATCH => {
-            let sk = r.bytes32()?;
+            let sk = r.key()?;
             let svh = r.bytes32()?;
             (
                 ClaimTermination::LeafMismatch {
@@ -865,6 +865,16 @@ impl<'a> ByteReader<'a> {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&self.bytes[..32]);
         self.bytes = &self.bytes[32..];
+        Ok(arr)
+    }
+
+    fn key(&mut self) -> Result<Key, DecodeError> {
+        if self.bytes.len() < KEY_BYTES {
+            return Err(DecodeError::Truncated);
+        }
+        let mut arr = [0u8; KEY_BYTES];
+        arr.copy_from_slice(&self.bytes[..KEY_BYTES]);
+        self.bytes = &self.bytes[KEY_BYTES..];
         Ok(arr)
     }
 
@@ -950,7 +960,7 @@ mod tests {
 
         let entries: Vec<(Key, ValueHash)> = (0u8..6)
             .map(|i| {
-                let mut key = [0u8; 32];
+                let mut key = [0u8; KEY_BYTES];
                 key[0] = 0xA0 | i; // top nibble 0xA matches the prefix
                 key[1] = i; // diverge below the prefix
                 (key, v(i.wrapping_mul(7)))
@@ -1043,8 +1053,8 @@ mod tests {
     #[test]
     fn deep_prefix_divergence_proof() {
         // Two keys sharing a long prefix — exercises binary chain.
-        let mut k1 = [0u8; 32];
-        let mut k2 = [0u8; 32];
+        let mut k1 = [0u8; KEY_BYTES];
+        let mut k2 = [0u8; KEY_BYTES];
         for i in 0..20 {
             k1[i] = 0xAB;
             k2[i] = 0xAB;
@@ -1061,7 +1071,7 @@ mod tests {
     fn larger_batch_roundtrip() {
         let mut entries: Vec<(Key, ValueHash)> = Vec::new();
         for i in 0u8..128 {
-            let mut key = [0u8; 32];
+            let mut key = [0u8; KEY_BYTES];
             key[0] = i.wrapping_mul(17);
             key[15] = i.wrapping_mul(31);
             entries.push((key, [i; 32]));
@@ -1219,7 +1229,7 @@ mod tests {
         let mut bytes = vec![WIRE_VERSION];
         bytes.extend_from_slice(&0u16.to_be_bytes()); // root_depth_bits
         bytes.extend_from_slice(&1u32.to_be_bytes());
-        bytes.extend_from_slice(&[0u8; 32]); // key
+        bytes.extend_from_slice(&[0u8; KEY_BYTES]); // key
         bytes.extend_from_slice(&0u16.to_be_bytes()); // depth
         bytes.push(0xAA); // invalid discriminator
         let err = MultiProof::decode(&bytes).unwrap_err();
@@ -1262,21 +1272,22 @@ mod tests {
 
     #[test]
     fn decode_rejects_oversized_depth() {
-        // A claim depth past the 256-bit key space. Left unbounded, this
-        // drives `verify_rec` to index a key byte past its end and panic.
+        // A claim depth past the key space. Left unbounded, this drives
+        // `verify_rec` to index a key byte past its end and panic.
+        let past_the_key = MAX_DEPTH_BITS + 1;
         let mut bytes = vec![WIRE_VERSION];
         bytes.extend_from_slice(&0u16.to_be_bytes()); // root_depth_bits
         bytes.extend_from_slice(&1u32.to_be_bytes());
-        bytes.extend_from_slice(&[0u8; 32]); // key
-        bytes.extend_from_slice(&300u16.to_be_bytes()); // depth past 256
+        bytes.extend_from_slice(&[0u8; KEY_BYTES]); // key
+        bytes.extend_from_slice(&past_the_key.to_be_bytes());
         bytes.push(TERM_EMPTY);
         let err = MultiProof::decode(&bytes).unwrap_err();
         assert!(matches!(
             err,
             DecodeError::DepthOutOfRange {
                 max: MAX_DEPTH_BITS,
-                depth_bits: 300,
-            }
+                depth_bits,
+            } if depth_bits == past_the_key
         ));
     }
 

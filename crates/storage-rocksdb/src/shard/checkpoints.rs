@@ -605,13 +605,14 @@ fn parse_entry_name(name: &str) -> Option<BlockHeight> {
 #[cfg(test)]
 mod tests {
     use blake3::hash as blake3_hash;
-    use hyperscale_jmt::{Blake3Hasher, Tree};
+    use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
         completed_import_progress, import_boundary_state, make_settled_writes,
         test_boundary_import_roundtrip, test_boundary_retention_evicts_oldest,
         test_boundary_unpinned_height_not_served,
     };
     use hyperscale_storage::{BOUNDARY_RETAIN, SubstateStore};
+    use hyperscale_types::AddressClass;
     use tempfile::TempDir;
 
     use super::*;
@@ -647,8 +648,8 @@ mod tests {
         // The checkpoint serves a completeness-checked range straight off
         // the snap-sync verifier.
         let root_key = store.get_root_key(version).expect("root resolves");
-        let start = [0u8; 32];
-        let end = [0xFFu8; 32];
+        let start = [0u8; KEY_BYTES];
+        let end = [0xFFu8; KEY_BYTES];
         let chunk = Jmt::collect_range(&store, &root_key, &start, &end, 1_000).unwrap();
         assert!(!chunk.leaves.is_empty());
         assert!(!chunk.more);
@@ -786,10 +787,11 @@ mod tests {
 
     /// An import leaf whose top byte places it under one trie half.
     fn staged_leaf(top: u8) -> SubstateLeaf {
-        let mut key = [0u8; 32];
+        let mut key = [0u8; KEY_BYTES];
         key[0] = top;
+        key[31] = AddressClass::Component.tag();
         SubstateLeaf {
-            key: SubstateKey::from_bytes(key),
+            key: SubstateKey::from_bytes(key).expect("a stored leaf key names an address"),
             value: vec![top; 3],
         }
     }
@@ -882,19 +884,22 @@ mod tests {
             state ^= state << 17;
             state
         };
-        let mut by_key: std::collections::BTreeMap<[u8; 32], SubstateLeaf> =
+        let mut by_key: std::collections::BTreeMap<[u8; KEY_BYTES], SubstateLeaf> =
             std::collections::BTreeMap::new();
         while by_key.len() < n {
-            let mut key = [0u8; 32];
+            let mut key = [0u8; KEY_BYTES];
             for chunk in key.chunks_mut(8) {
                 chunk.copy_from_slice(&next().to_be_bytes());
             }
+            // The owner half of a leaf key is an address, so its tag byte
+            // is not free entropy.
+            key[31] = AddressClass::Component.tag();
             #[allow(clippy::cast_possible_truncation)] // deliberate low-byte take
             let value: Vec<u8> = (0..=next() % 200).map(|_| next() as u8).collect();
             by_key.insert(
                 key,
                 SubstateLeaf {
-                    key: SubstateKey::from_bytes(key),
+                    key: SubstateKey::from_bytes(key).expect("a stored leaf key names an address"),
                     value,
                 },
             );
@@ -1137,13 +1142,21 @@ mod tests {
             let progress = completed_import_progress(height, TOTAL * VALUE_BYTES as u64);
             let mut chunk = Vec::with_capacity(STAGE_CHUNK);
             for index in 0..TOTAL {
-                let mut seed = [0u8; 32];
+                let mut seed = [0u8; KEY_BYTES];
                 seed[..8].copy_from_slice(&index.to_be_bytes());
                 // Hashed keys spread paths uniformly, like real
                 // leaf keys.
-                let key = *blake3_hash(&seed).as_bytes();
+                let digest = *blake3_hash(&seed).as_bytes();
+                let mut key = [0u8; KEY_BYTES];
+                for (chunk_index, slot) in key.chunks_mut(32).enumerate() {
+                    let len = slot.len();
+                    slot.copy_from_slice(&digest[..len]);
+                    slot[0] = slot[0]
+                        .wrapping_add(u8::try_from(chunk_index).expect("a key is a few chunks"));
+                }
+                key[31] = AddressClass::Component.tag();
                 chunk.push(SubstateLeaf {
-                    key: SubstateKey::from_bytes(key),
+                    key: SubstateKey::from_bytes(key).expect("a stored leaf key names an address"),
                     value: seed.repeat(VALUE_BYTES / 32),
                 });
                 if chunk.len() == STAGE_CHUNK {

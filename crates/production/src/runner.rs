@@ -54,7 +54,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, GenesisValidators, LocalTimestamp, MAX_DRAIN_WORK,
+    Address, BeaconChainConfig, BlockHeight, GenesisValidators, LocalTimestamp, MAX_DRAIN_WORK,
     NetworkDefinition, ShardId, Signer, StakePoolSeat, Transaction, ValidatorId, ValidatorStatus,
     Verifier, WorkInFlight,
 };
@@ -207,7 +207,7 @@ pub struct ProductionRunnerBuilder {
     genesis_config: Option<GenesisConfig>,
     /// VM addresses the process-wide statics register, when that set must
     /// be wider than this cluster's own genesis funding.
-    world_accounts: Vec<([u8; 16], u128)>,
+    world_accounts: Vec<(Address, u128)>,
     /// Pool instances the process-wide statics seat, when that set must be
     /// wider than this cluster's own genesis seating.
     world_pools: Vec<StakePoolSeat>,
@@ -353,7 +353,7 @@ impl ProductionRunnerBuilder {
     /// nothing: the world carries identities, and each cluster still funds
     /// its own balances from its own genesis.
     #[must_use]
-    pub fn world_accounts(mut self, accounts: Vec<([u8; 16], u128)>) -> Self {
+    pub fn world_accounts(mut self, accounts: Vec<(Address, u128)>) -> Self {
         self.world_accounts = accounts;
         self
     }

@@ -22,7 +22,7 @@ pub struct FundedAccount {
     pub keypair: Ed25519PrivateKey,
 
     /// This account's 16-byte address — also its shard placement.
-    pub address: [u8; 16],
+    pub address: Address,
 
     /// The shard this account belongs to.
     pub shard: ShardId,
@@ -97,14 +97,14 @@ impl FundedAccount {
     }
 
     /// Derive account address from keypair.
-    fn address_from_keypair(keypair: &Ed25519PrivateKey) -> [u8; 16] {
+    fn address_from_keypair(keypair: &Ed25519PrivateKey) -> Address {
         account_address(&keypair.public_key().0)
     }
 
     /// Determine which shard an address belongs to. An account's address
     /// *is* its placement, so this is a trie walk over the address bits.
-    fn shard_for_address(address: &[u8; 16], num_shards: u64) -> ShardId {
-        ShardTrie::uniform_from_count(num_shards).shard_for_prefix(Address(*address))
+    fn shard_for_address(address: &Address, num_shards: u64) -> ShardId {
+        ShardTrie::uniform_from_count(num_shards).shard_for_prefix(*address)
     }
 }
 
@@ -261,7 +261,7 @@ impl AccountPool {
         &self,
         shard: ShardId,
         balance: u128,
-    ) -> Vec<([u8; 16], u128)> {
+    ) -> Vec<(Address, u128)> {
         self.by_shard
             .get(&shard)
             .map(|accounts| {
@@ -275,7 +275,7 @@ impl AccountPool {
 
     /// Get all genesis balances across all shards.
     #[must_use]
-    pub fn all_genesis_balances(&self, balance: u128) -> Vec<([u8; 16], u128)> {
+    pub fn all_genesis_balances(&self, balance: u128) -> Vec<(Address, u128)> {
         self.by_shard
             .values()
             .flat_map(|accounts| accounts.iter().map(|a| (a.address, balance)))
@@ -687,7 +687,7 @@ impl AccountPool {
         let mut loaded = 0;
         for accounts in self.by_shard.values() {
             for account in accounts {
-                let addr_hex = hex_encode(account.address);
+                let addr_hex = hex_encode(account.address.to_bytes());
                 if let Some(&nonce) = nonces.get(&addr_hex) {
                     account.nonce.store(nonce, Ordering::SeqCst);
                     loaded += 1;
@@ -715,7 +715,7 @@ impl AccountPool {
             for account in accounts {
                 let nonce = account.nonce.load(Ordering::SeqCst);
                 if nonce > 0 {
-                    let addr_hex = hex_encode(account.address);
+                    let addr_hex = hex_encode(account.address.to_bytes());
                     nonces.insert(addr_hex, nonce);
                 }
             }

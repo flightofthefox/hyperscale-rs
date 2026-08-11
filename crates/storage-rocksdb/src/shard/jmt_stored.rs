@@ -17,7 +17,8 @@ use hyperscale_hbor::Hbor;
 #[cfg(test)]
 use hyperscale_jmt::PathDecodeError;
 use hyperscale_jmt::{
-    Child, ChildKind, Hash as JmtHash, InternalNode, Key as JmtKey, LeafNode, Node, NodeKey,
+    Child, ChildKind, Hash as JmtHash, InternalNode, KEY_BYTES, Key as JmtKey, LeafNode, Node,
+    NodeKey,
 };
 
 /// Version = block height.
@@ -247,10 +248,10 @@ fn hash_from_bytes(bytes: &[u8]) -> JmtHash {
 }
 
 fn key_from_bytes(bytes: &[u8]) -> JmtKey {
-    let mut out = [0u8; 32];
+    let mut out = [0u8; KEY_BYTES];
     assert!(
-        bytes.len() == 32,
-        "stored key must be 32 bytes, got {}",
+        bytes.len() == KEY_BYTES,
+        "stored key must be {KEY_BYTES} bytes, got {}",
         bytes.len()
     );
     out.copy_from_slice(bytes);
@@ -267,7 +268,7 @@ mod tests {
 
     #[test]
     fn roundtrip_leaf() {
-        let leaf = Node::Leaf(JmtLeaf::new([1u8; 32], [2u8; 32], 17));
+        let leaf = Node::Leaf(JmtLeaf::new([1u8; KEY_BYTES], [2u8; 32], 17));
         let stored = StoredNode::from_jmt(&leaf);
         let back = stored.to_jmt();
         match (leaf, back) {
@@ -317,7 +318,7 @@ mod tests {
 
     #[test]
     fn stored_node_key_roundtrip() {
-        let jmt_key = NodeKey::new(42, NibblePath::from_key_prefix(&[0xAB; 32], 13));
+        let jmt_key = NodeKey::new(42, NibblePath::from_key_prefix(&[0xAB; KEY_BYTES], 13));
         let stored = StoredNodeKey::from_jmt(&jmt_key);
         let back = stored.to_jmt().unwrap();
         assert_eq!(jmt_key.version, back.version);

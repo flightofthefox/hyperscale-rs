@@ -48,7 +48,7 @@ struct BuildArgs<'a> {
     config: &'a ScenarioConfig,
     seed: u64,
     dedicated_pool_hosts: bool,
-    accounts: &'a [([u8; 16], u128)],
+    accounts: &'a [(Address, u128)],
     execution_mode: ExecutionMode,
 }
 
@@ -72,11 +72,7 @@ impl SimCluster {
     /// Build a genesis cluster with funded accounts, batch-scheduling
     /// ticks serially.
     #[must_use]
-    pub fn with_accounts(
-        config: &ScenarioConfig,
-        seed: u64,
-        accounts: &[([u8; 16], u128)],
-    ) -> Self {
+    pub fn with_accounts(config: &ScenarioConfig, seed: u64, accounts: &[(Address, u128)]) -> Self {
         Self::with_execution_mode(config, seed, accounts, ExecutionMode::Serial)
     }
 
@@ -86,7 +82,7 @@ impl SimCluster {
     pub fn with_execution_mode(
         config: &ScenarioConfig,
         seed: u64,
-        accounts: &[([u8; 16], u128)],
+        accounts: &[(Address, u128)],
         execution_mode: ExecutionMode,
     ) -> Self {
         Self::build_full(&BuildArgs {
@@ -105,7 +101,7 @@ impl SimCluster {
     pub fn with_accounts_and_dedicated_pool_hosts(
         config: &ScenarioConfig,
         seed: u64,
-        accounts: &[([u8; 16], u128)],
+        accounts: &[(Address, u128)],
     ) -> Self {
         Self::build(config, seed, accounts, true)
     }
@@ -125,7 +121,7 @@ impl SimCluster {
     fn build(
         config: &ScenarioConfig,
         seed: u64,
-        accounts: &[([u8; 16], u128)],
+        accounts: &[(Address, u128)],
         dedicated_pool_hosts: bool,
     ) -> Self {
         Self::build_full(&BuildArgs {
@@ -205,7 +201,7 @@ impl SimCluster {
     pub fn with_grown_accounts(
         config: &ScenarioConfig,
         seed: u64,
-        accounts: &[([u8; 16], u128)],
+        accounts: &[(Address, u128)],
     ) -> Self {
         let grow_config = ScenarioConfig {
             split_bytes: 0,
@@ -422,14 +418,14 @@ impl Cluster for SimCluster {
             .map(|(_, state)| state)
     }
 
-    fn substate(&self, shard: ShardId, owner: [u8; 16], local: [u8; 16]) -> Option<Vec<u8>> {
+    fn substate(&self, shard: ShardId, owner: Address, local: [u8; 16]) -> Option<Vec<u8>> {
         let store = self
             .live_committee_hosts(shard)
             .into_iter()
             .find_map(|host| self.runner.hosts_shard(host, shard))?;
         let height = store.jmt_height();
         let key = SubstateKey {
-            owner: Address(owner),
+            owner,
             local: LocalKey(local),
         };
         store.get_substate_at_height(key, height)?

@@ -3,15 +3,15 @@
 use std::collections::BTreeMap;
 
 use crate::hasher::{Blake3Hasher, Hash};
-use crate::node::{Key, LeafValue, NodeKey, ValueHash};
+use crate::node::{KEY_BYTES, Key, LeafValue, NodeKey, ValueHash};
 use crate::storage::{MemoryStore, TreeReader};
 use crate::tree::Tree;
 
 type Jmt = Tree<Blake3Hasher, 1>;
 
-/// A 32-byte key with `b` as its leading byte.
+/// A tree key with `b` as its leading byte.
 pub fn k(b: u8) -> Key {
-    let mut key = [0u8; 32];
+    let mut key = [0u8; KEY_BYTES];
     key[0] = b;
     key
 }

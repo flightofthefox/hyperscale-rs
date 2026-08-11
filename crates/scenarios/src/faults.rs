@@ -4,7 +4,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHeight, Epoch, HALT_THRESHOLD_EPOCHS, ShardId, StateRoot, TransactionDecision,
+    Address, BlockHeight, Epoch, HALT_THRESHOLD_EPOCHS, ShardId, StateRoot, TransactionDecision,
     TransactionStatus, TxHash,
 };
 
@@ -220,7 +220,7 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
     let mut probes: Vec<TxHash> = Vec::new();
     // Each probe's payer account beside its hash: which shard pays decides
     // what the survivor owes once the counterpart freezes.
-    let mut payers: Vec<[u8; 16]> = Vec::new();
+    let mut payers: Vec<Address> = Vec::new();
     for (key, from, to) in &setup.straddlers[..HALT_STRADDLER_BATCH] {
         probes.push(submit_straddler(c, key, *from, *to));
         payers.push(*from);

@@ -14,8 +14,8 @@
 use std::collections::BTreeMap;
 
 use hyperscale_jmt::{
-    Blake3Hasher, EMPTY_HASH, Hash, Key, LeafValue, MemoryStore, MultiProof, NodeKey, Tree,
-    TreeReader, ValueHash,
+    Blake3Hasher, EMPTY_HASH, Hash, KEY_BYTES, Key, LeafValue, MemoryStore, MultiProof, NodeKey,
+    Tree, TreeReader, ValueHash,
 };
 use proptest::prelude::*;
 
@@ -26,7 +26,11 @@ type Jmt = Tree<Blake3Hasher, 1>;
 // ============================================================
 
 fn key_strategy() -> impl Strategy<Value = Key> {
-    prop::array::uniform32(any::<u8>())
+    prop::collection::vec(any::<u8>(), KEY_BYTES).prop_map(|bytes| {
+        let mut key = [0u8; KEY_BYTES];
+        key.copy_from_slice(&bytes);
+        key
+    })
 }
 
 fn value_strategy() -> impl Strategy<Value = ValueHash> {
@@ -359,21 +363,16 @@ proptest! {
         suffix_seeds in prop::collection::vec(any::<[u8; 4]>(), 4..32),
     ) {
         let mut entries: BTreeMap<Key, ValueHash> = BTreeMap::new();
-        let prefix = [0xA5u8; 32]; // arbitrary fixed prefix bytes
+        let prefix = [0xA5u8; KEY_BYTES]; // arbitrary fixed prefix bytes
         let mut value_seed = 0u8;
         for seed in &suffix_seeds {
-            let mut key = [0u8; 32];
+            let mut key = [0u8; KEY_BYTES];
             key[..prefix_bytes].copy_from_slice(&prefix[..prefix_bytes]);
             // Suffix differs per entry so keys diverge below the shared prefix.
-            key[prefix_bytes] = seed[0];
-            if prefix_bytes + 1 < 32 {
-                key[prefix_bytes + 1] = seed[1];
-            }
-            if prefix_bytes + 2 < 32 {
-                key[prefix_bytes + 2] = seed[2];
-            }
-            if prefix_bytes + 3 < 32 {
-                key[prefix_bytes + 3] = seed[3];
+            for (offset, byte) in seed.iter().enumerate() {
+                if let Some(slot) = key.get_mut(prefix_bytes + offset) {
+                    *slot = *byte;
+                }
             }
             let mut value = [0u8; 32];
             value[0] = value_seed;

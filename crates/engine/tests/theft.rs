@@ -27,14 +27,14 @@ use hyperscale_types::{
     TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
-    Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
-    Value,
+    Address, AddressClass, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl,
+    ManifestGraph, Value,
 };
 use hyperscale_vm_kernel::{amount_cell, encode_amount};
 
 /// A funded account whose key nothing in this binary holds — the address
 /// is all an attacker has, and the address is public.
-const VICTIM: [u8; 16] = [0x99; 16];
+const VICTIM: Address = Address::new([0x99; 31], AddressClass::Component);
 /// The signing seed of the account that pays for the theft.
 const THIEF: u8 = 3;
 /// What both accounts hold at genesis.
@@ -44,7 +44,7 @@ const FUNDED: u128 = 10_000;
 struct MapDb(BTreeMap<SubstateKey, Vec<u8>>);
 
 impl MapDb {
-    fn genesis(accounts: &[([u8; 16], u128)]) -> Self {
+    fn genesis(accounts: &[(Address, u128)]) -> Self {
         let writes = genesis_writes(accounts, &[]);
         let mut map = BTreeMap::new();
         for (key, change) in writes.cells() {
@@ -61,44 +61,44 @@ impl SubstateDatabase for MapDb {
     }
 }
 
-fn thief() -> [u8; 16] {
+fn thief() -> Address {
     let key = Ed25519PrivateKey::from_bytes(&[THIEF; 32]).unwrap();
     account_address(&key.public_key().0)
 }
 
 /// Every address any test in this binary transacts with.
-fn world_accounts() -> Vec<([u8; 16], u128)> {
+fn world_accounts() -> Vec<(Address, u128)> {
     vec![(VICTIM, FUNDED), (thief(), FUNDED)]
 }
 
-fn withdraw(target: [u8; 16], amount: u128) -> GraphNode {
+fn withdraw(target: Address, amount: u128) -> GraphNode {
     GraphNode {
-        target: Address(target),
+        target,
         method: "withdraw".into(),
         args: vec![
-            GraphArg::Literal(Value::Address(XRD)),
+            GraphArg::Literal(Value::Address(*XRD)),
             GraphArg::Literal(Value::U128(amount)),
         ],
     }
 }
 
-fn deposit(target: [u8; 16], producer: u32) -> GraphNode {
+fn deposit(target: Address, producer: u32) -> GraphNode {
     GraphNode {
-        target: Address(target),
+        target,
         method: "deposit".into(),
         args: vec![GraphArg::Edge {
             edge: EdgeRef {
                 producer,
                 output: 0,
             },
-            constraints: vec![Constraint::ResourceIs(XRD)],
+            constraints: vec![Constraint::ResourceIs(*XRD)],
         }],
     }
 }
 
-/// `from.withdraw(XRD, amount) -> to.deposit(..)`, signed and paid for by
+/// `from.withdraw(*XRD, amount) -> to.deposit(..)`, signed and paid for by
 /// the thief whatever `from` says.
-fn signed_transfer(from: [u8; 16], to: [u8; 16], amount: u128) -> Transaction {
+fn signed_transfer(from: Address, to: Address, amount: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[THIEF; 32]).unwrap();
     let tree = EnvelopeTree {
         root: IntentDecl {
@@ -114,7 +114,7 @@ fn signed_transfer(from: [u8; 16], to: [u8; 16], amount: u128) -> Transaction {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(&tree)),
             subintent_sigs: Vec::new(),
-            fee_payer: Address(thief()),
+            fee_payer: thief(),
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,
@@ -148,20 +148,20 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
 ///
 /// A receipt says what it moved, not what the cell ends at, so a balance
 /// assertion has to name the state the movement lands on.
-fn settled(writes: &StateWrites, accounts: &[([u8; 16], u128)]) -> SettledWrites {
+fn settled(writes: &StateWrites, accounts: &[(Address, u128)]) -> SettledWrites {
     writes.resolve(&mut |key| {
         accounts
             .iter()
-            .find(|(owner, _)| vault_key(*owner, XRD) == key)
+            .find(|(owner, _)| vault_key(*owner, *XRD) == key)
             .and_then(|(_, amount)| amount_cell(*amount).map(|cell| cell.to_vec()))
     })
 }
 
 /// An account's native vault as the batch left it.
-fn vault_cell(writes: &SettledWrites, owner: [u8; 16]) -> Option<Vec<u8>> {
+fn vault_cell(writes: &SettledWrites, owner: Address) -> Option<Vec<u8>> {
     writes
         .cells()
-        .get(&vault_key(owner, XRD))
+        .get(&vault_key(owner, *XRD))
         .cloned()
         .flatten()
 }

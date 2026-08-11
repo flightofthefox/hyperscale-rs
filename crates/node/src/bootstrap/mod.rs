@@ -460,7 +460,8 @@ mod tests {
     use hyperscale_storage::test_helpers::{pin_snap_sync_replica, stake_deposit};
     use hyperscale_storage::{BoundaryStore, ImportCursor, PendingChain, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
-    use hyperscale_types::{ShardWitnessPayload, SubstateKey};
+    use hyperscale_types::test_utils::test_key;
+    use hyperscale_types::{LEAF_KEY_BYTES, ShardWitnessPayload};
 
     use super::*;
     use crate::bootstrap::state_range_serve::serve_state_range_request;
@@ -708,8 +709,8 @@ mod tests {
             staged_bytes: 0,
             cursors: vec![
                 ImportCursor {
-                    next: [0u8; 32],
-                    end: [0xFF; 32],
+                    next: [0u8; LEAF_KEY_BYTES],
+                    end: [0xFF; LEAF_KEY_BYTES],
                     done: false,
                 };
                 1 << SPLIT_BITS
@@ -783,8 +784,8 @@ mod tests {
         // Still in the witness phase: a state response is unsolicited.
         let state_request = GetStateRangeRequest {
             height: anchor.height,
-            start: SubstateKey::from_bytes([0u8; 32]),
-            end: SubstateKey::from_bytes([0u8; 32]),
+            start: test_key(0u8).to_bytes(),
+            end: test_key(0u8).to_bytes(),
             limit: 16,
         };
         let response = serve_state_range_request(&serving, &state_request);

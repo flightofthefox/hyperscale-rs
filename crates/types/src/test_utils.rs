@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-use hyperscale_vm_types::{Address, Mode};
+use hyperscale_vm_types::{Address, AddressClass, LocalKey, Mode, SubstateKey};
 
 use crate::crypto::Ed25519PrivateKey;
 use crate::{
@@ -28,15 +28,15 @@ use crate::{
 #[must_use]
 pub fn test_transaction_with_prefixes(
     seed_bytes: &[u8],
-    read_prefixes: &[[u8; 16]],
-    write_prefixes: &[[u8; 16]],
+    read_prefixes: &[Address],
+    write_prefixes: &[Address],
 ) -> Transaction {
-    let mut payer = [0u8; 16];
-    for (slot, &byte) in payer.iter_mut().zip(seed_bytes) {
+    let mut body = [0u8; 31];
+    for (slot, &byte) in body.iter_mut().zip(seed_bytes) {
         *slot = byte;
     }
     stub_transaction_with_reads(
-        payer,
+        Address::new(body, AddressClass::Principal),
         read_prefixes,
         write_prefixes,
         1_000,
@@ -60,8 +60,18 @@ pub fn test_validity_range() -> TimestampRange {
 
 /// Create a test owner prefix from a seed byte.
 #[must_use]
-pub const fn test_prefix(seed: u8) -> [u8; 16] {
-    [seed; 16]
+pub const fn test_prefix(seed: u8) -> Address {
+    Address::new([seed; 31], AddressClass::Component)
+}
+
+/// A substate key seeded by one byte: the owner prefix and the local half
+/// both filled with it.
+#[must_use]
+pub const fn test_key(seed: u8) -> SubstateKey {
+    SubstateKey {
+        owner: test_prefix(seed),
+        local: LocalKey([seed; 16]),
+    }
 }
 
 /// Create a simple test transaction.
@@ -839,20 +849,28 @@ impl VmStatics for StubVmStatics {
         let Some((&read_count, prefixes)) = tree.split_first() else {
             return Err(VmStaticsError("stub tree is empty".into()));
         };
-        if !prefixes.len().is_multiple_of(16) || usize::from(read_count) * 16 > prefixes.len() {
+        if !prefixes.len().is_multiple_of(32) || usize::from(read_count) * 32 > prefixes.len() {
             return Err(VmStaticsError(
-                "stub tree must be a read count then 16-byte owner prefixes".into(),
+                "stub tree must be a read count then 32-byte owner prefixes".into(),
             ));
         }
-        let canonical = |chunks: &[u8]| {
-            let mut prefixes: Vec<[u8; 16]> = chunks.as_chunks::<16>().0.to_vec();
+        let canonical = |chunks: &[u8]| -> Result<Vec<Address>, VmStaticsError> {
+            let mut prefixes: Vec<Address> = chunks
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .map(|bytes| {
+                    Address::from_bytes(*bytes)
+                        .map_err(|err| VmStaticsError(format!("stub prefix: {err}")))
+                })
+                .collect::<Result<_, _>>()?;
             prefixes.sort_unstable();
             prefixes.dedup();
-            prefixes
+            Ok(prefixes)
         };
-        let (reads, writes) = prefixes.split_at(usize::from(read_count) * 16);
-        let read_prefixes = canonical(reads);
-        let write_prefixes = canonical(writes);
+        let (reads, writes) = prefixes.split_at(usize::from(read_count) * 32);
+        let read_prefixes = canonical(reads)?;
+        let write_prefixes = canonical(writes)?;
         Ok(Derived {
             routing: Routing {
                 read_keys: read_prefixes
@@ -870,9 +888,9 @@ impl VmStatics for StubVmStatics {
                     .copied()
                     .map(DeclaredKey::prefix)
                     .collect(),
-                provision_prefixes: read_prefixes.iter().copied().map(Address).collect(),
-                read_prefixes: read_prefixes.iter().copied().map(Address).collect(),
-                write_prefixes: write_prefixes.iter().copied().map(Address).collect(),
+                provision_prefixes: read_prefixes.clone(),
+                read_prefixes: read_prefixes.clone(),
+                write_prefixes: write_prefixes.clone(),
                 // The stub's two classes map to the two exclusive modes:
                 // a shared read and an exclusive write. It has no way to
                 // express a delta or a reservation, so a test that needs
@@ -917,8 +935,8 @@ pub fn install_stub_vm_statics() {
 /// exactly `owner_prefixes` as exclusive keys, paying from `fee_payer`.
 #[must_use]
 pub fn stub_transaction(
-    fee_payer: [u8; 16],
-    owner_prefixes: &[[u8; 16]],
+    fee_payer: Address,
+    owner_prefixes: &[Address],
     max_fee: u128,
     validity: TimestampRange,
 ) -> Transaction {
@@ -937,21 +955,22 @@ pub fn stub_transaction(
 /// set exceeds what a one-byte count can name.
 #[must_use]
 pub fn stub_transaction_with_reads(
-    fee_payer: [u8; 16],
-    read_prefixes: &[[u8; 16]],
-    write_prefixes: &[[u8; 16]],
+    fee_payer: Address,
+    read_prefixes: &[Address],
+    write_prefixes: &[Address],
     max_fee: u128,
     validity: TimestampRange,
 ) -> Transaction {
     install_stub_vm_statics();
     let key = Ed25519PrivateKey::from_bytes(&[0x5A; 32]).expect("fixture key");
     let mut tree = vec![u8::try_from(read_prefixes.len()).expect("stub read set fits a byte")];
-    tree.extend_from_slice(&read_prefixes.concat());
-    tree.extend_from_slice(&write_prefixes.concat());
+    for prefix in read_prefixes.iter().chain(write_prefixes) {
+        tree.extend_from_slice(&prefix.to_bytes());
+    }
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(tree),
         subintent_sigs: Vec::new(),
-        fee_payer: Address(fee_payer),
+        fee_payer,
         max_fee,
         gas_limit: 1_000_000,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),

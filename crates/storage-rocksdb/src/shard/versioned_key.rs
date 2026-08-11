@@ -50,13 +50,13 @@ impl DbCodec<VersionedKey> for VersionedSubstateKeyCodec {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Address, LocalKey};
+    use hyperscale_types::{Address, AddressClass, LocalKey};
 
     use super::*;
 
     fn make_test_key(local: [u8; 16]) -> SubstateKey {
         SubstateKey {
-            owner: Address([0u8; 16]),
+            owner: Address::new([0u8; 31], AddressClass::Component),
             local: LocalKey(local),
         }
     }

@@ -212,22 +212,23 @@ fn install_adoption(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_jmt::{Blake3Hasher, Hasher};
+    use hyperscale_jmt::{Blake3Hasher, Hasher, KEY_BYTES};
     use hyperscale_storage::test_helpers::import_boundary_state;
     use hyperscale_storage::{AdoptSource, WitnessSeed};
     use hyperscale_types::{
-        Block, BlockHash, BlockHeight, ChainOrigin, Hash, ShardId, StateRoot, SubstateKey,
-        SubstateLeaf, ValidatorId, WeightedTimestamp,
+        AddressClass, Block, BlockHash, BlockHeight, ChainOrigin, Hash, ShardId, StateRoot,
+        SubstateKey, SubstateLeaf, ValidatorId, WeightedTimestamp,
     };
 
     use super::*;
 
     /// An import leaf whose top byte places it under one trie half.
     fn leaf(top: u8) -> SubstateLeaf {
-        let mut key = [0u8; 32];
+        let mut key = [0u8; KEY_BYTES];
         key[0] = top;
+        key[31] = AddressClass::Component.tag();
         SubstateLeaf {
-            key: SubstateKey::from_bytes(key),
+            key: SubstateKey::from_bytes(key).expect("a stored leaf key names an address"),
             value: vec![top],
         }
     }

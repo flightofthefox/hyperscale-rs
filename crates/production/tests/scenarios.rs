@@ -41,6 +41,7 @@ use hyperscale_scenarios::{
     surviving_sibling_split_seats_full_committees,
     withdrawal_ejects_a_validator_that_a_deposit_reactivates, zipf_payments,
 };
+use hyperscale_types::Address;
 use serial_test::serial;
 use support::ProdCluster;
 
@@ -94,7 +95,7 @@ fn abort_converges_prod() {
 /// Everything `livelock_resolves_promptly` needs funded: it composes
 /// `split_lifecycle`, so the probe transfer's accounts come along with
 /// the conflicting pair's.
-fn livelock_accounts() -> Vec<([u8; 16], u128)> {
+fn livelock_accounts() -> Vec<(Address, u128)> {
     let mut accounts = genesis_accounts(1, 1);
     accounts.extend(livelock_genesis_accounts());
     accounts

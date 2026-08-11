@@ -24,7 +24,7 @@ pub trait EventExt {
 impl EventExt for Event {
     fn hash(&self) -> Hash {
         Hash::from_parts(&[
-            &self.emitter.0,
+            &self.emitter.to_bytes(),
             &self.event_type.to_le_bytes(),
             &self.payload,
         ])

@@ -542,9 +542,9 @@ impl ExecutionSim {
 
 /// The cell a declared owner prefix maps to.
 #[must_use]
-pub const fn cell_of(owner: [u8; 16]) -> SubstateKey {
+pub const fn cell_of(owner: Address) -> SubstateKey {
     SubstateKey {
-        owner: Address(owner),
+        owner,
         local: LocalKey([0; 16]),
     }
 }
@@ -558,9 +558,9 @@ pub const fn cell_of(owner: [u8; 16]) -> SubstateKey {
 /// fee burn and every payment actually carries, and it is the one that
 /// does not survive being dropped from a fold or applied twice.
 #[must_use]
-pub const fn vault_of(owner: [u8; 16]) -> SubstateKey {
+pub const fn vault_of(owner: Address) -> SubstateKey {
     SubstateKey {
-        owner: Address(owner),
+        owner,
         local: LocalKey([1; 16]),
     }
 }
@@ -577,9 +577,9 @@ pub const CREDIT: u128 = 1;
 /// from [`vault_of`] so a test can read what was charged without
 /// unpicking it from what was moved.
 #[must_use]
-pub const fn charge_of(owner: [u8; 16]) -> SubstateKey {
+pub const fn charge_of(owner: Address) -> SubstateKey {
     SubstateKey {
-        owner: Address(owner),
+        owner,
         local: LocalKey([2; 16]),
     }
 }
@@ -623,18 +623,18 @@ fn stub_execute(
     let mut cells = BTreeMap::new();
     let mut movements: BTreeMap<SubstateKey, Movement> = BTreeMap::new();
     // The payer this shard would charge: the first owner it holds.
-    let mut charged: Option<[u8; 16]> = None;
+    let mut charged: Option<Address> = None;
     for key in tx.admission_write_keys() {
         // Only the owning shard applies a cell, exactly as `Locality`
         // scopes the engine's fold.
         if trie.shard_for_prefix(key.owner()) != local_shard {
             continue;
         }
-        let cell = cell_of(key.owner().0);
+        let cell = cell_of(key.owner());
         let next = counter(snapshot.substate(cell)) + 1;
         cells.insert(cell, Some(next.to_le_bytes().to_vec()));
-        charged.get_or_insert_with(|| key.owner().0);
-        let credit = movements.entry(vault_of(key.owner().0)).or_default();
+        charged.get_or_insert_with(|| key.owner());
+        let credit = movements.entry(vault_of(key.owner())).or_default();
         *credit = credit.then(Movement {
             credit: CREDIT,
             debit: 0,
@@ -669,7 +669,7 @@ fn stub_execute(
 }
 
 /// The receipt a refused leg settles: the abort floor and nothing else.
-fn stub_charge(owner: [u8; 16]) -> ConsensusReceipt {
+fn stub_charge(owner: Address) -> ConsensusReceipt {
     let mut writes = StateWrites::default();
     writes.movements.insert(
         charge_of(owner),

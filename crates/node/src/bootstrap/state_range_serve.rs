@@ -28,6 +28,12 @@ const SOFT_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Every degraded case — boundary not pinned (or evicted), missing
 /// value, oversized value — answers `chunk: None` so the joiner rotates
 /// to another peer rather than receiving something unverifiable.
+///
+/// # Panics
+///
+/// If a leaf the tree enumerated is not a well-formed key. The tree only
+/// holds keys that were written through [`SubstateKey`], so this is a
+/// storage corruption, not a peer's input.
 pub fn serve_state_range_request<S: ShardStorage>(
     storage: &Arc<S>,
     req: &GetStateRangeRequest,
@@ -42,8 +48,8 @@ pub fn serve_state_range_request<S: ShardStorage>(
         return unavailable;
     };
 
-    let start = req.start.to_bytes();
-    let end = req.end.to_bytes();
+    let start = req.start;
+    let end = req.end;
     if start > end {
         return unavailable;
     }
@@ -58,7 +64,7 @@ pub fn serve_state_range_request<S: ShardStorage>(
     let mut wire_leaves: Vec<SubstateLeaf> = Vec::with_capacity(range.leaves.len());
     let mut budget = SOFT_RESPONSE_BYTES;
     for (leaf_key, _) in &range.leaves {
-        let key = SubstateKey::from_bytes(*leaf_key);
+        let key = SubstateKey::from_bytes(*leaf_key).expect("a stored leaf key names an address");
         let Some(value) = boundary.substate(key) else {
             warn!(height = version, "state range: leaf value missing");
             return unavailable;
@@ -100,6 +106,7 @@ mod tests {
     use hyperscale_storage::{BoundaryStore, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::BlockHeight;
+    use hyperscale_types::test_utils::test_key;
 
     use super::*;
 
@@ -112,8 +119,8 @@ mod tests {
     fn full_range_request(height: u64) -> GetStateRangeRequest {
         GetStateRangeRequest {
             height: BlockHeight::new(height),
-            start: SubstateKey::from_bytes([0u8; 32]),
-            end: SubstateKey::from_bytes([0xFFu8; 32]),
+            start: test_key(0u8).to_bytes(),
+            end: test_key(0xFFu8).to_bytes(),
             limit: 1_000,
         }
     }
@@ -146,8 +153,8 @@ mod tests {
             &proof,
             *pinned_root.as_raw().as_bytes(),
             &NibblePath::empty(),
-            &req.start.to_bytes(),
-            &req.end.to_bytes(),
+            &req.start,
+            &req.end,
             &jmt_chunk,
         )
         .unwrap();
@@ -180,7 +187,7 @@ mod tests {
         let cursor = next_key(&first.leaves.last().unwrap().key.to_bytes())
             .expect("not at the key-space maximum");
         let mut resume = full_range_request(8);
-        resume.start = SubstateKey::from_bytes(cursor);
+        resume.start = cursor;
         let second = serve_state_range_request(&storage, &resume)
             .chunk
             .expect("served");
@@ -201,8 +208,8 @@ mod tests {
             &proof,
             *pinned_root.as_raw().as_bytes(),
             &NibblePath::empty(),
-            &resume.start.to_bytes(),
-            &resume.end.to_bytes(),
+            &resume.start,
+            &resume.end,
             &jmt_chunk,
         )
         .unwrap();
@@ -219,7 +226,7 @@ mod tests {
         let all = serve_state_range_request(&storage, &full_range_request(8))
             .chunk
             .expect("served");
-        let mid_end = all.leaves[3].key;
+        let mid_end = all.leaves[3].key.to_bytes();
 
         let mut req = full_range_request(8);
         req.end = mid_end;

@@ -499,7 +499,7 @@ impl UnresolvedTxs {
 mod tests {
     use std::time::Duration;
 
-    use hyperscale_types::test_utils::{make_finalization, stub_transaction};
+    use hyperscale_types::test_utils::{make_finalization, stub_transaction, test_prefix};
     use hyperscale_types::{
         BlockHeight, EPOCH_DURATION, EpochWindows, TimestampRange, TransactionDecision,
         UnsettledTx, Verified, WeightedTimestamp,
@@ -524,7 +524,7 @@ mod tests {
             WeightedTimestamp::from_millis(end_ms),
         );
         Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-            stub_transaction([payer; 16], &[[also; 16]], 1_000, validity),
+            stub_transaction(test_prefix(payer), &[test_prefix(also)], 1_000, validity),
         )))
     }
 

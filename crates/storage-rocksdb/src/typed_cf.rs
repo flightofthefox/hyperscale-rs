@@ -13,7 +13,7 @@ use hyperscale_hbor::{
 };
 use hyperscale_storage::{ImportCursor, ImportProgress};
 use hyperscale_types::{
-    BlockHeight, ChainOrigin, Hash, QuorumCertificate, StateRoot, WeightedTimestamp,
+    BlockHeight, ChainOrigin, Hash, LEAF_KEY_BYTES, QuorumCertificate, StateRoot, WeightedTimestamp,
 };
 use rocksdb::{ColumnFamily, DB, DBRawIteratorWithThreadMode, Snapshot, WriteBatch};
 
@@ -493,7 +493,7 @@ pub struct ImportProgressCodec;
 /// Fixed prefix ahead of the cursor list.
 const IMPORT_PROGRESS_HEADER: usize = 8 + 32 + 1 + 4 + 8;
 /// Packed size of one cursor record.
-const IMPORT_CURSOR_BYTES: usize = 32 + 32 + 1;
+const IMPORT_CURSOR_BYTES: usize = LEAF_KEY_BYTES + LEAF_KEY_BYTES + 1;
 
 impl DbEncode<ImportProgress> for ImportProgressCodec {
     fn encode_to(&self, value: &ImportProgress, buf: &mut Vec<u8>) {
@@ -531,9 +531,13 @@ impl DbCodec<ImportProgress> for ImportProgressCodec {
             .0
             .iter()
             .map(|chunk| ImportCursor {
-                next: chunk[..32].try_into().expect("chunk is 65 bytes"),
-                end: chunk[32..64].try_into().expect("chunk is 65 bytes"),
-                done: chunk[64] != 0,
+                next: chunk[..LEAF_KEY_BYTES]
+                    .try_into()
+                    .expect("chunk is one cursor wide"),
+                end: chunk[LEAF_KEY_BYTES..2 * LEAF_KEY_BYTES]
+                    .try_into()
+                    .expect("chunk is one cursor wide"),
+                done: chunk[2 * LEAF_KEY_BYTES] != 0,
             })
             .collect();
         ImportProgress {

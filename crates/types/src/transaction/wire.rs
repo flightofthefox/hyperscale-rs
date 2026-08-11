@@ -431,10 +431,10 @@ mod tests {
     use hyperscale_hbor::{
         DecodeError, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
-    use hyperscale_vm_types::{Address, Mode};
+    use hyperscale_vm_types::{Address, AddressClass, Mode};
 
     use super::*;
-    use crate::test_utils::test_validity_range;
+    use crate::test_utils::{test_prefix, test_validity_range};
     use crate::{
         Ed25519PrivateKey, SubintentSig, TransactionBody, VmStatics, declared_work,
         install_vm_statics,
@@ -459,15 +459,18 @@ mod tests {
             Ok(Derived {
                 fee_vault_local: [0xEE; 16],
                 routing: Routing {
-                    read_keys: vec![DeclaredKey::prefix([0x11; 16])],
-                    write_keys: vec![DeclaredKey::substate([0x22; 16], [0x01; 16])],
-                    read_prefixes: vec![Address([0x11; 16])],
-                    write_prefixes: vec![Address([0x22; 16])],
-                    provision_keys: vec![DeclaredKey::prefix([0x11; 16])],
-                    provision_prefixes: vec![Address([0x11; 16])],
+                    read_keys: vec![DeclaredKey::prefix(test_prefix(0x11))],
+                    write_keys: vec![DeclaredKey::substate(test_prefix(0x22), [0x01; 16])],
+                    read_prefixes: vec![Address::new([0x11; 31], AddressClass::Component)],
+                    write_prefixes: vec![Address::new([0x22; 31], AddressClass::Component)],
+                    provision_keys: vec![DeclaredKey::prefix(test_prefix(0x11))],
+                    provision_prefixes: vec![Address::new([0x11; 31], AddressClass::Component)],
                     declared_modes: vec![
-                        (DeclaredKey::prefix([0x11; 16]), Mode::Read),
-                        (DeclaredKey::substate([0x22; 16], [0x01; 16]), Mode::Write),
+                        (DeclaredKey::prefix(test_prefix(0x11)), Mode::Read),
+                        (
+                            DeclaredKey::substate(test_prefix(0x22), [0x01; 16]),
+                            Mode::Write,
+                        ),
                     ],
                 },
                 subintent_hashes,
@@ -485,7 +488,7 @@ mod tests {
         TransactionEnvelope {
             body: TransactionBody::Call(tree.to_vec()),
             subintent_sigs: Vec::new(),
-            fee_payer: Address([0xAA; 16]),
+            fee_payer: Address::new([0xAA; 31], AddressClass::Component),
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: range.start_timestamp_inclusive.as_millis(),
@@ -517,11 +520,11 @@ mod tests {
         let tx = fixture(b"graph bytes");
         assert_eq!(
             tx.admission_read_keys(),
-            vec![DeclaredKey::prefix([0x11; 16])]
+            vec![DeclaredKey::prefix(test_prefix(0x11))]
         );
         assert_eq!(
             tx.admission_write_keys(),
-            vec![DeclaredKey::substate([0x22; 16], [0x01; 16])]
+            vec![DeclaredKey::substate(test_prefix(0x22), [0x01; 16])]
         );
         assert!(!tx.is_cross_shard(1));
     }

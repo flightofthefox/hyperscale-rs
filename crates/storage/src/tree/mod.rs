@@ -392,14 +392,15 @@ pub fn put_at_version<S: TreeReader + Sync>(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_jmt::{MemoryStore, TreeWriter};
+    use hyperscale_jmt::{KEY_BYTES, MemoryStore, TreeWriter};
+    use hyperscale_types::test_utils::test_prefix;
     use hyperscale_types::{Address, LocalKey};
 
     use super::*;
 
-    fn cell(owner: [u8; 16], local: [u8; 16]) -> SubstateKey {
+    fn cell(owner: Address, local: [u8; 16]) -> SubstateKey {
         SubstateKey {
-            owner: Address(owner),
+            owner,
             local: LocalKey(local),
         }
     }
@@ -409,7 +410,7 @@ mod tests {
     #[test]
     fn put_at_version_keys_writes_by_identity() {
         let mut store = MemoryStore::new();
-        let key = cell([0xA5u8; 16], [0x3Cu8; 16]);
+        let key = cell(test_prefix(0xA5), [0x3Cu8; 16]);
 
         let writes = SettledWrites::from_absolutes(BTreeMap::from([(key, Some(vec![42]))]));
 
@@ -421,7 +422,8 @@ mod tests {
 
         let root_key = NodeKey::new(1, store.root_path());
         let chunk =
-            Jmt::collect_range(&store, &root_key, &[0u8; 32], &[0xFF; 32], 10).expect("range");
+            Jmt::collect_range(&store, &root_key, &[0u8; KEY_BYTES], &[0xFF; KEY_BYTES], 10)
+                .expect("range");
         let leaf_keys: Vec<Key> = chunk.leaves.iter().map(|(k, _)| *k).collect();
         assert_eq!(leaf_keys, vec![key.to_bytes()]);
     }

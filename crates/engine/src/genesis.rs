@@ -13,10 +13,11 @@ pub use hyperscale_effects_bridge::{XRD, entropy_key, vault_key};
 use hyperscale_types::{SettledWrites, StakePoolSeat};
 use hyperscale_vm_effects::{
     Address, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, Value, package_hash,
+    resource_address,
 };
 use hyperscale_vm_kernel::encode_amount;
 use hyperscale_vm_stdlib::genesis_writes as stdlib_genesis_writes;
-pub use hyperscale_vm_stdlib::{GENESIS_PUBLISHER, account_artifact, staking_artifact};
+pub use hyperscale_vm_stdlib::{account_artifact, genesis_publisher, staking_artifact};
 
 /// Configuration for genesis bootstrapping.
 #[derive(Debug, Clone, Default)]
@@ -24,7 +25,7 @@ pub struct GenesisConfig {
     /// Funded accounts: owner prefix and initial balance. Seeded as
     /// identity-keyed vault cells and registered as account-package
     /// instances in the process's VM statics.
-    pub accounts: Vec<([u8; 16], u128)>,
+    pub accounts: Vec<(Address, u128)>,
 
     /// Stake pools the beacon folds facts for: the pool instance's owner
     /// prefix and the identifier it is folded under. Seated as stake pool
@@ -66,7 +67,7 @@ pub struct World {
 /// Panics if the stdlib artifact would not be admissible as a published
 /// package — a build defect, not a runtime condition.
 #[must_use]
-pub fn genesis_world(accounts: &[([u8; 16], u128)]) -> World {
+pub fn genesis_world(accounts: &[(Address, u128)]) -> World {
     genesis_world_with_pools(accounts, &[])
 }
 
@@ -83,7 +84,7 @@ pub fn genesis_world(accounts: &[([u8; 16], u128)]) -> World {
 /// Panics if a stdlib artifact would not be admissible as a published
 /// package — a build defect, not a runtime condition.
 #[must_use]
-pub fn genesis_world_with_pools(accounts: &[([u8; 16], u128)], pools: &[StakePoolSeat]) -> World {
+pub fn genesis_world_with_pools(accounts: &[(Address, u128)], pools: &[StakePoolSeat]) -> World {
     let artifact = account_artifact();
     let account_package = package_hash(&ProtocolHasher, artifact);
     let metadata =
@@ -102,7 +103,7 @@ pub fn genesis_world_with_pools(accounts: &[([u8; 16], u128)], pools: &[StakePoo
     let mut instances = InstanceRegistry::new();
     for (address, _) in accounts {
         instances.register(
-            Address(*address),
+            *address,
             InstanceMeta {
                 package: account_package,
                 config: vec![],
@@ -112,18 +113,15 @@ pub fn genesis_world_with_pools(accounts: &[([u8; 16], u128)], pools: &[StakePoo
     let mut registry = PoolRegistry::new();
     for seat in pools {
         instances.register(
-            Address(seat.address),
+            seat.address,
             InstanceMeta {
                 package: staking_package,
-                // The resource a delegation is denominated in, the one the
-                // pool issues against it, and the principal its operator
-                // surface admits. The pool's own identity is its address,
-                // so nothing here names it.
-                config: vec![
-                    Value::Address(XRD),
-                    Value::Address(stake_unit(seat.address)),
-                    Value::Address(Address(seat.operator)),
-                ],
+                // The resource a delegation is denominated in, and the
+                // principal its operator surface admits. The resource the
+                // pool *issues* is derived from the pool, not configured,
+                // and the pool's own identity is its address — so neither
+                // is named here.
+                config: vec![Value::Address(*XRD), Value::Address(seat.operator)],
             },
         );
         registry.register(seat.address, seat.id);
@@ -137,23 +135,25 @@ pub fn genesis_world_with_pools(accounts: &[([u8; 16], u128)], pools: &[StakePoo
     }
 }
 
-/// The resource a pool at `address` issues against delegations.
+/// The resource a pool issues against delegations.
 ///
-/// Derived from the pool rather than configured, so two pools can never be
-/// seated on one stake-unit resource and a holder's units always name the
-/// pool that owes them.
+/// A resource address under the pool's own provenance, which is what the
+/// staking signature's own derivation evaluates to — so two pools can
+/// never be seated on one stake-unit resource, a holder's units always
+/// name the pool that owes them, and the address says both facts on
+/// sight.
 #[must_use]
-pub fn stake_unit(pool: [u8; 16]) -> Address {
-    Address(vault_key(pool, XRD).local.0)
+pub fn stake_unit(pool: Address) -> Address {
+    resource_address(&ProtocolHasher, pool, &[])
 }
 
 /// The genesis substate writes.
 ///
 /// The protocol's stdlib flash composed with this network's allocations:
-/// a seated pool's validator records and one [`XRD`] vault cell per
+/// a seated pool's validator records and one [`*XRD`] vault cell per
 /// funded account, identity-keyed under the owner's prefix.
 #[must_use]
-pub fn genesis_writes(accounts: &[([u8; 16], u128)], pools: &[StakePoolSeat]) -> SettledWrites {
+pub fn genesis_writes(accounts: &[(Address, u128)], pools: &[StakePoolSeat]) -> SettledWrites {
     // The stdlib package as a committed cell, under the same content
     // address a publish would place it at. Genesis is then the cache's
     // cold start in the literal sense — the same projection of committed
@@ -175,7 +175,7 @@ pub fn genesis_writes(accounts: &[([u8; 16], u128)], pools: &[StakePoolSeat]) ->
     }
     for (address, balance) in accounts {
         writes.cells.insert(
-            vault_key(*address, XRD),
+            vault_key(*address, *XRD),
             Some(encode_amount(*balance).to_vec()),
         );
     }
@@ -184,6 +184,7 @@ pub fn genesis_writes(accounts: &[([u8; 16], u128)], pools: &[StakePoolSeat]) ->
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::test_utils::test_prefix;
     use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_metadata};
 
     use super::*;
@@ -191,8 +192,8 @@ mod tests {
 
     #[test]
     fn genesis_writes_are_identity_keyed_vault_cells() {
-        let alice = [0x11u8; 16];
-        let bob = [0x22u8; 16];
+        let alice = test_prefix(0x11);
+        let bob = test_prefix(0x22);
         let writes = genesis_writes(&[(alice, 500), (bob, 700)], &[]);
         // Two funded accounts' vault cells, plus the stdlib package under
         // the publisher no key derives.
@@ -201,12 +202,12 @@ mod tests {
             writes
                 .cells()
                 .keys()
-                .any(|key| key.owner == GENESIS_PUBLISHER)
+                .any(|key| key.owner == genesis_publisher(&ProtocolHasher))
         );
 
         for (owner, balance) in [(alice, 500u128), (bob, 700)] {
-            let key = vault_key(owner, XRD);
-            assert_eq!(key.owner.0, owner);
+            let key = vault_key(owner, *XRD);
+            assert_eq!(key.owner, owner);
             assert_eq!(
                 writes.cells().get(&key),
                 Some(&Some(encode_amount(balance).to_vec()))
@@ -258,11 +259,11 @@ mod tests {
 
     #[test]
     fn the_world_binds_every_funded_account_to_the_stdlib_package() {
-        let world = genesis_world(&[([0x11; 16], 1), ([0x22; 16], 2)]);
+        let world = genesis_world(&[(test_prefix(0x11), 1), (test_prefix(0x22), 2)]);
         assert!(world.cache.load().get(world.account_package).is_some());
-        for address in [[0x11; 16], [0x22; 16]] {
+        for address in [test_prefix(0x11), test_prefix(0x22)] {
             assert_eq!(
-                world.instances.get(Address(address)).map(|m| m.package),
+                world.instances.get(address).map(|m| m.package),
                 Some(world.account_package)
             );
         }

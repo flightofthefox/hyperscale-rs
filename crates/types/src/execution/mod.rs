@@ -44,7 +44,7 @@ mod tests {
         DecodeError, Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec, varint,
     };
 
-    use crate::test_utils::test_transaction_with_prefixes;
+    use crate::test_utils::{test_prefix, test_transaction_with_prefixes};
     use crate::{
         Address, AggregateSignature, Attempt, BlockHeight, ConsensusReceipt, ExecutionCertificate,
         ExecutionOutcome, Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot,
@@ -72,10 +72,10 @@ mod tests {
     }
 
     /// Find a node seed that routes to `target_shard` under 2-way sharding.
-    fn prefix_on_shard(topology_snapshot: &TopologySnapshot, target_shard: ShardId) -> [u8; 16] {
+    fn prefix_on_shard(topology_snapshot: &TopologySnapshot, target_shard: ShardId) -> Address {
         for seed in 0u8..=255 {
-            let prefix = [seed; 16];
-            if topology_snapshot.shard_for_prefix(Address(prefix)) == target_shard {
+            let prefix = test_prefix(seed);
+            if topology_snapshot.shard_for_prefix(prefix) == target_shard {
                 return prefix;
             }
         }

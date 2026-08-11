@@ -14,7 +14,7 @@
 //! other exclusive key.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
@@ -22,29 +22,30 @@ use hyperscale_types::{
     DeclaredKey, Derived, EnvelopeExt, Routing, TransactionEnvelope, VmStatics, VmStaticsError,
     declared_work,
 };
-use hyperscale_vm_effects::stdlib::{ENTROPY, VALIDATORS, VAULT};
+use hyperscale_vm_effects::stdlib::{ENTROPY, VALIDATORS, VAULT, XRD as XRD_ROLE};
 use hyperscale_vm_effects::{
     Accessibility, Address, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry, ManifestHash,
     MetadataCache, Mode, PackageHash, PackageMetadata, PrefixShardResolver, RoleId,
-    Routing as RoutedTransaction, SubstateKey, Value, admit_tree, child_key, footprint,
-    package_hash, route_tree,
+    Routing as RoutedTransaction, SchemeId, SubstateKey, Value, admit_tree, child_key, footprint,
+    native_address, package_hash, principal_address, route_tree,
 };
 
 use crate::ProtocolHasher;
 use crate::artifact::admit_package;
 
-const DOMAIN_ACCOUNT: &[u8] = b"hyperscale/engine/account-address";
-
-/// The native fee/transfer resource of the VM namespace.
-pub const XRD: Address = Address([0x58; 16]);
+/// The native fee and transfer resource of the VM namespace.
+///
+/// Derived from its protocol role rather than picked, so it sits where a
+/// hash puts it and no shard holds it by preference.
+pub static XRD: LazyLock<Address> = LazyLock::new(|| native_address(&ProtocolHasher, XRD_ROLE));
 
 /// The vault cell for `resource` under `owner` — the same child key the
 /// stdlib account metadata's effect clauses compute.
 #[must_use]
-pub fn vault_key(owner: [u8; 16], resource: Address) -> SubstateKey {
+pub fn vault_key(owner: Address, resource: Address) -> SubstateKey {
     child_key(
         &ProtocolHasher,
-        Address(owner),
+        owner,
         VAULT,
         &[Value::Address(resource).canonical_bytes()],
     )
@@ -58,10 +59,10 @@ pub fn vault_key(owner: [u8; 16], resource: Address) -> SubstateKey {
 /// it, so genesis has to write it for members the beacon created before
 /// the contract existed.
 #[must_use]
-pub fn validator_key(pool: [u8; 16], validator: u64) -> SubstateKey {
+pub fn validator_key(pool: Address, validator: u64) -> SubstateKey {
     child_key(
         &ProtocolHasher,
-        Address(pool),
+        pool,
         VALIDATORS,
         &[Value::U64(validator).canonical_bytes()],
     )
@@ -71,8 +72,8 @@ pub fn validator_key(pool: [u8; 16], validator: u64) -> SubstateKey {
 /// the transaction's randomness draw. Mirrors the effect signature the
 /// method declares.
 #[must_use]
-pub fn entropy_key(owner: [u8; 16]) -> SubstateKey {
-    child_key(&ProtocolHasher, Address(owner), ENTROPY, &[])
+pub fn entropy_key(owner: Address) -> SubstateKey {
+    child_key(&ProtocolHasher, owner, ENTROPY, &[])
 }
 
 /// The role a published package's artifact sits under, in the reserved
@@ -90,27 +91,24 @@ pub const PACKAGE_ROLE: RoleId = RoleId(0xFFFE);
 /// same artifact is the same cell — which is what makes publishing
 /// idempotent rather than a conflict.
 #[must_use]
-pub fn package_key(publisher: [u8; 16], package: PackageHash) -> SubstateKey {
+pub fn package_key(publisher: Address, package: PackageHash) -> SubstateKey {
     child_key(
         &ProtocolHasher,
-        Address(publisher),
+        publisher,
         PACKAGE_ROLE,
         &[package.0.0.to_vec()],
     )
 }
 
-/// The account address owned by an ed25519 public key: the protocol
-/// hash of the key, truncated to the owner-prefix width.
+/// The principal address an ed25519 public key opens.
 ///
-/// Deterministic — genesis funding, transaction builders, and admission
-/// all derive the same address from the same key.
+/// The address commits to the key and the scheme, so genesis funding,
+/// transaction builders and admission all derive the same address from
+/// the same key — and admission verifies a signer against its target by
+/// recomputing this, with nothing to look up.
 #[must_use]
-pub fn account_address(public_key: &[u8; 32]) -> [u8; 16] {
-    use hyperscale_vm_effects::Hasher as _;
-    let digest = ProtocolHasher.hash(DOMAIN_ACCOUNT, &[public_key]);
-    let mut address = [0u8; 16];
-    address.copy_from_slice(&digest.0[..16]);
-    address
+pub fn account_address(public_key: &[u8; 32]) -> Address {
+    principal_address(&ProtocolHasher, SchemeId::ED25519, public_key)
 }
 
 /// Encode an envelope tree to its canonical bytes.
@@ -265,7 +263,7 @@ impl PackageCache {
     /// is a package without any side channel, any tag, and any trust in
     /// what wrote it. A cell of any other kind cannot match except by
     /// finding a hash collision.
-    pub fn absorb_cell(&self, owner: [u8; 16], local: [u8; 16], value: &[u8]) {
+    pub fn absorb_cell(&self, owner: Address, local: [u8; 16], value: &[u8]) {
         let package = package_hash(&ProtocolHasher, value);
         if package_key(owner, package).local.0 != local {
             return;
@@ -300,8 +298,8 @@ impl BridgeStatics {
 
         let publisher = vm.fee_payer;
         let package = package_hash(&ProtocolHasher, artifact);
-        let cell = package_key(publisher.0, package);
-        let vault = vault_key(publisher.0, XRD);
+        let cell = package_key(publisher, package);
+        let vault = vault_key(publisher, *XRD);
         let mut write_keys = vec![DeclaredKey::Cell(cell), DeclaredKey::Cell(vault)];
         write_keys.sort_unstable();
         write_keys.dedup();
@@ -415,7 +413,10 @@ pub fn check_target_authority(
 }
 
 impl VmStatics for BridgeStatics {
-    fn absorb_committed_cell(&self, owner: [u8; 16], local: [u8; 16], value: &[u8]) {
+    fn absorb_committed_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) {
+        let Ok(owner) = Address::from_bytes(owner) else {
+            return;
+        };
         self.cache.absorb_cell(owner, local, value);
     }
 
@@ -428,7 +429,7 @@ impl VmStatics for BridgeStatics {
         // in the envelope. An unbound payer field is therefore a debit
         // on an account that authorised nothing, spendable by anyone
         // who knows its address.
-        if account_address(&vm.signer) != vm.fee_payer.0 {
+        if account_address(&vm.signer) != vm.fee_payer {
             return Err(VmStaticsError(
                 "fee payer is not the composer's own account".into(),
             ));
@@ -449,7 +450,7 @@ impl VmStatics for BridgeStatics {
         // declaration hashes returned here.
         for (index, (sig, subintent)) in vm.subintent_sigs.iter().zip(&tree.subintents).enumerate()
         {
-            if account_address(&sig.public_key) != subintent.signer.0 {
+            if account_address(&sig.public_key) != subintent.signer {
                 return Err(VmStaticsError(format!(
                     "subintent {index} signer address does not match its public key"
                 )));
@@ -517,7 +518,7 @@ impl VmStatics for BridgeStatics {
                 .iter()
                 .map(|record| record.subintent.0.0)
                 .collect(),
-            fee_vault_local: vault_key(vm.fee_payer.0, XRD).local.0,
+            fee_vault_local: vault_key(vm.fee_payer, *XRD).local.0,
         })
     }
 }
@@ -527,25 +528,26 @@ mod tests {
     use hyperscale_types::{Ed25519PrivateKey, NetworkId, SubintentSig, TX_UNITS, TransactionBody};
     use hyperscale_vm_effects::stdlib::{VAULT, account_metadata};
     use hyperscale_vm_effects::{
-        Constraint, EdgeRef, GraphArg, GraphNode, Hasher, InstanceMeta, IntentDecl, ManifestGraph,
-        PackageHash, Subintent, SubintentHash, YieldBinding, YieldParam, child_key, nullifier_key,
+        AddressClass, Constraint, EdgeRef, GraphArg, GraphNode, Hasher, InstanceMeta, IntentDecl,
+        ManifestGraph, PackageHash, Subintent, SubintentHash, YieldBinding, YieldParam, child_key,
+        nullifier_key,
     };
 
     use super::*;
 
-    const RES_X: Address = Address([0xE1; 16]);
-    const RES_Y: Address = Address([0xE2; 16]);
+    const RES_X: Address = Address::new([0xE1; 31], AddressClass::Component);
+    const RES_Y: Address = Address::new([0xE2; 31], AddressClass::Component);
 
     fn key(seed: u8) -> Ed25519PrivateKey {
         Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap()
     }
 
     fn composer_addr() -> Address {
-        Address(account_address(&key(7).public_key().0))
+        account_address(&key(7).public_key().0)
     }
 
     fn bob_addr() -> Address {
-        Address(account_address(&key(9).public_key().0))
+        account_address(&key(9).public_key().0)
     }
 
     fn statics() -> BridgeStatics {
@@ -755,7 +757,7 @@ mod tests {
             &[Value::Address(RES_X).canonical_bytes()],
         );
         assert!(derived.routing.write_keys.contains(&DeclaredKey::substate(
-            composer_addr().0,
+            composer_addr(),
             sender_vault.local.0
         )));
         assert!(derived.routing.read_keys.is_empty());
@@ -783,7 +785,7 @@ mod tests {
             derived
                 .routing
                 .write_keys
-                .contains(&DeclaredKey::substate(bob_addr().0, nullifier.local.0))
+                .contains(&DeclaredKey::substate(bob_addr(), nullifier.local.0))
         );
     }
 

@@ -37,7 +37,7 @@ use hyperscale_storage::{ImportCursor, ImportProgress};
 use hyperscale_types::network::request::GetStateRangeRequest;
 use hyperscale_types::network::response::{GetStateRangeResponse, StateRangeChunk};
 use hyperscale_types::state_key::jmt_value_hash;
-use hyperscale_types::{ShardAnchor, SubstateKey, SubstateLeaf};
+use hyperscale_types::{ShardAnchor, SubstateLeaf};
 
 type Jmt = Tree<Blake3Hasher, 1>;
 
@@ -199,8 +199,8 @@ impl SnapSync {
                 sub.state = SubRangeState::InFlight;
                 let request = GetStateRangeRequest {
                     height,
-                    start: SubstateKey::from_bytes(sub.cursor),
-                    end: SubstateKey::from_bytes(sub.end),
+                    start: sub.cursor,
+                    end: sub.end,
                     limit,
                 };
                 (id, request)

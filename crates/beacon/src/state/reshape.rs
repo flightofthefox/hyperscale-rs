@@ -692,7 +692,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use hyperscale_crypto_bls::BlsVerifier;
-    use hyperscale_types::{Address, Epoch, Hash, ShardWitnessPayload};
+    use hyperscale_types::{Address, AddressClass, Epoch, Hash, ShardWitnessPayload};
 
     use super::*;
     use crate::state::test_fixtures::{
@@ -1160,7 +1160,7 @@ mod tests {
         let active = state.derive_topology_snapshot(net());
         let lookahead = state.derive_next_topology_snapshot(net());
         for seed in 0..32u8 {
-            let owner = Address([seed; 16]);
+            let owner = Address::new([seed; 31], AddressClass::Component);
             let now = active.shard_for_prefix(owner);
             let next = lookahead.shard_for_prefix(owner);
             if now == p {
@@ -2369,7 +2369,7 @@ mod tests {
         let active = state.derive_topology_snapshot(net());
         let lookahead = state.derive_next_topology_snapshot(net());
         for seed in 0..32u8 {
-            let owner = Address([seed; 16]);
+            let owner = Address::new([seed; 31], AddressClass::Component);
             let now = active.shard_for_prefix(owner);
             let next = lookahead.shard_for_prefix(owner);
             if now == left || now == right {

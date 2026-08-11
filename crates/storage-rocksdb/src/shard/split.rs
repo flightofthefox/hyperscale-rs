@@ -339,11 +339,12 @@ impl TreeReader for PreRootStore<'_> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_jmt::{Blake3Hasher, Hasher, Key, NibblePath};
+    use hyperscale_jmt::{Blake3Hasher, Hasher, KEY_BYTES, Key, NibblePath};
     use hyperscale_storage::test_helpers::import_boundary_state;
     use hyperscale_storage::{AdoptSource, BoundaryStore, WitnessSeed};
     use hyperscale_types::{
-        BlockHash, BlockHeight, ShardId, SubstateKey, SubstateLeaf, ValidatorId, WeightedTimestamp,
+        AddressClass, BlockHash, BlockHeight, ShardId, SubstateKey, SubstateLeaf, ValidatorId,
+        WeightedTimestamp,
     };
     use tempfile::TempDir;
 
@@ -352,14 +353,15 @@ mod tests {
 
     /// A 32-byte leaf key with `b` as its leading byte.
     fn k(b: u8) -> Key {
-        let mut key = [0u8; 32];
+        let mut key = [0u8; KEY_BYTES];
         key[0] = b;
+        key[31] = AddressClass::Component.tag();
         key
     }
 
     fn leaf(b: u8) -> SubstateLeaf {
         SubstateLeaf {
-            key: SubstateKey::from_bytes(k(b)),
+            key: SubstateKey::from_bytes(k(b)).expect("a stored leaf key names an address"),
             value: vec![b],
         }
     }

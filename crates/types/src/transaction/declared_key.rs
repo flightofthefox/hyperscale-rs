@@ -27,17 +27,17 @@ pub enum DeclaredKey {
 impl DeclaredKey {
     /// The substate-granular key for a leaf `[owner | local]`.
     #[must_use]
-    pub const fn substate(owner: [u8; 16], local: [u8; 16]) -> Self {
+    pub const fn substate(owner: Address, local: [u8; 16]) -> Self {
         Self::Cell(SubstateKey {
-            owner: Address(owner),
+            owner,
             local: LocalKey(local),
         })
     }
 
     /// The owner-granular key for a prefix.
     #[must_use]
-    pub const fn prefix(owner: [u8; 16]) -> Self {
-        Self::Prefix(Address(owner))
+    pub const fn prefix(owner: Address) -> Self {
+        Self::Prefix(owner)
     }
 
     /// The owning address — the routing half either variant carries.

@@ -25,26 +25,26 @@ pub const DEFAULT_GAS_LIMIT: u64 = 1_000_000;
 /// The withdraw-then-deposit graph moving `amount` of the native
 /// resource from `from` to `to`.
 #[must_use]
-pub fn transfer_graph(from: [u8; 16], to: [u8; 16], amount: u128) -> ManifestGraph {
+pub fn transfer_graph(from: Address, to: Address, amount: u128) -> ManifestGraph {
     ManifestGraph {
         nodes: vec![
             GraphNode {
-                target: Address(from),
+                target: from,
                 method: "withdraw".into(),
                 args: vec![
-                    GraphArg::Literal(Value::Address(XRD)),
+                    GraphArg::Literal(Value::Address(*XRD)),
                     GraphArg::Literal(Value::U128(amount)),
                 ],
             },
             GraphNode {
-                target: Address(to),
+                target: to,
                 method: "deposit".into(),
                 args: vec![GraphArg::Edge {
                     edge: EdgeRef {
                         producer: 0,
                         output: 0,
                     },
-                    constraints: vec![Constraint::ResourceIs(XRD)],
+                    constraints: vec![Constraint::ResourceIs(*XRD)],
                 }],
             },
         ],
@@ -77,7 +77,7 @@ pub fn sign_call(
     TransactionEnvelope {
         body: TransactionBody::Call(encode_tree(&tree)),
         subintent_sigs: Vec::new(),
-        fee_payer: Address(account_address(&payer.public_key().0)),
+        fee_payer: account_address(&payer.public_key().0),
         max_fee,
         gas_limit: DEFAULT_GAS_LIMIT,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
@@ -98,8 +98,8 @@ pub fn sign_call(
 #[allow(clippy::too_many_arguments)] // the envelope's flat signing-time terms
 pub fn build_transfer_tx(
     payer: &Ed25519PrivateKey,
-    from: [u8; 16],
-    to: [u8; 16],
+    from: Address,
+    to: Address,
     amount: u128,
     max_fee: u128,
     validity: TimestampRange,

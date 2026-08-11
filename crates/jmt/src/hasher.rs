@@ -16,6 +16,8 @@
 
 use blake3::{Hasher as Blake3Backend, hash as blake3_hash};
 
+use crate::node::Key;
+
 /// 32-byte digest. All hashers in this crate produce 32-byte output.
 pub type Hash = [u8; 32];
 
@@ -28,9 +30,9 @@ pub trait Hasher: Send + Sync + 'static {
     /// Hash arbitrary bytes (e.g. for value hashing).
     fn hash(input: &[u8]) -> Hash;
 
-    /// Hash a leaf node. The key is the full 32-byte key; `value_hash`
-    /// is the pre-computed hash of the value bytes.
-    fn hash_leaf(key: &[u8; 32], value_hash: &Hash) -> Hash;
+    /// Hash a leaf node. The key is the full tree key; `value_hash` is
+    /// the pre-computed hash of the value bytes.
+    fn hash_leaf(key: &Key, value_hash: &Hash) -> Hash;
 
     /// Hash an internal node over its children. `children.len()` must
     /// equal the tree's arity (`1 << ARITY_BITS`). Empty children are
@@ -52,7 +54,7 @@ impl Hasher for Blake3Hasher {
         *blake3_hash(input).as_bytes()
     }
 
-    fn hash_leaf(key: &[u8; 32], value_hash: &Hash) -> Hash {
+    fn hash_leaf(key: &Key, value_hash: &Hash) -> Hash {
         let mut hasher = Blake3Backend::new();
         hasher.update(DOMAIN_LEAF);
         hasher.update(key);
@@ -73,23 +75,24 @@ impl Hasher for Blake3Hasher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::KEY_BYTES;
 
     #[test]
     fn leaf_and_internal_are_domain_separated() {
-        let key = [1u8; 32];
+        let key = [1u8; KEY_BYTES];
         let value_hash = [2u8; 32];
         let leaf = Blake3Hasher::hash_leaf(&key, &value_hash);
 
-        // Internal over (key, value_hash) — bytes happen to match the leaf
-        // content but domain tag differs.
-        let internal = Blake3Hasher::hash_internal(&[key, value_hash]);
+        // Internal over the same bytes the leaf covered — the domain tag
+        // is the only thing keeping the two apart.
+        let internal = Blake3Hasher::hash_internal(&[[1u8; 32], value_hash]);
 
         assert_ne!(leaf, internal);
     }
 
     #[test]
     fn empty_hash_distinct_from_all_zero_leaf() {
-        let zero_key = [0u8; 32];
+        let zero_key = [0u8; KEY_BYTES];
         let zero_val = [0u8; 32];
         let leaf = Blake3Hasher::hash_leaf(&zero_key, &zero_val);
         assert_ne!(leaf, EMPTY_HASH);

@@ -1,6 +1,6 @@
 //! Merging and filtering [`StateWrites`].
 
-use hyperscale_jmt::NibblePath;
+use hyperscale_jmt::{Key as JmtKey, NibblePath};
 use hyperscale_types::{SettledWrites, StateWrites, StoredReceipt, SubstateKey};
 
 /// Extract and merge the writes from stored receipts, resolving what
@@ -88,7 +88,7 @@ pub fn filter_writes_to_prefix(writes: &SettledWrites, prefix: &NibblePath) -> S
 
 /// Whether `key`'s leading bits equal `prefix` — the subtree-membership
 /// test shard prefixes partition the keyspace by.
-fn key_under_prefix(key: &[u8; 32], prefix: &NibblePath) -> bool {
+fn key_under_prefix(key: &JmtKey, prefix: &NibblePath) -> bool {
     (0..prefix.len()).all(|i| {
         let key_bit = (key[usize::from(i / 8)] >> (7 - (i % 8))) & 1;
         prefix.bits_at(i, 1) == key_bit
@@ -100,25 +100,26 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_jmt::NibblePath;
+    use hyperscale_types::test_utils::test_prefix;
     use hyperscale_types::{Address, LocalKey, SubstateKey};
 
     use super::*;
 
-    fn writes_for(owner: [u8; 16], value: u8) -> SettledWrites {
+    fn writes_for(owner: Address, value: u8) -> SettledWrites {
         SettledWrites::from_absolutes(BTreeMap::from([(
             SubstateKey {
-                owner: Address(owner),
+                owner,
                 local: LocalKey([1; 16]),
             },
             Some(vec![value]),
         )]))
     }
 
-    fn relative(owner: [u8; 16], value: u8) -> StateWrites {
+    fn relative(owner: Address, value: u8) -> StateWrites {
         let mut writes = StateWrites::default();
         writes.cells.insert(
             SubstateKey {
-                owner: Address(owner),
+                owner,
                 local: LocalKey([1; 16]),
             },
             Some(vec![value]),
@@ -128,15 +129,16 @@ mod tests {
 
     #[test]
     fn later_writes_win_per_cell() {
-        let merged = merge_state_writes(&[&relative([1; 16], 1), &relative([1; 16], 2)]);
+        let merged =
+            merge_state_writes(&[&relative(test_prefix(1), 1), &relative(test_prefix(1), 2)]);
         assert_eq!(merged.cells.len(), 1);
         assert_eq!(merged.cells.values().next().unwrap(), &Some(vec![2]));
     }
 
     #[test]
     fn prefix_filter_splits_on_the_leading_bit() {
-        let low = writes_for([0x00; 16], 1);
-        let high = writes_for([0xFF; 16], 2);
+        let low = writes_for(test_prefix(0x00), 1);
+        let high = writes_for(test_prefix(0xFF), 2);
         let merged = SettledWrites::from_absolutes(
             low.cells()
                 .iter()

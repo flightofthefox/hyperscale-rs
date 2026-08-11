@@ -18,7 +18,9 @@ use hyperscale_engine::genesis::{entropy_key, vault_key};
 use hyperscale_engine::{
     PreviewGrants, PreviewOutcome, PreviewReport, ResourceChange, XRD, account_address,
 };
-use hyperscale_types::{BlockHeight, ShardId, TransactionDecision, TransactionStatus, TxHash};
+use hyperscale_types::{
+    Address, BlockHeight, ShardId, TransactionDecision, TransactionStatus, TxHash,
+};
 use hyperscale_vm_effects::package_hash;
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
@@ -615,7 +617,7 @@ pub fn events_land_on_their_emitters_home_shard(c: &mut impl Cluster) {
     assert_eq!(
         sender_events
             .iter()
-            .map(|event| event.emitter.0)
+            .map(|event| event.emitter)
             .collect::<Vec<_>>(),
         vec![from],
         "the payer shard stores its own emission and nothing else"
@@ -623,7 +625,7 @@ pub fn events_land_on_their_emitters_home_shard(c: &mut impl Cluster) {
     assert_eq!(
         recipient_events
             .iter()
-            .map(|event| event.emitter.0)
+            .map(|event| event.emitter)
             .collect::<Vec<_>>(),
         vec![to],
         "the recipient shard stores its own emission and nothing else"
@@ -812,9 +814,9 @@ pub fn randomness_draw_agrees_across_shards<C: Cluster>(c: &mut C) {
 
     // The stamps are read off each shard's own committed state, which
     // trails the settling block by the persistence step.
-    let read = |c: &C, shard: ShardId, owner: [u8; 16]| -> Option<Vec<u8>> {
+    let read = |c: &C, shard: ShardId, owner: Address| -> Option<Vec<u8>> {
         let key = entropy_key(owner);
-        c.substate(shard, key.owner.0, key.local.0)
+        c.substate(shard, key.owner, key.local.0)
     };
     assert!(
         c.run_until(epochs(4), |c| read(c, ShardId::leaf(1, 0), left_owner)
@@ -1091,9 +1093,9 @@ pub fn withdrawals_compose_over_one_vault(c: &mut impl Cluster, count: u8) -> u6
 
 /// The committed balance of a account's native vault, read through the
 /// harness's client-proven snapshot seam.
-fn vault_balance(c: &impl Cluster, shard: ShardId, owner: [u8; 16]) -> u128 {
-    let vault = vault_key(owner, XRD);
-    c.substate(shard, vault.owner.0, vault.local.0)
+fn vault_balance(c: &impl Cluster, shard: ShardId, owner: Address) -> u128 {
+    let vault = vault_key(owner, *XRD);
+    c.substate(shard, vault.owner, vault.local.0)
         .map_or(0, |bytes| {
             let cell: [u8; 16] = bytes.as_slice().try_into().expect("an amount cell");
             u128::from_le_bytes(cell)
@@ -1101,8 +1103,8 @@ fn vault_balance(c: &impl Cluster, shard: ShardId, owner: [u8; 16]) -> u128 {
 }
 
 /// The reported change to `owner`'s native vault.
-fn preview_change(report: &PreviewReport, owner: [u8; 16]) -> ResourceChange {
-    let vault = vault_key(owner, XRD);
+fn preview_change(report: &PreviewReport, owner: Address) -> ResourceChange {
+    let vault = vault_key(owner, *XRD);
     *report
         .changes
         .iter()
@@ -1267,7 +1269,7 @@ pub fn deploy_storm_rides_out(c: &mut impl Cluster) {
 
     let validity = validity_around(c.now());
     let mut submitted: Vec<(TxHash, ShardId)> = Vec::new();
-    let mut cells: Vec<(ShardId, [u8; 16], [u8; 16])> = Vec::new();
+    let mut cells: Vec<(ShardId, Address, [u8; 16])> = Vec::new();
     for (index, (key, publisher)) in (0u16..).zip(publishers.iter()) {
         for nonce in 0..PER_PUBLISHER {
             // Distinct per publisher as well as per nonce, so the two
@@ -1277,7 +1279,7 @@ pub fn deploy_storm_rides_out(c: &mut impl Cluster) {
             let tx = build_publish_tx(key, artifact, validity);
             let shard = shards[usize::from(index)];
             submitted.push((tx.hash(), shard));
-            cells.push((shard, cell.owner.0, cell.local.0));
+            cells.push((shard, cell.owner, cell.local.0));
             c.submit(Arc::new(tx));
         }
     }

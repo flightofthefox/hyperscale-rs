@@ -214,7 +214,7 @@ pub trait VmStatics: Send + Sync {
     /// is what keeps routing identical across replicas: a package is
     /// usable by transactions admitted after its block commits, and a
     /// validator whose cache lagged would refuse what its peers admit.
-    fn absorb_committed_cell(&self, owner: [u8; 16], local: [u8; 16], value: &[u8]) {
+    fn absorb_committed_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) {
         let _ = (owner, local, value);
     }
 }

@@ -21,8 +21,8 @@ use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
 };
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, BlockHeight, NetworkDefinition, ReshapeThresholds, ShardId,
-    StateRoot, Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    Address, BeaconChainConfig, BeaconState, BlockHeight, NetworkDefinition, ReshapeThresholds,
+    ShardId, StateRoot, Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
     WeightedTimestamp, WorkInFlight,
 };
 use tokio::runtime::{Builder, Runtime};
@@ -41,7 +41,7 @@ struct StartArgs<'a> {
     config: &'a ScenarioConfig,
     seed: u64,
     epoch_ms: u64,
-    accounts: Vec<([u8; 16], u128)>,
+    accounts: Vec<(Address, u128)>,
 }
 
 /// The production adaptor: a [`Cluster`] over the real QUIC + `RocksDB` harness.
@@ -70,7 +70,7 @@ impl ProdCluster {
         config: &ScenarioConfig,
         seed: u64,
         epoch_ms: u64,
-        accounts: Vec<([u8; 16], u128)>,
+        accounts: Vec<(Address, u128)>,
     ) -> Self {
         Self::start_full(&StartArgs {
             config,
@@ -126,7 +126,7 @@ impl ProdCluster {
         config: &ScenarioConfig,
         seed: u64,
         epoch_ms: u64,
-        accounts: Vec<([u8; 16], u128)>,
+        accounts: Vec<(Address, u128)>,
     ) -> Self {
         let grow_config = ScenarioConfig {
             split_bytes: 0,

@@ -18,7 +18,9 @@ use hyperscale_jmt::NibblePath;
 use hyperscale_storage::test_helpers::completed_import_progress;
 use hyperscale_storage::{BoundaryStore, WitnessSeed};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
-use hyperscale_types::{BlockHeight, StateRoot, SubstateKey, SubstateLeaf};
+use hyperscale_types::{
+    Address, AddressClass, BlockHeight, LocalKey, StateRoot, SubstateKey, SubstateLeaf,
+};
 use tempfile::TempDir;
 
 /// Raw value bytes per generated leaf.
@@ -34,12 +36,19 @@ const HEIGHT: BlockHeight = BlockHeight::new(1_000);
 /// One deterministic generated leaf. Keys are hashed from the index so
 /// paths spread uniformly, exactly like real leaf keys.
 fn leaf(index: u64) -> SubstateLeaf {
-    let mut seed = [0u8; 32];
-    seed[..8].copy_from_slice(&index.to_be_bytes());
-    let key = *blake3_hash(&seed).as_bytes();
+    let mut seed = [0u8; 8];
+    seed.copy_from_slice(&index.to_be_bytes());
+    let digest = *blake3_hash(&seed).as_bytes();
+    let mut body = [0u8; 31];
+    body.copy_from_slice(&digest[..31]);
+    let mut local = [0u8; 16];
+    local.copy_from_slice(&digest[..16]);
     SubstateLeaf {
-        key: SubstateKey::from_bytes(key),
-        value: seed.repeat(VALUE_BYTES / 32),
+        key: SubstateKey {
+            owner: Address::new(body, AddressClass::Component),
+            local: LocalKey(local),
+        },
+        value: digest.repeat(VALUE_BYTES / 32),
     }
 }
 

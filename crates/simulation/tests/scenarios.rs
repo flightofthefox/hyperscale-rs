@@ -59,8 +59,8 @@ use hyperscale_simulation::ExecutionMode;
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::test_utils::shard_fork_proof_signed_by;
 use hyperscale_types::{
-    BlockHash, BlockHeight, NetworkDefinition, RecoveryCause, Round, ShardForkProof, ShardId,
-    Timeout,
+    Address, BlockHash, BlockHeight, NetworkDefinition, RecoveryCause, Round, ShardForkProof,
+    ShardId, Timeout,
 };
 use support::SimCluster;
 
@@ -103,7 +103,7 @@ fn isolated_validator_still_settles_sim() {
 /// Everything `livelock_resolves_promptly` needs funded: it composes
 /// `split_lifecycle`, so the probe transfer's accounts come along with
 /// the conflicting pair's.
-fn livelock_accounts() -> Vec<([u8; 16], u128)> {
+fn livelock_accounts() -> Vec<(Address, u128)> {
     let mut accounts = genesis_accounts(1, 1);
     accounts.extend(livelock_genesis_accounts());
     accounts

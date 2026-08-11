@@ -4,7 +4,7 @@
 use hyperscale_hbor::Hbor;
 use hyperscale_vm_types::MAX_CELL_VALUE_LEN;
 
-use crate::{Hash, SubstateKey};
+use crate::{Address, Hash, SubstateKey};
 
 /// One live substate as a proven pair: the key — its JMT leaf key by
 /// identity — and the raw value behind it.
@@ -64,14 +64,14 @@ impl SubstateEntry {
     /// seed.
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
-    pub fn test_entry(owner: [u8; 16], local: &[u8], value: Option<Vec<u8>>) -> Self {
-        use hyperscale_vm_types::{Address, LocalKey};
+    pub fn test_entry(owner: Address, local: &[u8], value: Option<Vec<u8>>) -> Self {
+        use hyperscale_vm_types::LocalKey;
         let mut half = [0u8; 16];
         let n = local.len().min(16);
         half[..n].copy_from_slice(&local[..n]);
         Self::new(
             SubstateKey {
-                owner: Address(owner),
+                owner,
                 local: LocalKey(half),
             },
             value,
@@ -86,10 +86,11 @@ mod tests {
     };
 
     use super::*;
+    use crate::test_utils::{test_key, test_prefix};
 
     #[test]
     fn test_substate_entry_hash() {
-        let entry = SubstateEntry::test_entry([1u8; 16], b"key", Some(b"value".to_vec()));
+        let entry = SubstateEntry::test_entry(test_prefix(1), b"key", Some(b"value".to_vec()));
 
         let hash1 = entry.hash();
         let hash2 = entry.hash();
@@ -98,7 +99,7 @@ mod tests {
 
     #[test]
     fn hbor_roundtrip_some_value() {
-        let entry = SubstateEntry::test_entry([7u8; 16], b"sort", Some(vec![9u8; 128]));
+        let entry = SubstateEntry::test_entry(test_prefix(7), b"sort", Some(vec![9u8; 128]));
         let bytes = hbor_to_vec(&entry).unwrap();
         let decoded: SubstateEntry = hbor_from_slice(&bytes).unwrap();
         assert_eq!(decoded, entry);
@@ -106,7 +107,7 @@ mod tests {
 
     #[test]
     fn hbor_roundtrip_none_value() {
-        let entry = SubstateEntry::test_entry([7u8; 16], b"sort", None);
+        let entry = SubstateEntry::test_entry(test_prefix(7), b"sort", None);
         let bytes = hbor_to_vec(&entry).unwrap();
         let decoded: SubstateEntry = hbor_from_slice(&bytes).unwrap();
         assert_eq!(decoded, entry);
@@ -116,7 +117,7 @@ mod tests {
     /// rejects at decode before allocation.
     #[test]
     fn decode_rejects_oversized_value() {
-        let mut buf = vec![0u8; 32]; // the fixed-width key
+        let mut buf = test_key(3).to_bytes().to_vec(); // the fixed-width key
         buf.push(1); // Some
         varint::write(&mut buf, MAX_CELL_VALUE_LEN + 1).unwrap();
         buf.extend(std::iter::repeat_n(0u8, MAX_CELL_VALUE_LEN + 1));

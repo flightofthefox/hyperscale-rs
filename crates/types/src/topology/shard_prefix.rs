@@ -47,10 +47,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use blake3::hash as blake3_hash;
-    use hyperscale_jmt::{Blake3Hasher, Hasher, LeafValue, MemoryStore, NibblePath, Tree};
+    use hyperscale_jmt::{
+        Blake3Hasher, Hasher, KEY_BYTES, Key as JmtKey, LeafValue, MemoryStore, NibblePath, Tree,
+    };
 
     use super::shard_prefix_path;
-    use crate::{Address, Hash, ShardId, ShardTrie, StateRoot};
+    use crate::test_utils::test_prefix;
+    use crate::{Hash, LocalKey, ShardId, ShardTrie, StateRoot, SubstateKey};
 
     type Jmt = Tree<Blake3Hasher, 1>;
 
@@ -84,11 +87,18 @@ mod tests {
     /// A 32-byte key whose top `shard.depth()` bits equal `shard.path()` (so it
     /// routes to `shard` under longest-prefix match), with the remaining bits
     /// pseudo-randomly varied by `i` so keys branch realistically within a shard.
-    fn key_in_shard(shard: ShardId, i: u64) -> [u8; 32] {
+    fn key_in_shard(shard: ShardId, i: u64) -> JmtKey {
         let mut seed = [0u8; 16];
         seed[..8].copy_from_slice(&shard.inner().to_be_bytes());
         seed[8..].copy_from_slice(&i.to_be_bytes());
-        let mut key = *blake3_hash(&seed).as_bytes();
+        let mut key = [0u8; KEY_BYTES];
+        for (chunk, slot) in key.chunks_mut(32).enumerate() {
+            let mut input = seed.to_vec();
+            input.push(u8::try_from(chunk).expect("a key is a few chunks"));
+            let digest = *blake3_hash(&input).as_bytes();
+            let len = slot.len();
+            slot.copy_from_slice(&digest[..len]);
+        }
         let depth = shard.depth();
         if depth > 0 {
             let mut top = u64::from_be_bytes(key[..8].try_into().unwrap());
@@ -104,7 +114,7 @@ mod tests {
     /// a shard prefix = that shard's subtree root.
     fn jmt_root_at(
         root_path: &NibblePath,
-        updates: &BTreeMap<[u8; 32], Option<LeafValue>>,
+        updates: &BTreeMap<JmtKey, Option<LeafValue>>,
     ) -> [u8; 32] {
         let store = MemoryStore::new();
         Jmt::apply_updates_at(&store, None, 1, root_path, updates)
@@ -112,9 +122,9 @@ mod tests {
             .root_hash
     }
 
-    /// Route a raw 32-byte key to its leaf by walking the trie on the key's own
+    /// Route a raw leaf key to its shard by walking the trie on the key's own
     /// top bits (mirrors `ShardTrie::shard_for`, sans the node-id hashing step).
-    fn shard_for_key_bits(trie: &ShardTrie, key: &[u8; 32]) -> ShardId {
+    fn shard_for_key_bits(trie: &ShardTrie, key: &JmtKey) -> ShardId {
         let bits = u64::from_be_bytes(key[..8].try_into().unwrap());
         let mut id = ShardId::ROOT;
         loop {
@@ -133,9 +143,8 @@ mod tests {
     /// the global tree. The whole sharding substrate (cross-shard proofs,
     /// snap-sync anchors, zero-copy resharding) rests on this identity.
     fn assert_identity(trie: &ShardTrie, keys_per_shard: u64) {
-        let mut all: BTreeMap<[u8; 32], Option<LeafValue>> = BTreeMap::new();
-        let mut per_shard: BTreeMap<ShardId, BTreeMap<[u8; 32], Option<LeafValue>>> =
-            BTreeMap::new();
+        let mut all: BTreeMap<JmtKey, Option<LeafValue>> = BTreeMap::new();
+        let mut per_shard: BTreeMap<ShardId, BTreeMap<JmtKey, Option<LeafValue>>> = BTreeMap::new();
 
         for leaf in trie.leaves() {
             for i in 0..keys_per_shard {
@@ -186,15 +195,15 @@ mod tests {
 
         for trie in [ShardTrie::uniform(3), non_uniform] {
             for seed in [0x00u8, 0x1F, 0x5A, 0x80, 0xC3, 0xFF] {
-                let owner = [seed; 16];
-                let leaf = {
-                    let mut leaf = [7u8; 32];
-                    leaf[..16].copy_from_slice(&owner);
-                    leaf
-                };
+                let owner = test_prefix(seed);
+                let leaf = SubstateKey {
+                    owner,
+                    local: LocalKey([7u8; 16]),
+                }
+                .to_bytes();
                 assert_eq!(
                     shard_for_key_bits(&trie, &leaf),
-                    trie.shard_for_prefix(Address(owner)),
+                    trie.shard_for_prefix(owner),
                     "owner {seed:#x}"
                 );
             }
@@ -241,7 +250,7 @@ mod tests {
 
         // All keys under p0 → one-sided at p's split bit; p1 is empty.
         let root_over = |root_path: &NibblePath, n: u64| -> [u8; 32] {
-            let mut updates: BTreeMap<[u8; 32], Option<LeafValue>> = BTreeMap::new();
+            let mut updates: BTreeMap<JmtKey, Option<LeafValue>> = BTreeMap::new();
             for i in 0..n {
                 let key = key_in_shard(p0, i);
                 updates.insert(key, Some(LeafValue::new(*blake3_hash(&key).as_bytes(), 1)));

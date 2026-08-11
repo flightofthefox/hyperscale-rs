@@ -172,7 +172,7 @@ impl Executor {
     /// Panics if the committed stdlib artifact fails validation or
     /// compilation — a build defect surfaced at boot, not in a tick.
     #[must_use]
-    pub fn new(accounts: &[([u8; 16], u128)], mode: ExecutionMode) -> Self {
+    pub fn new(accounts: &[(Address, u128)], mode: ExecutionMode) -> Self {
         Self::with_pools(accounts, &[], mode)
     }
 
@@ -184,7 +184,7 @@ impl Executor {
     /// As [`Self::new`].
     #[must_use]
     pub fn with_pools(
-        accounts: &[([u8; 16], u128)],
+        accounts: &[(Address, u128)],
         pools: &[StakePoolSeat],
         mode: ExecutionMode,
     ) -> Self {
@@ -484,7 +484,7 @@ pub const fn publish_work(artifact: &[u8]) -> u64 {
 fn assemble_published_tx(
     ctx: &TickBatchContext<'_>,
     vm_tx: TxHash,
-    publisher: [u8; 16],
+    publisher: Address,
     artifact: &[u8],
     fee: Option<PayerFee>,
     locality: &Locality,
@@ -500,7 +500,7 @@ fn assemble_published_tx(
     let cached = refusal.as_ref().map_or_else(
         || {
             let mut writes = StateWrites::default();
-            if locality.is_local(Address(publisher)) {
+            if locality.is_local(publisher) {
                 let package = package_hash(&ProtocolHasher, artifact);
                 // Content-addressed, so republishing the same artifact
                 // writes the same bytes to the same cell: idempotent by
@@ -614,7 +614,7 @@ fn assemble_executed_tx(
         // share so every participant derives the same set — which shard
         // keeps a fact is settled once, at projection, by the same rule
         // that settles which shard keeps the event.
-        let witnesses: Vec<([u8; 16], BeaconWitnessEvent)> = events
+        let witnesses: Vec<(Address, BeaconWitnessEvent)> = events
             .iter()
             .filter_map(|event| {
                 witness_from_event(
@@ -623,7 +623,7 @@ fn assemble_executed_tx(
                     inputs.instances,
                     inputs.staking_package,
                 )
-                .map(|witness| (event.emitter.0, witness))
+                .map(|witness| (event.emitter, witness))
             })
             .collect();
         let event_hashes: Vec<Hash> = events.iter().map(EventExt::hash).collect();
@@ -688,12 +688,12 @@ impl Executor {
         };
         // Publishes carry no manifest, so they never reach the kernel;
         // they settle in their own pass below.
-        let publishes: BTreeMap<TxHash, ([u8; 16], Vec<u8>)> = transactions
+        let publishes: BTreeMap<TxHash, (Address, Vec<u8>)> = transactions
             .iter()
             .filter_map(|tx| {
                 let vm = tx.body();
                 let artifact = vm.artifact()?;
-                Some((tx.hash(), (vm.fee_payer.0, artifact.to_vec())))
+                Some((tx.hash(), (vm.fee_payer, artifact.to_vec())))
             })
             .collect();
 

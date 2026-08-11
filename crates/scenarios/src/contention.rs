@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_types::{ShardId, TransactionDecision, TransactionStatus, TxHash};
+use hyperscale_types::{Address, ShardId, TransactionDecision, TransactionStatus, TxHash};
 
 use crate::reshape::split_lifecycle;
 use crate::support::tx::{
@@ -224,7 +224,7 @@ pub fn participant_count_sweep(
 
     let mut latencies = Vec::new();
     for participants in 2..=max_participants {
-        let recipients: Vec<[u8; 16]> = (1..participants)
+        let recipients: Vec<Address> = (1..participants)
             .map(|leaf| accounts[1 + leaf as usize].1)
             .collect();
         let tx = build_fan_out_tx(

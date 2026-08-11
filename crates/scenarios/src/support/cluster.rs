@@ -6,8 +6,8 @@ use std::time::Duration;
 use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_types::{
-    BeaconState, BlockHeight, Event, ShardId, Signer, StateRoot, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, WeightedTimestamp, WorkInFlight,
+    Address, BeaconState, BlockHeight, Event, ShardId, Signer, StateRoot, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, WorkInFlight,
 };
 
 use super::Budget;
@@ -83,7 +83,7 @@ pub trait Cluster {
     ///
     /// An observation seam, not a protocol one: scenarios assert against
     /// committed state, and nothing a transaction carries comes from here.
-    fn substate(&self, shard: ShardId, owner: [u8; 16], local: [u8; 16]) -> Option<Vec<u8>> {
+    fn substate(&self, shard: ShardId, owner: Address, local: [u8; 16]) -> Option<Vec<u8>> {
         let _ = (shard, owner, local);
         None
     }

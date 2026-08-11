@@ -54,7 +54,7 @@ mod tests {
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
-    use crate::SubstateKey;
+    use crate::test_utils::test_key;
 
     #[test]
     fn test_hbor_roundtrip_unavailable() {
@@ -68,7 +68,7 @@ mod tests {
     #[test]
     fn test_hbor_roundtrip_chunk() {
         let leaf = SubstateLeaf {
-            key: SubstateKey::from_bytes([7u8; 32]),
+            key: test_key(7u8),
             value: vec![9u8; 128],
         };
         let response = GetStateRangeResponse {

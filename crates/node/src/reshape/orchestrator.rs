@@ -1880,6 +1880,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
         BeaconWitnessLeafCount, BlockHash, BlockHeight, Hash, LocalTimestamp, NetworkDefinition,
         ReshapeSeat, ShardAnchor, ShardId, Signer, StateRoot, TopologySnapshot, ValidatorId,
@@ -2146,7 +2147,7 @@ mod tests {
     #[test]
     fn a_failed_stage_re_queues_and_re_emits_the_chunk() {
         use hyperscale_storage::test_helpers::completed_import_progress;
-        use hyperscale_types::{SubstateKey, SubstateLeaf};
+        use hyperscale_types::SubstateLeaf;
 
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
@@ -2160,7 +2161,7 @@ mod tests {
         );
         let progress = completed_import_progress(BlockHeight::new(1), 0);
         let leaves = vec![SubstateLeaf {
-            key: SubstateKey::from_bytes([7u8; 32]),
+            key: test_key(7u8),
             value: vec![7],
         }];
         duty.pending_stage.push((progress.clone(), leaves.clone()));

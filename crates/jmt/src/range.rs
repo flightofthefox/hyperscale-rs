@@ -48,7 +48,7 @@ use crate::hasher::{EMPTY_HASH, Hash, Hasher};
 use crate::multiproof::{
     ClaimTermination, MultiProof, ProofClaim, ProofError, check_claim_grid, terminal_group,
 };
-use crate::node::{Key, NibblePath, Node, NodeKey, ValueHash, bits_at};
+use crate::node::{KEY_BITS, KEY_BYTES, Key, NibblePath, Node, NodeKey, ValueHash, bits_at};
 use crate::storage::TreeReader;
 use crate::tree::Tree;
 
@@ -245,7 +245,7 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
 
         // Reconstruct the root, rejecting any non-empty sibling inside
         // the span.
-        let mut prefix = [0u8; 32];
+        let mut prefix = [0u8; KEY_BYTES];
         prefix[..root_path.as_bytes().len()].copy_from_slice(root_path.as_bytes());
         let (computed, consumed) = verify_range_rec::<H, ARITY_BITS>(
             &proof.claims,
@@ -507,7 +507,7 @@ pub fn next_key(key: &Key) -> Option<Key> {
 /// # Panics
 ///
 /// Panics if `index >= 2^split_bits`, `split_bits > 8`, or the split
-/// extends past the 256-bit key space.
+/// extends past the key space.
 #[must_use]
 pub fn subspan(path: &NibblePath, split_bits: u8, index: u64) -> (Key, Key) {
     assert!(split_bits <= 8, "subspan splits at most 8 bits at a time");
@@ -516,10 +516,10 @@ pub fn subspan(path: &NibblePath, split_bits: u8, index: u64) -> (Key, Key) {
         "subspan index {index} out of range for {split_bits} split bits",
     );
     assert!(
-        usize::from(path.len()) + usize::from(split_bits) <= 256,
+        usize::from(path.len()) + usize::from(split_bits) <= usize::from(KEY_BITS),
         "subspan split extends past the key space",
     );
-    let mut low = [0u8; 32];
+    let mut low = [0u8; KEY_BYTES];
     low[..path.as_bytes().len()].copy_from_slice(path.as_bytes());
     set_bits(
         &mut low,
@@ -536,7 +536,7 @@ pub fn subspan(path: &NibblePath, split_bits: u8, index: u64) -> (Key, Key) {
 /// with the low `count` bits of `val`.
 fn set_bits(key: &mut Key, at: u16, count: u8, val: u8) {
     debug_assert!(count <= 8);
-    debug_assert!(usize::from(at) + usize::from(count) <= 256);
+    debug_assert!(usize::from(at) + usize::from(count) <= usize::from(KEY_BITS));
 
     // Overwriting zero bits is a no-op. Guarding here also keeps the shift
     // below from reaching 16 (`16 - off - 0`), which would overflow a u16.
@@ -601,7 +601,7 @@ mod tests {
 
         let mut sorted: Vec<(Key, ValueHash)> = (0..count)
             .map(|i| {
-                let mut key = [0u8; 32];
+                let mut key = [0u8; KEY_BYTES];
                 key[0] = 0xA0 | (i % 16);
                 key[1] = i;
                 (key, v(i.wrapping_mul(7)))
@@ -622,9 +622,9 @@ mod tests {
 
     /// The span covered by the 4-bit prefix 0xA.
     fn prefix_span() -> (Key, Key) {
-        let mut low = [0u8; 32];
+        let mut low = [0u8; KEY_BYTES];
         low[0] = 0xA0;
-        let mut high = [0xFFu8; 32];
+        let mut high = [0xFFu8; KEY_BYTES];
         high[0] = 0xAF;
         (low, high)
     }
@@ -634,8 +634,8 @@ mod tests {
         let entries: Vec<(Key, ValueHash)> = (0u8..50).map(|i| (k(i), v(i))).collect();
         let (store, root, root_hash) = build_store(&entries);
 
-        let start = [0u8; 32];
-        let end = [0xFFu8; 32];
+        let start = [0u8; KEY_BYTES];
+        let end = [0xFFu8; KEY_BYTES];
         let chunk = Jmt::collect_range(&store, &root, &start, &end, 100).unwrap();
         assert_eq!(chunk.leaves.len(), 50);
         assert!(!chunk.more);
@@ -701,7 +701,7 @@ mod tests {
         let (store, root, root_hash) = build_store(&entries);
 
         let cursor = next_key(&k(13)).unwrap();
-        let end = [0xFFu8; 32];
+        let end = [0xFFu8; KEY_BYTES];
         let chunk = Jmt::collect_range(&store, &root, &cursor, &end, 100).unwrap();
         assert_eq!(chunk.leaves.len(), 18);
         let proof = Jmt::prove_range(&store, &root, &cursor, &end, &chunk).unwrap();
@@ -721,8 +721,8 @@ mod tests {
         let entries: Vec<(Key, ValueHash)> = (0u8..10).map(|i| (k(i), v(i))).collect();
         let (store, root, root_hash) = build_store(&entries);
 
-        let start = [0u8; 32];
-        let end = [0xFFu8; 32];
+        let start = [0u8; KEY_BYTES];
+        let end = [0xFFu8; KEY_BYTES];
         let mut chunk = Jmt::collect_range(&store, &root, &start, &end, 100).unwrap();
         chunk.leaves.remove(5);
         // The server proves exactly what it returned — the omitted leaf's
@@ -745,8 +745,8 @@ mod tests {
         let entries: Vec<(Key, ValueHash)> = (0u8..10).map(|i| (k(i), v(i))).collect();
         let (store, root, root_hash) = build_store(&entries);
 
-        let start = [0u8; 32];
-        let end = [0xFFu8; 32];
+        let start = [0u8; KEY_BYTES];
+        let end = [0xFFu8; KEY_BYTES];
         let mut chunk = Jmt::collect_range(&store, &root, &start, &end, 100).unwrap();
         chunk.leaves.pop();
         assert!(!chunk.more);
@@ -768,8 +768,8 @@ mod tests {
         let entries: Vec<(Key, ValueHash)> = (0u8..10).map(|i| (k(i), v(i))).collect();
         let (store, root, root_hash) = build_store(&entries);
 
-        let start = [0u8; 32];
-        let end = [0xFFu8; 32];
+        let start = [0u8; KEY_BYTES];
+        let end = [0xFFu8; KEY_BYTES];
         let mut chunk = Jmt::collect_range(&store, &root, &start, &end, 100).unwrap();
         chunk.leaves.pop();
         chunk.more = true;
@@ -790,8 +790,8 @@ mod tests {
         let entries: Vec<(Key, ValueHash)> = (0u8..10).map(|i| (k(i), v(i))).collect();
         let (store, root, root_hash) = build_store(&entries);
 
-        let start = [0u8; 32];
-        let end = [0xFFu8; 32];
+        let start = [0u8; KEY_BYTES];
+        let end = [0xFFu8; KEY_BYTES];
         let mut chunk = Jmt::collect_range(&store, &root, &start, &end, 100).unwrap();
         let proof = Jmt::prove_range(&store, &root, &start, &end, &chunk).unwrap();
         chunk.leaves[3].1 = v(99);
@@ -812,8 +812,8 @@ mod tests {
         let entries: Vec<(Key, ValueHash)> = (0u8..10).map(|i| (k(i * 2), v(i))).collect();
         let (store, root, root_hash) = build_store(&entries);
 
-        let start = [0u8; 32];
-        let end = [0xFFu8; 32];
+        let start = [0u8; KEY_BYTES];
+        let end = [0xFFu8; KEY_BYTES];
         let mut chunk = Jmt::collect_range(&store, &root, &start, &end, 100).unwrap();
         // Insert a leaf the tree does not hold (odd key inside the range).
         chunk.leaves.insert(3, (k(5), v(55)));
@@ -886,8 +886,8 @@ mod tests {
         let entries: Vec<(Key, ValueHash)> = (0u8..10).map(|i| (k(i), v(i))).collect();
         let (store, root, root_hash) = build_store(&entries);
 
-        let start = [0u8; 32];
-        let end = [0xFFu8; 32];
+        let start = [0u8; KEY_BYTES];
+        let end = [0xFFu8; KEY_BYTES];
         let chunk = RangeChunk {
             leaves: Vec::new(),
             more: false,
@@ -910,8 +910,8 @@ mod tests {
         let entries = vec![(k(1), v(1))];
         let (store, root, root_hash) = build_store(&entries);
 
-        let start = [0u8; 32];
-        let end = [0xFFu8; 32];
+        let start = [0u8; KEY_BYTES];
+        let end = [0xFFu8; KEY_BYTES];
         let chunk = RangeChunk {
             leaves: Vec::new(),
             more: true,
@@ -955,9 +955,9 @@ mod tests {
         let (_store, _root_key, root_hash, prefix, _entries) = build_prefix_store(8);
 
         // A range under prefix 0xB against a tree rooted at 0xA.
-        let mut low = [0u8; 32];
+        let mut low = [0u8; KEY_BYTES];
         low[0] = 0xB0;
-        let mut high = [0xFFu8; 32];
+        let mut high = [0xFFu8; KEY_BYTES];
         high[0] = 0xBF;
         let chunk = RangeChunk {
             leaves: Vec::new(),
@@ -978,8 +978,9 @@ mod tests {
         let (store, root, root_hash) = build_store(&entries);
 
         let start = k(2);
-        let end = [0xFFu8; 32];
-        let chunk = Jmt::collect_range(&store, &root, &[0u8; 32], &[0xFFu8; 32], 100).unwrap();
+        let end = [0xFFu8; KEY_BYTES];
+        let chunk = Jmt::collect_range(&store, &root, &[0u8; KEY_BYTES], &[0xFFu8; KEY_BYTES], 100)
+            .unwrap();
         // First leaf (key 0) precedes the verified range start.
         let proof = Jmt::prove_range(&store, &root, &start, &end, &chunk).unwrap();
         let err = Jmt::verify_range(
@@ -999,15 +1000,21 @@ mod tests {
         let entries: Vec<(Key, ValueHash)> = (0u8..10).map(|i| (k(i * 3), v(i))).collect();
         let (store, root, _root_hash) = build_store(&entries);
 
-        let chunk = Jmt::collect_range(&store, &root, &[0u8; 32], &[0xFFu8; 32], 4).unwrap();
+        let chunk =
+            Jmt::collect_range(&store, &root, &[0u8; KEY_BYTES], &[0xFFu8; KEY_BYTES], 4).unwrap();
         assert_eq!(chunk.leaves.len(), 4);
         assert!(chunk.more);
         let keys: Vec<Key> = chunk.leaves.iter().map(|(key, _)| *key).collect();
         assert_eq!(keys, vec![k(0), k(3), k(6), k(9)]);
 
-        let resumed =
-            Jmt::collect_range(&store, &root, &next_key(&k(9)).unwrap(), &[0xFFu8; 32], 100)
-                .unwrap();
+        let resumed = Jmt::collect_range(
+            &store,
+            &root,
+            &next_key(&k(9)).unwrap(),
+            &[0xFFu8; KEY_BYTES],
+            100,
+        )
+        .unwrap();
         assert_eq!(resumed.leaves.len(), 6);
         assert!(!resumed.more);
         assert_eq!(resumed.leaves.first().unwrap().0, k(12));
@@ -1058,7 +1065,8 @@ mod tests {
     fn collect_range_missing_root_errors() {
         let store = MemoryStore::new();
         let root = NodeKey::root(1);
-        let err = Jmt::collect_range(&store, &root, &[0u8; 32], &[0xFFu8; 32], 10).unwrap_err();
+        let err = Jmt::collect_range(&store, &root, &[0u8; KEY_BYTES], &[0xFFu8; KEY_BYTES], 10)
+            .unwrap_err();
         assert!(matches!(err, ProofError::RootMissing));
     }
 
@@ -1075,8 +1083,8 @@ mod tests {
         store.apply(&res);
         let root = store.get_root_key(1).unwrap();
 
-        let start = [0u8; 32];
-        let end = [0xFFu8; 32];
+        let start = [0u8; KEY_BYTES];
+        let end = [0xFFu8; KEY_BYTES];
         let chunk = Jmt4::collect_range(&store, &root, &start, &end, 100).unwrap();
         assert_eq!(chunk.leaves.len(), 16);
         let proof = Jmt4::prove_range(&store, &root, &start, &end, &chunk).unwrap();

@@ -79,7 +79,7 @@ fn fallbacks(cluster: &SimCluster, shard: ShardId) -> Vec<(u64, u64)> {
 /// where an account lands is a property of its key, and leaving that to
 /// chance would let the load stop crossing without the test noticing —
 /// which is the whole load it is meant to apply.
-fn cast() -> Vec<(Ed25519PrivateKey, [u8; 16])> {
+fn cast() -> Vec<(Ed25519PrivateKey, Address)> {
     let (left, right) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
     let mut taken = Vec::new();
     (0..ACCOUNTS)
@@ -115,8 +115,8 @@ fn cross_shard_load_costs_no_view_changes() {
         let from = (nonce % u32::from(ACCOUNTS)) as usize;
         let to = (from + 1) % cast.len();
         assert_ne!(
-            trie.shard_for_prefix(Address(cast[from].1)),
-            trie.shard_for_prefix(Address(cast[to].1)),
+            trie.shard_for_prefix(cast[from].1),
+            trie.shard_for_prefix(cast[to].1),
             "every leg of the load has to cross, or the test applies no load",
         );
         let transfer = build_transfer_tx(

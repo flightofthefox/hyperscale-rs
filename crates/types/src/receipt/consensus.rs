@@ -104,7 +104,7 @@ pub fn absorb_committed_cells<'a>(receipts: impl IntoIterator<Item = &'a Consens
         };
         for (key, change) in &writes.cells {
             if let Some(value) = change {
-                statics.absorb_committed_cell(key.owner.0, key.local.0, value);
+                statics.absorb_committed_cell(key.owner.to_bytes(), key.local.0, value);
             }
         }
     }
@@ -228,6 +228,7 @@ mod tests {
     use hyperscale_vm_types::Address;
 
     use super::*;
+    use crate::AddressClass;
 
     fn sample_succeeded() -> ConsensusReceipt {
         ConsensusReceipt::Succeeded {
@@ -235,7 +236,7 @@ mod tests {
             writes: StateWrites::default(),
             beacon_witness_events: Vec::new(),
             events: vec![Event {
-                emitter: Address([7; 16]),
+                emitter: Address::new([7; 31], AddressClass::Component),
                 event_type: 1,
                 payload: vec![4, 5, 6],
             }],

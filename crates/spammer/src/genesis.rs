@@ -5,6 +5,7 @@
 use std::fmt::Write;
 
 use hex::encode as hex_encode;
+use hyperscale_types::Address;
 
 use crate::accounts::{AccountPool, AccountPoolError};
 
@@ -41,7 +42,7 @@ pub fn generate_genesis_toml(
 ///
 /// Panics if `writeln!` to a `String` fails, which it cannot.
 #[must_use]
-pub fn format_balances_toml(balances: &[([u8; 16], u128)]) -> String {
+pub fn format_balances_toml(balances: &[(Address, u128)]) -> String {
     let mut output = String::new();
 
     writeln!(output, "# Generated genesis balances for spammer accounts").unwrap();
@@ -55,7 +56,7 @@ pub fn format_balances_toml(balances: &[([u8; 16], u128)]) -> String {
 
     for (address, balance) in balances {
         writeln!(output, "[[genesis.accounts]]").unwrap();
-        writeln!(output, "address = \"{}\"", hex_encode(address)).unwrap();
+        writeln!(output, "address = \"{}\"", hex_encode(address.to_bytes())).unwrap();
         writeln!(output, "balance = \"{balance}\"").unwrap();
         writeln!(output).unwrap();
     }

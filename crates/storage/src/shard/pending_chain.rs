@@ -1078,7 +1078,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::PoisonError;
 
-    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_types::test_utils::{test_prefix, test_transaction};
     use hyperscale_types::{
         Address, AggregateSignature, Block, CertifiedBlock, CertifiedBlockHeader,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
@@ -1261,18 +1261,18 @@ mod tests {
         }
     }
 
-    fn cell(owner: [u8; 16], local: [u8; 16]) -> SubstateKey {
+    fn cell(owner: Address, local: [u8; 16]) -> SubstateKey {
         SubstateKey {
-            owner: Address(owner),
+            owner,
             local: LocalKey(local),
         }
     }
 
-    fn make_writes(owner: [u8; 16], local: [u8; 16], value: Vec<u8>) -> StateWrites {
+    fn make_writes(owner: Address, local: [u8; 16], value: Vec<u8>) -> StateWrites {
         let mut writes = StateWrites::default();
         writes.cells.insert(
             SubstateKey {
-                owner: Address(owner),
+                owner,
                 local: LocalKey(local),
             },
             Some(value),
@@ -1361,7 +1361,7 @@ mod tests {
         let h1 = bh(b"h1");
         let h2 = bh(b"h2");
 
-        let owner = [7u8; 16];
+        let owner = test_prefix(7);
 
         chain.insert(
             h1,
@@ -1392,7 +1392,7 @@ mod tests {
         let h1 = bh(b"h1");
         let orphan = bh(b"orphan");
 
-        let owner = [7u8; 16];
+        let owner = test_prefix(7);
 
         chain.insert(
             h1,
@@ -1486,7 +1486,7 @@ mod tests {
     fn view_at_committed_tip_with_no_commits_returns_base_only() {
         let chain = empty_chain();
         let view = chain.view_at_committed_tip();
-        assert_eq!(view.substate(cell([9; 16], [1; 16])), None);
+        assert_eq!(view.substate(cell(test_prefix(9), [1; 16])), None);
     }
 
     // ── chain reader accessors ────────────────────────────────────────

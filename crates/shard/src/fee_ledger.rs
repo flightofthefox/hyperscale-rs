@@ -93,12 +93,14 @@ impl FeeReservationLedger {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::{make_finalization, stub_transaction};
-    use hyperscale_types::{BlockHeight, TimestampRange, TransactionDecision, Verified};
+    use hyperscale_types::{
+        AddressClass, BlockHeight, TimestampRange, TransactionDecision, Verified,
+    };
 
     use super::*;
 
-    const PAYER: [u8; 16] = [0xAA; 16];
-    const PAYER_ADDR: Address = Address(PAYER);
+    const PAYER: Address = Address::new([0xAA; 31], AddressClass::Component);
+    const PAYER_ADDR: Address = PAYER;
 
     fn transaction(max_fee: u128, end_ms: u64) -> Arc<Verifiable<Transaction>> {
         let validity = TimestampRange::new(
@@ -116,7 +118,10 @@ mod tests {
         let tx = transaction(1_000, 60_000);
         ledger.register_committed(std::slice::from_ref(&tx), |_| true);
         assert_eq!(ledger.held_for(PAYER_ADDR), 1_000);
-        assert_eq!(ledger.held_for(Address([0xBB; 16])), 0);
+        assert_eq!(
+            ledger.held_for(Address::new([0xBB; 31], AddressClass::Component)),
+            0
+        );
 
         let tick = Arc::new(Verifiable::from(make_finalization(
             BlockHeight::new(1),

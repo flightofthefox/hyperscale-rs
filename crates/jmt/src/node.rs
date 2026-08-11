@@ -18,9 +18,16 @@
 
 use crate::hasher::{EMPTY_HASH, Hash, Hasher};
 
-/// Fixed 32-byte key. Callers hash variable-length application keys to
-/// 32 bytes before calling into the tree.
-pub type Key = [u8; 32];
+/// The width of a tree key in bytes.
+pub const KEY_BYTES: usize = 48;
+
+/// The bit width of a tree key.
+#[allow(clippy::cast_possible_truncation)] // a key is 48 bytes; 384 fits a u16
+pub const KEY_BITS: u16 = KEY_BYTES as u16 * 8;
+
+/// Fixed-width key. Callers project variable-length application keys to
+/// exactly this width before calling into the tree.
+pub type Key = [u8; KEY_BYTES];
 
 /// Pre-computed hash of a stored value. The tree stores only the hash;
 /// the value itself lives in application storage alongside.
@@ -30,7 +37,7 @@ pub type ValueHash = Hash;
 /// starting at bit offset `depth_bits` from the MSB.
 pub(crate) fn bits_at(key: &Key, depth_bits: u16, count: u8) -> u8 {
     debug_assert!(count <= 8);
-    debug_assert!(depth_bits as usize + count as usize <= 256);
+    debug_assert!(depth_bits as usize + count as usize <= KEY_BITS as usize);
 
     let byte = (depth_bits / 8) as usize;
     let off = (depth_bits % 8) as usize;
@@ -42,10 +49,10 @@ pub(crate) fn bits_at(key: &Key, depth_bits: u16, count: u8) -> u8 {
     u8::try_from((combined >> shift) & mask).unwrap_or(u8::MAX)
 }
 
-/// Maximum tree depth in bits. A 32-byte key has 256 bits; for any
+/// Maximum tree depth in bits: the key's own bit width. For any
 /// supported arity (1, 2, or 4 bits per level) the depth is bounded by
-/// `256 / ARITY_BITS`.
-pub const MAX_DEPTH_BITS: u16 = 256;
+/// `KEY_BITS / ARITY_BITS`.
+pub const MAX_DEPTH_BITS: u16 = KEY_BITS;
 
 // ============================================================
 // NibblePath: compact bit-path representation
@@ -516,7 +523,7 @@ mod tests {
 
     #[test]
     fn from_key_prefix_truncates_and_masks() {
-        let key = [0xFFu8; 32];
+        let key = [0xFFu8; KEY_BYTES];
         let p = NibblePath::from_key_prefix(&key, 12);
         assert_eq!(p.len(), 12);
         // First 8 bits should be all-1s.

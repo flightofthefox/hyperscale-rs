@@ -864,6 +864,7 @@ impl TreeReader for NeverStore {
 mod tests {
     use super::*;
     use crate::hasher::Blake3Hasher;
+    use crate::node::KEY_BYTES;
     use crate::storage::MemoryStore;
     use crate::test_utils::{k, v, vl};
 
@@ -1193,7 +1194,7 @@ mod tests {
         let mut store = MemoryStore::new();
         let mut updates = BTreeMap::new();
         for i in 0u8..64 {
-            let mut key = [0u8; 32];
+            let mut key = [0u8; KEY_BYTES];
             key[0] = i;
             key[31] = i.wrapping_mul(7);
             updates.insert(key, Some(LeafValue::new([i; 32], 1)));
@@ -1257,8 +1258,8 @@ mod tests {
         // chain of single-child internals in binary. Verify reads still
         // work through the chain.
         let mut store = MemoryStore::new();
-        let mut k1 = [0u8; 32];
-        let mut k2 = [0u8; 32];
+        let mut k1 = [0u8; KEY_BYTES];
+        let mut k2 = [0u8; KEY_BYTES];
         for i in 0..20 {
             k1[i] = 0xAB;
             k2[i] = 0xAB;

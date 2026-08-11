@@ -99,16 +99,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_jmt::{
-        Blake3Hasher, Hasher, Key, LeafValue, MemoryStore, TreeReader, ValueHash,
+        Blake3Hasher, Hasher, KEY_BYTES, Key, LeafValue, MemoryStore, TreeReader, ValueHash,
     };
     use hyperscale_types::Hash;
 
     use super::*;
     use crate::tree::{Jmt, carry_noop_root, noop_jmt_snapshot, resolve_materialized_root};
 
-    /// A 32-byte key with `b` as its leading byte.
+    /// A tree key with `b` as its leading byte.
     fn k(b: u8) -> Key {
-        let mut key = [0u8; 32];
+        let mut key = [0u8; KEY_BYTES];
         key[0] = b;
         key
     }

@@ -309,9 +309,10 @@ mod tests {
     use hyperscale_storage::{BoundaryStore, PendingChain, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::{GetStateRangeRequest, GetWitnessHistoryRequest};
+    use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, ShardAnchor, SubstateKey,
-        SubstateLeaf, TopologySnapshot, ValidatorId, ValidatorSet,
+        GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, ShardAnchor, SubstateLeaf,
+        TopologySnapshot, ValidatorId, ValidatorSet,
     };
 
     use super::*;
@@ -527,7 +528,7 @@ mod tests {
         // chunk behind; its record binds neither this anchor's root nor
         // the fetch geometry.
         let poisoned = SubstateLeaf {
-            key: SubstateKey::from_bytes([0x42; 32]),
+            key: test_key(0x42),
             value: vec![0xEE; 8],
         };
         fresh

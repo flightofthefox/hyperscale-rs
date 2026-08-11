@@ -9,9 +9,9 @@ use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{CryptoScheme, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, Ed25519PrivateKey, MAX_VALIDITY_RANGE, NetworkDefinition,
-    NetworkId, ReshapeThresholds, ShardId, SharedCertificates, TimestampRange, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
+    Address, BeaconChainConfig, BlockHeight, Ed25519PrivateKey, MAX_VALIDITY_RANGE,
+    NetworkDefinition, NetworkId, ReshapeThresholds, ShardId, SharedCertificates, TimestampRange,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
 };
 
 use crate::event::{HostRole, ObserverSeat, ShardPath, TraceEvent};
@@ -23,7 +23,7 @@ fn signer_from_seed(seed: u8) -> Ed25519PrivateKey {
     Ed25519PrivateKey::from_bytes(&[seed; 32]).expect("32 bytes is a valid Ed25519 key")
 }
 
-fn account_from_seed(seed: u8) -> [u8; 16] {
+fn account_from_seed(seed: u8) -> Address {
     account_address(&signer_from_seed(seed).public_key().0)
 }
 
@@ -464,7 +464,7 @@ impl Session {
         )
     }
 
-    /// Submit an XRD transfer between two funded accounts, returning its hash.
+    /// Submit an *XRD transfer between two funded accounts, returning its hash.
     ///
     /// The payer rotates with the nonce, so a caller driving a steady rate
     /// spreads load across accounts instead of serializing on one. The payee

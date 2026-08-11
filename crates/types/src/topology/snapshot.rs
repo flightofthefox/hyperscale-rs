@@ -1628,10 +1628,10 @@ mod tests {
         topology_snapshot: &TopologySnapshot,
         shard: ShardId,
         count: usize,
-    ) -> Vec<[u8; 16]> {
-        let prefixes: Vec<[u8; 16]> = (0..=u8::MAX)
+    ) -> Vec<Address> {
+        let prefixes: Vec<Address> = (0..=u8::MAX)
             .map(test_prefix)
-            .filter(|p| topology_snapshot.shard_for_prefix(Address(*p)) == shard)
+            .filter(|p| topology_snapshot.shard_for_prefix(*p) == shard)
             .take(count)
             .collect();
         assert!(

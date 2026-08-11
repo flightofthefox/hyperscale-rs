@@ -75,8 +75,8 @@ use hyperscale_storage_rocksdb::{
     RocksDbShardStorage,
 };
 use hyperscale_types::{
-    BeaconChainConfig, ConsensusPublicKey, GenesisValidators, NetworkDefinition, ShardId, Signer,
-    ValidatorId, ValidatorInfo, ValidatorSet, shard_prefix_path,
+    Address, BeaconChainConfig, ConsensusPublicKey, GenesisValidators, NetworkDefinition, ShardId,
+    Signer, ValidatorId, ValidatorInfo, ValidatorSet, shard_prefix_path,
 };
 use igd_next::aio::tokio::search_gateway;
 use igd_next::{PortMappingProtocol, SearchOptions};
@@ -751,8 +751,10 @@ fn build_engine_genesis_config(config: &GenesisConfig) -> Result<EngineGenesisCo
     for entry in &config.accounts {
         let bytes = hex_decode(&entry.address)
             .map_err(|e| anyhow::anyhow!("Invalid address '{}': {e}", entry.address))?;
-        let address = <[u8; 16]>::try_from(bytes.as_slice())
-            .map_err(|_| anyhow::anyhow!("Address '{}' is not 16 bytes", entry.address))?;
+        let raw = <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| anyhow::anyhow!("Address '{}' is not 32 bytes", entry.address))?;
+        let address = Address::from_bytes(raw)
+            .map_err(|e| anyhow::anyhow!("Address '{}': {e}", entry.address))?;
         let balance = entry
             .balance
             .parse::<u128>()

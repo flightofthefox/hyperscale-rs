@@ -194,6 +194,12 @@ fn check_expr(expr: &Expr, depth: usize) -> Result<(), VmStaticsError> {
             check_expr(first, deeper)?;
             check_expr(second, deeper)
         }
+        Expr::SelfResource { material } => {
+            for part in material {
+                check_expr(part, deeper)?;
+            }
+            Ok(())
+        }
         Expr::ChildKey {
             owner, material, ..
         } => {
@@ -214,7 +220,8 @@ mod tests {
         VAULT, account_metadata, amm_metadata, book_metadata, splitter_metadata,
     };
     use hyperscale_vm_effects::{
-        Accessibility, Address, CallSite, LocalKey, ParamType, RoleId, SubstateKey, Value,
+        Accessibility, Address, AddressClass, CallSite, LocalKey, ParamType, RoleId, SubstateKey,
+        Value,
     };
 
     use super::*;
@@ -329,14 +336,14 @@ mod tests {
                     Value::U64(1),
                     Value::List(vec![Value::Bytes(vec![7, 8, 9])]),
                     Value::Key(SubstateKey {
-                        owner: Address([3; 16]),
+                        owner: Address::new([3; 31], AddressClass::Component),
                         local: LocalKey([4; 16]),
                     }),
                     Value::Bucket {
-                        resource: Address([5; 16]),
+                        resource: Address::new([5; 31], AddressClass::Component),
                     },
                     Value::U128(u128::MAX),
-                    Value::Address(Address([6; 16])),
+                    Value::Address(Address::new([6; 31], AddressClass::Component)),
                 ])),
             ],
             effects: vec![

@@ -250,7 +250,7 @@ impl Executor {
             // Derived rather than read off `fee_vault`, which panics
             // on an envelope derivation refuses — the exact envelope a
             // preview exists to give an answer about.
-            vault: vault_key(vm.fee_payer.0, XRD),
+            vault: vault_key(vm.fee_payer, *XRD),
             max_fee: vm.max_fee,
             floor: vm.abort_floor(),
             // A preview is one envelope against one snapshot: no tick can

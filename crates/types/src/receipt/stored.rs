@@ -47,11 +47,11 @@ mod tests {
     use hyperscale_vm_types::Address;
 
     use super::*;
-    use crate::{Event, FeeSummary, GlobalReceiptHash, Hash, StateWrites};
+    use crate::{AddressClass, Event, FeeSummary, GlobalReceiptHash, Hash, StateWrites};
 
     fn make_event(seed: u8) -> Event {
         Event {
-            emitter: Address([seed; 16]),
+            emitter: Address::new([seed; 31], AddressClass::Component),
             event_type: u32::from(seed),
             payload: vec![seed, seed + 1],
         }

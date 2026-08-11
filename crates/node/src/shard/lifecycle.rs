@@ -21,7 +21,7 @@ use hyperscale_engine::{GenesisConfig, genesis_writes};
 use hyperscale_network::Network;
 use hyperscale_storage::{GenesisCommit, RecoveredState, ShardStorage};
 use hyperscale_types::{
-    Address, Block, CertifiedBlock, ChainOrigin, ShardId, StateRoot, ValidatorId, Verified,
+    Block, CertifiedBlock, ChainOrigin, ShardId, StateRoot, ValidatorId, Verified,
 };
 
 use crate::host::{NodeHost, ShardGenesis};
@@ -134,7 +134,7 @@ where
         let mut config = config.clone();
         config
             .accounts
-            .retain(|(address, _)| topology_snapshot.shard_for_prefix(Address(*address)) == shard);
+            .retain(|(address, _)| topology_snapshot.shard_for_prefix(*address) == shard);
         let merged = genesis_writes(&config.accounts, &config.pools);
         // The stdlib package is replicated to every shard's substate store
         // for read availability, but the prefix-rooted JMT must hold only

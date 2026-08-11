@@ -503,7 +503,8 @@ mod tests {
     use std::sync::Mutex;
 
     use hyperscale_types::{
-        Address, Hash, LocalKey, MerkleInclusionProof, Movement, ShardId, StateRoot, encode_amount,
+        Address, AddressClass, Hash, LocalKey, MerkleInclusionProof, Movement, ShardId, StateRoot,
+        encode_amount,
     };
 
     use super::*;
@@ -604,7 +605,7 @@ mod tests {
 
     fn key(byte: u8) -> SubstateKey {
         SubstateKey {
-            owner: Address([byte; 16]),
+            owner: Address::new([byte; 31], AddressClass::Component),
             local: LocalKey([byte; 16]),
         }
     }

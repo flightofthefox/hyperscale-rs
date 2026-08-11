@@ -12,7 +12,8 @@ use std::sync::Arc;
 use hyperscale_engine::XRD;
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, Epoch, ShardId, TransactionDecision, TransactionStatus, TxHash,
+    Address, BlockHeight, Ed25519PrivateKey, Epoch, ShardId, TransactionDecision,
+    TransactionStatus, TxHash,
 };
 
 use crate::reshape::split_lifecycle;
@@ -615,9 +616,9 @@ pub fn split_surviving_counterpart_releases_its_reservation(c: &mut impl Faultab
 }
 
 /// The committed native-vault balance `owner` holds on `shard`.
-fn vault_balance<C: Cluster>(c: &C, shard: ShardId, owner: [u8; 16]) -> u128 {
-    let vault = vault_key(owner, XRD);
-    c.substate(shard, vault.owner.0, vault.local.0)
+fn vault_balance<C: Cluster>(c: &C, shard: ShardId, owner: Address) -> u128 {
+    let vault = vault_key(owner, *XRD);
+    c.substate(shard, vault.owner, vault.local.0)
         .map_or(0, |bytes| {
             let cell: [u8; 16] = bytes.as_slice().try_into().expect("an amount cell");
             u128::from_le_bytes(cell)
@@ -824,17 +825,17 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
         await_serves(c, survivor, epochs(4))
             && await_serves(c, merge_left, epochs(4))
             && await_serves(c, merge_right, epochs(4))
-            && await_serves(c, ShardId::leaf(2, 1), epochs(4)),
+            && await_serves(c, ShardId::leaf(2, 3), epochs(4)),
         "the grown four-shard topology must seat every quarter",
     );
 
     let mut probes: Vec<TxHash> = Vec::new();
     let half = setup.straddlers.len() / 2;
 
-    // Settling ticks: submitted while `leaf(2, 2)` still commits real blocks, so
+    // Settling ticks: submitted while `leaf(2, 0)` still commits real blocks, so
     // their cross-shard 2PC can finalize at or below its terminal block and land
     // in the attested settled set. Submitted before the keeper pairing arms the
-    // gate, then awaited to finalize on `leaf(2, 2)` so settlement can't lose the
+    // gate, then awaited to finalize on `leaf(2, 0)` so settlement can't lose the
     // race to the cut — a settler only needs to finalize before the terminal.
     let settling: Vec<TxHash> = setup
         .straddlers
@@ -858,7 +859,7 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
         "the light merging pair must pair a keeper quorum within budget",
     );
 
-    // Straddling ticks: submitted once the merge has paired and `leaf(2, 2)` is
+    // Straddling ticks: submitted once the merge has paired and `leaf(2, 0)` is
     // coasting to its terminal — the survivor still provisions to it, but its
     // coast blocks settle nothing, leaving them in flight when it terminates.
     for (key, from, to) in setup.straddlers.iter().skip(half) {
@@ -944,8 +945,8 @@ pub const STRADDLER_PAYMENT: u128 = 100;
 pub fn submit_straddler<C: Cluster>(
     c: &mut C,
     key: &Ed25519PrivateKey,
-    from: [u8; 16],
-    to: [u8; 16],
+    from: Address,
+    to: Address,
 ) -> TxHash {
     submit_straddler_reserving(c, key, from, to).0
 }
@@ -959,8 +960,8 @@ pub fn submit_straddler<C: Cluster>(
 fn submit_straddler_reserving<C: Cluster>(
     c: &mut C,
     key: &Ed25519PrivateKey,
-    from: [u8; 16],
-    to: [u8; 16],
+    from: Address,
+    to: Address,
 ) -> (TxHash, u64) {
     let tx = build_transfer_tx(key, from, to, STRADDLER_PAYMENT, validity_around(c.now()));
     let (hash, work) = (tx.hash(), tx.work());

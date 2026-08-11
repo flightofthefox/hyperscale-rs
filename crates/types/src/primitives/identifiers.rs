@@ -6,6 +6,7 @@ use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 use hyperscale_crypto::ConsensusPublicKey;
 use hyperscale_hbor::Hbor;
+use hyperscale_vm_types::Address;
 
 /// Validator identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Hbor)]
@@ -515,12 +516,12 @@ impl Display for StakePoolId {
 /// only the contract creates memberships, so they never drift again.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Hbor)]
 pub struct StakePoolSeat {
-    /// The pool instance's owner prefix.
-    pub address: [u8; 16],
+    /// The pool instance's address.
+    pub address: Address,
     /// The identifier the beacon folds this pool's facts under.
     pub id: StakePoolId,
-    /// The account whose signature the pool's operator methods admit.
-    pub operator: [u8; 16],
+    /// The principal whose signature the pool's operator methods admit.
+    pub operator: Address,
     /// Validators this pool already operates at genesis, with the
     /// consensus key each was registered under. Empty for a pool whose
     /// members will all arrive through its own contract.
