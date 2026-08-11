@@ -29,8 +29,8 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
     BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock, Hash, Inventory,
-    LocalReceiptRoot, ProvisionsRoot, RehydrateError, StoredReceipt, TransactionRoot, Verifiable,
-    Verified,
+    LocalReceiptRoot, ProvisionsRoot, RehydrateError, StoredReceipt, TerminalVerdictRoot,
+    TransactionRoot, Verifiable, Verified,
 };
 
 use crate::event::classify_fetch_error;
@@ -324,7 +324,10 @@ where
 /// tick store, provision store). A repeat from the same cache would
 /// reject identically; force-full bypasses elision on the next attempt.
 /// Header / QC identity mismatches (`height_mismatch`, `qc_hash_mismatch`,
-/// `qc_height_mismatch`) inspect non-elidable fields and are excluded.
+/// `qc_height_mismatch`) inspect non-elidable fields and are excluded, as
+/// is `terminal_verdict_root_mismatch` — the records ride inline whatever
+/// inventory the requester offers, so refetching without elision would ask
+/// the same peer for the same bytes.
 fn cache_sensitive_validation_failure(reason: &str) -> bool {
     matches!(
         reason,
@@ -345,6 +348,15 @@ fn cache_sensitive_validation_failure(reason: &str) -> bool {
 /// Provisions only ride on `Block::Live`, so `provision_root` is checked
 /// only when the response carried provision bodies.
 ///
+/// The terminal-verdict root is checked whether or not the block carries
+/// records, because an empty record list has a root of its own rather
+/// than no root: a header claiming records the body does not carry is as
+/// much a mismatch as the reverse. The records are what a verdict against
+/// a departed counterpart is composed on, and they are the one body list
+/// no hash in the manifest binds — they ride inline rather than by
+/// reference — so this is where a serving peer's copy is held to the
+/// header the committee actually signed.
+///
 /// On `Err`, the returned `&'static str` is suitable for both the
 /// metrics label and the warn message.
 fn validate_synced_block(
@@ -363,6 +375,12 @@ fn validate_synced_block(
     }
 
     let header = certified.block().header();
+
+    if Verified::<TerminalVerdictRoot>::compute(certified.block().terminal_verdicts()).into_inner()
+        != header.terminal_verdict_root()
+    {
+        return Err("terminal_verdict_root_mismatch");
+    }
 
     if !certified.block().transactions().is_empty()
         && Verified::<TransactionRoot>::compute(certified.block().transactions()).into_inner()
@@ -427,8 +445,9 @@ mod tests {
         AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts, CertificateRoot,
         ChainOrigin, ConsensusReceipt, ExecutionCertificate, ExecutionOutcome, Finalization,
         GlobalReceiptHash, GlobalReceiptRoot, LocalReceiptRoot, ProposerTimestamp,
-        QuorumCertificate, Round, ShardId, SignerBitfield, TickHalf, TickId, TransactionRoot,
-        TxHash, TxOutcome, Verifiable, WeightedTimestamp, WitnessSources,
+        QuorumCertificate, Round, ShardId, SignerBitfield, TerminalVerdict, TickHalf, TickId,
+        TransactionRoot, TxHash, TxOutcome, UnsettledTx, Verifiable, WeightedTimestamp,
+        WitnessSources,
     };
 
     use super::*;
@@ -630,6 +649,86 @@ mod tests {
         );
     }
 
+    /// [`header`] with `terminal_verdict_root` overridden.
+    fn header_committing(root: TerminalVerdictRoot) -> BlockHeader {
+        BlockHeader::new(BlockHeaderParts {
+            height: HEIGHT,
+            parent_block_hash: BlockHash::ZERO,
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            timestamp: ProposerTimestamp::from_millis(1_000),
+            provision_tx_roots: std::collections::BTreeMap::new(),
+            terminal_verdict_root: root,
+            ..Default::default()
+        })
+    }
+
+    fn boundary_record() -> TerminalVerdict {
+        TerminalVerdict::new(
+            ShardId::leaf(1, 0),
+            WeightedTimestamp::from_millis(2_000),
+            [UnsettledTx {
+                tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
+                deadline: WeightedTimestamp::from_millis(1_500),
+                declared_work: 7,
+            }],
+        )
+    }
+
+    /// A boundary record licenses abandoning a transaction and carries the
+    /// terms of the abort, and it is the one body list a manifest holds by
+    /// value rather than by hash. So a serving peer that attaches records
+    /// to a header committing none is refused here — the vote path that
+    /// would otherwise catch it never runs on a synced block.
+    #[test]
+    fn validate_rejects_terminal_verdicts_the_header_does_not_commit() {
+        let block = Block::Live {
+            header: header(),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(Vec::new()),
+            provisions: Arc::new(Vec::new()),
+            terminal_verdicts: Arc::new(vec![boundary_record()]),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let qc = qc_for(&block);
+        let certified = CertifiedBlock::new_unchecked(block, qc);
+        assert_eq!(
+            validate_synced_block(HEIGHT, &certified).unwrap_err(),
+            "terminal_verdict_root_mismatch"
+        );
+    }
+
+    /// And the reverse. A hop that dropped the records would hand back a
+    /// block that cannot answer for itself, so an empty list against a
+    /// header committing records is a mismatch rather than a lighter
+    /// answer — which is why the check runs whatever the body carries.
+    #[test]
+    fn validate_binds_terminal_verdicts_in_both_directions() {
+        let records = vec![boundary_record()];
+        let root = Verified::<TerminalVerdictRoot>::compute(&records).into_inner();
+        let live = |terminal_verdicts: Vec<TerminalVerdict>| Block::Live {
+            header: header_committing(root),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(Vec::new()),
+            provisions: Arc::new(Vec::new()),
+            terminal_verdicts: Arc::new(terminal_verdicts),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+
+        let dropped = live(Vec::new());
+        let qc = qc_for(&dropped);
+        assert_eq!(
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(dropped, qc)).unwrap_err(),
+            "terminal_verdict_root_mismatch"
+        );
+
+        let carried = live(records);
+        let qc = qc_for(&carried);
+        assert!(
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(carried, qc)).is_ok(),
+            "the records the header commits are the ones it accepts"
+        );
+    }
+
     #[test]
     fn validate_rejects_transaction_root_mismatch() {
         let tx = Arc::new(Verifiable::from(test_transaction(1)));
@@ -790,7 +889,8 @@ mod tests {
         // response fails `validate_synced_block`. Each cache-sensitive
         // reason inspects bytes that ride inside elidable bodies
         // (transactions, finalizations, provisions). Each non-sensitive
-        // reason inspects non-elidable header / QC identity fields. If a
+        // reason inspects something no inventory can elide — a header / QC
+        // identity field, or a body list that always rides inline. If a
         // new failure reason is added to `validate_synced_block`, decide
         // which bucket it belongs in and add it here.
         for reason in [
@@ -805,7 +905,12 @@ mod tests {
                 "{reason} should be classified as cache-sensitive"
             );
         }
-        for reason in ["height_mismatch", "qc_hash_mismatch", "qc_height_mismatch"] {
+        for reason in [
+            "height_mismatch",
+            "qc_hash_mismatch",
+            "qc_height_mismatch",
+            "terminal_verdict_root_mismatch",
+        ] {
             assert!(
                 !cache_sensitive_validation_failure(reason),
                 "{reason} should not be classified as cache-sensitive"
