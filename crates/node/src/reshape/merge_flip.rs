@@ -36,6 +36,13 @@ use hyperscale_types::{
 /// committed set says nothing about what the other committed, and the
 /// successor may only admit one absent from both.
 ///
+/// All or nothing, for that same reason. A terminal carrying no
+/// commitment takes the pair with it rather than leaving the other
+/// standing alone — a successor holding one of the two chains it
+/// succeeds would read a single absence proof as the whole answer and
+/// admit what the other child committed. Empty is the strict refusal it
+/// already runs under.
+///
 /// # Errors
 ///
 /// Fails when a quorum certificate does not certify its terminal block.
@@ -69,10 +76,11 @@ pub fn merge_genesis_from_terminals(
         },
         cut_wt,
     );
-    let predecessors = [left_terminal, right_terminal]
+    let predecessors: Vec<PredecessorTerminal> = [left_terminal, right_terminal]
         .into_iter()
-        .filter_map(BlockHeader::as_predecessor_terminal)
-        .collect();
+        .map(BlockHeader::as_predecessor_terminal)
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
     Ok((genesis, origin, predecessors))
 }
 
@@ -169,36 +177,10 @@ mod tests {
     fn both_children_become_predecessors() {
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
-        let cut_wt = WeightedTimestamp::from_millis(2_000);
+        let left_terminal = child_terminal(left, 8, b"left committed", true);
+        let right_terminal = child_terminal(right, 9, b"right committed", true);
 
-        let with_root = |shard: ShardId, height: u64, tag: &[u8]| {
-            BlockHeader::new(BlockHeaderParts {
-                shard_id: shard,
-                height: BlockHeight::new(height),
-                parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
-                parent_qc: QuorumCertificate::genesis(shard, ChainOrigin::ROOT).into(),
-                proposer: ValidatorId::new(2),
-                round: Round::new(7),
-                state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
-                terminal_roots: Some(TerminalRoots {
-                    settled_txs: SettledTxsRoot::ZERO,
-                    committed_txs: CommittedTxsRoot::from_raw(Hash::from_bytes(tag)),
-                }),
-                ..Default::default()
-            })
-        };
-        let left_terminal = with_root(left, 8, b"left committed");
-        let right_terminal = with_root(right, 9, b"right committed");
-        let left_qc = certifying_qc(&left_terminal, 2_400);
-        let right_qc = certifying_qc(&right_terminal, 2_600);
-
-        let (_, _, predecessors) = merge_genesis_from_terminals(
-            parent,
-            (&left_terminal, &left_qc),
-            (&right_terminal, &right_qc),
-            cut_wt,
-        )
-        .expect("derives");
+        let predecessors = merge_predecessors(parent, &left_terminal, &right_terminal);
 
         assert_eq!(predecessors.len(), 2, "both children are predecessors");
         assert_eq!(predecessors[0].shard, left);
@@ -209,6 +191,64 @@ mod tests {
             predecessors[0].committed_txs_root, predecessors[1].committed_txs_root,
             "each child commits its own set"
         );
+    }
+
+    /// And both or neither. A terminal carrying no commitment takes the
+    /// pair with it: a merged parent holding one of the two chains it
+    /// succeeds would read that child's absence proof as the whole answer
+    /// and admit a transaction the other child committed — the replay the
+    /// rule exists to refuse. Empty keeps the strict refusal instead.
+    #[test]
+    fn one_child_without_a_commitment_takes_the_pair() {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+
+        // Either side missing is the same answer, so both polarities run.
+        for (left_carries, right_carries) in [(true, false), (false, true)] {
+            let left_terminal = child_terminal(left, 8, b"left committed", left_carries);
+            let right_terminal = child_terminal(right, 9, b"right committed", right_carries);
+            assert!(
+                merge_predecessors(parent, &left_terminal, &right_terminal).is_empty(),
+                "one child's commitment is not the merged parent's answer",
+            );
+        }
+    }
+
+    /// A terminating child's header at `height`, carrying its own
+    /// committed-transaction commitment when `carries_roots`.
+    fn child_terminal(shard: ShardId, height: u64, tag: &[u8], carries_roots: bool) -> BlockHeader {
+        BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
+            height: BlockHeight::new(height),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"parent")),
+            parent_qc: QuorumCertificate::genesis(shard, ChainOrigin::ROOT).into(),
+            proposer: ValidatorId::new(2),
+            round: Round::new(7),
+            state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
+            terminal_roots: carries_roots.then(|| TerminalRoots {
+                settled_txs: SettledTxsRoot::ZERO,
+                committed_txs: CommittedTxsRoot::from_raw(Hash::from_bytes(tag)),
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// The predecessors a merge of these two terminals hands its parent.
+    fn merge_predecessors(
+        parent: ShardId,
+        left_terminal: &BlockHeader,
+        right_terminal: &BlockHeader,
+    ) -> Vec<PredecessorTerminal> {
+        let left_qc = certifying_qc(left_terminal, 2_400);
+        let right_qc = certifying_qc(right_terminal, 2_600);
+        let (_, _, predecessors) = merge_genesis_from_terminals(
+            parent,
+            (left_terminal, &left_qc),
+            (right_terminal, &right_qc),
+            WeightedTimestamp::from_millis(2_000),
+        )
+        .expect("derives");
+        predecessors
     }
 
     /// The merged root is composed from the terminals themselves, so a

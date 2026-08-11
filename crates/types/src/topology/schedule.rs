@@ -693,9 +693,19 @@ impl TopologySchedule {
     /// id can be a split parent in one era and a merged parent in the
     /// next.
     ///
-    /// A candidate carrying no [`TerminalRoots`] is left out rather than
-    /// guessed at: a successor handed nothing keeps refusing everything
-    /// from before its origin, which is the rule it would have relaxed.
+    /// All or nothing. A candidate whose boundary record is not yet
+    /// folded, or carries no [`TerminalRoots`] yet, takes the whole set
+    /// with it: a successor holding a *subset* of the chains it succeeds
+    /// reads one predecessor's absence proof as the whole answer and
+    /// admits what another predecessor committed, which is the replay
+    /// this rule exists to refuse. Holding none is the strict refusal the
+    /// successor already runs under, so nothing is lost by waiting — and
+    /// a caller only adopts when it holds nothing, so the next fold that
+    /// completes the set is what it takes.
+    ///
+    /// The two children's terminals fold independently and need not land
+    /// together, so a merged parent reading this mid-window sees exactly
+    /// that partial state.
     #[must_use]
     pub fn predecessor_terminals(
         &self,
@@ -713,11 +723,11 @@ impl TopologySchedule {
         // which reshape produced it, and the cut binding admits at most
         // one of the two shapes: a shard born at a cut has no children
         // that could have terminated at it.
-        [shard.parent(), Some(left), Some(right)]
+        let complete: Option<Vec<PredecessorTerminal>> = [shard.parent(), Some(left), Some(right)]
             .into_iter()
             .flatten()
             .filter(|candidate| self.terminal_cut_wt(*candidate) == Some(origin_wt))
-            .filter_map(|candidate| {
+            .map(|candidate| {
                 let anchor = self.head.boundary(candidate)?;
                 Some(PredecessorTerminal {
                     shard: candidate,
@@ -726,7 +736,8 @@ impl TopologySchedule {
                     committed_txs_root: anchor.terminal_roots?.committed_txs,
                 })
             })
-            .collect()
+            .collect();
+        complete.unwrap_or_default()
     }
 
     /// The epoch window a *parent-anchor* timestamp resolves: an anchor
@@ -1061,6 +1072,40 @@ mod tests {
             predecessors.iter().map(|p| p.shard).collect::<Vec<_>>(),
             vec![left, right],
         );
+    }
+
+    /// And both or neither. The two children's terminals fold
+    /// independently and need not land together, so a merged parent
+    /// reading this mid-window can see one with its roots and one
+    /// without — the ordinary state, not a corrupt one. Holding the one
+    /// would read its absence proof as the whole answer and admit what
+    /// the other child committed, so the partial set is refused entirely.
+    /// A caller adopts only while it holds nothing, so the fold that
+    /// completes the pair is the one it takes.
+    #[test]
+    fn a_merged_parent_holds_both_children_or_neither() {
+        let (left, right) = ShardId::ROOT.children();
+        let cut = WeightedTimestamp::from_millis(1000);
+        let succeeding = |terminated: &[(ShardId, Option<CommittedTxsRoot>)]| {
+            cut_at_1000(&[left, right], &[ShardId::ROOT], terminated)
+                .predecessor_terminals(ShardId::ROOT, cut)
+        };
+
+        assert_eq!(
+            succeeding(&[
+                (left, Some(root_committed())),
+                (right, Some(root_committed())),
+            ])
+            .len(),
+            2,
+        );
+        // The right child's terminal has folded, but without its roots.
+        assert!(
+            succeeding(&[(left, Some(root_committed())), (right, None)]).is_empty(),
+            "one child's commitment is not the merged parent's answer",
+        );
+        // And the case where its boundary record has not folded at all.
+        assert!(succeeding(&[(left, Some(root_committed()))]).is_empty());
     }
 
     /// The cut is what binds a terminal to a chain, not the shard tree. A
