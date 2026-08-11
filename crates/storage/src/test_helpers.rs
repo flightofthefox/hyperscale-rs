@@ -20,8 +20,8 @@ use hyperscale_types::{
     ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, Randomness, RatifyCert,
     RatifyRound, RevealChain, Round, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload,
     SignerBitfield, SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt,
-    SubstateKey, SubstateLeaf, TickHalf, TickId, Transaction, TransactionDecision, TxHash,
-    TxOutcome, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    SubstateKey, SubstateLeaf, TerminalVerdict, TickHalf, TickId, Transaction, TransactionDecision,
+    TxHash, TxOutcome, UnsettledTx, Verifiable, Verified, WeightedTimestamp, WitnessSources,
     compute_global_receipt_root, compute_merkle_root,
 };
 
@@ -411,6 +411,42 @@ fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Block {
                 witness_sources,
             }
         }
+    }
+}
+
+/// Put `record` on `block`, preserving the block variant.
+fn with_terminal_verdict(block: Block, record: TerminalVerdict) -> Block {
+    match block {
+        Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            witness_sources,
+            ..
+        } => Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            terminal_verdicts: Arc::new(vec![record]),
+            witness_sources,
+        },
+        Block::Sealed {
+            header,
+            transactions,
+            certificates,
+            provision_hashes,
+            witness_sources,
+            ..
+        } => Block::Sealed {
+            header,
+            transactions,
+            certificates,
+            provision_hashes,
+            terminal_verdicts: Arc::new(vec![record]),
+            witness_sources,
+        },
     }
 }
 
@@ -1143,5 +1179,63 @@ pub fn test_unresolved_fold(storage: &(impl ShardChainReader + ShardChainWriter)
             .iter()
             .all(|certified| certified.block().is_live()),
         "a replayed block arrives in the shape a commit runs on, bundles or not",
+    );
+}
+
+/// Shared rebuild test: an undischarged record holds the replay floor.
+///
+/// It does so from a window of its own — the transaction it names
+/// committed arbitrarily far below, so the record is what a rebuild has to
+/// reach.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_undischarged_record_holds_the_floor(
+    storage: &(impl ShardChainReader + ShardChainWriter),
+) {
+    let stranded = test_transaction(3);
+    let record = TerminalVerdict::new(
+        ShardId::leaf(1, 1),
+        WeightedTimestamp::from_millis(1_000),
+        [UnsettledTx {
+            tx_hash: stranded.hash(),
+            deadline: WeightedTimestamp::from_millis(500),
+            declared_work: stranded.work(),
+        }],
+    );
+
+    // The record commits without its transaction ever appearing: the block
+    // that carried it is below anything this chain holds, which is the
+    // rebuild the record exists to repair.
+    commit_empty_blocks_up_to(storage, BlockHeight::new(2));
+    let naming = with_terminal_verdict(make_test_block(BlockHeight::new(2)), record);
+    storage.commit_block(&make_test_certified(naming), &empty_witness());
+    storage.commit_block(
+        &make_test_certified(make_test_block(BlockHeight::new(3))),
+        &empty_witness(),
+    );
+
+    assert_eq!(
+        unresolved_replay_floor(storage, BlockHeight::new(3), WeightedTimestamp::ZERO),
+        Some(BlockHeight::new(2)),
+        "the replay opens at the record, which is where the entry comes from",
+    );
+
+    // The abort discharges it, and the floor lifts with it.
+    let aborting = push_certificate(
+        make_test_block(BlockHeight::new(4)),
+        Arc::new(Verifiable::from(make_finalization(
+            BlockHeight::new(4),
+            stranded.hash(),
+            TransactionDecision::Aborted,
+        ))),
+    );
+    storage.commit_block(&make_test_certified(aborting), &empty_witness());
+
+    assert_eq!(
+        unresolved_replay_floor(storage, BlockHeight::new(4), WeightedTimestamp::ZERO),
+        None,
+        "a discharged record holds nothing down",
     );
 }

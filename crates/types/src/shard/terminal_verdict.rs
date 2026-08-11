@@ -19,10 +19,31 @@
 //! transaction changes nothing this shard can act on — the transaction
 //! stays owed and unabandonable either way — while the absence of a
 //! settlement is what licenses a verdict.
+//!
+//! Each name carries the two figures composing the abort takes: the
+//! deadline it opens at and the reservation it returns. Both are functions
+//! of the transaction body, so a proposer restates them and a voter
+//! holding the transaction checks the restatement — and a replica whose
+//! rebuild never reached the transaction's own block still holds enough to
+//! compose the same verdict as its peers.
 
 use hyperscale_hbor::Hbor;
 
 use crate::{MAX_UNSETTLED_PER_BLOCK, ShardId, TxHash, WeightedTimestamp};
+
+/// One transaction a departed shard left unsettled, with what abandoning
+/// it takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+pub struct UnsettledTx {
+    /// The transaction.
+    pub tx_hash: TxHash,
+    /// The moment past which it can no longer finalize anywhere:
+    /// `validity_range.end_timestamp_exclusive + MAX_FINALIZATION_DELAY`.
+    pub deadline: WeightedTimestamp,
+    /// The reservation its committing block took against the drain, which
+    /// the abandonment returns exactly.
+    pub declared_work: u64,
+}
 
 /// One departed shard's unsettled remainder, as this chain sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
@@ -36,10 +57,10 @@ pub struct TerminalVerdict {
     /// Transactions this chain still owes an outcome for that `shard` did
     /// not settle before it went.
     ///
-    /// Sorted and duplicate-free, so the record has one form and a
-    /// validator checking it walks the same order it would build.
+    /// Sorted by hash and duplicate-free on it, so the record has one form
+    /// and a validator checking it walks the same order it would build.
     #[hbor(max = MAX_UNSETTLED_PER_BLOCK)]
-    unsettled: Vec<TxHash>,
+    unsettled: Vec<UnsettledTx>,
 }
 
 impl TerminalVerdict {
@@ -48,11 +69,11 @@ impl TerminalVerdict {
     pub fn new(
         shard: ShardId,
         terminal_wt: WeightedTimestamp,
-        unsettled: impl IntoIterator<Item = TxHash>,
+        unsettled: impl IntoIterator<Item = UnsettledTx>,
     ) -> Self {
-        let mut unsettled: Vec<TxHash> = unsettled.into_iter().collect();
-        unsettled.sort_unstable();
-        unsettled.dedup();
+        let mut unsettled: Vec<UnsettledTx> = unsettled.into_iter().collect();
+        unsettled.sort_unstable_by_key(|entry| entry.tx_hash);
+        unsettled.dedup_by_key(|entry| entry.tx_hash);
         Self {
             shard,
             terminal_wt,
@@ -72,10 +93,16 @@ impl TerminalVerdict {
         self.terminal_wt
     }
 
-    /// The transactions it left unsettled.
+    /// The transactions it left unsettled, each with what abandoning it
+    /// takes.
     #[must_use]
-    pub fn unsettled(&self) -> &[TxHash] {
+    pub fn unsettled(&self) -> &[UnsettledTx] {
         &self.unsettled
+    }
+
+    /// Just the transactions named.
+    pub fn tx_hashes(&self) -> impl Iterator<Item = TxHash> + '_ {
+        self.unsettled.iter().map(|entry| entry.tx_hash)
     }
 
     /// Whether the record is in the one form it may take: sorted, without
@@ -90,7 +117,10 @@ impl TerminalVerdict {
     pub fn is_well_formed(&self) -> bool {
         !self.unsettled.is_empty()
             && self.unsettled.len() <= MAX_UNSETTLED_PER_BLOCK
-            && self.unsettled.windows(2).all(|pair| pair[0] < pair[1])
+            && self
+                .unsettled
+                .windows(2)
+                .all(|pair| pair[0].tx_hash < pair[1].tx_hash)
     }
 }
 
@@ -99,8 +129,12 @@ mod tests {
     use super::*;
     use crate::Hash;
 
-    fn tx(seed: u8) -> TxHash {
-        TxHash::from(Hash::from_bytes(&[seed; 32]))
+    fn tx(seed: u8) -> UnsettledTx {
+        UnsettledTx {
+            tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
+            deadline: WeightedTimestamp::from_millis(u64::from(seed) * 100),
+            declared_work: u64::from(seed) * 7,
+        }
     }
 
     fn wt() -> WeightedTimestamp {
@@ -143,5 +177,18 @@ mod tests {
             unsettled: vec![tx(1), tx(1)],
         };
         assert!(!repeating.is_well_formed());
+    }
+
+    /// The figures ride each name, so a record that reaches a replica
+    /// holding none of the transactions still says what abandoning them
+    /// takes.
+    #[test]
+    fn a_name_carries_what_abandoning_it_takes() {
+        let record = TerminalVerdict::new(ShardId::ROOT, wt(), [tx(2), tx(1)]);
+        assert_eq!(
+            record.unsettled(),
+            &[tx(1), tx(2)],
+            "each name keeps its own deadline and reservation through the sort",
+        );
     }
 }

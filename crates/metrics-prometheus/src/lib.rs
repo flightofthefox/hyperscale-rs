@@ -150,10 +150,10 @@ pub struct Metrics {
     /// Committed transactions whose outcome the shard can no longer
     /// produce, by cause — their drain reservations never return.
     pub unresolvable_txs: CounterVec,
-    /// Committed boundary records naming a transaction this replica's
-    /// ledger does not hold. Read across a shard's replicas: an outlier is
-    /// one whose rebuild missed the transaction's own block.
-    pub unheld_verdict_names: Counter,
+    /// Ledger entries rebuilt from a committed boundary record. Read
+    /// across a shard's replicas: an outlier is one whose rebuild missed
+    /// the transaction's own block.
+    pub rebuilt_verdict_entries: Counter,
 
     // === Network class accounting ===
     /// Per-class in-flight request slot count.
@@ -741,10 +741,9 @@ impl Metrics {
             )
             .unwrap(),
 
-            unheld_verdict_names: register_counter!(
-                "hyperscale_unheld_verdict_names_total",
-                "Committed boundary records naming a transaction this replica's ledger \
-                 does not hold"
+            rebuilt_verdict_entries: register_counter!(
+                "hyperscale_rebuilt_verdict_entries_total",
+                "Ledger entries rebuilt from a committed boundary record"
             )
             .unwrap(),
 
@@ -1046,8 +1045,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .inc();
     }
 
-    fn record_unheld_verdict_name(&self) {
-        self.metrics.unheld_verdict_names.inc();
+    fn record_rebuilt_verdict_entry(&self) {
+        self.metrics.rebuilt_verdict_entries.inc();
     }
 
     fn set_request_slots_in_flight(&self, class: &str, count: usize) {

@@ -1037,9 +1037,8 @@ impl ShardCoordinator {
         }
         let claims = block.terminal_verdicts().iter().flat_map(|verdict| {
             verdict
-                .unsettled()
-                .iter()
-                .map(move |tx_hash| (verdict.shard(), *tx_hash, TxClaim::Abandoned))
+                .tx_hashes()
+                .map(move |tx_hash| (verdict.shard(), tx_hash, TxClaim::Abandoned))
         });
         match settled_set_verdict(
             &self.settled_sets,

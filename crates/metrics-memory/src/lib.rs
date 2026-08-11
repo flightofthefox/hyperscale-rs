@@ -258,8 +258,8 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("unresolvable_txs", Some(cause), 1);
     }
 
-    fn record_unheld_verdict_name(&self) {
-        self.inc("unheld_verdict_names", None, 1);
+    fn record_rebuilt_verdict_entry(&self) {
+        self.inc("rebuilt_verdict_entries", None, 1);
     }
 
     // ── Sync ─────────────────────────────────────────────────────────

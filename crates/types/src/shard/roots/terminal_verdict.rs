@@ -9,8 +9,8 @@ use crate::{Hash, TerminalVerdict, TerminalVerdictRoot, Verified, Verify, comput
 /// record's own hash.
 ///
 /// A record's leaf covers the shard it answers for, that shard's terminal,
-/// and every transaction it names, so two blocks claiming the same root
-/// carry the same verdicts.
+/// and every transaction it names with the figures abandoning it takes, so
+/// two blocks claiming the same root carry the same verdicts.
 #[must_use]
 pub fn terminal_verdict_root_from_records(verdicts: &[TerminalVerdict]) -> TerminalVerdictRoot {
     if verdicts.is_empty() {
@@ -24,15 +24,18 @@ pub fn terminal_verdict_root_from_records(verdicts: &[TerminalVerdict]) -> Termi
 /// leaf preimage the codebase hashes.
 const TERMINAL_VERDICT_LEAF_TAG: &[u8] = b"hyperscale.terminal_verdict_leaf.v1";
 
-/// One record's leaf: its shard, its terminal, and the transactions it
-/// names, in the canonical order the record is built in.
+/// One record's leaf: its shard, its terminal, and each transaction it
+/// names with its deadline and reservation, in the canonical order the
+/// record is built in.
 fn record_leaf(verdict: &TerminalVerdict) -> Hash {
     let mut bytes = TERMINAL_VERDICT_LEAF_TAG.to_vec();
-    bytes.reserve(16 + verdict.unsettled().len() * 32);
+    bytes.reserve(16 + verdict.unsettled().len() * 48);
     bytes.extend_from_slice(&verdict.shard().to_le_bytes());
     bytes.extend_from_slice(&verdict.terminal_wt().as_millis().to_le_bytes());
-    for tx_hash in verdict.unsettled() {
-        bytes.extend_from_slice(tx_hash.as_bytes());
+    for entry in verdict.unsettled() {
+        bytes.extend_from_slice(entry.tx_hash.as_bytes());
+        bytes.extend_from_slice(&entry.deadline.as_millis().to_le_bytes());
+        bytes.extend_from_slice(&entry.declared_work.to_le_bytes());
     }
     Hash::from_bytes(&bytes)
 }
@@ -87,10 +90,14 @@ impl Verify<&TerminalVerdictRootContext<'_>> for TerminalVerdictRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ShardId, TxHash, WeightedTimestamp};
+    use crate::{ShardId, TxHash, UnsettledTx, WeightedTimestamp};
 
-    fn tx(seed: u8) -> TxHash {
-        TxHash::from(Hash::from_bytes(&[seed; 32]))
+    fn tx(seed: u8) -> UnsettledTx {
+        UnsettledTx {
+            tx_hash: TxHash::from(Hash::from_bytes(&[seed; 32])),
+            deadline: WeightedTimestamp::from_millis(500),
+            declared_work: 7,
+        }
     }
 
     fn record(shard: ShardId, seeds: &[u8]) -> TerminalVerdict {
@@ -138,6 +145,42 @@ mod tests {
         assert_ne!(
             root,
             terminal_verdict_root_from_records(std::slice::from_ref(&other_terminal)),
+        );
+
+        // The figures a name carries are part of the claim: the record
+        // licenses an abort that returns exactly this much at exactly this
+        // deadline, so a block restating either differently is a different
+        // block.
+        let other_work = TerminalVerdict::new(
+            ShardId::ROOT,
+            WeightedTimestamp::from_millis(1_000),
+            [
+                UnsettledTx {
+                    declared_work: 8,
+                    ..tx(1)
+                },
+                tx(2),
+            ],
+        );
+        assert_ne!(
+            root,
+            terminal_verdict_root_from_records(std::slice::from_ref(&other_work)),
+        );
+
+        let other_deadline = TerminalVerdict::new(
+            ShardId::ROOT,
+            WeightedTimestamp::from_millis(1_000),
+            [
+                UnsettledTx {
+                    deadline: WeightedTimestamp::from_millis(501),
+                    ..tx(1)
+                },
+                tx(2),
+            ],
+        );
+        assert_ne!(
+            root,
+            terminal_verdict_root_from_records(std::slice::from_ref(&other_deadline)),
         );
     }
 

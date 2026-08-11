@@ -296,6 +296,13 @@ pub fn validate_no_duplicate_transactions(
 /// finalizations this node has not yet fetched contributes nothing to
 /// `qc_chain_resolved_txs` and is caught here instead.
 ///
+/// A boundary record is held to the same rule. It licenses an abort and
+/// carries the terms of one, so a record naming a transaction the chain
+/// has already resolved is a request for a second verdict on it — and one
+/// every replica would honour, since a replica reconstructs the entry from
+/// the record precisely when it cannot check the name against an account
+/// of its own.
+///
 /// Both proposer and validator hit `record_block_committed` synchronously
 /// during their respective commit handlers, so their `dedup_index` reflects
 /// the same just-committed ticks at the same logical moment. Validation
@@ -305,10 +312,6 @@ pub fn validate_no_duplicate_resolutions(
     qc_chain_resolved_txs: &HashSet<TxHash>,
     dedup_index: &CommitDedupIndex,
 ) -> Result<(), String> {
-    if block.certificates().is_empty() {
-        return Ok(());
-    }
-
     let mut resolved_here: HashSet<TxHash> = HashSet::new();
     for fw in block.certificates().iter() {
         for tx_hash in fw.tx_hashes() {
@@ -317,17 +320,39 @@ pub fn validate_no_duplicate_resolutions(
                     "transaction {tx_hash} resolved twice within the same block"
                 ));
             }
-            if qc_chain_resolved_txs.contains(&tx_hash) {
-                return Err(format!(
-                    "transaction {tx_hash} already resolved by a QC chain ancestor"
-                ));
-            }
-            if dedup_index.contains_resolved_tx(&tx_hash) {
-                return Err(format!(
-                    "transaction {tx_hash} already resolved within its retention window"
-                ));
-            }
+            reject_if_resolved(tx_hash, qc_chain_resolved_txs, dedup_index)?;
         }
+    }
+    for verdict in block.terminal_verdicts() {
+        for tx_hash in verdict.tx_hashes() {
+            if resolved_here.contains(&tx_hash) {
+                return Err(format!(
+                    "terminal-verdict record names {tx_hash}, which the same block resolves"
+                ));
+            }
+            reject_if_resolved(tx_hash, qc_chain_resolved_txs, dedup_index)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse `tx_hash` if the chain has already reached a verdict on it — by
+/// an ancestor above committed height, or by a committed block within the
+/// retention window.
+fn reject_if_resolved(
+    tx_hash: TxHash,
+    qc_chain_resolved_txs: &HashSet<TxHash>,
+    dedup_index: &CommitDedupIndex,
+) -> Result<(), String> {
+    if qc_chain_resolved_txs.contains(&tx_hash) {
+        return Err(format!(
+            "transaction {tx_hash} already resolved by a QC chain ancestor"
+        ));
+    }
+    if dedup_index.contains_resolved_tx(&tx_hash) {
+        return Err(format!(
+            "transaction {tx_hash} already resolved within its retention window"
+        ));
     }
     Ok(())
 }
@@ -632,8 +657,8 @@ mod tests {
         Hash, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp, ProvisionEntry,
         Provisions, QuorumCertificate, RevealChain, Round, ShardId, ShardLoad, Signer,
         SignerBitfield, TerminalVerdict, TerminalVerdictRoot, TimestampRange, Transaction,
-        TransactionDecision, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified,
-        WeightedTimestamp, WitnessSources, test_utils,
+        TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+        Verified, WeightedTimestamp, WitnessSources, test_utils,
     };
 
     use super::*;
@@ -1122,13 +1147,21 @@ mod tests {
         }
     }
 
+    fn named(tx_hash: TxHash) -> UnsettledTx {
+        UnsettledTx {
+            tx_hash,
+            deadline: WeightedTimestamp::from_millis(900),
+            declared_work: 11,
+        }
+    }
+
     fn verdict(shard: ShardId, seeds: &[u8]) -> TerminalVerdict {
         TerminalVerdict::new(
             shard,
             WeightedTimestamp::from_millis(1_000),
             seeds
                 .iter()
-                .map(|&seed| TxHash::from(Hash::from_bytes(&[seed; 32]))),
+                .map(|&seed| named(TxHash::from(Hash::from_bytes(&[seed; 32])))),
         )
     }
 
@@ -1209,7 +1242,8 @@ mod tests {
             TerminalVerdict::new(
                 shard,
                 WeightedTimestamp::from_millis(1_000),
-                (from..from + half).map(|i| TxHash::from(Hash::from_bytes(&i.to_le_bytes()))),
+                (from..from + half)
+                    .map(|i| named(TxHash::from(Hash::from_bytes(&i.to_le_bytes())))),
             )
         };
         let records = vec![span(left, 0), span(right, half)];
@@ -1417,6 +1451,61 @@ mod tests {
             err.contains("already resolved within its retention window"),
             "{err}"
         );
+    }
+
+    /// A boundary record is a request for a verdict, so it is held to the
+    /// same rule. It reaches replicas that hold no account of the
+    /// transaction and rebuild one from it, which is exactly the replica
+    /// that cannot tell the name is stale — so the block carrying it is
+    /// where the staleness has to be caught.
+    #[test]
+    fn a_record_naming_a_resolved_transaction_is_refused() {
+        let settled = finalization_at(1);
+        let tx_hash = settled
+            .tx_hashes()
+            .next()
+            .expect("a tick names its members");
+        let mut dedup_index = CommitDedupIndex::new();
+        dedup_index.register_committed_certs(&[Arc::new((*settled).clone().into())]);
+
+        let block = block_with_verdicts(
+            vec![TerminalVerdict::new(
+                ShardId::ROOT,
+                WeightedTimestamp::from_millis(1_000),
+                [named(tx_hash)],
+            )],
+            TerminalVerdictRoot::ZERO,
+        );
+        let err = no_resolutions(&block, &dedup_index).unwrap_err();
+        assert!(
+            err.contains("already resolved within its retention window"),
+            "{err}"
+        );
+    }
+
+    /// And a record naming what the same block resolves, which no window
+    /// or index has seen yet.
+    #[test]
+    fn a_record_naming_what_its_own_block_resolves_is_refused() {
+        let settled = finalization_at(1);
+        let tx_hash = settled
+            .tx_hashes()
+            .next()
+            .expect("a tick names its members");
+        let block = Block::Live {
+            header: header_at_height(BlockHeight::new(6), 100_000),
+            transactions: Arc::new(Vec::new()),
+            certificates: Arc::new(vec![Arc::new((*settled).clone().into())]),
+            provisions: Arc::new(Vec::new()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+            terminal_verdicts: Arc::new(vec![TerminalVerdict::new(
+                ShardId::ROOT,
+                WeightedTimestamp::from_millis(1_000),
+                [named(tx_hash)],
+            )]),
+        };
+        let err = no_resolutions(&block, &CommitDedupIndex::new()).unwrap_err();
+        assert!(err.contains("which the same block resolves"), "{err}");
     }
 
     /// The same, one block earlier: an ancestor above committed height

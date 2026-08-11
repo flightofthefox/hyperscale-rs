@@ -38,7 +38,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchAbandon, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
-use hyperscale_metrics::{record_unheld_verdict_name, record_unresolvable_tx};
+use hyperscale_metrics::{record_rebuilt_verdict_entry, record_unresolvable_tx};
 use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::{
     Attempt, AwaitingTopologyBuffer, Block, BlockHash, BlockHeader, BlockHeight, BloomFilter,
@@ -2052,11 +2052,11 @@ impl ExecutionCoordinator {
         self.unresolved.release_resolved(block.certificates());
         // What the block writes down about departed shards, before the
         // prune below reads what is still answerable.
-        let unheld = self
+        let rebuilt = self
             .unresolved
             .record_terminal_verdicts(block.terminal_verdicts());
-        for _ in 0..unheld {
-            record_unheld_verdict_name();
+        for _ in 0..rebuilt {
+            record_rebuilt_verdict_entry();
         }
         self.stamp_departures(topology_schedule);
         let unanswerable = self.unresolved.prune(self.committed_ts);
@@ -2438,7 +2438,7 @@ impl ExecutionCoordinator {
             }
             let settled = &self.settled_sets[&shard];
             let mut unsettled = self.unresolved.outstanding_with(shard, settled.terminal_wt);
-            unsettled.retain(|tx_hash| !settled.txs.contains(tx_hash));
+            unsettled.retain(|entry| !settled.txs.contains(&entry.tx_hash));
             unsettled.truncate(budget);
             if unsettled.is_empty() {
                 continue;
@@ -3399,7 +3399,7 @@ mod tests {
         AggregateSignature, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
         EPOCH_DURATION, Epoch, ExecutionOutcome, GlobalReceiptHash, Hash, MAX_FINALIZATION_DELAY,
         NetworkDefinition, QuorumCertificate, RecoveryCause, ShardRecovery, Signer, SignerBitfield,
-        StoredReceipt, TickHalf, ValidatorInfo, ValidatorSet,
+        StoredReceipt, TickHalf, UnsettledTx, ValidatorInfo, ValidatorSet,
     };
 
     use super::*;
@@ -6397,7 +6397,11 @@ mod tests {
             .record_terminal_verdicts(&[TerminalVerdict::new(
                 PEER,
                 WeightedTimestamp::from_millis(60_000),
-                vec![tx_hash],
+                vec![UnsettledTx {
+                    tx_hash,
+                    deadline: WeightedTimestamp::from_millis(30_000),
+                    declared_work: 1,
+                }],
             )]);
     }
 
@@ -6491,8 +6495,8 @@ mod tests {
         assert_eq!(records.len(), 1, "the peer's departure is answerable");
         assert_eq!(records[0].shard(), PEER);
         assert_eq!(
-            records[0].unsettled(),
-            &[tx_hash],
+            records[0].tx_hashes().collect::<Vec<_>>(),
+            vec![tx_hash],
             "the straddler is what it left unresolved of our business",
         );
 
@@ -6561,7 +6565,7 @@ mod tests {
             "and inside the block's own bound"
         );
         for record in &records {
-            assert_eq!(record.unsettled(), &[tx_hash]);
+            assert_eq!(record.tx_hashes().collect::<Vec<_>>(), vec![tx_hash]);
         }
     }
 

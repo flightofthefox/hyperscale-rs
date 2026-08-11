@@ -602,7 +602,7 @@ mod tests {
     };
     use hyperscale_types::{
         CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_VALIDITY_RANGE,
-        PredecessorTerminal, TimestampRange, TransactionDecision,
+        PredecessorTerminal, TimestampRange, TransactionDecision, UnsettledTx,
     };
 
     use super::*;
@@ -619,7 +619,11 @@ mod tests {
         let record = TerminalVerdict::new(
             ShardId::leaf(1, 0),
             cut,
-            [TxHash::from(Hash::from_bytes(b"stranded"))],
+            [UnsettledTx {
+                tx_hash: TxHash::from(Hash::from_bytes(b"stranded")),
+                deadline: WeightedTimestamp::from_millis(5_000),
+                declared_work: 3,
+            }],
         );
         let offered = |anchor: WeightedTimestamp| {
             select_terminal_verdicts(vec![record.clone()], windows, anchor).len()

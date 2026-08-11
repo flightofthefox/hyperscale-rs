@@ -679,6 +679,12 @@ fn a_replay_names_what_committed_and_never_resolved() {
 }
 
 #[test]
+fn a_replay_reaches_a_record_no_verdict_has_discharged() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_undischarged_record_holds_the_floor(&storage);
+}
+
+#[test]
 fn a_committed_bundle_outlives_its_block_s_sealing() {
     let storage = SimShardStorage::default();
     test_helpers::test_committed_bundle_outlives_sealing(&storage, || {

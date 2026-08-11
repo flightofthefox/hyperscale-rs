@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     Address, Finalization, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, ShardId, ShardTrie,
-    TerminalVerdict, Transaction, TxHash, Verifiable, WeightedTimestamp,
+    TerminalVerdict, Transaction, TxHash, UnsettledTx, Verifiable, WeightedTimestamp,
 };
 
 /// One committed transaction's outstanding account.
@@ -59,15 +59,20 @@ struct Owed {
     /// certificate outlives the tick, and a shard that could not say
     /// whether it had issued one would have to assume it had.
     certified: bool,
-    /// Whether a committed record says a departed shard left this
-    /// transaction unsettled.
+    /// The departed shard a committed record says left this transaction
+    /// unsettled.
     ///
     /// The evidence that nothing can settle it, in the one form that
     /// outlives the settled set it was read from. Where the deadline
     /// window says how long this shard may speak for a transaction on its
     /// own clock, this says it may speak whatever the clock reads: no
     /// counterpart is left to contradict it, and the chain says so.
-    unsettled_by_departed: bool,
+    ///
+    /// It also decides how long the entry lives. A covered entry is
+    /// abandonable from the moment the record commits, so what it waits on
+    /// is a block carrying the abort — and the departure that covered it
+    /// is the one clock both the entry and the record are stated in.
+    unsettled_by: Option<ShardId>,
 }
 
 /// Where a departed participant's chain ended, and how long what it left
@@ -150,7 +155,7 @@ impl UnresolvedTxs {
                     .filter(|prefix| !ShardTrie::shard_owns_prefix(local_shard, *prefix))
                     .collect(),
                 certified: false,
-                unsettled_by_departed: false,
+                unsettled_by: None,
             };
             self.owed.entry(tx.hash()).or_insert(owed);
         }
@@ -178,35 +183,57 @@ impl UnresolvedTxs {
     ///
     /// A record names transactions its shard did not settle before it
     /// went, which is what puts a settlement of them out of reach for
-    /// good. Returns how many it named that this ledger does not hold,
-    /// which is how many verdicts this replica will not compose that a
-    /// replica holding them will.
+    /// good. A name this ledger holds is marked; one it does not is
+    /// inserted from the record itself, which carries every term
+    /// abandoning it takes.
     ///
-    /// Most such names are ordinary: a record is offered until it commits,
-    /// so a later block repeats what an earlier one already discharged,
-    /// and one the same block resolves is released before this runs. The
-    /// one that is not ordinary is a rebuild that never reached the
-    /// transaction's own block — the entry's life is its counterpart's
-    /// clock while the replay window is measured in the transaction's, so
-    /// a restart can come back holding the record and not the entry. That
-    /// replica names a smaller abandonable set than its peers at the same
-    /// frontier, and the tick they compose is one it cannot sign. Counted
-    /// rather than silent because nothing else distinguishes it.
+    /// That insertion is what keeps a rebuild from falling short. The
+    /// entry's life is its counterpart's clock while the replay window is
+    /// measured in the transaction's, so a restart between the commit and
+    /// the record's landing comes back holding the record and not the
+    /// entry — and a replica that only marked would name a smaller
+    /// abandonable set than its peers at the same frontier, and could not
+    /// sign the tick they compose.
+    ///
+    /// A reconstructed entry is `certified`, because a record names
+    /// nothing else, and reaches no prefixes: the questions that read them
+    /// — who else is party, whether anyone can still settle — are the ones
+    /// a covered entry is never asked, since the record has already
+    /// answered them.
+    ///
+    /// Returns how many it reconstructed, which is how far short this
+    /// replica's replay window fell.
     pub fn record_terminal_verdicts(&mut self, verdicts: &[TerminalVerdict]) -> usize {
-        let mut unheld = 0usize;
+        let mut reconstructed = 0usize;
         for verdict in verdicts {
-            for tx_hash in verdict.unsettled() {
-                match self.owed.get_mut(tx_hash) {
-                    Some(owed) => owed.unsettled_by_departed = true,
-                    None => unheld = unheld.saturating_add(1),
+            for entry in verdict.unsettled() {
+                if let Some(owed) = self.owed.get_mut(&entry.tx_hash) {
+                    owed.unsettled_by = Some(verdict.shard());
+                    continue;
                 }
+                reconstructed = reconstructed.saturating_add(1);
+                self.owed.insert(
+                    entry.tx_hash,
+                    Owed {
+                        deadline: entry.deadline,
+                        declared_work: entry.declared_work,
+                        // The record dates it no later than the cut, which
+                        // is the one bound on its commit the record itself
+                        // establishes.
+                        committed_ts: verdict.terminal_wt(),
+                        remote_prefixes: BTreeSet::new(),
+                        certified: true,
+                        unsettled_by: Some(verdict.shard()),
+                    },
+                );
             }
         }
-        unheld
+        reconstructed
     }
 
     /// The transactions this ledger still owes an outcome for that
-    /// `shard` was party to, for a shard that left at `cut`.
+    /// `shard` was party to, for a shard that left at `cut`, each with the
+    /// terms a record naming it must state.
     ///
     /// Only certified ones: a transaction no certificate of ours covers
     /// is decided by its own deadline and needs no record to speak for
@@ -214,18 +241,22 @@ impl UnresolvedTxs {
     /// already gone was never party to what came after. And only ones no
     /// record covers yet, so a departure is answered once.
     #[must_use]
-    pub fn outstanding_with(&self, shard: ShardId, cut: WeightedTimestamp) -> Vec<TxHash> {
+    pub fn outstanding_with(&self, shard: ShardId, cut: WeightedTimestamp) -> Vec<UnsettledTx> {
         self.owed
             .iter()
             .filter(|(_, owed)| {
-                owed.certified && !owed.unsettled_by_departed && cut > owed.committed_ts
+                owed.certified && owed.unsettled_by.is_none() && cut > owed.committed_ts
             })
             .filter(|(_, owed)| {
                 owed.remote_prefixes
                     .iter()
                     .any(|prefix| ShardTrie::shard_owns_prefix(shard, *prefix))
             })
-            .map(|(tx_hash, _)| *tx_hash)
+            .map(|(tx_hash, owed)| UnsettledTx {
+                tx_hash: *tx_hash,
+                deadline: owed.deadline,
+                declared_work: owed.declared_work,
+            })
             .collect()
     }
 
@@ -236,7 +267,7 @@ impl UnresolvedTxs {
     pub fn is_unsettled_by_departed(&self, tx_hash: TxHash) -> bool {
         self.owed
             .get(&tx_hash)
-            .is_some_and(|owed| owed.unsettled_by_departed)
+            .is_some_and(|owed| owed.unsettled_by.is_some())
     }
 
     /// Record where a departed participant's chain ended, and when what it
@@ -356,7 +387,7 @@ impl UnresolvedTxs {
             .iter()
             .filter(|(_, owed)| {
                 now >= owed.deadline
-                    && (owed.unsettled_by_departed || now < owed.deadline.plus(MAX_VALIDITY_RANGE))
+                    && (owed.unsettled_by.is_some() || now < owed.deadline.plus(MAX_VALIDITY_RANGE))
             })
             .map(|(tx_hash, owed)| (*tx_hash, owed.declared_work))
             .collect()
@@ -380,6 +411,14 @@ impl UnresolvedTxs {
     /// to say about when its counterpart leaves, which is why one cannot
     /// be what ends the entry.
     ///
+    /// One a committed record already decided waits on nothing but a block
+    /// carrying its abort, so what it lives against is the departure the
+    /// record names rather than any counterpart's answerability. That is
+    /// the same window the record was composed in, it is the one an entry
+    /// reconstructed from a record has, and it is finite where a live
+    /// counterpart's is not — which is what lets a replay floor reach
+    /// every record still owed a verdict.
+    ///
     /// Returns the transactions dropped because every counterpart has
     /// fallen silent — the ones whose fate is settled by nobody rather
     /// than decided by anybody. Their reservations are owed to a
@@ -393,6 +432,20 @@ impl UnresolvedTxs {
         let kept: BTreeMap<TxHash, Owed> = std::mem::take(&mut self.owed)
             .into_iter()
             .filter(|(tx_hash, owed)| {
+                if let Some(shard) = owed.unsettled_by {
+                    if self
+                        .departed
+                        .get(&shard)
+                        .is_some_and(|departure| now <= departure.readable_until)
+                    {
+                        return true;
+                    }
+                    unanswerable.push(Unanswerable {
+                        tx_hash: *tx_hash,
+                        covered_by_record: true,
+                    });
+                    return false;
+                }
                 let answerable = owed.remote_prefixes.iter().any(|prefix| {
                     self.departure_over(owed, *prefix)
                         .is_none_or(|departure| now <= departure.readable_until)
@@ -409,7 +462,7 @@ impl UnresolvedTxs {
                     // combine it with.
                     unanswerable.push(Unanswerable {
                         tx_hash: *tx_hash,
-                        covered_by_record: owed.unsettled_by_departed,
+                        covered_by_record: false,
                     });
                     return false;
                 }
@@ -422,15 +475,18 @@ impl UnresolvedTxs {
         // successor, so one still covering a live entry stays: dropping
         // it would read the departed counterpart as the shard that holds
         // the keyspace now, and hold the entry open against a shard that
-        // was never party to it.
+        // was never party to it. One a record names stays for a second
+        // reason — it is the clock the covered entry lives against, so
+        // dropping it would retire the entry on the next pass.
         let owed = &self.owed;
         self.departed.retain(|shard, departure| {
             owed.values().any(|entry| {
-                departure.cut > entry.committed_ts
-                    && entry
-                        .remote_prefixes
-                        .iter()
-                        .any(|prefix| ShardTrie::shard_owns_prefix(*shard, *prefix))
+                entry.unsettled_by == Some(*shard)
+                    || (departure.cut > entry.committed_ts
+                        && entry
+                            .remote_prefixes
+                            .iter()
+                            .any(|prefix| ShardTrie::shard_owns_prefix(*shard, *prefix)))
             })
         });
 
@@ -449,8 +505,8 @@ mod tests {
 
     use hyperscale_types::test_utils::{make_finalization, stub_transaction};
     use hyperscale_types::{
-        BlockHeight, EPOCH_DURATION, EpochWindows, TimestampRange, TransactionDecision, Verified,
-        WeightedTimestamp,
+        BlockHeight, EPOCH_DURATION, EpochWindows, TimestampRange, TransactionDecision,
+        UnsettledTx, Verified, WeightedTimestamp,
     };
 
     use super::*;
@@ -493,6 +549,19 @@ mod tests {
 
     fn commit(ledger: &mut UnresolvedTxs, tx: &Arc<Verifiable<Transaction>>) {
         ledger.register_committed(LOCAL, WeightedTimestamp::ZERO, std::iter::once(tx));
+    }
+
+    /// A record's name for `tx`, stating the terms a committing block
+    /// would have registered for it.
+    fn names(tx: &Arc<Verifiable<Transaction>>) -> UnsettledTx {
+        UnsettledTx {
+            tx_hash: tx.hash(),
+            deadline: tx
+                .validity_range()
+                .end_timestamp_exclusive
+                .plus(MAX_FINALIZATION_DELAY),
+            declared_work: tx.work(),
+        }
     }
 
     /// A committed transaction is owed an outcome from the moment its
@@ -706,7 +775,7 @@ mod tests {
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, expiry(cut));
         assert_eq!(
-            ledger.record_terminal_verdicts(&[TerminalVerdict::new(PARTNER, cut, [tx.hash()])]),
+            ledger.record_terminal_verdicts(&[TerminalVerdict::new(PARTNER, cut, [names(&tx)])]),
             0,
             "the ledger holds the transaction the record names",
         );
@@ -720,22 +789,66 @@ mod tests {
         );
     }
 
-    /// A record naming what the ledger does not hold is counted rather
-    /// than ignored. Usually ordinary — a record is offered until it
-    /// commits, so a later block repeats a discharged one — but it is also
-    /// the one signal that a rebuild came back holding the record and not
-    /// the entry, which is a replica that will not compose the verdict its
-    /// peers do.
+    /// A record naming what the ledger does not hold rebuilds it. That is
+    /// a rebuild that came back holding the record and not the entry, and
+    /// what the record carries is exactly what the entry would have said,
+    /// so the replica reaches the same abandonable set as its peers rather
+    /// than a smaller one.
     #[test]
-    fn a_record_naming_an_unheld_transaction_is_counted() {
+    fn a_record_naming_an_unheld_transaction_rebuilds_it() {
         let mut ledger = UnresolvedTxs::default();
+        let (one, two) = (tx(19, 60_000), tx(20, 60_000));
+        let cut = ms(500_000);
+        ledger.record_terminal(PARTNER, cut, expiry(cut));
+
         assert_eq!(
             ledger.record_terminal_verdicts(&[TerminalVerdict::new(
                 PARTNER,
-                ms(500_000),
-                [tx(19, 60_000).hash(), tx(20, 60_000).hash()],
+                cut,
+                [names(&one), names(&two)],
             )]),
             2,
+            "neither was held, so both are rebuilt",
+        );
+        assert_eq!(ledger.len(), 2);
+        assert!(ledger.is_unsettled_by_departed(one.hash()));
+
+        // And each is abandonable on the record's own terms, which is the
+        // whole point of it carrying them.
+        let past = ms(60_000)
+            .plus(MAX_FINALIZATION_DELAY)
+            .plus(MAX_VALIDITY_RANGE);
+        let mut offered = ledger.past_deadline(past);
+        offered.sort_unstable();
+        let mut expected = vec![(one.hash(), one.work()), (two.hash(), two.work())];
+        expected.sort_unstable();
+        assert_eq!(offered, expected);
+    }
+
+    /// A rebuilt entry lives against the departure that named it, not
+    /// against a transaction clock it has nothing to say about. It waits
+    /// on a block carrying its abort, and stops when the departure it was
+    /// written against stops answering.
+    #[test]
+    fn a_rebuilt_entry_lives_against_the_departure_that_named_it() {
+        let mut ledger = UnresolvedTxs::default();
+        let tx = tx(21, 60_000);
+        let cut = ms(500_000);
+        ledger.record_terminal(PARTNER, cut, expiry(cut));
+        ledger.record_terminal_verdicts(&[TerminalVerdict::new(PARTNER, cut, [names(&tx)])]);
+
+        assert!(
+            ledger.prune(cut).is_empty(),
+            "the transaction's own deadline is long past, and decides nothing here",
+        );
+        assert_eq!(ledger.len(), 1);
+
+        assert_eq!(
+            ledger.prune(expiry(cut).plus(Duration::from_millis(1))),
+            vec![Unanswerable {
+                tx_hash: tx.hash(),
+                covered_by_record: true,
+            }],
         );
     }
 
@@ -757,7 +870,11 @@ mod tests {
             "on its own clock the shard has stopped speaking for it",
         );
 
-        ledger.record_terminal_verdicts(&[TerminalVerdict::new(PARTNER, ms(500_000), [tx.hash()])]);
+        ledger.record_terminal_verdicts(&[TerminalVerdict::new(
+            PARTNER,
+            ms(500_000),
+            [names(&tx)],
+        )]);
         assert_eq!(
             ledger.past_deadline(past),
             vec![(tx.hash(), tx.work())],
@@ -775,7 +892,11 @@ mod tests {
         let tx = tx(18, 60_000);
         commit(&mut ledger, &tx);
         ledger.certify(tx.hash());
-        ledger.record_terminal_verdicts(&[TerminalVerdict::new(PARTNER, ms(500_000), [tx.hash()])]);
+        ledger.record_terminal_verdicts(&[TerminalVerdict::new(
+            PARTNER,
+            ms(500_000),
+            [names(&tx)],
+        )]);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         assert!(
@@ -784,17 +905,6 @@ mod tests {
                 .is_empty(),
             "merely covered is not yet abandonable",
         );
-    }
-
-    /// A record naming a transaction the ledger no longer holds changes
-    /// nothing: one already resolved needs no verdict.
-    #[test]
-    fn a_record_for_a_transaction_we_no_longer_hold_is_ignored() {
-        let mut ledger = UnresolvedTxs::default();
-        let tx = tx(19, 60_000);
-        ledger.record_terminal_verdicts(&[TerminalVerdict::new(PARTNER, ms(500_000), [tx.hash()])]);
-        assert!(!ledger.is_unsettled_by_departed(tx.hash()));
-        assert_eq!(ledger.len(), 0);
     }
 
     /// A transaction that never left this shard has no counterpart to

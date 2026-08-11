@@ -18,13 +18,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_types::{
-    BlockHeight, CertifiedBlock, MAX_VALIDITY_RANGE, Provisions, RETENTION_HORIZON, TxHash,
-    Verifiable, Verified, WeightedTimestamp,
+    BlockHeight, CertifiedBlock, EPOCH_DURATION, MAX_VALIDITY_RANGE, Provisions, RETENTION_HORIZON,
+    TERMINAL_EVIDENCE_EPOCHS, TxHash, Verifiable, Verified, WeightedTimestamp,
 };
 
 use super::chain_reader::ShardChainReader;
 
-/// How far back a rebuild reads.
+/// How far back a rebuild reads for a transaction its own deadline
+/// decides.
 ///
 /// A transaction committed at time `T` states a validity end at most
 /// `MAX_VALIDITY_RANGE` beyond it, and its own clock stops deciding it a
@@ -37,17 +38,45 @@ use super::chain_reader::ShardChainReader;
 /// counterpart may run for hours past the commit and only then depart, and
 /// the entry survives to that departure's terminal-evidence expiry. No span
 /// measured back from the tip reaches such a commit, which is why widening
-/// this is not the answer.
+/// this is not the answer — [`RECORD_WINDOW`] is.
 const FOLD_WINDOW: Duration = MAX_VALIDITY_RANGE.saturating_add(RETENTION_HORIZON);
 
-/// The lowest height committing a transaction the chain still owes an
-/// outcome for — where a replay has to start to rebuild everything
-/// execution was tracking.
+/// How far back a rebuild reads for a transaction a committed boundary
+/// record decides.
 ///
-/// Every tick with an unresolved member sits at or above it: a tick
-/// below would need a member committed below it, which would have been
-/// this floor instead. So replaying from here reaches every tick whose
-/// output has not settled, and no earlier one.
+/// Such a record carries every term abandoning the transaction takes, so
+/// reaching the record is reaching the entry however far below the
+/// transaction's own block sits. And the record is bounded where the
+/// transaction is not: it is composed after its shard's cut and the entry
+/// it writes dies at that cut's terminal-evidence expiry, so one still
+/// owed a verdict now was committed within that span of now.
+///
+/// Stated in [`EPOCH_DURATION`] rather than the beacon's configured window
+/// because a rebuild reads this before the schedule is up. A chain running
+/// shorter windows only over-reaches, which costs a longer scan and
+/// nothing else.
+const RECORD_WINDOW: Duration = Duration::from_secs(
+    EPOCH_DURATION
+        .as_secs()
+        .saturating_mul(TERMINAL_EVIDENCE_EPOCHS),
+);
+
+/// The lowest height committing something the chain still owes an outcome
+/// for — where a replay has to start to rebuild everything execution was
+/// tracking.
+///
+/// Two things put a height in the running, because two things put an entry
+/// in the ledger. A committed transaction no certificate has resolved is
+/// the first, and every tick with an unresolved member sits at or above
+/// the lowest of them: a tick below would need a member committed below
+/// it, which would have been this floor instead.
+///
+/// A committed boundary record no certificate has discharged is the
+/// second. It carries every term abandoning the transactions it names
+/// takes, so replaying it rebuilds their entries whether or not the walk
+/// reaches the blocks that committed them — which is the whole point,
+/// since a counterpart may depart arbitrarily long after a transaction
+/// commits and no span measured back from the tip would reach both.
 ///
 /// `None` when nothing is owed, where there is nothing to replay.
 ///
@@ -65,7 +94,7 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
     committed_height: BlockHeight,
     committed_ts: WeightedTimestamp,
 ) -> Option<BlockHeight> {
-    let cutoff = committed_ts.minus(FOLD_WINDOW);
+    let cutoff = committed_ts.minus(FOLD_WINDOW.max(RECORD_WINDOW));
 
     // Walk back to the window's edge, then fold forward from there.
     let mut oldest = committed_height;
@@ -78,17 +107,31 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
         }
     }
 
+    // A transaction is in the running only from the shorter window; a
+    // record is in it from the whole of the longer one. Tracked apart so
+    // the extra reach a record needs does not resurrect a transaction the
+    // deadline path retired.
+    let fold_cutoff = committed_ts.minus(FOLD_WINDOW);
     let mut unresolved: BTreeMap<TxHash, BlockHeight> = BTreeMap::new();
+    let mut undischarged: BTreeMap<TxHash, BlockHeight> = BTreeMap::new();
     let mut height = oldest;
     loop {
         if let Some(certified) = reader.get_block(height) {
             let block = certified.block();
-            for tx in block.transactions().iter() {
-                unresolved.insert(tx.hash(), height);
+            if block.header().parent_qc().weighted_timestamp() >= fold_cutoff {
+                for tx in block.transactions().iter() {
+                    unresolved.insert(tx.hash(), height);
+                }
+            }
+            for verdict in block.terminal_verdicts() {
+                for tx_hash in verdict.tx_hashes() {
+                    undischarged.insert(tx_hash, height);
+                }
             }
             for finalization in block.certificates().iter() {
                 for tx_hash in finalization.tx_hashes() {
                     unresolved.remove(&tx_hash);
+                    undischarged.remove(&tx_hash);
                 }
             }
         }
@@ -98,7 +141,10 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
         height = height.next();
     }
 
-    unresolved.into_values().min()
+    unresolved
+        .into_values()
+        .chain(undischarged.into_values())
+        .min()
 }
 
 /// Where a restart resumes execution: the blocks to replay, and the

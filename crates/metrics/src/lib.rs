@@ -348,16 +348,14 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// a shard walking towards a budget it cannot admit against.
     fn record_unresolvable_tx(&self, cause: &str) {}
 
-    /// Record a committed boundary record naming a transaction this
-    /// replica's ledger does not hold.
+    /// Record an entry rebuilt from a committed boundary record, the
+    /// ledger having held nothing for the transaction it named.
     ///
-    /// Ordinary in the common case — a record is offered until it commits,
-    /// so a later block repeats what an earlier one discharged. Read it
-    /// across the replicas of one shard rather than on its own: a replica
-    /// counting these where its peers count none is one whose rebuild did
-    /// not reach the transaction's own block, and it will not compose the
-    /// verdict its peers do.
-    fn record_unheld_verdict_name(&self) {}
+    /// Read it across the replicas of one shard rather than on its own: a
+    /// replica counting these where its peers count none is one whose
+    /// rebuild did not reach the transaction's own block, and the record
+    /// is what puts it back in step with them.
+    fn record_rebuilt_verdict_entry(&self) {}
 
     /// Set the in-flight request slot count for a `MessageClass`.
     ///
@@ -808,11 +806,10 @@ pub fn record_unresolvable_tx(cause: &str) {
     recorder().record_unresolvable_tx(cause);
 }
 
-/// Record a committed boundary record naming a transaction this replica's
-/// ledger does not hold.
+/// Record an entry rebuilt from a committed boundary record.
 #[inline]
-pub fn record_unheld_verdict_name() {
-    recorder().record_unheld_verdict_name();
+pub fn record_rebuilt_verdict_entry() {
+    recorder().record_rebuilt_verdict_entry();
 }
 
 /// Set the in-flight request slot count for a class.
