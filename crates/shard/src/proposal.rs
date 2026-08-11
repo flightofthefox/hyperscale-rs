@@ -19,10 +19,10 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, FeeDemand};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, Finalization, Hash, LocalTimestamp,
-    ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger, RevealChain, Round,
-    ShardId, TerminalVerdict, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows, Finalization, Hash,
+    LocalTimestamp, ProposerTimestamp, ProvisionHash, Provisions, ReadySignal, ReshapeTrigger,
+    RevealChain, Round, ShardId, TerminalVerdict, TopologySnapshot, Transaction, TxHash,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp,
 };
 use tracing::debug;
 
@@ -299,6 +299,29 @@ pub fn select_finalizations(
         })
         .collect();
     (ticks_to_propose, finalized_tx_count)
+}
+
+/// Drop boundary records whose evidence has stopped answering at the
+/// clock the vote will read.
+///
+/// A record claims a departed shard left transactions unsettled, and the
+/// vote checks that against the shard's settled set — which stops being
+/// readable at its terminal-evidence expiry, past which the fence refuses
+/// the claim outright. The composing side holds the set against the
+/// *committed* frontier while the vote reads the block's own `anchor_wt`,
+/// which runs ahead of it, so the two can disagree by up to the pipeline's
+/// depth: without this the proposer offers a record every voter refuses,
+/// and because a chain that commits nothing never advances the frontier
+/// that would retire the set, the next proposal carries it again.
+pub fn select_terminal_verdicts(
+    verdicts: Vec<TerminalVerdict>,
+    windows: EpochWindows,
+    anchor_wt: WeightedTimestamp,
+) -> Vec<TerminalVerdict> {
+    verdicts
+        .into_iter()
+        .filter(|verdict| anchor_wt <= windows.terminal_evidence_expiry(verdict.terminal_wt()))
+        .collect()
 }
 
 /// Drop cross-shard transactions whose payer bundle is neither among
@@ -583,6 +606,33 @@ mod tests {
     };
 
     use super::*;
+
+    /// A boundary record is offered only while the vote can still accept
+    /// it. The vote reads the block's own anchor, which runs ahead of the
+    /// committed frontier the composing side holds its evidence against,
+    /// so the anchor is what decides here too.
+    #[test]
+    fn select_terminal_verdicts_stops_at_the_evidence_expiry() {
+        let windows = EpochWindows::new(1_000);
+        let cut = WeightedTimestamp::from_millis(10_000);
+        let expiry = windows.terminal_evidence_expiry(cut);
+        let record = TerminalVerdict::new(
+            ShardId::leaf(1, 0),
+            cut,
+            [TxHash::from(Hash::from_bytes(b"stranded"))],
+        );
+        let offered = |anchor: WeightedTimestamp| {
+            select_terminal_verdicts(vec![record.clone()], windows, anchor).len()
+        };
+
+        assert_eq!(offered(cut), 1, "inside the window");
+        assert_eq!(offered(expiry), 1, "to the last instant of it");
+        assert_eq!(
+            offered(expiry.plus(Duration::from_millis(1))),
+            0,
+            "past it every voter refuses the claim, so it must not be offered",
+        );
+    }
 
     /// A proposer offers one verdict per transaction. A settlement and an
     /// abandonment for the same transaction are different ticks, so

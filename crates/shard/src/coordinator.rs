@@ -118,7 +118,8 @@ use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::precut::{Precut, PrecutStatus, PrecutVerdict};
 use crate::proposal::{
     ProposalKind, ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
-    filter_engaged_transactions, select_finalizations, select_provisions, select_transactions,
+    filter_engaged_transactions, select_finalizations, select_provisions, select_terminal_verdicts,
+    select_transactions,
 };
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::timeout_keeper::TimeoutKeeper;
@@ -1937,6 +1938,11 @@ impl ShardCoordinator {
             &qc_chain_provision_hashes,
             &self.dedup_index,
             MAX_TXS_PER_BLOCK,
+        );
+        let terminal_verdicts = select_terminal_verdicts(
+            terminal_verdicts,
+            topology_schedule.windows(),
+            validity_anchor,
         );
         // Applied after provision selection: a cross-shard transaction
         // rides only beside (or after) its payer bundle, the engagement
