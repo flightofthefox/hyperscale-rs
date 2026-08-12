@@ -686,6 +686,14 @@ fn a_replay_reaches_a_record_no_verdict_has_discharged() {
 }
 
 #[test]
+fn recovery_carries_the_tip_drain_total() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_recovery_carries_the_tip_drain_total(&storage, || {
+        storage.load_recovered_state()
+    });
+}
+
+#[test]
 fn a_committed_bundle_outlives_its_block_s_sealing() {
     let storage = SimShardStorage::default();
     test_helpers::test_committed_bundle_outlives_sealing(&storage, || {

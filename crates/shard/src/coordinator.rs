@@ -261,10 +261,11 @@ pub struct ShardCoordinator {
     substate_bytes_frontier: (BlockHeight, u64),
 
     /// Drain total carried by the committed tip's header, retained so
-    /// the vote path can check a block extending the pruned tip. `None`
-    /// when the tip's header was never observed (an ordinary restart);
-    /// a snap-synced joiner seeds it from the boundary header so its
-    /// fresh committee's first block is votable.
+    /// the vote path can check a block extending the pruned tip. Seeded
+    /// from the recovered tip, so a restart can vote on the first block
+    /// it sees rather than waiting for a commit it may be needed to
+    /// form; `None` only when no tip header was recovered, which skips
+    /// the vote rather than checking against a guess.
     committed_in_flight: Option<WorkInFlight>,
     /// Settlement frontier carried by the committed tip's header — the
     /// value the next block advances. Seeded from the recovered tip so a
@@ -519,7 +520,12 @@ impl ShardCoordinator {
             pending_bytes_deltas: HashMap::new(),
             deferred_reservation_checks: HashMap::new(),
             committed_rounds: BTreeMap::new(),
-            committed_in_flight: recovered.committed_in_flight,
+            committed_in_flight: recovered.committed_in_flight.or_else(|| {
+                recovered
+                    .committed_hash
+                    .is_none()
+                    .then_some(WorkInFlight::ZERO)
+            }),
             committed_settled_frontier: recovered.committed_settled_frontier,
             // A fresh start's tip is the chain's genesis, whose header
             // carries `ZERO` — known, not guessed. A restart with a real

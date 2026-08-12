@@ -8,8 +8,9 @@ use hyperscale_storage::test_helpers::{
     state_key, test_committed_bundle_outlives_sealing,
     test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
-    test_retained_bundle_drops_below_the_history_floor, test_undischarged_record_holds_the_floor,
-    test_unresolved_fold, test_widest_tick_copy_holds_the_slot,
+    test_recovery_carries_the_tip_drain_total, test_retained_bundle_drops_below_the_history_floor,
+    test_undischarged_record_holds_the_floor, test_unresolved_fold,
+    test_widest_tick_copy_holds_the_slot,
     test_witness_payload_range_reads as helpers_test_witness_payload_range_reads, with_provisions,
 };
 use hyperscale_storage::{
@@ -1391,6 +1392,13 @@ fn safe_vote_registers_ignore_stale_chain_incarnation() {
 
     storage.persist_safe_vote_registers(v, registers(1, 2));
     assert_eq!(storage.safe_vote_registers(v), Some(registers(1, 2)));
+}
+
+#[test]
+fn recovery_carries_the_tip_drain_total() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_recovery_carries_the_tip_drain_total(&storage, || storage.load_recovered_state());
 }
 
 #[test]

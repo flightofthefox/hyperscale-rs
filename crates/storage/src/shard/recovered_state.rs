@@ -85,12 +85,13 @@ pub struct RecoveredState {
     /// storage directly.
     pub anchor_qc: Option<QuorumCertificate>,
 
-    /// Drain total carried by the committed tip's header. `None` on
-    /// an ordinary restart (peers' headers repopulate the window as the
-    /// chain advances); a snap-synced bootstrap seeds it from the
-    /// boundary header so the fresh committee's first block past the
-    /// anchor is votable — the vote path checks the claimed total
-    /// against the parent's.
+    /// Drain total carried by the committed tip's header. Read back from
+    /// the tip's stored header on an ordinary restart, and seeded from the
+    /// boundary header by a snap-synced bootstrap, so in both cases the
+    /// first block extending the tip is votable — the vote path checks the
+    /// claimed total against the parent's, and skips the vote when it
+    /// cannot resolve one. `None` only when no block is stored at the
+    /// committed height.
     pub committed_in_flight: Option<WorkInFlight>,
 
     /// Settlement frontier carried by the committed tip's header — the

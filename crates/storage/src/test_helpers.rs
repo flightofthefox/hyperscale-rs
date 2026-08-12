@@ -22,7 +22,7 @@ use hyperscale_types::{
     SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView,
     Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt, SubstateKey, SubstateLeaf,
     TerminalVerdict, TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome,
-    UnsettledTx, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    UnsettledTx, Verifiable, Verified, WeightedTimestamp, WitnessSources, WorkInFlight,
     compute_global_receipt_root, compute_merkle_root,
 };
 
@@ -1004,6 +1004,44 @@ fn commit_block_with_provisions(storage: &impl ShardChainWriter, height: u64) ->
         .hash();
     storage.commit_block(&make_test_certified(block), &empty_witness());
     hash
+}
+
+/// Shared recovery test: the committed tip's drain total comes back off
+/// its stored header.
+///
+/// A block extending the tip claims a total the vote path checks against
+/// the parent's, and skips the vote when it cannot resolve one. A replica
+/// that recovers no total therefore cannot vote until a commit reseats it
+/// — and a commit needs a quorum it is part of, so a shard where enough
+/// replicas restart together never forms one.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_recovery_carries_the_tip_drain_total(
+    storage: &impl ShardChainWriter,
+    recovered: impl Fn() -> RecoveredState,
+) {
+    let in_flight = WorkInFlight::new(7);
+    let mut block = make_test_block(BlockHeight::new(1));
+    let Block::Live { header, .. } = &mut block else {
+        panic!("the fixture builds a live block");
+    };
+    *header = BlockHeader::new(BlockHeaderParts {
+        height: header.height(),
+        parent_block_hash: header.parent_block_hash(),
+        parent_qc: header.parent_qc().clone().into(),
+        timestamp: header.timestamp(),
+        work_in_flight: in_flight,
+        ..Default::default()
+    });
+    storage.commit_block(&make_test_certified(block), &empty_witness());
+
+    assert_eq!(
+        recovered().committed_in_flight,
+        Some(in_flight),
+        "the tip's drain total is on its stored header, so recovery reads it",
+    );
 }
 
 /// Shared retention test: sealing a block keeps its bundles' hashes and
