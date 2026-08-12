@@ -7,24 +7,24 @@
 //! whichever executor was built first decide what the other one can see.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use hyperscale_effects_bridge::{ProtocolHasher, account_address, encode_tree};
-use hyperscale_engine::genesis::{pool_address, stake_unit, staking_artifact};
+use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
+use hyperscale_effects_bridge::{ProtocolHasher, account_address};
+use hyperscale_engine::genesis::{pool_address, staking_artifact};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, Parallelism, TickBatchContext, XRD, genesis_writes,
 };
 use hyperscale_storage::SubstateDatabase;
+use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    BeaconWitnessEvent, BlockHash, CallTarget, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey,
-    EnvelopeExt, Hash, NetworkId, PrincipalAddr, ProvisionalHolds, ResourceRef, RevealChain,
-    ShardId, ShardTrie, Stake, StakePoolId, StakePoolSeat, SubstateKey, Transaction,
-    TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
+    BeaconWitnessEvent, BlockHash, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt,
+    Hash, NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain, ShardId, ShardTrie, Stake,
+    StakePoolId, StakePoolSeat, SubstateKey, TimestampRange, Transaction, Verified,
+    WeightedTimestamp,
 };
-use hyperscale_vm_effects::{
-    Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
-    Value, package_hash,
-};
+use hyperscale_vm_effects::package_hash;
+use hyperscale_vm_manifest_builder::native::{account, staking};
 
 /// The identifier the beacon folds the seated pool under.
 const POOL_ID: u32 = 7;
@@ -83,28 +83,32 @@ fn pool_at(id: u32) -> ComponentAddr {
     pool_address(package_hash(&ProtocolHasher, staking_artifact()), &seat(id))
 }
 
-fn withdraw(
-    target: impl Into<CallTarget>,
-    resource: impl Into<Address>,
-    amount: u128,
-) -> GraphNode {
-    GraphNode {
-        target: target.into(),
-        method: "withdraw".into(),
-        args: vec![
-            GraphArg::Literal(Value::Address(resource.into())),
-            GraphArg::Literal(Value::U128(amount)),
-        ],
-    }
+/// The client this binary builds through.
+///
+/// Its world seats every pool the file names, which is not the same world
+/// any one executor installs: what a builder must resolve is the target it
+/// is writing, and what an executor recognises is the network's own
+/// decision.
+fn client() -> &'static Client {
+    static CLIENT: LazyLock<Client> = LazyLock::new(|| {
+        Client::new(
+            genesis_world_with_pools(&[seat(POOL_ID), seat(99)]),
+            NetworkId(242),
+        )
+    });
+    &CLIENT
 }
 
-fn from_edge(producer: u32, resource: impl Into<ResourceRef>) -> GraphArg {
-    GraphArg::Edge {
-        edge: EdgeRef {
-            producer,
-            output: 0,
-        },
-        constraints: vec![Constraint::ResourceIs(resource.into())],
+/// The signing terms every transaction here shares: a window nothing
+/// falls outside, and no message.
+const fn terms(max_fee: u128) -> Terms {
+    Terms {
+        max_fee,
+        validity: TimestampRange::new(
+            WeightedTimestamp::from_millis(0),
+            WeightedTimestamp::from_millis(u64::MAX),
+        ),
+        message: Vec::new(),
     }
 }
 
@@ -112,45 +116,13 @@ fn from_edge(producer: u32, resource: impl Into<ResourceRef>) -> GraphArg {
 fn signed_stake(pool: ComponentAddr, amount: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[DELEGATOR; 32]).unwrap();
     let from = account_address(&key.public_key().0);
-    let graph = ManifestGraph {
-        nodes: vec![
-            withdraw(from, *XRD, amount),
-            GraphNode {
-                target: pool.into(),
-                method: "stake".into(),
-                args: vec![from_edge(0, *XRD)],
-            },
-            GraphNode {
-                target: from.into(),
-                method: "deposit".into(),
-                args: vec![from_edge(1, stake_unit(pool))],
-            },
-        ],
-    };
-    let tree = EnvelopeTree {
-        root: IntentDecl {
-            graph,
-            params: Vec::new(),
-        },
-        root_bindings: Vec::new(),
-        subintents: Vec::new(),
-    };
-    Transaction::new(
-        TransactionEnvelope {
-            body: TransactionBody::Call(encode_tree(&tree)),
-            subintent_sigs: Vec::new(),
-            fee_payer: from,
-            max_fee: 1_000,
-            gas_limit: 1_000_000,
-            validity_start_ms: 0,
-            validity_end_ms: u64::MAX,
-            message: Vec::new(),
-            network: NetworkId(242),
-            signer: [0; 32],
-            signature: [0; 64],
-        }
-        .sign(&key),
-    )
+    let cache = client().cache();
+    let mut b = client().builder(&cache);
+    let funds = account::withdraw(&mut b, from, *XRD, amount).expect("an account withdraws");
+    let units = staking::stake(&mut b, pool, funds).expect("a pool takes a delegation");
+    account::deposit(&mut b, from, units).expect("an account banks its position");
+    let graph = b.build().expect("every output is consumed");
+    Transaction::new(client().sign(graph, &key, terms(1_000)))
 }
 
 fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
@@ -222,40 +194,10 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
     let executor = Executor::with_pools(&[seat(POOL_ID)], ExecutionMode::Serial);
     let key = Ed25519PrivateKey::from_bytes(&[DELEGATOR; 32]).unwrap();
     let from = account_address(&key.public_key().0);
-    let graph = ManifestGraph {
-        nodes: vec![
-            withdraw(from, *XRD, 100),
-            GraphNode {
-                target: from.into(),
-                method: "deposit".into(),
-                args: vec![from_edge(0, *XRD)],
-            },
-        ],
-    };
-    let tree = EnvelopeTree {
-        root: IntentDecl {
-            graph,
-            params: Vec::new(),
-        },
-        root_bindings: Vec::new(),
-        subintents: Vec::new(),
-    };
-    let tx = Transaction::new(
-        TransactionEnvelope {
-            body: TransactionBody::Call(encode_tree(&tree)),
-            subintent_sigs: Vec::new(),
-            fee_payer: from,
-            max_fee: 1_000,
-            gas_limit: 1_000_000,
-            validity_start_ms: 0,
-            validity_end_ms: u64::MAX,
-            message: Vec::new(),
-            network: NetworkId(242),
-            signer: [0; 32],
-            signature: [0; 64],
-        }
-        .sign(&key),
-    );
+    let graph = client()
+        .transfer_graph(from, from, 100)
+        .expect("an account answers a transfer");
+    let tx = Transaction::new(client().sign(graph, &key, terms(1_000)));
     let executed = execute(&executor, tx);
     assert!(
         witnesses(&executed[0]).is_empty(),
@@ -265,42 +207,14 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
 
 /// `pool.register-validator(id, pubkey, proof)`, signed and paid for by
 /// `seed` whatever the pool's configuration says.
-fn signed_registration(pool: impl Into<CallTarget>, seed: u8) -> Transaction {
+fn signed_registration(pool: ComponentAddr, seed: u8) -> Transaction {
     let key = key_of(seed);
-    let tree = EnvelopeTree {
-        root: IntentDecl {
-            graph: ManifestGraph {
-                nodes: vec![GraphNode {
-                    target: pool.into(),
-                    method: "register-validator".into(),
-                    args: vec![
-                        GraphArg::Literal(Value::U64(11)),
-                        GraphArg::Literal(Value::Bytes(vec![0xC1; 48])),
-                        GraphArg::Literal(Value::Bytes(vec![0xC2; 96])),
-                    ],
-                }],
-            },
-            params: Vec::new(),
-        },
-        root_bindings: Vec::new(),
-        subintents: Vec::new(),
-    };
-    Transaction::new(
-        TransactionEnvelope {
-            body: TransactionBody::Call(encode_tree(&tree)),
-            subintent_sigs: Vec::new(),
-            fee_payer: account_of(seed),
-            max_fee: 1_000,
-            gas_limit: 1_000_000,
-            validity_start_ms: 0,
-            validity_end_ms: u64::MAX,
-            message: Vec::new(),
-            network: NetworkId(242),
-            signer: [0; 32],
-            signature: [0; 64],
-        }
-        .sign(&key),
-    )
+    let cache = client().cache();
+    let mut b = client().builder(&cache);
+    staking::register_validator(&mut b, pool, 11, vec![0xC1; 48], vec![0xC2; 96])
+        .expect("a pool answers a registration");
+    let graph = b.build().expect("a registration produces nothing");
+    Transaction::new(client().sign(graph, &key, terms(1_000)))
 }
 
 /// A pool instance is owned by nobody, so its own authority is

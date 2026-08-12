@@ -3,30 +3,27 @@
 //! genesis-seeded snapshot.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::vm_statics::package_key;
-use hyperscale_effects_bridge::{
-    ProtocolHasher, account_address, admit_package, attach_metadata, encode_tree,
-};
+use hyperscale_effects_bridge::{ProtocolHasher, account_address, admit_package, attach_metadata};
 use hyperscale_engine::genesis::{account_artifact, entropy_key, vault_key};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, Parallelism, PreviewGrants, PreviewInputs, PreviewOutcome,
     PreviewReport, ResourceChange, TickBatchContext, XRD, genesis_writes,
 };
 use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput, VersionedStore};
+use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    BlockHash, BlockHeight, CallTarget, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey,
-    EnvelopeExt, Hash, MerkleInclusionProof, NetworkId, PrincipalAddr, ProvisionalHolds,
-    RevealChain, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
-    Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
-    absorb_committed_cells,
+    BlockHash, BlockHeight, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
+    MerkleInclusionProof, NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain, SettledWrites,
+    ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey, TimestampRange, Transaction,
+    TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp, absorb_committed_cells,
 };
-use hyperscale_vm_effects::{
-    AbiParam, Address, Constraint, EdgeRef, EnvelopeTree, Expr, GraphArg, GraphNode, IntentDecl,
-    ManifestGraph, Value, package_hash,
-};
+use hyperscale_vm_effects::{AbiParam, Address, Expr, package_hash};
 use hyperscale_vm_kernel::{amount_cell, encode_amount};
+use hyperscale_vm_manifest_builder::GraphBuilder;
+use hyperscale_vm_manifest_builder::native::account;
 use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_metadata};
 
 /// The two accounts the transfer cases move funds between, as signing
@@ -130,116 +127,80 @@ impl VersionedStore for MapDb {
     }
 }
 
-fn transfer_graph(
-    from: impl Into<CallTarget>,
-    to: impl Into<CallTarget>,
-    amount: u128,
-) -> ManifestGraph {
-    ManifestGraph {
-        nodes: vec![
-            GraphNode {
-                target: from.into(),
-                method: "withdraw".into(),
-                args: vec![
-                    GraphArg::Literal(Value::Address(XRD.address())),
-                    GraphArg::Literal(Value::U128(amount)),
-                ],
-            },
-            GraphNode {
-                target: to.into(),
-                method: "deposit".into(),
-                args: vec![GraphArg::Edge {
-                    edge: EdgeRef {
-                        producer: 0,
-                        output: 0,
-                    },
-                    constraints: vec![Constraint::ResourceIs((*XRD).into())],
-                }],
-            },
-        ],
+/// The client this binary builds through: the stdlib world, on the one
+/// network its envelopes name.
+fn client() -> &'static Client {
+    static CLIENT: LazyLock<Client> = LazyLock::new(|| Client::genesis(NetworkId(242)));
+    &CLIENT
+}
+
+/// The signing terms every transaction here shares: a window nothing
+/// falls outside, and no message.
+const fn terms(max_fee: u128) -> Terms {
+    Terms {
+        max_fee,
+        validity: TimestampRange::new(
+            WeightedTimestamp::from_millis(0),
+            WeightedTimestamp::from_millis(u64::MAX),
+        ),
+        message: Vec::new(),
     }
 }
 
-fn signed_transfer(
-    seed: u8,
-    from: impl Into<CallTarget>,
-    to: impl Into<CallTarget>,
-    amount: u128,
-) -> Transaction {
+fn signed_transfer(seed: u8, from: PrincipalAddr, to: PrincipalAddr, amount: u128) -> Transaction {
     signed_transfer_with_fee(seed, from, to, amount, TRANSFER_FEE)
 }
 
 /// A transfer whose recipient signs a floor the withdrawal cannot meet.
 fn signed_transfer_under_bound(
     seed: u8,
-    from: impl Into<CallTarget>,
-    to: impl Into<CallTarget>,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
     amount: u128,
     min: u128,
     max_fee: u128,
 ) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
-    let mut graph = transfer_graph(from, to, amount);
-    let GraphArg::Edge { constraints, .. } = &mut graph.nodes[1].args[0] else {
-        panic!("the deposit consumes an edge");
-    };
-    constraints.push(Constraint::MinAmount(min));
-    let tree = EnvelopeTree {
-        root: IntentDecl {
-            graph,
-            params: Vec::new(),
-        },
-        root_bindings: Vec::new(),
-        subintents: Vec::new(),
-    };
-    let vm = TransactionEnvelope {
-        body: TransactionBody::Call(encode_tree(&tree)),
-        subintent_sigs: Vec::new(),
-        fee_payer: account_address(&key.public_key().0),
-        max_fee,
-        gas_limit: 1_000_000,
-        validity_start_ms: 0,
-        validity_end_ms: u64::MAX,
-        message: Vec::new(),
-        network: NetworkId(242),
-        signer: [0; 32],
-        signature: [0; 64],
-    }
-    .sign(&key);
-    Transaction::new(vm)
+    let cache = client().cache();
+    let mut b = client().builder(&cache);
+    let funds = account::withdraw(&mut b, from, *XRD, amount).expect("an account withdraws");
+    account::deposit(&mut b, to, funds.min(min)).expect("an account deposits");
+    let graph = b.build().expect("every output is consumed");
+    Transaction::new(client().sign(graph, &key, terms(max_fee)))
 }
 
-fn signed_transfer_with_fee(
+/// A transfer drawing on an instance nothing registered.
+///
+/// The untyped builder writes it because the typed one cannot: refusing a
+/// target that resolves to nothing is the gate under test, so a graph that
+/// trips it has to be constructed without consulting the world.
+fn signed_transfer_from_unknown(
     seed: u8,
-    from: impl Into<CallTarget>,
-    to: impl Into<CallTarget>,
+    from: ComponentAddr,
+    to: PrincipalAddr,
     amount: u128,
     max_fee: u128,
 ) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
-    let tree = EnvelopeTree {
-        root: IntentDecl {
-            graph: transfer_graph(from, to, amount),
-            params: Vec::new(),
-        },
-        root_bindings: Vec::new(),
-        subintents: Vec::new(),
-    };
-    let vm = TransactionEnvelope {
-        body: TransactionBody::Call(encode_tree(&tree)),
-        subintent_sigs: Vec::new(),
-        fee_payer: account_address(&key.public_key().0),
-        max_fee,
-        gas_limit: 1_000_000,
-        validity_start_ms: 0,
-        validity_end_ms: u64::MAX,
-        message: Vec::new(),
-        network: NetworkId(242),
-        signer: [0; 32],
-        signature: [0; 64],
-    }
-    .sign(&key);
-    Transaction::new(vm)
+    let mut b = GraphBuilder::new();
+    let [funds] = b.call(from, "withdraw", (*XRD, amount));
+    let [] = b.call(to, "deposit", (funds.resource_is(*XRD),));
+    let graph = b.build().expect("every output is consumed");
+    Transaction::new(client().sign(graph, &key, terms(max_fee)))
+}
+
+fn signed_transfer_with_fee(
+    seed: u8,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
+    amount: u128,
+    max_fee: u128,
+) -> Transaction {
+    let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
+    let graph = client()
+        .transfer_graph(from, to, amount)
+        .expect("an account answers a transfer");
+    Transaction::new(client().sign(graph, &key, terms(max_fee)))
 }
 
 /// The account address the fee-paying tests derive from their signing key.
@@ -271,41 +232,17 @@ fn execute(executor: &Executor, transactions: &[Arc<Verified<Transaction>>]) -> 
 
 /// A signed single-node stamp: the account records the transaction's
 /// randomness draw in its entropy leaf.
-fn signed_stamp(seed: u8, owner: impl Into<CallTarget>) -> Transaction {
+fn signed_stamp(seed: u8, owner: PrincipalAddr) -> Transaction {
     signed_stamp_with_fee(seed, owner, 1_000_000)
 }
 
-fn signed_stamp_with_fee(seed: u8, owner: impl Into<CallTarget>, max_fee: u128) -> Transaction {
+fn signed_stamp_with_fee(seed: u8, owner: PrincipalAddr, max_fee: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
-    let tree = EnvelopeTree {
-        root: IntentDecl {
-            graph: ManifestGraph {
-                nodes: vec![GraphNode {
-                    target: owner.into(),
-                    method: "stamp-entropy".into(),
-                    args: vec![],
-                }],
-            },
-            params: Vec::new(),
-        },
-        root_bindings: Vec::new(),
-        subintents: Vec::new(),
-    };
-    let vm = TransactionEnvelope {
-        body: TransactionBody::Call(encode_tree(&tree)),
-        subintent_sigs: Vec::new(),
-        fee_payer: account_address(&key.public_key().0),
-        max_fee,
-        gas_limit: 1_000_000,
-        validity_start_ms: 0,
-        validity_end_ms: u64::MAX,
-        message: Vec::new(),
-        network: NetworkId(242),
-        signer: [0; 32],
-        signature: [0; 64],
-    }
-    .sign(&key);
-    Transaction::new(vm)
+    let cache = client().cache();
+    let mut b = client().builder(&cache);
+    account::stamp_entropy(&mut b, owner).expect("an account answers a stamp");
+    let graph = b.build().expect("a stamp produces nothing");
+    Transaction::new(client().sign(graph, &key, terms(max_fee)))
 }
 
 /// Execute `transactions` as a single-shard batch anchored on `reveal`.
@@ -1043,73 +980,16 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
 #[test]
 fn a_two_recipient_fan_out_executes() {
     let executor = Executor::new(ExecutionMode::Serial);
-    let graph = ManifestGraph {
-        nodes: vec![
-            GraphNode {
-                target: alice().into(),
-                method: "withdraw".into(),
-                args: vec![
-                    GraphArg::Literal(Value::Address(XRD.address())),
-                    GraphArg::Literal(Value::U128(5)),
-                ],
-            },
-            GraphNode {
-                target: bob().into(),
-                method: "deposit".into(),
-                args: vec![GraphArg::Edge {
-                    edge: EdgeRef {
-                        producer: 0,
-                        output: 0,
-                    },
-                    constraints: vec![Constraint::ResourceIs((*XRD).into())],
-                }],
-            },
-            GraphNode {
-                target: alice().into(),
-                method: "withdraw".into(),
-                args: vec![
-                    GraphArg::Literal(Value::Address(XRD.address())),
-                    GraphArg::Literal(Value::U128(6)),
-                ],
-            },
-            GraphNode {
-                target: fee_payer(7).into(),
-                method: "deposit".into(),
-                args: vec![GraphArg::Edge {
-                    edge: EdgeRef {
-                        producer: 2,
-                        output: 0,
-                    },
-                    constraints: vec![Constraint::ResourceIs((*XRD).into())],
-                }],
-            },
-        ],
-    };
     let key = Ed25519PrivateKey::from_bytes(&[ALICE_SEED; 32]).unwrap();
-    let tree = EnvelopeTree {
-        root: IntentDecl {
-            graph,
-            params: Vec::new(),
-        },
-        root_bindings: Vec::new(),
-        subintents: Vec::new(),
-    };
-    let vm = TransactionEnvelope {
-        body: TransactionBody::Call(encode_tree(&tree)),
-        subintent_sigs: Vec::new(),
-        fee_payer: alice(),
-        max_fee: 10,
-        gas_limit: 1_000_000,
-        validity_start_ms: 0,
-        validity_end_ms: u64::MAX,
-        message: Vec::new(),
-        network: NetworkId(242),
-        signer: [0; 32],
-        signature: [0; 64],
+    let cache = client().cache();
+    let mut b = client().builder(&cache);
+    for (to, amount) in [(bob(), 5u128), (fee_payer(7), 6)] {
+        let funds = account::withdraw(&mut b, alice(), *XRD, amount).expect("an account withdraws");
+        account::deposit(&mut b, to, funds).expect("an account deposits");
     }
-    .sign(&key);
+    let graph = b.build().expect("every output is consumed");
     let tx = Arc::new(Verified::<Transaction>::from_persisted(Transaction::new(
-        vm,
+        client().sign(graph, &key, terms(10)),
     )));
     let executed = execute_on(
         &[(alice(), 1_000), (bob(), 50), (fee_payer(7), 1_000)],
@@ -1510,7 +1390,7 @@ fn a_preview_prices_an_abort_at_its_class_floor() {
 fn a_preview_refuses_what_admission_would_refuse() {
     let unknown = ComponentAddr::new([0xAB; 31]);
     let executor = Executor::new(ExecutionMode::Serial);
-    let tx = signed_transfer_with_fee(7, unknown, bob(), 10, PREVIEW_CEILING);
+    let tx = signed_transfer_from_unknown(7, unknown, bob(), 10, PREVIEW_CEILING);
     let report = preview_on(&[(bob(), 50)], &executor, &tx, PreviewGrants::default());
 
     let PreviewOutcome::Refused { reason } = &report.outcome else {

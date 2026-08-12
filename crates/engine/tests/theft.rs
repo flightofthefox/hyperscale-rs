@@ -13,23 +13,21 @@
 //! cannot reach a block at all.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use hyperscale_effects_bridge::{account_address, encode_tree};
+use hyperscale_effects_bridge::account_address;
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, Parallelism, TickBatchContext, XRD, genesis_writes,
 };
 use hyperscale_storage::SubstateDatabase;
+use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    BlockHash, CallTarget, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash, NetworkId,
-    PrincipalAddr, ProvisionalHolds, RevealChain, SettledWrites, ShardId, ShardTrie, StateWrites,
-    SubstateKey, Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
+    BlockHash, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash, NetworkId, PrincipalAddr,
+    ProvisionalHolds, RevealChain, SettledWrites, ShardId, ShardTrie, StateWrites, SubstateKey,
+    TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
-use hyperscale_vm_effects::{
-    Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
-    Value,
-};
+use hyperscale_vm_effects::Address;
 use hyperscale_vm_kernel::{amount_cell, encode_amount};
 
 /// A funded account whose key nothing in this binary holds — the address
@@ -71,65 +69,34 @@ fn world_accounts() -> Vec<(PrincipalAddr, u128)> {
     vec![(VICTIM, FUNDED), (thief(), FUNDED)]
 }
 
-fn withdraw(target: impl Into<CallTarget>, amount: u128) -> GraphNode {
-    GraphNode {
-        target: target.into(),
-        method: "withdraw".into(),
-        args: vec![
-            GraphArg::Literal(Value::Address(XRD.address())),
-            GraphArg::Literal(Value::U128(amount)),
-        ],
-    }
+/// The client this binary builds through: the stdlib world, on the one
+/// network its envelopes name.
+fn client() -> &'static Client {
+    static CLIENT: LazyLock<Client> = LazyLock::new(|| Client::genesis(NetworkId(242)));
+    &CLIENT
 }
 
-fn deposit(target: impl Into<CallTarget>, producer: u32) -> GraphNode {
-    GraphNode {
-        target: target.into(),
-        method: "deposit".into(),
-        args: vec![GraphArg::Edge {
-            edge: EdgeRef {
-                producer,
-                output: 0,
-            },
-            constraints: vec![Constraint::ResourceIs((*XRD).into())],
-        }],
+/// The signing terms every transaction here shares: a window nothing
+/// falls outside, and no message.
+const fn terms(max_fee: u128) -> Terms {
+    Terms {
+        max_fee,
+        validity: TimestampRange::new(
+            WeightedTimestamp::from_millis(0),
+            WeightedTimestamp::from_millis(u64::MAX),
+        ),
+        message: Vec::new(),
     }
 }
 
 /// `from.withdraw(*XRD, amount) -> to.deposit(..)`, signed and paid for by
 /// the thief whatever `from` says.
-fn signed_transfer(
-    from: impl Into<CallTarget>,
-    to: impl Into<CallTarget>,
-    amount: u128,
-) -> Transaction {
+fn signed_transfer(from: PrincipalAddr, to: PrincipalAddr, amount: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[THIEF; 32]).unwrap();
-    let tree = EnvelopeTree {
-        root: IntentDecl {
-            graph: ManifestGraph {
-                nodes: vec![withdraw(from, amount), deposit(to, 0)],
-            },
-            params: Vec::new(),
-        },
-        root_bindings: Vec::new(),
-        subintents: Vec::new(),
-    };
-    Transaction::new(
-        TransactionEnvelope {
-            body: TransactionBody::Call(encode_tree(&tree)),
-            subintent_sigs: Vec::new(),
-            fee_payer: thief(),
-            max_fee: 1_000,
-            gas_limit: 1_000_000,
-            validity_start_ms: 0,
-            validity_end_ms: u64::MAX,
-            message: Vec::new(),
-            network: NetworkId(242),
-            signer: [0; 32],
-            signature: [0; 64],
-        }
-        .sign(&key),
-    )
+    let graph = client()
+        .transfer_graph(from, to, amount)
+        .expect("an account answers a transfer");
+    Transaction::new(client().sign(graph, &key, terms(1_000)))
 }
 
 fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
