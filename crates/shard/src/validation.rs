@@ -648,14 +648,14 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 #[cfg(test)]
 mod tests {
     use hyperscale_crypto_bls::BlsSigner;
-    use hyperscale_types::test_utils::{TestCommittee, make_finalization, test_prefix};
+    use hyperscale_types::test_utils::{TestCommittee, make_finalization, test_principal};
     use hyperscale_types::{
         Address, AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin,
-        Finalization, Hash, MerkleInclusionProof, NetworkDefinition, ProposerTimestamp,
-        ProvisionEntry, Provisions, QuorumCertificate, RevealChain, Round, ShardId, ShardLoad,
-        Signer, SignerBitfield, TerminalVerdict, TerminalVerdictRoot, TimestampRange, Transaction,
-        TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-        Verified, WeightedTimestamp, WitnessSources, test_utils,
+        Finalization, Hash, MerkleInclusionProof, NetworkDefinition, PrincipalAddr,
+        ProposerTimestamp, ProvisionEntry, Provisions, QuorumCertificate, RevealChain, Round,
+        ShardId, ShardLoad, Signer, SignerBitfield, TerminalVerdict, TerminalVerdictRoot,
+        TimestampRange, Transaction, TransactionDecision, UnsettledTx, ValidatorId, ValidatorInfo,
+        ValidatorSet, Verifiable, Verified, WeightedTimestamp, WitnessSources, test_utils,
     };
 
     use super::*;
@@ -1809,7 +1809,7 @@ mod tests {
 
     /// A signed stub transaction whose derived owners are exactly
     /// `owners`, paying from `payer`, wrapped verified for block content.
-    fn stub_tx(payer: Address, owners: &[Address]) -> Arc<Verifiable<Transaction>> {
+    fn stub_tx(payer: PrincipalAddr, owners: &[Address]) -> Arc<Verifiable<Transaction>> {
         test_utils::install_stub_vm_statics();
         let validity = TimestampRange::new(
             WeightedTimestamp::ZERO,
@@ -1840,9 +1840,9 @@ mod tests {
         // to leaf(1, 1). The payer lives on the remote shard.
         let topo = TestCommittee::new(4, 42).topology_snapshot(2);
         let local = ShardId::leaf(1, 0);
-        let local_owner = test_prefix(0x01);
-        let payer_owner = test_prefix(0x81);
-        let tx = stub_tx(payer_owner, &[local_owner, payer_owner]);
+        let local_owner = test_principal(0x01);
+        let payer_owner = test_principal(0x81);
+        let tx = stub_tx(payer_owner, &[local_owner.address(), payer_owner.address()]);
         let tx_hash = tx.hash();
 
         // No bundle anywhere: the counterpart must not engage.
@@ -1896,12 +1896,12 @@ mod tests {
     #[test]
     fn engagement_exempts_the_payer_shard_and_single_shard_legs() {
         let topo = TestCommittee::new(4, 42).topology_snapshot(2);
-        let local_owner = test_prefix(0x01);
-        let payer_owner = test_prefix(0x81);
+        let local_owner = test_principal(0x01);
+        let payer_owner = test_principal(0x81);
 
         // At the payer's own shard the reservation, not the bundle, is
         // the gate — no bundle demanded.
-        let cross = stub_tx(payer_owner, &[local_owner, payer_owner]);
+        let cross = stub_tx(payer_owner, &[local_owner.address(), payer_owner.address()]);
         let at_payer = block_with_tx(&cross, Vec::new());
         assert!(
             validate_engagement(
@@ -1914,7 +1914,7 @@ mod tests {
         );
 
         // A single-shard leg engages nothing remotely.
-        let single = stub_tx(local_owner, &[local_owner]);
+        let single = stub_tx(local_owner, &[local_owner.address()]);
         let local_only = block_with_tx(&single, Vec::new());
         assert!(
             validate_engagement(

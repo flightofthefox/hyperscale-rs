@@ -17,7 +17,7 @@ use hyperscale_engine::{
 use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput, VersionedStore};
 use hyperscale_types::test_utils::test_principal;
 use hyperscale_types::{
-    BlockHash, BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
+    BlockHash, BlockHeight, CallTarget, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
     MerkleInclusionProof, NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain, SettledWrites,
     ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey, Transaction, TransactionBody,
     TransactionEnvelope, Verified, WeightedTimestamp, absorb_committed_cells,
@@ -130,7 +130,11 @@ impl VersionedStore for MapDb {
     }
 }
 
-fn transfer_graph(from: impl Into<Address>, to: impl Into<Address>, amount: u128) -> ManifestGraph {
+fn transfer_graph(
+    from: impl Into<CallTarget>,
+    to: impl Into<CallTarget>,
+    amount: u128,
+) -> ManifestGraph {
     ManifestGraph {
         nodes: vec![
             GraphNode {
@@ -149,7 +153,7 @@ fn transfer_graph(from: impl Into<Address>, to: impl Into<Address>, amount: u128
                         producer: 0,
                         output: 0,
                     },
-                    constraints: vec![Constraint::ResourceIs(XRD.address())],
+                    constraints: vec![Constraint::ResourceIs((*XRD).into())],
                 }],
             },
         ],
@@ -158,8 +162,8 @@ fn transfer_graph(from: impl Into<Address>, to: impl Into<Address>, amount: u128
 
 fn signed_transfer(
     seed: u8,
-    from: impl Into<Address>,
-    to: impl Into<Address>,
+    from: impl Into<CallTarget>,
+    to: impl Into<CallTarget>,
     amount: u128,
 ) -> Transaction {
     signed_transfer_with_fee(seed, from, to, amount, TRANSFER_FEE)
@@ -168,8 +172,8 @@ fn signed_transfer(
 /// A transfer whose recipient signs a floor the withdrawal cannot meet.
 fn signed_transfer_under_bound(
     seed: u8,
-    from: impl Into<Address>,
-    to: impl Into<Address>,
+    from: impl Into<CallTarget>,
+    to: impl Into<CallTarget>,
     amount: u128,
     min: u128,
     max_fee: u128,
@@ -191,7 +195,7 @@ fn signed_transfer_under_bound(
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(encode_tree(&tree)),
         subintent_sigs: Vec::new(),
-        fee_payer: account_address(&key.public_key().0).into(),
+        fee_payer: account_address(&key.public_key().0),
         max_fee,
         gas_limit: 1_000_000,
         validity_start_ms: 0,
@@ -207,8 +211,8 @@ fn signed_transfer_under_bound(
 
 fn signed_transfer_with_fee(
     seed: u8,
-    from: impl Into<Address>,
-    to: impl Into<Address>,
+    from: impl Into<CallTarget>,
+    to: impl Into<CallTarget>,
     amount: u128,
     max_fee: u128,
 ) -> Transaction {
@@ -224,7 +228,7 @@ fn signed_transfer_with_fee(
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(encode_tree(&tree)),
         subintent_sigs: Vec::new(),
-        fee_payer: account_address(&key.public_key().0).into(),
+        fee_payer: account_address(&key.public_key().0),
         max_fee,
         gas_limit: 1_000_000,
         validity_start_ms: 0,
@@ -271,11 +275,11 @@ fn execute(executor: &Executor, transactions: &[Arc<Verified<Transaction>>]) -> 
 
 /// A signed single-node stamp: the account records the transaction's
 /// randomness draw in its entropy leaf.
-fn signed_stamp(seed: u8, owner: impl Into<Address>) -> Transaction {
+fn signed_stamp(seed: u8, owner: impl Into<CallTarget>) -> Transaction {
     signed_stamp_with_fee(seed, owner, 1_000_000)
 }
 
-fn signed_stamp_with_fee(seed: u8, owner: impl Into<Address>, max_fee: u128) -> Transaction {
+fn signed_stamp_with_fee(seed: u8, owner: impl Into<CallTarget>, max_fee: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let tree = EnvelopeTree {
         root: IntentDecl {
@@ -294,7 +298,7 @@ fn signed_stamp_with_fee(seed: u8, owner: impl Into<Address>, max_fee: u128) -> 
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(encode_tree(&tree)),
         subintent_sigs: Vec::new(),
-        fee_payer: account_address(&key.public_key().0).into(),
+        fee_payer: account_address(&key.public_key().0),
         max_fee,
         gas_limit: 1_000_000,
         validity_start_ms: 0,
@@ -1062,7 +1066,7 @@ fn a_two_recipient_fan_out_executes() {
                         producer: 0,
                         output: 0,
                     },
-                    constraints: vec![Constraint::ResourceIs(XRD.address())],
+                    constraints: vec![Constraint::ResourceIs((*XRD).into())],
                 }],
             },
             GraphNode {
@@ -1081,7 +1085,7 @@ fn a_two_recipient_fan_out_executes() {
                         producer: 2,
                         output: 0,
                     },
-                    constraints: vec![Constraint::ResourceIs(XRD.address())],
+                    constraints: vec![Constraint::ResourceIs((*XRD).into())],
                 }],
             },
         ],
@@ -1098,7 +1102,7 @@ fn a_two_recipient_fan_out_executes() {
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(encode_tree(&tree)),
         subintent_sigs: Vec::new(),
-        fee_payer: alice().into(),
+        fee_payer: alice(),
         max_fee: 10,
         gas_limit: 1_000_000,
         validity_start_ms: 0,
@@ -1140,7 +1144,7 @@ fn signed_publish(seed: u8, artifact: Vec<u8>) -> Transaction {
     let vm = TransactionEnvelope {
         body: TransactionBody::Publish(artifact),
         subintent_sigs: Vec::new(),
-        fee_payer: account_address(&key.public_key().0).into(),
+        fee_payer: account_address(&key.public_key().0),
         max_fee: 1_000_000,
         gas_limit: 1_000_000,
         validity_start_ms: 0,

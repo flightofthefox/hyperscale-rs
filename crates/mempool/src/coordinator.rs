@@ -1155,10 +1155,10 @@ mod tests {
     use hyperscale_metrics_memory::MemoryRecorder;
     use hyperscale_types::test_utils::{
         TestCommittee, certify, install_stub_vm_statics, make_finalization, make_live_block,
-        stub_transaction, test_prefix, test_transaction, test_transaction_with_prefixes,
-        test_validity_range,
+        stub_transaction, test_prefix, test_principal, test_transaction,
+        test_transaction_with_prefixes, test_validity_range,
     };
-    use hyperscale_types::{Address, RevealChain, Verified, WitnessSources};
+    use hyperscale_types::{Address, PrincipalAddr, RevealChain, Verified, WitnessSources};
 
     /// Test-only convenience: wrap any `Transaction` in a
     /// `Verified` witness via the test-only gate.
@@ -2140,7 +2140,7 @@ mod tests {
             WeightedTimestamp::from_millis(end_ms),
         );
         Arc::new(verified(stub_transaction(
-            test_prefix(seed),
+            test_principal(seed),
             &[test_prefix(seed)],
             1_000,
             range,
@@ -2443,7 +2443,7 @@ mod tests {
 
     /// A signed stub transaction whose derived owners are exactly
     /// `owners`, paying from `payer`.
-    fn stub_vm(payer: Address, owners: &[Address]) -> Arc<Verified<Transaction>> {
+    fn stub_vm(payer: PrincipalAddr, owners: &[Address]) -> Arc<Verified<Transaction>> {
         install_stub_vm_statics();
         Arc::new(verified(stub_transaction(
             payer,
@@ -2463,9 +2463,9 @@ mod tests {
         let topology = TestCommittee::new(4, 42).topology_snapshot(1);
         let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
 
-        let owners: Vec<Address> = (0..8u8).map(|i| test_prefix(0x40 + i)).collect();
+        let owners: Vec<PrincipalAddr> = (0..8u8).map(|i| test_principal(0x40 + i)).collect();
         for owner in &owners {
-            let tx = stub_vm(*owner, std::slice::from_ref(owner));
+            let tx = stub_vm(*owner, &[owner.address()]);
             mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
         }
         let now = LocalTimestamp::from_millis(1_000);
@@ -2503,9 +2503,9 @@ mod tests {
         let topology = TestCommittee::new(4, 42).topology_snapshot(1);
         let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
 
-        let owners: Vec<Address> = (0..6u8).map(|i| test_prefix(0x60 + i)).collect();
+        let owners: Vec<PrincipalAddr> = (0..6u8).map(|i| test_principal(0x60 + i)).collect();
         for owner in &owners {
-            let tx = stub_vm(*owner, std::slice::from_ref(owner));
+            let tx = stub_vm(*owner, &[owner.address()]);
             mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
         }
         let now = LocalTimestamp::from_millis(1_000);
@@ -2531,9 +2531,9 @@ mod tests {
         let mut mempool = MempoolCoordinator::new(local);
 
         // A clear top bit routes to leaf(1, 0); a set one to leaf(1, 1).
-        let local_owner = test_prefix(0x01);
-        let payer_owner = test_prefix(0x81);
-        let parked = stub_vm(payer_owner, &[local_owner, payer_owner]);
+        let local_owner = test_principal(0x01);
+        let payer_owner = test_principal(0x81);
+        let parked = stub_vm(payer_owner, &[local_owner.address(), payer_owner.address()]);
         let parked_hash = parked.hash();
         mempool.on_transaction_gossip(&topology, Arc::clone(&parked), false, LocalTimestamp::ZERO);
 
@@ -2547,7 +2547,7 @@ mod tests {
 
         // A conflicting local leg is not deferred behind the parked one:
         // the parked transaction holds no claim on their shared key.
-        let local_leg = stub_vm(local_owner, &[local_owner]);
+        let local_leg = stub_vm(local_owner, &[local_owner.address()]);
         let local_hash = local_leg.hash();
         mempool.on_transaction_gossip(
             &topology,
@@ -2589,9 +2589,9 @@ mod tests {
         let payer_shard = ShardId::leaf(1, 1);
         let mut mempool = MempoolCoordinator::new(local);
 
-        let local_owner = test_prefix(0x02);
-        let payer_owner = test_prefix(0x91);
-        let tx = stub_vm(payer_owner, &[local_owner, payer_owner]);
+        let local_owner = test_principal(0x02);
+        let payer_owner = test_principal(0x91);
+        let tx = stub_vm(payer_owner, &[local_owner.address(), payer_owner.address()]);
         let hash = tx.hash();
 
         mempool.on_engagement_evidence(payer_shard, [hash]);

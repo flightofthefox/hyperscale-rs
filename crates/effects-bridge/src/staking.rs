@@ -43,7 +43,7 @@ use hyperscale_types::{
     Event, NetworkParams, ParamProposal, ParamVote, ReshapeThresholds, Stake, StakePoolId,
     ValidatorId,
 };
-use hyperscale_vm_effects::{Address, InstanceRegistry, PackageHash};
+use hyperscale_vm_effects::{Address, ComponentAddr, InstanceRegistry, PackageHash};
 
 /// The stake pool's event table, by the index its guest emits.
 ///
@@ -118,7 +118,10 @@ pub fn witness_from_event(
     // is a genesis defect rather than a runtime condition, and it stays a
     // refusal rather than a panic because the execution path cannot take
     // a view on which of two authorities is wrong.
-    if instances.get(event.emitter)?.package != staking_package {
+    // An emitter is whatever ran, so its class is checked here rather
+    // than assumed: only a component emits a pool's events.
+    let emitter = ComponentAddr::try_from(event.emitter).ok()?;
+    if instances.get(emitter)?.package != staking_package {
         return None;
     }
     let payload = event.payload.as_slice();

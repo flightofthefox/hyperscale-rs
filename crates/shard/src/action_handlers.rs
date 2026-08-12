@@ -1208,7 +1208,9 @@ where
 mod tests {
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-    use hyperscale_types::test_utils::{install_stub_vm_statics, stub_transaction, test_prefix};
+    use hyperscale_types::test_utils::{
+        install_stub_vm_statics, stub_transaction, test_prefix, test_principal,
+    };
     use hyperscale_types::{
         CertificateRoot, LocalReceiptRoot, ProposerTimestamp, ProvisionsRoot, Signer,
         StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError,
@@ -1683,7 +1685,7 @@ mod tests {
         );
         install_stub_vm_statics();
         let tx = Arc::new(Verifiable::from(stub_transaction(
-            test_prefix(1),
+            test_principal(1),
             &[test_prefix(1)],
             1_000,
             expired_range,
@@ -1704,7 +1706,7 @@ mod tests {
         let valid_range = TimestampRange::new(anchor, anchor.plus(Duration::from_mins(1)));
 
         let tx2 = Arc::new(Verifiable::from(stub_transaction(
-            test_prefix(2),
+            test_principal(2),
             &[test_prefix(2)],
             1_000,
             valid_range,
@@ -1730,7 +1732,7 @@ mod tests {
         );
         install_stub_vm_statics();
         let tx = Arc::new(Verifiable::from(stub_transaction(
-            test_prefix(3),
+            test_principal(3),
             &[test_prefix(3)],
             1_000,
             too_wide,

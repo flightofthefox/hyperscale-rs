@@ -16,10 +16,10 @@ use hyperscale_engine::{
 };
 use hyperscale_storage::SubstateDatabase;
 use hyperscale_types::{
-    BeaconWitnessEvent, BlockHash, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt,
-    Hash, NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain, ShardId, ShardTrie, Stake,
-    StakePoolId, StakePoolSeat, SubstateKey, Transaction, TransactionBody, TransactionEnvelope,
-    Verified, WeightedTimestamp,
+    BeaconWitnessEvent, BlockHash, CallTarget, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey,
+    EnvelopeExt, Hash, NetworkId, PrincipalAddr, ProvisionalHolds, ResourceRef, RevealChain,
+    ShardId, ShardTrie, Stake, StakePoolId, StakePoolSeat, SubstateKey, Transaction,
+    TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
     Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
@@ -92,7 +92,11 @@ fn pool_at(id: u32) -> ComponentAddr {
     pool_address(package_hash(&ProtocolHasher, staking_artifact()), &seat(id))
 }
 
-fn withdraw(target: impl Into<Address>, resource: impl Into<Address>, amount: u128) -> GraphNode {
+fn withdraw(
+    target: impl Into<CallTarget>,
+    resource: impl Into<Address>,
+    amount: u128,
+) -> GraphNode {
     GraphNode {
         target: target.into(),
         method: "withdraw".into(),
@@ -103,7 +107,7 @@ fn withdraw(target: impl Into<Address>, resource: impl Into<Address>, amount: u1
     }
 }
 
-fn from_edge(producer: u32, resource: impl Into<Address>) -> GraphArg {
+fn from_edge(producer: u32, resource: impl Into<ResourceRef>) -> GraphArg {
     GraphArg::Edge {
         edge: EdgeRef {
             producer,
@@ -144,7 +148,7 @@ fn signed_stake(pool: ComponentAddr, amount: u128) -> Transaction {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(&tree)),
             subintent_sigs: Vec::new(),
-            fee_payer: from.into(),
+            fee_payer: from,
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,
@@ -253,7 +257,7 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(&tree)),
             subintent_sigs: Vec::new(),
-            fee_payer: from.into(),
+            fee_payer: from,
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,
@@ -274,7 +278,7 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
 
 /// `pool.register-validator(id, pubkey, proof)`, signed and paid for by
 /// `seed` whatever the pool's configuration says.
-fn signed_registration(pool: impl Into<Address>, seed: u8) -> Transaction {
+fn signed_registration(pool: impl Into<CallTarget>, seed: u8) -> Transaction {
     let key = key_of(seed);
     let tree = EnvelopeTree {
         root: IntentDecl {
@@ -298,7 +302,7 @@ fn signed_registration(pool: impl Into<Address>, seed: u8) -> Transaction {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(&tree)),
             subintent_sigs: Vec::new(),
-            fee_payer: account_of(seed).into(),
+            fee_payer: account_of(seed),
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,

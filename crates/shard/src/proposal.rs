@@ -598,7 +598,7 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_types::test_utils::{
-        install_stub_vm_statics, make_finalization, stub_transaction, test_prefix,
+        install_stub_vm_statics, make_finalization, stub_transaction, test_prefix, test_principal,
     };
     use hyperscale_types::{
         CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_VALIDITY_RANGE,
@@ -795,7 +795,7 @@ mod tests {
     fn tx_with_range(seed: u8, range: TimestampRange) -> Arc<Verified<Transaction>> {
         install_stub_vm_statics();
         Arc::new(Verified::<Transaction>::from_persisted(stub_transaction(
-            test_prefix(seed),
+            test_principal(seed),
             &[test_prefix(seed)],
             1_000,
             range,

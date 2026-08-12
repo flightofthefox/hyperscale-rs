@@ -14,10 +14,10 @@ use hyperscale_effects_bridge::{
 use hyperscale_engine::genesis::{pool_address, stake_unit, staking_artifact};
 use hyperscale_engine::{XRD, account_address};
 use hyperscale_types::{
-    ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey, EnvelopeExt, Epoch,
-    MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, NetworkId, NetworkParams, PrincipalAddr, ShardId,
-    ShardTrie, StakePoolId, StakePoolSeat, SubintentSig, TimestampRange, Transaction,
-    TransactionBody, TransactionEnvelope, ValidatorId, WeightedTimestamp,
+    CallTarget, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
+    EnvelopeExt, Epoch, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, NetworkId, NetworkParams,
+    PrincipalAddr, ShardId, ShardTrie, StakePoolId, StakePoolSeat, SubintentSig, TimestampRange,
+    Transaction, TransactionBody, TransactionEnvelope, ValidatorId, WeightedTimestamp,
     ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
@@ -529,8 +529,8 @@ pub fn withdrawal_burst_genesis_accounts(count: u8) -> Vec<(PrincipalAddr, u128)
 #[must_use]
 pub fn build_fan_out_tx(
     payer: &Ed25519PrivateKey,
-    from: impl Into<Address>,
-    recipients: &[Address],
+    from: impl Into<CallTarget>,
+    recipients: &[PrincipalAddr],
     amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
@@ -547,14 +547,14 @@ pub fn build_fan_out_tx(
             ],
         });
         nodes.push(GraphNode {
-            target: *to,
+            target: (*to).into(),
             method: "deposit".into(),
             args: vec![GraphArg::Edge {
                 edge: EdgeRef {
                     producer,
                     output: 0,
                 },
-                constraints: vec![Constraint::ResourceIs(XRD.address())],
+                constraints: vec![Constraint::ResourceIs((*XRD).into())],
             }],
         });
     }
@@ -997,7 +997,7 @@ pub fn build_stamp_tx(
         root_bindings: Vec::new(),
         subintents: vec![Subintent {
             decl: right.clone(),
-            signer: account_address(&right_key.public_key().0).into(),
+            signer: account_address(&right_key.public_key().0),
             bindings: Vec::new(),
         }],
     };
@@ -1008,7 +1008,7 @@ pub fn build_stamp_tx(
             public_key: right_key.public_key().0,
             signature: signed.0,
         }],
-        fee_payer: account_address(&payer.public_key().0).into(),
+        fee_payer: account_address(&payer.public_key().0),
         max_fee: MAX_FEE,
         gas_limit: 1_000_000,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
@@ -1033,8 +1033,8 @@ pub fn build_stamp_tx(
 #[must_use]
 pub fn build_transfer_tx(
     payer: &Ed25519PrivateKey,
-    from: impl Into<Address>,
-    to: impl Into<Address>,
+    from: impl Into<CallTarget>,
+    to: impl Into<CallTarget>,
     amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
@@ -1145,7 +1145,7 @@ pub fn build_publish_tx(
         TransactionEnvelope {
             body: TransactionBody::Publish(artifact),
             subintent_sigs: Vec::new(),
-            fee_payer: account_address(&payer.public_key().0).into(),
+            fee_payer: account_address(&payer.public_key().0),
             max_fee: PUBLISH_MAX_FEE,
             gas_limit: 1_000_000,
             validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
@@ -1253,7 +1253,7 @@ pub fn staking_pools() -> Vec<StakePoolSeat> {
 #[must_use]
 pub fn build_deactivate_tx(
     operator: &Ed25519PrivateKey,
-    pool: impl Into<Address>,
+    pool: impl Into<CallTarget>,
     validator: ValidatorId,
     validity: TimestampRange,
 ) -> Transaction {
@@ -1275,7 +1275,7 @@ pub fn build_deactivate_tx(
 #[must_use]
 pub fn build_register_tx(
     operator: &Ed25519PrivateKey,
-    pool: impl Into<Address>,
+    pool: impl Into<CallTarget>,
     validator: ValidatorId,
     pubkey: &ConsensusPublicKey,
     possession_proof: &ConsensusSignature,
@@ -1299,7 +1299,7 @@ pub fn build_register_tx(
 #[must_use]
 pub fn build_operator_tx(
     operator: &Ed25519PrivateKey,
-    pool: impl Into<Address>,
+    pool: impl Into<CallTarget>,
     method: &str,
     args: Vec<GraphArg>,
     validity: TimestampRange,
@@ -1324,8 +1324,8 @@ pub fn build_operator_tx(
 #[must_use]
 pub fn build_unstake_tx(
     delegator: &Ed25519PrivateKey,
-    from: impl Into<Address>,
-    pool: impl Into<Address>,
+    from: impl Into<CallTarget>,
+    pool: impl Into<CallTarget>,
     amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
@@ -1349,7 +1349,7 @@ pub fn build_unstake_tx(
                         producer: 0,
                         output: 0,
                     },
-                    constraints: vec![Constraint::ResourceIs(stake_unit(pool).address())],
+                    constraints: vec![Constraint::ResourceIs(stake_unit(pool).into())],
                 }],
             },
         ],
@@ -1375,8 +1375,8 @@ pub fn pool_operator() -> (Ed25519PrivateKey, PrincipalAddr) {
 #[must_use]
 pub fn build_stake_tx(
     delegator: &Ed25519PrivateKey,
-    from: impl Into<Address>,
-    pool: impl Into<Address>,
+    from: impl Into<CallTarget>,
+    pool: impl Into<CallTarget>,
     amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
@@ -1400,7 +1400,7 @@ pub fn build_stake_tx(
                         producer: 0,
                         output: 0,
                     },
-                    constraints: vec![Constraint::ResourceIs(XRD.address())],
+                    constraints: vec![Constraint::ResourceIs((*XRD).into())],
                 }],
             },
             GraphNode {
@@ -1411,7 +1411,7 @@ pub fn build_stake_tx(
                         producer: 1,
                         output: 0,
                     },
-                    constraints: vec![Constraint::ResourceIs(stake_unit(pool).address())],
+                    constraints: vec![Constraint::ResourceIs(stake_unit(pool).into())],
                 }],
             },
         ],
@@ -1427,18 +1427,17 @@ pub fn build_stake_tx(
 /// lets the signer sign it before any composer exists and lets two
 /// composers bind the identical declaration afterwards.
 #[must_use]
-pub fn payment_request(signer: impl Into<Address>, amount: u128) -> IntentDecl {
-    let signer = signer.into();
+pub fn payment_request(signer: impl Into<CallTarget>, amount: u128) -> IntentDecl {
     IntentDecl {
         graph: ManifestGraph {
             nodes: vec![GraphNode {
-                target: signer,
+                target: signer.into(),
                 method: "deposit".into(),
                 args: vec![GraphArg::Param(0)],
             }],
         },
         params: vec![YieldParam {
-            resource: XRD.address(),
+            resource: (*XRD).into(),
             constraints: vec![Constraint::MinAmount(amount)],
         }],
     }
@@ -1459,7 +1458,7 @@ pub fn payment_request(signer: impl Into<Address>, amount: u128) -> IntentDecl {
 #[must_use]
 pub fn build_composed_tx(
     composer: &Ed25519PrivateKey,
-    from: impl Into<Address>,
+    from: impl Into<CallTarget>,
     signer_key: &Ed25519PrivateKey,
     request: &IntentDecl,
     amount: u128,
@@ -1483,7 +1482,7 @@ pub fn build_composed_tx(
         root_bindings: Vec::new(),
         subintents: vec![Subintent {
             decl: request.clone(),
-            signer: account_address(&signer_key.public_key().0).into(),
+            signer: account_address(&signer_key.public_key().0),
             bindings: vec![YieldBinding {
                 intent: 0,
                 edge: EdgeRef {
@@ -1503,7 +1502,7 @@ pub fn build_composed_tx(
             public_key: signer_key.public_key().0,
             signature: signed.0,
         }],
-        fee_payer: account_address(&composer.public_key().0).into(),
+        fee_payer: account_address(&composer.public_key().0),
         max_fee: 1_000,
         gas_limit: 1_000_000,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),

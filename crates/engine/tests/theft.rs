@@ -22,9 +22,9 @@ use hyperscale_engine::{
 };
 use hyperscale_storage::SubstateDatabase;
 use hyperscale_types::{
-    BlockHash, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash, NetworkId, PrincipalAddr,
-    ProvisionalHolds, RevealChain, SettledWrites, ShardId, ShardTrie, StateWrites, SubstateKey,
-    Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
+    BlockHash, CallTarget, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash, NetworkId,
+    PrincipalAddr, ProvisionalHolds, RevealChain, SettledWrites, ShardId, ShardTrie, StateWrites,
+    SubstateKey, Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
     Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
@@ -71,7 +71,7 @@ fn world_accounts() -> Vec<(PrincipalAddr, u128)> {
     vec![(VICTIM, FUNDED), (thief(), FUNDED)]
 }
 
-fn withdraw(target: impl Into<Address>, amount: u128) -> GraphNode {
+fn withdraw(target: impl Into<CallTarget>, amount: u128) -> GraphNode {
     GraphNode {
         target: target.into(),
         method: "withdraw".into(),
@@ -82,7 +82,7 @@ fn withdraw(target: impl Into<Address>, amount: u128) -> GraphNode {
     }
 }
 
-fn deposit(target: impl Into<Address>, producer: u32) -> GraphNode {
+fn deposit(target: impl Into<CallTarget>, producer: u32) -> GraphNode {
     GraphNode {
         target: target.into(),
         method: "deposit".into(),
@@ -91,14 +91,18 @@ fn deposit(target: impl Into<Address>, producer: u32) -> GraphNode {
                 producer,
                 output: 0,
             },
-            constraints: vec![Constraint::ResourceIs(XRD.address())],
+            constraints: vec![Constraint::ResourceIs((*XRD).into())],
         }],
     }
 }
 
 /// `from.withdraw(*XRD, amount) -> to.deposit(..)`, signed and paid for by
 /// the thief whatever `from` says.
-fn signed_transfer(from: impl Into<Address>, to: impl Into<Address>, amount: u128) -> Transaction {
+fn signed_transfer(
+    from: impl Into<CallTarget>,
+    to: impl Into<CallTarget>,
+    amount: u128,
+) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[THIEF; 32]).unwrap();
     let tree = EnvelopeTree {
         root: IntentDecl {
@@ -114,7 +118,7 @@ fn signed_transfer(from: impl Into<Address>, to: impl Into<Address>, amount: u12
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(&tree)),
             subintent_sigs: Vec::new(),
-            fee_payer: thief().into(),
+            fee_payer: thief(),
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,

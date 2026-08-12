@@ -36,7 +36,7 @@ pub fn test_transaction_with_prefixes(
         *slot = byte;
     }
     stub_transaction_with_reads(
-        Address::new(body, AddressClass::Principal),
+        PrincipalAddr::new(body),
         read_prefixes,
         write_prefixes,
         1_000,
@@ -942,7 +942,7 @@ pub fn install_stub_vm_statics() {
 /// exactly `owner_prefixes` as exclusive keys, paying from `fee_payer`.
 #[must_use]
 pub fn stub_transaction(
-    fee_payer: Address,
+    fee_payer: PrincipalAddr,
     owner_prefixes: &[Address],
     max_fee: u128,
     validity: TimestampRange,
@@ -962,7 +962,7 @@ pub fn stub_transaction(
 /// set exceeds what a one-byte count can name.
 #[must_use]
 pub fn stub_transaction_with_reads(
-    fee_payer: Address,
+    fee_payer: PrincipalAddr,
     read_prefixes: &[Address],
     write_prefixes: &[Address],
     max_fee: u128,

@@ -484,7 +484,7 @@ pub const fn publish_work(artifact: &[u8]) -> u64 {
 fn assemble_published_tx(
     ctx: &TickBatchContext<'_>,
     vm_tx: TxHash,
-    publisher: Address,
+    publisher: PrincipalAddr,
     artifact: &[u8],
     fee: Option<PayerFee>,
     locality: &Locality,
@@ -688,7 +688,7 @@ impl Executor {
         };
         // Publishes carry no manifest, so they never reach the kernel;
         // they settle in their own pass below.
-        let publishes: BTreeMap<TxHash, (Address, Vec<u8>)> = transactions
+        let publishes: BTreeMap<TxHash, (PrincipalAddr, Vec<u8>)> = transactions
             .iter()
             .filter_map(|tx| {
                 let vm = tx.body();

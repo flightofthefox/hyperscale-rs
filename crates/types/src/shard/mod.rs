@@ -65,7 +65,7 @@ mod tests {
 
     use super::*;
     use crate::test_utils::{
-        install_stub_vm_statics, stub_transaction, test_prefix, test_validity_range,
+        install_stub_vm_statics, stub_transaction, test_prefix, test_principal, test_validity_range,
     };
     use crate::{
         AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot,
@@ -121,7 +121,7 @@ mod tests {
     fn test_compute_transaction_root_deterministic() {
         install_stub_vm_statics();
         let tx = Arc::new(Verifiable::from(stub_transaction(
-            test_prefix(1),
+            test_principal(1),
             &[test_prefix(2)],
             1_000,
             test_validity_range(),

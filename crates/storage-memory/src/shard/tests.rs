@@ -12,7 +12,7 @@ use hyperscale_storage::{
     test_helpers,
 };
 use hyperscale_types::test_utils::{
-    install_stub_vm_statics, stub_transaction, test_prefix, test_transaction,
+    install_stub_vm_statics, stub_transaction, test_prefix, test_principal, test_transaction,
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
@@ -1111,7 +1111,7 @@ fn dedup_tx(seed: u8, end_ms: u64) -> Arc<Verifiable<Transaction>> {
         WeightedTimestamp::from_millis(end_ms),
     );
     Arc::new(Verifiable::from(stub_transaction(
-        test_prefix(seed),
+        test_principal(seed),
         &[test_prefix(seed)],
         1_000,
         validity,

@@ -18,13 +18,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    Address, Finalization, RETENTION_HORIZON, Transaction, TxHash, Verifiable, WeightedTimestamp,
+    Address, Finalization, PrincipalAddr, RETENTION_HORIZON, Transaction, TxHash, Verifiable,
+    WeightedTimestamp,
 };
 
 /// One engaged reservation: the payer's owner prefix, the held ceiling,
 /// and the prune deadline.
 struct Hold {
-    payer: Address,
+    payer: PrincipalAddr,
     max_fee: u128,
     deadline: WeightedTimestamp,
 }
@@ -49,7 +50,7 @@ impl FeeReservationLedger {
     ) {
         for tx in transactions {
             let vm = tx.body();
-            if !payer_local(vm.fee_payer) {
+            if !payer_local(vm.fee_payer.address()) {
                 continue;
             }
             let deadline = tx
@@ -94,13 +95,13 @@ impl FeeReservationLedger {
 mod tests {
     use hyperscale_types::test_utils::{make_finalization, stub_transaction};
     use hyperscale_types::{
-        AddressClass, BlockHeight, TimestampRange, TransactionDecision, Verified,
+        AddressClass, BlockHeight, PrincipalAddr, TimestampRange, TransactionDecision, Verified,
     };
 
     use super::*;
 
-    const PAYER: Address = Address::new([0xAA; 31], AddressClass::Component);
-    const PAYER_ADDR: Address = PAYER;
+    const PAYER: PrincipalAddr = PrincipalAddr::new([0xAA; 31]);
+    const PAYER_ADDR: Address = PAYER.address();
 
     fn transaction(max_fee: u128, end_ms: u64) -> Arc<Verifiable<Transaction>> {
         let validity = TimestampRange::new(
@@ -108,7 +109,7 @@ mod tests {
             WeightedTimestamp::from_millis(end_ms),
         );
         Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-            stub_transaction(PAYER, &[PAYER], max_fee, validity),
+            stub_transaction(PAYER, &[PAYER.address()], max_fee, validity),
         )))
     }
 

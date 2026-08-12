@@ -253,7 +253,7 @@ impl Transaction {
     #[must_use]
     pub fn fee_vault(&self) -> SubstateKey {
         SubstateKey {
-            owner: self.body().fee_payer,
+            owner: self.body().fee_payer.address(),
             local: LocalKey(self.derived().fee_vault_local),
         }
     }
@@ -436,7 +436,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{test_prefix, test_validity_range};
     use crate::{
-        Ed25519PrivateKey, SubintentSig, TransactionBody, VmStatics, declared_work,
+        Ed25519PrivateKey, PrincipalAddr, SubintentSig, TransactionBody, VmStatics, declared_work,
         install_vm_statics,
     };
 
@@ -488,7 +488,7 @@ mod tests {
         TransactionEnvelope {
             body: TransactionBody::Call(tree.to_vec()),
             subintent_sigs: Vec::new(),
-            fee_payer: Address::new([0xAA; 31], AddressClass::Component),
+            fee_payer: PrincipalAddr::new([0xAA; 31]),
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: range.start_timestamp_inclusive.as_millis(),

@@ -11,7 +11,7 @@ use hyperscale_types::{
     TransactionEnvelope,
 };
 use hyperscale_vm_effects::{
-    Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
+    CallTarget, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
     Value,
 };
 
@@ -26,8 +26,8 @@ pub const DEFAULT_GAS_LIMIT: u64 = 1_000_000;
 /// resource from `from` to `to`.
 #[must_use]
 pub fn transfer_graph(
-    from: impl Into<Address>,
-    to: impl Into<Address>,
+    from: impl Into<CallTarget>,
+    to: impl Into<CallTarget>,
     amount: u128,
 ) -> ManifestGraph {
     ManifestGraph {
@@ -48,7 +48,7 @@ pub fn transfer_graph(
                         producer: 0,
                         output: 0,
                     },
-                    constraints: vec![Constraint::ResourceIs(XRD.address())],
+                    constraints: vec![Constraint::ResourceIs((*XRD).into())],
                 }],
             },
         ],
@@ -81,7 +81,7 @@ pub fn sign_call(
     TransactionEnvelope {
         body: TransactionBody::Call(encode_tree(&tree)),
         subintent_sigs: Vec::new(),
-        fee_payer: account_address(&payer.public_key().0).into(),
+        fee_payer: account_address(&payer.public_key().0),
         max_fee,
         gas_limit: DEFAULT_GAS_LIMIT,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
@@ -102,8 +102,8 @@ pub fn sign_call(
 #[allow(clippy::too_many_arguments)] // the envelope's flat signing-time terms
 pub fn build_transfer_tx(
     payer: &Ed25519PrivateKey,
-    from: impl Into<Address>,
-    to: impl Into<Address>,
+    from: impl Into<CallTarget>,
+    to: impl Into<CallTarget>,
     amount: u128,
     max_fee: u128,
     validity: TimestampRange,

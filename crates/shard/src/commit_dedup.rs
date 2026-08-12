@@ -265,7 +265,7 @@ impl CommitDedupIndex {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::{
-        install_stub_vm_statics, make_finalization, stub_transaction, test_prefix,
+        install_stub_vm_statics, make_finalization, stub_transaction, test_prefix, test_principal,
     };
     use hyperscale_types::{
         BlockHeight, Hash, MerkleInclusionProof, ProvisionEntry, Provisions, RevealChain, ShardId,
@@ -282,7 +282,7 @@ mod tests {
             WeightedTimestamp::from_millis(end_ms),
         );
         Arc::new(Verifiable::from(stub_transaction(
-            test_prefix(seed),
+            test_principal(seed),
             &[test_prefix(seed)],
             1_000,
             range,

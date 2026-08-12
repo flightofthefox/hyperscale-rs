@@ -142,11 +142,11 @@ impl Verify<&ProvisionTxRootsContext<'_>> for ProvisionTxRootsMap {
 mod tests {
     use super::*;
     use crate::test_utils::{
-        TestCommittee, install_stub_vm_statics, stub_transaction, test_prefix,
+        TestCommittee, install_stub_vm_statics, stub_transaction, test_prefix, test_principal,
     };
-    use crate::{Address, TimestampRange, WeightedTimestamp};
+    use crate::{PrincipalAddr, TimestampRange, WeightedTimestamp};
 
-    fn cross_shard_tx(payer: Address) -> Arc<Verifiable<Transaction>> {
+    fn cross_shard_tx(payer: PrincipalAddr) -> Arc<Verifiable<Transaction>> {
         install_stub_vm_statics();
         let validity = TimestampRange::new(
             WeightedTimestamp::ZERO,
@@ -170,7 +170,7 @@ mod tests {
         let topo = TestCommittee::new(4, 42).topology_snapshot(2);
         let payer_shard = ShardId::leaf(1, 1);
         let counterpart = ShardId::leaf(1, 0);
-        let txs = vec![cross_shard_tx(test_prefix(0x81))];
+        let txs = vec![cross_shard_tx(test_principal(0x81))];
 
         let at_counterpart = Verified::<ProvisionTxRootsMap>::compute(counterpart, &topo, &txs);
         let targets: Vec<ShardId> = at_counterpart.as_ref().keys().copied().collect();

@@ -317,7 +317,7 @@ impl BridgeStatics {
             work,
             routing: Routing {
                 read_prefixes: Vec::new(),
-                write_prefixes: vec![publisher],
+                write_prefixes: vec![publisher.address()],
                 provision_prefixes: Vec::new(),
                 read_keys: Vec::new(),
                 declared_modes: write_keys.iter().map(|key| (*key, Mode::Write)).collect(),
@@ -363,7 +363,7 @@ impl BridgeStatics {
 /// does not carry.
 pub fn check_target_authority(
     tree: &EnvelopeTree,
-    composer: Address,
+    composer: PrincipalAddr,
     packages: &MetadataCache,
     instances: &InstanceRegistry,
 ) -> Result<(), VmStaticsError> {
@@ -388,7 +388,7 @@ pub fn check_target_authority(
             };
             let admits = match signature.accessibility {
                 Accessibility::Public => continue,
-                Accessibility::RequiresTargetAuth => Some(node.target),
+                Accessibility::RequiresTargetAuth => Some(node.target.address()),
                 Accessibility::RequiresConfiguredAuth(field) => {
                     match meta.config.get(field as usize) {
                         Some(Value::Address(principal)) => Some(*principal),
@@ -396,7 +396,7 @@ pub fn check_target_authority(
                     }
                 }
             };
-            if admits == Some(authority) {
+            if admits == Some(authority.address()) {
                 continue;
             }
             let intent = subintent.map_or_else(
@@ -526,17 +526,19 @@ impl VmStatics for BridgeStatics {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Ed25519PrivateKey, NetworkId, SubintentSig, TX_UNITS, TransactionBody};
+    use hyperscale_types::{
+        CallTarget, Ed25519PrivateKey, NetworkId, SubintentSig, TX_UNITS, TransactionBody,
+    };
     use hyperscale_vm_effects::stdlib::{VAULT, account_metadata};
     use hyperscale_vm_effects::{
-        AddressClass, Constraint, EdgeRef, GraphArg, GraphNode, Hasher, IntentDecl, ManifestGraph,
-        PackageHash, Subintent, SubintentHash, YieldBinding, YieldParam, child_key, nullifier_key,
+        Constraint, EdgeRef, GraphArg, GraphNode, Hasher, IntentDecl, ManifestGraph, PackageHash,
+        ResourceAddr, Subintent, SubintentHash, YieldBinding, YieldParam, child_key, nullifier_key,
     };
 
     use super::*;
 
-    const RES_X: Address = Address::new([0xE1; 31], AddressClass::Component);
-    const RES_Y: Address = Address::new([0xE2; 31], AddressClass::Component);
+    const RES_X: ResourceAddr = ResourceAddr::new([0xE1; 31]);
+    const RES_Y: ResourceAddr = ResourceAddr::new([0xE2; 31]);
 
     fn key(seed: u8) -> Ed25519PrivateKey {
         Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap()
@@ -565,18 +567,22 @@ mod tests {
         }
     }
 
-    fn withdraw(target: impl Into<Address>, resource: Address, amount: u128) -> GraphNode {
+    fn withdraw(target: impl Into<CallTarget>, resource: ResourceAddr, amount: u128) -> GraphNode {
         GraphNode {
             target: target.into(),
             method: "withdraw".into(),
             args: vec![
-                GraphArg::Literal(Value::Address(resource)),
+                GraphArg::Literal(Value::Address(resource.address())),
                 GraphArg::Literal(Value::U128(amount)),
             ],
         }
     }
 
-    fn deposit_edge(target: impl Into<Address>, producer: u32, resource: Address) -> GraphNode {
+    fn deposit_edge(
+        target: impl Into<CallTarget>,
+        producer: u32,
+        resource: ResourceAddr,
+    ) -> GraphNode {
         GraphNode {
             target: target.into(),
             method: "deposit".into(),
@@ -585,12 +591,12 @@ mod tests {
                     producer,
                     output: 0,
                 },
-                constraints: vec![Constraint::ResourceIs(resource)],
+                constraints: vec![Constraint::ResourceIs(resource.into())],
             }],
         }
     }
 
-    fn deposit_param(target: impl Into<Address>, param: u32) -> GraphNode {
+    fn deposit_param(target: impl Into<CallTarget>, param: u32) -> GraphNode {
         GraphNode {
             target: target.into(),
             method: "deposit".into(),
@@ -621,7 +627,7 @@ mod tests {
                     ],
                 },
                 params: vec![YieldParam {
-                    resource: RES_Y,
+                    resource: RES_Y.into(),
                     constraints: vec![Constraint::MinAmount(10)],
                 }],
             },
@@ -641,11 +647,11 @@ mod tests {
                         ],
                     },
                     params: vec![YieldParam {
-                        resource: RES_X,
+                        resource: RES_X.into(),
                         constraints: vec![Constraint::MinAmount(100)],
                     }],
                 },
-                signer: bob_addr().into(),
+                signer: bob_addr(),
                 bindings: vec![YieldBinding {
                     intent: 0,
                     edge: EdgeRef {
@@ -673,7 +679,7 @@ mod tests {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(tree)),
             subintent_sigs,
-            fee_payer: composer_addr().into(),
+            fee_payer: composer_addr(),
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,
@@ -749,7 +755,7 @@ mod tests {
             &ProtocolHasher,
             composer_addr(),
             VAULT,
-            &[Value::Address(RES_X).canonical_bytes()],
+            &[Value::Address(RES_X.address()).canonical_bytes()],
         );
         assert!(derived.routing.write_keys.contains(&DeclaredKey::substate(
             composer_addr().address(),
@@ -793,7 +799,7 @@ mod tests {
             deposit_edge(bob_addr(), 0, RES_X),
         ]);
         let mut stolen = envelope(&tree, &[]);
-        stolen.fee_payer = bob_addr().into();
+        stolen.fee_payer = bob_addr();
         let stolen = stolen.sign(&key(7));
 
         assert!(stolen.signature_is_valid(), "the composer signed it");
