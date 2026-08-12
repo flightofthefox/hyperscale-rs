@@ -470,7 +470,7 @@ mod tests {
                     ],
                 },
                 subintent_hashes,
-                work: declared_work(0, 0),
+                work: declared_work(0, 0, 0),
             })
         }
     }

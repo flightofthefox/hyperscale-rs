@@ -926,6 +926,7 @@ impl VmStatics for StubVmStatics {
             work: declared_work(
                 (read_prefixes.len() + write_prefixes.len()) as u64,
                 vm.gas_limit,
+                vm.signature_work(),
             ),
         })
     }

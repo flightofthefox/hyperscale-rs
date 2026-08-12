@@ -324,7 +324,7 @@ impl BridgeStatics {
         // into state — the largest transaction the protocol admits, and
         // one the declared side would otherwise price as the smallest.
         let footprint = (write_keys.len() as u64).saturating_add(artifact.len() as u64);
-        let work = declared_work(footprint, vm.gas_limit);
+        let work = declared_work(footprint, vm.gas_limit, vm.signature_work());
 
         Ok(Derived {
             work,
@@ -515,6 +515,7 @@ impl VmStatics for BridgeStatics {
                 .values()
                 .fold(0u64, |total, set| total.saturating_add(footprint(set))),
             vm.gas_limit,
+            vm.signature_work(),
         );
         Ok(Derived {
             work,
@@ -742,6 +743,36 @@ mod tests {
             "a wider declaration must not be cheaper: {} vs {}",
             wider.work,
             derived.work
+        );
+    }
+
+    /// What a transaction's signatures cost to check is priced with the
+    /// rest of what it declares, so a wider scheme is a fee fact rather
+    /// than free verification.
+    #[test]
+    fn work_prices_the_signatures_the_envelope_carries() {
+        let tree = single_intent_tree(vec![
+            withdraw(composer_addr(), RES_X, 100),
+            deposit_edge(bob_addr(), 0, RES_X),
+        ]);
+        let ed = statics().derive(&envelope(&tree, &[])).expect("derives");
+
+        let secp = Secp256k1PrivateKey::from_bytes(&[7u8; 32]).expect("a scalar in range");
+        let payer = principal_for(SchemeId::SECP256K1, &secp.public_key().0)
+            .expect("a registered scheme opens an account");
+        let secp_tree = single_intent_tree(vec![
+            withdraw(payer, RES_X, 100),
+            deposit_edge(bob_addr(), 0, RES_X),
+        ]);
+        let mut wider = envelope(&secp_tree, &[]);
+        wider.fee_payer = payer;
+        let wider = statics().derive(&wider.sign(&secp)).expect("derives");
+
+        assert!(
+            wider.work > ed.work,
+            "a wider signature scheme must not verify for free: {} vs {}",
+            wider.work,
+            ed.work
         );
     }
 
