@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Hash,
-    PredecessorTerminal, Provisions, QuorumCertificate, RevealChain, SafeVoteRegisters,
-    ShardAnchor, ShardLoad, StateRoot, ValidatorId, Verified, WeightedTimestamp, WorkInFlight,
+    BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeight, ChainOrigin, CommittedTip, Hash,
+    PredecessorTerminal, Provisions, QuorumCertificate, SafeVoteRegisters, ShardAnchor, StateRoot,
+    ValidatorId, Verified, WeightedTimestamp,
 };
 
 use super::dedup_window::DedupWindow;
@@ -85,37 +85,14 @@ pub struct RecoveredState {
     /// storage directly.
     pub anchor_qc: Option<QuorumCertificate>,
 
-    /// Drain total carried by the committed tip's header. Read back from
-    /// the tip's stored header on an ordinary restart, and seeded from the
-    /// boundary header by a snap-synced bootstrap, so in both cases the
-    /// first block extending the tip is votable — the vote path checks the
-    /// claimed total against the parent's, and skips the vote when it
-    /// cannot resolve one. `None` only when no block is stored at the
-    /// committed height.
-    pub committed_in_flight: Option<WorkInFlight>,
-
-    /// Settlement frontier carried by the committed tip's header — the
-    /// highest tick whose determined half has settled at or below it, and
-    /// the value the next block advances. `None` when no block is stored
-    /// at the committed height; the coordinator then skips the frontier
-    /// check on its first block rather than checking against a guess.
-    pub committed_settled_frontier: Option<BlockHeight>,
-
-    /// Reveal chain carried by the committed tip's header — the value the
-    /// next block extends (or reseeds past, when it anchors in a later
-    /// epoch). Read back from the tip's stored header, so an ordinary
-    /// restart resolves it rather than waiting on a commit; a snap-synced
-    /// bootstrap seeds it from the boundary header, keeping the fresh
-    /// committee's first block past the anchor votable. `None` only when no
-    /// block is stored at the committed height, where the coordinator seeds
-    /// `ZERO` for the genesis tip; a `None` against a real tip skips the
-    /// vote rather than accept a chain it cannot check.
-    pub committed_reveal_chain: Option<RevealChain>,
-    /// Attested load carried by the committed tip's header — the running
-    /// gas total the next block advances, and the byte level behind it.
-    /// `None` when no block is stored at the committed height (fresh
-    /// start / genesis tip), where the coordinator seeds `ZERO`.
-    pub committed_load: Option<ShardLoad>,
+    /// The committed tip's running values, read back from its stored
+    /// header on an ordinary restart and seeded from the boundary header
+    /// by a snap-synced bootstrap, so in both cases the first block
+    /// extending the tip is checkable — the vote path checks a block's
+    /// claims against the parent's, and skips the vote when it cannot
+    /// resolve them. `None` only when no block is stored at the committed
+    /// height, where the coordinator seeds the genesis tip.
+    pub committed_tip: Option<CommittedTip>,
 
     /// Weighted timestamp of the committed tip's *parent* QC — the tip's own
     /// position on the weighted-time grid, and the anchor of the committee
@@ -223,10 +200,7 @@ impl RecoveredState {
             committed_hash: Some(anchor.block_hash),
             latest_qc: None,
             anchor_qc: Some(anchor_qc),
-            committed_in_flight: Some(boundary_header.work_in_flight()),
-            committed_settled_frontier: Some(boundary_header.settled_tick_frontier()),
-            committed_reveal_chain: Some(boundary_header.reveal_chain()),
-            committed_load: Some(boundary_header.load()),
+            committed_tip: Some(boundary_header.committed_tip()),
             committed_block_anchor_wt: Some(boundary_header.parent_qc().weighted_timestamp()),
             // The boundary's parent is not imported, so the committee that
             // signed the boundary block resolves only through the fallback.

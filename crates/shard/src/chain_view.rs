@@ -1,6 +1,6 @@
 //! Read-only view over the node's knowledge of the chain.
 //!
-//! `ChainView<'a>` bundles the committed-tip scalars, the latest QC, and a
+//! `ChainView<'a>` bundles the committed tip's terms, the latest QC, and a
 //! borrowed reference to the pending block map. It unifies reads that would
 //! otherwise have to thread half a dozen coordinator fields through every
 //! helper — proposal building, header validation, commit decisions all
@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, ProvisionHash,
+    BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, CommittedTip, ProvisionHash,
     QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, TxHash, Verified, WorkInFlight,
 };
 use tracing::warn;
@@ -27,10 +27,7 @@ pub struct ChainView<'a> {
     committed_height: BlockHeight,
     committed_hash: BlockHash,
     committed_state_root: StateRoot,
-    committed_in_flight: Option<WorkInFlight>,
-    committed_settled_frontier: Option<BlockHeight>,
-    committed_load: Option<ShardLoad>,
-    committed_reveal_chain: Option<RevealChain>,
+    committed_tip: Option<CommittedTip>,
     latest_qc: Option<&'a Verified<QuorumCertificate>>,
     pending: &'a PendingBlocks,
     certified: &'a HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
@@ -44,10 +41,7 @@ impl<'a> ChainView<'a> {
         committed_height: BlockHeight,
         committed_hash: BlockHash,
         committed_state_root: StateRoot,
-        committed_in_flight: Option<WorkInFlight>,
-        committed_settled_frontier: Option<BlockHeight>,
-        committed_load: Option<ShardLoad>,
-        committed_reveal_chain: Option<RevealChain>,
+        committed_tip: Option<CommittedTip>,
         latest_qc: Option<&'a Verified<QuorumCertificate>>,
         pending: &'a PendingBlocks,
         certified: &'a HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>,
@@ -58,10 +52,7 @@ impl<'a> ChainView<'a> {
             committed_height,
             committed_hash,
             committed_state_root,
-            committed_in_flight,
-            committed_settled_frontier,
-            committed_load,
-            committed_reveal_chain,
+            committed_tip,
             latest_qc,
             pending,
             certified,
@@ -112,19 +103,26 @@ impl<'a> ChainView<'a> {
         )
     }
 
+    /// The committed tip's running values, when `parent_block_hash` is the
+    /// tip itself. The tip's header is pruned from `pending` once it
+    /// commits, so a block extending it reads its terms from here.
+    fn tip_if(&self, parent_block_hash: BlockHash) -> Option<CommittedTip> {
+        (parent_block_hash == self.committed_hash)
+            .then_some(self.committed_tip)
+            .flatten()
+    }
+
     /// Drain total on the parent header, or `None` when the parent is
     /// unresolvable: pruned from `pending` and — when the parent is the
-    /// committed tip itself — the committed-tip scalar wasn't recovered.
-    /// A snap-synced joiner extending its boundary anchor resolves through
-    /// the scalar (the anchor header never enters `pending`); a `None`
-    /// skips the vote, since the claimed in-flight count can't be checked.
+    /// committed tip itself — no tip header was recovered. A snap-synced
+    /// joiner extending its boundary anchor resolves through the tip (the
+    /// anchor header never enters `pending`); a `None` skips the vote,
+    /// since the claimed in-flight count can't be checked.
     pub fn parent_in_flight_checked(&self, parent_block_hash: BlockHash) -> Option<WorkInFlight> {
         if let Some(header) = self.get_header(parent_block_hash) {
             return Some(header.work_in_flight());
         }
-        (parent_block_hash == self.committed_hash)
-            .then_some(self.committed_in_flight)
-            .flatten()
+        self.tip_if(parent_block_hash).map(|tip| tip.work_in_flight)
     }
 
     /// Settlement frontier on the parent header — the highest tick whose
@@ -140,9 +138,8 @@ impl<'a> ChainView<'a> {
         if let Some(header) = self.get_header(parent_block_hash) {
             return Some(header.settled_tick_frontier());
         }
-        (parent_block_hash == self.committed_hash)
-            .then_some(self.committed_settled_frontier)
-            .flatten()
+        self.tip_if(parent_block_hash)
+            .map(|tip| tip.settled_tick_frontier)
     }
 
     /// The parent's settlement frontier, or genesis when unresolvable —
@@ -162,26 +159,22 @@ impl<'a> ChainView<'a> {
         if let Some(header) = self.get_header(parent_block_hash) {
             return Some(header.load());
         }
-        (parent_block_hash == self.committed_hash)
-            .then_some(self.committed_load)
-            .flatten()
+        self.tip_if(parent_block_hash).map(|tip| tip.load)
     }
 
     /// Reveal chain on the parent header — the value the next block extends,
     /// or reseeds past when it anchors in a later epoch. `None` when the
     /// parent is unresolvable, under the same conditions as
     /// [`Self::parent_in_flight_checked`]: pruned from `pending` and, when
-    /// the parent is the committed tip itself, the committed-tip scalar
-    /// wasn't recovered. There is no safe default — a guessed chain produces
-    /// a header every other replica rejects — so a `None` skips the vote and
-    /// defers the build until the first commit reseats the scalar.
+    /// the parent is the committed tip itself, no tip header was recovered.
+    /// There is no safe default — a guessed chain produces a header every
+    /// other replica rejects — so a `None` skips the vote and defers the
+    /// build until the first commit reseats the tip.
     pub fn parent_reveal_chain(&self, parent_block_hash: BlockHash) -> Option<RevealChain> {
         if let Some(header) = self.get_header(parent_block_hash) {
             return Some(header.reveal_chain());
         }
-        (parent_block_hash == self.committed_hash)
-            .then_some(self.committed_reveal_chain)
-            .flatten()
+        self.tip_if(parent_block_hash).map(|tip| tip.reveal_chain)
     }
 
     /// Drain total on the parent header. Returns zero if the parent is
@@ -326,10 +319,7 @@ mod tests {
             committed_height: BlockHeight::new(committed_height),
             committed_hash,
             committed_state_root,
-            committed_in_flight: None,
-            committed_settled_frontier: None,
-            committed_load: None,
-            committed_reveal_chain: None,
+            committed_tip: None,
             latest_qc,
             pending,
             certified: &certified,

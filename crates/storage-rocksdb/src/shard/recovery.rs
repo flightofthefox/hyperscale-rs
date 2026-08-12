@@ -6,9 +6,8 @@ use std::sync::Arc;
 use hyperscale_metrics::record_storage_operation;
 use hyperscale_storage::{DedupWindow, RecoveredState, SubstateStore, replay_window};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, Hash, Provisions,
-    RevealChain, SafeVoteRegisters, ShardLoad, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
-    WorkInFlight,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, CommittedTip, Hash,
+    Provisions, SafeVoteRegisters, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
 };
 
 use super::column_families::{BeaconWitnessesCf, BlocksCf, ProvisionsCf, SafeVoteRegistersCf};
@@ -92,10 +91,7 @@ impl RocksDbShardStorage {
             committed_hash: committed_hash.map(BlockHash::from_raw),
             latest_qc,
             anchor_qc: None,
-            committed_in_flight: self.committed_in_flight(committed_height),
-            committed_reveal_chain: self.committed_reveal_chain(committed_height),
-            committed_load: self.committed_load(committed_height),
-            committed_settled_frontier: self.committed_settled_frontier(committed_height),
+            committed_tip: self.committed_tip(committed_height),
             committed_block_anchor_wt,
             committed_committee_anchor_wt: committed_height
                 .prev()
@@ -140,48 +136,15 @@ impl RocksDbShardStorage {
         Some(metadata.header().parent_qc().weighted_timestamp())
     }
 
-    /// Reveal chain carried by the committed tip's header, read from its
-    /// stored metadata — the value the next block extends. `None` when no
-    /// block is stored at `committed_height` (fresh start / genesis tip),
-    /// where the coordinator seeds `ZERO` for the genesis tip.
-    fn committed_reveal_chain(&self, committed_height: BlockHeight) -> Option<RevealChain> {
+    /// The committed tip's running values, read from its stored header.
+    /// `None` when no block is stored at `committed_height` (fresh start /
+    /// genesis tip), where the coordinator seeds the genesis tip.
+    fn committed_tip(&self, committed_height: BlockHeight) -> Option<CommittedTip> {
         let cf = self.cf();
         let blocks_cf = BlocksCf::handle(&cf);
         let metadata: BlockMetadata =
             get::<BlocksCf>(&*self.db, blocks_cf, &committed_height.inner())?;
-        Some(metadata.header().reveal_chain())
-    }
-
-    /// The committed tip's settlement frontier, read from its stored
-    /// header. `None` under the same condition as
-    /// [`Self::committed_reveal_chain`].
-    fn committed_settled_frontier(&self, committed_height: BlockHeight) -> Option<BlockHeight> {
-        let cf = self.cf();
-        let blocks_cf = BlocksCf::handle(&cf);
-        let metadata: BlockMetadata =
-            get::<BlocksCf>(&*self.db, blocks_cf, &committed_height.inner())?;
-        Some(metadata.header().settled_tick_frontier())
-    }
-
-    /// Drain total carried by the committed tip's header — what a block
-    /// extending the tip is checked against. `None` under the same
-    /// condition as [`Self::committed_reveal_chain`].
-    fn committed_in_flight(&self, committed_height: BlockHeight) -> Option<WorkInFlight> {
-        let cf = self.cf();
-        let blocks_cf = BlocksCf::handle(&cf);
-        let metadata: BlockMetadata =
-            get::<BlocksCf>(&*self.db, blocks_cf, &committed_height.inner())?;
-        Some(metadata.header().work_in_flight())
-    }
-
-    /// Attested load carried by the committed tip's header. `None` under
-    /// the same condition as [`Self::committed_reveal_chain`].
-    fn committed_load(&self, committed_height: BlockHeight) -> Option<ShardLoad> {
-        let cf = self.cf();
-        let blocks_cf = BlocksCf::handle(&cf);
-        let metadata: BlockMetadata =
-            get::<BlocksCf>(&*self.db, blocks_cf, &committed_height.inner())?;
-        Some(metadata.header().load())
+        Some(metadata.header().committed_tip())
     }
 
     /// The committed tip's witness window base, read from its stored

@@ -152,6 +152,7 @@ pub use shard::evidence::{
 pub use shard::fork_fence::ForkFence;
 pub use shard::header::{
     BlockHeader, BlockHeaderParentQcMismatch, BlockHeaderParts, BlockHeaderVerifyError,
+    CommittedTip,
 };
 pub use shard::inventory::{ElidedCertifiedBlock, Inventory, RehydrateError, RehydrationMiss};
 pub use shard::limits::{

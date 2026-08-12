@@ -18,6 +18,39 @@ use crate::{
     WeightedTimestamp, WorkInFlight,
 };
 
+/// The running values a block extending the committed tip is checked
+/// against, all read off the tip's own header.
+///
+/// Held as one value because they resolve as one: a replica that has the
+/// tip's header supplies all four, and one that does not supplies none.
+/// Carried separately they admit a state nothing can produce — a parent
+/// resolvable for its reveal chain and unresolvable for its drain total —
+/// and a checker reading the absent one refuses a block it could have
+/// checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommittedTip {
+    /// Work the tip leaves in flight, which the next block advances.
+    pub work_in_flight: WorkInFlight,
+    /// Highest tick whose determined half has settled at or below the tip.
+    pub settled_tick_frontier: BlockHeight,
+    /// Reveal chain the next block extends, or reseeds past in a later epoch.
+    pub reveal_chain: RevealChain,
+    /// Attested load through the tip: running gas total and the byte level.
+    pub load: ShardLoad,
+}
+
+impl CommittedTip {
+    /// A chain's genesis tip, whose header carries zero of everything —
+    /// known rather than guessed, which is why a fresh start resolves here
+    /// instead of refusing to check its first block.
+    pub const GENESIS: Self = Self {
+        work_in_flight: WorkInFlight::ZERO,
+        settled_tick_frontier: BlockHeight::GENESIS,
+        reveal_chain: RevealChain::ZERO,
+        load: ShardLoad::ZERO,
+    };
+}
+
 /// Block header containing consensus metadata.
 ///
 /// The header is what validators vote on. It contains:
@@ -666,6 +699,17 @@ impl BlockHeader {
     #[must_use]
     pub const fn load(&self) -> ShardLoad {
         self.load
+    }
+
+    /// The running values a block extending this one is checked against.
+    #[must_use]
+    pub const fn committed_tip(&self) -> CommittedTip {
+        CommittedTip {
+            work_in_flight: self.work_in_flight,
+            settled_tick_frontier: self.settled_tick_frontier,
+            reveal_chain: self.reveal_chain,
+            load: self.load,
+        }
     }
 
     /// Decompose into the raw fields, in struct-declaration order.

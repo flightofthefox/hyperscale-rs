@@ -91,14 +91,14 @@ use hyperscale_storage::RecoveredState;
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, BeaconWitnessRoot, BeaconWitnessRootVerifyError,
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CertRootVerifyError,
-    CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, Finalization,
+    CertificateRoot, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
     LocalReceiptRoot, LocalReceiptRootVerifyError, MAX_ROUND_GAP, MAX_VALIDITY_RANGE,
     PredecessorTerminal, ProvisionRootVerifyError, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext, QcVerifyError,
-    QuorumCertificate, RecoveryCause, RevealChain, Round, SafeVoteRegisters, ShardLoad, StateRoot,
-    StateRootVerifyError, Timeout, TopologySchedule, TopologySnapshot, Transaction,
-    TransactionRoot, TxHash, TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier,
-    Verify, VoteCount, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
+    QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, StateRootVerifyError,
+    Timeout, TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TxHash,
+    TxRootVerifyError, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
+    derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -260,32 +260,14 @@ pub struct ShardCoordinator {
     /// verification delta. Feeds reshape-trigger derivation.
     substate_bytes_frontier: (BlockHeight, u64),
 
-    /// Drain total carried by the committed tip's header, retained so
-    /// the vote path can check a block extending the pruned tip. Seeded
-    /// from the recovered tip, so a restart can vote on the first block
-    /// it sees rather than waiting for a commit it may be needed to
-    /// form; `None` only when no tip header was recovered, which skips
-    /// the vote rather than checking against a guess.
-    committed_in_flight: Option<WorkInFlight>,
-    /// Settlement frontier carried by the committed tip's header — the
-    /// value the next block advances. Seeded from the recovered tip so a
-    /// restart's first block checks against the same frontier its peers
-    /// do; `None` when no tip header was recovered, which skips the
-    /// frontier check rather than guessing at it.
-    committed_settled_frontier: Option<BlockHeight>,
-
-    /// Reveal chain on the committed tip's header — what the next block
-    /// extends. `None` under the same conditions as
-    /// [`Self::committed_in_flight`], and with the same consequence: a
-    /// block extending the pruned tip can't have its chain checked, so the
-    /// vote is skipped until the first commit reseats the scalar.
-    committed_reveal_chain: Option<RevealChain>,
-    /// Attested load on the committed tip's header — the running gas total
-    /// the next block advances. Held as a scalar for the same reason
-    /// `committed_block_anchor_wt` is: the tip's header is pruned from the
-    /// pending and certified caches, so a block whose parent is the tip has
-    /// no held header to read it off.
-    committed_load: Option<ShardLoad>,
+    /// The committed tip's running values, retained so the vote path can
+    /// check a block extending the tip after its header is pruned from the
+    /// pending and certified caches. Seeded from the recovered tip, so a
+    /// restart checks the first block it sees rather than waiting for a
+    /// commit it may itself be needed to form. `None` only when no tip
+    /// header was recovered, which skips the checks rather than guessing —
+    /// and skips them together, because the tip either resolves or does not.
+    committed_tip: Option<CommittedTip>,
 
     /// Latest QC (certifies the latest certified block). Verified at
     /// every adoption gate; the typestate makes that invariant local.
@@ -520,28 +502,15 @@ impl ShardCoordinator {
             pending_bytes_deltas: HashMap::new(),
             deferred_reservation_checks: HashMap::new(),
             committed_rounds: BTreeMap::new(),
-            committed_in_flight: recovered.committed_in_flight.or_else(|| {
-                recovered
-                    .committed_hash
-                    .is_none()
-                    .then_some(WorkInFlight::ZERO)
-            }),
-            committed_settled_frontier: recovered.committed_settled_frontier,
             // A fresh start's tip is the chain's genesis, whose header
-            // carries `ZERO` — known, not guessed. A restart with a real
-            // tip and no recovered scalar stays `None` and defers the
-            // build until the first commit reseats it.
-            committed_reveal_chain: recovered.committed_reveal_chain.or_else(|| {
+            // carries zero of everything — known, not guessed. A real tip
+            // whose header was not recovered stays `None` and defers the
+            // checks until the first commit reseats it.
+            committed_tip: recovered.committed_tip.or_else(|| {
                 recovered
                     .committed_hash
                     .is_none()
-                    .then_some(RevealChain::ZERO)
-            }),
-            committed_load: recovered.committed_load.or_else(|| {
-                recovered
-                    .committed_hash
-                    .is_none()
-                    .then_some(ShardLoad::ZERO)
+                    .then_some(CommittedTip::GENESIS)
             }),
             latest_qc: recovered.latest_qc,
             anchor_qc: recovered.anchor_qc,
@@ -600,10 +569,7 @@ impl ShardCoordinator {
             self.committed_height,
             self.committed_hash,
             self.committed_state_root,
-            self.committed_in_flight,
-            self.committed_settled_frontier,
-            self.committed_load,
-            self.committed_reveal_chain,
+            self.committed_tip,
             self.latest_qc.as_ref(),
             &self.pending_blocks,
             self.verification.verified_certified_blocks(),
@@ -1697,10 +1663,7 @@ impl ShardCoordinator {
 
         self.committed_hash = hash;
         self.committed_state_root = genesis.header().state_root();
-        self.committed_in_flight = Some(genesis.header().work_in_flight());
-        self.committed_settled_frontier = Some(genesis.header().settled_tick_frontier());
-        self.committed_reveal_chain = Some(genesis.header().reveal_chain());
-        self.committed_load = Some(genesis.header().load());
+        self.committed_tip = Some(genesis.header().committed_tip());
         // A chain's genesis height and clock are per-chain properties: a
         // split child's genesis continues the parent's height line and
         // anchors at its final canonical weighted timestamp (ZERO and
@@ -2304,7 +2267,7 @@ impl ShardCoordinator {
             return vec![];
         };
         // The block's reveal chain extends the parent's, so an unresolvable
-        // parent — pruned from pending with no recovered committed-tip scalar
+        // parent — pruned from pending with no recovered committed tip
         // — has no chain to extend. Defer rather than guess: a wrong chain
         // produces a header every other replica rejects. The first commit
         // past the gap reseats the scalar.
@@ -3412,7 +3375,7 @@ impl ShardCoordinator {
                 &self.pending_blocks,
                 &self.beacon_witness_accumulator,
                 self.committed_hash,
-                self.committed_reveal_chain,
+                self.committed_tip.map(|tip| tip.reveal_chain),
                 self.committed_block_anchor_wt,
                 self.committed_committee_anchor_wt,
                 block_hash,
@@ -4372,7 +4335,7 @@ impl ShardCoordinator {
             &self.pending_blocks,
             &self.beacon_witness_accumulator,
             self.committed_hash,
-            self.committed_reveal_chain,
+            self.committed_tip.map(|tip| tip.reveal_chain),
             self.committed_block_anchor_wt,
             self.committed_committee_anchor_wt,
             self.local_shard,
@@ -4896,10 +4859,7 @@ impl ShardCoordinator {
         self.committed_committee_anchor_wt = self.committed_block_anchor_wt;
         self.committed_block_anchor_wt = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
-        self.committed_in_flight = Some(block.header().work_in_flight());
-        self.committed_settled_frontier = Some(block.header().settled_tick_frontier());
-        self.committed_reveal_chain = Some(block.header().reveal_chain());
-        self.committed_load = Some(block.header().load());
+        self.committed_tip = Some(block.header().committed_tip());
         self.gc_settled_sets();
 
         // Retire the committed block's substate delta into the count
@@ -6562,7 +6522,8 @@ impl ShardCoordinator {
     /// before the first header is observed.
     #[must_use]
     pub fn committed_in_flight(&self) -> u64 {
-        self.committed_in_flight.map_or(0, WorkInFlight::inner)
+        self.committed_tip
+            .map_or(0, |tip| tip.work_in_flight.inner())
     }
 
     /// The drain this shard still owes at the proposal parent: committed

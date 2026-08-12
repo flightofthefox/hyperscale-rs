@@ -1038,7 +1038,7 @@ pub fn test_recovery_carries_the_tip_drain_total(
     storage.commit_block(&make_test_certified(block), &empty_witness());
 
     assert_eq!(
-        recovered().committed_in_flight,
+        recovered().committed_tip.map(|tip| tip.work_in_flight),
         Some(in_flight),
         "the tip's drain total is on its stored header, so recovery reads it",
     );

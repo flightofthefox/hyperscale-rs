@@ -161,22 +161,10 @@ impl SimShardStorage {
         let committed_block_anchor_wt = anchor_ts_at(committed_height);
         // The committee that signed the tip anchors on the header below it.
         let committed_committee_anchor_wt = committed_height.prev().and_then(anchor_ts_at);
-        let committed_in_flight = c
+        let committed_tip = c
             .blocks
             .get(&committed_height)
-            .map(|block| block.block().header().work_in_flight());
-        let committed_reveal_chain = c
-            .blocks
-            .get(&committed_height)
-            .map(|block| block.block().header().reveal_chain());
-        let committed_load = c
-            .blocks
-            .get(&committed_height)
-            .map(|block| block.block().header().load());
-        let committed_settled_frontier = c
-            .blocks
-            .get(&committed_height)
-            .map(|block| block.block().header().settled_tick_frontier());
+            .map(|block| block.block().header().committed_tip());
         // The accumulator window starts at the tip's witness base;
         // retained entries below it are the persistence layer's
         // hysteresis stock — serving data, not accumulator state.
@@ -226,10 +214,7 @@ impl SimShardStorage {
             committed_hash,
             latest_qc,
             anchor_qc: None,
-            committed_in_flight,
-            committed_reveal_chain,
-            committed_load,
-            committed_settled_frontier,
+            committed_tip,
             committed_block_anchor_wt,
             committed_committee_anchor_wt,
             jmt_root: Some(self.state_root()),
