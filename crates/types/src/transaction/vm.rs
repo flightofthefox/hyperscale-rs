@@ -18,7 +18,10 @@ pub use hyperscale_vm_types::{
 };
 use thiserror::Error;
 
-use crate::crypto::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature, verify_ed25519};
+use crate::crypto::{
+    AccountSigner, Ed25519PublicKey, Ed25519Signature, Secp256k1PublicKey, Secp256k1Signature,
+    verify_ed25519, verify_secp256k1,
+};
 use crate::{Address, DeclaredKey, Hash, TimestampRange, WeightedTimestamp};
 
 /// The curves behind the VM's scheme registry.
@@ -28,6 +31,11 @@ use crate::{Address, DeclaredKey, Hash, TimestampRange, WeightedTimestamp};
 /// accepts answers here, and one it does not — an id no registry entry
 /// claims, or material of a width its entry does not give it — answers
 /// `false` alongside a signature that is simply wrong.
+///
+/// Every message the transaction path presents is a 32-byte hash, and the
+/// ECDSA scheme takes one as its prehash rather than digesting again. A
+/// message of any other width is refused there, which is the same refusal
+/// as any other material this verifier cannot read.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProtocolVerifier;
 
@@ -50,6 +58,20 @@ impl SchemeVerifier for ProtocolVerifier {
                     &Ed25519Signature(signature),
                 )
             }
+            SchemeId::SECP256K1 => {
+                let (Ok(key), Ok(signature), Ok(prehash)) = (
+                    key.try_into(),
+                    signature.try_into(),
+                    <&[u8; 32]>::try_from(message),
+                ) else {
+                    return false;
+                };
+                verify_secp256k1(
+                    prehash,
+                    &Secp256k1PublicKey(key),
+                    &Secp256k1Signature(signature),
+                )
+            }
             _ => false,
         }
     }
@@ -61,11 +83,11 @@ impl SchemeVerifier for ProtocolVerifier {
 /// key and their claim about which curve produced it are written in one
 /// place and cannot drift apart.
 #[must_use]
-pub fn sign_subintent(key: &Ed25519PrivateKey, declaration_hash: &[u8; 32]) -> SubintentSig {
+pub fn sign_subintent<S: AccountSigner>(key: &S, declaration_hash: &[u8; 32]) -> SubintentSig {
     SubintentSig {
-        scheme: SchemeId::ED25519,
-        public_key: key.public_key().0.to_vec(),
-        signature: key.sign(declaration_hash).0.to_vec(),
+        scheme: key.scheme(),
+        public_key: key.public_key_bytes(),
+        signature: key.sign_digest(declaration_hash),
     }
 }
 
@@ -84,7 +106,7 @@ pub trait EnvelopeExt: Sized {
     /// Sign the envelope's content with the composer's key, filling the
     /// scheme, signer, and signature fields.
     #[must_use]
-    fn sign(self, key: &Ed25519PrivateKey) -> Self;
+    fn sign<S: AccountSigner>(self, key: &S) -> Self;
 
     /// Whether the composer's signature covers the envelope content
     /// under the signer's key, in the scheme the envelope names.
@@ -104,14 +126,14 @@ impl EnvelopeExt for TransactionEnvelope {
         Hash::from_hash_bytes(hasher.finalize().as_bytes())
     }
 
-    fn sign(mut self, key: &Ed25519PrivateKey) -> Self {
+    fn sign<S: AccountSigner>(mut self, key: &S) -> Self {
         // The scheme is signed content, so it is stamped before the
         // preimage is taken; the key and signature are not, and are
         // filled after.
-        self.signer_scheme = SchemeId::ED25519;
+        self.signer_scheme = key.scheme();
         let hash = self.signing_hash();
-        self.signer = key.public_key().0.to_vec();
-        self.signature = key.sign(hash.as_bytes()).0.to_vec();
+        self.signer = key.public_key_bytes();
+        self.signature = key.sign_digest(hash.as_bytes());
         self
     }
 
@@ -303,39 +325,60 @@ pub fn vm_statics() -> &'static dyn VmStatics {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtocolVerifier, SchemeId, SchemeVerifier};
-    use crate::crypto::Ed25519PrivateKey;
+    use super::{AccountSigner, ProtocolVerifier, SchemeId, SchemeVerifier};
+    use crate::crypto::{Ed25519PrivateKey, Secp256k1PrivateKey};
 
-    fn key() -> Ed25519PrivateKey {
+    const DIGEST: [u8; 32] = [3u8; 32];
+
+    fn ed() -> Ed25519PrivateKey {
         Ed25519PrivateKey::from_bytes(&[3u8; 32]).expect("32 bytes")
+    }
+
+    fn secp() -> Secp256k1PrivateKey {
+        Secp256k1PrivateKey::from_bytes(&[3u8; 32]).expect("a scalar in range")
+    }
+
+    fn signers() -> Vec<Box<dyn AccountSigner>> {
+        vec![Box::new(ed()), Box::new(secp())]
     }
 
     #[test]
     fn a_signature_verifies_under_the_scheme_it_was_made_in() {
-        let key = key();
-        let signature = key.sign(b"message").0;
-        assert!(ProtocolVerifier.verify(
-            SchemeId::ED25519,
-            &key.public_key().0,
-            &signature,
-            b"message"
-        ));
-        assert!(!ProtocolVerifier.verify(
-            SchemeId::ED25519,
-            &key.public_key().0,
-            &signature,
-            b"other"
-        ));
+        for signer in signers() {
+            let key = signer.public_key_bytes();
+            let signature = signer.sign_digest(&DIGEST);
+            assert!(ProtocolVerifier.verify(signer.scheme(), &key, &signature, &DIGEST));
+            assert!(!ProtocolVerifier.verify(signer.scheme(), &key, &signature, &[9u8; 32]));
+        }
+    }
+
+    /// Material presented under a scheme that did not produce it verifies
+    /// under neither: the widths disagree, and where they agree the curve
+    /// does.
+    #[test]
+    fn a_signature_verifies_under_no_other_scheme() {
+        for signer in signers() {
+            let key = signer.public_key_bytes();
+            let signature = signer.sign_digest(&DIGEST);
+            for scheme in [SchemeId::ED25519, SchemeId::SECP256K1] {
+                assert_eq!(
+                    ProtocolVerifier.verify(scheme, &key, &signature, &DIGEST),
+                    scheme == signer.scheme(),
+                );
+            }
+        }
     }
 
     /// A scheme no registry entry claims verifies nothing, whatever
     /// material is presented under it.
     #[test]
     fn an_unregistered_scheme_verifies_nothing() {
-        let key = key();
-        let signature = key.sign(b"message").0;
-        for scheme in [SchemeId::NONE, SchemeId(2), SchemeId(u16::MAX)] {
-            assert!(!ProtocolVerifier.verify(scheme, &key.public_key().0, &signature, b"message"));
+        for signer in signers() {
+            let key = signer.public_key_bytes();
+            let signature = signer.sign_digest(&DIGEST);
+            for scheme in [SchemeId::NONE, SchemeId(3), SchemeId(u16::MAX)] {
+                assert!(!ProtocolVerifier.verify(scheme, &key, &signature, &DIGEST));
+            }
         }
     }
 
@@ -344,11 +387,29 @@ mod tests {
     /// one the curve would accept.
     #[test]
     fn material_of_the_wrong_width_refuses() {
-        let key = key();
-        let public = key.public_key().0;
-        let signature = key.sign(b"message").0;
-        assert!(!ProtocolVerifier.verify(SchemeId::ED25519, &public[..31], &signature, b"message"));
-        assert!(!ProtocolVerifier.verify(SchemeId::ED25519, &public, &signature[..63], b"message"));
-        assert!(!ProtocolVerifier.verify(SchemeId::ED25519, &[], &[], b"message"));
+        for signer in signers() {
+            let scheme = signer.scheme();
+            let key = signer.public_key_bytes();
+            let signature = signer.sign_digest(&DIGEST);
+            assert!(!ProtocolVerifier.verify(scheme, &key[..key.len() - 1], &signature, &DIGEST));
+            assert!(!ProtocolVerifier.verify(
+                scheme,
+                &key,
+                &signature[..signature.len() - 1],
+                &DIGEST
+            ));
+            assert!(!ProtocolVerifier.verify(scheme, &[], &[], &DIGEST));
+        }
+    }
+
+    /// ECDSA reads the message as its prehash, so a message that is not
+    /// the curve's digest width is material this verifier cannot read.
+    #[test]
+    fn secp256k1_refuses_a_message_that_is_not_a_digest() {
+        let signer = secp();
+        let key = signer.public_key_bytes();
+        let signature = signer.sign_digest(&DIGEST);
+        assert!(ProtocolVerifier.verify(SchemeId::SECP256K1, &key, &signature, &DIGEST));
+        assert!(!ProtocolVerifier.verify(SchemeId::SECP256K1, &key, &signature, &DIGEST[..31]));
     }
 }

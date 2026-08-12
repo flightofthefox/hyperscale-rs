@@ -540,7 +540,8 @@ impl VmStatics for BridgeStatics {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        CallTarget, Ed25519PrivateKey, NetworkId, TX_UNITS, TransactionBody, sign_subintent,
+        CallTarget, Ed25519PrivateKey, NetworkId, Secp256k1PrivateKey, TX_UNITS, TransactionBody,
+        sign_subintent,
     };
     use hyperscale_vm_effects::stdlib::{VAULT, account_metadata};
     use hyperscale_vm_effects::{
@@ -683,7 +684,7 @@ mod tests {
             .zip(subintent_keys)
             .map(|(subintent, signer)| {
                 let hash = subintent.decl.hash(&ProtocolHasher);
-                sign_subintent(signer, &hash.0.0)
+                sign_subintent(*signer, &hash.0.0)
             })
             .collect();
         TransactionEnvelope {
@@ -820,6 +821,32 @@ mod tests {
         // The composer paying from their own account is the admitted
         // case, so the check bites on ownership and not on fees at all.
         assert!(statics().derive(&envelope(&tree, &[])).is_ok());
+    }
+
+    /// The payer binding is derived under the scheme the envelope names,
+    /// so a second scheme's key opens its own account and the same seed
+    /// under two schemes is two accounts.
+    #[test]
+    fn the_payer_binding_holds_under_a_second_scheme() {
+        let secp = Secp256k1PrivateKey::from_bytes(&[7u8; 32]).expect("a scalar in range");
+        let payer = principal_for(SchemeId::SECP256K1, &secp.public_key().0)
+            .expect("a registered scheme opens an account");
+        assert_ne!(
+            payer,
+            composer_addr(),
+            "one seed, two schemes, two accounts"
+        );
+
+        let tree = single_intent_tree(vec![
+            withdraw(payer, RES_X, 100),
+            deposit_edge(bob_addr(), 0, RES_X),
+        ]);
+        let mut signed = envelope(&tree, &[]);
+        signed.fee_payer = payer;
+        let signed = signed.sign(&secp);
+
+        assert!(signed.signature_is_valid());
+        assert!(statics().derive(&signed).is_ok());
     }
 
     /// The theft the gate closes: a manifest withdrawing from an account

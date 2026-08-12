@@ -73,8 +73,8 @@ pub use beacon::{
     verify_qc2, verify_qc3, verify_ratify_cert, verify_ratify_vote, verify_vote_equivocation,
     verify_vote1, verify_vote2, verify_vote3,
 };
-pub use crypto::Ed25519PrivateKey;
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
+pub use crypto::{AccountSigner, Ed25519PrivateKey, Secp256k1PrivateKey};
 pub use execution::computation::{tick_leader, tick_leader_at};
 pub use execution::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,

@@ -432,8 +432,8 @@ mod tests {
     use super::*;
     use crate::test_utils::{test_prefix, test_validity_range};
     use crate::{
-        Ed25519PrivateKey, PrincipalAddr, SchemeId, SubintentSig, TransactionBody, VmStatics,
-        declared_work, install_vm_statics,
+        Ed25519PrivateKey, PrincipalAddr, SchemeId, Secp256k1PrivateKey, SubintentSig,
+        TransactionBody, VmStatics, declared_work, install_vm_statics,
     };
 
     struct StubStatics;
@@ -479,7 +479,10 @@ mod tests {
     const TEST_NETWORK: NetworkId = NetworkId(242);
 
     fn test_envelope(tree: &[u8]) -> TransactionEnvelope {
-        let key = Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap();
+        unsigned_envelope(tree).sign(&Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap())
+    }
+
+    fn unsigned_envelope(tree: &[u8]) -> TransactionEnvelope {
         let range = test_validity_range();
         TransactionEnvelope {
             body: TransactionBody::Call(tree.to_vec()),
@@ -495,7 +498,6 @@ mod tests {
             signer: Vec::new(),
             signature: Vec::new(),
         }
-        .sign(&key)
     }
 
     fn fixture(tree: &[u8]) -> Transaction {
@@ -595,21 +597,54 @@ mod tests {
         );
     }
 
-    /// The scheme rides inside the preimage, so re-tagging signed
-    /// material loses the signature that covered it — a pair validating
-    /// under two registered schemes is still only presentable as the one
-    /// its signer named.
+    /// Either registered scheme signs an envelope that survives the wire
+    /// and verifies at the other end.
     #[test]
-    fn re_tagging_the_scheme_loses_the_signature() {
+    fn an_envelope_signed_under_either_scheme_round_trips() {
         install_vm_statics(Box::new(StubStatics));
-        let tx = fixture(b"graph bytes");
+        let ed = unsigned_envelope(b"graph bytes")
+            .sign(&Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap());
+        let secp = unsigned_envelope(b"graph bytes")
+            .sign(&Secp256k1PrivateKey::from_bytes(&[7u8; 32]).unwrap());
 
-        let mut retagged = tx.body().clone();
-        retagged.signer_scheme = SchemeId(2);
-        assert_eq!(
-            Transaction::new(retagged).verify(TEST_NETWORK).unwrap_err(),
-            TransactionVerifyError::InvalidSignature,
-        );
+        assert_eq!(ed.signer_scheme, SchemeId::ED25519);
+        assert_eq!(secp.signer_scheme, SchemeId::SECP256K1);
+        assert_ne!(ed.signer.len(), secp.signer.len());
+
+        for envelope in [ed, secp] {
+            let bytes = hbor_to_vec(&Transaction::new(envelope)).unwrap();
+            let carried: Transaction = hbor_from_slice(&bytes).unwrap();
+            carried
+                .verify(TEST_NETWORK)
+                .expect("what a registered scheme signed verifies under it");
+        }
+    }
+
+    /// The scheme rides inside the preimage, so re-tagging signed material
+    /// to the other registered scheme loses the signature that covered it.
+    /// The re-tagged envelope still decodes: this is a signature verdict,
+    /// not a codec one.
+    #[test]
+    fn re_tagging_between_schemes_loses_the_signature() {
+        install_vm_statics(Box::new(StubStatics));
+        let ed = unsigned_envelope(b"graph bytes")
+            .sign(&Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap());
+        let secp = unsigned_envelope(b"graph bytes")
+            .sign(&Secp256k1PrivateKey::from_bytes(&[7u8; 32]).unwrap());
+
+        for (envelope, other) in [(ed, SchemeId::SECP256K1), (secp, SchemeId::ED25519)] {
+            let mut retagged = envelope;
+            retagged.signer_scheme = other;
+            let bytes = hbor_to_vec(&Transaction::new(retagged)).unwrap();
+            let carried: Transaction = hbor_from_slice(&bytes).unwrap();
+            carried
+                .try_body()
+                .expect("a re-tagged envelope still decodes");
+            assert_eq!(
+                carried.verify(TEST_NETWORK).unwrap_err(),
+                TransactionVerifyError::InvalidSignature,
+            );
+        }
     }
 
     #[test]
