@@ -15,12 +15,12 @@ use hyperscale_engine::{
     PreviewReport, ResourceChange, TickBatchContext, XRD, genesis_writes,
 };
 use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput, VersionedStore};
-use hyperscale_types::test_utils::test_principal;
 use hyperscale_types::{
-    BlockHash, BlockHeight, CallTarget, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
-    MerkleInclusionProof, NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain, SettledWrites,
-    ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey, Transaction, TransactionBody,
-    TransactionEnvelope, Verified, WeightedTimestamp, absorb_committed_cells,
+    BlockHash, BlockHeight, CallTarget, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey,
+    EnvelopeExt, Hash, MerkleInclusionProof, NetworkId, PrincipalAddr, ProvisionalHolds,
+    RevealChain, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
+    Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
+    absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
     AbiParam, Address, Constraint, EdgeRef, EnvelopeTree, Expr, GraphArg, GraphNode, IntentDecl,
@@ -1500,22 +1500,23 @@ fn a_preview_prices_an_abort_at_its_class_floor() {
 
 /// An envelope admission would refuse previews as refused, and costs
 /// nothing: it could never enter a block, so nobody would pay for it.
+///
+/// The refusal is the instance gate, which only a component can trip: a
+/// principal is served by its class, so no principal address is unknown.
+/// The reason is asserted because the outcome alone cannot tell this
+/// gate from the authority one, and a preview that refused for the wrong
+/// reason would still pass a bare `Refused` check.
 #[test]
 fn a_preview_refuses_what_admission_would_refuse() {
-    let stranger = test_principal(0xAB);
-    assert!(
-        !world_accounts().iter().any(|(a, _)| *a == stranger),
-        "the address must be outside the world"
-    );
+    let unknown = ComponentAddr::new([0xAB; 31]);
     let executor = Executor::new(ExecutionMode::Serial);
-    let tx = signed_transfer_with_fee(7, stranger, bob(), 10, PREVIEW_CEILING);
+    let tx = signed_transfer_with_fee(7, unknown, bob(), 10, PREVIEW_CEILING);
     let report = preview_on(&[(bob(), 50)], &executor, &tx, PreviewGrants::default());
 
-    assert!(
-        matches!(report.outcome, PreviewOutcome::Refused { .. }),
-        "outcome = {:?}",
-        report.outcome
-    );
+    let PreviewOutcome::Refused { reason } = &report.outcome else {
+        panic!("an unknown instance must refuse: {:?}", report.outcome);
+    };
+    assert!(reason.contains("no instance"), "reason = {reason}");
     assert_eq!(report.fee, 0);
     assert!(report.changes.is_empty());
 }
