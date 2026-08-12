@@ -464,7 +464,7 @@ impl Session {
         )
     }
 
-    /// Submit an *XRD transfer between two funded accounts, returning its hash.
+    /// Submit an XRD transfer between two funded accounts, returning its hash.
     ///
     /// The payer rotates with the nonce, so a caller driving a steady rate
     /// spreads load across accounts instead of serializing on one. The payee

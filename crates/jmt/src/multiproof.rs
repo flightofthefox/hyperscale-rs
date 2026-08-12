@@ -46,13 +46,13 @@
 //! A claim has the layout:
 //!
 //! ```text
-//! 32 bytes : key
+//! 48 bytes : key
 //! 2 bytes  : depth_bits (u16 big-endian)
 //! 1 byte   : termination discriminator
 //! ...      : termination-specific body:
 //!              0x01 Leaf          → 32 bytes value_hash
 //!              0x02 EmptySubtree  → (no additional data)
-//!              0x03 LeafMismatch  → 32 bytes stored_key ||
+//!              0x03 LeafMismatch  → 48 bytes stored_key ||
 //!                                   32 bytes stored_value_hash
 //! ```
 //!
@@ -91,7 +91,7 @@ pub struct MultiProof {
 /// One key's outcome inside a [`MultiProof`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProofClaim {
-    /// The 32-byte key the claim is about.
+    /// The 48-byte key the claim is about.
     pub key: Key,
     /// `Some` iff the lookup hit a leaf whose key matches.
     pub value_hash: Option<ValueHash>,
@@ -234,7 +234,7 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
         expected_claims: &[(Key, Option<ValueHash>)],
     ) -> Result<(), ProofError> {
         // Cross-check each expected claim against the proof. Both are
-        // keyed by 32-byte keys; sort expected and walk together with
+        // keyed by 48-byte keys; sort expected and walk together with
         // proof.claims (which is sorted by prove()).
         let mut expected: Vec<(Key, Option<ValueHash>)> = expected_claims.to_vec();
         expected.sort_by_key(|(k, _)| *k);

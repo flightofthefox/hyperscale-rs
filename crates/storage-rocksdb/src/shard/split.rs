@@ -351,7 +351,7 @@ mod tests {
     use super::super::metadata::read_chain_origin;
     use super::*;
 
-    /// A 32-byte leaf key with `b` as its leading byte.
+    /// A 48-byte leaf key with `b` as its leading byte.
     fn k(b: u8) -> Key {
         let mut key = [0u8; KEY_BYTES];
         key[0] = b;

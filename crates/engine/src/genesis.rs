@@ -3,9 +3,9 @@
 //! [`GenesisConfig`] is the canonical input — the accounts a deployment
 //! funds and the stake pools its beacon folds facts for — so two nodes
 //! with the same config install byte-identical state. The metadata cache
-//! holds the stdlib account package, the instance registry binds each
-//! funded address to it, and the funded balances land as identity-keyed
-//! vault cells in one genesis batch.
+//! holds the stdlib account package, bound as the one serving every
+//! principal, and the funded balances land as identity-keyed vault cells
+//! in one genesis batch.
 
 use hyperscale_effects_bridge::vm_statics::PackageCache;
 use hyperscale_effects_bridge::{PoolRegistry, ProtocolHasher, admit_package, validator_key};
@@ -23,8 +23,8 @@ pub use hyperscale_vm_stdlib::{account_artifact, genesis_publisher, staking_arti
 #[derive(Debug, Clone, Default)]
 pub struct GenesisConfig {
     /// Funded accounts: owner prefix and initial balance. Seeded as
-    /// identity-keyed vault cells and registered as account-package
-    /// instances in the process's VM statics.
+    /// identity-keyed vault cells. Funding is all this does — an account
+    /// is callable whether or not it appears here.
     pub accounts: Vec<(PrincipalAddr, u128)>,
 
     /// Stake pools the beacon folds facts for: the pool instance's owner
@@ -35,8 +35,8 @@ pub struct GenesisConfig {
     pub pools: Vec<StakePoolSeat>,
 }
 
-/// The genesis-static world: published stdlib metadata and the funded
-/// accounts' instance registrations.
+/// The genesis-static world: published stdlib metadata, the blueprint
+/// serving every principal, and any seated pool instances.
 #[derive(Debug, Clone)]
 pub struct World {
     /// Published package metadata, growing as blocks commit.
@@ -168,7 +168,7 @@ pub fn stake_unit(pool: impl Into<Address>) -> ResourceAddr {
 /// The genesis substate writes.
 ///
 /// The protocol's stdlib flash composed with this network's allocations:
-/// a seated pool's validator records and one [`*XRD`] vault cell per
+/// a seated pool's validator records and one [`XRD`] vault cell per
 /// funded account, identity-keyed under the owner's prefix.
 #[must_use]
 pub fn genesis_writes(

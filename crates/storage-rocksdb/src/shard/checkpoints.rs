@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
+use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, SubstateDatabase, WitnessSeed,
@@ -43,10 +43,10 @@ use crate::typed_cf::{
 };
 
 /// Queue the staging CF's full range and the progress record for
-/// deletion in `batch`. Staged keys are exactly 32 bytes, so a 33-byte
-/// `0xFF` bound covers every possible key.
+/// deletion in `batch`. Staged keys are exactly [`KEY_BYTES`] long, so a
+/// bound one byte longer and all `0xFF` sorts above every possible key.
 fn wipe_staging_into(batch: &mut WriteBatch, staging_cf: &ColumnFamily) {
-    batch.delete_range_cf(staging_cf, &[][..], &[0xFF; 33][..]);
+    batch.delete_range_cf(staging_cf, &[][..], &[0xFF; KEY_BYTES + 1][..]);
     meta_delete::<ImportProgressEntry>(batch);
 }
 
@@ -68,7 +68,7 @@ fn wipe_cf_into(batch: &mut WriteBatch, db: &DB, cf: &ColumnFamily) {
 /// independent of state size.
 const IMPORT_BATCH_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Fixed per-leaf weight component (the 32-byte key, hashes, allocator
+/// Fixed per-leaf weight component (the 48-byte key, hashes, allocator
 /// overhead), so a run of tiny values still bounds a batch's leaf count.
 const IMPORT_LEAF_OVERHEAD: u64 = 96;
 
@@ -1142,13 +1142,11 @@ mod tests {
             let progress = completed_import_progress(height, TOTAL * VALUE_BYTES as u64);
             let mut chunk = Vec::with_capacity(STAGE_CHUNK);
             for index in 0..TOTAL {
-                let mut seed = [0u8; KEY_BYTES];
-                seed[..8].copy_from_slice(&index.to_be_bytes());
                 // Hashed keys spread paths uniformly, like real
                 // leaf keys.
-                let digest = *blake3_hash(&seed).as_bytes();
+                let digest = *blake3_hash(&index.to_be_bytes()).as_bytes();
                 let mut key = [0u8; KEY_BYTES];
-                for (chunk_index, slot) in key.chunks_mut(32).enumerate() {
+                for (chunk_index, slot) in key.chunks_mut(digest.len()).enumerate() {
                     let len = slot.len();
                     slot.copy_from_slice(&digest[..len]);
                     slot[0] = slot[0]
@@ -1157,7 +1155,9 @@ mod tests {
                 key[31] = AddressClass::Component.tag();
                 chunk.push(SubstateLeaf {
                     key: SubstateKey::from_bytes(key).expect("a stored leaf key names an address"),
-                    value: seed.repeat(VALUE_BYTES / 32),
+                    // Sized off the value width, not the key width: the
+                    // declared byte total is what this test checks.
+                    value: digest.repeat(VALUE_BYTES / digest.len()),
                 });
                 if chunk.len() == STAGE_CHUNK {
                     storage.stage_import_chunk(&progress, &chunk).unwrap();

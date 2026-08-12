@@ -4,13 +4,15 @@
 use hyperscale_hbor::Hbor;
 use hyperscale_vm_types::MAX_CELL_VALUE_LEN;
 
-use crate::{Address, Hash, SubstateKey};
+#[cfg(any(test, feature = "test-utils"))]
+use crate::Address;
+use crate::{Hash, SubstateKey};
 
 /// One live substate as a proven pair: the key — its JMT leaf key by
 /// identity — and the raw value behind it.
 ///
 /// The snap-sync unit, on the wire and through staging: a verifier
-/// trusts none of it bare — the key's own 32 bytes must prove into the
+/// trusts none of it bare — the key's own 48 bytes must prove into the
 /// shard's attested `state_root` via a range proof whose claimed value
 /// hash must equal the hash of `value`.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]

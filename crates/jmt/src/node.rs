@@ -450,7 +450,7 @@ impl LeafValue {
 /// and sits **outside** the leaf hash preimage — see [`Hasher::hash_leaf`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeafNode {
-    /// Full 32-byte key located at this leaf.
+    /// Full 48-byte key located at this leaf.
     pub key: Key,
     /// Pre-computed hash of the stored value.
     pub value_hash: ValueHash,

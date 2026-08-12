@@ -4,7 +4,7 @@
 //!
 //! # Key mapping
 //!
-//! A substate key's two halves *are* its 32-byte JMT key — the leaf
+//! A substate key's two halves *are* its 48-byte JMT key — the leaf
 //! is read off the key with no hashing, so one owner's substates form a
 //! contiguous subtree under the prefix its own bits name (see
 //! `hyperscale_types::state_key`).

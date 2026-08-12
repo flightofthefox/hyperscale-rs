@@ -395,9 +395,9 @@ pub fn split_straddler_setup() -> SplitStraddlerSetup {
 
 /// Build the merge-straddler genesis funding and straddler transfers.
 ///
-/// Across the four-shard topology the surviving quarters (`leaf(2, 0)`/`leaf(2,
-/// 1)`) are bulk-funded over the derived `merge_bytes` so neither auto-merges,
-/// while the lighter merging pair (`leaf(2, 2)`/`leaf(2, 3)`) stays under it and
+/// Across the four-shard topology the surviving quarters (`leaf(2, 2)`/`leaf(2,
+/// 3)`) are bulk-funded over the derived `merge_bytes` so neither auto-merges,
+/// while the lighter merging pair (`leaf(2, 0)`/`leaf(2, 1)`) stays under it and
 /// collapses into `leaf(1, 0)`. Straddler payers sit in the survivor
 /// `leaf(2, 2)` and recipients in the merging `leaf(2, 0)`, so each cross-shard
 /// tick names the shard that terminates at the merge.
@@ -491,9 +491,9 @@ pub fn recipient(index: u8) -> PrincipalAddr {
 /// Genesis accounts for the scenarios: `senders` funded payers plus
 /// `recipients` payees.
 ///
-/// Recipients must be genesis accounts too — an instance the registry
-/// does not know cannot be a deposit target; there is no
-/// instantiate-on-deposit flow.
+/// Recipients are listed for their opening balance, not to make them
+/// reachable: a deposit lands on any principal address, funded here or
+/// not.
 #[must_use]
 pub fn genesis_accounts(senders: u8, recipients: u8) -> Vec<(PrincipalAddr, u128)> {
     (0..senders)
@@ -800,8 +800,8 @@ pub fn cross_shard_keys() -> (
 }
 
 /// Genesis funding for the cross-shard VM cast: the payer funded, the
-/// recipient registered with dust (deposit targets must exist at
-/// genesis — no instantiate-on-deposit path exists).
+/// recipient seeded with dust so its vault cell exists before the
+/// transfer rather than being created by it.
 #[must_use]
 pub fn cross_shard_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
     let (_payer, from, to) = cross_shard_cast();
@@ -1393,7 +1393,7 @@ pub fn build_stake_tx(
 }
 
 /// The one-time payment request `signer` puts their name to: whoever
-/// hands them at least `amount` *XRD, they will bank it.
+/// hands them at least `amount` XRD, they will bank it.
 ///
 /// A declaration and nothing else — no envelope, no fee terms, no
 /// composer. Its hash is a function of this content alone, which is what

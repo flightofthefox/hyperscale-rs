@@ -23,7 +23,7 @@ pub struct FundedAccount {
     /// The Ed25519 keypair for signing transactions.
     pub keypair: Ed25519PrivateKey,
 
-    /// This account's 16-byte address — also its shard placement.
+    /// This account's 32-byte address — also its shard placement.
     pub address: PrincipalAddr,
 
     /// The shard this account belongs to.

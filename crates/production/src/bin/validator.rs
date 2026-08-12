@@ -525,7 +525,7 @@ pub struct GenesisConfig {
     #[serde(default)]
     pub validators: Vec<ValidatorEntry>,
 
-    /// Initial balances for funded accounts, keyed by their 16-byte
+    /// Initial balances for funded accounts, keyed by their 32-byte
     /// address. This is what genesis actually seeds: an account's address
     /// *is* its shard placement, so the list needs no routing metadata.
     #[serde(default)]
@@ -535,7 +535,7 @@ pub struct GenesisConfig {
 /// A funded-account entry for genesis configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountBalanceEntry {
-    /// Hex-encoded 16-byte account address.
+    /// Hex-encoded 32-byte account address.
     pub address: String,
 
     /// Balance as a string, parsed as `u128`.

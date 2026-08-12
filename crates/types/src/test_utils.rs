@@ -845,7 +845,7 @@ pub fn make_finalization(
 /// tests.
 ///
 /// The envelope's tree is a leading read count followed by that many
-/// 16-byte shared-mode owner prefixes and then the exclusive ones.
+/// 32-byte shared-mode owner prefixes and then the exclusive ones.
 /// Routing is thus fully controlled per transaction by
 /// [`stub_transaction`], with no effects-bridge dependency.
 struct StubVmStatics;
