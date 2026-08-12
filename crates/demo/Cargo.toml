@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 hyperscale-effects-bridge.workspace = true
+hyperscale-transactions.workspace = true
 hyperscale-node.workspace = true
 hyperscale-simulation.workspace = true
 hyperscale-storage.workspace = true

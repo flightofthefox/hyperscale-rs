@@ -4,10 +4,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_effects_bridge::{account_address, build_transfer_tx};
+use hyperscale_effects_bridge::account_address;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{CryptoScheme, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
+use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, Ed25519PrivateKey, MAX_VALIDITY_RANGE, NetworkDefinition,
     NetworkId, PrincipalAddr, ReshapeThresholds, ShardId, SharedCertificates, TimestampRange,
@@ -364,6 +365,8 @@ pub struct Session {
     /// clock, not the simulation's, so they wait here for the next drain.
     pending: Vec<TraceEvent>,
     nonce: u32,
+    /// The world every built transfer resolves its accounts in.
+    client: Client,
 }
 
 impl Session {
@@ -433,6 +436,7 @@ impl Session {
             reported_hosts: opening_hosts,
             pending: Vec::new(),
             nonce: 0,
+            client: Client::genesis(NetworkId::from(&NetworkDefinition::simulator())),
         }
     }
 
@@ -452,16 +456,19 @@ impl Session {
     /// inside one validity window would otherwise be the same transaction
     /// and the second would dedup away.
     fn build_transfer(&self, from: u8, to: u8) -> Transaction {
-        build_transfer_tx(
-            &signer_from_seed(from),
-            account_from_seed(from),
-            account_from_seed(to),
-            TRANSFER_AMOUNT,
-            TRANSFER_MAX_FEE,
-            validity_around(self.now),
-            self.nonce.to_le_bytes().to_vec(),
-            NetworkId::from(&NetworkDefinition::simulator()),
-        )
+        self.client
+            .transfer(
+                &signer_from_seed(from),
+                account_from_seed(from),
+                account_from_seed(to),
+                TRANSFER_AMOUNT,
+                Terms {
+                    max_fee: TRANSFER_MAX_FEE,
+                    validity: validity_around(self.now),
+                    message: self.nonce.to_le_bytes().to_vec(),
+                },
+            )
+            .expect("the stdlib account answers a transfer")
     }
 
     /// Submit an XRD transfer between two funded accounts, returning its hash.

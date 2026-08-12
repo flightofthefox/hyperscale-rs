@@ -33,6 +33,7 @@ members = [
     "crates/storage",
     "crates/storage-memory",
     "crates/storage-rocksdb",
+    "crates/transactions",
     "crates/types",
 ]
 exclude = ["vm"]
@@ -76,6 +77,7 @@ hyperscale-spammer = { path = "crates/spammer" }
 hyperscale-storage = { path = "crates/storage" }
 hyperscale-storage-memory = { path = "crates/storage-memory" }
 hyperscale-storage-rocksdb = { path = "crates/storage-rocksdb" }
+hyperscale-transactions = { path = "crates/transactions" }
 hyperscale-types = { path = "crates/types" }
 
 # External dependencies
@@ -135,6 +137,7 @@ zeroize = "1.9.0"
 hyperscale-hbor = { path = "vm/crates/hbor" }
 hyperscale-vm-effects = { path = "vm/crates/effects" }
 hyperscale-vm-kernel = { path = "vm/crates/kernel" }
+hyperscale-vm-manifest-builder = { path = "vm/crates/manifest-builder" }
 hyperscale-vm-ref = { path = "vm/crates/ref" }
 hyperscale-vm-runtime = { path = "vm/crates/runtime", default-features = false }
 hyperscale-vm-stdlib = { path = "vm/crates/stdlib" }

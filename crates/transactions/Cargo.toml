@@ -1,0 +1,18 @@
+[package]
+name = "hyperscale-transactions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Client-side construction of signed transactions"
+
+[dependencies]
+hyperscale-effects-bridge.workspace = true
+hyperscale-types.workspace = true
+hyperscale-vm-effects.workspace = true
+hyperscale-vm-manifest-builder.workspace = true
+
+[dev-dependencies]
+hyperscale-types = { workspace = true, features = ["test-utils"] }
+
+[lints]
+workspace = true

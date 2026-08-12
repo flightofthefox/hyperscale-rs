@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hyperscale_effects_bridge::build_transfer_tx;
+use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{NetworkDefinition, NetworkId, ShardId, Transaction};
 use rand::{Rng, RngExt};
 
@@ -36,6 +36,9 @@ pub struct TransferWorkload {
     /// Source of validity ranges. Defaults to wall clock; the simulator
     /// substitutes a simulated-clock anchor.
     validity_clock: ValidityClock,
+
+    /// The world every built transfer resolves its accounts in.
+    client: Client,
 }
 
 impl Default for TransferWorkload {
@@ -54,6 +57,7 @@ impl TransferWorkload {
             amount: DEFAULT_TRANSFER_AMOUNT,
             shard_counter: AtomicU64::new(0),
             validity_clock: wall_clock(),
+            client: Client::genesis(NetworkId::from(&NetworkDefinition::simulator())),
         }
     }
 
@@ -125,16 +129,19 @@ impl TransferWorkload {
     /// transaction and the second would dedup away.
     fn build_transfer(&self, from: &FundedAccount, to: &FundedAccount) -> Transaction {
         let nonce = from.next_nonce();
-        build_transfer_tx(
-            &from.keypair,
-            from.address,
-            to.address,
-            self.amount,
-            TRANSFER_MAX_FEE,
-            (self.validity_clock)(),
-            nonce.to_le_bytes().to_vec(),
-            NetworkId::from(&NetworkDefinition::simulator()),
-        )
+        self.client
+            .transfer(
+                &from.keypair,
+                from.address,
+                to.address,
+                self.amount,
+                Terms {
+                    max_fee: TRANSFER_MAX_FEE,
+                    validity: (self.validity_clock)(),
+                    message: nonce.to_le_bytes().to_vec(),
+                },
+            )
+            .expect("the stdlib account answers a transfer")
     }
 
     /// Generate one transaction (internal helper for trait impl).

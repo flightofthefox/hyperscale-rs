@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
-use hyperscale_effects_bridge::build_transfer_tx;
+use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{NetworkDefinition, NetworkId, PrincipalAddr, ShardId, Transaction};
 use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -571,14 +571,17 @@ struct PartitionWorkload {
     cross_shard_ratio: f64,
     selection_mode: SelectionMode,
     amount: u128,
+    /// The world every built transfer resolves its accounts in.
+    client: Client,
 }
 
 impl PartitionWorkload {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             cross_shard_ratio: 0.0,
             selection_mode: SelectionMode::NoContention,
             amount: DEFAULT_TRANSFER_AMOUNT,
+            client: Client::genesis(NetworkId::from(&NetworkDefinition::simulator())),
         }
     }
 
@@ -659,16 +662,19 @@ impl PartitionWorkload {
 
     fn build_transfer(&self, from: &FundedAccount, to: &FundedAccount) -> Transaction {
         let nonce = from.next_nonce();
-        build_transfer_tx(
-            &from.keypair,
-            from.address,
-            to.address,
-            self.amount,
-            TRANSFER_MAX_FEE,
-            validity_range_for_now(),
-            nonce.to_le_bytes().to_vec(),
-            NetworkId::from(&NetworkDefinition::simulator()),
-        )
+        self.client
+            .transfer(
+                &from.keypair,
+                from.address,
+                to.address,
+                self.amount,
+                Terms {
+                    max_fee: TRANSFER_MAX_FEE,
+                    validity: validity_range_for_now(),
+                    message: nonce.to_le_bytes().to_vec(),
+                },
+            )
+            .expect("the stdlib account answers a transfer")
     }
 }
 

@@ -15,6 +15,7 @@ path = "src/bin/spammer.rs"
 [dependencies]
 # Workspace dependencies
 hyperscale-effects-bridge.workspace = true
+hyperscale-transactions.workspace = true
 hyperscale-types.workspace = true
 
 hyperscale-hbor.workspace = true

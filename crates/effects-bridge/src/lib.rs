@@ -8,7 +8,6 @@
 //! a recognised pool's events as beacon facts.
 
 pub mod artifact;
-pub mod builder;
 pub mod genesis;
 pub mod staking;
 pub mod vm_metadata;
@@ -16,7 +15,6 @@ pub mod vm_statics;
 
 pub use artifact::{METADATA_SECTION, admit_package, attach_metadata, extract_metadata};
 use blake3::Hasher as Blake3;
-pub use builder::{DEFAULT_GAS_LIMIT, build_transfer_tx, sign_call, transfer_graph};
 use hyperscale_vm_effects::{Hash32, Hasher};
 pub use staking::{PoolRegistry, witness_from_event};
 pub use vm_metadata::{MAX_PACKAGE_METADATA_BYTES, decode_metadata, encode_metadata};

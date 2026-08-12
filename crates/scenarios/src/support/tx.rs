@@ -6,13 +6,14 @@
 //!
 //! [`Cluster::submit`]: crate::Cluster::submit
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
-use hyperscale_effects_bridge::{
-    ProtocolHasher, attach_metadata, encode_tree, sign_call, transfer_graph,
-};
+use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
+use hyperscale_effects_bridge::{ProtocolHasher, attach_metadata, encode_tree};
 use hyperscale_engine::genesis::{pool_address, stake_unit, staking_artifact};
 use hyperscale_engine::{XRD, account_address};
+use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     CallTarget, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
     EnvelopeExt, Epoch, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, NetworkId, NetworkParams,
@@ -1030,15 +1031,23 @@ pub fn build_stamp_tx(
 /// window included — so distinct submissions differ in signed content;
 /// byte-identical envelopes are one transaction, which is the hash-dedup
 /// replay protection working as designed.
+///
+/// # Panics
+///
+/// If the scenario world does not answer a transfer, which would be a
+/// defect in the world rather than in the transfer.
 #[must_use]
 pub fn build_transfer_tx(
     payer: &Ed25519PrivateKey,
-    from: impl Into<CallTarget>,
-    to: impl Into<CallTarget>,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
     amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
-    Transaction::new(envelope(transfer_graph(from, to, amount), payer, validity))
+    let graph = client()
+        .transfer_graph(from, to, amount)
+        .expect("the stdlib account answers a transfer");
+    Transaction::new(envelope(graph, payer, validity))
 }
 
 /// Every stake pool any scenario in this crate seats.
@@ -1502,6 +1511,17 @@ pub const MAX_FEE: u128 = 1_000;
 /// other network.
 pub const SCENARIO_NETWORK: NetworkId = NetworkId(242);
 
+/// The client every scenario transaction is built through: the world its
+/// pools are seated in, and the one network both harnesses run.
+///
+/// Built once because seating pools admits the stdlib artifacts, and the
+/// seat list is the same for every scenario in the binary.
+fn client() -> &'static Client {
+    static CLIENT: LazyLock<Client> =
+        LazyLock::new(|| Client::new(genesis_world_with_pools(&world_pools()), SCENARIO_NETWORK));
+    &CLIENT
+}
+
 /// Wrap a single-intent graph in a signed envelope at the scenario fee
 /// terms, with no message.
 fn envelope(
@@ -1509,13 +1529,14 @@ fn envelope(
     payer: &Ed25519PrivateKey,
     validity: TimestampRange,
 ) -> TransactionEnvelope {
-    sign_call(
+    client().sign(
         graph,
         payer,
-        MAX_FEE,
-        validity,
-        Vec::new(),
-        SCENARIO_NETWORK,
+        Terms {
+            max_fee: MAX_FEE,
+            validity,
+            message: Vec::new(),
+        },
     )
 }
 
