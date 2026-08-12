@@ -43,6 +43,78 @@ fn owed_an_outcome(c: &SimCluster, shard: ShardId, tx: TxHash) -> bool {
     committed.is_some() && outcome.is_none()
 }
 
+/// The chain advances again after `restarted` of four members bounce
+/// together, with traffic either side of the bounce.
+fn restart_and_advance(restarted: usize) {
+    let mut cluster = SimCluster::with_accounts(&one_shard(), 42, &genesis_accounts(8, 1));
+    let shard = ShardId::ROOT;
+    let (payer, from) = sender(0);
+
+    for index in 0..4u8 {
+        let tx = build_transfer_tx(
+            &payer,
+            from,
+            recipient(index),
+            10,
+            validity_around(cluster.now()),
+        );
+        cluster.submit(Arc::new(tx));
+    }
+    assert!(
+        cluster.run_until(epochs(8), |c| c
+            .committed_height(shard)
+            .is_some_and(|h| h.inner() > 3)),
+        "the chain must be running before the restart",
+    );
+
+    let hosts = cluster.committee_hosts(shard);
+    let before = cluster
+        .committed_height(shard)
+        .expect("the chain is running");
+    for &host in hosts.iter().take(restarted) {
+        cluster.restart_host(host, shard);
+    }
+
+    let target = before.inner() + 5;
+    assert!(
+        cluster.run_until(epochs(24), |c| c
+            .committed_height(shard)
+            .is_some_and(|h| h.inner() >= target)),
+        "the chain must advance past {target:?} after {restarted} of four restart; \
+         it reached {:?}",
+        cluster.committed_height(shard),
+    );
+}
+
+/// A committee keeps committing when part of it restarts at once.
+///
+/// One of four is carried by the three that stayed up, and the survivor
+/// count is what makes that case say so little: the chain commits without
+/// the restarted replica, and the commit is what reseats whatever its
+/// rebuild missed. At two the quorum needs them back, so anything a
+/// restart fails to rebuild stops the shard instead of healing behind it
+/// — which is why the sweep runs to the largest minority rather than
+/// asserting one restart and calling the path covered.
+#[test]
+fn a_committee_advances_after_part_of_it_restarts() {
+    for restarted in 1..=3 {
+        restart_and_advance(restarted);
+    }
+}
+
+/// Every replica restarting at once is not this test's case.
+///
+/// Nothing carries the chain: the committee comes back holding its
+/// committed tip and the certified block above it is gone from every
+/// replica at once, so the QC they all recover is the one below where
+/// they stopped. They propose and vote and no quorum forms.
+#[test]
+#[ignore = "known gap: a committee whose every replica restarts together \
+            re-proposes without ever forming a quorum"]
+fn a_committee_advances_after_all_of_it_restarts() {
+    restart_and_advance(4);
+}
+
 /// A restarted member agrees with its peers about what it executed.
 ///
 /// The membership assertion in its strong form. Composing a tick alone

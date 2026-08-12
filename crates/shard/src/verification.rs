@@ -1032,7 +1032,6 @@ impl VerificationPipeline {
         block_hash: BlockHash,
         block: &Block,
         parent_block_height: BlockHeight,
-        recovery_bridge: bool,
         split_child_roots_required: bool,
         terminal_roots_required: bool,
         settled_txs_window_floor: Option<WeightedTimestamp>,
@@ -1060,18 +1059,15 @@ impl VerificationPipeline {
         let parent_tree_available = parent_block_height <= self.last_persisted_height
             || self.is_state_root_verified(&parent_block_hash);
 
-        // Across a recovery bridge, a sync-admitted parent is QC-attested
-        // but never locally verified, and its tree materializes only at
-        // commit — which needs the successor QC this very verification
-        // gates. A bridge block is tick-less, so its replay applies no
-        // updates and the attested parent root alone decides it; the
-        // parent's inline commit lands first in height order, so the
-        // prepared successor never applies over a missing tree version.
-        // Scoped to the bridge: on a live chain an adopted-but-unverified
-        // certified parent must keep deferring its children, or their
-        // prepared snapshots chain to versions the tree never persisted.
-        let parent_qc_attested = recovery_bridge
-            && block.certificates().is_empty()
+        // A sync-admitted parent is QC-attested but never locally verified,
+        // and its tree materializes only at commit — which needs the
+        // successor QC this very verification gates. A tick-less child
+        // applies no updates, so it reads no tree version and its root is
+        // decided by the attested parent root alone; the parent commits
+        // first in height order, so nothing prepares over a version the
+        // tree never persisted. A child that does apply updates keeps
+        // deferring, because its prepared snapshot would chain to one.
+        let parent_qc_attested = block.certificates().is_empty()
             && self
                 .verified_certified_blocks
                 .contains_key(&parent_block_hash);
@@ -1860,18 +1856,10 @@ impl VerificationPipeline {
             let parent_block_height = h.parent_qc().height();
             let settled_txs_window_floor =
                 schedule.settled_window_floor(local_shard, h.parent_qc().weighted_timestamp());
-            // Whether this block rides an in-flight halt recovery's bridge:
-            // anchored below the bridge epoch while the recovery pends. Only
-            // there may the state-root deferral trust a QC-attested parent —
-            // the halted tip arrives by sync, unverifiable locally until a
-            // commit that needs this very block's QC.
-            let recovery_bridge =
-                schedule.recovery_bridging(local_shard, h.parent_qc().weighted_timestamp());
             self.initiate_state_root_verification(
                 block_hash,
                 block,
                 parent_block_height,
-                recovery_bridge,
                 split_child_roots_required,
                 terminal_roots_required,
                 settled_txs_window_floor,
@@ -2829,7 +2817,6 @@ mod tests {
             BlockHeight::GENESIS,
             false,
             false,
-            false,
             None,
         );
 
@@ -2876,7 +2863,6 @@ mod tests {
             block_hash,
             &block,
             BlockHeight::GENESIS,
-            false,
             false,
             false,
             None,
