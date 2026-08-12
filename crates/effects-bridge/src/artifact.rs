@@ -15,6 +15,7 @@
 use hyperscale_types::VmStaticsError;
 use hyperscale_vm_effects::{
     AbiParam, Clause, MethodSignature, ModeExpr, PackageMetadata, TargetExpr, check_abi,
+    check_declarations,
 };
 use hyperscale_vm_runtime::{ExportParam, component_export_params, validate_component};
 
@@ -174,6 +175,8 @@ pub fn admit_package(artifact: &[u8]) -> Result<PackageMetadata, VmStaticsError>
         // predicate again for a package that reached a cache without
         // ever passing this gate.
         check_abi(signature)
+            .map_err(|error| VmStaticsError(format!("method {method:?}: {error}")))?;
+        check_declarations(signature)
             .map_err(|error| VmStaticsError(format!("method {method:?}: {error}")))?;
         check_abi_against_export(method, signature, params)?;
     }
@@ -652,7 +655,7 @@ mod tests {
 
     #[test]
     fn a_binding_the_export_type_cannot_honour_refuses_at_publish() {
-        use hyperscale_vm_effects::{Clause, Expr, ModeExpr, TargetExpr};
+        use hyperscale_vm_effects::{Clause, Expr, ModeExpr, RoleId, TargetExpr};
 
         // Arity: the binding builds nothing, the export takes one.
         let empty = declaring(&["m"]);
@@ -665,7 +668,11 @@ mod tests {
         {
             let signature = wrong_kind.methods.get_mut("m").expect("declared");
             signature.effects = vec![Clause::Effect {
-                target: TargetExpr::Point(Expr::SelfAddr),
+                target: TargetExpr::Point(Expr::ChildKey {
+                    owner: Box::new(Expr::SelfAddr),
+                    role: RoleId(1),
+                    material: vec![],
+                }),
                 mode: ModeExpr::Write,
             }];
             signature.abi = vec![AbiParam::Handle(0)];
@@ -692,7 +699,11 @@ mod tests {
         {
             let signature = wrong_resource.methods.get_mut("m").expect("declared");
             signature.effects = vec![Clause::Effect {
-                target: TargetExpr::Point(Expr::SelfAddr),
+                target: TargetExpr::Point(Expr::ChildKey {
+                    owner: Box::new(Expr::SelfAddr),
+                    role: RoleId(1),
+                    material: vec![],
+                }),
                 mode: ModeExpr::Reserve(Expr::Arg(0)),
             }];
             signature.abi = vec![AbiParam::Handle(0)];
@@ -707,7 +718,11 @@ mod tests {
         {
             let signature = sound.methods.get_mut("m").expect("declared");
             signature.effects = vec![Clause::Effect {
-                target: TargetExpr::Point(Expr::SelfAddr),
+                target: TargetExpr::Point(Expr::ChildKey {
+                    owner: Box::new(Expr::SelfAddr),
+                    role: RoleId(1),
+                    material: vec![],
+                }),
                 mode: ModeExpr::Delta,
             }];
             signature.abi = vec![AbiParam::Handle(0)];
