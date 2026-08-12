@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-use hyperscale_vm_types::{Address, AddressClass, LocalKey, Mode, SubstateKey};
+use hyperscale_vm_types::{Address, AddressClass, LocalKey, Mode, PrincipalAddr, SubstateKey};
 
 use crate::crypto::Ed25519PrivateKey;
 use crate::{
@@ -67,8 +67,8 @@ pub const fn test_prefix(seed: u8) -> Address {
 /// A principal prefix from a seed byte — an account, whose class is what
 /// resolves it to the protocol's blueprint.
 #[must_use]
-pub const fn test_principal(seed: u8) -> Address {
-    Address::new([seed; 31], AddressClass::Principal)
+pub const fn test_principal(seed: u8) -> PrincipalAddr {
+    PrincipalAddr::new([seed; 31])
 }
 
 /// A substate key seeded by one byte: the owner prefix and the local half

@@ -963,7 +963,7 @@ impl TopologySnapshot {
     /// The shard owning an owner prefix's key space: the trie walk on
     /// the prefix's own bits, no hashing.
     #[must_use]
-    pub fn shard_for_prefix(&self, prefix: Address) -> ShardId {
+    pub fn shard_for_prefix(&self, prefix: impl Into<Address>) -> ShardId {
         self.shard_trie.shard_for_prefix(prefix)
     }
 

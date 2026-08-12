@@ -819,13 +819,17 @@ pub fn randomness_draw_agrees_across_shards<C: Cluster>(c: &mut C) {
         c.substate(shard, key.owner, key.local.0)
     };
     assert!(
-        c.run_until(epochs(4), |c| read(c, ShardId::leaf(1, 0), left_owner)
-            .is_some()
-            && read(c, ShardId::leaf(1, 1), right_owner).is_some()),
+        c.run_until(epochs(4), |c| read(
+            c,
+            ShardId::leaf(1, 0),
+            left_owner.address()
+        )
+        .is_some()
+            && read(c, ShardId::leaf(1, 1), right_owner.address()).is_some()),
         "both entropy leaves must carry a stamp"
     );
-    let left = read(c, ShardId::leaf(1, 0), left_owner).expect("stamped");
-    let right = read(c, ShardId::leaf(1, 1), right_owner).expect("stamped");
+    let left = read(c, ShardId::leaf(1, 0), left_owner.address()).expect("stamped");
+    let right = read(c, ShardId::leaf(1, 1), right_owner.address()).expect("stamped");
     assert_eq!(left.len(), 32, "a stamp is the 32-byte draw");
     assert_eq!(
         left, right,
@@ -1093,7 +1097,7 @@ pub fn withdrawals_compose_over_one_vault(c: &mut impl Cluster, count: u8) -> u6
 
 /// The committed balance of a account's native vault, read through the
 /// harness's client-proven snapshot seam.
-fn vault_balance(c: &impl Cluster, shard: ShardId, owner: Address) -> u128 {
+fn vault_balance(c: &impl Cluster, shard: ShardId, owner: impl Into<Address>) -> u128 {
     let vault = vault_key(owner, *XRD);
     c.substate(shard, vault.owner, vault.local.0)
         .map_or(0, |bytes| {
@@ -1103,7 +1107,8 @@ fn vault_balance(c: &impl Cluster, shard: ShardId, owner: Address) -> u128 {
 }
 
 /// The reported change to `owner`'s native vault.
-fn preview_change(report: &PreviewReport, owner: Address) -> ResourceChange {
+fn preview_change(report: &PreviewReport, owner: impl Into<Address>) -> ResourceChange {
+    let owner = owner.into();
     let vault = vault_key(owner, *XRD);
     *report
         .changes

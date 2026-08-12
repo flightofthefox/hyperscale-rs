@@ -9,8 +9,8 @@ use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_simulation::{CryptoScheme, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    Address, BeaconChainConfig, BlockHeight, Ed25519PrivateKey, MAX_VALIDITY_RANGE,
-    NetworkDefinition, NetworkId, ReshapeThresholds, ShardId, SharedCertificates, TimestampRange,
+    BeaconChainConfig, BlockHeight, Ed25519PrivateKey, MAX_VALIDITY_RANGE, NetworkDefinition,
+    NetworkId, PrincipalAddr, ReshapeThresholds, ShardId, SharedCertificates, TimestampRange,
     Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
 };
 
@@ -23,7 +23,7 @@ fn signer_from_seed(seed: u8) -> Ed25519PrivateKey {
     Ed25519PrivateKey::from_bytes(&[seed; 32]).expect("32 bytes is a valid Ed25519 key")
 }
 
-fn account_from_seed(seed: u8) -> Address {
+fn account_from_seed(seed: u8) -> PrincipalAddr {
     account_address(&signer_from_seed(seed).public_key().0)
 }
 

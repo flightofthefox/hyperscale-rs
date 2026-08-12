@@ -16,10 +16,10 @@ use hyperscale_engine::{
 };
 use hyperscale_storage::SubstateDatabase;
 use hyperscale_types::{
-    BeaconWitnessEvent, BlockHash, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
-    NetworkId, ProvisionalHolds, RevealChain, ShardId, ShardTrie, Stake, StakePoolId,
-    StakePoolSeat, SubstateKey, Transaction, TransactionBody, TransactionEnvelope, Verified,
-    WeightedTimestamp,
+    BeaconWitnessEvent, BlockHash, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt,
+    Hash, NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain, ShardId, ShardTrie, Stake,
+    StakePoolId, StakePoolSeat, SubstateKey, Transaction, TransactionBody, TransactionEnvelope,
+    Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
     Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
@@ -39,7 +39,7 @@ const OUTSIDER: u8 = 9;
 struct MapDb(BTreeMap<SubstateKey, Vec<u8>>);
 
 impl MapDb {
-    fn genesis(accounts: &[(Address, u128)], pools: &[StakePoolSeat]) -> Self {
+    fn genesis(accounts: &[(PrincipalAddr, u128)], pools: &[StakePoolSeat]) -> Self {
         let writes = genesis_writes(accounts, pools);
         let mut map = BTreeMap::new();
         for (key, change) in writes.cells() {
@@ -60,16 +60,16 @@ fn key_of(seed: u8) -> Ed25519PrivateKey {
     Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap()
 }
 
-fn account_of(seed: u8) -> Address {
+fn account_of(seed: u8) -> PrincipalAddr {
     account_address(&key_of(seed).public_key().0)
 }
 
-fn delegator() -> Address {
+fn delegator() -> PrincipalAddr {
     account_of(DELEGATOR)
 }
 
 /// Every address any test in this binary transacts with, pools included.
-fn world_accounts() -> Vec<(Address, u128)> {
+fn world_accounts() -> Vec<(PrincipalAddr, u128)> {
     vec![
         (delegator(), 10_000),
         (account_of(OPERATOR), 10_000),
@@ -88,45 +88,45 @@ fn seat(id: u32) -> StakePoolSeat {
 
 /// Where genesis seats the pool with this identifier — derived from the
 /// record, so a test names it the way genesis places it.
-fn pool_at(id: u32) -> Address {
+fn pool_at(id: u32) -> ComponentAddr {
     pool_address(package_hash(&ProtocolHasher, staking_artifact()), &seat(id))
 }
 
-fn withdraw(target: Address, resource: Address, amount: u128) -> GraphNode {
+fn withdraw(target: impl Into<Address>, resource: impl Into<Address>, amount: u128) -> GraphNode {
     GraphNode {
-        target,
+        target: target.into(),
         method: "withdraw".into(),
         args: vec![
-            GraphArg::Literal(Value::Address(resource)),
+            GraphArg::Literal(Value::Address(resource.into())),
             GraphArg::Literal(Value::U128(amount)),
         ],
     }
 }
 
-fn from_edge(producer: u32, resource: Address) -> GraphArg {
+fn from_edge(producer: u32, resource: impl Into<Address>) -> GraphArg {
     GraphArg::Edge {
         edge: EdgeRef {
             producer,
             output: 0,
         },
-        constraints: vec![Constraint::ResourceIs(resource)],
+        constraints: vec![Constraint::ResourceIs(resource.into())],
     }
 }
 
 /// `delegator.withdraw(*XRD) -> pool.stake -> delegator.deposit(units)`.
-fn signed_stake(pool: Address, amount: u128) -> Transaction {
+fn signed_stake(pool: ComponentAddr, amount: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[DELEGATOR; 32]).unwrap();
     let from = account_address(&key.public_key().0);
     let graph = ManifestGraph {
         nodes: vec![
             withdraw(from, *XRD, amount),
             GraphNode {
-                target: pool,
+                target: pool.into(),
                 method: "stake".into(),
                 args: vec![from_edge(0, *XRD)],
             },
             GraphNode {
-                target: from,
+                target: from.into(),
                 method: "deposit".into(),
                 args: vec![from_edge(1, stake_unit(pool))],
             },
@@ -144,7 +144,7 @@ fn signed_stake(pool: Address, amount: u128) -> Transaction {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(&tree)),
             subintent_sigs: Vec::new(),
-            fee_payer: from,
+            fee_payer: from.into(),
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,
@@ -235,7 +235,7 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
         nodes: vec![
             withdraw(from, *XRD, 100),
             GraphNode {
-                target: from,
+                target: from.into(),
                 method: "deposit".into(),
                 args: vec![from_edge(0, *XRD)],
             },
@@ -253,7 +253,7 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(&tree)),
             subintent_sigs: Vec::new(),
-            fee_payer: from,
+            fee_payer: from.into(),
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,
@@ -274,13 +274,13 @@ fn an_ordinary_transfer_is_not_a_beacon_fact() {
 
 /// `pool.register-validator(id, pubkey, proof)`, signed and paid for by
 /// `seed` whatever the pool's configuration says.
-fn signed_registration(pool: Address, seed: u8) -> Transaction {
+fn signed_registration(pool: impl Into<Address>, seed: u8) -> Transaction {
     let key = key_of(seed);
     let tree = EnvelopeTree {
         root: IntentDecl {
             graph: ManifestGraph {
                 nodes: vec![GraphNode {
-                    target: pool,
+                    target: pool.into(),
                     method: "register-validator".into(),
                     args: vec![
                         GraphArg::Literal(Value::U64(11)),
@@ -298,7 +298,7 @@ fn signed_registration(pool: Address, seed: u8) -> Transaction {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(&tree)),
             subintent_sigs: Vec::new(),
-            fee_payer: account_of(seed),
+            fee_payer: account_of(seed).into(),
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use hyperscale_engine::XRD;
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_types::{
-    Address, BlockHeight, Ed25519PrivateKey, Epoch, ShardId, TransactionDecision,
+    Address, BlockHeight, Ed25519PrivateKey, Epoch, PrincipalAddr, ShardId, TransactionDecision,
     TransactionStatus, TxHash,
 };
 
@@ -616,7 +616,7 @@ pub fn split_surviving_counterpart_releases_its_reservation(c: &mut impl Faultab
 }
 
 /// The committed native-vault balance `owner` holds on `shard`.
-fn vault_balance<C: Cluster>(c: &C, shard: ShardId, owner: Address) -> u128 {
+fn vault_balance<C: Cluster>(c: &C, shard: ShardId, owner: impl Into<Address>) -> u128 {
     let vault = vault_key(owner, *XRD);
     c.substate(shard, vault.owner, vault.local.0)
         .map_or(0, |bytes| {
@@ -945,8 +945,8 @@ pub const STRADDLER_PAYMENT: u128 = 100;
 pub fn submit_straddler<C: Cluster>(
     c: &mut C,
     key: &Ed25519PrivateKey,
-    from: Address,
-    to: Address,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
 ) -> TxHash {
     submit_straddler_reserving(c, key, from, to).0
 }
@@ -960,8 +960,8 @@ pub fn submit_straddler<C: Cluster>(
 fn submit_straddler_reserving<C: Cluster>(
     c: &mut C,
     key: &Ed25519PrivateKey,
-    from: Address,
-    to: Address,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
 ) -> (TxHash, u64) {
     let tx = build_transfer_tx(key, from, to, STRADDLER_PAYMENT, validity_around(c.now()));
     let (hash, work) = (tx.hash(), tx.work());

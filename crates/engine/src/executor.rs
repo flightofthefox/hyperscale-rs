@@ -28,8 +28,8 @@ use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::SubstateDatabase;
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Event, EventExt, EventRoot,
-    ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, ProvisionalHolds, RevealChain,
-    Stake, StakePoolSeat, StateWrites, SubstateEntry, Transaction, TxHash, Verified,
+    ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PrincipalAddr, ProvisionalHolds,
+    RevealChain, Stake, StakePoolSeat, StateWrites, SubstateEntry, Transaction, TxHash, Verified,
     compute_merkle_root, install_vm_statics,
 };
 use hyperscale_vm_effects::{
@@ -172,7 +172,7 @@ impl Executor {
     /// Panics if the committed stdlib artifact fails validation or
     /// compilation — a build defect surfaced at boot, not in a tick.
     #[must_use]
-    pub fn new(accounts: &[(Address, u128)], mode: ExecutionMode) -> Self {
+    pub fn new(accounts: &[(PrincipalAddr, u128)], mode: ExecutionMode) -> Self {
         Self::with_pools(accounts, &[], mode)
     }
 
@@ -184,7 +184,7 @@ impl Executor {
     /// As [`Self::new`].
     #[must_use]
     pub fn with_pools(
-        accounts: &[(Address, u128)],
+        accounts: &[(PrincipalAddr, u128)],
         pools: &[StakePoolSeat],
         mode: ExecutionMode,
     ) -> Self {

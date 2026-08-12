@@ -10,7 +10,7 @@
 use hyperscale_effects_bridge::vm_statics::PackageCache;
 use hyperscale_effects_bridge::{PoolRegistry, ProtocolHasher, admit_package, validator_key};
 pub use hyperscale_effects_bridge::{XRD, entropy_key, vault_key};
-use hyperscale_types::{SettledWrites, StakePoolSeat};
+use hyperscale_types::{ComponentAddr, PrincipalAddr, ResourceAddr, SettledWrites, StakePoolSeat};
 use hyperscale_vm_effects::{
     Address, Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash, Value,
     package_hash, resource_address,
@@ -25,7 +25,7 @@ pub struct GenesisConfig {
     /// Funded accounts: owner prefix and initial balance. Seeded as
     /// identity-keyed vault cells and registered as account-package
     /// instances in the process's VM statics.
-    pub accounts: Vec<(Address, u128)>,
+    pub accounts: Vec<(PrincipalAddr, u128)>,
 
     /// Stake pools the beacon folds facts for: the pool instance's owner
     /// prefix and the identifier it is folded under. Seated as stake pool
@@ -67,7 +67,7 @@ pub struct World {
 /// Panics if the stdlib artifact would not be admissible as a published
 /// package — a build defect, not a runtime condition.
 #[must_use]
-pub fn genesis_world(accounts: &[(Address, u128)]) -> World {
+pub fn genesis_world(accounts: &[(PrincipalAddr, u128)]) -> World {
     genesis_world_with_pools(accounts, &[])
 }
 
@@ -84,7 +84,10 @@ pub fn genesis_world(accounts: &[(Address, u128)]) -> World {
 /// Panics if a stdlib artifact would not be admissible as a published
 /// package — a build defect, not a runtime condition.
 #[must_use]
-pub fn genesis_world_with_pools(_accounts: &[(Address, u128)], pools: &[StakePoolSeat]) -> World {
+pub fn genesis_world_with_pools(
+    _accounts: &[(PrincipalAddr, u128)],
+    pools: &[StakePoolSeat],
+) -> World {
     let artifact = account_artifact();
     let account_package = package_hash(&ProtocolHasher, artifact);
     let metadata =
@@ -133,14 +136,17 @@ pub fn genesis_world_with_pools(_accounts: &[(Address, u128)], pools: &[StakePoo
 pub fn pool_meta(staking_package: PackageHash, seat: &StakePoolSeat) -> InstanceMeta {
     InstanceMeta {
         package: staking_package,
-        config: vec![Value::Address(*XRD), Value::Address(seat.operator)],
+        config: vec![
+            Value::Address(XRD.address()),
+            Value::Address(seat.operator.address()),
+        ],
         salt: ProtocolHasher.hash(DOMAIN_GENESIS_SALT, &[&seat.id.inner().to_le_bytes()]),
     }
 }
 
 /// The address genesis seats `seat` at.
 #[must_use]
-pub fn pool_address(staking_package: PackageHash, seat: &StakePoolSeat) -> Address {
+pub fn pool_address(staking_package: PackageHash, seat: &StakePoolSeat) -> ComponentAddr {
     pool_meta(staking_package, seat).address(&ProtocolHasher)
 }
 
@@ -154,7 +160,7 @@ const DOMAIN_GENESIS_SALT: &[u8] = b"hyperscale/engine/genesis-instance";
 /// name the pool that owes them, and the address says both facts on
 /// sight.
 #[must_use]
-pub fn stake_unit(pool: Address) -> Address {
+pub fn stake_unit(pool: impl Into<Address>) -> ResourceAddr {
     resource_address(&ProtocolHasher, pool, &[])
 }
 
@@ -164,7 +170,10 @@ pub fn stake_unit(pool: Address) -> Address {
 /// a seated pool's validator records and one [`*XRD`] vault cell per
 /// funded account, identity-keyed under the owner's prefix.
 #[must_use]
-pub fn genesis_writes(accounts: &[(Address, u128)], pools: &[StakePoolSeat]) -> SettledWrites {
+pub fn genesis_writes(
+    accounts: &[(PrincipalAddr, u128)],
+    pools: &[StakePoolSeat],
+) -> SettledWrites {
     // The stdlib package as a committed cell, under the same content
     // address a publish would place it at. Genesis is then the cache's
     // cold start in the literal sense — the same projection of committed

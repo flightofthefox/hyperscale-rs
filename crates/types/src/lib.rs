@@ -97,9 +97,11 @@ pub use hyperscale_crypto::{
 };
 pub use hyperscale_hbor::HborSigned;
 pub use hyperscale_vm_types::{
-    AMOUNT_CELL_BYTES, Address, AddressClass, InvalidAddress, LEAF_KEY_BYTES, LocalKey,
-    MAX_CELL_VALUE_LEN, Mode, ModeKind, Movement, SchemeId, SettledWrites, StateWrites,
-    SubstateKey, TX_UNITS, amount_cell, compatible, declared_work, encode_amount, read_amount,
+    AMOUNT_CELL_BYTES, Address, AddressClass, CallTarget, ComponentAddr, InvalidAddress,
+    LEAF_KEY_BYTES, LocalKey, MAX_CELL_VALUE_LEN, Mode, ModeKind, Movement, NativeAddr,
+    NotAResource, NotCallable, PackageAddr, PrincipalAddr, ResourceAddr, ResourceRef, SchemeId,
+    SettledWrites, StateWrites, SubstateKey, TX_UNITS, amount_cell, compatible, declared_work,
+    encode_amount, read_amount,
 };
 pub use network::{
     GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,

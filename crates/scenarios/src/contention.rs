@@ -225,7 +225,7 @@ pub fn participant_count_sweep(
     let mut latencies = Vec::new();
     for participants in 2..=max_participants {
         let recipients: Vec<Address> = (1..participants)
-            .map(|leaf| accounts[1 + leaf as usize].1)
+            .map(|leaf| accounts[1 + leaf as usize].1.address())
             .collect();
         let tx = build_fan_out_tx(
             payer,

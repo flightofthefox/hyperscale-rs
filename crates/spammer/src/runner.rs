@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::join_all;
 use hyperscale_effects_bridge::build_transfer_tx;
-use hyperscale_types::{Address, NetworkDefinition, NetworkId, ShardId, Transaction};
+use hyperscale_types::{NetworkDefinition, NetworkId, PrincipalAddr, ShardId, Transaction};
 use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use tokio::spawn;
@@ -392,7 +392,7 @@ impl Spammer {
 
     /// Get genesis balances for all accounts.
     #[must_use]
-    pub fn genesis_balances(&self, balance: u128) -> Vec<(Address, u128)> {
+    pub fn genesis_balances(&self, balance: u128) -> Vec<(PrincipalAddr, u128)> {
         self.accounts.all_genesis_balances(balance)
     }
 

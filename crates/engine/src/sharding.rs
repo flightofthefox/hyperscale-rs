@@ -78,16 +78,16 @@ pub fn writes_root(writes: &StateWrites) -> WritesRoot {
 mod tests {
     use hyperscale_types::test_utils::test_principal;
     use hyperscale_types::{ShardId, ShardTrie, StateWrites, SubstateKey, WritesRoot};
-    use hyperscale_vm_effects::{Address, LocalKey};
+    use hyperscale_vm_effects::{LocalKey, PrincipalAddr};
 
     use super::*;
 
-    fn writes(cells: &[(Address, [u8; 16], Vec<u8>)]) -> StateWrites {
+    fn writes(cells: &[(PrincipalAddr, [u8; 16], Vec<u8>)]) -> StateWrites {
         let mut writes = StateWrites::default();
         for (owner, local, value) in cells {
             writes.cells.insert(
                 SubstateKey {
-                    owner: *owner,
+                    owner: owner.address(),
                     local: LocalKey(*local),
                 },
                 Some(value.clone()),

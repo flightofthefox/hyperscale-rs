@@ -25,9 +25,9 @@ use hyperscale_types::{
 use hyperscale_vm_effects::stdlib::{ENTROPY, VALIDATORS, VAULT, XRD as XRD_ROLE};
 use hyperscale_vm_effects::{
     Accessibility, Address, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry, ManifestHash,
-    MetadataCache, Mode, PackageHash, PackageMetadata, PrefixShardResolver, RoleId,
-    Routing as RoutedTransaction, SchemeId, SubstateKey, Value, admit_tree, child_key, footprint,
-    native_address, package_hash, principal_address, route_tree,
+    MetadataCache, Mode, NativeAddr, PackageHash, PackageMetadata, PrefixShardResolver,
+    PrincipalAddr, RoleId, Routing as RoutedTransaction, SchemeId, SubstateKey, Value, admit_tree,
+    child_key, footprint, native_address, package_hash, principal_address, route_tree,
 };
 
 use crate::ProtocolHasher;
@@ -37,17 +37,17 @@ use crate::artifact::admit_package;
 ///
 /// Derived from its protocol role rather than picked, so it sits where a
 /// hash puts it and no shard holds it by preference.
-pub static XRD: LazyLock<Address> = LazyLock::new(|| native_address(&ProtocolHasher, XRD_ROLE));
+pub static XRD: LazyLock<NativeAddr> = LazyLock::new(|| native_address(&ProtocolHasher, XRD_ROLE));
 
 /// The vault cell for `resource` under `owner` — the same child key the
 /// stdlib account metadata's effect clauses compute.
 #[must_use]
-pub fn vault_key(owner: Address, resource: Address) -> SubstateKey {
+pub fn vault_key(owner: impl Into<Address>, resource: impl Into<Address>) -> SubstateKey {
     child_key(
         &ProtocolHasher,
         owner,
         VAULT,
-        &[Value::Address(resource).canonical_bytes()],
+        &[Value::Address(resource.into()).canonical_bytes()],
     )
 }
 
@@ -59,7 +59,7 @@ pub fn vault_key(owner: Address, resource: Address) -> SubstateKey {
 /// it, so genesis has to write it for members the beacon created before
 /// the contract existed.
 #[must_use]
-pub fn validator_key(pool: Address, validator: u64) -> SubstateKey {
+pub fn validator_key(pool: impl Into<Address>, validator: u64) -> SubstateKey {
     child_key(
         &ProtocolHasher,
         pool,
@@ -72,7 +72,7 @@ pub fn validator_key(pool: Address, validator: u64) -> SubstateKey {
 /// the transaction's randomness draw. Mirrors the effect signature the
 /// method declares.
 #[must_use]
-pub fn entropy_key(owner: Address) -> SubstateKey {
+pub fn entropy_key(owner: impl Into<Address>) -> SubstateKey {
     child_key(&ProtocolHasher, owner, ENTROPY, &[])
 }
 
@@ -91,7 +91,7 @@ pub const PACKAGE_ROLE: RoleId = RoleId(0xFFFE);
 /// same artifact is the same cell — which is what makes publishing
 /// idempotent rather than a conflict.
 #[must_use]
-pub fn package_key(publisher: Address, package: PackageHash) -> SubstateKey {
+pub fn package_key(publisher: impl Into<Address>, package: PackageHash) -> SubstateKey {
     child_key(
         &ProtocolHasher,
         publisher,
@@ -107,7 +107,7 @@ pub fn package_key(publisher: Address, package: PackageHash) -> SubstateKey {
 /// the same key — and admission verifies a signer against its target by
 /// recomputing this, with nothing to look up.
 #[must_use]
-pub fn account_address(public_key: &[u8; 32]) -> Address {
+pub fn account_address(public_key: &[u8; 32]) -> PrincipalAddr {
     principal_address(&ProtocolHasher, SchemeId::ED25519, public_key)
 }
 
@@ -263,7 +263,8 @@ impl PackageCache {
     /// is a package without any side channel, any tag, and any trust in
     /// what wrote it. A cell of any other kind cannot match except by
     /// finding a hash collision.
-    pub fn absorb_cell(&self, owner: Address, local: [u8; 16], value: &[u8]) {
+    pub fn absorb_cell(&self, owner: impl Into<Address>, local: [u8; 16], value: &[u8]) {
+        let owner = owner.into();
         let package = package_hash(&ProtocolHasher, value);
         if package_key(owner, package).local.0 != local {
             return;
@@ -541,11 +542,11 @@ mod tests {
         Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap()
     }
 
-    fn composer_addr() -> Address {
+    fn composer_addr() -> PrincipalAddr {
         account_address(&key(7).public_key().0)
     }
 
-    fn bob_addr() -> Address {
+    fn bob_addr() -> PrincipalAddr {
         account_address(&key(9).public_key().0)
     }
 
@@ -564,9 +565,9 @@ mod tests {
         }
     }
 
-    fn withdraw(target: Address, resource: Address, amount: u128) -> GraphNode {
+    fn withdraw(target: impl Into<Address>, resource: Address, amount: u128) -> GraphNode {
         GraphNode {
-            target,
+            target: target.into(),
             method: "withdraw".into(),
             args: vec![
                 GraphArg::Literal(Value::Address(resource)),
@@ -575,9 +576,9 @@ mod tests {
         }
     }
 
-    fn deposit_edge(target: Address, producer: u32, resource: Address) -> GraphNode {
+    fn deposit_edge(target: impl Into<Address>, producer: u32, resource: Address) -> GraphNode {
         GraphNode {
-            target,
+            target: target.into(),
             method: "deposit".into(),
             args: vec![GraphArg::Edge {
                 edge: EdgeRef {
@@ -589,9 +590,9 @@ mod tests {
         }
     }
 
-    fn deposit_param(target: Address, param: u32) -> GraphNode {
+    fn deposit_param(target: impl Into<Address>, param: u32) -> GraphNode {
         GraphNode {
-            target,
+            target: target.into(),
             method: "deposit".into(),
             args: vec![GraphArg::Param(param)],
         }
@@ -644,7 +645,7 @@ mod tests {
                         constraints: vec![Constraint::MinAmount(100)],
                     }],
                 },
-                signer: bob_addr(),
+                signer: bob_addr().into(),
                 bindings: vec![YieldBinding {
                     intent: 0,
                     edge: EdgeRef {
@@ -672,7 +673,7 @@ mod tests {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(tree)),
             subintent_sigs,
-            fee_payer: composer_addr(),
+            fee_payer: composer_addr().into(),
             max_fee: 1_000,
             gas_limit: 1_000_000,
             validity_start_ms: 0,
@@ -751,7 +752,7 @@ mod tests {
             &[Value::Address(RES_X).canonical_bytes()],
         );
         assert!(derived.routing.write_keys.contains(&DeclaredKey::substate(
-            composer_addr(),
+            composer_addr().address(),
             sender_vault.local.0
         )));
         assert!(derived.routing.read_keys.is_empty());
@@ -775,12 +776,10 @@ mod tests {
         let hash = tree.subintents[0].decl.hash(&ProtocolHasher);
         assert_eq!(derived.subintent_hashes, vec![hash.0.0]);
         let nullifier = nullifier_key(&ProtocolHasher, bob_addr(), hash);
-        assert!(
-            derived
-                .routing
-                .write_keys
-                .contains(&DeclaredKey::substate(bob_addr(), nullifier.local.0))
-        );
+        assert!(derived.routing.write_keys.contains(&DeclaredKey::substate(
+            bob_addr().address(),
+            nullifier.local.0
+        )));
     }
 
     #[test]
@@ -794,7 +793,7 @@ mod tests {
             deposit_edge(bob_addr(), 0, RES_X),
         ]);
         let mut stolen = envelope(&tree, &[]);
-        stolen.fee_payer = bob_addr();
+        stolen.fee_payer = bob_addr().into();
         let stolen = stolen.sign(&key(7));
 
         assert!(stolen.signature_is_valid(), "the composer signed it");
@@ -838,9 +837,9 @@ mod tests {
     /// funds, which is exactly why it is easy to leave open.
     #[test]
     fn a_stamp_on_an_unsigned_account_is_refused() {
-        let stamp = |target: Address| {
+        let stamp = |target: PrincipalAddr| {
             single_intent_tree(vec![GraphNode {
-                target,
+                target: target.into(),
                 method: "stamp-entropy".into(),
                 args: vec![],
             }])

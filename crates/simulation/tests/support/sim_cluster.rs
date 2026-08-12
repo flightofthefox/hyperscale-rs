@@ -25,9 +25,9 @@ use hyperscale_simulation::{EPOCH_MS, ExecutionMode, JoinKind, SimConfig, Simula
 use hyperscale_storage::{ShardChainReader, SubstateStore};
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeight, CertifiedBlock, ConsensusReceipt, Event,
-    LocalKey, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, ValidatorId, Verified, WeightedTimestamp,
-    WorkInFlight,
+    LocalKey, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId, Verified,
+    WeightedTimestamp, WorkInFlight,
 };
 
 /// The clock slice `run_until` advances per poll, matching the runner's own
@@ -48,7 +48,7 @@ struct BuildArgs<'a> {
     config: &'a ScenarioConfig,
     seed: u64,
     dedicated_pool_hosts: bool,
-    accounts: &'a [(Address, u128)],
+    accounts: &'a [(PrincipalAddr, u128)],
     execution_mode: ExecutionMode,
 }
 
@@ -72,7 +72,11 @@ impl SimCluster {
     /// Build a genesis cluster with funded accounts, batch-scheduling
     /// ticks serially.
     #[must_use]
-    pub fn with_accounts(config: &ScenarioConfig, seed: u64, accounts: &[(Address, u128)]) -> Self {
+    pub fn with_accounts(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+    ) -> Self {
         Self::with_execution_mode(config, seed, accounts, ExecutionMode::Serial)
     }
 
@@ -82,7 +86,7 @@ impl SimCluster {
     pub fn with_execution_mode(
         config: &ScenarioConfig,
         seed: u64,
-        accounts: &[(Address, u128)],
+        accounts: &[(PrincipalAddr, u128)],
         execution_mode: ExecutionMode,
     ) -> Self {
         Self::build_full(&BuildArgs {
@@ -101,7 +105,7 @@ impl SimCluster {
     pub fn with_accounts_and_dedicated_pool_hosts(
         config: &ScenarioConfig,
         seed: u64,
-        accounts: &[(Address, u128)],
+        accounts: &[(PrincipalAddr, u128)],
     ) -> Self {
         Self::build(config, seed, accounts, true)
     }
@@ -121,7 +125,7 @@ impl SimCluster {
     fn build(
         config: &ScenarioConfig,
         seed: u64,
-        accounts: &[(Address, u128)],
+        accounts: &[(PrincipalAddr, u128)],
         dedicated_pool_hosts: bool,
     ) -> Self {
         Self::build_full(&BuildArgs {
@@ -201,7 +205,7 @@ impl SimCluster {
     pub fn with_grown_accounts(
         config: &ScenarioConfig,
         seed: u64,
-        accounts: &[(Address, u128)],
+        accounts: &[(PrincipalAddr, u128)],
     ) -> Self {
         let grow_config = ScenarioConfig {
             split_bytes: 0,

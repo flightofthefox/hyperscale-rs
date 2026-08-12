@@ -65,8 +65,8 @@ impl ShardTrie {
     /// # Panics
     /// As [`Self::shard_for`].
     #[must_use]
-    pub fn shard_for_prefix(&self, prefix: Address) -> ShardId {
-        let bytes = prefix.to_bytes();
+    pub fn shard_for_prefix(&self, prefix: impl Into<Address>) -> ShardId {
+        let bytes = prefix.into().to_bytes();
         self.walk(u64::from_be_bytes(
             bytes[..8].try_into().expect("an address is 32 bytes"),
         ))

@@ -6,7 +6,7 @@ use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 use hyperscale_crypto::ConsensusPublicKey;
 use hyperscale_hbor::Hbor;
-use hyperscale_vm_types::Address;
+use hyperscale_vm_types::PrincipalAddr;
 
 /// Validator identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Hbor)]
@@ -523,7 +523,7 @@ pub struct StakePoolSeat {
     /// declare it with.
     pub id: StakePoolId,
     /// The principal whose signature the pool's operator methods admit.
-    pub operator: Address,
+    pub operator: PrincipalAddr,
     /// Validators this pool already operates at genesis, with the
     /// consensus key each was registered under. Empty for a pool whose
     /// members will all arrive through its own contract.

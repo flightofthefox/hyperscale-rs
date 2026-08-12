@@ -14,7 +14,7 @@ use std::time::Duration;
 use hyperscale_scenarios::tx::{account_routing_to, build_transfer_tx, validity_around};
 use hyperscale_scenarios::{Cluster, ScenarioConfig};
 use hyperscale_storage::ShardChainReader;
-use hyperscale_types::{Address, BlockHeight, Ed25519PrivateKey, ShardId, ShardTrie};
+use hyperscale_types::{BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, ShardTrie};
 
 mod support;
 
@@ -79,7 +79,7 @@ fn fallbacks(cluster: &SimCluster, shard: ShardId) -> Vec<(u64, u64)> {
 /// where an account lands is a property of its key, and leaving that to
 /// chance would let the load stop crossing without the test noticing —
 /// which is the whole load it is meant to apply.
-fn cast() -> Vec<(Ed25519PrivateKey, Address)> {
+fn cast() -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
     let (left, right) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
     let mut taken = Vec::new();
     (0..ACCOUNTS)

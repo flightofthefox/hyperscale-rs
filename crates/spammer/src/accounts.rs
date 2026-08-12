@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hex::encode as hex_encode;
 use hyperscale_effects_bridge::account_address;
-use hyperscale_types::{Address, Ed25519PrivateKey, ShardId, ShardTrie, ed25519_keypair_from_seed};
+use hyperscale_types::{
+    Ed25519PrivateKey, PrincipalAddr, ShardId, ShardTrie, ed25519_keypair_from_seed,
+};
 use rand::{Rng, RngExt};
 use serde_json::{from_str as json_from_str, to_string_pretty as json_to_string_pretty};
 use tracing::info;
@@ -22,7 +24,7 @@ pub struct FundedAccount {
     pub keypair: Ed25519PrivateKey,
 
     /// This account's 16-byte address — also its shard placement.
-    pub address: Address,
+    pub address: PrincipalAddr,
 
     /// The shard this account belongs to.
     pub shard: ShardId,
@@ -97,14 +99,14 @@ impl FundedAccount {
     }
 
     /// Derive account address from keypair.
-    fn address_from_keypair(keypair: &Ed25519PrivateKey) -> Address {
+    fn address_from_keypair(keypair: &Ed25519PrivateKey) -> PrincipalAddr {
         account_address(&keypair.public_key().0)
     }
 
     /// Determine which shard an address belongs to. An account's address
     /// *is* its placement, so this is a trie walk over the address bits.
-    fn shard_for_address(address: &Address, num_shards: u64) -> ShardId {
-        ShardTrie::uniform_from_count(num_shards).shard_for_prefix(*address)
+    fn shard_for_address(address: &PrincipalAddr, num_shards: u64) -> ShardId {
+        ShardTrie::uniform_from_count(num_shards).shard_for_prefix(address.address())
     }
 }
 
@@ -261,7 +263,7 @@ impl AccountPool {
         &self,
         shard: ShardId,
         balance: u128,
-    ) -> Vec<(Address, u128)> {
+    ) -> Vec<(PrincipalAddr, u128)> {
         self.by_shard
             .get(&shard)
             .map(|accounts| {
@@ -275,7 +277,7 @@ impl AccountPool {
 
     /// Get all genesis balances across all shards.
     #[must_use]
-    pub fn all_genesis_balances(&self, balance: u128) -> Vec<(Address, u128)> {
+    pub fn all_genesis_balances(&self, balance: u128) -> Vec<(PrincipalAddr, u128)> {
         self.by_shard
             .values()
             .flat_map(|accounts| accounts.iter().map(|a| (a.address, balance)))

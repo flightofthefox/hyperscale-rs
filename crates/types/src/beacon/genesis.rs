@@ -308,7 +308,7 @@ mod tests {
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
-    use crate::test_utils::test_prefix;
+    use crate::test_utils::test_principal;
 
     fn sample_config() -> BeaconGenesisConfig {
         let pool_id = StakePoolId::new(0);
@@ -536,7 +536,7 @@ mod tests {
         let config = sample_config();
         let seat = StakePoolSeat {
             id: StakePoolId::new(7777),
-            operator: test_prefix(0x51),
+            operator: test_principal(0x51),
             founding: Vec::new(),
         };
         let unseated = genesis_config_hash(&config, &net(), &[]);
@@ -546,7 +546,7 @@ mod tests {
         );
 
         let mut other_operator = seat.clone();
-        other_operator.operator = test_prefix(0x52);
+        other_operator.operator = test_principal(0x52);
         assert_ne!(
             genesis_config_hash(&config, &net(), std::slice::from_ref(&seat)),
             genesis_config_hash(&config, &net(), &[other_operator]),

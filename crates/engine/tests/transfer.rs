@@ -18,8 +18,8 @@ use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput,
 use hyperscale_types::test_utils::test_principal;
 use hyperscale_types::{
     BlockHash, BlockHeight, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
-    MerkleInclusionProof, NetworkId, ProvisionalHolds, RevealChain, SettledWrites, ShardId,
-    ShardTrie, StateRoot, StateWrites, SubstateKey, Transaction, TransactionBody,
+    MerkleInclusionProof, NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain, SettledWrites,
+    ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey, Transaction, TransactionBody,
     TransactionEnvelope, Verified, WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
@@ -44,11 +44,11 @@ const BOB_SEED: u8 = 42;
 /// is the signer, and the signer is whoever the withdrawing node names.
 const TRANSFER_FEE: u128 = 100;
 
-fn alice() -> Address {
+fn alice() -> PrincipalAddr {
     fee_payer(ALICE_SEED)
 }
 
-fn bob() -> Address {
+fn bob() -> PrincipalAddr {
     fee_payer(BOB_SEED)
 }
 
@@ -56,7 +56,7 @@ fn bob() -> Address {
 struct MapDb(BTreeMap<SubstateKey, Vec<u8>>);
 
 impl MapDb {
-    fn genesis(accounts: &[(Address, u128)]) -> Self {
+    fn genesis(accounts: &[(PrincipalAddr, u128)]) -> Self {
         let writes = genesis_writes(accounts, &[]);
         let mut map = BTreeMap::new();
         for (key, change) in writes.cells() {
@@ -130,41 +130,46 @@ impl VersionedStore for MapDb {
     }
 }
 
-fn transfer_graph(from: Address, to: Address, amount: u128) -> ManifestGraph {
+fn transfer_graph(from: impl Into<Address>, to: impl Into<Address>, amount: u128) -> ManifestGraph {
     ManifestGraph {
         nodes: vec![
             GraphNode {
-                target: from,
+                target: from.into(),
                 method: "withdraw".into(),
                 args: vec![
-                    GraphArg::Literal(Value::Address(*XRD)),
+                    GraphArg::Literal(Value::Address(XRD.address())),
                     GraphArg::Literal(Value::U128(amount)),
                 ],
             },
             GraphNode {
-                target: to,
+                target: to.into(),
                 method: "deposit".into(),
                 args: vec![GraphArg::Edge {
                     edge: EdgeRef {
                         producer: 0,
                         output: 0,
                     },
-                    constraints: vec![Constraint::ResourceIs(*XRD)],
+                    constraints: vec![Constraint::ResourceIs(XRD.address())],
                 }],
             },
         ],
     }
 }
 
-fn signed_transfer(seed: u8, from: Address, to: Address, amount: u128) -> Transaction {
+fn signed_transfer(
+    seed: u8,
+    from: impl Into<Address>,
+    to: impl Into<Address>,
+    amount: u128,
+) -> Transaction {
     signed_transfer_with_fee(seed, from, to, amount, TRANSFER_FEE)
 }
 
 /// A transfer whose recipient signs a floor the withdrawal cannot meet.
 fn signed_transfer_under_bound(
     seed: u8,
-    from: Address,
-    to: Address,
+    from: impl Into<Address>,
+    to: impl Into<Address>,
     amount: u128,
     min: u128,
     max_fee: u128,
@@ -186,7 +191,7 @@ fn signed_transfer_under_bound(
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(encode_tree(&tree)),
         subintent_sigs: Vec::new(),
-        fee_payer: account_address(&key.public_key().0),
+        fee_payer: account_address(&key.public_key().0).into(),
         max_fee,
         gas_limit: 1_000_000,
         validity_start_ms: 0,
@@ -202,8 +207,8 @@ fn signed_transfer_under_bound(
 
 fn signed_transfer_with_fee(
     seed: u8,
-    from: Address,
-    to: Address,
+    from: impl Into<Address>,
+    to: impl Into<Address>,
     amount: u128,
     max_fee: u128,
 ) -> Transaction {
@@ -219,7 +224,7 @@ fn signed_transfer_with_fee(
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(encode_tree(&tree)),
         subintent_sigs: Vec::new(),
-        fee_payer: account_address(&key.public_key().0),
+        fee_payer: account_address(&key.public_key().0).into(),
         max_fee,
         gas_limit: 1_000_000,
         validity_start_ms: 0,
@@ -234,7 +239,7 @@ fn signed_transfer_with_fee(
 }
 
 /// The account address the fee-paying tests derive from their signing key.
-fn fee_payer(seed: u8) -> Address {
+fn fee_payer(seed: u8) -> PrincipalAddr {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     account_address(&key.public_key().0)
 }
@@ -248,7 +253,7 @@ fn fee_payer(seed: u8) -> Address {
 /// instance` rather than anything to do with the test's own subject. Per-test
 /// balances are unaffected — those come from the snapshot `execute_on`
 /// builds, which is separate from the world.
-fn world_accounts() -> Vec<(Address, u128)> {
+fn world_accounts() -> Vec<(PrincipalAddr, u128)> {
     vec![
         (alice(), 1_000),
         (bob(), 50),
@@ -266,17 +271,17 @@ fn execute(executor: &Executor, transactions: &[Arc<Verified<Transaction>>]) -> 
 
 /// A signed single-node stamp: the account records the transaction's
 /// randomness draw in its entropy leaf.
-fn signed_stamp(seed: u8, owner: Address) -> Transaction {
+fn signed_stamp(seed: u8, owner: impl Into<Address>) -> Transaction {
     signed_stamp_with_fee(seed, owner, 1_000_000)
 }
 
-fn signed_stamp_with_fee(seed: u8, owner: Address, max_fee: u128) -> Transaction {
+fn signed_stamp_with_fee(seed: u8, owner: impl Into<Address>, max_fee: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let tree = EnvelopeTree {
         root: IntentDecl {
             graph: ManifestGraph {
                 nodes: vec![GraphNode {
-                    target: owner,
+                    target: owner.into(),
                     method: "stamp-entropy".into(),
                     args: vec![],
                 }],
@@ -289,7 +294,7 @@ fn signed_stamp_with_fee(seed: u8, owner: Address, max_fee: u128) -> Transaction
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(encode_tree(&tree)),
         subintent_sigs: Vec::new(),
-        fee_payer: account_address(&key.public_key().0),
+        fee_payer: account_address(&key.public_key().0).into(),
         max_fee,
         gas_limit: 1_000_000,
         validity_start_ms: 0,
@@ -324,7 +329,7 @@ fn execute_anchored(
 }
 
 /// The entropy leaf a stamp wrote, if any.
-fn entropy_cell(executed: &ExecutedTx, owner: Address) -> Option<Vec<u8>> {
+fn entropy_cell(executed: &ExecutedTx, owner: impl Into<Address>) -> Option<Vec<u8>> {
     let writes = executed.consensus.writes()?;
     writes.cells.get(&entropy_key(owner)).cloned().flatten()
 }
@@ -392,7 +397,7 @@ fn consecutive_payments_thread_through_the_tick_chain() {
     let accounts = [(payer_a, 1_000), (payer_b, 1_000), (hot, 10)];
     let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
 
-    let pay = |seed: u8, from: Address| {
+    let pay = |seed: u8, from: PrincipalAddr| {
         Arc::new(Verified::<Transaction>::from_persisted(
             signed_transfer_with_fee(seed, from, hot, 100, 10),
         ))
@@ -450,7 +455,7 @@ fn consecutive_payments_thread_through_the_tick_chain() {
 }
 
 fn execute_on(
-    accounts: &[(Address, u128)],
+    accounts: &[(PrincipalAddr, u128)],
     executor: &Executor,
     transactions: &[Arc<Verified<Transaction>>],
 ) -> Vec<ExecutedTx> {
@@ -487,7 +492,7 @@ fn settled_on(writes: &StateWrites, state: &impl SubstateDatabase) -> SettledWri
     writes.resolve(&mut |key| state.substate(key))
 }
 
-fn settled(writes: &StateWrites, accounts: &[(Address, u128)]) -> SettledWrites {
+fn settled(writes: &StateWrites, accounts: &[(PrincipalAddr, u128)]) -> SettledWrites {
     eprintln!(
         "SETTLEDBG cells={:?} movements={:?} accounts={:?}",
         writes.cells.keys().collect::<Vec<_>>(),
@@ -505,7 +510,7 @@ fn settled(writes: &StateWrites, accounts: &[(Address, u128)]) -> SettledWrites 
     })
 }
 
-fn vault_cell(writes: &SettledWrites, owner: Address) -> Option<Vec<u8>> {
+fn vault_cell(writes: &SettledWrites, owner: impl Into<Address>) -> Option<Vec<u8>> {
     writes
         .cells()
         .get(&vault_key(owner, *XRD))
@@ -515,7 +520,7 @@ fn vault_cell(writes: &SettledWrites, owner: Address) -> Option<Vec<u8>> {
 
 /// Whether the batch removed the vault cell outright — a drain, never a
 /// zero write.
-fn vault_removed(writes: &SettledWrites, owner: Address) -> bool {
+fn vault_removed(writes: &SettledWrites, owner: impl Into<Address>) -> bool {
     writes.cells().get(&vault_key(owner, *XRD)) == Some(&None)
 }
 
@@ -956,11 +961,10 @@ fn a_payer_drained_by_its_own_fee_deletes_its_vault() {
 /// An account whose prefix routes to the other half of a two-shard trie
 /// from [`alice`], derived by flipping the bit that trie splits on so the
 /// pair straddles it whatever address derivation produces.
-fn far() -> Address {
-    let base = alice();
-    let mut body = base.body();
+fn far() -> PrincipalAddr {
+    let mut body = alice().body();
     body[0] ^= 0x80;
-    Address::new(body, base.class())
+    PrincipalAddr::new(body)
 }
 
 /// Execute one batch as `local_shard` under a two-leaf trie.
@@ -1025,8 +1029,8 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
     let sender_side = execute_on_shard(&executor, near_shard, std::slice::from_ref(&tx));
     let recipient_side = execute_on_shard(&executor, far_shard, &[tx]);
 
-    assert_eq!(events_of(&sender_side[0]), vec![(alice(), 0)]);
-    assert_eq!(events_of(&recipient_side[0]), vec![(far(), 1)]);
+    assert_eq!(events_of(&sender_side[0]), vec![(alice().address(), 0)]);
+    assert_eq!(events_of(&recipient_side[0]), vec![(far().address(), 1)]);
     assert_eq!(
         hash_of(&sender_side[0]),
         hash_of(&recipient_side[0]),
@@ -1043,41 +1047,41 @@ fn a_two_recipient_fan_out_executes() {
     let graph = ManifestGraph {
         nodes: vec![
             GraphNode {
-                target: alice(),
+                target: alice().into(),
                 method: "withdraw".into(),
                 args: vec![
-                    GraphArg::Literal(Value::Address(*XRD)),
+                    GraphArg::Literal(Value::Address(XRD.address())),
                     GraphArg::Literal(Value::U128(5)),
                 ],
             },
             GraphNode {
-                target: bob(),
+                target: bob().into(),
                 method: "deposit".into(),
                 args: vec![GraphArg::Edge {
                     edge: EdgeRef {
                         producer: 0,
                         output: 0,
                     },
-                    constraints: vec![Constraint::ResourceIs(*XRD)],
+                    constraints: vec![Constraint::ResourceIs(XRD.address())],
                 }],
             },
             GraphNode {
-                target: alice(),
+                target: alice().into(),
                 method: "withdraw".into(),
                 args: vec![
-                    GraphArg::Literal(Value::Address(*XRD)),
+                    GraphArg::Literal(Value::Address(XRD.address())),
                     GraphArg::Literal(Value::U128(6)),
                 ],
             },
             GraphNode {
-                target: fee_payer(7),
+                target: fee_payer(7).into(),
                 method: "deposit".into(),
                 args: vec![GraphArg::Edge {
                     edge: EdgeRef {
                         producer: 2,
                         output: 0,
                     },
-                    constraints: vec![Constraint::ResourceIs(*XRD)],
+                    constraints: vec![Constraint::ResourceIs(XRD.address())],
                 }],
             },
         ],
@@ -1094,7 +1098,7 @@ fn a_two_recipient_fan_out_executes() {
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(encode_tree(&tree)),
         subintent_sigs: Vec::new(),
-        fee_payer: alice(),
+        fee_payer: alice().into(),
         max_fee: 10,
         gas_limit: 1_000_000,
         validity_start_ms: 0,
@@ -1136,7 +1140,7 @@ fn signed_publish(seed: u8, artifact: Vec<u8>) -> Transaction {
     let vm = TransactionEnvelope {
         body: TransactionBody::Publish(artifact),
         subintent_sigs: Vec::new(),
-        fee_payer: account_address(&key.public_key().0),
+        fee_payer: account_address(&key.public_key().0).into(),
         max_fee: 1_000_000,
         gas_limit: 1_000_000,
         validity_start_ms: 0,
@@ -1151,7 +1155,11 @@ fn signed_publish(seed: u8, artifact: Vec<u8>) -> Transaction {
 }
 
 /// The raw update a batch made to a package's cell under `publisher`.
-fn package_cell(writes: &StateWrites, publisher: Address, artifact: &[u8]) -> Option<Vec<u8>> {
+fn package_cell(
+    writes: &StateWrites,
+    publisher: impl Into<Address>,
+    artifact: &[u8],
+) -> Option<Vec<u8>> {
     let key = package_key(publisher, package_hash(&ProtocolHasher, artifact));
     writes.cells.get(&key).cloned().flatten()
 }
@@ -1305,7 +1313,7 @@ fn only_a_cell_that_addresses_its_own_contents_publishes() {
 /// Preview `tx` against a genesis snapshot of `accounts`, committing
 /// nothing.
 fn preview_on(
-    accounts: &[(Address, u128)],
+    accounts: &[(PrincipalAddr, u128)],
     executor: &Executor,
     tx: &Transaction,
     grants: PreviewGrants,
@@ -1323,7 +1331,8 @@ fn preview_on(
 }
 
 /// The reported change to `owner`'s native vault.
-fn change_for(report: &PreviewReport, owner: Address) -> ResourceChange {
+fn change_for(report: &PreviewReport, owner: impl Into<Address>) -> ResourceChange {
+    let owner = owner.into();
     let key = vault_key(owner, *XRD);
     *report
         .changes
@@ -1338,8 +1347,8 @@ fn change_for(report: &PreviewReport, owner: Address) -> ResourceChange {
 const PREVIEW_CEILING: u128 = 10;
 
 struct PreviewFixture {
-    payer: Address,
-    accounts: Vec<(Address, u128)>,
+    payer: PrincipalAddr,
+    accounts: Vec<(PrincipalAddr, u128)>,
     tx: Transaction,
 }
 

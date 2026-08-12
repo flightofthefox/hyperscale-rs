@@ -80,14 +80,14 @@ impl PoolRegistry {
     }
 
     /// Recognise `address` as the pool the beacon folds under `id`.
-    pub fn register(&mut self, address: Address, id: StakePoolId) {
-        self.pools.insert(address, id);
+    pub fn register(&mut self, address: impl Into<Address>, id: StakePoolId) {
+        self.pools.insert(address.into(), id);
     }
 
     /// The pool `address` is recognised as, if any.
     #[must_use]
-    pub fn pool_of(&self, address: Address) -> Option<StakePoolId> {
-        self.pools.get(&address).copied()
+    pub fn pool_of(&self, address: impl Into<Address>) -> Option<StakePoolId> {
+        self.pools.get(&address.into()).copied()
     }
 
     /// Whether any pool is recognised — the cheap guard that keeps a
@@ -232,7 +232,7 @@ fn registration_of(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_vm_effects::{Address, Hash32, InstanceMeta};
+    use hyperscale_vm_effects::{Address, ComponentAddr, Hash32, InstanceMeta};
 
     use super::*;
     use crate::ProtocolHasher;
@@ -243,7 +243,7 @@ mod tests {
         PackageHash(Hash32([tag; 32]))
     }
 
-    fn instance(instances: &mut InstanceRegistry, salt: u8) -> Address {
+    fn instance(instances: &mut InstanceRegistry, salt: u8) -> ComponentAddr {
         instances.create(
             &ProtocolHasher,
             InstanceMeta {
@@ -254,7 +254,7 @@ mod tests {
         )
     }
 
-    fn world() -> (PoolRegistry, InstanceRegistry, Address, Address) {
+    fn world() -> (PoolRegistry, InstanceRegistry, ComponentAddr, ComponentAddr) {
         let mut instances = InstanceRegistry::new();
         let pool = instance(&mut instances, 1);
         let impostor = instance(&mut instances, 2);
@@ -263,9 +263,9 @@ mod tests {
         (pools, instances, pool, impostor)
     }
 
-    fn event(emitter: Address, event_type: u32, amount: u128) -> Event {
+    fn event(emitter: impl Into<Address>, event_type: u32, amount: u128) -> Event {
         Event {
-            emitter,
+            emitter: emitter.into(),
             event_type,
             payload: amount.to_le_bytes().to_vec(),
         }
@@ -331,9 +331,9 @@ mod tests {
         payload
     }
 
-    fn raw(emitter: Address, event_type: u32, payload: Vec<u8>) -> Event {
+    fn raw(emitter: impl Into<Address>, event_type: u32, payload: Vec<u8>) -> Event {
         Event {
-            emitter,
+            emitter: emitter.into(),
             event_type,
             payload,
         }
@@ -562,7 +562,7 @@ mod tests {
         let (pools, instances, pool, _impostor) = world();
         for payload in [Vec::new(), vec![1; 8], vec![1; 17]] {
             let event = Event {
-                emitter: pool,
+                emitter: pool.into(),
                 event_type: STAKED,
                 payload,
             };

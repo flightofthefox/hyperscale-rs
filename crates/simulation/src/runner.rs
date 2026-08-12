@@ -33,10 +33,10 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::{
-    Address, BeaconChainConfig, ConsensusPublicKey, Epoch, GenesisConfigHash, GenesisValidators,
-    LocalTimestamp, NetworkDefinition, ShardId, Signer, StakePoolSeat, TopologySnapshot,
-    TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet, Verifier,
-    shard_prefix_path,
+    BeaconChainConfig, ConsensusPublicKey, Epoch, GenesisConfigHash, GenesisValidators,
+    LocalTimestamp, NetworkDefinition, PrincipalAddr, ShardId, Signer, StakePoolSeat,
+    TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo, ValidatorSet,
+    Verifier, shard_prefix_path,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -130,7 +130,7 @@ pub struct SimConfig {
     /// Genesis-funded accounts (owner prefix, balance). Builds the
     /// process VM statics and the executor world, and seeds the funded
     /// vault cells at genesis. Empty runs no traffic.
-    pub accounts: Vec<(Address, u128)>,
+    pub accounts: Vec<(PrincipalAddr, u128)>,
     /// Addresses the process's VM statics must resolve, when that is wider
     /// than what this cluster funds.
     ///
@@ -141,7 +141,7 @@ pub struct SimConfig {
     /// Genesis still seeds only [`SimConfig::accounts`], which is what
     /// keeps per-cluster funding independent. Empty means "the same
     /// accounts this cluster funds".
-    pub world_accounts: Vec<(Address, u128)>,
+    pub world_accounts: Vec<(PrincipalAddr, u128)>,
     /// Stake pools the beacon folds facts for: the pool instance's owner
     /// prefix and the identifier it is folded under.
     pub pools: Vec<StakePoolSeat>,
@@ -231,7 +231,7 @@ pub struct SimulationRunner {
 
     /// [`SimConfig::accounts`], retained so genesis seeds the same
     /// world the executor and statics were built with.
-    accounts: Vec<(Address, u128)>,
+    accounts: Vec<(PrincipalAddr, u128)>,
 
     /// [`SimConfig::pools`] with each seat's founding members filled
     /// in from the folded genesis beacon state, so the contract's record

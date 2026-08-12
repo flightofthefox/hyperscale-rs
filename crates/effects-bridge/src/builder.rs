@@ -25,26 +25,30 @@ pub const DEFAULT_GAS_LIMIT: u64 = 1_000_000;
 /// The withdraw-then-deposit graph moving `amount` of the native
 /// resource from `from` to `to`.
 #[must_use]
-pub fn transfer_graph(from: Address, to: Address, amount: u128) -> ManifestGraph {
+pub fn transfer_graph(
+    from: impl Into<Address>,
+    to: impl Into<Address>,
+    amount: u128,
+) -> ManifestGraph {
     ManifestGraph {
         nodes: vec![
             GraphNode {
-                target: from,
+                target: from.into(),
                 method: "withdraw".into(),
                 args: vec![
-                    GraphArg::Literal(Value::Address(*XRD)),
+                    GraphArg::Literal(Value::Address(XRD.address())),
                     GraphArg::Literal(Value::U128(amount)),
                 ],
             },
             GraphNode {
-                target: to,
+                target: to.into(),
                 method: "deposit".into(),
                 args: vec![GraphArg::Edge {
                     edge: EdgeRef {
                         producer: 0,
                         output: 0,
                     },
-                    constraints: vec![Constraint::ResourceIs(*XRD)],
+                    constraints: vec![Constraint::ResourceIs(XRD.address())],
                 }],
             },
         ],
@@ -77,7 +81,7 @@ pub fn sign_call(
     TransactionEnvelope {
         body: TransactionBody::Call(encode_tree(&tree)),
         subintent_sigs: Vec::new(),
-        fee_payer: account_address(&payer.public_key().0),
+        fee_payer: account_address(&payer.public_key().0).into(),
         max_fee,
         gas_limit: DEFAULT_GAS_LIMIT,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
@@ -98,8 +102,8 @@ pub fn sign_call(
 #[allow(clippy::too_many_arguments)] // the envelope's flat signing-time terms
 pub fn build_transfer_tx(
     payer: &Ed25519PrivateKey,
-    from: Address,
-    to: Address,
+    from: impl Into<Address>,
+    to: impl Into<Address>,
     amount: u128,
     max_fee: u128,
     validity: TimestampRange,
