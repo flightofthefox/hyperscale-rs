@@ -11,13 +11,13 @@ blake3.workspace = true
 hyperscale-types.workspace = true
 hyperscale-hbor.workspace = true
 hyperscale-vm-effects.workspace = true
+hyperscale-vm-stdlib.workspace = true
 # The profile validator, without the blessed engine: a publish verdict is
 # the same verdict wherever it is reached.
 hyperscale-vm-runtime.workspace = true
 
 [dev-dependencies]
 hyperscale-types = { workspace = true, features = ["test-utils"] }
-hyperscale-vm-stdlib.workspace = true
 wat.workspace = true
 
 [lints]

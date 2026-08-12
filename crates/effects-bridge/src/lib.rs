@@ -9,6 +9,7 @@
 
 pub mod artifact;
 pub mod builder;
+pub mod genesis;
 pub mod staking;
 pub mod vm_metadata;
 pub mod vm_statics;
