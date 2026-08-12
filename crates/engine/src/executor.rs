@@ -163,17 +163,17 @@ pub struct Executor {
 }
 
 impl Executor {
-    /// Build the engine for the genesis-funded `accounts` and install the
-    /// process-wide VM statics (first installation wins, so co-hosted
-    /// nodes sharing one genesis coexist).
+    /// Build the engine and install the process-wide VM statics (first
+    /// installation wins, so co-hosted nodes sharing one genesis
+    /// coexist).
     ///
     /// # Panics
     ///
     /// Panics if the committed stdlib artifact fails validation or
     /// compilation — a build defect surfaced at boot, not in a tick.
     #[must_use]
-    pub fn new(accounts: &[(PrincipalAddr, u128)], mode: ExecutionMode) -> Self {
-        Self::with_pools(accounts, &[], mode)
+    pub fn new(mode: ExecutionMode) -> Self {
+        Self::with_pools(&[], mode)
     }
 
     /// [`Self::new`] seating `pools` as the stake pools the beacon folds
@@ -183,12 +183,8 @@ impl Executor {
     ///
     /// As [`Self::new`].
     #[must_use]
-    pub fn with_pools(
-        accounts: &[(PrincipalAddr, u128)],
-        pools: &[StakePoolSeat],
-        mode: ExecutionMode,
-    ) -> Self {
-        let world = genesis_world_with_pools(accounts, pools);
+    pub fn with_pools(pools: &[StakePoolSeat], mode: ExecutionMode) -> Self {
+        let world = genesis_world_with_pools(pools);
         install_vm_statics(Box::new(BridgeStatics {
             cache: world.cache.clone(),
             instances: world.instances.clone(),

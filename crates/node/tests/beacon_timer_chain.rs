@@ -163,7 +163,7 @@ impl Fixture {
             HashMap::<ShardId, SimShardStorage>::new(),
             Arc::clone(&self.beacon_storage),
             NetworkDefinition::simulator(),
-            Arc::new(Executor::new(&[], ExecutionMode::Serial)),
+            Arc::new(Executor::new(ExecutionMode::Serial)),
             network,
             SyncDispatch,
             BTreeMap::new(),

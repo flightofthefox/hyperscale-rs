@@ -248,15 +248,11 @@ fn fee_payer(seed: u8) -> PrincipalAddr {
     account_address(&key.public_key().0)
 }
 
-/// Every account any test in this binary transacts with.
+/// The opening balances every test in this binary starts from.
 ///
-/// The VM statics are process-global and first-installed-wins, so every
-/// executor here has to be built over one world: sharing a process, the
-/// first `Executor::new` fixes the instance registry for every test that
-/// follows, and an address missing from it fails admission with `no
-/// instance` rather than anything to do with the test's own subject. Per-test
-/// balances are unaffected — those come from the snapshot `execute_on`
-/// builds, which is separate from the world.
+/// Funding only — an address needs nothing registered before a test can
+/// transact with it, so this names who holds what and not who exists.
+/// The balances reach a test through the snapshot `execute_on` builds.
 fn world_accounts() -> Vec<(PrincipalAddr, u128)> {
     vec![
         (alice(), 1_000),
@@ -344,7 +340,7 @@ fn entropy_cell(executed: &ExecutedTx, owner: impl Into<Address>) -> Option<Vec<
 /// randomness-reading guest's receipt.
 #[test]
 fn a_stamp_writes_the_draw_its_anchor_fixes() {
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_stamp(
         ALICE_SEED,
         alice(),
@@ -399,7 +395,7 @@ fn consecutive_payments_thread_through_the_tick_chain() {
     let payer_b = fee_payer(32);
     let hot = bob();
     let accounts = [(payer_a, 1_000), (payer_b, 1_000), (hot, 10)];
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
 
     let pay = |seed: u8, from: PrincipalAddr| {
         Arc::new(Verified::<Transaction>::from_persisted(
@@ -530,7 +526,7 @@ fn vault_removed(writes: &SettledWrites, owner: impl Into<Address>) -> bool {
 
 #[test]
 fn a_transfer_folds_to_identity_keyed_absolute_updates() {
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
         ALICE_SEED,
         alice(),
@@ -563,7 +559,7 @@ fn a_transfer_folds_to_identity_keyed_absolute_updates() {
 
 #[test]
 fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let over = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
         BOB_SEED,
         bob(),
@@ -623,7 +619,7 @@ fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
 /// debit to avoid reverting it.
 #[test]
 fn a_failed_charge_survives_a_later_sibling_credit() {
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let failed = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
         BOB_SEED,
         bob(),
@@ -670,8 +666,8 @@ fn a_failed_charge_survives_a_later_sibling_credit() {
 
 #[test]
 fn serial_and_parallel_scheduling_produce_identical_receipts() {
-    let serial = Executor::new(&world_accounts(), ExecutionMode::Serial);
-    let parallel = Executor::new(&world_accounts(), ExecutionMode::Parallel);
+    let serial = Executor::new(ExecutionMode::Serial);
+    let parallel = Executor::new(ExecutionMode::Parallel);
     let txs: Vec<Arc<Verified<Transaction>>> = (0..4u128)
         .map(|i| {
             Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
@@ -707,7 +703,7 @@ fn serial_and_parallel_scheduling_produce_identical_receipts() {
 /// because the declaration was admitted, routed, and locked regardless.
 #[test]
 fn an_unapplied_attempt_still_attests_its_declaration() {
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let over = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
         ALICE_SEED,
         alice(),
@@ -752,7 +748,7 @@ fn an_unapplied_attempt_still_attests_its_declaration() {
 fn a_completed_transfer_burns_the_fee_ceiling_from_its_payer() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (bob(), 50)];
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     // A transfer's fuel far exceeds the tiny ceiling, so the burn is
     // exactly `max_fee` — the cap working.
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
@@ -784,7 +780,7 @@ fn a_completed_transfer_burns_the_fee_ceiling_from_its_payer() {
 /// leaf.
 #[test]
 fn a_call_that_never_touches_its_payers_vault_still_pays() {
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     // A stamp's fuel far exceeds the tiny ceiling, so the burn is
     // exactly `max_fee`.
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
@@ -818,7 +814,7 @@ fn a_receipt_carries_only_its_own_payers_burn() {
     let payer_a = fee_payer(31);
     let payer_b = fee_payer(32);
     let accounts = [(payer_a, 1_000), (payer_b, 1_000), (bob(), 50)];
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let txs = vec![
         Arc::new(Verified::<Transaction>::from_persisted(
             signed_transfer_with_fee(31, payer_a, bob(), 100, 10),
@@ -855,7 +851,7 @@ fn a_receipt_carries_only_its_own_payers_burn() {
 /// hash-sorted — loses none of them.
 #[test]
 fn shared_payer_burns_accumulate_across_a_batch() {
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     // Distinct ceilings make three distinct stamps; the stamp's fuel
     // exceeds all of them, so each burns exactly its ceiling.
     let mut txs: Vec<Arc<Verified<Transaction>>> = [10u128, 11, 12]
@@ -891,7 +887,7 @@ fn a_missed_edge_bound_charges_its_payer_the_floor() {
     let payer = fee_payer(23);
     let funded = 1_000;
     let accounts = [(payer, funded), (bob(), 50)];
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     // The withdrawal is covered and the guest is honest — it returns the
     // 100 it reserved. What fails is the recipient's signed floor.
     let tx = signed_transfer_under_bound(23, payer, bob(), 100, 150, 1_000);
@@ -938,7 +934,7 @@ fn a_payer_drained_by_its_own_fee_deletes_its_vault() {
     let payer = fee_payer(11);
     // Exactly the transfer plus the ceiling: nothing survives the burn.
     let accounts = [(payer, 110), (bob(), 50)];
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
         signed_transfer_with_fee(11, payer, bob(), 100, 10),
     ));
@@ -1015,8 +1011,7 @@ fn hash_of(executed: &ExecutedTx) -> Hash {
 /// storing the other's events.
 #[test]
 fn an_event_lands_only_on_its_emitters_home_shard() {
-    let world = vec![(alice(), 1_000u128), (far(), 50), (fee_payer(7), 1_000)];
-    let executor = Executor::new(&world, ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
     assert_ne!(
@@ -1047,7 +1042,7 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
 /// takes.
 #[test]
 fn a_two_recipient_fan_out_executes() {
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let graph = ManifestGraph {
         nodes: vec![
             GraphNode {
@@ -1171,7 +1166,7 @@ fn package_cell(
 #[test]
 fn a_publish_writes_the_artifact_under_its_publisher() {
     let payer = fee_payer(7);
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let artifact = account_artifact().to_vec();
     let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
         7,
@@ -1246,7 +1241,7 @@ fn a_publish_that_is_not_a_package_never_reaches_execution() {
 #[test]
 fn a_committed_publish_grows_the_cache_that_routing_reads() {
     let payer = fee_payer(7);
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
 
     // A package the world has never seen: the stdlib artifact with its
     // metadata attached a second time under a different publisher would
@@ -1290,7 +1285,7 @@ fn only_a_cell_that_addresses_its_own_contents_publishes() {
     // of the value it holds. Without that check, any committed cell
     // whose bytes happened to parse as an artifact would publish a
     // package — no publish transaction, no fee, no cell of its own.
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let cache = executor.packages();
 
     let mut metadata = account_metadata();
@@ -1376,7 +1371,7 @@ fn a_preview_reports_the_resource_changes_a_transfer_would_make() {
         accounts,
         tx,
     } = preview_fixture();
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
     assert_eq!(report.outcome, PreviewOutcome::Completed);
@@ -1416,7 +1411,7 @@ fn a_preview_agrees_with_the_tick_that_would_commit_it() {
         accounts,
         tx,
     } = preview_fixture();
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
     let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
@@ -1448,7 +1443,7 @@ fn free_credit_reports_the_fee_without_charging_it() {
         accounts,
         tx,
     } = preview_fixture();
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let charged = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
     let credited = preview_on(
         &accounts,
@@ -1480,7 +1475,7 @@ fn free_credit_reports_the_fee_without_charging_it() {
 fn a_preview_prices_an_abort_at_its_class_floor() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (bob(), 50)];
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let tx = signed_transfer_with_fee(7, payer, bob(), 5_000, PREVIEW_CEILING);
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
@@ -1512,7 +1507,7 @@ fn a_preview_refuses_what_admission_would_refuse() {
         !world_accounts().iter().any(|(a, _)| *a == stranger),
         "the address must be outside the world"
     );
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let tx = signed_transfer_with_fee(7, stranger, bob(), 10, PREVIEW_CEILING);
     let report = preview_on(&[(bob(), 50)], &executor, &tx, PreviewGrants::default());
 
@@ -1537,7 +1532,7 @@ fn a_preview_refuses_what_admission_would_refuse() {
 fn a_preview_holds_a_node_to_its_targets_authority_unless_granted() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (alice(), 1_000), (bob(), 50)];
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     // Signed by 7, withdrawing from Alice: the shape the gate refuses.
     let tx = signed_transfer_with_fee(7, alice(), bob(), 100, PREVIEW_CEILING);
 
@@ -1570,7 +1565,7 @@ fn a_preview_holds_a_node_to_its_targets_authority_unless_granted() {
 fn a_preview_prices_a_publish_by_its_artifact() {
     let payer = fee_payer(7);
     let artifact = account_artifact().to_vec();
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let tx = signed_publish(7, artifact.clone());
     let report = preview_on(
         &[(payer, 1_000_000)],
@@ -1604,7 +1599,7 @@ fn a_preview_prices_a_publish_by_its_artifact() {
 fn a_committed_cell_that_is_not_a_package_is_ignored() {
     // The other half: ordinary traffic cannot grow the cache by
     // accident, whatever it writes.
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
         ALICE_SEED,
         alice(),

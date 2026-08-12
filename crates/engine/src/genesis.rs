@@ -54,9 +54,13 @@ pub struct World {
     pub pools: PoolRegistry,
 }
 
-/// Build the world for `accounts` (owner prefix, balance): the account
-/// package published under its artifact hash, one instance per funded
-/// address.
+/// Build the world: the stdlib packages published under their artifact
+/// hashes, and the account package bound as the one serving every
+/// principal.
+///
+/// Funded accounts are not an input. A principal address commits its own
+/// auth material, so an account is callable without anything registered
+/// for it — genesis seeds balances, not instances.
 ///
 /// The published signatures are the ones the artifact declares, admitted
 /// through the same check a publish transaction runs — genesis is the
@@ -67,8 +71,8 @@ pub struct World {
 /// Panics if the stdlib artifact would not be admissible as a published
 /// package — a build defect, not a runtime condition.
 #[must_use]
-pub fn genesis_world(accounts: &[(PrincipalAddr, u128)]) -> World {
-    genesis_world_with_pools(accounts, &[])
+pub fn genesis_world() -> World {
+    genesis_world_with_pools(&[])
 }
 
 /// [`genesis_world`] seating `pools` as the stake pools the beacon folds
@@ -84,10 +88,7 @@ pub fn genesis_world(accounts: &[(PrincipalAddr, u128)]) -> World {
 /// Panics if a stdlib artifact would not be admissible as a published
 /// package — a build defect, not a runtime condition.
 #[must_use]
-pub fn genesis_world_with_pools(
-    _accounts: &[(PrincipalAddr, u128)],
-    pools: &[StakePoolSeat],
-) -> World {
+pub fn genesis_world_with_pools(pools: &[StakePoolSeat]) -> World {
     let artifact = account_artifact();
     let account_package = package_hash(&ProtocolHasher, artifact);
     let metadata =
@@ -254,7 +255,7 @@ mod tests {
         // the real guest's exports back every method it declares.
         let declared = admit_package(artifact).expect("publishes as a package");
         assert_eq!(declared, account_metadata());
-        let world = genesis_world(&[]);
+        let world = genesis_world();
         assert_eq!(
             world.cache.load().get(world.account_package),
             Some(&declared)
@@ -279,8 +280,11 @@ mod tests {
     }
 
     #[test]
-    fn the_world_binds_every_funded_account_to_the_stdlib_package() {
-        let world = genesis_world(&[(test_principal(0x11), 1), (test_principal(0x22), 2)]);
+    fn the_world_binds_every_principal_to_the_stdlib_package() {
+        // Funding is not what makes an account callable: the world is
+        // built without naming any address, and an address nothing has
+        // ever funded resolves the same as one genesis seeds.
+        let world = genesis_world();
         assert!(world.cache.load().get(world.account_package).is_some());
         for address in [test_principal(0x11), test_principal(0x22)] {
             assert_eq!(

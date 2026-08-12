@@ -17,7 +17,7 @@ use hyperscale_network::fault::{HostId, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{chain_fate, status_rank};
-use hyperscale_scenarios::tx::{staking_genesis_accounts, world_accounts, world_pools};
+use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, vote_reshape_threshold,
 };
@@ -166,13 +166,6 @@ impl SimCluster {
                 .copied()
                 .chain(staking_genesis_accounts())
                 .collect(),
-            // Unconditional, including for clusters that fund no accounts
-            // at all: the statics install once per process and the first
-            // cluster built wins, and a scenario that never transacts
-            // would otherwise install an empty registry that every later
-            // scenario fails against. Registering an address nothing
-            // transacts with costs nothing.
-            world_accounts: world_accounts(),
             execution_mode: args.execution_mode,
             pools: world_pools(),
             world_pools: world_pools(),

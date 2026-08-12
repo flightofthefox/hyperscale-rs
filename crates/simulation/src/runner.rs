@@ -127,29 +127,22 @@ pub struct SimConfig {
     pub packet_loss_rate: f64,
     /// Consensus crypto scheme every simulated validator runs.
     pub crypto_scheme: CryptoScheme,
-    /// Genesis-funded accounts (owner prefix, balance). Builds the
-    /// process VM statics and the executor world, and seeds the funded
+    /// Genesis-funded accounts (owner prefix, balance). Seeds the funded
     /// vault cells at genesis. Empty runs no traffic.
     pub accounts: Vec<(PrincipalAddr, u128)>,
-    /// Addresses the process's VM statics must resolve, when that is wider
-    /// than what this cluster funds.
-    ///
-    /// The statics install once per process and the first installation
-    /// wins, so a test binary running several clusters has to register
-    /// every address any of them will transact with — otherwise the first
-    /// cluster fixes the instance registry and the rest fail admission.
-    /// Genesis still seeds only [`SimConfig::accounts`], which is what
-    /// keeps per-cluster funding independent. Empty means "the same
-    /// accounts this cluster funds".
-    pub world_accounts: Vec<(PrincipalAddr, u128)>,
     /// Stake pools the beacon folds facts for: the pool instance's owner
     /// prefix and the identifier it is folded under.
     pub pools: Vec<StakePoolSeat>,
     /// Pool instances the process's VM statics must resolve, when that is
-    /// wider than what this cluster seats — the pool counterpart of
-    /// [`SimConfig::world_accounts`], installed for the same
-    /// first-wins reason. Empty means "the same pools this cluster
-    /// seats".
+    /// wider than what this cluster seats.
+    ///
+    /// The statics install once per process and the first installation
+    /// wins, so a test binary running several clusters has to register
+    /// every pool any of them will reach — otherwise the first cluster
+    /// fixes the instance registry and the rest fail admission. A pool is
+    /// a real instance keyed by its configuration, so unlike an account
+    /// it cannot be resolved by class alone. Empty means "the same pools
+    /// this cluster seats".
     pub world_pools: Vec<StakePoolSeat>,
     /// The batch executor's group scheduling. Receipts are
     /// schedule-invariant, so this cannot change any outcome — the
@@ -172,7 +165,6 @@ impl Default for SimConfig {
             packet_loss_rate: 0.0,
             crypto_scheme: CryptoScheme::default(),
             accounts: Vec::new(),
-            world_accounts: Vec::new(),
             pools: Vec::new(),
             world_pools: Vec::new(),
             execution_mode: ExecutionMode::Serial,
@@ -388,18 +380,12 @@ impl SimulationRunner {
 
         // One engine per cluster: the genesis-static world is shared by
         // every host, and construction installs the process VM statics.
-        let world_accounts = if network_config.world_accounts.is_empty() {
-            &network_config.accounts
-        } else {
-            &network_config.world_accounts
-        };
         let world_pools = if network_config.world_pools.is_empty() {
             &network_config.pools
         } else {
             &network_config.world_pools
         };
         let engine = Arc::new(Executor::with_pools(
-            world_accounts,
             world_pools,
             network_config.execution_mode,
         ));

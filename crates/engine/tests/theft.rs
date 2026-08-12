@@ -66,7 +66,7 @@ fn thief() -> PrincipalAddr {
     account_address(&key.public_key().0)
 }
 
-/// Every address any test in this binary transacts with.
+/// The opening balances every test in this binary starts from.
 fn world_accounts() -> Vec<(PrincipalAddr, u128)> {
     vec![(VICTIM, FUNDED), (thief(), FUNDED)]
 }
@@ -173,7 +173,7 @@ fn vault_cell(writes: &SettledWrites, owner: impl Into<Address>) -> Option<Vec<u
 /// The defect, closed: an address is public, and knowing one buys nothing.
 #[test]
 fn draining_an_account_the_envelope_does_not_sign_for_is_refused() {
-    let _ = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let _ = Executor::new(ExecutionMode::Serial);
     let theft = signed_transfer(VICTIM, thief(), 5_000);
 
     assert!(theft.body().signature_is_valid());
@@ -202,7 +202,7 @@ fn draining_an_account_the_envelope_does_not_sign_for_is_refused() {
 /// binding protects is a whole balance rather than a fee floor of it.
 #[test]
 fn the_gated_node_is_the_one_that_moves_the_balance() {
-    let executor = Executor::new(&world_accounts(), ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let executed = execute(&executor, signed_transfer(thief(), VICTIM, 5_000));
     let ConsensusReceipt::Succeeded {
         writes: database_updates,

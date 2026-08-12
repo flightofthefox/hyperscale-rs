@@ -55,8 +55,8 @@ use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_storage_rocksdb::{RocksDbShardStorage, SharedStorage};
 use hyperscale_types::{
     BeaconChainConfig, BlockHeight, GenesisValidators, LocalTimestamp, MAX_DRAIN_WORK,
-    NetworkDefinition, PrincipalAddr, ShardId, Signer, StakePoolSeat, Transaction, ValidatorId,
-    ValidatorStatus, Verifier, WorkInFlight,
+    NetworkDefinition, ShardId, Signer, StakePoolSeat, Transaction, ValidatorId, ValidatorStatus,
+    Verifier, WorkInFlight,
 };
 use libp2p::identity::Keypair;
 use thiserror::Error;
@@ -205,9 +205,6 @@ pub struct ProductionRunnerBuilder {
     publishers: RpcPublishers,
     /// Optional genesis configuration for initial state.
     genesis_config: Option<GenesisConfig>,
-    /// VM addresses the process-wide statics register, when that set must
-    /// be wider than this cluster's own genesis funding.
-    world_accounts: Vec<(PrincipalAddr, u128)>,
     /// Pool instances the process-wide statics seat, when that set must be
     /// wider than this cluster's own genesis seating.
     world_pools: Vec<StakePoolSeat>,
@@ -256,7 +253,6 @@ impl ProductionRunnerBuilder {
             channel_capacity: 10_000,
             publishers: RpcPublishers::default(),
             genesis_config: None,
-            world_accounts: Vec::new(),
             world_pools: Vec::new(),
             network_definition: None,
             // Harness default: the routing overlay runs in production
@@ -343,26 +339,14 @@ impl ProductionRunnerBuilder {
         self
     }
 
-    /// Register `accounts` in the process VM statics instead of this
-    /// cluster's own genesis funding.
-    ///
-    /// The statics install once per process and the first installer wins, so
-    /// several clusters in one process must agree on one world or the later
-    /// ones fail admission against a registry that never heard of their
-    /// addresses. Registering an address nothing transacts with costs
-    /// nothing: the world carries identities, and each cluster still funds
-    /// its own balances from its own genesis.
-    #[must_use]
-    pub fn world_accounts(mut self, accounts: Vec<(PrincipalAddr, u128)>) -> Self {
-        self.world_accounts = accounts;
-        self
-    }
-
     /// Seat `pools` in the process VM statics instead of this cluster's
-    /// own genesis seating — [`Self::world_accounts`] for pool
-    /// instances, and installed for the same first-wins reason. A pool
-    /// nobody delegates to emits nothing, so recognising one everywhere
-    /// costs a registry entry.
+    /// own genesis seating.
+    ///
+    /// The statics install once per process and the first installer wins,
+    /// so several clusters in one process must agree on one world or the
+    /// later ones fail admission against a registry that never heard of
+    /// their pools. A pool nobody delegates to emits nothing, so
+    /// recognising one everywhere costs a registry entry.
     #[must_use]
     pub fn world_pools(mut self, pools: Vec<StakePoolSeat>) -> Self {
         self.world_pools = pools;
@@ -568,25 +552,17 @@ impl ProductionRunnerBuilder {
         let engine_bootstrap = EngineBootstrap {
             config: bootstrap_config,
         };
-        // The VM engine's world derives from the same genesis config the
-        // startup genesis path installs, unless a wider one was set:
-        // construction installs the process VM statics, which are
-        // first-writer-wins, so several clusters in one process must agree.
-        let world_accounts = if self.world_accounts.is_empty() {
-            &engine_bootstrap.config.accounts
-        } else {
-            &self.world_accounts
-        };
+        // The VM engine's world seats the same pools the startup genesis
+        // path installs, unless a wider set was given: construction
+        // installs the process VM statics, which are first-writer-wins,
+        // so several clusters in one process must agree.
         let world_pools = if self.world_pools.is_empty() {
             &engine_bootstrap.config.pools
         } else {
             &self.world_pools
         };
-        let executor: Arc<Executor> = Arc::new(Executor::with_pools(
-            world_accounts,
-            world_pools,
-            ExecutionMode::Serial,
-        ));
+        let executor: Arc<Executor> =
+            Arc::new(Executor::with_pools(world_pools, ExecutionMode::Serial));
 
         // Each shard's `shard_event_senders` entry points at that
         // shard's own pinned-thread callback channel — callbacks,

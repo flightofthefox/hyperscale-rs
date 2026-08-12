@@ -1041,45 +1041,18 @@ pub fn build_transfer_tx(
     Transaction::new(envelope(transfer_graph(from, to, amount), payer, validity))
 }
 
-/// Every account address any scenario in this crate transacts with.
-///
-/// The VM statics are process-global and first-installed-wins, so a test
-/// binary sharing one process must install a world covering every scenario
-/// it will run — otherwise the first cluster built fixes the instance
-/// registry and every later scenario's addresses fail admission with `no
-/// instance`, which reads as a defect in whatever that scenario was
-/// testing. Balances here are placeholders: `genesis_world` registers
-/// addresses and ignores amounts, and each cluster still seeds its own
-/// funding from its own fixture — which matters, because the insolvent
-/// scenario deliberately funds an address the cross-shard one funds richly.
-#[must_use]
-pub fn world_accounts() -> Vec<(PrincipalAddr, u128)> {
-    let mut all = genesis_accounts(24, 6);
-    all.extend(storm_genesis_accounts());
-    all.extend(cross_shard_genesis_accounts());
-    all.extend(insolvent_genesis_accounts());
-    all.extend(nullifier_race_genesis_accounts());
-    all.extend(split_straddler_setup().accounts);
-    all.extend(merge_straddler_setup().accounts);
-    all.extend(halt_straddler_setup().accounts);
-    all.extend(cross_shard_fault_genesis_accounts());
-    all.extend(staking_genesis_accounts());
-    all.extend(livelock_genesis_accounts());
-    all.extend(cross_fraction_genesis_accounts(CROSS_FRACTION_SENDERS));
-    all.extend(reshape_lifecycle_accounts());
-    all.sort_unstable_by_key(|(address, _)| *address);
-    all.dedup_by_key(|(address, _)| *address);
-    all
-}
-
 /// Every stake pool any scenario in this crate seats.
 ///
-/// The companion to [`world_accounts`], for the same reason: a pool is
-/// an instance the statics must resolve, so a shared-process binary whose
-/// first cluster seats none would leave every later delegation failing
-/// admission with `no instance`. Seating a pool writes no genesis state
-/// and a pool nobody delegates to emits nothing, so recognising one
-/// everywhere costs a registry entry.
+/// The VM statics are process-global and first-installed-wins, so a test
+/// binary sharing one process must install a world covering every
+/// scenario it will run — a pool is an instance the statics must
+/// resolve, so a binary whose first cluster seats none would leave every
+/// later delegation failing admission with `no instance`, which reads as
+/// a defect in whatever that scenario was testing. Accounts need no such
+/// list: a principal address is resolved by its class, so every scenario
+/// address is callable against any cluster's world. Seating a pool
+/// writes no genesis state and a pool nobody delegates to emits nothing,
+/// so recognising one everywhere costs a registry entry.
 #[must_use]
 pub fn world_pools() -> Vec<StakePoolSeat> {
     staking_pools()

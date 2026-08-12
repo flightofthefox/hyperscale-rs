@@ -68,15 +68,6 @@ fn delegator() -> PrincipalAddr {
     account_of(DELEGATOR)
 }
 
-/// Every address any test in this binary transacts with, pools included.
-fn world_accounts() -> Vec<(PrincipalAddr, u128)> {
-    vec![
-        (delegator(), 10_000),
-        (account_of(OPERATOR), 10_000),
-        (account_of(OUTSIDER), 10_000),
-    ]
-}
-
 /// A pool seat and the principal its operator surface admits.
 fn seat(id: u32) -> StakePoolSeat {
     StakePoolSeat {
@@ -195,11 +186,7 @@ fn witnesses(executed: &ExecutedTx) -> Vec<BeaconWitnessEvent> {
 /// the instance that emitted it and the amount carried across as attos.
 #[test]
 fn a_delegation_to_a_seated_pool_reaches_the_witness_channel() {
-    let executor = Executor::with_pools(
-        &world_accounts(),
-        &[seat(POOL_ID), seat(99)],
-        ExecutionMode::Serial,
-    );
+    let executor = Executor::with_pools(&[seat(POOL_ID), seat(99)], ExecutionMode::Serial);
     let executed = execute(&executor, signed_stake(pool_at(POOL_ID), 500));
     assert_eq!(
         witnesses(&executed[0]),
@@ -215,7 +202,7 @@ fn a_delegation_to_a_seated_pool_reaches_the_witness_channel() {
 /// decision the network makes, not one a transaction can make for it.
 #[test]
 fn an_unseated_instance_of_the_same_package_reaches_nobody() {
-    let executor = Executor::with_pools(&world_accounts(), &[seat(POOL_ID)], ExecutionMode::Serial);
+    let executor = Executor::with_pools(&[seat(POOL_ID)], ExecutionMode::Serial);
     // `pool_at(99)` is not in the pool set, so it was never registered as an
     // instance either and the delegation cannot even be routed to it —
     // which is the outer of the two guards. The inner one is covered by
@@ -232,7 +219,7 @@ fn an_unseated_instance_of_the_same_package_reaches_nobody() {
 /// channel carries what a stake pool says and nothing else.
 #[test]
 fn an_ordinary_transfer_is_not_a_beacon_fact() {
-    let executor = Executor::with_pools(&world_accounts(), &[seat(POOL_ID)], ExecutionMode::Serial);
+    let executor = Executor::with_pools(&[seat(POOL_ID)], ExecutionMode::Serial);
     let key = Ed25519PrivateKey::from_bytes(&[DELEGATOR; 32]).unwrap();
     let from = account_address(&key.public_key().0);
     let graph = ManifestGraph {
@@ -322,7 +309,7 @@ fn signed_registration(pool: impl Into<CallTarget>, seed: u8) -> Transaction {
 /// principal's signature reaches it.
 #[test]
 fn only_the_configured_operator_may_register_a_validator() {
-    let _ = Executor::with_pools(&world_accounts(), &[seat(POOL_ID)], ExecutionMode::Serial);
+    let _ = Executor::with_pools(&[seat(POOL_ID)], ExecutionMode::Serial);
 
     let outsider = signed_registration(pool_at(POOL_ID), OUTSIDER);
     assert!(outsider.body().signature_is_valid());
@@ -350,6 +337,6 @@ fn only_the_configured_operator_may_register_a_validator() {
 /// in the funds it carries, so anyone may delegate to any seated pool.
 #[test]
 fn a_delegation_needs_no_operator() {
-    let _ = Executor::with_pools(&world_accounts(), &[seat(POOL_ID)], ExecutionMode::Serial);
+    let _ = Executor::with_pools(&[seat(POOL_ID)], ExecutionMode::Serial);
     assert!(signed_stake(pool_at(POOL_ID), 500).try_derived().is_ok());
 }
