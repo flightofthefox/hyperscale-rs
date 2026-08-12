@@ -10,19 +10,17 @@
 
 use std::sync::OnceLock;
 
-use blake3::Hasher as Blake3;
-use hyperscale_hbor::HborSigned;
 pub use hyperscale_vm_types::{
-    MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SchemeId, SchemeVerifier, SubintentSig, TransactionBody,
-    TransactionEnvelope,
+    AccountSigner, MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SchemeId, SchemeVerifier, SubintentSig,
+    TransactionBody, TransactionEnvelope,
 };
 use thiserror::Error;
 
 use crate::crypto::{
-    AccountSigner, Ed25519PublicKey, Ed25519Signature, Secp256k1PublicKey, Secp256k1Signature,
-    verify_ed25519, verify_secp256k1,
+    Ed25519PublicKey, Ed25519Signature, Secp256k1PublicKey, Secp256k1Signature, verify_ed25519,
+    verify_secp256k1,
 };
-use crate::{Address, DeclaredKey, Hash, TimestampRange, WeightedTimestamp};
+use crate::{Address, DeclaredKey, Hash, ProtocolHasher, TimestampRange, WeightedTimestamp};
 
 /// The curves behind the VM's scheme registry.
 ///
@@ -77,20 +75,6 @@ impl SchemeVerifier for ProtocolVerifier {
     }
 }
 
-/// One bound subintent's signature over its declaration hash.
-///
-/// The scheme is stamped beside the material it describes, so a signer's
-/// key and their claim about which curve produced it are written in one
-/// place and cannot drift apart.
-#[must_use]
-pub fn sign_subintent<S: AccountSigner>(key: &S, declaration_hash: &[u8; 32]) -> SubintentSig {
-    SubintentSig {
-        scheme: key.scheme(),
-        public_key: key.public_key_bytes(),
-        signature: key.sign_digest(declaration_hash),
-    }
-}
-
 /// The workspace's crypto and clock binding for the envelope.
 ///
 /// The envelope defines its signed content — the preimage — and this
@@ -118,22 +102,19 @@ pub trait EnvelopeExt: Sized {
 
 impl EnvelopeExt for TransactionEnvelope {
     fn signing_hash(&self) -> Hash {
-        let preimage = self
-            .signing_bytes()
-            .expect("an envelope within its caps encodes");
-        let mut hasher = Blake3::new();
-        hasher.update(&preimage);
-        Hash::from_hash_bytes(hasher.finalize().as_bytes())
+        Hash::from_hash_bytes(&self.signing_digest(&ProtocolHasher))
     }
 
     fn sign<S: AccountSigner>(mut self, key: &S) -> Self {
         // The scheme is signed content, so it is stamped before the
-        // preimage is taken; the key and signature are not, and are
-        // filled after.
+        // digest is taken; the key and signature are not, and are filled
+        // after. `manifest-builder`'s own signing tier does the same over
+        // its own hasher — this is the protocol hash's spelling of it,
+        // for the fixtures and call sites that already hold a key.
         self.signer_scheme = key.scheme();
-        let hash = self.signing_hash();
+        let digest = self.signing_digest(&ProtocolHasher);
         self.signer = key.public_key_bytes();
-        self.signature = key.sign_digest(hash.as_bytes());
+        self.signature = key.sign_digest(&digest);
         self
     }
 

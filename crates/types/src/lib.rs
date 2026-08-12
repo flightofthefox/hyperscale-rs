@@ -18,6 +18,7 @@
 //! inclusion proofs the provisioning types verify.
 
 mod crypto;
+mod hashing;
 pub mod network;
 mod primitives;
 mod provisioning;
@@ -74,7 +75,7 @@ pub use beacon::{
     verify_vote1, verify_vote2, verify_vote3,
 };
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
-pub use crypto::{AccountSigner, Ed25519PrivateKey, Secp256k1PrivateKey};
+pub use crypto::{Ed25519PrivateKey, Secp256k1PrivateKey};
 pub use execution::computation::{tick_leader, tick_leader_at};
 pub use execution::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
@@ -90,6 +91,7 @@ pub use execution::receipt_tree::{
 };
 pub use execution::tick_id::TickId;
 pub use execution::vote::{ExecutionVote, ExecutionVoteContext, ExecutionVoteVerifyError};
+pub use hashing::ProtocolHasher;
 pub use hyperscale_crypto::{
     AggregateError, AggregateSignature, CONSENSUS_PUBLIC_KEY_BYTES, CONSENSUS_SIGNATURE_BYTES,
     ConsensusPublicKey, ConsensusSignature, SignError, Signer, VRF_PROOF_BYTES, Verifier,
@@ -97,11 +99,11 @@ pub use hyperscale_crypto::{
 };
 pub use hyperscale_hbor::HborSigned;
 pub use hyperscale_vm_types::{
-    AMOUNT_CELL_BYTES, Address, AddressClass, CallTarget, ComponentAddr, InvalidAddress,
-    LEAF_KEY_BYTES, LocalKey, MAX_CELL_VALUE_LEN, Mode, ModeKind, Movement, NativeAddr,
-    NotAResource, NotCallable, PackageAddr, PrincipalAddr, ResourceAddr, ResourceRef, SchemeId,
-    SettledWrites, StateWrites, SubstateKey, TX_UNITS, amount_cell, compatible, declared_work,
-    encode_amount, read_amount,
+    AMOUNT_CELL_BYTES, AccountSigner, Address, AddressClass, CallTarget, ComponentAddr,
+    InvalidAddress, LEAF_KEY_BYTES, LocalKey, MAX_CELL_VALUE_LEN, Mode, ModeKind, Movement,
+    NativeAddr, NotAResource, NotCallable, PackageAddr, PrincipalAddr, ResourceAddr, ResourceRef,
+    SchemeId, SettledWrites, StateWrites, SubstateKey, TX_UNITS, amount_cell, compatible,
+    declared_work, encode_amount, read_amount,
 };
 pub use network::{
     GossipMessage, MessageClass, NetworkMessage, Request, Signed, SignedContext, SignedVerifyError,
@@ -230,7 +232,7 @@ pub use transaction::status::{
 pub use transaction::vm::{
     Derived, EnvelopeExt, MAX_MESSAGE_LEN, MAX_SUBINTENTS, ProtocolVerifier, Routing,
     SchemeVerifier, SubintentSig, TransactionBody, TransactionEnvelope, VmStatics, VmStaticsError,
-    install_vm_statics, sign_subintent, vm_statics_installed,
+    install_vm_statics, vm_statics_installed,
 };
 pub use transaction::wire::{Transaction, TransactionVerifyError};
 pub use verifiable::{Verifiable, Verified, Verify};

@@ -14,33 +14,13 @@ pub mod vm_metadata;
 pub mod vm_statics;
 
 pub use artifact::{METADATA_SECTION, admit_package, attach_metadata, extract_metadata};
-use blake3::Hasher as Blake3;
-use hyperscale_vm_effects::{Hash32, Hasher};
+pub use hyperscale_types::ProtocolHasher;
 pub use staking::{PoolRegistry, witness_from_event};
 pub use vm_metadata::{MAX_PACKAGE_METADATA_BYTES, decode_metadata, encode_metadata};
 pub use vm_statics::{
     BridgeStatics, XRD, account_address, decode_tree, encode_tree, entropy_key, envelope_identity,
     validator_key, vault_key,
 };
-
-/// The protocol hash behind the `vm_effects` hashing seam: blake3 over the
-/// length-framed domain and parts. Pure, and framed so that moving bytes
-/// across a part boundary always changes the digest.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ProtocolHasher;
-
-impl Hasher for ProtocolHasher {
-    fn hash(&self, domain: &[u8], parts: &[&[u8]]) -> Hash32 {
-        let mut hasher = Blake3::new();
-        hasher.update(&(domain.len() as u64).to_le_bytes());
-        hasher.update(domain);
-        for part in parts {
-            hasher.update(&(part.len() as u64).to_le_bytes());
-            hasher.update(part);
-        }
-        Hash32(*hasher.finalize().as_bytes())
-    }
-}
 
 #[cfg(test)]
 mod tests {

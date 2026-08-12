@@ -457,7 +457,6 @@ impl VmStatics for BridgeStatics {
 mod tests {
     use hyperscale_types::{
         CallTarget, Ed25519PrivateKey, NetworkId, Secp256k1PrivateKey, TX_UNITS, TransactionBody,
-        sign_subintent,
     };
     use hyperscale_vm_effects::stdlib::{VAULT, account_metadata};
     use hyperscale_vm_effects::{
@@ -465,6 +464,7 @@ mod tests {
         PackageHash, ResourceAddr, Subintent, SubintentHash, YieldBinding, YieldParam, child_key,
         nullifier_key,
     };
+    use hyperscale_vm_manifest_builder::signing::sign_subintent;
 
     use super::*;
 

@@ -18,10 +18,11 @@ use hyperscale_types::{
     ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey, EnvelopeExt, Epoch,
     MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, NetworkId, NetworkParams, PrincipalAddr, SchemeId,
     ShardId, ShardTrie, StakePoolId, StakePoolSeat, TimestampRange, Transaction, TransactionBody,
-    TransactionEnvelope, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed, sign_subintent,
+    TransactionEnvelope, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{Address, Constraint, IntentDecl, ManifestGraph, package_hash};
 use hyperscale_vm_manifest_builder::native::{account, staking};
+use hyperscale_vm_manifest_builder::signing::sign_subintent;
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, IntentBuilder, TypedBuilder, TypedError};
 use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_metadata};
 

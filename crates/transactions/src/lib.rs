@@ -18,28 +18,32 @@
 
 use std::sync::{Arc, LazyLock};
 
+use hyperscale_effects_bridge::XRD;
 use hyperscale_effects_bridge::genesis::{World, genesis_world};
-use hyperscale_effects_bridge::vm_statics::{account_address, encode_tree};
-use hyperscale_effects_bridge::{ProtocolHasher, XRD};
+use hyperscale_effects_bridge::vm_statics::account_address;
 use hyperscale_types::{
-    Ed25519PrivateKey, EnvelopeExt, NetworkId, SchemeId, SubintentSig, TimestampRange, Transaction,
-    TransactionBody, TransactionEnvelope,
+    Ed25519PrivateKey, NetworkId, ProtocolHasher, SubintentSig, TimestampRange, Transaction,
+    TransactionEnvelope,
 };
 use hyperscale_vm_effects::{
     EnvelopeTree, IntentDecl, ManifestGraph, MetadataCache, PrincipalAddr,
 };
 use hyperscale_vm_manifest_builder::native::account;
-use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError};
+use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
 
 /// The execution gas limit every built envelope signs. Placeholder
 /// pricing — well above what a transfer draws, so the ceiling is never
 /// what a load generator hits first.
 pub const DEFAULT_GAS_LIMIT: u64 = 1_000_000;
 
-/// What a signer commits to beyond the manifest.
+/// What a signer commits to beyond the manifest, in this workspace's
+/// vocabulary.
 ///
-/// Three terms that always travel together: they are the envelope's, not
-/// the graph's, and a caller choosing one chooses all three.
+/// The VM's own terms carry a validity window as plain milliseconds and a
+/// gas ceiling the caller chooses; this names the window with the clock
+/// type the rest of the workspace speaks and supplies the ceiling from
+/// [`DEFAULT_GAS_LIMIT`], which is what makes it deployment binding rather
+/// than a second spelling of the same struct.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Terms {
     /// The most the signer will pay to have this transaction carried.
@@ -174,21 +178,20 @@ impl Client {
         payer: &Ed25519PrivateKey,
         terms: Terms,
     ) -> TransactionEnvelope {
-        TransactionEnvelope {
-            body: TransactionBody::Call(encode_tree(tree)),
-            subintent_sigs: sigs,
-            fee_payer: account_address(&payer.public_key().0),
-            max_fee: terms.max_fee,
-            gas_limit: DEFAULT_GAS_LIMIT,
-            validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
-            validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
-            message: terms.message,
-            network: self.network,
-            signer_scheme: SchemeId::NONE,
-            signer: Vec::new(),
-            signature: Vec::new(),
-        }
-        .sign(payer)
+        let envelope = signing::wrap(
+            tree,
+            sigs,
+            account_address(&payer.public_key().0),
+            self.network,
+            signing::Terms {
+                max_fee: terms.max_fee,
+                gas_limit: DEFAULT_GAS_LIMIT,
+                validity_start_ms: terms.validity.start_timestamp_inclusive.as_millis(),
+                validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
+                message: terms.message,
+            },
+        );
+        signing::sign(envelope, payer, &ProtocolHasher)
     }
 
     /// A signed native-resource transfer from `from` to `to`.
