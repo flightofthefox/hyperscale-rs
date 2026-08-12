@@ -22,8 +22,8 @@ use hyperscale_effects_bridge::genesis::{World, genesis_world};
 use hyperscale_effects_bridge::vm_statics::{account_address, encode_tree};
 use hyperscale_effects_bridge::{ProtocolHasher, XRD};
 use hyperscale_types::{
-    Ed25519PrivateKey, EnvelopeExt, NetworkId, TimestampRange, Transaction, TransactionBody,
-    TransactionEnvelope,
+    Ed25519PrivateKey, EnvelopeExt, NetworkId, SubintentSig, TimestampRange, Transaction,
+    TransactionBody, TransactionEnvelope,
 };
 use hyperscale_vm_effects::{
     EnvelopeTree, IntentDecl, ManifestGraph, MetadataCache, PrincipalAddr,
@@ -155,6 +155,7 @@ impl Client {
                 root_bindings: Vec::new(),
                 subintents: Vec::new(),
             },
+            Vec::new(),
             payer,
             terms,
         )
@@ -162,19 +163,20 @@ impl Client {
 
     /// Wrap a composed tree in an envelope signed by `payer`.
     ///
-    /// The subintent signatures the tree's own signers produced ride
-    /// separately; what `payer` signs is the whole envelope, those
+    /// `sigs` are what the tree's own signers produced over their
+    /// declarations; what `payer` signs is the whole envelope, those
     /// signatures included.
     #[must_use]
     pub fn sign_tree(
         &self,
         tree: &EnvelopeTree,
+        sigs: Vec<SubintentSig>,
         payer: &Ed25519PrivateKey,
         terms: Terms,
     ) -> TransactionEnvelope {
         TransactionEnvelope {
             body: TransactionBody::Call(encode_tree(tree)),
-            subintent_sigs: Vec::new(),
+            subintent_sigs: sigs,
             fee_payer: account_address(&payer.public_key().0),
             max_fee: terms.max_fee,
             gas_limit: DEFAULT_GAS_LIMIT,

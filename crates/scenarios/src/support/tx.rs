@@ -10,21 +10,20 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
-use hyperscale_effects_bridge::{ProtocolHasher, attach_metadata, encode_tree};
+use hyperscale_effects_bridge::{ProtocolHasher, attach_metadata};
 use hyperscale_engine::genesis::{pool_address, stake_unit, staking_artifact};
 use hyperscale_engine::{XRD, account_address};
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    CallTarget, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
-    EnvelopeExt, Epoch, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, NetworkId, NetworkParams,
-    PrincipalAddr, ShardId, ShardTrie, StakePoolId, StakePoolSeat, SubintentSig, TimestampRange,
-    Transaction, TransactionBody, TransactionEnvelope, ValidatorId, WeightedTimestamp,
+    ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey, EnvelopeExt, Epoch,
+    MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, NetworkId, NetworkParams, PrincipalAddr, ShardId,
+    ShardTrie, StakePoolId, StakePoolSeat, SubintentSig, TimestampRange, Transaction,
+    TransactionBody, TransactionEnvelope, ValidatorId, WeightedTimestamp,
     ed25519_keypair_from_seed,
 };
-use hyperscale_vm_effects::{
-    Address, Constraint, EdgeRef, EnvelopeTree, GraphArg, GraphNode, IntentDecl, ManifestGraph,
-    Subintent, Value, YieldBinding, YieldParam, package_hash,
-};
+use hyperscale_vm_effects::{Address, Constraint, IntentDecl, ManifestGraph, package_hash};
+use hyperscale_vm_manifest_builder::native::{account, staking};
+use hyperscale_vm_manifest_builder::{EnvelopeBuilder, IntentBuilder, TypedBuilder, TypedError};
 use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_metadata};
 
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
@@ -530,36 +529,20 @@ pub fn withdrawal_burst_genesis_accounts(count: u8) -> Vec<(PrincipalAddr, u128)
 #[must_use]
 pub fn build_fan_out_tx(
     payer: &Ed25519PrivateKey,
-    from: impl Into<CallTarget>,
+    from: PrincipalAddr,
     recipients: &[PrincipalAddr],
     amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
-    let from = from.into();
-    let mut nodes = Vec::with_capacity(recipients.len() * 2);
-    for (index, to) in recipients.iter().enumerate() {
-        let producer = u32::try_from(nodes.len()).expect("fan-out node count fits");
-        nodes.push(GraphNode {
-            target: from,
-            method: "withdraw".into(),
-            args: vec![
-                GraphArg::Literal(Value::Address(XRD.address())),
-                GraphArg::Literal(Value::U128(amount + index as u128)),
-            ],
-        });
-        nodes.push(GraphNode {
-            target: (*to).into(),
-            method: "deposit".into(),
-            args: vec![GraphArg::Edge {
-                edge: EdgeRef {
-                    producer,
-                    output: 0,
-                },
-                constraints: vec![Constraint::ResourceIs((*XRD).into())],
-            }],
-        });
-    }
-    Transaction::new(envelope(ManifestGraph { nodes }, payer, validity))
+    let graph = graph(|b| {
+        for (index, to) in recipients.iter().enumerate() {
+            let leg = amount + index as u128;
+            let funds = account::withdraw(b, from, *XRD, leg)?;
+            account::deposit(b, *to, funds)?;
+        }
+        Ok(())
+    });
+    Transaction::new(envelope(graph, payer, validity))
 }
 
 /// The accounts the participant sweep fans out across: one payer on the
@@ -975,6 +958,11 @@ pub fn insolvent_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// right-hand account signs its own. That is the composition it takes to
 /// touch a second party at all, and it costs the scenario nothing —
 /// admission still folds one manifest and one draw still covers both.
+///
+/// # Panics
+///
+/// If the scenario world does not answer a stamp, which would be a defect
+/// in the world rather than in the stamp.
 #[must_use]
 pub fn build_stamp_tx(
     payer: &Ed25519PrivateKey,
@@ -982,45 +970,36 @@ pub fn build_stamp_tx(
     right_key: &Ed25519PrivateKey,
     validity: TimestampRange,
 ) -> Transaction {
-    let stamp = |owner: PrincipalAddr| IntentDecl {
-        graph: ManifestGraph {
-            nodes: vec![GraphNode {
-                target: owner.into(),
-                method: "stamp-entropy".into(),
-                args: vec![],
-            }],
-        },
-        params: Vec::new(),
-    };
-    let right = stamp(account_address(&right_key.public_key().0));
-    let tree = EnvelopeTree {
-        root: stamp(left),
-        root_bindings: Vec::new(),
-        subintents: vec![Subintent {
-            decl: right.clone(),
-            signer: account_address(&right_key.public_key().0),
-            bindings: Vec::new(),
-        }],
-    };
+    let owner = account_address(&right_key.public_key().0);
+    let right = declaration(|b| account::stamp_entropy(b, owner));
+    // The right-hand account signs its own declaration, which is all it
+    // ever sees: no part of the envelope enters that hash.
     let signed = right_key.sign(right.hash(&ProtocolHasher).0.0);
-    let vm = TransactionEnvelope {
-        body: TransactionBody::Call(encode_tree(&tree)),
-        subintent_sigs: vec![SubintentSig {
+
+    let client = client();
+    let cache = client.cache();
+    let (mut env, mut root) =
+        EnvelopeBuilder::new(&cache, &client.world().instances, &ProtocolHasher);
+    account::stamp_entropy(&mut root, left).expect("an account answers a stamp");
+    env.present(owner, right)
+        .expect("the declaration discharges itself");
+    env.seal(root)
+        .expect("the root declares nothing to discharge");
+    let tree = env.build().expect("neither intent declares a hole");
+
+    Transaction::new(client.sign_tree(
+        &tree,
+        vec![SubintentSig {
             public_key: right_key.public_key().0,
             signature: signed.0,
         }],
-        fee_payer: account_address(&payer.public_key().0),
-        max_fee: MAX_FEE,
-        gas_limit: 1_000_000,
-        validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
-        validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
-        message: Vec::new(),
-        network: SCENARIO_NETWORK,
-        signer: [0; 32],
-        signature: [0; 64],
-    }
-    .sign(payer);
-    Transaction::new(vm)
+        payer,
+        Terms {
+            max_fee: MAX_FEE,
+            validity,
+            message: Vec::new(),
+        },
+    ))
 }
 
 /// Build a transfer at the scenario fee terms: the account guest's
@@ -1235,17 +1214,12 @@ pub fn staking_pools() -> Vec<StakePoolSeat> {
 #[must_use]
 pub fn build_deactivate_tx(
     operator: &Ed25519PrivateKey,
-    pool: impl Into<CallTarget>,
+    pool: ComponentAddr,
     validator: ValidatorId,
     validity: TimestampRange,
 ) -> Transaction {
-    build_operator_tx(
-        operator,
-        pool,
-        "deactivate-validator",
-        vec![GraphArg::Literal(Value::U64(validator.inner()))],
-        validity,
-    )
+    let graph = graph(|b| staking::deactivate_validator(b, pool, validator.inner()));
+    Transaction::new(envelope(graph, operator, validity))
 }
 
 /// Register `validator` against `pool`, carrying the consensus key it
@@ -1257,43 +1231,21 @@ pub fn build_deactivate_tx(
 #[must_use]
 pub fn build_register_tx(
     operator: &Ed25519PrivateKey,
-    pool: impl Into<CallTarget>,
+    pool: ComponentAddr,
     validator: ValidatorId,
     pubkey: &ConsensusPublicKey,
     possession_proof: &ConsensusSignature,
     validity: TimestampRange,
 ) -> Transaction {
-    build_operator_tx(
-        operator,
-        pool,
-        "register-validator",
-        vec![
-            GraphArg::Literal(Value::U64(validator.inner())),
-            GraphArg::Literal(Value::Bytes(pubkey.as_bytes().to_vec())),
-            GraphArg::Literal(Value::Bytes(possession_proof.as_bytes().to_vec())),
-        ],
-        validity,
-    )
-}
-
-/// One operator action on `pool`: a single node, no funds, and the
-/// operator's own signature as its authority.
-#[must_use]
-pub fn build_operator_tx(
-    operator: &Ed25519PrivateKey,
-    pool: impl Into<CallTarget>,
-    method: &str,
-    args: Vec<GraphArg>,
-    validity: TimestampRange,
-) -> Transaction {
-    let pool = pool.into();
-    let graph = ManifestGraph {
-        nodes: vec![GraphNode {
-            target: pool,
-            method: method.into(),
-            args,
-        }],
-    };
+    let graph = graph(|b| {
+        staking::register_validator(
+            b,
+            pool,
+            validator.inner(),
+            pubkey.as_bytes().to_vec(),
+            possession_proof.as_bytes().to_vec(),
+        )
+    });
     Transaction::new(envelope(graph, operator, validity))
 }
 
@@ -1306,36 +1258,15 @@ pub fn build_operator_tx(
 #[must_use]
 pub fn build_unstake_tx(
     delegator: &Ed25519PrivateKey,
-    from: impl Into<CallTarget>,
-    pool: impl Into<CallTarget>,
+    from: PrincipalAddr,
+    pool: ComponentAddr,
     amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
-    let pool = pool.into();
-    let from = from.into();
-    let graph = ManifestGraph {
-        nodes: vec![
-            GraphNode {
-                target: from,
-                method: "withdraw".into(),
-                args: vec![
-                    GraphArg::Literal(Value::Address(stake_unit(pool).address())),
-                    GraphArg::Literal(Value::U128(amount)),
-                ],
-            },
-            GraphNode {
-                target: pool,
-                method: "unstake".into(),
-                args: vec![GraphArg::Edge {
-                    edge: EdgeRef {
-                        producer: 0,
-                        output: 0,
-                    },
-                    constraints: vec![Constraint::ResourceIs(stake_unit(pool).into())],
-                }],
-            },
-        ],
-    };
+    let graph = graph(|b| {
+        let units = account::withdraw(b, from, stake_unit(pool), amount)?;
+        staking::unstake(b, pool, units)
+    });
     Transaction::new(envelope(graph, delegator, validity))
 }
 
@@ -1357,47 +1288,16 @@ pub fn pool_operator() -> (Ed25519PrivateKey, PrincipalAddr) {
 #[must_use]
 pub fn build_stake_tx(
     delegator: &Ed25519PrivateKey,
-    from: impl Into<CallTarget>,
-    pool: impl Into<CallTarget>,
+    from: PrincipalAddr,
+    pool: ComponentAddr,
     amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
-    let pool = pool.into();
-    let from = from.into();
-    let graph = ManifestGraph {
-        nodes: vec![
-            GraphNode {
-                target: from,
-                method: "withdraw".into(),
-                args: vec![
-                    GraphArg::Literal(Value::Address(XRD.address())),
-                    GraphArg::Literal(Value::U128(amount)),
-                ],
-            },
-            GraphNode {
-                target: pool,
-                method: "stake".into(),
-                args: vec![GraphArg::Edge {
-                    edge: EdgeRef {
-                        producer: 0,
-                        output: 0,
-                    },
-                    constraints: vec![Constraint::ResourceIs((*XRD).into())],
-                }],
-            },
-            GraphNode {
-                target: from,
-                method: "deposit".into(),
-                args: vec![GraphArg::Edge {
-                    edge: EdgeRef {
-                        producer: 1,
-                        output: 0,
-                    },
-                    constraints: vec![Constraint::ResourceIs(stake_unit(pool).into())],
-                }],
-            },
-        ],
-    };
+    let graph = graph(|b| {
+        let funds = account::withdraw(b, from, *XRD, amount)?;
+        let units = staking::stake(b, pool, funds)?;
+        account::deposit(b, from, units)
+    });
     Transaction::new(envelope(graph, delegator, validity))
 }
 
@@ -1409,20 +1309,11 @@ pub fn build_stake_tx(
 /// lets the signer sign it before any composer exists and lets two
 /// composers bind the identical declaration afterwards.
 #[must_use]
-pub fn payment_request(signer: impl Into<CallTarget>, amount: u128) -> IntentDecl {
-    IntentDecl {
-        graph: ManifestGraph {
-            nodes: vec![GraphNode {
-                target: signer.into(),
-                method: "deposit".into(),
-                args: vec![GraphArg::Param(0)],
-            }],
-        },
-        params: vec![YieldParam {
-            resource: (*XRD).into(),
-            constraints: vec![Constraint::MinAmount(amount)],
-        }],
-    }
+pub fn payment_request(signer: PrincipalAddr, amount: u128) -> IntentDecl {
+    declaration(|b| {
+        let incoming = b.declare(*XRD, [Constraint::MinAmount(amount)]);
+        account::deposit(b, signer, incoming)
+    })
 }
 
 /// Compose `request` — signed by `signer_key`, whose account is the
@@ -1440,62 +1331,46 @@ pub fn payment_request(signer: impl Into<CallTarget>, amount: u128) -> IntentDec
 #[must_use]
 pub fn build_composed_tx(
     composer: &Ed25519PrivateKey,
-    from: impl Into<CallTarget>,
+    from: PrincipalAddr,
     signer_key: &Ed25519PrivateKey,
     request: &IntentDecl,
     amount: u128,
     validity: TimestampRange,
 ) -> Transaction {
-    let from = from.into();
-    let tree = EnvelopeTree {
-        root: IntentDecl {
-            graph: ManifestGraph {
-                nodes: vec![GraphNode {
-                    target: from,
-                    method: "withdraw".into(),
-                    args: vec![
-                        GraphArg::Literal(Value::Address(XRD.address())),
-                        GraphArg::Literal(Value::U128(amount)),
-                    ],
-                }],
-            },
-            params: Vec::new(),
-        },
-        root_bindings: Vec::new(),
-        subintents: vec![Subintent {
-            decl: request.clone(),
-            signer: account_address(&signer_key.public_key().0),
-            bindings: vec![YieldBinding {
-                intent: 0,
-                edge: EdgeRef {
-                    producer: 0,
-                    output: 0,
-                },
-            }],
-        }],
-    };
     // The signer signs its own declaration's hash, which no part of the
     // envelope enters — the composer binds it afterwards and signs the
     // whole, subintent signatures included.
     let signed = signer_key.sign(request.hash(&ProtocolHasher).0.0);
-    let vm = TransactionEnvelope {
-        body: TransactionBody::Call(encode_tree(&tree)),
-        subintent_sigs: vec![SubintentSig {
+
+    let client = client();
+    let cache = client.cache();
+    let (mut env, mut root) =
+        EnvelopeBuilder::new(&cache, &client.world().instances, &ProtocolHasher);
+    let funds =
+        account::withdraw(&mut root, from, *XRD, amount).expect("an account answers a withdrawal");
+    let paid = root.export(funds);
+    let [wants] = env
+        .present(account_address(&signer_key.public_key().0), request.clone())
+        .expect("the request discharges its own hole")
+        .try_into()
+        .expect("the request declares one parameter");
+    env.seal(root).expect("the composer declares no hole");
+    env.bind(wants, paid);
+    let tree = env.build().expect("the request's hole is bound");
+
+    Transaction::new(client.sign_tree(
+        &tree,
+        vec![SubintentSig {
             public_key: signer_key.public_key().0,
             signature: signed.0,
         }],
-        fee_payer: account_address(&composer.public_key().0),
-        max_fee: 1_000,
-        gas_limit: 1_000_000,
-        validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
-        validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
-        message: Vec::new(),
-        network: SCENARIO_NETWORK,
-        signer: [0; 32],
-        signature: [0; 64],
-    }
-    .sign(composer);
-    Transaction::new(vm)
+        composer,
+        Terms {
+            max_fee: 1_000,
+            validity,
+            message: Vec::new(),
+        },
+    ))
 }
 
 /// The fee ceiling every built call envelope signs.
@@ -1520,6 +1395,37 @@ fn client() -> &'static Client {
     static CLIENT: LazyLock<Client> =
         LazyLock::new(|| Client::new(genesis_world_with_pools(&world_pools()), SCENARIO_NETWORK));
     &CLIENT
+}
+
+/// Build a graph against the scenario world, so every call is typed by
+/// the signature it names and every edge carries the resource that
+/// signature declares.
+///
+/// # Panics
+///
+/// If a call does not type or an output dangles, which is a defect in the
+/// builder rather than a runtime condition.
+fn graph(write: impl FnOnce(&mut TypedBuilder<'_>) -> Result<(), TypedError>) -> ManifestGraph {
+    let client = client();
+    let cache = client.cache();
+    let mut b = client.builder(&cache);
+    write(&mut b).expect("every scenario call types against its signature");
+    b.build().expect("every output is consumed")
+}
+
+/// Build a declaration against the scenario world, for its own signer to
+/// sign and a composer to present later.
+///
+/// # Panics
+///
+/// As [`graph`].
+fn declaration(write: impl FnOnce(&mut IntentBuilder<'_>) -> Result<(), TypedError>) -> IntentDecl {
+    let client = client();
+    let cache = client.cache();
+    let mut decl = IntentBuilder::declaration(&cache, &client.world().instances, &ProtocolHasher);
+    write(&mut decl).expect("every scenario call types against its signature");
+    decl.into_decl()
+        .expect("the declaration discharges its own holes")
 }
 
 /// Wrap a single-intent graph in a signed envelope at the scenario fee
@@ -1558,17 +1464,16 @@ pub fn build_reshape_threshold_vote_tx(
     activate_at: Epoch,
     validity: TimestampRange,
 ) -> Transaction {
-    build_operator_tx(
-        operator,
-        pool_at(GENESIS_POOL_ID),
-        "cast-param-vote",
-        vec![
-            GraphArg::Literal(Value::U64(split_bytes)),
-            GraphArg::Literal(Value::U64(NetworkParams::default().impound_epochs)),
-            GraphArg::Literal(Value::U64(activate_at.inner())),
-        ],
-        validity,
-    )
+    let graph = graph(|b| {
+        staking::cast_param_vote(
+            b,
+            pool_at(GENESIS_POOL_ID),
+            split_bytes,
+            NetworkParams::default().impound_epochs,
+            activate_at.inner(),
+        )
+    });
+    Transaction::new(envelope(graph, operator, validity))
 }
 
 #[cfg(test)]
