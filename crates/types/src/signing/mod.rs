@@ -100,7 +100,7 @@ mod tests {
         };
         assert_ne!(
             signed_bytes(&message, &NetworkDefinition::mainnet()),
-            signed_bytes(&message, &NetworkDefinition::stokenet())
+            signed_bytes(&message, &NetworkDefinition::testnet())
         );
     }
 

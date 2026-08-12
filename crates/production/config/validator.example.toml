@@ -10,7 +10,7 @@
 # ═══════════════════════════════════════════════════════════════════════════════
 
 [node]
-# Radix network this node is configured for (mainnet, stokenet, simulator, ...).
+# Network this node is configured for (mainnet, testnet, simulator).
 # Bound into every BLS-signed consensus message to prevent cross-network replay.
 network = "simulator"
 
@@ -62,8 +62,8 @@ gossipsub_heartbeat_ms = 100
 consensus_threads = 0
 
 # Throughput pool: general crypto verification (provisions, execution
-# votes, cert aggregation), transaction signature validation, and Radix
-# Engine execution share this pool with work-stealing. (0 = auto.)
+# votes, cert aggregation), transaction signature validation, and
+# transaction execution share this pool with work-stealing. (0 = auto.)
 throughput_threads = 0
 
 # Tokio runtime worker threads for async I/O (network, timers, RPC) (0 = auto-detect)

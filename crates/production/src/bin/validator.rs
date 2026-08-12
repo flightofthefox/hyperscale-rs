@@ -200,7 +200,7 @@ pub struct ValidatorConfig {
 pub struct NodeConfig {
     /// Network this node is configured for. Bound into every
     /// signed consensus message to prevent cross-network replay.
-    /// Parsed from a network name (`"mainnet"`, `"stokenet"`,
+    /// Parsed from a network name (`"mainnet"`, `"testnet"`,
     /// `"simulator"`, etc.) via [`NetworkDefinition::from_str`].
     #[serde(default = "default_network", with = "network_serde")]
     pub network: NetworkDefinition,
@@ -217,9 +217,10 @@ fn default_network() -> NetworkDefinition {
 
 /// `serde` adapter that parses `NetworkDefinition` from its logical name.
 ///
-/// `NetworkDefinition` doesn't impl `Deserialize` directly because its
-/// `logical_name` / `hrp_suffix` fields are derived from `id` — the
-/// canonical wire representation is the name string.
+/// `NetworkDefinition` doesn't impl `Deserialize` directly because a
+/// definition is fixed by which network it is, not assembled field by
+/// field — the name string is the whole of it, and everything else follows
+/// from the id it names.
 mod network_serde {
     use std::str::FromStr;
 
@@ -234,7 +235,7 @@ mod network_serde {
         let name = String::deserialize(deserializer)?;
         NetworkDefinition::from_str(&name).map_err(|_| {
             D::Error::custom(format!(
-                "unknown network `{name}` (expected one of: mainnet, stokenet, simulator, ...)"
+                "unknown network `{name}` (expected one of: mainnet, testnet, simulator, ...)"
             ))
         })
     }

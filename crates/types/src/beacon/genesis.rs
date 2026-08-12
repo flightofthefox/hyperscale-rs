@@ -268,7 +268,7 @@ pub struct BeaconGenesisConfig {
 /// Pure function over the HBOR-canonical encoding plus the network's
 /// id byte. Two operators with byte-identical TOML produce the same
 /// hash *only* when bootstrapping the same network — mainnet and
-/// stokenet operators using identical genesis TOML still get distinct
+/// testnet operators using identical genesis TOML still get distinct
 /// chain identities. Any divergent field (validator pubkey, pool stake,
 /// initial randomness, ...) likewise yields a different hash and a
 /// different [`BeaconBlockHash`](crate::BeaconBlockHash) at genesis.
@@ -524,7 +524,7 @@ mod tests {
         let config = sample_config();
         assert_ne!(
             genesis_config_hash(&config, &NetworkDefinition::mainnet(), &[]),
-            genesis_config_hash(&config, &NetworkDefinition::stokenet(), &[]),
+            genesis_config_hash(&config, &NetworkDefinition::testnet(), &[]),
         );
     }
 
