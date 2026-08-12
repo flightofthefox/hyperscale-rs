@@ -16,12 +16,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_scenarios::tx::{
-    build_transfer_tx, genesis_accounts, recipient, sender, validity_around,
+    HALT_STRADDLER_BATCH, build_transfer_tx, genesis_accounts, halt_straddler_setup, recipient,
+    sender, validity_around,
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
-use hyperscale_scenarios::{Cluster, FaultableCluster, ScenarioConfig, epochs};
-use hyperscale_types::{ShardId, TransactionStatus, TxHash};
+use hyperscale_scenarios::{Cluster, FaultableCluster, ScenarioConfig, epochs, split_lifecycle};
+use hyperscale_types::{HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
 use support::SimCluster;
+
+/// The halt scenarios' topology: a split leaves a live sibling to carry
+/// the beacon through the folds that detect a stalled shard, and the pool
+/// holds the spares a re-draw seats.
+const fn halt_recovery_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 14,
+        num_shards: 1,
+        split_bytes: 36_000,
+        latency: Duration::from_millis(150),
+    }
+}
 
 /// Single shard, four-validator committee, resharding disarmed.
 const fn one_shard() -> ScenarioConfig {
@@ -102,15 +117,121 @@ fn a_committee_advances_after_part_of_it_restarts() {
     }
 }
 
-/// Every replica restarting at once is not this test's case.
+/// A committee whose every replica restarts mid-traffic resumes, given a
+/// live counterpart.
 ///
-/// Nothing carries the chain: the committee comes back holding its
-/// committed tip and the certified block above it is gone from every
-/// replica at once, so the QC they all recover is the one below where
-/// they stopped. They propose and vote and no quorum forms.
+/// Restarting the whole committee is the case nothing local carries: the
+/// certified block above the committed tip goes down with every replica
+/// at once, and the QC each one recovers certifies a block none of them
+/// holds. On a shard with no counterpart that is terminal — see
+/// [`a_committee_advances_after_all_of_it_restarts`]. Here the shard has a
+/// live sibling and the network recovers it, so the case that matters
+/// operationally — a coordinated bounce of one shard's validators — is
+/// covered rather than assumed.
+///
+/// The assertion is deliberately over the outcome and not the path: the
+/// shard has to commit again, and the beacon and sibling have to stay live
+/// while it does, whether it resumes on its own or the beacon misses its
+/// boundary for `HALT_THRESHOLD_EPOCHS` folds and re-draws the committee.
+/// It takes the first path today. The topology is the halt scenarios' one
+/// because both paths need it: a lone stalled shard leaves no sibling to
+/// carry the beacon through the folds that do the detecting, and no
+/// counterpart to hold what the committee dropped.
 #[test]
-#[ignore = "known gap: a committee whose every replica restarts together \
-            re-proposes without ever forming a quorum"]
+fn a_restarted_committee_resumes_beside_a_live_sibling() {
+    let setup = halt_straddler_setup();
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
+        &halt_recovery_config(),
+        11,
+        &setup.accounts,
+    );
+    cluster.run_faultable(|c| {
+        split_lifecycle(c);
+        let (halting, sibling) = ShardId::ROOT.children();
+        let before = c
+            .committed_height(halting)
+            .expect("the split child commits")
+            .inner();
+        let sibling_before = c
+            .committed_height(sibling)
+            .expect("the sibling commits")
+            .inner();
+
+        // Restart the committee mid-pipeline. An idle committee loses
+        // nothing — its certified tip is its committed tip, so the QC each
+        // replica recovers certifies a block they all hold. The wedge needs
+        // a certified block above the commit tip at the instant they go
+        // down, which is what an owed outcome marks.
+        let mut submitted = Vec::new();
+        for (key, from, to) in &setup.straddlers[..HALT_STRADDLER_BATCH] {
+            let tx = build_transfer_tx(key, *from, *to, 100, validity_around(c.now()));
+            submitted.push(tx.hash());
+            c.submit(Arc::new(tx));
+        }
+        let held = submitted[0];
+        assert!(
+            c.run_until(epochs(12), |c| {
+                let (committed, _) = c.chain_fate(halting, held);
+                committed.is_some()
+            }),
+            "the shard must be holding something for the restart to lose",
+        );
+
+        for host in c.committee_hosts(halting) {
+            c.restart_host(host, halting);
+        }
+
+        // Detection is a fold-driven miss count, so the budget is the
+        // threshold plus room for the re-draw and the fresh committee's
+        // sync — the same ceiling the staged-freeze scenarios allow.
+        let threshold = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("threshold fits u32");
+        let flagged = c.run_until(epochs(threshold + 25), |c| {
+            c.beacon_state()
+                .is_some_and(|state| state.pending_recoveries.contains_key(&halting))
+                || c.committed_height(halting)
+                    .is_some_and(|h| h.inner() > before + 2)
+        });
+        assert!(
+            flagged,
+            "a shard whose whole committee restarts must resume or be flagged \
+             for re-draw; it sat at {:?}",
+            c.committed_height(halting),
+        );
+        assert!(
+            c.committed_height(sibling)
+                .is_some_and(|h| h.inner() > sibling_before),
+            "the sibling shard and the beacon must stay live throughout",
+        );
+
+        // Whichever path it took, the shard has to commit again.
+        assert!(
+            c.run_until(epochs(threshold + 25), |c| c
+                .committed_height(halting)
+                .is_some_and(|h| h.inner() > before + 2)),
+            "the shard must commit again; it sat at {:?}",
+            c.committed_height(halting),
+        );
+    });
+}
+
+/// Every replica restarting at once, on a shard with no counterpart.
+///
+/// The committee comes back holding its committed tip, and the certified
+/// block above it is gone from every replica at once. Each recovers a lock
+/// it cannot satisfy: the QC that justifies it certifies a block none of
+/// them holds, so every proposal they can build extends a lower QC and the
+/// safe-vote rule refuses it. They propose and vote and no quorum forms.
+///
+/// The single shard is the whole of the condition — with a live sibling
+/// the shard resumes ([`a_restarted_committee_resumes_beside_a_live_sibling`]),
+/// so what is missing here is any counterpart holding what the committee
+/// dropped. Closing it means making certified-but-uncommitted blocks
+/// durable, since the lock cannot be lowered: nothing in a shard's own
+/// state distinguishes "nothing was committed above me" from "an absent
+/// replica committed and I would be forking away from it".
+#[test]
+#[ignore = "known gap: a lone shard whose every replica restarts together \
+            recovers a lock no proposal it can build satisfies"]
 fn a_committee_advances_after_all_of_it_restarts() {
     restart_and_advance(4);
 }
