@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use hyperscale_crypto::{Signer, Verifier};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-use hyperscale_vm_types::{Address, AddressClass, LocalKey, Mode, PrincipalAddr, SubstateKey};
+use hyperscale_vm_types::{
+    Address, AddressClass, LocalKey, Mode, PrincipalAddr, SchemeId, SubstateKey,
+};
 
 use crate::crypto::Ed25519PrivateKey;
 use crate::{
@@ -984,8 +986,9 @@ pub fn stub_transaction_with_reads(
         validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
         message: Vec::new(),
         network: NetworkId::from(&NetworkDefinition::simulator()),
-        signer: [0; 32],
-        signature: [0; 64],
+        signer_scheme: SchemeId::NONE,
+        signer: Vec::new(),
+        signature: Vec::new(),
     }
     .sign(&key);
     Transaction::new(vm)

@@ -1030,7 +1030,7 @@ pub fn test_registers_recover_their_justification(
         last_voted_round: Round::new(7),
         high_qc: Some((*justification).clone()),
     };
-    storage.persist_safe_vote_registers(validator, locked.clone());
+    storage.persist_safe_vote_registers(validator, locked);
 
     assert_eq!(
         storage

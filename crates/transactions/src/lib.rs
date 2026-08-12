@@ -22,7 +22,7 @@ use hyperscale_effects_bridge::genesis::{World, genesis_world};
 use hyperscale_effects_bridge::vm_statics::{account_address, encode_tree};
 use hyperscale_effects_bridge::{ProtocolHasher, XRD};
 use hyperscale_types::{
-    Ed25519PrivateKey, EnvelopeExt, NetworkId, SubintentSig, TimestampRange, Transaction,
+    Ed25519PrivateKey, EnvelopeExt, NetworkId, SchemeId, SubintentSig, TimestampRange, Transaction,
     TransactionBody, TransactionEnvelope,
 };
 use hyperscale_vm_effects::{
@@ -184,8 +184,9 @@ impl Client {
             validity_end_ms: terms.validity.end_timestamp_exclusive.as_millis(),
             message: terms.message,
             network: self.network,
-            signer: [0; 32],
-            signature: [0; 64],
+            signer_scheme: SchemeId::NONE,
+            signer: Vec::new(),
+            signature: Vec::new(),
         }
         .sign(payer)
     }

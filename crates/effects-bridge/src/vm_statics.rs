@@ -100,12 +100,25 @@ pub fn package_key(publisher: impl Into<Address>, package: PackageHash) -> Subst
     )
 }
 
-/// The principal address an ed25519 public key opens.
+/// The principal address `public_key` opens under `scheme`, or `None` if
+/// the scheme registers nothing or gives its keys another width.
 ///
 /// The address commits to the key and the scheme, so genesis funding,
 /// transaction builders and admission all derive the same address from
 /// the same key — and admission verifies a signer against its target by
-/// recomputing this, with nothing to look up.
+/// recomputing this, with nothing to look up. Material no registered
+/// scheme claims opens no account at all, so a key that arrives under the
+/// wrong tag derives nothing rather than deriving somewhere unreachable.
+#[must_use]
+pub fn principal_for(scheme: SchemeId, public_key: &[u8]) -> Option<PrincipalAddr> {
+    scheme
+        .spec()
+        .filter(|spec| spec.admits_key(public_key))
+        .map(|_| principal_address(&ProtocolHasher, scheme, public_key))
+}
+
+/// The principal address an ed25519 public key opens — the ed25519 case
+/// of [`principal_for`], for the callers that hold a typed key.
 #[must_use]
 pub fn account_address(public_key: &[u8; 32]) -> PrincipalAddr {
     principal_address(&ProtocolHasher, SchemeId::ED25519, public_key)
@@ -430,7 +443,7 @@ impl VmStatics for BridgeStatics {
         // in the envelope. An unbound payer field is therefore a debit
         // on an account that authorised nothing, spendable by anyone
         // who knows its address.
-        if account_address(&vm.signer) != vm.fee_payer {
+        if principal_for(vm.signer_scheme, &vm.signer) != Some(vm.fee_payer) {
             return Err(VmStaticsError(
                 "fee payer is not the composer's own account".into(),
             ));
@@ -451,7 +464,7 @@ impl VmStatics for BridgeStatics {
         // declaration hashes returned here.
         for (index, (sig, subintent)) in vm.subintent_sigs.iter().zip(&tree.subintents).enumerate()
         {
-            if account_address(&sig.public_key) != subintent.signer {
+            if principal_for(sig.scheme, &sig.public_key) != Some(subintent.signer) {
                 return Err(VmStaticsError(format!(
                     "subintent {index} signer address does not match its public key"
                 )));
@@ -527,7 +540,7 @@ impl VmStatics for BridgeStatics {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{
-        CallTarget, Ed25519PrivateKey, NetworkId, SubintentSig, TX_UNITS, TransactionBody,
+        CallTarget, Ed25519PrivateKey, NetworkId, TX_UNITS, TransactionBody, sign_subintent,
     };
     use hyperscale_vm_effects::stdlib::{VAULT, account_metadata};
     use hyperscale_vm_effects::{
@@ -670,10 +683,7 @@ mod tests {
             .zip(subintent_keys)
             .map(|(subintent, signer)| {
                 let hash = subintent.decl.hash(&ProtocolHasher);
-                SubintentSig {
-                    public_key: signer.public_key().0,
-                    signature: signer.sign(hash.0.0).0,
-                }
+                sign_subintent(signer, &hash.0.0)
             })
             .collect();
         TransactionEnvelope {
@@ -686,8 +696,9 @@ mod tests {
             validity_end_ms: 1_000_000,
             message: Vec::new(),
             network: NetworkId(242),
-            signer: [0; 32],
-            signature: [0; 64],
+            signer_scheme: SchemeId::NONE,
+            signer: Vec::new(),
+            signature: Vec::new(),
         }
         .sign(&key(7))
     }

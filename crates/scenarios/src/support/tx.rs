@@ -16,10 +16,9 @@ use hyperscale_engine::{XRD, account_address};
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey, EnvelopeExt, Epoch,
-    MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, NetworkId, NetworkParams, PrincipalAddr, ShardId,
-    ShardTrie, StakePoolId, StakePoolSeat, SubintentSig, TimestampRange, Transaction,
-    TransactionBody, TransactionEnvelope, ValidatorId, WeightedTimestamp,
-    ed25519_keypair_from_seed,
+    MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, NetworkId, NetworkParams, PrincipalAddr, SchemeId,
+    ShardId, ShardTrie, StakePoolId, StakePoolSeat, TimestampRange, Transaction, TransactionBody,
+    TransactionEnvelope, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed, sign_subintent,
 };
 use hyperscale_vm_effects::{Address, Constraint, IntentDecl, ManifestGraph, package_hash};
 use hyperscale_vm_manifest_builder::native::{account, staking};
@@ -974,7 +973,7 @@ pub fn build_stamp_tx(
     let right = declaration(|b| account::stamp_entropy(b, owner));
     // The right-hand account signs its own declaration, which is all it
     // ever sees: no part of the envelope enters that hash.
-    let signed = right_key.sign(right.hash(&ProtocolHasher).0.0);
+    let signed = sign_subintent(right_key, &right.hash(&ProtocolHasher).0.0);
 
     let client = client();
     let cache = client.cache();
@@ -989,10 +988,7 @@ pub fn build_stamp_tx(
 
     Transaction::new(client.sign_tree(
         &tree,
-        vec![SubintentSig {
-            public_key: right_key.public_key().0,
-            signature: signed.0,
-        }],
+        vec![signed],
         payer,
         Terms {
             max_fee: MAX_FEE,
@@ -1113,8 +1109,9 @@ pub fn build_publish_tx(
             validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
             message: Vec::new(),
             network: SCENARIO_NETWORK,
-            signer: [0; 32],
-            signature: [0; 64],
+            signer_scheme: SchemeId::NONE,
+            signer: Vec::new(),
+            signature: Vec::new(),
         }
         .sign(payer),
     )
@@ -1340,7 +1337,7 @@ pub fn build_composed_tx(
     // The signer signs its own declaration's hash, which no part of the
     // envelope enters — the composer binds it afterwards and signs the
     // whole, subintent signatures included.
-    let signed = signer_key.sign(request.hash(&ProtocolHasher).0.0);
+    let signed = sign_subintent(signer_key, &request.hash(&ProtocolHasher).0.0);
 
     let client = client();
     let cache = client.cache();
@@ -1360,10 +1357,7 @@ pub fn build_composed_tx(
 
     Transaction::new(client.sign_tree(
         &tree,
-        vec![SubintentSig {
-            public_key: signer_key.public_key().0,
-            signature: signed.0,
-        }],
+        vec![signed],
         composer,
         Terms {
             max_fee: 1_000,

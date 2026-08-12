@@ -17,8 +17,7 @@ use blake3::Hasher;
 use hyperscale_hbor::{Hbor, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use thiserror::Error;
 
-use crate::crypto::{Ed25519PublicKey, Ed25519Signature, verify_ed25519};
-use crate::transaction::vm::vm_statics;
+use crate::transaction::vm::{ProtocolVerifier, SchemeVerifier, vm_statics};
 use crate::{
     DeclaredKey, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN, NetworkId, Routing,
     ShardTrie, SubstateKey, TimestampRange, TransactionEnvelope, TxHash, Verified, Verify,
@@ -388,11 +387,8 @@ impl Verify<NetworkId> for Transaction {
             .zip(&derived.subintent_hashes)
             .enumerate()
         {
-            let valid = verify_ed25519(
-                subintent,
-                &Ed25519PublicKey(sig.public_key),
-                &Ed25519Signature(sig.signature),
-            );
+            let valid =
+                ProtocolVerifier.verify(sig.scheme, &sig.public_key, &sig.signature, subintent);
             if !valid {
                 return Err(TransactionVerifyError::InvalidSubintentSignature(
                     u32::try_from(index).unwrap_or(u32::MAX),
@@ -436,8 +432,8 @@ mod tests {
     use super::*;
     use crate::test_utils::{test_prefix, test_validity_range};
     use crate::{
-        Ed25519PrivateKey, PrincipalAddr, SubintentSig, TransactionBody, VmStatics, declared_work,
-        install_vm_statics,
+        Ed25519PrivateKey, PrincipalAddr, SchemeId, SubintentSig, TransactionBody, VmStatics,
+        declared_work, install_vm_statics,
     };
 
     struct StubStatics;
@@ -495,8 +491,9 @@ mod tests {
             validity_end_ms: range.end_timestamp_exclusive.as_millis(),
             message: Vec::new(),
             network: TEST_NETWORK,
-            signer: [0; 32],
-            signature: [0; 64],
+            signer_scheme: SchemeId::NONE,
+            signer: Vec::new(),
+            signature: Vec::new(),
         }
         .sign(&key)
     }
@@ -598,6 +595,23 @@ mod tests {
         );
     }
 
+    /// The scheme rides inside the preimage, so re-tagging signed
+    /// material loses the signature that covered it — a pair validating
+    /// under two registered schemes is still only presentable as the one
+    /// its signer named.
+    #[test]
+    fn re_tagging_the_scheme_loses_the_signature() {
+        install_vm_statics(Box::new(StubStatics));
+        let tx = fixture(b"graph bytes");
+
+        let mut retagged = tx.body().clone();
+        retagged.signer_scheme = SchemeId(2);
+        assert_eq!(
+            Transaction::new(retagged).verify(TEST_NETWORK).unwrap_err(),
+            TransactionVerifyError::InvalidSignature,
+        );
+    }
+
     #[test]
     fn verification_checks_subintent_signatures() {
         install_vm_statics(Box::new(StubStatics));
@@ -607,8 +621,9 @@ mod tests {
         let composer_key = Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap();
         let mut envelope = test_envelope(b"with-subintent");
         envelope.subintent_sigs = vec![SubintentSig {
-            public_key: subintent_key.public_key().0,
-            signature: subintent_key.sign(STUB_SUBINTENT_HASH).0,
+            scheme: SchemeId::ED25519,
+            public_key: subintent_key.public_key().0.to_vec(),
+            signature: subintent_key.sign(STUB_SUBINTENT_HASH).0.to_vec(),
         }];
         let composed = envelope.sign(&composer_key);
         assert!(

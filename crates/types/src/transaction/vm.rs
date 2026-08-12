@@ -13,12 +13,61 @@ use std::sync::OnceLock;
 use blake3::Hasher as Blake3;
 use hyperscale_hbor::HborSigned;
 pub use hyperscale_vm_types::{
-    MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SubintentSig, TransactionBody, TransactionEnvelope,
+    MAX_MESSAGE_LEN, MAX_SUBINTENTS, Mode, SchemeId, SchemeVerifier, SubintentSig, TransactionBody,
+    TransactionEnvelope,
 };
 use thiserror::Error;
 
 use crate::crypto::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature, verify_ed25519};
 use crate::{Address, DeclaredKey, Hash, TimestampRange, WeightedTimestamp};
+
+/// The curves behind the VM's scheme registry.
+///
+/// The registry says how wide a scheme's material is and what verifying it
+/// costs; this says what verifying it *means*. Every scheme the protocol
+/// accepts answers here, and one it does not — an id no registry entry
+/// claims, or material of a width its entry does not give it — answers
+/// `false` alongside a signature that is simply wrong.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProtocolVerifier;
+
+impl SchemeVerifier for ProtocolVerifier {
+    fn verify(&self, scheme: SchemeId, key: &[u8], signature: &[u8], message: &[u8]) -> bool {
+        let Some(spec) = scheme.spec() else {
+            return false;
+        };
+        if !spec.admits(key, signature) {
+            return false;
+        }
+        match scheme {
+            SchemeId::ED25519 => {
+                let (Ok(key), Ok(signature)) = (key.try_into(), signature.try_into()) else {
+                    return false;
+                };
+                verify_ed25519(
+                    message,
+                    &Ed25519PublicKey(key),
+                    &Ed25519Signature(signature),
+                )
+            }
+            _ => false,
+        }
+    }
+}
+
+/// One bound subintent's signature over its declaration hash.
+///
+/// The scheme is stamped beside the material it describes, so a signer's
+/// key and their claim about which curve produced it are written in one
+/// place and cannot drift apart.
+#[must_use]
+pub fn sign_subintent(key: &Ed25519PrivateKey, declaration_hash: &[u8; 32]) -> SubintentSig {
+    SubintentSig {
+        scheme: SchemeId::ED25519,
+        public_key: key.public_key().0.to_vec(),
+        signature: key.sign(declaration_hash).0.to_vec(),
+    }
+}
 
 /// The workspace's crypto and clock binding for the envelope.
 ///
@@ -33,12 +82,12 @@ pub trait EnvelopeExt: Sized {
     fn signing_hash(&self) -> Hash;
 
     /// Sign the envelope's content with the composer's key, filling the
-    /// signer and signature fields.
+    /// scheme, signer, and signature fields.
     #[must_use]
     fn sign(self, key: &Ed25519PrivateKey) -> Self;
 
     /// Whether the composer's signature covers the envelope content
-    /// under the signer's key.
+    /// under the signer's key, in the scheme the envelope names.
     fn signature_is_valid(&self) -> bool;
 
     /// The signed validity window as the wire's range form.
@@ -56,18 +105,23 @@ impl EnvelopeExt for TransactionEnvelope {
     }
 
     fn sign(mut self, key: &Ed25519PrivateKey) -> Self {
+        // The scheme is signed content, so it is stamped before the
+        // preimage is taken; the key and signature are not, and are
+        // filled after.
+        self.signer_scheme = SchemeId::ED25519;
         let hash = self.signing_hash();
-        self.signer = key.public_key().0;
-        self.signature = key.sign(hash.as_bytes()).0;
+        self.signer = key.public_key().0.to_vec();
+        self.signature = key.sign(hash.as_bytes()).0.to_vec();
         self
     }
 
     fn signature_is_valid(&self) -> bool {
         let hash = self.signing_hash();
-        verify_ed25519(
+        ProtocolVerifier.verify(
+            self.signer_scheme,
+            &self.signer,
+            &self.signature,
             hash.as_bytes(),
-            &Ed25519PublicKey(self.signer),
-            &Ed25519Signature(self.signature),
         )
     }
 
@@ -245,4 +299,56 @@ pub fn vm_statics() -> &'static dyn VmStatics {
         .get()
         .expect("VM statics not installed; node wiring installs the effects-bridge derivation")
         .as_ref()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProtocolVerifier, SchemeId, SchemeVerifier};
+    use crate::crypto::Ed25519PrivateKey;
+
+    fn key() -> Ed25519PrivateKey {
+        Ed25519PrivateKey::from_bytes(&[3u8; 32]).expect("32 bytes")
+    }
+
+    #[test]
+    fn a_signature_verifies_under_the_scheme_it_was_made_in() {
+        let key = key();
+        let signature = key.sign(b"message").0;
+        assert!(ProtocolVerifier.verify(
+            SchemeId::ED25519,
+            &key.public_key().0,
+            &signature,
+            b"message"
+        ));
+        assert!(!ProtocolVerifier.verify(
+            SchemeId::ED25519,
+            &key.public_key().0,
+            &signature,
+            b"other"
+        ));
+    }
+
+    /// A scheme no registry entry claims verifies nothing, whatever
+    /// material is presented under it.
+    #[test]
+    fn an_unregistered_scheme_verifies_nothing() {
+        let key = key();
+        let signature = key.sign(b"message").0;
+        for scheme in [SchemeId::NONE, SchemeId(2), SchemeId(u16::MAX)] {
+            assert!(!ProtocolVerifier.verify(scheme, &key.public_key().0, &signature, b"message"));
+        }
+    }
+
+    /// Material of a width its scheme does not give it is refused before
+    /// any curve arithmetic runs, so a short key is never padded out to
+    /// one the curve would accept.
+    #[test]
+    fn material_of_the_wrong_width_refuses() {
+        let key = key();
+        let public = key.public_key().0;
+        let signature = key.sign(b"message").0;
+        assert!(!ProtocolVerifier.verify(SchemeId::ED25519, &public[..31], &signature, b"message"));
+        assert!(!ProtocolVerifier.verify(SchemeId::ED25519, &public, &signature[..63], b"message"));
+        assert!(!ProtocolVerifier.verify(SchemeId::ED25519, &[], &[], b"message"));
+    }
 }

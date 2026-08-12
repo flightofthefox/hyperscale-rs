@@ -16,9 +16,10 @@ use hyperscale_storage::{SubstateDatabase, SubstateStore, TickChain, TickOutput,
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     BlockHash, BlockHeight, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, Hash,
-    MerkleInclusionProof, NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain, SettledWrites,
-    ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey, TimestampRange, Transaction,
-    TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp, absorb_committed_cells,
+    MerkleInclusionProof, NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain, SchemeId,
+    SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey, TimestampRange,
+    Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
+    absorb_committed_cells,
 };
 use hyperscale_vm_effects::{AbiParam, Address, Expr, package_hash};
 use hyperscale_vm_kernel::{amount_cell, encode_amount};
@@ -1026,8 +1027,9 @@ fn signed_publish(seed: u8, artifact: Vec<u8>) -> Transaction {
         validity_end_ms: u64::MAX,
         message: Vec::new(),
         network: NetworkId(242),
-        signer: [0; 32],
-        signature: [0; 64],
+        signer_scheme: SchemeId::NONE,
+        signer: Vec::new(),
+        signature: Vec::new(),
     }
     .sign(&key);
     Transaction::new(vm)
