@@ -1030,7 +1030,16 @@ fn registers(locked: u64, last_voted: u64) -> SafeVoteRegisters {
     SafeVoteRegisters {
         locked_round: Round::new(locked),
         last_voted_round: Round::new(last_voted),
+        high_qc: None,
     }
+}
+
+#[test]
+fn safe_vote_registers_recover_their_justification() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_registers_recover_their_justification(&storage, || {
+        storage.load_recovered_state()
+    });
 }
 
 /// Writes merge field-wise max and survive a coordinator "restart" —

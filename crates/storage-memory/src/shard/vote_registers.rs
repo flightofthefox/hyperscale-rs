@@ -18,7 +18,7 @@ impl SafeVoteRegisterStore for SimShardStorage {
         let origin = c.chain_origin;
         let merged = match c.safe_vote_registers.get(&validator) {
             Some((stored_origin, stored_registers)) if *stored_origin == origin => {
-                registers.max(*stored_registers)
+                registers.max(stored_registers.clone())
             }
             _ => registers,
         };
@@ -28,6 +28,6 @@ impl SafeVoteRegisterStore for SimShardStorage {
     fn safe_vote_registers(&self, validator: ValidatorId) -> Option<SafeVoteRegisters> {
         let c = read_or_recover(&self.consensus);
         let (origin, registers) = c.safe_vote_registers.get(&validator)?;
-        (*origin == c.chain_origin).then_some(*registers)
+        (*origin == c.chain_origin).then_some(registers.clone())
     }
 }

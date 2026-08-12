@@ -19,18 +19,19 @@ use hyperscale_types::{
     GlobalReceiptRoot, Hash, LocalKey, LogLevel, MerkleInclusionProof, PcQc2, PcQc3,
     PcSignerLengths, PcVector, PcXpProof, ProposerTimestamp, ProvisionEntry, ProvisionHash,
     Provisions, QuorumCertificate, Randomness, RatifyCert, RatifyRound, RevealChain, Round,
-    SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView,
-    Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt, SubstateKey, SubstateLeaf,
-    TerminalVerdict, TickHalf, TickId, Transaction, TransactionDecision, TxHash, TxOutcome,
-    UnsettledTx, Verifiable, Verified, WeightedTimestamp, WitnessSources, WorkInFlight,
-    compute_global_receipt_root, compute_merkle_root,
+    SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield,
+    SpcCert, SpcView, Stake, StakePoolId, StateRoot, StateWrites, StoredReceipt, SubstateKey,
+    SubstateLeaf, TerminalVerdict, TickHalf, TickId, Transaction, TransactionDecision, TxHash,
+    TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+    WorkInFlight, compute_global_receipt_root, compute_merkle_root,
 };
 
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, RecoveredState, ShardChainReader,
-    ShardChainWriter, SubstateDatabase, SubstateStore, WitnessSeed,
+    BOUNDARY_RETAIN, BoundaryStore, ImportCursor, ImportProgress, RecoveredState,
+    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateDatabase, SubstateStore,
+    WitnessSeed,
 };
 
 /// A completed [`ImportProgress`] covering the whole key span as one
@@ -1004,6 +1005,63 @@ fn commit_block_with_provisions(storage: &impl ShardChainWriter, height: u64) ->
         .hash();
     storage.commit_block(&make_test_certified(block), &empty_witness());
     hash
+}
+
+/// Shared recovery test: a durable lock comes back with the certificate
+/// that justifies it.
+///
+/// A validator refuses to vote for a block whose `parent_qc` sits below
+/// `locked_round`. A record that keeps the round and drops the
+/// certificate therefore describes a position nothing can satisfy: every
+/// proposal extends a lower QC, and the QC that would raise the lock can
+/// only form out of the votes being refused.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_registers_recover_their_justification(
+    storage: &impl SafeVoteRegisterStore,
+    recovered: impl Fn() -> RecoveredState,
+) {
+    let validator = ValidatorId::new(1);
+    let justification = make_test_qc(&make_test_block(BlockHeight::new(4)));
+    let locked = SafeVoteRegisters {
+        locked_round: Round::new(6),
+        last_voted_round: Round::new(7),
+        high_qc: Some((*justification).clone()),
+    };
+    storage.persist_safe_vote_registers(validator, locked.clone());
+
+    assert_eq!(
+        storage
+            .safe_vote_registers(validator)
+            .and_then(|r| r.high_qc),
+        Some((*justification).clone()),
+        "the lock's justification is part of the record",
+    );
+
+    // A later write that raises nothing keeps the justification: the
+    // certificate travels with the higher lock, not with the newer write.
+    storage.persist_safe_vote_registers(
+        validator,
+        SafeVoteRegisters {
+            locked_round: Round::new(2),
+            last_voted_round: Round::new(9),
+            high_qc: None,
+        },
+    );
+    let merged = recovered()
+        .safe_vote_registers
+        .get(&validator)
+        .cloned()
+        .expect("the record survives into recovery");
+    assert_eq!(merged.locked_round, Round::new(6));
+    assert_eq!(merged.last_voted_round, Round::new(9));
+    assert_eq!(
+        merged.high_qc,
+        Some((*justification).clone()),
+        "a write that lowers the lock cannot strip the justification off it",
+    );
 }
 
 /// Shared recovery test: the committed tip's drain total comes back off

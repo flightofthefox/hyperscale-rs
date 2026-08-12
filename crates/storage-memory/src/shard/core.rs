@@ -186,7 +186,7 @@ impl SimShardStorage {
             .safe_vote_registers
             .iter()
             .filter(|(_, (origin, _))| *origin == chain_origin)
-            .map(|(validator, (_, registers))| (*validator, *registers))
+            .map(|(validator, (_, registers))| (*validator, registers.clone()))
             .collect();
         let retained_provisions = c.provisions.values().map(Arc::clone).collect();
         drop(c);

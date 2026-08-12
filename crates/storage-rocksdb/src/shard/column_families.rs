@@ -5,7 +5,7 @@
 
 use hyperscale_types::{
     BlockHeight, BlockMetadata, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
-    ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash, Provisions, Round,
+    ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash, Provisions,
     SafeVoteRegisters, ShardWitnessPayload, SubstateKey, TickId, Transaction, ValidatorId,
 };
 use rocksdb::{ColumnFamily, DB};
@@ -569,35 +569,34 @@ impl DbCodec<ValidatorId> for ValidatorIdCodec {
     }
 }
 
-/// Value codec for [`SafeVoteRegistersCf`]: packed 32-byte record
-/// `[chain_origin_16B][locked_round_BE_8B][last_voted_round_BE_8B]`.
+/// Value codec for [`SafeVoteRegistersCf`]: a 16-byte chain origin
+/// followed by the HBOR-encoded registers.
+///
+/// The origin stays a raw prefix so a record's incarnation reads without
+/// decoding the rest; the registers carry a certificate, so their half is
+/// variable width.
 #[derive(Default)]
 pub struct SafeVoteRegisterRecordCodec;
+
+/// Bytes the [`ChainOrigin`] prefix occupies in a safe-vote record.
+const CHAIN_ORIGIN_BYTES: usize = 16;
 
 impl DbEncode<(ChainOrigin, SafeVoteRegisters)> for SafeVoteRegisterRecordCodec {
     fn encode_to(&self, value: &(ChainOrigin, SafeVoteRegisters), buf: &mut Vec<u8>) {
         ChainOriginCodec.encode_to(&value.0, buf);
-        buf.extend_from_slice(&value.1.locked_round.inner().to_be_bytes());
-        buf.extend_from_slice(&value.1.last_voted_round.inner().to_be_bytes());
+        HborCodec::<SafeVoteRegisters>::default().encode_to(&value.1, buf);
     }
 }
 
 impl DbCodec<(ChainOrigin, SafeVoteRegisters)> for SafeVoteRegisterRecordCodec {
     fn decode(&self, bytes: &[u8]) -> (ChainOrigin, SafeVoteRegisters) {
-        assert_eq!(
-            bytes.len(),
-            32,
-            "safe-vote register record must be 32 bytes"
+        assert!(
+            bytes.len() > CHAIN_ORIGIN_BYTES,
+            "safe-vote register record must carry an origin and registers"
         );
-        let origin = ChainOriginCodec.decode(&bytes[..16]);
-        let registers = SafeVoteRegisters {
-            locked_round: Round::new(u64::from_be_bytes(
-                bytes[16..24].try_into().expect("length checked above"),
-            )),
-            last_voted_round: Round::new(u64::from_be_bytes(
-                bytes[24..32].try_into().expect("length checked above"),
-            )),
-        };
+        let origin = ChainOriginCodec.decode(&bytes[..CHAIN_ORIGIN_BYTES]);
+        let registers =
+            HborCodec::<SafeVoteRegisters>::default().decode(&bytes[CHAIN_ORIGIN_BYTES..]);
         (origin, registers)
     }
 }

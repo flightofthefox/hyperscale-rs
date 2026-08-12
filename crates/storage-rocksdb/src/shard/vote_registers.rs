@@ -24,18 +24,18 @@ impl SafeVoteRegisterStore for RocksDbShardStorage {
         let origin = read_chain_origin(&*self.db);
         let stored = cache
             .get(&validator)
-            .copied()
+            .cloned()
             .or_else(|| self.cf_get::<SafeVoteRegistersCf>(&validator));
-        let merged = match stored {
+        let merged = match &stored {
             // A record from a different chain incarnation is dead
             // weight — overwrite it rather than merging round numbers
             // that belong to an unrelated chain.
-            Some((stored_origin, stored_registers)) if stored_origin == origin => {
-                registers.max(stored_registers)
+            Some((stored_origin, stored_registers)) if *stored_origin == origin => {
+                registers.max(stored_registers.clone())
             }
             _ => registers,
         };
-        if stored == Some((origin, merged)) {
+        if stored.as_ref() == Some(&(origin, merged.clone())) {
             return; // nothing raised (e.g. a timeout retransmit) — skip the fsync
         }
 
@@ -44,7 +44,7 @@ impl SafeVoteRegisterStore for RocksDbShardStorage {
             &mut batch,
             SafeVoteRegistersCf::handle(&self.cf()),
             &validator,
-            &(origin, merged),
+            &(origin, merged.clone()),
         );
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(true);

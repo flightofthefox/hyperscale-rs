@@ -473,8 +473,24 @@ impl ShardCoordinator {
         let recovered_registers = recovered
             .safe_vote_registers
             .get(&me)
-            .copied()
+            .cloned()
             .unwrap_or_default();
+        // The chain metadata only keeps the QC of a committed block, and a
+        // lock rises on QCs that certify blocks well above the commit tip.
+        // Restoring the higher of the two is what lets a validator satisfy
+        // its own lock again: a committee that restarts together holds no
+        // certificate above the lock anywhere else, and every proposal it
+        // can build extends whatever it recovers here.
+        let high_qc = match (recovered.latest_qc, recovered_registers.high_qc.clone()) {
+            (Some(committed), Some(justification)) if justification.round() > committed.round() => {
+                Some(Verified::<QuorumCertificate>::from_persisted(justification))
+            }
+            (Some(committed), _) => Some(committed),
+            (None, Some(justification)) => {
+                Some(Verified::<QuorumCertificate>::from_persisted(justification))
+            }
+            (None, None) => None,
+        };
         // Seeded from the chain the store kept, not constructed empty: an
         // empty index refuses no duplicate, so a coordinator resuming a
         // chain without it re-admits everything the window still covers.
@@ -512,7 +528,7 @@ impl ShardCoordinator {
                     .is_none()
                     .then_some(CommittedTip::GENESIS)
             }),
-            latest_qc: recovered.latest_qc,
+            latest_qc: high_qc,
             anchor_qc: recovered.anchor_qc,
             deferred_qc: DeferredQc::new(),
             pending_blocks: PendingBlocks::new(),
@@ -6580,14 +6596,19 @@ impl ShardCoordinator {
         self.locked_round
     }
 
-    /// Snapshot of both safe-vote registers, carried on vote and timeout
+    /// Snapshot of the safe-vote registers, carried on vote and timeout
     /// signing actions so the runner can persist them ahead of the
     /// signature.
+    ///
+    /// The high QC rides along because the lock is unusable without it: a
+    /// record restored with a lock above every QC the validator can
+    /// produce refuses every proposal forever.
     #[must_use]
-    pub const fn safe_vote_registers(&self) -> SafeVoteRegisters {
+    pub fn safe_vote_registers(&self) -> SafeVoteRegisters {
         SafeVoteRegisters {
             locked_round: self.locked_round,
             last_voted_round: self.last_voted_round,
+            high_qc: self.latest_qc.as_deref().map(|qc| (*qc).clone()),
         }
     }
 
