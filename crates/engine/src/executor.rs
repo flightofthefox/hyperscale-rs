@@ -21,8 +21,8 @@ use std::sync::Arc;
 use blake3::hash as blake3_hash;
 use hyperscale_effects_bridge::vm_statics::{PackageCache, package_key};
 use hyperscale_effects_bridge::{
-    BridgeStatics, PoolRegistry, ProtocolHasher, admit_package, check_target_authority,
-    decode_tree, envelope_identity, witness_from_event,
+    BridgeStatics, PoolRegistry, ProtocolHasher, admit_package, decode_tree, envelope_identity,
+    witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
 use hyperscale_storage::SubstateDatabase;
@@ -232,12 +232,9 @@ impl Executor {
                 .ok_or_else(|| "publish body in a call sub-batch".to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        if authority == TargetAuthority::Required {
-            check_target_authority(&tree, vm.fee_payer, &packages, &self.world.instances)
-                .map_err(|error| error.0)?;
-        }
         let admitted = admit_tree(
             &tree,
+            vm.fee_payer,
             envelope_identity(vm),
             &packages,
             &self.world.instances,
@@ -261,7 +258,22 @@ impl Executor {
             .declaration()
             .map_err(|error| format!("declaration: {error:?}"))?;
         Ok(PreparedTx {
-            calls: routing.calls,
+            calls: match authority {
+                TargetAuthority::Required => routing.calls,
+                // A preview shown before its counterparties have signed:
+                // every guarded call is answered as if whoever it names
+                // had presented themselves. The lie is told here and
+                // nowhere else, so nothing on the commit path can reach
+                // it.
+                TargetAuthority::Assumed => routing
+                    .calls
+                    .into_iter()
+                    .map(|call| NodeCall {
+                        authority: None,
+                        ..call
+                    })
+                    .collect(),
+            },
             declaration,
             nullifiers: admitted
                 .subintents
@@ -295,6 +307,9 @@ pub fn abort_reason(outcome: &Outcome) -> String {
             amount,
         } => format!("constraint unmet: node {node} parameter {param} carried {amount}"),
         Outcome::NullifierSpent { key } => format!("subintent already spent at {key:?}"),
+        Outcome::Unauthorized { node } => {
+            format!("node {node} presents no authority its target admits")
+        }
         Outcome::Completed { .. } => unreachable!("aborts only"),
     }
 }
@@ -380,7 +395,13 @@ pub const fn charge_for(outcome: &Outcome, payer: PayerFee) -> Option<u128> {
         // pays the ceiling it declared. Not the work consumed — that is
         // unknowable — but the sender chose the bound, and anything less
         // leaves failure discounted against success.
-        Outcome::UserError { .. } => Some(payer.max_fee),
+        //
+        // A call presenting authority its target does not admit is the
+        // same class and priced the same way: what a node presents and
+        // what its target requires are both content the signer put their
+        // name to, so an unauthorized call is one its composer built
+        // wrong rather than one the world moved under.
+        Outcome::UserError { .. } | Outcome::Unauthorized { .. } => Some(payer.max_fee),
         // A lost deterministic race. The sender did nothing wrong and
         // could not have avoided it, so it pays only the floor covering
         // the declaration work its attempt really did consume.

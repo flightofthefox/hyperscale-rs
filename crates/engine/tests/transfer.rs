@@ -184,7 +184,7 @@ fn signed_transfer_from_unknown(
 ) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let mut b = GraphBuilder::new();
-    let [funds] = b.call(from, "withdraw", (*XRD, amount));
+    let [funds] = b.call_signed(from, "withdraw", (*XRD, amount));
     let [] = b.call(to, "deposit", (funds.resource_is(*XRD),));
     let graph = b.build().expect("every output is consumed");
     Transaction::new(client().sign(graph, &key, terms(max_fee)))
@@ -1419,13 +1419,19 @@ fn a_preview_holds_a_node_to_its_targets_authority_unless_granted() {
     // Signed by 7, withdrawing from Alice: the shape the gate refuses.
     let tx = signed_transfer_with_fee(7, alice(), bob(), 100, PREVIEW_CEILING);
 
-    let refused = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
+    let held = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
     assert!(
-        matches!(refused.outcome, PreviewOutcome::Refused { .. }),
+        matches!(held.outcome, PreviewOutcome::Aborted { .. }),
         "outcome = {:?}",
-        refused.outcome
+        held.outcome
     );
-    assert_eq!(refused.fee, 0);
+    // Only the payer's own fee is reported: nothing of Alice's moves
+    // without her.
+    assert!(
+        held.changes
+            .iter()
+            .all(|change| change.key.owner != alice().address())
+    );
 
     let granted = preview_on(
         &accounts,

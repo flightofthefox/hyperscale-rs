@@ -214,10 +214,12 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use hyperscale_effects_bridge::genesis::account_artifact;
     use hyperscale_types::test_utils::test_principal;
     use hyperscale_vm_effects::{
-        Constraint, EdgeRef, GraphArg, GraphNode, Value, admit, package_hash,
+        Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Value, admit, package_hash,
     };
 
     use super::*;
@@ -243,6 +245,7 @@ mod tests {
                             GraphArg::Literal(Value::Address(XRD.address())),
                             GraphArg::Literal(Value::U128(100)),
                         ],
+                        evidence: [EvidenceRef::IntentSignature].into(),
                     },
                     GraphNode {
                         target: to.into(),
@@ -254,6 +257,7 @@ mod tests {
                             },
                             constraints: vec![Constraint::ResourceIs((*XRD).into())],
                         }],
+                        evidence: BTreeSet::new(),
                     },
                 ],
             }
@@ -267,8 +271,14 @@ mod tests {
             .transfer_graph(test_principal(0x11), test_principal(0x22), 100)
             .unwrap();
         let cache = client.cache();
-        admit(&graph, &cache, &client.world().instances, &ProtocolHasher)
-            .expect("a built transfer admits");
+        admit(
+            &graph,
+            test_principal(0x11),
+            &cache,
+            &client.world().instances,
+            &ProtocolHasher,
+        )
+        .expect("a built transfer admits");
     }
 
     #[test]

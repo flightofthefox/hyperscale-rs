@@ -24,10 +24,10 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::stdlib::{ENTROPY, VALIDATORS, VAULT, XRD as XRD_ROLE};
 use hyperscale_vm_effects::{
-    Accessibility, Address, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry, ManifestHash,
-    MetadataCache, Mode, NativeAddr, PackageHash, PackageMetadata, PrefixShardResolver,
-    PrincipalAddr, RoleId, Routing as RoutedTransaction, SchemeId, SubstateKey, Value, admit_tree,
-    child_key, footprint, native_address, package_hash, principal_address, route_tree,
+    Address, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry, ManifestHash, MetadataCache,
+    Mode, NativeAddr, PackageHash, PackageMetadata, PrefixShardResolver, PrincipalAddr, RoleId,
+    Routing as RoutedTransaction, SchemeId, SubstateKey, Value, admit_tree, child_key, footprint,
+    native_address, package_hash, principal_address, route_tree,
 };
 
 use crate::ProtocolHasher;
@@ -343,89 +343,6 @@ impl BridgeStatics {
     }
 }
 
-/// Refuse a node whose target's method admits a principal the intent
-/// carrying the node is not.
-///
-/// One authority per intent: the composer's account covers the root
-/// intent's nodes, and a subintent's declared signer covers its own.
-/// Nothing crosses that line — a second party signs their own
-/// declaration and never the composer's, which is what the subintent
-/// primitive exists to express.
-///
-/// What this judges is the structural half — that each intent's declared
-/// authority covers the nodes it carries. The cryptographic half, that a
-/// declared authority is backed by a signature in the envelope, is the
-/// fee-payer and subintent-signer bindings in [`BridgeStatics::derive`].
-/// Together they are one rule, and it is a pure function of signed
-/// content: no state read, no rule evaluation, and a refusal that costs
-/// the sender nothing because the transaction never enters a block.
-///
-/// A method may name its principal two ways, and both resolve here
-/// against content that cannot change after the target exists. The
-/// target's own authority is satisfiable only by the key its address
-/// derives from, so a gated method on a target no key derives — a
-/// component instance, say — is uncallable rather than open. A method
-/// naming a configuration field reaches a principal the instance was
-/// created with, which is how an object nobody owns admits somebody at
-/// all; a field that holds no address names nobody, and the method is
-/// uncallable for the same reason. Both fall the safe way.
-///
-/// # Errors
-///
-/// [`VmStaticsError`] naming the first node whose principal the envelope
-/// does not carry.
-pub fn check_target_authority(
-    tree: &EnvelopeTree,
-    composer: PrincipalAddr,
-    packages: &MetadataCache,
-    instances: &InstanceRegistry,
-) -> Result<(), VmStaticsError> {
-    let root = std::iter::once((composer, &tree.root, None));
-    let bound = tree
-        .subintents
-        .iter()
-        .enumerate()
-        .map(|(index, subintent)| (subintent.signer, &subintent.decl, Some(index)));
-    for (authority, decl, subintent) in root.chain(bound) {
-        for (position, node) in decl.graph.nodes.iter().enumerate() {
-            // A target that resolves to nothing is admission's refusal to
-            // make, and admission makes it.
-            let Some(meta) = instances.get(node.target) else {
-                continue;
-            };
-            let Some(signature) = packages
-                .get(meta.package)
-                .and_then(|package| package.methods.get(&node.method))
-            else {
-                continue;
-            };
-            let admits = match signature.accessibility {
-                Accessibility::Public => continue,
-                Accessibility::RequiresTargetAuth => Some(node.target.address()),
-                Accessibility::RequiresConfiguredAuth(field) => {
-                    match meta.config.get(field as usize) {
-                        Some(Value::Address(principal)) => Some(*principal),
-                        _ => None,
-                    }
-                }
-            };
-            if admits == Some(authority.address()) {
-                continue;
-            }
-            let intent = subintent.map_or_else(
-                || "the root intent".to_owned(),
-                |index| format!("subintent {index}"),
-            );
-            return Err(VmStaticsError(format!(
-                "{intent} node {position} calls `{}`, which admits an authority the envelope does \
-                 not carry",
-                node.method
-            )));
-        }
-    }
-    Ok(())
-}
-
 impl VmStatics for BridgeStatics {
     fn absorb_committed_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) {
         let Ok(owner) = Address::from_bytes(owner) else {
@@ -471,11 +388,9 @@ impl VmStatics for BridgeStatics {
             }
         }
         let packages = self.cache.load();
-        // What the fee-payer binding above does for the one field that
-        // debits an account, generalised to every node that touches one.
-        check_target_authority(&tree, vm.fee_payer, &packages, &self.instances)?;
         let admitted = admit_tree(
             &tree,
+            vm.fee_payer,
             envelope_identity(vm),
             &packages,
             &self.instances,
@@ -546,8 +461,9 @@ mod tests {
     };
     use hyperscale_vm_effects::stdlib::{VAULT, account_metadata};
     use hyperscale_vm_effects::{
-        Constraint, EdgeRef, GraphArg, GraphNode, Hasher, IntentDecl, ManifestGraph, PackageHash,
-        ResourceAddr, Subintent, SubintentHash, YieldBinding, YieldParam, child_key, nullifier_key,
+        Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hasher, IntentDecl, ManifestGraph,
+        PackageHash, ResourceAddr, Subintent, SubintentHash, YieldBinding, YieldParam, child_key,
+        nullifier_key,
     };
 
     use super::*;
@@ -590,6 +506,7 @@ mod tests {
                 GraphArg::Literal(Value::Address(resource.address())),
                 GraphArg::Literal(Value::U128(amount)),
             ],
+            evidence: [EvidenceRef::IntentSignature].into(),
         }
     }
 
@@ -608,6 +525,7 @@ mod tests {
                 },
                 constraints: vec![Constraint::ResourceIs(resource.into())],
             }],
+            evidence: BTreeSet::new(),
         }
     }
 
@@ -616,6 +534,7 @@ mod tests {
             target: target.into(),
             method: "deposit".into(),
             args: vec![GraphArg::Param(param)],
+            evidence: BTreeSet::new(),
         }
     }
 
@@ -880,23 +799,19 @@ mod tests {
         assert!(statics().derive(&signed).is_ok());
     }
 
-    /// The theft the gate closes: a manifest withdrawing from an account
-    /// the envelope carries no signature for.
+    /// A withdrawal from an account the envelope carries no signature for
+    /// is well-formed and derives: the composer's own badge is presented,
+    /// and what admission asks of a guarded call is that it present
+    /// something. Whether Bob's account admits that badge is Bob's
+    /// account's answer, and the engine's theft test is where it is
+    /// asserted.
     #[test]
-    fn a_withdrawal_from_an_unsigned_account_is_refused() {
+    fn a_withdrawal_from_an_unsigned_account_derives_and_defers() {
         let tree = single_intent_tree(vec![
             withdraw(bob_addr(), RES_X, 100),
             deposit_edge(composer_addr(), 0, RES_X),
         ]);
-        let refused = statics()
-            .derive(&envelope(&tree, &[]))
-            .expect_err("refuses");
-        assert!(
-            refused.0.contains("the root intent node 0"),
-            "{}",
-            refused.0
-        );
-        assert!(refused.0.contains("withdraw"), "{}", refused.0);
+        assert!(statics().derive(&envelope(&tree, &[])).is_ok());
 
         // Reversed, it is the ordinary transfer: the composer withdraws
         // from their own account and Bob is credited without being asked.
@@ -911,57 +826,55 @@ mod tests {
     /// The stamp writes a leaf under its target's prefix and moves no
     /// funds, which is exactly why it is easy to leave open.
     #[test]
-    fn a_stamp_on_an_unsigned_account_is_refused() {
-        let stamp = |target: PrincipalAddr| {
+    fn a_stamp_presenting_nothing_is_refused() {
+        let stamp = |evidence: BTreeSet<EvidenceRef>| {
             single_intent_tree(vec![GraphNode {
-                target: target.into(),
+                target: composer_addr().into(),
                 method: "stamp-entropy".into(),
                 args: vec![],
+                evidence,
             }])
         };
+        // A guarded method reached with no evidence at all is a defect in
+        // the signed form, so derivation refuses it and nobody pays.
+        // Whether the evidence a call *does* present satisfies its
+        // target is the target's own question, answered at execution.
         let refused = statics()
-            .derive(&envelope(&stamp(bob_addr()), &[]))
+            .derive(&envelope(&stamp(BTreeSet::new()), &[]))
             .expect_err("refuses");
-        assert!(refused.0.contains("stamp-entropy"), "{}", refused.0);
+        assert!(refused.0.contains("evidence"), "{}", refused.0);
         assert!(
             statics()
-                .derive(&envelope(&stamp(composer_addr()), &[]))
+                .derive(&envelope(
+                    &stamp([EvidenceRef::IntentSignature].into()),
+                    &[]
+                ))
                 .is_ok()
         );
     }
 
-    /// A second party's funds are reachable exactly when that party
-    /// signed the node that touches them — which is the mechanism the
-    /// subintent primitive was built for.
+    /// A badge is scoped to the intent whose signature produced it, so a
+    /// node draws the identity of its own intent's signer and no other —
+    /// which is the mechanism the subintent primitive was built for.
     #[test]
-    fn a_subintents_signature_covers_its_own_nodes_and_no_others() {
+    fn a_badge_carries_its_own_intents_signer() {
         let bob = key(9);
-        // Both sides withdraw from themselves under their own signature.
-        assert!(
-            statics()
-                .derive(&envelope(&composed_tree(), &[&bob]))
-                .is_ok()
-        );
+        let derived = statics()
+            .derive(&envelope(&composed_tree(), &[&bob]))
+            .expect("both sides withdraw from themselves");
+        // Nothing about the identities survives into the routing view,
+        // so what this pins is that the tree derives at all: each intent
+        // presents its own signer, and the withdrawals name those same
+        // accounts.
+        assert!(!derived.routing.write_keys.is_empty());
 
         // The same envelope with Bob's withdrawal moved into the
-        // composer's intent: Bob signed a declaration, not this node, so
-        // his signature does not reach it.
+        // composer's intent still derives — its badge now carries the
+        // composer, which Bob's account does not admit, and the verdict
+        // on that is the account's to give at execution.
         let mut stolen = composed_tree();
         stolen.root.graph.nodes[0] = withdraw(bob_addr(), RES_X, 100);
-        let refused = statics()
-            .derive(&envelope(&stolen, &[&bob]))
-            .expect_err("refuses");
-        assert!(refused.0.contains("the root intent"), "{}", refused.0);
-
-        // And the mirror: a subintent reaching into the composer's
-        // account. The composer signed the envelope, not this subintent's
-        // declaration, so the composer's key does not reach it either.
-        let mut reversed = composed_tree();
-        reversed.subintents[0].decl.graph.nodes[0] = withdraw(composer_addr(), RES_Y, 10);
-        let refused = statics()
-            .derive(&envelope(&reversed, &[&bob]))
-            .expect_err("refuses");
-        assert!(refused.0.contains("subintent 0"), "{}", refused.0);
+        assert!(statics().derive(&envelope(&stolen, &[&bob])).is_ok());
     }
 
     #[test]

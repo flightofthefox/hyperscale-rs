@@ -320,7 +320,7 @@ mod tests {
         // each expression form, each target form, each mode, a nested
         // for-each body, a call site, and a deep literal.
         let signature = MethodSignature {
-            accessibility: Accessibility::RequiresTargetAuth,
+            accessibility: Accessibility::Guarded(Expr::SelfAddr),
             abi: Vec::new(),
             params: vec![
                 ParamType::U64,

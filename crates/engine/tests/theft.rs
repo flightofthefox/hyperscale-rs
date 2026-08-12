@@ -138,28 +138,31 @@ fn vault_cell(writes: &SettledWrites, owner: impl Into<Address>) -> Option<Vec<u
 }
 
 /// The defect, closed: an address is public, and knowing one buys nothing.
+///
+/// The envelope is well-formed — the thief's own badge is presented, and
+/// admission asks only that a guarded call present something — so the
+/// verdict is the victim's account's to give, and it aborts. The thief
+/// pays the ceiling they signed for having asked.
 #[test]
 fn draining_an_account_the_envelope_does_not_sign_for_is_refused() {
-    let _ = Executor::new(ExecutionMode::Serial);
+    let executor = Executor::new(ExecutionMode::Serial);
     let theft = signed_transfer(VICTIM, thief(), 5_000);
 
     assert!(theft.body().signature_is_valid());
-    let refused = theft.try_derived().expect_err("derivation refuses");
-    assert!(refused.0.contains("withdraw"), "{}", refused.0);
-    assert!(
-        refused.0.contains("authority"),
-        "the refusal names its reason: {}",
-        refused.0
-    );
+    assert!(theft.try_derived().is_ok(), "the shape is well-formed");
 
-    // The thief spending their own account is the admitted case, so what
-    // bites is whose account the node names and not the shape of the
-    // manifest.
-    assert!(
-        signed_transfer(thief(), VICTIM, 5_000)
-            .try_derived()
-            .is_ok()
-    );
+    let executed = execute(&executor, theft);
+    let ConsensusReceipt::Failed = &executed[0].consensus else {
+        panic!("the theft must not settle: {:?}", executed[0].consensus);
+    };
+
+    // The victim's balance is untouched, which is the property the whole
+    // mechanism exists for.
+    let executed = execute(&executor, signed_transfer(thief(), VICTIM, 5_000));
+    assert!(matches!(
+        &executed[0].consensus,
+        ConsensusReceipt::Succeeded { .. }
+    ));
 }
 
 /// What the gate is holding back, stated as an amount.

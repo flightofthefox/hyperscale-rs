@@ -312,7 +312,7 @@ fn read_uleb128(bytes: &[u8], pos: &mut usize) -> Result<usize, VmStaticsError> 
 mod tests {
 
     use hyperscale_vm_effects::stdlib::{account_metadata, book_metadata};
-    use hyperscale_vm_effects::{AbiParam, Accessibility, MethodSignature, PackageMetadata};
+    use hyperscale_vm_effects::{AbiParam, Accessibility, Expr, MethodSignature, PackageMetadata};
     use hyperscale_vm_stdlib::{account_artifact, staking_artifact};
     use wat::parse_str;
 
@@ -551,13 +551,13 @@ mod tests {
             .methods
             .get_mut("withdraw")
             .expect("declared")
-            .accessibility = Accessibility::RequiresTargetAuth;
+            .accessibility = Accessibility::Guarded(Expr::SelfAddr);
         let artifact = attach_metadata(&component, &metadata).expect("attaches");
 
         let admitted = admit_package(&artifact).expect("admits");
         assert_eq!(
             admitted.methods["withdraw"].accessibility,
-            Accessibility::RequiresTargetAuth
+            Accessibility::Guarded(Expr::SelfAddr)
         );
         assert_eq!(
             admitted.methods["deposit"].accessibility,

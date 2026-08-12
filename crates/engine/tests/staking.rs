@@ -223,27 +223,28 @@ fn signed_registration(pool: ComponentAddr, seed: u8) -> Transaction {
 /// principal's signature reaches it.
 #[test]
 fn only_the_configured_operator_may_register_a_validator() {
-    let _ = Executor::with_pools(&[seat(POOL_ID)], ExecutionMode::Serial);
+    let executor = Executor::with_pools(&[seat(POOL_ID)], ExecutionMode::Serial);
 
+    // Well-formed: the outsider presents their own badge, which is what
+    // admission asks of a guarded call. The pool's configured identity is
+    // what it is not, and the pool says so when the call reaches it.
     let outsider = signed_registration(pool_at(POOL_ID), OUTSIDER);
     assert!(outsider.body().signature_is_valid());
-    let refused = outsider
-        .try_derived()
-        .expect_err("an outsider's registration refuses");
-    assert!(refused.0.contains("register-validator"), "{}", refused.0);
+    assert!(outsider.try_derived().is_ok(), "the shape is well-formed");
+    let executed = execute(&executor, outsider);
     assert!(
-        refused.0.contains("authority"),
-        "the refusal names its reason: {}",
-        refused.0
+        matches!(&executed[0].consensus, ConsensusReceipt::Failed),
+        "an outsider's registration must not settle: {:?}",
+        executed[0].consensus
     );
 
     // The control: the same manifest, the same fee, one signature
     // different. What bites is whose key signed it and not the shape.
+    let executed = execute(&executor, signed_registration(pool_at(POOL_ID), OPERATOR));
     assert!(
-        signed_registration(pool_at(POOL_ID), OPERATOR)
-            .try_derived()
-            .is_ok(),
-        "the configured operator's own registration admits",
+        matches!(&executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
+        "the configured operator's own registration settles: {:?}",
+        executed[0].consensus
     );
 }
 
