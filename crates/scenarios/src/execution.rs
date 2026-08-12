@@ -27,8 +27,9 @@ use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::faultable::FaultableCluster;
 use crate::support::tx::{
     OVERDRAW_AMOUNT, build_composed_tx, build_publish_tx, build_stamp_tx, build_transfer_tx,
-    cross_shard_cast, cross_shard_keys, nullifier_race_cast, overdraw_cast, payment_request,
-    recipient, sender, shared_recipient_cast, storm_artifact, storm_publishers, validity_around,
+    build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, nullifier_race_cast, overdraw_cast,
+    payment_request, recipient, sender, shared_recipient_cast, storm_artifact, storm_publishers,
+    unbound_payer_cast, validity_around,
 };
 use crate::support::wait::{await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -879,6 +880,55 @@ pub fn insolvent_payer_engages_nothing(c: &mut impl Cluster) {
     assert!(
         counterpart_inclusion.is_none(),
         "the counterpart must not engage an insolvent payer's transaction"
+    );
+}
+
+/// A payer whose rule does not admit the signer engages nothing
+/// anywhere.
+///
+/// The manifest, the signature, and the fee ceiling are all honest —
+/// only the payer field names an account the signer's key does not
+/// open, and that account is funded, so nothing about solvency can
+/// refuse it. Derivation admits the envelope: the binding is the payer
+/// shard's own verdict, judged where the payer's rule lives. No
+/// payer-shard proposer selects the transaction, the reservation
+/// verification refuses any block that carries it, and it never
+/// commits at the payer shard — so no bundle flows, no counterpart
+/// engages, and the named account is debited nothing.
+///
+/// # Panics
+///
+/// Panics if either chain stalls, the transaction completes, or either
+/// shard's chain ever includes it.
+pub fn unbound_payer_engages_nothing(c: &mut impl Cluster) {
+    let (signer, from, to, victim) = unbound_payer_cast();
+    let tx = build_unbound_payer_tx(&signer, from, to, victim, validity_around(c.now()));
+    let hash = tx.hash();
+    c.submit(Arc::new(tx));
+
+    // Both chains keep advancing while the transaction goes nowhere.
+    assert!(
+        await_height(c, ShardId::leaf(1, 0), 3, epochs(6)),
+        "payer shard chain must keep advancing"
+    );
+    assert!(
+        await_height(c, ShardId::leaf(1, 1), 3, epochs(6)),
+        "counterpart shard chain must keep advancing"
+    );
+    let status = c.tx_status(hash);
+    assert!(
+        !matches!(status, Some(TransactionStatus::Completed(_))),
+        "an unbound payer's transaction must never complete; status = {status:?}"
+    );
+    let (payer_inclusion, _) = c.chain_fate(ShardId::leaf(1, 0), hash);
+    assert!(
+        payer_inclusion.is_none(),
+        "the unbound payer's transaction must never commit at the payer shard"
+    );
+    let (counterpart_inclusion, _) = c.chain_fate(ShardId::leaf(1, 1), hash);
+    assert!(
+        counterpart_inclusion.is_none(),
+        "the counterpart must not engage an unbound payer's transaction"
     );
 }
 

@@ -317,12 +317,13 @@ where
                         tx.verify(NetworkId::from(topology.network()))
                             .ok()
                             .filter(|v| {
-                                payer_covers_fee_ceiling(
-                                    v,
-                                    &topology,
-                                    local_shard,
-                                    storage.as_deref(),
-                                )
+                                payer_binding_holds(v, &topology, local_shard)
+                                    && payer_covers_fee_ceiling(
+                                        v,
+                                        &topology,
+                                        local_shard,
+                                        storage.as_deref(),
+                                    )
                             });
                     (hash, verified)
                 });
@@ -404,6 +405,29 @@ where
             }
         }
     }
+}
+
+/// Whether the payer's rule admits the signer of a transaction whose
+/// payer is local. `true` for a remote payer — the rule is the payer
+/// shard's state, so only that shard's admission judges it. Advisory
+/// like the ceiling check beside it: the builder and vote checks stay
+/// the deterministic authorities.
+fn payer_binding_holds(
+    tx: &Verified<Transaction>,
+    topology: &TopologySnapshot,
+    local_shard: ShardId,
+) -> bool {
+    if topology.shard_trie().shard_for_prefix(tx.fee_vault().owner) != local_shard {
+        return true;
+    }
+    if !tx.payer_admits_signer() {
+        tracing::debug!(
+            tx_hash = ?tx.hash(),
+            "Refusing admission: the payer's rule does not admit the signer"
+        );
+        return false;
+    }
+    true
 }
 
 /// Whether the payer of a transaction can cover its signed fee

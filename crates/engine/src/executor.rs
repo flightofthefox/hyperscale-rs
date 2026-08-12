@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use blake3::hash as blake3_hash;
-use hyperscale_effects_bridge::vm_statics::{PackageCache, package_key};
+use hyperscale_effects_bridge::vm_statics::{PackageCache, package_key, principal_for};
 use hyperscale_effects_bridge::{
     BridgeStatics, PoolRegistry, ProtocolHasher, admit_package, decode_tree, envelope_identity,
     witness_from_event,
@@ -232,9 +232,15 @@ impl Executor {
                 .ok_or_else(|| "publish body in a call sub-batch".to_string())?,
         )
         .map_err(|error| error.to_string())?;
+        // The composer identity is what the signature's own key opens,
+        // never the payer field: the payer names who is debited, and
+        // whether the payer's rule admits this signer was the payer
+        // shard's verdict before the transaction committed.
+        let signer = principal_for(vm.signer_scheme, &vm.signer)
+            .ok_or_else(|| "the envelope's signer key derives no principal".to_string())?;
         let admitted = admit_tree(
             &tree,
-            vm.fee_payer,
+            signer,
             envelope_identity(vm),
             &packages,
             &self.world.instances,

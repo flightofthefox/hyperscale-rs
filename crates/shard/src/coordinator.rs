@@ -17,11 +17,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use hyperscale_core::{Action, CommitSource, FeeDemand, ProtocolEvent, TimerId};
 use hyperscale_types::{
     BlockHash, FinalizationHash, Hash, LocalTimestamp, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProposerTimestamp,
-    ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup,
-    SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt, SubstateKey,
-    TerminalVerdict, TxClaim, TxOutcome, WeightedTimestamp, WorkInFlight, derive_reshape_trigger,
-    ready_signal_window, settled_set_verdict,
+    MAX_PROGRESS_WAIT, MAX_READY_SIGNALS_PER_BLOCK, MAX_TXS_PER_BLOCK, PrincipalAddr,
+    ProposerTimestamp, ProvisionHash, ReadySignal, ReshapeThresholds, ReshapeTrigger,
+    ScheduleLookup, SettledSetVerdict, SettledTxSet, ShardId, SplitAtBoundary, StoredReceipt,
+    SubstateKey, TerminalVerdict, TxClaim, TxOutcome, WeightedTimestamp, WorkInFlight,
+    derive_reshape_trigger, ready_signal_window, settled_set_verdict,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -2354,7 +2354,7 @@ impl ShardCoordinator {
             ProposalKind::Normal { transactions, .. } => {
                 let payer_seeds = self.local_payer_fees(
                     committee,
-                    transactions.iter().map(|tx| (tx.fee_vault(), 0u128)),
+                    transactions.iter().map(|tx| (tx.fee_vault(), 0u128, None)),
                 );
                 self.fee_demands(&payer_seeds, parent_block_hash)
             }
@@ -3371,7 +3371,7 @@ impl ShardCoordinator {
                 block
                     .transactions()
                     .iter()
-                    .map(|tx| (tx.fee_vault(), tx.body().max_fee)),
+                    .map(|tx| (tx.fee_vault(), tx.body().max_fee, Some(tx.signer()))),
             );
             let fee_demands = self.fee_demands(&block_fees, block.header().parent_block_hash());
             let fee_read_height = self.ancestry_committed_height(block.header().parent_qc());
@@ -3428,22 +3428,26 @@ impl ShardCoordinator {
     }
 
     /// Per-payer fee-reservation demands for the transaction list
-    /// `fees`, given as `(vault, max_fee)` pairs of this shard's payers:
-    /// each listed ceiling, plus the still-held ceilings in the complete
-    /// uncommitted ancestor bodies behind `parent_block_hash`, plus the
-    /// committed in-flight ledger holds. Empty when the list names no
+    /// `fees`, given as `(vault, max_fee, signer)` entries of this
+    /// shard's payers: each listed ceiling, plus the still-held ceilings
+    /// in the complete uncommitted ancestor bodies behind
+    /// `parent_block_hash`, plus the committed in-flight ledger holds.
+    /// The signers are this block's own — ancestors answered for theirs
+    /// at their own vote — and each must be one the payer's rule admits
+    /// for the reservation to engage. Empty when the list names no
     /// local payer. A rare manifest-only ancestor under view changes
     /// contributes nothing — a bounded optimism the fee settlement's
     /// saturating debit absorbs.
     fn fee_demands(
         &self,
-        fees: &[(SubstateKey, u128)],
+        fees: &[(SubstateKey, u128, Option<PrincipalAddr>)],
         parent_block_hash: BlockHash,
     ) -> Vec<FeeDemand> {
-        let mut demands: BTreeMap<SubstateKey, u128> = BTreeMap::new();
-        for (vault, max_fee) in fees {
-            let entry = demands.entry(*vault).or_insert(0);
-            *entry = entry.saturating_add(*max_fee);
+        let mut demands: BTreeMap<SubstateKey, (u128, BTreeSet<PrincipalAddr>)> = BTreeMap::new();
+        for (vault, max_fee, signer) in fees {
+            let entry = demands.entry(*vault).or_insert((0, BTreeSet::new()));
+            entry.0 = entry.0.saturating_add(*max_fee);
+            entry.1.extend(*signer);
         }
         if demands.is_empty() {
             return Vec::new();
@@ -3457,18 +3461,24 @@ impl ShardCoordinator {
                 for tx in block.transactions().iter() {
                     if let Some(entry) = demands.get_mut(&tx.fee_vault()) {
                         let fee = tx.body().max_fee;
-                        *entry = entry.saturating_add(fee);
+                        entry.0 = entry.0.saturating_add(fee);
                     }
                 }
             }
             cursor = pending.header().parent_block_hash();
         }
         for (vault, entry) in &mut demands {
-            *entry = entry.saturating_add(self.fee_ledger.held_for(vault.owner));
+            entry.0 = entry
+                .0
+                .saturating_add(self.fee_ledger.held_for(vault.owner));
         }
         demands
             .into_iter()
-            .map(|(vault, demand)| FeeDemand { vault, demand })
+            .map(|(vault, (demand, signers))| FeeDemand {
+                vault,
+                demand,
+                signers,
+            })
             .collect()
     }
 
@@ -3521,11 +3531,11 @@ impl ShardCoordinator {
     fn local_payer_fees(
         &self,
         topology_snapshot: &TopologySnapshot,
-        transactions: impl Iterator<Item = (SubstateKey, u128)>,
-    ) -> Vec<(SubstateKey, u128)> {
+        transactions: impl Iterator<Item = (SubstateKey, u128, Option<PrincipalAddr>)>,
+    ) -> Vec<(SubstateKey, u128, Option<PrincipalAddr>)> {
         let trie = topology_snapshot.shard_trie();
         transactions
-            .filter(|(vault, _)| trie.shard_for_prefix(vault.owner) == self.local_shard)
+            .filter(|(vault, ..)| trie.shard_for_prefix(vault.owner) == self.local_shard)
             .collect()
     }
 

@@ -19,8 +19,8 @@ use thiserror::Error;
 
 use crate::transaction::vm::{ProtocolVerifier, SchemeVerifier, vm_statics};
 use crate::{
-    DeclaredKey, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN, NetworkId, Routing,
-    ShardTrie, SubstateKey, TimestampRange, TransactionEnvelope, TxHash, Verified, Verify,
+    DeclaredKey, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN, NetworkId, PrincipalAddr,
+    Routing, ShardTrie, SubstateKey, TimestampRange, TransactionEnvelope, TxHash, Verified, Verify,
     VmStaticsError,
 };
 
@@ -257,6 +257,40 @@ impl Transaction {
         }
     }
 
+    /// The principal the envelope's signature opens — the identity the
+    /// root intent presents as evidence.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Self::routing`].
+    #[must_use]
+    pub fn signer(&self) -> PrincipalAddr {
+        self.derived().signer
+    }
+
+    /// Whether the fee payer's rule admits the envelope signer.
+    ///
+    /// Every fee rule debits the account the envelope's `fee_payer`
+    /// names — the reservation the payer shard enforces as block
+    /// validity, the burn a completed transaction writes, the floor an
+    /// abort settles — so a payer whose rule does not admit the signer
+    /// would be a debit on an account that authorised nothing,
+    /// spendable by anyone who knows its address.
+    ///
+    /// Judged only where the payer's state is — the payer's shard, at
+    /// mempool admission, at proposal, and as a block-validity
+    /// condition at vote. Every account's rule is the virtual one, the
+    /// identity its own address derives, so the verdict is this
+    /// comparison.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Self::routing`].
+    #[must_use]
+    pub fn payer_admits_signer(&self) -> bool {
+        self.signer() == self.body().fee_payer
+    }
+
     /// The cached derivation, or a panic naming the refusal.
     fn derived(&self) -> &Derived {
         self.try_derived()
@@ -453,6 +487,10 @@ mod tests {
                 Vec::new()
             };
             Ok(Derived {
+                // The stub cannot derive an address from a key, so it
+                // binds the signer to the payer field — every stubbed
+                // transaction's payer admits its signer.
+                signer: vm.fee_payer,
                 fee_vault_local: [0xEE; 16],
                 routing: Routing {
                     read_keys: vec![DeclaredKey::prefix(test_prefix(0x11))],

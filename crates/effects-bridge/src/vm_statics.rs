@@ -300,6 +300,7 @@ impl BridgeStatics {
     /// happens to name the same vault.
     fn derive_publish(
         vm: &TransactionEnvelope,
+        signer: PrincipalAddr,
         artifact: &[u8],
     ) -> Result<Derived, VmStaticsError> {
         if !vm.subintent_sigs.is_empty() {
@@ -328,6 +329,7 @@ impl BridgeStatics {
 
         Ok(Derived {
             work,
+            signer,
             routing: Routing {
                 read_prefixes: Vec::new(),
                 write_prefixes: vec![publisher.address()],
@@ -352,21 +354,19 @@ impl VmStatics for BridgeStatics {
     }
 
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
-        // The payer is the composer, and this is what makes that true.
-        // Every fee rule debits the account this field names — the
-        // reservation a payer shard enforces as block validity, the
-        // burn a completed transaction writes, the floor an abort
-        // settles — and the composer's signature is the only authority
-        // in the envelope. An unbound payer field is therefore a debit
-        // on an account that authorised nothing, spendable by anyone
-        // who knows its address.
-        if principal_for(vm.signer_scheme, &vm.signer) != Some(vm.fee_payer) {
+        // The identity the envelope's own signature opens: what the root
+        // intent presents as evidence, and the identity the payer's rule
+        // must admit. Whether it does is the payer shard's verdict —
+        // taken where the payer's state is, as a condition of the fee
+        // reservation engaging — so derivation records the identity and
+        // never compares it against the payer field.
+        let Some(signer) = principal_for(vm.signer_scheme, &vm.signer) else {
             return Err(VmStaticsError(
-                "fee payer is not the composer's own account".into(),
+                "the envelope's signer key derives no principal".into(),
             ));
-        }
+        };
         if let Some(artifact) = vm.artifact() {
-            return Self::derive_publish(vm, artifact);
+            return Self::derive_publish(vm, signer, artifact);
         }
         let tree = decode_tree(vm.call_tree().unwrap_or_default())?;
         if vm.subintent_sigs.len() != tree.subintents.len() {
@@ -390,7 +390,7 @@ impl VmStatics for BridgeStatics {
         let packages = self.cache.load();
         let admitted = admit_tree(
             &tree,
-            vm.fee_payer,
+            signer,
             envelope_identity(vm),
             &packages,
             &self.instances,
@@ -434,6 +434,7 @@ impl VmStatics for BridgeStatics {
         );
         Ok(Derived {
             work,
+            signer,
             routing: Routing {
                 read_prefixes: prefixes(&read_keys),
                 write_prefixes: prefixes(&write_keys),
@@ -751,11 +752,14 @@ mod tests {
     }
 
     #[test]
-    fn a_fee_payer_the_composer_does_not_own_is_refused() {
-        // The whole fee path debits whatever this field names, and the
-        // composer's signature is the only authority in the envelope —
-        // so naming someone else's account has to be refused before any
-        // of it runs, or that account is spendable by a stranger.
+    fn a_fee_payer_the_composer_does_not_own_derives_unbound() {
+        // The whole fee path debits whatever this field names, so
+        // whether the payer's rule admits the signer is the payer
+        // shard's block-validity verdict, taken where the payer's state
+        // is. Derivation refuses nothing here: it records the identity
+        // the envelope's key opens, and records it from the key rather
+        // than from the payer field — so a stranger naming someone
+        // else's account gets their own badge, never the account's.
         let tree = single_intent_tree(vec![
             withdraw(composer_addr(), RES_X, 100),
             deposit_edge(bob_addr(), 0, RES_X),
@@ -765,19 +769,23 @@ mod tests {
         let stolen = stolen.sign(&key(7));
 
         assert!(stolen.signature_is_valid(), "the composer signed it");
-        let refused = statics().derive(&stolen).expect_err("refuses");
-        assert!(refused.0.contains("fee payer"), "{}", refused.0);
-
-        // The composer paying from their own account is the admitted
-        // case, so the check bites on ownership and not on fees at all.
-        assert!(statics().derive(&envelope(&tree, &[])).is_ok());
+        let derived = statics().derive(&stolen).expect("derives");
+        assert_eq!(
+            derived.signer,
+            composer_addr(),
+            "the recorded identity is the key's, not the payer field's"
+        );
+        assert_ne!(
+            derived.signer, stolen.fee_payer,
+            "which is exactly the mismatch the payer shard's verdict reads"
+        );
     }
 
-    /// The payer binding is derived under the scheme the envelope names,
-    /// so a second scheme's key opens its own account and the same seed
-    /// under two schemes is two accounts.
+    /// The signer's identity is derived under the scheme the envelope
+    /// names, so a second scheme's key opens its own account and the
+    /// same seed under two schemes is two accounts.
     #[test]
-    fn the_payer_binding_holds_under_a_second_scheme() {
+    fn the_signer_identity_derives_under_the_envelopes_scheme() {
         let secp = Secp256k1PrivateKey::from_bytes(&[7u8; 32]).expect("a scalar in range");
         let payer = principal_for(SchemeId::SECP256K1, &secp.public_key().0)
             .expect("a registered scheme opens an account");
@@ -796,7 +804,8 @@ mod tests {
         let signed = signed.sign(&secp);
 
         assert!(signed.signature_is_valid());
-        assert!(statics().derive(&signed).is_ok());
+        let derived = statics().derive(&signed).expect("derives");
+        assert_eq!(derived.signer, payer);
     }
 
     /// A withdrawal from an account the envelope carries no signature for

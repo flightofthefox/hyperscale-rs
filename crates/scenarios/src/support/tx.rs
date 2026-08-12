@@ -13,16 +13,18 @@ use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
 use hyperscale_effects_bridge::{ProtocolHasher, attach_metadata};
 use hyperscale_engine::genesis::{pool_address, stake_unit, staking_artifact};
 use hyperscale_engine::{XRD, account_address};
-use hyperscale_transactions::{Client, Terms};
+use hyperscale_transactions::{Client, DEFAULT_GAS_LIMIT, Terms};
 use hyperscale_types::{
     ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey, EnvelopeExt, Epoch,
     MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, NetworkId, NetworkParams, PrincipalAddr, SchemeId,
     ShardId, ShardTrie, StakePoolId, StakePoolSeat, TimestampRange, Transaction, TransactionBody,
     TransactionEnvelope, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
 };
-use hyperscale_vm_effects::{Address, Constraint, IntentDecl, ManifestGraph, package_hash};
+use hyperscale_vm_effects::{
+    Address, Constraint, EnvelopeTree, IntentDecl, ManifestGraph, package_hash,
+};
 use hyperscale_vm_manifest_builder::native::{account, staking};
-use hyperscale_vm_manifest_builder::signing::sign_subintent;
+use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, IntentBuilder, TypedBuilder, TypedError};
 use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_metadata};
 
@@ -1024,6 +1026,78 @@ pub fn build_transfer_tx(
         .transfer_graph(from, to, amount)
         .expect("the stdlib account answers a transfer");
     Transaction::new(envelope(graph, payer, validity))
+}
+
+/// Build a transfer whose fee payer is somebody else's account.
+///
+/// The manifest and the signature are the signer's own, and only the
+/// payer field names the victim. Derivation admits it — nothing about
+/// the signed content is malformed — and the payer shard's binding
+/// verdict is what must refuse it.
+///
+/// # Panics
+///
+/// If the scenario world does not answer a transfer, which would be a
+/// defect in the world rather than in the transfer.
+#[must_use]
+pub fn build_unbound_payer_tx(
+    signer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
+    payer: PrincipalAddr,
+    validity: TimestampRange,
+) -> Transaction {
+    let client = client();
+    let graph = client
+        .transfer_graph(from, to, 5)
+        .expect("the stdlib account answers a transfer");
+    let envelope = signing::wrap(
+        &EnvelopeTree {
+            root: IntentDecl {
+                graph,
+                params: Vec::new(),
+            },
+            root_bindings: Vec::new(),
+            subintents: Vec::new(),
+        },
+        Vec::new(),
+        payer,
+        client.network(),
+        signing::Terms {
+            max_fee: MAX_FEE,
+            gas_limit: DEFAULT_GAS_LIMIT,
+            validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
+            validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
+            message: Vec::new(),
+        },
+    );
+    Transaction::new(signing::sign(envelope, signer, &ProtocolHasher))
+}
+
+/// The unbound-payer cast: the signer's key and account on `leaf(1, 0)`,
+/// the recipient on `leaf(1, 1)`, and a victim account also on
+/// `leaf(1, 0)` that the signer's key does not open.
+#[must_use]
+pub fn unbound_payer_cast() -> (
+    Ed25519PrivateKey,
+    PrincipalAddr,
+    PrincipalAddr,
+    PrincipalAddr,
+) {
+    let mut taken = Vec::new();
+    let (signer, from) = account_routing_to(ShardId::leaf(1, 0), &mut taken);
+    let (_, to) = account_routing_to(ShardId::leaf(1, 1), &mut taken);
+    let (_, victim) = account_routing_to(ShardId::leaf(1, 0), &mut taken);
+    (signer, from, to, victim)
+}
+
+/// Genesis funding for the unbound-payer cast: everyone funded, the
+/// victim well past any fee ceiling — so the only thing that can refuse
+/// the transaction is the payer binding, never solvency.
+#[must_use]
+pub fn unbound_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let (_signer, from, to, victim) = unbound_payer_cast();
+    vec![(from, 10_000), (to, 10), (victim, 10_000)]
 }
 
 /// Every stake pool any scenario in this crate seats.

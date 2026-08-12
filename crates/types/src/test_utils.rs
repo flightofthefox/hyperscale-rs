@@ -918,6 +918,10 @@ impl VmStatics for StubVmStatics {
                     .collect(),
             },
             subintent_hashes: Vec::new(),
+            // The stub cannot derive an address from a key, so it binds
+            // the signer to the payer field — every stubbed
+            // transaction's payer admits its signer.
+            signer: vm.fee_payer,
             fee_vault_local: [0xEE; 16],
             // The stub prices a declared key like the real derivation
             // prices an effect — one unit each — and hands the total to

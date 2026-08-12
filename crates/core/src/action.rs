@@ -1,6 +1,6 @@
 //! Action types for the deterministic state machine.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,10 +12,10 @@ use hyperscale_types::{
     CertificateRoot, CertifiedBeaconBlock, CertifiedBlock, CertifiedBlockHeader,
     ConsensusPublicKey, Epoch, ExecutionCertificate, ExecutionVote, Finalization,
     GlobalReceiptRoot, Hash, HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1,
-    PcVote2, PcVote3, PcVoteEquivocation, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
-    Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote,
-    ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round,
-    RoutingCommittees, SafeVoteRegisters, ShardForkProof, ShardId, ShardLoad,
+    PcVote2, PcVote3, PcVoteEquivocation, PrincipalAddr, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
+    RatifyVote, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain,
+    Round, RoutingCommittees, SafeVoteRegisters, ShardForkProof, ShardId, ShardLoad,
     ShardVoteEquivocation, SharedCertificates, SharedTransactions, SharedWitnessSources,
     SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots,
     StateRoot, SubstateEntry, SubstateKey, TerminalEvidence, TerminalRoots, TerminalVerdict,
@@ -173,6 +173,14 @@ pub struct FeeDemand {
     /// engaged fee ceilings plus the in-flight holds derived from chain
     /// content.
     pub demand: u128,
+    /// The distinct signer identities behind this block's demands on
+    /// this payer, each of which the payer's rule must admit for the
+    /// reservation to engage. Ancestor and in-flight holds contribute
+    /// demand but no signers — their blocks answered for their own.
+    ///
+    /// Empty when the demand seeds a proposal builder, whose candidate
+    /// transactions carry their own signers.
+    pub signers: BTreeSet<PrincipalAddr>,
 }
 
 /// Actions the state machine wants to perform.

@@ -20,7 +20,9 @@ use crate::crypto::{
     Ed25519PublicKey, Ed25519Signature, Secp256k1PublicKey, Secp256k1Signature, verify_ed25519,
     verify_secp256k1,
 };
-use crate::{Address, DeclaredKey, Hash, ProtocolHasher, TimestampRange, WeightedTimestamp};
+use crate::{
+    Address, DeclaredKey, Hash, PrincipalAddr, ProtocolHasher, TimestampRange, WeightedTimestamp,
+};
 
 /// The curves behind the VM's scheme registry.
 ///
@@ -214,6 +216,15 @@ impl Routing {
 pub struct Derived {
     /// The routing identity.
     pub routing: Routing,
+    /// The principal the envelope's own signature opens — the identity
+    /// the root intent's signature badge carries.
+    ///
+    /// Deliberately not compared against the envelope's `fee_payer`
+    /// here: whether the payer's rule admits this identity is the payer
+    /// shard's verdict, taken where the payer's state is, so derivation
+    /// records the identity and leaves the judgement to the one shard
+    /// that can reach it.
+    pub signer: PrincipalAddr,
     /// One declaration hash per bound subintent, in tree order.
     pub subintent_hashes: Vec<[u8; 32]>,
     /// The local half of the fee payer's native-resource vault cell —

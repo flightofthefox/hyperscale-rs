@@ -612,7 +612,21 @@ where
             // or persistence progress.
             let view = ctx.pending_chain.view_at_committed_tip();
             let mut result: Result<(), String> = Ok(());
-            for demand in &demands {
+            'demands: for demand in &demands {
+                // The reservation engages only for signers the payer's
+                // rule admits. Every account's rule is the virtual one —
+                // the identity its own address derives — so the verdict
+                // is a comparison; a stored rule would be read here, at
+                // the same anchored height as the balance beside it.
+                for signer in &demand.signers {
+                    if signer.address() != demand.vault.owner {
+                        result = Err(format!(
+                            "payer {:?}: rule does not admit signer {signer:?}",
+                            demand.vault.owner
+                        ));
+                        break 'demands;
+                    }
+                }
                 let Some(cell) = view.get_substate_at_height(demand.vault, read_height) else {
                     result = Err(format!(
                         "payer {:?}: balance history unavailable at height {}",
@@ -934,6 +948,7 @@ where
                     })
                     .collect();
                 let mut dropped = 0usize;
+                let mut unbound = 0usize;
                 let kept: Vec<_> = transactions
                     .into_iter()
                     .filter(|tx| {
@@ -941,6 +956,14 @@ where
                         let Some(used) = running.get_mut(&vault) else {
                             return true;
                         };
+                        // The builder-side form of the voters' payer
+                        // binding verdict, so a proposal never
+                        // self-rejects on a signer the payer's rule
+                        // refuses.
+                        if !tx.payer_admits_signer() {
+                            unbound += 1;
+                            return false;
+                        }
                         let max_fee = tx.body().max_fee;
                         let wanted = used.saturating_add(max_fee);
                         if wanted > balances.get(&vault).copied().unwrap_or(0) {
@@ -956,6 +979,13 @@ where
                         dropped,
                         height = height.inner(),
                         "Dropped transactions whose payer cannot cover its fee reservation"
+                    );
+                }
+                if unbound > 0 {
+                    tracing::debug!(
+                        unbound,
+                        height = height.inner(),
+                        "Dropped transactions whose payer's rule does not admit their signer"
                     );
                 }
                 kept
