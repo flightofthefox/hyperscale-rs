@@ -500,7 +500,7 @@ mod tests {
     }
 
     /// The sign-in every fixture graph leads with: node 0 of its intent,
-    /// which is what the withdraw fixtures point their badges at.
+    /// which is what the withdraw fixtures point their proofs at.
     fn sign_in(target: impl Into<CallTarget>) -> GraphNode {
         GraphNode {
             target: target.into(),
@@ -874,7 +874,7 @@ mod tests {
             .derive(&envelope(&stamp(BTreeSet::new()), &[]))
             .expect_err("refuses");
         assert!(refused.0.contains("evidence"), "{}", refused.0);
-        // A signature badge is not the stamp's to read either: it signs
+        // A signature proof is not the stamp's to read either: it signs
         // in, and the stamp takes what the sign-in minted.
         let refused = statics()
             .derive(&envelope(
@@ -882,7 +882,7 @@ mod tests {
                 &[],
             ))
             .expect_err("refuses");
-        assert!(refused.0.contains("signature badge"), "{}", refused.0);
+        assert!(refused.0.contains("signature proof"), "{}", refused.0);
         assert!(
             statics()
                 .derive(&envelope(
@@ -901,11 +901,11 @@ mod tests {
         );
     }
 
-    /// A badge is scoped to the intent whose signature produced it, so a
+    /// A proof is scoped to the intent whose signature produced it, so a
     /// node draws the identity of its own intent's signer and no other —
     /// which is the mechanism the subintent primitive was built for.
     #[test]
-    fn a_badge_carries_its_own_intents_signer() {
+    fn a_proof_carries_its_own_intents_signer() {
         let bob = key(9);
         let derived = statics()
             .derive(&envelope(&composed_tree(), &[&bob]))
@@ -917,7 +917,7 @@ mod tests {
         assert!(!derived.routing.write_keys.is_empty());
 
         // The same envelope with Bob's withdrawal moved into the
-        // composer's intent still derives — its badge now carries the
+        // composer's intent still derives — its proof now carries the
         // composer, which Bob's account does not admit, and the verdict
         // on that is the account's to give at execution.
         let mut stolen = composed_tree();

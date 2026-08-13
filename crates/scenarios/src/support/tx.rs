@@ -1296,8 +1296,8 @@ pub fn build_deactivate_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(|b| {
-        let badge = account::authorize(b, account_address(&operator.public_key().0))?;
-        staking::deactivate_validator(b, badge, pool, validator.inner())
+        let proof = account::authorize(b, account_address(&operator.public_key().0))?;
+        staking::deactivate_validator(b, proof, pool, validator.inner())
     });
     Transaction::new(envelope(graph, operator, validity))
 }
@@ -1318,10 +1318,10 @@ pub fn build_register_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(|b| {
-        let badge = account::authorize(b, account_address(&operator.public_key().0))?;
+        let proof = account::authorize(b, account_address(&operator.public_key().0))?;
         staking::register_validator(
             b,
-            badge,
+            proof,
             pool,
             validator.inner(),
             pubkey.as_bytes().to_vec(),
@@ -1547,10 +1547,10 @@ pub fn build_reshape_threshold_vote_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(|b| {
-        let badge = account::authorize(b, account_address(&operator.public_key().0))?;
+        let proof = account::authorize(b, account_address(&operator.public_key().0))?;
         staking::cast_param_vote(
             b,
-            badge,
+            proof,
             pool_at(GENESIS_POOL_ID),
             split_bytes,
             NetworkParams::default().impound_epochs,

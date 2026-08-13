@@ -212,9 +212,9 @@ fn signed_registration(pool: ComponentAddr, seed: u8) -> Transaction {
     let key = key_of(seed);
     let cache = client().cache();
     let mut b = client().builder(&cache);
-    let badge = account::authorize(&mut b, account_address(&key.public_key().0))
+    let proof = account::authorize(&mut b, account_address(&key.public_key().0))
         .expect("an account signs in");
-    staking::register_validator(&mut b, badge, pool, 11, vec![0xC1; 48], vec![0xC2; 96])
+    staking::register_validator(&mut b, proof, pool, 11, vec![0xC1; 48], vec![0xC2; 96])
         .expect("a pool answers a registration");
     let graph = b.build().expect("a registration produces nothing");
     Transaction::new(client().sign(graph, &key, terms(1_000)))
