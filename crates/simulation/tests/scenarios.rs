@@ -17,7 +17,7 @@ use hyperscale_scenarios::tx::{
     nullifier_race_genesis_accounts, overdraw_genesis_accounts, participant_sweep_genesis_accounts,
     probe_train_genesis_accounts, reshape_lifecycle_accounts, shared_recipient_genesis_accounts,
     split_straddler_setup, staking_genesis_accounts, storm_genesis_accounts,
-    unbound_genesis_accounts, withdrawal_burst_genesis_accounts,
+    unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig,
@@ -52,8 +52,8 @@ use hyperscale_scenarios::{
     split_survivor_recovers_a_settlement_it_never_received,
     split_terminating_payer_releases_its_reservation, stake_withdraw_drops_effective_stake,
     surviving_sibling_split_seats_full_committees, unbound_payer_engages_nothing,
-    withdrawal_ejects_a_validator_that_a_deposit_reactivates, withdrawals_compose_over_one_vault,
-    zipf_payments,
+    unbound_remote_payer_engages_nothing, withdrawal_ejects_a_validator_that_a_deposit_reactivates,
+    withdrawals_compose_over_one_vault, zipf_payments,
 };
 use hyperscale_simulation::ExecutionMode;
 use hyperscale_storage::ShardChainReader;
@@ -319,6 +319,16 @@ fn unbound_payer_engages_nothing_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &unbound_genesis_accounts());
     unbound_payer_engages_nothing(&mut cluster);
+}
+
+#[test]
+fn unbound_remote_payer_engages_nothing_sim() {
+    let mut cluster = SimCluster::with_grown_accounts(
+        &cross_shard_config(),
+        42,
+        &unbound_remote_genesis_accounts(),
+    );
+    unbound_remote_payer_engages_nothing(&mut cluster);
 }
 
 #[test]

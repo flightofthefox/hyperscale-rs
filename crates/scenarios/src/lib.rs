@@ -36,7 +36,7 @@ pub use execution::{
     insolvent_payer_engages_nothing, nullifier_race_admits_exactly_one,
     preview_reports_resource_changes, randomness_draw_agrees_across_shards,
     reads_the_committed_baseline, single_transfer, unbound_payer_engages_nothing,
-    withdrawals_compose_over_one_vault, zipf_payments,
+    unbound_remote_payer_engages_nothing, withdrawals_compose_over_one_vault, zipf_payments,
 };
 pub use faults::{
     beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,

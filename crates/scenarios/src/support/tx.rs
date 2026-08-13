@@ -1105,6 +1105,34 @@ pub fn unbound_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
     vec![(from, 10_000), (to, 10), (victim, 10_000)]
 }
 
+/// The remote unbound-payer cast: the whole manifest — signer, sender,
+/// recipient — on `leaf(1, 1)`, and the victim payer on `leaf(1, 0)`.
+///
+/// The payer's shard is touched through no key but the payer's own —
+/// the fee vault and the stored-authority cell — so its binding verdict
+/// stands alone rather than beside a manifest leg.
+#[must_use]
+pub fn unbound_remote_payer_cast() -> (
+    Ed25519PrivateKey,
+    PrincipalAddr,
+    PrincipalAddr,
+    PrincipalAddr,
+) {
+    let mut taken = Vec::new();
+    let (signer, from) = account_routing_to(ShardId::leaf(1, 1), &mut taken);
+    let (_, to) = account_routing_to(ShardId::leaf(1, 1), &mut taken);
+    let (_, victim) = account_routing_to(ShardId::leaf(1, 0), &mut taken);
+    (signer, from, to, victim)
+}
+
+/// Genesis funding for the remote unbound-payer cast, on the same
+/// terms as [`unbound_genesis_accounts`].
+#[must_use]
+pub fn unbound_remote_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let (_signer, from, to, victim) = unbound_remote_payer_cast();
+    vec![(from, 10_000), (to, 10), (victim, 10_000)]
+}
+
 /// Every stake pool any scenario in this crate seats.
 ///
 /// The VM statics are process-global and first-installed-wins, so a test

@@ -29,7 +29,7 @@ use crate::support::tx::{
     OVERDRAW_AMOUNT, build_composed_tx, build_publish_tx, build_stamp_tx, build_transfer_tx,
     build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, nullifier_race_cast, overdraw_cast,
     payment_request, recipient, sender, shared_recipient_cast, storm_artifact, storm_publishers,
-    unbound_payer_cast, validity_around,
+    unbound_payer_cast, unbound_remote_payer_cast, validity_around,
 };
 use crate::support::wait::{await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -929,6 +929,53 @@ pub fn unbound_payer_engages_nothing(c: &mut impl Cluster) {
     assert!(
         counterpart_inclusion.is_none(),
         "the counterpart must not engage an unbound payer's transaction"
+    );
+}
+
+/// The same refusal when the payer's shard holds nothing else of the
+/// transaction.
+///
+/// The manifest — signer, sender, recipient — lives whole on the
+/// counterpart shard, and the payer shard's only stake is the fee vault
+/// and the stored-authority cell beside it. The binding verdict cannot
+/// lean on a manifest leg it would have judged anyway; it stands alone,
+/// and it alone must keep the reservation from engaging — so the
+/// transaction never commits on either shard and the remote victim is
+/// debited nothing.
+///
+/// # Panics
+///
+/// Panics if either chain stalls, the transaction completes, or either
+/// shard's chain ever includes it.
+pub fn unbound_remote_payer_engages_nothing(c: &mut impl Cluster) {
+    let (signer, from, to, victim) = unbound_remote_payer_cast();
+    let tx = build_unbound_payer_tx(&signer, from, to, victim, validity_around(c.now()));
+    let hash = tx.hash();
+    c.submit(Arc::new(tx));
+
+    // Both chains keep advancing while the transaction goes nowhere.
+    assert!(
+        await_height(c, ShardId::leaf(1, 0), 3, epochs(6)),
+        "payer shard chain must keep advancing"
+    );
+    assert!(
+        await_height(c, ShardId::leaf(1, 1), 3, epochs(6)),
+        "manifest shard chain must keep advancing"
+    );
+    let status = c.tx_status(hash);
+    assert!(
+        !matches!(status, Some(TransactionStatus::Completed(_))),
+        "an unbound remote payer's transaction must never complete; status = {status:?}"
+    );
+    let (payer_inclusion, _) = c.chain_fate(ShardId::leaf(1, 0), hash);
+    assert!(
+        payer_inclusion.is_none(),
+        "the unbound payer's transaction must never commit at the payer shard"
+    );
+    let (manifest_inclusion, _) = c.chain_fate(ShardId::leaf(1, 1), hash);
+    assert!(
+        manifest_inclusion.is_none(),
+        "the manifest shard must not engage without the payer's reservation"
     );
 }
 
