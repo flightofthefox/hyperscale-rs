@@ -22,12 +22,12 @@ use hyperscale_types::{
     DeclaredKey, Derived, EnvelopeExt, Routing, TransactionEnvelope, VmStatics, VmStaticsError,
     declared_work,
 };
-use hyperscale_vm_effects::stdlib::{ENTROPY, VALIDATORS, VAULT, XRD as XRD_ROLE};
+use hyperscale_vm_effects::stdlib::{AUTH, ENTROPY, VALIDATORS, VAULT, XRD as XRD_ROLE};
 use hyperscale_vm_effects::{
     Address, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry, ManifestHash, MetadataCache,
     Mode, NativeAddr, PackageHash, PackageMetadata, PrefixShardResolver, PrincipalAddr, RoleId,
-    Routing as RoutedTransaction, SchemeId, SubstateKey, Value, admit_tree, child_key, footprint,
-    native_address, package_hash, principal_address, route_tree,
+    Routing as RoutedTransaction, Rule, SchemeId, SubstateKey, Value, admit_tree, child_key,
+    footprint, native_address, package_hash, principal_address, route_tree,
 };
 
 use crate::ProtocolHasher;
@@ -49,6 +49,13 @@ pub fn vault_key(owner: impl Into<Address>, resource: impl Into<Address>) -> Sub
         VAULT,
         &[Value::Address(resource.into()).canonical_bytes()],
     )
+}
+
+/// The stored-authority cell under `owner` — what `securify` writes,
+/// `authorize` reads, and the payer shard's binding verdict consults.
+#[must_use]
+pub fn auth_key(owner: impl Into<Address>) -> SubstateKey {
+    child_key(&ProtocolHasher, owner, AUTH, &[])
 }
 
 /// A stake pool's record of one validator it operates: the cell the
@@ -341,6 +348,7 @@ impl BridgeStatics {
             },
             subintent_hashes: Vec::new(),
             fee_vault_local: vault.local.0,
+            auth_cell_local: auth_key(publisher).local.0,
         })
     }
 }
@@ -351,6 +359,23 @@ impl VmStatics for BridgeStatics {
             return;
         };
         self.cache.absorb_cell(owner, local, value);
+    }
+
+    fn rule_admits(
+        &self,
+        auth_cell: Option<&[u8]>,
+        payer: PrincipalAddr,
+        signer: PrincipalAddr,
+    ) -> bool {
+        match auth_cell {
+            None | Some([]) => payer == signer,
+            // Stored bytes that do not decode admit nobody — the write
+            // path refuses such bytes, so these are not a rule, and the
+            // verdict fails closed like the execution gate's.
+            Some(bytes) => {
+                Rule::from_slice(bytes).is_ok_and(|rule| rule.satisfied_by(&[signer.address()]))
+            }
+        }
     }
 
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
@@ -450,6 +475,7 @@ impl VmStatics for BridgeStatics {
                 .map(|record| record.subintent.0.0)
                 .collect(),
             fee_vault_local: vault_key(vm.fee_payer, *XRD).local.0,
+            auth_cell_local: auth_key(vm.fee_payer).local.0,
         })
     }
 }
@@ -732,6 +758,9 @@ mod tests {
 
         // Reserve at the sender's vault and deltas at the recipient's:
         // all exclusive-class, substate-granular, under the two owners.
+        // The sign-in reads the sender's rule cell, which is the one
+        // shared key and the one provision — its absence is what the
+        // read carries to every participant.
         let sender_vault = child_key(
             &ProtocolHasher,
             composer_addr(),
@@ -742,14 +771,41 @@ mod tests {
             composer_addr().address(),
             sender_vault.local.0
         )));
-        assert!(derived.routing.read_keys.is_empty());
-        // A commutative-only transfer provisions nothing at all.
-        assert!(derived.routing.provision_keys.is_empty());
-        assert!(derived.routing.provision_prefixes.is_empty());
+        let rule_cell =
+            DeclaredKey::substate(composer_addr().address(), auth_key(composer_addr()).local.0);
+        assert_eq!(derived.routing.read_keys, vec![rule_cell]);
+        assert_eq!(derived.routing.provision_keys, vec![rule_cell]);
+        assert_eq!(
+            derived.routing.provision_prefixes,
+            vec![composer_addr().address()]
+        );
         assert!(derived.subintent_hashes.is_empty());
         let mut owners = vec![composer_addr(), bob_addr()];
         owners.sort_unstable();
         assert_eq!(derived.routing.write_prefixes, owners);
+    }
+
+    /// The payer shard's binding verdict across the securify boundary:
+    /// absent means the virtual rule, stored bytes mean the rule and
+    /// nothing else, and bytes that decode as no rule admit nobody.
+    #[test]
+    fn the_stored_rule_governs_the_payer_binding() {
+        let statics = statics();
+
+        // Virtual: the payer's own identity and no other.
+        assert!(statics.rule_admits(None, composer_addr(), composer_addr()));
+        assert!(statics.rule_admits(Some(&[]), composer_addr(), composer_addr()));
+        assert!(!statics.rule_admits(None, composer_addr(), bob_addr()));
+
+        // Securified to Bob: the old identity is dead, the rule's lives.
+        let rule = Rule::Require(bob_addr().address()).to_bytes().unwrap();
+        assert!(statics.rule_admits(Some(&rule), composer_addr(), bob_addr()));
+        assert!(!statics.rule_admits(Some(&rule), composer_addr(), composer_addr()));
+
+        // Bytes no rule decodes from admit nobody — fail closed, like
+        // the execution gate.
+        assert!(!statics.rule_admits(Some(&[0xFF, 0xFF]), composer_addr(), composer_addr()));
+        assert!(!statics.rule_admits(Some(&[0xFF, 0xFF]), composer_addr(), bob_addr()));
     }
 
     #[test]

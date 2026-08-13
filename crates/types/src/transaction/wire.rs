@@ -268,7 +268,25 @@ impl Transaction {
         self.derived().signer
     }
 
-    /// Whether the fee payer's rule admits the envelope signer.
+    /// The fee payer's stored-authority cell — what the payer shard's
+    /// binding verdict reads beside the vault, at the same anchored
+    /// height.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Self::routing`].
+    #[must_use]
+    pub fn auth_cell(&self) -> SubstateKey {
+        SubstateKey {
+            owner: self.body().fee_payer.address(),
+            local: LocalKey(self.derived().auth_cell_local),
+        }
+    }
+
+    /// Whether the fee payer's rule admits the envelope signer, given
+    /// the payer's stored-authority cell as read at the caller's own
+    /// anchored height — `None` or empty meaning absent, the virtual
+    /// rule.
     ///
     /// Every fee rule debits the account the envelope's `fee_payer`
     /// names — the reservation the payer shard enforces as block
@@ -279,16 +297,14 @@ impl Transaction {
     ///
     /// Judged only where the payer's state is — the payer's shard, at
     /// mempool admission, at proposal, and as a block-validity
-    /// condition at vote. Every account's rule is the virtual one, the
-    /// identity its own address derives, so the verdict is this
-    /// comparison.
+    /// condition at vote.
     ///
     /// # Panics
     ///
     /// Panics under the same conditions as [`Self::routing`].
     #[must_use]
-    pub fn payer_admits_signer(&self) -> bool {
-        self.signer() == self.body().fee_payer
+    pub fn payer_admits_signer(&self, auth_cell: Option<&[u8]>) -> bool {
+        vm_statics().rule_admits(auth_cell, self.body().fee_payer, self.signer())
     }
 
     /// The cached derivation, or a panic naming the refusal.
@@ -492,6 +508,7 @@ mod tests {
                 // transaction's payer admits its signer.
                 signer: vm.fee_payer,
                 fee_vault_local: [0xEE; 16],
+                auth_cell_local: [0xAE; 16],
                 routing: Routing {
                     read_keys: vec![DeclaredKey::prefix(test_prefix(0x11))],
                     write_keys: vec![DeclaredKey::substate(test_prefix(0x22), [0x01; 16])],

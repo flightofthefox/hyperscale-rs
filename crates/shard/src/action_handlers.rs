@@ -23,16 +23,16 @@ use hyperscale_types::{
     CertificateRoot, CertificateRootContext, CertifiedBlockHeader,
     CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError, ConsensusPublicKey,
     ConsensusReceipt, Epoch, Finalization, Hash, LocalReceiptRoot, LocalReceiptRootContext,
-    NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, ProvisionsRootContext, QcContext,
-    QuorumCertificate, ReadySignal, ReshapeTrigger, RevealChain, Round, ShardId, ShardLoad,
-    SplitChildRoots, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateKey,
-    TerminalRoots, TerminalVerdict, TerminalVerdictRoot, Timeout, TimeoutContext, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionRootContext, TxHash, ValidatorId, Verifiable,
-    Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
-    WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves,
+    NetworkDefinition, PreparedCommit, PrincipalAddr as AccountAddr, ProposerTimestamp,
+    ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot,
+    ProvisionsRootContext, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, RevealChain,
+    Round, ShardId, ShardLoad, SplitChildRoots, StateRoot, StateRootContext, Stopwatch,
+    StoredReceipt, SubstateKey, TerminalRoots, TerminalVerdict, TerminalVerdictRoot, Timeout,
+    TimeoutContext, TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash,
+    ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp,
+    WitnessSources, WorkInFlight, absorb_committed_cells, commit_witness_window, derive_leaves,
     local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
-    shard_reveal_sign, signed_bytes, vrf_output_from_proof, work_over_certificates,
+    shard_reveal_sign, signed_bytes, vm_statics, vrf_output_from_proof, work_over_certificates,
 };
 
 /// Result of QC verification and assembly.
@@ -614,12 +614,27 @@ where
             let mut result: Result<(), String> = Ok(());
             'demands: for demand in &demands {
                 // The reservation engages only for signers the payer's
-                // rule admits. Every account's rule is the virtual one —
-                // the identity its own address derives — so the verdict
-                // is a comparison; a stored rule would be read here, at
-                // the same anchored height as the balance beside it.
+                // rule admits — the stored rule, read beside the balance
+                // at the same anchored height, through the statics seam
+                // so its encoding stays the VM's fact.
+                let Ok(payer) = AccountAddr::try_from(demand.vault.owner) else {
+                    result = Err(format!(
+                        "payer {:?}: the vault owner is not a principal",
+                        demand.vault.owner
+                    ));
+                    break;
+                };
+                let Some(auth_cell) = view.get_substate_at_height(demand.auth_cell, read_height)
+                else {
+                    result = Err(format!(
+                        "payer {:?}: authority history unavailable at height {}",
+                        demand.vault.owner,
+                        read_height.inner()
+                    ));
+                    break;
+                };
                 for signer in &demand.signers {
-                    if signer.address() != demand.vault.owner {
+                    if !vm_statics().rule_admits(auth_cell.as_deref(), payer, *signer) {
                         result = Err(format!(
                             "payer {:?}: rule does not admit signer {signer:?}",
                             demand.vault.owner
@@ -936,6 +951,16 @@ where
                     .iter()
                     .map(|check| (check.vault, check.demand))
                     .collect();
+                let auth_cells: std::collections::HashMap<SubstateKey, Option<Vec<u8>>> =
+                    fee_checks
+                        .iter()
+                        .map(|check| {
+                            let cell = view
+                                .get_substate_at_height(check.auth_cell, fee_read_height)
+                                .flatten();
+                            (check.vault, cell)
+                        })
+                        .collect();
                 let balances: std::collections::HashMap<SubstateKey, u128> = fee_checks
                     .iter()
                     .map(|check| {
@@ -960,7 +985,8 @@ where
                         // binding verdict, so a proposal never
                         // self-rejects on a signer the payer's rule
                         // refuses.
-                        if !tx.payer_admits_signer() {
+                        let auth_cell = auth_cells.get(&vault).and_then(Option::as_deref);
+                        if !tx.payer_admits_signer(auth_cell) {
                             unbound += 1;
                             return false;
                         }

@@ -232,6 +232,10 @@ pub struct Derived {
     /// fee settlement debits. The owner half is the envelope's
     /// `fee_payer`.
     pub fee_vault_local: [u8; 16],
+    /// The local half of the payer's stored-authority cell, read beside
+    /// the vault at the same anchored height: the reservation engages
+    /// only for a signer the payer's rule admits.
+    pub auth_cell_local: [u8; 16],
     /// What including this transaction costs a block, in work units.
     ///
     /// A fixed admit-and-track charge, the declared footprint, and the
@@ -269,6 +273,27 @@ pub trait VmStatics: Send + Sync {
     /// a subintent signature list that does not match the tree, or a
     /// bound signer address the matching public key does not derive.
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError>;
+
+    /// Whether `payer`'s rule admits `signer`, given the payer's
+    /// stored-authority cell as read at the caller's own anchored
+    /// height — `None` or empty meaning absent.
+    ///
+    /// The rule's encoding is the VM's fact, so consensus hands the
+    /// bytes across this seam and stays blind to them. Absent means the
+    /// account is virtual and the rule is the identity its address
+    /// derives; stored bytes that do not decode admit nobody, the same
+    /// fail-closed verdict the execution gate gives them.
+    fn rule_admits(
+        &self,
+        auth_cell: Option<&[u8]>,
+        payer: PrincipalAddr,
+        signer: PrincipalAddr,
+    ) -> bool {
+        match auth_cell {
+            None | Some([]) => payer == signer,
+            Some(_) => false,
+        }
+    }
 
     /// Offer one committed cell to the published-package cache.
     ///

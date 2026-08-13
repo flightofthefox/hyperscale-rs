@@ -2354,7 +2354,9 @@ impl ShardCoordinator {
             ProposalKind::Normal { transactions, .. } => {
                 let payer_seeds = self.local_payer_fees(
                     committee,
-                    transactions.iter().map(|tx| (tx.fee_vault(), 0u128, None)),
+                    transactions
+                        .iter()
+                        .map(|tx| (tx.fee_vault(), tx.auth_cell(), 0u128, None)),
                 );
                 self.fee_demands(&payer_seeds, parent_block_hash)
             }
@@ -3368,10 +3370,14 @@ impl ShardCoordinator {
             }
             let block_fees = self.local_payer_fees(
                 committee,
-                block
-                    .transactions()
-                    .iter()
-                    .map(|tx| (tx.fee_vault(), tx.body().max_fee, Some(tx.signer()))),
+                block.transactions().iter().map(|tx| {
+                    (
+                        tx.fee_vault(),
+                        tx.auth_cell(),
+                        tx.body().max_fee,
+                        Some(tx.signer()),
+                    )
+                }),
             );
             let fee_demands = self.fee_demands(&block_fees, block.header().parent_block_hash());
             let fee_read_height = self.ancestry_committed_height(block.header().parent_qc());
@@ -3440,14 +3446,17 @@ impl ShardCoordinator {
     /// saturating debit absorbs.
     fn fee_demands(
         &self,
-        fees: &[(SubstateKey, u128, Option<PrincipalAddr>)],
+        fees: &[(SubstateKey, SubstateKey, u128, Option<PrincipalAddr>)],
         parent_block_hash: BlockHash,
     ) -> Vec<FeeDemand> {
-        let mut demands: BTreeMap<SubstateKey, (u128, BTreeSet<PrincipalAddr>)> = BTreeMap::new();
-        for (vault, max_fee, signer) in fees {
-            let entry = demands.entry(*vault).or_insert((0, BTreeSet::new()));
-            entry.0 = entry.0.saturating_add(*max_fee);
-            entry.1.extend(*signer);
+        let mut demands: BTreeMap<SubstateKey, (SubstateKey, u128, BTreeSet<PrincipalAddr>)> =
+            BTreeMap::new();
+        for (vault, auth_cell, max_fee, signer) in fees {
+            let entry = demands
+                .entry(*vault)
+                .or_insert((*auth_cell, 0, BTreeSet::new()));
+            entry.1 = entry.1.saturating_add(*max_fee);
+            entry.2.extend(*signer);
         }
         if demands.is_empty() {
             return Vec::new();
@@ -3461,21 +3470,22 @@ impl ShardCoordinator {
                 for tx in block.transactions().iter() {
                     if let Some(entry) = demands.get_mut(&tx.fee_vault()) {
                         let fee = tx.body().max_fee;
-                        entry.0 = entry.0.saturating_add(fee);
+                        entry.1 = entry.1.saturating_add(fee);
                     }
                 }
             }
             cursor = pending.header().parent_block_hash();
         }
         for (vault, entry) in &mut demands {
-            entry.0 = entry
-                .0
+            entry.1 = entry
+                .1
                 .saturating_add(self.fee_ledger.held_for(vault.owner));
         }
         demands
             .into_iter()
-            .map(|(vault, (demand, signers))| FeeDemand {
+            .map(|(vault, (auth_cell, demand, signers))| FeeDemand {
                 vault,
+                auth_cell,
                 demand,
                 signers,
             })
@@ -3531,8 +3541,8 @@ impl ShardCoordinator {
     fn local_payer_fees(
         &self,
         topology_snapshot: &TopologySnapshot,
-        transactions: impl Iterator<Item = (SubstateKey, u128, Option<PrincipalAddr>)>,
-    ) -> Vec<(SubstateKey, u128, Option<PrincipalAddr>)> {
+        transactions: impl Iterator<Item = (SubstateKey, SubstateKey, u128, Option<PrincipalAddr>)>,
+    ) -> Vec<(SubstateKey, SubstateKey, u128, Option<PrincipalAddr>)> {
         let trie = topology_snapshot.shard_trie();
         transactions
             .filter(|(vault, ..)| trie.shard_for_prefix(vault.owner) == self.local_shard)

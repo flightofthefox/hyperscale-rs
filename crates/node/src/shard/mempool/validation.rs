@@ -317,7 +317,7 @@ where
                         tx.verify(NetworkId::from(topology.network()))
                             .ok()
                             .filter(|v| {
-                                payer_binding_holds(v, &topology, local_shard)
+                                payer_binding_holds(v, &topology, local_shard, storage.as_deref())
                                     && payer_covers_fee_ceiling(
                                         v,
                                         &topology,
@@ -412,15 +412,19 @@ where
 /// shard's state, so only that shard's admission judges it. Advisory
 /// like the ceiling check beside it: the builder and vote checks stay
 /// the deterministic authorities.
-fn payer_binding_holds(
+fn payer_binding_holds<S: SubstateStore>(
     tx: &Verified<Transaction>,
     topology: &TopologySnapshot,
     local_shard: ShardId,
+    storage: Option<&S>,
 ) -> bool {
     if topology.shard_trie().shard_for_prefix(tx.fee_vault().owner) != local_shard {
         return true;
     }
-    if !tx.payer_admits_signer() {
+    let auth_cell = storage
+        .and_then(|storage| storage.get_substate_at_height(tx.auth_cell(), storage.jmt_height()))
+        .flatten();
+    if !tx.payer_admits_signer(auth_cell.as_deref()) {
         tracing::debug!(
             tx_hash = ?tx.hash(),
             "Refusing admission: the payer's rule does not admit the signer"

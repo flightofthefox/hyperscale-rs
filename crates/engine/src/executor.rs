@@ -401,13 +401,7 @@ pub const fn charge_for(outcome: &Outcome, payer: PayerFee) -> Option<u128> {
         // pays the ceiling it declared. Not the work consumed — that is
         // unknowable — but the sender chose the bound, and anything less
         // leaves failure discounted against success.
-        //
-        // A call presenting authority its target does not admit is the
-        // same class and priced the same way: what a node presents and
-        // what its target requires are both content the signer put their
-        // name to, so an unauthorized call is one its composer built
-        // wrong rather than one the world moved under.
-        Outcome::UserError { .. } | Outcome::Unauthorized { .. } => Some(payer.max_fee),
+        Outcome::UserError { .. } => Some(payer.max_fee),
         // A lost deterministic race. The sender did nothing wrong and
         // could not have avoided it, so it pays only the floor covering
         // the declaration work its attempt really did consume.
@@ -416,10 +410,14 @@ pub const fn charge_for(outcome: &Outcome, payer: PayerFee) -> Option<u128> {
         // class: the sender declared what it would accept and the world
         // moved between signing and execution. So is a spent subintent —
         // a conflict tiebreak or a stale declaration, neither of which a
-        // composer can see at signing time.
+        // composer can see at signing time. And so is an unauthorized
+        // call: a stored rule can change between signing and execution,
+        // so presented authority a target no longer admits is a stale
+        // declaration, not a defect.
         Outcome::Infeasible { .. }
         | Outcome::ConstraintUnmet { .. }
-        | Outcome::NullifierSpent { .. } => Some(payer.floor),
+        | Outcome::NullifierSpent { .. }
+        | Outcome::Unauthorized { .. } => Some(payer.floor),
         // The kernel's own defect. `materialize_abort` refuses to price
         // it to the sender, and the burn agrees.
         Outcome::ProtocolError { .. } => None,

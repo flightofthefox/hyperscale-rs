@@ -169,6 +169,10 @@ pub struct ProvisionsRequest {
 pub struct FeeDemand {
     /// The payer's fee vault cell.
     pub vault: SubstateKey,
+    /// The payer's stored-authority cell, read beside the vault at the
+    /// same anchored height: the reservation engages only for signers
+    /// the payer's rule admits.
+    pub auth_cell: SubstateKey,
     /// The total reservation the payer must cover: this block's newly
     /// engaged fee ceilings plus the in-flight holds derived from chain
     /// content.
