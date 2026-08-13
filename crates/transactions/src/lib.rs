@@ -132,7 +132,8 @@ impl Client {
     ) -> Result<ManifestGraph, TypedError> {
         let cache = self.cache();
         let mut b = self.builder(&cache);
-        let funds = account::withdraw(&mut b, from, *XRD, amount)?;
+        let sender = account::authorize(&mut b, from)?;
+        let funds = account::withdraw(&mut b, sender, *XRD, amount)?;
         account::deposit(&mut b, to, funds)?;
         b.build()
     }
@@ -243,19 +244,25 @@ mod tests {
                 nodes: vec![
                     GraphNode {
                         target: from.into(),
+                        method: "authorize".into(),
+                        args: vec![],
+                        evidence: [EvidenceRef::IntentSignature].into(),
+                    },
+                    GraphNode {
+                        target: from.into(),
                         method: "withdraw".into(),
                         args: vec![
                             GraphArg::Literal(Value::Address(XRD.address())),
                             GraphArg::Literal(Value::U128(100)),
                         ],
-                        evidence: [EvidenceRef::IntentSignature].into(),
+                        evidence: [EvidenceRef::Node(0)].into(),
                     },
                     GraphNode {
                         target: to.into(),
                         method: "deposit".into(),
                         args: vec![GraphArg::Edge {
                             edge: EdgeRef {
-                                producer: 0,
+                                producer: 1,
                                 output: 0,
                             },
                             constraints: vec![Constraint::ResourceIs((*XRD).into())],

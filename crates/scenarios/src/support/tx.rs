@@ -537,9 +537,10 @@ pub fn build_fan_out_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(|b| {
+        let sender = account::authorize(b, from)?;
         for (index, to) in recipients.iter().enumerate() {
             let leg = amount + index as u128;
-            let funds = account::withdraw(b, from, *XRD, leg)?;
+            let funds = account::withdraw(b, sender, *XRD, leg)?;
             account::deposit(b, *to, funds)?;
         }
         Ok(())
@@ -973,7 +974,10 @@ pub fn build_stamp_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let owner = account_address(&right_key.public_key().0);
-    let right = declaration(|b| account::stamp_entropy(b, owner));
+    let right = declaration(|b| {
+        let stamper = account::authorize(b, owner)?;
+        account::stamp_entropy(b, stamper)
+    });
     // The right-hand account signs its own declaration, which is all it
     // ever sees: no part of the envelope enters that hash.
     let signed = sign_subintent(right_key, &right.hash(&ProtocolHasher).0.0);
@@ -982,7 +986,8 @@ pub fn build_stamp_tx(
     let cache = client.cache();
     let (mut env, mut root) =
         EnvelopeBuilder::new(&cache, &client.world().instances, &ProtocolHasher);
-    account::stamp_entropy(&mut root, left).expect("an account answers a stamp");
+    let stamper = account::authorize(&mut root, left).expect("an account signs in");
+    account::stamp_entropy(&mut root, stamper).expect("an account answers a stamp");
     env.present(owner, right)
         .expect("the declaration discharges itself");
     env.seal(root)
@@ -1290,7 +1295,10 @@ pub fn build_deactivate_tx(
     validator: ValidatorId,
     validity: TimestampRange,
 ) -> Transaction {
-    let graph = graph(|b| staking::deactivate_validator(b, pool, validator.inner()));
+    let graph = graph(|b| {
+        let badge = account::authorize(b, account_address(&operator.public_key().0))?;
+        staking::deactivate_validator(b, badge, pool, validator.inner())
+    });
     Transaction::new(envelope(graph, operator, validity))
 }
 
@@ -1310,8 +1318,10 @@ pub fn build_register_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(|b| {
+        let badge = account::authorize(b, account_address(&operator.public_key().0))?;
         staking::register_validator(
             b,
+            badge,
             pool,
             validator.inner(),
             pubkey.as_bytes().to_vec(),
@@ -1336,7 +1346,8 @@ pub fn build_unstake_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(|b| {
-        let units = account::withdraw(b, from, stake_unit(pool), amount)?;
+        let delegator = account::authorize(b, from)?;
+        let units = account::withdraw(b, delegator, stake_unit(pool), amount)?;
         staking::unstake(b, pool, units)
     });
     Transaction::new(envelope(graph, delegator, validity))
@@ -1366,7 +1377,8 @@ pub fn build_stake_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(|b| {
-        let funds = account::withdraw(b, from, *XRD, amount)?;
+        let delegator = account::authorize(b, from)?;
+        let funds = account::withdraw(b, delegator, *XRD, amount)?;
         let units = staking::stake(b, pool, funds)?;
         account::deposit(b, from, units)
     });
@@ -1418,8 +1430,9 @@ pub fn build_composed_tx(
     let cache = client.cache();
     let (mut env, mut root) =
         EnvelopeBuilder::new(&cache, &client.world().instances, &ProtocolHasher);
-    let funds =
-        account::withdraw(&mut root, from, *XRD, amount).expect("an account answers a withdrawal");
+    let sender = account::authorize(&mut root, from).expect("an account signs in");
+    let funds = account::withdraw(&mut root, sender, *XRD, amount)
+        .expect("an account answers a withdrawal");
     let paid = root.export(funds);
     let [wants] = env
         .present(account_address(&signer_key.public_key().0), request.clone())
@@ -1534,8 +1547,10 @@ pub fn build_reshape_threshold_vote_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(|b| {
+        let badge = account::authorize(b, account_address(&operator.public_key().0))?;
         staking::cast_param_vote(
             b,
+            badge,
             pool_at(GENESIS_POOL_ID),
             split_bytes,
             NetworkParams::default().impound_epochs,

@@ -164,7 +164,8 @@ fn signed_transfer_under_bound(
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let cache = client().cache();
     let mut b = client().builder(&cache);
-    let funds = account::withdraw(&mut b, from, *XRD, amount).expect("an account withdraws");
+    let sender = account::authorize(&mut b, from).expect("an account signs in");
+    let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
     account::deposit(&mut b, to, funds.min(min)).expect("an account deposits");
     let graph = b.build().expect("every output is consumed");
     Transaction::new(client().sign(graph, &key, terms(max_fee)))
@@ -241,7 +242,8 @@ fn signed_stamp_with_fee(seed: u8, owner: PrincipalAddr, max_fee: u128) -> Trans
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let cache = client().cache();
     let mut b = client().builder(&cache);
-    account::stamp_entropy(&mut b, owner).expect("an account answers a stamp");
+    let stamper = account::authorize(&mut b, owner).expect("an account signs in");
+    account::stamp_entropy(&mut b, stamper).expect("an account answers a stamp");
     let graph = b.build().expect("a stamp produces nothing");
     Transaction::new(client().sign(graph, &key, terms(max_fee)))
 }
@@ -985,7 +987,8 @@ fn a_two_recipient_fan_out_executes() {
     let cache = client().cache();
     let mut b = client().builder(&cache);
     for (to, amount) in [(bob(), 5u128), (fee_payer(7), 6)] {
-        let funds = account::withdraw(&mut b, alice(), *XRD, amount).expect("an account withdraws");
+        let sender = account::authorize(&mut b, alice()).expect("an account signs in");
+        let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
         account::deposit(&mut b, to, funds).expect("an account deposits");
     }
     let graph = b.build().expect("every output is consumed");

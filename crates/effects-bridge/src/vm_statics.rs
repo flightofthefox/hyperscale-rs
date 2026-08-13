@@ -499,6 +499,17 @@ mod tests {
         }
     }
 
+    /// The sign-in every fixture graph leads with: node 0 of its intent,
+    /// which is what the withdraw fixtures point their badges at.
+    fn sign_in(target: impl Into<CallTarget>) -> GraphNode {
+        GraphNode {
+            target: target.into(),
+            method: "authorize".into(),
+            args: vec![],
+            evidence: [EvidenceRef::IntentSignature].into(),
+        }
+    }
+
     fn withdraw(target: impl Into<CallTarget>, resource: ResourceAddr, amount: u128) -> GraphNode {
         GraphNode {
             target: target.into(),
@@ -507,7 +518,7 @@ mod tests {
                 GraphArg::Literal(Value::Address(resource.address())),
                 GraphArg::Literal(Value::U128(amount)),
             ],
-            evidence: [EvidenceRef::IntentSignature].into(),
+            evidence: [EvidenceRef::Node(0)].into(),
         }
     }
 
@@ -557,6 +568,7 @@ mod tests {
             root: IntentDecl {
                 graph: ManifestGraph {
                     nodes: vec![
+                        sign_in(composer_addr()),
                         withdraw(composer_addr(), RES_X, 100),
                         deposit_param(composer_addr(), 0),
                     ],
@@ -569,7 +581,7 @@ mod tests {
             root_bindings: vec![YieldBinding {
                 intent: 1,
                 edge: EdgeRef {
-                    producer: 0,
+                    producer: 1,
                     output: 0,
                 },
             }],
@@ -577,6 +589,7 @@ mod tests {
                 decl: IntentDecl {
                     graph: ManifestGraph {
                         nodes: vec![
+                            sign_in(bob_addr()),
                             withdraw(bob_addr(), RES_Y, 10),
                             deposit_param(bob_addr(), 0),
                         ],
@@ -590,7 +603,7 @@ mod tests {
                 bindings: vec![YieldBinding {
                     intent: 0,
                     edge: EdgeRef {
-                        producer: 0,
+                        producer: 1,
                         output: 0,
                     },
                 }],
@@ -636,8 +649,9 @@ mod tests {
     #[test]
     fn work_prices_the_fixed_cost_of_carrying_a_transaction() {
         let tree = single_intent_tree(vec![
+            sign_in(composer_addr()),
             withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 0, RES_X),
+            deposit_edge(bob_addr(), 1, RES_X),
         ]);
         let derived = statics().derive(&envelope(&tree, &[])).expect("derives");
 
@@ -652,10 +666,11 @@ mod tests {
         // A second recipient declares more, so it costs more — nothing
         // else about the two envelopes differs.
         let wider = single_intent_tree(vec![
+            sign_in(composer_addr()),
             withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 0, RES_X),
+            deposit_edge(bob_addr(), 1, RES_X),
             withdraw(composer_addr(), RES_Y, 10),
-            deposit_edge(bob_addr(), 2, RES_Y),
+            deposit_edge(bob_addr(), 3, RES_Y),
         ]);
         let wider = statics().derive(&envelope(&wider, &[])).expect("derives");
         assert!(
@@ -672,8 +687,9 @@ mod tests {
     #[test]
     fn work_prices_the_signatures_the_envelope_carries() {
         let tree = single_intent_tree(vec![
+            sign_in(composer_addr()),
             withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 0, RES_X),
+            deposit_edge(bob_addr(), 1, RES_X),
         ]);
         let ed = statics().derive(&envelope(&tree, &[])).expect("derives");
 
@@ -681,8 +697,9 @@ mod tests {
         let payer = principal_for(SchemeId::SECP256K1, &secp.public_key().0)
             .expect("a registered scheme opens an account");
         let secp_tree = single_intent_tree(vec![
+            sign_in(payer),
             withdraw(payer, RES_X, 100),
-            deposit_edge(bob_addr(), 0, RES_X),
+            deposit_edge(bob_addr(), 1, RES_X),
         ]);
         let mut wider = envelope(&secp_tree, &[]);
         wider.fee_payer = payer;
@@ -707,8 +724,9 @@ mod tests {
     #[test]
     fn a_transfer_derives_substate_keys_and_owner_prefixes() {
         let tree = single_intent_tree(vec![
+            sign_in(composer_addr()),
             withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 0, RES_X),
+            deposit_edge(bob_addr(), 1, RES_X),
         ]);
         let derived = statics().derive(&envelope(&tree, &[])).expect("derives");
 
@@ -761,8 +779,9 @@ mod tests {
         // than from the payer field — so a stranger naming someone
         // else's account gets their own badge, never the account's.
         let tree = single_intent_tree(vec![
+            sign_in(composer_addr()),
             withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 0, RES_X),
+            deposit_edge(bob_addr(), 1, RES_X),
         ]);
         let mut stolen = envelope(&tree, &[]);
         stolen.fee_payer = bob_addr();
@@ -796,8 +815,9 @@ mod tests {
         );
 
         let tree = single_intent_tree(vec![
+            sign_in(payer),
             withdraw(payer, RES_X, 100),
-            deposit_edge(bob_addr(), 0, RES_X),
+            deposit_edge(bob_addr(), 1, RES_X),
         ]);
         let mut signed = envelope(&tree, &[]);
         signed.fee_payer = payer;
@@ -817,8 +837,9 @@ mod tests {
     #[test]
     fn a_withdrawal_from_an_unsigned_account_derives_and_defers() {
         let tree = single_intent_tree(vec![
+            sign_in(composer_addr()),
             withdraw(bob_addr(), RES_X, 100),
-            deposit_edge(composer_addr(), 0, RES_X),
+            deposit_edge(composer_addr(), 1, RES_X),
         ]);
         assert!(statics().derive(&envelope(&tree, &[])).is_ok());
 
@@ -826,8 +847,9 @@ mod tests {
         // from their own account and Bob is credited without being asked.
         // One signature, because only the spending side is gated.
         let transfer = single_intent_tree(vec![
+            sign_in(composer_addr()),
             withdraw(composer_addr(), RES_X, 100),
-            deposit_edge(bob_addr(), 0, RES_X),
+            deposit_edge(bob_addr(), 1, RES_X),
         ]);
         assert!(statics().derive(&envelope(&transfer, &[])).is_ok());
     }
@@ -852,10 +874,27 @@ mod tests {
             .derive(&envelope(&stamp(BTreeSet::new()), &[]))
             .expect_err("refuses");
         assert!(refused.0.contains("evidence"), "{}", refused.0);
+        // A signature badge is not the stamp's to read either: it signs
+        // in, and the stamp takes what the sign-in minted.
+        let refused = statics()
+            .derive(&envelope(
+                &stamp([EvidenceRef::IntentSignature].into()),
+                &[],
+            ))
+            .expect_err("refuses");
+        assert!(refused.0.contains("signature badge"), "{}", refused.0);
         assert!(
             statics()
                 .derive(&envelope(
-                    &stamp([EvidenceRef::IntentSignature].into()),
+                    &single_intent_tree(vec![
+                        sign_in(composer_addr()),
+                        GraphNode {
+                            target: composer_addr().into(),
+                            method: "stamp-entropy".into(),
+                            args: vec![],
+                            evidence: [EvidenceRef::Node(0)].into(),
+                        },
+                    ]),
                     &[]
                 ))
                 .is_ok()
@@ -882,7 +921,7 @@ mod tests {
         // composer, which Bob's account does not admit, and the verdict
         // on that is the account's to give at execution.
         let mut stolen = composed_tree();
-        stolen.root.graph.nodes[0] = withdraw(bob_addr(), RES_X, 100);
+        stolen.root.graph.nodes[1] = withdraw(bob_addr(), RES_X, 100);
         assert!(statics().derive(&envelope(&stolen, &[&bob])).is_ok());
     }
 

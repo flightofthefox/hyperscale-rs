@@ -118,7 +118,8 @@ fn signed_stake(pool: ComponentAddr, amount: u128) -> Transaction {
     let from = account_address(&key.public_key().0);
     let cache = client().cache();
     let mut b = client().builder(&cache);
-    let funds = account::withdraw(&mut b, from, *XRD, amount).expect("an account withdraws");
+    let sender = account::authorize(&mut b, from).expect("an account signs in");
+    let funds = account::withdraw(&mut b, sender, *XRD, amount).expect("an account withdraws");
     let units = staking::stake(&mut b, pool, funds).expect("a pool takes a delegation");
     account::deposit(&mut b, from, units).expect("an account banks its position");
     let graph = b.build().expect("every output is consumed");
@@ -211,7 +212,9 @@ fn signed_registration(pool: ComponentAddr, seed: u8) -> Transaction {
     let key = key_of(seed);
     let cache = client().cache();
     let mut b = client().builder(&cache);
-    staking::register_validator(&mut b, pool, 11, vec![0xC1; 48], vec![0xC2; 96])
+    let badge = account::authorize(&mut b, account_address(&key.public_key().0))
+        .expect("an account signs in");
+    staking::register_validator(&mut b, badge, pool, 11, vec![0xC1; 48], vec![0xC2; 96])
         .expect("a pool answers a registration");
     let graph = b.build().expect("a registration produces nothing");
     Transaction::new(client().sign(graph, &key, terms(1_000)))
