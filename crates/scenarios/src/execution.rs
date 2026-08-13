@@ -1367,12 +1367,18 @@ pub fn deploy_storm_rides_out(c: &mut impl Cluster) {
     // Every package the storm deployed is in state, which is what makes
     // the distinctness above load-bearing: idempotent duplicates would
     // collapse into one cell and the storm would be a single publish.
-    for (shard, owner, local) in &cells {
-        assert!(
-            c.substate(*shard, *owner, *local).is_some(),
-            "{shard:?} does not hold the package cell the storm published"
-        );
-    }
+    // The read is served from the persisted frontier, which trails the
+    // commit that settled the transaction, so presence is awaited like
+    // every other observation here rather than asserted at an instant.
+    let all_present = c.run_until(epochs(2), |c| {
+        cells
+            .iter()
+            .all(|(shard, owner, local)| c.substate(*shard, *owner, *local).is_some())
+    });
+    assert!(
+        all_present,
+        "a package cell the storm published never reached persisted state"
+    );
 
     for (shard, height) in shards.iter().zip(before) {
         let after = c.committed_height(*shard);
