@@ -24,10 +24,11 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::stdlib::{AUTH, ENTROPY, VALIDATORS, VAULT, XRD as XRD_ROLE};
 use hyperscale_vm_effects::{
-    Address, AuthCell, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry, ManifestHash,
-    MetadataCache, Mode, NativeAddr, PackageHash, PackageMetadata, PrefixShardResolver,
-    PrincipalAddr, RoleId, Routing as RoutedTransaction, SchemeId, SubstateKey, Value, admit_tree,
-    child_key, footprint, native_address, package_hash, principal_address, route_tree,
+    Address, AuthCell, AuthRole, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry,
+    ManifestHash, MetadataCache, Mode, NativeAddr, PackageHash, PackageMetadata,
+    PrefixShardResolver, PrincipalAddr, RoleId, Routing as RoutedTransaction, SchemeId,
+    SubstateKey, Value, admit_tree, child_key, footprint, native_address, package_hash,
+    principal_address, route_tree,
 };
 
 use crate::ProtocolHasher;
@@ -368,21 +369,16 @@ impl VmStatics for BridgeStatics {
         signer: PrincipalAddr,
         clock_ms: u64,
     ) -> bool {
-        match auth_cell {
-            None | Some([]) => payer == signer,
-            // Stored bytes that do not decode admit nobody — the write
-            // path refuses such bytes, so these are not a rule, and the
-            // verdict fails closed like the execution gate's. Paying is
-            // governed by the primary of whichever role set the clock
-            // picks, so a matured recovery proposal retires the old key
-            // here with nothing applying it.
-            Some(bytes) => AuthCell::from_slice(bytes).is_ok_and(|cell| {
-                cell.governing(clock_ms)
-                    .roles
-                    .primary
-                    .satisfied_by(&[signer.address()])
-            }),
-        }
+        // The verdict is the kernel gate's own, judged over the envelope
+        // signer alone and the primary — paying is governed by whatever
+        // governs `authorize`.
+        AuthCell::admits(
+            auth_cell.unwrap_or_default(),
+            payer.address(),
+            AuthRole::Primary,
+            &[signer.address()],
+            clock_ms,
+        )
     }
 
     fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
