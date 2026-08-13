@@ -202,6 +202,20 @@ struct WitnessCommitmentPreview {
     base: BeaconWitnessLeafCount,
 }
 
+/// One transaction's contribution to its payer's fee demand.
+struct PayerFee {
+    /// The payer's fee vault.
+    vault: SubstateKey,
+    /// The payer's stored-authority cell, read beside the balance.
+    auth_cell: SubstateKey,
+    /// The signed ceiling; zero where the caller only seeds prior
+    /// demand.
+    max_fee: u128,
+    /// The envelope signer the payer's rule must admit — carried at
+    /// vote, where the binding is judged, and absent at proposal seed.
+    signer: Option<PrincipalAddr>,
+}
+
 /// Shard consensus state machine (HotStuff-2).
 ///
 /// Handles block proposal, voting, QC formation, commitment, and view changes.
@@ -2354,9 +2368,12 @@ impl ShardCoordinator {
             ProposalKind::Normal { transactions, .. } => {
                 let payer_seeds = self.local_payer_fees(
                     committee,
-                    transactions
-                        .iter()
-                        .map(|tx| (tx.fee_vault(), tx.auth_cell(), 0u128, None)),
+                    transactions.iter().map(|tx| PayerFee {
+                        vault: tx.fee_vault(),
+                        auth_cell: tx.auth_cell(),
+                        max_fee: 0,
+                        signer: None,
+                    }),
                 );
                 self.fee_demands(&payer_seeds, parent_block_hash)
             }
@@ -3370,13 +3387,11 @@ impl ShardCoordinator {
             }
             let block_fees = self.local_payer_fees(
                 committee,
-                block.transactions().iter().map(|tx| {
-                    (
-                        tx.fee_vault(),
-                        tx.auth_cell(),
-                        tx.body().max_fee,
-                        Some(tx.signer()),
-                    )
+                block.transactions().iter().map(|tx| PayerFee {
+                    vault: tx.fee_vault(),
+                    auth_cell: tx.auth_cell(),
+                    max_fee: tx.body().max_fee,
+                    signer: Some(tx.signer()),
                 }),
             );
             let fee_demands = self.fee_demands(&block_fees, block.header().parent_block_hash());
@@ -3434,29 +3449,25 @@ impl ShardCoordinator {
     }
 
     /// Per-payer fee-reservation demands for the transaction list
-    /// `fees`, given as `(vault, max_fee, signer)` entries of this
-    /// shard's payers: each listed ceiling, plus the still-held ceilings
-    /// in the complete uncommitted ancestor bodies behind
-    /// `parent_block_hash`, plus the committed in-flight ledger holds.
-    /// The signers are this block's own — ancestors answered for theirs
-    /// at their own vote — and each must be one the payer's rule admits
-    /// for the reservation to engage. Empty when the list names no
-    /// local payer. A rare manifest-only ancestor under view changes
-    /// contributes nothing — a bounded optimism the fee settlement's
-    /// saturating debit absorbs.
-    fn fee_demands(
-        &self,
-        fees: &[(SubstateKey, SubstateKey, u128, Option<PrincipalAddr>)],
-        parent_block_hash: BlockHash,
-    ) -> Vec<FeeDemand> {
-        let mut demands: BTreeMap<SubstateKey, (SubstateKey, u128, BTreeSet<PrincipalAddr>)> =
-            BTreeMap::new();
-        for (vault, auth_cell, max_fee, signer) in fees {
-            let entry = demands
-                .entry(*vault)
-                .or_insert((*auth_cell, 0, BTreeSet::new()));
-            entry.1 = entry.1.saturating_add(*max_fee);
-            entry.2.extend(*signer);
+    /// `fees`: each listed ceiling, plus the still-held ceilings in the
+    /// complete uncommitted ancestor bodies behind `parent_block_hash`,
+    /// plus the committed in-flight ledger holds. The signers are this
+    /// block's own — ancestors answered for theirs at their own vote —
+    /// and each must be one the payer's rule admits for the reservation
+    /// to engage. Empty when the list names no local payer. A rare
+    /// manifest-only ancestor under view changes contributes nothing —
+    /// a bounded optimism the fee settlement's saturating debit absorbs.
+    fn fee_demands(&self, fees: &[PayerFee], parent_block_hash: BlockHash) -> Vec<FeeDemand> {
+        let mut demands: BTreeMap<SubstateKey, FeeDemand> = BTreeMap::new();
+        for fee in fees {
+            let entry = demands.entry(fee.vault).or_insert_with(|| FeeDemand {
+                vault: fee.vault,
+                auth_cell: fee.auth_cell,
+                demand: 0,
+                signers: BTreeSet::new(),
+            });
+            entry.demand = entry.demand.saturating_add(fee.max_fee);
+            entry.signers.extend(fee.signer);
         }
         if demands.is_empty() {
             return Vec::new();
@@ -3470,26 +3481,18 @@ impl ShardCoordinator {
                 for tx in block.transactions().iter() {
                     if let Some(entry) = demands.get_mut(&tx.fee_vault()) {
                         let fee = tx.body().max_fee;
-                        entry.1 = entry.1.saturating_add(fee);
+                        entry.demand = entry.demand.saturating_add(fee);
                     }
                 }
             }
             cursor = pending.header().parent_block_hash();
         }
-        for (vault, entry) in &mut demands {
-            entry.1 = entry
-                .1
-                .saturating_add(self.fee_ledger.held_for(vault.owner));
+        for demand in demands.values_mut() {
+            demand.demand = demand
+                .demand
+                .saturating_add(self.fee_ledger.held_for(demand.vault.owner));
         }
-        demands
-            .into_iter()
-            .map(|(vault, (auth_cell, demand, signers))| FeeDemand {
-                vault,
-                auth_cell,
-                demand,
-                signers,
-            })
-            .collect()
+        demands.into_values().collect()
     }
 
     /// The highest height a block's own ancestry proves committed,
@@ -3536,16 +3539,16 @@ impl ShardCoordinator {
         }
     }
 
-    /// The `(vault, max_fee)` pairs of `transactions` whose fee payer
-    /// routes to this shard.
+    /// The fee contributions of `transactions` whose payer routes to
+    /// this shard.
     fn local_payer_fees(
         &self,
         topology_snapshot: &TopologySnapshot,
-        transactions: impl Iterator<Item = (SubstateKey, SubstateKey, u128, Option<PrincipalAddr>)>,
-    ) -> Vec<(SubstateKey, SubstateKey, u128, Option<PrincipalAddr>)> {
+        transactions: impl Iterator<Item = PayerFee>,
+    ) -> Vec<PayerFee> {
         let trie = topology_snapshot.shard_trie();
         transactions
-            .filter(|(vault, ..)| trie.shard_for_prefix(vault.owner) == self.local_shard)
+            .filter(|fee| trie.shard_for_prefix(fee.vault.owner) == self.local_shard)
             .collect()
     }
 
