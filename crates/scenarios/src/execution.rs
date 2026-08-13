@@ -26,9 +26,10 @@ use hyperscale_vm_effects::package_hash;
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::faultable::FaultableCluster;
 use crate::support::tx::{
-    OVERDRAW_AMOUNT, build_composed_tx, build_publish_tx, build_stamp_tx, build_transfer_tx,
-    build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, nullifier_race_cast, overdraw_cast,
-    payment_request, recipient, sender, shared_recipient_cast, storm_artifact, storm_publishers,
+    OVERDRAW_AMOUNT, build_composed_tx, build_publish_tx, build_securify_tx, build_stamp_tx,
+    build_transfer_paid_by, build_transfer_tx, build_unbound_payer_tx, cross_shard_cast,
+    cross_shard_keys, nullifier_race_cast, overdraw_cast, payment_request, recipient,
+    securify_cast, sender, shared_recipient_cast, storm_artifact, storm_publishers,
     unbound_payer_cast, unbound_remote_payer_cast, validity_around,
 };
 use crate::support::wait::{await_height, await_tx_terminal};
@@ -976,6 +977,113 @@ pub fn unbound_remote_payer_engages_nothing(c: &mut impl Cluster) {
     assert!(
         manifest_inclusion.is_none(),
         "the manifest shard must not engage without the payer's reservation"
+    );
+}
+
+/// The whole securify transition, through consensus.
+///
+/// The founding key pays and settles, signs its account over to another
+/// identity's rule, and from that commit on is dead at its own payer
+/// shard — while the installed rule's key acts and pays from the
+/// account it governs.
+///
+/// The retired key's refusal is the payer shard's binding verdict over
+/// the stored cell, judged at the anchored read height like the balance
+/// beside it; the corpus pins the same flip inside one process, and
+/// this drives it across the reservation machinery — mempool advisory,
+/// proposal build, and the vote-time verification — with the recipient
+/// on the counterpart shard so the engagement rails carry the verdict.
+///
+/// # Panics
+///
+/// Panics if the baseline or securify transactions fail, the retired
+/// key's transfer is ever included, the holder's transfer fails, or the
+/// recipient's balance shows anything but the two settled transfers.
+pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
+    let payer_shard = ShardId::leaf(1, 0);
+    let counterpart = ShardId::leaf(1, 1);
+    let (owner_key, owner, holder_key, holder, to) = securify_cast();
+
+    // Baseline: the founding key pays for its own account and settles
+    // cross-shard.
+    let tx = build_transfer_tx(&owner_key, owner, to, 100, validity_around(c.now()));
+    let hash = tx.hash();
+    c.submit(Arc::new(tx));
+    let status = await_tx_terminal(c, hash, epochs(16));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the baseline transfer must settle; status = {status:?}"
+    );
+
+    // The one-way transition: the account's stored rule becomes the
+    // holder's identity.
+    let tx = build_securify_tx(&owner_key, owner, holder, validity_around(c.now()));
+    let hash = tx.hash();
+    c.submit(Arc::new(tx));
+    let status = await_tx_terminal(c, hash, epochs(16));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "securify must settle; status = {status:?}"
+    );
+
+    // The retired key still derives the account's address, and that
+    // identity is exactly what the stored rule no longer admits: no
+    // proposer selects its transfer, and it never commits anywhere.
+    let tx = build_transfer_tx(&owner_key, owner, to, 7, validity_around(c.now()));
+    let hash = tx.hash();
+    c.submit(Arc::new(tx));
+    let payer_height = c
+        .committed_height(payer_shard)
+        .map_or(0, BlockHeight::inner);
+    assert!(
+        await_height(c, payer_shard, payer_height + 3, epochs(6)),
+        "payer shard chain must keep advancing past the refused transfer"
+    );
+    let status = c.tx_status(hash);
+    assert!(
+        !matches!(status, Some(TransactionStatus::Completed(_))),
+        "the retired key's transfer must never complete; status = {status:?}"
+    );
+    let (payer_inclusion, _) = c.chain_fate(payer_shard, hash);
+    assert!(
+        payer_inclusion.is_none(),
+        "the retired key's transfer must never commit at the payer shard"
+    );
+    let (counterpart_inclusion, _) = c.chain_fate(counterpart, hash);
+    assert!(
+        counterpart_inclusion.is_none(),
+        "the counterpart must not engage the retired key's transfer"
+    );
+
+    // The installed rule's key signs in as the account it governs and
+    // pays from it, from another shard's identity entirely.
+    let tx = build_transfer_paid_by(&holder_key, owner, to, 9, owner, validity_around(c.now()));
+    let hash = tx.hash();
+    c.submit(Arc::new(tx));
+    let status = await_tx_terminal(c, hash, epochs(16));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the installed rule's key must act and pay; status = {status:?}"
+    );
+
+    // The recipient holds exactly the two settled transfers: the
+    // refused one credited nothing. Awaited, because the terminal
+    // status precedes the credit's settlement round on the recipient's
+    // shard.
+    assert!(
+        c.run_until(epochs(8), |c| vault_balance(c, counterpart, to)
+            == 10 + 100 + 9),
+        "the recipient's balance must carry the settled transfers alone; balance = {}",
+        vault_balance(c, counterpart, to)
     );
 }
 

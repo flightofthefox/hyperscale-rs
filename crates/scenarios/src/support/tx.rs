@@ -1033,28 +1033,29 @@ pub fn build_transfer_tx(
     Transaction::new(envelope(graph, payer, validity))
 }
 
-/// Build a transfer whose fee payer is somebody else's account.
+/// Build a transfer whose fee payer's account is not the signing key's
+/// own.
 ///
-/// The manifest and the signature are the signer's own, and only the
-/// payer field names the victim. Derivation admits it — nothing about
-/// the signed content is malformed — and the payer shard's binding
-/// verdict is what must refuse it.
+/// The payer field names `payer`, and whether the signer's identity may
+/// spend it is the payer shard's binding verdict — refused where the
+/// payer's rule does not admit it, engaged where it does.
 ///
 /// # Panics
 ///
 /// If the scenario world does not answer a transfer, which would be a
 /// defect in the world rather than in the transfer.
 #[must_use]
-pub fn build_unbound_payer_tx(
+pub fn build_transfer_paid_by(
     signer: &Ed25519PrivateKey,
     from: PrincipalAddr,
     to: PrincipalAddr,
+    amount: u128,
     payer: PrincipalAddr,
     validity: TimestampRange,
 ) -> Transaction {
     let client = client();
     let graph = client
-        .transfer_graph(from, to, 5)
+        .transfer_graph(from, to, amount)
         .expect("the stdlib account answers a transfer");
     let envelope = signing::wrap(
         &EnvelopeTree {
@@ -1077,6 +1078,20 @@ pub fn build_unbound_payer_tx(
         },
     );
     Transaction::new(signing::sign(envelope, signer, &ProtocolHasher))
+}
+
+/// Build a transfer whose fee payer is somebody else's account, which
+/// the signer's key does not open — the unbound case of
+/// [`build_transfer_paid_by`], where the binding must refuse.
+#[must_use]
+pub fn build_unbound_payer_tx(
+    signer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
+    payer: PrincipalAddr,
+    validity: TimestampRange,
+) -> Transaction {
+    build_transfer_paid_by(signer, from, to, 5, payer, validity)
 }
 
 /// The unbound-payer cast: the signer's key and account on `leaf(1, 0)`,
@@ -1131,6 +1146,58 @@ pub fn unbound_remote_payer_cast() -> (
 pub fn unbound_remote_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
     let (_signer, from, to, victim) = unbound_remote_payer_cast();
     vec![(from, 10_000), (to, 10), (victim, 10_000)]
+}
+
+/// The securify cast.
+///
+/// The account to be securified and its founding key on `leaf(1, 0)`,
+/// the rule holder's key and account on `leaf(1, 1)`, and a recipient
+/// on `leaf(1, 1)` for the transfers that prove who pays.
+#[must_use]
+pub fn securify_cast() -> (
+    Ed25519PrivateKey,
+    PrincipalAddr,
+    Ed25519PrivateKey,
+    PrincipalAddr,
+    PrincipalAddr,
+) {
+    let mut taken = Vec::new();
+    let (owner_key, owner) = account_routing_to(ShardId::leaf(1, 0), &mut taken);
+    let (holder_key, holder) = account_routing_to(ShardId::leaf(1, 1), &mut taken);
+    let (_, to) = account_routing_to(ShardId::leaf(1, 1), &mut taken);
+    (owner_key, owner, holder_key, holder, to)
+}
+
+/// Genesis funding for the securify cast.
+///
+/// The account is funded well past every ceiling it will pay, and the
+/// recipient's starting balance is a constant the scenario counts
+/// deposits from. The holder is deliberately unfunded — its account is
+/// an identity, and identities are addresses.
+#[must_use]
+pub fn securify_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let (_owner_key, owner, _holder_key, _holder, to) = securify_cast();
+    vec![(owner, 10_000), (to, 10)]
+}
+
+/// Build the securify transaction: `owner`'s key signs its account over
+/// to the rule requiring `holder`'s identity.
+///
+/// # Panics
+///
+/// If the scenario world does not answer a securify, which would be a
+/// defect in the world rather than in the transition.
+#[must_use]
+pub fn build_securify_tx(
+    owner_key: &Ed25519PrivateKey,
+    owner: PrincipalAddr,
+    holder: PrincipalAddr,
+    validity: TimestampRange,
+) -> Transaction {
+    let graph = client()
+        .securify_graph(owner, holder, 86_400_000)
+        .expect("the stdlib account answers a securify");
+    Transaction::new(envelope(graph, owner_key, validity))
 }
 
 /// Every stake pool any scenario in this crate seats.

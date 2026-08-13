@@ -26,7 +26,7 @@ use hyperscale_types::{
     TransactionEnvelope,
 };
 use hyperscale_vm_effects::{
-    EnvelopeTree, IntentDecl, ManifestGraph, MetadataCache, PrincipalAddr,
+    EnvelopeTree, IntentDecl, ManifestGraph, MetadataCache, PrincipalAddr, Rule,
 };
 use hyperscale_vm_manifest_builder::native::account;
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
@@ -135,6 +135,35 @@ impl Client {
         let sender = account::authorize(&mut b, from)?;
         let funds = account::withdraw(&mut b, sender, *XRD, amount)?;
         account::deposit(&mut b, to, funds)?;
+        b.build()
+    }
+
+    /// The sign-in-then-securify graph: `account` stores one rule as all
+    /// three roles — the identity `holder`'s key derives — under
+    /// `recovery_delay_ms`. The one-way transition off the rule the
+    /// account's address derives; from the commit on, `holder`'s key
+    /// governs acting and paying, and the account's own key governs
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`TypedError`] if the account or its methods do not resolve in
+    /// this client's world.
+    pub fn securify_graph(
+        &self,
+        account: PrincipalAddr,
+        holder: PrincipalAddr,
+        recovery_delay_ms: u64,
+    ) -> Result<ManifestGraph, TypedError> {
+        let cache = self.cache();
+        let mut b = self.builder(&cache);
+        let owner = account::authorize(&mut b, account)?;
+        account::securify_uniform(
+            &mut b,
+            owner,
+            Rule::Require(holder.address()),
+            recovery_delay_ms,
+        )?;
         b.build()
     }
 

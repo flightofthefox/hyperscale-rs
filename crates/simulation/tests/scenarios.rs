@@ -15,9 +15,10 @@ use hyperscale_scenarios::tx::{
     cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
     insolvent_genesis_accounts, livelock_genesis_accounts, merge_straddler_setup,
     nullifier_race_genesis_accounts, overdraw_genesis_accounts, participant_sweep_genesis_accounts,
-    probe_train_genesis_accounts, reshape_lifecycle_accounts, shared_recipient_genesis_accounts,
-    split_straddler_setup, staking_genesis_accounts, storm_genesis_accounts,
-    unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
+    probe_train_genesis_accounts, reshape_lifecycle_accounts, securify_genesis_accounts,
+    shared_recipient_genesis_accounts, split_straddler_setup, staking_genesis_accounts,
+    storm_genesis_accounts, unbound_genesis_accounts, unbound_remote_genesis_accounts,
+    withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig,
@@ -44,8 +45,8 @@ use hyperscale_scenarios::{
     preview_reports_resource_changes, randomness_draw_agrees_across_shards,
     re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
     register_validator_pools_a_node, register_without_capacity_is_rejected,
-    registered_validator_activates_onto_a_shard, single_transfer,
-    split_boundary_admits_an_uncommitted_precut_tx,
+    registered_validator_activates_onto_a_shard, securify_retires_the_key_at_the_payer_shard,
+    single_transfer, split_boundary_admits_an_uncommitted_precut_tx,
     split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
     split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_surviving_counterpart_releases_its_reservation,
@@ -329,6 +330,13 @@ fn unbound_remote_payer_engages_nothing_sim() {
         &unbound_remote_genesis_accounts(),
     );
     unbound_remote_payer_engages_nothing(&mut cluster);
+}
+
+#[test]
+fn securify_retires_the_key_at_the_payer_shard_sim() {
+    let mut cluster =
+        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &securify_genesis_accounts());
+    securify_retires_the_key_at_the_payer_shard(&mut cluster);
 }
 
 #[test]
