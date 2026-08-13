@@ -604,6 +604,7 @@ where
             block_hash,
             demands,
             read_height,
+            clock,
         } => {
             // Balance reads anchor at the height the block's ancestry
             // proves committed — the coordinator dispatches only once
@@ -634,7 +635,12 @@ where
                     break;
                 };
                 for signer in &demand.signers {
-                    if !vm_statics().rule_admits(auth_cell.as_deref(), payer, *signer) {
+                    if !vm_statics().rule_admits(
+                        auth_cell.as_deref(),
+                        payer,
+                        *signer,
+                        clock.as_millis(),
+                    ) {
                         result = Err(format!(
                             "payer {:?}: rule does not admit signer {signer:?}",
                             demand.vault.owner
@@ -982,11 +988,16 @@ where
                             return true;
                         };
                         // The builder-side form of the voters' payer
-                        // binding verdict, so a proposal never
-                        // self-rejects on a signer the payer's rule
-                        // refuses.
+                        // binding verdict, judged at the same instant
+                        // they will judge it — the parent QC this block
+                        // rides is the clock its transactions execute
+                        // under — so a proposal never self-rejects on a
+                        // signer the payer's rule refuses.
                         let auth_cell = auth_cells.get(&vault).and_then(Option::as_deref);
-                        if !tx.payer_admits_signer(auth_cell) {
+                        if !tx.payer_admits_signer(
+                            auth_cell,
+                            parent_qc.weighted_timestamp().as_millis(),
+                        ) {
                             unbound += 1;
                             return false;
                         }

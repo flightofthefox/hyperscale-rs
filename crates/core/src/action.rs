@@ -867,6 +867,11 @@ pub enum Action {
         demands: Vec<FeeDemand>,
         /// The ancestry-proven committed height balances are read at.
         read_height: BlockHeight,
+        /// The judged block's own parent-QC weighted timestamp — the
+        /// transaction clock its members execute under if it commits
+        /// them, and so the instant the payer binding's maturity
+        /// comparison is judged at.
+        clock: WeightedTimestamp,
     },
 
     /// Build a complete block proposal.

@@ -1286,12 +1286,16 @@ impl VerificationPipeline {
     /// callers skip the dispatch entirely when it is empty. `read_height`
     /// is the balance-read anchor: the height the block's own ancestry
     /// proves committed, so every replica verifying the block reads the
-    /// same vault version.
+    /// same vault version. `clock` is the block's own parent-QC weighted
+    /// timestamp — the transaction clock its members execute under if it
+    /// commits them — which is what the payer binding's maturity
+    /// comparison is judged at.
     pub fn initiate_reservations_verification(
         &mut self,
         block_hash: BlockHash,
         demands: Vec<FeeDemand>,
         read_height: BlockHeight,
+        clock: WeightedTimestamp,
     ) -> Vec<Action> {
         debug!(
             ?block_hash,
@@ -1304,6 +1308,7 @@ impl VerificationPipeline {
             block_hash,
             demands,
             read_height,
+            clock,
         }]
     }
 
@@ -1925,6 +1930,7 @@ impl VerificationPipeline {
                     block_hash,
                     fee_demands,
                     fee_read_height,
+                    h.parent_qc().weighted_timestamp(),
                 ));
             } else {
                 // The anchor height isn't materialized locally yet — the

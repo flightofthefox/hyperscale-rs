@@ -286,7 +286,8 @@ impl Transaction {
     /// Whether the fee payer's rule admits the envelope signer, given
     /// the payer's stored-authority cell as read at the caller's own
     /// anchored height — `None` or empty meaning absent, the virtual
-    /// rule.
+    /// rule — judged at `clock_ms`, the caller's weighted-time instant,
+    /// so a matured recovery proposal governs paying too.
     ///
     /// Every fee rule debits the account the envelope's `fee_payer`
     /// names — the reservation the payer shard enforces as block
@@ -303,8 +304,8 @@ impl Transaction {
     ///
     /// Panics under the same conditions as [`Self::routing`].
     #[must_use]
-    pub fn payer_admits_signer(&self, auth_cell: Option<&[u8]>) -> bool {
-        vm_statics().rule_admits(auth_cell, self.body().fee_payer, self.signer())
+    pub fn payer_admits_signer(&self, auth_cell: Option<&[u8]>, clock_ms: u64) -> bool {
+        vm_statics().rule_admits(auth_cell, self.body().fee_payer, self.signer(), clock_ms)
     }
 
     /// The cached derivation, or a panic naming the refusal.

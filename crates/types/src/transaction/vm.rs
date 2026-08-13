@@ -276,19 +276,27 @@ pub trait VmStatics: Send + Sync {
 
     /// Whether `payer`'s rule admits `signer`, given the payer's
     /// stored-authority cell as read at the caller's own anchored
-    /// height — `None` or empty meaning absent.
+    /// height — `None` or empty meaning absent — and the weighted-time
+    /// instant the verdict is judged at, in milliseconds.
     ///
     /// The rule's encoding is the VM's fact, so consensus hands the
     /// bytes across this seam and stays blind to them. Absent means the
     /// account is virtual and the rule is the identity its address
     /// derives; stored bytes that do not decode admit nobody, the same
-    /// fail-closed verdict the execution gate gives them.
+    /// fail-closed verdict the execution gate gives them. The clock is
+    /// what lets a matured recovery proposal govern here with nothing
+    /// applying it: voters pass the judged block's own parent-QC
+    /// weighted timestamp — the same instant its transactions execute
+    /// under if it commits them — the proposal builder the parent QC it
+    /// builds on, and mempool admission its local advisory instant.
     fn rule_admits(
         &self,
         auth_cell: Option<&[u8]>,
         payer: PrincipalAddr,
         signer: PrincipalAddr,
+        clock_ms: u64,
     ) -> bool {
+        let _ = clock_ms;
         match auth_cell {
             None | Some([]) => payer == signer,
             Some(_) => false,

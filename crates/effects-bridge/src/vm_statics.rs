@@ -24,10 +24,10 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::stdlib::{AUTH, ENTROPY, VALIDATORS, VAULT, XRD as XRD_ROLE};
 use hyperscale_vm_effects::{
-    Address, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry, ManifestHash, MetadataCache,
-    Mode, NativeAddr, PackageHash, PackageMetadata, PrefixShardResolver, PrincipalAddr, RoleId,
-    Routing as RoutedTransaction, Rule, SchemeId, SubstateKey, Value, admit_tree, child_key,
-    footprint, native_address, package_hash, principal_address, route_tree,
+    Address, AuthCell, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry, ManifestHash,
+    MetadataCache, Mode, NativeAddr, PackageHash, PackageMetadata, PrefixShardResolver,
+    PrincipalAddr, RoleId, Routing as RoutedTransaction, SchemeId, SubstateKey, Value, admit_tree,
+    child_key, footprint, native_address, package_hash, principal_address, route_tree,
 };
 
 use crate::ProtocolHasher;
@@ -366,15 +366,22 @@ impl VmStatics for BridgeStatics {
         auth_cell: Option<&[u8]>,
         payer: PrincipalAddr,
         signer: PrincipalAddr,
+        clock_ms: u64,
     ) -> bool {
         match auth_cell {
             None | Some([]) => payer == signer,
             // Stored bytes that do not decode admit nobody — the write
             // path refuses such bytes, so these are not a rule, and the
-            // verdict fails closed like the execution gate's.
-            Some(bytes) => {
-                Rule::from_slice(bytes).is_ok_and(|rule| rule.satisfied_by(&[signer.address()]))
-            }
+            // verdict fails closed like the execution gate's. Paying is
+            // governed by the primary of whichever role set the clock
+            // picks, so a matured recovery proposal retires the old key
+            // here with nothing applying it.
+            Some(bytes) => AuthCell::from_slice(bytes).is_ok_and(|cell| {
+                cell.governing(clock_ms)
+                    .roles
+                    .primary
+                    .satisfied_by(&[signer.address()])
+            }),
         }
     }
 
@@ -487,9 +494,9 @@ mod tests {
     };
     use hyperscale_vm_effects::stdlib::{VAULT, account_metadata};
     use hyperscale_vm_effects::{
-        Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hasher, IntentDecl, ManifestGraph,
-        PackageHash, ResourceAddr, Subintent, SubintentHash, YieldBinding, YieldParam, child_key,
-        nullifier_key,
+        AuthBase, Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hasher, IntentDecl,
+        ManifestGraph, PackageHash, Proposal, ResourceAddr, RoleSet, Rule, Subintent,
+        SubintentHash, YieldBinding, YieldParam, child_key, nullifier_key,
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
 
@@ -786,26 +793,58 @@ mod tests {
     }
 
     /// The payer shard's binding verdict across the securify boundary:
-    /// absent means the virtual rule, stored bytes mean the rule and
-    /// nothing else, and bytes that decode as no rule admit nobody.
+    /// absent means the virtual rule, stored bytes mean the governing
+    /// primary and nothing else, and bytes that decode as no cell admit
+    /// nobody.
     #[test]
     fn the_stored_rule_governs_the_payer_binding() {
         let statics = statics();
 
-        // Virtual: the payer's own identity and no other.
-        assert!(statics.rule_admits(None, composer_addr(), composer_addr()));
-        assert!(statics.rule_admits(Some(&[]), composer_addr(), composer_addr()));
-        assert!(!statics.rule_admits(None, composer_addr(), bob_addr()));
+        // Virtual: the payer's own identity and no other, whatever the
+        // clock says.
+        assert!(statics.rule_admits(None, composer_addr(), composer_addr(), 0));
+        assert!(statics.rule_admits(Some(&[]), composer_addr(), composer_addr(), u64::MAX));
+        assert!(!statics.rule_admits(None, composer_addr(), bob_addr(), 0));
 
         // Securified to Bob: the old identity is dead, the rule's lives.
-        let rule = Rule::Require(bob_addr().address()).to_bytes().unwrap();
-        assert!(statics.rule_admits(Some(&rule), composer_addr(), bob_addr()));
-        assert!(!statics.rule_admits(Some(&rule), composer_addr(), composer_addr()));
+        let cell = AuthCell::new(AuthBase {
+            recovery_delay_ms: 1_000,
+            roles: RoleSet::uniform(Rule::Require(bob_addr().address())),
+        })
+        .to_bytes()
+        .unwrap();
+        assert!(statics.rule_admits(Some(&cell), composer_addr(), bob_addr(), 0));
+        assert!(!statics.rule_admits(Some(&cell), composer_addr(), composer_addr(), 0));
 
-        // Bytes no rule decodes from admit nobody — fail closed, like
-        // the execution gate.
-        assert!(!statics.rule_admits(Some(&[0xFF, 0xFF]), composer_addr(), composer_addr()));
-        assert!(!statics.rule_admits(Some(&[0xFF, 0xFF]), composer_addr(), bob_addr()));
+        // A pending proposal moves the payer binding at its instant and
+        // not before: the retired primary stops paying the moment the
+        // recovery matures, with nothing applying it.
+        let recovering = AuthCell {
+            base: AuthBase {
+                recovery_delay_ms: 1_000,
+                roles: RoleSet::uniform(Rule::Require(bob_addr().address())),
+            },
+            proposal: Some(Proposal {
+                effective_at_ms: 5_000,
+                base: AuthBase {
+                    recovery_delay_ms: 1_000,
+                    roles: RoleSet::uniform(Rule::Require(composer_addr().address())),
+                },
+            }),
+        }
+        .to_bytes()
+        .unwrap();
+        assert!(statics.rule_admits(Some(&recovering), composer_addr(), bob_addr(), 4_999));
+        assert!(!statics.rule_admits(Some(&recovering), composer_addr(), composer_addr(), 4_999));
+        assert!(statics.rule_admits(Some(&recovering), composer_addr(), composer_addr(), 5_000));
+        assert!(!statics.rule_admits(Some(&recovering), composer_addr(), bob_addr(), 5_000));
+
+        // Bytes no cell decodes from admit nobody — fail closed, like
+        // the execution gate. Bare rule bytes are among them: the write
+        // path stores frames.
+        assert!(!statics.rule_admits(Some(&[0xFF, 0xFF]), composer_addr(), composer_addr(), 0));
+        let bare = Rule::Require(bob_addr().address()).to_bytes().unwrap();
+        assert!(!statics.rule_admits(Some(&bare), composer_addr(), bob_addr(), 0));
     }
 
     #[test]
