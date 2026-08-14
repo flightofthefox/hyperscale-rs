@@ -1464,6 +1464,13 @@ pub fn preview_reports_resource_changes(c: &mut impl Cluster) {
 /// settling is what says the code reached the nodes that never held it —
 /// every shard the transaction touches runs the whole of it.
 ///
+/// What a simulated cluster puts under test is the compiled half. The
+/// process has one metadata cache however many hosts it stands up, so
+/// every host here can route a call the moment the publish commits;
+/// only the code is per host, and only the fetch supplies it. So the
+/// two earlier moments are held by the registry rule alone, which is
+/// the guarantee being probed — a node's own holdings never enter it.
+///
 /// # Panics
 ///
 /// Panics if the publish does not settle, if a call before the window
@@ -1496,12 +1503,12 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     });
     assert!(in_state, "the package cell never reached persisted state");
 
-    // Before the beacon has heard of it at all. The publisher's own
-    // committee holds the code and could run this, but no other shard
-    // can even derive it, so a rule that refused only the registered and
-    // immature would let this through on an argument about who holds
-    // what metadata. The rule refuses it because the registry does not
-    // list it.
+    // Before the beacon has heard of it at all. A rule that refused only
+    // the registered and immature would have to let this through on an
+    // argument about who holds what metadata — true of a real network,
+    // and unavailable to any node as a local check. The rule refuses it
+    // for the one reason every node can check alike: the registry does
+    // not list it.
     let unregistered =
         build_instance_deposit_tx(key, &artifact, SALT, DEPOSIT, validity_around(c.now()));
     let unregistered_hash = unregistered.hash();
