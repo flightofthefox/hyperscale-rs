@@ -103,8 +103,9 @@ pub use spc::{
 };
 pub use state::{
     BeaconState, CohortSeat, CommitteeTransition, CompletedRecovery, JailReason, KeeperSeat,
-    KeptSeat, ObserverSeat, PackageFact, PendingReshape, PendingRotation, PendingWithdrawal,
-    PoolConviction, RecoveryCause, ScheduledSplit, ShardBoundary, ShardCommittee, ShardRecovery,
-    SlotEffects, StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
+    KeptSeat, ObserverSeat, PACKAGE_MATURITY_EPOCHS, PackageFact, PendingReshape, PendingRotation,
+    PendingWithdrawal, PoolConviction, RecoveryCause, ScheduledSplit, ShardBoundary,
+    ShardCommittee, ShardRecovery, SlotEffects, StakePool, TransitionCause, ValidatorRecord,
+    ValidatorStatus,
 };
 pub use witness::{BeaconWitnessEvent, SHARD_WITNESS_LEAF_DOMAIN_TAG, ShardWitnessPayload};

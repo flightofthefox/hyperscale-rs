@@ -16,9 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use hyperscale_core::CrossShardExecutionRequest;
-use hyperscale_types::{
-    Hash, RevealChain, ShardId, Transaction, TxHash, Verified, WeightedTimestamp,
-};
+use hyperscale_types::{RevealChain, ShardId, Transaction, TxHash, Verified, WeightedTimestamp};
 
 use crate::provisional::ProvisionalCells;
 use crate::provisioning::ProvisioningTracker;
@@ -72,12 +70,6 @@ pub struct TickCandidates {
     /// Keyed and iterated in hash order so composition is a function of
     /// the candidate set and nothing about arrival.
     candidates: BTreeMap<TxHash, Candidate>,
-    /// Packages the beacon registers that this node does not yet hold.
-    /// A candidate naming one waits in the pool: dispatching it would
-    /// reach the engine's deterministic no-code refusal while a replica
-    /// holding the bytes settles it — the fetch heals, the pool retries
-    /// on the next commit's composition.
-    missing_packages: BTreeSet<Hash>,
 }
 
 /// One member's admission to the tick being composed.
@@ -99,7 +91,6 @@ impl TickCandidates {
         Self {
             local_shard,
             candidates: BTreeMap::new(),
-            missing_packages: BTreeSet::new(),
         }
     }
 
@@ -154,20 +145,6 @@ impl TickCandidates {
         }
     }
 
-    /// Replace the missing-package exclusion set — the reconciliation of
-    /// the beacon registry against local holdings, taken each beacon
-    /// commit.
-    pub fn set_missing_packages(&mut self, packages: Vec<Hash>) {
-        self.missing_packages = packages.into_iter().collect();
-    }
-
-    /// Remove acquired packages from the exclusion set.
-    pub fn packages_acquired(&mut self, packages: &[Hash]) {
-        for package in packages {
-            self.missing_packages.remove(package);
-        }
-    }
-
     /// Take the members that can execute at this commit, in hash order.
     ///
     /// A member joins when it has everything it needs to reach its final
@@ -206,15 +183,6 @@ impl TickCandidates {
                 continue;
             }
             if !candidate.engagement_settled(now) {
-                continue;
-            }
-            if !self.missing_packages.is_empty()
-                && candidate
-                    .tx
-                    .packages()
-                    .iter()
-                    .any(|package| self.missing_packages.contains(package))
-            {
                 continue;
             }
             let declared = &candidate.tx.routing().declared_modes;
