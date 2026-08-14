@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
+use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::artifact_package;
 use hyperscale_network::{Network, ResponseVerdict};
@@ -22,7 +23,9 @@ use hyperscale_types::{BeaconState, Hash, MessageClass, ShardId, ValidatorId};
 
 use crate::config::NodeConfig;
 use crate::fetch::{Fetch, FetchBinding, FetchInput, partition_solicited};
-use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
+use crate::shard::{
+    HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_protocol_event, push_shard_input,
+};
 
 /// Per-package artifact fetch keyed by content address.
 pub type PackageArtifactFetch = Fetch<Hash>;
@@ -151,6 +154,14 @@ where
             }
         }
         drop(snapshot);
+        // The exclusion set the execution gate composes against: replaced
+        // wholesale each commit, so it heals itself whatever was missed.
+        let missing: Vec<Hash> = by_shard.values().flatten().copied().collect();
+        push_protocol_event(
+            self.event_sender(),
+            self.shard,
+            ProtocolEvent::MissingPackagesUpdated { packages: missing },
+        );
         for (shard, ids) in by_shard {
             self.drive_fetch::<PackageArtifactBinding>(FetchInput::Request {
                 ids,
@@ -174,6 +185,13 @@ where
                 .store_fetched_package(package, artifact);
             ids.push(package);
         }
+        push_protocol_event(
+            self.event_sender(),
+            self.shard,
+            ProtocolEvent::PackagesAcquired {
+                packages: ids.clone(),
+            },
+        );
         self.drive_fetch::<PackageArtifactBinding>(FetchInput::Admitted { ids });
     }
 }

@@ -90,6 +90,7 @@ impl VmStatics for ReservingStatics {
             fee_vault_local: [0xEE; 16],
             auth_cell_local: [0xAE; 16],
             work: declared_work(4, vm.gas_limit, vm.signature_work()),
+            packages: Vec::new(),
         })
     }
 }

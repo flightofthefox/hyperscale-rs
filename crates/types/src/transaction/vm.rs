@@ -236,6 +236,10 @@ pub struct Derived {
     /// the vault at the same anchored height: the reservation engages
     /// only for a signer the payer's rule admits.
     pub auth_cell_local: [u8; 16],
+    /// The content addresses of every package the manifest's calls run,
+    /// deduplicated. What the execution gate holds a candidate to: a
+    /// shard dispatches the transaction only once it holds all of them.
+    pub packages: Vec<Hash>,
     /// What including this transaction costs a block, in work units.
     ///
     /// A fixed admit-and-track charge, the declared footprint, and the
