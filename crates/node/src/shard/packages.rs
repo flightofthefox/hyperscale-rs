@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
+use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::artifact_package;
 use hyperscale_network::{Network, ResponseVerdict};
@@ -26,7 +27,9 @@ use hyperscale_types::{BeaconState, Hash, MessageClass, ShardId, ValidatorId};
 
 use crate::config::NodeConfig;
 use crate::fetch::{Fetch, FetchBinding, FetchInput, partition_solicited};
-use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
+use crate::shard::{
+    HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_protocol_event, push_shard_input,
+};
 
 /// Per-package artifact fetch keyed by content address.
 pub type PackageArtifactFetch = Fetch<Hash>;
@@ -161,6 +164,15 @@ where
             }
         }
         drop(snapshot);
+        // The set the tick dispatch head waits on, replaced wholesale so
+        // it heals whatever any single report missed.
+        push_protocol_event(
+            self.event_sender(),
+            self.shard,
+            ProtocolEvent::MissingPackagesUpdated {
+                packages: by_shard.values().flatten().copied().collect(),
+            },
+        );
         for (shard, ids) in by_shard {
             self.drive_fetch::<PackageArtifactBinding>(FetchInput::Request {
                 ids,
@@ -192,6 +204,9 @@ where
     pub(crate) fn handle_package_artifacts_fetched(&mut self, artifacts: Vec<(Hash, Vec<u8>)>) {
         let ids: Vec<Hash> = artifacts.iter().map(|(package, _)| *package).collect();
         let handles = Arc::clone(&self.process.dispatch_handles);
+        let events = self.event_sender().clone();
+        let shard = self.shard;
+        let acquired = ids.clone();
         self.process
             .dispatch
             .spawn(DispatchPool::Throughput, move || {
@@ -204,6 +219,15 @@ where
                         .beacon_storage
                         .store_fetched_package(package, &artifact);
                 }
+                // Reported from inside the install, not beside it: a tick
+                // held for want of this code may dispatch on the strength
+                // of this event, and the engine has to hold the package
+                // before that is true.
+                push_protocol_event(
+                    &events,
+                    shard,
+                    ProtocolEvent::PackagesAcquired { packages: acquired },
+                );
             });
         self.drive_fetch::<PackageArtifactBinding>(FetchInput::Admitted { ids });
     }

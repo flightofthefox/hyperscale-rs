@@ -111,6 +111,19 @@ struct PendingTick {
     requests: Vec<CrossShardExecutionRequest>,
 }
 
+impl PendingTick {
+    /// Whether any member runs code drawn from `missing`.
+    fn runs_any_of(&self, missing: &BTreeSet<Hash>) -> bool {
+        self.requests.iter().any(|request| {
+            request
+                .transaction
+                .packages()
+                .iter()
+                .any(|package| missing.contains(package))
+        })
+    }
+}
+
 /// Data returned when a tick is ready for voting.
 ///
 /// The state machine produces this; the `io_loop` uses it to sign the execution vote
@@ -217,6 +230,18 @@ pub struct ExecutionCoordinator {
     /// Whether a dispatched tick's `ExecutionBatchCompleted` is still
     /// outstanding.
     tick_in_flight: bool,
+
+    /// Packages the beacon registers that this node does not hold the
+    /// bytes for, replaced wholesale at each beacon commit.
+    ///
+    /// A queued tick whose members run one of them waits at the dispatch
+    /// head until the fetch lands. It cannot be consulted where the tick
+    /// is composed: membership is what the committee's votes are cast
+    /// over, so it has to be a function of committed chain state alone,
+    /// and a node's holdings are not that. Dispatch is where the
+    /// difference is local — the tick still answers for exactly the
+    /// members it was composed with, whenever it runs.
+    missing_packages: BTreeSet<Hash>,
 
     /// The highest tick whose output is on the tick chain. A resolution
     /// is emitted only once its tick's tick has appended, so a commit
@@ -451,6 +476,7 @@ impl ExecutionCoordinator {
             committed_ts: committed_block_anchor_wt,
             committed_committee_anchor_wt,
             pending_ticks: VecDeque::new(),
+            missing_packages: BTreeSet::new(),
             tick_in_flight: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
@@ -946,6 +972,39 @@ impl ExecutionCoordinator {
 
         completions.sort_by_key(|a| a.tick_id);
         completions
+    }
+
+    /// Replace the set of registered packages this node lacks with the
+    /// latest beacon reconciliation, releasing the dispatch head if what
+    /// held it is no longer missing.
+    ///
+    /// Replaced wholesale rather than merged, so a package that arrived
+    /// by any route — a fetch, this shard's own commit, a boot reseed —
+    /// leaves the set at the next commit without anyone reporting it.
+    pub fn on_missing_packages_updated(&mut self, packages: Vec<Hash>) -> Vec<Action> {
+        let missing: BTreeSet<Hash> = packages.into_iter().collect();
+        if missing == self.missing_packages {
+            return Vec::new();
+        }
+        self.missing_packages = missing;
+        self.dispatch_next_tick()
+    }
+
+    /// Drop installed packages from the missing set and release the
+    /// dispatch head if they were what held it.
+    ///
+    /// Reported once the engine holds the code, not once the bytes
+    /// arrive: what the head waits on is the ability to run, and
+    /// installation is where that is acquired.
+    pub fn on_packages_acquired(&mut self, packages: &[Hash]) -> Vec<Action> {
+        let held = self.missing_packages.len();
+        for package in packages {
+            self.missing_packages.remove(package);
+        }
+        if self.missing_packages.len() == held {
+            return Vec::new();
+        }
+        self.dispatch_next_tick()
     }
 
     /// Absorb a completed batch: route receipts and per-member outcomes
@@ -2570,6 +2629,25 @@ impl ExecutionCoordinator {
         if self.tick_in_flight {
             return Vec::new();
         }
+        let Some(head) = self.pending_ticks.front() else {
+            return Vec::new();
+        };
+        // Running a member whose code this node lacks would reach the
+        // engine's no-code refusal while every replica holding the bytes
+        // settles it — one tick, two receipt roots. Waiting is the whole
+        // of the fix: the fetch heals, and the tick that runs then is the
+        // tick that was composed now. Ticks are serial, so this shard's
+        // execution stops here until the bytes land — the trade a
+        // withheld artifact is meant to draw, liveness rather than a
+        // fork.
+        if head.runs_any_of(&self.missing_packages) {
+            tracing::debug!(
+                shard = %self.local_shard,
+                tick = %head.tick,
+                "Holding a tick whose members run code this node has not fetched"
+            );
+            return Vec::new();
+        }
         let Some(tick) = self.pending_ticks.pop_front() else {
             return Vec::new();
         };
@@ -3438,7 +3516,7 @@ mod tests {
     use hyperscale_storage::ReplayWindow;
     use hyperscale_types::test_utils::{
         certify as test_certify, make_live_block as helpers_make_live_block, test_prefix,
-        test_transaction, test_transaction_with_prefixes,
+        test_transaction, test_transaction_running, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt,
@@ -3597,6 +3675,86 @@ mod tests {
         let tick_id = state.ticks.tick_assignment(tx_hash);
         assert!(tick_id.is_some());
         assert!(state.ticks.contains_tick(&tick_id.unwrap()));
+    }
+
+    /// A tick composes whatever the block committed, and waits at the
+    /// dispatch head for code this node has not fetched.
+    ///
+    /// Membership is what the committee votes over, so it cannot turn on
+    /// local holdings; running a member whose code is missing would reach
+    /// the engine's no-code refusal while every replica holding the bytes
+    /// settled it. So the tick is composed either way and held here, and
+    /// what dispatches when the fetch lands is the tick composed now.
+    #[test]
+    fn a_tick_waits_at_the_dispatch_head_for_code_this_node_lacks() {
+        let mut state = make_test_state();
+        let topology_schedule = make_test_topology();
+
+        let package = Hash::from_bytes(b"a package this node has not fetched");
+        state.on_missing_packages_updated(vec![package]);
+
+        let tx = test_transaction_running(1, &[package]);
+        let tx_hash = tx.hash();
+        let block = make_live_block(
+            BlockHeight::new(1),
+            1000,
+            ValidatorId::new(0),
+            vec![Arc::new(tx)],
+        );
+        let actions = state.on_block_committed(&topology_schedule, &certify(block));
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ExecuteTransactions { .. })),
+            "a tick running unfetched code must not dispatch"
+        );
+        assert!(
+            state.ticks.tick_assignment(tx_hash).is_some(),
+            "the tick is composed regardless — only its dispatch waits"
+        );
+
+        // The fetch lands and the held tick goes, unchanged.
+        let released = state.on_packages_acquired(&[package]);
+        let dispatched: Vec<&TxHash> = released
+            .iter()
+            .filter_map(|action| match action {
+                Action::ExecuteTransactions { requests, .. } => Some(requests),
+                _ => None,
+            })
+            .flatten()
+            .map(|request| &request.tx_hash)
+            .collect();
+        assert_eq!(
+            dispatched,
+            vec![&tx_hash],
+            "acquiring the package releases exactly the tick that waited on it"
+        );
+    }
+
+    /// A package nothing in the queued tick runs never holds it.
+    #[test]
+    fn an_unrelated_missing_package_holds_no_tick() {
+        let mut state = make_test_state();
+        let topology_schedule = make_test_topology();
+
+        state.on_missing_packages_updated(vec![Hash::from_bytes(b"someone else's code")]);
+
+        let tx = test_transaction_running(1, &[Hash::from_bytes(b"code this node holds")]);
+        let block = make_live_block(
+            BlockHeight::new(1),
+            1000,
+            ValidatorId::new(0),
+            vec![Arc::new(tx)],
+        );
+        let actions = state.on_block_committed(&topology_schedule, &certify(block));
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::ExecuteTransactions { .. })),
+            "only the code a member runs can hold its tick"
+        );
     }
 
     fn make_topology() -> TopologySchedule {

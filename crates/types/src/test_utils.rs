@@ -93,6 +93,27 @@ pub fn test_transaction(seed: u8) -> Transaction {
     )
 }
 
+/// [`test_transaction`] reported as running `packages` — the fixture for
+/// anything gated on what code a transaction needs.
+#[must_use]
+pub fn test_transaction_running(seed: u8, packages: &[Hash]) -> Transaction {
+    let mut body = [0u8; 31];
+    for (slot, &byte) in body
+        .iter_mut()
+        .zip(&[seed, seed.wrapping_add(1), seed.wrapping_add(2)])
+    {
+        *slot = byte;
+    }
+    stub_transaction_running(
+        PrincipalAddr::new(body),
+        packages,
+        &[test_prefix(seed)],
+        &[test_prefix(seed.wrapping_add(10))],
+        1_000,
+        test_validity_range(),
+    )
+}
+
 /// Convenience: wrap [`test_transaction`] in a `Verified` witness via
 /// the test-only gate.
 ///
@@ -855,9 +876,11 @@ const fn stub_cell(owner: Address) -> DeclaredKey {
 /// tests.
 ///
 /// The envelope's tree is a leading read count followed by that many
-/// 32-byte shared-mode owner prefixes and then the exclusive ones.
-/// Routing is thus fully controlled per transaction by
-/// [`stub_transaction`], with no effects-bridge dependency.
+/// 32-byte shared-mode owner prefixes and then the exclusive ones, and
+/// its message is a run of 32-byte package addresses the transaction
+/// runs. Routing and package set are thus fully controlled per
+/// transaction by [`stub_transaction`] and
+/// [`stub_transaction_running`], with no effects-bridge dependency.
 struct StubVmStatics;
 
 impl VmStatics for StubVmStatics {
@@ -888,6 +911,18 @@ impl VmStatics for StubVmStatics {
         let (reads, writes) = prefixes.split_at(usize::from(read_count) * 32);
         let read_prefixes = canonical(reads)?;
         let write_prefixes = canonical(writes)?;
+        if !vm.message.len().is_multiple_of(32) {
+            return Err(VmStaticsError(
+                "stub message must be 32-byte package addresses".into(),
+            ));
+        }
+        let packages: Vec<Hash> = vm
+            .message
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|bytes| Hash::from_hash_bytes(bytes))
+            .collect();
         Ok(Derived {
             routing: Routing {
                 read_keys: read_prefixes.iter().copied().map(stub_cell).collect(),
@@ -920,7 +955,7 @@ impl VmStatics for StubVmStatics {
             signer: vm.fee_payer,
             fee_vault_local: [0xEE; 16],
             auth_cell_local: [0xAE; 16],
-            packages: Vec::new(),
+            packages,
             // The stub prices a declared key like the real derivation
             // prices an effect — one unit each — and hands the total to
             // the same schedule, so a stubbed transaction and a derived
@@ -982,11 +1017,46 @@ pub fn stub_transaction_with_reads(
     max_fee: u128,
     validity: TimestampRange,
 ) -> Transaction {
+    stub_transaction_running(
+        fee_payer,
+        &[],
+        read_prefixes,
+        write_prefixes,
+        max_fee,
+        validity,
+    )
+}
+
+/// Build a signed transaction the [`StubVmStatics`] derivation routes as
+/// [`stub_transaction_with_reads`] does and reports as running
+/// `packages`.
+///
+/// The package set rides in the envelope's message, which the stub reads
+/// as a run of 32-byte addresses — the fixture for anything gated on
+/// what code a transaction needs.
+///
+/// # Panics
+///
+/// Panics if the fixture signing key fails to construct, or if the read
+/// set exceeds what a one-byte count can name.
+#[must_use]
+pub fn stub_transaction_running(
+    fee_payer: PrincipalAddr,
+    packages: &[Hash],
+    read_prefixes: &[Address],
+    write_prefixes: &[Address],
+    max_fee: u128,
+    validity: TimestampRange,
+) -> Transaction {
     install_stub_vm_statics();
     let key = Ed25519PrivateKey::from_bytes(&[0x5A; 32]).expect("fixture key");
     let mut tree = vec![u8::try_from(read_prefixes.len()).expect("stub read set fits a byte")];
     for prefix in read_prefixes.iter().chain(write_prefixes) {
         tree.extend_from_slice(&prefix.to_bytes());
+    }
+    let mut message = Vec::with_capacity(packages.len() * 32);
+    for package in packages {
+        message.extend_from_slice(package.as_bytes());
     }
     let vm = TransactionEnvelope {
         body: TransactionBody::Call(tree),
@@ -996,7 +1066,7 @@ pub fn stub_transaction_with_reads(
         gas_limit: 1_000_000,
         validity_start_ms: validity.start_timestamp_inclusive.as_millis(),
         validity_end_ms: validity.end_timestamp_exclusive.as_millis(),
-        message: Vec::new(),
+        message,
         network: NetworkId::from(&NetworkDefinition::simulator()),
         signer_scheme: SchemeId::NONE,
         signer: Vec::new(),
