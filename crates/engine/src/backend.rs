@@ -221,8 +221,18 @@ mod reference {
                     exhausted: false,
                 };
             };
-            let mut instance = RefComponentInstance::instantiate(component, HostState(session))
-                .expect("the validated genesis component instantiates");
+            let mut instance =
+                match RefComponentInstance::instantiate(component, HostState(session)) {
+                    Ok(instance) => instance,
+                    Err((host, error)) => {
+                        return InvokeResult {
+                            session: host.0,
+                            fuel: 0,
+                            result: Err(format!("instantiate: {error}")),
+                            exhausted: false,
+                        };
+                    }
+                };
             // The same ceiling the blessed engine meters against. Without
             // it this engine is unbounded, and a guest past the budget
             // traps on one target and runs on the other.

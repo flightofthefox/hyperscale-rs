@@ -28,7 +28,7 @@ use hyperscale_vm_effects::{
 use hyperscale_vm_manifest_builder::native::{account, staking};
 use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, IntentBuilder, TypedBuilder, TypedError};
-use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_metadata};
+use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_artifact, account_metadata};
 
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
 /// fee comes from the faucet, so any key notarizes it.
@@ -47,17 +47,40 @@ pub const STRADDLER_SPLITTER: ShardId = ShardId::leaf(1, 0);
 /// terminating splitter.
 pub const STRADDLER_SURVIVOR: ShardId = ShardId::leaf(1, 1);
 
+/// The genesis package flash's byte total: every stdlib artifact, written
+/// whole under the publisher's single prefix.
+///
+/// The flash lands on whichever shard that prefix routes to — nothing a
+/// scenario controls — so every byte band calibrated around a shard that
+/// may hold it offsets by this total. Expressed as an offset, a band's
+/// margin holds as the stdlib grows; expressed as a literal, it silently
+/// erodes with every regenerated guest blob.
+#[must_use]
+pub fn stdlib_flash_bytes() -> u64 {
+    (account_artifact().len() + staking_artifact().len()) as u64
+}
+
+/// What one ballast account's vault cell stores: its `u128` balance.
+/// Substate byte totals count value bytes, so this converts a byte band
+/// into a ballast account count.
+const BALLAST_CELL_BYTES: u64 = 16;
+
+/// Bytes of ballast lead the splitter carries over the flash total, so a
+/// vote threshold fits between the flash-holding survivor and the
+/// splitter with fixed margins on both sides.
+const SPLITTER_BALLAST_LEAD: u64 = 24_000;
+
 /// Ballast accounts funded into the splitter, so it clears the voted-down
 /// threshold while the survivor — ballasted at [`STRADDLER_SURVIVOR_BULK`]
 /// — stays under it.
 ///
-/// Sized so the ordering holds wherever the stdlib package cell lands.
-/// Genesis writes that cell whole under one prefix, so it sits on one
-/// shard as a single ~14 KiB lump — and which shard that is follows from
-/// the publisher's address, not from anything this scenario controls. The
-/// splitter therefore clears the threshold on its ballast alone, and the
-/// survivor stays under it even holding the lump.
-const STRADDLER_BULK: usize = 1_800;
+/// Derived so the ordering holds wherever the flash lands: the splitter
+/// clears the threshold on its ballast alone, and the survivor stays
+/// under it even holding the whole flash beside its own ballast.
+fn straddler_bulk() -> usize {
+    usize::try_from((stdlib_flash_bytes() + SPLITTER_BALLAST_LEAD) / BALLAST_CELL_BYTES)
+        .expect("ballast count fits usize")
+}
 
 /// Ballast accounts funded into the survivor: enough to clear the derived
 /// merge floor with margin, and short of the splitter's by enough that
@@ -77,10 +100,10 @@ pub const STRADDLER_COUNT: usize = 8;
 /// sibling pair never merges. Straddler payers live here; their cross-shard
 /// ticks name the terminating merge-left child.
 ///
-/// The surviving pair is the half the stdlib package cell lands under, so
-/// the lump only reinforces the ordering this scenario needs: a shard the
-/// merge floor must sit *below* is the one that can carry a ~14 KiB cell
-/// it does not control.
+/// The surviving pair is the half the genesis package flash lands under,
+/// so the flash only reinforces the ordering this scenario needs: a shard
+/// the merge floor must sit *below* is the one that carries
+/// [`stdlib_flash_bytes`] it does not control.
 pub const MERGE_STRADDLER_SURVIVOR: ShardId = ShardId::leaf(2, 2);
 
 /// The merge-left child — `leaf(2, 0)`.
@@ -170,9 +193,9 @@ pub struct HaltStraddlerSetup {
 /// summing over it, so the root splits exactly once and the grown pair
 /// holds while the halt and its recovery play out.
 ///
-/// The child that receives the stdlib package cell starts ~14 KiB ahead,
-/// so the band has to be wide enough to hold both — see
-/// [`STRADDLER_BULK`] for why the lump sets the scale.
+/// The child that receives the genesis package flash starts
+/// [`stdlib_flash_bytes`] ahead, so the armed band offsets by the flash —
+/// see [`straddler_bulk`] for why the flash sets the scale.
 const HALT_RECOVERY_BULK: usize = 900;
 
 /// Build the halted-shard straddler genesis funding and probe transfers.
@@ -355,7 +378,7 @@ const CONTENTION_RECIPIENT_BASE: u8 = 200;
 #[must_use]
 pub fn split_straddler_setup() -> SplitStraddlerSetup {
     let mut accounts = Vec::new();
-    ballast(STRADDLER_SPLITTER, 2, STRADDLER_BULK, &mut accounts);
+    ballast(STRADDLER_SPLITTER, 2, straddler_bulk(), &mut accounts);
     ballast(
         STRADDLER_SURVIVOR,
         2,

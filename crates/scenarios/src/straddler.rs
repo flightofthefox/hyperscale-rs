@@ -24,7 +24,7 @@ use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, STRADDLER_SPLITTER,
     STRADDLER_SUCCESSOR, STRADDLER_SURVIVOR, SplitStraddlerSetup, TERMINATING_PAYER_FUNDING,
     build_reshape_threshold_vote_tx, build_transfer_tx, merge_straddler_setup, pool_operator,
-    split_straddler_setup, validity_around,
+    split_straddler_setup, stdlib_flash_bytes, validity_around,
 };
 use crate::support::wait::{
     await_anchor_seeded, await_beacon_epoch, await_merge_keeper_count, await_root_matches_anchor,
@@ -80,13 +80,15 @@ const fn vote_activate_lead(fold_budget_ms: u64, epoch_ms: u64) -> u64 {
 /// survivor's byte total and the splitter's, so only the heavier splitter
 /// crosses and terminates while the survivor stays a live leaf.
 ///
-/// Bracketed against what genesis writes — the stdlib package cell under
-/// one prefix plus one 16-byte vault cell per funded account — so the
-/// survivor (~8.1 KB) sits below it, the splitter (~29.2 KB) above it, and
-/// the derived merge floor (an eighth of it) below every live leaf,
-/// including the splitter's own children once it splits (~21.1 KB and
-/// ~8.1 KB).
-const STRADDLER_SPLIT_BYTES: u64 = 25_000;
+/// Offset by the genesis package flash, which the survivor's half holds
+/// beside its own ballast, while the splitter's ballast carries a fixed
+/// lead over the flash — so the threshold sits between the two with
+/// margins that hold as the stdlib grows, and the derived merge floor (an
+/// eighth of it) stays below every live leaf, including the splitter's
+/// own children once it splits.
+fn straddler_split_bytes() -> u64 {
+    stdlib_flash_bytes() + 12_000
+}
 
 /// Verify a split straddler settles atomically across the reshape boundary.
 ///
@@ -168,7 +170,7 @@ pub fn arm_splitter_termination<C: Cluster>(c: &mut C) {
         .epoch_duration_ms;
     let vote = build_reshape_threshold_vote_tx(
         &pool_operator().0,
-        STRADDLER_SPLIT_BYTES,
+        straddler_split_bytes(),
         Epoch::new(current.inner() + vote_activate_lead(c.vote_fold_budget_ms(), epoch_ms)),
         validity_around(c.now()),
     );

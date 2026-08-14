@@ -17,7 +17,7 @@ use hyperscale_scenarios::tx::{
     merge_straddler_setup, nullifier_race_genesis_accounts, overdraw_genesis_accounts,
     participant_sweep_genesis_accounts, probe_train_genesis_accounts, reshape_lifecycle_accounts,
     securify_genesis_accounts, shared_recipient_genesis_accounts, split_straddler_setup,
-    staking_genesis_accounts, storm_genesis_accounts, unbound_genesis_accounts,
+    staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts, unbound_genesis_accounts,
     unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
@@ -552,13 +552,16 @@ fn beacon_lag_drops_skipped_epochs_reveal_chains_sim() {
 /// scenario's ~40 epochs an organic `Performance` jail on the healthy shard
 /// refills its seat from the pool, which with zero slack would starve the
 /// draw and park the recovery.
-const fn halt_recovery_config() -> ScenarioConfig {
+fn halt_recovery_config() -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 14,
         num_shards: 1,
-        split_bytes: 36_000,
+        // Above the flash-holding child's ballast-plus-flash total and
+        // below the root's sum, so the root splits exactly once and the
+        // grown pair holds through the halt.
+        split_bytes: stdlib_flash_bytes() + 20_000,
         latency: Duration::from_millis(150),
     }
 }
@@ -944,17 +947,18 @@ fn merge_boundary_admits_an_uncommitted_precut_tx_sim() {
 }
 
 /// Single-shard genesis with the grow trigger armed — `split_bytes` above
-/// each child of the ballasted root (~29.2 KB and ~8.1 KB) and below the
-/// root itself (~37.2 KB), so the root splits once and the pair holds —
-/// and two cohorts of pool surplus: one grows ROOT to the two siblings,
-/// the other splits the heavier one after the vote.
-const fn straddler_config() -> ScenarioConfig {
+/// each child of the ballasted root (the splitter's flash-led ballast and
+/// the survivor's ballast-plus-flash) and below the root itself, so the
+/// root splits once and the pair holds — and two cohorts of pool surplus:
+/// one grows ROOT to the two siblings, the other splits the heavier one
+/// after the vote.
+fn straddler_config() -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 8,
         num_shards: 1,
-        split_bytes: 33_000,
+        split_bytes: stdlib_flash_bytes() + 30_000,
         latency: Duration::from_millis(150),
     }
 }
@@ -1053,13 +1057,16 @@ fn split_straddler_ec_partition_atomic_seed_2026_sim() {
 /// below it, so only the merging pair auto-merges into `leaf(1,1)`. Three cohorts
 /// of pool surplus staff the two split generations the grow walks through; the
 /// merge keepers then come from the merging children's own committees.
-const fn merge_straddler_config() -> ScenarioConfig {
+fn merge_straddler_config() -> ScenarioConfig {
     ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
         pool_surplus: 12,
         num_shards: 4,
-        split_bytes: 40_000,
+        // Above the flash-holding survivor quarter, with the derived
+        // merge floor (an eighth) between the merging pair's totals and
+        // the surviving pair's bulk funding.
+        split_bytes: stdlib_flash_bytes() + 18_000,
         latency: Duration::from_millis(150),
     }
 }

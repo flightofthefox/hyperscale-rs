@@ -53,7 +53,7 @@ pub fn genesis_writes(
     accounts: &[(PrincipalAddr, u128)],
     pools: &[StakePoolSeat],
 ) -> SettledWrites {
-    // The stdlib package as a committed cell, under the same content
+    // Each stdlib package as a committed cell, under the same content
     // address a publish would place it at. Genesis is then the cache's
     // cold start in the literal sense — the same projection of committed
     // state every later block extends, rather than a second source the
@@ -122,9 +122,9 @@ mod tests {
         let alice = test_principal(0x11);
         let bob = test_principal(0x22);
         let writes = genesis_writes(&[(alice, 500), (bob, 700)], &[]);
-        // Two funded accounts' vault cells, plus the stdlib package under
-        // the publisher no key derives.
-        assert_eq!(writes.cells().len(), 3);
+        // Two funded accounts' vault cells, plus the stdlib packages
+        // under the publisher no key derives.
+        assert_eq!(writes.cells().len(), 4);
         assert!(
             writes
                 .cells()

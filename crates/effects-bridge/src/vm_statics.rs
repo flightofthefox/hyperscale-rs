@@ -25,9 +25,9 @@ use hyperscale_vm_effects::stdlib::{AUTH, ENTROPY, VALIDATORS, VAULT, XRD as XRD
 use hyperscale_vm_effects::{
     Address, AuthCell, AuthRole, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry,
     ManifestHash, MetadataCache, Mode, NativeAddr, PackageHash, PackageMetadata,
-    PrefixShardResolver, PrincipalAddr, RoleId, Routing as RoutedTransaction, SchemeId,
-    SubstateKey, Value, admit_tree, child_key, footprint, native_address, package_hash,
-    principal_address, route_tree,
+    PrefixShardResolver, PrincipalAddr, Routing as RoutedTransaction, SchemeId, SubstateKey, Value,
+    admit_tree, child_key, footprint, native_address, package_hash,
+    package_key as canonical_package_key, principal_address, route_tree,
 };
 
 use crate::ProtocolHasher;
@@ -83,28 +83,11 @@ pub fn entropy_key(owner: impl Into<Address>) -> SubstateKey {
     child_key(&ProtocolHasher, owner, ENTROPY, &[])
 }
 
-/// The role a published package's artifact sits under, in the reserved
-/// band the vocabulary's nullifier role occupies the top of.
-///
-/// A package cell lives under its publisher's own prefix, and no
-/// package's metadata can declare an effect on this role — the account
-/// signatures name vault, claims, config and entropy — so the cell is
-/// reachable by the publish path and by nothing else.
-pub const PACKAGE_ROLE: RoleId = RoleId(0xFFFE);
-
-/// Where `publisher`'s copy of the package addressed by `package` lives.
-///
-/// Keyed by content address under the publisher, so republishing the
-/// same artifact is the same cell — which is what makes publishing
-/// idempotent rather than a conflict.
+/// Where `publisher`'s copy of the package addressed by `package` lives:
+/// the vocabulary's own derivation, bound to the protocol hasher.
 #[must_use]
 pub fn package_key(publisher: impl Into<Address>, package: PackageHash) -> SubstateKey {
-    child_key(
-        &ProtocolHasher,
-        publisher,
-        PACKAGE_ROLE,
-        &[package.0.0.to_vec()],
-    )
+    canonical_package_key(&ProtocolHasher, publisher, package)
 }
 
 /// The principal address `public_key` opens under `scheme`, or `None` if
