@@ -149,8 +149,12 @@ pub enum ShardScopedInput {
     /// verified: each hashed to a requested content address at the
     /// response boundary.
     PackageArtifactsFetched {
-        /// The verified artifacts' bytes.
-        artifacts: Vec<Vec<u8>>,
+        /// The verified artifacts, each beside the content address its
+        /// bytes hash to. The address is derived once, where the
+        /// response is verified, because deriving it is a hash over a
+        /// whole artifact and the shard loop is the one place that
+        /// should never pay for one.
+        artifacts: Vec<(Hash, Vec<u8>)>,
     },
 
     /// A package artifact request failed or returned without some ids;

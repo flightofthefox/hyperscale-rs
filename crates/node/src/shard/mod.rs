@@ -478,7 +478,7 @@ where
                 self.drive_fetch::<TransactionBinding>(FetchInput::Failed { ids: hashes });
             }
             ShardScopedInput::PackageArtifactsFetched { artifacts } => {
-                self.handle_package_artifacts_fetched(&artifacts);
+                self.handle_package_artifacts_fetched(artifacts);
             }
             ShardScopedInput::PackageArtifactsFetchFailed { ids } => {
                 self.drive_fetch::<PackageArtifactBinding>(FetchInput::Failed { ids });

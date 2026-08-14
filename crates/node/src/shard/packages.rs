@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crossbeam::channel::Sender;
-use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_engine::artifact_package;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
@@ -88,10 +88,16 @@ impl FetchBinding for PackageArtifactBinding {
                 if let Ok(resp) = result {
                     // Hashing the bytes is the whole verification: an
                     // artifact either is the one asked for or is dropped
-                    // here, before anything installs it.
-                    let split = partition_solicited(resp.artifacts, &requested, |artifact| {
-                        [artifact_package(artifact)]
-                    });
+                    // here, before anything installs it. The address
+                    // travels on beside the bytes, so nothing downstream
+                    // derives it a second time.
+                    let addressed: Vec<(Hash, Vec<u8>)> = resp
+                        .artifacts
+                        .into_iter()
+                        .map(|artifact| (artifact_package(&artifact), artifact))
+                        .collect();
+                    let split =
+                        partition_solicited(addressed, &requested, |(package, _)| [*package]);
                     if !split.kept.is_empty() {
                         push_shard_input(
                             &es,
@@ -168,26 +174,37 @@ where
     /// Install verified fetched artifacts: code into the engine, bytes
     /// into the node-level cache a restart reconciles from.
     ///
+    /// Both halves run off the shard loop. Admitting an artifact means
+    /// clearing the deterministic wasm profile and parsing every export
+    /// it declares, and persisting it means a synchronous store write —
+    /// per artifact, at a transaction's whole byte budget each. The loop
+    /// this would otherwise run on drives vnode state machines and
+    /// consensus timers, and nothing here is on the path of a verdict:
+    /// the bytes were verified against their content address before this
+    /// was ever posted, and the maturity window means no transaction
+    /// naming the package can reach a tick for another two epochs.
+    ///
     /// The engine is the node's, not the shard's, so a host carrying
     /// several shards can be handed one artifact once per shard that
     /// asked for it. Installing is idempotent either way; skipping what
     /// the engine already holds is what keeps the second copy from
     /// paying for a full re-validation of bytes already judged.
-    pub(crate) fn handle_package_artifacts_fetched(&mut self, artifacts: &[Vec<u8>]) {
+    pub(crate) fn handle_package_artifacts_fetched(&mut self, artifacts: Vec<(Hash, Vec<u8>)>) {
+        let ids: Vec<Hash> = artifacts.iter().map(|(package, _)| *package).collect();
         let handles = Arc::clone(&self.process.dispatch_handles);
-        let mut ids = Vec::with_capacity(artifacts.len());
-        for artifact in artifacts {
-            let package = artifact_package(artifact);
-            if handles.executor.package_known(package) {
-                ids.push(package);
-                continue;
-            }
-            handles.executor.install_artifact(artifact);
-            handles
-                .beacon_storage
-                .store_fetched_package(package, artifact);
-            ids.push(package);
-        }
+        self.process
+            .dispatch
+            .spawn(DispatchPool::Throughput, move || {
+                for (package, artifact) in artifacts {
+                    if handles.executor.package_known(package) {
+                        continue;
+                    }
+                    handles.executor.install_artifact(&artifact);
+                    handles
+                        .beacon_storage
+                        .store_fetched_package(package, &artifact);
+                }
+            });
         self.drive_fetch::<PackageArtifactBinding>(FetchInput::Admitted { ids });
     }
 }
