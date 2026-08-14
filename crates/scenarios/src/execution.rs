@@ -1447,27 +1447,27 @@ pub fn preview_reports_resource_changes(c: &mut impl Cluster) {
     );
 }
 
-/// A published package runs only once its maturity window has passed —
-/// and when it runs, it runs on nodes that never committed its publish.
+/// A published package runs only once the chain says it may — and when
+/// it runs, it runs on nodes that never committed its publish.
 ///
-/// Two facts, and they are the same fact seen from both ends. The
-/// beacon registers a publish the instant it commits, but the code lives
-/// on the publisher's shard alone; every other node has to fetch it. The
-/// maturity window is the time that fetch is given, and holding a
-/// transaction out of a block until the window closes is what turns
-/// "does this node hold the code" from a race into a fact about the
-/// chain.
+/// A publish commits on its publisher's shard, where the code then lives
+/// alone; every other node has to fetch it, and it learns to on the
+/// beacon fact the publish raises. The maturity window is the time that
+/// fetch is given. Holding a transaction out of a block until the window
+/// closes is what turns "does this node hold the code" from a race into
+/// a fact about the chain.
 ///
 /// The probe is a deposit into an instance of the freshly published
-/// package. Offered inside the window it is not committed by anyone;
-/// offered after, it settles — which it can only do if the code reached
-/// the nodes that never held it, because every shard the transaction
-/// touches runs the whole of it.
+/// package, offered at each of the three moments the rule distinguishes:
+/// before the beacon has registered the package, after it has but inside
+/// the window, and after the window. Only the last is committed, and its
+/// settling is what says the code reached the nodes that never held it —
+/// every shard the transaction touches runs the whole of it.
 ///
 /// # Panics
 ///
-/// Panics if the publish does not settle, if a call inside the window
-/// reaches a decision, or if a call after the window does not.
+/// Panics if the publish does not settle, if a call before the window
+/// closes reaches a decision, or if a call after it does not.
 pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     const SALT: u8 = 9;
     const DEPOSIT: u128 = 40;
@@ -1496,18 +1496,38 @@ pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
     });
     assert!(in_state, "the package cell never reached persisted state");
 
-    // The beacon registers the publish on its own next block, and the
-    // maturity window opens there rather than at the shard's commit.
-    let on_beacon = c.run_until(epochs(4), |c| {
-        c.beacon_state()
-            .is_some_and(|state| state.packages.contains_key(&registered))
+    // Before the beacon has heard of it at all. The publisher's own
+    // committee holds the code and could run this, but no other shard
+    // can even derive it, so a rule that refused only the registered and
+    // immature would let this through on an argument about who holds
+    // what metadata. The rule refuses it because the registry does not
+    // list it.
+    let unregistered =
+        build_instance_deposit_tx(key, &artifact, SALT, DEPOSIT, validity_around(c.now()));
+    let unregistered_hash = unregistered.hash();
+    c.submit(Arc::new(unregistered));
+    c.run_until(epochs(8), |c| {
+        c.tx_status(unregistered_hash).is_some_and(|s| s.is_final())
+            || c.beacon_state()
+                .is_some_and(|state| state.packages.contains_key(&registered))
     });
-    assert!(on_beacon, "the beacon never registered the publish");
+    let before_registry = c.tx_status(unregistered_hash);
+    assert!(
+        !before_registry
+            .as_ref()
+            .is_some_and(TransactionStatus::is_final),
+        "a call was decided before the beacon registered its package: {before_registry:?}"
+    );
+    assert!(
+        c.beacon_state()
+            .is_some_and(|state| state.packages.contains_key(&registered)),
+        "the beacon never registered the publish"
+    );
 
-    // Offered inside the window. Every honest proposer filters it and
-    // every honest voter would refuse it, so it waits — which is the
-    // whole of the guarantee, since a transaction committed here could
-    // be handed to a node whose fetch had not landed.
+    // Registered, still inside the window. Every honest proposer filters
+    // it and every honest voter would refuse it, so it waits — which is
+    // the whole of the guarantee, since a transaction committed here
+    // could be handed to a node whose fetch had not landed.
     let early = build_instance_deposit_tx(key, &artifact, SALT, DEPOSIT, validity_around(c.now()));
     let early_hash = early.hash();
     c.submit(Arc::new(early));
