@@ -79,6 +79,14 @@ pub struct PoolConviction {
     /// Later governance changes never shorten an in-force impound.
     pub lifts_at: Epoch,
 }
+/// Epochs a registered package waits before a transaction may name it.
+///
+/// The window is what every node fetches the artifact's bytes in. Two
+/// rather than one because a package registered moments before an epoch
+/// cut would otherwise mature moments later: at two, the shortest wait
+/// any package can draw is still a whole epoch.
+pub const PACKAGE_MATURITY_EPOCHS: u64 = 2;
+
 /// One published package, as the beacon registers it: the fact every
 /// node prefetches the artifact's bytes on.
 ///
@@ -90,6 +98,23 @@ pub struct PoolConviction {
 pub struct PackageFact {
     /// The prefix the package cell sits under.
     pub publisher: Address,
+    /// Epoch this registration folded in. A transaction may not name the
+    /// package until [`PACKAGE_MATURITY_EPOCHS`] have passed, which is
+    /// what makes running it a question about the chain rather than
+    /// about whose fetch finished first.
+    pub registered_at: Epoch,
+}
+
+impl PackageFact {
+    /// Whether a block governed by `epoch` may name this package.
+    ///
+    /// Counted forward from the registration rather than back from the
+    /// block: subtracting saturates, and at the genesis epochs that
+    /// would mature a package the instant it registered.
+    #[must_use]
+    pub const fn usable_in(&self, epoch: Epoch) -> bool {
+        epoch.inner() >= self.registered_at.inner() + PACKAGE_MATURITY_EPOCHS
+    }
 }
 
 /// Aggregate stake-pool record.
@@ -1111,6 +1136,10 @@ struct WindowProjection {
     /// Governable params for this window: `params` (head) or `next_params`
     /// (lookahead). Frozen one epoch ahead like the committee.
     params: NetworkParams,
+    /// Registered packages still inside their maturity window at this
+    /// projection's epoch — what a block governed by this window may not
+    /// yet name.
+    immature_packages: BTreeSet<Hash>,
 }
 
 impl BeaconState {
@@ -1421,6 +1450,7 @@ impl BeaconState {
                 scheduled_terminals: self.window.scheduled_terminals.clone(),
                 settled_window_floors: self.window.settled_window_floors.clone(),
                 params: self.params,
+                immature_packages: self.immature_packages(self.current_epoch),
             },
             network,
         )
@@ -1448,6 +1478,7 @@ impl BeaconState {
                 scheduled_terminals: live.scheduled_terminals,
                 settled_window_floors: live.settled_window_floors,
                 params: self.next_params,
+                immature_packages: self.immature_packages(self.current_epoch.next()),
             },
             network,
         )
@@ -1694,6 +1725,7 @@ impl BeaconState {
             scheduled_terminals,
             settled_window_floors,
             params,
+            immature_packages,
         } = projection;
         let validators: Vec<ValidatorInfo> = self
             .validators
@@ -1763,6 +1795,25 @@ impl BeaconState {
         .with_advanced(self.advanced.iter().copied().collect())
         .with_pending_recoveries(self.pending_recoveries.clone())
         .with_completed_recoveries(self.completed_recoveries.clone())
+        .with_immature_packages(immature_packages)
+    }
+
+    /// The registered packages a block governed by `epoch` may not name
+    /// yet — those still inside [`PACKAGE_MATURITY_EPOCHS`].
+    ///
+    /// Stated as the refusal rather than the permission because those
+    /// are not complements: the genesis packages are runnable and were
+    /// never registered, and a package nobody published is named by a
+    /// transaction that fails on every node alike. Only the registered
+    /// and not-yet-matured need holding back, and that set is small and
+    /// empties on its own.
+    #[must_use]
+    pub fn immature_packages(&self, epoch: Epoch) -> BTreeSet<Hash> {
+        self.packages
+            .iter()
+            .filter(|(_, fact)| !fact.usable_in(epoch))
+            .map(|(package, _)| *package)
+            .collect()
     }
 
     /// Active-duty validator pool: the [`Self::beacon_eligible`] serving
@@ -1911,7 +1962,7 @@ mod tests {
     use hyperscale_crypto_bls::public_key_from_u64_seed;
 
     use super::*;
-    use crate::{Hash, JailReason};
+    use crate::{Hash, JailReason, PrincipalAddr};
 
     fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> ValidatorRecord {
         ValidatorRecord {
@@ -2505,5 +2556,64 @@ mod tests {
         state.miss_counters.insert(ValidatorId::new(7), 12);
         assert_eq!(state.miss_counters.get(&ValidatorId::new(5)), Some(&3));
         assert_eq!(state.miss_counters.get(&ValidatorId::new(7)), Some(&12));
+    }
+
+    /// A package registered in epoch `N` is held back for the whole of
+    /// `N` and `N + 1`, and runs from `N + 2`. The shortest wait it can
+    /// draw — registration in the last instant of `N` — is still the
+    /// whole of `N + 1`, which is the window every node fetches its
+    /// bytes in.
+    #[test]
+    fn a_registered_package_matures_two_epochs_on() {
+        let fact = PackageFact {
+            publisher: Address::from(PrincipalAddr::new([7u8; 31])),
+            registered_at: Epoch::new(4),
+        };
+        assert!(!fact.usable_in(Epoch::new(4)), "not in its own epoch");
+        assert!(!fact.usable_in(Epoch::new(5)), "not in the next one");
+        assert!(fact.usable_in(Epoch::new(6)), "runs two epochs on");
+        assert!(fact.usable_in(Epoch::new(600)), "and every epoch after");
+
+        // The genesis epochs are where a backwards count would saturate
+        // and mature a package the instant it registered.
+        let born = PackageFact {
+            publisher: Address::from(PrincipalAddr::new([8u8; 31])),
+            registered_at: Epoch::GENESIS,
+        };
+        assert!(!born.usable_in(Epoch::GENESIS), "not in the genesis epoch");
+        assert!(!born.usable_in(Epoch::new(1)), "nor the one after it");
+        assert!(born.usable_in(Epoch::new(2)), "and then it runs");
+    }
+
+    /// The projection names what a block may not run, not what it may:
+    /// a matured package leaves the set, and a package nobody registered
+    /// was never in it.
+    #[test]
+    fn only_the_immature_project_into_the_window() {
+        let mut state = empty_state();
+        let young = Hash::from_bytes(b"young");
+        let old = Hash::from_bytes(b"old");
+        state.packages.insert(
+            young,
+            PackageFact {
+                publisher: Address::from(PrincipalAddr::new([1u8; 31])),
+                registered_at: Epoch::new(9),
+            },
+        );
+        state.packages.insert(
+            old,
+            PackageFact {
+                publisher: Address::from(PrincipalAddr::new([2u8; 31])),
+                registered_at: Epoch::new(1),
+            },
+        );
+
+        let held = state.immature_packages(Epoch::new(10));
+        assert!(held.contains(&young), "registered last epoch, still held");
+        assert!(!held.contains(&old), "long since matured");
+        assert!(
+            state.immature_packages(Epoch::new(11)).is_empty(),
+            "the set empties on its own as the window passes"
+        );
     }
 }

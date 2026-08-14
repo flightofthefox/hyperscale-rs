@@ -948,18 +948,6 @@ impl ExecutionCoordinator {
         completions
     }
 
-    /// Replace the missing-package exclusion set with the latest beacon
-    /// reconciliation.
-    pub fn on_missing_packages_updated(&mut self, packages: Vec<Hash>) {
-        self.candidates.set_missing_packages(packages);
-    }
-
-    /// Installed packages leave the exclusion set; their candidates are
-    /// retried on the next commit's composition.
-    pub fn on_packages_acquired(&mut self, packages: &[Hash]) {
-        self.candidates.packages_acquired(packages);
-    }
-
     /// Absorb a completed batch: route receipts and per-member outcomes
     /// onto the tick that ran them, then vote and, where the tick is
     /// already covered, finalize.

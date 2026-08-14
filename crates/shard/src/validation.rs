@@ -456,6 +456,37 @@ pub fn validate_engagement(
     Ok(())
 }
 
+/// No transaction may name a package still inside its maturity window.
+///
+/// The window is what every node fetches a newly registered artifact's
+/// bytes in, so what this establishes is that by the time a transaction
+/// can run, the code it runs is code the whole committee holds. Without
+/// it, whether a transaction executes or refuses for want of code is a
+/// question about whose fetch finished first — and replicas that answer
+/// it differently attest different ticks.
+///
+/// Only the registered-and-immature are refused. A package nobody
+/// published is named by a transaction that reaches the same no-code
+/// refusal on every node, which is a verdict rather than a divergence.
+///
+/// Deterministic over block content plus the window-frozen registry
+/// every member of the committee shares; the proposer's own selection
+/// gate makes honest proposals satisfy it.
+pub fn validate_packages_mature(
+    topology_snapshot: &TopologySnapshot,
+    block: &Block,
+) -> Result<(), String> {
+    for tx in block.transactions().iter() {
+        if let Some(package) = topology_snapshot.immature_package_of(tx) {
+            return Err(format!(
+                "transaction {} names package {package} inside its maturity window",
+                tx.hash()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The header's running work total must be its parent's advanced by the
 /// work the block's own certificates report.
 ///
@@ -516,6 +547,7 @@ pub fn validate_block_for_vote(
     validate_no_duplicate_resolutions(block, qc_chain_resolved_txs, dedup_index)?;
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
     validate_provisions_not_fenced(topology_snapshot, block)?;
+    validate_packages_mature(topology_snapshot, block)?;
     validate_engagement(topology_snapshot, local_shard, block, dedup_index)?;
     validate_terminal_verdicts_well_formed(block)?;
     Ok(())

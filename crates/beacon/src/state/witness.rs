@@ -687,6 +687,7 @@ pub(super) fn apply_shard_payload(
             if ShardTrie::shard_owns_prefix(source_shard, *publisher) {
                 state.packages.entry(*package).or_insert(PackageFact {
                     publisher: *publisher,
+                    registered_at: state.current_epoch,
                 });
             }
             None

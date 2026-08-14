@@ -1189,23 +1189,6 @@ pub enum ProtocolEvent {
         /// Epoch that was persisted.
         epoch: Epoch,
     },
-
-    /// The reconciliation of the beacon's package registry against this
-    /// node's holdings, taken on a beacon commit: every registered
-    /// package the node does not yet hold. Replaces the execution gate's
-    /// exclusion set wholesale, so a stale entry cannot outlive the next
-    /// commit.
-    MissingPackagesUpdated {
-        /// The packages still missing, by content address.
-        packages: Vec<Hash>,
-    },
-
-    /// Fetched package artifacts were verified and installed; the named
-    /// packages leave the execution gate's exclusion set.
-    PackagesAcquired {
-        /// The installed packages, by content address.
-        packages: Vec<Hash>,
-    },
 }
 
 impl ProtocolEvent {

@@ -12,7 +12,7 @@ use hyperscale_hbor::Hbor;
 
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, CompletedRecovery, ConsensusPublicKey,
-    DeclaredKey, Epoch, NetworkDefinition, NetworkParams, ReshapeThresholds, Round, ShardId,
+    DeclaredKey, Epoch, Hash, NetworkDefinition, NetworkParams, ReshapeThresholds, Round, ShardId,
     ShardRecovery, ShardTrie, StateRoot, TerminalRoots, Transaction, ValidatorId, ValidatorSet,
     VoteCount, WeightedTimestamp,
 };
@@ -188,6 +188,13 @@ pub struct TopologySnapshot {
     /// the same `reshape_thresholds` for a block off its weighted-time-bound
     /// snapshot rather than a live head value that skews across folds.
     params: NetworkParams,
+    /// Registered packages still inside their maturity window at this
+    /// projection's epoch, projected from `BeaconState.packages`. A
+    /// transaction naming one is refused a block: the window is what
+    /// every node fetches the artifact in, so clearing it is what makes
+    /// running the code a fact about the chain rather than a race
+    /// between one node's fetch and another's.
+    immature_packages: BTreeSet<Hash>,
     validator_pubkeys: HashMap<ValidatorId, ConsensusPublicKey>,
     global_validator_set: Arc<ValidatorSet>,
 }
@@ -235,6 +242,7 @@ impl TopologySnapshot {
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
+            immature_packages: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -282,6 +290,7 @@ impl TopologySnapshot {
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
+            immature_packages: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -338,6 +347,7 @@ impl TopologySnapshot {
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
+            immature_packages: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -430,6 +440,7 @@ impl TopologySnapshot {
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
+            immature_packages: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -443,6 +454,15 @@ impl TopologySnapshot {
     #[must_use]
     pub const fn with_params(mut self, params: NetworkParams) -> Self {
         self.params = params;
+        self
+    }
+
+    /// Set the packages still inside their maturity window (see
+    /// [`Self::package_immature`]). Defaults empty, which is what every
+    /// committee-only construction wants: nothing to hold back.
+    #[must_use]
+    pub fn with_immature_packages(mut self, packages: BTreeSet<Hash>) -> Self {
+        self.immature_packages = packages;
         self
     }
 
@@ -545,6 +565,31 @@ impl TopologySnapshot {
     #[must_use]
     pub const fn params(&self) -> NetworkParams {
         self.params
+    }
+
+    /// Whether `package` is registered but still inside its maturity
+    /// window at this projection's epoch — the one answer that keeps a
+    /// transaction out of a block.
+    #[must_use]
+    pub fn package_immature(&self, package: &Hash) -> bool {
+        self.immature_packages.contains(package)
+    }
+
+    /// The first package `tx` names that is not yet usable, if it names
+    /// one.
+    ///
+    /// The proposer asks this of what it selects and the voter asks it
+    /// of what it receives, so a proposer never offers a block its own
+    /// committee would refuse.
+    #[must_use]
+    pub fn immature_package_of(&self, tx: &Transaction) -> Option<Hash> {
+        if self.immature_packages.is_empty() {
+            return None;
+        }
+        tx.packages()
+            .iter()
+            .find(|package| self.immature_packages.contains(package))
+            .copied()
     }
 
     /// Substate-byte reshape thresholds in force for this window.

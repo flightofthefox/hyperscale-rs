@@ -161,6 +161,8 @@ impl ProposalTracker {
 ///    This is the same question voters ask during block verification, so
 ///    filtering here keeps a proposer from offering what its own voters
 ///    would defer on or refuse.
+/// 4. Txs naming a package still inside its maturity window — the same
+///    question `validate_packages_mature` asks, for the same reason.
 ///
 /// Logs the dedup and expiry counts when non-zero.
 pub fn select_transactions(
@@ -170,11 +172,13 @@ pub fn select_transactions(
     validity_anchor: WeightedTimestamp,
     chain_origin_wt: WeightedTimestamp,
     precut: &Precut,
+    topology_snapshot: &TopologySnapshot,
 ) -> Vec<Arc<Verified<Transaction>>> {
     let before = ready_txs.len();
     let mut deduped = 0;
     let mut expired = 0;
     let mut predates = 0;
+    let mut immature = 0;
     let filtered: Vec<_> = ready_txs
         .iter()
         .filter(|tx| {
@@ -200,15 +204,22 @@ pub fn select_transactions(
                 predates += 1;
                 return false;
             }
+            // Published, but not for long enough that every voter is
+            // sure to hold its code yet.
+            if topology_snapshot.immature_package_of(tx).is_some() {
+                immature += 1;
+                return false;
+            }
             true
         })
         .cloned()
         .collect();
-    if deduped > 0 || expired > 0 || predates > 0 {
+    if deduped > 0 || expired > 0 || predates > 0 || immature > 0 {
         debug!(
             deduped,
             expired,
             predates,
+            immature,
             before,
             after = filtered.len(),
             "Filtered proposal candidates"
@@ -601,8 +612,8 @@ mod tests {
         install_stub_vm_statics, make_finalization, stub_transaction, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_VALIDITY_RANGE,
-        PredecessorTerminal, TimestampRange, TransactionDecision, UnsettledTx,
+        CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
+        PredecessorTerminal, TimestampRange, TransactionDecision, UnsettledTx, ValidatorSet,
     };
 
     use super::*;
@@ -855,6 +866,16 @@ mod tests {
         CommitDedupIndex::new()
     }
 
+    /// A window with nothing held back — what every case that is not
+    /// about package maturity wants.
+    fn all_packages_usable() -> TopologySnapshot {
+        TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(Vec::new()),
+        )
+    }
+
     /// A successor of one chain that has answered nothing, so no pre-cut
     /// transaction is admissible. Cases anchored at
     /// `WeightedTimestamp::ZERO` never consult it, since nothing opens
@@ -897,6 +918,7 @@ mod tests {
             anchor,
             cut,
             &refuses_precut(),
+            &all_packages_usable(),
         );
         assert!(
             refused.is_empty(),
@@ -910,6 +932,7 @@ mod tests {
             anchor,
             cut,
             &admits_precut(hash),
+            &all_packages_usable(),
         );
         assert_eq!(
             admitted.len(),
@@ -937,6 +960,7 @@ mod tests {
             anchor,
             WeightedTimestamp::ZERO,
             &refuses_precut(),
+            &all_packages_usable(),
         );
 
         assert_eq!(selected.len(), 1, "only the in-range tx should survive");
@@ -957,6 +981,7 @@ mod tests {
             anchor,
             WeightedTimestamp::ZERO,
             &refuses_precut(),
+            &all_packages_usable(),
         );
 
         assert!(
@@ -982,6 +1007,7 @@ mod tests {
             anchor,
             WeightedTimestamp::ZERO,
             &refuses_precut(),
+            &all_packages_usable(),
         );
 
         assert!(selected.is_empty(), "malformed range should be filtered");
@@ -1001,6 +1027,7 @@ mod tests {
             anchor,
             WeightedTimestamp::ZERO,
             &refuses_precut(),
+            &all_packages_usable(),
         );
 
         assert!(
@@ -1023,6 +1050,7 @@ mod tests {
             anchor,
             WeightedTimestamp::ZERO,
             &refuses_precut(),
+            &all_packages_usable(),
         );
 
         assert_eq!(selected.len(), 1, "anchor == start_inclusive must be kept");
@@ -1045,6 +1073,7 @@ mod tests {
             anchor,
             WeightedTimestamp::ZERO,
             &refuses_precut(),
+            &all_packages_usable(),
         );
         assert!(selected.is_empty());
     }

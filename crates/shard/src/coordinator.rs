@@ -1942,6 +1942,7 @@ impl ShardCoordinator {
             validity_anchor,
             self.chain_origin.anchor_wt,
             &self.precut,
+            topology_schedule.head(),
         );
         let (finalizations, _finalized_tx_count) = select_finalizations(
             finalizations,
