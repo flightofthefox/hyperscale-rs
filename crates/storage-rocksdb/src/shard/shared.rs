@@ -20,7 +20,7 @@ use hyperscale_storage::{
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, ExecutionCertificate,
-    Finalization, FinalizationHash, PreparedCommit, Provisions, QuorumCertificate,
+    Finalization, FinalizationHash, Hash, PreparedCommit, Provisions, QuorumCertificate,
     SafeVoteRegisters, SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey,
     SubstateLeaf, TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
 };
@@ -66,6 +66,10 @@ impl std::ops::Deref for SharedStorage {
 impl PackageArtifactStore for SharedStorage {
     fn package_artifacts(&self) -> Vec<Vec<u8>> {
         self.0.package_artifacts()
+    }
+
+    fn package_artifact(&self, package: Hash) -> Option<Vec<u8>> {
+        self.0.package_artifact(package)
     }
 }
 

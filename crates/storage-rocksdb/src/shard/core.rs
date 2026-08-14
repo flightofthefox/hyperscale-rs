@@ -23,12 +23,12 @@ use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeRea
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
     BaseReadCache, GenesisCommit, JmtSnapshot, SubstateStore, Substates, entry_leaf_value,
-    pending_write, tree,
+    package_of_cell, pending_write, tree,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryLeaf, ProtocolHasher, QuorumCertificate,
     SafeVoteRegisters, SettledWrites, StateRoot, SubstateKey, ValidatorId, Verified,
-    entry_leaf_key, vm_statics, vm_statics_installed,
+    entry_leaf_key,
 };
 use hyperscale_vm_effects::{Address, CollectionId};
 use rocksdb::{
@@ -578,21 +578,13 @@ impl RocksDbShardStorage {
 
         // A committed cell that self-identifies as a package lands its
         // artifact in the content-addressed index, in the same atomic
-        // batch as the state that carries it — every commit path funnels
-        // through here, so synced and imported blocks index alike. What
-        // makes a cell a package is the VM's judgement; without installed
-        // statics (bare storage tests) nothing indexes, matching the
-        // cache-absorption seam.
-        if vm_statics_installed() {
-            let statics = vm_statics();
-            let artifacts_cf = PackageArtifactsCf::handle(&cf);
-            for (key, change) in writes.cells() {
-                if let Some(value) = change
-                    && let Some(package) =
-                        statics.package_cell(key.owner.to_bytes(), key.local.0, value)
-                {
-                    batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, value);
-                }
+        // batch as the state that carries it.
+        let artifacts_cf = PackageArtifactsCf::handle(&cf);
+        for (key, change) in writes.cells() {
+            if let Some(value) = change
+                && let Some(package) = package_of_cell(*key, value)
+            {
+                batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, value);
             }
         }
 

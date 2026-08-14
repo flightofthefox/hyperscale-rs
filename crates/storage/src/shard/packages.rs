@@ -1,6 +1,27 @@
 //! The committed-package artifact index a backend keeps beside its state.
 
-use hyperscale_types::Hash;
+use hyperscale_types::{Hash, SubstateKey, vm_statics, vm_statics_installed};
+
+/// The content address a committed cell publishes, or `None` for a cell
+/// that publishes nothing.
+///
+/// The judgement is the VM's: a package cell is self-identifying, its
+/// key being the content address of the very bytes it holds, so no tag
+/// and no trust in the writer enters into it. Every backend derives the
+/// index through here — the commit batch and the import that rebuilds a
+/// store from leaves alike — because an index built one way at commit
+/// and another way at import is an index a turned-over committee cannot
+/// serve from.
+///
+/// Without installed statics (bare storage tests) nothing is a package,
+/// matching the cache-absorption seam.
+#[must_use]
+pub fn package_of_cell(key: SubstateKey, value: &[u8]) -> Option<Hash> {
+    if !vm_statics_installed() {
+        return None;
+    }
+    vm_statics().package_cell(key.owner.to_bytes(), key.local.0, value)
+}
 
 /// Read access to the package artifacts this store's committed state
 /// publishes, by content address.
