@@ -167,11 +167,21 @@ where
 
     /// Install verified fetched artifacts: code into the engine, bytes
     /// into the node-level cache a restart reconciles from.
+    ///
+    /// The engine is the node's, not the shard's, so a host carrying
+    /// several shards can be handed one artifact once per shard that
+    /// asked for it. Installing is idempotent either way; skipping what
+    /// the engine already holds is what keeps the second copy from
+    /// paying for a full re-validation of bytes already judged.
     pub(crate) fn handle_package_artifacts_fetched(&mut self, artifacts: &[Vec<u8>]) {
         let handles = Arc::clone(&self.process.dispatch_handles);
         let mut ids = Vec::with_capacity(artifacts.len());
         for artifact in artifacts {
             let package = artifact_package(artifact);
+            if handles.executor.package_known(package) {
+                ids.push(package);
+                continue;
+            }
             handles.executor.install_artifact(artifact);
             handles
                 .beacon_storage
