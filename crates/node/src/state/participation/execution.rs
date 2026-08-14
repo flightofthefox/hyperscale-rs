@@ -109,6 +109,15 @@ impl ShardParticipation {
                 );
                 actions
             }
+            ProtocolEvent::MissingPackagesUpdated { packages } => {
+                self.execution_coordinator
+                    .on_missing_packages_updated(packages);
+                Vec::new()
+            }
+            ProtocolEvent::PackagesAcquired { packages } => {
+                self.execution_coordinator.on_packages_acquired(&packages);
+                Vec::new()
+            }
             _ => unreachable!("non-execution event routed to handle_execution"),
         }
     }

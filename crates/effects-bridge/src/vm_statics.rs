@@ -408,6 +408,8 @@ impl BridgeStatics {
             subintent_hashes: Vec::new(),
             fee_vault_local: vault.local.0,
             auth_cell_local: auth_key(publisher).local.0,
+            // A publish runs no package: it writes one and calls nothing.
+            packages: Vec::new(),
         })
     }
 }
@@ -523,6 +525,15 @@ impl VmStatics for BridgeStatics {
                 .into_iter()
                 .collect()
         };
+        // Every package the lowered calls run, deduplicated — what the
+        // execution gate holds the transaction to on each shard.
+        let packages: Vec<Hash> = routing
+            .calls
+            .iter()
+            .map(|call| Hash::from(call.package.0))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         // What this transaction costs a block, on the engine's own
         // schedule: the fixed charge for carrying it, what it declared it
         // would touch, and the ceiling it signed for its own execution.
@@ -555,6 +566,7 @@ impl VmStatics for BridgeStatics {
                 .collect(),
             fee_vault_local: vault_key(vm.fee_payer, *XRD).local.0,
             auth_cell_local: auth_key(vm.fee_payer).local.0,
+            packages,
         })
     }
 }

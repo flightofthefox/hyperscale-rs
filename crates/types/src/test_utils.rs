@@ -920,6 +920,7 @@ impl VmStatics for StubVmStatics {
             signer: vm.fee_payer,
             fee_vault_local: [0xEE; 16],
             auth_cell_local: [0xAE; 16],
+            packages: Vec::new(),
             // The stub prices a declared key like the real derivation
             // prices an effect — one unit each — and hands the total to
             // the same schedule, so a stubbed transaction and a derived

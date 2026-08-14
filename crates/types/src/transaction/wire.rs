@@ -243,6 +243,17 @@ impl Transaction {
         &self.derived().routing
     }
 
+    /// The packages the manifest's calls run — what the execution gate
+    /// holds this transaction to on every participant shard.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::routing`]: derivation must have succeeded.
+    #[must_use]
+    pub fn packages(&self) -> &[Hash] {
+        &self.derived().packages
+    }
+
     /// The fee payer's native-resource vault cell — what the payer
     /// shard's reservation check reads and the fee settlement debits.
     ///
@@ -530,6 +541,7 @@ mod tests {
                 },
                 subintent_hashes,
                 work: declared_work(0, 0, 0),
+                packages: Vec::new(),
             })
         }
     }
