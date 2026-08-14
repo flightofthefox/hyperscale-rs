@@ -40,7 +40,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use hyperscale_types::{
-    BlockHeight, ProvisionalHolds, StateWrites, SubstateKey, TickId, TxHash, amount_cell,
+    BlockHeight, Movement, ProvisionalHolds, StateWrites, SubstateKey, TickId, TxHash, amount_cell,
     read_amount,
 };
 use hyperscale_vm_effects::{Address, CollectionId};
@@ -130,6 +130,46 @@ struct Contribution {
     in_base_from: Option<BlockHeight>,
 }
 
+/// One tick's readable contributions folded into a single write set, and
+/// the span of base heights that fold is the answer for.
+///
+/// A fold leaves out whatever the base already carries, so it answers
+/// only while the same contributions are left out — an interval running
+/// from the highest stamp it treats as carried up to the lowest it still
+/// folds. Every base height in that interval partitions the entry's
+/// contributions identically, and most of the heights a chain passes
+/// through cross no stamp of any given tick.
+struct CachedFold {
+    /// The contributions this fold applies, composed in entry order.
+    writes: Arc<StateWrites>,
+    /// Lowest base height this fold answers for: the highest stamp it
+    /// treats as already carried by the base.
+    from: BlockHeight,
+    /// One past the highest base height it answers for: the lowest stamp
+    /// among the contributions it still folds. `None` when none of them
+    /// is stamped, so no base height above `from` changes the partition.
+    until: Option<BlockHeight>,
+}
+
+impl CachedFold {
+    /// Whether the partition this fold was built for is the partition at
+    /// `base_at`.
+    fn answers_for(&self, base_at: BlockHeight) -> bool {
+        self.from <= base_at && self.until.is_none_or(|until| base_at < until)
+    }
+
+    /// The layer a view reads through, absent when the fold applies
+    /// nothing — the shape a tick takes once the base carries everything
+    /// it held and eviction is still waiting on the execution floor.
+    /// Layering that would cost every read a step for nothing.
+    fn layer(&self) -> Option<Arc<StateWrites>> {
+        let carries_something = !self.writes.cells.is_empty()
+            || !self.writes.movements.is_empty()
+            || !self.writes.entries.is_empty();
+        carries_something.then(|| Arc::clone(&self.writes))
+    }
+}
+
 /// One tick's retained state.
 struct TickEntry {
     /// Readable contributions in canonical transaction order — the order
@@ -142,6 +182,11 @@ struct TickEntry {
     /// resolve independently of its determined members and, at a
     /// terminal, of each other.
     pending: BTreeMap<TxHash, ProvisionalTx>,
+    /// This tick's contributions pre-folded, held across every read it
+    /// answers for. A view layers one of these per tick rather than
+    /// merging every tick's contributions into one map, which is what
+    /// keeps a read's cost off the whole content of the retained chain.
+    folded: Option<CachedFold>,
 }
 
 impl TickEntry {
@@ -166,6 +211,50 @@ impl TickEntry {
                 .into_iter()
                 .map(|tx| (tx.tx_hash, tx))
                 .collect(),
+            folded: None,
+        }
+    }
+
+    /// This entry's fold for a base at `base_at`, rebuilt only when the
+    /// one in hand answers for a different partition.
+    fn fold_at(&mut self, base_at: BlockHeight) -> &CachedFold {
+        if !self
+            .folded
+            .as_ref()
+            .is_some_and(|fold| fold.answers_for(base_at))
+        {
+            let rebuilt = self.build_fold(base_at);
+            self.folded = Some(rebuilt);
+        }
+        self.folded.as_ref().expect("the fold was just built")
+    }
+
+    /// Compose the contributions a base at `base_at` does not carry,
+    /// recording the stamps either side of the partition so a later read
+    /// can tell whether it still holds.
+    ///
+    /// Ascending in entry order, because an exclusive write supersedes
+    /// what stood before it and a movement composes onto it — an order
+    /// the fold has to respect even though movements commute among
+    /// themselves.
+    fn build_fold(&self, base_at: BlockHeight) -> CachedFold {
+        let mut writes = StateWrites::default();
+        let mut from = BlockHeight::GENESIS;
+        let mut until: Option<BlockHeight> = None;
+        for contribution in self.readable.values() {
+            if let Some(height) = contribution.in_base_from {
+                if height <= base_at {
+                    from = from.max(height);
+                    continue;
+                }
+                until = Some(until.map_or(height, |lowest| lowest.min(height)));
+            }
+            fold_state_writes(&mut writes, &contribution.writes);
+        }
+        CachedFold {
+            writes: Arc::new(writes),
+            from,
+            until,
         }
     }
 
@@ -180,6 +269,9 @@ impl TickEntry {
     /// Idempotent per member — a member already resolved is not in
     /// `pending` and its contribution is already stamped.
     fn resolve(&mut self, tick_id: &TickId, resolution: &TickResolution) {
+        // A verdict changes both what the entry holds and which stamps
+        // bound the partition, so the fold in hand answers for nothing.
+        self.folded = None;
         match resolution {
             TickResolution::Settled {
                 height,
@@ -269,7 +361,7 @@ impl TickEntry {
 /// dispatch closures via `Arc`.
 ///
 /// Ticks are keyed by the committing block's height. Blocks that carry no
-/// executable work produce no entry; [`Self::view_at`] folds every
+/// executable work produce no entry; [`Self::view_at`] layers every
 /// retained tick at or below its anchor.
 pub struct TickChain<S> {
     base: Arc<S>,
@@ -396,28 +488,29 @@ where
     /// height, the overlay covers the rest, and the answer is the same
     /// whichever side of that line a replica's persistence happens to
     /// sit.
+    ///
+    /// The view is one layer per tick rather than one merged write set,
+    /// and the chain holds those layers rather than the view: a tick's
+    /// fold is composed once per partition it is read under, not once
+    /// per dispatch. The reader resolves a key across the layers, which
+    /// costs it the retained tick count on the keys it actually asks for
+    /// instead of costing every dispatch the whole retained content.
+    ///
+    /// Takes the write lock because refreshing those folds is part of the
+    /// read.
     pub fn view_at(&self, tick: BlockHeight) -> TickView<S> {
-        let mut overlay = StateWrites::default();
+        let mut overlays: Vec<Arc<StateWrites>> = Vec::new();
         let mut holds = ProvisionalHolds::new();
-        // One acquisition for the base height, the overlay and the holds.
+        // One acquisition for the base height, the layers and the holds.
         // A resolution landing between two reads would drop a leg's hold
         // without the debit it stood for reaching the overlay, and the
         // reader would spend a balance twice.
-        let entries = read_or_recover(&self.entries);
+        let mut entries = write_or_recover(&self.entries);
         let base_at = tick.min(*read_or_recover(&self.persisted));
-        // Ascending, because an exclusive write supersedes what stood
-        // before it and a movement composes onto it — an order the fold
-        // has to respect even though movements commute among themselves.
-        for (_, entry) in entries.range(..=tick) {
-            for contribution in entry.readable.values() {
-                if contribution
-                    .in_base_from
-                    .is_some_and(|height| height <= base_at)
-                {
-                    continue;
-                }
-                fold_state_writes(&mut overlay, &contribution.writes);
-            }
+        // Ascending, so a later tick's layer sits above an earlier one's
+        // and the reader can walk them back.
+        for (_, entry) in entries.range_mut(..=tick) {
+            overlays.extend(entry.fold_at(base_at).layer());
             for leg in entry.pending.values() {
                 for (cell, amount) in &leg.reserved {
                     *holds
@@ -432,7 +525,7 @@ where
         TickView {
             base: Arc::clone(&self.base),
             anchor: base_at,
-            overlay: Arc::new(overlay),
+            overlays: Arc::new(overlays),
             holds: Arc::new(holds),
         }
     }
@@ -447,7 +540,9 @@ where
 pub struct TickView<S> {
     base: Arc<S>,
     anchor: BlockHeight,
-    overlay: Arc<StateWrites>,
+    /// One retained tick's fold per layer, ascending — a later tick's
+    /// writes sit above an earlier tick's.
+    overlays: Arc<Vec<Arc<StateWrites>>>,
     holds: Arc<ProvisionalHolds>,
 }
 
@@ -458,7 +553,7 @@ impl<S: VersionedStore> TickView<S> {
     pub fn snapshot(&self) -> TickViewSnapshot<S::Snapshot<'_>> {
         TickViewSnapshot {
             base_snapshot: self.base.snapshot_at(self.anchor),
-            overlay: Arc::clone(&self.overlay),
+            overlays: Arc::clone(&self.overlays),
         }
     }
 
@@ -472,20 +567,36 @@ impl<S: VersionedStore> TickView<S> {
     }
 }
 
-/// Snapshot from a [`TickView`] — the same overlay on the base storage's
+/// Snapshot from a [`TickView`] — the same layers on the base storage's
 /// snapshot.
 pub struct TickViewSnapshot<Snap> {
     base_snapshot: Snap,
-    overlay: Arc<StateWrites>,
+    overlays: Arc<Vec<Arc<StateWrites>>>,
 }
 
 impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
     fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
-        let written = self.overlay.cells.get(&key);
-        let Some(movement) = self.overlay.movements.get(&key) else {
+        // Topmost layer down, stopping at the first exclusive write:
+        // that write states the cell outright, so nothing below it is
+        // still reachable through it. A movement in the same layer sits
+        // above that write and composes onto it, as do the movements of
+        // every layer already passed — an order the composition itself
+        // is indifferent to, since movements commute.
+        let mut moved: Option<Movement> = None;
+        let mut written: Option<&Option<Vec<u8>>> = None;
+        for overlay in self.overlays.iter().rev() {
+            if let Some(movement) = overlay.movements.get(&key) {
+                moved = Some(moved.map_or(*movement, |above| movement.then(above)));
+            }
+            if let Some(change) = overlay.cells.get(&key) {
+                written = Some(change);
+                break;
+            }
+        }
+        let Some(moved) = moved else {
             return written.map_or_else(|| self.base_snapshot.cell(key), Clone::clone);
         };
-        // A cell the folds only moved resolves here, where the base it
+        // A cell the layers only moved resolves here, where the base it
         // moved from is finally in reach; one an exclusive write also
         // reached moves from that write instead.
         let before = written
@@ -494,7 +605,7 @@ impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
             .as_deref()
             .and_then(read_amount)
             .unwrap_or(0);
-        amount_cell(movement.apply(before).unwrap_or(0)).map(|cell| cell.to_vec())
+        amount_cell(moved.apply(before).unwrap_or(0)).map(|cell| cell.to_vec())
     }
 
     fn entries_in_range(
@@ -505,9 +616,22 @@ impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
         hi: u128,
         limit: usize,
     ) -> Vec<(u128, Vec<u8>)> {
+        // Collapsed bottom layer up, so a later tick's write wins the
+        // order key — the widening rule the merge applies needs one
+        // overlay, and only the interval asked for is ever collapsed.
+        let mut overlay: BTreeMap<u128, Option<Vec<u8>>> = BTreeMap::new();
+        for layer in self.overlays.iter() {
+            overlay.extend(entry_overlay_range(
+                &layer.entries,
+                owner,
+                collection,
+                lo,
+                hi,
+            ));
+        }
         merge_entry_overlay(
             &self.base_snapshot,
-            entry_overlay_range(&self.overlay.entries, owner, collection, lo, hi),
+            overlay.into_iter().collect(),
             owner,
             collection,
             lo,
@@ -523,7 +647,7 @@ mod tests {
     use std::sync::Mutex;
 
     use hyperscale_types::{
-        Address, AddressClass, DeclaredRange, Hash, LocalKey, Movement, ShardId, StateRoot,
+        Address, AddressClass, DeclaredRange, EntryKey, Hash, LocalKey, ShardId, StateRoot,
         encode_amount,
     };
 
@@ -742,6 +866,199 @@ mod tests {
 
         let view = chain.view_at(BlockHeight::new(1));
         assert_eq!(amount(&view.snapshot().cell(key(1)).unwrap()), 700);
+    }
+
+    /// An exclusive write states the cell outright, so the movements of
+    /// every tick beneath it are out of reach — reading through to them
+    /// would apply a debit the write has already accounted for.
+    #[test]
+    fn a_later_ticks_write_supersedes_an_earlier_ticks_movement() {
+        let store = Arc::new(StubStore::with_cell(key(1), encode_amount(1_000).as_ref()));
+        let chain = TickChain::new(store);
+        chain.append(
+            BlockHeight::new(1),
+            TickOutput {
+                determined: vec![(tx(1), debit(key(1), 300))],
+                provisional: Vec::new(),
+            },
+        );
+        chain.append(
+            BlockHeight::new(2),
+            TickOutput {
+                determined: vec![(
+                    tx(2),
+                    writes(&[(key(1), Some(encode_amount(500).as_ref()))]),
+                )],
+                provisional: Vec::new(),
+            },
+        );
+
+        let view = chain.view_at(BlockHeight::new(2));
+        assert_eq!(amount(&view.snapshot().cell(key(1)).unwrap()), 500);
+    }
+
+    /// The other order: a movement above an exclusive write moves from
+    /// that write rather than from the base, so the read has to reach the
+    /// write beneath it and stop exactly there.
+    #[test]
+    fn a_movement_moves_from_an_earlier_ticks_write() {
+        let store = Arc::new(StubStore::with_cell(key(1), encode_amount(1_000).as_ref()));
+        let chain = TickChain::new(store);
+        chain.append(
+            BlockHeight::new(1),
+            TickOutput {
+                determined: vec![(
+                    tx(1),
+                    writes(&[(key(1), Some(encode_amount(500).as_ref()))]),
+                )],
+                provisional: Vec::new(),
+            },
+        );
+        chain.append(
+            BlockHeight::new(2),
+            TickOutput {
+                determined: vec![(tx(2), debit(key(1), 200))],
+                provisional: Vec::new(),
+            },
+        );
+
+        let view = chain.view_at(BlockHeight::new(2));
+        assert_eq!(amount(&view.snapshot().cell(key(1)).unwrap()), 300);
+    }
+
+    #[test]
+    fn movements_compose_across_ticks() {
+        let store = Arc::new(StubStore::with_cell(key(1), encode_amount(1_000).as_ref()));
+        let chain = TickChain::new(store);
+        for (height, member, moved) in [(1u64, 1u8, 100u128), (2, 2, 200)] {
+            chain.append(
+                BlockHeight::new(height),
+                TickOutput {
+                    determined: vec![(tx(member), debit(key(1), moved))],
+                    provisional: Vec::new(),
+                },
+            );
+        }
+
+        let view = chain.view_at(BlockHeight::new(2));
+        assert_eq!(amount(&view.snapshot().cell(key(1)).unwrap()), 700);
+    }
+
+    /// A tick settles in halves, so one entry holds contributions the
+    /// base gains at different heights. What a read derives is the same
+    /// wherever persistence sits among them: each contribution comes from
+    /// the fold below its own settling height and from the base at or
+    /// above it, and never from both.
+    #[test]
+    fn each_contribution_leaves_the_fold_at_its_own_settling_height() {
+        let store = Arc::new(StubStore {
+            history: [
+                (BlockHeight::GENESIS, 1_000u128),
+                (BlockHeight::new(5), 900),
+                (BlockHeight::new(9), 700),
+            ]
+            .into_iter()
+            .map(|(height, held)| {
+                (
+                    height,
+                    HashMap::from([(key(1), encode_amount(held).as_ref().to_vec())]),
+                )
+            })
+            .collect(),
+            tip: BlockHeight::new(9),
+            anchors: Mutex::new(Vec::new()),
+        });
+        let chain = TickChain::new(store);
+        let w = tick(3);
+        chain.append(
+            BlockHeight::new(3),
+            TickOutput {
+                determined: Vec::new(),
+                provisional: [(tx(7), 100u128), (tx(8), 200)]
+                    .into_iter()
+                    .map(|(tx_hash, moved)| ProvisionalTx {
+                        tx_hash,
+                        writes: Some(debit(key(1), moved)),
+                        reserve: None,
+                        reserved: BTreeMap::new(),
+                    })
+                    .collect(),
+            },
+        );
+        // Each leg's counterpart certifies in a block of its own.
+        for (member, height) in [(tx(7), 5u64), (tx(8), 9)] {
+            chain.resolve(
+                &w,
+                &TickResolution::Settled {
+                    height: BlockHeight::new(height),
+                    members: BTreeSet::from([member]),
+                    aborted: BTreeSet::new(),
+                },
+            );
+        }
+        chain.prune_persisted(BlockHeight::new(10));
+
+        // Below both settlements, between them, above both — then back
+        // down, because a queued tick anchors below a persistence that
+        // has already moved past it.
+        for anchor in [4u64, 6, 10, 6, 4] {
+            let view = chain.view_at(BlockHeight::new(anchor));
+            assert_eq!(
+                amount(&view.snapshot().cell(key(1)).unwrap()),
+                700,
+                "anchored at {anchor}"
+            );
+        }
+    }
+
+    /// An ordered-collection entry is an exclusive write like any other,
+    /// so the topmost tick that reached the order key owns it — including
+    /// when what it wrote there is a removal.
+    #[test]
+    fn a_later_tick_owns_an_entry_an_earlier_one_wrote() {
+        let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
+        let owner = Address::new([3; 31], AddressClass::Component);
+        let collection = CollectionId([4; 16]);
+        let entry = |order: u128, value: Option<&[u8]>| {
+            let mut written = StateWrites::default();
+            written.entries.insert(
+                EntryKey {
+                    owner,
+                    collection,
+                    order,
+                },
+                value.map(<[u8]>::to_vec),
+            );
+            written
+        };
+        chain.append(
+            BlockHeight::new(1),
+            TickOutput {
+                determined: vec![
+                    (tx(1), entry(1, Some(b"one"))),
+                    (tx(2), entry(2, Some(b"two"))),
+                ],
+                provisional: Vec::new(),
+            },
+        );
+        chain.append(
+            BlockHeight::new(2),
+            TickOutput {
+                determined: vec![
+                    (tx(3), entry(1, Some(b"rewritten"))),
+                    (tx(4), entry(2, None)),
+                ],
+                provisional: Vec::new(),
+            },
+        );
+
+        let view = chain.view_at(BlockHeight::new(2));
+        assert_eq!(
+            view.snapshot()
+                .entries_in_range(owner, collection, 0, 10, 10),
+            vec![(1, b"rewritten".to_vec())],
+            "the rewrite wins its key and the removal takes the other",
+        );
     }
 
     /// A tick reads the base no later than its own height, and no later
