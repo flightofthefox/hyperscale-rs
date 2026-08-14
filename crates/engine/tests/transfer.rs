@@ -1303,6 +1303,15 @@ fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
     // Junk in the index is refused, not trusted: the cells are the
     // authority and the index is derived.
     executor.install_artifact(b"\0asm\x01\0\0\0");
+
+    // And a refusal costs nothing that follows it: the next artifact in
+    // the index still reaches the compile worker. A restart replays
+    // whatever the store holds, so one unreadable entry must not be the
+    // end of the reseed.
+    metadata.events.push("after the refusal".into());
+    let next = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
+    executor.install_artifact(&next);
+    await_code_settled(&executor, package_hash(&ProtocolHasher, &next));
 }
 
 #[test]
