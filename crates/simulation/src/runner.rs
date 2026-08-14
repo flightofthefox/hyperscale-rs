@@ -378,8 +378,12 @@ impl SimulationRunner {
         );
         let rng = ChaCha8Rng::seed_from_u64(seed);
 
-        // One engine per cluster: the genesis-static world is shared by
-        // every host, and construction installs the process VM statics.
+        // One engine per host, over one shared world. The process has a
+        // single metadata cache — derivation reads it through the VM
+        // statics, which install once — but compiled code is per host,
+        // so a host that did not commit a publish holds none of its code
+        // until its own fetch lands it. That is what puts the artifact
+        // acquisition path under test instead of around it.
         let world_pools = if network_config.world_pools.is_empty() {
             &network_config.pools
         } else {
@@ -389,7 +393,6 @@ impl SimulationRunner {
             world_pools,
             network_config.execution_mode,
         ));
-        let shared_executor = Arc::clone(&engine);
 
         // Generate keys for all registered validators using deterministic
         // seeding. Pool extras are registered in beacon genesis (landing
@@ -517,7 +520,14 @@ impl SimulationRunner {
 
             let (event_tx, event_rx) = unbounded();
 
-            let executor = Arc::clone(&shared_executor);
+            // The first host runs the engine the statics were installed
+            // from — the one the commit-time compile feeds — and every
+            // other host runs its own, holding only what it fetched.
+            let executor = if host_index == 0 {
+                Arc::clone(&engine)
+            } else {
+                Arc::new(engine.peer(network_config.execution_mode))
+            };
 
             // One `SimShardStorage` per hosted shard on this host.
             let storages: HashMap<ShardId, SimShardStorage> = by_shard
