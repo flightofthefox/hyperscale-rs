@@ -37,9 +37,9 @@ use crate::beacon::params::{NetworkParams, ParamProposal};
 use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, NetworkDefinition,
-    RETENTION_HORIZON, Randomness, ShardId, Stake, StakePoolId, StateRoot, TerminalRoots,
-    ValidatorId, WeightedTimestamp,
+    Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, Epoch, Hash,
+    NetworkDefinition, RETENTION_HORIZON, Randomness, ShardId, Stake, StakePoolId, StateRoot,
+    TerminalRoots, ValidatorId, WeightedTimestamp,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -78,6 +78,18 @@ pub struct PoolConviction {
     /// `impound_epochs` governance parameter as it stood at conviction.
     /// Later governance changes never shorten an in-force impound.
     pub lifts_at: Epoch,
+}
+/// One published package, as the beacon registers it: the fact every
+/// node prefetches the artifact's bytes on.
+///
+/// The publisher locates the bytes — the package cell sits under its
+/// prefix, and the owning shard at any later moment follows from the
+/// current trie — so the fact stays valid across reshapes without
+/// naming a shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+pub struct PackageFact {
+    /// The prefix the package cell sits under.
+    pub publisher: Address,
 }
 
 /// Aggregate stake-pool record.
@@ -687,6 +699,12 @@ pub struct BeaconState {
     pub validators: BTreeMap<ValidatorId, ValidatorRecord>,
     /// Per-id stake pools.
     pub pools: BTreeMap<StakePoolId, StakePool>,
+    /// The global package registry: every published artifact's content
+    /// address, folded from `PackagePublished` witnesses. The fact every
+    /// node prefetches a package's bytes on, and the registry a restart
+    /// or snap-synced joiner reconciles its artifact stores against —
+    /// the leaf is transport, this map is the durable record.
+    pub packages: BTreeMap<Hash, PackageFact>,
     /// Running beacon randomness — BLAKE3 mix of the prior value with
     /// the shard reveal chains folded this epoch; an epoch where no
     /// reveal folds mixes the accepted ceremony VRF outputs instead.
@@ -1109,6 +1127,7 @@ impl BeaconState {
             params: NetworkParams::default(),
             next_params: NetworkParams::default(),
             param_votes: BTreeMap::new(),
+            packages: BTreeMap::new(),
             current_epoch: Epoch::GENESIS,
             validators: BTreeMap::new(),
             pools: BTreeMap::new(),
