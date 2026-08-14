@@ -19,18 +19,18 @@ use hyperscale_engine::{
     PreviewGrants, PreviewOutcome, PreviewReport, ResourceChange, XRD, account_address,
 };
 use hyperscale_types::{
-    Address, BlockHeight, ShardId, TransactionDecision, TransactionStatus, TxHash,
+    Address, BlockHeight, Hash, ShardId, TransactionDecision, TransactionStatus, TxHash,
 };
 use hyperscale_vm_effects::package_hash;
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::faultable::FaultableCluster;
 use crate::support::tx::{
-    OVERDRAW_AMOUNT, build_composed_tx, build_publish_tx, build_securify_tx, build_stamp_tx,
-    build_transfer_paid_by, build_transfer_tx, build_unbound_payer_tx, cross_shard_cast,
-    cross_shard_keys, nullifier_race_cast, overdraw_cast, payment_request, recipient,
-    securify_cast, sender, shared_recipient_cast, storm_artifact, storm_publishers,
-    unbound_payer_cast, unbound_remote_payer_cast, validity_around,
+    OVERDRAW_AMOUNT, build_composed_tx, build_instance_deposit_tx, build_publish_tx,
+    build_securify_tx, build_stamp_tx, build_transfer_paid_by, build_transfer_tx,
+    build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, nullifier_race_cast, overdraw_cast,
+    payment_request, recipient, securify_cast, sender, shared_recipient_cast, storm_artifact,
+    storm_publishers, unbound_payer_cast, unbound_remote_payer_cast, validity_around,
 };
 use crate::support::wait::{await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -1444,6 +1444,101 @@ pub fn preview_reports_resource_changes(c: &mut impl Cluster) {
         vault_balance(c, ShardId::ROOT, to),
         recipient.after,
         "the commit landed on the figure the preview named for the recipient"
+    );
+}
+
+/// A published package runs only once its maturity window has passed —
+/// and when it runs, it runs on nodes that never committed its publish.
+///
+/// Two facts, and they are the same fact seen from both ends. The
+/// beacon registers a publish the instant it commits, but the code lives
+/// on the publisher's shard alone; every other node has to fetch it. The
+/// maturity window is the time that fetch is given, and holding a
+/// transaction out of a block until the window closes is what turns
+/// "does this node hold the code" from a race into a fact about the
+/// chain.
+///
+/// The probe is a deposit into an instance of the freshly published
+/// package. Offered inside the window it is not committed by anyone;
+/// offered after, it settles — which it can only do if the code reached
+/// the nodes that never held it, because every shard the transaction
+/// touches runs the whole of it.
+///
+/// # Panics
+///
+/// Panics if the publish does not settle, if a call inside the window
+/// reaches a decision, or if a call after the window does not.
+pub fn a_published_package_matures_before_it_runs(c: &mut impl Cluster) {
+    const SALT: u8 = 9;
+    const DEPOSIT: u128 = 40;
+
+    let publishers = storm_publishers();
+    let (key, publisher) = &publishers[0];
+    let artifact = storm_artifact(4_242);
+    let package = package_hash(&ProtocolHasher, &artifact);
+    let registered = Hash::from(package.0);
+    let cell = package_key(*publisher, package);
+
+    let publish = build_publish_tx(key, artifact.clone(), validity_around(c.now()));
+    let publish_hash = publish.hash();
+    c.submit(Arc::new(publish));
+    let status = await_tx_terminal(c, publish_hash, epochs(24));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the publish did not accept; status = {status:?}"
+    );
+    let in_state = c.run_until(epochs(2), |c| {
+        c.substate(ShardId::leaf(1, 0), cell.owner, cell.local.0)
+            .is_some()
+    });
+    assert!(in_state, "the package cell never reached persisted state");
+
+    // The beacon registers the publish on its own next block, and the
+    // maturity window opens there rather than at the shard's commit.
+    let on_beacon = c.run_until(epochs(4), |c| {
+        c.beacon_state()
+            .is_some_and(|state| state.packages.contains_key(&registered))
+    });
+    assert!(on_beacon, "the beacon never registered the publish");
+
+    // Offered inside the window. Every honest proposer filters it and
+    // every honest voter would refuse it, so it waits — which is the
+    // whole of the guarantee, since a transaction committed here could
+    // be handed to a node whose fetch had not landed.
+    let early = build_instance_deposit_tx(key, &artifact, SALT, DEPOSIT, validity_around(c.now()));
+    let early_hash = early.hash();
+    c.submit(Arc::new(early));
+    c.run_until(epochs(8), |c| {
+        c.tx_status(early_hash).is_some_and(|s| s.is_final())
+            || c.beacon_state().is_some_and(|state| {
+                state
+                    .packages
+                    .get(&registered)
+                    .is_some_and(|fact| fact.usable_in(state.current_epoch))
+            })
+    });
+    let held = c.tx_status(early_hash);
+    assert!(
+        !held.as_ref().is_some_and(TransactionStatus::is_final),
+        "a call was decided while its package was still maturing: {held:?}"
+    );
+
+    // Past the window. The same call settles now, and settling it means
+    // the code reached the nodes that never committed the publish —
+    // every shard the transaction touches runs the whole of it.
+    let late = build_instance_deposit_tx(key, &artifact, SALT, DEPOSIT, validity_around(c.now()));
+    let late_hash = late.hash();
+    c.submit(Arc::new(late));
+    let status = await_tx_terminal(c, late_hash, epochs(24));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "a matured package's call did not settle; status = {status:?}"
     );
 }
 

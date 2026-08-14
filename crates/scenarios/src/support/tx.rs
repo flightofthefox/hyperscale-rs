@@ -23,11 +23,14 @@ use hyperscale_types::{
     TransactionEnvelope, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
-    Address, Constraint, EnvelopeTree, IntentDecl, ManifestGraph, package_hash,
+    Address, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, ManifestGraph,
+    package_hash,
 };
 use hyperscale_vm_manifest_builder::native::{account, staking};
 use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
-use hyperscale_vm_manifest_builder::{EnvelopeBuilder, IntentBuilder, TypedBuilder, TypedError};
+use hyperscale_vm_manifest_builder::{
+    EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError,
+};
 use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_artifact, account_metadata};
 
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
@@ -1354,6 +1357,76 @@ pub fn build_publish_tx(
         }
         .sign(payer),
     )
+}
+
+/// The instance record a call to `artifact`'s package presents.
+///
+/// An instance is computed rather than created: its address is the hash
+/// of the package, the config it is bound to, and the salt that
+/// distinguishes it from every other instance of the same code. Nothing
+/// is registered anywhere — the envelope carries the record, and every
+/// node composes the same registry from it.
+#[must_use]
+pub fn published_instance(artifact: &[u8], salt: u8) -> InstanceMeta {
+    InstanceMeta {
+        package: package_hash(&ProtocolHasher, artifact),
+        config: Vec::new(),
+        salt: Hash32([salt; 32]),
+    }
+}
+
+/// Build a deposit into an instance of a runtime-published package.
+///
+/// Untyped, because the signature this types against lives in metadata
+/// the scenario's own client learns only from the chain it is driving;
+/// the graph is the same shape the typed builder would emit.
+///
+/// This is the probe the artifact fetch has to answer. The code runs on
+/// every shard the transaction touches, and only the publisher's own
+/// committee held it at commit — so unless the rest of the network
+/// fetched it, this transaction has no code to run.
+///
+/// # Panics
+///
+/// Panics if the graph leaves an output unconsumed, which would be a
+/// defect in this builder rather than a runtime condition.
+#[must_use]
+pub fn build_instance_deposit_tx(
+    payer: &Ed25519PrivateKey,
+    artifact: &[u8],
+    salt: u8,
+    amount: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    let meta = published_instance(artifact, salt);
+    let component = meta.address(&ProtocolHasher);
+    let account = account_address(&payer.public_key().0);
+
+    let mut b = GraphBuilder::new();
+    let [] = b.call_signed(account, "authorize", ());
+    let [funds] = b.call_bearing(account, "withdraw", (*XRD, amount), 0);
+    let [] = b.call(component, "deposit", (funds.resource_is(*XRD),));
+    let graph = b.build().expect("every output is consumed");
+
+    let tree = EnvelopeTree {
+        root: IntentDecl {
+            graph,
+            params: Vec::new(),
+        },
+        root_bindings: Vec::new(),
+        subintents: Vec::new(),
+        instances: vec![meta],
+    };
+    Transaction::new(client().sign_tree(
+        &tree,
+        Vec::new(),
+        payer,
+        Terms {
+            max_fee: MAX_FEE,
+            validity,
+            message: Vec::new(),
+        },
+    ))
 }
 
 /// The identifier the beacon folds the VM staking scenario's pool under.
