@@ -188,6 +188,7 @@ impl Client {
                 },
                 root_bindings: Vec::new(),
                 subintents: Vec::new(),
+                instances: Vec::new(),
             },
             Vec::new(),
             payer,
