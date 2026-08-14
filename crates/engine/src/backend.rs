@@ -93,6 +93,12 @@ impl<C> PackageSlots<C> {
 
     /// Land a claimed build's verdict — `None` a refusal — and release
     /// its waiters.
+    ///
+    /// One producer only: the swap over `settled` is a read-modify-write
+    /// with no lock around it, so two builds landing at once would lose
+    /// one. Every claim reaches exactly one builder — the compile worker
+    /// on the blessed engine, the absorbing thread on the reference one —
+    /// and construction lands the stdlib before either exists.
     fn fulfil(&self, package: PackageHash, code: Option<C>) {
         let mut next = (**self.settled.load()).clone();
         next.entry(package).or_insert_with(|| code.map(Arc::new));
@@ -126,6 +132,7 @@ impl<C> PackageSlots<C> {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Arc;
     use std::thread;
 
@@ -180,7 +187,7 @@ mod native {
             let slots = Arc::new(PackageSlots::new());
             for artifact in [account_artifact(), staking_artifact()] {
                 validate_component(artifact).expect("a stdlib artifact clears the profile");
-                let pre = compile(&engine, &linker, artifact).expect("a stdlib artifact compiles");
+                let pre = build(&engine, &linker, artifact).expect("a stdlib artifact compiles");
                 let package = package_hash(&ProtocolHasher, artifact);
                 assert!(slots.claim(package), "stdlib packages are distinct");
                 slots.fulfil(package, Some(pre));
@@ -195,22 +202,7 @@ mod native {
                     let linker = kernel_linker(&worker_engine);
                     for artifact in compile_rx {
                         let package = package_hash(&ProtocolHasher, &artifact);
-                        match compile(&worker_engine, &linker, &artifact) {
-                            Ok(pre) => worker_slots.fulfil(package, Some(pre)),
-                            Err(reason) => {
-                                // Deterministic per bytes, so every
-                                // replica refuses this package's calls
-                                // alike — but an admitted artifact the
-                                // engine cannot compile means the profile
-                                // validator and wasmtime disagree.
-                                tracing::error!(
-                                    ?package,
-                                    reason,
-                                    "published artifact failed to compile"
-                                );
-                                worker_slots.fulfil(package, None);
-                            }
-                        }
+                        worker_slots.fulfil(package, build(&worker_engine, &linker, &artifact));
                     }
                 })
                 .expect("the compile worker spawns");
@@ -228,9 +220,7 @@ mod native {
         /// resolvable when the worker lands it, and an invocation
         /// arriving sooner waits on exactly that.
         pub fn absorb_artifact(&self, artifact: &[u8]) {
-            if self.slots.claim(package_hash(&ProtocolHasher, artifact)) {
-                let _ = self.compile.send(artifact.to_vec());
-            }
+            queue(&self.slots, &self.compile, artifact);
         }
 
         /// A cheap-clone feed of this backend for the commit path to
@@ -238,11 +228,7 @@ mod native {
         pub fn absorber(&self) -> impl Fn(&[u8]) + Send + Sync + 'static {
             let slots = Arc::clone(&self.slots);
             let compile = self.compile.clone();
-            move |artifact: &[u8]| {
-                if slots.claim(package_hash(&ProtocolHasher, artifact)) {
-                    let _ = compile.send(artifact.to_vec());
-                }
-            }
+            move |artifact: &[u8]| queue(&slots, &compile, artifact)
         }
 
         /// Whether `package`'s code resolves without waiting — landed or
@@ -267,18 +253,59 @@ mod native {
         linker
     }
 
-    /// Compile and pre-link one artifact, with a deterministic reason on
-    /// refusal.
-    fn compile(
+    /// Claim `artifact`'s build and hand it to the compile worker.
+    ///
+    /// A claim and a send, in that order, so two callers racing the same
+    /// bytes queue one build. A send that fails means the worker is gone
+    /// — the claim then stands unfulfilled and every call to the package
+    /// waits on a build that will never land, which is a dead node
+    /// rather than a divergent one. Loud, because nothing downstream can
+    /// tell that apart from a slow fetch.
+    fn queue(
+        slots: &PackageSlots<InstancePre<HostState>>,
+        compile: &Sender<Vec<u8>>,
+        artifact: &[u8],
+    ) {
+        let package = package_hash(&ProtocolHasher, artifact);
+        if slots.claim(package) && compile.send(artifact.to_vec()).is_err() {
+            tracing::error!(
+                ?package,
+                "the compile worker is gone; its packages cannot run"
+            );
+        }
+    }
+
+    /// Build one artifact, or `None` if the blessed engine refuses it.
+    ///
+    /// Compilation is one pinned wasmtime over one blessed config, so
+    /// every way it can end is a function of the bytes and every replica
+    /// reaches the same one — an unwind included, which is why the
+    /// worker catches rather than dies on it. What is not deterministic
+    /// is the profile validator having admitted bytes wasmtime will not
+    /// take, so a refusal here is logged as the disagreement it is.
+    fn build(
         engine: &Engine,
         linker: &Linker<HostState>,
         artifact: &[u8],
-    ) -> Result<InstancePre<HostState>, String> {
-        let component =
-            Component::new(engine, artifact).map_err(|error| format!("compile: {error:#}"))?;
-        linker
-            .instantiate_pre(&component)
-            .map_err(|error| format!("link: {error:#}"))
+    ) -> Option<InstancePre<HostState>> {
+        let attempt = catch_unwind(AssertUnwindSafe(|| {
+            let component =
+                Component::new(engine, artifact).map_err(|error| format!("compile: {error:#}"))?;
+            linker
+                .instantiate_pre(&component)
+                .map_err(|error| format!("link: {error:#}"))
+        }));
+        let reason = match attempt {
+            Ok(Ok(pre)) => return Some(pre),
+            Ok(Err(reason)) => reason,
+            Err(_) => "panic".to_string(),
+        };
+        tracing::error!(
+            package = ?package_hash(&ProtocolHasher, artifact),
+            reason,
+            "published artifact failed to compile"
+        );
+        None
     }
 
     impl Backend for EngineBackend {
