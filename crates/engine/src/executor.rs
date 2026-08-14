@@ -289,6 +289,24 @@ impl Executor {
         }
     }
 
+    /// A second engine over this one's world: its own compiled code, the
+    /// same published metadata.
+    ///
+    /// Derivation reads metadata through the process-wide statics, so a
+    /// process has exactly one metadata cache however many engines it
+    /// builds — but compiled code is per engine, and that is the half a
+    /// node acquires for itself. A harness standing several nodes up in
+    /// one process uses this so each of them has to fetch the code a
+    /// publish put on the chain, the way separate processes would.
+    #[must_use]
+    pub fn peer(&self, mode: ExecutionMode) -> Self {
+        Self {
+            world: self.world.clone(),
+            backend: EngineBackend::new(),
+            mode,
+        }
+    }
+
     /// The published-package cache this engine routes against.
     ///
     /// Shared with the installed statics rather than copied, so a package
