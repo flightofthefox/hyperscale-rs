@@ -6190,11 +6190,15 @@ impl ShardCoordinator {
     /// store. Same shape as `on_transactions_admitted` and
     /// `on_provisions_admitted`.
     ///
-    /// Each tick is validated against its own EC before use: a peer with
-    /// divergent local execution could serve a tick whose receipts disagree
-    /// with the outcomes the EC attests to. Rejecting such a tick leaves the
-    /// pending block incomplete; the fetch protocol retries from a different
-    /// peer.
+    /// Each tick is validated against the certificates it carries before
+    /// use, and this is where a proposer's choice of them is checked. A
+    /// peer with divergent local execution could serve a tick whose
+    /// receipts disagree with the outcomes its own certificate attests
+    /// to; a dishonest one could serve a tick whose certificates leave out
+    /// a participant, which reads as unanimous acceptance and settles
+    /// effects a counterpart discarded. Rejecting such a tick leaves the
+    /// pending block incomplete, so the block gets no vote here; the fetch
+    /// protocol retries from a different peer.
     pub fn on_finalizations_admitted(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -6202,11 +6206,11 @@ impl ShardCoordinator {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for fw in ticks {
-            if let Err(err) = fw.validate_receipts_against_ec() {
+            if let Err(err) = fw.validate_against_certificates() {
                 warn!(
                     tick_id = ?fw.tick_id(),
                     ?err,
-                    "Rejecting Finalization: receipts inconsistent with its EC"
+                    "Rejecting Finalization: inconsistent with the certificates it carries"
                 );
                 continue;
             }

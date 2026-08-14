@@ -765,6 +765,138 @@ mod tests {
         assert!(fw.is_none(), "reconstruction requires the local EC");
     }
 
+    /// Dropping the certificate carrying a counterpart's refusal is
+    /// caught, because the tick's own certificate names the counterpart.
+    ///
+    /// The set left behind is internally consistent — [`settles`] reads
+    /// the outcomes in front of it, finds no refusal, and the receipts
+    /// built around that reading agree with it — so nothing about the
+    /// receipts can tell the two sets apart. What can is that the local
+    /// outcome says shard 1 is party to the transaction and no
+    /// certificate here speaks for shard 1.
+    ///
+    /// [`settles`]: crate::settles
+    #[test]
+    fn dropping_a_refusal_leaves_the_transaction_uncovered() {
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
+        let counterpart = make_tick_id(1, BlockHeight::new(42));
+        let leg = TxHash::from(Hash::from_bytes(b"cross_shard_leg"));
+
+        let local_ec = make_local_ec(
+            &tick_id,
+            vec![
+                TxOutcome::new(
+                    leg,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .awaiting([counterpart.shard_id()]),
+            ],
+        );
+        let refusal = make_local_ec(
+            &counterpart,
+            vec![TxOutcome::new(leg, ExecutionOutcome::Aborted).awaiting([tick_id.shard_id()])],
+        );
+        let effects = StoredReceipt {
+            tx_hash: leg,
+            consensus: make_success_receipt(),
+            metadata: None,
+        };
+
+        let thinned = Finalization::new(
+            tick_id,
+            TickHalf::Legs,
+            vec![Arc::clone(&local_ec)],
+            vec![effects],
+        );
+        assert_eq!(
+            thinned.validate_against_certificates(),
+            Err(ReceiptValidationError::IncompleteCoverage {
+                tx_hash: leg,
+                missing: counterpart.shard_id(),
+            }),
+            "a set that leaves out a participant decides nothing about its transaction",
+        );
+        assert!(
+            thinned.settling_receipts().is_empty(),
+            "and nothing it carries reaches state by another road",
+        );
+
+        // The same tick with the refusal present settles the charge its
+        // outcome named — here, none — and never the effects.
+        let whole = Finalization::new(tick_id, TickHalf::Legs, vec![local_ec, refusal], vec![]);
+        assert_eq!(whole.validate_against_certificates(), Ok(()));
+        assert!(whole.settling_receipts().is_empty());
+    }
+
+    /// A transaction reaching no further than its own shard names no
+    /// counterpart, so its tick settles on its own certificate.
+    #[test]
+    fn a_determined_member_needs_no_counterpart() {
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
+        let tx = TxHash::from(Hash::from_bytes(b"determined"));
+        let fw = Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            vec![make_local_ec(
+                &tick_id,
+                vec![TxOutcome::new(
+                    tx,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )],
+            )],
+            vec![StoredReceipt {
+                tx_hash: tx,
+                consensus: make_success_receipt(),
+                metadata: None,
+            }],
+        );
+        assert_eq!(fw.validate_against_certificates(), Ok(()));
+        assert_eq!(fw.settling_receipts().len(), 1);
+    }
+
+    /// A refused transaction needs no completeness: one refusal discards
+    /// its effects everywhere, so the shards yet to report can only agree.
+    #[test]
+    fn a_refused_transaction_settles_without_every_participant() {
+        let tick_id = make_tick_id(0, BlockHeight::new(42));
+        let absent = make_tick_id(2, BlockHeight::new(42));
+        let leg = TxHash::from(Hash::from_bytes(b"refused_leg"));
+        let fw = Finalization::new(
+            tick_id,
+            TickHalf::Legs,
+            vec![make_local_ec(
+                &tick_id,
+                vec![TxOutcome::new(leg, ExecutionOutcome::Aborted).awaiting([absent.shard_id()])],
+            )],
+            vec![],
+        );
+        assert_eq!(fw.validate_against_certificates(), Ok(()));
+    }
+
+    /// The awaited shards sit under the signed receipt root, so a set
+    /// naming fewer participants is a different certificate rather than
+    /// the same one read narrowly.
+    #[test]
+    fn awaited_shards_change_the_outcome_leaf() {
+        let tx = TxHash::from(Hash::from_bytes(b"tx"));
+        let outcome = TxOutcome::new(
+            tx,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        );
+        let awaiting = outcome.clone().awaiting([ShardId::leaf(3, 1)]);
+        assert_ne!(tx_outcome_leaf(&outcome), tx_outcome_leaf(&awaiting));
+        assert_ne!(
+            tx_outcome_leaf(&awaiting),
+            tx_outcome_leaf(&outcome.awaiting([ShardId::leaf(3, 2)])),
+        );
+    }
+
     #[test]
     fn validate_accepts_receipts_matching_outcomes() {
         let tick_id = make_tick_id(0, BlockHeight::new(42));
@@ -804,7 +936,7 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(fw.validate_receipts_against_ec(), Ok(()));
+        assert_eq!(fw.validate_against_certificates(), Ok(()));
     }
 
     #[test]
@@ -829,7 +961,7 @@ mod tests {
             }],
         );
         assert!(matches!(
-            fw.validate_receipts_against_ec(),
+            fw.validate_against_certificates(),
             Err(ReceiptValidationError::UnexpectedFailure { .. })
         ));
     }
@@ -856,7 +988,7 @@ mod tests {
             }],
         );
         assert!(matches!(
-            fw.validate_receipts_against_ec(),
+            fw.validate_against_certificates(),
             Err(ReceiptValidationError::UnexpectedSuccess { .. })
         ));
     }
@@ -890,7 +1022,7 @@ mod tests {
             }],
         );
         assert!(matches!(
-            fw.validate_receipts_against_ec(),
+            fw.validate_against_certificates(),
             Err(ReceiptValidationError::ReceiptHashMismatch { expected, actual, .. })
                 if expected == ec_hash && actual == receipt_hash
         ));
@@ -913,7 +1045,7 @@ mod tests {
             vec![],
         );
         assert!(matches!(
-            fw.validate_receipts_against_ec(),
+            fw.validate_against_certificates(),
             Err(ReceiptValidationError::MissingReceipt { .. })
         ));
     }
@@ -939,7 +1071,7 @@ mod tests {
             }],
         );
         assert!(matches!(
-            fw.validate_receipts_against_ec(),
+            fw.validate_against_certificates(),
             Err(ReceiptValidationError::ExtraReceipt { .. })
         ));
     }
@@ -971,7 +1103,7 @@ mod tests {
             }],
         );
         assert!(matches!(
-            fw.validate_receipts_against_ec(),
+            fw.validate_against_certificates(),
             Err(ReceiptValidationError::TxHashMismatch { .. })
         ));
     }
@@ -983,7 +1115,7 @@ mod tests {
         let remote_ec = make_local_ec(&remote_tick_id, vec![]);
         let fw = Finalization::new(tick_id, TickHalf::Determined, vec![remote_ec], vec![]);
         assert_eq!(
-            fw.validate_receipts_against_ec(),
+            fw.validate_against_certificates(),
             Err(ReceiptValidationError::MissingLocalEc)
         );
     }
@@ -1001,6 +1133,6 @@ mod tests {
             vec![make_local_ec(&tick_id, outcomes)],
             vec![],
         );
-        assert_eq!(fw.validate_receipts_against_ec(), Ok(()));
+        assert_eq!(fw.validate_against_certificates(), Ok(()));
     }
 }

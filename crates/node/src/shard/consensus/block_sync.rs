@@ -408,7 +408,7 @@ fn validate_synced_block(
     // success/failure). `local_receipt_root` below catches content
     // mismatches but doesn't enforce per-tick grouping.
     for fw in certified.block().certificates().iter() {
-        if fw.validate_receipts_against_ec().is_err() {
+        if fw.validate_against_certificates().is_err() {
             return Err("receipts_vs_ec_mismatch");
         }
     }
@@ -896,7 +896,7 @@ mod tests {
     #[test]
     fn validate_rejects_receipts_inconsistent_with_ec() {
         // Tick whose EC attests Success but whose receipt reports Failure.
-        // `validate_receipts_against_ec` catches this even when both
+        // `validate_against_certificates` catches this even when both
         // certificate_root and local_receipt_root are computed off the
         // (corrupted) body and would tautologically match.
         let tx_hash = TxHash::from(Hash::from_bytes(b"tx_divergent"));

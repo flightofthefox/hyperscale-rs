@@ -13,12 +13,14 @@ use crate::{
 ///
 /// The domain tags ensure the three variants can never collide.
 ///
-/// The attested `work` scalar and any settled fee receipt extend the
-/// leaf under their own domain tags. The vote signature covers only the
-/// receipt root, and decoding recomputes that root from the outcomes —
-/// so a field outside the leaf would be an aggregator's to forge. Work
-/// in particular feeds emission weighting and the reshape load
-/// predicate, so it must sit under the signed root.
+/// The attested `work` scalar, any settled fee receipt, and the shards
+/// the transaction's settlement waits on extend the leaf under their own
+/// domain tags. The vote signature covers only the receipt root, and
+/// decoding recomputes that root from the outcomes — so a field outside
+/// the leaf would be an aggregator's to forge. Work in particular feeds
+/// emission weighting and the reshape load predicate, and the awaited
+/// shards decide how many certificates it takes to settle the
+/// transaction at all, so both must sit under the signed root.
 #[must_use]
 pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
     let base = match outcome.outcome() {
@@ -35,9 +37,22 @@ pub fn tx_outcome_leaf(outcome: &TxOutcome) -> Hash {
         b"RESERVED:",
         &outcome.declared_work().to_le_bytes(),
     ]);
-    outcome.fee_receipt().map_or(with_work, |fee_receipt| {
+    let with_fee = outcome.fee_receipt().map_or(with_work, |fee_receipt| {
         Hash::from_parts(&[with_work.as_bytes(), b"FEE:", fee_receipt.as_bytes()])
-    })
+    });
+    // Fixed-width per shard, so the concatenation admits one reading — a
+    // variable encoding would let two different sets agree on their bytes.
+    let awaited: Vec<u8> = outcome
+        .counterparts()
+        .iter()
+        .flat_map(|shard| {
+            let mut bytes = [0u8; 12];
+            bytes[..4].copy_from_slice(&shard.depth().to_le_bytes());
+            bytes[4..].copy_from_slice(&shard.path().to_le_bytes());
+            bytes
+        })
+        .collect();
+    Hash::from_parts(&[with_fee.as_bytes(), b"AWAITS:", &awaited])
 }
 
 /// Compute the receipt root from a list of transaction outcomes.

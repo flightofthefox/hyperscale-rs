@@ -3,7 +3,7 @@
 
 use hyperscale_hbor::Hbor;
 
-use crate::{GlobalReceiptHash, TxHash};
+use crate::{GlobalReceiptHash, MAX_PROVISION_TARGET_SHARDS, ShardId, TxHash};
 
 /// Per-transaction execution outcome within a tick.
 ///
@@ -58,6 +58,24 @@ pub struct TxOutcome {
     /// number and releasing another leaves the running total drifting
     /// upward and never returning to zero.
     declared_work: u64,
+    /// The other shards party to the transaction — the ones whose
+    /// certificates its settlement waits on. Ascending and distinct;
+    /// empty for a transaction reaching no further than this shard.
+    ///
+    /// A function of the declaration and the topology that committed it,
+    /// so every participant derives the same set. The certifying shard is
+    /// left out: the certificate carrying this outcome is its report.
+    ///
+    /// Attested rather than re-derived for the reason
+    /// [`TxOutcome::declared_work`] is — a validator holding the
+    /// certificate but not the transaction still has to reach the same
+    /// answer — and it is what lets a set of certificates state how
+    /// complete it needs to be. Without it the rule discarding a refused
+    /// transaction's effects is read over whichever certificates the set
+    /// happens to carry, and a set with the refusal dropped reads as
+    /// unanimous.
+    #[hbor(max = MAX_PROVISION_TARGET_SHARDS)]
+    counterparts: Vec<ShardId>,
 }
 
 impl TxOutcome {
@@ -76,6 +94,7 @@ impl TxOutcome {
             tx_hash,
             outcome,
             fee_receipt: None,
+            counterparts: Vec::new(),
         }
     }
 
@@ -83,6 +102,18 @@ impl TxOutcome {
     #[must_use]
     pub const fn reserving(mut self, declared_work: u64) -> Self {
         self.declared_work = declared_work;
+        self
+    }
+
+    /// Bind the shards this transaction's settlement waits on, in the one
+    /// form the set may take: ascending, distinct, and without the shard
+    /// whose certificate carries the outcome.
+    #[must_use]
+    pub fn awaiting(mut self, counterparts: impl IntoIterator<Item = ShardId>) -> Self {
+        let mut counterparts: Vec<ShardId> = counterparts.into_iter().collect();
+        counterparts.sort_unstable();
+        counterparts.dedup();
+        self.counterparts = counterparts;
         self
     }
 
@@ -108,6 +139,7 @@ impl TxOutcome {
             tx_hash,
             outcome,
             fee_receipt: Some(fee_receipt),
+            counterparts: Vec::new(),
         }
     }
 
@@ -129,6 +161,13 @@ impl TxOutcome {
         self.fee_receipt
     }
 
+    /// The shards this transaction's settlement waits on, besides the one
+    /// certifying this outcome.
+    #[must_use]
+    pub fn counterparts(&self) -> &[ShardId] {
+        &self.counterparts
+    }
+
     /// Transaction hash.
     #[must_use]
     pub const fn tx_hash(&self) -> TxHash {
@@ -143,7 +182,7 @@ impl TxOutcome {
 
     /// Consume the outcome and return its parts.
     #[must_use]
-    pub const fn into_parts(self) -> (TxHash, ExecutionOutcome) {
+    pub fn into_parts(self) -> (TxHash, ExecutionOutcome) {
         (self.tx_hash, self.outcome)
     }
 

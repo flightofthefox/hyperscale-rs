@@ -454,7 +454,7 @@ impl TickState {
     /// outcomes need no receipt.
     ///
     /// Gates each half so it can't produce a [`Finalization`] that fails
-    /// [`Finalization::validate_receipts_against_ec`]. The check mirrors
+    /// [`Finalization::validate_against_certificates`]. The check mirrors
     /// that invariant: a receipt is needed exactly for the outcomes the
     /// certificate attests as `Executed`. When this validator's local
     /// decision disagrees with the quorum's, the gate blocks here rather
@@ -470,8 +470,8 @@ impl TickState {
     /// `local_ec_emitted` is checked separately for the same reason.
     ///
     /// [`Finalization`]: hyperscale_types::Finalization
-    /// [`Finalization::validate_receipts_against_ec`]:
-    ///     hyperscale_types::Finalization::validate_receipts_against_ec
+    /// [`Finalization::validate_against_certificates`]:
+    ///     hyperscale_types::Finalization::validate_against_certificates
     fn has_local_receipts_for(&self, members: &[TxHash]) -> bool {
         let Some(local_ec) = self.local_certificate() else {
             return false;
@@ -552,6 +552,7 @@ impl TickState {
             return None;
         }
 
+        let local = self.tick_id.shard_id();
         let outcomes: Vec<TxOutcome> = self
             .tx_hashes
             .iter()
@@ -581,6 +582,17 @@ impl TickState {
                     .reserved_work
                     .get(tx_hash)
                     .expect("a tick prices every member it names");
+                // Who the settlement waits on, stated so a peer reading
+                // the certificate can tell a complete set of them from
+                // one a proposer thinned. This shard is not among them:
+                // this certificate is its report.
+                let counterparts = self
+                    .participating_shards
+                    .get(tx_hash)
+                    .expect("a tick names the participants of every member it holds")
+                    .iter()
+                    .copied()
+                    .filter(|&shard| shard != local);
                 let charge = self
                     .fee_receipts
                     .get(tx_hash)
@@ -590,6 +602,7 @@ impl TickState {
                     None => TxOutcome::attesting(*tx_hash, outcome, work),
                 }
                 .reserving(reserved)
+                .awaiting(counterparts)
             })
             .collect();
 
@@ -951,7 +964,7 @@ impl TickState {
     /// against the whole certificate rather than against this shard's own
     /// verdict: a leg that completed here and was refused by a counterpart
     /// settles its charge, not its effects. Peers re-derive the same rule
-    /// through `validate_receipts_against_ec` at ingress.
+    /// through `validate_against_certificates` at ingress.
     fn with_drained_receipts(&mut self, attestation: Finalization) -> Finalization {
         let local_ec = attestation
             .execution_certificates()

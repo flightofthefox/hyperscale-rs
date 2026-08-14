@@ -5,7 +5,7 @@
 //! `Verified<Finalization>`; predicate at
 //! [`impl Verify<&FinalizationContext<'_>>`](Verify::verify) below.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use blake3::Hasher;
@@ -16,8 +16,8 @@ use thiserror::Error;
 use crate::{
     ConsensusPublicKey, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificateVerifyError, ExecutionOutcome, FinalizationHash, GlobalReceiptHash, Hash,
-    MAX_TXS_PER_BLOCK, NetworkDefinition, StoredReceipt, TickId, TransactionDecision, TxHash,
-    TxOutcome, Verifiable, Verified, Verify,
+    MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, StoredReceipt, TickId, TransactionDecision,
+    TxHash, TxOutcome, Verifiable, Verified, Verify,
 };
 
 /// Cap on execution certificates accepted in a single [`Finalization`] at
@@ -122,6 +122,11 @@ fn check_finalization(tick: &Finalization) -> Result<(), &'static str> {
 /// outcome named beside them, which is how an attempt nobody applied
 /// still costs its payer.
 ///
+/// Every participant *accepted* it, not every participant present: a set
+/// of certificates missing one is a transaction with no verdict yet, and
+/// that is [`Finalization::uncovered_transactions`]'s question, asked
+/// before this one.
+///
 /// One rule with two readers: the tick's own shard builds its receipt
 /// list from it, and every peer re-derives it to check that list. They
 /// have to be the same rule, because a tick that stored the other side
@@ -171,7 +176,7 @@ pub fn settles(outcome: &TxOutcome, refused: &BTreeSet<TxHash>) -> Settles {
     }
 }
 
-/// Reason a `Finalization`'s receipts don't agree with its own EC.
+/// Reason a `Finalization` doesn't agree with the certificates it carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptValidationError {
     /// The tick has no EC whose `tick_id` is the tick's own. Every
@@ -179,6 +184,14 @@ pub enum ReceiptValidationError {
     /// `TickState::attestation` invariant; this indicates a malformed
     /// or tampered certificate.
     MissingLocalEc,
+    /// A transaction the tick settles names a participant no carried
+    /// certificate speaks for, so the set decides nothing about it.
+    IncompleteCoverage {
+        /// Hash of the tx left without a verdict.
+        tx_hash: TxHash,
+        /// A participant it names that has not reported.
+        missing: ShardId,
+    },
     /// A non-aborted `tx_outcome` has no corresponding receipt.
     MissingReceipt {
         /// Hash of the tx whose receipt is missing.
@@ -505,9 +518,73 @@ impl Finalization {
         self
     }
 
-    /// Validate that `receipts` are consistent with the local EC's
-    /// `tx_outcomes`: exactly one receipt per outcome that carries one —
-    /// every non-aborted outcome, plus every abort settling a fee — in
+    /// Transactions this tick's own certificate names a participant for
+    /// that no carried certificate speaks for, each with one such shard.
+    ///
+    /// The completeness half of the settlement rule, and the half a set
+    /// of certificates cannot supply on its own: [`settles`] reads the
+    /// outcomes in front of it, so a set with a counterpart's refusal
+    /// removed reads as unanimous and is internally consistent while it
+    /// does. What that set cannot do is deny the participant, because
+    /// the tick's own certificate names it under the signed receipt root
+    /// ([`TxOutcome::counterparts`]) — so the question of who is missing
+    /// is answerable from the set alone, which is what makes this
+    /// checkable by every validator and not just the node that built it.
+    ///
+    /// Refusal needs no completeness. One refusal anywhere discards the
+    /// transaction's effects everywhere, so a set carrying any is already
+    /// decided and the shards yet to report can only agree.
+    ///
+    /// Read off the tick's own certificate rather than the union of all
+    /// of them: participants are resolved against the topology that
+    /// committed the transaction, and two shards that committed it across
+    /// a reshape cut can name different sets. This shard settles on the
+    /// set it committed under, which is the one its own committee signed.
+    #[must_use]
+    pub fn uncovered_transactions(&self) -> BTreeMap<TxHash, ShardId> {
+        let Some(local_ec) = self
+            .execution_certificates
+            .iter()
+            .find(|ec| ec.tick_id() == &self.tick_id)
+        else {
+            return BTreeMap::new();
+        };
+        let refused = refused_transactions(&self.execution_certificates);
+        let mut certifying: HashMap<TxHash, HashSet<ShardId>> = HashMap::new();
+        for ec in &self.execution_certificates {
+            let shard = ec.shard_id();
+            for outcome in ec.tx_outcomes() {
+                certifying
+                    .entry(outcome.tx_hash())
+                    .or_default()
+                    .insert(shard);
+            }
+        }
+        local_ec
+            .tx_outcomes()
+            .iter()
+            .filter(|outcome| !refused.contains(&outcome.tx_hash()))
+            .filter_map(|outcome| {
+                let reported = certifying.get(&outcome.tx_hash());
+                let missing = outcome
+                    .counterparts()
+                    .iter()
+                    .find(|shard| !reported.is_some_and(|reported| reported.contains(shard)))?;
+                Some((outcome.tx_hash(), *missing))
+            })
+            .collect()
+    }
+
+    /// Validate the tick against the certificates it carries: that they
+    /// decide every transaction it settles, and that `receipts` follow
+    /// from what they decided.
+    ///
+    /// Completeness first — a transaction whose participants have not all
+    /// reported has no verdict to check receipts against, and
+    /// [`Self::uncovered_transactions`] is where the reason lives.
+    ///
+    /// Then exactly one receipt per outcome that carries one — every
+    /// non-aborted outcome, plus every abort settling a fee — in
     /// `tx_outcomes` canonical order, with matching `tx_hash` and
     /// matching receipt hash.
     ///
@@ -521,12 +598,16 @@ impl Finalization {
     ///
     /// Returns the corresponding [`ReceiptValidationError`] variant on
     /// the first inconsistency found.
-    pub fn validate_receipts_against_ec(&self) -> Result<(), ReceiptValidationError> {
+    pub fn validate_against_certificates(&self) -> Result<(), ReceiptValidationError> {
         let local_ec = self
             .execution_certificates
             .iter()
             .find(|ec| ec.tick_id() == &self.tick_id)
             .ok_or(ReceiptValidationError::MissingLocalEc)?;
+
+        if let Some((&tx_hash, &missing)) = self.uncovered_transactions().iter().next() {
+            return Err(ReceiptValidationError::IncompleteCoverage { tx_hash, missing });
+        }
 
         let refused = refused_transactions(&self.execution_certificates);
         let mut receipt_iter = self.receipts.iter();
@@ -605,11 +686,13 @@ impl Finalization {
     /// anything that reaches state by another road.
     ///
     /// It bites in one direction only. A refused transaction settles the
-    /// charge its outcome named and nothing else, because the failure to
-    /// stop there moves value one-sidedly. Anything the certificate does
-    /// not refuse passes as it stands — a receipt whose hash disagreed
-    /// with its outcome is caught at ingress, and dropping it here
-    /// instead would lose committed state with no diagnostic.
+    /// charge its outcome named and nothing else, and one no set of
+    /// certificates decides — a participant it names has not reported —
+    /// settles nothing at all, because the failure to stop there moves
+    /// value one-sidedly. Anything the certificates refuse nothing of and
+    /// decide between them passes as it stands — a receipt whose hash
+    /// disagreed with its outcome is caught at ingress, and dropping it
+    /// here instead would lose committed state with no diagnostic.
     ///
     /// The attested roots are deliberately not filtered this way:
     /// `local_receipt_root` covers everything the tick carried, because
@@ -623,6 +706,7 @@ impl Finalization {
         // a malformed certificate needs no special case on the commit
         // path.
         let refused = refused_transactions(&self.execution_certificates);
+        let uncovered = self.uncovered_transactions();
         // Per transaction, not a bare set of hashes: two legs of one payer
         // owing the same floor produce byte-identical charges, and a set
         // would let either stand in for the other.
@@ -637,8 +721,9 @@ impl Finalization {
         self.receipts
             .iter()
             .filter(|receipt| {
-                !refused.contains(&receipt.tx_hash)
-                    || charges.get(&receipt.tx_hash) == Some(&receipt.consensus.receipt_hash())
+                !uncovered.contains_key(&receipt.tx_hash)
+                    && (!refused.contains(&receipt.tx_hash)
+                        || charges.get(&receipt.tx_hash) == Some(&receipt.consensus.receipt_hash()))
             })
             .cloned()
             .collect()
