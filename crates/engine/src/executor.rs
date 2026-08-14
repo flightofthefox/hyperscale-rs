@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use blake3::hash as blake3_hash;
-use hyperscale_effects_bridge::vm_statics::{PackageCache, package_key, principal_for};
+use hyperscale_effects_bridge::vm_statics::{PackageCache, config_key, package_key, principal_for};
 use hyperscale_effects_bridge::{
     BridgeStatics, PoolRegistry, ProtocolHasher, admit_package, decode_tree, envelope_identity,
     witness_from_event,
@@ -33,8 +33,9 @@ use hyperscale_types::{
     compute_merkle_root, install_vm_statics,
 };
 use hyperscale_vm_effects::{
-    Address, CollectionId, Declaration, EffectSet, EffectTarget, EntryKey, InstanceRegistry,
-    NodeCall, PackageHash, PrefixShardResolver, SubstateKey, admit_tree, package_hash, route_tree,
+    Address, CallTarget, CollectionId, Declaration, EffectSet, EffectTarget, EntryKey,
+    InstanceRegistry, NodeCall, PackageHash, PrefixShardResolver, SubstateKey, admit_tree,
+    package_hash, route_tree,
 };
 use hyperscale_vm_kernel::{
     Baseline, BatchTx, EnvInputs, ExecutionMode, Locality, ManifestWalk, Outcome, Receipt,
@@ -77,6 +78,12 @@ pub struct PreparedTx {
     /// The envelope's signed execution ceiling, in fuel — one budget for
     /// the whole transaction, however many nodes its manifest walks.
     pub gas_limit: u64,
+    /// The locked configuration cells of the manifest's component
+    /// targets: `(cell, canonical config bytes)` per distinct target the
+    /// per-envelope registry resolves. A locked read makes no
+    /// participant, so every executing shard serves these from the
+    /// record rather than from state.
+    pub locked_configs: Vec<(SubstateKey, Vec<u8>)>,
 }
 
 /// The protocol crypto hash behind the kernel's hashing host function
@@ -124,6 +131,10 @@ pub struct TickBaseline {
     /// a baseline with nothing in flight over it — a preview, or a shard
     /// with no cross-shard leg outstanding.
     pub holds: ProvisionalHolds,
+    /// The cells locked at this baseline: instance configuration leaves,
+    /// their values in `cells` beside them. Lockedness both admits the
+    /// locked-read capability and refuses mutation.
+    pub locked: BTreeSet<SubstateKey>,
 }
 
 impl Substates for TickBaseline {
@@ -161,8 +172,8 @@ impl Substates for TickBaseline {
 }
 
 impl Baseline for TickBaseline {
-    fn is_locked(&self, _key: SubstateKey) -> bool {
-        false
+    fn is_locked(&self, key: SubstateKey) -> bool {
+        self.locked.contains(&key)
     }
 
     fn holds(&self, key: SubstateKey) -> BTreeMap<TxHash, u128> {
@@ -375,6 +386,24 @@ impl Executor {
         let declaration = routing
             .declaration()
             .map_err(|error| format!("declaration: {error:?}"))?;
+        // Every distinct component target's configuration leaf, served
+        // locked from its own record on whichever shard executes.
+        let mut locked_configs = Vec::new();
+        let mut config_targets = BTreeSet::new();
+        for call in &routing.calls {
+            if !config_targets.insert(call.target) {
+                continue;
+            }
+            let Ok(target @ CallTarget::Component(_)) = CallTarget::try_from(call.target) else {
+                continue;
+            };
+            if let Some(meta) = instances.get(target) {
+                let bytes = meta
+                    .config_bytes()
+                    .map_err(|error| format!("config encode: {error}"))?;
+                locked_configs.push((config_key(call.target), bytes));
+            }
+        }
         Ok(PreparedTx {
             calls: match authority {
                 TargetAuthority::Required => routing.calls,
@@ -399,6 +428,7 @@ impl Executor {
                 .map(|record| record.nullifier)
                 .collect(),
             gas_limit: vm.gas_limit,
+            locked_configs,
         })
     }
 }
@@ -655,13 +685,25 @@ fn assemble_published_tx(
                 writes_root(&writes),
             )
             .receipt_hash();
+            // The publish becomes a beacon fact: paired with the
+            // publisher as emitter, so the shard owning the publisher's
+            // prefix — the one that keeps the cell — is the one whose
+            // witness stream carries it, exactly once.
+            let package = package_hash(&ProtocolHasher, artifact);
+            let witnesses = vec![(
+                publisher.address(),
+                BeaconWitnessEvent::PackagePublished {
+                    package: Hash::from(package.0),
+                    publisher: publisher.address(),
+                },
+            )];
             CachedOutput::succeeded(
                 writes,
                 receipt_hash,
                 vm_metadata(work, None),
                 work,
                 Vec::new(),
-                Vec::new(),
+                witnesses,
             )
         },
         |reason| CachedOutput::failed(vm_metadata(work, Some(reason.clone()))),
@@ -884,6 +926,15 @@ impl Executor {
         }
         for entry in prepared.values() {
             materialize_declared(snapshot, &entry.declaration.set, &locality, &mut base);
+        }
+        // Locked configuration leaves land last so the record's value
+        // stands whatever the snapshot held: the record is the
+        // authority, and every participant shard serves it locally.
+        for entry in prepared.values() {
+            for (key, value) in &entry.locked_configs {
+                base.cells.insert(*key, value.clone());
+                base.locked.insert(*key);
+            }
         }
         // A manifest needn't touch its payer's own vault — a publish
         // declares no effects at all, and a call can spend entirely from

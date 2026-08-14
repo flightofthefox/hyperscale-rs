@@ -21,7 +21,7 @@ use hyperscale_types::{
     DeclaredKey, DeclaredRange, Derived, EnvelopeExt, Hash, MAX_STATE_ENTRIES_PER_TX, Routing,
     TransactionEnvelope, VmStatics, VmStaticsError, declared_work,
 };
-use hyperscale_vm_effects::stdlib::{AUTH, ENTROPY, VALIDATORS, VAULT, XRD as XRD_ROLE};
+use hyperscale_vm_effects::stdlib::{AUTH, CONFIG, ENTROPY, VALIDATORS, VAULT, XRD as XRD_ROLE};
 use hyperscale_vm_effects::{
     Address, AuthCell, AuthRole, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry,
     ManifestHash, MetadataCache, Mode, NativeAddr, PackageHash, PackageMetadata,
@@ -81,6 +81,16 @@ pub fn validator_key(pool: impl Into<Address>, validator: u64) -> SubstateKey {
 #[must_use]
 pub fn entropy_key(owner: impl Into<Address>) -> SubstateKey {
     child_key(&ProtocolHasher, owner, ENTROPY, &[])
+}
+
+/// An instance's configuration cell: the locked leaf its creation fixed.
+///
+/// Its value re-derives from the instance's own presented record, which
+/// is what serves it — a locked read makes no participant, so no shard
+/// reads another's state for it.
+#[must_use]
+pub fn config_key(owner: impl Into<Address>) -> SubstateKey {
+    child_key(&ProtocolHasher, owner, CONFIG, &[])
 }
 
 /// Where `publisher`'s copy of the package addressed by `package` lives:

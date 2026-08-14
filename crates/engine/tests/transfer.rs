@@ -15,19 +15,20 @@ use hyperscale_engine::{
 use hyperscale_storage::{SubstateStore, Substates, TickChain, TickOutput, VersionedStore};
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
-    BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange, Ed25519PrivateKey, EnvelopeExt,
-    Hash, NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain, SchemeId, SettledWrites,
-    ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey, TimestampRange, Transaction,
-    TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp, absorb_committed_cells,
+    BeaconWitnessEvent, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
+    Ed25519PrivateKey, EnvelopeExt, Hash, NetworkId, PrincipalAddr, ProvisionalHolds, RevealChain,
+    SchemeId, SettledWrites, ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey,
+    TimestampRange, Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
+    absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
-    AbiParam, Address, CollectionId, EnvelopeTree, Expr, Hash32, InstanceMeta, IntentDecl,
-    PackageHash, package_hash,
+    AbiParam, Address, Clause, CollectionId, EnvelopeTree, Expr, Hash32, InstanceMeta, IntentDecl,
+    ModeExpr, PackageHash, TargetExpr, Value, package_hash,
 };
 use hyperscale_vm_kernel::{amount_cell, encode_amount};
 use hyperscale_vm_manifest_builder::GraphBuilder;
 use hyperscale_vm_manifest_builder::native::account;
-use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_metadata};
+use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, CONFIG, account_metadata};
 
 /// The two accounts the transfer cases move funds between, as signing
 /// seeds rather than as literal addresses: a withdrawing node admits only
@@ -1122,6 +1123,7 @@ fn a_publish_writes_the_artifact_under_its_publisher() {
 
     let ConsensusReceipt::Succeeded {
         writes: database_updates,
+        beacon_witness_events,
         ..
     } = &executed[0].consensus
     else {
@@ -1131,6 +1133,17 @@ fn a_publish_writes_the_artifact_under_its_publisher() {
         package_cell(database_updates, payer, &artifact).as_deref(),
         Some(artifact.as_slice()),
         "the artifact lands whole in its content-addressed cell"
+    );
+    // The publish is a beacon fact: one witness, from the shard owning
+    // the publisher's prefix, carrying the content address the world
+    // prefetches on.
+    assert_eq!(
+        beacon_witness_events.as_slice(),
+        &[BeaconWitnessEvent::PackagePublished {
+            package: Hash::from(package_hash(&ProtocolHasher, &artifact).0),
+            publisher: payer.address(),
+        }],
+        "the publish settles with its beacon fact"
     );
     // The publisher paid: the vault carries the burn, and the fee is the
     // only other thing a publish writes.
@@ -1713,5 +1726,81 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
         vault_cell(&settled(writes, &[(payer, 1_000)]), component),
         Some(encode_amount(40).to_vec()),
         "the presented instance's vault holds the deposit"
+    );
+}
+
+/// A locked configuration read is served from the instance's own
+/// presented record: the value every shard derives locally, because a
+/// locked read makes no participant and no provision can carry it.
+///
+/// The published package appends a locked CONFIG clause to `deposit`, so
+/// materialization demands a locked cell no state anywhere holds — the
+/// deposit settles only because the baseline answers from the record.
+#[test]
+fn a_locked_config_read_serves_from_the_presented_record() {
+    let payer = fee_payer(7);
+    let key = Ed25519PrivateKey::from_bytes(&[7; 32]).unwrap();
+    let executor = Executor::new(ExecutionMode::Serial);
+
+    let mut metadata = account_metadata();
+    metadata.events.push("locked-config".into());
+    metadata
+        .methods
+        .get_mut("deposit")
+        .expect("the account declares deposit")
+        .effects
+        .push(Clause::Effect {
+            target: TargetExpr::Point(Expr::ChildKey {
+                owner: Box::new(Expr::SelfAddr),
+                role: CONFIG,
+                material: vec![],
+            }),
+            mode: ModeExpr::Locked,
+        });
+    let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
+    let package = package_hash(&ProtocolHasher, &artifact);
+    let publish = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
+        7, artifact,
+    )));
+    let executed = execute_on(&[(payer, 1_000_000)], &executor, &[publish]);
+    absorb_committed_cells([&executed[0].consensus]);
+
+    let meta = InstanceMeta {
+        package,
+        config: vec![Value::U64(7)],
+        salt: Hash32([8; 32]),
+    };
+    let component = meta.address(&ProtocolHasher);
+
+    let mut b = GraphBuilder::new();
+    let [] = b.call_signed(payer, "authorize", ());
+    let [funds] = b.call_bearing(payer, "withdraw", (*XRD, 25u128), 0);
+    let [] = b.call(component, "deposit", (funds.resource_is(*XRD),));
+    let graph = b.build().expect("every output is consumed");
+    let tree = EnvelopeTree {
+        root: IntentDecl {
+            graph,
+            params: Vec::new(),
+        },
+        root_bindings: Vec::new(),
+        subintents: Vec::new(),
+        instances: vec![meta],
+    };
+    let call = Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(TRANSFER_FEE)));
+    let executed = execute_on(
+        &[(payer, 1_000)],
+        &executor,
+        &[Arc::new(Verified::<Transaction>::from_persisted(call))],
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
+        panic!(
+            "a deposit behind a locked config read must settle: {:?}",
+            executed[0].consensus
+        );
+    };
+    assert_eq!(
+        vault_cell(&settled(writes, &[(payer, 1_000)]), component),
+        Some(encode_amount(25).to_vec()),
+        "the instance's vault holds the deposit"
     );
 }
