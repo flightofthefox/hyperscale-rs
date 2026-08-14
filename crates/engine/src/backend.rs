@@ -30,19 +30,22 @@ use crate::host::HostState;
 /// nodes disagreeing on whether a runaway guest trapped.
 const FUEL: u64 = 10_000_000;
 
-/// Runnable guest code by content address, growable while invocations
-/// run.
+/// The build verdict for guest code by content address, growable while
+/// invocations run.
 ///
 /// Shared between the target-gated backends — each fills it with its own
 /// compiled form — so package resolution cannot drift between targets
-/// the way a per-module map could. The ready map takes the metadata
+/// the way a per-module map could. The settled map takes the metadata
 /// cache's shape: lock-free loads on the invoke path, clone-and-swap on
-/// the rare publish, first write wins by content address. The pending
-/// set is what keeps cache state out of verdicts: an invocation arriving
-/// while its package compiles waits the work out rather than answering
-/// differently than a replica whose compile already finished.
+/// the rare publish, first write wins by content address. `None` records
+/// a build that refused these bytes, which is as settled an answer as a
+/// build that landed and is what keeps a refusal from being re-fetched
+/// and rebuilt forever. The pending set is what keeps cache state out of
+/// verdicts: an invocation arriving while its package compiles waits the
+/// work out rather than answering differently than a replica whose
+/// compile already finished.
 struct PackageSlots<C> {
-    ready: ArcSwap<BTreeMap<PackageHash, Arc<C>>>,
+    settled: ArcSwap<BTreeMap<PackageHash, Option<Arc<C>>>>,
     pending: Mutex<BTreeSet<PackageHash>>,
     done: Condvar,
 }
@@ -50,7 +53,7 @@ struct PackageSlots<C> {
 impl<C> PackageSlots<C> {
     fn new() -> Self {
         Self {
-            ready: ArcSwap::from_pointee(BTreeMap::new()),
+            settled: ArcSwap::from_pointee(BTreeMap::new()),
             pending: Mutex::new(BTreeSet::new()),
             done: Condvar::new(),
         }
@@ -58,12 +61,12 @@ impl<C> PackageSlots<C> {
 
     /// The runnable form of `package`, waiting out an in-flight compile.
     ///
-    /// `None` when the package was never absorbed or its build failed —
-    /// both deterministic functions of committed bytes, so every replica
-    /// answers alike.
+    /// `None` when the package was never absorbed or its build refused it
+    /// — both deterministic functions of committed bytes, so every
+    /// replica answers alike.
     fn resolve(&self, package: PackageHash) -> Option<Arc<C>> {
-        if let Some(code) = self.ready.load().get(&package) {
-            return Some(code.clone());
+        if let Some(verdict) = self.settled.load().get(&package) {
+            return verdict.clone();
         }
         let mut pending = self.pending.lock().expect("package slots lock poisoned");
         while pending.contains(&package) {
@@ -73,13 +76,13 @@ impl<C> PackageSlots<C> {
                 .expect("package slots lock poisoned");
         }
         drop(pending);
-        self.ready.load().get(&package).cloned()
+        self.settled.load().get(&package).cloned().flatten()
     }
 
     /// Claim the build of `package`: `true` exactly once per content
-    /// address, `false` when it is already runnable or in flight.
+    /// address, `false` when its verdict is settled or in flight.
     fn claim(&self, package: PackageHash) -> bool {
-        if self.ready.load().contains_key(&package) {
+        if self.settled.load().contains_key(&package) {
             return false;
         }
         self.pending
@@ -88,30 +91,30 @@ impl<C> PackageSlots<C> {
             .insert(package)
     }
 
-    /// Land a claimed build — `None` a failed one — and release its
-    /// waiters.
+    /// Land a claimed build's verdict — `None` a refusal — and release
+    /// its waiters.
     fn fulfil(&self, package: PackageHash, code: Option<C>) {
-        if let Some(code) = code {
-            let mut next = (**self.ready.load()).clone();
-            next.entry(package).or_insert_with(|| Arc::new(code));
-            self.ready.store(Arc::new(next));
-        }
+        let mut next = (**self.settled.load()).clone();
+        next.entry(package).or_insert_with(|| code.map(Arc::new));
+        self.settled.store(Arc::new(next));
         let mut pending = self.pending.lock().expect("package slots lock poisoned");
         pending.remove(&package);
         drop(pending);
         self.done.notify_all();
     }
 
-    /// Whether `package` is runnable right now, in-flight work excluded.
-    fn is_ready(&self, package: PackageHash) -> bool {
-        self.ready.load().contains_key(&package)
+    /// Whether `package` resolves without waiting, in-flight work
+    /// excluded. A refused build qualifies: it resolves to no code, and
+    /// it resolves there on every replica.
+    fn is_settled(&self, package: PackageHash) -> bool {
+        self.settled.load().contains_key(&package)
     }
 
-    /// Whether `package` is runnable or its build is in flight — the
-    /// probe that keeps a prefetch from re-requesting bytes the backend
-    /// already holds.
+    /// Whether `package`'s verdict is settled or its build is in flight
+    /// — the probe that keeps a prefetch from re-requesting bytes the
+    /// backend has already judged.
     fn is_known(&self, package: PackageHash) -> bool {
-        if self.is_ready(package) {
+        if self.is_settled(package) {
             return true;
         }
         self.pending
@@ -242,13 +245,14 @@ mod native {
             }
         }
 
-        /// Whether `package`'s code is resolvable without waiting.
+        /// Whether `package`'s code resolves without waiting — landed or
+        /// refused.
         #[must_use]
-        pub fn code_ready(&self, package: PackageHash) -> bool {
-            self.slots.is_ready(package)
+        pub fn code_settled(&self, package: PackageHash) -> bool {
+            self.slots.is_settled(package)
         }
 
-        /// Whether `package`'s code is held or being built.
+        /// Whether `package`'s code is judged or being built.
         #[must_use]
         pub fn code_known(&self, package: PackageHash) -> bool {
             self.slots.is_known(package)
@@ -417,13 +421,14 @@ mod reference {
             move |artifact: &[u8]| absorb_into(&slots, artifact)
         }
 
-        /// Whether `package`'s code is resolvable without waiting.
+        /// Whether `package`'s code resolves without waiting — landed or
+        /// refused.
         #[must_use]
-        pub fn code_ready(&self, package: PackageHash) -> bool {
-            self.slots.is_ready(package)
+        pub fn code_settled(&self, package: PackageHash) -> bool {
+            self.slots.is_settled(package)
         }
 
-        /// Whether `package`'s code is held or being built.
+        /// Whether `package`'s code is judged or being built.
         #[must_use]
         pub fn code_known(&self, package: PackageHash) -> bool {
             self.slots.is_known(package)
