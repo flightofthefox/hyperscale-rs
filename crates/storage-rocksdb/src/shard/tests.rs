@@ -16,9 +16,10 @@ use hyperscale_storage::test_helpers::{
     test_witness_payload_range_reads as helpers_test_witness_payload_range_reads, with_provisions,
 };
 use hyperscale_storage::{
-    ParentAnchor, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore,
-    Substates, VersionedStore,
+    PackageArtifactStore, ParentAnchor, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
+    SubstateStore, Substates, VersionedStore,
 };
+use hyperscale_types::test_utils::{STUB_PACKAGE_MARKER, install_stub_vm_statics};
 use hyperscale_types::{
     Address, AddressClass, AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block,
     BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, ExecutionCertificate,
@@ -1640,4 +1641,34 @@ fn the_tx_index_answers_with_the_local_shards_certificate() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_tx_index_answers_with_the_local_shards_certificate(&storage);
+}
+
+#[test]
+fn a_package_cell_lands_in_the_artifact_index_with_its_commit() {
+    // The judgement of what a package cell is belongs to the installed
+    // statics; the stub judges by local-key marker so the index write is
+    // under test without the VM stack.
+    install_stub_vm_statics();
+
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+
+    let artifact = vec![7u8; 64];
+    let mut cells = BTreeMap::from([(state_key(1, STUB_PACKAGE_MARKER), Some(artifact.clone()))]);
+    cells.insert(state_key(1, 10), Some(vec![9, 9, 9]));
+    let writes = SettledWrites::from_absolutes(cells);
+    let cert = make_test_finalization(BlockHeight::new(1), ShardId::ROOT);
+    storage.commit_certificate_with_writes(&cert, &writes);
+
+    assert_eq!(
+        storage.package_artifacts(),
+        vec![artifact],
+        "the package-marked cell is indexed; the ordinary cell is not"
+    );
+
+    // The index survives a reopen — it is what a restarting host reseeds
+    // its caches from.
+    drop(storage);
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    assert_eq!(storage.package_artifacts().len(), 1);
 }

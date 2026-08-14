@@ -7,11 +7,12 @@ use hyperscale_storage::test_helpers::{
 };
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    DedupWindow, ParentAnchor, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
-    SubstateStore, Substates, VersionedStore, test_helpers,
+    DedupWindow, PackageArtifactStore, ParentAnchor, SafeVoteRegisterStore, ShardChainReader,
+    ShardChainWriter, SubstateStore, Substates, VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::{
-    install_stub_vm_statics, stub_transaction, test_prefix, test_principal, test_transaction,
+    STUB_PACKAGE_MARKER, install_stub_vm_statics, stub_transaction, test_prefix, test_principal,
+    test_transaction,
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
@@ -1293,5 +1294,28 @@ fn dedup_window_stamps_each_batch_against_its_own_block() {
             WeightedTimestamp::from_millis(newer_ms).plus(RETENTION_HORIZON),
         ],
         "two blocks at different anchors must not share one deadline",
+    );
+}
+
+#[test]
+fn a_package_cell_lands_in_the_artifact_index_with_its_commit() {
+    // The judgement of what a package cell is belongs to the installed
+    // statics; the stub judges by local-key marker so the index write is
+    // under test without the VM stack.
+    install_stub_vm_statics();
+    let storage = SimShardStorage::default();
+
+    let artifact = vec![7u8; 64];
+    let mut cells = BTreeMap::from([(state_key(1, STUB_PACKAGE_MARKER), Some(artifact.clone()))]);
+    cells.insert(state_key(1, 10), Some(vec![9, 9, 9]));
+    let writes = SettledWrites::from_absolutes(cells);
+    let block = make_test_block(BlockHeight::new(1));
+    let qc = make_test_qc(&block);
+    commit_with(&storage, &writes, &block, &qc);
+
+    assert_eq!(
+        storage.package_artifacts(),
+        vec![artifact],
+        "the package-marked cell is indexed; the ordinary cell is not"
     );
 }

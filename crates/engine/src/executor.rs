@@ -258,13 +258,15 @@ impl Executor {
     #[must_use]
     pub fn with_pools(pools: &[StakePoolSeat], mode: ExecutionMode) -> Self {
         let world = genesis_world_with_pools(pools);
+        let backend = EngineBackend::new();
         install_vm_statics(Box::new(BridgeStatics {
             cache: world.cache.clone(),
             instances: world.instances.clone(),
+            artifact_sink: Some(Arc::new(backend.absorber())),
         }));
         Self {
             world,
-            backend: EngineBackend::new(),
+            backend,
             mode,
         }
     }
@@ -277,6 +279,37 @@ impl Executor {
     #[must_use]
     pub const fn packages(&self) -> &PackageCache {
         &self.world.cache
+    }
+
+    /// Seed one committed artifact from a store's package index: metadata
+    /// into the cache, code into the backend.
+    ///
+    /// The boot half of what commit-time absorption does live — a
+    /// restarted node re-learns its packages from the index its own
+    /// commits wrote. The index holds only committed, self-identified
+    /// artifacts, so a refusal here means a corrupt store and is skipped
+    /// loudly rather than trusted.
+    pub fn install_artifact(&self, artifact: &[u8]) {
+        match admit_package(artifact) {
+            Ok(metadata) => {
+                self.world
+                    .cache
+                    .publish(package_hash(&ProtocolHasher, artifact), metadata);
+                self.backend.absorb_artifact(artifact);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    reason = error.0,
+                    "indexed package artifact refused admission"
+                );
+            }
+        }
+    }
+
+    /// Whether `package`'s code is built and resolvable without waiting.
+    #[must_use]
+    pub fn package_code_ready(&self, package: PackageHash) -> bool {
+        self.backend.code_ready(package)
     }
 
     /// Derive one transaction's invocations, effect set, and nullifiers

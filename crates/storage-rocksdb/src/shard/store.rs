@@ -5,17 +5,19 @@ use std::time::Instant;
 use hex::encode as hex_encode;
 use hyperscale_metrics::{record_storage_operation, record_storage_write};
 use hyperscale_storage::tree::carry_noop_root;
-use hyperscale_storage::{JmtSnapshot, SubstateStore, VersionedStore};
+use hyperscale_storage::{JmtSnapshot, PackageArtifactStore, SubstateStore, VersionedStore};
 use hyperscale_types::{
     Block, BlockHeight, DeclaredRange, QuorumCertificate, StateRoot, SubstateKey, Verified,
 };
 use rocksdb::{WriteBatch, WriteOptions};
 
+use super::column_families::PackageArtifactsCf;
 use super::core::RocksDbShardStorage;
 use super::execution_certs::append_block_certs_to_batch;
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::metadata::read_jmt_metadata;
 use super::snapshot::RocksDbSnapshot;
+use crate::typed_cf::{TypedCf, iter_all};
 
 impl SubstateStore for RocksDbShardStorage {
     type Snapshot<'a> = RocksDbSnapshot<'a>;
@@ -237,5 +239,14 @@ impl RocksDbShardStorage {
         );
 
         true
+    }
+}
+
+impl PackageArtifactStore for RocksDbShardStorage {
+    fn package_artifacts(&self) -> Vec<Vec<u8>> {
+        let cf = self.cf();
+        iter_all::<PackageArtifactsCf>(&self.db, PackageArtifactsCf::handle(&cf))
+            .map(|(_, artifact)| artifact)
+            .collect()
     }
 }

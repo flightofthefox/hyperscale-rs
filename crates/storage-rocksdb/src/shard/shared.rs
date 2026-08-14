@@ -14,8 +14,8 @@ use std::sync::Arc;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::{
     AdoptSource, BlockForSync, BoundaryStore, GenesisCommit, ImportProgress, JmtSnapshot,
-    ParentAnchor, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore,
-    Substates, VersionedStore, WitnessSeed,
+    PackageArtifactStore, ParentAnchor, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
+    SubstateStore, Substates, VersionedStore, WitnessSeed,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlock,
@@ -60,6 +60,12 @@ impl std::ops::Deref for SharedStorage {
     type Target = RocksDbShardStorage;
     fn deref(&self) -> &RocksDbShardStorage {
         &self.0
+    }
+}
+
+impl PackageArtifactStore for SharedStorage {
+    fn package_artifacts(&self) -> Vec<Vec<u8>> {
+        self.0.package_artifacts()
     }
 }
 

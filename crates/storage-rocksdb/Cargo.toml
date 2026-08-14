@@ -19,6 +19,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true
+hyperscale-types = { workspace = true, features = ["test-utils"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true

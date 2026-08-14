@@ -931,7 +931,16 @@ impl VmStatics for StubVmStatics {
             ),
         })
     }
+
+    fn package_cell(&self, _owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<Hash> {
+        (local[0] == STUB_PACKAGE_MARKER)
+            .then(|| Hash::from_hash_bytes(&[*value.first().unwrap_or(&0); 32]))
+    }
 }
+
+/// The local-key first byte the stub judges a package cell by, in place
+/// of the content-address re-derivation the bridge statics perform.
+pub const STUB_PACKAGE_MARKER: u8 = 0xAB;
 
 /// Install [`StubVmStatics`] for this process. First-install-wins, like
 /// the production install — a test binary uses either the stub or the

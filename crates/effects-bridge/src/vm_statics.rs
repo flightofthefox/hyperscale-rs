@@ -18,7 +18,7 @@ use std::sync::{Arc, LazyLock};
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_types::{
-    DeclaredKey, DeclaredRange, Derived, EnvelopeExt, MAX_STATE_ENTRIES_PER_TX, Routing,
+    DeclaredKey, DeclaredRange, Derived, EnvelopeExt, Hash, MAX_STATE_ENTRIES_PER_TX, Routing,
     TransactionEnvelope, VmStatics, VmStaticsError, declared_work,
 };
 use hyperscale_vm_effects::stdlib::{AUTH, ENTROPY, VALIDATORS, VAULT, XRD as XRD_ROLE};
@@ -253,6 +253,11 @@ pub fn envelope_identity(vm: &TransactionEnvelope) -> ManifestHash {
     ManifestHash(vm.signing_hash().as_hash32())
 }
 
+/// A consumer of committed package artifacts — the engine's compile
+/// pipeline registers one so a package's code is being compiled from the
+/// moment its cell commits, not from its first call.
+pub type ArtifactSink = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 /// The bridge's [`VmStatics`]: `decode → admit → route` over the
 /// process's genesis-static metadata.
 pub struct BridgeStatics {
@@ -260,6 +265,23 @@ pub struct BridgeStatics {
     pub cache: PackageCache,
     /// Instance registrations, genesis-static.
     pub instances: InstanceRegistry,
+    /// Where a committed package's artifact bytes are handed on, beside
+    /// the metadata absorption.
+    pub artifact_sink: Option<ArtifactSink>,
+}
+
+/// The package a committed cell publishes, or `None` for every other
+/// cell.
+///
+/// A package cell is self-identifying: its key is the content address of
+/// the very bytes it stores, so recomputing the address from the value
+/// and rebuilding the key answers the question without any side channel,
+/// any tag, and any trust in what wrote it. A cell of any other kind
+/// cannot match except by finding a hash collision.
+#[must_use]
+pub fn committed_package(owner: Address, local: [u8; 16], value: &[u8]) -> Option<PackageHash> {
+    let package = package_hash(&ProtocolHasher, value);
+    (package_key(owner, package).local.0 == local).then_some(package)
 }
 
 /// The published-package cache: content-addressed, shared process-wide,
@@ -313,11 +335,9 @@ impl PackageCache {
     /// what wrote it. A cell of any other kind cannot match except by
     /// finding a hash collision.
     pub fn absorb_cell(&self, owner: impl Into<Address>, local: [u8; 16], value: &[u8]) {
-        let owner = owner.into();
-        let package = package_hash(&ProtocolHasher, value);
-        if package_key(owner, package).local.0 != local {
+        let Some(package) = committed_package(owner.into(), local, value) else {
             return;
-        }
+        };
         if let Ok(metadata) = admit_package(value) {
             self.publish(package, metadata);
         }
@@ -388,6 +408,16 @@ impl VmStatics for BridgeStatics {
             return;
         };
         self.cache.absorb_cell(owner, local, value);
+        if let Some(sink) = &self.artifact_sink
+            && committed_package(owner, local, value).is_some()
+        {
+            sink(value);
+        }
+    }
+
+    fn package_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<Hash> {
+        let owner = Address::from_bytes(owner).ok()?;
+        committed_package(owner, local, value).map(|package| Hash::from(package.0))
     }
 
     fn rule_admits(
@@ -554,6 +584,7 @@ mod tests {
         BridgeStatics {
             cache: PackageCache::new(cache),
             instances,
+            artifact_sink: None,
         }
     }
 

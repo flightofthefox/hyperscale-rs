@@ -165,6 +165,15 @@ where
 
         let network = Arc::new(network);
 
+        // Reseed published code from each store's package index — the
+        // boot half of commit-time absorption, so a restarted host
+        // executes calls to packages published before the restart.
+        for storage in storages.values() {
+            for artifact in storage.package_artifacts() {
+                executor.install_artifact(&artifact);
+            }
+        }
+
         // First pass: build ShardIo + Vec<Vnode> for each shard, plus the
         // per-shard dispatch handles map. ShardLoop construction is deferred
         // to a second pass because each ShardLoop needs an Arc<ProcessIo>

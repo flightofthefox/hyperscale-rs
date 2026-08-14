@@ -318,6 +318,19 @@ pub trait VmStatics: Send + Sync {
     fn absorb_committed_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) {
         let _ = (owner, local, value);
     }
+
+    /// The content address of the package this committed cell publishes,
+    /// or `None` for every other cell.
+    ///
+    /// What makes a cell a package is a property of its own bytes — the
+    /// value re-derives the cell's local key under its owner — so the
+    /// implementation decides, and this seam carries no VM vocabulary.
+    /// Storage backends consult it to index a committed package's
+    /// artifact bytes beside the commit that carries them.
+    fn package_cell(&self, owner: [u8; 32], local: [u8; 16], value: &[u8]) -> Option<Hash> {
+        let _ = (owner, local, value);
+        None
+    }
 }
 
 static VM_STATICS: OnceLock<Box<dyn VmStatics>> = OnceLock::new();
