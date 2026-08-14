@@ -610,6 +610,7 @@ mod tests {
 
     use hyperscale_types::test_utils::{
         install_stub_vm_statics, make_finalization, stub_transaction, test_prefix, test_principal,
+        test_transaction_running,
     };
     use hyperscale_types::{
         CommittedTxsRoot, Hash, MAX_FINALIZED_TX_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
@@ -866,14 +867,29 @@ mod tests {
         CommitDedupIndex::new()
     }
 
-    /// A window with nothing held back — what every case that is not
-    /// about package maturity wants.
-    fn all_packages_usable() -> TopologySnapshot {
+    /// A window whose registry lists nothing.
+    ///
+    /// It holds back everything that names a package and nothing that
+    /// does not, which is what every case here but the package ones
+    /// wants: their transactions run no code.
+    fn window_listing_no_packages() -> TopologySnapshot {
         TopologySnapshot::new(
             NetworkDefinition::simulator(),
             1,
             ValidatorSet::new(Vec::new()),
         )
+    }
+
+    /// The same window with `packages` listed as runnable.
+    fn window_listing(packages: &[Hash]) -> TopologySnapshot {
+        window_listing_no_packages().with_usable_packages(packages.iter().copied().collect())
+    }
+
+    fn tx_running(seed: u8, packages: &[Hash]) -> Arc<Verified<Transaction>> {
+        install_stub_vm_statics();
+        Arc::new(Verified::<Transaction>::from_persisted(
+            test_transaction_running(seed, packages),
+        ))
     }
 
     /// A successor of one chain that has answered nothing, so no pre-cut
@@ -918,7 +934,7 @@ mod tests {
             anchor,
             cut,
             &refuses_precut(),
-            &all_packages_usable(),
+            &window_listing_no_packages(),
         );
         assert!(
             refused.is_empty(),
@@ -932,7 +948,7 @@ mod tests {
             anchor,
             cut,
             &admits_precut(hash),
-            &all_packages_usable(),
+            &window_listing_no_packages(),
         );
         assert_eq!(
             admitted.len(),
@@ -960,7 +976,7 @@ mod tests {
             anchor,
             WeightedTimestamp::ZERO,
             &refuses_precut(),
-            &all_packages_usable(),
+            &window_listing_no_packages(),
         );
 
         assert_eq!(selected.len(), 1, "only the in-range tx should survive");
@@ -981,7 +997,7 @@ mod tests {
             anchor,
             WeightedTimestamp::ZERO,
             &refuses_precut(),
-            &all_packages_usable(),
+            &window_listing_no_packages(),
         );
 
         assert!(
@@ -1007,7 +1023,7 @@ mod tests {
             anchor,
             WeightedTimestamp::ZERO,
             &refuses_precut(),
-            &all_packages_usable(),
+            &window_listing_no_packages(),
         );
 
         assert!(selected.is_empty(), "malformed range should be filtered");
@@ -1027,7 +1043,7 @@ mod tests {
             anchor,
             WeightedTimestamp::ZERO,
             &refuses_precut(),
-            &all_packages_usable(),
+            &window_listing_no_packages(),
         );
 
         assert!(
@@ -1050,7 +1066,7 @@ mod tests {
             anchor,
             WeightedTimestamp::ZERO,
             &refuses_precut(),
-            &all_packages_usable(),
+            &window_listing_no_packages(),
         );
 
         assert_eq!(selected.len(), 1, "anchor == start_inclusive must be kept");
@@ -1073,8 +1089,61 @@ mod tests {
             anchor,
             WeightedTimestamp::ZERO,
             &refuses_precut(),
-            &all_packages_usable(),
+            &window_listing_no_packages(),
         );
         assert!(selected.is_empty());
+    }
+
+    /// A proposer offers only what its own voters would accept, and the
+    /// package rule is one of the things they ask. A transaction naming a
+    /// package the window does not list is left out; one naming a listed
+    /// package goes in.
+    ///
+    /// Stated as the permission, so the two ways a package can fail to be
+    /// runnable here — registered but still maturing, and never
+    /// registered at all — are refused by the same test.
+    #[test]
+    fn a_tx_naming_a_package_the_window_does_not_list_is_left_out() {
+        let listed = Hash::from_bytes(b"a package past its window");
+        let unlisted = Hash::from_bytes(b"a package still inside one");
+        let anchor = ts(1_000);
+
+        let runnable = tx_running(1, &[listed]);
+        let held = tx_running(2, &[unlisted]);
+        let selected = select_transactions(
+            &[Arc::clone(&runnable), held],
+            &HashSet::new(),
+            &empty_dedup_index(),
+            anchor,
+            WeightedTimestamp::ZERO,
+            &refuses_precut(),
+            &window_listing(&[listed]),
+        );
+
+        assert_eq!(
+            selected.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
+            vec![runnable.hash()],
+            "only the transaction whose packages the window lists is offered"
+        );
+    }
+
+    /// One unlisted package is enough, however many the transaction runs.
+    #[test]
+    fn one_unlisted_package_holds_back_a_tx_that_names_others_too() {
+        let listed = Hash::from_bytes(b"code the window lists");
+        let unlisted = Hash::from_bytes(b"code it does not");
+        let selected = select_transactions(
+            &[tx_running(3, &[listed, unlisted])],
+            &HashSet::new(),
+            &empty_dedup_index(),
+            ts(1_000),
+            WeightedTimestamp::ZERO,
+            &refuses_precut(),
+            &window_listing(&[listed]),
+        );
+        assert!(
+            selected.is_empty(),
+            "a transaction is offered only when every package it runs is listed"
+        );
     }
 }
