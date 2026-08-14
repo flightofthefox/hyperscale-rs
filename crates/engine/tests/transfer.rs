@@ -20,7 +20,10 @@ use hyperscale_types::{
     ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey, TimestampRange, Transaction,
     TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp, absorb_committed_cells,
 };
-use hyperscale_vm_effects::{AbiParam, Address, CollectionId, Expr, PackageHash, package_hash};
+use hyperscale_vm_effects::{
+    AbiParam, Address, CollectionId, EnvelopeTree, Expr, Hash32, InstanceMeta, IntentDecl,
+    PackageHash, package_hash,
+};
 use hyperscale_vm_kernel::{amount_cell, encode_amount};
 use hyperscale_vm_manifest_builder::GraphBuilder;
 use hyperscale_vm_manifest_builder::native::account;
@@ -1629,5 +1632,86 @@ fn a_committed_cell_that_is_not_a_package_is_ignored() {
     assert!(
         executor.packages().load().get(bogus).is_none(),
         "vault writes are not packages"
+    );
+}
+
+/// The full pipeline a runtime-published package rides: its cell
+/// commits, its code compiles, and a presented instance of it — an
+/// address computed by a client, created nowhere — answers a call whose
+/// invocation runs the freshly compiled guest.
+#[test]
+fn a_presented_instance_of_a_published_package_answers_a_call() {
+    let payer = fee_payer(7);
+    let key = Ed25519PrivateKey::from_bytes(&[7; 32]).unwrap();
+    let executor = Executor::new(ExecutionMode::Serial);
+
+    let mut metadata = account_metadata();
+    metadata.events.push("instantiable".into());
+    let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
+    let package = package_hash(&ProtocolHasher, &artifact);
+    let publish = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
+        7, artifact,
+    )));
+    let executed = execute_on(&[(payer, 1_000_000)], &executor, &[publish]);
+    let ConsensusReceipt::Succeeded { .. } = &executed[0].consensus else {
+        panic!("the publish must succeed: {:?}", executed[0].consensus);
+    };
+    absorb_committed_cells([&executed[0].consensus]);
+
+    // The instance is computed, not created: a package hash, a
+    // configuration, and a salt derive the address, and the presented
+    // record carrying them is the whole of instantiation.
+    let meta = InstanceMeta {
+        package,
+        config: Vec::new(),
+        salt: Hash32([7; 32]),
+    };
+    let component = meta.address(&ProtocolHasher);
+
+    let mut b = GraphBuilder::new();
+    let [] = b.call_signed(payer, "authorize", ());
+    let [funds] = b.call_bearing(payer, "withdraw", (*XRD, 40u128), 0);
+    let [] = b.call(component, "deposit", (funds.resource_is(*XRD),));
+    let graph = b.build().expect("every output is consumed");
+    let tree = EnvelopeTree {
+        root: IntentDecl {
+            graph,
+            params: Vec::new(),
+        },
+        root_bindings: Vec::new(),
+        subintents: Vec::new(),
+        instances: vec![meta],
+    };
+
+    // The same call without its record has an unresolvable target and
+    // never clears admission.
+    let mut unpresented = tree.clone();
+    unpresented.instances.clear();
+    let bare =
+        Transaction::new(client().sign_tree(&unpresented, Vec::new(), &key, terms(TRANSFER_FEE)));
+    let refusal = bare
+        .try_derived()
+        .expect_err("an unpresented instance target must refuse");
+    assert!(refusal.0.contains("no instance"), "reason = {}", refusal.0);
+
+    // Presented: the call admits, the invocation resolves the freshly
+    // compiled package — waiting out the compile if it is still in
+    // flight — and the instance's vault holds the deposit.
+    let call = Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(TRANSFER_FEE)));
+    let executed = execute_on(
+        &[(payer, 1_000)],
+        &executor,
+        &[Arc::new(Verified::<Transaction>::from_persisted(call))],
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
+        panic!(
+            "the presented call must succeed: {:?}",
+            executed[0].consensus
+        );
+    };
+    assert_eq!(
+        vault_cell(&settled(writes, &[(payer, 1_000)]), component),
+        Some(encode_amount(40).to_vec()),
+        "the presented instance's vault holds the deposit"
     );
 }

@@ -474,19 +474,26 @@ impl VmStatics for BridgeStatics {
             }
         }
         let packages = self.cache.load();
+        // The per-envelope registry: what genesis serves plus the tree's
+        // own presented instance records, each registered at exactly the
+        // address it derives — the whole of instantiation, composed
+        // identically on every node from the signed tree alone.
+        let instances = self
+            .instances
+            .with_instances(&tree.instances, &ProtocolHasher);
         let admitted = admit_tree(
             &tree,
             signer,
             envelope_identity(vm),
             &packages,
-            &self.instances,
+            &instances,
             &ProtocolHasher,
         )
         .map_err(|error| VmStaticsError(format!("admission: {error}")))?;
         let routing = route_tree(
             &admitted,
             &packages,
-            &self.instances,
+            &instances,
             &ProtocolHasher,
             &PrefixShardResolver { bits: 0 },
         )
@@ -647,6 +654,7 @@ mod tests {
             },
             root_bindings: Vec::new(),
             subintents: Vec::new(),
+            instances: Vec::new(),
         }
     }
 
@@ -697,6 +705,7 @@ mod tests {
                     },
                 }],
             }],
+            instances: Vec::new(),
         }
     }
 

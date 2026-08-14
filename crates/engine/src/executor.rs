@@ -344,19 +344,25 @@ impl Executor {
         // shard's verdict before the transaction committed.
         let signer = principal_for(vm.signer_scheme, &vm.signer)
             .ok_or_else(|| "the envelope's signer key derives no principal".to_string())?;
+        // The same per-envelope registry admission composed: genesis
+        // plus the tree's own presented instance records.
+        let instances = self
+            .world
+            .instances
+            .with_instances(&tree.instances, &ProtocolHasher);
         let admitted = admit_tree(
             &tree,
             signer,
             envelope_identity(vm),
             &packages,
-            &self.world.instances,
+            &instances,
             &ProtocolHasher,
         )
         .map_err(|error| format!("admission: {error}"))?;
         let routing = route_tree(
             &admitted,
             &packages,
-            &self.world.instances,
+            &instances,
             &ProtocolHasher,
             &PrefixShardResolver { bits: 0 },
         )

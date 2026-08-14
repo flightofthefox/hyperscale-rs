@@ -1090,6 +1090,7 @@ pub fn build_transfer_paid_by(
             },
             root_bindings: Vec::new(),
             subintents: Vec::new(),
+            instances: Vec::new(),
         },
         Vec::new(),
         payer,
