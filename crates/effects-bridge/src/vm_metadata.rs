@@ -1,16 +1,13 @@
-//! The package-metadata section codec's chain-policy caps.
+//! The package-metadata section codec's chain-policy byte budget.
 //!
-//! The encoding itself is the vocabulary's own — canonical HBOR of
-//! [`PackageMetadata`], the same bytes the artifact section carries — and
-//! so are the semantic bounds, which [`check_metadata`] enforces beside
-//! the vocabulary it validates. What belongs here is what the vocabulary
-//! deliberately does not fix: the byte budget a section may claim of a
-//! transaction, and the nesting cap that budget implies.
+//! The codec itself is the vocabulary's own — canonical HBOR of
+//! [`PackageMetadata`] at the vocabulary's wire depth, judged by its own
+//! bounds. What belongs here is the one thing the vocabulary deliberately
+//! does not fix: the byte budget a section may claim of a transaction.
 
-use hyperscale_hbor::{from_slice_with_depth, to_vec_with_depth};
 use hyperscale_types::{MAX_TX_BYTES_LEN, VmStaticsError};
 use hyperscale_vm_effects::{
-    MAX_CLAUSE_DEPTH, MAX_EXPR_DEPTH, MAX_VALUE_DEPTH, PackageMetadata, check_metadata,
+    PackageMetadata, decode_metadata as decode_canonical, encode_metadata as encode_canonical,
 };
 
 /// The bound on an encoded metadata section.
@@ -23,16 +20,6 @@ use hyperscale_vm_effects::{
 /// can outrun the input.
 pub const MAX_PACKAGE_METADATA_BYTES: usize = MAX_TX_BYTES_LEN / 4;
 
-/// The nesting cap the section codec encodes and decodes at.
-///
-/// A vocabulary layer costs at most two decoder levels — a collection
-/// field and its hoisted element body — so the clause, expression, and
-/// value bounds translate at two apiece, over a fixed prefix for the
-/// record, its method table, a method, and a clause's target and mode.
-/// The cap admits everything [`check_metadata`] accepts; the checks are
-/// what decide.
-const METADATA_WIRE_DEPTH: usize = 16 + 2 * (MAX_CLAUSE_DEPTH + MAX_EXPR_DEPTH + MAX_VALUE_DEPTH);
-
 /// Encode package metadata into its canonical section bytes.
 ///
 /// # Errors
@@ -40,9 +27,7 @@ const METADATA_WIRE_DEPTH: usize = 16 + 2 * (MAX_CLAUSE_DEPTH + MAX_EXPR_DEPTH +
 /// [`VmStaticsError`] if the metadata is past a bound decode enforces, so
 /// that whatever this returns decodes back to an equal value.
 pub fn encode_metadata(metadata: &PackageMetadata) -> Result<Vec<u8>, VmStaticsError> {
-    check_metadata(metadata).map_err(|error| VmStaticsError(error.0))?;
-    let bytes = to_vec_with_depth(metadata, METADATA_WIRE_DEPTH)
-        .map_err(|error| VmStaticsError(format!("metadata encode: {error}")))?;
+    let bytes = encode_canonical(metadata).map_err(|error| VmStaticsError(error.to_string()))?;
     if bytes.len() > MAX_PACKAGE_METADATA_BYTES {
         return Err(VmStaticsError(format!(
             "metadata encodes to {} bytes, past the {MAX_PACKAGE_METADATA_BYTES} cap",
@@ -65,24 +50,23 @@ pub fn decode_metadata(bytes: &[u8]) -> Result<PackageMetadata, VmStaticsError> 
             bytes.len()
         )));
     }
-    let metadata: PackageMetadata = from_slice_with_depth(bytes, METADATA_WIRE_DEPTH)
-        .map_err(|error| VmStaticsError(format!("metadata decode: {error}")))?;
-    check_metadata(&metadata).map_err(|error| VmStaticsError(error.0))?;
-    Ok(metadata)
+    decode_canonical(bytes).map_err(|error| VmStaticsError(error.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
+    use hyperscale_hbor::to_vec_with_depth;
     use hyperscale_types::MAX_EVENT_TYPES;
     use hyperscale_vm_effects::stdlib::{
         VAULT, account_metadata, amm_metadata, book_metadata, splitter_metadata,
     };
     use hyperscale_vm_effects::{
         Accessibility, Address, AddressClass, CallSite, Clause, EdgeContent, Expr, LocalKey,
-        MAX_EFFECTS_PER_SIGNATURE, MethodSignature, ModeExpr, ParamType, RoleId, SubstateKey,
-        TargetExpr, Value,
+        MAX_CLAUSE_DEPTH, MAX_EFFECTS_PER_SIGNATURE, MAX_EXPR_DEPTH, MAX_VALUE_DEPTH,
+        METADATA_WIRE_DEPTH, MethodSignature, ModeExpr, ParamType, RoleId, SubstateKey, TargetExpr,
+        Value,
     };
 
     use super::*;
