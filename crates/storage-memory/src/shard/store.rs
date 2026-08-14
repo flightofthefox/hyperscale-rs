@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::lock_recover::read_or_recover;
 use hyperscale_storage::{PackageArtifactStore, SubstateStore, Substates, VersionedStore};
-use hyperscale_types::{BlockHeight, DeclaredRange, StateRoot, SubstateKey};
+use hyperscale_types::{BlockHeight, DeclaredRange, Hash, StateRoot, SubstateKey};
 
 use super::core::SimShardStorage;
 use super::snapshot::SimSnapshot;
@@ -126,5 +126,12 @@ impl PackageArtifactStore for SimShardStorage {
             .values()
             .cloned()
             .collect()
+    }
+
+    fn package_artifact(&self, package: Hash) -> Option<Vec<u8>> {
+        read_or_recover(&self.state)
+            .package_artifacts
+            .get(&package)
+            .cloned()
     }
 }

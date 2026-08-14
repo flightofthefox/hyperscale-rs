@@ -22,6 +22,9 @@ pub struct NodeConfig {
     pub shard_witness_fetch: FetchConfig,
     /// Missing-proposal fetch configuration.
     pub beacon_proposal_fetch: FetchConfig,
+    /// Package artifact fetch configuration. Small chunks: an artifact
+    /// runs to a transaction's whole byte budget.
+    pub package_artifact_fetch: FetchConfig,
     /// Batch-window configuration.
     pub batch: BatchConfig,
 }

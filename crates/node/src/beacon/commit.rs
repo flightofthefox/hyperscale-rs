@@ -92,7 +92,9 @@ impl Default for BeaconCommitCoordinator {
 mod tests {
     use crossbeam::channel::{Receiver, Sender, bounded};
     use hyperscale_storage::test_helpers::{make_test_beacon_block, make_test_beacon_state};
-    use hyperscale_storage::{BeaconChainReader, BeaconChainWriter, RatifyRegisterStore};
+    use hyperscale_storage::{
+        BeaconChainReader, BeaconChainWriter, FetchedPackageStore, RatifyRegisterStore,
+    };
     use hyperscale_storage_memory::SimBeaconStorage;
     use hyperscale_types::{
         BeaconBlockHash, RatifyPhase, RatifyRound, RatifyVoteRecord, ValidatorId,
@@ -113,6 +115,8 @@ mod tests {
         entered: Sender<()>,
         release: Receiver<()>,
     }
+
+    impl FetchedPackageStore for BlockingBeaconStorage {}
 
     impl BeaconChainReader for BlockingBeaconStorage {
         fn get_beacon_block_by_epoch(

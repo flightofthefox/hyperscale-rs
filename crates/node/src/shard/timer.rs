@@ -20,6 +20,7 @@ use crate::shard::cross_shard::{
     ProvisionBinding,
 };
 use crate::shard::mempool::TransactionBinding;
+use crate::shard::packages::PackageArtifactBinding;
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -45,5 +46,6 @@ where
         self.drive_fetch::<ProvisionBinding>(FetchInput::Tick);
         self.drive_fetch::<ExecCertBinding>(FetchInput::Tick);
         self.drive_fetch::<CommittedTxBinding>(FetchInput::Tick);
+        self.drive_fetch::<PackageArtifactBinding>(FetchInput::Tick);
     }
 }

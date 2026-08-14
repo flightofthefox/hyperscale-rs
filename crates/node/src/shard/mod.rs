@@ -28,6 +28,7 @@ pub(crate) mod consensus;
 pub(crate) mod cross_shard;
 pub(crate) mod io;
 pub(crate) mod mempool;
+pub(crate) mod packages;
 pub(crate) mod phase_times;
 pub(crate) mod verify;
 
@@ -76,6 +77,7 @@ use crate::shard::cross_shard::{
     ProvisionBinding,
 };
 use crate::shard::mempool::TransactionBinding;
+use crate::shard::packages::PackageArtifactBinding;
 use crate::vnode::Vnode;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
@@ -474,6 +476,12 @@ where
             // ── Fetch protocol ─────────────────────────────────────────
             ShardScopedInput::TransactionsFetchFailed { hashes } => {
                 self.drive_fetch::<TransactionBinding>(FetchInput::Failed { ids: hashes });
+            }
+            ShardScopedInput::PackageArtifactsFetched { artifacts } => {
+                self.handle_package_artifacts_fetched(&artifacts);
+            }
+            ShardScopedInput::PackageArtifactsFetchFailed { ids } => {
+                self.drive_fetch::<PackageArtifactBinding>(FetchInput::Failed { ids });
             }
             ShardScopedInput::ProvisionsFetchFailed {
                 source_shard,

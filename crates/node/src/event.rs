@@ -23,7 +23,7 @@ use hyperscale_network::RequestError;
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
-    FinalizationHash, HeaderFetchCount, LeafIndex, PredecessorTerminal, ProvisionHash,
+    FinalizationHash, Hash, HeaderFetchCount, LeafIndex, PredecessorTerminal, ProvisionHash,
     ShardForkProof, ShardId, ShardVoteEquivocation, Transaction, TxHash, ValidatorId, Verifiable,
     Verified,
 };
@@ -143,6 +143,21 @@ pub enum ShardScopedInput {
     TransactionsFetched {
         /// Transactions returned by the peer.
         batch: Vec<Arc<Transaction>>,
+    },
+
+    /// Package artifacts delivered by the fetch protocol, already
+    /// verified: each hashed to a requested content address at the
+    /// response boundary.
+    PackageArtifactsFetched {
+        /// The verified artifacts' bytes.
+        artifacts: Vec<Vec<u8>>,
+    },
+
+    /// A package artifact request failed or returned without some ids;
+    /// releases the in-flight slots for retry.
+    PackageArtifactsFetchFailed {
+        /// The content addresses still missing.
+        ids: Vec<Hash>,
     },
 
     /// Locally-submitted tx delivered to a passive co-host: a hosted
@@ -498,9 +513,10 @@ impl ShardScopedInput {
                 // through to Internal.
                 _ => EventPriority::Internal,
             },
-            Self::TransactionGossipReceived { .. } | Self::TransactionsFetched { .. } => {
-                EventPriority::Network
-            }
+            Self::TransactionGossipReceived { .. }
+            | Self::TransactionsFetched { .. }
+            | Self::PackageArtifactsFetched { .. }
+            | Self::PackageArtifactsFetchFailed { .. } => EventPriority::Network,
             Self::CommittedBlockGossipReceived { .. }
             | Self::ShardForkProofGossipReceived { .. }
             | Self::ShardVoteEquivocationGossipReceived { .. } => EventPriority::Network,

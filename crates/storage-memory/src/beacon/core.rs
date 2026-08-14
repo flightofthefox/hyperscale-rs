@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use hyperscale_types::{
-    BeaconBlockHash, BeaconState, CertifiedBeaconBlock, Epoch, RatifyVoteRecord, ValidatorId,
+    BeaconBlockHash, BeaconState, CertifiedBeaconBlock, Epoch, Hash, RatifyVoteRecord, ValidatorId,
     Verified,
 };
 
@@ -42,6 +42,9 @@ pub(super) struct Inner {
     /// Per-validator durable ratification registers. Mirrors the
     /// production `ratify_registers` CF.
     pub(super) ratify_records: HashMap<ValidatorId, RatifyVoteRecord>,
+    /// Fetched package artifacts by content address. Mirrors the
+    /// production `fetched_packages` CF.
+    pub(super) fetched_packages: BTreeMap<Hash, Vec<u8>>,
 }
 
 impl SimBeaconStorage {
