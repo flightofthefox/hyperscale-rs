@@ -28,7 +28,7 @@ use hyperscale_storage::{
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryLeaf, ProtocolHasher, QuorumCertificate,
     SafeVoteRegisters, SettledWrites, StateRoot, SubstateKey, ValidatorId, Verified,
-    entry_leaf_key,
+    entry_leaf_key, vm_statics, vm_statics_installed,
 };
 use hyperscale_vm_effects::{Address, CollectionId};
 use rocksdb::{
@@ -40,8 +40,8 @@ use tracing::{Level, Span, instrument};
 
 use super::column_families::{
     ALL_COLUMN_FAMILIES, CfHandles, EntriesCf, EntriesHistoryCf, HOT_WRITE_COLUMN_FAMILIES,
-    JmtNodesCf, STATE_HISTORY_CF, StaleEntriesHistoryCf, StaleJmtNodesCf, StaleStateHistoryCf,
-    StateCf, StateHistoryCf, SubstateBytesCf,
+    JmtNodesCf, PackageArtifactsCf, STATE_HISTORY_CF, StaleEntriesHistoryCf, StaleJmtNodesCf,
+    StaleStateHistoryCf, StateCf, StateHistoryCf, SubstateBytesCf,
 };
 use super::entry_key::VersionedEntryKeyCodec;
 use super::jmt_snapshot_store::SnapshotTreeStore;
@@ -575,6 +575,26 @@ impl RocksDbShardStorage {
             &mut stale_history_keys,
             pending,
         );
+
+        // A committed cell that self-identifies as a package lands its
+        // artifact in the content-addressed index, in the same atomic
+        // batch as the state that carries it — every commit path funnels
+        // through here, so synced and imported blocks index alike. What
+        // makes a cell a package is the VM's judgement; without installed
+        // statics (bare storage tests) nothing indexes, matching the
+        // cache-absorption seam.
+        if vm_statics_installed() {
+            let statics = vm_statics();
+            let artifacts_cf = PackageArtifactsCf::handle(&cf);
+            for (key, change) in writes.cells() {
+                if let Some(value) = change
+                    && let Some(package) =
+                        statics.package_cell(key.owner.to_bytes(), key.local.0, value)
+                {
+                    batch_put::<PackageArtifactsCf>(batch, artifacts_cf, &package, value);
+                }
+            }
+        }
 
         // Index the history keys by version so GC can delete them without
         // scanning StateHistoryCf. Skipped when write_history is false

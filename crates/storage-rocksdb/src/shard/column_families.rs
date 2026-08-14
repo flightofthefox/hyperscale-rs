@@ -166,6 +166,16 @@ pub const IMPORT_STAGING_CF: &str = "import_staging";
 /// bundle, not `Provisions::block_height`, which is the source shard's.
 pub const PROVISIONS_CF: &str = "provisions";
 
+/// Column family indexing committed package artifacts by content address.
+///
+/// Key: the 32-byte package hash; value: the artifact bytes, verbatim —
+/// the same bytes the package cell stores. Derived state, written in the
+/// commit batch whenever a committed cell self-identifies as a package,
+/// so a restarted node re-learns published code from here without
+/// scanning cells it cannot name. Content-addressed, so re-writing an
+/// entry is writing the same bytes.
+pub const PACKAGE_ARTIFACTS_CF: &str = "package_artifacts";
+
 // Default-CF metadata keys are defined as MetadataEntry types in typed_cf.rs.
 // See CommittedHeightEntry, CommittedHashEntry, CommittedQcEntry, JmtMetadataEntry.
 
@@ -196,6 +206,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     SAFE_VOTE_REGISTERS_CF,
     IMPORT_STAGING_CF,
     PROVISIONS_CF,
+    PACKAGE_ARTIFACTS_CF,
 ];
 
 // ─── CfHandles ───────────────────────────────────────────────────────────────
@@ -227,6 +238,7 @@ pub struct CfHandles<'a> {
     safe_vote_registers: &'a ColumnFamily,
     import_staging: &'a ColumnFamily,
     provisions: &'a ColumnFamily,
+    package_artifacts: &'a ColumnFamily,
 }
 
 impl<'a> CfHandles<'a> {
@@ -259,6 +271,7 @@ impl<'a> CfHandles<'a> {
             substate_bytes: resolve(SUBSTATE_BYTES_CF),
             safe_vote_registers: resolve(SAFE_VOTE_REGISTERS_CF),
             import_staging: resolve(IMPORT_STAGING_CF),
+            package_artifacts: resolve(PACKAGE_ARTIFACTS_CF),
             provisions: resolve(PROVISIONS_CF),
         }
     }
@@ -346,6 +359,21 @@ impl TypedCf for SubstateBytesCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.substate_bytes
+    }
+}
+
+/// Committed package artifacts by content address; see
+/// [`PACKAGE_ARTIFACTS_CF`].
+pub struct PackageArtifactsCf;
+impl TypedCf for PackageArtifactsCf {
+    const NAME: &'static str = PACKAGE_ARTIFACTS_CF;
+    type Key = Hash; // the package's content address
+    type Value = Vec<u8>; // the artifact bytes, verbatim
+    type KeyCodec = HashCodec;
+    type ValueCodec = RawCodec;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.package_artifacts
     }
 }
 

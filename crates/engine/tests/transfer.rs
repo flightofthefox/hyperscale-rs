@@ -20,7 +20,7 @@ use hyperscale_types::{
     ShardId, ShardTrie, StateRoot, StateWrites, SubstateKey, TimestampRange, Transaction,
     TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp, absorb_committed_cells,
 };
-use hyperscale_vm_effects::{AbiParam, Address, CollectionId, Expr, package_hash};
+use hyperscale_vm_effects::{AbiParam, Address, CollectionId, Expr, PackageHash, package_hash};
 use hyperscale_vm_kernel::{amount_cell, encode_amount};
 use hyperscale_vm_manifest_builder::GraphBuilder;
 use hyperscale_vm_manifest_builder::native::account;
@@ -1217,6 +1217,76 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
         Some(&metadata),
         "the committed cell published exactly the metadata the artifact declares"
     );
+}
+
+/// Wait out the compile worker; the bound is a harness valve, not a
+/// verdict — consensus never reads a clock here.
+fn await_code_ready(executor: &Executor, package: PackageHash) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while !executor.package_code_ready(package) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the package's code never became resolvable"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_committed_publish_compiles_ahead_of_its_first_call() {
+    let payer = fee_payer(7);
+    let executor = Executor::new(ExecutionMode::Serial);
+
+    let mut metadata = account_metadata();
+    metadata.events.push("compiled".into());
+    let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
+    let package = package_hash(&ProtocolHasher, &artifact);
+    assert!(
+        !executor.package_code_ready(package),
+        "the code is unknown before its block commits"
+    );
+
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
+        7, artifact,
+    )));
+    let executed = execute_on(&[(payer, 1_000_000)], &executor, &[tx]);
+    let ConsensusReceipt::Succeeded { .. } = &executed[0].consensus else {
+        panic!("the publish must succeed: {:?}", executed[0].consensus);
+    };
+    assert!(
+        !executor.package_code_ready(package),
+        "execution alone compiles nothing"
+    );
+
+    // The same committed-cell walk that grows the metadata cache hands
+    // the artifact to the compile worker: the code is on its way from
+    // the commit, not from the first call that needs it.
+    absorb_committed_cells([&executed[0].consensus]);
+    await_code_ready(&executor, package);
+}
+
+#[test]
+fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
+    let executor = Executor::new(ExecutionMode::Serial);
+
+    let mut metadata = account_metadata();
+    metadata.events.push("reseeded".into());
+    let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
+    let package = package_hash(&ProtocolHasher, &artifact);
+
+    // What a restarting host replays from its stores' package indices:
+    // one call re-learns the metadata and queues the compile.
+    executor.install_artifact(&artifact);
+    assert_eq!(
+        executor.packages().load().get(package),
+        Some(&metadata),
+        "the reseeded artifact's metadata is routable"
+    );
+    await_code_ready(&executor, package);
+
+    // Junk in the index is refused, not trusted: the cells are the
+    // authority and the index is derived.
+    executor.install_artifact(b"\0asm\x01\0\0\0");
 }
 
 #[test]

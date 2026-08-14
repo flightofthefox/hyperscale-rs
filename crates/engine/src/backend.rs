@@ -11,6 +11,12 @@
 //! own declaration, so an embedder here can get engine embedding wrong
 //! and cannot get manifest semantics wrong.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Condvar, Mutex};
+
+use arc_swap::ArcSwap;
+use hyperscale_vm_effects::PackageHash;
+
 use crate::host::HostState;
 
 /// The ceiling on what one invocation may consume, whatever its
@@ -24,10 +30,90 @@ use crate::host::HostState;
 /// nodes disagreeing on whether a runaway guest trapped.
 const FUEL: u64 = 10_000_000;
 
+/// Runnable guest code by content address, growable while invocations
+/// run.
+///
+/// Shared between the target-gated backends — each fills it with its own
+/// compiled form — so package resolution cannot drift between targets
+/// the way a per-module map could. The ready map takes the metadata
+/// cache's shape: lock-free loads on the invoke path, clone-and-swap on
+/// the rare publish, first write wins by content address. The pending
+/// set is what keeps cache state out of verdicts: an invocation arriving
+/// while its package compiles waits the work out rather than answering
+/// differently than a replica whose compile already finished.
+struct PackageSlots<C> {
+    ready: ArcSwap<BTreeMap<PackageHash, Arc<C>>>,
+    pending: Mutex<BTreeSet<PackageHash>>,
+    done: Condvar,
+}
+
+impl<C> PackageSlots<C> {
+    fn new() -> Self {
+        Self {
+            ready: ArcSwap::from_pointee(BTreeMap::new()),
+            pending: Mutex::new(BTreeSet::new()),
+            done: Condvar::new(),
+        }
+    }
+
+    /// The runnable form of `package`, waiting out an in-flight compile.
+    ///
+    /// `None` when the package was never absorbed or its build failed —
+    /// both deterministic functions of committed bytes, so every replica
+    /// answers alike.
+    fn resolve(&self, package: PackageHash) -> Option<Arc<C>> {
+        if let Some(code) = self.ready.load().get(&package) {
+            return Some(code.clone());
+        }
+        let mut pending = self.pending.lock().expect("package slots lock poisoned");
+        while pending.contains(&package) {
+            pending = self
+                .done
+                .wait(pending)
+                .expect("package slots lock poisoned");
+        }
+        drop(pending);
+        self.ready.load().get(&package).cloned()
+    }
+
+    /// Claim the build of `package`: `true` exactly once per content
+    /// address, `false` when it is already runnable or in flight.
+    fn claim(&self, package: PackageHash) -> bool {
+        if self.ready.load().contains_key(&package) {
+            return false;
+        }
+        self.pending
+            .lock()
+            .expect("package slots lock poisoned")
+            .insert(package)
+    }
+
+    /// Land a claimed build — `None` a failed one — and release its
+    /// waiters.
+    fn fulfil(&self, package: PackageHash, code: Option<C>) {
+        if let Some(code) = code {
+            let mut next = (**self.ready.load()).clone();
+            next.entry(package).or_insert_with(|| Arc::new(code));
+            self.ready.store(Arc::new(next));
+        }
+        let mut pending = self.pending.lock().expect("package slots lock poisoned");
+        pending.remove(&package);
+        drop(pending);
+        self.done.notify_all();
+    }
+
+    /// Whether `package` is runnable right now, in-flight work excluded.
+    fn is_ready(&self, package: PackageHash) -> bool {
+        self.ready.load().contains_key(&package)
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::thread;
 
+    use crossbeam::channel::{Sender, unbounded};
     use hyperscale_effects_bridge::ProtocolHasher;
     use hyperscale_vm_effects::{PackageHash, package_hash};
     use hyperscale_vm_kernel::{
@@ -40,10 +126,10 @@ mod native {
     use wasmtime::component::{Component, InstancePre, Linker};
     use wasmtime::{Engine, Store, Trap};
 
-    use super::{FUEL, HostState};
+    use super::{FUEL, HostState, PackageSlots};
     use crate::genesis::{account_artifact, staking_artifact};
 
-    /// The compiled account guest, pre-linked for cheap instantiation.
+    /// The compiled guests, pre-linked for cheap instantiation.
     pub struct EngineBackend {
         engine: Engine,
         /// Compiled code by content address. A lowered call names the
@@ -51,11 +137,18 @@ mod native {
         /// backend resolves and code is what a content address covers —
         /// so two instances of one package share one compilation and two
         /// packages in one transaction each get their own.
-        packages: BTreeMap<PackageHash, InstancePre<HostState>>,
+        slots: Arc<PackageSlots<InstancePre<HostState>>>,
+        /// Feed of the compile worker: a dedicated OS thread, never the
+        /// shared dispatch pools — wasmtime's internal parallel
+        /// compilation nested inside a pooled worker is a known
+        /// self-deadlock shape. The thread exits when the last sender
+        /// drops.
+        compile: Sender<Vec<u8>>,
     }
 
     impl EngineBackend {
-        /// Compile the genesis packages on the blessed engine.
+        /// Compile the genesis packages on the blessed engine and start
+        /// the compile worker for everything published after them.
         ///
         /// The artifact compiled is the one the package address covers,
         /// metadata section included: what the chain stores is what the
@@ -63,26 +156,106 @@ mod native {
         ///
         /// # Panics
         ///
-        /// Panics if the stdlib artifact fails profile validation or
+        /// Panics if a stdlib artifact fails profile validation or
         /// compilation — a build defect, not a runtime condition.
         pub fn new() -> Self {
             let engine = blessed_engine().expect("blessed engine configuration is pinned");
-            let mut linker = Linker::<HostState>::new(&engine);
-            add_kernel_to_linker(&mut linker).expect("kernel world wiring");
-            let mut packages = BTreeMap::new();
+            let linker = kernel_linker(&engine);
+            let slots = Arc::new(PackageSlots::new());
             for artifact in [account_artifact(), staking_artifact()] {
                 validate_component(artifact).expect("a stdlib artifact clears the profile");
-                let component =
-                    Component::new(&engine, artifact).expect("a stdlib artifact compiles");
-                packages.insert(
-                    package_hash(&ProtocolHasher, artifact),
-                    linker
-                        .instantiate_pre(&component)
-                        .expect("a stdlib component links against the kernel world"),
-                );
+                let pre = compile(&engine, &linker, artifact).expect("a stdlib artifact compiles");
+                let package = package_hash(&ProtocolHasher, artifact);
+                assert!(slots.claim(package), "stdlib packages are distinct");
+                slots.fulfil(package, Some(pre));
             }
-            Self { engine, packages }
+
+            let (compile_tx, compile_rx) = unbounded::<Vec<u8>>();
+            let worker_engine = engine.clone();
+            let worker_slots = Arc::clone(&slots);
+            thread::Builder::new()
+                .name("package-compile".into())
+                .spawn(move || {
+                    let linker = kernel_linker(&worker_engine);
+                    for artifact in compile_rx {
+                        let package = package_hash(&ProtocolHasher, &artifact);
+                        match compile(&worker_engine, &linker, &artifact) {
+                            Ok(pre) => worker_slots.fulfil(package, Some(pre)),
+                            Err(reason) => {
+                                // Deterministic per bytes, so every
+                                // replica refuses this package's calls
+                                // alike — but an admitted artifact the
+                                // engine cannot compile means the profile
+                                // validator and wasmtime disagree.
+                                tracing::error!(
+                                    ?package,
+                                    reason,
+                                    "published artifact failed to compile"
+                                );
+                                worker_slots.fulfil(package, None);
+                            }
+                        }
+                    }
+                })
+                .expect("the compile worker spawns");
+
+            Self {
+                engine,
+                slots,
+                compile: compile_tx,
+            }
         }
+
+        /// Queue a committed package's artifact for compilation.
+        ///
+        /// Idempotent by content address; the compiled code becomes
+        /// resolvable when the worker lands it, and an invocation
+        /// arriving sooner waits on exactly that.
+        pub fn absorb_artifact(&self, artifact: &[u8]) {
+            if self.slots.claim(package_hash(&ProtocolHasher, artifact)) {
+                let _ = self.compile.send(artifact.to_vec());
+            }
+        }
+
+        /// A cheap-clone feed of this backend for the commit path to
+        /// hold: [`Self::absorb_artifact`] detached from the borrow.
+        pub fn absorber(&self) -> impl Fn(&[u8]) + Send + Sync + 'static {
+            let slots = Arc::clone(&self.slots);
+            let compile = self.compile.clone();
+            move |artifact: &[u8]| {
+                if slots.claim(package_hash(&ProtocolHasher, artifact)) {
+                    let _ = compile.send(artifact.to_vec());
+                }
+            }
+        }
+
+        /// Whether `package`'s code is resolvable without waiting.
+        #[must_use]
+        pub fn code_ready(&self, package: PackageHash) -> bool {
+            self.slots.is_ready(package)
+        }
+    }
+
+    /// A linker carrying the kernel world — the one import surface a
+    /// deployable component may name.
+    fn kernel_linker(engine: &Engine) -> Linker<HostState> {
+        let mut linker = Linker::<HostState>::new(engine);
+        add_kernel_to_linker(&mut linker).expect("kernel world wiring");
+        linker
+    }
+
+    /// Compile and pre-link one artifact, with a deterministic reason on
+    /// refusal.
+    fn compile(
+        engine: &Engine,
+        linker: &Linker<HostState>,
+        artifact: &[u8],
+    ) -> Result<InstancePre<HostState>, String> {
+        let component =
+            Component::new(engine, artifact).map_err(|error| format!("compile: {error:#}"))?;
+        linker
+            .instantiate_pre(&component)
+            .map_err(|error| format!("link: {error:#}"))
     }
 
     impl Backend for EngineBackend {
@@ -92,7 +265,7 @@ mod native {
             let budget = call.fuel_budget.min(FUEL);
             let mut store = Store::new(&self.engine, HostState(session));
             store.set_fuel(budget).expect("fuel metering is enabled");
-            let Some(pre) = self.packages.get(&call.package) else {
+            let Some(pre) = self.slots.resolve(call.package) else {
                 return InvokeResult {
                     session: store.into_data().0,
                     fuel: 0,
@@ -165,7 +338,7 @@ pub use native::EngineBackend;
 
 #[cfg(target_arch = "wasm32")]
 mod reference {
-    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use hyperscale_effects_bridge::ProtocolHasher;
     use hyperscale_vm_effects::{PackageHash, package_hash};
@@ -177,12 +350,12 @@ mod reference {
     };
     use hyperscale_vm_runtime::validate_component;
 
-    use super::{FUEL, HostState};
+    use super::{FUEL, HostState, PackageSlots};
     use crate::genesis::{account_artifact, staking_artifact};
 
-    /// The decoded stdlib guests under the reference interpreter.
+    /// The decoded guests under the reference interpreter.
     pub struct EngineBackend {
-        packages: BTreeMap<PackageHash, RefComponent>,
+        slots: Arc<PackageSlots<RefComponent>>,
     }
 
     impl EngineBackend {
@@ -198,22 +371,58 @@ mod reference {
         /// Panics if the stdlib artifact fails profile validation or
         /// decoding — a build defect, not a runtime condition.
         pub fn new() -> Self {
-            let mut packages = BTreeMap::new();
+            let slots = Arc::new(PackageSlots::new());
             for artifact in [account_artifact(), staking_artifact()] {
                 validate_component(artifact).expect("a stdlib artifact clears the profile");
-                packages.insert(
-                    package_hash(&ProtocolHasher, artifact),
-                    RefComponent::decode(artifact).expect("a stdlib artifact decodes"),
-                );
+                let component = RefComponent::decode(artifact).expect("a stdlib artifact decodes");
+                let package = package_hash(&ProtocolHasher, artifact);
+                assert!(slots.claim(package), "stdlib packages are distinct");
+                slots.fulfil(package, Some(component));
             }
-            Self { packages }
+            Self { slots }
+        }
+
+        /// Absorb a committed package's artifact.
+        ///
+        /// Decoding is one parser pass, so this target does it in place
+        /// — no worker, and the pending set never holds an entry long
+        /// enough for an invocation to wait on it.
+        pub fn absorb_artifact(&self, artifact: &[u8]) {
+            absorb_into(&self.slots, artifact);
+        }
+
+        /// A cheap-clone feed of this backend for the commit path to
+        /// hold: [`Self::absorb_artifact`] detached from the borrow.
+        pub fn absorber(&self) -> impl Fn(&[u8]) + Send + Sync + 'static {
+            let slots = Arc::clone(&self.slots);
+            move |artifact: &[u8]| absorb_into(&slots, artifact)
+        }
+
+        /// Whether `package`'s code is resolvable without waiting.
+        #[must_use]
+        pub fn code_ready(&self, package: PackageHash) -> bool {
+            self.slots.is_ready(package)
+        }
+    }
+
+    fn absorb_into(slots: &PackageSlots<RefComponent>, artifact: &[u8]) {
+        let package = package_hash(&ProtocolHasher, artifact);
+        if !slots.claim(package) {
+            return;
+        }
+        match RefComponent::decode(artifact) {
+            Ok(component) => slots.fulfil(package, Some(component)),
+            Err(error) => {
+                tracing::error!(?package, %error, "published artifact failed to decode");
+                slots.fulfil(package, None);
+            }
         }
     }
 
     impl Backend for EngineBackend {
         fn invoke(&self, session: KernelSession, call: &GuestCall<'_>) -> InvokeResult {
             let args: Vec<CVal> = call.args.iter().map(ref_arg).collect();
-            let Some(component) = self.packages.get(&call.package) else {
+            let Some(component) = self.slots.resolve(call.package) else {
                 return InvokeResult {
                     session,
                     fuel: 0,
@@ -222,7 +431,7 @@ mod reference {
                 };
             };
             let mut instance =
-                match RefComponentInstance::instantiate(component, HostState(session)) {
+                match RefComponentInstance::instantiate(&component, HostState(session)) {
                     Ok(instance) => instance,
                     Err((host, error)) => {
                         return InvokeResult {

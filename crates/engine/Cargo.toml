@@ -28,6 +28,7 @@ hyperscale-hbor.workspace = true
 # fuel across both runtimes — is what makes the split sound.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 hyperscale-vm-runtime = { workspace = true, features = ["engine"] }
+crossbeam.workspace = true
 wasmtime.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

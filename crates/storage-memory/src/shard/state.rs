@@ -9,9 +9,10 @@ use hyperscale_storage::tree::{carry_noop_root, jmt_parent_height, put_at_versio
 use hyperscale_storage::{JmtSnapshot, entry_leaf_rows};
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, EntryKey,
-    ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, ProvisionHash,
+    ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
     Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites, ShardWitnessPayload,
-    StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash, ValidatorId,
+    StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash, ValidatorId, vm_statics,
+    vm_statics_installed,
 };
 
 use super::tree_store::SimTreeStore;
@@ -49,6 +50,11 @@ pub struct SharedState {
     /// shard-witness derivation reads it, so it must be identical on
     /// every replica.
     pub substate_bytes: BTreeMap<u64, u64>,
+    /// Committed package artifacts by content address — the mirror of
+    /// the `RocksDB` backend's package index. Derived state: a committed
+    /// cell that self-identifies as a package lands its bytes here in
+    /// the same application that lands the cell.
+    pub package_artifacts: BTreeMap<Hash, Vec<u8>>,
 }
 
 impl SharedState {
@@ -66,6 +72,7 @@ impl SharedState {
             current_entries: BTreeMap::new(),
             entries_history: BTreeMap::new(),
             substate_bytes: BTreeMap::new(),
+            package_artifacts: BTreeMap::new(),
         }
     }
 
@@ -309,6 +316,23 @@ pub fn apply_writes(
             }
             None => {
                 state.current_state.remove(key);
+            }
+        }
+    }
+    // The package index, fed exactly as the RocksDB backend feeds its
+    // CF: the VM judges what a package cell is, and without installed
+    // statics (bare storage tests) nothing indexes.
+    if vm_statics_installed() {
+        let statics = vm_statics();
+        for (key, change) in writes.cells() {
+            if let Some(value) = change
+                && let Some(package) =
+                    statics.package_cell(key.owner.to_bytes(), key.local.0, value)
+            {
+                state
+                    .package_artifacts
+                    .entry(package)
+                    .or_insert_with(|| value.clone());
             }
         }
     }
