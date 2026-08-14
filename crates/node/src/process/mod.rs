@@ -421,9 +421,12 @@ where
         // routing which shards it touches is asking for an answer it
         // does not have.
         if let Err(error) = tx.try_derived() {
-            tracing::debug!(
+            // Warn rather than debug: a refusal here can be this node's
+            // own gap as easily as the envelope's fault, and the two read
+            // identically from the submitter's side.
+            tracing::warn!(
                 reason = error.0,
-                "refusing a submission that derives nothing"
+                "Dropping locally-submitted transaction: it derives no routing"
             );
             return SubmitFanout::Underivable;
         }
@@ -608,8 +611,14 @@ pub enum SubmitFanout {
     /// locally-submitted tx is dropped.
     NoHostedShard,
     /// The envelope's derivation refuses, so it names no shards to fan
-    /// out to. Dropped here rather than gossiped: the same refusal is
-    /// what every recipient's admission would reach.
+    /// out to and there is nothing to gossip it on.
+    ///
+    /// Not necessarily the envelope's fault: derivation reads the
+    /// package metadata this node holds, so a call to code the node has
+    /// not installed refuses here and derives fine everywhere that has
+    /// it. The maturity window is what makes that gap a startup
+    /// condition rather than a standing one — a submission caught inside
+    /// it is dropped and has to be offered again.
     Underivable,
 }
 
