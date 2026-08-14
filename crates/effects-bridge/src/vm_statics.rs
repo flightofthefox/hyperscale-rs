@@ -288,11 +288,24 @@ pub struct BridgeStatics {
 /// and rebuilding the key answers the question without any side channel,
 /// any tag, and any trust in what wrote it. A cell of any other kind
 /// cannot match except by finding a hash collision.
+///
+/// The preamble is tested first because this runs over every cell of
+/// every commit, and hashing a whole value to learn that it was never
+/// code is the one cost that scales with what the chain writes rather
+/// than with what it publishes. Admission demands the deterministic wasm
+/// profile of anything it lets through, so no artifact that could
+/// publish is turned away here.
 #[must_use]
 pub fn committed_package(owner: Address, local: [u8; 16], value: &[u8]) -> Option<PackageHash> {
+    if !value.starts_with(WASM_PREAMBLE) {
+        return None;
+    }
     let package = package_hash(&ProtocolHasher, value);
     (package_key(owner, package).local.0 == local).then_some(package)
 }
+
+/// The four bytes every wasm artifact opens with.
+const WASM_PREAMBLE: &[u8] = b"\0asm";
 
 /// The published-package cache: content-addressed, shared process-wide,
 /// and grown from committed state.
@@ -336,21 +349,25 @@ impl PackageCache {
         self.0.store(Arc::new(next));
     }
 
-    /// Publish the package a committed cell holds, if it holds one.
+    /// Publish the package a committed cell holds, if it holds one, and
+    /// say whether it did.
     ///
-    /// A package cell is self-identifying: its key is the content
-    /// address of the very bytes it stores, so recomputing the address
-    /// from the value and rebuilding the key answers whether this cell
-    /// is a package without any side channel, any tag, and any trust in
-    /// what wrote it. A cell of any other kind cannot match except by
-    /// finding a hash collision.
-    pub fn absorb_cell(&self, owner: impl Into<Address>, local: [u8; 16], value: &[u8]) {
+    /// A package cell is self-identifying — see [`committed_package`] —
+    /// and its bytes still have to clear admission before anything is
+    /// published under them. The two together are the whole of what
+    /// makes a cell a package, which is why the answer is returned
+    /// rather than inferred again by the caller: the code that runs an
+    /// artifact and the metadata that routes calls into it must never
+    /// disagree about whether it was admitted.
+    pub fn absorb_cell(&self, owner: impl Into<Address>, local: [u8; 16], value: &[u8]) -> bool {
         let Some(package) = committed_package(owner.into(), local, value) else {
-            return;
+            return false;
         };
-        if let Ok(metadata) = admit_package(value) {
-            self.publish(package, metadata);
-        }
+        let Ok(metadata) = admit_package(value) else {
+            return false;
+        };
+        self.publish(package, metadata);
+        true
     }
 }
 
@@ -419,9 +436,8 @@ impl VmStatics for BridgeStatics {
         let Ok(owner) = Address::from_bytes(owner) else {
             return;
         };
-        self.cache.absorb_cell(owner, local, value);
-        if let Some(sink) = &self.artifact_sink
-            && committed_package(owner, local, value).is_some()
+        if self.cache.absorb_cell(owner, local, value)
+            && let Some(sink) = &self.artifact_sink
         {
             sink(value);
         }
