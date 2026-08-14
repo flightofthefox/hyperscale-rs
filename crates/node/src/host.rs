@@ -44,6 +44,7 @@ use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
 use crate::shard::consensus::{BlockSyncInput, ConsensusState};
 use crate::shard::cross_shard::CrossShardState;
 use crate::shard::mempool::MempoolState;
+use crate::shard::packages::PackagesState;
 use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::shard::{
     DispatchHandles, HostEvent, ProcessScopedInput, ShardDispatchHandles, ShardIo, ShardLoop,
@@ -172,6 +173,11 @@ where
             for artifact in storage.package_artifacts() {
                 executor.install_artifact(&artifact);
             }
+        }
+        // And foreign code the node fetched on beacon facts: the same
+        // reconciliation, from the node-level cache.
+        for artifact in beacon_storage.fetched_packages() {
+            executor.install_artifact(&artifact);
         }
 
         // First pass: build ShardIo + Vec<Vnode> for each shard, plus the
@@ -780,6 +786,7 @@ fn build_shard_io<S: ShardStorage>(
         cross_shard: CrossShardState::new(config),
         mempool: MempoolState::new(config),
         beacon_fetch: BeaconFetchState::new(config),
+        packages: PackagesState::new(config),
         tx_phase_times: TxPhaseTimesCache::default(),
         last_slow_tx_warn: LocalTimestamp::ZERO,
     };

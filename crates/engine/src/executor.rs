@@ -86,6 +86,13 @@ pub struct PreparedTx {
     pub locked_configs: Vec<(SubstateKey, Vec<u8>)>,
 }
 
+/// The content address of a package artifact, as the workspace hash the
+/// beacon registry and fetch protocol carry.
+#[must_use]
+pub fn artifact_package(artifact: &[u8]) -> Hash {
+    Hash::from(package_hash(&ProtocolHasher, artifact).0)
+}
+
 /// The protocol crypto hash behind the kernel's hashing host function
 /// and fresh-ID derivation.
 pub fn protocol_hash(data: &[u8]) -> [u8; 32] {
@@ -321,6 +328,13 @@ impl Executor {
     #[must_use]
     pub fn package_code_ready(&self, package: PackageHash) -> bool {
         self.backend.code_ready(package)
+    }
+
+    /// Whether the artifact behind `package` — named by the workspace
+    /// hash the beacon registry carries — is held or being built.
+    #[must_use]
+    pub fn package_known(&self, package: Hash) -> bool {
+        self.backend.code_known(PackageHash(package.as_hash32()))
     }
 
     /// Derive one transaction's invocations, effect set, and nullifiers

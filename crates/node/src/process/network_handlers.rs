@@ -788,10 +788,11 @@ pub fn register_shard_request_handlers<S, N, D>(
     use std::sync::Arc;
 
     use hyperscale_types::network::request::{
-        GetBlockRequest, GetCommittedTxsRequest, GetProvisionsRequest, GetRemoteHeadersRequest,
-        GetSettledTxsRequest, GetStateRangeRequest, GetTransactionsRequest,
-        GetWitnessHistoryRequest,
+        GetBlockRequest, GetCommittedTxsRequest, GetPackageArtifactsRequest, GetProvisionsRequest,
+        GetRemoteHeadersRequest, GetSettledTxsRequest, GetStateRangeRequest,
+        GetTransactionsRequest, GetWitnessHistoryRequest,
     };
+    use hyperscale_types::network::response::GetPackageArtifactsResponse;
 
     use crate::beacon::serve::serve_beacon_block_request;
     use crate::beacon::witness_serve::serve_shard_witnesses_request;
@@ -889,6 +890,28 @@ pub fn register_shard_request_handlers<S, N, D>(
         .register_request_handler::<GetStateRangeRequest>(shard, move |req| {
             serve_state_range_request(&storage, &req)
         });
+
+    // ── package_artifact.request → published-code availability ───
+
+    // Raw storage like snap-sync, and for the same reason: the package
+    // index is a store-level CF over committed cells, not chain
+    // content. A point lookup per id — this runs on the blocking pool,
+    // where a scan would pin a thread per request.
+    let storage = Arc::clone(&io.storage);
+    process
+        .network
+        .register_request_handler::<GetPackageArtifactsRequest>(
+            shard,
+            move |req: GetPackageArtifactsRequest| {
+                let artifacts: Vec<Vec<u8>> = req
+                    .packages
+                    .iter()
+                    .filter_map(|package| storage.package_artifact(*package))
+                    .collect();
+                record_fetch_response_sent("package_artifact", artifacts.len());
+                GetPackageArtifactsResponse::new(artifacts)
+            },
+        );
 
     // ── witness_history.request → snap-sync accumulator seeding ──
 

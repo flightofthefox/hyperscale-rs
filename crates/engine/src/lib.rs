@@ -37,7 +37,7 @@ pub mod genesis;
 pub mod sharding;
 
 pub use batch::{TickBatchContext, TickTxInput};
-pub use executor::Executor;
+pub use executor::{Executor, artifact_package};
 pub use genesis::{GenesisConfig, World, XRD, genesis_world, genesis_writes};
 pub use hyperscale_effects_bridge::account_address;
 pub use hyperscale_vm_kernel::ExecutionMode;

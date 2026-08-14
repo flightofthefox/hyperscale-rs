@@ -106,6 +106,19 @@ impl<C> PackageSlots<C> {
     fn is_ready(&self, package: PackageHash) -> bool {
         self.ready.load().contains_key(&package)
     }
+
+    /// Whether `package` is runnable or its build is in flight — the
+    /// probe that keeps a prefetch from re-requesting bytes the backend
+    /// already holds.
+    fn is_known(&self, package: PackageHash) -> bool {
+        if self.is_ready(package) {
+            return true;
+        }
+        self.pending
+            .lock()
+            .expect("package slots lock poisoned")
+            .contains(&package)
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -233,6 +246,12 @@ mod native {
         #[must_use]
         pub fn code_ready(&self, package: PackageHash) -> bool {
             self.slots.is_ready(package)
+        }
+
+        /// Whether `package`'s code is held or being built.
+        #[must_use]
+        pub fn code_known(&self, package: PackageHash) -> bool {
+            self.slots.is_known(package)
         }
     }
 
@@ -402,6 +421,12 @@ mod reference {
         #[must_use]
         pub fn code_ready(&self, package: PackageHash) -> bool {
             self.slots.is_ready(package)
+        }
+
+        /// Whether `package`'s code is held or being built.
+        #[must_use]
+        pub fn code_known(&self, package: PackageHash) -> bool {
+            self.slots.is_known(package)
         }
     }
 

@@ -20,6 +20,7 @@ use crate::shard::commit::BlockCommitCoordinator;
 use crate::shard::consensus::{BlockSyncStatus, ConsensusState};
 use crate::shard::cross_shard::CrossShardState;
 use crate::shard::mempool::MempoolState;
+use crate::shard::packages::PackagesState;
 use crate::shard::phase_times::TxPhaseTimesCache;
 
 /// Per-shard I/O state hosted by the `NodeHost`.
@@ -66,6 +67,10 @@ pub struct ShardIo<S: ShardStorage> {
     /// Per-shard beacon fetch instances (missing proposals, shard-witness
     /// leaves) the beacon coordinator drives for this shard.
     pub(crate) beacon_fetch: BeaconFetchState,
+
+    /// Package artifact acquisition: the fetch reconciling the beacon's
+    /// package registry against what the engine holds.
+    pub(crate) packages: PackagesState,
 
     /// Per-tx phase-time stamps for the slow-tx finalization log.
     /// Populated from `EmitTransactionStatus` and `RecordTxEcCreated`

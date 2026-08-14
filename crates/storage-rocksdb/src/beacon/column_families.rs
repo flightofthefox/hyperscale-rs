@@ -17,7 +17,7 @@ use hyperscale_types::{BeaconState, CertifiedBeaconBlock, Hash, RatifyVoteRecord
 use rocksdb::{ColumnFamily, DB};
 
 use crate::shard::column_families::ValidatorIdCodec;
-use crate::typed_cf::{BeU64Codec, HashCodec, HborCodec, TypedCf};
+use crate::typed_cf::{BeU64Codec, HashCodec, HborCodec, RawCodec, TypedCf};
 
 /// Default CF (presence required by `RocksDB`; unused by beacon today).
 pub const DEFAULT_CF: &str = "default";
@@ -46,6 +46,12 @@ pub const BEACON_STATE_BY_EPOCH_CF: &str = "beacon_state_by_epoch";
 /// ratify-vote signature leaves the process.
 pub const RATIFY_REGISTERS_CF: &str = "ratify_registers";
 
+/// Fetched package artifacts by content address — the node-level cache
+/// of foreign code pulled on beacon package facts. Value: the artifact
+/// bytes, verbatim. A cache over the beacon registry, reconciled at
+/// boot; the owning shard's package cell stays the authority.
+pub const FETCHED_PACKAGES_CF: &str = "fetched_packages";
+
 /// Full CF set passed to `DB::open_cf_descriptors` when initialising the
 /// beacon database.
 pub const ALL_COLUMN_FAMILIES: &[&str] = &[
@@ -54,6 +60,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     BEACON_HASH_TO_EPOCH_CF,
     BEACON_STATE_BY_EPOCH_CF,
     RATIFY_REGISTERS_CF,
+    FETCHED_PACKAGES_CF,
 ];
 
 // ─── CfHandles ───────────────────────────────────────────────────────────────
@@ -67,6 +74,7 @@ pub struct CfHandles<'a> {
     hash_to_epoch: &'a ColumnFamily,
     state_by_epoch: &'a ColumnFamily,
     ratify_registers: &'a ColumnFamily,
+    fetched_packages: &'a ColumnFamily,
 }
 
 impl<'a> CfHandles<'a> {
@@ -85,6 +93,7 @@ impl<'a> CfHandles<'a> {
             hash_to_epoch: resolve(BEACON_HASH_TO_EPOCH_CF),
             state_by_epoch: resolve(BEACON_STATE_BY_EPOCH_CF),
             ratify_registers: resolve(RATIFY_REGISTERS_CF),
+            fetched_packages: resolve(FETCHED_PACKAGES_CF),
         }
     }
 }
@@ -147,5 +156,20 @@ impl TypedCf for RatifyRegistersCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.ratify_registers
+    }
+}
+
+/// Fetched package artifacts by content address; see
+/// [`FETCHED_PACKAGES_CF`].
+pub struct FetchedPackagesCf;
+impl TypedCf for FetchedPackagesCf {
+    const NAME: &'static str = FETCHED_PACKAGES_CF;
+    type Key = Hash; // the package's content address
+    type Value = Vec<u8>; // the artifact bytes, verbatim
+    type KeyCodec = HashCodec;
+    type ValueCodec = RawCodec;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.fetched_packages
     }
 }
