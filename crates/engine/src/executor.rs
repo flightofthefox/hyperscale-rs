@@ -324,14 +324,15 @@ impl Executor {
         }
     }
 
-    /// Whether `package`'s code is built and resolvable without waiting.
+    /// Whether `package`'s code resolves without waiting — built, or
+    /// refused by a build every replica refuses alike.
     #[must_use]
-    pub fn package_code_ready(&self, package: PackageHash) -> bool {
-        self.backend.code_ready(package)
+    pub fn package_code_settled(&self, package: PackageHash) -> bool {
+        self.backend.code_settled(package)
     }
 
     /// Whether the artifact behind `package` — named by the workspace
-    /// hash the beacon registry carries — is held or being built.
+    /// hash the beacon registry carries — is judged or being built.
     #[must_use]
     pub fn package_known(&self, package: Hash) -> bool {
         self.backend.code_known(PackageHash(package.as_hash32()))

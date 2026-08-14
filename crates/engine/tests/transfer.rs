@@ -1237,9 +1237,9 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
 
 /// Wait out the compile worker; the bound is a harness valve, not a
 /// verdict — consensus never reads a clock here.
-fn await_code_ready(executor: &Executor, package: PackageHash) {
+fn await_code_settled(executor: &Executor, package: PackageHash) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while !executor.package_code_ready(package) {
+    while !executor.package_code_settled(package) {
         assert!(
             std::time::Instant::now() < deadline,
             "the package's code never became resolvable"
@@ -1258,7 +1258,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
     let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
     assert!(
-        !executor.package_code_ready(package),
+        !executor.package_code_settled(package),
         "the code is unknown before its block commits"
     );
 
@@ -1270,7 +1270,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
         panic!("the publish must succeed: {:?}", executed[0].consensus);
     };
     assert!(
-        !executor.package_code_ready(package),
+        !executor.package_code_settled(package),
         "execution alone compiles nothing"
     );
 
@@ -1278,7 +1278,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
     // the artifact to the compile worker: the code is on its way from
     // the commit, not from the first call that needs it.
     absorb_committed_cells([&executed[0].consensus]);
-    await_code_ready(&executor, package);
+    await_code_settled(&executor, package);
 }
 
 #[test]
@@ -1298,7 +1298,7 @@ fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
         Some(&metadata),
         "the reseeded artifact's metadata is routable"
     );
-    await_code_ready(&executor, package);
+    await_code_settled(&executor, package);
 
     // Junk in the index is refused, not trusted: the cells are the
     // authority and the index is derived.
