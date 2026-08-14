@@ -13,7 +13,7 @@ use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
     AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, Substates, WitnessSeed,
-    entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts,
+    entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts, package_of_cell,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryKey, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf,
@@ -193,6 +193,12 @@ impl BoundaryStore for SimShardStorage {
             // leaf re-derives.
             if let Some((entry_key, value)) = entry_from_leaf(leaf.key, &leaf.value) {
                 state.current_entries.insert(entry_key, value);
+            }
+            // So is the package index, and for a sharper reason: an
+            // imported store whose committee turns over is the only place
+            // a foreign shard can still fetch this artifact from.
+            if let Some(package) = package_of_cell(leaf.key, &leaf.value) {
+                state.package_artifacts.insert(package, leaf.value.clone());
             }
             state.current_state.insert(leaf.key, leaf.value);
         }

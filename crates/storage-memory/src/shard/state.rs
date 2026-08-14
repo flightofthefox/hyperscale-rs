@@ -6,13 +6,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use hyperscale_storage::tree::{carry_noop_root, jmt_parent_height, put_at_version};
-use hyperscale_storage::{JmtSnapshot, entry_leaf_rows};
+use hyperscale_storage::{JmtSnapshot, entry_leaf_rows, package_of_cell};
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, ChainOrigin, ConsensusReceipt, EntryKey,
     ExecutionCertificate, ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash,
     Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites, ShardWitnessPayload,
-    StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash, ValidatorId, vm_statics,
-    vm_statics_installed,
+    StateRoot, StoredReceipt, SubstateKey, TickId, Transaction, TxHash, ValidatorId,
 };
 
 use super::tree_store::SimTreeStore;
@@ -319,21 +318,12 @@ pub fn apply_writes(
             }
         }
     }
-    // The package index, fed exactly as the RocksDB backend feeds its
-    // CF: the VM judges what a package cell is, and without installed
-    // statics (bare storage tests) nothing indexes.
-    if vm_statics_installed() {
-        let statics = vm_statics();
-        for (key, change) in writes.cells() {
-            if let Some(value) = change
-                && let Some(package) =
-                    statics.package_cell(key.owner.to_bytes(), key.local.0, value)
-            {
-                state
-                    .package_artifacts
-                    .entry(package)
-                    .or_insert_with(|| value.clone());
-            }
+    // The package index, fed exactly as the RocksDB backend feeds its CF.
+    for (key, change) in writes.cells() {
+        if let Some(value) = change
+            && let Some(package) = package_of_cell(*key, value)
+        {
+            state.package_artifacts.insert(package, value.clone());
         }
     }
     for (key, change) in writes.entries() {

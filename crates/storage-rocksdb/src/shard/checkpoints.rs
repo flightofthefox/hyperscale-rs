@@ -19,7 +19,7 @@ use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeK
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, Substates, WitnessSeed,
-    entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts,
+    entry_from_leaf, filter_writes_to_prefix, merge_writes_from_receipts, package_of_cell,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf,
@@ -31,7 +31,7 @@ use tracing::warn;
 
 use super::column_families::{
     ALL_COLUMN_FAMILIES, BeaconWitnessesCf, CfHandles, EntriesCf, ImportStagingCf, JmtNodesCf,
-    StateCf, SubstateBytesCf,
+    PackageArtifactsCf, StateCf, SubstateBytesCf,
 };
 use super::core::RocksDbShardStorage;
 use super::entry_key::scan_entries;
@@ -261,6 +261,7 @@ impl RocksDbShardStorage {
             }
             let state_cf = StateCf::handle(&cf);
             let entries_cf = EntriesCf::handle(&cf);
+            let artifacts_cf = PackageArtifactsCf::handle(&cf);
             for leaf in &batch_leaves {
                 batch_put::<StateCf>(&mut batch, state_cf, &leaf.key, &leaf.value);
                 // The ordered entry index is derived state: rebuild it
@@ -269,6 +270,18 @@ impl RocksDbShardStorage {
                 // leaf re-derives.
                 if let Some((entry_key, value)) = entry_from_leaf(leaf.key, &leaf.value) {
                     batch_put::<EntriesCf>(&mut batch, entries_cf, &entry_key, &value);
+                }
+                // So is the package index, and for a sharper reason: an
+                // imported store whose committee turns over is the only
+                // place a foreign shard can still fetch this artifact
+                // from.
+                if let Some(package) = package_of_cell(leaf.key, &leaf.value) {
+                    batch_put::<PackageArtifactsCf>(
+                        &mut batch,
+                        artifacts_cf,
+                        &package,
+                        &leaf.value,
+                    );
                 }
             }
             bytes_total += result.batch.bytes_delta;
