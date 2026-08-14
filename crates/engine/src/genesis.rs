@@ -14,12 +14,14 @@ pub use hyperscale_effects_bridge::genesis::{
 };
 use hyperscale_effects_bridge::{ProtocolHasher, validator_key};
 pub use hyperscale_effects_bridge::{XRD, entropy_key, vault_key};
-use hyperscale_types::{EntryKey, PrincipalAddr, SettledWrites, StakePoolSeat};
+use hyperscale_types::{EntryKey, Hash, PrincipalAddr, SettledWrites, StakePoolSeat};
 use hyperscale_vm_effects::{
-    holdings_collection, instance_data_key, package_hash, resource_record_key,
+    Address, holdings_collection, instance_data_key, package_hash, resource_record_key,
 };
 use hyperscale_vm_kernel::encode_amount;
 use hyperscale_vm_stdlib::genesis_writes as stdlib_genesis_writes;
+
+use crate::executor::artifact_package;
 
 /// Configuration for genesis bootstrapping.
 #[derive(Debug, Clone, Default)]
@@ -109,6 +111,23 @@ pub fn genesis_writes(
         );
     }
     SettledWrites::from_parts(writes.cells, writes.entries)
+}
+
+/// The packages the chain is born running, as the beacon registry holds
+/// them: `(content address, the prefix their bytes sit under)`.
+///
+/// Genesis seeds these so the block-validity rule can ask one question of
+/// every package a transaction names. They are usable from the genesis
+/// epoch and no node ever fetches them, because every node compiles them
+/// at boot — the publisher is what the registry keys fetching on, and it
+/// is never consulted for these.
+#[must_use]
+pub fn genesis_package_facts() -> Vec<(Hash, Address)> {
+    let publisher = Address::from(genesis_publisher(&ProtocolHasher));
+    [account_artifact(), staking_artifact()]
+        .into_iter()
+        .map(|artifact| (artifact_package(artifact), publisher))
+        .collect()
 }
 
 #[cfg(test)]

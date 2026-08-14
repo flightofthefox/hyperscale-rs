@@ -17,15 +17,38 @@ use std::sync::Arc;
 
 use hyperscale_storage::BeaconStorage;
 use hyperscale_types::{
-    BeaconChainConfig, BeaconGenesisConfig, BeaconState, BeaconWitnessLeafCount, BlockHash,
-    BlockHeight, CertifiedBeaconBlock, Epoch, GenesisConfigHash, GenesisPool, GenesisValidator,
-    GenesisValidators, MAX_BEACON_COMMITTEE, MAX_VOTE_VECTOR_LEN, MIN_BEACON_COMMITTEE_SIZE,
-    MIN_STAKE_FLOOR, NetworkParams, Randomness, ShardBoundary, ShardCommittee, ShardId, Stake,
-    StakePool, StakePoolId, StakePoolSeat, StateRoot, TopologySnapshot, ValidatorId,
-    ValidatorRecord, ValidatorStatus, Verified, WeightedTimestamp, genesis_config_hash,
+    Address, BeaconChainConfig, BeaconGenesisConfig, BeaconState, BeaconWitnessLeafCount,
+    BlockHash, BlockHeight, CertifiedBeaconBlock, Epoch, GenesisConfigHash, GenesisPool,
+    GenesisValidator, GenesisValidators, Hash, MAX_BEACON_COMMITTEE, MAX_VOTE_VECTOR_LEN,
+    MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkParams, PackageFact, Randomness,
+    ShardBoundary, ShardCommittee, ShardId, Stake, StakePool, StakePoolId, StakePoolSeat,
+    StateRoot, TopologySnapshot, ValidatorId, ValidatorRecord, ValidatorStatus, Verified,
+    WeightedTimestamp, genesis_config_hash,
 };
 
 // ─── builder ───────────────────────────────────────────────────────────────
+
+/// The registry a chain is born with: the packages genesis seeds, usable
+/// from the first epoch.
+///
+/// They enter beside everything a publish will later add, so the
+/// block-validity rule has one place to ask whether a transaction may
+/// name a package — and so a genesis package needs no carve-out there.
+fn genesis_registry(config: &BeaconGenesisConfig) -> BTreeMap<Hash, PackageFact> {
+    config
+        .genesis_packages
+        .iter()
+        .map(|(package, publisher)| {
+            (
+                *package,
+                PackageFact {
+                    publisher: *publisher,
+                    usable_from: Epoch::GENESIS,
+                },
+            )
+        })
+        .collect()
+}
 
 /// Construct the live genesis [`BeaconState`] from a
 /// [`BeaconGenesisConfig`].
@@ -163,6 +186,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
     // Genesis placements are `ready: true` by construction, so the frozen
     // consensus subset starts as full membership; the witness window
     // bases start at the zeroed genesis watermarks.
+    state.packages = genesis_registry(config);
     state.shard_consensus_members = state.ready_consensus_members(&state.shard_committees);
     state.window.witness_bases = state.live_witness_bases();
     state
@@ -215,6 +239,7 @@ pub fn build_genesis(
     genesis: &GenesisValidators,
     chain_config: BeaconChainConfig,
     pools: &[StakePoolSeat],
+    genesis_packages: &[(Hash, Address)],
 ) -> GenesisBoot {
     let pool_id = StakePoolId::new(0);
     let validators: Vec<GenesisValidator> = genesis
@@ -245,6 +270,7 @@ pub fn build_genesis(
         initial_beacon_committee: beacon_committee,
         initial_shard_committee: genesis.committee.clone(),
         initial_randomness: Randomness::new([0x42; 32]),
+        genesis_packages: genesis_packages.to_vec(),
     };
     let state = Arc::new(build_genesis_beacon_state(&config));
     let config_hash = genesis_config_hash(&config, &genesis.network, pools);
@@ -446,6 +472,7 @@ mod tests {
         let beacon_members: Vec<ValidatorId> =
             (0..n_beacon_members).map(ValidatorId::new).collect();
         BeaconGenesisConfig {
+            genesis_packages: Vec::new(),
             chain_config: BeaconChainConfig::default(),
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
@@ -581,6 +608,7 @@ mod tests {
             .collect();
         // Beacon committee supplied OUT of id order — builder sorts it.
         let cfg = BeaconGenesisConfig {
+            genesis_packages: Vec::new(),
             chain_config: BeaconChainConfig::default(),
             initial_validators: validators,
             initial_pools: vec![GenesisPool {
@@ -615,6 +643,7 @@ mod tests {
     fn rejects_duplicate_validator_id() {
         let pool_id = StakePoolId::new(0);
         let cfg = BeaconGenesisConfig {
+            genesis_packages: Vec::new(),
             chain_config: BeaconChainConfig::default(),
             initial_validators: vec![
                 GenesisValidator {
@@ -643,6 +672,7 @@ mod tests {
     #[should_panic(expected = "declares pool Pool(99) which is not in initial_pools")]
     fn rejects_validator_referencing_unknown_pool() {
         let cfg = BeaconGenesisConfig {
+            genesis_packages: Vec::new(),
             chain_config: BeaconChainConfig::default(),
             initial_validators: vec![GenesisValidator {
                 id: ValidatorId::new(0),
@@ -665,6 +695,7 @@ mod tests {
     fn rejects_pool_with_insufficient_stake() {
         let pool_id = StakePoolId::new(0);
         let cfg = BeaconGenesisConfig {
+            genesis_packages: Vec::new(),
             chain_config: BeaconChainConfig::default(),
             initial_validators: (0u64..4)
                 .map(|i| GenesisValidator {
@@ -690,6 +721,7 @@ mod tests {
     fn rejects_validator_listed_twice_in_shard_committee() {
         let pool_id = StakePoolId::new(0);
         let cfg = BeaconGenesisConfig {
+            genesis_packages: Vec::new(),
             chain_config: BeaconChainConfig::default(),
             initial_validators: vec![GenesisValidator {
                 id: ValidatorId::new(0),
@@ -730,6 +762,7 @@ mod tests {
         // Default beacon_committee_size is 4 — pass 5 to overflow.
         let pool_id = StakePoolId::new(0);
         let cfg = BeaconGenesisConfig {
+            genesis_packages: Vec::new(),
             chain_config: BeaconChainConfig::default(),
             initial_validators: (0u64..5)
                 .map(|i| GenesisValidator {
@@ -757,6 +790,7 @@ mod tests {
         // `compute_view_input` panic at the first epoch rollover.
         let pool_id = StakePoolId::new(0);
         let cfg = BeaconGenesisConfig {
+            genesis_packages: Vec::new(),
             chain_config: BeaconChainConfig {
                 beacon_committee_size: u32::try_from(MAX_VOTE_VECTOR_LEN + 1)
                     .expect("cap + 1 fits in u32"),

@@ -213,6 +213,7 @@ impl CoordinatorSim {
             ..BeaconChainConfig::default()
         };
         let config = BeaconGenesisConfig {
+            genesis_packages: Vec::new(),
             chain_config,
             initial_validators: members
                 .iter()
