@@ -19,8 +19,13 @@ pub struct GetPackageArtifactsResponse {
     pub artifacts: Vec<Vec<u8>>,
 }
 
-/// Each artifact is bounded by what a publish transaction can carry, so
-/// a response is refused at decode before an oversized allocation.
+/// No artifact is larger than the publish that could have carried it.
+///
+/// A protocol bound, not a guard on what decoding allocates — a claimed
+/// length the remaining input cannot satisfy is refused before any
+/// collection is built, so oversized bytes are unreachable either way.
+/// What this adds is that a well-formed frame still cannot name an
+/// artifact no publish transaction could have put on the chain.
 fn artifacts_fit(response: &GetPackageArtifactsResponse) -> Result<(), &'static str> {
     if response
         .artifacts
