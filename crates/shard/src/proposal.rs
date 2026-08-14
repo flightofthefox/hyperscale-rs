@@ -161,8 +161,8 @@ impl ProposalTracker {
 ///    This is the same question voters ask during block verification, so
 ///    filtering here keeps a proposer from offering what its own voters
 ///    would defer on or refuse.
-/// 4. Txs naming a package still inside its maturity window — the same
-///    question `validate_packages_mature` asks, for the same reason.
+/// 4. Txs naming a package this window cannot run — the same question
+///    `validate_packages_usable` asks, for the same reason.
 ///
 /// Logs the dedup and expiry counts when non-zero.
 pub fn select_transactions(
@@ -178,7 +178,7 @@ pub fn select_transactions(
     let mut deduped = 0;
     let mut expired = 0;
     let mut predates = 0;
-    let mut immature = 0;
+    let mut unrunnable = 0;
     let filtered: Vec<_> = ready_txs
         .iter()
         .filter(|tx| {
@@ -204,22 +204,22 @@ pub fn select_transactions(
                 predates += 1;
                 return false;
             }
-            // Published, but not for long enough that every voter is
+            // Not published, or not for long enough that every voter is
             // sure to hold its code yet.
-            if topology_snapshot.immature_package_of(tx).is_some() {
-                immature += 1;
+            if topology_snapshot.unusable_package_of(tx).is_some() {
+                unrunnable += 1;
                 return false;
             }
             true
         })
         .cloned()
         .collect();
-    if deduped > 0 || expired > 0 || predates > 0 || immature > 0 {
+    if deduped > 0 || expired > 0 || predates > 0 || unrunnable > 0 {
         debug!(
             deduped,
             expired,
             predates,
-            immature,
+            unrunnable,
             before,
             after = filtered.len(),
             "Filtered proposal candidates"

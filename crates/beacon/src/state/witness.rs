@@ -5,10 +5,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     BeaconProposal, BeaconState, BlockHeader, Hash, JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS,
-    MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PackageFact, PendingReshape,
-    PendingWithdrawal, RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS, ShardId, ShardTrie,
-    ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier,
-    validator_possession_proof_verify, verify_shard_vote_equivocation, verify_vote_equivocation,
+    MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PACKAGE_MATURITY_EPOCHS, PackageFact,
+    PendingReshape, PendingWithdrawal, RESHAPE_READY_TTL_EPOCHS, RESHAPE_TRIGGER_TTL_EPOCHS,
+    ShardId, ShardTrie, ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord,
+    ValidatorStatus, Verifier, validator_possession_proof_verify, verify_shard_vote_equivocation,
+    verify_vote_equivocation,
 };
 
 use crate::rules;
@@ -685,10 +686,13 @@ pub(super) fn apply_shard_payload(
             // content address, so a second registration could only
             // restate it.
             if ShardTrie::shard_owns_prefix(source_shard, *publisher) {
-                state.packages.entry(*package).or_insert(PackageFact {
-                    publisher: *publisher,
-                    registered_at: state.current_epoch,
-                });
+                state
+                    .packages
+                    .entry(*package)
+                    .or_insert_with(|| PackageFact {
+                        publisher: *publisher,
+                        usable_from: state.current_epoch.saturating_add(PACKAGE_MATURITY_EPOCHS),
+                    });
             }
             None
         }

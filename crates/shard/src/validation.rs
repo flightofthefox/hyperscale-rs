@@ -456,7 +456,8 @@ pub fn validate_engagement(
     Ok(())
 }
 
-/// No transaction may name a package still inside its maturity window.
+/// Every package a transaction names must be one this window may run:
+/// registered, past its maturity window, or born with the chain.
 ///
 /// The window is what every node fetches a newly registered artifact's
 /// bytes in, so what this establishes is that by the time a transaction
@@ -465,21 +466,24 @@ pub fn validate_engagement(
 /// question about whose fetch finished first — and replicas that answer
 /// it differently attest different ticks.
 ///
-/// Only the registered-and-immature are refused. A package nobody
-/// published is named by a transaction that reaches the same no-code
-/// refusal on every node, which is a verdict rather than a divergence.
+/// Stated as the permission rather than the refusal, which is what makes
+/// it checkable here. Refusing only the registered-and-immature would
+/// leave the window between a publish committing on its own shard and
+/// the beacon registering it, and closing that by argument — about which
+/// nodes hold which metadata, and so which of them could have built the
+/// transaction at all — is an invariant no reader can check locally.
 ///
 /// Deterministic over block content plus the window-frozen registry
 /// every member of the committee shares; the proposer's own selection
 /// gate makes honest proposals satisfy it.
-pub fn validate_packages_mature(
+pub fn validate_packages_usable(
     topology_snapshot: &TopologySnapshot,
     block: &Block,
 ) -> Result<(), String> {
     for tx in block.transactions().iter() {
-        if let Some(package) = topology_snapshot.immature_package_of(tx) {
+        if let Some(package) = topology_snapshot.unusable_package_of(tx) {
             return Err(format!(
-                "transaction {} names package {package} inside its maturity window",
+                "transaction {} names package {package}, which this window cannot run",
                 tx.hash()
             ));
         }
@@ -547,7 +551,7 @@ pub fn validate_block_for_vote(
     validate_no_duplicate_resolutions(block, qc_chain_resolved_txs, dedup_index)?;
     validate_no_duplicate_provisions(block, qc_chain_provision_hashes, dedup_index)?;
     validate_provisions_not_fenced(topology_snapshot, block)?;
-    validate_packages_mature(topology_snapshot, block)?;
+    validate_packages_usable(topology_snapshot, block)?;
     validate_engagement(topology_snapshot, local_shard, block, dedup_index)?;
     validate_terminal_verdicts_well_formed(block)?;
     Ok(())

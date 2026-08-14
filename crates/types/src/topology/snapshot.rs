@@ -188,13 +188,14 @@ pub struct TopologySnapshot {
     /// the same `reshape_thresholds` for a block off its weighted-time-bound
     /// snapshot rather than a live head value that skews across folds.
     params: NetworkParams,
-    /// Registered packages still inside their maturity window at this
-    /// projection's epoch, projected from `BeaconState.packages`. A
-    /// transaction naming one is refused a block: the window is what
-    /// every node fetches the artifact in, so clearing it is what makes
-    /// running the code a fact about the chain rather than a race
-    /// between one node's fetch and another's.
-    immature_packages: BTreeSet<Hash>,
+    /// The packages a block governed by this window may name, projected
+    /// from `BeaconState.packages`: registered and past their maturity
+    /// window, plus the genesis packages the registry is seeded with. A
+    /// transaction naming anything else is refused a block, because the
+    /// window is what every node fetches an artifact in and clearing it
+    /// is what makes running the code a fact about the chain rather than
+    /// a race between one node's fetch and another's.
+    usable_packages: BTreeSet<Hash>,
     validator_pubkeys: HashMap<ValidatorId, ConsensusPublicKey>,
     global_validator_set: Arc<ValidatorSet>,
 }
@@ -242,7 +243,7 @@ impl TopologySnapshot {
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
-            immature_packages: BTreeSet::new(),
+            usable_packages: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -290,7 +291,7 @@ impl TopologySnapshot {
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
-            immature_packages: BTreeSet::new(),
+            usable_packages: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(validator_set),
         }
@@ -347,7 +348,7 @@ impl TopologySnapshot {
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
-            immature_packages: BTreeSet::new(),
+            usable_packages: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -440,7 +441,7 @@ impl TopologySnapshot {
             pending_recoveries: BTreeMap::new(),
             completed_recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
-            immature_packages: BTreeSet::new(),
+            usable_packages: BTreeSet::new(),
             validator_pubkeys,
             global_validator_set: Arc::new(global_validator_set.clone()),
         }
@@ -457,12 +458,14 @@ impl TopologySnapshot {
         self
     }
 
-    /// Set the packages still inside their maturity window (see
-    /// [`Self::package_immature`]). Defaults empty, which is what every
-    /// committee-only construction wants: nothing to hold back.
+    /// Set the packages this window may name (see
+    /// [`Self::package_usable`]). Defaults empty, which refuses every
+    /// package — only a snapshot projected from a beacon state carries
+    /// the registry that answers this, and only that snapshot governs a
+    /// vote.
     #[must_use]
-    pub fn with_immature_packages(mut self, packages: BTreeSet<Hash>) -> Self {
-        self.immature_packages = packages;
+    pub fn with_usable_packages(mut self, packages: BTreeSet<Hash>) -> Self {
+        self.usable_packages = packages;
         self
     }
 
@@ -567,28 +570,23 @@ impl TopologySnapshot {
         self.params
     }
 
-    /// Whether `package` is registered but still inside its maturity
-    /// window at this projection's epoch — the one answer that keeps a
-    /// transaction out of a block.
+    /// Whether a block governed by this window may name `package`.
     #[must_use]
-    pub fn package_immature(&self, package: &Hash) -> bool {
-        self.immature_packages.contains(package)
+    pub fn package_usable(&self, package: &Hash) -> bool {
+        self.usable_packages.contains(package)
     }
 
-    /// The first package `tx` names that is not yet usable, if it names
+    /// The first package `tx` names that this window may not, if it names
     /// one.
     ///
     /// The proposer asks this of what it selects and the voter asks it
     /// of what it receives, so a proposer never offers a block its own
     /// committee would refuse.
     #[must_use]
-    pub fn immature_package_of(&self, tx: &Transaction) -> Option<Hash> {
-        if self.immature_packages.is_empty() {
-            return None;
-        }
+    pub fn unusable_package_of(&self, tx: &Transaction) -> Option<Hash> {
         tx.packages()
             .iter()
-            .find(|package| self.immature_packages.contains(package))
+            .find(|package| !self.usable_packages.contains(package))
             .copied()
     }
 

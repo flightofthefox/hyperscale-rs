@@ -348,6 +348,13 @@ impl Epoch {
         Self(self.0 + 1)
     }
 
+    /// Saturating addition — a maturity deadline counted forward from
+    /// the epoch a record was folded in.
+    #[must_use]
+    pub const fn saturating_add(self, rhs: u64) -> Self {
+        Self(self.0.saturating_add(rhs))
+    }
+
     /// Saturating subtraction. Beacon cooldown and unbonding checks
     /// compare `current_epoch.saturating_sub(initiated_at_epoch.inner())`
     /// against the relevant `*_EPOCHS` constant; saturating semantics
