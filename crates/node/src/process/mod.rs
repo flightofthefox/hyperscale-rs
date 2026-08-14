@@ -416,6 +416,17 @@ where
     /// [`SubmitFanout::GossipOnly`] — gossip still goes out via some
     /// hosted shard, but no shard admits or takes ownership.
     pub(crate) fn compute_submit_fanout(&self, tx: &Transaction) -> SubmitFanout {
+        // Ingress bytes are unverified, and routing is a derivation the
+        // envelope has to earn: asking an envelope that derives no
+        // routing which shards it touches is asking for an answer it
+        // does not have.
+        if let Err(error) = tx.try_derived() {
+            tracing::debug!(
+                reason = error.0,
+                "refusing a submission that derives nothing"
+            );
+            return SubmitFanout::Underivable;
+        }
         let topology_snapshot = self.topology_snapshot.load();
         let touched_shards: Vec<ShardId> = topology_snapshot.all_shards_for_transaction(tx);
 
@@ -506,6 +517,7 @@ where
                 tracing::warn!("Dropping locally-submitted transaction: host carries no shard");
                 ok = false;
             }
+            SubmitFanout::Underivable => ok = false,
         }
         ok
     }
@@ -595,6 +607,10 @@ pub enum SubmitFanout {
     /// It runs no shard pipeline to admit or gossip through, so a
     /// locally-submitted tx is dropped.
     NoHostedShard,
+    /// The envelope's derivation refuses, so it names no shards to fan
+    /// out to. Dropped here rather than gossiped: the same refusal is
+    /// what every recipient's admission would reach.
+    Underivable,
 }
 
 #[cfg(test)]

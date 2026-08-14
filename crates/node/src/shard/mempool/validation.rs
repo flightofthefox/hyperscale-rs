@@ -413,6 +413,7 @@ where
             SubmitFanout::NoHostedShard => {
                 tracing::warn!("Dropping locally-submitted transaction: host carries no shard");
             }
+            SubmitFanout::Underivable => {}
         }
     }
 }
