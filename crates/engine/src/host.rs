@@ -31,6 +31,9 @@ macro_rules! delegate {
             fn delta_sub(&mut self, rep: u32, amount: u128) -> Result<(), AbortReason> {
                 self.0.delta_sub(rep, amount).map_err(AbortReason::from)
             }
+            fn issuer_take(&mut self, rep: u32, amount: u128) -> Result<u32, AbortReason> {
+                self.0.issuer_take(rep, amount).map_err(AbortReason::from)
+            }
             fn delta_take(&mut self, rep: u32, amount: u128) -> Result<u32, AbortReason> {
                 self.0.delta_take(rep, amount).map_err(AbortReason::from)
             }
