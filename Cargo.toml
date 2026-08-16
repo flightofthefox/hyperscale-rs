@@ -139,6 +139,7 @@ zeroize = "1.9.0"
 hyperscale-hbor = { path = "vm/crates/hbor" }
 hyperscale-vm-effects = { path = "vm/crates/effects" }
 hyperscale-vm-fixtures = { path = "vm/crates/fixtures" }
+hyperscale-vm-gate = { path = "vm/crates/gate" }
 hyperscale-vm-kernel = { path = "vm/crates/kernel" }
 hyperscale-vm-manifest-builder = { path = "vm/crates/manifest-builder" }
 hyperscale-vm-ref = { path = "vm/crates/ref" }
