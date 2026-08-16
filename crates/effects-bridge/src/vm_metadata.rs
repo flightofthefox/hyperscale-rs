@@ -66,7 +66,7 @@ mod tests {
         Accessibility, Address, AddressClass, CallSite, Clause, EdgeContent, Expr, LocalKey,
         MAX_CLAUSE_DEPTH, MAX_EFFECTS_PER_SIGNATURE, MAX_EXPR_DEPTH, MAX_VALUE_DEPTH,
         METADATA_WIRE_DEPTH, MethodSignature, ModeExpr, ParamType, RoleId, SubstateKey, TargetExpr,
-        Value,
+        Totality, Value,
     };
 
     use super::*;
@@ -166,6 +166,7 @@ mod tests {
         // for-each body, a call site, and a deep literal.
         let signature = MethodSignature {
             accessibility: Accessibility::Guarded(Expr::SelfAddr),
+            totality: Totality::Fallible,
             mints: None,
             abi: Vec::new(),
             params: vec![
