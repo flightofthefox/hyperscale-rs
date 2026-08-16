@@ -55,10 +55,9 @@ pub fn decode_metadata(bytes: &[u8]) -> Result<PackageMetadata, VmStaticsError> 
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use hyperscale_hbor::to_vec_with_depth;
-    use hyperscale_types::MAX_EVENT_TYPES;
+    use hyperscale_types::{MAX_ERROR_CODES, MAX_EVENT_TYPES};
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
         Accessibility, Address, AddressClass, CallSite, Clause, EdgeContent, Expr, LocalKey,
@@ -310,6 +309,7 @@ mod tests {
         struct Forged {
             methods: Vec<(String, MethodSignature)>,
             events: Vec<String>,
+            errors: Vec<String>,
         }
 
         let mut metadata = PackageMetadata::default();
@@ -327,6 +327,7 @@ mod tests {
                         .map(|name| ((*name).to_owned(), MethodSignature::default()))
                         .collect(),
                     events: Vec::new(),
+                    errors: Vec::new(),
                 },
                 METADATA_WIRE_DEPTH,
             )
@@ -439,14 +440,23 @@ mod tests {
     }
 
     #[test]
-    fn an_event_table_past_the_index_the_kernel_accepts_is_refused() {
-        let table = |len: usize| PackageMetadata {
-            methods: BTreeMap::new(),
+    fn a_name_table_past_the_index_the_kernel_accepts_is_refused() {
+        let events = |len: usize| PackageMetadata {
             events: vec![String::new(); len],
+            ..PackageMetadata::default()
         };
         assert_bounded(
-            &table(MAX_EVENT_TYPES as usize),
-            &table(MAX_EVENT_TYPES as usize + 1),
+            &events(MAX_EVENT_TYPES as usize),
+            &events(MAX_EVENT_TYPES as usize + 1),
+        );
+
+        let errors = |len: usize| PackageMetadata {
+            errors: vec![String::new(); len],
+            ..PackageMetadata::default()
+        };
+        assert_bounded(
+            &errors(MAX_ERROR_CODES as usize),
+            &errors(MAX_ERROR_CODES as usize + 1),
         );
     }
 
@@ -456,8 +466,8 @@ mod tests {
         // than the section budget, refused on length before the decoder
         // reads a byte of it.
         let over = PackageMetadata {
-            methods: BTreeMap::new(),
             events: vec!["e".repeat(1024); MAX_EVENT_TYPES as usize],
+            ..PackageMetadata::default()
         };
         let bytes = encode_unchecked(&over);
         assert!(bytes.len() > MAX_PACKAGE_METADATA_BYTES);

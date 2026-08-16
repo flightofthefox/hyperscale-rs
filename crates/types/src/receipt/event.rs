@@ -5,7 +5,9 @@
 //! decode, so the two cannot drift. What binds here is the leaf hash —
 //! the protocol hash is this workspace's to name.
 
-pub use hyperscale_vm_types::{Event, MAX_EVENT_PAYLOAD_BYTES, MAX_EVENT_TYPES, MAX_EVENTS_PER_TX};
+pub use hyperscale_vm_types::{
+    Event, MAX_ERROR_CODES, MAX_EVENT_PAYLOAD_BYTES, MAX_EVENT_TYPES, MAX_EVENTS_PER_TX,
+};
 
 use crate::Hash;
 
