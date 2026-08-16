@@ -140,12 +140,12 @@ mod native {
     use hyperscale_effects_bridge::ProtocolHasher;
     use hyperscale_vm_effects::{PackageHash, package_hash};
     use hyperscale_vm_kernel::{
-        AbortReason, CellKind, GuestArg, GuestBackend as Backend, GuestCall, InvokeResult,
+        AbortReason, CellKind, GuestArg, GuestBackend as Backend, GuestCall, InvokeResult, Invoked,
         KernelSession,
     };
     use hyperscale_vm_runtime::{
-        CellKind as HostCellKind, HostArg, add_kernel_to_linker, blessed_engine, call_export,
-        classify, exhausted as fuel_exhausted, validate_component,
+        CellKind as HostCellKind, HostArg, Returned, add_kernel_to_linker, blessed_engine,
+        call_export, classify, exhausted as fuel_exhausted, validate_component,
     };
     use wasmtime::component::{Component, InstancePre, Linker};
     use wasmtime::{Engine, Store};
@@ -322,7 +322,7 @@ mod native {
                 return InvokeResult {
                     session: store.into_data().0,
                     fuel: 0,
-                    result: Err(AbortReason::CodeUnavailable),
+                    result: Invoked::Aborted(AbortReason::CodeUnavailable),
                     exhausted: false,
                 };
             };
@@ -333,13 +333,13 @@ mod native {
                     return InvokeResult {
                         session: store.into_data().0,
                         fuel: 0,
-                        result: Err(AbortReason::InstantiationFailed),
+                        result: Invoked::Aborted(AbortReason::InstantiationFailed),
                         exhausted: false,
                     };
                 }
             };
             let args: Vec<HostArg<'_>> = call.args.iter().map(host_arg).collect();
-            let outcome = call_export(&mut store, &instance, call.export, &args, call.returns);
+            let outcome = call_export(&mut store, &instance, call.export, &args);
             // The engine's own classification, not an inference from the
             // fuel left: a trap that happens to land on an exhausted
             // counter is a different outcome from one caused by it, and
@@ -347,11 +347,15 @@ mod native {
             // Two runtimes disagreeing here is two nodes disagreeing on
             // whether a transaction was its sender's own defect.
             let exhausted = outcome.as_ref().err().is_some_and(fuel_exhausted);
-            let result = outcome.map_err(|error| {
-                let reason = classify(&error);
-                tracing::debug!(export = call.export, ?reason, detail = ?error, "guest aborted");
-                reason
-            });
+            let result = match outcome {
+                Ok(Returned::Values(bytes)) => Invoked::Returned(bytes),
+                Ok(Returned::Declined(code)) => Invoked::Declined(code),
+                Err(error) => {
+                    let reason = classify(&error);
+                    tracing::debug!(export = call.export, ?reason, detail = ?error, "guest aborted");
+                    Invoked::Aborted(reason)
+                }
+            };
             let remaining = store.get_fuel().expect("fuel metering is enabled");
             let fuel = budget - remaining;
             InvokeResult {
@@ -397,7 +401,7 @@ mod reference {
     use hyperscale_effects_bridge::ProtocolHasher;
     use hyperscale_vm_effects::{PackageHash, package_hash};
     use hyperscale_vm_kernel::{
-        AbortReason, CellKind, GuestArg, GuestBackend as Backend, GuestCall, InvokeResult,
+        AbortReason, CellKind, GuestArg, GuestBackend as Backend, GuestCall, InvokeResult, Invoked,
         KernelSession,
     };
     use hyperscale_vm_ref::{
@@ -488,7 +492,7 @@ mod reference {
                 return InvokeResult {
                     session,
                     fuel: 0,
-                    result: Err(AbortReason::CodeUnavailable),
+                    result: Invoked::Aborted(AbortReason::CodeUnavailable),
                     exhausted: false,
                 };
             };
@@ -500,7 +504,7 @@ mod reference {
                         return InvokeResult {
                             session: host.0,
                             fuel: 0,
-                            result: Err(AbortReason::InstantiationFailed),
+                            result: Invoked::Aborted(AbortReason::InstantiationFailed),
                             exhausted: false,
                         };
                     }
@@ -514,24 +518,25 @@ mod reference {
             let fuel = instance.fuel_consumed();
             let session = instance.into_host().0;
             let result = match outcome {
-                Ok(Ok(values)) => match (call.returns, values.as_slice()) {
-                    (false, []) => Ok(None),
-                    (true, [CVal::Bytes(bytes)]) => Ok(Some(bytes.clone())),
+                Ok(Ok(values)) => match values.as_slice() {
+                    [] => Invoked::Returned(None),
+                    [CVal::Bytes(bytes)] => Invoked::Returned(Some(bytes.clone())),
+                    [CVal::Declined(code)] => Invoked::Declined(*code),
                     other => {
                         tracing::debug!(export = call.export, ?other, "off-convention result");
-                        Err(AbortReason::BadReturnShape)
+                        Invoked::Aborted(AbortReason::BadReturnShape)
                     }
                 },
                 Ok(Err(error)) => {
                     let reason = error.abort_reason();
                     tracing::debug!(export = call.export, ?reason, ?error, "guest aborted");
-                    Err(reason)
+                    Invoked::Aborted(reason)
                 }
                 // The export is not in the component's table, which the
                 // publish gate admitted it against.
                 Err(error) => {
                     tracing::debug!(export = call.export, ?error, "export not invocable");
-                    Err(AbortReason::ExportMissing)
+                    Invoked::Aborted(AbortReason::ExportMissing)
                 }
             };
             InvokeResult {
