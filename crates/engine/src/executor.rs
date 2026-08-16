@@ -472,8 +472,11 @@ impl Executor {
 }
 
 /// Fuel and the abort reason (if any) as node-local metadata.
-/// How an abort reads in a diagnostic: the kernel's own verdict, or the
-/// deterministic text a trap carried.
+/// How an abort reads in a diagnostic: its class, rendered.
+///
+/// The only place an abort becomes prose, and it is the right one — the
+/// metadata is node-local, so nothing downstream of here is hashed or
+/// compared between committees.
 ///
 /// One derivation, because a preview quotes the same verdict a tick
 /// records and two copies would drift apart silently. Never
@@ -485,7 +488,7 @@ impl Executor {
 /// Panics on a completed outcome, which is not an abort.
 pub fn abort_reason(outcome: &Outcome) -> String {
     match outcome {
-        Outcome::UserError { reason } | Outcome::ProtocolError { reason } => reason.clone(),
+        Outcome::UserError { reason } | Outcome::ProtocolError { reason } => format!("{reason:?}"),
         Outcome::Infeasible { key, amount } => format!("infeasible: {amount} uncovered on {key:?}"),
         Outcome::ConstraintUnmet {
             node,

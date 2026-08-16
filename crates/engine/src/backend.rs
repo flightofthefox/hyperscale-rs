@@ -140,14 +140,15 @@ mod native {
     use hyperscale_effects_bridge::ProtocolHasher;
     use hyperscale_vm_effects::{PackageHash, package_hash};
     use hyperscale_vm_kernel::{
-        CellKind, GuestArg, GuestBackend as Backend, GuestCall, InvokeResult, KernelSession,
+        AbortReason, CellKind, GuestArg, GuestBackend as Backend, GuestCall, InvokeResult,
+        KernelSession,
     };
     use hyperscale_vm_runtime::{
         CellKind as HostCellKind, HostArg, add_kernel_to_linker, blessed_engine, call_export,
-        validate_component,
+        classify, exhausted as fuel_exhausted, validate_component,
     };
     use wasmtime::component::{Component, InstancePre, Linker};
-    use wasmtime::{Engine, Store, Trap};
+    use wasmtime::{Engine, Store};
 
     use super::{FUEL, HostState, PackageSlots};
     use crate::genesis::GenesisPackages;
@@ -321,17 +322,18 @@ mod native {
                 return InvokeResult {
                     session: store.into_data().0,
                     fuel: 0,
-                    result: Err("no compiled code for the called package".to_string()),
+                    result: Err(AbortReason::CodeUnavailable),
                     exhausted: false,
                 };
             };
             let instance = match pre.instantiate(&mut store) {
                 Ok(instance) => instance,
                 Err(error) => {
+                    tracing::debug!(?error, "component did not instantiate");
                     return InvokeResult {
                         session: store.into_data().0,
                         fuel: 0,
-                        result: Err(format!("instantiate: {error:#}")),
+                        result: Err(AbortReason::InstantiationFailed),
                         exhausted: false,
                     };
                 }
@@ -344,12 +346,12 @@ mod native {
             // the reference interpreter reports the distinction exactly.
             // Two runtimes disagreeing here is two nodes disagreeing on
             // whether a transaction was its sender's own defect.
-            let exhausted = outcome
-                .as_ref()
-                .err()
-                .and_then(|error| error.downcast_ref::<Trap>())
-                .is_some_and(|trap| matches!(trap, Trap::OutOfFuel));
-            let result = outcome.map_err(|trap| format!("{trap:#}"));
+            let exhausted = outcome.as_ref().err().is_some_and(fuel_exhausted);
+            let result = outcome.map_err(|error| {
+                let reason = classify(&error);
+                tracing::debug!(export = call.export, ?reason, detail = ?error, "guest aborted");
+                reason
+            });
             let remaining = store.get_fuel().expect("fuel metering is enabled");
             let fuel = budget - remaining;
             InvokeResult {
@@ -395,7 +397,8 @@ mod reference {
     use hyperscale_effects_bridge::ProtocolHasher;
     use hyperscale_vm_effects::{PackageHash, package_hash};
     use hyperscale_vm_kernel::{
-        CellKind, GuestArg, GuestBackend as Backend, GuestCall, InvokeResult, KernelSession,
+        AbortReason, CellKind, GuestArg, GuestBackend as Backend, GuestCall, InvokeResult,
+        KernelSession,
     };
     use hyperscale_vm_ref::{
         CVal, ExecError, RefComponent, RefComponentInstance, ResourceKind, Trap as RefTrap,
@@ -485,7 +488,7 @@ mod reference {
                 return InvokeResult {
                     session,
                     fuel: 0,
-                    result: Err("no decoded code for the called package".to_string()),
+                    result: Err(AbortReason::CodeUnavailable),
                     exhausted: false,
                 };
             };
@@ -493,10 +496,11 @@ mod reference {
                 match RefComponentInstance::instantiate(&component, HostState(session)) {
                     Ok(instance) => instance,
                     Err((host, error)) => {
+                        tracing::debug!(?error, "component did not instantiate");
                         return InvokeResult {
                             session: host.0,
                             fuel: 0,
-                            result: Err(format!("instantiate: {error}")),
+                            result: Err(AbortReason::InstantiationFailed),
                             exhausted: false,
                         };
                     }
@@ -513,10 +517,22 @@ mod reference {
                 Ok(Ok(values)) => match (call.returns, values.as_slice()) {
                     (false, []) => Ok(None),
                     (true, [CVal::Bytes(bytes)]) => Ok(Some(bytes.clone())),
-                    other => Err(format!("unexpected result shape: {other:?}")),
+                    other => {
+                        tracing::debug!(export = call.export, ?other, "off-convention result");
+                        Err(AbortReason::BadReturnShape)
+                    }
                 },
-                Ok(Err(trap)) => Err(format!("{trap:?}")),
-                Err(error) => Err(format!("invoke: {error:?}")),
+                Ok(Err(error)) => {
+                    let reason = error.abort_reason();
+                    tracing::debug!(export = call.export, ?reason, ?error, "guest aborted");
+                    Err(reason)
+                }
+                // The export is not in the component's table, which the
+                // publish gate admitted it against.
+                Err(error) => {
+                    tracing::debug!(export = call.export, ?error, "export not invocable");
+                    Err(AbortReason::ExportMissing)
+                }
             };
             InvokeResult {
                 session,
