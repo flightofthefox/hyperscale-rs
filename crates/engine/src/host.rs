@@ -31,6 +31,9 @@ macro_rules! delegate {
             fn delta_sub(&mut self, rep: u32, amount: u128) -> Result<(), AbortReason> {
                 self.0.delta_sub(rep, amount).map_err(AbortReason::from)
             }
+            fn bucket_amount(&mut self, rep: u32) -> Result<u128, AbortReason> {
+                self.0.bucket(rep).map_err(AbortReason::from)
+            }
             fn delta_put(&mut self, rep: u32, funds: u32) -> Result<(), AbortReason> {
                 self.0.delta_put(rep, funds).map_err(AbortReason::from)
             }
