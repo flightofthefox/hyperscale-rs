@@ -494,8 +494,8 @@ mod tests {
     use super::*;
     use crate::test_utils::{test_prefix, test_validity_range};
     use crate::{
-        Ed25519PrivateKey, PrincipalAddr, SchemeId, Secp256k1PrivateKey, SubintentSig,
-        TransactionBody, VmStatics, declared_work, install_vm_statics,
+        Ed25519PrivateKey, MlDsa65PrivateKey, PrincipalAddr, SchemeId, Secp256k1PrivateKey,
+        SubintentSig, TransactionBody, VmStatics, declared_work, install_vm_statics,
     };
 
     struct StubStatics;
@@ -668,21 +668,24 @@ mod tests {
         );
     }
 
-    /// Either registered scheme signs an envelope that survives the wire
-    /// and verifies at the other end.
+    /// Any registered scheme signs an envelope that survives the wire and
+    /// verifies at the other end — including one whose material is
+    /// kilobytes rather than tens of bytes.
     #[test]
-    fn an_envelope_signed_under_either_scheme_round_trips() {
+    fn an_envelope_signed_under_any_registered_scheme_round_trips() {
         install_vm_statics(Box::new(StubStatics));
         let ed = unsigned_envelope(b"graph bytes")
             .sign(&Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap());
         let secp = unsigned_envelope(b"graph bytes")
             .sign(&Secp256k1PrivateKey::from_bytes(&[7u8; 32]).unwrap());
+        let ml_dsa = unsigned_envelope(b"graph bytes")
+            .sign(&MlDsa65PrivateKey::from_bytes(&[7u8; 32]).unwrap());
 
         assert_eq!(ed.signer_scheme, SchemeId::ED25519);
         assert_eq!(secp.signer_scheme, SchemeId::SECP256K1);
-        assert_ne!(ed.signer.len(), secp.signer.len());
+        assert_eq!(ml_dsa.signer_scheme, SchemeId::ML_DSA_65);
 
-        for envelope in [ed, secp] {
+        for envelope in [ed, secp, ml_dsa] {
             let bytes = hbor_to_vec(&Transaction::new(envelope)).unwrap();
             let carried: Transaction = hbor_from_slice(&bytes).unwrap();
             carried
@@ -702,8 +705,14 @@ mod tests {
             .sign(&Ed25519PrivateKey::from_bytes(&[7u8; 32]).unwrap());
         let secp = unsigned_envelope(b"graph bytes")
             .sign(&Secp256k1PrivateKey::from_bytes(&[7u8; 32]).unwrap());
+        let ml_dsa = unsigned_envelope(b"graph bytes")
+            .sign(&MlDsa65PrivateKey::from_bytes(&[7u8; 32]).unwrap());
 
-        for (envelope, other) in [(ed, SchemeId::SECP256K1), (secp, SchemeId::ED25519)] {
+        for (envelope, other) in [
+            (ed, SchemeId::SECP256K1),
+            (secp, SchemeId::ML_DSA_65),
+            (ml_dsa, SchemeId::ED25519),
+        ] {
             let mut retagged = envelope;
             retagged.signer_scheme = other;
             let bytes = hbor_to_vec(&Transaction::new(retagged)).unwrap();

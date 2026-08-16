@@ -76,7 +76,7 @@ pub use beacon::{
     verify_vote1, verify_vote2, verify_vote3,
 };
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
-pub use crypto::{Ed25519PrivateKey, Secp256k1PrivateKey};
+pub use crypto::{Ed25519PrivateKey, MlDsa65PrivateKey, Secp256k1PrivateKey};
 pub use execution::computation::{tick_leader, tick_leader_at};
 pub use execution::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,

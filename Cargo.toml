@@ -97,6 +97,7 @@ hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 im = "15.1.0"
 indexmap = "2.14.0"
 libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "quic", "tokio", "macros", "identify"] }
+ml-dsa = "0.1.1"
 libp2p-stream = "0.4.0-alpha"
 opentelemetry = "0.32.0"
 opentelemetry_sdk = "0.32.1"

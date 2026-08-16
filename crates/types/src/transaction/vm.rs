@@ -4,9 +4,9 @@
 //! [`TransactionEnvelope`] and its body live in `hyperscale-vm-types` —
 //! the envelope is the VM's artifact, and its signed content is defined
 //! there through the derived preimage. What binds here is what the leaf
-//! crate deliberately does not know: the protocol hash and curve behind
-//! [`EnvelopeExt`], the clock behind the validity window, and the
-//! workspace's admission vocabulary behind [`VmStatics`].
+//! crate deliberately does not know: the protocol hash and the signature
+//! arithmetic behind [`EnvelopeExt`], the clock behind the validity
+//! window, and the workspace's admission vocabulary behind [`VmStatics`].
 
 use std::sync::OnceLock;
 
@@ -18,13 +18,13 @@ use thiserror::Error;
 
 use crate::crypto::{
     Ed25519PublicKey, Ed25519Signature, Secp256k1PublicKey, Secp256k1Signature, verify_ed25519,
-    verify_secp256k1,
+    verify_ml_dsa_65, verify_secp256k1,
 };
 use crate::{
     Address, DeclaredKey, Hash, PrincipalAddr, ProtocolHasher, TimestampRange, WeightedTimestamp,
 };
 
-/// The curves behind the VM's scheme registry.
+/// The arithmetic behind the VM's scheme registry.
 ///
 /// The registry says how wide a scheme's material is and what verifying it
 /// costs; this says what verifying it *means*. Every scheme the protocol
@@ -32,10 +32,12 @@ use crate::{
 /// claims, or material of a width its entry does not give it — answers
 /// `false` alongside a signature that is simply wrong.
 ///
-/// Every message the transaction path presents is a 32-byte hash, and the
-/// ECDSA scheme takes one as its prehash rather than digesting again. A
-/// message of any other width is refused there, which is the same refusal
-/// as any other material this verifier cannot read.
+/// Every message the transaction path presents is a 32-byte hash, and no
+/// scheme here digests it a second time: ECDSA takes it as its prehash,
+/// and ML-DSA signs it as a message under the pure variant. A message of
+/// any other width is refused by the schemes that require the digest
+/// exactly, which is the same refusal as any other material this verifier
+/// cannot read.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProtocolVerifier;
 
@@ -72,6 +74,7 @@ impl SchemeVerifier for ProtocolVerifier {
                     &Secp256k1Signature(signature),
                 )
             }
+            SchemeId::ML_DSA_65 => verify_ml_dsa_65(message, key, signature),
             _ => false,
         }
     }
@@ -81,7 +84,7 @@ impl SchemeVerifier for ProtocolVerifier {
 ///
 /// The envelope defines its signed content — the preimage — and this
 /// trait turns it into signatures and windows with the protocol's own
-/// hash, curve, and time vocabulary.
+/// hash, signature, and time vocabulary.
 pub trait EnvelopeExt: Sized {
     /// The domain-separated hash of the envelope's signed content —
     /// everything but the composer's own key and signature. This is
@@ -368,7 +371,7 @@ pub fn vm_statics() -> &'static dyn VmStatics {
 #[cfg(test)]
 mod tests {
     use super::{AccountSigner, ProtocolVerifier, SchemeId, SchemeVerifier};
-    use crate::crypto::{Ed25519PrivateKey, Secp256k1PrivateKey};
+    use crate::crypto::{Ed25519PrivateKey, MlDsa65PrivateKey, Secp256k1PrivateKey};
 
     const DIGEST: [u8; 32] = [3u8; 32];
 
@@ -380,8 +383,12 @@ mod tests {
         Secp256k1PrivateKey::from_bytes(&[3u8; 32]).expect("a scalar in range")
     }
 
+    fn ml_dsa() -> MlDsa65PrivateKey {
+        MlDsa65PrivateKey::from_bytes(&[3u8; 32]).expect("32 bytes")
+    }
+
     fn signers() -> Vec<Box<dyn AccountSigner>> {
-        vec![Box::new(ed()), Box::new(secp())]
+        vec![Box::new(ed()), Box::new(secp()), Box::new(ml_dsa())]
     }
 
     #[test]
@@ -402,7 +409,7 @@ mod tests {
         for signer in signers() {
             let key = signer.public_key_bytes();
             let signature = signer.sign_digest(&DIGEST);
-            for scheme in [SchemeId::ED25519, SchemeId::SECP256K1] {
+            for scheme in [SchemeId::ED25519, SchemeId::SECP256K1, SchemeId::ML_DSA_65] {
                 assert_eq!(
                     ProtocolVerifier.verify(scheme, &key, &signature, &DIGEST),
                     scheme == signer.scheme(),
@@ -418,7 +425,7 @@ mod tests {
         for signer in signers() {
             let key = signer.public_key_bytes();
             let signature = signer.sign_digest(&DIGEST);
-            for scheme in [SchemeId::NONE, SchemeId(3), SchemeId(u16::MAX)] {
+            for scheme in [SchemeId::NONE, SchemeId(4), SchemeId(u16::MAX)] {
                 assert!(!ProtocolVerifier.verify(scheme, &key, &signature, &DIGEST));
             }
         }

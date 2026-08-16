@@ -1,15 +1,17 @@
 //! Cryptographic types and helpers for the transaction path.
 //!
-//! [`ed25519`] and [`secp256k1`] are the schemes themselves; [`keys`] is
-//! keypair generation over them. Each key implements the VM's
+//! [`ed25519`], [`secp256k1`] and [`ml_dsa`] are the schemes themselves;
+//! [`keys`] is keypair generation over them. Each key implements the VM's
 //! `AccountSigner`, which is what an envelope asks of any of them.
 
 pub mod ed25519;
 pub mod keys;
+pub mod ml_dsa;
 pub mod secp256k1;
 
 pub use ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature, verify_ed25519};
 use hyperscale_vm_types::{AccountSigner, SchemeId};
+pub use ml_dsa::{MlDsa65PrivateKey, verify_ml_dsa_65};
 pub use secp256k1::{
     Secp256k1PrivateKey, Secp256k1PublicKey, Secp256k1Signature, verify_secp256k1,
 };
@@ -39,5 +41,19 @@ impl AccountSigner for Secp256k1PrivateKey {
 
     fn sign_digest(&self, digest: &[u8; 32]) -> Vec<u8> {
         self.sign_prehash(digest).0.to_vec()
+    }
+}
+
+impl AccountSigner for MlDsa65PrivateKey {
+    fn scheme(&self) -> SchemeId {
+        SchemeId::ML_DSA_65
+    }
+
+    fn public_key_bytes(&self) -> Vec<u8> {
+        self.public_key()
+    }
+
+    fn sign_digest(&self, digest: &[u8; 32]) -> Vec<u8> {
+        self.sign(digest)
     }
 }
