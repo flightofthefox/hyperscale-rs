@@ -14,21 +14,22 @@ use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, badge_buyer, cross_fraction_genesis_accounts,
     cross_shard_fault_genesis_accounts, cross_shard_genesis_accounts, genesis_accounts,
     halt_straddler_setup, insolvent_genesis_accounts, livelock_genesis_accounts,
-    merge_straddler_setup, nullifier_race_genesis_accounts, overdraw_genesis_accounts,
-    participant_sweep_genesis_accounts, probe_train_genesis_accounts, reshape_lifecycle_accounts,
-    securify_genesis_accounts, shared_recipient_genesis_accounts, split_straddler_setup,
-    staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts, unbound_genesis_accounts,
-    unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
+    merge_straddler_setup, native_pq_genesis_accounts, nullifier_race_genesis_accounts,
+    overdraw_genesis_accounts, participant_sweep_genesis_accounts, probe_train_genesis_accounts,
+    reshape_lifecycle_accounts, securify_genesis_accounts, shared_recipient_genesis_accounts,
+    split_straddler_setup, staking_genesis_accounts, stdlib_flash_bytes, storm_genesis_accounts,
+    unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig,
-    a_failed_attempt_still_attests_work, a_payer_cannot_spend_one_balance_twice,
-    a_published_package_matures_before_it_runs, abort_converges, abort_floor_settles_on_deadline,
-    attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
-    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_fetch_fallback,
-    cross_shard_fraction, cross_shard_header_fetch_fallback,
-    cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
+    a_failed_attempt_still_attests_work, a_native_post_quantum_account_pays_its_own_way,
+    a_payer_cannot_spend_one_balance_twice, a_published_package_matures_before_it_runs,
+    abort_converges, abort_floor_settles_on_deadline, attested_load_reaches_the_beacon,
+    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
+    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
+    cross_shard_exec_cert_drop_fetch_fallback, cross_shard_fraction,
+    cross_shard_header_fetch_fallback, cross_shard_provisions_drop_fetch_fallback,
+    cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
     delegation_folds_into_beacon_state, deploy_storm_rides_out, epochs,
@@ -345,6 +346,13 @@ fn securify_retires_the_key_at_the_payer_shard_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &securify_genesis_accounts());
     securify_retires_the_key_at_the_payer_shard(&mut cluster);
+}
+
+#[test]
+fn a_native_post_quantum_account_pays_its_own_way_sim() {
+    let mut cluster =
+        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &native_pq_genesis_accounts());
+    a_native_post_quantum_account_pays_its_own_way(&mut cluster);
 }
 
 #[test]

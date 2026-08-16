@@ -1109,8 +1109,8 @@ pub fn build_stamp_tx(
 /// If the scenario world does not answer a transfer, which would be a
 /// defect in the world rather than in the transfer.
 #[must_use]
-pub fn build_transfer_tx(
-    payer: &Ed25519PrivateKey,
+pub fn build_transfer_tx<S: AccountSigner>(
+    payer: &S,
     from: PrincipalAddr,
     to: PrincipalAddr,
     amount: u128,
@@ -1274,6 +1274,34 @@ pub fn securify_cast() -> (
 pub fn securify_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
     let (_owner_key, owner, _holder_key, _holder, to) = securify_cast();
     vec![(owner, 10_000), (to, 10)]
+}
+
+/// The native post-quantum cast.
+///
+/// An account whose founding key is ML-DSA-65 on `leaf(1, 0)`, and a
+/// recipient on `leaf(1, 1)` so what it pays for crosses shards.
+///
+/// The counterpart to [`securify_cast`]: nothing here migrates, because
+/// there is no classical key to migrate off. The address the ML-DSA key
+/// derives *is* the account, and it opens by signature alone — a virtual
+/// account's rule is the identity its own address derives.
+#[must_use]
+pub fn native_pq_cast() -> (MlDsa65PrivateKey, PrincipalAddr, PrincipalAddr) {
+    let (payer_key, payer) = ml_dsa_account_routing_to(ShardId::leaf(1, 0), &mut Vec::new());
+    let (_, to) = account_routing_to(ShardId::leaf(1, 1), &mut Vec::new());
+    (payer_key, payer, to)
+}
+
+/// Genesis funding for the native post-quantum cast.
+///
+/// Genesis funds an address, and an address is where a scheme has
+/// already been folded in — so a post-quantum account is seeded by the
+/// same call that seeds a classical one, with nothing to say about
+/// which it is.
+#[must_use]
+pub fn native_pq_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let (_payer_key, payer, to) = native_pq_cast();
+    vec![(payer, 10_000), (to, 10)]
 }
 
 /// Build the securify transaction: `owner`'s key signs its account over
@@ -1820,9 +1848,9 @@ fn declaration(write: impl FnOnce(&mut IntentBuilder<'_>) -> Result<(), TypedErr
 
 /// Wrap a single-intent graph in a signed envelope at the scenario fee
 /// terms, with no message.
-fn envelope(
+fn envelope<S: AccountSigner>(
     graph: ManifestGraph,
-    payer: &Ed25519PrivateKey,
+    payer: &S,
     validity: TimestampRange,
 ) -> TransactionEnvelope {
     client().sign(

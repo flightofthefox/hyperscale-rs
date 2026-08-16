@@ -29,9 +29,10 @@ use crate::support::faultable::FaultableCluster;
 use crate::support::tx::{
     OVERDRAW_AMOUNT, build_composed_tx, build_instance_deposit_tx, build_publish_tx,
     build_securify_tx, build_stamp_tx, build_transfer_paid_by, build_transfer_tx,
-    build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, nullifier_race_cast, overdraw_cast,
-    payment_request, recipient, securify_cast, sender, shared_recipient_cast, storm_artifact,
-    storm_publishers, unbound_payer_cast, unbound_remote_payer_cast, validity_around,
+    build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, native_pq_cast,
+    nullifier_race_cast, overdraw_cast, payment_request, recipient, securify_cast, sender,
+    shared_recipient_cast, storm_artifact, storm_publishers, unbound_payer_cast,
+    unbound_remote_payer_cast, validity_around,
 };
 use crate::support::wait::{await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -1098,6 +1099,72 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
             == 10 + 100 + 9),
         "the recipient's balance must carry the settled transfers alone; balance = {}",
         vault_balance(c, counterpart, to)
+    );
+}
+
+/// An account founded on a post-quantum key pays its own way.
+///
+/// The other half of the post-quantum story from
+/// [`securify_retires_the_key_at_the_payer_shard`], and the half that
+/// needs no transition: this account never held a classical key. Its
+/// address is what an ML-DSA-65 key derives, so the identity that opens
+/// it by signature is the one its own address names, and it is a virtual
+/// account with nothing stored.
+///
+/// What that costs the protocol is the whole point of driving it here.
+/// The account signs, is admitted, reserves against its own vault, and
+/// settles a transfer to a recipient on another shard — so a
+/// kilobyte-scale signature travels the full cross-shard path, and the
+/// fee binding names a principal that no curve derived.
+///
+/// # Panics
+///
+/// Panics if the payer's key is not post-quantum, the transfer does not
+/// accept, the recipient is not credited, or the payer's vault does not
+/// show the transfer and a fee on top of it.
+pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
+    let payer_shard = ShardId::leaf(1, 0);
+    let counterpart = ShardId::leaf(1, 1);
+    let (payer_key, payer, to) = native_pq_cast();
+    assert_eq!(
+        payer_key.scheme(),
+        SchemeId::ML_DSA_65,
+        "this account's founding key must be post-quantum"
+    );
+    assert_eq!(
+        vault_balance(c, payer_shard, payer),
+        10_000,
+        "genesis must seed a post-quantum address like any other"
+    );
+
+    let tx = build_transfer_tx(&payer_key, payer, to, 100, validity_around(c.now()));
+    let hash = tx.hash();
+    c.submit(Arc::new(tx));
+    let status = await_tx_terminal(c, hash, epochs(16));
+    assert!(
+        matches!(
+            status,
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        ),
+        "the post-quantum account's own transfer must settle; status = {status:?}"
+    );
+
+    // Awaited, because the terminal status precedes the credit's
+    // settlement round on the recipient's shard.
+    assert!(
+        c.run_until(epochs(8), |c| vault_balance(c, counterpart, to) == 10 + 100),
+        "the recipient must carry the settled transfer; balance = {}",
+        vault_balance(c, counterpart, to)
+    );
+
+    // The account paid the transfer *and* a fee out of its own vault:
+    // the reservation engaged against a principal an ML-DSA key derived,
+    // which is what distinguishes paying its own way from merely being
+    // a signature that verified.
+    let remaining = vault_balance(c, payer_shard, payer);
+    assert!(
+        remaining < 10_000 - 100,
+        "the payer must have settled a fee beyond the transfer; balance = {remaining}"
     );
 }
 
