@@ -16,7 +16,9 @@ use hyperscale_vm_effects::{
     AbiParam, Clause, MethodSignature, ModeExpr, PackageMetadata, TargetExpr, Totality,
     attach_metadata as attach_canonical, check_abi, check_declarations, metadata_section,
 };
-use hyperscale_vm_runtime::{ExportParam, component_export_params, validate_component};
+use hyperscale_vm_runtime::{
+    ExportParam, check_method, component_export_params, validate_component,
+};
 
 use crate::vm_metadata::{decode_metadata, encode_metadata};
 
@@ -90,16 +92,19 @@ pub fn admit_package(artifact: &[u8]) -> Result<PackageMetadata, VmStaticsError>
 
 /// Admit an artifact the protocol supplies rather than a publisher.
 ///
-/// Identical to [`admit_package`] but for the totality mark, which this
-/// one permits. Genesis seeds the stdlib through here; nothing reachable
-/// from a transaction does, so the distinction is a fact about the caller
-/// rather than about the bytes — which is the only place it can live,
-/// since an artifact claiming to be protocol code looks exactly like one
-/// that is.
+/// Identical to [`admit_package`] but for the totality mark, which a
+/// publisher cannot claim and which this one reads against the code
+/// rather than takes on faith. Genesis seeds the stdlib through here;
+/// nothing reachable from a transaction does, so the distinction is a
+/// fact about the caller rather than about the bytes — which is the only
+/// place it can live, since an artifact claiming to be protocol code
+/// looks exactly like one that is.
 ///
 /// # Errors
 ///
-/// As [`admit_package`], less the totality refusal.
+/// As [`admit_package`], except that a claim to totality is checked
+/// against the artifact instead of refused, and fails admission when the
+/// code does not support it.
 pub fn admit_protocol_package(artifact: &[u8]) -> Result<PackageMetadata, VmStaticsError> {
     admit(artifact, Provenance::Protocol)
 }
@@ -136,44 +141,54 @@ fn admit(artifact: &[u8], provenance: Provenance) -> Result<PackageMetadata, VmS
         check_declarations(signature)
             .map_err(|error| VmStaticsError(format!("method {method:?}: {error}")))?;
         check_abi_against_export(method, signature, params)?;
-        if provenance == Provenance::Published {
-            refuse_published_totality(method, signature)?;
-        }
+        judge_totality(artifact, method, signature, provenance)?;
     }
     Ok(metadata)
 }
 
-/// Refuse a published package's claim to totality.
+/// Judge a claim to totality: refused outright from a publisher, and read
+/// against the code when the protocol makes it.
 ///
 /// The mark says a caller can commit without waiting to hear back, so a
 /// wrong one is not a lost optimisation but a torn settlement: an
-/// outbound leg the core already committed against, failing. What stands
-/// behind it is a scan whose two documented gaps — linear memory taken as
-/// safe, the canonical ABI's glue excluded — are both open in the
-/// direction an author who wanted the mark would push, and claiming it is
-/// what gets their legs decomposed.
+/// outbound leg the core already committed against, failing. Two
+/// different things follow from that, one per provenance.
 ///
-/// So the mark is the protocol's own to make, and the caller says which
-/// it is. Provenance cannot be read off the bytes — an artifact claiming
-/// to be protocol code looks exactly like one that is — so it rides the
-/// entry point instead of an allowlist something could talk its way onto.
+/// **A publisher cannot claim it at all.** What stands behind the mark is
+/// a scan with documented gaps — linear memory taken as safe, the ABI's
+/// allocator set aside — and both are open in the direction an author who
+/// wanted the mark would push. Provenance cannot be read off the bytes,
+/// since an artifact claiming to be protocol code looks exactly like one
+/// that is, so it rides the entry point rather than an allowlist. The
+/// refusal costs a published package little: a venue's own code is core,
+/// where no mark is wanted, and the legs around it are the account's
+/// withdraw and deposit that the stdlib supplies.
 ///
-/// The refusal costs a published package little. A venue's own code is
-/// core, where no mark is wanted — the legs around it are the account's
-/// withdraw and deposit, which the stdlib supplies — so what a package
-/// gives up is a delivery method of its own, and that classifies as core
-/// and still runs.
-fn refuse_published_totality(
+/// **The protocol's own claim is checked here rather than trusted.** The
+/// artifact is in hand and the scan is a pure function of it, so a mark
+/// the code cannot support fails admission rather than waiting for a test
+/// to notice — which is what makes the mark verified at deploy instead of
+/// asserted at deploy and audited later.
+fn judge_totality(
+    artifact: &[u8],
     method: &str,
     signature: &MethodSignature,
+    provenance: Provenance,
 ) -> Result<(), VmStaticsError> {
-    if signature.totality == Totality::Total {
-        return Err(VmStaticsError(format!(
+    if signature.totality != Totality::Total {
+        return Ok(());
+    }
+    match provenance {
+        Provenance::Published => Err(VmStaticsError(format!(
             "method {method:?} claims totality, which a published package cannot: \
              the mark is granted to protocol code seeded at genesis"
-        )));
+        ))),
+        Provenance::Protocol => check_method(artifact, method).map_err(|error| {
+            VmStaticsError(format!(
+                "method {method:?} claims totality its artifact does not support: {error}"
+            ))
+        }),
     }
-    Ok(())
 }
 
 /// Judge a method's ABI binding against the export type that will
@@ -267,7 +282,7 @@ mod tests {
 
     use hyperscale_vm_effects::{AbiParam, Accessibility, Expr, MethodSignature, PackageMetadata};
     use hyperscale_vm_fixtures::book;
-    use hyperscale_vm_stdlib::{account, account_artifact, staking_artifact};
+    use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account, account_artifact, staking_artifact};
     use wat::parse_str;
 
     use super::{admit_protocol_package, *};
@@ -512,6 +527,32 @@ mod tests {
         let error = admit_package(artifact).expect_err("a publish cannot carry the mark");
         assert!(
             error.0.contains("claims totality"),
+            "refused for the wrong reason: {}",
+            error.0,
+        );
+    }
+
+    /// The protocol's own claim is read against its code. Marking a
+    /// method the artifact cannot support fails admission, which is what
+    /// makes the mark verified at deploy rather than asserted at deploy
+    /// and audited somewhere else.
+    #[test]
+    fn a_protocol_claim_its_artifact_refuses_does_not_admit() {
+        let mut metadata = account::metadata();
+        // `deposit-nf` is public, so it clears the gate rule and reaches
+        // the artifact — which refuses it, because filing each arriving
+        // id is a loop and a loop has no static fuel ceiling.
+        metadata
+            .methods
+            .get_mut("deposit-nf")
+            .expect("the account files instances")
+            .totality = Totality::Total;
+        let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
+
+        let error = admit_protocol_package(&artifact)
+            .expect_err("a mark the code cannot support is not admissible");
+        assert!(
+            error.0.contains("does not support"),
             "refused for the wrong reason: {}",
             error.0,
         );
