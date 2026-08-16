@@ -8,14 +8,13 @@
 //! target, and none of them executes anything.
 
 use hyperscale_types::{ComponentAddr, ResourceAddr, StakePoolSeat};
-use hyperscale_vm_effects::stdlib::OWNER_BADGE;
 use hyperscale_vm_effects::{
     Address, Fungibility, Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash,
     ResourceRecord, Value, package_hash, resource_address,
 };
 use hyperscale_vm_fixtures::artifacts as fixture_artifacts;
-use hyperscale_vm_stdlib::protocol_artifacts;
 pub use hyperscale_vm_stdlib::{account_artifact, genesis_publisher, staking_artifact};
+use hyperscale_vm_stdlib::{protocol_artifacts, staking};
 
 use crate::vm_statics::PackageCache;
 use crate::{PoolRegistry, ProtocolHasher, XRD, admit_protocol_package};
@@ -205,7 +204,7 @@ pub fn pool_owner_badge(pool: impl Into<Address>) -> ResourceAddr {
     resource_address(
         &ProtocolHasher,
         pool,
-        &[Value::Bytes(OWNER_BADGE.to_vec()).canonical_bytes()],
+        &[Value::Bytes(staking::OWNER_BADGE.to_vec()).canonical_bytes()],
     )
 }
 
@@ -230,7 +229,7 @@ pub const OWNER_BADGE_RECORD: ResourceRecord = ResourceRecord {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::test_principal;
-    use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_metadata};
+    use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account};
 
     use super::*;
     use crate::account_address;
@@ -252,7 +251,7 @@ mod tests {
         // publish check, and it is the signature set the stdlib authors:
         // the real guest's exports back every method it declares.
         let declared = admit_protocol_package(artifact).expect("publishes as a package");
-        assert_eq!(declared, account_metadata());
+        assert_eq!(declared, account::metadata());
         let world = genesis_world();
         assert_eq!(
             world.cache.load().get(world.account_package),

@@ -26,7 +26,7 @@ use hyperscale_types::{
     WeightedTimestamp,
 };
 use hyperscale_vm_effects::{Address, CollectionId, package_hash};
-use hyperscale_vm_stdlib::calls::{account, staking};
+use hyperscale_vm_stdlib::{account, staking};
 
 /// The identifier the beacon folds the seated pool under.
 const POOL_ID: u32 = 7;

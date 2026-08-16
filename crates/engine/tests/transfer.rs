@@ -25,16 +25,15 @@ use hyperscale_types::{
     TimestampRange, Transaction, TransactionBody, TransactionEnvelope, Verified, WeightedTimestamp,
     absorb_committed_cells,
 };
+use hyperscale_vm_effects::vocabulary::CONFIG;
 use hyperscale_vm_effects::{
     AbiParam, Address, Clause, CollectionId, EnvelopeTree, Expr, Hash32, InstanceMeta, IntentDecl,
     ModeExpr, PackageHash, PackageMetadata, TargetExpr, Totality, Value, package_hash,
 };
-use hyperscale_vm_fixtures::calls::lottery;
-use hyperscale_vm_fixtures::lottery_package_hash;
+use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_kernel::{amount_cell, encode_amount};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
-use hyperscale_vm_stdlib::calls::account;
-use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, CONFIG, account_metadata};
+use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account};
 
 /// The two accounts the transfer cases move funds between, as signing
 /// seeds rather than as literal addresses: a withdrawing node admits only
@@ -1306,7 +1305,7 @@ fn published_account_artifact() -> Vec<u8> {
 }
 
 fn published_account_metadata() -> PackageMetadata {
-    let mut metadata = account_metadata();
+    let mut metadata = account::metadata();
     for signature in metadata.methods.values_mut() {
         signature.totality = Totality::Fallible;
     }

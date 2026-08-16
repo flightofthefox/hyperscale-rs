@@ -22,7 +22,7 @@ use hyperscale_types::{
     StoredReceipt, TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{CollectionId, holdings_collection};
-use hyperscale_vm_stdlib::calls::account;
+use hyperscale_vm_stdlib::account;
 
 /// The two signing seeds this world funds.
 const ALICE: u8 = 1;

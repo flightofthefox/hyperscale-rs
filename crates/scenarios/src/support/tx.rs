@@ -28,14 +28,12 @@ use hyperscale_vm_effects::{
     Address, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, ManifestGraph, Totality,
     package_hash,
 };
-use hyperscale_vm_fixtures::calls::lottery;
-use hyperscale_vm_fixtures::lottery_package_hash;
+use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
 use hyperscale_vm_manifest_builder::{
     EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError,
 };
-use hyperscale_vm_stdlib::calls::{account, staking};
-use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_artifact, account_metadata};
+use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account, account_artifact, staking};
 
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
 /// fee comes from the faucet, so any key notarizes it.
@@ -1448,7 +1446,7 @@ const PUBLISH_MAX_FEE: u128 = 1_000_000;
 /// the codec rather than a runtime condition.
 #[must_use]
 pub fn storm_artifact(nonce: u16) -> Vec<u8> {
-    let mut metadata = account_metadata();
+    let mut metadata = account::metadata();
     metadata.events.push(format!("storm-{nonce}"));
     // The account declares a total method and this artifact publishes
     // through the ordinary path, which grants the mark to nothing: it is

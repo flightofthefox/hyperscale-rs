@@ -21,7 +21,7 @@ use hyperscale_types::{
     DeclaredKey, DeclaredRange, Derived, EnvelopeExt, Hash, MAX_STATE_ENTRIES_PER_TX, Routing,
     TransactionEnvelope, VmStatics, VmStaticsError, declared_work,
 };
-use hyperscale_vm_effects::stdlib::{AUTH, CONFIG, DRAW, VALIDATORS, VAULT, XRD as XRD_ROLE};
+use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT, XRD as XRD_ROLE};
 use hyperscale_vm_effects::{
     Address, AuthCell, AuthRole, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry,
     ManifestHash, MetadataCache, Mode, NativeAddr, PackageHash, PackageMetadata,
@@ -29,6 +29,8 @@ use hyperscale_vm_effects::{
     admit_tree, child_key, footprint, native_address, package_hash,
     package_key as canonical_package_key, principal_address, route_tree,
 };
+use hyperscale_vm_fixtures::lottery;
+use hyperscale_vm_stdlib::staking;
 
 use crate::ProtocolHasher;
 use crate::artifact::admit_package;
@@ -70,7 +72,7 @@ pub fn validator_key(pool: impl Into<Address>, validator: u64) -> SubstateKey {
     child_key(
         &ProtocolHasher,
         pool,
-        VALIDATORS,
+        staking::VALIDATORS,
         &[Value::U64(validator).canonical_bytes()],
     )
 }
@@ -80,7 +82,7 @@ pub fn validator_key(pool: impl Into<Address>, validator: u64) -> SubstateKey {
 /// effect signature the method declares.
 #[must_use]
 pub fn draw_key(lottery: impl Into<Address>) -> SubstateKey {
-    child_key(&ProtocolHasher, lottery, DRAW, &[])
+    child_key(&ProtocolHasher, lottery, lottery::DRAW, &[])
 }
 
 /// An instance's configuration cell: the locked leaf its creation fixed.
@@ -592,13 +594,14 @@ mod tests {
     use hyperscale_types::{
         CallTarget, Ed25519PrivateKey, NetworkId, Secp256k1PrivateKey, TX_UNITS, TransactionBody,
     };
-    use hyperscale_vm_effects::stdlib::{VAULT, account_metadata};
+    use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
         AddressClass, AuthBase, CollectionId, Constraint, EdgeRef, EvidenceRef, GraphArg,
         GraphNode, Hasher, IntentDecl, ManifestGraph, PackageHash, Proposal, ResourceAddr, RoleSet,
         Rule, Subintent, SubintentHash, YieldBinding, YieldParam, child_key, nullifier_key,
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
+    use hyperscale_vm_stdlib::account;
 
     use super::*;
 
@@ -620,7 +623,7 @@ mod tests {
     fn statics() -> BridgeStatics {
         let package = PackageHash(ProtocolHasher.hash(b"package", &[b"account"]));
         let mut cache = MetadataCache::new();
-        cache.publish(package, account_metadata());
+        cache.publish(package, account::metadata());
         let mut instances = InstanceRegistry::new();
         // The composer and its counterparty are principals: their
         // addresses derive from their keys, so nothing is registered for
