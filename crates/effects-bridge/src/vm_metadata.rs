@@ -59,24 +59,24 @@ mod tests {
 
     use hyperscale_hbor::to_vec_with_depth;
     use hyperscale_types::MAX_EVENT_TYPES;
-    use hyperscale_vm_effects::stdlib::{
-        VAULT, account_metadata, amm_metadata, book_metadata, splitter_metadata,
-    };
+    use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
         Accessibility, Address, AddressClass, CallSite, Clause, EdgeContent, Expr, LocalKey,
         MAX_CLAUSE_DEPTH, MAX_EFFECTS_PER_SIGNATURE, MAX_EXPR_DEPTH, MAX_VALUE_DEPTH,
         METADATA_WIRE_DEPTH, MethodSignature, ModeExpr, ParamType, RoleId, SubstateKey, TargetExpr,
         Totality, Value,
     };
+    use hyperscale_vm_fixtures::{amm, book, splitter};
+    use hyperscale_vm_stdlib::account;
 
     use super::*;
 
     fn stdlib() -> Vec<(&'static str, PackageMetadata)> {
         vec![
-            ("account", account_metadata()),
-            ("amm", amm_metadata()),
-            ("book", book_metadata()),
-            ("splitter", splitter_metadata()),
+            ("account", account::metadata()),
+            ("amm", amm::metadata()),
+            ("book", book::metadata()),
+            ("splitter", splitter::metadata()),
         ]
     }
 
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn truncated_and_extended_payloads_are_refused() {
-        let bytes = encode_metadata(&account_metadata()).expect("encodes");
+        let bytes = encode_metadata(&account::metadata()).expect("encodes");
         for cut in 0..bytes.len() {
             assert!(
                 decode_metadata(&bytes[..cut]).is_err(),

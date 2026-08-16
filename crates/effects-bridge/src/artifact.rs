@@ -265,9 +265,9 @@ const fn expected_resource(clause: &Clause) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
 
-    use hyperscale_vm_effects::stdlib::{account_metadata, book_metadata};
     use hyperscale_vm_effects::{AbiParam, Accessibility, Expr, MethodSignature, PackageMetadata};
-    use hyperscale_vm_stdlib::{account_artifact, staking_artifact};
+    use hyperscale_vm_fixtures::book;
+    use hyperscale_vm_stdlib::{account, account_artifact, staking_artifact};
     use wat::parse_str;
 
     use super::{admit_protocol_package, *};
@@ -343,7 +343,7 @@ mod tests {
 
     #[test]
     fn an_artifact_declares_the_metadata_it_was_attached() {
-        for metadata in [account_metadata(), book_metadata()] {
+        for metadata in [account::metadata(), book::metadata()] {
             let plain = with_section(1, b"code goes here");
             assert_eq!(extract_metadata(&plain).expect("walks"), None);
 
@@ -363,15 +363,15 @@ mod tests {
         // What content addressing over the whole artifact buys: the
         // declared effects cannot drift from the code under one address.
         let plain = with_section(1, b"code");
-        let one = attach_metadata(&plain, &account_metadata()).expect("attaches");
-        let other = attach_metadata(&plain, &book_metadata()).expect("attaches");
+        let one = attach_metadata(&plain, &account::metadata()).expect("attaches");
+        let other = attach_metadata(&plain, &book::metadata()).expect("attaches");
         assert_ne!(one, other);
     }
 
     #[test]
     fn a_corrupt_payload_is_refused_rather_than_read() {
         let plain = with_section(1, b"code");
-        let artifact = attach_metadata(&plain, &account_metadata()).expect("attaches");
+        let artifact = attach_metadata(&plain, &account::metadata()).expect("attaches");
         // Every byte the section's payload occupies: a change either
         // fails to decode or names different metadata, never silently
         // the same.
@@ -379,7 +379,7 @@ mod tests {
             let mut mutated = artifact.clone();
             mutated[index] ^= 0xFF;
             if let Ok(Some(metadata)) = extract_metadata(&mutated) {
-                assert_ne!(metadata, account_metadata());
+                assert_ne!(metadata, account::metadata());
             }
         }
     }
