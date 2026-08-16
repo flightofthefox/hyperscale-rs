@@ -11,7 +11,9 @@ use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
-use hyperscale_engine::genesis::{pool_address, pool_owner_badge, staking_artifact};
+use hyperscale_engine::genesis::{
+    GenesisPackages, pool_address, pool_owner_badge, staking_artifact,
+};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, TickBatchContext, XRD, genesis_writes,
 };
@@ -24,7 +26,7 @@ use hyperscale_types::{
     WeightedTimestamp,
 };
 use hyperscale_vm_effects::{Address, CollectionId, package_hash};
-use hyperscale_vm_manifest_builder::native::{account, staking};
+use hyperscale_vm_stdlib::calls::{account, staking};
 
 /// The identifier the beacon folds the seated pool under.
 const POOL_ID: u32 = 7;
@@ -43,7 +45,8 @@ struct MapDb {
 
 impl MapDb {
     fn genesis(accounts: &[(PrincipalAddr, u128)], pools: &[StakePoolSeat]) -> Self {
-        let (cells, entries) = genesis_writes(accounts, pools).into_parts();
+        let (cells, entries) =
+            genesis_writes(accounts, pools, &GenesisPackages::protocol()).into_parts();
         Self {
             cells: cells
                 .into_iter()
@@ -128,7 +131,7 @@ fn pool_at(id: u32) -> ComponentAddr {
 fn client() -> &'static Client {
     static CLIENT: LazyLock<Client> = LazyLock::new(|| {
         Client::new(
-            genesis_world_with_pools(&[seat(POOL_ID), seat(99)]),
+            genesis_world_with_pools(&[seat(POOL_ID), seat(99)], &GenesisPackages::protocol()),
             NetworkId(242),
         )
     });
@@ -198,9 +201,19 @@ fn witnesses(executed: &ExecutedTx) -> Vec<BeaconWitnessEvent> {
 /// The whole channel in one assertion: a delegation to a seated pool is a
 /// beacon fact by the time it leaves the engine, with the pool named by
 /// the instance that emitted it and the amount carried across as attos.
+/// An executor over a network seating `pools`, on the protocol's own
+/// packages — the staking surface reaches no fixture.
+fn seated(pools: &[StakePoolSeat], mode: ExecutionMode) -> Executor {
+    Executor::with_genesis(pools, &GenesisPackages::protocol(), mode)
+}
+
 #[test]
 fn a_delegation_to_a_seated_pool_reaches_the_witness_channel() {
-    let executor = Executor::with_pools(&[seat(POOL_ID), seat(99)], ExecutionMode::Serial);
+    let executor = Executor::with_genesis(
+        &[seat(POOL_ID), seat(99)],
+        &GenesisPackages::protocol(),
+        ExecutionMode::Serial,
+    );
     let executed = execute(&executor, signed_stake(pool_at(POOL_ID), 500));
     assert_eq!(
         witnesses(&executed[0]),
@@ -216,7 +229,7 @@ fn a_delegation_to_a_seated_pool_reaches_the_witness_channel() {
 /// decision the network makes, not one a transaction can make for it.
 #[test]
 fn an_unseated_instance_of_the_same_package_reaches_nobody() {
-    let executor = Executor::with_pools(&[seat(POOL_ID)], ExecutionMode::Serial);
+    let executor = seated(&[seat(POOL_ID)], ExecutionMode::Serial);
     // `pool_at(99)` is not in the pool set, so it was never registered as an
     // instance either and the delegation cannot even be routed to it —
     // which is the outer of the two guards. The inner one is covered by
@@ -233,7 +246,7 @@ fn an_unseated_instance_of_the_same_package_reaches_nobody() {
 /// channel carries what a stake pool says and nothing else.
 #[test]
 fn an_ordinary_transfer_is_not_a_beacon_fact() {
-    let executor = Executor::with_pools(&[seat(POOL_ID)], ExecutionMode::Serial);
+    let executor = seated(&[seat(POOL_ID)], ExecutionMode::Serial);
     let key = Ed25519PrivateKey::from_bytes(&[DELEGATOR; 32]).unwrap();
     let from = account_address(&key.public_key().0);
     let graph = client()
@@ -272,7 +285,7 @@ fn signed_registration(pool: ComponentAddr, seed: u8) -> Transaction {
 /// genesis seats that badge in the seat's operator account.
 #[test]
 fn only_the_badge_holder_may_register_a_validator() {
-    let executor = Executor::with_pools(&[seat(POOL_ID)], ExecutionMode::Serial);
+    let executor = seated(&[seat(POOL_ID)], ExecutionMode::Serial);
 
     // Well-formed: the outsider presents a badge from their own
     // account, which is what admission asks of a custodial call. The
@@ -302,6 +315,6 @@ fn only_the_badge_holder_may_register_a_validator() {
 /// in the funds it carries, so anyone may delegate to any seated pool.
 #[test]
 fn a_delegation_needs_no_operator() {
-    let _ = Executor::with_pools(&[seat(POOL_ID)], ExecutionMode::Serial);
+    let _ = seated(&[seat(POOL_ID)], ExecutionMode::Serial);
     assert!(signed_stake(pool_at(POOL_ID), 500).try_derived().is_ok());
 }

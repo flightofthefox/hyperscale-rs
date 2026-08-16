@@ -28,8 +28,8 @@ use hyperscale_types::{
 use hyperscale_vm_effects::{
     EnvelopeTree, IntentDecl, ManifestGraph, MetadataCache, PrincipalAddr, Rule,
 };
-use hyperscale_vm_manifest_builder::native::account;
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
+use hyperscale_vm_stdlib::calls::account;
 
 /// The execution gas limit every built envelope signs. Placeholder
 /// pricing — well above what a transfer draws, so the ceiling is never

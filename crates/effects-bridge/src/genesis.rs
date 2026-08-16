@@ -13,10 +13,57 @@ use hyperscale_vm_effects::{
     Address, Fungibility, Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash,
     ResourceRecord, Value, package_hash, resource_address,
 };
+use hyperscale_vm_fixtures::artifacts as fixture_artifacts;
+use hyperscale_vm_stdlib::protocol_artifacts;
 pub use hyperscale_vm_stdlib::{account_artifact, genesis_publisher, staking_artifact};
 
 use crate::vm_statics::PackageCache;
 use crate::{PoolRegistry, ProtocolHasher, XRD, admit_protocol_package};
+
+/// The packages a network is born running.
+///
+/// The protocol's own are every network's; a network may seed others
+/// beside them, and a test or simulation network is where that happens.
+/// Production names [`GenesisPackages::protocol`] and nothing else, so a
+/// fixture reaching a real chain takes a deliberate edit at the call site
+/// rather than a flag someone left on.
+///
+/// Every genesis surface reads its set from one of these — the package
+/// cells, the beacon's usability registry, and the process's metadata
+/// cache — because a package present in one and absent from another is a
+/// chain that cannot route to its own code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenesisPackages(Vec<&'static [u8]>);
+
+impl Default for GenesisPackages {
+    fn default() -> Self {
+        Self::protocol()
+    }
+}
+
+impl GenesisPackages {
+    /// The protocol's own: the account every principal answers and the
+    /// stake pool the beacon folds facts for.
+    #[must_use]
+    pub fn protocol() -> Self {
+        Self(protocol_artifacts())
+    }
+
+    /// The protocol's, plus the test packages a network outside
+    /// production seeds beside them.
+    #[must_use]
+    pub fn with_fixtures() -> Self {
+        let mut packages = Self::protocol();
+        packages.0.extend(fixture_artifacts());
+        packages
+    }
+
+    /// The artifacts, in the order they are seeded.
+    #[must_use]
+    pub fn artifacts(&self) -> &[&'static [u8]] {
+        &self.0
+    }
+}
 
 /// The genesis-static world: published stdlib metadata, the blueprint
 /// serving every principal, and any seated pool instances.
@@ -55,11 +102,12 @@ pub struct World {
 /// package — a build defect, not a runtime condition.
 #[must_use]
 pub fn genesis_world() -> World {
-    genesis_world_with_pools(&[])
+    genesis_world_with_pools(&[], &GenesisPackages::protocol())
 }
 
-/// [`genesis_world`] seating `pools` as the stake pools the beacon folds
-/// for: `(instance address, the identifier it is folded under)`.
+/// [`genesis_world`] over `packages`, seating `pools` as the stake pools
+/// the beacon folds for: `(instance address, the identifier it is folded
+/// under)`.
 ///
 /// A pool is an instance of the stdlib stake pool package configured with
 /// the resource it stakes and the resource it issues. Seating it here is
@@ -68,23 +116,19 @@ pub fn genesis_world() -> World {
 ///
 /// # Panics
 ///
-/// Panics if a stdlib artifact would not be admissible as a published
+/// Panics if a genesis artifact would not be admissible as a published
 /// package — a build defect, not a runtime condition.
 #[must_use]
-pub fn genesis_world_with_pools(pools: &[StakePoolSeat]) -> World {
-    let artifact = account_artifact();
-    let account_package = package_hash(&ProtocolHasher, artifact);
-    let metadata = admit_protocol_package(artifact)
-        .expect("the stdlib account artifact publishes as a package");
+pub fn genesis_world_with_pools(pools: &[StakePoolSeat], packages: &GenesisPackages) -> World {
     let mut seed = MetadataCache::new();
-    seed.publish(account_package, metadata);
-
+    for artifact in packages.artifacts() {
+        seed.publish(
+            package_hash(&ProtocolHasher, artifact),
+            admit_protocol_package(artifact).expect("a genesis artifact publishes as a package"),
+        );
+    }
+    let account_package = package_hash(&ProtocolHasher, account_artifact());
     let staking_package = package_hash(&ProtocolHasher, staking_artifact());
-    seed.publish(
-        staking_package,
-        admit_protocol_package(staking_artifact())
-            .expect("the stdlib stake pool artifact publishes as a package"),
-    );
 
     let cache = PackageCache::new(seed);
     let mut instances = InstanceRegistry::new();

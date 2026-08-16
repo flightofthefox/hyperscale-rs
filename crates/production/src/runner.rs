@@ -403,11 +403,19 @@ impl ProductionRunnerBuilder {
             .as_ref()
             .map(|config| config.pools.clone())
             .unwrap_or_default();
+        // The registry the chain is born with has to name the same set
+        // the state seeds and the executor's world holds, so all three
+        // read it off the one config.
+        let genesis_packages = self
+            .genesis_config
+            .as_ref()
+            .map(|config| config.packages.clone())
+            .unwrap_or_default();
         let boot = build_genesis(
             &genesis_validators,
             chain_config,
             &seat_list,
-            &genesis_package_facts(),
+            &genesis_package_facts(&genesis_packages),
         );
         // Warm-restart: resume the beacon coordinator from the latest
         // committed (block, state) in storage. On an empty store, commit the
@@ -566,8 +574,11 @@ impl ProductionRunnerBuilder {
         } else {
             &self.world_pools
         };
-        let executor: Arc<Executor> =
-            Arc::new(Executor::with_pools(world_pools, ExecutionMode::Serial));
+        let executor: Arc<Executor> = Arc::new(Executor::with_genesis(
+            world_pools,
+            &engine_bootstrap.config.packages,
+            ExecutionMode::Serial,
+        ));
 
         // Each shard's `shard_event_senders` entry points at that
         // shard's own pinned-thread callback channel — callbacks,

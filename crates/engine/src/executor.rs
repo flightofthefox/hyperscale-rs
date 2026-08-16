@@ -43,7 +43,7 @@ use hyperscale_vm_kernel::{
 };
 
 use crate::backend::EngineBackend;
-use crate::genesis::{World, genesis_world_with_pools};
+use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
 use crate::sharding::writes_root;
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
 
@@ -264,19 +264,24 @@ impl Executor {
     /// compilation — a build defect surfaced at boot, not in a tick.
     #[must_use]
     pub fn new(mode: ExecutionMode) -> Self {
-        Self::with_pools(&[], mode)
+        Self::with_genesis(&[], &GenesisPackages::protocol(), mode)
     }
 
-    /// [`Self::new`] seating `pools` as the stake pools the beacon folds
-    /// for: `(instance address, the identifier it is folded under)`.
+    /// [`Self::new`] over this network's genesis: `pools` seated as the
+    /// stake pools the beacon folds for, and `packages` as the code the
+    /// chain is born running.
     ///
     /// # Panics
     ///
     /// As [`Self::new`].
     #[must_use]
-    pub fn with_pools(pools: &[StakePoolSeat], mode: ExecutionMode) -> Self {
-        let world = genesis_world_with_pools(pools);
-        let backend = EngineBackend::new();
+    pub fn with_genesis(
+        pools: &[StakePoolSeat],
+        packages: &GenesisPackages,
+        mode: ExecutionMode,
+    ) -> Self {
+        let world = genesis_world_with_pools(pools, packages);
+        let backend = EngineBackend::new(packages);
         install_vm_statics(Box::new(BridgeStatics {
             cache: world.cache.clone(),
             instances: world.instances.clone(),
@@ -302,7 +307,7 @@ impl Executor {
     pub fn peer(&self, mode: ExecutionMode) -> Self {
         Self {
             world: self.world.clone(),
-            backend: EngineBackend::new(),
+            backend: EngineBackend::new(&GenesisPackages::protocol()),
             mode,
         }
     }

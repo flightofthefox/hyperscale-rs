@@ -14,6 +14,7 @@ use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_crypto_mock::{MockSigner, MockVerifier};
 use hyperscale_dispatch_sync::SyncDispatch;
+use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig, genesis_package_facts};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
@@ -149,6 +150,14 @@ pub struct SimConfig {
     /// serial-vs-parallel A/B constructs one cluster per mode and
     /// asserts exactly that.
     pub execution_mode: ExecutionMode,
+    /// The packages this network is born running.
+    ///
+    /// The protocol's own by default rather than every fixture the
+    /// workspace ships: a genesis package is genesis substate, and a
+    /// cluster tuned to reshape at a byte threshold is a cluster whose
+    /// behaviour a spare artifact changes. A scenario that calls a
+    /// fixture asks for it.
+    pub packages: GenesisPackages,
 }
 
 impl Default for SimConfig {
@@ -168,6 +177,7 @@ impl Default for SimConfig {
             pools: Vec::new(),
             world_pools: Vec::new(),
             execution_mode: ExecutionMode::Serial,
+            packages: GenesisPackages::protocol(),
         }
     }
 }
@@ -230,6 +240,12 @@ pub struct SimulationRunner {
     /// of who a pool operates and the beacon's agree from the first
     /// block.
     pools: Vec<StakePoolSeat>,
+
+    /// [`SimConfig::packages`], retained for the same reason the
+    /// accounts are: genesis seeds the set the executor and the beacon
+    /// registry were built with, or the chain cannot route to its own
+    /// code.
+    packages: GenesisPackages,
 
     /// The [`Executor`] every host runs, retained so a harness can reach
     /// engine-side surfaces that are not part of tick execution, such as
@@ -389,8 +405,9 @@ impl SimulationRunner {
         } else {
             &network_config.world_pools
         };
-        let engine = Arc::new(Executor::with_pools(
+        let engine = Arc::new(Executor::with_genesis(
             world_pools,
+            &network_config.packages,
             network_config.execution_mode,
         ));
 
@@ -450,7 +467,7 @@ impl SimulationRunner {
             &genesis_validators,
             chain_config,
             &network_config.pools,
-            &genesis_package_facts(),
+            &genesis_package_facts(&network_config.packages),
         );
         let mut pools = network_config.pools.clone();
         seed_founding_members(&boot.state, &mut pools);
@@ -615,6 +632,7 @@ impl SimulationRunner {
             crypto_scheme,
             accounts: network_config.accounts.clone(),
             pools,
+            packages: network_config.packages.clone(),
             engine,
             beacon_config_hash,
             beacon_network,
@@ -892,6 +910,7 @@ impl SimulationRunner {
         GenesisConfig {
             accounts: self.accounts.clone(),
             pools: self.pools.clone(),
+            packages: self.packages.clone(),
         }
     }
 

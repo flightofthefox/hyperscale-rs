@@ -10,6 +10,7 @@
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::account_address;
+use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{ExecutedTx, ExecutionMode, Executor, TickBatchContext, genesis_writes};
 use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_storage::{BoundaryStore, GenesisCommit, SubstateStore, Substates};
@@ -21,7 +22,7 @@ use hyperscale_types::{
     StoredReceipt, TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{CollectionId, holdings_collection};
-use hyperscale_vm_manifest_builder::native::account;
+use hyperscale_vm_stdlib::calls::account;
 
 /// The two signing seeds this world funds.
 const ALICE: u8 = 1;
@@ -75,7 +76,11 @@ fn held_ids(storage: &SimShardStorage, who: PrincipalAddr, resource: ResourceAdd
 /// Genesis: both accounts funded, and Alice's holdings of [`NF`] seeded
 /// with instances 1 and 2 — the entries the first tick moves.
 fn storage() -> SimShardStorage {
-    let genesis = genesis_writes(&[(principal(ALICE), FUNDED), (principal(BOB), FUNDED)], &[]);
+    let genesis = genesis_writes(
+        &[(principal(ALICE), FUNDED), (principal(BOB), FUNDED)],
+        &[],
+        &GenesisPackages::protocol(),
+    );
     let entries = [1u128, 2]
         .into_iter()
         .map(|id| {

@@ -9,7 +9,7 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
+use hyperscale_effects_bridge::genesis::{GenesisPackages, genesis_world_with_pools};
 use hyperscale_effects_bridge::vm_statics::principal_for;
 use hyperscale_effects_bridge::{ProtocolHasher, attach_metadata};
 use hyperscale_engine::genesis::{
@@ -28,11 +28,13 @@ use hyperscale_vm_effects::{
     Address, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, ManifestGraph, Totality,
     package_hash,
 };
-use hyperscale_vm_manifest_builder::native::{account, staking};
+use hyperscale_vm_fixtures::calls::lottery;
+use hyperscale_vm_fixtures::lottery_package_hash;
 use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
 use hyperscale_vm_manifest_builder::{
     EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError,
 };
+use hyperscale_vm_stdlib::calls::{account, staking};
 use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_artifact, account_metadata};
 
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
@@ -1037,55 +1039,79 @@ pub fn insolvent_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
     vec![(from, 10), (to, 10)]
 }
 
-/// Build a cross-shard entropy stamp: both accounts record the
-/// transaction's randomness draw in their own entropy leaf, so the two
-/// shards' stamps are equal exactly when they executed under one draw.
+/// A lottery instance whose settled-round cell lands on `shard`.
 ///
-/// Each stamp is an exclusive write, so each shard owes the other the
-/// prior value of the leaf it owns — the read-set-provisioned shape, in
-/// both directions.
-///
-/// The two stamps sit in two intents because they write two accounts'
-/// leaves: a stamp is gated on its target's own authority, so the
-/// right-hand account signs its own. That is the composition it takes to
-/// touch a second party at all, and it costs the scenario nothing —
-/// admission still folds one manifest and one draw still covers both.
+/// An instance's address is the hash of its package, configuration and
+/// salt, and its address *is* its placement, so putting one on a chosen
+/// shard is a scan over salts — the same grind an account's signing seed
+/// takes, one derivation along.
 ///
 /// # Panics
 ///
-/// If the scenario world does not answer a stamp, which would be a defect
-/// in the world rather than in the stamp.
+/// Panics if no salt in the `u8` space lands on `shard`.
 #[must_use]
-pub fn build_stamp_tx(
+pub fn lottery_on(shard: ShardId) -> InstanceMeta {
+    let trie = ShardTrie::uniform_from_count(2);
+    for salt in 0..=u8::MAX {
+        let meta = InstanceMeta {
+            package: lottery_package_hash(&ProtocolHasher),
+            config: Vec::new(),
+            salt: Hash32([salt; 32]),
+        };
+        if trie.shard_for_prefix(meta.address(&ProtocolHasher).address()) == shard {
+            return meta;
+        }
+    }
+    panic!("no lottery salt lands on {shard:?}");
+}
+
+/// Build a cross-shard draw: two lottery instances, one per shard,
+/// settling their rounds in one transaction — so the two recorded draws
+/// are equal exactly when the two committees executed under one value.
+///
+/// Each round's result is an exclusive write, so each shard owes the
+/// other the prior value of the cell it owns — the read-set-provisioned
+/// shape, in both directions.
+///
+/// One intent and one signature, because a draw is public: the payer
+/// signs the fee and nothing else is anyone's to authorize. That is the
+/// package's own point rather than a convenience here — the value the
+/// round turns on is not a signer's to choose.
+///
+/// # Panics
+///
+/// If the scenario world does not answer a draw, which would be a defect
+/// in the world rather than in the draw.
+#[must_use]
+pub fn build_draw_tx(
     payer: &Ed25519PrivateKey,
-    left: PrincipalAddr,
-    right_key: &Ed25519PrivateKey,
+    lotteries: &[InstanceMeta],
     validity: TimestampRange,
 ) -> Transaction {
-    let owner = account_address(&right_key.public_key().0);
-    let right = declaration(|b| {
-        let stamper = account::authorize(b, owner)?;
-        account::stamp_entropy(b, stamper)
-    });
-    // The right-hand account signs its own declaration, which is all it
-    // ever sees: no part of the envelope enters that hash.
-    let signed = sign_subintent(right_key, &right.hash(&ProtocolHasher).0.0);
-
     let client = client();
     let cache = client.cache();
-    let (mut env, mut root) =
-        EnvelopeBuilder::new(&cache, &client.world().instances, &ProtocolHasher);
-    let stamper = account::authorize(&mut root, left).expect("an account signs in");
-    account::stamp_entropy(&mut root, stamper).expect("an account answers a stamp");
-    env.present(owner, right)
-        .expect("the declaration discharges itself");
+    // The builder resolves targets against the registry it is given, so
+    // the presented records are composed in first — exactly as admission
+    // composes them from the tree.
+    let mut instances = client.world().instances.clone();
+    let addresses: Vec<_> = lotteries
+        .iter()
+        .map(|meta| instances.create(&ProtocolHasher, meta.clone()))
+        .collect();
+    let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
+    for address in addresses {
+        lottery::draw(&mut root, address).expect("a lottery answers a draw");
+    }
+    for meta in lotteries {
+        env.instance(meta.clone());
+    }
     env.seal(root)
         .expect("the root declares nothing to discharge");
-    let tree = env.build().expect("neither intent declares a hole");
+    let tree = env.build().expect("the intent declares no hole");
 
     Transaction::new(client.sign_tree(
         &tree,
-        vec![signed],
+        Vec::new(),
         payer,
         Terms {
             max_fee: MAX_FEE,
@@ -1816,8 +1842,12 @@ pub const SCENARIO_NETWORK: NetworkId = NetworkId(242);
 /// Built once because seating pools admits the stdlib artifacts, and the
 /// seat list is the same for every scenario in the binary.
 fn client() -> &'static Client {
-    static CLIENT: LazyLock<Client> =
-        LazyLock::new(|| Client::new(genesis_world_with_pools(&world_pools()), SCENARIO_NETWORK));
+    static CLIENT: LazyLock<Client> = LazyLock::new(|| {
+        Client::new(
+            genesis_world_with_pools(&world_pools(), &GenesisPackages::with_fixtures()),
+            SCENARIO_NETWORK,
+        )
+    });
     &CLIENT
 }
 

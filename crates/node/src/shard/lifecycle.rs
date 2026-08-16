@@ -135,7 +135,7 @@ where
         config
             .accounts
             .retain(|(address, _)| topology_snapshot.shard_for_prefix(*address) == shard);
-        let merged = genesis_writes(&config.accounts, &config.pools);
+        let merged = genesis_writes(&config.accounts, &config.pools, &config.packages);
         // The stdlib package is replicated to every shard's substate store
         // for read availability, but the prefix-rooted JMT must hold only
         // this shard's subtree, so the committed state root is the global

@@ -138,6 +138,7 @@ zeroize = "1.9.0"
 # 48 LTS, expected 2026-08-20); upgrades are protocol events.
 hyperscale-hbor = { path = "vm/crates/hbor" }
 hyperscale-vm-effects = { path = "vm/crates/effects" }
+hyperscale-vm-fixtures = { path = "vm/crates/fixtures" }
 hyperscale-vm-kernel = { path = "vm/crates/kernel" }
 hyperscale-vm-manifest-builder = { path = "vm/crates/manifest-builder" }
 hyperscale-vm-ref = { path = "vm/crates/ref" }

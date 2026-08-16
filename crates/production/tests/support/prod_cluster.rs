@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use hyperscale_engine::GenesisConfig;
+use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_metrics::set_global_recorder;
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network_libp2p::fault::{DropSpec, HostId, RuleHandle};
@@ -183,6 +184,7 @@ impl ProdCluster {
                     .chain(staking_genesis_accounts())
                     .collect(),
                 pools: world_pools(),
+                packages: GenesisPackages::protocol(),
             }),
             simulated_outbound_latency: config.latency,
         }

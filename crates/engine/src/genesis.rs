@@ -8,18 +8,18 @@
 //! kernel's own amount encoding.
 
 pub use hyperscale_effects_bridge::genesis::{
-    OWNER_BADGE_RECORD, World, account_artifact, genesis_publisher, genesis_world,
+    GenesisPackages, OWNER_BADGE_RECORD, World, account_artifact, genesis_publisher, genesis_world,
     genesis_world_with_pools, owner_badge_id, pool_address, pool_meta, pool_owner_badge,
     stake_unit, staking_artifact,
 };
 use hyperscale_effects_bridge::{ProtocolHasher, validator_key};
-pub use hyperscale_effects_bridge::{XRD, entropy_key, vault_key};
+pub use hyperscale_effects_bridge::{XRD, draw_key, vault_key};
 use hyperscale_types::{EntryKey, Hash, PrincipalAddr, SettledWrites, StakePoolSeat};
 use hyperscale_vm_effects::{
     Address, holdings_collection, instance_data_key, package_hash, resource_record_key,
 };
 use hyperscale_vm_kernel::encode_amount;
-use hyperscale_vm_stdlib::genesis_writes as stdlib_genesis_writes;
+use hyperscale_vm_stdlib::package_writes;
 
 use crate::executor::artifact_package;
 
@@ -37,6 +37,14 @@ pub struct GenesisConfig {
     /// their emitted events beacon facts — running the package never
     /// does, because anyone may run the package.
     pub pools: Vec<StakePoolSeat>,
+
+    /// The packages this network is born running. The protocol's own by
+    /// default; a test or simulation network seeds fixtures beside them.
+    ///
+    /// Part of the config rather than of the call site because a restart
+    /// replicates genesis from this, and a set that differed between the
+    /// two would rebuild a store the chain no longer matches.
+    pub packages: GenesisPackages,
 }
 
 /// The genesis substate writes.
@@ -54,13 +62,14 @@ pub struct GenesisConfig {
 pub fn genesis_writes(
     accounts: &[(PrincipalAddr, u128)],
     pools: &[StakePoolSeat],
+    packages: &GenesisPackages,
 ) -> SettledWrites {
-    // Each stdlib package as a committed cell, under the same content
+    // Each genesis package as a committed cell, under the same content
     // address a publish would place it at. Genesis is then the cache's
     // cold start in the literal sense — the same projection of committed
     // state every later block extends, rather than a second source the
     // cache would have to be told about separately.
-    let mut writes = stdlib_genesis_writes(&ProtocolHasher);
+    let mut writes = package_writes(&ProtocolHasher, packages.artifacts());
     let staking_package = package_hash(&ProtocolHasher, staking_artifact());
     // A seated pool's record of the validators it already operates.
     // Beacon genesis creates those memberships directly in beacon state,
@@ -122,10 +131,11 @@ pub fn genesis_writes(
 /// at boot — the publisher is what the registry keys fetching on, and it
 /// is never consulted for these.
 #[must_use]
-pub fn genesis_package_facts() -> Vec<(Hash, Address)> {
+pub fn genesis_package_facts(packages: &GenesisPackages) -> Vec<(Hash, Address)> {
     let publisher = Address::from(genesis_publisher(&ProtocolHasher));
-    [account_artifact(), staking_artifact()]
-        .into_iter()
+    packages
+        .artifacts()
+        .iter()
         .map(|artifact| (artifact_package(artifact), publisher))
         .collect()
 }
@@ -140,7 +150,11 @@ mod tests {
     fn genesis_writes_are_identity_keyed_vault_cells() {
         let alice = test_principal(0x11);
         let bob = test_principal(0x22);
-        let writes = genesis_writes(&[(alice, 500), (bob, 700)], &[]);
+        let writes = genesis_writes(
+            &[(alice, 500), (bob, 700)],
+            &[],
+            &GenesisPackages::protocol(),
+        );
         // Two funded accounts' vault cells, plus the stdlib packages
         // under the publisher no key derives.
         assert_eq!(writes.cells().len(), 4);
