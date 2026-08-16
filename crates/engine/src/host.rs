@@ -66,6 +66,9 @@ macro_rules! delegate {
             fn range_remove(&mut self, rep: u32, index: u32) -> Result<(), AbortReason> {
                 self.0.range_remove(rep, index).map_err(AbortReason::from)
             }
+            fn bucket_drop(&mut self, rep: u32) -> Result<(), AbortReason> {
+                self.0.drop_bucket(rep).map_err(AbortReason::from)
+            }
             fn clock_ms(&self) -> u64 {
                 self.0.clock_ms()
             }
