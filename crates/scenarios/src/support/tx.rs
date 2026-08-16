@@ -10,6 +10,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
+use hyperscale_effects_bridge::vm_statics::principal_for;
 use hyperscale_effects_bridge::{ProtocolHasher, attach_metadata};
 use hyperscale_engine::genesis::{
     owner_badge_id, pool_address, pool_owner_badge, stake_unit, staking_artifact,
@@ -17,10 +18,11 @@ use hyperscale_engine::genesis::{
 use hyperscale_engine::{XRD, account_address};
 use hyperscale_transactions::{Client, DEFAULT_GAS_LIMIT, Terms};
 use hyperscale_types::{
-    ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey, EnvelopeExt, Epoch,
-    MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, NetworkId, NetworkParams, PrincipalAddr, SchemeId,
-    ShardId, ShardTrie, StakePoolId, StakePoolSeat, TimestampRange, Transaction, TransactionBody,
-    TransactionEnvelope, ValidatorId, WeightedTimestamp, ed25519_keypair_from_seed,
+    AccountSigner, ComponentAddr, ConsensusPublicKey, ConsensusSignature, Ed25519PrivateKey,
+    EnvelopeExt, Epoch, MAX_VALIDITY_RANGE, MIN_STAKE_FLOOR, MlDsa65PrivateKey, NetworkId,
+    NetworkParams, PrincipalAddr, SchemeId, ShardId, ShardTrie, StakePoolId, StakePoolSeat,
+    TimestampRange, Transaction, TransactionBody, TransactionEnvelope, ValidatorId,
+    WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
     Address, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, ManifestGraph,
@@ -38,6 +40,16 @@ use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account_artifact, account_metadata
 #[must_use]
 pub fn signer_from_seed(seed: u8) -> Ed25519PrivateKey {
     ed25519_keypair_from_seed(&[seed; 32])
+}
+
+/// A deterministic ML-DSA-65 signer from a one-byte seed.
+///
+/// # Panics
+///
+/// Cannot panic: every 32-byte string is a valid ML-DSA seed.
+#[must_use]
+pub fn ml_dsa_signer_from_seed(seed: u8) -> MlDsa65PrivateKey {
+    MlDsa65PrivateKey::from_bytes(&[seed; 32]).expect("any 32 bytes seed ML-DSA")
 }
 
 /// The splitting shard of the grown surviving-sibling shape — `leaf(1, 0)`, the
@@ -503,6 +515,22 @@ pub fn account_from_seed(seed: u8) -> PrincipalAddr {
     account_address(&signer_from_seed(seed).public_key().0)
 }
 
+/// The account owned by [`ml_dsa_signer_from_seed`]'s key for `seed`.
+///
+/// A scheme is part of what a principal address derives from, so this
+/// and [`account_from_seed`] never collide on one seed.
+///
+/// # Panics
+///
+/// Cannot panic: the registry admits ML-DSA-65 keys at the width this
+/// signer produces them, which its own crate pins.
+#[must_use]
+pub fn ml_dsa_account_from_seed(seed: u8) -> PrincipalAddr {
+    let key = ml_dsa_signer_from_seed(seed);
+    principal_for(SchemeId::ML_DSA_65, &key.public_key())
+        .expect("ML-DSA-65 is registered at the width its keys have")
+}
+
 /// Contention sender `index`: its signing key and account, drawn from a
 /// seed lane disjoint from every other fixture's, so senders never
 /// collide with recipients or with the ballast.
@@ -758,6 +786,39 @@ pub fn account_routing_to_n(
         }
     }
     panic!("no VM account seed routes to {shard:?}");
+}
+
+/// Grind an ML-DSA-65 signing key whose account routes to `shard` under
+/// the depth-1 uniform partition, skipping seeds already `taken`.
+///
+/// [`account_routing_to`]'s post-quantum twin, and a separate seed lane:
+/// the scheme rides in the address preimage, so one seed grinds to a
+/// different account under each scheme and the two never collide.
+///
+/// # Panics
+///
+/// Panics if no seed in the `u8` space routes to `shard`.
+#[must_use]
+pub fn ml_dsa_account_routing_to(
+    shard: ShardId,
+    taken: &mut Vec<u8>,
+) -> (MlDsa65PrivateKey, PrincipalAddr) {
+    assert!(
+        shard == ShardId::leaf(1, 0) || shard == ShardId::leaf(1, 1),
+        "depth-1 grinding only"
+    );
+    let trie = ShardTrie::uniform_from_count(2);
+    for seed in 1..=u8::MAX {
+        if taken.contains(&seed) {
+            continue;
+        }
+        let address = ml_dsa_account_from_seed(seed);
+        if trie.shard_for_prefix(address) == shard {
+            taken.push(seed);
+            return (ml_dsa_signer_from_seed(seed), address);
+        }
+    }
+    panic!("no ML-DSA account seed routes to {shard:?}");
 }
 
 /// The shard owning `address` under the `num_shards`-wide uniform
@@ -1073,8 +1134,8 @@ pub fn build_transfer_tx(
 /// If the scenario world does not answer a transfer, which would be a
 /// defect in the world rather than in the transfer.
 #[must_use]
-pub fn build_transfer_paid_by(
-    signer: &Ed25519PrivateKey,
+pub fn build_transfer_paid_by<S: AccountSigner>(
+    signer: &S,
     from: PrincipalAddr,
     to: PrincipalAddr,
     amount: u128,
@@ -1179,21 +1240,27 @@ pub fn unbound_remote_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 
 /// The securify cast.
 ///
-/// The account to be securified and its founding key on `leaf(1, 0)`,
-/// the rule holder's key and account on `leaf(1, 1)`, and a recipient
-/// on `leaf(1, 1)` for the transfers that prove who pays.
+/// The account to be securified and its founding ed25519 key on
+/// `leaf(1, 0)`, the rule holder's key and account on `leaf(1, 1)`, and
+/// a recipient on `leaf(1, 1)` for the transfers that prove who pays.
+///
+/// The holder's key is ML-DSA-65, which is what makes this the migration
+/// an account actually performs: the address the founding key derived
+/// keeps its balance and its placement, and the identity governing it
+/// afterwards is post-quantum. A rule names an address and an address
+/// commits to a scheme, so nothing between the two knows which happened.
 #[must_use]
 pub fn securify_cast() -> (
     Ed25519PrivateKey,
     PrincipalAddr,
-    Ed25519PrivateKey,
+    MlDsa65PrivateKey,
     PrincipalAddr,
     PrincipalAddr,
 ) {
     let mut taken = Vec::new();
     let (owner_key, owner) = account_routing_to(ShardId::leaf(1, 0), &mut taken);
-    let (holder_key, holder) = account_routing_to(ShardId::leaf(1, 1), &mut taken);
     let (_, to) = account_routing_to(ShardId::leaf(1, 1), &mut taken);
+    let (holder_key, holder) = ml_dsa_account_routing_to(ShardId::leaf(1, 1), &mut Vec::new());
     (owner_key, owner, holder_key, holder, to)
 }
 

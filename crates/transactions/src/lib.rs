@@ -20,9 +20,9 @@ use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::XRD;
 use hyperscale_effects_bridge::genesis::{World, genesis_world};
-use hyperscale_effects_bridge::vm_statics::account_address;
+use hyperscale_effects_bridge::vm_statics::principal_for;
 use hyperscale_types::{
-    Ed25519PrivateKey, NetworkId, ProtocolHasher, SubintentSig, TimestampRange, Transaction,
+    AccountSigner, NetworkId, ProtocolHasher, SubintentSig, TimestampRange, Transaction,
     TransactionEnvelope,
 };
 use hyperscale_vm_effects::{
@@ -174,10 +174,10 @@ impl Client {
     /// varies it to keep the submissions distinct transactions rather than
     /// one deduplicated by hash.
     #[must_use]
-    pub fn sign(
+    pub fn sign<S: AccountSigner>(
         &self,
         graph: ManifestGraph,
-        payer: &Ed25519PrivateKey,
+        payer: &S,
         terms: Terms,
     ) -> TransactionEnvelope {
         self.sign_tree(
@@ -201,18 +201,30 @@ impl Client {
     /// `sigs` are what the tree's own signers produced over their
     /// declarations; what `payer` signs is the whole envelope, those
     /// signatures included.
+    ///
+    /// The envelope names the principal `payer`'s own scheme and key
+    /// derive, which is the account it can open by signing. A scheme is
+    /// part of that derivation, so the same key under two schemes names
+    /// two accounts and neither pays for the other.
+    ///
+    /// # Panics
+    ///
+    /// If `payer` produces a key its own scheme does not admit, which is
+    /// a defect in the signer rather than in what it was asked to sign.
     #[must_use]
-    pub fn sign_tree(
+    pub fn sign_tree<S: AccountSigner>(
         &self,
         tree: &EnvelopeTree,
         sigs: Vec<SubintentSig>,
-        payer: &Ed25519PrivateKey,
+        payer: &S,
         terms: Terms,
     ) -> TransactionEnvelope {
+        let signer = principal_for(payer.scheme(), &payer.public_key_bytes())
+            .expect("a signer's key is material its own scheme admits");
         let envelope = signing::wrap(
             tree,
             sigs,
-            account_address(&payer.public_key().0),
+            signer,
             self.network,
             signing::Terms {
                 max_fee: terms.max_fee,
@@ -233,9 +245,9 @@ impl Client {
     /// # Errors
     ///
     /// As [`transfer_graph`](Self::transfer_graph).
-    pub fn transfer(
+    pub fn transfer<S: AccountSigner>(
         &self,
-        payer: &Ed25519PrivateKey,
+        payer: &S,
         from: PrincipalAddr,
         to: PrincipalAddr,
         amount: u128,

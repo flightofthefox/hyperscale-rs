@@ -19,7 +19,8 @@ use hyperscale_engine::{
     PreviewGrants, PreviewOutcome, PreviewReport, ResourceChange, XRD, account_address,
 };
 use hyperscale_types::{
-    Address, BlockHeight, Hash, ShardId, TransactionDecision, TransactionStatus, TxHash,
+    AccountSigner, Address, BlockHeight, Hash, SchemeId, ShardId, TransactionDecision,
+    TransactionStatus, TxHash,
 };
 use hyperscale_vm_effects::package_hash;
 
@@ -987,6 +988,14 @@ pub fn unbound_remote_payer_engages_nothing(c: &mut impl Cluster) {
 /// shard — while the installed rule's key acts and pays from the
 /// account it governs.
 ///
+/// The installed identity is ML-DSA-65, so this is also the account
+/// migration to post-quantum authority end to end: the classical key
+/// retires, the account keeps its address, balance and placement, and a
+/// kilobyte-scale signature carries a transaction through mempool
+/// admission, proposal, and the vote-time verification. Nothing between
+/// the rule and the reservation is told which scheme happened — a rule
+/// names an address, and the scheme is already folded into it.
+///
 /// The retired key's refusal is the payer shard's binding verdict over
 /// the stored cell, judged at the anchored read height like the balance
 /// beside it; the corpus pins the same flip inside one process, and
@@ -1003,6 +1012,11 @@ pub fn securify_retires_the_key_at_the_payer_shard(c: &mut impl Cluster) {
     let payer_shard = ShardId::leaf(1, 0);
     let counterpart = ShardId::leaf(1, 1);
     let (owner_key, owner, holder_key, holder, to) = securify_cast();
+    assert_eq!(
+        holder_key.scheme(),
+        SchemeId::ML_DSA_65,
+        "the identity this account migrates to must be post-quantum"
+    );
 
     // Baseline: the founding key pays for its own account and settles
     // cross-shard.
