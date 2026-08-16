@@ -13,7 +13,7 @@
 use hyperscale_types::VmStaticsError;
 pub use hyperscale_vm_effects::METADATA_SECTION;
 use hyperscale_vm_effects::{
-    AbiParam, Clause, MethodSignature, ModeExpr, PackageMetadata, TargetExpr,
+    AbiParam, Clause, MethodSignature, ModeExpr, PackageMetadata, TargetExpr, Totality,
     attach_metadata as attach_canonical, check_abi, check_declarations, metadata_section,
 };
 use hyperscale_vm_runtime::{ExportParam, component_export_params, validate_component};
@@ -82,8 +82,39 @@ pub fn extract_metadata(artifact: &[u8]) -> Result<Option<PackageMetadata>, VmSt
 ///
 /// [`VmStaticsError`] on an artifact outside the profile, an absent or
 /// non-canonical metadata section, a declared method the component does
-/// not export, or an ABI binding the export's type cannot honour.
+/// not export, an ABI binding the export's type cannot honour, or a
+/// claim to totality, which only [`admit_protocol_package`] grants.
 pub fn admit_package(artifact: &[u8]) -> Result<PackageMetadata, VmStaticsError> {
+    admit(artifact, Provenance::Published)
+}
+
+/// Admit an artifact the protocol supplies rather than a publisher.
+///
+/// Identical to [`admit_package`] but for the totality mark, which this
+/// one permits. Genesis seeds the stdlib through here; nothing reachable
+/// from a transaction does, so the distinction is a fact about the caller
+/// rather than about the bytes — which is the only place it can live,
+/// since an artifact claiming to be protocol code looks exactly like one
+/// that is.
+///
+/// # Errors
+///
+/// As [`admit_package`], less the totality refusal.
+pub fn admit_protocol_package(artifact: &[u8]) -> Result<PackageMetadata, VmStaticsError> {
+    admit(artifact, Provenance::Protocol)
+}
+
+/// Who supplied an artifact, which is what decides whether its claim to
+/// totality is its own to make.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Provenance {
+    /// A publisher's, arriving through a transaction.
+    Published,
+    /// The protocol's own, seeded at genesis.
+    Protocol,
+}
+
+fn admit(artifact: &[u8], provenance: Provenance) -> Result<PackageMetadata, VmStaticsError> {
     validate_component(artifact)
         .map_err(|error| VmStaticsError(format!("artifact is outside the profile: {error}")))?;
     let metadata = extract_metadata(artifact)?
@@ -105,8 +136,44 @@ pub fn admit_package(artifact: &[u8]) -> Result<PackageMetadata, VmStaticsError>
         check_declarations(signature)
             .map_err(|error| VmStaticsError(format!("method {method:?}: {error}")))?;
         check_abi_against_export(method, signature, params)?;
+        if provenance == Provenance::Published {
+            refuse_published_totality(method, signature)?;
+        }
     }
     Ok(metadata)
+}
+
+/// Refuse a published package's claim to totality.
+///
+/// The mark says a caller can commit without waiting to hear back, so a
+/// wrong one is not a lost optimisation but a torn settlement: an
+/// outbound leg the core already committed against, failing. What stands
+/// behind it is a scan whose two documented gaps — linear memory taken as
+/// safe, the canonical ABI's glue excluded — are both open in the
+/// direction an author who wanted the mark would push, and claiming it is
+/// what gets their legs decomposed.
+///
+/// So the mark is the protocol's own to make, and the caller says which
+/// it is. Provenance cannot be read off the bytes — an artifact claiming
+/// to be protocol code looks exactly like one that is — so it rides the
+/// entry point instead of an allowlist something could talk its way onto.
+///
+/// The refusal costs a published package little. A venue's own code is
+/// core, where no mark is wanted — the legs around it are the account's
+/// withdraw and deposit, which the stdlib supplies — so what a package
+/// gives up is a delivery method of its own, and that classifies as core
+/// and still runs.
+fn refuse_published_totality(
+    method: &str,
+    signature: &MethodSignature,
+) -> Result<(), VmStaticsError> {
+    if signature.totality == Totality::Total {
+        return Err(VmStaticsError(format!(
+            "method {method:?} claims totality, which a published package cannot: \
+             the mark is granted to protocol code seeded at genesis"
+        )));
+    }
+    Ok(())
 }
 
 /// Judge a method's ABI binding against the export type that will
@@ -203,7 +270,7 @@ mod tests {
     use hyperscale_vm_stdlib::{account_artifact, staking_artifact};
     use wat::parse_str;
 
-    use super::*;
+    use super::{admit_protocol_package, *};
 
     /// A component exporting one no-argument function per name.
     fn component_exporting(names: &[&str]) -> Vec<u8> {
@@ -425,9 +492,29 @@ mod tests {
             ("account", account_artifact()),
             ("staking", staking_artifact()),
         ] {
-            admit_package(artifact)
+            admit_protocol_package(artifact)
                 .unwrap_or_else(|error| panic!("{name}: the stdlib must admit: {}", error.0));
         }
+    }
+
+    /// The stdlib's own artifact is what a publisher would have to submit
+    /// to claim totality, and submitting it is exactly what the gate
+    /// refuses: the same bytes admit as protocol code and refuse as a
+    /// publish, because provenance is the caller's and not the artifact's.
+    #[test]
+    fn a_published_package_cannot_claim_totality() {
+        let artifact = account_artifact();
+        assert!(
+            admit_protocol_package(artifact).is_ok(),
+            "the account declares a total method, or this proves nothing",
+        );
+
+        let error = admit_package(artifact).expect_err("a publish cannot carry the mark");
+        assert!(
+            error.0.contains("claims totality"),
+            "refused for the wrong reason: {}",
+            error.0,
+        );
     }
 
     /// A component whose one export takes a `u64`, for bindings to

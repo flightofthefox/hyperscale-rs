@@ -16,7 +16,7 @@ use hyperscale_vm_effects::{
 pub use hyperscale_vm_stdlib::{account_artifact, genesis_publisher, staking_artifact};
 
 use crate::vm_statics::PackageCache;
-use crate::{PoolRegistry, ProtocolHasher, XRD, admit_package};
+use crate::{PoolRegistry, ProtocolHasher, XRD, admit_protocol_package};
 
 /// The genesis-static world: published stdlib metadata, the blueprint
 /// serving every principal, and any seated pool instances.
@@ -74,15 +74,15 @@ pub fn genesis_world() -> World {
 pub fn genesis_world_with_pools(pools: &[StakePoolSeat]) -> World {
     let artifact = account_artifact();
     let account_package = package_hash(&ProtocolHasher, artifact);
-    let metadata =
-        admit_package(artifact).expect("the stdlib account artifact publishes as a package");
+    let metadata = admit_protocol_package(artifact)
+        .expect("the stdlib account artifact publishes as a package");
     let mut seed = MetadataCache::new();
     seed.publish(account_package, metadata);
 
     let staking_package = package_hash(&ProtocolHasher, staking_artifact());
     seed.publish(
         staking_package,
-        admit_package(staking_artifact())
+        admit_protocol_package(staking_artifact())
             .expect("the stdlib stake pool artifact publishes as a package"),
     );
 
@@ -207,7 +207,7 @@ mod tests {
         // What genesis publishes is admitted out of the artifact by the
         // publish check, and it is the signature set the stdlib authors:
         // the real guest's exports back every method it declares.
-        let declared = admit_package(artifact).expect("publishes as a package");
+        let declared = admit_protocol_package(artifact).expect("publishes as a package");
         assert_eq!(declared, account_metadata());
         let world = genesis_world();
         assert_eq!(

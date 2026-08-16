@@ -25,7 +25,7 @@ use hyperscale_types::{
     WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
-    Address, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, ManifestGraph,
+    Address, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, ManifestGraph, Totality,
     package_hash,
 };
 use hyperscale_vm_manifest_builder::native::{account, staking};
@@ -1424,6 +1424,12 @@ const PUBLISH_MAX_FEE: u128 = 1_000_000;
 pub fn storm_artifact(nonce: u16) -> Vec<u8> {
     let mut metadata = account_metadata();
     metadata.events.push(format!("storm-{nonce}"));
+    // The account declares a total method and this artifact publishes
+    // through the ordinary path, which grants the mark to nothing: it is
+    // the protocol's, and the protocol seeds its own code at genesis.
+    for signature in metadata.methods.values_mut() {
+        signature.totality = Totality::Fallible;
+    }
     attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("storm metadata attaches")
 }
 

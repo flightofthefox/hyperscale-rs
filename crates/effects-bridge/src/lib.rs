@@ -13,7 +13,9 @@ pub mod staking;
 pub mod vm_metadata;
 pub mod vm_statics;
 
-pub use artifact::{METADATA_SECTION, admit_package, attach_metadata, extract_metadata};
+pub use artifact::{
+    METADATA_SECTION, admit_package, admit_protocol_package, attach_metadata, extract_metadata,
+};
 pub use hyperscale_types::ProtocolHasher;
 pub use staking::{PoolRegistry, witness_from_event};
 pub use vm_metadata::{MAX_PACKAGE_METADATA_BYTES, decode_metadata, encode_metadata};

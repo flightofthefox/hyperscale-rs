@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::vm_statics::package_key;
-use hyperscale_effects_bridge::{ProtocolHasher, account_address, admit_package, attach_metadata};
+use hyperscale_effects_bridge::{
+    ProtocolHasher, account_address, admit_package, admit_protocol_package, attach_metadata,
+};
 use hyperscale_engine::genesis::{account_artifact, entropy_key, vault_key};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PreviewGrants, PreviewInputs, PreviewOutcome,
@@ -23,7 +25,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     AbiParam, Address, Clause, CollectionId, EnvelopeTree, Expr, Hash32, InstanceMeta, IntentDecl,
-    ModeExpr, PackageHash, TargetExpr, Value, package_hash,
+    ModeExpr, PackageHash, PackageMetadata, TargetExpr, Totality, Value, package_hash,
 };
 use hyperscale_vm_kernel::{amount_cell, encode_amount};
 use hyperscale_vm_manifest_builder::GraphBuilder;
@@ -1111,7 +1113,7 @@ fn package_cell(
 fn a_publish_writes_the_artifact_under_its_publisher() {
     let payer = fee_payer(7);
     let executor = Executor::new(ExecutionMode::Serial);
-    let artifact = account_artifact().to_vec();
+    let artifact = published_account_artifact();
     let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
         7,
         artifact.clone(),
@@ -1165,7 +1167,7 @@ fn a_publish_writes_the_artifact_under_its_publisher() {
 /// through them rather than through a table that knows its method names.
 #[test]
 fn the_stdlib_artifact_carries_resolvable_bindings() {
-    let metadata = admit_package(account_artifact()).expect("the stdlib artifact admits");
+    let metadata = admit_protocol_package(account_artifact()).expect("the stdlib artifact admits");
     assert_eq!(
         metadata.methods["withdraw"].abi,
         vec![AbiParam::Handle(0), AbiParam::Derived(Expr::Arg(1))],
@@ -1189,7 +1191,7 @@ fn a_publish_that_is_not_a_package_never_reaches_execution() {
         "well-formed wasm framing is not a package"
     );
     assert!(
-        admit_package(account_artifact()).is_ok(),
+        admit_protocol_package(account_artifact()).is_ok(),
         "the stdlib artifact is one"
     );
 }
@@ -1202,7 +1204,7 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
     // A package the world has never seen: the stdlib artifact with its
     // metadata attached a second time under a different publisher would
     // be the same bytes, so vary the metadata to vary the address.
-    let mut metadata = account_metadata();
+    let mut metadata = published_account_metadata();
     metadata.events.push("republished".into());
     let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -1237,6 +1239,25 @@ fn a_committed_publish_grows_the_cache_that_routing_reads() {
 
 /// Wait out the compile worker; the bound is a harness valve, not a
 /// verdict — consensus never reads a clock here.
+/// The stdlib account's metadata as a *publisher* could submit it.
+///
+/// These tests publish through the ordinary transaction path, and that
+/// path refuses a claim to totality — the mark is the protocol's, granted
+/// to what genesis seeds. The account declares one total method, so the
+/// fixture drops the claim rather than the tests asserting a publish the
+/// gate does not allow.
+fn published_account_artifact() -> Vec<u8> {
+    attach_metadata(ACCOUNT_COMPONENT, &published_account_metadata()).expect("attaches")
+}
+
+fn published_account_metadata() -> PackageMetadata {
+    let mut metadata = account_metadata();
+    for signature in metadata.methods.values_mut() {
+        signature.totality = Totality::Fallible;
+    }
+    metadata
+}
+
 fn await_code_settled(executor: &Executor, package: PackageHash) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while !executor.package_code_settled(package) {
@@ -1253,7 +1274,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
     let payer = fee_payer(7);
     let executor = Executor::new(ExecutionMode::Serial);
 
-    let mut metadata = account_metadata();
+    let mut metadata = published_account_metadata();
     metadata.events.push("compiled".into());
     let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -1285,7 +1306,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
 fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
     let executor = Executor::new(ExecutionMode::Serial);
 
-    let mut metadata = account_metadata();
+    let mut metadata = published_account_metadata();
     metadata.events.push("reseeded".into());
     let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -1323,7 +1344,7 @@ fn only_a_cell_that_addresses_its_own_contents_publishes() {
     let executor = Executor::new(ExecutionMode::Serial);
     let cache = executor.packages();
 
-    let mut metadata = account_metadata();
+    let mut metadata = published_account_metadata();
     metadata.events.push("smuggled".into());
     let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -1606,7 +1627,7 @@ fn a_preview_holds_a_node_to_its_targets_authority_unless_granted() {
 #[test]
 fn a_preview_prices_a_publish_by_its_artifact() {
     let payer = fee_payer(7);
-    let artifact = account_artifact().to_vec();
+    let artifact = published_account_artifact();
     let executor = Executor::new(ExecutionMode::Serial);
     let tx = signed_publish(7, artifact.clone());
     let report = preview_on(
@@ -1667,7 +1688,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     let key = Ed25519PrivateKey::from_bytes(&[7; 32]).unwrap();
     let executor = Executor::new(ExecutionMode::Serial);
 
-    let mut metadata = account_metadata();
+    let mut metadata = published_account_metadata();
     metadata.events.push("instantiable".into());
     let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);
@@ -1751,7 +1772,7 @@ fn a_locked_config_read_serves_from_the_presented_record() {
     let key = Ed25519PrivateKey::from_bytes(&[7; 32]).unwrap();
     let executor = Executor::new(ExecutionMode::Serial);
 
-    let mut metadata = account_metadata();
+    let mut metadata = published_account_metadata();
     metadata.events.push("locked-config".into());
     metadata
         .methods
