@@ -1452,7 +1452,9 @@ pub fn storm_artifact(nonce: u16) -> Vec<u8> {
     // through the ordinary path, which grants the mark to nothing: it is
     // the protocol's, and the protocol seeds its own code at genesis.
     for signature in metadata.methods.values_mut() {
-        signature.totality = Totality::Fallible;
+        if signature.totality == Totality::Total {
+            signature.totality = Totality::Infallible;
+        }
     }
     attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("storm metadata attaches")
 }

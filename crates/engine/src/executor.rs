@@ -496,6 +496,7 @@ pub fn abort_reason(outcome: &Outcome) -> String {
             amount,
         } => format!("constraint unmet: node {node} parameter {param} carried {amount}"),
         Outcome::NullifierSpent { key } => format!("subintent already spent at {key:?}"),
+        Outcome::Declined { node, code } => format!("node {node} declined with code {code}"),
         Outcome::Unauthorized { node } => {
             format!("node {node} presents no authority its target admits")
         }
@@ -597,10 +598,20 @@ pub const fn charge_for(outcome: &Outcome, payer: PayerFee) -> Option<u128> {
         // call: a stored rule can change between signing and execution,
         // so presented authority a target no longer admits is a stale
         // declaration, not a defect.
+        //
+        // A declared refusal joins them and is the one that need not
+        // stay: the export returned, so unlike every other abort here
+        // its consumed work is agreed between the runtimes and already
+        // attested on the receipt, which is what a refundable execution
+        // charge would settle against. Until one exists it pays the
+        // floor, and the discount a package could engineer by burning
+        // its budget before declining is bounded by that transaction's
+        // own gas.
         Outcome::Infeasible { .. }
         | Outcome::ConstraintUnmet { .. }
         | Outcome::NullifierSpent { .. }
-        | Outcome::Unauthorized { .. } => Some(payer.floor),
+        | Outcome::Unauthorized { .. }
+        | Outcome::Declined { .. } => Some(payer.floor),
         // The kernel's own defect. `materialize_abort` refuses to price
         // it to the sender, and the burn agrees.
         Outcome::ProtocolError { .. } => None,
@@ -1261,6 +1272,9 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::{AddressClass, LocalKey};
+    use hyperscale_vm_kernel::AbortReason;
+
     use super::*;
 
     fn reveal(seed: &[u8]) -> RevealChain {
@@ -1288,6 +1302,39 @@ mod tests {
         assert_ne!(
             tx_randomness(anchor, tx(b"a")),
             tx_randomness(reveal(b"another block"), tx(b"a"))
+        );
+    }
+
+    /// A declared refusal is priced as the lost race it is, not as the
+    /// defect it is not.
+    ///
+    /// The whole point of the class is that an author who declares a
+    /// failure ends up better off than one who traps into the same
+    /// outcome; pricing both at the ceiling would leave the fee schedule
+    /// arguing against the ergonomics.
+    #[test]
+    fn a_decline_pays_the_floor_and_a_trap_pays_the_ceiling() {
+        let payer = PayerFee {
+            vault: SubstateKey {
+                owner: Address::new([1; 31], AddressClass::Component),
+                local: LocalKey([0; 16]),
+            },
+            floor: 7,
+            max_fee: 1_000,
+            abortable: false,
+        };
+        assert_eq!(
+            charge_for(&Outcome::Declined { node: 0, code: 3 }, payer),
+            Some(payer.floor)
+        );
+        assert_eq!(
+            charge_for(
+                &Outcome::UserError {
+                    reason: AbortReason::Unreachable
+                },
+                payer
+            ),
+            Some(payer.max_fee)
         );
     }
 }

@@ -1307,7 +1307,9 @@ fn published_account_artifact() -> Vec<u8> {
 fn published_account_metadata() -> PackageMetadata {
     let mut metadata = account::metadata();
     for signature in metadata.methods.values_mut() {
-        signature.totality = Totality::Fallible;
+        if signature.totality == Totality::Total {
+            signature.totality = Totality::Infallible;
+        }
     }
     metadata
 }

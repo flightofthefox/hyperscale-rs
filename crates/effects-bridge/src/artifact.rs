@@ -17,7 +17,7 @@ use hyperscale_vm_effects::{
     attach_metadata as attach_canonical, check_abi, check_declarations, metadata_section,
 };
 use hyperscale_vm_runtime::{
-    ExportParam, check_method, component_export_params, validate_component,
+    ExportParam, ExportShape, check_method, component_exports, validate_component,
 };
 
 use crate::vm_metadata::{decode_metadata, encode_metadata};
@@ -124,10 +124,10 @@ fn admit(artifact: &[u8], provenance: Provenance) -> Result<PackageMetadata, VmS
         .map_err(|error| VmStaticsError(format!("artifact is outside the profile: {error}")))?;
     let metadata = extract_metadata(artifact)?
         .ok_or_else(|| VmStaticsError("artifact declares no effect metadata section".into()))?;
-    let exports = component_export_params(artifact)
+    let exports = component_exports(artifact)
         .map_err(|error| VmStaticsError(format!("artifact does not parse: {error}")))?;
     for (method, signature) in &metadata.methods {
-        let Some(params) = exports.get(method.as_str()) else {
+        let Some(export) = exports.get(method.as_str()) else {
             return Err(VmStaticsError(format!(
                 "metadata declares method {method:?}, which the component does not export"
             )));
@@ -140,8 +140,8 @@ fn admit(artifact: &[u8], provenance: Provenance) -> Result<PackageMetadata, VmS
             .map_err(|error| VmStaticsError(format!("method {method:?}: {error}")))?;
         check_declarations(signature)
             .map_err(|error| VmStaticsError(format!("method {method:?}: {error}")))?;
-        check_abi_against_export(method, signature, params)?;
-        judge_totality(artifact, method, signature, provenance)?;
+        check_abi_against_export(method, signature, &export.params)?;
+        judge_totality(artifact, method, signature, export, provenance)?;
     }
     Ok(metadata)
 }
@@ -173,8 +173,26 @@ fn judge_totality(
     artifact: &[u8],
     method: &str,
     signature: &MethodSignature,
+    export: &ExportShape,
     provenance: Provenance,
 ) -> Result<(), VmStaticsError> {
+    // The weakest state is the one the component type decides outright,
+    // in both directions. A signature is `Fallible` exactly when its
+    // export carries an error arm: claiming it without one describes a
+    // refusal channel the code does not have, and omitting it with one
+    // hides the channel from every reader that acts on the mark. Neither
+    // is a conservative reading — the mark is a function of the artifact,
+    // so there is one right answer and the gate holds authors to it.
+    if export.declines != (signature.totality == Totality::Fallible) {
+        return Err(VmStaticsError(if export.declines {
+            format!(
+                "method {method:?} declares {:?} over an export that carries an error arm",
+                signature.totality
+            )
+        } else {
+            format!("method {method:?} declares Fallible over an export that cannot decline")
+        }));
+    }
     if signature.totality != Totality::Total {
         return Ok(());
     }
@@ -448,6 +466,54 @@ mod tests {
         assert_ne!(artifact, public);
     }
 
+    /// A component whose one export declines: the refusal channel over a
+    /// method producing nothing, which is the shape a `Fallible` mark is
+    /// judged against.
+    fn component_declining(name: &str) -> Vec<u8> {
+        parse_str(&*format!(
+            "(component\n  (core module $m\n    (memory (export \"mem\") 1 1)\n               (func (export \"f\") (result i32) i32.const 0))\n             (core instance $i (instantiate $m))\n             (func (export \"{name}\") (result (result (error u32)))\n               (canon lift (core func $i \"f\") (memory $i \"mem\"))))"
+        ))
+        .expect("the component assembles")
+    }
+
+    /// The totality mark is a function of the component type, and the
+    /// gate holds it to that in both directions.
+    ///
+    /// Under-claiming is refused as firmly as over-claiming, which is
+    /// what makes the mark canonical: a leg's decomposition reads it, and
+    /// two artifacts with the same code could otherwise describe
+    /// themselves differently and be judged differently.
+    #[test]
+    fn a_totality_mark_the_export_type_contradicts_refuses_at_publish() {
+        let declining = component_declining("swap");
+        let mut fallible = PackageMetadata::default();
+        fallible.methods.insert(
+            "swap".into(),
+            MethodSignature {
+                totality: Totality::Fallible,
+                ..MethodSignature::default()
+            },
+        );
+        assert!(
+            admit_package(&attach_metadata(&declining, &fallible).expect("attaches")).is_ok(),
+            "an error arm is what a Fallible mark describes"
+        );
+
+        // The same code, marked as if it could not decline.
+        let understated = attach_metadata(&declining, &declaring(&["swap"])).expect("attaches");
+        let error = admit_package(&understated).expect_err("the arm is in the type");
+        assert!(
+            error.to_string().contains("carries an error arm"),
+            "{error}"
+        );
+
+        // And the converse: an arm-free export marked as declining.
+        let overstated =
+            attach_metadata(&component_exporting(&["swap"]), &fallible).expect("attaches");
+        let error = admit_package(&overstated).expect_err("there is no arm to describe");
+        assert!(error.to_string().contains("cannot decline"), "{error}");
+    }
+
     #[test]
     fn a_publish_refuses_a_method_the_component_does_not_export() {
         let component = component_exporting(&["deposit"]);
@@ -491,7 +557,7 @@ mod tests {
         ))
         .expect("the component assembles");
 
-        let exports = component_export_params(&outer).expect("parses");
+        let exports = component_exports(&outer).expect("parses");
         assert_eq!(exports.keys().collect::<Vec<_>>(), vec!["shown"]);
         let artifact = attach_metadata(&outer, &declaring(&["hidden"])).expect("attaches");
         assert!(admit_package(&artifact).is_err());
