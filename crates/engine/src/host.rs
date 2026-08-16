@@ -25,19 +25,19 @@ macro_rules! delegate {
             fn write_cell_set(&mut self, rep: u32, value: Vec<u8>) -> Result<(), AbortReason> {
                 self.0.write_cell_set(rep, value).map_err(AbortReason::from)
             }
-            fn delta_add(&mut self, rep: u32, amount: &[u8]) -> Result<(), AbortReason> {
+            fn delta_add(&mut self, rep: u32, amount: u128) -> Result<(), AbortReason> {
                 self.0.delta_add(rep, amount).map_err(AbortReason::from)
             }
-            fn delta_sub(&mut self, rep: u32, amount: &[u8]) -> Result<(), AbortReason> {
+            fn delta_sub(&mut self, rep: u32, amount: u128) -> Result<(), AbortReason> {
                 self.0.delta_sub(rep, amount).map_err(AbortReason::from)
             }
-            fn reserve_amount(&mut self, rep: u32) -> Result<Vec<u8>, AbortReason> {
+            fn reserve_amount(&mut self, rep: u32) -> Result<u128, AbortReason> {
                 self.0.reserve_amount(rep).map_err(AbortReason::from)
             }
             fn range_count(&mut self, rep: u32) -> Result<u32, AbortReason> {
                 self.0.range_count(rep).map_err(AbortReason::from)
             }
-            fn range_order(&mut self, rep: u32, index: u32) -> Result<Vec<u8>, AbortReason> {
+            fn range_order(&mut self, rep: u32, index: u32) -> Result<u128, AbortReason> {
                 self.0.range_order(rep, index).map_err(AbortReason::from)
             }
             fn range_entry(&mut self, rep: u32, index: u32) -> Result<Vec<u8>, AbortReason> {
@@ -56,7 +56,7 @@ macro_rules! delegate {
             fn range_insert(
                 &mut self,
                 rep: u32,
-                order: &[u8],
+                order: u128,
                 value: Vec<u8>,
             ) -> Result<(), AbortReason> {
                 self.0
