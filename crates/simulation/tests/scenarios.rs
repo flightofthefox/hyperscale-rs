@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
+use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_node::shard::{HostEvent, ShardScopedInput};
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, badge_buyer, cross_fraction_genesis_accounts,
@@ -305,8 +306,14 @@ fn attested_load_reaches_the_beacon_sim() {
 
 #[test]
 fn randomness_draw_agrees_across_shards_sim() {
-    let mut cluster =
-        SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
+    // The one scenario that calls a fixture package, so the one network
+    // born running it.
+    let mut cluster = SimCluster::with_grown_packages(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
     randomness_draw_agrees_across_shards(&mut cluster);
 }
 

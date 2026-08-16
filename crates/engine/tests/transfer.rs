@@ -9,7 +9,9 @@ use hyperscale_effects_bridge::vm_statics::package_key;
 use hyperscale_effects_bridge::{
     ProtocolHasher, account_address, admit_package, admit_protocol_package, attach_metadata,
 };
-use hyperscale_engine::genesis::{account_artifact, entropy_key, vault_key};
+use hyperscale_engine::genesis::{
+    GenesisPackages, account_artifact, draw_key, genesis_world_with_pools, vault_key,
+};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PreviewGrants, PreviewInputs, PreviewOutcome,
     PreviewReport, ResourceChange, TickBatchContext, XRD, genesis_writes,
@@ -27,9 +29,11 @@ use hyperscale_vm_effects::{
     AbiParam, Address, Clause, CollectionId, EnvelopeTree, Expr, Hash32, InstanceMeta, IntentDecl,
     ModeExpr, PackageHash, PackageMetadata, TargetExpr, Totality, Value, package_hash,
 };
+use hyperscale_vm_fixtures::calls::lottery;
+use hyperscale_vm_fixtures::lottery_package_hash;
 use hyperscale_vm_kernel::{amount_cell, encode_amount};
-use hyperscale_vm_manifest_builder::GraphBuilder;
-use hyperscale_vm_manifest_builder::native::account;
+use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
+use hyperscale_vm_stdlib::calls::account;
 use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, CONFIG, account_metadata};
 
 /// The two accounts the transfer cases move funds between, as signing
@@ -60,7 +64,7 @@ struct MapDb(BTreeMap<SubstateKey, Vec<u8>>);
 
 impl MapDb {
     fn genesis(accounts: &[(PrincipalAddr, u128)]) -> Self {
-        let writes = genesis_writes(accounts, &[]);
+        let writes = genesis_writes(accounts, &[], &packages());
         let mut map = BTreeMap::new();
         for (key, change) in writes.cells() {
             let value = change.clone().expect("genesis writes are Set-only");
@@ -146,11 +150,44 @@ impl VersionedStore for MapDb {
     }
 }
 
-/// The client this binary builds through: the stdlib world, on the one
+/// The genesis package set this binary runs on.
+///
+/// The fixture set rather than the protocol's: the randomness cases
+/// below settle a lottery round, and a package the state seeds but the
+/// world cannot route to — or the reverse — is a chain that cannot call
+/// its own code.
+fn packages() -> GenesisPackages {
+    GenesisPackages::with_fixtures()
+}
+
+/// The executor every case here runs on, over that same set.
+fn executor(mode: ExecutionMode) -> Executor {
+    Executor::with_genesis(&[], &packages(), mode)
+}
+
+/// The client this binary builds through: the genesis world, on the one
 /// network its envelopes name.
 fn client() -> &'static Client {
-    static CLIENT: LazyLock<Client> = LazyLock::new(|| Client::genesis(NetworkId(242)));
+    static CLIENT: LazyLock<Client> =
+        LazyLock::new(|| Client::new(genesis_world_with_pools(&[], &packages()), NetworkId(242)));
     &CLIENT
+}
+
+/// The lottery this binary settles rounds on.
+///
+/// Computed rather than created: the envelope carries the record, and
+/// every node composes the same registry from it, so nothing had to be
+/// registered anywhere before the call.
+fn lottery_meta() -> InstanceMeta {
+    InstanceMeta {
+        package: lottery_package_hash(&ProtocolHasher),
+        config: Vec::new(),
+        salt: Hash32([0x4C; 32]),
+    }
+}
+
+fn lottery_addr() -> ComponentAddr {
+    lottery_meta().address(&ProtocolHasher)
 }
 
 /// The signing terms every transaction here shares: a window nothing
@@ -250,20 +287,32 @@ fn execute(executor: &Executor, transactions: &[Arc<Verified<Transaction>>]) -> 
     execute_on(&[(alice(), 1_000), (bob(), 50)], executor, transactions)
 }
 
-/// A signed single-node stamp: the account records the transaction's
-/// randomness draw in its entropy leaf.
-fn signed_stamp(seed: u8, owner: PrincipalAddr) -> Transaction {
-    signed_stamp_with_fee(seed, owner, 1_000_000)
+/// A signed single-node draw: the lottery settles its round on the
+/// transaction's randomness.
+///
+/// Public, so the round needs no signature of its own — what the payer
+/// signs is the fee. That is the package's point rather than a
+/// convenience: the draw is nobody's to choose, so there is nothing an
+/// operator would be trusted with.
+fn signed_draw(seed: u8) -> Transaction {
+    signed_draw_with_fee(seed, 1_000_000)
 }
 
-fn signed_stamp_with_fee(seed: u8, owner: PrincipalAddr, max_fee: u128) -> Transaction {
+fn signed_draw_with_fee(seed: u8, max_fee: u128) -> Transaction {
     let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
     let cache = client().cache();
-    let mut b = client().builder(&cache);
-    let stamper = account::authorize(&mut b, owner).expect("an account signs in");
-    account::stamp_entropy(&mut b, stamper).expect("an account answers a stamp");
-    let graph = b.build().expect("a stamp produces nothing");
-    Transaction::new(client().sign(graph, &key, terms(max_fee)))
+    // The builder resolves targets against the registry it is given, so
+    // the presented record is composed in first — exactly as admission
+    // composes it from the tree.
+    let mut instances = client().world().instances.clone();
+    let lottery_addr = instances.create(&ProtocolHasher, lottery_meta());
+    let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
+    lottery::draw(&mut root, lottery_addr).expect("a lottery answers a draw");
+    env.instance(lottery_meta());
+    env.seal(root)
+        .expect("the root declares nothing to discharge");
+    let tree = env.build().expect("the intent declares no hole");
+    Transaction::new(client().sign_tree(&tree, Vec::new(), &key, terms(max_fee)))
 }
 
 /// Execute `transactions` as a single-shard batch anchored on `reveal`.
@@ -284,33 +333,37 @@ fn execute_anchored(
     executor.execute_batch(&ctx, &snapshot_store, transactions)
 }
 
-/// The entropy leaf a stamp wrote, if any.
-fn entropy_cell(executed: &ExecutedTx, owner: impl Into<Address>) -> Option<Vec<u8>> {
+/// The settled round a draw wrote, if any.
+fn draw_cell(executed: &ExecutedTx) -> Option<Vec<u8>> {
     let writes = executed.consensus.writes()?;
-    writes.cells.get(&entropy_key(owner)).cloned().flatten()
+    writes
+        .cells
+        .get(&draw_key(lottery_addr()))
+        .cloned()
+        .flatten()
 }
 
-/// The stamp writes a draw fixed by the anchor: the same anchor gives the
-/// same 32 bytes, a different anchor gives different ones — which is what
-/// makes the payer block, and not the executing block, decide a
-/// randomness-reading guest's receipt.
+/// The round settles on a draw fixed by the anchor: the same anchor
+/// gives the same 32 bytes, a different anchor gives different ones —
+/// which is what makes the payer block, and not the executing block,
+/// decide a randomness-reading guest's receipt.
 #[test]
-fn a_stamp_writes_the_draw_its_anchor_fixes() {
-    let executor = Executor::new(ExecutionMode::Serial);
-    let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_stamp(
+fn a_draw_settles_on_what_its_anchor_fixes() {
+    let executor = executor(ExecutionMode::Serial);
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_draw(
         ALICE_SEED,
-        alice(),
     )));
     let anchor = RevealChain::from_raw(Hash::from_bytes(b"payer block"));
 
     let executed = execute_anchored(&executor, anchor, std::slice::from_ref(&tx));
-    let stamped = entropy_cell(&executed[0], alice()).expect("the stamp wrote the entropy leaf");
-    assert_eq!(stamped.len(), 32);
+    let settled = draw_cell(&executed[0]).expect("the draw settled the round");
+    // Nobody entered, so the round is the draw and no winner after it.
+    assert_eq!(settled.len(), 32);
 
     let again = execute_anchored(&executor, anchor, std::slice::from_ref(&tx));
     assert_eq!(
-        entropy_cell(&again[0], alice()),
-        Some(stamped.clone()),
+        draw_cell(&again[0]),
+        Some(settled.clone()),
         "one anchor, one draw"
     );
 
@@ -320,8 +373,8 @@ fn a_stamp_writes_the_draw_its_anchor_fixes() {
         std::slice::from_ref(&tx),
     );
     assert_ne!(
-        entropy_cell(&elsewhere[0], alice()),
-        Some(stamped),
+        draw_cell(&elsewhere[0]),
+        Some(settled),
         "a different anchor is a different draw"
     );
 }
@@ -351,7 +404,7 @@ fn consecutive_payments_thread_through_the_tick_chain() {
     let payer_b = fee_payer(32);
     let hot = bob();
     let accounts = [(payer_a, 1_000), (payer_b, 1_000), (hot, 10)];
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
 
     let pay = |seed: u8, from: PrincipalAddr| {
         Arc::new(Verified::<Transaction>::from_persisted(
@@ -480,7 +533,7 @@ fn vault_removed(writes: &SettledWrites, owner: impl Into<Address>) -> bool {
 
 #[test]
 fn a_transfer_folds_to_identity_keyed_absolute_updates() {
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
         ALICE_SEED,
         alice(),
@@ -513,7 +566,7 @@ fn a_transfer_folds_to_identity_keyed_absolute_updates() {
 
 #[test]
 fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let over = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
         BOB_SEED,
         bob(),
@@ -573,7 +626,7 @@ fn an_uncovered_withdrawal_aborts_and_the_batch_carries_on() {
 /// debit to avoid reverting it.
 #[test]
 fn a_failed_charge_survives_a_later_sibling_credit() {
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let failed = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
         BOB_SEED,
         bob(),
@@ -620,8 +673,8 @@ fn a_failed_charge_survives_a_later_sibling_credit() {
 
 #[test]
 fn serial_and_parallel_scheduling_produce_identical_receipts() {
-    let serial = Executor::new(ExecutionMode::Serial);
-    let parallel = Executor::new(ExecutionMode::Parallel);
+    let serial = executor(ExecutionMode::Serial);
+    let parallel = executor(ExecutionMode::Parallel);
     let txs: Vec<Arc<Verified<Transaction>>> = (0..4u128)
         .map(|i| {
             Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
@@ -657,7 +710,7 @@ fn serial_and_parallel_scheduling_produce_identical_receipts() {
 /// because the declaration was admitted, routed, and locked regardless.
 #[test]
 fn an_unapplied_attempt_still_attests_its_declaration() {
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let over = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
         ALICE_SEED,
         alice(),
@@ -702,7 +755,7 @@ fn an_unapplied_attempt_still_attests_its_declaration() {
 fn a_completed_transfer_burns_the_fee_ceiling_from_its_payer() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (bob(), 50)];
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     // A transfer's fuel far exceeds the tiny ceiling, so the burn is
     // exactly `max_fee` — the cap working.
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
@@ -734,11 +787,11 @@ fn a_completed_transfer_burns_the_fee_ceiling_from_its_payer() {
 /// leaf.
 #[test]
 fn a_call_that_never_touches_its_payers_vault_still_pays() {
-    let executor = Executor::new(ExecutionMode::Serial);
-    // A stamp's fuel far exceeds the tiny ceiling, so the burn is
+    let executor = executor(ExecutionMode::Serial);
+    // A draw's fuel far exceeds the tiny ceiling, so the burn is
     // exactly `max_fee`.
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
-        signed_stamp_with_fee(ALICE_SEED, alice(), 10),
+        signed_draw_with_fee(ALICE_SEED, 10),
     ));
     let executed = execute(&executor, &[tx]);
     let ConsensusReceipt::Succeeded {
@@ -746,11 +799,13 @@ fn a_call_that_never_touches_its_payers_vault_still_pays() {
         ..
     } = &executed[0].consensus
     else {
-        panic!("the stamp must succeed: {:?}", executed[0].consensus);
+        panic!("the draw must succeed: {:?}", executed[0].consensus);
     };
     assert!(
-        database_updates.cells.contains_key(&entropy_key(alice())),
-        "the stamp wrote its entropy leaf"
+        database_updates
+            .cells
+            .contains_key(&draw_key(lottery_addr())),
+        "the draw settled its round"
     );
     assert_eq!(
         vault_cell(&settled(database_updates, &world_accounts()), alice()),
@@ -768,7 +823,7 @@ fn a_receipt_carries_only_its_own_payers_burn() {
     let payer_a = fee_payer(31);
     let payer_b = fee_payer(32);
     let accounts = [(payer_a, 1_000), (payer_b, 1_000), (bob(), 50)];
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let txs = vec![
         Arc::new(Verified::<Transaction>::from_persisted(
             signed_transfer_with_fee(31, payer_a, bob(), 100, 10),
@@ -805,14 +860,14 @@ fn a_receipt_carries_only_its_own_payers_burn() {
 /// hash-sorted — loses none of them.
 #[test]
 fn shared_payer_burns_accumulate_across_a_batch() {
-    let executor = Executor::new(ExecutionMode::Serial);
-    // Distinct ceilings make three distinct stamps; the stamp's fuel
+    let executor = executor(ExecutionMode::Serial);
+    // Distinct ceilings make three distinct draws; a draw's fuel
     // exceeds all of them, so each burns exactly its ceiling.
     let mut txs: Vec<Arc<Verified<Transaction>>> = [10u128, 11, 12]
         .into_iter()
         .map(|fee| {
             Arc::new(Verified::<Transaction>::from_persisted(
-                signed_stamp_with_fee(ALICE_SEED, alice(), fee),
+                signed_draw_with_fee(ALICE_SEED, fee),
             ))
         })
         .collect();
@@ -822,7 +877,7 @@ fn shared_payer_burns_accumulate_across_a_batch() {
     let executed = execute_batch_on(&store, &executor, &txs);
     for tx in &executed {
         let ConsensusReceipt::Succeeded { writes, .. } = &tx.consensus else {
-            panic!("every stamp must succeed: {:?}", tx.consensus);
+            panic!("every draw must succeed: {:?}", tx.consensus);
         };
         store.apply(writes);
     }
@@ -841,7 +896,7 @@ fn a_missed_edge_bound_charges_its_payer_the_floor() {
     let payer = fee_payer(23);
     let funded = 1_000;
     let accounts = [(payer, funded), (bob(), 50)];
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     // The withdrawal is covered and the guest is honest — it returns the
     // 100 it reserved. What fails is the recipient's signed floor.
     let tx = signed_transfer_under_bound(23, payer, bob(), 100, 150, 1_000);
@@ -888,7 +943,7 @@ fn a_payer_drained_by_its_own_fee_deletes_its_vault() {
     let payer = fee_payer(11);
     // Exactly the transfer plus the ceiling: nothing survives the burn.
     let accounts = [(payer, 110), (bob(), 50)];
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let tx = Arc::new(Verified::<Transaction>::from_persisted(
         signed_transfer_with_fee(11, payer, bob(), 100, 10),
     ));
@@ -964,7 +1019,7 @@ fn hash_of(executed: &ExecutedTx) -> Hash {
 /// design; the union event root is what both paths share.
 #[test]
 fn an_event_lands_only_on_its_emitters_home_shard() {
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let (near_shard, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
     assert_ne!(
@@ -997,7 +1052,7 @@ fn an_event_lands_only_on_its_emitters_home_shard() {
 /// what refused it.
 #[test]
 fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let near_shard = trie.shard_for_prefix(alice());
     let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
@@ -1043,7 +1098,7 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
 /// takes.
 #[test]
 fn a_two_recipient_fan_out_executes() {
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let key = Ed25519PrivateKey::from_bytes(&[ALICE_SEED; 32]).unwrap();
     let cache = client().cache();
     let mut b = client().builder(&cache);
@@ -1112,7 +1167,7 @@ fn package_cell(
 #[test]
 fn a_publish_writes_the_artifact_under_its_publisher() {
     let payer = fee_payer(7);
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let artifact = published_account_artifact();
     let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_publish(
         7,
@@ -1199,7 +1254,7 @@ fn a_publish_that_is_not_a_package_never_reaches_execution() {
 #[test]
 fn a_committed_publish_grows_the_cache_that_routing_reads() {
     let payer = fee_payer(7);
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
 
     // A package the world has never seen: the stdlib artifact with its
     // metadata attached a second time under a different publisher would
@@ -1272,7 +1327,7 @@ fn await_code_settled(executor: &Executor, package: PackageHash) {
 #[test]
 fn a_committed_publish_compiles_ahead_of_its_first_call() {
     let payer = fee_payer(7);
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
 
     let mut metadata = published_account_metadata();
     metadata.events.push("compiled".into());
@@ -1304,7 +1359,7 @@ fn a_committed_publish_compiles_ahead_of_its_first_call() {
 
 #[test]
 fn an_indexed_artifact_reseeds_metadata_and_code_at_boot() {
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
 
     let mut metadata = published_account_metadata();
     metadata.events.push("reseeded".into());
@@ -1341,7 +1396,7 @@ fn only_a_cell_that_addresses_its_own_contents_publishes() {
     // of the value it holds. Without that check, any committed cell
     // whose bytes happened to parse as an artifact would publish a
     // package — no publish transaction, no fee, no cell of its own.
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let cache = executor.packages();
 
     let mut metadata = published_account_metadata();
@@ -1427,7 +1482,7 @@ fn a_preview_reports_the_resource_changes_a_transfer_would_make() {
         accounts,
         tx,
     } = preview_fixture();
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
     assert_eq!(report.outcome, PreviewOutcome::Completed);
@@ -1467,7 +1522,7 @@ fn a_preview_agrees_with_the_tick_that_would_commit_it() {
         accounts,
         tx,
     } = preview_fixture();
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
     let verified = Arc::new(Verified::<Transaction>::from_persisted(tx));
@@ -1499,7 +1554,7 @@ fn free_credit_reports_the_fee_without_charging_it() {
         accounts,
         tx,
     } = preview_fixture();
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let charged = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
     let credited = preview_on(
         &accounts,
@@ -1531,7 +1586,7 @@ fn free_credit_reports_the_fee_without_charging_it() {
 fn a_preview_prices_an_abort_at_its_class_floor() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (bob(), 50)];
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let tx = signed_transfer_with_fee(7, payer, bob(), 5_000, PREVIEW_CEILING);
     let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
 
@@ -1565,7 +1620,7 @@ fn a_preview_prices_an_abort_at_its_class_floor() {
 #[test]
 fn a_preview_refuses_what_admission_would_refuse() {
     let unknown = ComponentAddr::new([0xAB; 31]);
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let tx = signed_transfer_from_unknown(7, unknown, bob(), 10, PREVIEW_CEILING);
     let report = preview_on(&[(bob(), 50)], &executor, &tx, PreviewGrants::default());
 
@@ -1589,7 +1644,7 @@ fn a_preview_refuses_what_admission_would_refuse() {
 fn a_preview_holds_a_node_to_its_targets_authority_unless_granted() {
     let payer = fee_payer(7);
     let accounts = [(payer, 1_000), (alice(), 1_000), (bob(), 50)];
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     // Signed by 7, withdrawing from Alice: the shape the gate refuses.
     let tx = signed_transfer_with_fee(7, alice(), bob(), 100, PREVIEW_CEILING);
 
@@ -1628,7 +1683,7 @@ fn a_preview_holds_a_node_to_its_targets_authority_unless_granted() {
 fn a_preview_prices_a_publish_by_its_artifact() {
     let payer = fee_payer(7);
     let artifact = published_account_artifact();
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let tx = signed_publish(7, artifact.clone());
     let report = preview_on(
         &[(payer, 1_000_000)],
@@ -1662,7 +1717,7 @@ fn a_preview_prices_a_publish_by_its_artifact() {
 fn a_committed_cell_that_is_not_a_package_is_ignored() {
     // The other half: ordinary traffic cannot grow the cache by
     // accident, whatever it writes.
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
     let tx = Arc::new(Verified::<Transaction>::from_persisted(signed_transfer(
         ALICE_SEED,
         alice(),
@@ -1686,7 +1741,7 @@ fn a_committed_cell_that_is_not_a_package_is_ignored() {
 fn a_presented_instance_of_a_published_package_answers_a_call() {
     let payer = fee_payer(7);
     let key = Ed25519PrivateKey::from_bytes(&[7; 32]).unwrap();
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
 
     let mut metadata = published_account_metadata();
     metadata.events.push("instantiable".into());
@@ -1770,7 +1825,7 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
 fn a_locked_config_read_serves_from_the_presented_record() {
     let payer = fee_payer(7);
     let key = Ed25519PrivateKey::from_bytes(&[7; 32]).unwrap();
-    let executor = Executor::new(ExecutionMode::Serial);
+    let executor = executor(ExecutionMode::Serial);
 
     let mut metadata = published_account_metadata();
     metadata.events.push("locked-config".into());

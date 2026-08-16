@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::package_key;
-use hyperscale_engine::genesis::{entropy_key, vault_key};
+use hyperscale_engine::genesis::{draw_key, vault_key};
 use hyperscale_engine::{
     PreviewGrants, PreviewOutcome, PreviewReport, ResourceChange, XRD, account_address,
 };
@@ -22,17 +22,17 @@ use hyperscale_types::{
     AccountSigner, Address, BlockHeight, Hash, SchemeId, ShardId, TransactionDecision,
     TransactionStatus, TxHash,
 };
-use hyperscale_vm_effects::package_hash;
+use hyperscale_vm_effects::{InstanceMeta, package_hash};
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::faultable::FaultableCluster;
 use crate::support::tx::{
-    OVERDRAW_AMOUNT, build_composed_tx, build_instance_deposit_tx, build_publish_tx,
-    build_securify_tx, build_stamp_tx, build_transfer_paid_by, build_transfer_tx,
-    build_unbound_payer_tx, cross_shard_cast, cross_shard_keys, native_pq_cast,
-    nullifier_race_cast, overdraw_cast, payment_request, recipient, securify_cast, sender,
-    shared_recipient_cast, storm_artifact, storm_publishers, unbound_payer_cast,
-    unbound_remote_payer_cast, validity_around,
+    OVERDRAW_AMOUNT, build_composed_tx, build_draw_tx, build_instance_deposit_tx, build_publish_tx,
+    build_securify_tx, build_transfer_paid_by, build_transfer_tx, build_unbound_payer_tx,
+    cross_shard_cast, cross_shard_keys, lottery_on, native_pq_cast, nullifier_race_cast,
+    overdraw_cast, payment_request, recipient, securify_cast, sender, shared_recipient_cast,
+    storm_artifact, storm_publishers, unbound_payer_cast, unbound_remote_payer_cast,
+    validity_around,
 };
 use crate::support::wait::{await_height, await_tx_terminal};
 use crate::support::{Cluster, epochs};
@@ -779,24 +779,30 @@ fn recorded_bytes<C: Cluster>(c: &C, shard: ShardId) -> Option<u64> {
 
 /// A randomness-reading transaction derives one draw on both shards.
 ///
-/// Both accounts stamp the transaction's draw into their own entropy
-/// leaf, one leaf per shard, so the two stamps agree exactly when the two
-/// committees executed the transaction under one value. The draw is
-/// anchored on the payer block — the block that committed the
-/// transaction on the payer's shard, whose reveal chain rides the
-/// engagement bundle — so agreement holds by construction rather than by
-/// the two shards happening to commit in step. Each stamp is an
-/// exclusive write, so this is also the read-set-provisioned shape in
-/// both directions: each shard executes on the other's shipped prior.
+/// Two lottery instances, one per shard, settle their rounds in the same
+/// transaction, so the two recorded draws agree exactly when the two
+/// committees executed under one value. The draw is anchored on the
+/// payer block — the block that committed the transaction on the payer's
+/// shard, whose reveal chain rides the engagement bundle — so agreement
+/// holds by construction rather than by the two shards happening to
+/// commit in step. Each result is an exclusive write, so this is also the
+/// read-set-provisioned shape in both directions: each shard executes on
+/// the other's shipped prior.
 ///
 /// # Panics
 ///
-/// Panics if the stamp misses its budget, does not accept, either
-/// shard's chain never commits it, either leaf is unstamped, or the two
-/// stamps differ.
+/// Panics if the draw misses its budget, does not accept, either shard's
+/// chain never commits it, either round is unsettled, or the two rounds
+/// settled on different draws.
 pub fn randomness_draw_agrees_across_shards<C: Cluster>(c: &mut C) {
-    let (payer, left_owner, right_key, right_owner) = cross_shard_keys();
-    let tx = build_stamp_tx(&payer, left_owner, &right_key, validity_around(c.now()));
+    let (payer, ..) = cross_shard_keys();
+    let left = lottery_on(ShardId::leaf(1, 0));
+    let right = lottery_on(ShardId::leaf(1, 1));
+    let tx = build_draw_tx(
+        &payer,
+        &[left.clone(), right.clone()],
+        validity_around(c.now()),
+    );
     let hash = tx.hash();
     c.submit(Arc::new(tx));
 
@@ -806,35 +812,31 @@ pub fn randomness_draw_agrees_across_shards<C: Cluster>(c: &mut C) {
             status,
             Some(TransactionStatus::Completed(TransactionDecision::Accept))
         ),
-        "cross-shard VM stamp did not accept; status = {status:?}"
+        "cross-shard VM draw did not accept; status = {status:?}"
     );
     let (left_fate, _) = c.chain_fate(ShardId::leaf(1, 0), hash);
     let (right_fate, _) = c.chain_fate(ShardId::leaf(1, 1), hash);
-    assert!(left_fate.is_some(), "payer shard never committed the stamp");
+    assert!(left_fate.is_some(), "payer shard never committed the draw");
     assert!(
         right_fate.is_some(),
-        "counterpart shard never committed the stamp"
+        "counterpart shard never committed the draw"
     );
 
-    // The stamps are read off each shard's own committed state, which
+    // The rounds are read off each shard's own committed state, which
     // trails the settling block by the persistence step.
-    let read = |c: &C, shard: ShardId, owner: Address| -> Option<Vec<u8>> {
-        let key = entropy_key(owner);
+    let read = |c: &C, shard: ShardId, lottery: &InstanceMeta| -> Option<Vec<u8>> {
+        let key = draw_key(lottery.address(&ProtocolHasher));
         c.substate(shard, key.owner, key.local.0)
     };
     assert!(
-        c.run_until(epochs(4), |c| read(
-            c,
-            ShardId::leaf(1, 0),
-            left_owner.address()
-        )
-        .is_some()
-            && read(c, ShardId::leaf(1, 1), right_owner.address()).is_some()),
-        "both entropy leaves must carry a stamp"
+        c.run_until(epochs(4), |c| read(c, ShardId::leaf(1, 0), &left).is_some()
+            && read(c, ShardId::leaf(1, 1), &right).is_some()),
+        "both rounds must have settled"
     );
-    let left = read(c, ShardId::leaf(1, 0), left_owner.address()).expect("stamped");
-    let right = read(c, ShardId::leaf(1, 1), right_owner.address()).expect("stamped");
-    assert_eq!(left.len(), 32, "a stamp is the 32-byte draw");
+    let left = read(c, ShardId::leaf(1, 0), &left).expect("settled");
+    let right = read(c, ShardId::leaf(1, 1), &right).expect("settled");
+    // Nobody entered either round, so each cell is the draw alone.
+    assert_eq!(left.len(), 32, "an unentered round is the 32-byte draw");
     assert_eq!(
         left, right,
         "the two shards executed the transaction under different draws"

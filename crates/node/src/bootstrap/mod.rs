@@ -68,7 +68,11 @@ where
         BlockHeight::GENESIS,
         "genesis replication requires a store with no committed blocks"
     );
-    storage.replicate_genesis_substates(&genesis_writes(&[], &genesis_config.pools));
+    storage.replicate_genesis_substates(&genesis_writes(
+        &[],
+        &genesis_config.pools,
+        &genesis_config.packages,
+    ));
 }
 
 /// The identity of the network's genesis package state.

@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::account_address;
-use hyperscale_engine::genesis::vault_key;
+use hyperscale_engine::genesis::{GenesisPackages, vault_key};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, TickBatchContext, XRD, genesis_writes,
 };
@@ -43,7 +43,7 @@ struct MapDb(BTreeMap<SubstateKey, Vec<u8>>);
 
 impl MapDb {
     fn genesis(accounts: &[(PrincipalAddr, u128)]) -> Self {
-        let writes = genesis_writes(accounts, &[]);
+        let writes = genesis_writes(accounts, &[], &GenesisPackages::protocol());
         let mut map = BTreeMap::new();
         for (key, change) in writes.cells() {
             let value = change.clone().expect("genesis writes are Set-only");

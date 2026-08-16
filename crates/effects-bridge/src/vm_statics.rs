@@ -21,7 +21,7 @@ use hyperscale_types::{
     DeclaredKey, DeclaredRange, Derived, EnvelopeExt, Hash, MAX_STATE_ENTRIES_PER_TX, Routing,
     TransactionEnvelope, VmStatics, VmStaticsError, declared_work,
 };
-use hyperscale_vm_effects::stdlib::{AUTH, CONFIG, ENTROPY, VALIDATORS, VAULT, XRD as XRD_ROLE};
+use hyperscale_vm_effects::stdlib::{AUTH, CONFIG, DRAW, VALIDATORS, VAULT, XRD as XRD_ROLE};
 use hyperscale_vm_effects::{
     Address, AuthCell, AuthRole, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry,
     ManifestHash, MetadataCache, Mode, NativeAddr, PackageHash, PackageMetadata,
@@ -75,12 +75,12 @@ pub fn validator_key(pool: impl Into<Address>, validator: u64) -> SubstateKey {
     )
 }
 
-/// An account's entropy leaf: where the stdlib's `stamp-entropy` records
-/// the transaction's randomness draw. Mirrors the effect signature the
-/// method declares.
+/// A lottery's settled-round cell: where its `draw` records the
+/// transaction's randomness beside the entrant it selected. Mirrors the
+/// effect signature the method declares.
 #[must_use]
-pub fn entropy_key(owner: impl Into<Address>) -> SubstateKey {
-    child_key(&ProtocolHasher, owner, ENTROPY, &[])
+pub fn draw_key(lottery: impl Into<Address>) -> SubstateKey {
+    child_key(&ProtocolHasher, lottery, DRAW, &[])
 }
 
 /// An instance's configuration cell: the locked leaf its creation fixed.
@@ -1052,31 +1052,41 @@ mod tests {
         assert!(statics().derive(&envelope(&transfer, &[])).is_ok());
     }
 
-    /// The stamp writes a leaf under its target's prefix and moves no
-    /// funds, which is exactly why it is easy to leave open.
+    /// A method writing a leaf under its target's prefix and moving no
+    /// funds is exactly the shape that is easy to leave open — so
+    /// `securify`, which consumes nothing, is held to the same evidence
+    /// rule a withdrawal is.
     #[test]
-    fn a_stamp_presenting_nothing_is_refused() {
-        let stamp = |evidence: BTreeSet<EvidenceRef>| {
-            single_intent_tree(vec![GraphNode {
-                target: composer_addr().into(),
-                method: "stamp-entropy".into(),
-                args: vec![],
-                evidence,
-            }])
+    fn a_leaf_write_presenting_nothing_is_refused() {
+        let node = |evidence: BTreeSet<EvidenceRef>| GraphNode {
+            target: composer_addr().into(),
+            method: "securify".into(),
+            args: vec![
+                GraphArg::Literal(Value::Bytes(
+                    RoleSet::uniform(Rule::Require(bob_addr().address()))
+                        .to_bytes()
+                        .unwrap(),
+                )),
+                GraphArg::Literal(Value::U64(86_400_000)),
+            ],
+            evidence,
         };
         // A guarded method reached with no evidence at all is a defect in
         // the signed form, so derivation refuses it and nobody pays.
         // Whether the evidence a call *does* present satisfies its
         // target is the target's own question, answered at execution.
         let refused = statics()
-            .derive(&envelope(&stamp(BTreeSet::new()), &[]))
+            .derive(&envelope(
+                &single_intent_tree(vec![node(BTreeSet::new())]),
+                &[],
+            ))
             .expect_err("refuses");
         assert!(refused.0.contains("evidence"), "{}", refused.0);
-        // A signature proof is not the stamp's to read either: it signs
-        // in, and the stamp takes what the sign-in minted.
+        // A signature proof is not this method's to read either: it signs
+        // in, and the write takes what the sign-in minted.
         let refused = statics()
             .derive(&envelope(
-                &stamp([EvidenceRef::IntentSignature].into()),
+                &single_intent_tree(vec![node([EvidenceRef::IntentSignature].into())]),
                 &[],
             ))
             .expect_err("refuses");
@@ -1086,12 +1096,7 @@ mod tests {
                 .derive(&envelope(
                     &single_intent_tree(vec![
                         sign_in(composer_addr()),
-                        GraphNode {
-                            target: composer_addr().into(),
-                            method: "stamp-entropy".into(),
-                            args: vec![],
-                            evidence: [EvidenceRef::Node(0)].into(),
-                        },
+                        node([EvidenceRef::Node(0)].into()),
                     ]),
                     &[]
                 ))

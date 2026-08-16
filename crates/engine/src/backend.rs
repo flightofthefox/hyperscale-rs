@@ -150,7 +150,7 @@ mod native {
     use wasmtime::{Engine, Store, Trap};
 
     use super::{FUEL, HostState, PackageSlots};
-    use crate::genesis::{account_artifact, staking_artifact};
+    use crate::genesis::GenesisPackages;
 
     /// The compiled guests, pre-linked for cheap instantiation.
     pub struct EngineBackend {
@@ -170,26 +170,28 @@ mod native {
     }
 
     impl EngineBackend {
-        /// Compile the genesis packages on the blessed engine and start
-        /// the compile worker for everything published after them.
+        /// Compile `packages` on the blessed engine and start the
+        /// compile worker for everything published after them.
         ///
         /// The artifact compiled is the one the package address covers,
         /// metadata section included: what the chain stores is what the
-        /// engine runs.
+        /// engine runs. The set is the network's genesis set, because a
+        /// package the chain is born holding is one no node ever fetches
+        /// — every node compiles it at boot instead.
         ///
         /// # Panics
         ///
-        /// Panics if a stdlib artifact fails profile validation or
+        /// Panics if a genesis artifact fails profile validation or
         /// compilation — a build defect, not a runtime condition.
-        pub fn new() -> Self {
+        pub fn new(packages: &GenesisPackages) -> Self {
             let engine = blessed_engine().expect("blessed engine configuration is pinned");
             let linker = kernel_linker(&engine);
             let slots = Arc::new(PackageSlots::new());
-            for artifact in [account_artifact(), staking_artifact()] {
-                validate_component(artifact).expect("a stdlib artifact clears the profile");
-                let pre = build(&engine, &linker, artifact).expect("a stdlib artifact compiles");
+            for artifact in packages.artifacts() {
+                validate_component(artifact).expect("a genesis artifact clears the profile");
+                let pre = build(&engine, &linker, artifact).expect("a genesis artifact compiles");
                 let package = package_hash(&ProtocolHasher, artifact);
-                assert!(slots.claim(package), "stdlib packages are distinct");
+                assert!(slots.claim(package), "genesis packages are distinct");
                 slots.fulfil(package, Some(pre));
             }
 
@@ -401,7 +403,7 @@ mod reference {
     use hyperscale_vm_runtime::validate_component;
 
     use super::{FUEL, HostState, PackageSlots};
-    use crate::genesis::{account_artifact, staking_artifact};
+    use crate::genesis::GenesisPackages;
 
     /// The decoded guests under the reference interpreter.
     pub struct EngineBackend {
@@ -418,15 +420,15 @@ mod reference {
         ///
         /// # Panics
         ///
-        /// Panics if the stdlib artifact fails profile validation or
+        /// Panics if a genesis artifact fails profile validation or
         /// decoding — a build defect, not a runtime condition.
-        pub fn new() -> Self {
+        pub fn new(packages: &GenesisPackages) -> Self {
             let slots = Arc::new(PackageSlots::new());
-            for artifact in [account_artifact(), staking_artifact()] {
-                validate_component(artifact).expect("a stdlib artifact clears the profile");
-                let component = RefComponent::decode(artifact).expect("a stdlib artifact decodes");
+            for artifact in packages.artifacts() {
+                validate_component(artifact).expect("a genesis artifact clears the profile");
+                let component = RefComponent::decode(artifact).expect("a genesis artifact decodes");
                 let package = package_hash(&ProtocolHasher, artifact);
-                assert!(slots.claim(package), "stdlib packages are distinct");
+                assert!(slots.claim(package), "genesis packages are distinct");
                 slots.fulfil(package, Some(component));
             }
             Self { slots }

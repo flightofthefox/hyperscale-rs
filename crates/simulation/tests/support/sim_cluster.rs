@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{PreviewGrants, PreviewInputs, PreviewReport};
 use hyperscale_metrics::{MetricsRecorder, with_scoped_recorder};
 use hyperscale_metrics_memory::MemoryRecorder;
@@ -50,6 +51,7 @@ struct BuildArgs<'a> {
     dedicated_pool_hosts: bool,
     accounts: &'a [(PrincipalAddr, u128)],
     execution_mode: ExecutionMode,
+    packages: GenesisPackages,
 }
 
 /// The simulation adaptor: a [`Cluster`] over a [`SimulationRunner`].
@@ -95,6 +97,7 @@ impl SimCluster {
             dedicated_pool_hosts: false,
             accounts,
             execution_mode,
+            packages: GenesisPackages::protocol(),
         })
     }
 
@@ -134,6 +137,7 @@ impl SimCluster {
             dedicated_pool_hosts,
             accounts,
             execution_mode: ExecutionMode::Serial,
+            packages: GenesisPackages::protocol(),
         })
     }
 
@@ -167,6 +171,7 @@ impl SimCluster {
                 .chain(staking_genesis_accounts())
                 .collect(),
             execution_mode: args.execution_mode,
+            packages: args.packages.clone(),
             pools: world_pools(),
             world_pools: world_pools(),
             ..SimConfig::default()
@@ -200,11 +205,30 @@ impl SimCluster {
         seed: u64,
         accounts: &[(PrincipalAddr, u128)],
     ) -> Self {
+        Self::with_grown_packages(config, seed, accounts, GenesisPackages::protocol())
+    }
+
+    /// [`Self::with_grown_accounts`] over a network born running
+    /// `packages` — how a scenario reaching a fixture asks for it.
+    #[must_use]
+    pub fn with_grown_packages(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        packages: GenesisPackages,
+    ) -> Self {
         let grow_config = ScenarioConfig {
             split_bytes: 0,
             ..*config
         };
-        let mut cluster = Self::with_accounts(&grow_config, seed, accounts);
+        let mut cluster = Self::build_full(&BuildArgs {
+            config: &grow_config,
+            seed,
+            dedicated_pool_hosts: false,
+            accounts,
+            execution_mode: ExecutionMode::Serial,
+            packages,
+        });
         grow_to(&mut cluster, config.num_shards);
         vote_reshape_threshold(&mut cluster, config.split_bytes);
         cluster
