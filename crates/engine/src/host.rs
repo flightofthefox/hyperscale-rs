@@ -31,8 +31,17 @@ macro_rules! delegate {
             fn delta_sub(&mut self, rep: u32, amount: u128) -> Result<(), AbortReason> {
                 self.0.delta_sub(rep, amount).map_err(AbortReason::from)
             }
+            fn delta_take(&mut self, rep: u32, amount: u128) -> Result<u32, AbortReason> {
+                self.0.delta_take(rep, amount).map_err(AbortReason::from)
+            }
+            fn write_take(&mut self, rep: u32, amount: u128) -> Result<u32, AbortReason> {
+                self.0.write_take(rep, amount).map_err(AbortReason::from)
+            }
             fn reserve_amount(&mut self, rep: u32) -> Result<u128, AbortReason> {
                 self.0.reserve_amount(rep).map_err(AbortReason::from)
+            }
+            fn reserve_take(&mut self, rep: u32) -> Result<u32, AbortReason> {
+                self.0.reserve_take(rep).map_err(AbortReason::from)
             }
             fn range_count(&mut self, rep: u32) -> Result<u32, AbortReason> {
                 self.0.range_count(rep).map_err(AbortReason::from)
