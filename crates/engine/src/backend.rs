@@ -348,6 +348,7 @@ mod native {
             // whether a transaction was its sender's own defect.
             let exhausted = outcome.as_ref().err().is_some_and(fuel_exhausted);
             let result = match outcome {
+                Ok(Returned::Edges(reps)) => Invoked::Produced(reps),
                 Ok(Returned::Values(bytes)) => Invoked::Returned(bytes),
                 Ok(Returned::Declined(code)) => Invoked::Declined(code),
                 Err(error) => {
@@ -388,6 +389,8 @@ mod native {
             GuestArg::U64(scalar) => HostArg::U64(*scalar),
             GuestArg::Address(address) => HostArg::Address(*address),
             GuestArg::Bytes(bytes) => HostArg::Bytes(bytes),
+            GuestArg::Bucket(rep) => HostArg::Bucket(*rep),
+            GuestArg::Issuer => HostArg::Issuer,
         }
     }
 }
@@ -402,8 +405,8 @@ mod reference {
     use hyperscale_effects_bridge::ProtocolHasher;
     use hyperscale_vm_effects::{PackageHash, package_hash};
     use hyperscale_vm_kernel::{
-        AbortReason, CellKind, GuestArg, GuestBackend as Backend, GuestCall, InvokeResult, Invoked,
-        KernelSession,
+        AbortReason, CellKind, GuestArg, GuestBackend as Backend, GuestCall, ISSUER_REP,
+        InvokeResult, Invoked, KernelSession,
     };
     use hyperscale_vm_ref::{
         CVal, ExecError, RefComponent, RefComponentInstance, ResourceKind, Trap as RefTrap,
@@ -523,6 +526,17 @@ mod reference {
                     [] => Invoked::Returned(None),
                     [CVal::Bytes(bytes)] => Invoked::Returned(Some(bytes.clone())),
                     [CVal::Declined(code)] => Invoked::Declined(*code),
+                    // Every value is an edge, or the shape is one the
+                    // convention does not fix.
+                    edges if edges.iter().all(|v| matches!(v, CVal::Own(_))) => Invoked::Produced(
+                        edges
+                            .iter()
+                            .map(|v| match v {
+                                CVal::Own(rep) => *rep,
+                                _ => unreachable!("every value is an owned edge"),
+                            })
+                            .collect(),
+                    ),
                     other => {
                         tracing::debug!(export = call.export, ?other, "off-convention result");
                         Invoked::Aborted(AbortReason::BadReturnShape)
@@ -567,6 +581,8 @@ mod reference {
             GuestArg::U64(scalar) => CVal::U64(*scalar),
             GuestArg::Address(address) => CVal::Address(address.to_bytes()),
             GuestArg::Bytes(bytes) => CVal::Bytes(bytes.to_vec()),
+            GuestArg::Bucket(rep) => CVal::Own(*rep),
+            GuestArg::Issuer => CVal::Borrow(ISSUER_REP, ResourceKind::Issuer),
         }
     }
 }
