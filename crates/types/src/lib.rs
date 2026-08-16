@@ -138,7 +138,7 @@ pub use provisioning::provisions::{Provisions, ProvisionsContext, ProvisionsVeri
 pub use provisioning::substate::{SubstateEntry, SubstateLeaf};
 pub use receipt::consensus::{ConsensusReceipt, FAILED_RECEIPT_HASH, absorb_committed_cells};
 pub use receipt::event::{
-    Event, EventExt, MAX_EVENT_PAYLOAD_BYTES, MAX_EVENT_TYPES, MAX_EVENTS_PER_TX,
+    Event, EventExt, MAX_ERROR_CODES, MAX_EVENT_PAYLOAD_BYTES, MAX_EVENT_TYPES, MAX_EVENTS_PER_TX,
 };
 pub use receipt::global::GlobalReceipt;
 pub use receipt::metadata::{ExecutionMetadata, FeeSummary, LogLevel};
