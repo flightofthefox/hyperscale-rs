@@ -1222,9 +1222,11 @@ fn a_publish_writes_the_artifact_under_its_publisher() {
 #[test]
 fn the_stdlib_artifact_carries_resolvable_bindings() {
     let metadata = admit_protocol_package(account_artifact()).expect("the stdlib artifact admits");
+    // The grant is the bucket, so the amount the manifest asked for
+    // reaches the declaration and never the body.
     assert_eq!(
         metadata.methods["withdraw"].abi,
-        vec![AbiParam::Handle(0), AbiParam::Derived(Expr::Arg(1))],
+        vec![AbiParam::Handle(0)],
         "the binding decoded is the binding authored"
     );
     assert_eq!(
