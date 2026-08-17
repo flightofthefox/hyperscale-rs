@@ -194,10 +194,12 @@ fn the_gated_node_is_the_one_that_moves_the_balance() {
         );
     };
     // Half the payer's balance in one node, less the fee they also pay,
-    // and the recipient credited without having signed anything.
+    // and the recipient credited without having signed anything. The
+    // remainder tracks the fee, so it moves whenever what the guests
+    // execute does.
     assert_eq!(
         vault_cell(&settled(database_updates, &world_accounts()), thief()),
-        Some(encode_amount(4_000).to_vec())
+        Some(encode_amount(4_726).to_vec())
     );
     assert_eq!(
         vault_cell(&settled(database_updates, &world_accounts()), VICTIM),
