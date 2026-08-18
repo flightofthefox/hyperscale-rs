@@ -1655,10 +1655,11 @@ pub fn build_deactivate_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(|b| {
-        let proof = account::present_badge(
+        let proof = account::present_instance(
             b,
             account_address(&operator.public_key().0),
             pool_owner_badge(pool),
+            owner_badge_id(pool),
         )?;
         staking::deactivate_validator(b, proof, pool, validator.inner())
     });
@@ -1682,10 +1683,11 @@ pub fn build_register_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(|b| {
-        let proof = account::present_badge(
+        let proof = account::present_instance(
             b,
             account_address(&operator.public_key().0),
             pool_owner_badge(pool),
+            owner_badge_id(pool),
         )?;
         staking::register_validator(
             b,
@@ -1919,10 +1921,11 @@ pub fn build_reshape_threshold_vote_tx(
     validity: TimestampRange,
 ) -> Transaction {
     let graph = graph(|b| {
-        let proof = account::present_badge(
+        let proof = account::present_instance(
             b,
             account_address(&operator.public_key().0),
             pool_owner_badge(pool_at(GENESIS_POOL_ID)),
+            owner_badge_id(pool_at(GENESIS_POOL_ID)),
         )?;
         staking::cast_param_vote(
             b,

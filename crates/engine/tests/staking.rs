@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock};
 use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
 use hyperscale_engine::genesis::{
-    GenesisPackages, pool_address, pool_owner_badge, staking_artifact,
+    GenesisPackages, owner_badge_id, pool_address, pool_owner_badge, staking_artifact,
 };
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, TickBatchContext, XRD, genesis_writes,
@@ -267,10 +267,11 @@ fn signed_registration(pool: ComponentAddr, seed: u8) -> Transaction {
     let key = key_of(seed);
     let cache = client().cache();
     let mut b = client().builder(&cache);
-    let proof = account::present_badge(
+    let proof = account::present_instance(
         &mut b,
         account_address(&key.public_key().0),
         pool_owner_badge(pool),
+        owner_badge_id(pool),
     )
     .expect("a presentation types");
     staking::register_validator(&mut b, proof, pool, 11, vec![0xC1; 48], vec![0xC2; 96])
