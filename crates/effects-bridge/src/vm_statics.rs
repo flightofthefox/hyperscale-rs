@@ -924,31 +924,25 @@ mod tests {
         assert!(!statics.rule_admits(None, composer_addr(), bob_addr(), 0));
 
         // Securified to Bob: the old identity is dead, the rule's lives.
-        let cell = AuthCell::new(AuthBase {
-            recovery_delay_ms: 1_000,
-            roles: RoleSet::uniform(Rule::Require(Presented::Identity(bob_addr().address()))),
-        })
-        .to_bytes()
-        .unwrap();
+        let bob_rules =
+            || RoleSet::uniform(Rule::Require(Presented::Identity(bob_addr().address())));
+        let cell = AuthCell::new(AuthBase::new(1_000, &bob_rules()).unwrap())
+            .to_bytes()
+            .unwrap();
         assert!(statics.rule_admits(Some(&cell), composer_addr(), bob_addr(), 0));
         assert!(!statics.rule_admits(Some(&cell), composer_addr(), composer_addr(), 0));
 
         // A pending proposal moves the payer binding at its instant and
         // not before: the retired primary stops paying the moment the
         // recovery matures, with nothing applying it.
+        let composer_rules = RoleSet::uniform(Rule::Require(Presented::Identity(
+            composer_addr().address(),
+        )));
         let recovering = AuthCell {
-            base: AuthBase {
-                recovery_delay_ms: 1_000,
-                roles: RoleSet::uniform(Rule::Require(Presented::Identity(bob_addr().address()))),
-            },
+            base: AuthBase::new(1_000, &bob_rules()).unwrap(),
             proposal: Some(Proposal {
                 effective_at_ms: 5_000,
-                base: AuthBase {
-                    recovery_delay_ms: 1_000,
-                    roles: RoleSet::uniform(Rule::Require(Presented::Identity(
-                        composer_addr().address(),
-                    ))),
-                },
+                base: AuthBase::new(1_000, &composer_rules).unwrap(),
             }),
         }
         .to_bytes()
