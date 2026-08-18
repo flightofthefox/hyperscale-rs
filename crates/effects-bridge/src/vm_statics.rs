@@ -25,8 +25,8 @@ use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT, XRD as XRD_ROLE};
 use hyperscale_vm_effects::{
     Address, AuthCell, AuthRole, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry,
     ManifestHash, MetadataCache, Mode, NativeAddr, PackageHash, PackageMetadata,
-    PrefixShardResolver, PrincipalAddr, Routing as RoutedTransaction, SchemeId, SubstateKey, Value,
-    admit_tree, child_key, footprint, native_address, package_hash,
+    PrefixShardResolver, Presented, PrincipalAddr, Routing as RoutedTransaction, SchemeId,
+    SubstateKey, Value, admit_tree, child_key, footprint, native_address, package_hash,
     package_key as canonical_package_key, principal_address, route_tree,
 };
 use hyperscale_vm_fixtures::lottery;
@@ -464,7 +464,7 @@ impl VmStatics for BridgeStatics {
             auth_cell.unwrap_or_default(),
             payer.address(),
             AuthRole::Primary,
-            &[signer.address()],
+            &[Presented::Identity(signer.address())],
             clock_ms,
         )
     }
@@ -597,8 +597,9 @@ mod tests {
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
         AddressClass, AuthBase, CollectionId, Constraint, EdgeRef, EvidenceRef, GraphArg,
-        GraphNode, Hasher, IntentDecl, ManifestGraph, PackageHash, Proposal, ResourceAddr, RoleSet,
-        Rule, Subintent, SubintentHash, YieldBinding, YieldParam, child_key, nullifier_key,
+        GraphNode, Hasher, IntentDecl, ManifestGraph, PackageHash, Presented, Proposal,
+        ResourceAddr, RoleSet, Rule, Subintent, SubintentHash, YieldBinding, YieldParam, child_key,
+        nullifier_key,
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
     use hyperscale_vm_stdlib::account;
@@ -915,7 +916,7 @@ mod tests {
         // Securified to Bob: the old identity is dead, the rule's lives.
         let cell = AuthCell::new(AuthBase {
             recovery_delay_ms: 1_000,
-            roles: RoleSet::uniform(Rule::Require(bob_addr().address())),
+            roles: RoleSet::uniform(Rule::Require(Presented::Identity(bob_addr().address()))),
         })
         .to_bytes()
         .unwrap();
@@ -928,13 +929,15 @@ mod tests {
         let recovering = AuthCell {
             base: AuthBase {
                 recovery_delay_ms: 1_000,
-                roles: RoleSet::uniform(Rule::Require(bob_addr().address())),
+                roles: RoleSet::uniform(Rule::Require(Presented::Identity(bob_addr().address()))),
             },
             proposal: Some(Proposal {
                 effective_at_ms: 5_000,
                 base: AuthBase {
                     recovery_delay_ms: 1_000,
-                    roles: RoleSet::uniform(Rule::Require(composer_addr().address())),
+                    roles: RoleSet::uniform(Rule::Require(Presented::Identity(
+                        composer_addr().address(),
+                    ))),
                 },
             }),
         }
@@ -949,7 +952,9 @@ mod tests {
         // the execution gate. Bare rule bytes are among them: the write
         // path stores frames.
         assert!(!statics.rule_admits(Some(&[0xFF, 0xFF]), composer_addr(), composer_addr(), 0));
-        let bare = Rule::Require(bob_addr().address()).to_bytes().unwrap();
+        let bare = Rule::Require(Presented::Identity(bob_addr().address()))
+            .to_bytes()
+            .unwrap();
         assert!(!statics.rule_admits(Some(&bare), composer_addr(), bob_addr(), 0));
     }
 
@@ -1066,7 +1071,7 @@ mod tests {
             method: "securify".into(),
             args: vec![
                 GraphArg::Literal(Value::Bytes(
-                    RoleSet::uniform(Rule::Require(bob_addr().address()))
+                    RoleSet::uniform(Rule::Require(Presented::Identity(bob_addr().address())))
                         .to_bytes()
                         .unwrap(),
                 )),
