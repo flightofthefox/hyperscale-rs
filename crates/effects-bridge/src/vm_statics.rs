@@ -82,7 +82,7 @@ pub fn validator_key(pool: impl Into<Address>, validator: u64) -> SubstateKey {
 /// effect signature the method declares.
 #[must_use]
 pub fn draw_key(lottery: impl Into<Address>) -> SubstateKey {
-    child_key(&ProtocolHasher, lottery, lottery::DRAW, &[])
+    child_key(&ProtocolHasher, lottery, lottery::OUTCOME, &[])
 }
 
 /// An instance's configuration cell: the locked leaf its creation fixed.
