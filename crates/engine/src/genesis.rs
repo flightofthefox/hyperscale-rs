@@ -14,12 +14,13 @@ pub use hyperscale_effects_bridge::genesis::{
 };
 use hyperscale_effects_bridge::{ProtocolHasher, validator_key};
 pub use hyperscale_effects_bridge::{XRD, draw_key, vault_key};
+use hyperscale_hbor::to_vec;
 use hyperscale_types::{EntryKey, Hash, PrincipalAddr, SettledWrites, StakePoolSeat};
 use hyperscale_vm_effects::{
     Address, holdings_collection, instance_data_key, package_hash, resource_record_key,
 };
 use hyperscale_vm_kernel::encode_amount;
-use hyperscale_vm_stdlib::package_writes;
+use hyperscale_vm_stdlib::{package_writes, staking};
 
 use crate::executor::artifact_package;
 
@@ -79,10 +80,18 @@ pub fn genesis_writes(
     for seat in pools {
         let pool = pool_address(staking_package, seat);
         for (validator, pubkey) in &seat.founding {
-            writes.cells.insert(
-                validator_key(pool, validator.inner()),
-                Some(pubkey.as_bytes().to_vec()),
-            );
+            // Written as the record the package declares, through that
+            // package's own type: genesis seeds what a registration
+            // would have written, so the methods that read it back are
+            // reading their own encoding rather than a layout stated
+            // twice.
+            let held = to_vec(&staking::Validator {
+                pubkey: pubkey.as_bytes().to_vec(),
+            })
+            .expect("a validator record encodes");
+            writes
+                .cells
+                .insert(validator_key(pool, validator.inner()), Some(held));
         }
         // Custody of the pool: the badge's record under the pool, the
         // instance's data cell, and the holdings entry in the seat's

@@ -835,8 +835,13 @@ pub fn randomness_draw_agrees_across_shards<C: Cluster>(c: &mut C) {
     );
     let left = read(c, ShardId::leaf(1, 0), &left).expect("settled");
     let right = read(c, ShardId::leaf(1, 1), &right).expect("settled");
-    // Nobody entered either round, so each cell is the draw alone.
-    assert_eq!(left.len(), 32, "an unentered round is the 32-byte draw");
+    // Nobody entered either round, so each cell holds the draw and no
+    // winner: thirty-two bytes behind their length, and the absence.
+    assert_eq!(
+        left.len(),
+        34,
+        "an unentered round is the draw and no winner"
+    );
     assert_eq!(
         left, right,
         "the two shards executed the transaction under different draws"

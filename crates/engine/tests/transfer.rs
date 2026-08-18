@@ -358,8 +358,9 @@ fn a_draw_settles_on_what_its_anchor_fixes() {
 
     let executed = execute_anchored(&executor, anchor, std::slice::from_ref(&tx));
     let settled = draw_cell(&executed[0]).expect("the draw settled the round");
-    // Nobody entered, so the round is the draw and no winner after it.
-    assert_eq!(settled.len(), 32);
+    // Nobody entered, so the round holds the draw and no winner: the
+    // thirty-two bytes behind their length, and the absent winner.
+    assert_eq!(settled.len(), 34);
 
     let again = execute_anchored(&executor, anchor, std::slice::from_ref(&tx));
     assert_eq!(
