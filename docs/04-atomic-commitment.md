@@ -91,4 +91,4 @@ Any deviation lands in an abort path whose verdict both sides compute identicall
 
 ## 8. Properties
 
-The atomic-commitment invariants this document motivates — INV-EXEC-1 through INV-EXEC-10 — are stated precisely in [08-invariants.md](08-invariants.md); the VM's authority rules INV-VM-12 and INV-VM-15 are stated in the VM register, [vm/docs/08-invariants.md](../vm/docs/08-invariants.md).
+The atomic-commitment invariants this document motivates — INV-EXEC-1 through INV-EXEC-10 — are stated precisely in [08-invariants.md](08-invariants.md); the VM's authority rules INV-VM-12 and INV-VM-15 are stated in the VM register, [vm/docs/09-invariants.md](../vm/docs/09-invariants.md).
