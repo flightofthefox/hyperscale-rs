@@ -26,7 +26,7 @@ use hyperscale_types::{
     TransactionEnvelope,
 };
 use hyperscale_vm_effects::{
-    EnvelopeTree, IntentDecl, ManifestGraph, MetadataCache, PrincipalAddr, Rule,
+    EnvelopeTree, IntentDecl, ManifestGraph, MetadataCache, Presented, PrincipalAddr, Rule,
 };
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
 use hyperscale_vm_stdlib::account;
@@ -161,7 +161,7 @@ impl Client {
         account::securify_uniform(
             &mut b,
             owner,
-            Rule::Require(holder.address()),
+            Rule::Require(Presented::Identity(holder.address())),
             recovery_delay_ms,
         )?;
         b.build()
