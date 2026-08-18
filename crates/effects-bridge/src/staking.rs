@@ -43,8 +43,9 @@ use hyperscale_types::{
     BeaconWitnessEvent, ConsensusPublicKey, ConsensusSignature, Epoch, Event, NetworkParams,
     ParamProposal, ParamVote, ReshapeThresholds, Stake, StakePoolId, ValidatorId,
 };
-use hyperscale_vm_effects::{Address, ComponentAddr, InstanceRegistry, PackageHash};
+use hyperscale_vm_effects::{InstanceRegistry, PackageHash};
 use hyperscale_vm_stdlib::staking as pool;
+use hyperscale_vm_types::{Address, ComponentAddr};
 
 /// The stake pool's event table, by the index its guest emits.
 ///
@@ -212,7 +213,8 @@ const fn proposal_of(vote: &pool::ParamVote) -> ParamProposal {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::CONSENSUS_PUBLIC_KEY_BYTES;
-    use hyperscale_vm_effects::{Address, ComponentAddr, Hash32, InstanceMeta};
+    use hyperscale_vm_effects::{Hash32, InstanceMeta};
+    use hyperscale_vm_types::{Address, ComponentAddr};
 
     use super::*;
     use crate::ProtocolHasher;

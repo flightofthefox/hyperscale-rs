@@ -138,17 +138,26 @@ mod native {
     use hyperscale_effects_bridge::ProtocolHasher;
     use hyperscale_vm_effects::{PackageHash, package_hash};
     use hyperscale_vm_kernel::{
-        AbortReason, GuestBackend as Backend, GuestCall, InvokeResult, Invoked, KernelSession,
+        GuestBackend as Backend, GuestCall, InvokeResult, Invoked, KernelSession,
     };
     use hyperscale_vm_runtime::{
-        Returned, add_kernel_to_linker, blessed_engine, call_export, classify,
-        exhausted as fuel_exhausted, validate_component,
+        InstantiationCharges, add_kernel_to_linker, blessed_engine, classify,
+        exhausted as fuel_exhausted, instantiate_charged, instantiation_charges, invoke_export,
+        validate_component,
     };
+    use hyperscale_vm_types::AbortReason;
     use wasmtime::component::{Component, InstancePre, Linker};
     use wasmtime::{Engine, Store};
 
     use super::{FUEL, PackageSlots};
     use crate::genesis::GenesisPackages;
+
+    /// One package's runnable form: the pre-linked compilation and the
+    /// instantiation charge sequence derived from the same bytes.
+    pub struct CompiledPackage {
+        pre: InstancePre<KernelSession>,
+        charges: InstantiationCharges,
+    }
 
     /// The compiled guests, pre-linked for cheap instantiation.
     pub struct EngineBackend {
@@ -158,7 +167,7 @@ mod native {
         /// backend resolves and code is what a content address covers —
         /// so two instances of one package share one compilation and two
         /// packages in one transaction each get their own.
-        slots: Arc<PackageSlots<InstancePre<KernelSession>>>,
+        slots: Arc<PackageSlots<CompiledPackage>>,
         /// Feed of the compile worker: a dedicated OS thread, never the
         /// shared dispatch pools — wasmtime's internal parallel
         /// compilation nested inside a pooled worker is a known
@@ -261,11 +270,7 @@ mod native {
     /// waits on a build that will never land, which is a dead node
     /// rather than a divergent one. Loud, because nothing downstream can
     /// tell that apart from a slow fetch.
-    fn queue(
-        slots: &PackageSlots<InstancePre<KernelSession>>,
-        compile: &Sender<Vec<u8>>,
-        artifact: &[u8],
-    ) {
+    fn queue(slots: &PackageSlots<CompiledPackage>, compile: &Sender<Vec<u8>>, artifact: &[u8]) {
         let package = package_hash(&ProtocolHasher, artifact);
         if slots.claim(package) && compile.send(artifact.to_vec()).is_err() {
             tracing::error!(
@@ -287,13 +292,16 @@ mod native {
         engine: &Engine,
         linker: &Linker<KernelSession>,
         artifact: &[u8],
-    ) -> Option<InstancePre<KernelSession>> {
+    ) -> Option<CompiledPackage> {
         let attempt = catch_unwind(AssertUnwindSafe(|| {
             let component =
                 Component::new(engine, artifact).map_err(|error| format!("compile: {error:#}"))?;
-            linker
+            let pre = linker
                 .instantiate_pre(&component)
-                .map_err(|error| format!("link: {error:#}"))
+                .map_err(|error| format!("link: {error:#}"))?;
+            let charges = instantiation_charges(artifact)
+                .map_err(|error| format!("charge derivation: {error:#}"))?;
+            Ok(CompiledPackage { pre, charges })
         }));
         let reason = match attempt {
             Ok(Ok(pre)) => return Some(pre),
@@ -314,51 +322,51 @@ mod native {
             // ceiling: a manifest's nodes draw from one signed budget.
             let budget = call.fuel_budget.min(FUEL);
             let mut store = Store::new(&self.engine, session);
-            store.set_fuel(budget).expect("fuel metering is enabled");
-            let Some(pre) = self.slots.resolve(call.package) else {
+            let Some(package) = self.slots.resolve(call.package) else {
+                // This node's own cache, not the transaction: nothing
+                // about the batch is decided by a miss here.
                 return InvokeResult {
                     session: store.into_data(),
                     fuel: 0,
-                    result: Invoked::Aborted(AbortReason::CodeUnavailable),
+                    result: Invoked::Unavailable(AbortReason::CodeUnavailable),
                     exhausted: false,
                 };
             };
-            let instance = match pre.instantiate(&mut store) {
+            let instance = match instantiate_charged(&mut store, budget, &package.charges, |s| {
+                package.pre.instantiate(s)
+            }) {
                 Ok(instance) => instance,
+                // Exhausting the signed budget during instantiation is the
+                // sender's own deterministic trap; any other instantiation
+                // failure is this machine's.
+                Err(error) if fuel_exhausted(&error) => {
+                    let fuel = budget - store.get_fuel().expect("fuel metering is enabled");
+                    return InvokeResult {
+                        session: store.into_data(),
+                        fuel,
+                        result: Invoked::Aborted(classify(&error)),
+                        exhausted: true,
+                    };
+                }
                 Err(error) => {
                     tracing::debug!(?error, "component did not instantiate");
                     return InvokeResult {
                         session: store.into_data(),
                         fuel: 0,
-                        result: Invoked::Aborted(AbortReason::InstantiationFailed),
+                        result: Invoked::Unavailable(AbortReason::InstantiationFailed),
                         exhausted: false,
                     };
                 }
             };
-            let outcome = call_export(&mut store, &instance, call.export, call.args);
-            // The engine's own classification, not an inference from the
-            // fuel left: a trap that happens to land on an exhausted
-            // counter is a different outcome from one caused by it, and
-            // the reference interpreter reports the distinction exactly.
-            // Two runtimes disagreeing here is two nodes disagreeing on
-            // whether a transaction was its sender's own defect.
-            let exhausted = outcome.as_ref().err().is_some_and(fuel_exhausted);
-            let result = match outcome {
-                Ok(Returned::Edges(reps)) => Invoked::Produced(reps),
-                Ok(Returned::Declined(code)) => Invoked::Declined(code),
-                Err(error) => {
-                    let reason = classify(&error);
-                    tracing::debug!(export = call.export, ?reason, detail = ?error, "guest aborted");
-                    Invoked::Aborted(reason)
-                }
-            };
-            let remaining = store.get_fuel().expect("fuel metering is enabled");
-            let fuel = budget - remaining;
+            let end = invoke_export(&mut store, &instance, call.export, call.args, budget);
+            if let Invoked::Aborted(reason) = &end.result {
+                tracing::debug!(export = call.export, ?reason, "guest aborted");
+            }
             InvokeResult {
                 session: store.into_data(),
-                fuel,
-                result,
-                exhausted,
+                fuel: end.fuel,
+                result: end.result,
+                exhausted: end.exhausted,
             }
         }
     }
@@ -374,10 +382,13 @@ mod reference {
     use hyperscale_effects_bridge::ProtocolHasher;
     use hyperscale_vm_effects::{PackageHash, package_hash};
     use hyperscale_vm_kernel::{
-        AbortReason, GuestBackend as Backend, GuestCall, InvokeResult, Invoked, KernelSession,
+        GuestBackend as Backend, GuestCall, InvokeResult, Invoked, KernelSession,
     };
-    use hyperscale_vm_ref::{CVal, ExecError, RefComponent, RefComponentInstance, Trap as RefTrap};
+    use hyperscale_vm_ref::{
+        CVal, InstantiateError, RefComponent, RefComponentInstance, Trap as RefTrap,
+    };
     use hyperscale_vm_runtime::validate_component;
+    use hyperscale_vm_types::AbortReason;
 
     use super::{FUEL, PackageSlots};
     use crate::genesis::GenesisPackages;
@@ -459,70 +470,50 @@ mod reference {
         fn invoke(&self, session: KernelSession, call: &GuestCall<'_>) -> InvokeResult {
             let args: Vec<CVal> = call.args.iter().map(CVal::from).collect();
             let Some(component) = self.slots.resolve(call.package) else {
+                // This node's own cache, not the transaction: nothing
+                // about the batch is decided by a miss here.
                 return InvokeResult {
                     session,
                     fuel: 0,
-                    result: Invoked::Aborted(AbortReason::CodeUnavailable),
+                    result: Invoked::Unavailable(AbortReason::CodeUnavailable),
                     exhausted: false,
                 };
             };
-            let mut instance = match RefComponentInstance::instantiate(&component, session) {
+            // The same budget the blessed engine meters against, applied
+            // before segment work: exhausting it during instantiation is
+            // the sender's own deterministic trap; any other instantiation
+            // failure is this machine's.
+            let budget = call.fuel_budget.min(FUEL);
+            let mut instance = match RefComponentInstance::instantiate(&component, session, budget)
+            {
                 Ok(instance) => instance,
+                Err((host, InstantiateError::Trap(RefTrap::OutOfFuel))) => {
+                    return InvokeResult {
+                        session: host,
+                        fuel: budget,
+                        result: Invoked::Aborted(AbortReason::OutOfGas),
+                        exhausted: true,
+                    };
+                }
                 Err((host, error)) => {
                     tracing::debug!(?error, "component did not instantiate");
                     return InvokeResult {
                         session: host,
                         fuel: 0,
-                        result: Invoked::Aborted(AbortReason::InstantiationFailed),
+                        result: Invoked::Unavailable(AbortReason::InstantiationFailed),
                         exhausted: false,
                     };
                 }
             };
-            // The same ceiling the blessed engine meters against. Without
-            // it this engine is unbounded, and a guest past the budget
-            // traps on one target and runs on the other.
-            instance.set_fuel_limit(call.fuel_budget.min(FUEL));
-            let outcome = instance.invoke(call.export, &args);
-            let exhausted = matches!(outcome, Ok(Err(ExecError::Trap(RefTrap::OutOfFuel))));
-            let fuel = instance.fuel_consumed();
-            let session = instance.into_host();
-            let result = match outcome {
-                Ok(Ok(values)) => match values.as_slice() {
-                    [] => Invoked::Produced(Vec::new()),
-                    [CVal::Declined(code)] => Invoked::Declined(*code),
-                    // Every value is an edge, or the shape is one the
-                    // convention does not fix.
-                    edges if edges.iter().all(|v| matches!(v, CVal::Own(_))) => Invoked::Produced(
-                        edges
-                            .iter()
-                            .map(|v| match v {
-                                CVal::Own(rep) => *rep,
-                                _ => unreachable!("every value is an owned edge"),
-                            })
-                            .collect(),
-                    ),
-                    other => {
-                        tracing::debug!(export = call.export, ?other, "off-convention result");
-                        Invoked::Aborted(AbortReason::BadReturnShape)
-                    }
-                },
-                Ok(Err(error)) => {
-                    let reason = error.abort_reason();
-                    tracing::debug!(export = call.export, ?reason, ?error, "guest aborted");
-                    Invoked::Aborted(reason)
-                }
-                // The export is not in the component's table, which the
-                // publish gate admitted it against.
-                Err(error) => {
-                    tracing::debug!(export = call.export, ?error, "export not invocable");
-                    Invoked::Aborted(AbortReason::ExportMissing)
-                }
-            };
+            let end = instance.invoke_kernel(call.export, &args);
+            if let Invoked::Aborted(reason) = &end.result {
+                tracing::debug!(export = call.export, ?reason, "guest aborted");
+            }
             InvokeResult {
-                session,
-                fuel,
-                result,
-                exhausted,
+                session: instance.into_host(),
+                fuel: end.fuel,
+                result: end.result,
+                exhausted: end.exhausted,
             }
         }
     }

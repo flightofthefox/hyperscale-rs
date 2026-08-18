@@ -22,7 +22,7 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, SettledWrites, StateRoot,
     SubstateKey, Verified, WeightedTimestamp,
 };
-use hyperscale_vm_effects::{Address, CollectionId};
+use hyperscale_vm_types::{Address, CollectionId};
 
 use super::state::{ConsensusState, SharedState, apply_writes};
 

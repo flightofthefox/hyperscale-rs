@@ -25,7 +25,7 @@ use hyperscale_types::{
     WeightedTimestamp, ed25519_keypair_from_seed,
 };
 use hyperscale_vm_effects::{
-    Address, Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, ManifestGraph, Totality,
+    Constraint, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, ManifestGraph, Totality,
     package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
@@ -34,6 +34,7 @@ use hyperscale_vm_manifest_builder::{
     EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError,
 };
 use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account, account_artifact, staking};
+use hyperscale_vm_types::Address;
 
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
 /// fee comes from the faucet, so any key notarizes it.

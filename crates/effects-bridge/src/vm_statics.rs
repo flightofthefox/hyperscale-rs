@@ -23,14 +23,17 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT, XRD as XRD_ROLE};
 use hyperscale_vm_effects::{
-    Address, AuthCell, AuthRole, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry,
-    ManifestHash, MetadataCache, Mode, NativeAddr, PackageHash, PackageMetadata,
-    PrefixShardResolver, Presence, Presented, PrincipalAddr, Routing as RoutedTransaction,
-    SchemeId, SubstateKey, Value, admit_tree, child_key, footprint, native_address, package_hash,
+    AuthCell, AuthRole, EnvelopeTree, InstanceRegistry, ManifestHash, MetadataCache, PackageHash,
+    PackageMetadata, PrefixShardResolver, Presented, Routing as RoutedTransaction, Value,
+    admit_tree, child_key, footprint, native_address, package_hash,
     package_key as canonical_package_key, principal_address, route_tree,
 };
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
+use hyperscale_vm_types::{
+    Address, EffectSet, EffectTarget, Mode, NativeAddr, Presence, PrincipalAddr, SchemeId,
+    SubstateKey,
+};
 
 use crate::ProtocolHasher;
 use crate::artifact::admit_package;
@@ -342,12 +345,19 @@ impl PackageCache {
     /// First-write-wins by content address, which is what makes
     /// republishing idempotent: equal hash means equal artifact, so the
     /// entry can never need replacing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the metadata fails the cache's publish check. Every
+    /// caller feeds this from a committed artifact that already cleared
+    /// admission, so a refusal here is a node defect, never an input.
     pub fn publish(&self, package: PackageHash, metadata: PackageMetadata) {
         if self.load().get(package).is_some() {
             return;
         }
         let mut next = (*self.load()).clone();
-        next.publish(package, metadata);
+        next.publish(package, metadata)
+            .expect("everything published here cleared the artifact gate");
         self.0.store(Arc::new(next));
     }
 
@@ -474,7 +484,7 @@ impl VmStatics for BridgeStatics {
             auth_cell.unwrap_or_default(),
             payer.address(),
             AuthRole::Primary,
-            &[Presented::Identity(signer.address())],
+            &[Presented::Identity(signer.into())],
             clock_ms,
         )
     }
@@ -530,14 +540,7 @@ impl VmStatics for BridgeStatics {
             &ProtocolHasher,
         )
         .map_err(|error| VmStaticsError(format!("admission: {error}")))?;
-        let routing = route_tree(
-            &admitted,
-            &packages,
-            &instances,
-            &ProtocolHasher,
-            &PrefixShardResolver { bits: 0 },
-        )
-        .map_err(|error| VmStaticsError(format!("routing: {error}")))?;
+        let routing = route_tree(&admitted, &PrefixShardResolver { bits: 0 });
 
         let DeclaredAccess {
             read_keys,
@@ -606,13 +609,13 @@ mod tests {
     };
     use hyperscale_vm_effects::vocabulary::VAULT;
     use hyperscale_vm_effects::{
-        AddressClass, AuthBase, CollectionId, Constraint, EdgeRef, EvidenceRef, GraphArg,
-        GraphNode, Hasher, IntentDecl, ManifestGraph, PackageHash, Presented, Proposal,
-        ResourceAddr, RoleSet, Rule, Subintent, SubintentHash, YieldBinding, YieldParam, child_key,
-        nullifier_key,
+        AuthBase, Constraint, EdgeRef, EvidenceRef, GraphArg, GraphNode, Hasher, IntentDecl,
+        ManifestGraph, PackageHash, Presented, Proposal, RoleSet, StoredRule, Subintent,
+        SubintentHash, YieldBinding, YieldParam, child_key, nullifier_key,
     };
     use hyperscale_vm_manifest_builder::signing::sign_subintent;
     use hyperscale_vm_stdlib::account;
+    use hyperscale_vm_types::{AddressClass, CollectionId, ResourceAddr};
 
     use super::*;
 
@@ -634,7 +637,9 @@ mod tests {
     fn statics() -> BridgeStatics {
         let package = PackageHash(ProtocolHasher.hash(b"package", &[b"account"]));
         let mut cache = MetadataCache::new();
-        cache.publish(package, account::metadata());
+        cache
+            .publish(package, account::metadata())
+            .expect("the account package publishes");
         let mut instances = InstanceRegistry::new();
         // The composer and its counterparty are principals: their
         // addresses derive from their keys, so nothing is registered for
@@ -925,7 +930,7 @@ mod tests {
 
         // Securified to Bob: the old identity is dead, the rule's lives.
         let bob_rules =
-            || RoleSet::uniform(Rule::Require(Presented::Identity(bob_addr().address())));
+            || RoleSet::uniform(StoredRule::Require(Presented::Identity(bob_addr().into())));
         let cell = AuthCell::new(AuthBase::new(1_000, &bob_rules()).unwrap())
             .to_bytes()
             .unwrap();
@@ -935,8 +940,8 @@ mod tests {
         // A pending proposal moves the payer binding at its instant and
         // not before: the retired primary stops paying the moment the
         // recovery matures, with nothing applying it.
-        let composer_rules = RoleSet::uniform(Rule::Require(Presented::Identity(
-            composer_addr().address(),
+        let composer_rules = RoleSet::uniform(StoredRule::Require(Presented::Identity(
+            composer_addr().into(),
         )));
         let recovering = AuthCell {
             base: AuthBase::new(1_000, &bob_rules()).unwrap(),
@@ -956,7 +961,7 @@ mod tests {
         // the execution gate. Bare rule bytes are among them: the write
         // path stores frames.
         assert!(!statics.rule_admits(Some(&[0xFF, 0xFF]), composer_addr(), composer_addr(), 0));
-        let bare = Rule::Require(Presented::Identity(bob_addr().address()))
+        let bare = StoredRule::Require(Presented::Identity(bob_addr().into()))
             .to_bytes()
             .unwrap();
         assert!(!statics.rule_admits(Some(&bare), composer_addr(), bob_addr(), 0));
@@ -1075,7 +1080,7 @@ mod tests {
             method: "securify".into(),
             args: vec![
                 GraphArg::Literal(Value::Bytes(
-                    RoleSet::uniform(Rule::Require(Presented::Identity(bob_addr().address())))
+                    RoleSet::uniform(StoredRule::Require(Presented::Identity(bob_addr().into())))
                         .to_bytes()
                         .unwrap(),
                 )),

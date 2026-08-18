@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use hyperscale_storage::Substates;
 use hyperscale_types::SubstateKey;
-use hyperscale_vm_effects::{Address, CollectionId};
+use hyperscale_vm_types::{Address, CollectionId};
 use rocksdb::{DB, ReadOptions, Snapshot};
 
 use super::column_families::{CfHandles, EntriesCf, EntriesHistoryCf, StateCf, StateHistoryCf};

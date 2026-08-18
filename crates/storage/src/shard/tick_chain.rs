@@ -43,7 +43,7 @@ use hyperscale_types::{
     BlockHeight, Movement, ProvisionalHolds, StateWrites, SubstateKey, TickId, TxHash, amount_cell,
     read_amount,
 };
-use hyperscale_vm_effects::{Address, CollectionId};
+use hyperscale_vm_types::{Address, CollectionId};
 
 use crate::lock_recover::{read_or_recover, write_or_recover};
 use crate::shard::writes::{entry_overlay_range, fold_state_writes, merge_entry_overlay};

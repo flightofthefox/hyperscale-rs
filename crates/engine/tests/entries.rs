@@ -21,8 +21,9 @@ use hyperscale_types::{
     ProtocolHasher, ProvisionalHolds, ResourceAddr, RevealChain, SettledWrites, ShardId, ShardTrie,
     StoredReceipt, TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
-use hyperscale_vm_effects::{CollectionId, holdings_collection};
+use hyperscale_vm_effects::holdings_collection;
 use hyperscale_vm_stdlib::account;
+use hyperscale_vm_types::CollectionId;
 
 /// The two signing seeds this world funds.
 const ALICE: u8 = 1;

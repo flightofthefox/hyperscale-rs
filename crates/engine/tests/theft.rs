@@ -24,11 +24,10 @@ use hyperscale_storage::Substates;
 use hyperscale_transactions::{Client, Terms};
 use hyperscale_types::{
     ConsensusReceipt, Ed25519PrivateKey, EnvelopeExt, NetworkId, PrincipalAddr, ProvisionalHolds,
-    RevealChain, SettledWrites, ShardId, ShardTrie, StateWrites, SubstateKey, TimestampRange,
-    Transaction, Verified, WeightedTimestamp,
+    RevealChain, SettledWrites, ShardId, ShardTrie, Stake, StateWrites, SubstateKey,
+    TimestampRange, Transaction, Verified, WeightedTimestamp,
 };
-use hyperscale_vm_effects::{Address, CollectionId};
-use hyperscale_vm_kernel::{amount_cell, encode_amount};
+use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
 
 /// A funded account whose key nothing in this binary holds — the address
 /// is all an attacker has, and the address is public.
@@ -194,15 +193,27 @@ fn the_gated_node_is_the_one_that_moves_the_balance() {
         );
     };
     // Half the payer's balance in one node, less the fee they also pay,
-    // and the recipient credited without having signed anything. The
-    // remainder tracks the fee, so it moves whenever what the guests
-    // execute does.
+    // and the recipient credited without having signed anything. The fee
+    // is read off the receipt's own metadata rather than pinned: it
+    // tracks whatever the guests execute, and what this test holds still
+    // is the movement, not the fuel schedule.
+    let charged = executed[0]
+        .metadata
+        .fee_summary
+        .total_execution_cost
+        .expect("an executed receipt reports its cost")
+        / Stake::ATTOS_PER_WHOLE;
+    assert!(
+        charged > 0 && charged < 1_000,
+        "the burn is real and inside the signed ceiling, so the balance equation below \
+         is exact rather than capped: charged {charged}"
+    );
     assert_eq!(
         vault_cell(&settled(database_updates, &world_accounts()), thief()),
-        Some(encode_amount(4_236).to_vec())
+        Some(encode_amount(FUNDED - 5_000 - charged).to_vec())
     );
     assert_eq!(
         vault_cell(&settled(database_updates, &world_accounts()), VICTIM),
-        Some(encode_amount(15_000).to_vec())
+        Some(encode_amount(FUNDED + 5_000).to_vec())
     );
 }

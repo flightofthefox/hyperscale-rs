@@ -91,7 +91,7 @@ pub fn writes_root(writes: &StateWrites) -> WritesRoot {
 mod tests {
     use hyperscale_types::test_utils::test_principal;
     use hyperscale_types::{ShardId, ShardTrie, StateWrites, SubstateKey, WritesRoot};
-    use hyperscale_vm_effects::{LocalKey, PrincipalAddr};
+    use hyperscale_vm_types::{LocalKey, PrincipalAddr};
 
     use super::*;
 

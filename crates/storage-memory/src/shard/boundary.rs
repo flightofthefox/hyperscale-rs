@@ -18,7 +18,7 @@ use hyperscale_storage::{
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryKey, StateRoot, StoredReceipt, SubstateKey, SubstateLeaf,
 };
-use hyperscale_vm_effects::{Address, CollectionId};
+use hyperscale_vm_types::{Address, CollectionId};
 
 use super::core::SimShardStorage;
 use super::snapshot::{entries_in_range_at, value_at_version};

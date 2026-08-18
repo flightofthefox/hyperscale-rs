@@ -27,13 +27,13 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::vocabulary::CONFIG;
 use hyperscale_vm_effects::{
-    AbiParam, Address, Clause, CollectionId, EnvelopeTree, Expr, Hash32, InstanceMeta, IntentDecl,
-    ModeExpr, PackageHash, PackageMetadata, TargetExpr, Totality, Value, package_hash,
+    AbiParam, Clause, EnvelopeTree, Expr, Hash32, InstanceMeta, IntentDecl, ModeExpr, PackageHash,
+    PackageMetadata, TargetExpr, Totality, Value, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
-use hyperscale_vm_kernel::{amount_cell, encode_amount};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
 use hyperscale_vm_stdlib::{ACCOUNT_COMPONENT, account};
+use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
 
 /// The two accounts the transfer cases move funds between, as signing
 /// seeds rather than as literal addresses: a withdrawing node admits only
@@ -1843,6 +1843,7 @@ fn a_locked_config_read_serves_from_the_presented_record() {
         .expect("the account declares deposit")
         .effects
         .push(Clause::Effect {
+            guard: None,
             target: TargetExpr::Point(Expr::ChildKey {
                 owner: Box::new(Expr::SelfAddr),
                 slot: CONFIG,

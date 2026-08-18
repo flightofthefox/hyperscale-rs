@@ -26,10 +26,11 @@ use hyperscale_types::{
     TransactionEnvelope,
 };
 use hyperscale_vm_effects::{
-    EnvelopeTree, IntentDecl, ManifestGraph, MetadataCache, Presented, PrincipalAddr, Rule,
+    EnvelopeTree, IntentDecl, ManifestGraph, MetadataCache, Presented, StoredRule,
 };
 use hyperscale_vm_manifest_builder::{TypedBuilder, TypedError, signing};
 use hyperscale_vm_stdlib::account;
+use hyperscale_vm_types::PrincipalAddr;
 
 /// The execution gas limit every built envelope signs. Placeholder
 /// pricing — well above what a transfer draws, so the ceiling is never
@@ -161,7 +162,7 @@ impl Client {
         account::securify_uniform(
             &mut b,
             owner,
-            Rule::Require(Presented::Identity(holder.address())),
+            StoredRule::Require(Presented::Identity(holder.into())),
             recovery_delay_ms,
         )?;
         b.build()

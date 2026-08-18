@@ -27,10 +27,11 @@ use crate::{
 /// A signed transaction as the network carries it.
 ///
 /// `serialized_bytes` is the canonical wire form — the HBOR
-/// encoding of the envelope. The hash covers those exact bytes, so a peer
-/// cannot ship one encoding and have us key it by another. Every other
-/// field is a lazily-populated cache, skipped on the wire and rebuilt at
-/// each end.
+/// encoding of the envelope. The hash is the envelope's signing hash,
+/// recomputed locally from those bytes, so a peer can neither ship one
+/// encoding and have us key it by another nor mint a second identity for
+/// signed content by re-rolling the signature. Every other field is a
+/// lazily-populated cache, skipped on the wire and rebuilt at each end.
 #[derive(Hbor)]
 pub struct Transaction {
     /// HBOR-encoded [`TransactionEnvelope`] bytes — the canonical wire form.
@@ -48,10 +49,10 @@ pub struct Transaction {
     #[hbor(skip)]
     derived: OnceLock<Derived>,
 
-    /// Content hash, populated on first call to `hash()` via
-    /// `blake3(&serialized_bytes)`. `::new` pre-populates. Not on the
-    /// wire — recomputed at each end so a peer can't ship `(hash=X,
-    /// tx_bytes=Y)` and have us key the bogus body by X.
+    /// The envelope's signing hash, populated on first call to `hash()`.
+    /// `::new` pre-populates. Not on the wire — recomputed at each end so
+    /// a peer can't ship `(hash=X, tx_bytes=Y)` and have us key the bogus
+    /// body by X.
     #[hbor(skip)]
     hash: OnceLock<Hash>,
 
@@ -169,9 +170,7 @@ impl Transaction {
     #[must_use]
     pub fn new(vm: TransactionEnvelope) -> Self {
         let payload = hbor_to_vec(&vm).expect("an envelope within its caps encodes");
-        let mut hasher = Hasher::new();
-        hasher.update(&payload);
-        let hash = Hash::from_hash_bytes(hasher.finalize().as_bytes());
+        let hash = vm.signing_hash();
 
         let body_lock = OnceLock::new();
         let _ = body_lock.set(vm);
@@ -187,15 +186,32 @@ impl Transaction {
         }
     }
 
-    /// Get the transaction hash (content-addressed).
+    /// The transaction's identity: the protocol hash of the envelope's
+    /// signing bytes.
     ///
-    /// Computes `blake3(serialized_bytes)` on first call and caches the
-    /// result. `::new` pre-populates the cache.
+    /// One identity for every job — dedup, canonical ordering, receipt
+    /// and certificate naming, and the root every fresh derivation and
+    /// nullifier already grows from — and it covers exactly what the
+    /// composer signed. The signature and key sit outside it, so a
+    /// re-rolled signature over the same content is the same
+    /// transaction rather than a distinct one minting the same fresh
+    /// keys: the envelope's "distinct transactions never mint the same
+    /// fresh key" guarantee holds structurally.
+    ///
+    /// Computed on first call and cached; `::new` pre-populates. Bytes
+    /// that do not decode as an envelope hash as themselves — such a
+    /// transaction is refused at verification and enters nothing, so the
+    /// stand-in identity only ever keys the refusal.
     pub fn hash(&self) -> TxHash {
         TxHash::from(*self.hash.get_or_init(|| {
-            let mut hasher = Hasher::new();
-            hasher.update(&self.serialized_bytes);
-            Hash::from_hash_bytes(hasher.finalize().as_bytes())
+            self.try_body().map_or_else(
+                |_| {
+                    let mut hasher = Hasher::new();
+                    hasher.update(&self.serialized_bytes);
+                    Hash::from_hash_bytes(hasher.finalize().as_bytes())
+                },
+                EnvelopeExt::signing_hash,
+            )
         }))
     }
 
@@ -779,16 +795,32 @@ mod tests {
     }
 
     #[test]
-    fn decoded_hash_is_blake3_of_tx_bytes_not_wire_value() {
+    fn decoded_hash_is_the_signing_hash_not_a_wire_value() {
         // The hash isn't on the wire; decode pulls only `serialized_bytes`
-        // and the lazy `hash()` call computes blake3 over those bytes.
+        // and the lazy `hash()` call derives the signing hash from them.
         let tx = fixture(b"graph bytes");
         let bytes = hbor_to_vec(&tx).unwrap();
         let decoded: Transaction = hbor_from_slice(&bytes).unwrap();
-        let mut hasher = Hasher::new();
-        hasher.update(decoded.serialized_bytes());
-        let expected = TxHash::from(Hash::from_hash_bytes(hasher.finalize().as_bytes()));
+        let expected = TxHash::from(decoded.body().signing_hash());
         assert_eq!(decoded.hash(), expected);
+    }
+
+    #[test]
+    fn a_rerolled_signature_is_the_same_transaction() {
+        // The identity covers what the composer signed and nothing else,
+        // so an envelope differing only in its signature bytes — a
+        // signer re-rolling a nonce, a scheme with malleable encodings —
+        // deduplicates to one transaction, and the fresh keys it roots
+        // cannot be minted twice under two identities.
+        let key = Ed25519PrivateKey::from_bytes(&[9u8; 32]).unwrap();
+        let signed = test_envelope(b"graph bytes").sign(&key);
+        let mut rerolled = signed.clone();
+        rerolled.signature[0] ^= 0xFF;
+        assert_ne!(signed.signature, rerolled.signature);
+        assert_eq!(
+            Transaction::new(signed).hash(),
+            Transaction::new(rerolled).hash(),
+        );
     }
 
     #[test]

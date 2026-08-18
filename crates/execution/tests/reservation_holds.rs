@@ -24,7 +24,7 @@ use hyperscale_types::{
     TransactionEnvelope, TxHash, Verified, VmStatics, VmStaticsError, WeightedTimestamp,
     declared_work, install_vm_statics,
 };
-use hyperscale_vm_effects::Presence;
+use hyperscale_vm_types::Presence;
 
 /// The two amount cells every fixture transaction declares a reservation
 /// on. Real derivation folds duplicate reservations per cell before the

@@ -17,10 +17,10 @@ pub use hyperscale_effects_bridge::{XRD, draw_key, vault_key};
 use hyperscale_hbor::to_vec;
 use hyperscale_types::{EntryKey, Hash, PrincipalAddr, SettledWrites, StakePoolSeat};
 use hyperscale_vm_effects::{
-    Address, holdings_collection, instance_data_key, package_hash, resource_record_key,
+    holdings_collection, instance_data_key, package_hash, resource_record_key,
 };
-use hyperscale_vm_kernel::encode_amount;
 use hyperscale_vm_stdlib::{package_writes, staking};
+use hyperscale_vm_types::{Address, encode_amount};
 
 use crate::executor::artifact_package;
 

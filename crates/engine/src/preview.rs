@@ -24,10 +24,10 @@ use std::sync::Arc;
 use hyperscale_effects_bridge::admit_package;
 use hyperscale_storage::Substates;
 use hyperscale_types::{Event, RevealChain, Transaction, WeightedTimestamp};
-use hyperscale_vm_effects::SubstateKey;
 use hyperscale_vm_kernel::{
-    Baseline, BatchTx, Locality, ManifestWalk, Outcome, Receipt, decode_amount, execute_batch,
+    Baseline, BatchTx, EnvInputs, Locality, ManifestWalk, Receipt, decode_amount, execute_batch,
 };
+use hyperscale_vm_types::{Outcome, SubstateKey};
 
 use crate::executor::{
     PayerFee, TargetAuthority, TickBaseline, abort_reason, charge_for, materialize_declared,
@@ -297,8 +297,10 @@ impl Executor {
         let batch = [BatchTx::new(
             vm_tx,
             prepared.declaration,
-            inputs.clock.as_millis(),
-            tx_randomness(inputs.randomness, tx.hash()),
+            EnvInputs {
+                clock_ms: inputs.clock.as_millis(),
+                randomness: tx_randomness(inputs.randomness, tx.hash()),
+            },
         )
         .with_calls(prepared.calls)
         .with_nullifiers(prepared.nullifiers)];

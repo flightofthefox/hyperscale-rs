@@ -30,7 +30,7 @@ use hyperscale_types::{
     SafeVoteRegisters, SettledWrites, StateRoot, SubstateKey, ValidatorId, Verified,
     entry_leaf_key,
 };
-use hyperscale_vm_effects::{Address, CollectionId};
+use hyperscale_vm_types::{Address, CollectionId};
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Options,
     SliceTransform, WriteBatch,

@@ -33,13 +33,15 @@ use hyperscale_types::{
     compute_merkle_root, install_vm_statics,
 };
 use hyperscale_vm_effects::{
-    Address, CallTarget, CollectionId, Declaration, EffectSet, EffectTarget, EntryKey,
-    InstanceRegistry, NodeCall, PackageHash, PrefixShardResolver, SubstateKey, admit_tree,
+    Declaration, InstanceRegistry, NodeCall, PackageHash, PrefixShardResolver, admit_tree,
     package_hash, route_tree,
 };
 use hyperscale_vm_kernel::{
-    Baseline, BatchTx, EnvInputs, ExecutionMode, Locality, ManifestWalk, Outcome, Receipt,
-    Substates, execute_batch,
+    Baseline, BatchTx, EnvInputs, ExecutionMode, Locality, ManifestWalk, Receipt, Substates,
+    execute_batch,
+};
+use hyperscale_vm_types::{
+    Address, CallTarget, CollectionId, EffectSet, EffectTarget, EntryKey, Outcome, SubstateKey,
 };
 
 use crate::backend::EngineBackend;
@@ -408,22 +410,13 @@ impl Executor {
             &ProtocolHasher,
         )
         .map_err(|error| format!("admission: {error}"))?;
-        let routing = route_tree(
-            &admitted,
-            &packages,
-            &instances,
-            &ProtocolHasher,
-            &PrefixShardResolver { bits: 0 },
-        )
-        .map_err(|error| format!("routing: {error}"))?;
+        let routing = route_tree(&admitted, &PrefixShardResolver { bits: 0 });
         // Both views of the declaration, straight from the fold: the
         // folded set that scheduling and judging read, and the clause
         // order capability materialization walks. Unioning `per_shard`
         // here would reach the same set but discard the order, which is
         // what a guest's positional handle parameters are indexed by.
-        let declaration = routing
-            .declaration()
-            .map_err(|error| format!("declaration: {error:?}"))?;
+        let declaration = routing.declaration().clone();
         // Every distinct component target's configuration leaf, served
         // locked from its own record on whichever shard executes.
         let mut locked_configs = Vec::new();
@@ -1040,15 +1033,10 @@ impl Executor {
                     .get(vm_tx)
                     .copied()
                     .expect("every prepared transaction has an environment");
-                BatchTx::new(
-                    *vm_tx,
-                    entry.declaration.clone(),
-                    env.clock_ms,
-                    env.randomness,
-                )
-                .with_calls(entry.calls.clone())
-                .with_nullifiers(entry.nullifiers.clone())
-                .with_gas_limit(entry.gas_limit)
+                BatchTx::new(*vm_tx, entry.declaration.clone(), env)
+                    .with_calls(entry.calls.clone())
+                    .with_nullifiers(entry.nullifiers.clone())
+                    .with_gas_limit(entry.gas_limit)
             })
             .collect();
         let walk = ManifestWalk {
@@ -1280,7 +1268,7 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{AddressClass, LocalKey, Presence};
-    use hyperscale_vm_kernel::AbortReason;
+    use hyperscale_vm_types::AbortReason;
 
     use super::*;
 

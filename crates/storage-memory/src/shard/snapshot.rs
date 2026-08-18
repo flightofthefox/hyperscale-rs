@@ -12,7 +12,7 @@ use std::ops::Bound;
 
 use hyperscale_storage::Substates;
 use hyperscale_types::{EntryKey, SubstateKey};
-use hyperscale_vm_effects::{Address, CollectionId};
+use hyperscale_vm_types::{Address, CollectionId};
 
 /// Point-in-time snapshot of in-memory storage scoped to a specific
 /// version within the retention window. Retention enforcement happens

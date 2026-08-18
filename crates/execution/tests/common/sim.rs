@@ -48,7 +48,7 @@ use hyperscale_types::{
     TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
     WeightedTimestamp, compute_global_receipt_root, read_amount,
 };
-use hyperscale_vm_effects::CollectionId;
+use hyperscale_vm_types::CollectionId;
 
 /// The shard a single-shard fixture runs on.
 pub const SHARD: ShardId = ShardId::ROOT;

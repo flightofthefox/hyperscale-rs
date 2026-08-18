@@ -17,7 +17,7 @@ use hyperscale_types::{
     WeightedTimestamp, committed_txs_root_from_hashes, local_settled_tx_hashes,
     settled_txs_root_from_hashes,
 };
-use hyperscale_vm_effects::{Address, CollectionId};
+use hyperscale_vm_types::{Address, CollectionId};
 
 use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
 use crate::{

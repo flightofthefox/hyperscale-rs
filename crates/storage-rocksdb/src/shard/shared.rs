@@ -24,7 +24,7 @@ use hyperscale_types::{
     SafeVoteRegisters, SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey,
     SubstateLeaf, TickId, Transaction, TxHash, ValidatorId, Verifiable, Verified,
 };
-use hyperscale_vm_effects::{Address, CollectionId};
+use hyperscale_vm_types::{Address, CollectionId};
 
 use super::core::RocksDbShardStorage;
 use super::snapshot::RocksDbSnapshot;

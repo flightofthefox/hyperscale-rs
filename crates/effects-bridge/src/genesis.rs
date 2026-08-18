@@ -9,12 +9,13 @@
 
 use hyperscale_types::{ComponentAddr, ResourceAddr, StakePoolSeat};
 use hyperscale_vm_effects::{
-    Address, Fungibility, Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash,
+    Fungibility, Hasher, InstanceMeta, InstanceRegistry, MetadataCache, PackageHash,
     ResourceRecord, Value, package_hash, resource_address,
 };
 use hyperscale_vm_fixtures::artifacts as fixture_artifacts;
 pub use hyperscale_vm_stdlib::{account_artifact, genesis_publisher, staking_artifact};
 use hyperscale_vm_stdlib::{protocol_artifacts, staking};
+use hyperscale_vm_types::Address;
 
 use crate::vm_statics::PackageCache;
 use crate::{PoolRegistry, ProtocolHasher, XRD, admit_protocol_package};
@@ -124,7 +125,8 @@ pub fn genesis_world_with_pools(pools: &[StakePoolSeat], packages: &GenesisPacka
         seed.publish(
             package_hash(&ProtocolHasher, artifact),
             admit_protocol_package(artifact).expect("a genesis artifact publishes as a package"),
-        );
+        )
+        .expect("a gate-admitted record clears the cache door");
     }
     let account_package = package_hash(&ProtocolHasher, account_artifact());
     let staking_package = package_hash(&ProtocolHasher, staking_artifact());
