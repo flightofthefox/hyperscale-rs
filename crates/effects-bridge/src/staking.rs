@@ -38,12 +38,13 @@
 
 use std::collections::BTreeMap;
 
+use hyperscale_hbor::from_slice;
 use hyperscale_types::{
-    BeaconWitnessEvent, CONSENSUS_PUBLIC_KEY_BYTES, ConsensusPublicKey, ConsensusSignature, Epoch,
-    Event, NetworkParams, ParamProposal, ParamVote, ReshapeThresholds, Stake, StakePoolId,
-    ValidatorId,
+    BeaconWitnessEvent, ConsensusPublicKey, ConsensusSignature, Epoch, Event, NetworkParams,
+    ParamProposal, ParamVote, ReshapeThresholds, Stake, StakePoolId, ValidatorId,
 };
 use hyperscale_vm_effects::{Address, ComponentAddr, InstanceRegistry, PackageHash};
+use hyperscale_vm_stdlib::staking as pool;
 
 /// The stake pool's event table, by the index its guest emits.
 ///
@@ -124,37 +125,62 @@ pub fn witness_from_event(
     if instances.get(emitter)?.package != staking_package {
         return None;
     }
+    // Decoded through the emitting package's own event types, so what
+    // this reads is what that package says it wrote. A payload that does
+    // not decode is a package whose code and metadata disagree — its
+    // author's defect, and not a fact.
     let payload = event.payload.as_slice();
     match event.event_type {
-        STAKED => Some(BeaconWitnessEvent::StakeDeposit {
-            pool_id,
-            amount: Stake::from_attos(amount_of(payload)?),
-        }),
-        UNSTAKED => Some(BeaconWitnessEvent::StakeWithdraw {
-            pool_id,
-            amount: Stake::from_attos(amount_of(payload)?),
+        STAKED => {
+            from_slice(payload)
+                .ok()
+                .map(|staked: pool::Staked| BeaconWitnessEvent::StakeDeposit {
+                    pool_id,
+                    amount: Stake::from_attos(staked.amount.subunits()),
+                })
+        }
+        UNSTAKED => from_slice(payload).ok().map(|unstaked: pool::Unstaked| {
+            BeaconWitnessEvent::StakeWithdraw {
+                pool_id,
+                amount: Stake::from_attos(unstaked.amount.subunits()),
+            }
         }),
         VALIDATOR_REGISTERED => {
-            let (validator_id, pubkey, possession_proof) = registration_of(payload)?;
-            Some(BeaconWitnessEvent::RegisterValidator {
-                pool_id,
-                validator_id,
-                pubkey,
-                possession_proof,
-            })
+            from_slice(payload)
+                .ok()
+                .map(|registered: pool::ValidatorRegistered| {
+                    BeaconWitnessEvent::RegisterValidator {
+                        pool_id,
+                        validator_id: ValidatorId::new(registered.validator_id),
+                        pubkey: ConsensusPublicKey::new(registered.pubkey),
+                        possession_proof: ConsensusSignature::new(registered.possession_proof),
+                    }
+                })
         }
-        VALIDATOR_DEACTIVATED => Some(BeaconWitnessEvent::DeactivateValidator {
-            pool_id,
-            validator_id: validator_of(payload)?,
+        VALIDATOR_DEACTIVATED => {
+            from_slice(payload)
+                .ok()
+                .map(|stood_down: pool::ValidatorDeactivated| {
+                    BeaconWitnessEvent::DeactivateValidator {
+                        pool_id,
+                        validator_id: ValidatorId::new(stood_down.validator_id),
+                    }
+                })
+        }
+        VALIDATOR_UNJAILED => from_slice(payload)
+            .ok()
+            .map(
+                |asked: pool::ValidatorUnjailed| BeaconWitnessEvent::Unjail {
+                    pool_id,
+                    id: ValidatorId::new(asked.validator_id),
+                },
+            ),
+        PARAM_VOTE_CAST => from_slice(payload).ok().map(|cast: pool::ParamVoteCast| {
+            BeaconWitnessEvent::ParamVote(ParamVote {
+                pool: pool_id,
+                proposal: Some(proposal_of(&cast.0)),
+            })
         }),
-        VALIDATOR_UNJAILED => Some(BeaconWitnessEvent::Unjail {
-            pool_id,
-            id: validator_of(payload)?,
-        }),
-        PARAM_VOTE_CAST => Some(BeaconWitnessEvent::ParamVote(ParamVote {
-            pool: pool_id,
-            proposal: Some(proposal_of(payload)?),
-        })),
         // A pool backing nothing says so with nothing.
         PARAM_VOTE_CLEARED if payload.is_empty() => {
             Some(BeaconWitnessEvent::ParamVote(ParamVote {
@@ -166,75 +192,26 @@ pub fn witness_from_event(
     }
 }
 
-/// The amount a lifecycle fact carries: the kernel's own 16-byte
-/// little-endian cell, and nothing else in the payload.
+/// The parameter change a cast backs, as the pool's own vote records it.
 ///
-/// A payload of any other length is a package whose code and metadata
-/// disagree — its author's defect, and not a fact.
-fn amount_of(payload: &[u8]) -> Option<u128> {
-    let cell: [u8; 16] = payload.try_into().ok()?;
-    Some(u128::from_le_bytes(cell))
-}
-
-/// The validator an operator fact names, little-endian and alone.
-fn validator_of(payload: &[u8]) -> Option<ValidatorId> {
-    let id: [u8; 8] = payload.try_into().ok()?;
-    Some(ValidatorId::new(u64::from_le_bytes(id)))
-}
-
-/// The parameter change a cast backs: the governed values in the order
-/// the package declares them, each a little-endian `u64`.
-///
-/// The package carries the parameters themselves rather than an encoding
-/// of them, so this is a positional read and not a decode — which is what
-/// lets the pool's own guest refuse a malformed vote before it becomes a
-/// transaction nobody can act on. Whether the values are *admissible* is
-/// the fold's to judge, and it does: bounds and a live activation epoch
-/// are checked where the vote is recorded.
-fn proposal_of(payload: &[u8]) -> Option<ParamProposal> {
-    let (split_bytes, rest) = u64_of(payload)?;
-    let (impound_epochs, rest) = u64_of(rest)?;
-    let (activate_at, rest) = u64_of(rest)?;
-    if !rest.is_empty() {
-        return None;
-    }
-    Some(ParamProposal {
+/// Whether the values are *admissible* is the fold's to judge, and it
+/// does: bounds and a live activation epoch are checked where the vote is
+/// recorded.
+const fn proposal_of(vote: &pool::ParamVote) -> ParamProposal {
+    ParamProposal {
         params: NetworkParams {
-            reshape_thresholds: ReshapeThresholds { split_bytes },
-            impound_epochs,
+            reshape_thresholds: ReshapeThresholds {
+                split_bytes: vote.split_bytes,
+            },
+            impound_epochs: vote.impound_epochs,
         },
-        activate_at: Epoch::new(activate_at),
-    })
-}
-
-/// The leading little-endian `u64` of `payload`, and what follows it.
-fn u64_of(payload: &[u8]) -> Option<(u64, &[u8])> {
-    let (head, rest) = payload.split_at_checked(8)?;
-    Some((u64::from_le_bytes(head.try_into().ok()?), rest))
-}
-
-/// What a registration carries: the validator, the consensus key it
-/// registers, and the proof it holds that key.
-///
-/// The three widths are fixed by the consensus scheme, so the
-/// concatenation is unambiguous and its total length is the whole of the
-/// shape check. The proof is not verified here — the beacon fold verifies
-/// it before the key enters the registry, which is where the rogue-key
-/// defence belongs and the only place holding the registry it defends.
-fn registration_of(
-    payload: &[u8],
-) -> Option<(ValidatorId, ConsensusPublicKey, ConsensusSignature)> {
-    let (id, rest) = payload.split_at_checked(8)?;
-    let (pubkey, proof) = rest.split_at_checked(CONSENSUS_PUBLIC_KEY_BYTES)?;
-    Some((
-        validator_of(id)?,
-        ConsensusPublicKey::new(pubkey.try_into().ok()?),
-        ConsensusSignature::new(proof.try_into().ok()?),
-    ))
+        activate_at: Epoch::new(vote.activate_at),
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::CONSENSUS_PUBLIC_KEY_BYTES;
     use hyperscale_vm_effects::{Address, ComponentAddr, Hash32, InstanceMeta};
 
     use super::*;

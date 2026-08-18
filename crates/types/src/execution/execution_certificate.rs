@@ -11,7 +11,7 @@ use std::fmt::{self, Debug, Formatter};
 use hyperscale_crypto::{ConsensusSignature, Verifier};
 use hyperscale_hbor::error::{DecodeError as HborDecodeError, EncodeError as HborEncodeError};
 use hyperscale_hbor::{
-    Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth,
+    Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth, Sink,
     bounded as hbor_bounded, to_vec as hbor_to_vec, varint,
 };
 use thiserror::Error;
@@ -179,7 +179,7 @@ fn decode_leaf_indices(mut bytes: &[u8], count: usize) -> Result<Vec<u32>, HborD
 }
 
 impl HborEncode for ExecutionCertificate {
-    fn encode(&self, encoder: &mut HborEncoder<'_>) -> Result<(), HborEncodeError> {
+    fn encode<S: Sink>(&self, encoder: &mut HborEncoder<S>) -> Result<(), HborEncodeError> {
         encoder.nested(&self.tick_id)?;
         encoder.nested(&self.vote_anchor_ts)?;
         encoder.nested(&self.global_receipt_root)?;

@@ -39,7 +39,7 @@ use std::ops::Deref;
 
 use hyperscale_hbor::error::{DecodeError as HborDecodeError, EncodeError as HborEncodeError};
 use hyperscale_hbor::{
-    Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth,
+    Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth, Sink,
 };
 
 /// A type whose value can be verified against a `Ctx`.
@@ -322,7 +322,7 @@ impl<T: HborWidth> HborWidth for Verifiable<T> {
 }
 
 impl<T: HborEncode> HborEncode for Verifiable<T> {
-    fn encode(&self, encoder: &mut HborEncoder<'_>) -> Result<(), HborEncodeError> {
+    fn encode<S: Sink>(&self, encoder: &mut HborEncoder<S>) -> Result<(), HborEncodeError> {
         self.as_unverified().encode(encoder)
     }
 }
