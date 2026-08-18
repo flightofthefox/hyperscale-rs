@@ -34,7 +34,7 @@ use std::marker::PhantomData;
 
 use hyperscale_hbor::error::{DecodeError as HborDecodeError, EncodeError as HborEncodeError};
 use hyperscale_hbor::{
-    Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth,
+    Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth, Sink,
 };
 
 use crate::TypedHash;
@@ -243,7 +243,7 @@ impl<T> HborWidth for BloomFilter<T> {
 }
 
 impl<T> HborEncode for BloomFilter<T> {
-    fn encode(&self, encoder: &mut HborEncoder<'_>) -> Result<(), HborEncodeError> {
+    fn encode<S: Sink>(&self, encoder: &mut HborEncoder<S>) -> Result<(), HborEncodeError> {
         encoder.nested(&self.bits)?;
         encoder.nested(&self.k)
     }

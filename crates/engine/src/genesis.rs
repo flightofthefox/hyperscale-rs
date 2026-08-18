@@ -86,7 +86,7 @@ pub fn genesis_writes(
             // reading their own encoding rather than a layout stated
             // twice.
             let held = to_vec(&staking::Validator {
-                pubkey: pubkey.as_bytes().to_vec(),
+                pubkey: *pubkey.as_bytes(),
             })
             .expect("a validator record encodes");
             writes

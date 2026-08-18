@@ -836,10 +836,11 @@ pub fn randomness_draw_agrees_across_shards<C: Cluster>(c: &mut C) {
     let left = read(c, ShardId::leaf(1, 0), &left).expect("settled");
     let right = read(c, ShardId::leaf(1, 1), &right).expect("settled");
     // Nobody entered either round, so each cell holds the draw and no
-    // winner: thirty-two bytes behind their length, and the absence.
+    // winner: thirty-two bytes at the width the record states, and one
+    // byte saying there is no winner.
     assert_eq!(
         left.len(),
-        34,
+        33,
         "an unentered round is the draw and no winner"
     );
     assert_eq!(

@@ -2,7 +2,7 @@
 
 use hyperscale_hbor::error::{DecodeError as HborDecodeError, EncodeError as HborEncodeError};
 use hyperscale_hbor::{
-    Decoder, Encoder, HborDecode, HborEncode, HborWidth, bounded as hbor_bounded,
+    Decoder, Encoder, HborDecode, HborEncode, HborWidth, Sink, bounded as hbor_bounded,
 };
 
 /// Hard cap on signers a single bitfield may describe.
@@ -135,7 +135,7 @@ impl HborWidth for SignerBitfield {
 }
 
 impl HborEncode for SignerBitfield {
-    fn encode(&self, encoder: &mut Encoder<'_>) -> Result<(), HborEncodeError> {
+    fn encode<S: Sink>(&self, encoder: &mut Encoder<S>) -> Result<(), HborEncodeError> {
         hbor_bounded::check_encoded_len("bits", self.bits.len(), MAX_BITS_BYTES_LEN)?;
         encoder.descend(|encoder| hbor_bounded::encode_bytes(encoder, &self.bits))?;
         let count =

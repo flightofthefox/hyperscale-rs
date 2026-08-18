@@ -21,7 +21,7 @@
 use hyperscale_crypto::Verifier;
 use hyperscale_hbor::error::{DecodeError as HborDecodeError, EncodeError as HborEncodeError};
 use hyperscale_hbor::{
-    Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth,
+    Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth, Sink,
 };
 use thiserror::Error;
 
@@ -459,7 +459,7 @@ impl HborWidth for CertifiedBeaconBlock {
 }
 
 impl HborEncode for CertifiedBeaconBlock {
-    fn encode(&self, encoder: &mut HborEncoder<'_>) -> Result<(), HborEncodeError> {
+    fn encode<S: Sink>(&self, encoder: &mut HborEncoder<S>) -> Result<(), HborEncodeError> {
         encoder.nested(&self.block)?;
         encoder.nested(&self.cert)
     }
