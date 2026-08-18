@@ -26,7 +26,6 @@
 mod backend;
 mod batch;
 mod executor;
-mod host;
 mod output;
 mod preview;
 mod receipt;

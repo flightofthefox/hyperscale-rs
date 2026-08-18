@@ -1231,8 +1231,9 @@ fn the_stdlib_artifact_carries_resolvable_bindings() {
     );
     assert_eq!(
         metadata.methods["deposit"].abi,
-        vec![AbiParam::Handle(0), AbiParam::Bucket(0)],
-        "a bucket's amount is the one argument a signature cannot derive"
+        vec![AbiParam::Handle(1), AbiParam::Bucket(0)],
+        "the handle names a clause rather than a position, and the vault is \
+         the second one the account declares"
     );
 }
 
@@ -1844,6 +1845,7 @@ fn a_locked_config_read_serves_from_the_presented_record() {
                 material: vec![],
             }),
             mode: ModeExpr::Locked,
+            denomination: None,
         });
     let artifact = attach_metadata(ACCOUNT_COMPONENT, &metadata).expect("attaches");
     let package = package_hash(&ProtocolHasher, &artifact);

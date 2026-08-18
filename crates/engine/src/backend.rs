@@ -17,8 +17,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use arc_swap::ArcSwap;
 use hyperscale_vm_effects::PackageHash;
 
-use crate::host::HostState;
-
 /// The ceiling on what one invocation may consume, whatever its
 /// transaction declared.
 ///
@@ -140,17 +138,16 @@ mod native {
     use hyperscale_effects_bridge::ProtocolHasher;
     use hyperscale_vm_effects::{PackageHash, package_hash};
     use hyperscale_vm_kernel::{
-        AbortReason, CellKind, GuestArg, GuestBackend as Backend, GuestCall, InvokeResult, Invoked,
-        KernelSession,
+        AbortReason, GuestBackend as Backend, GuestCall, InvokeResult, Invoked, KernelSession,
     };
     use hyperscale_vm_runtime::{
-        CellKind as HostCellKind, HostArg, Returned, add_kernel_to_linker, blessed_engine,
-        call_export, classify, exhausted as fuel_exhausted, validate_component,
+        Returned, add_kernel_to_linker, blessed_engine, call_export, classify,
+        exhausted as fuel_exhausted, validate_component,
     };
     use wasmtime::component::{Component, InstancePre, Linker};
     use wasmtime::{Engine, Store};
 
-    use super::{FUEL, HostState, PackageSlots};
+    use super::{FUEL, PackageSlots};
     use crate::genesis::GenesisPackages;
 
     /// The compiled guests, pre-linked for cheap instantiation.
@@ -161,7 +158,7 @@ mod native {
         /// backend resolves and code is what a content address covers —
         /// so two instances of one package share one compilation and two
         /// packages in one transaction each get their own.
-        slots: Arc<PackageSlots<InstancePre<HostState>>>,
+        slots: Arc<PackageSlots<InstancePre<KernelSession>>>,
         /// Feed of the compile worker: a dedicated OS thread, never the
         /// shared dispatch pools — wasmtime's internal parallel
         /// compilation nested inside a pooled worker is a known
@@ -250,8 +247,8 @@ mod native {
 
     /// A linker carrying the kernel world — the one import surface a
     /// deployable component may name.
-    fn kernel_linker(engine: &Engine) -> Linker<HostState> {
-        let mut linker = Linker::<HostState>::new(engine);
+    fn kernel_linker(engine: &Engine) -> Linker<KernelSession> {
+        let mut linker = Linker::<KernelSession>::new(engine);
         add_kernel_to_linker(&mut linker).expect("kernel world wiring");
         linker
     }
@@ -265,7 +262,7 @@ mod native {
     /// rather than a divergent one. Loud, because nothing downstream can
     /// tell that apart from a slow fetch.
     fn queue(
-        slots: &PackageSlots<InstancePre<HostState>>,
+        slots: &PackageSlots<InstancePre<KernelSession>>,
         compile: &Sender<Vec<u8>>,
         artifact: &[u8],
     ) {
@@ -288,9 +285,9 @@ mod native {
     /// take, so a refusal here is logged as the disagreement it is.
     fn build(
         engine: &Engine,
-        linker: &Linker<HostState>,
+        linker: &Linker<KernelSession>,
         artifact: &[u8],
-    ) -> Option<InstancePre<HostState>> {
+    ) -> Option<InstancePre<KernelSession>> {
         let attempt = catch_unwind(AssertUnwindSafe(|| {
             let component =
                 Component::new(engine, artifact).map_err(|error| format!("compile: {error:#}"))?;
@@ -316,11 +313,11 @@ mod native {
             // What the transaction has left, under the per-invocation
             // ceiling: a manifest's nodes draw from one signed budget.
             let budget = call.fuel_budget.min(FUEL);
-            let mut store = Store::new(&self.engine, HostState(session));
+            let mut store = Store::new(&self.engine, session);
             store.set_fuel(budget).expect("fuel metering is enabled");
             let Some(pre) = self.slots.resolve(call.package) else {
                 return InvokeResult {
-                    session: store.into_data().0,
+                    session: store.into_data(),
                     fuel: 0,
                     result: Invoked::Aborted(AbortReason::CodeUnavailable),
                     exhausted: false,
@@ -331,15 +328,14 @@ mod native {
                 Err(error) => {
                     tracing::debug!(?error, "component did not instantiate");
                     return InvokeResult {
-                        session: store.into_data().0,
+                        session: store.into_data(),
                         fuel: 0,
                         result: Invoked::Aborted(AbortReason::InstantiationFailed),
                         exhausted: false,
                     };
                 }
             };
-            let args: Vec<HostArg<'_>> = call.args.iter().map(host_arg).collect();
-            let outcome = call_export(&mut store, &instance, call.export, &args);
+            let outcome = call_export(&mut store, &instance, call.export, call.args);
             // The engine's own classification, not an inference from the
             // fuel left: a trap that happens to land on an exhausted
             // counter is a different outcome from one caused by it, and
@@ -349,7 +345,6 @@ mod native {
             let exhausted = outcome.as_ref().err().is_some_and(fuel_exhausted);
             let result = match outcome {
                 Ok(Returned::Edges(reps)) => Invoked::Produced(reps),
-                Ok(Returned::Values(bytes)) => Invoked::Returned(bytes),
                 Ok(Returned::Declined(code)) => Invoked::Declined(code),
                 Err(error) => {
                     let reason = classify(&error);
@@ -360,37 +355,11 @@ mod native {
             let remaining = store.get_fuel().expect("fuel metering is enabled");
             let fuel = budget - remaining;
             InvokeResult {
-                session: store.into_data().0,
+                session: store.into_data(),
                 fuel,
                 result,
                 exhausted,
             }
-        }
-    }
-
-    const fn host_kind(kind: CellKind) -> HostCellKind {
-        match kind {
-            CellKind::Read => HostCellKind::Read,
-            CellKind::Locked => HostCellKind::Locked,
-            CellKind::Write => HostCellKind::Write,
-            CellKind::Delta => HostCellKind::Delta,
-            CellKind::Reserve => HostCellKind::Reserve,
-            CellKind::RangeRead => HostCellKind::RangeRead,
-            CellKind::RangeWrite => HostCellKind::RangeWrite,
-        }
-    }
-
-    const fn host_arg<'a>(arg: &GuestArg<'a>) -> HostArg<'a> {
-        match arg {
-            GuestArg::Handle { rep, kind } => HostArg::Handle {
-                rep: *rep,
-                kind: host_kind(*kind),
-            },
-            GuestArg::U64(scalar) => HostArg::U64(*scalar),
-            GuestArg::Address(address) => HostArg::Address(*address),
-            GuestArg::Bytes(bytes) => HostArg::Bytes(bytes),
-            GuestArg::Bucket(rep) => HostArg::Bucket(*rep),
-            GuestArg::Issuer => HostArg::Issuer,
         }
     }
 }
@@ -405,15 +374,12 @@ mod reference {
     use hyperscale_effects_bridge::ProtocolHasher;
     use hyperscale_vm_effects::{PackageHash, package_hash};
     use hyperscale_vm_kernel::{
-        AbortReason, CellKind, GuestArg, GuestBackend as Backend, GuestCall, ISSUER_REP,
-        InvokeResult, Invoked, KernelSession,
+        AbortReason, GuestBackend as Backend, GuestCall, InvokeResult, Invoked, KernelSession,
     };
-    use hyperscale_vm_ref::{
-        CVal, ExecError, RefComponent, RefComponentInstance, ResourceKind, Trap as RefTrap,
-    };
+    use hyperscale_vm_ref::{CVal, ExecError, RefComponent, RefComponentInstance, Trap as RefTrap};
     use hyperscale_vm_runtime::validate_component;
 
-    use super::{FUEL, HostState, PackageSlots};
+    use super::{FUEL, PackageSlots};
     use crate::genesis::GenesisPackages;
 
     /// The decoded guests under the reference interpreter.
@@ -491,7 +457,7 @@ mod reference {
 
     impl Backend for EngineBackend {
         fn invoke(&self, session: KernelSession, call: &GuestCall<'_>) -> InvokeResult {
-            let args: Vec<CVal> = call.args.iter().map(ref_arg).collect();
+            let args: Vec<CVal> = call.args.iter().map(CVal::from).collect();
             let Some(component) = self.slots.resolve(call.package) else {
                 return InvokeResult {
                     session,
@@ -500,19 +466,18 @@ mod reference {
                     exhausted: false,
                 };
             };
-            let mut instance =
-                match RefComponentInstance::instantiate(&component, HostState(session)) {
-                    Ok(instance) => instance,
-                    Err((host, error)) => {
-                        tracing::debug!(?error, "component did not instantiate");
-                        return InvokeResult {
-                            session: host.0,
-                            fuel: 0,
-                            result: Invoked::Aborted(AbortReason::InstantiationFailed),
-                            exhausted: false,
-                        };
-                    }
-                };
+            let mut instance = match RefComponentInstance::instantiate(&component, session) {
+                Ok(instance) => instance,
+                Err((host, error)) => {
+                    tracing::debug!(?error, "component did not instantiate");
+                    return InvokeResult {
+                        session: host,
+                        fuel: 0,
+                        result: Invoked::Aborted(AbortReason::InstantiationFailed),
+                        exhausted: false,
+                    };
+                }
+            };
             // The same ceiling the blessed engine meters against. Without
             // it this engine is unbounded, and a guest past the budget
             // traps on one target and runs on the other.
@@ -520,11 +485,10 @@ mod reference {
             let outcome = instance.invoke(call.export, &args);
             let exhausted = matches!(outcome, Ok(Err(ExecError::Trap(RefTrap::OutOfFuel))));
             let fuel = instance.fuel_consumed();
-            let session = instance.into_host().0;
+            let session = instance.into_host();
             let result = match outcome {
                 Ok(Ok(values)) => match values.as_slice() {
-                    [] => Invoked::Returned(None),
-                    [CVal::Bytes(bytes)] => Invoked::Returned(Some(bytes.clone())),
+                    [] => Invoked::Produced(Vec::new()),
                     [CVal::Declined(code)] => Invoked::Declined(*code),
                     // Every value is an edge, or the shape is one the
                     // convention does not fix.
@@ -560,29 +524,6 @@ mod reference {
                 result,
                 exhausted,
             }
-        }
-    }
-
-    const fn ref_kind(kind: CellKind) -> ResourceKind {
-        match kind {
-            CellKind::Read => ResourceKind::ReadCell,
-            CellKind::Locked => ResourceKind::LockedCell,
-            CellKind::Write => ResourceKind::WriteCell,
-            CellKind::Delta => ResourceKind::DeltaCell,
-            CellKind::Reserve => ResourceKind::ReserveCell,
-            CellKind::RangeRead => ResourceKind::RangeRead,
-            CellKind::RangeWrite => ResourceKind::RangeWrite,
-        }
-    }
-
-    fn ref_arg(arg: &GuestArg<'_>) -> CVal {
-        match arg {
-            GuestArg::Handle { rep, kind } => CVal::Borrow(*rep, ref_kind(*kind)),
-            GuestArg::U64(scalar) => CVal::U64(*scalar),
-            GuestArg::Address(address) => CVal::Address(address.to_bytes()),
-            GuestArg::Bytes(bytes) => CVal::Bytes(bytes.to_vec()),
-            GuestArg::Bucket(rep) => CVal::Own(*rep),
-            GuestArg::Issuer => CVal::Borrow(ISSUER_REP, ResourceKind::Issuer),
         }
     }
 }

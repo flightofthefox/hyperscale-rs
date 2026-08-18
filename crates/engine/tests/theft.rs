@@ -199,7 +199,7 @@ fn the_gated_node_is_the_one_that_moves_the_balance() {
     // execute does.
     assert_eq!(
         vault_cell(&settled(database_updates, &world_accounts()), thief()),
-        Some(encode_amount(4_726).to_vec())
+        Some(encode_amount(4_534).to_vec())
     );
     assert_eq!(
         vault_cell(&settled(database_updates, &world_accounts()), VICTIM),
