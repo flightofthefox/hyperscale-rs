@@ -496,6 +496,9 @@ pub fn abort_reason(outcome: &Outcome) -> String {
             amount,
         } => format!("constraint unmet: node {node} parameter {param} carried {amount}"),
         Outcome::NullifierSpent { key } => format!("subintent already spent at {key:?}"),
+        Outcome::PresenceUnmet { target, required } => {
+            format!("leaf of {target:?} is not {required:?} as the write required")
+        }
         Outcome::Declined { node, code } => format!("node {node} declined with code {code}"),
         Outcome::Unauthorized { node } => {
             format!("node {node} presents no authority its target admits")
@@ -597,7 +600,10 @@ pub const fn charge_for(outcome: &Outcome, payer: PayerFee) -> Option<u128> {
         // composer can see at signing time. And so is an unauthorized
         // call: a stored rule can change between signing and execution,
         // so presented authority a target no longer admits is a stale
-        // declaration, not a defect.
+        // declaration, not a defect. A write whose presence requirement
+        // the committed leaf no longer meets joins them on the same
+        // reading: a leaf somebody else created or removed is the same
+        // event as a rule they changed.
         //
         // A declared refusal joins them and is the one that need not
         // stay: the export returned, so unlike every other abort here
@@ -611,6 +617,7 @@ pub const fn charge_for(outcome: &Outcome, payer: PayerFee) -> Option<u128> {
         | Outcome::ConstraintUnmet { .. }
         | Outcome::NullifierSpent { .. }
         | Outcome::Unauthorized { .. }
+        | Outcome::PresenceUnmet { .. }
         | Outcome::Declined { .. } => Some(payer.floor),
         // The kernel's own defect. `materialize_abort` refuses to price
         // it to the sender, and the burn agrees.
@@ -1272,7 +1279,7 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{AddressClass, LocalKey};
+    use hyperscale_types::{AddressClass, LocalKey, Presence};
     use hyperscale_vm_kernel::AbortReason;
 
     use super::*;
@@ -1335,6 +1342,50 @@ mod tests {
                 payer
             ),
             Some(payer.max_fee)
+        );
+    }
+
+    /// A presence requirement the committed leaf no longer meets is the
+    /// same lost race a changed rule is, and pays the same floor.
+    ///
+    /// The protocol cannot tell a sender who declared wrongly from one
+    /// somebody raced to the leaf — the two leave identical state — so
+    /// pricing the ambiguity at the ceiling would charge every honest
+    /// loser to reach the careless caller, and would make any leaf a
+    /// third party can create a lever for spending somebody else's
+    /// declared maximum.
+    #[test]
+    fn an_unmet_presence_pays_the_floor_a_changed_rule_pays() {
+        let payer = PayerFee {
+            vault: SubstateKey {
+                owner: Address::new([1; 31], AddressClass::Component),
+                local: LocalKey([0; 16]),
+            },
+            floor: 7,
+            max_fee: 1_000,
+            abortable: false,
+        };
+        let leaf = EffectTarget::Point(SubstateKey {
+            owner: Address::new([2; 31], AddressClass::Component),
+            local: LocalKey([9; 16]),
+        });
+        for required in [Presence::Absent, Presence::Present] {
+            assert_eq!(
+                charge_for(
+                    &Outcome::PresenceUnmet {
+                        target: leaf,
+                        required
+                    },
+                    payer
+                ),
+                Some(payer.floor),
+                "{required:?}"
+            );
+        }
+        assert_eq!(
+            charge_for(&Outcome::Unauthorized { node: 0 }, payer),
+            Some(payer.floor),
+            "the class it is priced with"
         );
     }
 }
