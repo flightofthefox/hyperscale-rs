@@ -112,14 +112,15 @@ fn signed_nf_transfer(from: u8, to: u8, ids: &[u64]) -> Transaction {
     Transaction::new(client().sign(graph, &key_of(from), terms()))
 }
 
-/// `who.present-badge(badge)`: custody presented as evidence, consumed
-/// by nothing — the gate's own verdict is the assertion.
-fn signed_present(who: u8, badge: ResourceAddr) -> Transaction {
+/// `who.present-instance(badge, id)`: custody presented as evidence,
+/// consumed by nothing — the gate's own verdict is the assertion.
+fn signed_present(who: u8, badge: ResourceAddr, id: u64) -> Transaction {
     let cache = client().cache();
     let mut b = client().builder(&cache);
     // The proof stays unpresented: nothing here needs its authority —
     // the gate's own verdict is what the test reads.
-    let _ = account::present_badge(&mut b, principal(who), badge).expect("present-badge types");
+    let _ = account::present_instance(&mut b, principal(who), badge, id)
+        .expect("present-instance types");
     let graph = b.build().expect("a dangling proof is not an output");
     Transaction::new(client().sign(graph, &key_of(who), terms()))
 }
@@ -205,8 +206,8 @@ fn custody_opens_for_the_holder_and_refuses_the_rest() {
     let executor = Executor::new(ExecutionMode::Serial);
     let storage = storage();
 
-    // Alice holds instances of NF, so her presentation settles.
-    let executed = run_tick(&executor, &storage, 1, signed_present(ALICE, NF));
+    // Alice holds instance 1 of NF, so her presentation settles.
+    let executed = run_tick(&executor, &storage, 1, signed_present(ALICE, NF, 1));
     assert!(
         matches!(&executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
         "possession opens the gate: {:?}",
@@ -215,7 +216,7 @@ fn custody_opens_for_the_holder_and_refuses_the_rest() {
 
     // Bob holds nothing of UNHELD — no vault, no holdings — so the gate
     // refuses, and refuses deterministically.
-    let executed = run_tick(&executor, &storage, 2, signed_present(BOB, UNHELD));
+    let executed = run_tick(&executor, &storage, 2, signed_present(BOB, UNHELD, 1));
     assert!(
         matches!(&executed[0].consensus, ConsensusReceipt::Failed),
         "no possession, no proof: {:?}",
