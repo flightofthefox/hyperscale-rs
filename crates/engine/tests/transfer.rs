@@ -1843,7 +1843,7 @@ fn a_locked_config_read_serves_from_the_presented_record() {
         .push(Clause::Effect {
             target: TargetExpr::Point(Expr::ChildKey {
                 owner: Box::new(Expr::SelfAddr),
-                role: CONFIG,
+                slot: CONFIG,
                 material: vec![],
             }),
             mode: ModeExpr::Locked,
