@@ -306,7 +306,9 @@ fn signed_draw_with_fee(seed: u8, max_fee: u128) -> Transaction {
     let mut instances = client().world().instances.clone();
     let lottery_addr = instances.create(&ProtocolHasher, lottery_meta());
     let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
-    lottery::draw(&mut root, lottery_addr).expect("a lottery answers a draw");
+    lottery::Lottery::at(lottery_addr)
+        .draw(&mut root)
+        .expect("a lottery answers a draw");
     env.instance(lottery_meta());
     env.seal(root)
         .expect("the root declares nothing to discharge");

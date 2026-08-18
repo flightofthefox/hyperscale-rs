@@ -1098,7 +1098,9 @@ pub fn build_draw_tx(
         .collect();
     let (mut env, mut root) = EnvelopeBuilder::new(&cache, &instances, &ProtocolHasher);
     for address in addresses {
-        lottery::draw(&mut root, address).expect("a lottery answers a draw");
+        lottery::Lottery::at(address)
+            .draw(&mut root)
+            .expect("a lottery answers a draw");
     }
     for meta in lotteries {
         env.instance(meta.clone());
@@ -1661,7 +1663,7 @@ pub fn build_deactivate_tx(
             pool_owner_badge(pool),
             owner_badge_id(pool),
         )?;
-        staking::deactivate_validator(b, proof, pool, validator.inner())
+        staking::Staking::at(pool).deactivate_validator(b, proof, validator.inner())
     });
     Transaction::new(envelope(graph, operator, validity))
 }
@@ -1689,10 +1691,9 @@ pub fn build_register_tx(
             pool_owner_badge(pool),
             owner_badge_id(pool),
         )?;
-        staking::register_validator(
+        staking::Staking::at(pool).register_validator(
             b,
             proof,
-            pool,
             validator.inner(),
             pubkey.as_bytes().to_vec(),
             possession_proof.as_bytes().to_vec(),
@@ -1718,7 +1719,7 @@ pub fn build_unstake_tx(
     let graph = graph(|b| {
         let delegator = account::authorize(b, from)?;
         let units = account::withdraw(b, delegator, stake_unit(pool), amount)?;
-        staking::unstake(b, pool, units)
+        staking::Staking::at(pool).unstake(b, units)
     });
     Transaction::new(envelope(graph, delegator, validity))
 }
@@ -1749,7 +1750,7 @@ pub fn build_stake_tx(
     let graph = graph(|b| {
         let delegator = account::authorize(b, from)?;
         let funds = account::withdraw(b, delegator, *XRD, amount)?;
-        let units = staking::stake(b, pool, funds)?;
+        let units = staking::Staking::at(pool).stake(b, funds)?;
         account::deposit(b, from, units)
     });
     Transaction::new(envelope(graph, delegator, validity))
@@ -1927,10 +1928,9 @@ pub fn build_reshape_threshold_vote_tx(
             pool_owner_badge(pool_at(GENESIS_POOL_ID)),
             owner_badge_id(pool_at(GENESIS_POOL_ID)),
         )?;
-        staking::cast_param_vote(
+        staking::Staking::at(pool_at(GENESIS_POOL_ID)).cast_param_vote(
             b,
             proof,
-            pool_at(GENESIS_POOL_ID),
             split_bytes,
             NetworkParams::default().impound_epochs,
             activate_at.inner(),
