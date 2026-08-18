@@ -25,8 +25,8 @@ use hyperscale_vm_effects::vocabulary::{AUTH, CONFIG, VAULT, XRD as XRD_ROLE};
 use hyperscale_vm_effects::{
     Address, AuthCell, AuthRole, EffectSet, EffectTarget, EnvelopeTree, InstanceRegistry,
     ManifestHash, MetadataCache, Mode, NativeAddr, PackageHash, PackageMetadata,
-    PrefixShardResolver, Presented, PrincipalAddr, Routing as RoutedTransaction, SchemeId,
-    SubstateKey, Value, admit_tree, child_key, footprint, native_address, package_hash,
+    PrefixShardResolver, Presence, Presented, PrincipalAddr, Routing as RoutedTransaction,
+    SchemeId, SubstateKey, Value, admit_tree, child_key, footprint, native_address, package_hash,
     package_key as canonical_package_key, principal_address, route_tree,
 };
 use hyperscale_vm_fixtures::lottery;
@@ -186,7 +186,7 @@ fn classify_declared_access(routing: &RoutedTransaction) -> DeclaredAccess {
                 access.read_keys.insert(key);
                 access.provision_keys.insert(key);
             }
-            Mode::Write => {
+            Mode::Write { .. } => {
                 access.write_keys.insert(key);
                 access.provision_keys.insert(key);
             }
@@ -420,7 +420,17 @@ impl BridgeStatics {
                 write_prefixes: vec![publisher.address()],
                 provision_prefixes: Vec::new(),
                 read_keys: Vec::new(),
-                declared_modes: write_keys.iter().map(|key| (*key, Mode::Write)).collect(),
+                declared_modes: write_keys
+                    .iter()
+                    .map(|key| {
+                        (
+                            *key,
+                            Mode::Write {
+                                requires: Presence::Either,
+                            },
+                        )
+                    })
+                    .collect(),
                 write_keys,
                 provision_keys: Vec::new(),
             },
