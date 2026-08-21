@@ -33,7 +33,7 @@ use hyperscale_vm_manifest_builder::signing::{self, sign_subintent};
 use hyperscale_vm_manifest_builder::{
     EnvelopeBuilder, GraphBuilder, IntentBuilder, TypedBuilder, TypedError,
 };
-use hyperscale_vm_stdlib::{STAKING_COMPONENT, account, account_artifact, staking};
+use hyperscale_vm_stdlib::{STAKING_COMPONENT, account, account_artifact, instantiate, staking};
 use hyperscale_vm_types::Address;
 
 /// A deterministic Ed25519 signer from a one-byte seed. A faucet transaction's
@@ -1088,11 +1088,10 @@ pub fn build_instantiate_tx(
         .iter()
         .map(|meta| meta.address(&ProtocolHasher))
         .collect();
+    let founder = account_address(&payer.public_key().0);
     let (mut env, mut root) = EnvelopeBuilder::new(&composed, &ProtocolHasher);
     for address in addresses {
-        lottery::Lottery::at(address)
-            .instantiate(&mut root)
-            .expect("a derivable lottery answers its seal");
+        instantiate(&mut root, founder, address).expect("a derivable lottery answers its seal");
     }
     for meta in lotteries {
         env.instance(meta.clone());
