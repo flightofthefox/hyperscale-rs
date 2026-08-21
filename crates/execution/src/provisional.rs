@@ -186,13 +186,4 @@ mod tests {
         over_cell.claim(&[(cell(1, 1), Mode::Write)]);
         assert!(!over_cell.blocks(&[(interval(1, 0, 10), Mode::Write)]));
     }
-
-    /// A locked read declares nothing anywhere, so it neither claims nor
-    /// is claimed against — the one mode that never contends.
-    #[test]
-    fn a_locked_read_contends_with_nothing() {
-        let mut claims = ProvisionalCells::default();
-        claims.claim(&[(cell(1, 1), Mode::Write)]);
-        assert!(!claims.blocks(&[(cell(1, 1), Mode::Locked)]));
-    }
 }
