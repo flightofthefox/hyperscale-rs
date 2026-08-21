@@ -154,6 +154,7 @@ where
     pub(crate) fn update_fetch_tick_timer(&mut self) {
         let any_pending = self.io.beacon_fetch.has_pending()
             || self.io.packages.has_pending()
+            || self.io.instances.has_pending()
             || self.io.mempool.has_pending()
             || self.io.consensus.has_pending()
             || beacon::has_pending(&self.beacon_block)

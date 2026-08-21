@@ -365,6 +365,18 @@ fn unresolved_targets(tree: &EnvelopeTree, instances: &InstanceRegistry) -> Vec<
     missing
 }
 
+/// The component address a record's own contents derive, or `None` for
+/// bytes that decode as no record at all.
+///
+/// What a fetched record is verified by: an address is the hash of the
+/// record sealed at it, so bytes either derive the address they were
+/// asked for or derive some other one and are dropped.
+#[must_use]
+pub fn record_address(record: &[u8]) -> Option<Address> {
+    let meta: InstanceMeta = hbor_from_slice(record).ok()?;
+    Some(meta.address(&ProtocolHasher).address())
+}
+
 /// The instance registry: what the chain answers a call target with,
 /// grown from committed state.
 ///

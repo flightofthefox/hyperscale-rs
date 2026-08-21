@@ -21,7 +21,7 @@ use std::sync::Arc;
 use hyperscale_core::{CommitSource, ProtocolEvent};
 use hyperscale_network::RequestError;
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
+    Address, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
     FinalizationHash, Hash, HeaderFetchCount, LeafIndex, PredecessorTerminal, ProvisionHash,
     ShardForkProof, ShardId, ShardVoteEquivocation, Transaction, TxHash, ValidatorId, Verifiable,
@@ -162,6 +162,30 @@ pub enum ShardScopedInput {
     PackageArtifactsFetchFailed {
         /// The content addresses still missing.
         ids: Vec<Hash>,
+    },
+
+    /// Component records a derivation wanted and this node did not
+    /// hold, named so the fetch can ask the shards owning them.
+    InstanceRecordsWanted {
+        /// The component addresses to resolve.
+        instances: Vec<Address>,
+    },
+
+    /// Instance records delivered by the fetch protocol, already
+    /// verified: each re-derived the component address it was asked
+    /// for, at the response boundary.
+    InstanceRecordsFetched {
+        /// The verified records, each beside the address its own
+        /// contents derive. Derived once, where the response is
+        /// verified, so the shard loop never pays for the hash.
+        records: Vec<(Address, Vec<u8>)>,
+    },
+
+    /// An instance record request failed or returned without some ids;
+    /// releases the in-flight slots for retry.
+    InstanceRecordsFetchFailed {
+        /// The component addresses still missing.
+        ids: Vec<Address>,
     },
 
     /// Locally-submitted tx delivered to a passive co-host: a hosted
@@ -520,7 +544,10 @@ impl ShardScopedInput {
             Self::TransactionGossipReceived { .. }
             | Self::TransactionsFetched { .. }
             | Self::PackageArtifactsFetched { .. }
-            | Self::PackageArtifactsFetchFailed { .. } => EventPriority::Network,
+            | Self::PackageArtifactsFetchFailed { .. }
+            | Self::InstanceRecordsFetched { .. }
+            | Self::InstanceRecordsFetchFailed { .. }
+            | Self::InstanceRecordsWanted { .. } => EventPriority::Network,
             Self::CommittedBlockGossipReceived { .. }
             | Self::ShardForkProofGossipReceived { .. }
             | Self::ShardVoteEquivocationGossipReceived { .. } => EventPriority::Network,

@@ -19,6 +19,7 @@ use crate::shard::caches::SharedCaches;
 use crate::shard::commit::BlockCommitCoordinator;
 use crate::shard::consensus::{BlockSyncStatus, ConsensusState};
 use crate::shard::cross_shard::CrossShardState;
+use crate::shard::instances::InstancesState;
 use crate::shard::mempool::MempoolState;
 use crate::shard::packages::PackagesState;
 use crate::shard::phase_times::TxPhaseTimesCache;
@@ -71,6 +72,7 @@ pub struct ShardIo<S: ShardStorage> {
     /// Package artifact acquisition: the fetch reconciling the beacon's
     /// package registry against what the engine holds.
     pub(crate) packages: PackagesState,
+    pub(crate) instances: InstancesState,
 
     /// Per-tx phase-time stamps for the slow-tx finalization log.
     /// Populated from `EmitTransactionStatus` and `RecordTxEcCreated`

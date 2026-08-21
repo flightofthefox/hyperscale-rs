@@ -19,7 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use blake3::hash as blake3_hash;
-use hyperscale_effects_bridge::vm_statics::{PackageCache, package_key, principal_for};
+use hyperscale_effects_bridge::vm_statics::{
+    PackageCache, config_key, package_key, principal_for, record_address,
+};
 use hyperscale_effects_bridge::{
     BridgeStatics, PoolRegistry, ProtocolHasher, admit_package, decode_tree, envelope_identity,
     witness_from_event,
@@ -41,7 +43,8 @@ use hyperscale_vm_kernel::{
     execute_batch,
 };
 use hyperscale_vm_types::{
-    Address, CollectionId, EffectSet, EffectTarget, EntryKey, Outcome, SubstateKey, UnmetCondition,
+    Address, CallTarget, CollectionId, EffectSet, EffectTarget, EntryKey, Outcome, SubstateKey,
+    UnmetCondition,
 };
 
 use crate::backend::EngineBackend;
@@ -80,6 +83,17 @@ pub struct PreparedTx {
     /// The envelope's signed execution ceiling, in fuel — one budget for
     /// the whole transaction, however many nodes its manifest walks.
     pub gas_limit: u64,
+}
+
+/// The component address a record's own contents derive, or `None` for
+/// bytes that are not a record.
+///
+/// What verifies a fetched record: the address is the hash of the
+/// record, so bytes claiming to be one either derive the address asked
+/// for or derive some other and are dropped.
+#[must_use]
+pub fn instance_of_record(record: &[u8]) -> Option<Address> {
+    record_address(record)
 }
 
 /// The content address of a package artifact, as the workspace hash the
@@ -353,6 +367,40 @@ impl Executor {
     #[must_use]
     pub fn package_known(&self, package: Hash) -> bool {
         self.backend.code_known(PackageHash(package.as_hash32()))
+    }
+
+    /// The cell a component's record is sealed into — where a node
+    /// serving a record fetch reads, and what the address alone names.
+    ///
+    /// Unlike a package, whose cell sits under whoever published it, a
+    /// component's leaf sits under the component itself. So a request
+    /// naming an address is a request naming a key, and serving one
+    /// needs no index over what a store has committed.
+    #[must_use]
+    pub fn instance_record_key(instance: Address) -> SubstateKey {
+        config_key(instance)
+    }
+
+    /// Seat one fetched record under the component it derives.
+    ///
+    /// The re-derivation is the whole verification, and it happens here
+    /// as well as at the response boundary: a component's address is the
+    /// hash of its record, so bytes deriving any other address seat
+    /// nothing. Idempotent — a record is immutable once sealed, so a
+    /// second copy is the same copy.
+    pub fn install_instance(&self, instance: Address, record: &[u8]) {
+        let _ = self.world.instances.absorb_cell(
+            instance,
+            Self::instance_record_key(instance).local.0,
+            record,
+        );
+    }
+
+    /// Whether this node answers for the component at `instance`.
+    #[must_use]
+    pub fn instance_known(&self, instance: Address) -> bool {
+        CallTarget::try_from(instance)
+            .is_ok_and(|target| self.world.instances.load().get(target).is_some())
     }
 
     /// Derive one transaction's invocations, effect set, and nullifiers

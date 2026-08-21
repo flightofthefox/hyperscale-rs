@@ -43,6 +43,7 @@ use crate::shard::caches::SharedCaches;
 use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
 use crate::shard::consensus::{BlockSyncInput, ConsensusState};
 use crate::shard::cross_shard::CrossShardState;
+use crate::shard::instances::InstancesState;
 use crate::shard::mempool::MempoolState;
 use crate::shard::packages::PackagesState;
 use crate::shard::phase_times::TxPhaseTimesCache;
@@ -787,6 +788,7 @@ fn build_shard_io<S: ShardStorage>(
         mempool: MempoolState::new(config),
         beacon_fetch: BeaconFetchState::new(config),
         packages: PackagesState::new(config),
+        instances: InstancesState::new(config),
         tx_phase_times: TxPhaseTimesCache::default(),
         last_slow_tx_warn: LocalTimestamp::ZERO,
     };
