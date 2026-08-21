@@ -430,12 +430,6 @@ impl NodeRecords {
         }
     }
 
-    /// The record `address` sealed, read out of this node's own state.
-    ///
-    /// Verified on the way in exactly as a fetched one is: the leaf sits
-    /// at the key its owner derives and holds a record deriving that
-    /// owner, so bytes that say anything else are not this component's
-    /// record and are dropped.
     /// What the state already answered for `address` in this derivation.
     fn seen(&self, address: Address) -> Option<Arc<InstanceMeta>> {
         self.seen
@@ -453,6 +447,12 @@ impl NodeRecords {
             .insert(address, Arc::clone(record));
     }
 
+    /// The record `address` sealed, read out of this node's own state.
+    ///
+    /// Verified on the way in exactly as a fetched one is: the leaf sits
+    /// at the key its owner derives and holds a record deriving that
+    /// owner, so bytes that say anything else are not this component's
+    /// record and are dropped.
     fn read_from_state(&self, address: Address) -> Option<Arc<InstanceMeta>> {
         let key = config_key(address);
         let value = self.cells.as_ref()?.committed_cell(key)?;
