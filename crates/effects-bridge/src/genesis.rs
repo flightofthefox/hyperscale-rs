@@ -270,17 +270,17 @@ pub fn pool_owner_badge(pool: impl Into<Address>) -> ResourceAddr {
 /// and a founded one rests on.
 pub const OWNER_BADGE_ID: u64 = 0;
 
-/// The stake unit's resource record, at the divisibility the staking
+/// The stake unit's resource record, at the display width the staking
 /// package's own mark declares — instantiation writes this cell for a
 /// pool it brings up, and genesis writes it for a pool it seats.
-pub const STAKE_UNIT_RECORD: ResourceRecord = ResourceRecord::Fungible { divisibility: 18 };
+pub const STAKE_UNIT_RECORD: ResourceRecord = ResourceRecord::Fungible { display_digits: 18 };
 
 /// The owner badge's resource record: one non-fungible kind.
 pub const OWNER_BADGE_RECORD: ResourceRecord = ResourceRecord::NonFungible;
 
 /// The fee resource's record: fungible, displayed at eighteen subunit
 /// digits. Display quantization only — nothing on-chain consults it.
-pub const XRD_RECORD: ResourceRecord = ResourceRecord::Fungible { divisibility: 18 };
+pub const XRD_RECORD: ResourceRecord = ResourceRecord::Fungible { display_digits: 18 };
 
 #[cfg(test)]
 mod tests {
