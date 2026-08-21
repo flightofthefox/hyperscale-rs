@@ -45,10 +45,10 @@ mod tests {
                 "principal/ed25519/b = eef14e9e4037201e80c2cc20ce863c237f751c337d87224ae1d56d1e53363b01",
                 "component/salted = 6abb649cd46f582de44c4ec573818a3c678f643292307e48ac94e49d7fa7b702",
                 "package/content = 7e5f726fe1bb474718cfd6c20c04e2cd10de46768f830dabdc8845f0e2bc1e03",
-                "resource/minted = a9ae3894034d9f0ee3d489027b203a7b31fd5274533a88f7921557f5ed96fd04",
-                "resource/minted-nf = e8b5d6381fe5f53437b15db84aa15a59a7e93d417894ddc52ab513ee4ac65b04",
+                "resource/minted = e7ade2f9f5f36c4a571c1f0f003b6a5e3a788d18362634e11b9d82df673bd404",
+                "resource/minted-nf = ac913fc5425c3f6b4712e91099ef2754b4d739998d3bdee9eff308794405b904",
                 "native/genesis-publisher = 89ba159512ed286bc66436f6a009090f87af9a1c8b5f9fa3a7d633ef37b40105",
-                "resource/xrd = 9e69ffbc7d409d7a6475fdd4304a60a53f2c5f6495acb1f3c9c80b14efabe004",
+                "resource/xrd = b9c3798c9eeebca9e772f4f0d256872e193ab5864e9e557bba8a1c413c255704",
             ]
         );
     }
