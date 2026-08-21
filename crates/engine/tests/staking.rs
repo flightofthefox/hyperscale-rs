@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
-use hyperscale_effects_bridge::vm_statics::config_key;
+use hyperscale_effects_bridge::vm_statics::{committed_instance, config_key};
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
 use hyperscale_engine::genesis::{
     GenesisPackages, OWNER_BADGE_ID, pool_address, pool_meta, pool_owner_badge, staking_artifact,
@@ -25,11 +25,12 @@ use hyperscale_types::{
     WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{
-    Composed, holdings_collection, instance_data_key, package_hash, resource_record_key,
+    ChainRecords, Composed, holdings_collection, instance_data_key, package_hash,
+    resource_record_key,
 };
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, TypedError};
 use hyperscale_vm_stdlib::{account, staking};
-use hyperscale_vm_types::{Address, CollectionId};
+use hyperscale_vm_types::{Address, CallTarget, CollectionId};
 
 /// The identifier the beacon folds the seated pool under.
 const POOL_ID: u32 = 7;
@@ -208,6 +209,78 @@ fn witnesses(executed: &ExecutedTx) -> Vec<BeaconWitnessEvent> {
 /// The whole channel in one assertion: a delegation to a seated pool is a
 /// beacon fact by the time it leaves the engine, with the pool named by
 /// the instance that emitted it and the amount carried across as attos.
+/// A record the cache answers for is the record the cell that sealed it
+/// holds, whether genesis wrote the cell or a transaction did.
+///
+/// The claim a state-backed instance store rests on. A node's registry is
+/// a second copy of a projection of its own state: the `CONFIG` leaf is
+/// where a component's record lives, and the cache is grown from the
+/// commits that write it. If a reader consulting the store for a prefix
+/// this shard owns answered anything but what the cache answers, two
+/// nodes would derive one envelope two ways — a fork rather than a
+/// stall, which is why it is pinned here rather than assumed.
+///
+/// The principal blueprint is the one record with no cell, and needs
+/// none: a principal's address derives from a key, so it is resolved by
+/// its address class and never looked up.
+#[test]
+fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
+    let genesis_seated = seat(POOL_ID);
+    let sealed_here = seat(55);
+    let executor = seated(std::slice::from_ref(&genesis_seated), ExecutionMode::Serial);
+    let mut store = MapDb::genesis(
+        &[(account_of(OPERATOR), 10_000)],
+        std::slice::from_ref(&genesis_seated),
+    );
+    let trie = ShardTrie::single();
+    let ctx = TickBatchContext {
+        local_shard: ShardId::ROOT,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        tick_reveal: RevealChain::ZERO,
+        holds: &ProvisionalHolds::new(),
+    };
+    // The second pool becomes actual the way the chain makes one actual:
+    // a transaction seals it, and the commit path offers its cells to
+    // the cache.
+    let raw = signed_instantiate(OPERATOR, &sealed_here);
+    raw.try_derived(executor.derivation().as_ref())
+        .expect("a fixture transaction derives");
+    let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let executed = executor.execute_batch(&ctx, &store, std::slice::from_ref(&tx));
+    absorb(&mut store, &executed[0], &executor);
+
+    let staking = package_hash(&ProtocolHasher, staking_artifact());
+    let chain = executor.records();
+    for seat in [&genesis_seated, &sealed_here] {
+        let pool = pool_address(staking, seat);
+        let answered = chain
+            .instance(pool.into())
+            .expect("the cache answers for a sealed pool");
+
+        let key = config_key(pool);
+        let cell = store
+            .cell(key)
+            .expect("a sealed component's record lives in its configuration leaf");
+        let from_state = committed_instance(pool.address(), key.local.0, &cell)
+            .expect("the leaf holds the record its own address derives");
+
+        assert_eq!(
+            *answered, from_state,
+            "the cache and the cell disagree about pool {:?}",
+            seat.id
+        );
+    }
+
+    // And the one record with no cell behind it resolves all the same.
+    assert!(
+        chain
+            .instance(CallTarget::Principal(account_of(OPERATOR)))
+            .is_some(),
+        "a principal resolves by its address class, with no leaf to read"
+    );
+}
+
 /// An executor over a network seating `pools`, on the protocol's own
 /// packages — the staking surface reaches no fixture.
 fn seated(pools: &[StakePoolSeat], mode: ExecutionMode) -> Executor {
