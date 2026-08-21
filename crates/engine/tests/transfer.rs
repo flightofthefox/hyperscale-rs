@@ -27,7 +27,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{
     AbiParam, Composed, EnvelopeTree, Hash32, InstanceMeta, IntentDecl, PackageHash,
-    PackageMetadata, Totality, Value, package_hash,
+    PackageMetadata, ResourceKind, Totality, Value, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{EnvelopeBuilder, GraphBuilder};
@@ -1924,8 +1924,21 @@ fn a_presented_instance_of_a_published_package_answers_a_call() {
     };
     let component = meta.address(&ProtocolHasher);
 
+    // The founder its configuration names signs in, and the owner badge
+    // the seal mints is filed in that same account: bringing up is one
+    // node, and the supply a component comes up holding leaves with
+    // whoever composed it.
     let mut b = GraphBuilder::new();
-    let [] = b.call(component, "instantiate", ());
+    let signed_in = 0;
+    let [] = b.call_signed(payer, "authorize", ());
+    let [badge] = b.call_bearing(component, "instantiate", (), signed_in);
+    let owner_badge = issued_resource(
+        &ProtocolHasher,
+        component,
+        ResourceKind::NonFungible,
+        staking::OWNER_BADGE,
+    );
+    let [] = b.call(payer, "deposit-nf", (badge.resource_is(owner_badge),));
     let graph = b.build().expect("every output is consumed");
     let tree = EnvelopeTree {
         root: IntentDecl {
