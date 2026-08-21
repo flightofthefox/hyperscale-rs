@@ -53,10 +53,16 @@ pub struct DeferredTransaction {
 }
 
 /// Envelopes waiting on records, indexed by the records they wait on.
+///
+/// The index names only envelopes the queue is still holding, so the
+/// bound over the queue is a bound over the whole structure. Nothing
+/// awaited has to arrive — an envelope naming a component that does not
+/// exist is one anyone can gossip — so a key that outlived its envelopes
+/// would never be reached by an arrival, and the index would grow with
+/// what was asked for rather than with what is waiting.
 pub struct DeferredForRecords {
     held: HashMap<TxHash, (Arc<Transaction>, DeferredOrigin)>,
-    /// Which envelopes each awaited record would release. An entry can
-    /// name a hash the queue has since evicted; reads drop those.
+    /// Which envelopes each awaited record would release.
     waiting: HashMap<Address, Vec<TxHash>>,
     order: VecDeque<TxHash>,
     capacity: usize,
@@ -101,7 +107,25 @@ impl DeferredForRecords {
                 evicted.push(oldest);
             }
         }
+        if !evicted.is_empty() {
+            self.forget_dropped();
+        }
         evicted
+    }
+
+    /// Drop from the order and the index every envelope the queue has
+    /// stopped holding.
+    ///
+    /// Where the bound is made to cover the index too: an evicted
+    /// envelope leaves a key behind that only its own arrival would ever
+    /// read, and the arrival is exactly what may never come.
+    fn forget_dropped(&mut self) {
+        let held = &self.held;
+        self.order.retain(|hash| held.contains_key(hash));
+        self.waiting.retain(|_, hashes| {
+            hashes.retain(|hash| held.contains_key(hash));
+            !hashes.is_empty()
+        });
     }
 
     /// Take the envelopes `arrived` releases.
@@ -122,7 +146,7 @@ impl DeferredForRecords {
                 }
             }
         }
-        self.order.retain(|hash| self.held.contains_key(hash));
+        self.forget_dropped();
         released
     }
 
@@ -143,9 +167,7 @@ impl DeferredForRecords {
             self.held.remove(hash);
         }
         if !expired.is_empty() {
-            self.order.retain(|hash| self.held.contains_key(hash));
-            self.waiting
-                .retain(|_, hashes| hashes.iter().any(|hash| self.held.contains_key(hash)));
+            self.forget_dropped();
         }
         expired
     }
@@ -193,6 +215,32 @@ mod tests {
             instances,
             origin: DeferredOrigin::Validation,
         }
+    }
+
+    /// The bound covers the index, not just the queue.
+    ///
+    /// Anyone can gossip an envelope naming a component that does not
+    /// exist, and each one asks for a record nothing will ever deliver.
+    /// If eviction left the index alone, what a node held would grow
+    /// with every distinct address ever asked for — and the sweep that
+    /// would have caught it stands down once the queue is empty.
+    #[test]
+    fn an_evicted_envelope_leaves_nothing_behind_in_the_index() {
+        let mut wait = DeferredForRecords {
+            held: HashMap::new(),
+            waiting: HashMap::new(),
+            order: VecDeque::new(),
+            capacity: 2,
+        };
+        for seed in 1..=8u8 {
+            wait.defer(deferred(envelope(seed, u64::MAX), vec![instance(seed)]));
+        }
+        assert_eq!(wait.held.len(), 2, "the queue holds its bound");
+        assert_eq!(
+            wait.waiting.len(),
+            2,
+            "and the index names those two alone, not every address asked for"
+        );
     }
 
     #[test]
