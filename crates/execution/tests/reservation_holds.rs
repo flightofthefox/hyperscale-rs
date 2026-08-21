@@ -19,9 +19,10 @@ use hyperscale_execution::action_handlers::accumulate_tick_output;
 use hyperscale_storage::TickOutput;
 use hyperscale_types::{
     Address, AddressClass, CollectionId, ConsensusReceipt, DeclaredKey, DeclaredRange, Derivation,
-    Derived, ExecutionMetadata, GlobalReceiptHash, Hash, LocalKey, Mode, NetworkId, PrincipalAddr,
-    RevealChain, Routing, SchemeId, StateWrites, SubstateKey, Transaction, TransactionBody,
-    TransactionEnvelope, TxHash, Verified, VmStaticsError, WeightedTimestamp, declared_work,
+    DerivationError, Derived, ExecutionMetadata, GlobalReceiptHash, Hash, LocalKey, Mode,
+    NetworkId, PrincipalAddr, RevealChain, Routing, SchemeId, StateWrites, SubstateKey,
+    Transaction, TransactionBody, TransactionEnvelope, TxHash, Verified, WeightedTimestamp,
+    declared_work,
 };
 
 /// The two amount cells every fixture transaction declares a reservation
@@ -49,7 +50,7 @@ const fn counterparty_vault() -> SubstateKey {
 struct ReservingStatics;
 
 impl Derivation for ReservingStatics {
-    fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
+    fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
         let written = DeclaredKey::Cell(SubstateKey {
             owner: Address::new([0x33; 31], AddressClass::Component),
             local: LocalKey([0x01; 16]),

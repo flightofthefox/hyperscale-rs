@@ -19,9 +19,9 @@ use thiserror::Error;
 
 use crate::transaction::vm::{Derivation, ProtocolVerifier, SchemeVerifier};
 use crate::{
-    DeclaredKey, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN, NetworkId, PrincipalAddr,
-    Routing, ShardTrie, SubstateKey, TimestampRange, TransactionEnvelope, TxHash, Verified, Verify,
-    VmStaticsError, protocol_statics,
+    DeclaredKey, DerivationError, Derived, EnvelopeExt, Hash, LocalKey, MAX_TX_BYTES_LEN,
+    NetworkId, PrincipalAddr, Routing, ShardTrie, SubstateKey, TimestampRange, TransactionEnvelope,
+    TxHash, Verified, Verify, protocol_statics,
 };
 
 /// What a transaction is verified against: the network its envelope has
@@ -367,8 +367,8 @@ impl Transaction {
     ///
     /// # Errors
     ///
-    /// [`VmStaticsError`] from `derivation`.
-    pub fn try_derived(&self, derivation: &dyn Derivation) -> Result<&Derived, VmStaticsError> {
+    /// [`DerivationError`] from `derivation`.
+    pub fn try_derived(&self, derivation: &dyn Derivation) -> Result<&Derived, DerivationError> {
         if let Some(derived) = self.derived.get() {
             return Ok(derived);
         }
@@ -438,7 +438,7 @@ pub enum TransactionVerifyError {
     InvalidSubintentSignature(u32),
     /// Static derivation refused the envelope.
     #[error(transparent)]
-    Derivation(#[from] VmStaticsError),
+    Derivation(#[from] DerivationError),
 }
 
 /// Construction asserts: the body decodes, the envelope names this
@@ -542,9 +542,9 @@ mod tests {
     const STUB_SUBINTENT_HASH: [u8; 32] = [0x5A; 32];
 
     impl Derivation for StubStatics {
-        fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError> {
+        fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
             if vm.call_tree().unwrap_or_default() == b"inadmissible" {
-                return Err(VmStaticsError::Refused("stub refusal".into()));
+                return Err(DerivationError::Refused("stub refusal".into()));
             }
             let subintent_hashes = if vm.call_tree().unwrap_or_default() == b"with-subintent" {
                 vec![STUB_SUBINTENT_HASH]

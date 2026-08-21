@@ -19,9 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
 use blake3::hash as blake3_hash;
-use hyperscale_effects_bridge::vm_statics::{
-    PackageCache, config_key, package_key, principal_for, record_address,
-};
+use hyperscale_effects_bridge::records::{PackageCache, record_address};
+use hyperscale_effects_bridge::vm_statics::{config_key, package_key, principal_for};
 use hyperscale_effects_bridge::{
     BridgeStatics, LocalCells, NodeRecords, PoolRegistry, ProtocolHasher, admit_package,
     decode_tree, envelope_identity, witness_from_event,

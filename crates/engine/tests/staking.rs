@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use hyperscale_effects_bridge::genesis::genesis_world_with_pools;
-use hyperscale_effects_bridge::vm_statics::{committed_instance, config_key};
+use hyperscale_effects_bridge::records::committed_instance;
+use hyperscale_effects_bridge::vm_statics::config_key;
 use hyperscale_effects_bridge::{ProtocolHasher, account_address};
 use hyperscale_engine::genesis::{
     GenesisPackages, OWNER_BADGE_ID, pool_address, pool_meta, pool_owner_badge, stake_unit,

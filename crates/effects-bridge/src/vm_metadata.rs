@@ -7,7 +7,7 @@
 //!
 //! [`MAX_TX_BYTES_LEN`]: hyperscale_types::MAX_TX_BYTES_LEN
 
-use hyperscale_types::VmStaticsError;
+use hyperscale_types::DerivationError;
 use hyperscale_vm_effects::PackageMetadata;
 pub use hyperscale_vm_gate::MAX_PACKAGE_METADATA_BYTES;
 use hyperscale_vm_gate::{
@@ -18,18 +18,18 @@ use hyperscale_vm_gate::{
 ///
 /// # Errors
 ///
-/// [`VmStaticsError`] if the metadata is past a bound decode enforces, so
+/// [`DerivationError`] if the metadata is past a bound decode enforces, so
 /// that whatever this returns decodes back to an equal value.
-pub fn encode_metadata(metadata: &PackageMetadata) -> Result<Vec<u8>, VmStaticsError> {
-    encode_canonical(metadata).map_err(|error| VmStaticsError::Refused(error.0))
+pub fn encode_metadata(metadata: &PackageMetadata) -> Result<Vec<u8>, DerivationError> {
+    encode_canonical(metadata).map_err(|error| DerivationError::Refused(error.0))
 }
 
 /// Decode a metadata section's canonical bytes.
 ///
 /// # Errors
 ///
-/// [`VmStaticsError`] if the payload is oversized, not canonical, or not
+/// [`DerivationError`] if the payload is oversized, not canonical, or not
 /// metadata at all.
-pub fn decode_metadata(bytes: &[u8]) -> Result<PackageMetadata, VmStaticsError> {
-    decode_canonical(bytes).map_err(|error| VmStaticsError::Refused(error.0))
+pub fn decode_metadata(bytes: &[u8]) -> Result<PackageMetadata, DerivationError> {
+    decode_canonical(bytes).map_err(|error| DerivationError::Refused(error.0))
 }

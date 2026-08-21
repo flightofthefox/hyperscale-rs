@@ -4,14 +4,14 @@
 //! function of the artifact's bytes, so it is the same verdict wherever it
 //! is reached, and it lives beside the vocabulary it judges rather than
 //! beside one of its callers. What this module adds is the chain's error
-//! type — admission carries [`VmStaticsError`] through a long path that
+//! type — admission carries [`DerivationError`] through a long path that
 //! has nothing to do with packages — and nothing else.
 //!
 //! Keeping the seam this thin is what makes `cargo hyperscale` honest: a
 //! package that builds locally has passed the call admission runs, not a
 //! reimplementation of it that agrees until it does not.
 
-use hyperscale_types::VmStaticsError;
+use hyperscale_types::DerivationError;
 pub use hyperscale_vm_effects::METADATA_SECTION;
 use hyperscale_vm_effects::PackageMetadata;
 use hyperscale_vm_gate::{
@@ -19,8 +19,8 @@ use hyperscale_vm_gate::{
     attach_metadata as attach, extract_metadata as extract,
 };
 
-fn chain(error: GateError) -> VmStaticsError {
-    VmStaticsError::Refused(error.0)
+fn chain(error: GateError) -> DerivationError {
+    DerivationError::Refused(error.0)
 }
 
 /// Attach `metadata` to a component artifact as its metadata section.
@@ -30,14 +30,14 @@ fn chain(error: GateError) -> VmStaticsError {
 ///
 /// # Errors
 ///
-/// [`VmStaticsError`] if the artifact's section framing is malformed, if
+/// [`DerivationError`] if the artifact's section framing is malformed, if
 /// it already declares a metadata section, or if the metadata is past a
 /// bound the codec enforces — the chain's byte budget included, judged
 /// here so nothing assembles an artifact admission would refuse on size.
 pub fn attach_metadata(
     artifact: &[u8],
     metadata: &PackageMetadata,
-) -> Result<Vec<u8>, VmStaticsError> {
+) -> Result<Vec<u8>, DerivationError> {
     attach(artifact, metadata).map_err(chain)
 }
 
@@ -45,10 +45,10 @@ pub fn attach_metadata(
 ///
 /// # Errors
 ///
-/// [`VmStaticsError`] if the artifact's section framing is malformed, if
+/// [`DerivationError`] if the artifact's section framing is malformed, if
 /// it declares the metadata section more than once, or if the section's
 /// payload is oversized or not canonical metadata.
-pub fn extract_metadata(artifact: &[u8]) -> Result<Option<PackageMetadata>, VmStaticsError> {
+pub fn extract_metadata(artifact: &[u8]) -> Result<Option<PackageMetadata>, DerivationError> {
     extract(artifact).map_err(chain)
 }
 
@@ -59,11 +59,11 @@ pub fn extract_metadata(artifact: &[u8]) -> Result<Option<PackageMetadata>, VmSt
 ///
 /// # Errors
 ///
-/// [`VmStaticsError`] on an artifact outside the profile, an absent or
+/// [`DerivationError`] on an artifact outside the profile, an absent or
 /// non-canonical metadata section, a declared method the component does
 /// not export, an ABI binding the export's type cannot honour, or a
 /// claim to totality, which only [`admit_protocol_package`] grants.
-pub fn admit_package(artifact: &[u8]) -> Result<PackageMetadata, VmStaticsError> {
+pub fn admit_package(artifact: &[u8]) -> Result<PackageMetadata, DerivationError> {
     admit(artifact).map_err(chain)
 }
 
@@ -80,7 +80,7 @@ pub fn admit_package(artifact: &[u8]) -> Result<PackageMetadata, VmStaticsError>
 /// As [`admit_package`], except that a claim to totality is checked
 /// against the artifact instead of refused, and fails admission when the
 /// code does not support it.
-pub fn admit_protocol_package(artifact: &[u8]) -> Result<PackageMetadata, VmStaticsError> {
+pub fn admit_protocol_package(artifact: &[u8]) -> Result<PackageMetadata, DerivationError> {
     admit_protocol(artifact).map_err(chain)
 }
 

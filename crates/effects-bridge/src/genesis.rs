@@ -17,7 +17,7 @@ pub use hyperscale_vm_stdlib::{account_artifact, genesis_publisher, staking_arti
 use hyperscale_vm_stdlib::{protocol_artifacts, staking};
 use hyperscale_vm_types::Address;
 
-use crate::vm_statics::{InstanceCache, NodeRecords, PackageCache};
+use crate::records::{InstanceCache, NodeRecords, PackageCache};
 use crate::{PoolRegistry, ProtocolHasher, XRD, admit_protocol_package};
 
 /// The packages a network is born running.

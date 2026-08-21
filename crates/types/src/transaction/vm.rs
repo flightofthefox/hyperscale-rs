@@ -259,7 +259,7 @@ pub struct Derived {
     pub work: u64,
 }
 
-/// Why VM static derivation did not answer.
+/// Why a derivation did not answer.
 ///
 /// Two different things, and a caller has to tell them apart. A refusal
 /// is a verdict every node reaches alike for the same bytes. A gap is
@@ -269,19 +269,19 @@ pub struct Derived {
 /// the envelope's fault forever; the second closes when the record
 /// arrives.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
-pub enum VmStaticsError {
+pub enum DerivationError {
     /// The envelope is inadmissible, on terms every node agrees on.
-    #[error("vm static derivation failed: {0}")]
+    #[error("derivation refused the envelope: {0}")]
     Refused(String),
     /// Component records this node holds none of, so it cannot say what
     /// the envelope declares. Not a verdict: the addresses are what a
     /// fetch asks its owning shard for, and derivation answers once they
     /// are seated.
-    #[error("vm static derivation wants records this node has not seen: {0:?}")]
+    #[error("derivation wants records this node has not seen: {0:?}")]
     Unresolved(Vec<Address>),
 }
 
-impl VmStaticsError {
+impl DerivationError {
     /// The records this node would need before derivation could answer,
     /// empty for a refusal.
     #[must_use]
@@ -310,10 +310,10 @@ pub trait Derivation: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`VmStaticsError`] on an undecodable or inadmissible envelope,
+    /// [`DerivationError`] on an undecodable or inadmissible envelope,
     /// a subintent signature list that does not match the tree, or a
     /// bound signer address the matching public key does not derive.
-    fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, VmStaticsError>;
+    fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError>;
 
     /// Offer one committed cell to the published-package cache.
     ///
