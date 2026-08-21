@@ -200,7 +200,6 @@ fn classify_declared_access(routing: &RoutedTransaction) -> DeclaredAccess {
             Mode::Delta | Mode::Reserve { .. } => {
                 access.write_keys.insert(key);
             }
-            Mode::Locked => continue,
         }
         access.declared_modes.push((key, effect.mode));
     }

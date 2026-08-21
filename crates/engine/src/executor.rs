@@ -188,10 +188,6 @@ impl Substates for TickBaseline {
 }
 
 impl Baseline for TickBaseline {
-    fn is_locked(&self, _key: SubstateKey) -> bool {
-        false
-    }
-
     fn holds(&self, key: SubstateKey) -> BTreeMap<TxHash, u128> {
         self.holds.get(&key).cloned().unwrap_or_default()
     }
