@@ -31,8 +31,8 @@ use hyperscale_vm_effects::{
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
-    Address, CallTarget, EffectSet, EffectTarget, Mode, PrincipalAddr, ResourceAddr, SchemeId,
-    SubstateKey,
+    Address, CallTarget, ComponentAddr, EffectSet, EffectTarget, Mode, PrincipalAddr, ResourceAddr,
+    SchemeId, SubstateKey,
 };
 use im::{OrdMap, Vector};
 
@@ -551,9 +551,20 @@ impl Resident {
 
     /// This world with `meta` seated at `address`, and whatever the
     /// bound leaves no room for let go.
-    fn seated(&self, address: Address, meta: InstanceMeta) -> Self {
+    ///
+    /// A record already resident seats again as itself. The question is
+    /// asked here rather than only at the door because two threads
+    /// seating one address both find it absent before either commits,
+    /// and the loser retries against a world that already holds it — a
+    /// second place in the order would then let the record go while the
+    /// first place still answers for it.
+    fn seated(&self, address: ComponentAddr, meta: &InstanceMeta) -> Self {
         let mut next = self.clone();
-        next.grown.insert(address, Arc::new(meta));
+        if next.record(address.into()).is_some() {
+            return next;
+        }
+        let address = address.address();
+        next.grown.insert(address, Arc::new(meta.clone()));
         next.order.push_back(address);
         while next.order.len() > next.capacity {
             let Some(oldest) = next.order.pop_front() else {
@@ -622,13 +633,16 @@ impl InstanceCache {
     /// First-write-wins, which costs nothing to be sure of: a record is
     /// registered at the address its own contents derive, so a second
     /// one at that address is the same record.
+    ///
+    /// The check here spares the common repeat a swap; the one the fold
+    /// makes is what settles it, since only that one sees the world the
+    /// swap actually lands on.
     fn seat(&self, hasher: &dyn Hasher, meta: &InstanceMeta) {
         let address = meta.address(hasher);
         if self.load().record(address.into()).is_some() {
             return;
         }
-        self.0
-            .rcu(|current| current.seated(address.address(), meta.clone()));
+        self.0.rcu(|current| current.seated(address, meta));
     }
 
     /// Seat a record verified elsewhere — read out of a committed cell
@@ -1071,6 +1085,48 @@ mod tests {
             chain.instance(address.into()).as_deref(),
             Some(&oldest),
             "a record let go is read back from its own cell"
+        );
+    }
+
+    /// A record seated twice takes one place in the order.
+    ///
+    /// The fold a swap retries against already holds what the losing
+    /// thread was seating, and a second place would let the record go
+    /// while the first still answers for it — so the bound would evict a
+    /// record the node is holding and count a place that names nothing.
+    #[test]
+    fn a_record_seated_twice_takes_one_place_in_the_order() {
+        let record_at = |salt: u8| InstanceMeta {
+            package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
+            config: Vec::new(),
+            salt: Hash32([salt; 32]),
+        };
+        let first = record_at(1);
+        let second = record_at(2);
+
+        // What the losing thread's retry runs: seating a record the
+        // world it retried against already holds.
+        let resident = Resident {
+            seeded: Arc::new(InstanceRegistry::new()),
+            grown: OrdMap::new(),
+            order: Vector::new(),
+            capacity: 2,
+        };
+        let once = resident.seated(first.address(&ProtocolHasher), &first);
+        let twice = once.seated(first.address(&ProtocolHasher), &first);
+        let then = twice.seated(second.address(&ProtocolHasher), &second);
+
+        assert_eq!(then.order.len(), 2, "one place each, not one per seating");
+        assert_eq!(
+            then.record(first.address(&ProtocolHasher).into())
+                .as_deref(),
+            Some(&first),
+            "a bound of two holds both, so the twice-seated record stays"
+        );
+        assert_eq!(
+            then.record(second.address(&ProtocolHasher).into())
+                .as_deref(),
+            Some(&second),
         );
     }
 
